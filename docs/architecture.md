@@ -3,6 +3,9 @@
 This document explains how open-scion works, for a new contributor who has
 read the [README](../README.md). It describes the code on `main`. Parts that do
 not exist yet are marked **planned**, with the issue that tracks them.
+The design follows Anthropic's article
+[Redesigning source control](https://www.anthropic.com/engineering/redesigning-source-control).
+The README lists where this project makes its own choices.
 
 ## 1. Overview
 
@@ -19,10 +22,10 @@ flowchart LR
     subgraph serve["scion-server serve"]
         svc["service.rs + auth.rs"] --> ops["write.rs, land.rs, read.rs"]
         ops --> tree["tree.rs: apply, root trees"]
-        ops --> db["db.rs"]
+        ops --> db["db.rs, store.rs"]
         tree --> db
-        db --> sqlite[("data/scion.db: SQLite")]
-        ops --> blobs[("data/objects/blob: zstd files")]
+        db --> sqlite[("scion.db: SQLite")]
+        ops --> blobs[("objects/blob: zstd files")]
     end
     git[("git repository")] --> imp["scion-server import"]
     imp --> tree
@@ -51,12 +54,14 @@ Three kinds of objects. All are content-addressed and never change.
 **A changeset stores only first-parent deltas.** `parents[0]` is the diff
 base. `changes` maps each path that differs from `parents[0]` to a new file
 state or to a delete. Other parents, such as the second parent of a merge, are
-recorded but not diffed. So creating a changeset costs as much as the change,
-not as much as the repository. The full snapshot is derived data (section 4).
+recorded but not diffed. So a changeset's size grows with the change, not
+with the repository. The full snapshot is derived data (section 4).
 
 A file state is a regular file (blob and executable flag), a symlink (blob
 that holds the target), or a gitlink (a git commit ID, no blob). Only git
-import sets `committer` or creates changesets with more than one parent.
+import sets `committer`, creates a changeset with zero or several parents, or
+creates a repo or a ref. No RPC creates a repo or a ref, so a new repo starts
+with `scion-server import`.
 
 ```mermaid
 flowchart LR
@@ -120,7 +125,8 @@ corrupt, and the next put of that content replaces it.
 
 **Durability rules.**
 
-- A database transaction is durable when it commits (WAL, `synchronous = FULL`).
+- A database transaction is durable when it commits: WAL, `synchronous = FULL`,
+  and `fullfsync = ON`, so on macOS the commit goes through the drive cache too.
 - A blob is durable after `BlobBatch::sync`. Each blob file gets a plain
   `fsync` when written. `sync` then flushes each changed fan-out directory and
   issues one full drive flush for the whole batch (`F_FULLFSYNC` on macOS).
@@ -130,8 +136,9 @@ corrupt, and the next put of that content replaces it.
   before the transaction that records them.
 - A put of a blob that is already stored intact keeps the file, but still
   flushes its directory: another batch may have written it and not synced.
-- One full flush per new blob limits the write rate. **Planned:** group
-  commit, where writers share one flush ([#3](https://github.com/bnsd55/open-scion/issues/3)).
+- Each `PutBlob` call does one full flush, even for a blob already stored.
+  This limits the write rate. **Planned:** group commit, where writers share
+  one flush ([#3](https://github.com/bnsd55/open-scion/issues/3)).
 
 **Data-directory lock.** `Store::open` takes an exclusive, non-blocking
 `flock` on `<data>/lock` and holds it until the last `Store` clone is dropped.
@@ -176,6 +183,8 @@ An agent writes in three steps. Only the last one moves a ref.
 3. `Land` rebases the changeset onto a ref and moves the ref.
 
 All three are safe to repeat. A land retry must reuse its request key.
+`GetLand(land_id)` returns the stored state of a land that the same caller
+started.
 
 **CreateChangeset** (`write.rs`):
 
@@ -203,20 +212,24 @@ sequenceDiagram
     end
     L->>L: take the ref lock, one land at a time per ref
     L->>DB: read the row again, a call with the same key may have finished it
-    L->>DB: read the ref head, update the path index
-    L->>L: plan: is the base on the ref history? did a path change after the base?
-    alt base not on the history, or a path conflicts
-        L->>DB: transaction: set the row to rejected or conflict
-        L-->>A: REJECTED, or CONFLICT with the paths
-    else no conflict
-        L->>DB: transaction: store the rebased changeset, compare-and-swap the ref, set the row to landed
-        alt the ref moved since the plan
-            L->>L: roll back and plan again, at most 3 attempts
-            L-->>A: ABORTED, the row stays pending
-        else the swap succeeded
-            L->>L: add the new head to the path index
-            L-->>A: LANDED with the result changeset
+    loop at most 3 attempts, again only if the ref moved
+        L->>DB: read the ref head, update the path index
+        L->>L: plan: is the base on the ref history? did a path change after the base?
+        alt base not on the history, or a path conflicts
+            L->>DB: transaction: set the row to rejected or conflict
+            L-->>A: REJECTED, or CONFLICT with the paths
+        else no path conflict
+            L->>DB: transaction: store the rebased changeset, compare-and-swap the ref, set the row to landed
         end
+    end
+    alt the swap succeeded
+        L->>L: add the new head to the path index
+        L-->>A: LANDED with the result changeset
+    else the changes do not apply to the head tree
+        L->>DB: transaction: set the row to conflict
+        L-->>A: CONFLICT with no paths
+    else the ref moved in all 3 attempts
+        L-->>A: ABORTED, the row stays pending
     end
 ```
 
@@ -237,8 +250,9 @@ sequenceDiagram
   The data-directory lock keeps the `import` command and the server apart, so
   this race needs both in one process, as in the tests. If the
   compare-and-swap fails, the transaction rolls back and the land is planned
-  again from the new head. After 3 attempts the call fails with `ABORTED`,
-  and the client retries with the same key.
+  again from the new head. After 3 attempts the call fails with `ABORTED` and
+  the row stays pending. The caller retries with the same key. `scn land`
+  does not retry. Run it again: the default key is the same.
 - **Outcomes.** `CONFLICT` and `REJECTED` are land states in a successful
   reply, not gRPC errors. A land to a missing ref is rejected at once. If the
   path check passes but the changes do not apply to the head tree, the land
@@ -329,8 +343,9 @@ stored intact.
 
 ## 7. The read path
 
-**Today.** Every read takes a changeset ID, never a ref name, so every answer
-is about an immutable object. A client resolves a ref first. `scn` accepts a
+**Today.** Every read except `ResolveRef` takes a changeset ID, not a ref
+name, so its answer is about an immutable object. A client resolves a ref
+first. `scn` accepts a
 ref name or a 64-digit changeset ID wherever it takes a revision.
 
 | RPC | Answer |
@@ -339,7 +354,7 @@ ref name or a 64-digit changeset ID wherever it takes a revision.
 | `GetChangeset` | `ChangesetV1` bytes. |
 | `ReadFile` | A regular file's content, or a symlink's target, in 1 MiB chunks. |
 | `ListDir` | One directory level as `TreeV1` bytes. |
-| `Log` | First-parent history, newest first. At most 1,000 entries and about 32 MiB per reply. The client pages for more. |
+| `Log` | First-parent history, newest first. At most 1,000 entries and about 32 MiB per reply. A client asks again from the first parent of the last entry. `scn log` makes one call. |
 
 `ReadFile` and `ListDir` get the changeset's root tree from `derived`
 (deriving it if the row is missing), then walk trees from SQLite one path part
@@ -357,12 +372,17 @@ with three calls:
   checks each one by its hash.
 
 `scn checkout` will walk one tree level per batch, then fetch blobs in
-batches, with optional sparse directories. Every tier answers the same calls,
-in strict order:
+batches, with optional sparse directories.
+
+The article says one `scion-daemon` stores objects for the whole node and is
+reached over a socket. It talks only to a regional `scion-cache`, which serves
+objects from memory. Every tier answers identical calls, and no tier skips the
+next one. The Unix socket, the daemon's disk store, the call names above and
+access tickets are this project's choices:
 
 ```mermaid
 flowchart LR
-    job["scn checkout"] -->|"Unix socket"| daemon["scion-daemon<br/>one per machine, disk store"]
+    job["scn checkout"] -->|"Unix socket"| daemon["scion-daemon<br/>one per node, disk store"]
     daemon -->|"miss"| cache["scion-cache<br/>regional, memory store"]
     cache -->|"miss"| server["scion-server"]
 ```
@@ -401,7 +421,7 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-core/src/codec.rs` (`put_len`) | Encoding panics if a field is longer than `u32::MAX`. Every ingest path caps sizes far below that. | `try_encode` returning `Result`, if a path ever does not. | |
 | `scion-server/src/store.rs` (`MAX_OBJECT_BYTES`) | An upload is buffered in memory, up to 100 MiB, before it is hashed and written. | Stream to a temp file and hash the chunks. | [#16](https://github.com/bnsd55/open-scion/issues/16) |
 | `scion-server/src/store.rs` (`Inner::db`) | One SQLite connection behind a mutex, so reads wait for writes. | A pool of read-only connections. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
-| `scion-server/src/store.rs` (`Store::open`) | One process per data directory, so an import needs the server stopped. | Lands that re-plan when the ref moves, then a separate importer process. | |
+| `scion-server/src/store.rs` (`Store::open`) | One process per data directory, so an import needs the server stopped. | Let a separate importer process share the directory. Lands already re-plan when the ref moves (`MAX_ATTEMPTS`). | |
 | `scion-server/src/store.rs` (`Blobs::verify`) | Holds the packed and the unpacked bytes, up to about 200 MiB per call. | Stream the unpacked bytes into the hasher. | [#20](https://github.com/bnsd55/open-scion/issues/20) |
 | `scion-server/src/write.rs` (`create_changeset`) | Limits are checked after a full decode. | A decoder that stops at a count limit. | |
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
