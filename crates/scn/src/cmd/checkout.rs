@@ -6,7 +6,7 @@
 //! arrival. Nothing is written until the whole tree is walked and every name
 //! has passed the checkout path rules.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -35,8 +35,9 @@ fn parse_dir(dir: &str) -> Result<RepoPath> {
     RepoPath::new(dir.trim_end_matches('/')).with_context(|| format!("bad path {dir:?}"))
 }
 
-/// Files to write, by path. Never holds a gitlink.
-type Files = BTreeMap<RepoPath, FileState>;
+/// Files to write, grouped by the blob that holds their content: a blob may
+/// back several files. Never holds a gitlink.
+type Files = HashMap<BlobId, Vec<(RepoPath, FileState)>>;
 
 /// Writes the files of a changeset into a new or empty directory, and prints
 /// how many it wrote.
@@ -55,13 +56,14 @@ pub async fn checkout(ctx: &mut Ctx, args: CheckoutArgs) -> Result<()> {
     let files = walk(&mut ctx.objects, &ctx.repo, root, &args.sparse).await?;
     let dest = Root::create(&args.into)?;
     write_files(&mut ctx.objects, &ctx.repo, &dest, &files).await?;
+    let count: usize = files.values().map(Vec::len).sum();
     let into = args.into.display();
     if ctx.json {
         let summary =
-            json!({ "changeset": id.to_string(), "files": files.len(), "into": into.to_string() });
+            json!({ "changeset": id.to_string(), "files": count, "into": into.to_string() });
         println!("{summary}");
     } else {
-        println!("checked out {} files from {id} into {into}", files.len());
+        println!("checked out {count} files from {id} into {into}");
     }
     Ok(())
 }
@@ -129,7 +131,9 @@ async fn walk(
                 match entry {
                     Entry::Dir(id) => next.push((Some(path), *id)),
                     Entry::File(state) => {
-                        files.insert(path, *state);
+                        if let Some(blob) = state.blob() {
+                            files.entry(blob).or_default().push((path, *state));
+                        }
                     }
                 }
             }
@@ -149,18 +153,11 @@ async fn walk(
 ///
 /// Fails if a fetch or a write fails.
 async fn write_files(objects: &mut Objects, repo: &str, dest: &Root, files: &Files) -> Result<()> {
-    // A blob may hold the content of several files.
-    let mut users: HashMap<BlobId, Vec<(&RepoPath, &FileState)>> = HashMap::new();
-    for (path, state) in files {
-        if let Some(blob) = state.blob() {
-            users.entry(blob).or_default().push((path, state));
-        }
-    }
-    let ids: Vec<_> = users.keys().map(|id| *id.as_bytes()).collect();
+    let ids = files.keys().map(|id| *id.as_bytes());
     fetch(objects, repo, ObjectKind::Blob, ids, |id, data| {
         let id = BlobId::from_bytes(id);
         check_blob(id, &data)?;
-        for &(path, state) in users.get(&id).into_iter().flatten() {
+        for (path, state) in files.get(&id).into_iter().flatten() {
             match *state {
                 FileState::Regular { executable, .. } => dest.file(path, executable, &data)?,
                 FileState::Symlink { .. } => dest.symlink(path, &data)?,
@@ -207,13 +204,11 @@ async fn fetch(
             .into_inner();
         let before = want.len();
         while let Some(object) = stream.message().await.context("cannot fetch objects")? {
-            let id = <[u8; 32]>::try_from(object.id.as_slice()).ok();
-            match id {
-                Some(id) if object.kind == i32::from(kind) && want.remove(&id) => {
-                    got(id, object.data)?;
-                }
-                _ => bail!("server sent an object that was not asked for"),
+            let id = id_from(&object.id)?;
+            if object.kind != i32::from(kind) || !want.remove(&id) {
+                bail!("server sent an object that was not asked for");
             }
+            got(id, object.data)?;
         }
         if want.len() == before {
             bail!("server sent none of the requested objects");

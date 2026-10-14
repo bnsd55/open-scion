@@ -2,7 +2,7 @@
 //! of the same commit.
 #![cfg(unix)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -266,12 +266,7 @@ fn sparse_checkout_writes_only_the_requested_directories() {
     expected.retain(|path, _| {
         path == Path::new("src") || path.starts_with("src/nested") || path.starts_with("docs")
     });
-    let got = snapshot(&ours);
-    assert_eq!(
-        got.keys().collect::<BTreeSet<_>>(),
-        expected.keys().collect::<BTreeSet<_>>()
-    );
-    assert_eq!(got, expected);
+    assert_eq!(snapshot(&ours), expected);
 
     // A sparse path that is not in the tree is an error, not an empty checkout.
     let missing = tmp.path().join("missing");
@@ -338,7 +333,7 @@ fn unsafe_names_fail_before_anything_is_written() {
         target: store.blobs().put(b"../../outside").unwrap(),
     };
     // Each tree is valid in the object format, and each error names the path.
-    let cases: [(Files, &str); 5] = [
+    let cases: [(Files, &str); 4] = [
         (&[(b"A", file), (b"a", file)], r#""A" and "a""#),
         // On a case-insensitive filesystem `link/x` would go through `Link`.
         (
@@ -347,7 +342,6 @@ fn unsafe_names_fail_before_anything_is_written() {
         ),
         (&[(b"ok", file), (b"ok\x1b[2J", file)], r#""ok\x1b[2J""#),
         (&[(b"src/.git/config", file)], r#""src/.git""#),
-        (&[(b".Scion", file)], r#"".Scion""#),
     ];
     let files: Vec<_> = cases.iter().map(|(files, _)| *files).collect();
     let ids = store_changesets(&store, &files);

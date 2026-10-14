@@ -5,8 +5,6 @@
 //! `TreeV1` bytes and a blob as its raw content, so the client checks each one
 //! against its ID.
 
-use std::pin::Pin;
-
 use scion_core::{BlobId, TreeId};
 use scion_proto::v1::objects_server::{Objects, ObjectsServer};
 use scion_proto::v1::{
@@ -15,22 +13,20 @@ use scion_proto::v1::{
 };
 use scion_proto::{MAX_MESSAGE_BYTES, MAX_OBJECT_MESSAGE_BYTES, MAX_OBJECT_REFS};
 use tokio::sync::mpsc;
-use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use crate::db;
 use crate::error::Result;
 use crate::service::{Worker, check_name, parse_id, resolve_ref};
-use crate::store::{MAX_OBJECT_BYTES, Store};
-use crate::tree;
+use crate::store::{self, Store};
+use crate::{db, read};
 
 /// A `GetObjects` reply stops before the next object once it has sent this
 /// many bytes. The client asks again for the rest, so one call stays short.
 const REPLY_BUDGET_BYTES: usize = MAX_MESSAGE_BYTES;
 
-// Every stored object fits in one reply message, with room for its kind and ID.
-const _: () = assert!(MAX_OBJECT_BYTES + 64 <= MAX_OBJECT_MESSAGE_BYTES);
+// The store keeps exactly the objects that the API promises to send.
+const _: () = assert!(store::MAX_OBJECT_BYTES == scion_proto::MAX_OBJECT_BYTES);
 
 /// One object to read.
 #[derive(Clone, Copy)]
@@ -38,8 +34,6 @@ enum Key {
     Tree(TreeId),
     Blob(BlobId),
 }
-
-type ObjectStream = Pin<Box<dyn Stream<Item = Result<Object, Status>> + Send>>;
 
 /// Implements the `Objects` RPCs.
 pub struct ObjectsService {
@@ -109,22 +103,19 @@ impl Objects for ObjectsService {
         let cs = parse_id(&changeset_id, "changeset_id")?;
         let tree = self
             .worker
-            .run(move |store| {
-                let repo = store.read(|c| db::repo_id(c, &repo))?;
-                tree::root_tree(&store, repo, cs)
-            })
+            .run(move |store| read::root_tree(&store, &repo, cs))
             .await?;
         Ok(Response::new(GetRootTreeResponse {
             tree_id: tree.as_bytes().to_vec(),
         }))
     }
 
-    type GetObjectsStream = ObjectStream;
+    type GetObjectsStream = ReceiverStream<Result<Object, Status>>;
 
     async fn get_objects(
         &self,
         request: Request<GetObjectsRequest>,
-    ) -> Result<Response<ObjectStream>, Status> {
+    ) -> Result<Response<Self::GetObjectsStream>, Status> {
         let GetObjectsRequest { repo, refs } = request.into_inner();
         check_name("repo", &repo)?;
         if refs.is_empty() || refs.len() > MAX_OBJECT_REFS {
@@ -138,6 +129,9 @@ impl Objects for ObjectsService {
             .await?;
         // Reads one object at a time, as the client takes them, so a call
         // holds at most two objects in memory.
+        // SHORTCUT: one blocking hop per object and no read-ahead, so many
+        // small objects are read one after another. Upgrade: read a batch
+        // capped by bytes per hop, or keep a few reads in flight.
         let (tx, rx) = mpsc::channel(1);
         let worker = self.worker.clone();
         tokio::spawn(async move {
@@ -155,6 +149,6 @@ impl Objects for ObjectsService {
                 }
             }
         });
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }

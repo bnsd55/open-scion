@@ -110,20 +110,22 @@ impl Root {
     }
 
     /// Opens the directory that holds `path`, creating missing parents, and
-    /// returns it with the last part of `path`.
-    // SHORTCUT: opens every parent again for each file, one `openat` per
-    // part. Upgrade: keep the last directory open while writing in path order.
+    /// returns it with the last part of `path`. Fails before creating
+    /// anything if a part breaks [`check_name`].
+    // SHORTCUT: one `mkdirat` and one `openat` per parent for every file, and
+    // files arrive in blob order, not path order. Upgrade: create each
+    // directory once from the walk, fetch blobs in path order, and keep the
+    // last directory open.
     fn parent<'p>(&self, path: &'p RepoPath) -> io::Result<(OwnedFd, &'p [u8])> {
-        let bytes = path.as_bytes();
-        let (parents, name) = match bytes.iter().rposition(|&b| b == b'/') {
-            Some(slash) => (&bytes[..slash], &bytes[slash + 1..]),
-            None => (&bytes[..0], bytes),
-        };
+        let parts = || path.as_bytes().split(|&b| b == b'/');
+        if let Some(why) = parts().find_map(|part| check_name(part).err()) {
+            return Err(io::Error::other(why));
+        }
+        let mut parents = parts();
+        // A path has at least one part.
+        let name = parents.next_back().unwrap_or_default();
         let mut dir = self.dir.try_clone()?;
-        for part in parents
-            .split(|&b| b == b'/')
-            .filter(|part| !part.is_empty())
-        {
+        for part in parents {
             dir = open_dir(&dir, part)?;
         }
         Ok((dir, name))
@@ -210,5 +212,12 @@ mod tests {
         ] {
             assert!(check_name(bad).is_err(), "{}", bad.escape_ascii());
         }
+
+        // The writer applies the rules too, to every part.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Root::create(tmp.path()).unwrap();
+        assert!(root.file(&path("a/.git/hooks/x"), true, b"x").is_err());
+        assert!(root.symlink(&path("a/b\x1b"), b"x").is_err());
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
 }
