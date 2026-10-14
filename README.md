@@ -13,10 +13,9 @@ A version control system for large monorepos where most of the writers are
 AI agents. The server keeps the history and makes the commits; clients ask
 only for what they need. Written in Rust.
 
-> **Status: early proof of concept.** Git import, server-side commits and
-> lands, and reads over the API work on one machine. Checkout, cache tiers
-> and access control beyond one token are not built yet. Do not use it for
-> real code.
+> **Early proof of concept.** It runs on one machine and is not ready for real
+> code. Planned work is tracked in [issues](https://github.com/bnsd55/open-scion/issues)
+> and [milestones](https://github.com/bnsd55/open-scion/milestones).
 
 ## What this is, and what it is not
 
@@ -92,25 +91,6 @@ scn land "$cs"                                               # rebase onto main 
 `scn land` exits non-zero on a conflict and prints the paths, so an agent can
 re-read them, redo the change, and try again. A retry of the same land is safe:
 the server returns the first result.
-
-## Status
-
-| Part | State |
-|---|---|
-| Object format: changesets, trees, blobs | Done. Frozen byte format, golden tests, fuzzed. |
-| Git import (one way) | Done. Imported commits are checked against git. |
-| Reads over the API: `cat`, `ls`, `log`, `show` | Done |
-| Server-side commit and land | Done |
-| Cache tiers (per-machine daemon, regional cache) and sparse checkout | Next |
-| Virtual checkout (files load when read) | Planned |
-| Blame and path history | Planned |
-| Users, permissions per folder | Planned |
-
-Measured on a laptop with one server process: 200 agents landed 10,000
-changes in parallel at about 210 lands per second, with none lost or
-duplicated. Importing a git repository with 23,871 commits took 50 seconds.
-Today the write rate is limited by one full disk flush per new file; batching
-those flushes across requests is the next step.
 
 ## Try it
 
