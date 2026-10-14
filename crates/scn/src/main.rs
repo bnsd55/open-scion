@@ -2,6 +2,7 @@
 
 mod client;
 mod cmd;
+mod materialize;
 
 use std::process::ExitCode;
 
@@ -59,6 +60,9 @@ enum Command {
         /// Ref name or changeset ID.
         rev: String,
     },
+    /// Write the files of a changeset into a new directory:
+    /// `scn checkout main --sparse src --into ./work`.
+    Checkout(cmd::checkout::CheckoutArgs),
     /// Create a changeset on the server. Moves no ref; use `scn land` next.
     Commit(cmd::commit::CommitArgs),
     /// Rebase a changeset onto a ref and move the ref.
@@ -86,6 +90,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Ls { spec } => cmd::read::ls(&mut ctx, &spec).await,
         Command::Log { rev, limit } => cmd::read::log(&mut ctx, &rev, limit).await,
         Command::Show { rev } => cmd::read::show(&mut ctx, &rev).await,
+        Command::Checkout(args) => cmd::checkout::checkout(&mut ctx, args).await,
         Command::Commit(args) => cmd::commit::commit(&mut ctx, args).await,
         Command::Land(args) => cmd::land::land(&mut ctx, args).await,
         Command::Bench(args) => cmd::bench::bench(&ctx, args).await,

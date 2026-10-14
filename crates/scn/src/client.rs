@@ -5,9 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use scion_core::{BlobId, Changeset, ChangesetId, RepoPath};
+use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ResolveRefRequest};
-use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES};
+use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_OBJECT_MESSAGE_BYTES};
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
@@ -15,6 +16,9 @@ use tonic::transport::Channel;
 
 /// A connected client.
 pub type Client = ScionClient<InterceptedService<Channel, Bearer>>;
+
+/// A connected client for the object reads that a cache tier can answer.
+pub type Objects = ObjectsClient<InterceptedService<Channel, Bearer>>;
 
 /// Adds the bearer token to every request.
 #[derive(Clone)]
@@ -37,6 +41,8 @@ impl Interceptor for Bearer {
 pub struct Ctx {
     /// The gRPC client.
     pub client: Client,
+    /// The `Objects` client, on the same connection.
+    pub objects: Objects,
     /// Repository name.
     pub repo: String,
     /// Print JSON instead of text.
@@ -51,22 +57,31 @@ impl Ctx {
             .connect()
             .await
             .with_context(|| format!("cannot connect to {server}"))?;
-        let bearer = format!("Bearer {token}")
+        let bearer: MetadataValue<Ascii> = format!("Bearer {token}")
             .parse()
             .context("token is not valid ASCII")?;
+        let objects = ObjectsClient::with_interceptor(channel.clone(), Bearer(bearer.clone()))
+            .max_decoding_message_size(MAX_OBJECT_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES);
         let client = ScionClient::with_interceptor(channel, Bearer(bearer))
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
-        Ok(Self { client, repo, json })
+        Ok(Self {
+            client,
+            objects,
+            repo,
+            json,
+        })
     }
 
-    /// Turns a ref name or a 64-digit changeset ID into a changeset ID.
+    /// Turns a ref name or a 64-digit changeset ID into a changeset ID. A ref
+    /// is resolved through `Objects`, which a cache tier forwards.
     pub async fn resolve(&mut self, rev: &str) -> Result<ChangesetId> {
         if let Ok(id) = rev.parse() {
             return Ok(id);
         }
         let reply = self
-            .client
+            .objects
             .resolve_ref(ResolveRefRequest {
                 repo: self.repo.clone(),
                 name: rev.to_owned(),

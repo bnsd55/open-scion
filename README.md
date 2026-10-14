@@ -101,7 +101,8 @@ the server returns the first result.
 | Git import (one way) | Done. Imported commits are checked against git. |
 | Reads over the API: `cat`, `ls`, `log`, `show` | Done |
 | Server-side commit and land | Done |
-| Cache tiers (per-machine daemon, regional cache) and sparse checkout | Next |
+| Object reads (`Objects` service) and `scn checkout`, full or sparse | Done |
+| Cache tiers (per-machine daemon, regional cache) | Next |
 | Virtual checkout (files load when read) | Planned |
 | Blame and path history | Planned |
 | Users, permissions per folder | Planned |
@@ -122,6 +123,7 @@ export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
 
 ./target/release/scn log -n 5
 ./target/release/scn cat main:README.md
+./target/release/scn checkout main --into /tmp/work   # --sparse DIR for part of it
 echo hello > hello.txt
 cs=$(./target/release/scn commit -m "add hello" --put hello.txt=hello.txt)
 ./target/release/scn land "$cs"

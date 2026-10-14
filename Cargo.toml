@@ -16,6 +16,7 @@ authors = ["Ben Shaharizad <bnsd55@gmail.com>"]
 [workspace.dependencies]
 scion-core = { path = "crates/scion-core" }
 scion-proto = { path = "crates/scion-proto" }
+scion-server = { path = "crates/scion-server" }
 
 anyhow = "1.0"
 blake3 = "1.8"
