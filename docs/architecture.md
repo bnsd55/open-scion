@@ -428,7 +428,6 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/land.rs` (`MAX_ATTEMPTS`) | Imports move refs without the land lock, so a land retries 3 times, then returns `ABORTED`. | Route every ref move through the per-ref lander. |[#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | One lander per ref that rebases a batch and moves the ref once. | [#18](https://github.com/bnsd55/open-scion/issues/18) |
 | `scion-server/src/land.rs` (`PathIndex`) | Never pruned: memory grows with the paths changed since the server started. | Drop entries older than the oldest base in use. | [#19](https://github.com/bnsd55/open-scion/issues/19) |
-| `scion-server/src/import.rs` (`Importer::blobs`) | The git-to-Scion blob map grows with every distinct blob, about 100 bytes each. | A bounded LRU cache. |[#29](https://github.com/bnsd55/open-scion/issues/29) |
 | `scion-server/src/auth.rs` (`Auth`) | One static token, one principal. | A token-to-principal map, then per-path write rules. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/main.rs` (`serve`) | No TLS. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
 | `scn/src/client.rs` (`lossy`) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | Escape or base64 raw bytes in JSON. | |

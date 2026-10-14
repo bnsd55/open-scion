@@ -14,6 +14,7 @@ use std::time::Instant;
 
 use gix::ObjectId;
 use gix::actor::SignatureRef;
+use hashlink::LruCache;
 use rusqlite::{Connection, params};
 use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileState, GitOid, IdentityTime, PathElem, RepoPath,
@@ -32,6 +33,9 @@ const BATCH: usize = 1000;
 /// Cache for decoded git objects. A tree diff re-reads the trees that the
 /// previous commit's diff just read.
 const OBJECT_CACHE_BYTES: usize = 64 << 20;
+/// Most entries in each blob cache of an import. An entry takes at most about
+/// 100 bytes, so a full cache takes at most about 6.5 MB.
+const BLOB_CACHE_ENTRIES: usize = 1 << 16;
 
 /// What to import.
 #[derive(Clone, Debug)]
@@ -78,6 +82,17 @@ pub fn import_git(
     git_dir: &Path,
     opts: &ImportOptions,
 ) -> Result<ImportReport> {
+    import_with_cache(store, repo, git_dir, opts, BLOB_CACHE_ENTRIES)
+}
+
+/// [`import_git`] with at most `cache_entries` entries in each blob cache.
+fn import_with_cache(
+    store: &Store,
+    repo: &str,
+    git_dir: &Path,
+    opts: &ImportOptions,
+    cache_entries: usize,
+) -> Result<ImportReport> {
     let started = Instant::now();
     let mut git = gix::open(git_dir)
         .map_err(|e| Error::Git(format!("cannot open {}: {e}", git_dir.display())))?;
@@ -107,15 +122,15 @@ pub fn import_git(
 
     let mut importer = Importer {
         git: &git,
-        blobs: HashMap::new(),
+        blobs: LruCache::new(cache_entries),
         put: Vec::new(),
     };
     let mut checker = Checker {
         git: &git,
         store,
         equal: HashSet::new(),
-        blobs: HashMap::new(),
-        intact: HashSet::new(),
+        blobs: LruCache::new(cache_entries),
+        intact: LruCache::new(cache_entries),
     };
     let mut done = 0;
     for batch in plan.todo.chunks(BATCH) {
@@ -130,8 +145,10 @@ pub fn import_git(
         }
         blobs.sync()?;
         // A put writes or reads back its blob, so the checker reads back only
-        // blobs from earlier runs.
-        checker.intact.extend(importer.put.drain(..));
+        // blobs from earlier runs, or blobs that its cache dropped.
+        checker
+            .intact
+            .extend(importer.put.drain(..).map(|blob| (blob, ())));
         store.write(|c| {
             for (commit, cs, git_tree) in &prepared {
                 let root = record(c, repo_id, *commit, cs)?;
@@ -328,12 +345,10 @@ fn point_ref(c: &Connection, repo: RepoId, name: &str, tip: ChangesetId) -> Resu
 /// Turns git commits into changesets.
 struct Importer<'a> {
     git: &'a gix::Repository,
-    /// Blobs stored in this run, so each is read from git once.
-    // SHORTCUT: grows with every distinct blob in the history (about 100
-    // bytes each, so 1M blobs take about 100 MB). Upgrade: a bounded LRU; a
-    // miss costs a git read and a read-back of the stored blob, since
-    // `BlobBatch::put` keeps a stored blob only after checking it.
-    blobs: HashMap<ObjectId, BlobId>,
+    /// Blobs recently stored in this run, so most are read from git once. A
+    /// miss costs a git read and a read-back of the stored blob, since
+    /// `BlobBatch::put` keeps a stored blob only after checking it.
+    blobs: LruCache<ObjectId, BlobId>,
     /// Blobs put since the checker last took them.
     put: Vec<BlobId>,
 }
@@ -461,10 +476,10 @@ struct Checker<'a> {
     /// Tree pairs already found equal, so shared subtrees are checked once.
     equal: HashSet<(ObjectId, TreeId)>,
     /// Blob IDs hashed from git content, apart from the importer's cache.
-    blobs: HashMap<ObjectId, BlobId>,
-    /// Stored blobs known to be intact: put in this run, or read back by an
-    /// earlier check.
-    intact: HashSet<BlobId>,
+    blobs: LruCache<ObjectId, BlobId>,
+    /// Stored blobs recently known to be intact: put in this run, or read
+    /// back by an earlier check. A miss costs a read-back of the stored blob.
+    intact: LruCache<BlobId, ()>,
 }
 
 impl Checker<'_> {
@@ -506,11 +521,11 @@ impl Checker<'_> {
                             return Err(differs(format!("git {expected:?}, Scion {state:?}")));
                         }
                         if let Some(blob) = state.blob()
-                            && !self.intact.contains(&blob)
+                            && self.intact.get(&blob).is_none()
                         {
                             let problem = match self.store.blobs().verify(blob)? {
                                 BlobStatus::Valid => {
-                                    self.intact.insert(blob);
+                                    self.intact.insert(blob, ());
                                     continue;
                                 }
                                 BlobStatus::Missing => "is not stored",
@@ -542,7 +557,7 @@ impl Checker<'_> {
 
 /// Looks up `oid` in `cache`, filling it from `compute` on a miss.
 fn cached(
-    cache: &mut HashMap<ObjectId, BlobId>,
+    cache: &mut LruCache<ObjectId, BlobId>,
     oid: ObjectId,
     compute: impl FnOnce() -> Result<BlobId>,
 ) -> Result<BlobId> {
@@ -703,4 +718,69 @@ fn identity(
 
 fn per_sec(count: usize, since: Instant) -> u128 {
     count as u128 * 1000 / since.elapsed().as_millis().max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::process::Command;
+
+    use super::*;
+
+    /// Runs git in `dir` with a fixed identity and no user or system config.
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Ada")
+            .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+            .env("GIT_COMMITTER_NAME", "Ada")
+            .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn a_tiny_blob_cache_imports_the_same_changesets() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        // Eight distinct blobs, then the same blobs at new paths. With a cache
+        // of two entries, most of them are met again after they were evicted.
+        for i in 0..8 {
+            fs::write(dir.join(format!("f{i}")), format!("{i}\n")).unwrap();
+        }
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "add"]);
+        fs::create_dir(dir.join("d")).unwrap();
+        for i in 0..8 {
+            fs::rename(dir.join(format!("f{i}")), dir.join(format!("d/f{i}"))).unwrap();
+        }
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "move"]);
+
+        let opts = ImportOptions {
+            rev: "main".into(),
+            target_ref: "main".into(),
+            verify_sample: usize::MAX,
+        };
+        let import = |cache_entries| {
+            let data = tempfile::tempdir().unwrap();
+            let store = Store::open(data.path()).unwrap();
+            import_with_cache(&store, "main", dir, &opts, cache_entries).unwrap()
+        };
+        let tiny = import(2);
+        let unbounded = import(usize::MAX);
+        assert_eq!((tiny.commits, tiny.verified), (2, 2));
+        // Each changeset names its parents by ID, so equal tips mean that
+        // every changeset is the same.
+        assert_eq!(tiny.tip, unbounded.tip);
+    }
 }
