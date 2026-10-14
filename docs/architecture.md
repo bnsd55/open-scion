@@ -188,10 +188,10 @@ started.
 
 **CreateChangeset** (`write.rs`):
 
-1. Decode strictly.
-2. Check the request: exactly one parent, no committer, at most 100,000
-   changes, a message of at most 1 MiB, author name and email of at most
-   1 KiB each.
+1. Decode strictly, with at most 100,000 changes. A larger change count is
+   refused before any change is read.
+2. Check the request: exactly one parent, no committer, a message of at most
+   1 MiB, author name and email of at most 1 KiB each.
 3. Read back every blob it names, outside the database lock.
 4. In one write transaction: if the repo already has this ID, return it (a
    retry). The parent must be in the repo. Then `tree::store_changeset`.
@@ -294,9 +294,28 @@ land of b,    base B   dirs["b"]     = 12 > 10    conflict
 land of d.rs, base B   no entry                   lands on H
 ```
 
+**Pruning.** The index works in cycles of 10,000 generations of the tip.
+During a cycle it notes the oldest base that a land used. When the cycle
+ends, the floor moves up to that base, or to the tip at the cycle start if no
+base was older. Every entry at or below the new floor is dropped. So memory
+follows the oldest base in use, not the time since the server started. A
+base that a cycle used stays in the index until the next cycle ends.
+
+**Why pruning cannot hide a conflict.** After a prune, the index still holds,
+for each path, the newest generation that changed it after the floor. A
+land's base is at or above the floor, or below it:
+
+- At or above the floor: every dropped entry has a generation at or below the
+  floor, so at or below `base_gen`. It never counts as newer than the base,
+  so the check gives the same answer as before the prune.
+- Below the floor: `reach` walks the history in the database from the floor
+  back to the base, and adds each changeset it passes. The index then holds
+  every change after the base again.
+
+So the choice of the new floor changes only the speed, never the answer.
+
 **Planned:** a lander that rebases a batch of pending lands and moves the ref
-once ([#18](https://github.com/bnsd55/open-scion/issues/18)), and pruning of
-the path index ([#19](https://github.com/bnsd55/open-scion/issues/19)).
+once ([#18](https://github.com/bnsd55/open-scion/issues/18)).
 
 ## 6. Git import
 
@@ -421,13 +440,12 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-core/src/codec.rs` (`put_len`) | Encoding panics if a field is longer than `u32::MAX`. Every ingest path caps sizes far below that. | `try_encode` returning `Result`, if a path ever does not. | |
 | `scion-server/src/store.rs` (`MAX_OBJECT_BYTES`) | An upload is buffered in memory, up to 100 MiB, before it is hashed and written. | Stream to a temp file and hash the chunks. | [#16](https://github.com/bnsd55/open-scion/issues/16) |
 | `scion-server/src/store.rs` (`Inner::db`) | One SQLite connection behind a mutex, so reads wait for writes. | A pool of read-only connections. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
-| `scion-server/src/store.rs` (`Store::open`) | One process per data directory, so an import needs the server stopped. | Let a separate importer process share the directory. Lands already re-plan when the ref moves (`MAX_ATTEMPTS`). |[#27](https://github.com/bnsd55/open-scion/issues/27) |
+| `scion-server/src/store.rs` (`Store::open`) | One process per data directory, so an import needs the server stopped. | Let a separate importer process share the directory. Lands already re-plan when the ref moves (`MAX_ATTEMPTS`). | [#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/store.rs` (`Blobs::verify`) | Holds the packed and the unpacked bytes, up to about 200 MiB per call. | Stream the unpacked bytes into the hasher. | [#20](https://github.com/bnsd55/open-scion/issues/20) |
-| `scion-server/src/write.rs` (`create_changeset`) | Limits are checked after a full decode. | A decoder that stops at a count limit. |[#28](https://github.com/bnsd55/open-scion/issues/28) |
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
-| `scion-server/src/land.rs` (`MAX_ATTEMPTS`) | Imports move refs without the land lock, so a land retries 3 times, then returns `ABORTED`. | Route every ref move through the per-ref lander. |[#27](https://github.com/bnsd55/open-scion/issues/27) |
+| `scion-server/src/land.rs` (`MAX_ATTEMPTS`) | Imports move refs without the land lock, so a land retries 3 times, then returns `ABORTED`. | Route every ref move through the per-ref lander. | [#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | One lander per ref that rebases a batch and moves the ref once. | [#18](https://github.com/bnsd55/open-scion/issues/18) |
-| `scion-server/src/land.rs` (`PathIndex`) | Never pruned: memory grows with the paths changed since the server started. | Drop entries older than the oldest base in use. | [#19](https://github.com/bnsd55/open-scion/issues/19) |
+| `scion-server/src/land.rs` (`PathIndex`) | Memory follows the oldest base in use. A client that lands on a very old base in every cycle keeps that much history in memory. | Check bases older than a fixed depth with a walk from the database that keeps no entries. | [#36](https://github.com/bnsd55/open-scion/issues/36) |
 | `scion-server/src/auth.rs` (`Auth`) | One static token, one principal. | A token-to-principal map, then per-path write rules. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/main.rs` (`serve`) | No TLS. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
 | `scn/src/client.rs` (`lossy`) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | Escape or base64 raw bytes in JSON. | |

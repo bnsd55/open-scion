@@ -87,6 +87,15 @@ fn changeset(parents: Vec<ChangesetId>, changes: &[(&str, Option<FileState>)]) -
     }
 }
 
+/// The bytes of a changeset on `parent` whose change count is `n`, with no
+/// change after it. The count is the last field when there are no changes.
+fn change_count(parent: ChangesetId, n: usize) -> Vec<u8> {
+    let mut bytes = changeset(vec![parent], &[]).encode();
+    let count = bytes.len() - 4;
+    bytes[count..].copy_from_slice(&u32::try_from(n).unwrap().to_be_bytes());
+    bytes
+}
+
 fn count_changesets(c: &Connection) -> scion_server::Result<i64> {
     Ok(c.query_row("SELECT count(*) FROM changesets", [], |row| row.get(0))?)
 }
@@ -152,14 +161,17 @@ fn bad_requests_are_rejected_and_store_nothing() {
             ok(|cs| cs.committer = Some(cs.author.clone())),
             "committer",
         ),
+        // No change follows these counts. The limit error, not "ends early",
+        // shows that the decoder stopped before it read any change.
         (
-            "too many changes",
-            ok(|cs| {
-                cs.changes = (0..=MAX_CHANGES)
-                    .map(|i| (path(&format!("f{i}")), None))
-                    .collect();
-            }),
+            "one change too many",
+            change_count(f.root, MAX_CHANGES + 1),
             "more than",
+        ),
+        (
+            "exactly the limit, so decoding goes on",
+            change_count(f.root, MAX_CHANGES),
+            "ends early",
         ),
         (
             "message too long",

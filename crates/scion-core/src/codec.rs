@@ -19,7 +19,7 @@ const TAG_DIR: u8 = 4;
 const GIT_SHA1: u8 = 1;
 const GIT_SHA256: u8 = 2;
 
-/// Why bytes are not a canonical v1 object.
+/// Why bytes are not a canonical v1 object, or break a limit the caller set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeError {
     /// The input ends before the object does, or a length points past the end.
@@ -38,6 +38,8 @@ pub enum DecodeError {
     Unsorted,
     /// A path or name breaks the path rules.
     BadPath(PathError),
+    /// The change count is above the caller's limit.
+    TooManyChanges(usize),
 }
 
 impl fmt::Display for DecodeError {
@@ -51,6 +53,7 @@ impl fmt::Display for DecodeError {
             Self::BadGitAlgo(a) => write!(f, "unknown git hash algorithm {a}"),
             Self::Unsorted => f.write_str("paths are not strictly increasing"),
             Self::BadPath(e) => write!(f, "bad path: {e}"),
+            Self::TooManyChanges(max) => write!(f, "more than {max} changes"),
         }
     }
 }
@@ -97,6 +100,39 @@ impl Changeset {
     /// Returns [`DecodeError`] unless `bytes` is exactly the canonical encoding
     /// of some changeset.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::decode_max_changes(bytes, usize::MAX)
+    }
+
+    /// Decodes a v1 changeset and returns its ID, hashing `bytes` directly.
+    /// Strict decoding means `bytes` is the canonical encoding, so no
+    /// re-encode is needed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Changeset::decode`].
+    pub fn decode_with_id(bytes: &[u8]) -> Result<(Self, ChangesetId), DecodeError> {
+        Ok((Self::decode(bytes)?, ChangesetId::hash(bytes)))
+    }
+
+    /// As [`Changeset::decode_with_id`], with at most `max_changes` changes.
+    /// The count is checked before any change is read, so a server can bound
+    /// the work of one request.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::TooManyChanges`] if the change count is above
+    /// `max_changes`. Otherwise as [`Changeset::decode`].
+    pub fn decode_with_id_max_changes(
+        bytes: &[u8],
+        max_changes: usize,
+    ) -> Result<(Self, ChangesetId), DecodeError> {
+        Ok((
+            Self::decode_max_changes(bytes, max_changes)?,
+            ChangesetId::hash(bytes),
+        ))
+    }
+
+    fn decode_max_changes(bytes: &[u8], max_changes: usize) -> Result<Self, DecodeError> {
         let mut r = Reader(bytes);
         r.version()?;
         let mut parents = Vec::new();
@@ -106,8 +142,12 @@ impl Changeset {
         let author = r.identity()?;
         let committer = if r.flag()? { Some(r.identity()?) } else { None };
         let message = r.bytes()?.to_vec();
+        let n_changes = r.u32()?;
+        if n_changes > max_changes {
+            return Err(DecodeError::TooManyChanges(max_changes));
+        }
         let mut changes = Vec::new();
-        for _ in 0..r.u32()? {
+        for _ in 0..n_changes {
             let path = RepoPath::new(r.bytes()?).map_err(DecodeError::BadPath)?;
             ensure_after(&changes, &path)?;
             let change = match r.u8()? {
@@ -124,17 +164,6 @@ impl Changeset {
             message,
             changes: BTreeMap::from_iter(changes),
         })
-    }
-
-    /// Decodes a v1 changeset and returns its ID, hashing `bytes` directly.
-    /// Strict decoding means `bytes` is the canonical encoding, so no
-    /// re-encode is needed.
-    ///
-    /// # Errors
-    ///
-    /// As [`Changeset::decode`].
-    pub fn decode_with_id(bytes: &[u8]) -> Result<(Self, ChangesetId), DecodeError> {
-        Ok((Self::decode(bytes)?, ChangesetId::hash(bytes)))
     }
 
     /// The content address of this changeset.
