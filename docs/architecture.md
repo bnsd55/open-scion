@@ -125,20 +125,27 @@ corrupt, and the next put of that content replaces it.
 
 **Durability rules.**
 
-- A database transaction is durable when it commits: WAL, `synchronous = FULL`,
-  and `fullfsync = ON`, so on macOS the commit goes through the drive cache too.
-- A blob is durable after `BlobBatch::sync`. Each blob file gets a plain
-  `fsync` when written. `sync` then flushes each changed fan-out directory and
-  issues one full drive flush for the whole batch (`F_FULLFSYNC` on macOS).
+- Group commit: concurrent callers share one full drive flush (`F_FULLFSYNC`
+  on macOS). Each caller first makes its writes reach the drive with a plain
+  `fsync`, then waits for a full flush that starts after that, and one
+  waiting caller runs it for all. A failed flush fails every caller that
+  waited for it.
+- A database transaction is durable when `Store::write` returns, or after a
+  later `Store::flush`. WAL with `synchronous = FULL` ends each commit with a
+  plain `fsync`. On macOS that can leave the commit in the drive cache, so
+  `flush` waits for a shared full flush. SQLite runs no full flush of its own
+  (`fullfsync = OFF`), except in checkpoints (`checkpoint_fullfsync`).
+  Elsewhere the commit's `fsync` already flushes the cache. A land waits for
+  the flush after it releases the ref's lock, so queued lands share it.
+- A blob is durable after `BlobBatch::sync`: a plain `fsync` of each blob file
+  when written, then of each changed fan-out directory, then a shared full
+  flush.
 - No committed metadata may name a blob that a crash could lose. `PutBlob`
-  syncs its blob before it replies. `CreateChangeset` reads back and hashes
-  every blob it names. Git import syncs one blob batch per 1,000 commits
-  before the transaction that records them.
-- A put of a blob that is already stored intact keeps the file, but still
-  flushes its directory: another batch may have written it and not synced.
-- Each `PutBlob` call does one full flush, even for a blob already stored.
-  This limits the write rate. **Planned:** group commit, where writers share
-  one flush ([#3](https://github.com/bnsd55/open-scion/issues/3)).
+  syncs its blob before it replies. `CreateChangeset` reads back, hashes and
+  syncs every blob it names before its transaction. Git import syncs one blob
+  batch per 1,000 commits before the transaction that records them.
+- A stored blob still costs a full flush when it is put again or named by a
+  changeset: another batch may have written it and not synced yet.
 
 **Data-directory lock.** `Store::open` takes an exclusive, non-blocking
 `flock` on `<data>/lock` and holds it until the last `Store` clone is dropped.
@@ -246,6 +253,9 @@ sequenceDiagram
   ref, and marks the row landed. A crash leaves a pending row (a retry
   finishes it) or a landed row (a retry returns it), never a moved ref
   without a landed row. The ref lock is one mutex per (repo, ref), in process.
+- **Durable before the reply.** Every reply waits for a full flush that covers
+  the land's transactions (`Store::flush`). The land releases the ref lock
+  first, so the lands queued behind it share that flush.
 - **ABORTED on contention.** Only git import moves a ref without the ref lock.
   The data-directory lock keeps the `import` command and the server apart, so
   this race needs both in one process, as in the tests. If the
@@ -423,6 +433,8 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/store.rs` (`Inner::db`) | One SQLite connection behind a mutex, so reads wait for writes. | A pool of read-only connections. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
 | `scion-server/src/store.rs` (`Store::open`) | One process per data directory, so an import needs the server stopped. | Let a separate importer process share the directory. Lands already re-plan when the ref moves (`MAX_ATTEMPTS`). | |
 | `scion-server/src/store.rs` (`Blobs::verify`) | Holds the packed and the unpacked bytes, up to about 200 MiB per call. | Stream the unpacked bytes into the hasher. | [#20](https://github.com/bnsd55/open-scion/issues/20) |
+| `scion-server/src/store.rs` (`Store::flush`) | Between a commit and its full flush, other calls can read the commit, and a power loss can undo what they saw. | Hide commits until their flush, or a lander that batches lands. | [#18](https://github.com/bnsd55/open-scion/issues/18) |
+| `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | |
 | `scion-server/src/write.rs` (`create_changeset`) | Limits are checked after a full decode. | A decoder that stops at a count limit. | |
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/land.rs` (`MAX_ATTEMPTS`) | Imports move refs without the land lock, so a land retries 3 times, then returns `ABORTED`. | Route every ref move through the per-ref lander. | |

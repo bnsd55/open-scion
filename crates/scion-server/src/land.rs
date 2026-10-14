@@ -11,6 +11,8 @@
 //!   5. one transaction: apply to the head tree, store the rebased changeset,
 //!      compare-and-swap the ref, mark the land landed. If an import moved
 //!      the ref since step 4, roll back and go to step 4.
+//!   6. release the ref's lock, then wait for a full flush that covers the
+//!      commits (`Store::flush`), shared with the lands queued behind it
 //! ```
 //!
 //! A crash at any point leaves either a pending row (a retry finishes it) or a
@@ -122,9 +124,23 @@ impl Lands {
     /// moving the ref; the land stays pending and a retry with the same
     /// request key resumes it. Store errors otherwise.
     pub fn land(&self, store: &Store, caller: &Caller, req: &LandRequest) -> Result<LandOutcome> {
+        let outcome = self.land_committed(store, caller, req)?;
+        // Lands on one ref commit one at a time. Waiting for the flush after
+        // the ref lock is released lets them share it.
+        store.flush()?;
+        Ok(outcome)
+    }
+
+    /// [`Lands::land`], up to commits that are not durable yet.
+    fn land_committed(
+        &self,
+        store: &Store,
+        caller: &Caller,
+        req: &LandRequest,
+    ) -> Result<LandOutcome> {
         check_name("target_ref", &req.target_ref)?;
         check_name("request_key", &req.request_key)?;
-        let (repo, recorded) = store.write(|c| record(c, caller, req))?;
+        let (repo, recorded) = store.commit(|c| record(c, caller, req))?;
         if recorded.state != LandState::Pending {
             return Ok(recorded);
         }
@@ -390,17 +406,18 @@ fn settle(
 ) -> Result<LandOutcome> {
     let (rebased, head) = match plan {
         Plan::Reject(detail) => {
-            return store
-                .write(|c| set_state(c, repo, land_id, LandState::Rejected, None, detail, vec![]));
+            return store.commit(|c| {
+                set_state(c, repo, land_id, LandState::Rejected, None, detail, vec![])
+            });
         }
         Plan::Conflict(detail, paths) => {
             return store
-                .write(|c| set_state(c, repo, land_id, LandState::Conflict, None, detail, paths));
+                .commit(|c| set_state(c, repo, land_id, LandState::Conflict, None, detail, paths));
         }
         Plan::Land { rebased, head } => (rebased, head),
     };
 
-    let landed = store.write(|c| {
+    let landed = store.commit(|c| {
         let (id, _) = tree::store_changeset(c, repo, &rebased)?;
         if !db::cas_ref(c, repo, target, Some(head.version), id)? {
             // The error rolls back the transaction, rebased changeset included.
@@ -433,7 +450,7 @@ fn settle(
         // transaction rolled back; record the conflict.
         Err(Error::Apply(e)) => {
             let detail = format!("does not apply to {target:?}: {e}");
-            store.write(|c| set_state(c, repo, land_id, LandState::Conflict, None, detail, vec![]))
+            store.commit(|c| set_state(c, repo, land_id, LandState::Conflict, None, detail, vec![]))
         }
         Err(e) => Err(e),
     }
@@ -614,6 +631,7 @@ fn decode_paths(bytes: &[u8]) -> Option<Vec<RepoPath>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::FSYNC_LEAVES_DRIVE_CACHE;
     use scion_core::{BlobId, Entry, IdentityTime};
 
     type Change = (RepoPath, Option<FileState>);
@@ -760,6 +778,19 @@ mod tests {
         assert_eq!((out.state, out.result), (LandState::Landed, Some(cs)));
         assert_eq!(f.main().target, cs);
         assert_eq!(f.main().version, 2);
+    }
+
+    #[test]
+    fn a_land_waits_for_one_full_flush_for_all_its_commits() {
+        let f = fixture();
+        let cs = f.commit(f.root, &[put("a/x", "new")]);
+        let before = f.store.blobs().full_flushes();
+        assert_eq!(f.land(cs, "k").state, LandState::Landed);
+        // None where `fsync` already flushes the drive cache.
+        assert_eq!(
+            f.store.blobs().full_flushes() - before,
+            u64::from(FSYNC_LEAVES_DRIVE_CACHE)
+        );
     }
 
     #[test]

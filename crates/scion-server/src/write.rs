@@ -95,13 +95,16 @@ fn check_request(cs: &Changeset) -> Result<ChangesetId> {
 
 /// Fails on the first put, in path order, whose blob is not stored intact.
 /// Reads every blob back, so a torn or overwritten file is not accepted.
+/// Then syncs them (see [`BlobBatch::keep`]), so the commit never names a
+/// blob that a crash can lose.
 fn check_blobs(store: &Store, cs: &Changeset) -> Result<()> {
     let puts = cs
         .changes
         .iter()
         .filter_map(|(path, state)| Some((path, state.as_ref()?.blob()?)));
+    let mut blobs = store.blobs().batch();
     for (path, blob) in puts {
-        let problem = match store.blobs().verify(blob)? {
+        let problem = match blobs.keep(blob)? {
             BlobStatus::Valid => continue,
             BlobStatus::Missing => "is not stored",
             BlobStatus::Corrupt => "is corrupt",
@@ -110,5 +113,63 @@ fn check_blobs(store: &Store, cs: &Changeset) -> Result<()> {
             "blob {blob} for {path:?} {problem}; upload it with PutBlob"
         )));
     }
-    Ok(())
+    blobs.sync()
+}
+
+#[cfg(test)]
+mod tests {
+    use scion_core::{FileState, IdentityTime, RepoPath};
+
+    use super::*;
+    use crate::store::FSYNC_LEAVES_DRIVE_CACHE;
+
+    fn changeset(parents: Vec<ChangesetId>, blob: Option<BlobId>) -> Changeset {
+        Changeset {
+            parents,
+            author: IdentityTime {
+                name: b"Ada".to_vec(),
+                email: b"ada@example.com".to_vec(),
+                unix_secs: 1_700_000_000,
+                tz_offset_minutes: 0,
+            },
+            committer: None,
+            message: b"change\n".to_vec(),
+            changes: blob
+                .map(|content| {
+                    let file = FileState::Regular {
+                        content,
+                        executable: false,
+                    };
+                    (RepoPath::new("f").unwrap(), Some(file))
+                })
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_changeset_makes_its_blobs_durable_before_it_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let root = store
+            .write(|c| {
+                let repo = db::create_repo(c, "main")?;
+                db::insert_changeset(c, repo, &changeset(vec![], None))
+            })
+            .unwrap();
+        // Stored by an upload that never synced.
+        let mut upload = store.blobs().batch();
+        let blob = upload.put(b"new").unwrap();
+        drop(upload);
+
+        let before = store.blobs().full_flushes();
+        let child = changeset(vec![root], Some(blob)).encode();
+        create_changeset(&store, "main", &child).unwrap();
+        // One flush for the blob before the commit, and one for the commit
+        // where a plain fsync leaves it in the drive cache.
+        assert_eq!(
+            store.blobs().full_flushes() - before,
+            1 + u64::from(FSYNC_LEAVES_DRIVE_CACHE)
+        );
+    }
 }

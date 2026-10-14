@@ -76,7 +76,9 @@ pub fn root_tree(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<TreeId>
     })?;
     match known {
         Some(tree) => Ok(TreeId::from_bytes(tree)),
-        None => store.write(|tx| derive_root_tree(tx, repo, cs)),
+        // Derived data can be derived again, so a read does not wait for a
+        // flush; a later write's flush covers it.
+        None => store.commit(|tx| derive_root_tree(tx, repo, cs)),
     }
 }
 
