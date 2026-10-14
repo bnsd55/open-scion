@@ -17,7 +17,7 @@
 //! landed one (a retry returns it). The ref and the row move in the same
 //! transaction, so they never disagree.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -43,6 +43,18 @@ const MAX_ATTEMPTS: u32 = 3;
 /// How far, in generations, the ref moves in one prune cycle of a
 /// [`PathIndex`]. Tests use a short cycle, so that they prune.
 const PRUNE_EVERY: i64 = if cfg!(test) { 4 } else { 10_000 };
+
+/// A base more than this many generations below the tip is checked without
+/// growing the [`PathIndex`], so it never holds the floor down. One prune
+/// cycle, so bases keep at most about three cycles of history in the index.
+/// A client lands soon after it reads the head, so an older base is rare.
+/// Tests use a depth longer than the history in their pruned index.
+// SHORTCUT: each land on such a base walks the history from the floor back
+// to the base, and holds the database lock while it walks. Ceiling: a client
+// that lands on a base millions of generations old makes each of its lands
+// slow, and other requests wait. Upgrade: per-path history in the database,
+// so the check reads only the paths it changes.
+const MAX_DEPTH: i64 = if cfg!(test) { 16 } else { PRUNE_EVERY };
 
 /// Where a land stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,13 +377,11 @@ fn plan(
         None => index.insert(PathIndex::new(c, repo, head.target)?),
     };
     index.advance_to(c, repo, head.target)?;
-    let Some(base_gen) = index.reach(c, repo, base)? else {
+    let Some(conflicts) = index.check(c, repo, base, &cs.changes)? else {
         return Ok(Plan::Reject(format!(
             "base {base} is not on the first-parent history of {target:?}"
         )));
     };
-    let conflicts = index.conflicts(&cs.changes, base_gen);
-    index.prune(base_gen);
     if !conflicts.is_empty() {
         let detail = format!(
             "{} path(s) changed on {target:?} after the base",
@@ -455,13 +465,10 @@ fn settle(
 /// A conflict check then costs one lookup per path part, not a history walk.
 ///
 /// The index covers the changesets after `floor` up to `tip`. It grows
-/// forward as the ref moves and backward when a land has an older base.
-/// Each [`PRUNE_EVERY`] generations, [`PathIndex::prune`] moves `floor` up to
-/// the oldest base that the cycle used, so memory follows the bases in use.
-// SHORTCUT: a land with an old base keeps the index back to that base until
-// the next cycle ends. Ceiling: a client that lands on a very old base in
-// every cycle keeps that much history in memory. Upgrade: check bases older
-// than a fixed depth with a walk from the database that keeps no entries.
+/// forward as the ref moves and backward when a land has an older base, up
+/// to [`MAX_DEPTH`] below the tip. Each [`PRUNE_EVERY`] generations,
+/// [`PathIndex::prune`] moves `floor` up to the oldest base that the cycle
+/// used, so memory follows the bases in use.
 struct PathIndex {
     tip: ChangesetId,
     floor: ChangesetId,
@@ -523,63 +530,90 @@ impl PathIndex {
         Ok(())
     }
 
-    /// The generation of `base` if it is on the indexed history, extending
-    /// the index backward if needed. `None` if `base` is not on the history.
-    fn reach(&mut self, c: &Connection, repo: RepoId, base: ChangesetId) -> Result<Option<i64>> {
+    /// The paths in `changes` that changed on the history after `base`, or
+    /// `None` if `base` is not on the history. Then prunes.
+    ///
+    /// A base below the floor is reached: the changesets from the floor back
+    /// to it are added to the index. A base more than [`MAX_DEPTH`] below the
+    /// tip is not. [`touched_below`] checks those changesets without keeping
+    /// them, and the base does not count as used for pruning.
+    fn check(
+        &mut self,
+        c: &Connection,
+        repo: RepoId,
+        base: ChangesetId,
+        changes: &BTreeMap<RepoPath, Option<FileState>>,
+    ) -> Result<Option<Vec<RepoPath>>> {
         let base_gen = db::generation(c, repo, base)?;
-        if base == self.floor || self.chain.get(&base_gen) == Some(&base) {
-            return Ok(Some(base_gen));
-        }
-        let mut cur = self.floor;
-        loop {
-            let generation = db::generation(c, repo, cur)?;
-            if generation <= base_gen {
+        let tip_gen = match self.chain.last_key_value() {
+            Some((&generation, _)) => generation,
+            None => db::generation(c, repo, self.tip)?,
+        };
+        let deep = tip_gen - base_gen > MAX_DEPTH;
+        let mut below = HashSet::new();
+        if base != self.floor && self.chain.get(&base_gen) != Some(&base) {
+            let reached = if deep {
+                touched_below(c, repo, self.floor, base, base_gen, changes, &mut below)?
+            } else {
+                self.reach(c, repo, base, base_gen)?
+            };
+            if !reached {
                 return Ok(None);
             }
-            let cs = db::get_changeset(c, repo, cur)?;
-            self.add(cur, generation, &cs.changes);
-            match cs.parents.first() {
-                Some(&parent) => {
-                    self.floor = parent;
-                    if parent == base {
-                        return Ok(Some(base_gen));
-                    }
-                    cur = parent;
-                }
-                None => return Ok(None),
-            }
         }
-    }
-
-    /// Paths in `changes` that touch a path changed after `base_gen`: the same
-    /// path, a directory above it, or anything below it.
-    fn conflicts(
-        &self,
-        changes: &BTreeMap<RepoPath, Option<FileState>>,
-        base_gen: i64,
-    ) -> Vec<RepoPath> {
-        let after =
-            |map: &HashMap<Vec<u8>, i64>, key: &[u8]| map.get(key).is_some_and(|&g| g > base_gen);
-        changes
+        // The index holds the changesets after the floor, and `below` the paths
+        // that older ones touched, so together they see every change after
+        // the base.
+        let conflicts = changes
             .keys()
             .filter(|path| {
                 let path = path.as_bytes();
-                after(&self.files, path)
-                    || after(&self.dirs, path)
-                    || ancestors(path).any(|dir| after(&self.files, dir))
+                below.contains(path) || self.touches(path, base_gen)
             })
             .cloned()
-            .collect()
+            .collect();
+        if !deep {
+            self.oldest_base = self.oldest_base.min(base_gen);
+        }
+        self.prune();
+        Ok(Some(conflicts))
     }
 
-    /// Notes that a land used `base_gen`. Once the tip is [`PRUNE_EVERY`]
-    /// generations past the cycle start, moves `floor` up to the oldest base
-    /// the cycle used, drops what is now below it, and starts a new cycle.
+    /// Whether `base` is on the history, adding the changesets from the floor
+    /// back to it. The caller has checked that `base` is not the floor and not
+    /// in the index.
+    fn reach(
+        &mut self,
+        c: &Connection,
+        repo: RepoId,
+        base: ChangesetId,
+        base_gen: i64,
+    ) -> Result<bool> {
+        walk_back(c, repo, self.floor, base, base_gen, |id, generation, cs| {
+            self.add(id, generation, &cs.changes);
+            if let Some(&parent) = cs.parents.first() {
+                self.floor = parent;
+            }
+        })
+    }
+
+    /// Whether a changeset after `base_gen` touched `path`: the same path, a
+    /// directory above it, or anything below it.
+    fn touches(&self, path: &[u8], base_gen: i64) -> bool {
+        let after =
+            |map: &HashMap<Vec<u8>, i64>, key: &[u8]| map.get(key).is_some_and(|&g| g > base_gen);
+        after(&self.files, path)
+            || after(&self.dirs, path)
+            || ancestors(path).any(|dir| after(&self.files, dir))
+    }
+
+    /// Once the tip is [`PRUNE_EVERY`] generations past the cycle start,
+    /// moves `floor` up to the oldest base the cycle used, drops what is now
+    /// below it, and starts a new cycle.
     ///
     /// A later base below the new floor is still checked in full:
-    /// [`Self::reach`] adds the dropped changesets back from the database.
-    fn prune(&mut self, base_gen: i64) {
-        self.oldest_base = self.oldest_base.min(base_gen);
+    /// [`Self::check`] reads the dropped changesets back from the database.
+    fn prune(&mut self) {
         let Some((&tip_gen, _)) = self.chain.last_key_value() else {
             return;
         };
@@ -626,6 +660,71 @@ impl PathIndex {
             }
         }
     }
+}
+
+/// Walks first parents from `from` back to `base`, and passes each changeset
+/// after `base` to `visit`, newest first. `false` if `base` is not on that
+/// history.
+fn walk_back(
+    c: &Connection,
+    repo: RepoId,
+    from: ChangesetId,
+    base: ChangesetId,
+    base_gen: i64,
+    mut visit: impl FnMut(ChangesetId, i64, &Changeset),
+) -> Result<bool> {
+    let mut cur = from;
+    loop {
+        let generation = db::generation(c, repo, cur)?;
+        if generation <= base_gen {
+            return Ok(false);
+        }
+        let cs = db::get_changeset(c, repo, cur)?;
+        visit(cur, generation, &cs);
+        match cs.parents.first() {
+            Some(&parent) if parent == base => return Ok(true),
+            Some(&parent) => cur = parent,
+            None => return Ok(false),
+        }
+    }
+}
+
+/// For a base more than [`MAX_DEPTH`] below the tip: walks the history from
+/// `floor` back to `base`, and adds to `hits` each path in `land` that the
+/// walked changesets touched, by the rule of [`PathIndex::touches`]. Keeps
+/// only the land's own paths and directories, so memory follows the land,
+/// not the depth. `false` if `base` is not on the history.
+fn touched_below<'a>(
+    c: &Connection,
+    repo: RepoId,
+    floor: ChangesetId,
+    base: ChangesetId,
+    base_gen: i64,
+    land: &'a BTreeMap<RepoPath, Option<FileState>>,
+    hits: &mut HashSet<&'a [u8]>,
+) -> Result<bool> {
+    let paths: HashSet<&[u8]> = land.keys().map(RepoPath::as_bytes).collect();
+    let parents: HashSet<&[u8]> = paths.iter().flat_map(|p| ancestors(p)).collect();
+    // What `files` and `dirs` of an index over the walk would hold, kept only
+    // where `touches` reads them for the land's paths.
+    let mut files: HashSet<&[u8]> = HashSet::new();
+    let mut dirs: HashSet<&[u8]> = HashSet::new();
+    let mut walked = 0_u64;
+    let reached = walk_back(c, repo, floor, base, base_gen, |_, _, cs| {
+        walked += 1;
+        for path in cs.changes.keys() {
+            let path = path.as_bytes();
+            if let Some(&key) = paths.get(path).or_else(|| parents.get(path)) {
+                files.insert(key);
+            }
+            dirs.extend(ancestors(path).filter_map(|dir| paths.get(dir)));
+        }
+    })?;
+    tracing::debug!(base_gen, walked, reached, "checked an old base");
+    hits.extend(paths.into_iter().filter(|&path| {
+        files.contains(path) || dirs.contains(path) || ancestors(path).any(|d| files.contains(d))
+    }));
+    Ok(reached)
 }
 
 fn bump(map: &mut HashMap<Vec<u8>, i64>, key: &[u8], generation: i64) {
@@ -1010,16 +1109,23 @@ mod tests {
         usize::try_from(PRUNE_EVERY).unwrap()
     }
 
-    /// `main` goes root ─ A ─ F1 ─ F2 ─ …, three prune cycles of F's, each
-    /// landed on the head. A puts `a/x`, and each Fi puts `fi`. By the end,
-    /// the index has pruned A and the first F's. Returns the fixture and the
-    /// history, root first.
-    fn pruned_history() -> (Fixture, Vec<ChangesetId>) {
+    /// `main` goes root ─ A ─ F1 ─ … ─ Fn, each landed on the head. A puts
+    /// `a/x`, and each Fi puts `fi`. Returns the fixture and the history,
+    /// root first.
+    fn history(n: usize) -> (Fixture, Vec<ChangesetId>) {
         let f = fixture();
         let a = f.commit(f.root, &[put("a/x", "A")]);
         assert_eq!(f.land(a, "a").state, LandState::Landed);
         let mut history = vec![f.root, a];
-        history.extend(f.fill("f", 3 * cycle()));
+        history.extend(f.fill("f", n));
+        (f, history)
+    }
+
+    /// A [`history`] of three prune cycles of F's. By the end, the index has
+    /// pruned A and the first F's.
+    fn pruned_history() -> (Fixture, Vec<ChangesetId>) {
+        let (f, history) = history(3 * cycle());
+        let a = history[1];
         let floor = f.index(|index| index.floor);
         assert!(
             f.generation(floor) > f.generation(a),
@@ -1049,6 +1155,65 @@ mod tests {
             if state == Conflict {
                 assert_eq!(out.conflict_paths, [RepoPath::new(path).unwrap()]);
             }
+        }
+    }
+
+    #[test]
+    fn a_base_beyond_the_depth_is_checked_without_moving_the_floor() {
+        use LandState::{Conflict, Landed, Rejected};
+        let depth = usize::try_from(MAX_DEPTH).unwrap();
+        let (f, history) = history(depth + cycle());
+        let root = history[0];
+        assert!(f.generation(f.main().target) - f.generation(root) > MAX_DEPTH);
+        let last = format!("f{}", history.len() - 2);
+        let path = |p: &str| RepoPath::new(p).unwrap();
+        // A's a/x and F2's f2 are below the floor, so only the walk sees
+        // them. The last F's change is still in the index.
+        assert!(f.index(|index| {
+            !index.files.contains_key(b"a/x".as_slice())
+                && !index.files.contains_key(b"f2".as_slice())
+                && index.files.contains_key(last.as_bytes())
+        }));
+
+        // (base, the path the land puts, the outcome); one rule each.
+        let side = f.commit(root, &[put("s", "side")]);
+        let cases = [
+            (root, "a/x", Conflict),         // A changed it
+            (root, "a", Conflict),           // A changed a path below it
+            (root, "f2/z", Conflict),        // F2 changed a file at a parent path
+            (root, last.as_str(), Conflict), // the index holds this change
+            (root, "a/y", Landed),           // A changed only a sibling
+            (side, "t", Rejected),           // not on the history
+        ];
+        let floor = f.index(|index| index.floor);
+        for (base, put_path, state) in cases {
+            let cs = f.commit(base, &[put(put_path, "mine")]);
+            let out = f.land(cs, &format!("old {put_path}"));
+            assert_eq!(out.state, state, "{put_path}: {}", out.detail);
+            if state == Conflict {
+                assert_eq!(out.conflict_paths, [path(put_path)]);
+            }
+            assert_eq!(f.index(|index| index.floor), floor, "{put_path}");
+        }
+
+        // A client lands on root in every cycle. The old base does not count
+        // as used, so each cycle still moves the floor up.
+        let mine = [
+            put("a/x", "mine"),
+            put("b/y", "mine"),
+            put("f2/z", "mine"),
+            put(&last, "mine"),
+        ];
+        let mut want = vec![path("a/x"), path("f2/z"), path(&last)];
+        want.sort();
+        for round in 0..3 {
+            let floor = f.index(|index| index.floor);
+            let out = f.land(f.commit(root, &mine), &format!("old{round}"));
+            assert_eq!(out.conflict_paths, want, "round {round}");
+            assert_eq!(f.index(|index| index.floor), floor, "round {round}");
+            f.fill(&format!("g{round}/"), cycle());
+            let moved = f.index(|index| index.floor);
+            assert!(f.generation(moved) > f.generation(floor), "round {round}");
         }
     }
 

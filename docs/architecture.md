@@ -265,8 +265,9 @@ ref's first-parent history, from a `floor` changeset to the `tip`:
 - `dirs`: directory to the newest generation that changed anything below it.
 
 It is built on the first land to a ref. It grows forward when the ref moves,
-and backward when a land has an older base. If the head does not descend from
-the tip, it starts over. After an error other than `ABORTED` it is dropped and
+and backward when a land has an older base, down to `MAX_DEPTH` (one cycle,
+10,000) generations below the tip. If the head does not descend from the tip,
+it starts over. After an error other than `ABORTED` it is dropped and
 rebuilt, because it may be ahead of the database.
 
 A changed path `p` conflicts when one of these is newer than the base:
@@ -301,6 +302,11 @@ base was older. Every entry at or below the new floor is dropped. So memory
 follows the oldest base in use, not the time since the server started. A
 base that a cycle used stays in the index until the next cycle ends.
 
+A base more than `MAX_DEPTH` generations below the tip is not added to the
+index and does not count as used. So however old the bases are, they keep
+at most about three cycles of history in the index. Such a base is rare: a
+client lands soon after it reads the head.
+
 **Why pruning cannot hide a conflict.** After a prune, the index still holds,
 for each path, the newest generation that changed it after the floor. A
 land's base is at or above the floor, or below it:
@@ -308,11 +314,19 @@ land's base is at or above the floor, or below it:
 - At or above the floor: every dropped entry has a generation at or below the
   floor, so at or below `base_gen`. It never counts as newer than the base,
   so the check gives the same answer as before the prune.
-- Below the floor: `reach` walks the history in the database from the floor
-  back to the base, and adds each changeset it passes. The index then holds
-  every change after the base again.
+- Below the floor, at most `MAX_DEPTH` below the tip: `reach` walks the
+  history in the database from the floor back to the base, and adds each
+  changeset it passes. The index then holds every change after the base
+  again.
+- Below the floor and deeper: the same walk runs, but adds nothing to the
+  index. It keeps only what the three conflict rules read for the land's own
+  paths. The index holds the changes after the floor, and the walk sees the
+  changes from the floor back to the base. A path changed after the base
+  exactly when one of the two says so, so the answer is the same as with one
+  index. Memory follows the size of the land, not the depth of the base.
 
-So the choice of the new floor changes only the speed, never the answer.
+So the choice of the new floor, and of `MAX_DEPTH`, changes only the speed,
+never the answer.
 
 **Planned:** a lander that rebases a batch of pending lands and moves the ref
 once ([#18](https://github.com/bnsd55/open-scion/issues/18)).
@@ -445,7 +459,7 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/land.rs` (`MAX_ATTEMPTS`) | Imports move refs without the land lock, so a land retries 3 times, then returns `ABORTED`. | Route every ref move through the per-ref lander. | [#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | One lander per ref that rebases a batch and moves the ref once. | [#18](https://github.com/bnsd55/open-scion/issues/18) |
-| `scion-server/src/land.rs` (`PathIndex`) | Memory follows the oldest base in use. A client that lands on a very old base in every cycle keeps that much history in memory. | Check bases older than a fixed depth with a walk from the database that keeps no entries. | [#36](https://github.com/bnsd55/open-scion/issues/36) |
+| `scion-server/src/land.rs` (`MAX_DEPTH`) | A land on a base more than `MAX_DEPTH` generations below the tip walks the history from the index floor back to the base, each time, and holds the database lock while it walks. | Per-path history in the database, so the check reads only the paths that the land changes. | [#38](https://github.com/bnsd55/open-scion/issues/38) |
 | `scion-server/src/auth.rs` (`Auth`) | One static token, one principal. | A token-to-principal map, then per-path write rules. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/main.rs` (`serve`) | No TLS. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
 | `scn/src/client.rs` (`lossy`) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | Escape or base64 raw bytes in JSON. | |
