@@ -69,7 +69,7 @@ pub struct ImportReport {
 ///
 /// [`Error::Git`] if git cannot be read, or a path or file is not valid in
 /// Scion. [`Error::Corrupt`] if a verified commit's tree differs from git's or
-/// names a blob that is not stored intact. [`Error::InvalidArgument`] if
+/// names a blob that is not stored intact. [`Error::FailedPrecondition`] if
 /// `opts.target_ref` points at a changeset that the tip does not descend
 /// from; the commits stay imported and the ref is left alone.
 pub fn import_git(

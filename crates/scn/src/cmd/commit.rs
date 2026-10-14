@@ -60,7 +60,7 @@ pub async fn commit(ctx: &mut Ctx, args: CommitArgs) -> Result<()> {
             None => None,
             Some(file) => {
                 // SHORTCUT: reads each file whole, so memory caps the file
-                // size (the server caps it at 1 GiB too). Upgrade: stream
+                // size (the server caps it at 100 MiB). Upgrade: stream
                 // chunks from the file.
                 let data = std::fs::read(file)
                     .with_context(|| format!("cannot read {}", file.display()))?;
