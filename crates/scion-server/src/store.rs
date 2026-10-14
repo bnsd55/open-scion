@@ -61,14 +61,18 @@ impl Store {
     pub fn open(dir: &Path) -> Result<Self> {
         fs::create_dir_all(dir)?;
         // SHORTCUT: one process per data directory, so an import needs the
-        // server stopped. Upgrade: lands that re-plan when the ref moved
-        // under them, then allow a separate importer process.
+        // server stopped. Upgrade: allow a separate importer process. Lands
+        // already re-plan when the ref moves (`MAX_ATTEMPTS`).
         let lock = lock_dir(dir)?;
         let blobs = Blobs::open(dir)?;
         let db = Connection::open(dir.join("scion.db"))?;
         db.execute_batch(
+            // `fullfsync`: on macOS a plain fsync leaves the commit in the
+            // drive cache, so a power loss could drop a land that replied
+            // LANDED. Blobs already use F_FULLFSYNC. No effect elsewhere.
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;
+             PRAGMA fullfsync = ON;
              PRAGMA foreign_keys = ON;
              PRAGMA busy_timeout = 5000;",
         )?;
@@ -554,5 +558,23 @@ mod tests {
             let err = result.expect_err("every caller sees the failure");
             assert_eq!(err.to_string(), "the drive is gone");
         }
+    }
+
+    #[test]
+    fn commits_flush_through_the_drive_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let (sync, full): (i64, i64) = store
+            .read(|db| {
+                let sync = db.pragma_query_value(None, "synchronous", |r| r.get(0))?;
+                let full = db.pragma_query_value(None, "fullfsync", |r| r.get(0))?;
+                Ok((sync, full))
+            })
+            .unwrap();
+        assert_eq!(
+            (sync, full),
+            (2, 1),
+            "synchronous = FULL and fullfsync = ON"
+        );
     }
 }
