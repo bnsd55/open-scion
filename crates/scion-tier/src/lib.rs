@@ -91,10 +91,6 @@ pub const CACHE_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
 /// [`BUSY_TIMEOUT`] for room in its own reply budget.
 pub const DAEMON_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Time for the work around the waits: reading, checking and moving one
-/// object. A tier gives up only after the tier it calls would have.
-const MARGIN: Duration = Duration::from_secs(30);
-
 // The limits nest: a busy server answers the cache before the cache gives
 // up, and a cache that waits on the server answers the daemon before the
 // daemon gives up.
@@ -102,12 +98,14 @@ const MARGIN: Duration = Duration::from_secs(30);
 // can wait for the objects ahead of it, and a client's own deadline does not
 // reach the tiers. Upgrade (issue #98): pass the remaining deadline down with
 // grpc-timeout.
-const _: () =
-    assert!(BUSY_TIMEOUT.as_secs() + MARGIN.as_secs() <= CACHE_UPSTREAM_TIMEOUT.as_secs());
-const _: () = assert!(
-    CACHE_UPSTREAM_TIMEOUT.as_secs() + BUSY_TIMEOUT.as_secs() + MARGIN.as_secs()
-        <= DAEMON_UPSTREAM_TIMEOUT.as_secs()
-);
+const _: () = {
+    // Seconds for the work around the waits: reading, checking and moving one
+    // object.
+    let margin = 30;
+    let (busy, cache) = (BUSY_TIMEOUT.as_secs(), CACHE_UPSTREAM_TIMEOUT.as_secs());
+    assert!(busy + margin <= cache);
+    assert!(cache + busy + margin <= DAEMON_UPSTREAM_TIMEOUT.as_secs());
+};
 
 /// One object, by kind and ID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
