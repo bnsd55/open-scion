@@ -1,9 +1,10 @@
-//! Writes: store blobs and create changesets. Neither moves a ref.
+//! Writes: create changesets. Moves no ref. An upload goes straight to the
+//! blob folder (`Blobs::upload`).
 
 use std::collections::BTreeSet;
 
 use rusqlite::Connection;
-use scion_core::{BlobId, Changeset, ChangesetId};
+use scion_core::{Changeset, ChangesetId};
 
 use crate::db::{self, RepoId};
 use crate::error::{Error, Result};
@@ -16,16 +17,6 @@ pub const MAX_CHANGES: usize = 100_000;
 pub const MAX_COMMIT_MESSAGE_BYTES: usize = 1 << 20;
 /// Longest author name or email in a created changeset, in bytes.
 pub const MAX_IDENTITY_BYTES: usize = 1 << 10;
-
-/// Stores one file's content for later use in a changeset. Safe to repeat.
-///
-/// # Errors
-///
-/// [`crate::Error::NotFound`] if the repo does not exist.
-pub fn put_blob(store: &Store, repo: &str, data: &[u8]) -> Result<BlobId> {
-    store.read(|c| db::repo_id(c, repo))?;
-    store.blobs().put(data)
-}
 
 /// Stores a changeset sent as `ChangesetV1` bytes, with the root tree of its
 /// parent plus its changes. Safe to repeat: the ID is the content.
@@ -130,7 +121,7 @@ fn check_blobs(store: &Store, cs: &Changeset) -> Result<()> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use scion_core::{FileState, IdentityTime, RepoPath};
+    use scion_core::{BlobId, FileState, IdentityTime, RepoPath};
 
     use super::*;
     use crate::store::FSYNC_LEAVES_DRIVE_CACHE;

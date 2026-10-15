@@ -357,7 +357,7 @@ pub fn cas_ref(
     Ok(changed == 1)
 }
 
-/// A derived value, if computed.
+/// The stored bytes of a derived value, if computed.
 ///
 /// # Errors
 ///
@@ -367,20 +367,12 @@ pub fn get_derived(
     kind: &str,
     version: u32,
     cs: ChangesetId,
-) -> Result<Option<[u8; 32]>> {
-    let value: Option<Vec<u8>> = c
-        .query_row(
-            "SELECT value FROM derived WHERE kind = ?1 AND version = ?2 AND cs = ?3",
-            params![kind, version, cs.as_bytes()],
-            |row| row.get(0),
-        )
-        .optional()?;
-    value
-        .map(|v| {
-            <[u8; 32]>::try_from(v.as_slice())
-                .map_err(|_| Error::Corrupt(format!("derived {kind} for {cs}")))
-        })
-        .transpose()
+) -> Result<Option<Vec<u8>>> {
+    Ok(
+        c.prepare_cached("SELECT value FROM derived WHERE kind = ?1 AND version = ?2 AND cs = ?3")?
+            .query_row(params![kind, version, cs.as_bytes()], |row| row.get(0))
+            .optional()?,
+    )
 }
 
 /// Records a derived value. A second write must agree with the first:
@@ -394,14 +386,14 @@ pub fn put_derived(
     kind: &str,
     version: u32,
     cs: ChangesetId,
-    value: [u8; 32],
+    value: &[u8],
 ) -> Result<()> {
     let inserted = c
         .prepare_cached(
             "INSERT OR IGNORE INTO derived (kind, version, cs, value) VALUES (?1, ?2, ?3, ?4)",
         )?
         .execute(params![kind, version, cs.as_bytes(), value])?;
-    if inserted == 0 && get_derived(c, kind, version, cs)? != Some(value) {
+    if inserted == 0 && get_derived(c, kind, version, cs)?.as_deref() != Some(value) {
         return Err(Error::Corrupt(format!(
             "derived {kind} v{version} for {cs} differs from the stored value"
         )));

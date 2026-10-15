@@ -21,7 +21,7 @@ flowchart LR
     scn["scn"] -->|"gRPC, bearer token"| svc
     subgraph serve["scion-server serve"]
         svc["service.rs, objects.rs + auth.rs"] --> ops["write.rs, land.rs, read.rs, blame.rs"]
-        ops --> tree["tree.rs: apply, root trees"]
+        ops --> tree["tree.rs: apply, root trees<br/>derived.rs: derived data"]
         ops --> db["db.rs, store.rs"]
         tree --> db
         db --> sqlite[("scion.db: SQLite")]
@@ -100,7 +100,7 @@ One data directory holds everything (`store.rs`):
 <data>/lock                    locked by the one process that uses <data>
 <data>/scion.db                metadata and trees (SQLite)
 <data>/objects/blob/ab/cd..    one zstd file per blob, named by its ID in hex
-<data>/tmp/                    staging for atomic blob writes
+<data>/tmp/                    staging for atomic blob writes and uploads
 ```
 
 **SQLite tables** ([`migrations/`](../crates/scion-server/migrations)):
@@ -114,7 +114,7 @@ One data directory holds everything (`store.rs`):
 | `refs` | Ref name to target and `version`. A ref moves only by compare-and-swap on `version`. A foreign key keeps the target in the repo. |
 | `lands` | One row per land request, unique on (repo, caller, request key): state, result, detail, conflict paths, and when it finished. A finished row expires after 7 days (section 5). |
 | `trees` | `TreeV1` bytes by tree ID. Global. |
-| `derived` | Derived values by (kind, version, changeset). Rebuildable. |
+| `derived` | Derived values by (kind, version, changeset), as bytes that each kind encodes. Rebuildable (section 4). |
 | `git_import` | Git commit ID to changeset, per repo, so a re-import skips known commits. |
 
 Trees live in SQLite, not in the blob folder, so a derivation that writes many
@@ -122,17 +122,29 @@ trees commits them in one transaction. The schema version is
 `PRAGMA user_version`. When a database opens, each migration in
 `migrations/` that is newer than its version runs, in order, in its own
 transaction. A released migration never changes. A build refuses a database
-with a newer version. All database access goes through one connection behind
+with a newer version. Version 3 lets a derived value have any length; the
+upgrade copies every row. All database access goes through one connection behind
 a mutex. Write transactions use `BEGIN IMMEDIATE`.
 
 **Blob folder.** One zstd file per blob, at most 100 MiB uncompressed. A write
-goes to a temp file in `tmp/`, is flushed, and is renamed into place. A read
-unpacks the file and checks its hash. A check that does not need the content
-(`Blobs::verify`, used by puts, `CreateChangeset` and import) streams the file
-through the decoder into the hasher, so it holds the zstd window and small
-buffers, not the whole blob. A file that does not match its ID, or that
-unpacks to more than 100 MiB, is corrupt, and the next put of that content
-replaces it.
+goes to a temp file in `tmp/`, is flushed, and is renamed into place. The zstd
+frame header holds the uncompressed size, so `Blobs::size` reads only the
+header. A read unpacks the file and checks its hash. A check that does not
+need the content (`Blobs::verify`, used by puts, `CreateChangeset` and
+import) streams the file through the decoder into the hasher, so it holds the
+zstd window and small buffers, not the whole blob. A file that does not match
+its ID, or that unpacks to more than 100 MiB, is corrupt, and the next put of
+that content replaces it.
+
+**Uploads.** `PutBlob` streams (`Blobs::upload`). Each message goes into the
+hasher and to a spool file in `tmp/` before the server reads the next one, so
+an upload holds one message in memory, not the whole blob. The spool file
+holds raw bytes, because the frame header needs the size before the first
+compressed byte. After the last message, the server keeps an intact stored
+copy if there is one. Otherwise it streams the spool file through the
+compressor into the temp file. The spool file has no name, so a dropped
+upload or a crash leaves nothing behind. `Store::open` removes any temp file
+that a crash left before its rename.
 
 **Durability rules.**
 
@@ -154,6 +166,9 @@ replaces it.
   `ResolveRef` or a land state from `GetLand`. Where `fsync` already flushes
   the drive cache, no read waits. A land reads with `Store::read_unflushed`,
   because it flushes before it replies.
+- A read that derives a value, such as the root tree for `GetRootTree`,
+  waits for a full flush of that derivation before it replies (section 4).
+  So a client never gets a tree ID that a power loss can undo.
 - A blob is durable after `BlobBatch::sync`: a plain `fsync` of each blob file
   when written, then of each changed fan-out directory, then a shared full
   flush.
@@ -171,37 +186,60 @@ would not see. So `scion-server import` needs the server stopped.
 
 ## 4. Derived data
 
-Derived data is computed from changesets and is not part of them. Clients
-never see how it is stored, so the server can change it freely. Today there is
-one kind, `root_tree` version 1: the root tree of a changeset's full snapshot.
+Derived data is computed from changesets and is not part of them.
 
-**Computed from the parent.** A changeset's root tree is its first parent's
-root tree plus its changes. `tree::store_changeset`, the one write path for
-changesets (`CreateChangeset`, `Land`, git import), does this in the caller's
-transaction: apply the changes, store the new trees, insert the changeset,
-record its `root_tree`.
+**What the article says.** Everything that is not part of a changeset is
+derived data, and one generic mechanism computes all of it. Each kind is
+defined recursively: its value for a changeset is computed from its values
+for that changeset's parents. For each kind, the server chooses to compute it
+eagerly or to defer the work. Clients never see these structures, so the
+server can change them without a client change.
+
+**How this project does it** (`derived.rs`). Only two ideas in this table
+come from the article: a value comes from the parents' values, and a kind is
+computed eagerly or on demand. The rest is this project's choice.
+
+| Part | Here |
+|---|---|
+| A kind | `derived::Kind`: a name, a version, and `derive`, a function from a changeset and its first parent's value to a value. Each kind encodes its value as bytes. |
+| Inputs | The first parent's value only, because a changeset stores only its changes against its first parent (section 2). The article says "parents". A kind over the full graph does not fit yet ([#76](https://github.com/bnsd55/open-scion/issues/76)). |
+| On demand | `derived::get` reads the stored value. If there is none, `derived::derive` walks first parents back to the nearest changeset with a stored value, then derives forward, oldest first, and stores each value. It is a loop, not recursion, so a long chain is safe. |
+| Eager | A kind can also store its value when the changeset is written. `root_tree` does (below). |
+| Storage | One `derived` row per (kind, version, changeset), written in the transaction that derives it. A large structure belongs in its own table, and the value is its ID, as `root_tree` keeps trees in `trees`. |
+| A version bump | A new version reads and writes only its own rows. So the old rows become unused, and nothing rewrites them. The new version derives its values again, on demand. Nothing removes the old rows yet ([#71](https://github.com/bnsd55/open-scion/issues/71)). |
+| Repos | Rows are keyed by changeset alone. A changeset ID fixes its whole history, so a value is the same in every repo. `get` and `derive` check `repo_changesets` first, so a stored value never leaks to a repo that cannot see the changeset. |
+| Durability | A value can name rows that its derivation wrote, such as trees, and a reply can send it to a client. So when `get` derives a value, it waits for one full flush, shared with concurrent commits, before it returns. `derive` and `put` never flush: inside a write, the write's own flush covers them. |
+| One answer | A second write of a value must equal the first, or the store reports corruption. |
+
+**Cost of a new kind or version.** The first read derives every missing value
+on the chain in one transaction, and holds the database lock while it runs.
+For a tip with a long history, that is the whole history at once. **Planned:**
+a backfill that derives a bounded number of changesets per transaction
+([#71](https://github.com/bnsd55/open-scion/issues/71)).
+
+**Root trees.** Kind `root_tree` version 1 (`tree::RootTree`): the root tree
+of a changeset's full snapshot, as a 32-byte tree ID. It is the first
+parent's root tree plus the changeset's changes. It is eager.
+`tree::store_changeset`, the one write path for changesets (`CreateChangeset`,
+`Land`, git import), does this in the caller's transaction: apply the
+changes, store the new trees, insert the changeset, record its `root_tree`.
+If the row is missing, `tree::root_tree` derives it on demand. A golden test
+pins the tree IDs of a fixed history, both when they are stored at write time
+and when they are derived on demand.
 
 `tree::apply` runs all deletes before all puts, so one changeset can turn a
 file into a directory or back. It loads only the directories on changed paths
 and removes directories left empty. It fails on a delete of a missing path or
 of a directory, and on a put where a file or a directory is in the way.
 
-**Iterative derivation.** If a `root_tree` row is missing,
-`tree::derive_root_tree` walks first parents back to the nearest changeset
-that has one, then applies changes forward, oldest first, storing each root
-tree. It is a loop, not recursion, so a long chain is safe. A second write of
-a value must equal the first, or the store reports corruption. Rows are keyed
-by changeset alone, so `root_tree` checks `repo_changesets` first: a cached
-tree must not leak to a repo that cannot see the changeset.
-
 **Path history and blame are not derived data yet.** The article says
 Scion builds dedicated structures for file blame and path history from the
 changesets, through the same mechanism. Here both are computed on each call
 from first-parent changes, with a bound per call (section 7). That is this
-project's choice for now. **Planned:** both as derived data
-([#61](https://github.com/bnsd55/open-scion/issues/61)), on one generic
-mechanism for every kind
-([#57](https://github.com/bnsd55/open-scion/issues/57)).
+project's choice for now. **Planned:** both as kinds on this mechanism
+([#61](https://github.com/bnsd55/open-scion/issues/61)). A unit test shows
+that a kind with another value type, which is derived only on demand, works
+the same way.
 
 ## 5. The write path
 
@@ -644,7 +682,7 @@ an untrusted network.
 | Network | Listens on `127.0.0.1:7878` by default. A non-loopback address is refused unless `--insecure-listen` is given. | No TLS: the token and all data travel unencrypted ([#14](https://github.com/bnsd55/open-scion/issues/14)). |
 | Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. | Trees and blobs are shared by all repos. `GetObjects` reads any tree or blob by ID, and a changeset can name another repo's blob and then read it ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
-| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once, 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget, and a reply whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 1 MiB, diffs at most 100 versions and about 1M lines, and at most 4 run at once. `MergeBase` and `IsAncestor` walk at most 10,000 changesets; a `Diff` reply holds at most 1,000 paths. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object inside HTTP/2 until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
+| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once (each holds one message in memory), 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget, and a reply whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 1 MiB, diffs at most 100 versions and about 1M lines, and at most 4 run at once. `MergeBase` and `IsAncestor` walk at most 10,000 changesets; a `Diff` reply holds at most 1,000 paths. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object inside HTTP/2 until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. | The client trusts the server for a ref's target and for a changeset's root tree, which it cannot check by hash. Tiers ([#5](https://github.com/bnsd55/open-scion/issues/5)) must forward these answers, not compute them. |
 | Checkout | `scn checkout` writes into a private temp directory with a random name and renames it onto a new or empty destination, never follows a symlink while writing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure the destination stays as it was. | The destination's parent must not be writable by other users, unless it has the sticky bit: they could swap the temp directory before the rename. No Windows rules: device names and names that end in a dot or a space pass. |
 | Errors | Internal errors reply `internal error`. The detail stays in the server log. | |
@@ -661,10 +699,11 @@ limit and its upgrade path. This is the list on `main` today.
 | File | Shortcut | Upgrade | Issue |
 |---|---|---|---|
 | `scion-core/src/codec.rs` (`put_len`) | Encoding panics if a field is longer than `u32::MAX`. Every ingest path caps sizes far below that. | `try_encode` returning `Result`, if a path ever does not. | |
-| `scion-server/src/store.rs` (`MAX_OBJECT_BYTES`) | An upload is buffered in memory, up to 100 MiB, before it is hashed and written. | Stream to a temp file and hash the chunks. | [#16](https://github.com/bnsd55/open-scion/issues/16) |
 | `scion-server/src/store.rs` (`Inner::db`) | One SQLite connection behind a mutex, so reads wait for writes. | A pool of read-only connections. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
 | `scion-server/src/store.rs` (`Store::open`) | One process per data directory, so an import needs the server stopped. | Let a separate importer process share the directory. Lands already re-plan when the ref moves (`MAX_ATTEMPTS`). | [#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
+| `scion-server/src/derived.rs` (`Kind::derive`) | A kind gets only its first parent's value, so a kind over the full commit graph, such as a generation number, does not fit. | Pass every parent's value, and derive ancestors in generation order. | [#76](https://github.com/bnsd55/open-scion/issues/76) |
+| `scion-server/src/derived.rs` (`derive`) | One transaction derives every missing value on the chain, and holds the database lock. So the first read after a new kind or a version bump derives the whole history at once. Rows of old versions are never removed. | A backfill that derives a bounded number of changesets per transaction, and a bounded delete of old versions. | [#71](https://github.com/bnsd55/open-scion/issues/71) |
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/land.rs` (`MAX_ATTEMPTS`) | Imports move refs without the land lock, so a land retries 3 times, then returns `ABORTED`. | Route every ref move through the per-ref lander. | [#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | One lander per ref that rebases a batch and moves the ref once. | [#18](https://github.com/bnsd55/open-scion/issues/18) |

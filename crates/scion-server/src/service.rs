@@ -29,14 +29,15 @@ use crate::auth::{Auth, Caller};
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
 use crate::objects::ObjectsService;
-use crate::store::{MAX_OBJECT_BYTES, Store};
+use crate::store::Store;
 use crate::{blame, db, names, read, write};
 
 /// Most changeset bytes in one `Log` reply; the client pages for more.
 const LOG_BUDGET_BYTES: usize = MAX_MESSAGE_BYTES / 2;
 /// Most store operations running at once.
 const MAX_BLOCKING: usize = 256;
-/// Most uploads in flight at once. Each buffers up to `MAX_OBJECT_BYTES`.
+/// Most uploads read at once. Each holds one request message in memory, of up
+/// to `MAX_MESSAGE_BYTES`, and a spool file of up to `MAX_OBJECT_BYTES`.
 const MAX_UPLOADS: usize = 16;
 /// Most `Blame` calls running at once. One call can diff for seconds, so
 /// blames never take more than this many of the `MAX_BLOCKING` permits that
@@ -75,8 +76,8 @@ pub async fn serve(
 pub struct ScionService {
     worker: Worker,
     lands: Arc<Lands>,
-    /// Bounds buffered uploads, so their memory stays under
-    /// `MAX_UPLOADS * MAX_OBJECT_BYTES`.
+    /// Bounds uploads read at once (`MAX_UPLOADS`): their messages in memory
+    /// and their spool files in `tmp/`.
     uploads: Arc<Semaphore>,
     /// Bounds blames running at once (`MAX_BLAMES`).
     blames: Arc<Semaphore>,
@@ -229,13 +230,16 @@ impl Scion for ScionService {
             .await
             .ok_or_else(|| Status::invalid_argument("empty upload"))??;
         check_name("repo", &first.repo)?;
-        let repo = first.repo;
-        // Check the repo before buffering any more data.
-        let lookup = repo.clone();
-        self.worker
-            .run(move |store| store.read(|c| db::repo_id(c, &lookup)))
+        // Check the repo before reading any more data. Each message goes to
+        // the spool file before the next one is read, so an upload holds one
+        // message in memory, not the whole blob.
+        let mut upload = self
+            .worker
+            .run(move |store| {
+                store.read(|c| db::repo_id(c, &first.repo))?;
+                store.blobs().upload()?.append(&first.data)
+            })
             .await?;
-        let mut data = first.data;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             if !chunk.repo.is_empty() {
@@ -243,16 +247,11 @@ impl Scion for ScionService {
                     "only the first PutBlob message names the repo",
                 ));
             }
-            if data.len() + chunk.data.len() > MAX_OBJECT_BYTES {
-                return Err(Status::invalid_argument(format!(
-                    "blob is larger than {MAX_OBJECT_BYTES} bytes"
-                )));
-            }
-            data.extend_from_slice(&chunk.data);
+            upload = self.worker.run(move |_| upload.append(&chunk.data)).await?;
         }
         let id = self
             .worker
-            .run(move |store| write::put_blob(&store, &repo, &data))
+            .run(move |store| store.blobs().put_upload(upload))
             .await?;
         Ok(Response::new(PutBlobResponse {
             blob_id: id.as_bytes().to_vec(),

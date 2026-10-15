@@ -10,12 +10,9 @@ use rusqlite::Connection;
 use scion_core::{Changeset, ChangesetId, Entry, FileState, PathElem, RepoPath, Tree, TreeId};
 
 use crate::db::{self, RepoId};
+use crate::derived::{self, Kind};
 use crate::error::{ApplyError, Error, Result};
 use crate::store::Store;
-
-/// Derived-data kind for the root tree of a changeset.
-const ROOT_TREE: &str = "root_tree";
-const ROOT_TREE_VERSION: u32 = 1;
 
 /// Applies `changes` to `base` (`None` is the empty tree), stores the new
 /// trees, and returns the new root.
@@ -63,6 +60,36 @@ pub fn lookup(c: &Connection, root: TreeId, path: &RepoPath) -> Result<Option<En
     Ok(Some(entry))
 }
 
+/// The root tree of a changeset's full snapshot: its first parent's root
+/// tree plus its changes.
+pub struct RootTree;
+
+impl Kind for RootTree {
+    const NAME: &'static str = "root_tree";
+    const VERSION: u32 = 1;
+    type Value = TreeId;
+
+    fn derive(
+        c: &Connection,
+        id: ChangesetId,
+        changeset: &Changeset,
+        parent: Option<TreeId>,
+    ) -> Result<TreeId> {
+        apply(c, parent, &changeset.changes).map_err(|e| match e {
+            Error::Apply(e) => Error::Corrupt(format!("stored changeset {id} does not apply: {e}")),
+            other => other,
+        })
+    }
+
+    fn encode(tree: &TreeId) -> Vec<u8> {
+        tree.as_bytes().to_vec()
+    }
+
+    fn decode(bytes: &[u8]) -> Option<TreeId> {
+        TreeId::try_from(bytes).ok()
+    }
+}
+
 /// The root tree of a changeset that `repo` may see, deriving it if needed.
 ///
 /// # Errors
@@ -70,53 +97,18 @@ pub fn lookup(c: &Connection, root: TreeId, path: &RepoPath) -> Result<Option<En
 /// [`Error::NotFound`] if `repo` does not have `cs`. [`Error::Corrupt`] if a
 /// stored changeset does not apply to its parent tree.
 pub fn root_tree(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
-    let known = store.read(|c| {
-        require(c, repo, cs)?;
-        db::get_derived(c, ROOT_TREE, ROOT_TREE_VERSION, cs)
-    })?;
-    match known {
-        Some(tree) => Ok(TreeId::from_bytes(tree)),
-        // Derived data can be derived again, so a read does not wait for a
-        // flush; a later write's flush covers it.
-        None => store.commit(|tx| derive_root_tree(tx, repo, cs)),
-    }
+    derived::get::<RootTree>(store, repo, cs)
 }
 
-/// Derives the root tree of `cs` inside the caller's transaction.
-///
-/// Walks first parents back to the nearest changeset with a known root tree,
-/// then applies changes forward, oldest first. No recursion, so a long
-/// underived history is safe.
+/// Derives the root tree of `cs` inside the caller's transaction, as
+/// [`derived::derive`] does.
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. [`Error::Corrupt`] if a
 /// stored changeset does not apply to its parent tree.
 pub fn derive_root_tree(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
-    // Derived data is keyed by changeset alone, so check the repo here: a
-    // cached tree must not leak to a repo that cannot see the changeset.
-    require(c, repo, cs)?;
-    let mut pending = Vec::new();
-    let mut cur = Some(cs);
-    let mut base = None;
-    while let Some(id) = cur {
-        if let Some(tree) = db::get_derived(c, ROOT_TREE, ROOT_TREE_VERSION, id)? {
-            base = Some(TreeId::from_bytes(tree));
-            break;
-        }
-        pending.push(id);
-        cur = db::first_parent(c, id)?;
-    }
-    for id in pending.into_iter().rev() {
-        let changeset = db::get_changeset(c, repo, id)?;
-        let tree = apply(c, base, &changeset.changes).map_err(|e| match e {
-            Error::Apply(e) => Error::Corrupt(format!("stored changeset {id} does not apply: {e}")),
-            other => other,
-        })?;
-        db::put_derived(c, ROOT_TREE, ROOT_TREE_VERSION, id, *tree.as_bytes())?;
-        base = Some(tree);
-    }
-    base.ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
+    derived::derive::<RootTree>(c, repo, cs)
 }
 
 /// Stores a changeset in `repo` with its root tree: the first parent's tree
@@ -140,16 +132,8 @@ pub fn store_changeset(
         .transpose()?;
     let tree = apply(c, base, &cs.changes)?;
     let id = db::insert_changeset(c, repo, cs)?;
-    db::put_derived(c, ROOT_TREE, ROOT_TREE_VERSION, id, *tree.as_bytes())?;
+    derived::put::<RootTree>(c, id, &tree)?;
     Ok((id, tree))
-}
-
-fn require(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result<()> {
-    if db::has_changeset(c, repo, cs)? {
-        Ok(())
-    } else {
-        Err(Error::NotFound(format!("changeset {cs}")))
-    }
 }
 
 /// The parts of a path, as tree entry names.
@@ -481,6 +465,88 @@ mod tests {
                 Ok(())
             });
         }
+    }
+
+    /// Root trees of a fixed history, stored when written and derived when
+    /// read, are pinned IDs. So a change to derivation that changes a tree
+    /// fails here.
+    #[test]
+    fn root_trees_match_golden_ids() {
+        let history: [Edits<'_>; 3] = [
+            &[("a/b/c", Some("1")), ("a/d", Some("2")), ("e", Some("3"))],
+            &[("a/b/c", None), ("a/b", Some("4")), ("f/g/h", Some("5"))],
+            &[("e", None), ("a/d", Some("6")), ("f/g/h", None)],
+        ];
+        let golden = [
+            "512cf237e5e62fc7d013ee67bd701857d637c2c7b3c60897ee9f57d4f63212b5",
+            "8e7be185763f5990a6b48bca674e5766e80aa28a5769f46c530d8e4de2b1c8be",
+            "27d510c1cac510175ac54737191dab75dbc4e3de391ee9c3b56233d74a70124c",
+        ];
+        for stored in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path()).unwrap();
+            let (repo, ids) = store
+                .write(|c| {
+                    let repo = db::create_repo(c, "r")?;
+                    let mut ids: Vec<ChangesetId> = Vec::new();
+                    for edits in history {
+                        let cs = changeset(ids.last().copied(), edits);
+                        ids.push(if stored {
+                            store_changeset(c, repo, &cs)?.0
+                        } else {
+                            db::insert_changeset(c, repo, &cs)?
+                        });
+                    }
+                    Ok((repo, ids))
+                })
+                .unwrap();
+            let trees: Vec<String> = ids
+                .iter()
+                .map(|&cs| root_tree(&store, repo, cs).unwrap().to_string())
+                .collect();
+            assert_eq!(trees, golden, "stored when written: {stored}");
+        }
+    }
+
+    fn changeset(parent: Option<ChangesetId>, edits: Edits<'_>) -> Changeset {
+        Changeset {
+            parents: parent.into_iter().collect(),
+            author: IdentityTime {
+                name: b"a".to_vec(),
+                email: b"a@x".to_vec(),
+                unix_secs: 0,
+                tz_offset_minutes: 0,
+            },
+            committer: None,
+            message: vec![],
+            changes: changes(edits),
+        }
+    }
+
+    /// `GetRootTree` sends a tree ID that the client then fetches. So a tree
+    /// derived during the read is durable before the reply, or a power loss
+    /// could lose a tree that the client was told about.
+    #[test]
+    fn get_root_tree_flushes_once_after_it_derives() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        // A changeset with no root tree row yet.
+        let cs = store
+            .write(|c| {
+                let repo = db::create_repo(c, "r")?;
+                db::insert_changeset(c, repo, &changeset(None, &[("a/b", Some("1"))]))
+            })
+            .unwrap();
+        let get_root_tree = || {
+            let before = store.blobs().full_flushes();
+            let tree = crate::read::root_tree(&store, "r", cs).unwrap();
+            (tree, store.blobs().full_flushes() - before)
+        };
+        let (tree, flushes) = get_root_tree();
+        // None where the commit's own fsync flushes the drive cache.
+        let want = u64::from(crate::store::FSYNC_LEAVES_DRIVE_CACHE);
+        assert_eq!(flushes, want, "the derivation is durable before the reply");
+        assert_eq!(get_root_tree(), (tree, 0), "a stored tree needs no flush");
     }
 
     #[test]
