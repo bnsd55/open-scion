@@ -9,7 +9,9 @@
 //! [`crate::materialize`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{self, Write as _};
 use std::path::PathBuf;
+use std::task::Poll;
 
 use anyhow::{Context, Result, anyhow, bail};
 use hashlink::LinkedHashSet;
@@ -17,9 +19,10 @@ use scion_core::{BlobId, Entry, FileState, PathElem, RepoPath, Tree, TreeId};
 use scion_proto::MAX_OBJECT_REFS;
 use scion_proto::v1::{GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
 use serde_json::json;
+use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use crate::client::{Ctx, Objects, id_from};
-use crate::materialize::{Checkout, check_dest, check_name, is_within};
+use crate::materialize::{self, Checkout, check_dest, check_name, is_within};
 
 /// Arguments of `scn checkout`.
 #[derive(clap::Args)]
@@ -47,18 +50,79 @@ fn parse_dir(dir: &str) -> Result<RepoPath> {
 type Files = BTreeMap<RepoPath, FileState>;
 
 /// Writes the files of a changeset into a new or empty directory, and prints
-/// how many it wrote. On failure, or on Ctrl-C, the destination is left as
-/// it was.
+/// how many it wrote. On failure, or on a signal in [`STOP_SIGNALS`], the
+/// destination is left as it was.
 pub async fn checkout(ctx: &mut Ctx, args: CheckoutArgs) -> Result<()> {
-    // Listening for Ctrl-C replaces the default exit, so start it first. On
-    // Ctrl-C the checkout is dropped at its next wait, and the drop removes
-    // what it wrote. If listening fails, that branch is off and Ctrl-C exits
-    // as usual.
-    tokio::select! {
+    // Listening replaces the default exit, so start it first. On a signal
+    // the checkout is dropped at its next wait, and the drop removes what it
+    // wrote.
+    let mut signals = listen()?;
+    let mut run = Box::pin(run(ctx, &args));
+    let stop = tokio::select! {
         biased;
-        Ok(()) = tokio::signal::ctrl_c() => bail!("interrupted: nothing was checked out"),
-        done = run(ctx, &args) => done,
-    }
+        stop = next_signal(&mut signals) => stop,
+        done = &mut run => return done,
+    };
+    // The removal can take long, and it blocks this thread. A second signal
+    // reaches this task on a worker thread of the runtime, and exits at once.
+    tokio::spawn(async move {
+        let again = next_signal(&mut signals).await;
+        let what = match materialize::removing() {
+            Some(temp) => format!("stopped removing the checkout: left {}", temp.display()),
+            None => "nothing was checked out".to_owned(),
+        };
+        exit(again, &what);
+    });
+    drop(run);
+    exit(stop, "nothing was checked out")
+}
+
+/// A signal and its name.
+type Stop = (SignalKind, &'static str);
+
+/// The signals that stop a checkout.
+const STOP_SIGNALS: [Stop; 3] = [
+    (SignalKind::interrupt(), "SIGINT"),
+    (SignalKind::terminate(), "SIGTERM"),
+    (SignalKind::hangup(), "SIGHUP"),
+];
+
+/// Listens for each of [`STOP_SIGNALS`]. Listening replaces the default exit
+/// until the process ends.
+fn listen() -> Result<Vec<(Stop, Signal)>> {
+    STOP_SIGNALS
+        .into_iter()
+        .map(|stop @ (kind, name)| {
+            let signal = signal(kind).with_context(|| format!("cannot listen for {name}"))?;
+            Ok((stop, signal))
+        })
+        .collect()
+}
+
+/// Waits for the next of the `signals`.
+async fn next_signal(signals: &mut [(Stop, Signal)]) -> Stop {
+    std::future::poll_fn(|cx| {
+        for (stop, signal) in signals.iter_mut() {
+            if let Poll::Ready(Some(())) = signal.poll_recv(cx) {
+                return Poll::Ready(*stop);
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// Prints `scn: interrupted by NAME: what`, and dies by the signal: it
+/// restores the default action and raises the signal again. So a shell that
+/// runs `scn` stops too, as a bash loop does on Ctrl-C, and reports 128 plus
+/// the signal number (not the 2 of other errors). After SIGHUP the terminal
+/// can be gone, so a failed print changes nothing.
+fn exit((kind, name): Stop, what: &str) -> ! {
+    let _ = writeln!(io::stderr(), "scn: interrupted by {name}: {what}");
+    let number = kind.as_raw_value();
+    // For these signals it returns only if it does not know the signal.
+    let _ = signal_hook::low_level::emulate_default_handler(number);
+    std::process::exit(128 + number)
 }
 
 async fn run(ctx: &mut Ctx, args: &CheckoutArgs) -> Result<()> {
