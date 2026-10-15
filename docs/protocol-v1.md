@@ -247,7 +247,8 @@ server checks, in order:
    more than 100,000 changesets behind the head on that history MAY be
    `REJECTED` as too old. Then the client makes a new changeset on a newer
    head and lands that. A base within 100,000 changesets of the head is never
-   too old.
+   too old. Further back, the answer depends on what the server holds in
+   memory at the time, so the same base can pass later under a new key.
 4. Each path P that the changeset changes is checked. P conflicts when a
    changeset on the ref after the base changed P itself, a path below P, or a
    file at a directory above P. If any path conflicts, the land is
