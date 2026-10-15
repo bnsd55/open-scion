@@ -1,8 +1,9 @@
 //! Reads. Each takes a changeset ID, so each answer is immutable.
 
+use rusqlite::Connection;
 use scion_core::{Changeset, ChangesetId, Entry, RepoPath, Tree, TreeId};
 
-use crate::db;
+use crate::db::{self, RepoId};
 use crate::error::{Error, Result};
 use crate::store::Store;
 use crate::tree;
@@ -86,7 +87,29 @@ pub fn list_dir(
     })
 }
 
+/// Most changesets one call checks on a first-parent walk: a `Log` call, or
+/// the walk of a `Blame` call. So it is also the most entries a `Log` reply
+/// holds. Each check reads one changeset while the call holds the database
+/// lock.
+// SHORTCUT: path history and blame walk first parents on every call, so a
+// path changed long ago costs one call per 1,000 changesets since. Upgrade:
+// per-path history as derived data, so a call reads only the changesets that
+// changed the path.
+pub const MAX_SCAN: usize = 1000;
+
+/// One page of first-parent history.
+#[derive(Debug)]
+pub struct LogPage {
+    /// The changesets found, newest first.
+    pub entries: Vec<(ChangesetId, Changeset)>,
+    /// Where the next page starts: the first changeset this call did not
+    /// check. `None` when the history ends.
+    pub next: Option<ChangesetId>,
+}
+
 /// Up to `limit` changesets, walking first parents from `cs`, newest first.
+/// Reads one [`log_page`] at a time, so it holds the database lock for at
+/// most [`MAX_SCAN`] changesets at once.
 ///
 /// # Errors
 ///
@@ -97,15 +120,75 @@ pub fn log(
     cs: ChangesetId,
     limit: usize,
 ) -> Result<Vec<(ChangesetId, Changeset)>> {
+    let mut entries = Vec::new();
+    let mut next = Some(cs);
+    while let Some(from) = next.filter(|_| entries.len() < limit) {
+        let page = log_page(store, repo, from, None, limit - entries.len())?;
+        entries.extend(page.entries);
+        next = page.next;
+    }
+    Ok(entries)
+}
+
+/// Up to `limit` changesets, walking first parents from `cs`, newest first.
+/// With a `path`, only the changesets that change it ([`changes_path`]).
+/// Checks at most [`MAX_SCAN`] changesets.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if the repo or changeset does not exist.
+pub fn log_page(
+    store: &Store,
+    repo: &str,
+    cs: ChangesetId,
+    path: Option<&RepoPath>,
+    limit: usize,
+) -> Result<LogPage> {
     store.read(|c| {
         let repo = db::repo_id(c, repo)?;
-        let mut out = Vec::new();
-        let mut cur = Some(cs);
-        while let Some(id) = cur.filter(|_| out.len() < limit) {
-            let changeset = db::get_changeset(c, repo, id)?;
-            cur = changeset.parents.first().copied();
-            out.push((id, changeset));
+        let mut entries = Vec::new();
+        let mut next = Some(cs);
+        let mut budget = MAX_SCAN;
+        while entries.len() < limit {
+            match next_change(c, repo, path, &mut next, &mut budget)? {
+                Some(entry) => entries.push(entry),
+                None => break,
+            }
         }
-        Ok(out)
+        Ok(LogPage { entries, next })
+    })
+}
+
+/// Walks first parents from `next` to the newest changeset that changes
+/// `path` ([`changes_path`]), or to the next changeset if `path` is `None`.
+/// Checks at most `budget` changesets, and leaves `next` at the first one it
+/// did not check.
+pub(crate) fn next_change(
+    c: &Connection,
+    repo: RepoId,
+    path: Option<&RepoPath>,
+    next: &mut Option<ChangesetId>,
+    budget: &mut usize,
+) -> Result<Option<(ChangesetId, Changeset)>> {
+    while let Some(id) = next.filter(|_| *budget > 0) {
+        *budget -= 1;
+        let changeset = db::get_changeset(c, repo, id)?;
+        *next = changeset.parents.first().copied();
+        if path.is_none_or(|path| changes_path(&changeset, path)) {
+            return Ok(Some((id, changeset)));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a changeset changes `path`: the file itself, or anything below it
+/// if it is a directory. A changeset lists every file it changes, so this
+/// needs no tree.
+#[must_use]
+pub fn changes_path(cs: &Changeset, path: &RepoPath) -> bool {
+    let path = path.as_bytes();
+    cs.changes.keys().any(|changed| {
+        let changed = changed.as_bytes();
+        changed.starts_with(path) && matches!(changed.get(path.len()), None | Some(b'/'))
     })
 }

@@ -25,5 +25,9 @@ release.
 - Reads over the API: resolve a ref, read a file, list a directory, history.
 - `scn`, the command-line client: `cat`, `ls`, `log`, `show`, `commit`,
   `land` and `bench`, with `--json` output.
+- Path history and blame on first-parent history: `Log` takes an optional
+  path and says where to continue, and a new `Blame` RPC gives each line's
+  last changeset. `scn log --path` and `scn blame`. Each call has a bound,
+  and the client continues where a call stopped.
 - Bearer-token auth, loopback-only listening by default, request limits and
   name validation at the RPC boundary.

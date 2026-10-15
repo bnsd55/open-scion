@@ -101,6 +101,8 @@ export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
 ./target/release/scion-server --data /tmp/scion serve &
 
 ./target/release/scn log -n 5
+./target/release/scn log --path src -n 5          # changesets that changed src/
+./target/release/scn blame main:README.md         # last changeset of each line
 ./target/release/scn cat main:README.md
 ./target/release/scn checkout main --into /tmp/work   # --sparse DIR for part of it
 echo hello > hello.txt
@@ -142,6 +144,7 @@ These are this project's choices where the article does not give details.
 | Landing | One land at a time per ref, inside one process. A changeset can be created in parallel without any lock. |
 | Retries | Each land has a caller-chosen request key, so a retry returns the first result |
 | Git | One-way import. Commit IDs are not kept identical to git commit IDs. |
+| History and blame | Computed on each call from first-parent changes, with a bound per call. The article keeps them as derived data; that is planned ([#61](https://github.com/bnsd55/open-scion/issues/61)). |
 
 Deliberate simplifications are marked `SHORTCUT:` in the code, each with its
 limit and its upgrade path.

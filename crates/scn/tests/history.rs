@@ -1,0 +1,400 @@
+//! `scn blame` and `scn log --path` against an in-process server. Blame is
+//! compared with `git blame --first-parent` of the same history.
+#![cfg(unix)]
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::process::{Command, Output};
+
+use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
+use scion_server::blame::MAX_BLAME_VERSIONS;
+use scion_server::import::{ImportOptions, import_git};
+use scion_server::read::MAX_SCAN;
+use scion_server::{Store, db, service, tree};
+use serde_json::Value;
+use tempfile::TempDir;
+use tokio::net::TcpListener;
+use tokio::runtime::Runtime;
+
+const REPO: &str = "r";
+const TOKEN: &str = "secret";
+
+/// Runs git in `dir` with fixed identities and dates and no user or system
+/// config, and returns stdout. Fails the test unless git succeeds.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "Ada")
+        .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+        .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+        .env("GIT_COMMITTER_NAME", "Ada")
+        .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+        .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Writes the files (`None` deletes) and commits everything.
+fn commit(dir: &Path, message: &str, files: &[(&str, Option<&str>)]) {
+    for (name, content) in files {
+        let file = dir.join(name);
+        match content {
+            Some(content) => {
+                fs::create_dir_all(file.parent().unwrap()).unwrap();
+                fs::write(file, content).unwrap();
+            }
+            None => fs::remove_file(file).unwrap(),
+        }
+    }
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-q", "-m", message]);
+}
+
+/// A server for one test. Dropping it stops the server.
+struct Server {
+    url: String,
+    _runtime: Runtime,
+    _data: TempDir,
+}
+
+impl Server {
+    fn start(data: TempDir, store: Store) -> Self {
+        let runtime = Runtime::new().unwrap();
+        let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        runtime.spawn(service::serve(
+            store,
+            listener,
+            TOKEN,
+            std::future::pending(),
+        ));
+        Self {
+            url,
+            _runtime: runtime,
+            _data: data,
+        }
+    }
+
+    /// Runs `scn --json` and parses its output.
+    fn json(&self, args: &[&str]) -> Value {
+        let out: Output = Command::new(env!("CARGO_BIN_EXE_scn"))
+            .args(["--server", &self.url, "--repo", REPO, "--json"])
+            .args(args)
+            .env("SCION_TOKEN", TOKEN)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "scn {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+}
+
+/// `scn blame --json` as one `(changeset, origin line)` per line.
+fn blame_lines(server: &Server, spec: &str) -> Vec<(String, u64)> {
+    let mut lines = Vec::new();
+    for range in server.json(&["blame", spec]).as_array().unwrap() {
+        assert_eq!(
+            range["start_line"].as_u64().unwrap(),
+            lines.len() as u64 + 1
+        );
+        let id = range["changeset"].as_str().unwrap().to_owned();
+        let origin = range["origin_line"].as_u64().unwrap();
+        for n in 0..range["line_count"].as_u64().unwrap() {
+            lines.push((id.clone(), origin + n));
+        }
+    }
+    lines
+}
+
+/// The changeset that a git commit was imported as, in hex.
+fn changeset_of(store: &Store, commit: &str) -> String {
+    let oid: Vec<u8> = (0..commit.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&commit[i..i + 2], 16).unwrap())
+        .collect();
+    store
+        .read(|c| {
+            let cs: Vec<u8> = c.query_row(
+                "SELECT cs FROM git_import WHERE git_oid = ?1",
+                [oid],
+                |row| row.get(0),
+            )?;
+            Ok(ChangesetId::try_from(cs.as_slice()).unwrap().to_string())
+        })
+        .unwrap()
+}
+
+/// `git blame --first-parent --porcelain` as one `(changeset, origin
+/// line)` per line, with each commit mapped to its changeset.
+fn git_blame_lines(store: &Store, dir: &Path, file: &str) -> Vec<(String, u64)> {
+    git(dir, &["blame", "--first-parent", "--porcelain", file])
+        .lines()
+        .filter(|line| !line.starts_with('\t'))
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let is_header = fields[0].len() == 40
+                && fields[0].bytes().all(|b| b.is_ascii_hexdigit())
+                && (3..=4).contains(&fields.len());
+            is_header.then(|| (changeset_of(store, fields[0]), fields[1].parse().unwrap()))
+        })
+        .collect()
+}
+
+/// A git history of edits that blame must follow: inserts, edits, a merge,
+/// a mode change, a delete and re-add, a last line with no newline, and
+/// lines that a diff can place in more than one way.
+fn blame_fixture(dir: &Path) {
+    git(dir, &["init", "-q", "-b", "main"]);
+    commit(
+        dir,
+        "add",
+        &[
+            (
+                "lib.rs",
+                Some("fn a() {\n    one();\n}\n\nfn b() {\n    two();\n}\n"),
+            ),
+            ("b.txt", Some("x\ny\n")),
+            (
+                "slide.txt",
+                Some("top\n\n    y();\n}\n        z();\n        z();\nend\n"),
+            ),
+        ],
+    );
+    commit(
+        dir,
+        "insert a function",
+        &[(
+            "lib.rs",
+            Some(
+                "fn a() {\n    one(1);\n}\n\nfn new() {\n    three();\n}\n\nfn b() {\n    two();\n}\n",
+            ),
+        )],
+    );
+    git(dir, &["checkout", "-q", "-b", "side"]);
+    commit(
+        dir,
+        "side",
+        &[(
+            "lib.rs",
+            Some(
+                "fn a() {\n    one(1);\n}\n\nfn new() {\n    three();\n}\n\nfn b() {\n    two(2);\n}\n",
+            ),
+        )],
+    );
+    git(dir, &["checkout", "-q", "main"]);
+    commit(
+        dir,
+        "header, insert, no newline at the end, delete b.txt",
+        &[
+            (
+                "lib.rs",
+                Some(
+                    "// header\n\nfn a() {\n    one(1);\n}\n\nfn new() {\n    four();\n    three();\n}\n\nfn b() {\n    two();\n}\n// end",
+                ),
+            ),
+            ("b.txt", None),
+        ],
+    );
+    git(dir, &["merge", "-q", "--no-ff", "side", "-m", "merge side"]);
+    fs::set_permissions(dir.join("lib.rs"), fs::Permissions::from_mode(0o755)).unwrap();
+    commit(
+        dir,
+        "executable only, re-add b.txt",
+        &[("b.txt", Some("x\ny\nz\n"))],
+    );
+    commit(
+        dir,
+        "end with a newline",
+        &[(
+            "lib.rs",
+            Some(
+                "// header\n\nfn a() {\n    one(1);\n}\n\nfn new() {\n    four();\n    three();\n}\n\nfn b() {\n    two(2);\n}\n// end\n\nfn c() {}\n",
+            ),
+        )],
+    );
+    // Both ends change, so the diff cannot trim them. The two lines added
+    // to slide.txt fit in more than one place. Only a Myers diff with the
+    // indent heuristic places them where git does.
+    commit(
+        dir,
+        "both ends, and lines that can slide",
+        &[
+            (
+                "lib.rs",
+                Some(
+                    "// header 2\n\nfn a() {\n    one(1);\n}\n\nfn m() {\n    one(1);\n}\n\nfn new() {\n    four();\n    three();\n}\n\nfn b() {\n    two(2);\n}\n// end\n\nfn c() { }\n",
+                ),
+            ),
+            (
+                "slide.txt",
+                Some("top 2\n\n    y();\n}\n        z();\n\n        z();\n        z();\nend 2\n"),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn blame_matches_git_blame_first_parent() {
+    let git_dir = tempfile::tempdir().unwrap();
+    let dir = git_dir.path();
+    blame_fixture(dir);
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let opts = ImportOptions {
+        rev: "HEAD".into(),
+        target_ref: "main".into(),
+        verify_sample: 0,
+    };
+    import_git(&store, REPO, dir, &opts).unwrap();
+    let expected: Vec<_> = ["lib.rs", "b.txt", "slide.txt"]
+        .iter()
+        .map(|file| git_blame_lines(&store, dir, file))
+        .collect();
+    let server = Server::start(data, store);
+    for (file, expected) in ["lib.rs", "b.txt", "slide.txt"].iter().zip(expected) {
+        assert_eq!(
+            blame_lines(&server, &format!("main:{file}")),
+            expected,
+            "{file}"
+        );
+    }
+}
+
+fn regular(content: BlobId) -> FileState {
+    FileState::Regular {
+        content,
+        executable: false,
+    }
+}
+
+/// A changeset's message and the files it puts.
+type Puts<'a> = (Vec<u8>, Vec<(&'a str, FileState)>);
+
+/// Stores a first-parent chain in a new repo, one changeset per entry.
+/// Returns the IDs, oldest first.
+fn chain(store: &Store, changesets: Vec<Puts<'_>>) -> Vec<ChangesetId> {
+    store
+        .write(|c| {
+            let repo = db::create_repo(c, REPO)?;
+            let mut ids: Vec<ChangesetId> = Vec::new();
+            for (message, files) in changesets {
+                let cs = Changeset {
+                    parents: ids.last().copied().into_iter().collect(),
+                    author: IdentityTime {
+                        name: b"Ada".to_vec(),
+                        email: b"ada@example.com".to_vec(),
+                        unix_secs: 1_700_000_000,
+                        tz_offset_minutes: 0,
+                    },
+                    committer: None,
+                    message,
+                    changes: files
+                        .into_iter()
+                        .map(|(p, state)| (RepoPath::new(p).unwrap(), Some(state)))
+                        .collect(),
+                };
+                ids.push(tree::store_changeset(c, repo, &cs)?.0);
+            }
+            Ok(ids)
+        })
+        .unwrap()
+}
+
+/// The changeset IDs that `scn log --json` prints.
+fn log_ids(server: &Server, args: &[&str]) -> Vec<String> {
+    server
+        .json(args)
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn log_path_and_blame_continue_past_the_server_bounds() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    // The root adds `f` with two lines. Then 2 * MAX_SCAN changesets change
+    // only `g`, so at least one `Log` reply has no entries. Then
+    // MAX_BLAME_VERSIONS changesets each add one line at the top of `f`, one
+    // more than one `Blame` call diffs.
+    let mut text = String::from("line 1\nend\n");
+    let mut changes = vec![vec![
+        ("f", regular(store.blobs().put(text.as_bytes()).unwrap())),
+        ("g", regular(BlobId::of(b""))),
+    ]];
+    changes.extend((0..2 * MAX_SCAN).map(|i| vec![("g", regular(BlobId::of(&i.to_le_bytes())))]));
+    for n in 2..=MAX_BLAME_VERSIONS + 1 {
+        text.insert_str(0, &format!("line {n}\n"));
+        changes.push(vec![(
+            "f",
+            regular(store.blobs().put(text.as_bytes()).unwrap()),
+        )]);
+    }
+    let message = b"change\n";
+    let ids = chain(
+        &store,
+        changes
+            .into_iter()
+            .map(|files| (message.to_vec(), files))
+            .collect(),
+    );
+    let tip = ids.last().unwrap().to_string();
+    // The changesets that add `f` and its lines, newest first.
+    let mut f_history: Vec<String> = ids[ids.len() - MAX_BLAME_VERSIONS..]
+        .iter()
+        .rev()
+        .map(ToString::to_string)
+        .collect();
+    f_history.push(ids[0].to_string());
+    let server = Server::start(data, store);
+
+    assert_eq!(
+        log_ids(&server, &["log", &tip, "--path", "f", "-n", "1000"]),
+        f_history
+    );
+
+    // Each line came from the changeset that added it, as line 1 there. The
+    // last line is line 2 of the root's file.
+    let root = ids[0].to_string();
+    let mut expected: Vec<(String, u64)> = f_history.into_iter().map(|id| (id, 1)).collect();
+    expected.push((root, 2));
+    assert_eq!(blame_lines(&server, &format!("{tip}:f")), expected);
+}
+
+#[test]
+fn log_continues_after_a_reply_cut_by_its_byte_budget() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    // A reply holds about 32 MiB of changesets, so it stops after three of
+    // these and must say where to continue.
+    let ids = chain(
+        &store,
+        (0..5_u8)
+            .map(|n| {
+                let size = if n == 0 { 1 } else { 9 << 20 };
+                (vec![b'a' + n; size], vec![("f", regular(BlobId::of(&[n])))])
+            })
+            .collect(),
+    );
+    let server = Server::start(data, store);
+    let tip = ids.last().unwrap().to_string();
+    let expected: Vec<String> = ids.iter().rev().map(ToString::to_string).collect();
+    for args in [vec!["log", &tip], vec!["log", &tip, "--path", "f"]] {
+        assert_eq!(log_ids(&server, &args), expected, "{args:?}");
+    }
+}

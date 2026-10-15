@@ -14,13 +14,13 @@ The README lists where this project makes its own choices.
 | [`scion-core`](../crates/scion-core) | Object model (`Changeset`, `Tree`, IDs, `RepoPath`) and the v1 encoder and strict decoder. No I/O. |
 | [`scion-proto`](../crates/scion-proto) | gRPC types generated from [`proto/scion.proto`](../proto/scion.proto): the `Scion` and `Objects` services. Largest message 64 MiB (a `GetObjects` reply message: one object of up to 100 MiB), stream chunk 1 MiB. |
 | [`scion-server`](../crates/scion-server) | One binary with two commands: `serve` (the API) and `import` (git import). |
-| [`scn`](../crates/scn) | Command-line client: `cat`, `ls`, `log`, `show`, `checkout`, `commit`, `land`, `bench`. |
+| [`scn`](../crates/scn) | Command-line client: `cat`, `ls`, `log`, `blame`, `show`, `checkout`, `commit`, `land`, `bench`. |
 
 ```mermaid
 flowchart LR
     scn["scn"] -->|"gRPC, bearer token"| svc
     subgraph serve["scion-server serve"]
-        svc["service.rs, objects.rs + auth.rs"] --> ops["write.rs, land.rs, read.rs"]
+        svc["service.rs, objects.rs + auth.rs"] --> ops["write.rs, land.rs, read.rs, blame.rs"]
         ops --> tree["tree.rs: apply, root trees"]
         ops --> db["db.rs, store.rs"]
         tree --> db
@@ -36,11 +36,12 @@ How one request flows through the server:
 
 1. `auth.rs` checks the bearer token and tags the request with a `Caller`.
 2. `service.rs` (the `Scion` service) or `objects.rs` (the `Objects` service)
-   checks names, IDs and paths, then runs `write.rs`, `land.rs` or `read.rs`
-   on a blocking thread (SQLite and the blob folder are synchronous). Both
-   services share one bound: at most 256 run at once. A request times out
-   after 600 s; for a streamed reply that covers only its start. A
-   `GetObjects` reply ends when its client takes no object for 120 s.
+   checks names, IDs and paths, then runs `write.rs`, `land.rs`, `read.rs`
+   or `blame.rs` on a blocking thread (SQLite and the blob folder are
+   synchronous). Both services share one bound: at most 256 run at once. A
+   request times out after 600 s; for a streamed reply that covers only its
+   start. A `GetObjects` reply ends when its client takes no object for
+   120 s.
 3. `error.rs` maps errors to gRPC codes. Database, I/O, git and corruption
    errors reply `INTERNAL`. The detail goes only to the server log.
 
@@ -182,9 +183,14 @@ a value must equal the first, or the store reports corruption. Rows are keyed
 by changeset alone, so `root_tree` checks `repo_changesets` first: a cached
 tree must not leak to a repo that cannot see the changeset.
 
-**Planned:** blame and path history as a second kind, with a generic
-mechanism for dependencies between kinds and backfill
-([#12](https://github.com/bnsd55/open-scion/issues/12)).
+**Path history and blame are not derived data yet.** The article says
+Scion builds dedicated structures for file blame and path history from the
+changesets, through the same mechanism. Here both are computed on each call
+from first-parent changes, with a bound per call (section 7). That is this
+project's choice for now. **Planned:** both as derived data
+([#61](https://github.com/bnsd55/open-scion/issues/61)), on one generic
+mechanism for every kind
+([#57](https://github.com/bnsd55/open-scion/issues/57)).
 
 ## 5. The write path
 
@@ -416,7 +422,47 @@ takes a revision, and resolves refs through `Objects`.
 | `GetChangeset` | `ChangesetV1` bytes. |
 | `ReadFile` | A regular file's content, or a symlink's target, in 1 MiB chunks. |
 | `ListDir` | One directory level as `TreeV1` bytes. |
-| `Log` | First-parent history, newest first. At most 1,000 entries and about 32 MiB per reply. A client asks again from the first parent of the last entry. `scn log` makes one call. |
+| `Log` | First-parent history, newest first. With a path, only the changesets that change it. A reply holds at most 1,000 entries and about 32 MiB, and checks at most 1,000 changesets. `next_changeset_id` says where to continue. `scn log` asks again until it has `-n` entries. |
+| `Blame` | For each range of lines in a file, the changeset that last changed it on first-parent history, and that changeset's author and time. |
+
+**Path history** (`Log` with a path, `read::log_page`). The walk follows
+first parents from the given changeset, newest first. It returns each
+changeset that changes the path: the file itself, or anything below it if it
+is a directory. A changeset lists every file it changes against its first
+parent, so the check reads no trees. A commit on a merged branch never
+appears; the merge appears when its diff against its first parent changes
+the path. The article stores changes against the first parent because people
+care about history and blame only for commits on the main line.
+
+**Blame** (`blame.rs`). The article does not describe how blame is
+computed. These steps, the diff and the bounds below are this project's
+choices. For a file at a changeset:
+
+1. Read the file. A directory, a symlink, a submodule, a file over 1 MiB or a
+   file with a NUL byte is `INVALID_ARGUMENT`.
+2. Walk first parents to the next changeset C that changes the path. Read the
+   version in C's first parent, and diff it with C's version, line by line.
+   The lines that C added go to C. The other lines move to their place in the
+   older version.
+3. Repeat from C's first parent until every line has a changeset. If the
+   older version does not exist, or is not text that blame reads, every line
+   left goes to C. So a file deleted and added again starts over, as in git.
+
+The diff is Myers with git's indent heuristic, as `git blame` uses by
+default. It comes from `gix` (`gix::diff::blob`), already a dependency for
+the import. A test compares the result with `git blame --first-parent`,
+line by line.
+
+**Bounds and resume.** A `Log` or `Blame` call checks at most 1,000
+changesets (`MAX_SCAN`), so it holds the database lock no longer than a plain
+`Log` of 1,000 entries. A `Blame` call also diffs at most 100 versions. When
+a call stops at a bound, `next_changeset_id` names the first changeset it did
+not check. A `Log` reply can then have no entries. In a `Blame` reply, the
+ranges left have no changeset, and `origin_line` gives their line in the file
+at `next_changeset_id`. A blame of the same path there continues the work
+exactly. `scn log --path` and `scn blame` ask again until they are done.
+Path history and blame as derived data will remove these bounds
+([#61](https://github.com/bnsd55/open-scion/issues/61)).
 
 `ReadFile` and `ListDir` get the changeset's root tree from `derived`
 (deriving it if the row is missing), then walk trees from SQLite one path part
@@ -522,7 +568,7 @@ an untrusted network.
 | Network | Listens on `127.0.0.1:7878` by default. A non-loopback address is refused unless `--insecure-listen` is given. | No TLS: the token and all data travel unencrypted ([#14](https://github.com/bnsd55/open-scion/issues/14)). |
 | Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. | Trees and blobs are shared by all repos. `GetObjects` reads any tree or blob by ID, and a changeset can name another repo's blob and then read it ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
-| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once, 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget, and a reply whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object inside HTTP/2 until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
+| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once, 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget, and a reply whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 1 MiB and diffs at most 100 versions. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object inside HTTP/2 until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. | The client trusts the server for a ref's target and for a changeset's root tree, which it cannot check by hash. Tiers ([#5](https://github.com/bnsd55/open-scion/issues/5)) must forward these answers, not compute them. |
 | Checkout | `scn checkout` writes into a temp directory and renames it onto a new or empty destination, never follows a symlink while writing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure the destination stays as it was. | No Windows rules: device names and names that end in a dot or a space pass. |
 | Errors | Internal errors reply `internal error`. The detail stays in the server log. | |
@@ -552,6 +598,9 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/objects.rs` (`read_object`) | An object ID is treated as permission to read it; trees and blobs are shared by all repos. Safe with one principal. | A read ticket bound to a principal, a repo and a root tree, checked by the server and every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/objects.rs` (`STALL_TIMEOUT`) | A stalled `GetObjects` reply ends, but HTTP/2 keeps the one encoded object it was sending until the connection closes. | A response body timeout that resets the stream. | [#42](https://github.com/bnsd55/open-scion/issues/42) |
 | `scion-server/src/objects.rs` (`send_objects`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
+| `scion-server/src/read.rs` (`MAX_SCAN`) | Path history and blame walk first parents on every call, at most 1,000 changesets per call. A path changed long ago costs many calls. | Path history as derived data. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
+| `scion-server/src/blame.rs` (`MAX_BLAME_VERSIONS`) | One call diffs at most 100 versions of a file. A file with more versions costs more calls. | Blame as derived data, kept per file version. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
+| `scion-server/src/blame.rs` (`MAX_BLAME_BYTES`) | A file over 1 MiB, or with a NUL byte, is refused. An older version like that counts as absent, so its lines go to the changeset that replaced it. | Blame from derived data, so a call does not diff whole versions, then a higher limit. | [#62](https://github.com/bnsd55/open-scion/issues/62) |
 | `scion-server/src/auth.rs` (`Auth`) | One static token, one principal. | A token-to-principal map, then per-path write rules. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/main.rs` (`serve`) | No TLS. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
 | `scn/src/client.rs` (`lossy`) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | Escape or base64 raw bytes in JSON. | |

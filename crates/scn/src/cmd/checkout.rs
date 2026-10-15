@@ -34,7 +34,7 @@ pub struct CheckoutArgs {
     into: PathBuf,
 }
 
-fn parse_dir(dir: &str) -> Result<RepoPath> {
+pub(crate) fn parse_dir(dir: &str) -> Result<RepoPath> {
     RepoPath::new(dir.trim_end_matches('/')).with_context(|| format!("bad path {dir:?}"))
 }
 
