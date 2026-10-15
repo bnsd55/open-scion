@@ -10,6 +10,7 @@ use scion_core::{
 
 use crate::db::{self, RepoId};
 use crate::error::{Error, Result};
+use crate::graph;
 use crate::store::Store;
 use crate::tree;
 
@@ -207,33 +208,34 @@ pub fn changes_path(cs: &Changeset, path: &RepoPath) -> bool {
     })
 }
 
-/// Most changesets one `MergeBase` or `IsAncestor` call walks. Each step
-/// reads the parents of one changeset while the call holds the database
-/// lock.
-// SHORTCUT: graph queries walk the history on every call, and fail past
-// this many changesets. Upgrade: a commit-graph index as derived data, such
-// as the skip lists the article describes, so a call reads a few rows
+/// Most steps of one `MergeBase` or `IsAncestor` call. A step reads one
+/// changeset's parents, or its node in the commit graph ([`graph`]), while
+/// the call holds the database lock.
+// SHORTCUT: `MergeBase` walks every changeset between its inputs and their
+// merge bases, unless neither first-parent history has a merge above where
+// the two meet. `IsAncestor` reads every merge between. Both fail past this
+// many steps. Upgrade: a merge-base search that moves along first-parent
+// histories of the commit graph, as `IsAncestor` does
 // (https://github.com/bnsd55/open-scion/issues/72).
 pub const MAX_WALK: usize = 10_000;
 
 /// Whether `ancestor` is `descendant` or one of its ancestors, over all
-/// parents. Walks at most [`MAX_WALK`] changesets, and none if `ancestor`
-/// has the higher generation.
+/// parents ([`graph::is_ancestor`]). Reads O(log n) nodes of the commit
+/// graph for each first-parent history it searches, and three rows for each
+/// merge newer than `ancestor` that it finds: at most [`MAX_WALK`].
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or a changeset does not exist.
-/// [`Error::ResourceExhausted`] if the walk passes [`MAX_WALK`].
+/// [`Error::ResourceExhausted`] if the search passes [`MAX_WALK`].
 pub fn is_ancestor(
     store: &Store,
     repo: &str,
     ancestor: ChangesetId,
     descendant: ChangesetId,
 ) -> Result<bool> {
-    store.read(|c| {
-        let repo = db::repo_id(c, repo)?;
-        db::is_ancestor(c, repo, ancestor, descendant, MAX_WALK)
-    })
+    let repo = store.read(|c| db::repo_id(c, repo))?;
+    graph::is_ancestor(store, repo, ancestor, descendant, MAX_WALK)
 }
 
 /// The best common ancestors of `a` and `b`, over all parents: every common
@@ -241,7 +243,9 @@ pub fn is_ancestor(
 /// ([`db::merge_bases`]). This is the rule of `git merge-base --all`.
 /// Usually there is one. After criss-cross merges there can be several, and
 /// all are returned. Highest generation first, then lowest ID. Empty if the
-/// histories share no changeset. Walks at most [`MAX_WALK`] changesets.
+/// histories share no changeset. Reads a few nodes of the commit graph if
+/// neither first-parent history has a merge above where the two meet
+/// ([`graph::merge_bases`]). Else walks at most [`MAX_WALK`] changesets.
 ///
 /// # Errors
 ///
@@ -253,10 +257,8 @@ pub fn merge_base(
     a: ChangesetId,
     b: ChangesetId,
 ) -> Result<Vec<ChangesetId>> {
-    store.read(|c| {
-        let repo = db::repo_id(c, repo)?;
-        db::merge_bases(c, repo, a, b, MAX_WALK)
-    })
+    let repo = store.read(|c| db::repo_id(c, repo))?;
+    graph::merge_bases(store, repo, a, b, MAX_WALK)
 }
 
 /// Most paths one `Diff` call returns. Each path costs at most one tree read

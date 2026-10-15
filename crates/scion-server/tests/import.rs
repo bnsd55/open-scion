@@ -508,7 +508,7 @@ fn verification_catches_a_tree_that_differs_from_git() {
             )]);
             let bad = tree::apply(c, Some(root), &extra)?;
             c.execute(
-                "UPDATE derived SET value = ?1 WHERE cs = ?2",
+                "UPDATE derived SET value = ?1 WHERE kind = 'root_tree' AND cs = ?2",
                 params![bad.as_bytes(), first.tip.as_bytes()],
             )?;
             Ok(())

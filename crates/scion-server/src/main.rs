@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use scion_server::derived::{self, Kind};
+use scion_server::graph::CommitGraph;
 use scion_server::import::{ImportOptions, import_git};
 use scion_server::tree::RootTree;
 use scion_server::{Error, Store, db, read, service};
@@ -64,7 +65,8 @@ enum Command {
         /// Scion repository.
         #[arg(long, default_value = "main")]
         repo: String,
-        /// Ref whose first-parent history is derived.
+        /// Ref whose history is derived: its first-parent history for
+        /// `root_tree`, every ancestor for `commit_graph`.
         #[arg(long = "ref", default_value = "main")]
         target_ref: String,
     },
@@ -76,6 +78,9 @@ enum KindName {
     /// The root tree of each changeset.
     #[value(name = "root_tree")]
     RootTree,
+    /// The commit-graph index of each changeset.
+    #[value(name = "commit_graph")]
+    CommitGraph,
 }
 
 #[tokio::main]
@@ -141,6 +146,10 @@ async fn main() -> anyhow::Result<()> {
                     KindName::RootTree => {
                         derived::backfill::<RootTree>(&store, repo_id, tip)?;
                         RootTree::NAME
+                    }
+                    KindName::CommitGraph => {
+                        derived::backfill::<CommitGraph>(&store, repo_id, tip)?;
+                        CommitGraph::NAME
                     }
                 };
                 Ok::<_, Error>((name, tip))
