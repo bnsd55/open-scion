@@ -12,7 +12,7 @@ The README lists where this project makes its own choices.
 | Crate | Role |
 |---|---|
 | [`scion-core`](../crates/scion-core) | Object model (`Changeset`, `Tree`, IDs, `RepoPath`) and the v1 encoder and strict decoder. No I/O. |
-| [`scion-proto`](../crates/scion-proto) | gRPC types generated from [`proto/scion.proto`](../proto/scion.proto): the `Scion` and `Objects` services. Largest message 64 MiB (a `GetObjects` reply message: one object of up to 100 MiB), stream chunk 1 MiB. |
+| [`scion-proto`](../crates/scion-proto) | gRPC types generated from [`proto/scion.proto`](../proto/scion.proto): the `Scion` and `Objects` services, whose contract is [`protocol-v1.md`](protocol-v1.md). Largest message 64 MiB (a `GetObjects` reply message: one object of up to 100 MiB), stream chunk 1 MiB. |
 | [`scion-server`](../crates/scion-server) | One binary with two commands: `serve` (the API) and `import` (git import). |
 | [`scn`](../crates/scn) | Command-line client: `cat`, `ls`, `log`, `blame`, `show`, `checkout`, `commit`, `land`, `bench`. |
 
