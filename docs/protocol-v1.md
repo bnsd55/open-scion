@@ -598,7 +598,7 @@ content, and its ID is of those bytes. They travel in one of two encodings:
 | Encoding | Encoded bytes |
 |---|---|
 | `RAW` | The bytes as they are. |
-| `ZSTD` | One zstd frame ([RFC 8878](https://www.rfc-editor.org/rfc/rfc8878)) of the bytes, with their size in the frame header, and no other bytes before or after it. At most `ZSTD_compressBound(size)` bytes, as the zstd library computes it: `size + size / 256`, plus `(128 KiB - size) / 2048` if `size` is below 128 KiB. |
+| `ZSTD` | One Zstandard frame ([RFC 8878](https://www.rfc-editor.org/rfc/rfc8878)) of the bytes, and no other bytes before or after it. It starts with the Zstandard magic number `0xFD2FB528`: not a skippable frame, not a legacy format. It has no `Dictionary_ID`, gives the size of the bytes as its `Frame_Content_Size`, and has a `Window_Size` of at most 8 MiB (for a single-segment frame, its size). It is at most `ZSTD_compressBound(size)` bytes, as the zstd library computes it: `size + size / 256`, plus `(128 KiB - size) / 2048` if `size` is below 128 KiB. libzstd makes such frames at every level up to 19. |
 
 The article says caches send objects in the disk format that the daemon will
 consume. Here, the server stores each blob as one zstd file, and sends a blob
@@ -607,26 +607,36 @@ server does not unpack. It unpacks a blob for a client that accepts only
 `RAW`. It sends a tree `RAW`. A server or tier MUST NOT send `ZSTD` to a
 client that did not accept it. It MAY send any object `RAW`.
 
-**Parts.** An object of E encoded bytes comes in ceil(E / 1 MiB) `ObjectPart`
-messages, or one if E is 0. Every part but the last holds exactly 1 MiB of
-`data`; the last holds the rest. The first part also sets `kind`, `id`,
-`encoding`, `encoded_size` (E) and `size` (the size of the object's bytes,
-at most 100 MiB). For `RAW`, `encoded_size` equals `size`. A later part sets
-only `data`. So a receiver knows from the first part how much memory the
-object takes, before the rest arrives.
+**Parts.** An object of E encoded bytes comes in one or more `ObjectPart`
+messages. Each part holds 1 byte to 1 MiB of `data`, and the parts add up to
+E. An object with E = 0 is one part with no data. The server and
+`scion-tier` send parts of 1 MiB, the last one shorter. The first part also
+sets `kind` (1), `id` (2), `encoding` (4), `encoded_size` (5, which is E) and
+`size` (6, the size of the object's bytes, at most 100 MiB). For `RAW`,
+`encoded_size` equals `size`. A later part sets none of fields 1, 2, 4, 5
+and 6. So a receiver knows from the first part how much memory the object
+takes, before the rest arrives.
 
 **A receiver MUST**, before it uses, stores or forwards an object:
 
-- refuse a first part whose `kind` and `id` are not the next object that it
-  asked for, whose encoding it did not accept, whose `size` is over 100 MiB,
-  or whose `encoded_size` does not fit `size` as the table above says;
-- refuse a part of the wrong length, a later part that sets a field other
-  than `data`, and a reply that ends in the middle of an object;
-- for `ZSTD`, refuse a frame whose header has no size, gives a size other
-  than `size`, or is followed by other bytes, and unpack it into at most
-  `size` bytes, so that a frame never makes it hold more than the first part
-  said;
+- refuse a first part whose `kind` and `id` are not an object that it asked
+  for and has not got yet, whose encoding it did not accept, whose `size` is
+  over 100 MiB, or whose `encoded_size` does not fit `size` as the table
+  above says;
+- refuse a part of more than 1 MiB, an empty part (but the one part of an
+  empty object), parts that add up to more than E, a later part that sets
+  any of fields 1, 2, 4, 5 and 6, and a reply that ends in the middle of an
+  object;
+- for `ZSTD`, refuse a frame that breaks the rules of the table above, or
+  whose size is not `size`, and unpack it into at most `size` bytes with a
+  window of at most 8 MiB, so that a frame never makes it hold more than the
+  first part said;
 - check the bytes against the ID (section 5).
+
+A receiver ignores fields that it does not know, also in a later part. A
+server sends objects in request order; a receiver MAY refuse one out of
+order. `scion-tier` does; `scn` takes each object it asked for in any
+order.
 
 **Reply.**
 
@@ -636,9 +646,13 @@ object takes, before the rest arrives.
   of encoded data. So a reply holds at least one object, and at most 64 MiB
   plus one object of up to 100 MiB.
 - All replies share a budget of 400 MiB. Before the server reads an object,
-  the object takes its share of the budget: the encoded bytes that it sends.
-  Each part frees its piece when the client takes it. The server finds the
-  first object before it answers the call. If it has no memory for that
+  the object takes its share of the budget: all the memory that the reply
+  holds for it (its bytes, and the decoder while it unpacks a blob for a
+  `RAW` client). It keeps the share until the reply has handed the object's
+  last part on. Each part is a buffer of its own, so a part that waits for
+  the client never keeps the rest of the object. Not counted: the part that
+  waits for the client and the part that HTTP/2 is sending, at most 1 MiB
+  each. The server finds the first object before it answers the call. If it has no memory for that
   object within 30 s, the call fails with `RESOURCE_EXHAUSTED` and sends no
   object. The client SHOULD wait before it asks again.
 - The reply stops when the server waits 30 s for memory for a later object,
@@ -707,10 +721,12 @@ order is daemon, cache, server. These rules hold for any tier:
 - A tier SHOULD wait longer for its upstream than that upstream may wait for
   its own, so it does not give up on a slow but healthy path. The limits of
   `scion-tier` nest. The server and each tier wait at most 30 s for memory
-  before an object. `scion-cache` waits at most 60 s for each step of the
-  server (an answer, or the next part), so a busy server answers first.
-  `scion-daemon` waits 120 s for each step of the cache, which covers one
-  step of the server, the cache's own 30 s, and 30 s to spare. On a timeout,
+  before an object, and a tier at most 30 s for memory for an object from
+  upstream, while that upstream reply waits. `scion-cache` waits at most
+  60 s for each step of the server (an answer, or the next part), so a busy
+  server answers first. `scion-daemon` waits 150 s for each step of the
+  cache, which covers one step of the server, the cache's own two waits of
+  30 s, and 30 s to spare. On a timeout,
   the tier fails with `UNAVAILABLE`. A deadline that the client passes down
   is not in v0.1 ([#98](https://github.com/bnsd55/open-scion/issues/98)).
 - The `Scion` service goes only to the server.
@@ -743,6 +759,7 @@ only if an answer that ignores it is still correct for the client.
 | A new reply field that an older client can ignore | No |
 | A new request field whose empty value means today's behavior, and that an older server can safely ignore | No |
 | A new `Encoding` value. A server sends it only to a client that lists it in `accept`, and ignores a value that it does not know. | No |
+| A new field in `ObjectPart`, first or later part, that an older receiver can ignore | No |
 | A higher limit on requests that the server accepts | No |
 | Deprecating a call that keeps working | No |
 | A field's number, type or meaning, or the meaning of its empty value | Yes |

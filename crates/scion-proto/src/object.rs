@@ -208,8 +208,9 @@ impl Assembler {
     /// that memory first.
     #[must_use]
     pub fn new(header: Header, first: ObjectPart) -> Self {
+        let ObjectPart { data: first, .. } = first;
         let mut data = Vec::with_capacity(header.encoded_size);
-        data.extend_from_slice(&first.data);
+        data.extend_from_slice(&first);
         Self { header, data }
     }
 
@@ -588,7 +589,7 @@ mod tests {
             .unwrap()
             .read_to_end(&mut streamed)
             .unwrap();
-        assert!(streamed == big);
+        assert_eq!(blake3::hash(&streamed), blake3::hash(&big));
         let fits = vec![0; 8 << 20];
         assert_eq!(frame_size(&pack_with(&fits, 1, 24)), Ok(fits.len()));
         // A single-segment frame of 8 MiB and a byte, and a window byte of

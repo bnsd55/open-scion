@@ -790,11 +790,15 @@ starting at the root tree, and never says what it already has.
   reserves its memory before the rest arrives (`scion-proto/src/object.rs`).
 - Memory: before an object is read, the bytes it sends come from the store
   (a tree's stored length, a blob file's length, or the size in its zstd
-  frame header), and the object takes that share of a server-wide budget of
-  400 MiB. The reply loop and the budget live in
-  `scion-proto/src/reply.rs`, so the tiers follow the same rules. Each part
-  carries its piece of the share, and frees it when the reply takes the
-  part from the channel. With the budget spent, a reply waits holding no
+  frame header), and the object takes its share of a server-wide budget of
+  400 MiB: those bytes, plus the decoder (3 MiB) while a blob is unpacked
+  for a `RAW` client, in chunks of 1 MiB. The reply loop and the budget
+  live in `scion-proto/src/reply.rs`, so the tiers follow the same rules.
+  The reply keeps the object and its share until it has handed the last
+  part to the channel. Each part is a buffer of its own: a chunk read from
+  the file or the decoder, or a copy of 1 MiB out of a tree's bytes. So the
+  part that waits for a client that stopped reading never keeps the whole
+  object. With the budget spent, a reply waits holding no
   object bytes. The server finds the first object before the call answers.
   If the budget has no room for it within 30 s, the call fails with
   `RESOURCE_EXHAUSTED`, so a reply never ends `OK` with no object. A later
@@ -802,9 +806,12 @@ starting at the root tree, and never says what it already has.
   asks again. A reply whose client takes no part for 120 s ends and frees
   its share; in the middle of an object it ends with `DEADLINE_EXCEEDED`,
   as `ReadFile` does, never `OK`. A blob read back with another size than its header said is corrupt
-  and is never sent. Not counted: the one part per reply inside HTTP/2, at
-  most 1 MiB, which stays until the connection closes
-  ([#42](https://github.com/bnsd55/open-scion/issues/42)).
+  and is never sent. Not counted: per reply, the part in its channel and the
+  part inside HTTP/2, at most 1 MiB each, which stay until the client reads
+  them or the connection closes
+  ([#42](https://github.com/bnsd55/open-scion/issues/42)). Also not counted:
+  the work of the reads in progress, at most 256 at once (a tree's decoded
+  entries, the file buffers).
 - A reply sends the next object only while it has sent less than 64 MiB of
   encoded data. So it holds at least one object, and at most 64 MiB plus
   one object of up to 100 MiB. The client asks again for the rest, so one
@@ -938,13 +945,19 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
 - **Memory.** At most 64 fetches read from upstream at once. Each holds at
   most one message that is not counted yet: the first part of an object,
   1 MiB plus its header. From that header, the object takes what checking it
-  needs from a fetch budget of the rest of 400 MiB: its encoded bytes plus
-  its other form (the content of a zstd frame, or the frame packed from a
-  `RAW` blob). It keeps that share until it is stored. So all fetches
+  needs from a fetch budget of the rest of 400 MiB: its encoded bytes, its
+  other form (the frame packed from a `RAW` blob, or the content of a zstd
+  tree) and a codec (9 MiB: a zstd window is at most 8 MiB). It keeps that
+  share until it is stored. If the room does not come within 30 s, the
+  fetch ends, its upstream reply with it, and each of its objects fails
+  with `UNAVAILABLE`. So all fetches
   together hold at most 400 MiB, and a fetch of small objects takes only
   their size. A reply copies a fetched object only if its own budget has
   room at once. Else it lets the bytes go, waits for room, and reads the
-  object again from the store.
+  object again from the store. A reply takes a stored object as one buffer
+  (`Bytes`), not a copy: the memory store's own buffer, or the file the disk
+  store read. Its reply share covers the codec too while the disk store
+  checks a blob, or while a blob is unpacked for a `RAW` client.
 - **Timeouts.** A tier waits at most a fixed time for each step of its
   upstream: an answer, or the next part of a fetch. Then the fetch fails
   with `UNAVAILABLE`, which says so. A reply that waits for a fetch has no
@@ -952,10 +965,11 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
   A fetch that waits for a fetch slot or for room in the fetch budget has no
   limit either: they free up as other fetches finish their steps, and each
   step has a limit. The limits nest, and const asserts keep them so: the
-  server and each tier wait at most 30 s for reply memory; the cache waits
-  60 s per step for the server, so a busy server answers first; the daemon
-  waits 120 s per step for the cache, which covers one step of the server,
-  the cache's own 30 s and 30 s to spare. A fetch joined in the middle of
+  server and each tier wait at most 30 s for reply memory, and a tier 30 s
+  for fetch memory; the cache waits 60 s per step for the server, so a busy
+  server answers first; the daemon waits 150 s per step for the cache,
+  which covers one step of the server, the cache's own two waits and 30 s
+  to spare. A fetch joined in the middle of
   its batch can still wait for the objects ahead of it, and a client's own
   deadline does not reach the tiers
   ([#98](https://github.com/bnsd55/open-scion/issues/98)).
@@ -971,7 +985,7 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
 |---|---|---|
 | Listens on | TCP, `127.0.0.1:7879`. Another address needs `--insecure-listen`. | A Unix socket with mode 0600, by default `<data>/daemon.sock`, in a directory that only its user can reach (checked as for `<data>`). So nobody else can connect, even before the mode is set, or put another socket in its place. A stale socket file is replaced; a live one is an error. |
 | Upstream | `--upstream`, by default the server at `127.0.0.1:7878`. | `--upstream`, by default the cache at `127.0.0.1:7879`. |
-| Store | Memory, at most `--max-bytes` (1 GiB) of stored objects (blobs packed). | Disk, at most `--max-bytes` (10 GiB) of stored object bytes (not disk blocks): one file per object under `<data>/objects/`, a tree's `TreeV1` bytes or a blob's zstd frame, written to a temp file and renamed, unpacked as a stream and checked against its ID when read back. `<data>` is made with mode 0700 if missing. It must be a real directory (not a symlink), owned by the daemon's user, and closed to others, or the daemon refuses it. One daemon locks it. |
+| Store | Memory, at most `--max-bytes` (1 GiB) of stored objects (blobs packed). | Disk, at most `--max-bytes` (10 GiB) of stored object bytes (not disk blocks): one file per object under `<data>/objects/`, a tree's `TreeV1` bytes or a blob's zstd frame, written to a temp file and renamed, unpacked as a stream and checked against its ID when read back. A file that the limit drops leaves its name by a rename under the index lock, and is removed after it, so a put of the same object keeps its new file. `<data>` is made with mode 0700 if missing. It must be a real directory (not a symlink), owned by the daemon's user, and closed to others, or the daemon refuses it. One daemon locks it. |
 | Eviction | Least recently used first. | Least recently used first, from an index in memory that a scan rebuilds at start, oldest write first ([#63](https://github.com/bnsd55/open-scion/issues/63)). |
 
 This project's choices, not the article's: the Unix socket and its mode,
@@ -1005,7 +1019,7 @@ an untrusted network.
 | Network | The server listens on `127.0.0.1:7878` and `scion-cache` on `127.0.0.1:7879` by default. A non-loopback address is refused unless `--insecure-listen` is given. `scion-daemon` listens only on a Unix socket with mode 0600, in a directory that only its user can reach; it refuses any other. `scn` refuses a socket that another user owns. | No TLS: the token and all data travel unencrypted, also between tiers ([#14](https://github.com/bnsd55/open-scion/issues/14)). |
 | Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. | Trees and blobs are shared by all repos. `GetObjects` reads any tree or blob by ID, and a changeset can name another repo's blob and then read it ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
-| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 1 MiB plus 1 KiB: one part of an object), blobs up to 100 MiB, 16 uploads at once (each holds one message in memory), 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget and `ReadFile` replies a 256 MiB budget. A reply of either whose client stops reading ends after 120 s. Every receiver of an object unpacks it within the size its first part gives, at most 100 MiB. Names of 1 to 256 bytes with no control characters. A ref's path index holds at most 128 MiB, and a land walks at most 100,000 changesets below it. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 16 MiB and 1,048,576 lines, diffs at most 100 versions and about 1M lines (a line counts once per 64 bytes), compares at most 100 deleted files and about 100 MiB to find a rename, and at most 4 run at once. `MergeBase` and `IsAncestor` take at most 10,000 steps; a `Diff` reply holds at most 1,000 paths. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one part of an object (at most 1 MiB), or up to 2 MiB of a file, in memory until its connection closes, and the number of stalled replies has no bound ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
+| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 1 MiB plus 1 KiB: one part of an object), blobs up to 100 MiB, 16 uploads at once (each holds one message in memory), 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget and `ReadFile` replies a 256 MiB budget. A reply of either whose client stops reading ends after 120 s. Every receiver of an object unpacks it within the size its first part gives, at most 100 MiB, with a zstd window of at most 8 MiB, and accepts only plain Zstandard frames (no skippable or legacy frames, no dictionary). The zstd library is built without its legacy decoders. Names of 1 to 256 bytes with no control characters. A ref's path index holds at most 128 MiB, and a land walks at most 100,000 changesets below it. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 16 MiB and 1,048,576 lines, diffs at most 100 versions and about 1M lines (a line counts once per 64 bytes), compares at most 100 deleted files and about 100 MiB to find a rename, and at most 4 run at once. `MergeBase` and `IsAncestor` take at most 10,000 steps; a `Diff` reply holds at most 1,000 paths. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps two parts of an object (at most 1 MiB each), or up to 2 MiB of a file, in memory until its connection closes, and the number of stalled replies has no bound ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. Each tier also checks every object from upstream before it stores or sends it, and the daemon checks each object again when it reads it from disk. The server sends a blob's zstd file without unpacking it, so the receiver finds a damaged file. | Tiers are trusted in v0.1: the client trusts the `ResolveRef` and `GetRootTree` answers that a tier passes on, which it cannot check by hash. A tier forwards them, and keeps only what upstream answered. |
 | Checkout | `scn checkout` writes into a private temp directory with a random name. It renames it onto a new destination, or moves its entries up into an existing empty directory that the user owns, never over an entry already there. It never follows a symlink while writing or removing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure, or on SIGINT, SIGTERM or SIGHUP, the destination stays as it was. | The directory that gets the checkout (an existing destination, or a new one's parent) must not be writable by all users, unless it has the sticky bit: they could swap parts of the checkout. An existing destination that breaks this is refused. Members of a group that can write it are trusted. The check reads only the mode bits, not ACLs: an ACL that lets other users add or delete entries gets past it. No Windows rules: device names and names that end in a dot or a space pass. |
 | Cache tiers | A tier refuses calls without its token, and serves only objects that match their IDs. | A tier serves a stored object for any valid repo name and does not ask whether the repo exists. Safe with one principal ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
@@ -1032,7 +1046,7 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/land.rs` (`MAX_INDEX_BYTES`) | Each ref's path index has its own 128 MiB budget, so the memory of all indexes grows with the refs that take lands. | One budget for all indexes, which drops the least recently used. | [#75](https://github.com/bnsd55/open-scion/issues/75) |
 | `scion-server/src/land.rs` (`MAX_WALK`) | A land on a base more than `MAX_DEPTH` generations below the tip walks the history from the index floor back to the base, each time, and holds the database lock while it walks. A base more than 100,000 changesets below the floor is rejected. | Per-path history in the database, so the check reads only the paths that the land changes. | [#38](https://github.com/bnsd55/open-scion/issues/38) |
 | `scion-server/src/objects.rs` (`read_object`) | An object ID is treated as permission to read it; trees and blobs are shared by all repos. Safe with one principal. | A read ticket bound to a principal, a repo and a root tree, checked by the server and every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
-| `scion-proto/src/reply.rs` (`STALL_TIMEOUT`) | A stalled `GetObjects` reply ends, but HTTP/2 keeps the one part (at most 1 MiB) it was sending until the connection closes, and the number of stalled replies has no bound. | A response body timeout that resets the stream. | [#42](https://github.com/bnsd55/open-scion/issues/42) |
+| `scion-proto/src/reply.rs` (`STALL_TIMEOUT`) | A stalled `GetObjects` reply ends, but its channel and HTTP/2 keep the part each holds (at most 1 MiB each) until the connection closes, and the number of stalled replies has no bound. | A response body timeout that resets the stream. | [#42](https://github.com/bnsd55/open-scion/issues/42) |
 | `scion-server/src/objects.rs` (`find`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
 | `scion-server/src/service.rs` (`READ_STALL_TIMEOUT`) | A stalled `ReadFile` reply frees its share, but the part in its channel and the part inside HTTP/2 stay in memory until the connection closes, up to 2 MiB per reply. | A response body timeout that resets the stream. | [#42](https://github.com/bnsd55/open-scion/issues/42) |
 | `scion-server/src/read.rs` (`MAX_SCAN`) | Path history and blame walk first parents on every call, at most 1,000 changesets per call. A path changed long ago costs many calls. | Path history as derived data. | [#61](https://github.com/bnsd55/open-scion/issues/61) |

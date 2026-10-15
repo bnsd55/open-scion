@@ -91,8 +91,11 @@ release.
   from upstream instead of 4, within the same 400 MiB. A reply cut off in
   the middle of an object ends with `DEADLINE_EXCEEDED`.
 - The tier timeouts nest: the server and tiers wait 30 s for reply memory,
-  the cache 60 s per step of the server, the daemon 120 s per step of the
-  cache.
+  a tier 30 s for fetch memory, the cache 60 s per step of the server, the
+  daemon 150 s per step of the cache.
+- Receivers accept only plain Zstandard frames, with no dictionary and a
+  window of at most 8 MiB; the zstd library is built without its legacy
+  decoders.
 - `docs/protocol-v1.md`: the contract of the `Scion` and `Objects` services,
   for independent clients, tiers and servers.
 - Query API: `MergeBase` (every best common ancestor, as
