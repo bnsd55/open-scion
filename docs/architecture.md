@@ -785,9 +785,11 @@ daemon checks the directories above the socket or `<data>` yet
 `Objects`, so of the `scn` commands only `checkout` works through it; the
 others need the server.
 
-Related planned work: a checkout benchmark against `git clone`
-([#6](https://github.com/bnsd55/open-scion/issues/6)), and virtual checkout,
-where files load when first read
+`scripts/bench-checkout.sh` runs 50 sparse checkouts at once through one
+daemon, cold and warm, against `git clone` doing the same checkout
+([benchmarks](benchmarks.md),
+[#6](https://github.com/bnsd55/open-scion/issues/6)). Planned: virtual
+checkout, where files load when first read
 ([#11](https://github.com/bnsd55/open-scion/issues/11)).
 
 ## 8. Security model

@@ -64,3 +64,6 @@ release.
   requests run between steps after a new kind or a version bump. Each step
   removes some rows of older versions. `scion-server derive --kind
   root_tree` fills a ref's history ahead of reads and removes the rest.
+- `scripts/demo.sh`, a demo that anyone can rerun on a fixed public
+  repository, and `scripts/bench-checkout.sh`, a checkout benchmark against
+  git. `docs/benchmarks.md` gives the method.
