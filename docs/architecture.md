@@ -208,9 +208,13 @@ started.
    refused before any change is read.
 2. Check the request: exactly one parent, no committer, a message of at most
    1 MiB, author name and email of at most 1 KiB each.
-3. Read back every blob it names, outside the database lock.
-4. In one write transaction: if the repo already has this ID, return it (a
-   retry). The parent must be in the repo. Then `tree::store_changeset`.
+3. Check that the repo exists and has the parent, so a bad request reads no
+   blob.
+4. Read back each blob it names, outside the database lock. A blob that many
+   paths name is read once. The error names the first path, in path order,
+   whose blob is missing or corrupt.
+5. In one write transaction: check the repo and the parent again. If the repo
+   already has this ID, return it (a retry). Then `tree::store_changeset`.
    Changes that do not apply to the parent's tree are `INVALID_ARGUMENT`.
 
 **Land** (`land.rs`):

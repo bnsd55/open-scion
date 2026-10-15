@@ -224,6 +224,9 @@ pub struct Blobs {
     root: PathBuf,
     tmp: PathBuf,
     group_flush: GroupFlush,
+    /// Calls to [`Blobs::verify`] so far.
+    #[cfg(test)]
+    verifies: std::sync::atomic::AtomicU64,
 }
 
 impl Blobs {
@@ -242,6 +245,8 @@ impl Blobs {
             root,
             tmp,
             group_flush: GroupFlush::default(),
+            #[cfg(test)]
+            verifies: std::sync::atomic::AtomicU64::default(),
         })
     }
 
@@ -340,6 +345,9 @@ impl Blobs {
     ///
     /// [`Error::Io`] if the file exists but cannot be read.
     pub fn verify(&self, id: BlobId) -> Result<BlobStatus> {
+        #[cfg(test)]
+        self.verifies
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let file = match self.open_file(id) {
             Ok(file) => file,
             Err(Error::NotFound(_)) => return Ok(BlobStatus::Missing),
@@ -391,6 +399,12 @@ impl Blobs {
     #[cfg(test)]
     pub(crate) fn full_flushes(&self) -> u64 {
         self.group_flush.lock().finished
+    }
+
+    /// Calls to [`Blobs::verify`] so far.
+    #[cfg(test)]
+    pub(crate) fn verifies(&self) -> u64 {
+        self.verifies.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

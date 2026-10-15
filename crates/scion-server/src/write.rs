@@ -1,8 +1,11 @@
 //! Writes: store blobs and create changesets. Neither moves a ref.
 
+use std::collections::BTreeSet;
+
+use rusqlite::Connection;
 use scion_core::{BlobId, Changeset, ChangesetId};
 
-use crate::db;
+use crate::db::{self, RepoId};
 use crate::error::{Error, Result};
 use crate::store::{BlobStatus, Store};
 use crate::tree;
@@ -38,6 +41,9 @@ pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<Chang
     let (cs, id) = Changeset::decode_with_id_max_changes(bytes, MAX_CHANGES)
         .map_err(|e| Error::InvalidArgument(format!("bad changeset: {e}")))?;
     let parent = check_request(&cs)?;
+    // A cheap read first, so a request on a missing repo or parent reads no
+    // blob. The transaction checks again.
+    store.read(|c| check_parent(c, repo, parent))?;
     // The blob check touches only the object folder, so it runs before the
     // database lock is taken.
     // SHORTCUT: blobs are shared by all repos, so a changeset may name a blob
@@ -45,18 +51,24 @@ pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<Chang
     // Upgrade before multi-tenant auth: a repo_blobs table checked here.
     check_blobs(store, &cs)?;
     store.write(|c| {
-        let repo_id = db::repo_id(c, repo)?;
+        let repo_id = check_parent(c, repo, parent)?;
         if db::has_changeset(c, repo_id, id)? {
             // A retry. Its tree was checked and recorded the first time.
             return Ok(id);
         }
-        if !db::has_changeset(c, repo_id, parent)? {
-            return Err(Error::InvalidArgument(format!(
-                "parent {parent} is not in repo {repo:?}"
-            )));
-        }
         tree::store_changeset(c, repo_id, &cs).map(|(id, _)| id)
     })
+}
+
+/// Checks that `repo` exists and has `parent`, and returns the repo.
+fn check_parent(c: &Connection, repo: &str, parent: ChangesetId) -> Result<RepoId> {
+    let repo_id = db::repo_id(c, repo)?;
+    if !db::has_changeset(c, repo_id, parent)? {
+        return Err(Error::InvalidArgument(format!(
+            "parent {parent} is not in repo {repo:?}"
+        )));
+    }
+    Ok(repo_id)
 }
 
 /// Checks what a client may send, and returns the one parent.
@@ -86,16 +98,22 @@ fn check_request(cs: &Changeset) -> Result<ChangesetId> {
 }
 
 /// Fails on the first put, in path order, whose blob is not stored intact.
-/// Reads every blob back, so a torn or overwritten file is not accepted.
-/// Then syncs them (see [`BlobBatch::keep`]), so the commit never names a
-/// blob that a crash can lose.
+/// Reads every blob back, once however many paths name it, so a torn or
+/// overwritten file is not accepted. Then syncs them (see
+/// [`BlobBatch::keep`]), so the commit never names a blob that a crash can
+/// lose.
 fn check_blobs(store: &Store, cs: &Changeset) -> Result<()> {
     let puts = cs
         .changes
         .iter()
         .filter_map(|(path, state)| Some((path, state.as_ref()?.blob()?)));
     let mut blobs = store.blobs().batch();
+    // A blob seen before was intact, or the loop would have stopped.
+    let mut seen = BTreeSet::new();
     for (path, blob) in puts {
+        if !seen.insert(blob) {
+            continue;
+        }
         let problem = match blobs.keep(blob)? {
             BlobStatus::Valid => continue,
             BlobStatus::Missing => "is not stored",
@@ -110,12 +128,14 @@ fn check_blobs(store: &Store, cs: &Changeset) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use scion_core::{FileState, IdentityTime, RepoPath};
 
     use super::*;
     use crate::store::FSYNC_LEAVES_DRIVE_CACHE;
 
-    fn changeset(parents: Vec<ChangesetId>, blob: Option<BlobId>) -> Changeset {
+    fn changeset(parents: Vec<ChangesetId>) -> Changeset {
         Changeset {
             parents,
             author: IdentityTime {
@@ -126,42 +146,95 @@ mod tests {
             },
             committer: None,
             message: b"change\n".to_vec(),
-            changes: blob
-                .map(|content| {
-                    let file = FileState::Regular {
-                        content,
-                        executable: false,
-                    };
-                    (RepoPath::new("f").unwrap(), Some(file))
-                })
-                .into_iter()
-                .collect(),
+            changes: BTreeMap::new(),
         }
     }
 
-    #[test]
-    fn a_changeset_makes_its_blobs_durable_before_it_commits() {
+    /// A store with repo `main` and an empty root changeset in it.
+    fn store_with_root() -> (tempfile::TempDir, Store, ChangesetId) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let root = store
             .write(|c| {
                 let repo = db::create_repo(c, "main")?;
-                db::insert_changeset(c, repo, &changeset(vec![], None))
+                db::insert_changeset(c, repo, &changeset(vec![]))
             })
             .unwrap();
+        (dir, store, root)
+    }
+
+    /// A child of `parent` that puts each `(path, blob)`.
+    fn child(parent: ChangesetId, puts: &[(&str, BlobId)]) -> Vec<u8> {
+        let mut cs = changeset(vec![parent]);
+        for &(path, content) in puts {
+            let file = FileState::Regular {
+                content,
+                executable: false,
+            };
+            cs.changes.insert(RepoPath::new(path).unwrap(), Some(file));
+        }
+        cs.encode()
+    }
+
+    #[test]
+    fn a_changeset_makes_its_blobs_durable_before_it_commits() {
+        let (_dir, store, root) = store_with_root();
         // Stored by an upload that never synced.
         let mut upload = store.blobs().batch();
         let blob = upload.put(b"new").unwrap();
         drop(upload);
 
         let before = store.blobs().full_flushes();
-        let child = changeset(vec![root], Some(blob)).encode();
-        create_changeset(&store, "main", &child).unwrap();
+        create_changeset(&store, "main", &child(root, &[("f", blob)])).unwrap();
         // One flush for the blob before the commit, and one for the commit
         // where a plain fsync leaves it in the drive cache.
         assert_eq!(
             store.blobs().full_flushes() - before,
             1 + u64::from(FSYNC_LEAVES_DRIVE_CACHE)
         );
+    }
+
+    #[test]
+    fn a_blob_that_many_paths_name_is_read_once() {
+        let (_dir, store, root) = store_with_root();
+        let blob = store.blobs().put(b"same").unwrap();
+        let paths: Vec<String> = (0..100).map(|i| format!("f{i}")).collect();
+        let puts: Vec<(&str, BlobId)> = paths.iter().map(|p| (p.as_str(), blob)).collect();
+        let before = store.blobs().verifies();
+        create_changeset(&store, "main", &child(root, &puts)).unwrap();
+        assert_eq!(store.blobs().verifies() - before, 1);
+    }
+
+    #[test]
+    fn a_missing_repo_or_parent_fails_before_any_blob_is_read() {
+        let (_dir, store, root) = store_with_root();
+        let blob = store.blobs().put(b"new").unwrap();
+        let before = store.blobs().verifies();
+        let ok = child(root, &[("f", blob)]);
+        assert!(matches!(
+            create_changeset(&store, "absent", &ok),
+            Err(Error::NotFound(_))
+        ));
+        let orphan = child(ChangesetId::from_bytes([7; 32]), &[("f", blob)]);
+        assert!(matches!(
+            create_changeset(&store, "main", &orphan),
+            Err(Error::InvalidArgument(why)) if why.contains("is not in repo")
+        ));
+        assert_eq!(store.blobs().verifies(), before);
+    }
+
+    #[test]
+    fn the_error_names_the_first_path_whose_blob_is_missing() {
+        let (_dir, store, root) = store_with_root();
+        // Path order is the reverse of blob ID order.
+        let (x, y) = (BlobId::of(b"x"), BlobId::of(b"y"));
+        let (first, second) = (x.max(y), x.min(y));
+        let cs = child(root, &[("a", first), ("b", second)]);
+        match create_changeset(&store, "main", &cs) {
+            Err(Error::InvalidArgument(why)) => {
+                assert!(why.contains(&first.to_string()), "{why}");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
     }
 }
