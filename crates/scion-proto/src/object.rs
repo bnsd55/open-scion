@@ -384,14 +384,23 @@ mod tests {
         });
         bad(|p| p.encoding = Encoding::Zstd.into());
         bad(|p| p.encoding = 7);
-        bad(|p| p.size = MAX_OBJECT_BYTES as u64 + 1);
         bad(|p| p.encoded_size = 4);
         bad(|p| p.data.push(b'd'));
-        // ZSTD: only if asked for, and within the bound of its size.
+        // ZSTD, if asked for: a size over the limit, or more encoded bytes
+        // than a frame of its size may take, is refused.
         let mut zstd = ok.clone();
         zstd.encoding = Encoding::Zstd.into();
-        zstd.encoded_size = zstd_bound(3) as u64 + 1;
-        assert!(Header::of(&zstd, true).is_err());
+        assert!(Header::of(&zstd, true).is_ok());
+        let mut huge = zstd.clone();
+        huge.size = MAX_OBJECT_BYTES as u64 + 1;
+        let why = Header::of(&huge, true).unwrap_err();
+        assert!(why.contains("above the object limit"), "{why}");
+        let mut long = zstd;
+        long.data = vec![0; zstd_bound(0) + 1];
+        long.encoded_size = long.data.len() as u64;
+        long.size = 0;
+        let why = Header::of(&long, true).unwrap_err();
+        assert!(why.contains("do not fit"), "{why}");
     }
 
     #[test]
