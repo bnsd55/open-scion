@@ -6,7 +6,9 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use gix::ObjectId;
@@ -108,6 +110,27 @@ impl Git {
         self.run(&["add", "-A"]);
         self.run(&["commit", "-q", "-m", message]);
         self.head()
+    }
+
+    /// Adds commits `from..to` to `main` with `git fast-import`, which is
+    /// fast for long histories. Commit `i` puts `g/f{i % 50}`. Returns the
+    /// new head.
+    fn fast_commits(&self, from: usize, to: usize) -> String {
+        let mut stream = Vec::new();
+        for i in from..to {
+            let (message, content) = (format!("c{i}\n"), format!("{i}\n"));
+            let when = 1_700_000_000 + i;
+            writeln!(stream, "commit refs/heads/main").unwrap();
+            writeln!(stream, "committer Bob <bob@example.com> {when} +0000").unwrap();
+            write!(stream, "data {}\n{message}", message.len()).unwrap();
+            if i == from && from > 0 {
+                writeln!(stream, "from refs/heads/main^0").unwrap();
+            }
+            writeln!(stream, "M 100644 inline g/f{}", i % 50).unwrap();
+            writeln!(stream, "data {}\n{content}", content.len()).unwrap();
+        }
+        self.run_with(&["fast-import", "--quiet"], &stream);
+        self.run(&["rev-parse", "main"])
     }
 }
 
@@ -598,33 +621,8 @@ fn import_never_moves_a_ref_off_a_land() {
     assert_eq!(imported, changeset_of(&store, &h.submodule));
 
     // A changeset created and landed on `main` after the import.
-    let file = FileState::Regular {
-        content: store.blobs().put(b"landed\n").unwrap(),
-        executable: false,
-    };
-    let created = Changeset {
-        parents: vec![imported],
-        author: IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_200,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"land\n".to_vec(),
-        changes: BTreeMap::from([(path("landed.txt"), Some(file))]),
-    };
-    let created = write::create_changeset(&store, "r", &created.encode()).unwrap();
-    let request = LandRequest {
-        repo: "r".into(),
-        changeset: created,
-        target_ref: "main".into(),
-        request_key: "k".into(),
-        deadline: Deadline::new(Instant::now() + Duration::from_secs(600)),
-    };
-    let outcome = Lands::default()
-        .land(&store, &Caller("t".into()), &request)
-        .unwrap();
+    let created = create(&store, imported, "landed.txt");
+    let outcome = land(&store, &Lands::default(), created);
     assert_eq!(outcome.state, LandState::Landed);
     let landed = main_ref(&store);
     assert_eq!(landed.target, created);
@@ -709,4 +707,180 @@ fn criss_cross_merges_import_and_the_ref_moves_only_to_descendants() {
     for name in ["a.txt", "b.txt", "c.txt", "base.txt"] {
         assert!(root_entry(&store, report.tip, name).is_some(), "{name}");
     }
+}
+
+/// `scion-server --data <data> <args>`, to run as another process.
+fn server_process(data: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_scion-server"));
+    command.arg("--data").arg(data).args(args);
+    command.env("RUST_LOG", "warn");
+    command
+}
+
+/// `scion-server import` of `rev` into ref `name` of repo `r`.
+fn import_process(data: &Path, git: &Git, rev: &str, name: &str) -> Command {
+    let mut command = server_process(data, &["import", "--repo", "r", "--rev", rev]);
+    command
+        .args(["--ref", name, "--verify", "10"])
+        .arg(git.path());
+    command
+}
+
+fn assert_success(out: &Output) {
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn identity() -> IdentityTime {
+    IdentityTime {
+        name: b"Ada".to_vec(),
+        email: b"ada@example.com".to_vec(),
+        unix_secs: 1_700_000_200,
+        tz_offset_minutes: 0,
+    }
+}
+
+/// Creates a changeset on `base` that puts `path`, through the write path.
+fn create(store: &Store, base: ChangesetId, path: &str) -> ChangesetId {
+    let file = FileState::Regular {
+        content: store.blobs().put(path.as_bytes()).unwrap(),
+        executable: false,
+    };
+    let cs = Changeset {
+        parents: vec![base],
+        author: identity(),
+        committer: None,
+        message: path.as_bytes().to_vec(),
+        changes: BTreeMap::from([(self::path(path), Some(file))]),
+    };
+    write::create_changeset(store, "r", &cs.encode()).unwrap()
+}
+
+/// Lands `cs` on `main`, and retries with the same key while the ref moves.
+fn land(store: &Store, lands: &Lands, cs: ChangesetId) -> scion_server::land::LandOutcome {
+    let request = LandRequest {
+        repo: "r".into(),
+        changeset: cs,
+        target_ref: "main".into(),
+        request_key: cs.to_string(),
+        deadline: Deadline::new(Instant::now() + Duration::from_secs(600)),
+    };
+    loop {
+        match lands.land(store, &Caller("t".into()), &request) {
+            Err(Error::Aborted(_)) => {}
+            outcome => return outcome.unwrap(),
+        }
+    }
+}
+
+#[test]
+fn an_import_process_shares_the_data_directory_with_lands() {
+    let git = Git::init();
+    let first = git.fast_commits(0, 1);
+    let tip = git.fast_commits(1, 60);
+    // The server's store and lands; the imports run as other processes.
+    let (dir, store) = open_store();
+    let lands = Lands::default();
+    let data = dir.path();
+    assert_success(&import_process(data, &git, &first, "main").output().unwrap());
+    let start = main_ref(&store).target;
+
+    // A land whose base is not on main builds main's path index at the
+    // start, and leaves main alone.
+    let repo = store.read(|c| db::repo_id(c, "r")).unwrap();
+    let side = Changeset {
+        parents: vec![],
+        author: identity(),
+        committer: None,
+        message: b"side".to_vec(),
+        changes: BTreeMap::new(),
+    };
+    let side = store
+        .write(|c| db::insert_changeset(c, repo, &side))
+        .unwrap();
+    let out = land(&store, &lands, create(&store, side, "s.txt"));
+    assert_eq!(out.state, LandState::Rejected, "{}", out.detail);
+    assert_eq!(main_ref(&store).target, start);
+
+    // The other process moves main forward. The next plan reads the new
+    // head, so the index sees the imported changes.
+    assert_success(&import_process(data, &git, &tip, "main").output().unwrap());
+    let imported = changeset_of(&store, &tip);
+    assert_eq!(main_ref(&store).target, imported);
+    let out = land(&store, &lands, create(&store, start, "g/f5"));
+    assert_eq!(out.state, LandState::Conflict, "{}", out.detail);
+    assert_eq!(out.conflict_paths, [path("g/f5")]);
+    let out = land(&store, &lands, create(&store, start, "mine.txt"));
+    assert_eq!(out.state, LandState::Landed, "{}", out.detail);
+    let mine = out.result.unwrap();
+    let parents = read::get_changeset(&store, "r", mine).unwrap().parents;
+    assert_eq!(parents, [imported]);
+
+    // Agents land on main while another process imports more commits into
+    // another ref.
+    let more = git.fast_commits(60, 400);
+    let import = import_process(data, &git, &more, "git/main")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let done = AtomicBool::new(false);
+    let landed: Vec<ChangesetId> = thread::scope(|scope| {
+        let agents: Vec<_> = (0..4)
+            .map(|agent| {
+                let (store, lands, done) = (&store, &lands, &done);
+                scope.spawn(move || {
+                    let mut landed = Vec::new();
+                    while !done.load(Ordering::Relaxed) || landed.is_empty() {
+                        let head = main_ref(store).target;
+                        let cs = create(store, head, &format!("agent{agent}/{}", landed.len()));
+                        let out = land(store, lands, cs);
+                        assert_eq!(out.state, LandState::Landed, "{}", out.detail);
+                        landed.push(out.result.unwrap());
+                    }
+                    landed
+                })
+            })
+            .collect();
+        let out = import.wait_with_output().unwrap();
+        done.store(true, Ordering::Relaxed);
+        assert_success(&out);
+        agents.into_iter().flat_map(|a| a.join().unwrap()).collect()
+    });
+
+    // Every commit is imported, and the other ref points at the tip.
+    let rows: i64 = store
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM git_import", [], |row| row.get(0))?))
+        .unwrap();
+    assert_eq!(rows, 400);
+    assert_eq!(
+        read::resolve_ref(&store, "r", "git/main").unwrap(),
+        changeset_of(&store, &more)
+    );
+    // Main's first-parent history above `mine` is the lands, each once.
+    let head = main_ref(&store).target;
+    let log = read::log_page(&store, "r", head, None, landed.len() + 1).unwrap();
+    let mut history: Vec<ChangesetId> = log.entries.into_iter().map(|(id, _)| id).collect();
+    assert_eq!(history.pop(), Some(mine));
+    let mut want = landed;
+    want.sort();
+    history.sort();
+    assert_eq!(history, want);
+}
+
+#[test]
+fn a_second_server_process_is_refused() {
+    let (dir, _server) = open_store();
+    let out = server_process(
+        dir.path(),
+        &["serve", "--token", "t", "--listen", "127.0.0.1:0"],
+    )
+    .output()
+    .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("in use by another server"), "{stderr}");
 }

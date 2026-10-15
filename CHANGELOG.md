@@ -19,6 +19,11 @@ release.
   drive flush.
 - One-way git import. Imported commits are checked against git, and a
   re-import never moves a ref off later lands.
+- `scion-server import` can run while the server runs on the same data
+  directory. It moves the ref by compare-and-swap, as a land does, and its
+  commits are durable before the server can see them. A second server, or
+  a process of another build, is refused. A request that waits for the
+  import's write lock for more than 5 s fails with `UNAVAILABLE`.
 - Server-side commits (`CreateChangeset`) and lands: path-level conflict
   checks through a per-ref index, one transaction per land, retries by
   request key, and bounded retry when the ref moves.

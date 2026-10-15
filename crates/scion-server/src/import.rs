@@ -29,6 +29,11 @@ use crate::tree;
 /// `git_import.git_algo` for SHA-1 object names.
 const SHA1: i64 = 1;
 /// Commits per write transaction.
+// SHORTCUT: a server that shares the data directory waits for each batch
+// transaction, up to `busy_timeout` (5 s), and then its write fails. Its
+// reads wait behind that write, which holds its one connection.
+// Ceiling: a batch that takes longer. Upgrade (issue #100): shorter
+// transactions while a server shares the directory.
 const BATCH: usize = 1000;
 /// Cache for decoded git objects. A tree diff re-reads the trees that the
 /// previous commit's diff just read.
@@ -139,9 +144,12 @@ fn import_with_cache(
         // blob that a crash could lose.
         let mut blobs = store.blobs().batch();
         let mut prepared = Vec::with_capacity(batch.len());
+        let mut in_batch = HashSet::with_capacity(batch.len());
         for &commit in batch {
             let (cs, git_tree) = importer.changeset(commit, &known, &mut blobs)?;
-            known.insert(commit, cs.id());
+            let id = cs.id();
+            known.insert(commit, id);
+            in_batch.insert(id);
             prepared.push((commit, cs, git_tree));
         }
         blobs.sync()?;
@@ -150,6 +158,15 @@ fn import_with_cache(
         checker
             .intact
             .extend(importer.put.drain(..).map(|blob| (blob, ())));
+        // A server that shares the data directory waits for the transaction
+        // below. So a first parent from before this batch gets its root tree
+        // first, in steps: after a version bump it has none, and the
+        // transaction would derive its whole history.
+        for (_, cs, _) in &prepared {
+            if let Some(&parent) = cs.parents.first().filter(|p| !in_batch.contains(*p)) {
+                tree::fill_root_tree(store, repo_id, parent)?;
+            }
+        }
         store.write(|c| {
             for (commit, cs, git_tree) in &prepared {
                 let root = record(c, repo_id, *commit, cs)?;
@@ -173,7 +190,12 @@ fn import_with_cache(
         .get(&tip)
         .copied()
         .ok_or_else(|| Error::Corrupt(format!("commit {tip} was not imported")))?;
-    store.write(|c| point_ref(c, repo_id, &opts.target_ref, tip))?;
+    let pointed = point_ref(store, repo_id, &opts.target_ref, tip);
+    // The ref may contain the tip, or have diverged from git, through a land
+    // that the server has not flushed yet. A full flush covers it, as it
+    // covers every commit that another process made before it.
+    store.flush()?;
+    pointed?;
     // Every planned check ran, or the import failed above.
     let report = ImportReport {
         commits: plan.reachable,
@@ -316,31 +338,36 @@ fn imported_commits(c: &Connection, repo: RepoId) -> Result<HashMap<ObjectId, Ch
 /// Moves an existing ref only forward, to a descendant of where it points.
 /// Anything else would drop the changesets on the ref that git does not
 /// have, such as lands made after an earlier import.
-fn point_ref(c: &Connection, repo: RepoId, name: &str, tip: ChangesetId) -> Result<()> {
-    let current = db::get_ref(c, repo, name)?;
-    if let Some(current) = current {
-        // Already there, or the ref already contains the tip (changes were
-        // landed on top of an earlier import): nothing to do.
-        // Import runs with the server stopped, so its walks have no bound.
-        if current.target == tip || db::is_ancestor(c, repo, tip, current.target, usize::MAX)? {
+///
+/// The move is a compare-and-swap on the ref's version, as a land's is. A
+/// server can land on the ref while the import checks it, so a lost swap
+/// checks the ref again.
+fn point_ref(store: &Store, repo: RepoId, name: &str, tip: ChangesetId) -> Result<()> {
+    // The walks run in reads, outside any write transaction, so a server
+    // that shares the data directory does not wait for them. They have no
+    // bound. The swap fails if the ref moved after the read.
+    let contains = |head, cs| store.read(|c| db::is_ancestor(c, repo, cs, head, usize::MAX));
+    loop {
+        let current = store.read(|c| db::get_ref(c, repo, name))?;
+        if let Some(current) = current {
+            // Already there, or the ref already contains the tip (changes
+            // were landed on top of an earlier import): nothing to do.
+            if current.target == tip || contains(current.target, tip)? {
+                return Ok(());
+            }
+            if !contains(tip, current.target)? {
+                return Err(Error::FailedPrecondition(format!(
+                    "ref {name:?} has diverged from git: it points at {}, which is not \
+                     an ancestor of the imported tip {tip}; import into another ref",
+                    current.target
+                )));
+            }
+        }
+        let expected = current.map(|r| r.version);
+        if store.write(|c| db::cas_ref(c, repo, name, expected, tip))? {
             return Ok(());
         }
-        if !db::is_ancestor(c, repo, current.target, tip, usize::MAX)? {
-            return Err(Error::FailedPrecondition(format!(
-                "ref {name:?} has diverged from git: it points at {}, which is not \
-                 an ancestor of the imported tip {tip}; import into another ref",
-                current.target
-            )));
-        }
-    }
-    // The caller's write transaction holds the database lock, so the version
-    // read above is still current.
-    if db::cas_ref(c, repo, name, current.map(|r| r.version), tip)? {
-        Ok(())
-    } else {
-        Err(Error::Corrupt(format!(
-            "ref {name:?} changed inside a write transaction"
-        )))
+        tracing::info!(name, "the ref moved during the import; checking it again");
     }
 }
 
@@ -726,8 +753,13 @@ fn per_sec(count: usize, since: Instant) -> u128 {
 mod tests {
     use std::fs;
     use std::process::Command;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
 
     use super::*;
+    use crate::derived::{self, Kind};
+    use crate::tree::RootTree;
 
     /// Runs git in `dir` with a fixed identity and no user or system config.
     fn git(dir: &Path, args: &[&str]) {
@@ -784,5 +816,93 @@ mod tests {
         // Each changeset names its parents by ID, so equal tips mean that
         // every changeset is the same.
         assert_eq!(tiny.tip, unbounded.tip);
+    }
+
+    #[test]
+    fn a_land_while_the_import_checks_the_ref_is_never_overwritten() {
+        let data = tempfile::tempdir().unwrap();
+        let server = Store::open(data.path()).unwrap();
+        let importer = Store::open_shared(data.path()).unwrap();
+        // main is at root. Git has root ─ tip, and a land puts X on root.
+        let changeset = |parents, message: &str| Changeset {
+            parents,
+            author: IdentityTime {
+                name: b"Ada".to_vec(),
+                email: b"ada@example.com".to_vec(),
+                unix_secs: 0,
+                tz_offset_minutes: 0,
+            },
+            committer: None,
+            message: message.into(),
+            changes: BTreeMap::new(),
+        };
+        let (repo, tip, x) = server
+            .write(|c| {
+                let repo = db::create_repo(c, "r")?;
+                let root = db::insert_changeset(c, repo, &changeset(vec![], "root"))?;
+                let tip = db::insert_changeset(c, repo, &changeset(vec![root], "tip"))?;
+                let x = db::insert_changeset(c, repo, &changeset(vec![root], "x"))?;
+                assert!(db::cas_ref(c, repo, "main", None, root)?);
+                Ok((repo, tip, x))
+            })
+            .unwrap();
+
+        // The land's transaction has moved main but not committed, so the
+        // import still reads root, then waits to write.
+        let started = Arc::new(Barrier::new(2));
+        let land = {
+            let (server, started) = (server.clone(), Arc::clone(&started));
+            thread::spawn(move || {
+                server.write(|c| {
+                    let moved = db::cas_ref(c, repo, "main", Some(1), x)?;
+                    started.wait();
+                    thread::sleep(Duration::from_millis(300));
+                    Ok(moved)
+                })
+            })
+        };
+        started.wait();
+        let moved = point_ref(&importer, repo, "main", tip);
+        assert!(land.join().unwrap().unwrap());
+        // The swap lost, and the check again sees that main has diverged.
+        assert!(
+            matches!(moved, Err(Error::FailedPrecondition(_))),
+            "{moved:?}"
+        );
+        let main = server.read(|c| db::get_ref(c, repo, "main")).unwrap();
+        assert_eq!(main.unwrap().target, x);
+    }
+
+    #[test]
+    fn an_import_derives_missing_parent_root_trees_in_steps_first() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        for i in 0..5 {
+            fs::write(dir.join("f"), format!("{i}\n")).unwrap();
+            git(dir, &["add", "-A"]);
+            git(dir, &["commit", "-q", "-m", &i.to_string()]);
+        }
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open(data.path()).unwrap();
+        let import = |rev: &str| {
+            let opts = ImportOptions {
+                rev: rev.into(),
+                target_ref: "main".into(),
+                verify_sample: 0,
+            };
+            import_git(&store, "main", dir, &opts).unwrap()
+        };
+        import("main~1");
+        // As after a version bump of the root tree: no stored root trees.
+        let sql = "DELETE FROM derived WHERE kind = ?1";
+        let removed = store.write(|c| Ok(c.execute(sql, [RootTree::NAME])?));
+        assert_eq!(removed.unwrap(), 4);
+
+        let commits = store.commits();
+        assert_eq!(import("main").imported, 1);
+        // The repo, the root trees of the four parents in steps, the batch
+        // and the ref. The batch derives nothing while it holds the lock.
+        assert_eq!(store.commits() - commits, 3 + derived::steps(4));
     }
 }
