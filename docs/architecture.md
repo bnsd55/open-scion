@@ -200,7 +200,7 @@ import with `Store::open_shared`. Each holds its `flock`s until the last
 | Lock file | Held by |
 |---|---|
 | `<data>/server.lock` | The server, exclusive. Lands are serialized in its memory (section 5), so a second server is refused. `derive` opens as the server too: it removes rows of older versions of a kind, which a running server of an older build may still read. |
-| `<data>/lock` | Every process, shared, for its whole life. An open first tries to take it exclusive, to learn whether another process uses the directory. An older build holds it exclusive for its whole life, so it and this build keep each other out. |
+| `<data>/lock` | Every process, shared, for its whole life. An open first tries to take it exclusive, to learn whether another process uses the directory. An older build holds it exclusive for its whole life, so it and this build keep each other out. The file holds the build of the processes that use the directory (below). |
 | `<data>/open.lock` | A process while it opens the directory, so opens take turns. |
 
 - **Alone at open.** Only a process that opens the directory alone removes
@@ -210,9 +210,15 @@ import with `Store::open_shared`. Each holds its `flock`s until the last
   directory unused ([#101](https://github.com/bnsd55/open-scion/issues/101)).
   A shared open of an older schema fails: stop the other processes to
   upgrade it.
+- **One build.** Each process removes the derived rows of older versions of
+  a kind (section 4), which a process of an older build may still read. So
+  the first process writes its build into `<data>/lock`: the schema version
+  and the version of each kind (`store::build`). An open while other
+  processes run fails unless its build is the same.
 - **Writes take turns.** SQLite in WAL mode lets one process read while the
   other writes. A write waits for the write transaction of the other
-  process, up to `busy_timeout` (5 s), and then fails. An import holds the
+  process, up to `busy_timeout` (5 s), and then fails with `UNAVAILABLE`, so
+  the client retries. An import holds the
   write lock for one batch of 1,000 commits, verification included. While a
   server write waits, it holds the server's one connection, so the server's
   reads wait too ([#100](https://github.com/bnsd55/open-scion/issues/100)).
@@ -1055,7 +1061,7 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/store.rs` (`Inner::db`) | One SQLite connection behind a mutex, so reads wait for writes. | A pool of read-only connections. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
-| `scion-server/src/import.rs` (`BATCH`) | A server that shares the data directory waits for each import batch transaction, up to `busy_timeout` (5 s), and then its write fails. Its reads wait behind that write. | Shorter import transactions while a server shares the directory. | [#100](https://github.com/bnsd55/open-scion/issues/100) |
+| `scion-server/src/import.rs` (`BATCH`) | A server that shares the data directory waits for each import batch transaction, up to `busy_timeout` (5 s), and then its write fails with `UNAVAILABLE`. Its reads wait behind that write. | Shorter import transactions while a server shares the directory. | [#100](https://github.com/bnsd55/open-scion/issues/100) |
 | `scion-server/src/store.rs` (`Blobs::sweep_tmp`) | Only an open that finds no other process removes the temp files that a crash left, so those of a crashed import stay while the server runs. | A `tmp/` folder per process, under its own lock. | [#101](https://github.com/bnsd55/open-scion/issues/101) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | Per-ref serialization in a shared database ([design](design/scalable-backend.md)). | [#47](https://github.com/bnsd55/open-scion/issues/47) |
 | `scion-server/src/land.rs` (`MAX_WALK`) | A land on a base more than `MAX_DEPTH` generations below the tip walks the history from the index floor back to the base, each time, and holds the database lock while it walks. A base more than 100,000 changesets below the floor is rejected. | Per-path history in the database, so the check reads only the paths that the land changes. | [#38](https://github.com/bnsd55/open-scion/issues/38) |

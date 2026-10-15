@@ -86,7 +86,7 @@ impl Store {
     /// database cannot be created, or if the schema is newer than this build,
     /// or older while another `Store` uses the directory.
     pub fn open(dir: &Path) -> Result<Self> {
-        Self::open_as(dir, true)
+        Self::open_as(dir, true, &build())
     }
 
     /// Opens or creates a data directory for a process that does not land,
@@ -105,10 +105,11 @@ impl Store {
     ///
     /// As [`Store::open`], except that a server `Store` is no conflict.
     pub fn open_shared(dir: &Path) -> Result<Self> {
-        Self::open_as(dir, false)
+        Self::open_as(dir, false, &build())
     }
 
-    fn open_as(dir: &Path, server: bool) -> Result<Self> {
+    /// Opens a data directory for a process of build `build` ([`build`]).
+    fn open_as(dir: &Path, server: bool, build: &str) -> Result<Self> {
         fs::create_dir_all(dir)?;
         // A second server fails here, before it waits for anything.
         let server_lock = if server {
@@ -130,6 +131,22 @@ impl Store {
         let alone = flock(&lock, FlockOperation::NonBlockingLockExclusive)?;
         if !flock(&lock, FlockOperation::NonBlockingLockShared)? {
             return Err(in_use(dir, "lock", "a process that holds it alone"));
+        }
+        // The first process writes its build into `lock`, and every other
+        // one must have the same build.
+        if alone {
+            lock.set_len(0)?;
+            (&lock).write_all(build.as_bytes())?;
+        } else {
+            let mut theirs = String::new();
+            (&lock).read_to_string(&mut theirs)?;
+            if theirs != build {
+                return Err(Error::FailedPrecondition(format!(
+                    "data directory {} is in use by a process of another build \
+                     ({theirs}); this build is {build}. Stop it, or use the same build",
+                    dir.display()
+                )));
+            }
         }
         let blobs = Blobs::open(dir)?;
         if alone {
@@ -281,12 +298,29 @@ impl Store {
     }
 }
 
+/// What processes that share a data directory must agree on: the schema,
+/// and the version of each kind of derived data. Each process removes the
+/// derived rows of older versions, which a process of an older build may
+/// still read.
+fn build() -> String {
+    use crate::derived::Kind;
+    use crate::graph::CommitGraph;
+    use crate::tree::RootTree;
+    let kinds = [
+        (RootTree::NAME, RootTree::VERSION),
+        (CommitGraph::NAME, CommitGraph::VERSION),
+    ];
+    let kinds = kinds.map(|(name, version)| format!("{name} {version}"));
+    format!("schema {SCHEMA_VERSION}, {}", kinds.join(", "))
+}
+
 /// Opens the lock file `<dir>/<name>`, made if missing. A lock on it lasts as
 /// long as the file is open.
 fn lock_file(dir: &Path, name: &str) -> io::Result<fs::File> {
     fs::OpenOptions::new()
         .create(true)
         .truncate(false)
+        .read(true)
         .write(true)
         .open(dir.join(name))
 }
@@ -991,10 +1025,11 @@ mod tests {
         }
     }
 
-    /// Holds `<dir>/lock` as a process of another build would, with `op`.
-    fn hold_lock(dir: &Path, op: FlockOperation) -> fs::File {
+    /// Holds `<dir>/lock` with `op`, as a process of build `build` would.
+    fn hold_lock(dir: &Path, op: FlockOperation, build: &str) -> fs::File {
         let file = lock_file(dir, "lock").unwrap();
         assert!(flock(&file, op).unwrap());
+        (&file).write_all(build.as_bytes()).unwrap();
         file
     }
 
@@ -1023,7 +1058,7 @@ mod tests {
         }
         let version = |store: &Store| store.read(user_version).unwrap();
         // Another process of this build uses the directory.
-        let live = hold_lock(dir.path(), FlockOperation::NonBlockingLockShared);
+        let live = hold_lock(dir.path(), FlockOperation::NonBlockingLockShared, &build());
         for open in [Store::open, Store::open_shared] {
             match open(dir.path()) {
                 Err(Error::FailedPrecondition(msg)) => {
@@ -1048,7 +1083,7 @@ mod tests {
     #[test]
     fn a_process_that_holds_the_directory_alone_keeps_every_store_out() {
         let dir = tempfile::tempdir().unwrap();
-        let old = hold_lock(dir.path(), FlockOperation::NonBlockingLockExclusive);
+        let old = hold_lock(dir.path(), FlockOperation::NonBlockingLockExclusive, "");
         let by = "a process that holds it alone";
         assert_in_use(Store::open(dir.path()), dir.path(), by);
         assert_in_use(Store::open_shared(dir.path()), dir.path(), by);
@@ -1059,6 +1094,57 @@ mod tests {
         let file = lock_file(dir.path(), "lock").unwrap();
         assert!(!flock(&file, FlockOperation::NonBlockingLockExclusive).unwrap());
         drop(store);
+    }
+
+    #[test]
+    fn processes_of_two_builds_never_share_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = build();
+        // root_tree 2 would remove the rows of root_tree 1 that our server
+        // reads.
+        let other = ours.replace("root_tree 1", "root_tree 2");
+        assert_ne!(other, ours);
+        let refused = |opened: Result<Store>| match opened {
+            Err(Error::FailedPrecondition(msg)) => {
+                assert!(msg.contains("another build"), "{msg}");
+            }
+            other => panic!("expected the open to fail, got {:?}", other.err()),
+        };
+        let server = Store::open(dir.path()).unwrap();
+        refused(Store::open_as(dir.path(), false, &other));
+        Store::open_shared(dir.path()).unwrap();
+        drop(server);
+        // The import of the other build opened alone, so its build counts.
+        let import = Store::open_as(dir.path(), false, &other).unwrap();
+        refused(Store::open(dir.path()));
+        refused(Store::open_shared(dir.path()));
+        drop(import);
+        Store::open(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn an_open_removes_temp_files_before_another_open_ends() {
+        // What crashes left, enough that removing it takes a while.
+        const LEFT: usize = 5_000;
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("tmp");
+        fs::create_dir_all(&tmp).unwrap();
+        for i in 0..LEFT {
+            fs::write(tmp.join(format!("left{i}")), b"").unwrap();
+        }
+        let count = || fs::read_dir(&tmp).unwrap().count();
+        // The sweep removes the files in the order that the folder lists them.
+        let listed_first = fs::read_dir(&tmp).unwrap().next().unwrap().unwrap().path();
+        let path = dir.path().to_owned();
+        let first = thread::spawn(move || Store::open(&path));
+        while listed_first.exists() && !first.is_finished() {
+            thread::yield_now();
+        }
+        // The first open is removing them. A second open waits for it, so
+        // the temp files that it writes next are safe from that sweep.
+        let second = Store::open_shared(dir.path()).unwrap();
+        assert_eq!(count(), 0);
+        drop((first.join().unwrap().unwrap(), second));
     }
 
     #[test]

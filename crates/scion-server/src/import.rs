@@ -190,11 +190,12 @@ fn import_with_cache(
         .get(&tip)
         .copied()
         .ok_or_else(|| Error::Corrupt(format!("commit {tip} was not imported")))?;
-    point_ref(store, repo_id, &opts.target_ref, tip)?;
-    // The ref may contain the tip through a land that the server has not
-    // flushed yet. A full flush covers it, as it covers every commit that
-    // another process made before it.
+    let pointed = point_ref(store, repo_id, &opts.target_ref, tip);
+    // The ref may contain the tip, or have diverged from git, through a land
+    // that the server has not flushed yet. A full flush covers it, as it
+    // covers every commit that another process made before it.
     store.flush()?;
+    pointed?;
     // Every planned check ran, or the import failed above.
     let report = ImportReport {
         commits: plan.reachable,

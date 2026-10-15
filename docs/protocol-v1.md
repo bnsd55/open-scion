@@ -112,7 +112,7 @@ contract. A client MUST NOT depend on its text.
 | `RESOURCE_EXHAUSTED` | `MergeBase` or `IsAncestor` only: the answer needs more work than one call may do. | No: the same request fails again |
 | `CANCELLED` | The server's 600 s limit or the client's `grpc-timeout` ran out. A client library can report its own deadline as `DEADLINE_EXCEEDED`. | Yes. A `Land` retry uses the same request key. |
 | `DEADLINE_EXCEEDED` | `ReadFile`: the client took no message for 120 s. `Land`: the land ran past 600 s from the start of the call. The land stays `PENDING`. | Yes. A `Land` retry uses the same request key. |
-| `UNAVAILABLE` | The server cannot be reached or is shutting down. A tier also replies `UNAVAILABLE` when its upstream does not answer in time (section 8). | Yes |
+| `UNAVAILABLE` | The server cannot be reached or is shutting down, or its database stayed busy for 5 s (another process, such as an import, held its write lock). A tier also replies `UNAVAILABLE` when its upstream does not answer in time (section 8). | Yes |
 | `RESOURCE_EXHAUSTED` | `GetObjects` only: no memory for the first object within 120 s (section 7.3). | Yes, after a wait |
 | `DATA_LOSS` | From a tier only: its upstream sent bytes that are not the object asked for (section 8). | MAY |
 | `INTERNAL` | A database, I/O or stored-data error, or a server bug. The message is `internal error`; the detail stays in the server log. | MAY |
