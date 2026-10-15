@@ -438,8 +438,9 @@ file has no lines and gets no ranges.
 **Bounds per call.** At most 1,000 changesets checked, 100 versions diffed,
 and about 1M lines diffed (both sides of each diff; a line counts once per
 64 bytes). A rename search counts each chunk of up to 64 bytes it compares as
-a line, compares at most 100 deleted files, and stops after about 1M chunks.
-The first diff of a call always runs, so every call makes progress.
+a line, compares at most 100 deleted files, and stops after it has read about
+100 MiB of them. The first step of a call always runs, so every call makes
+progress.
 
 **Rules.** The server walks first parents to each changeset that changed the
 file, and diffs that version with the older version. The older version is

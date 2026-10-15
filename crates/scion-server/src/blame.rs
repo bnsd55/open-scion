@@ -47,13 +47,16 @@ pub const MAX_BLAME_LINES: usize = 1 << 20;
 // Upgrade: blame as derived data, kept per file version.
 pub const MAX_BLAME_VERSIONS: usize = 100;
 
-/// Most lines one call diffs, counting both sides of each diff. A line
-/// counts once per 64 bytes ([`diff_cost`]), so a call also reads about
-/// 64 MiB at most. A diff of many repeated lines can take seconds, so this
-/// bounds the time of a call. A rename search counts each chunk it compares
-/// ([`chunks`]) as a line, and one search compares about this many chunks
-/// at most. The first diff of a call always runs, so a call always makes
-/// progress.
+/// Most lines one call diffs, counting both sides of each diff. A diff of
+/// many repeated lines can take seconds, so this bounds the time of a call.
+/// A line counts once per 64 bytes ([`diff_cost`]), a rename search counts
+/// each chunk it compares ([`chunks`]), and a file read and refused counts
+/// once per 64 bytes, so every byte read counts. The first step of a call
+/// always runs, so a call always makes progress. So a call reads about
+/// 64 MiB in steps that fit, plus two steps past the budget: the first, and
+/// the one that stops the call. One step reads one older version (at most
+/// [`MAX_BLAME_BYTES`]) or one rename search (about [`MAX_RENAME_BYTES`]
+/// and one more file).
 // SHORTCUT: the cost of a diff grows faster than its lines when lines
 // repeat, so one diff of two files of MAX_BLAME_LINES lines is the worst
 // case of a call. Upgrade: blame from derived data, so a call does not diff
@@ -69,6 +72,18 @@ pub const MAX_BLAME_DIFF_LINES: usize = 1 << 20;
 // derived data, so a search compares only files that share chunks with the
 // new file (#87).
 pub const MAX_RENAME_SOURCES: usize = 100;
+
+/// Most bytes one rename search reads, about: [`MAX_RENAME_SOURCES`] files of
+/// 1 MiB, the old file limit, so a search still reads every file it read
+/// under that limit. Past it, the search stops and keeps the best file so
+/// far. It is the same for every search, so the source does not depend on
+/// where a call stops.
+// SHORTCUT: with larger files a search can stop before it reaches the
+// source, and pick another file or none. git reads them all.
+// Upgrade: an index of each changeset's deleted files by chunk, as derived
+// data, so a search reads only files that share chunks with the new file
+// (#87).
+pub const MAX_RENAME_BYTES: usize = MAX_RENAME_SOURCES << 20;
 
 /// git's similarity scale: this score means the same content.
 const SAME: u64 = 60_000;
@@ -103,8 +118,10 @@ pub struct Blame {
     pub next: Option<(ChangesetId, RepoPath)>,
 }
 
-/// A version of the blamed file: its path, blob and text.
-type Version = (RepoPath, BlobId, Vec<u8>);
+/// An older version of the blamed file: its path, blob and text. The text
+/// is `None` when the content is the same as the newer version's, so it is
+/// not read again.
+type Version = (RepoPath, BlobId, Option<Vec<u8>>);
 
 /// Blames the file at `path` in `cs`. Diffs at most [`MAX_BLAME_VERSIONS`]
 /// versions and about [`MAX_BLAME_DIFF_LINES`] lines, and checks at most
@@ -128,7 +145,7 @@ pub fn blame(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Res
         }
         None => return Err(Error::NotFound(format!("path {path:?}"))),
     };
-    let mut text = read_text(store, blob, path)??;
+    let mut text = read_text(store, blob, path, &mut 0)??;
     let mut path = path.clone();
     // For each line of the blamed file: its changeset once known, and until
     // then its line in `text`, the version being explained.
@@ -167,10 +184,7 @@ pub fn blame(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Res
             }
             None => None,
         };
-        let same = older
-            .as_ref()
-            .is_some_and(|(_, older_blob, _)| *older_blob == blob);
-        if let Some((_, _, older_text)) = older.as_ref().filter(|_| !same) {
+        if let Some((_, _, Some(older_text))) = &older {
             cost += diff_cost(older_text) + diff_cost(&text);
         }
         // A step runs if it fits in the budget left. The first always runs.
@@ -180,27 +194,32 @@ pub fn blame(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Res
             break;
         }
         diffed += cost;
-        let line_count = byte_lines(&text).count();
         let kept = match &older {
-            // The same content, as after a rename with no edit: no diff.
-            Some(_) if same => (0..line_count).map(Some).collect(),
-            Some((_, _, older_text)) => kept_lines(older_text, &text),
-            None => vec![None; line_count],
+            // The same content, as after a mode change or a rename with no
+            // edit: every line stays where it is.
+            Some((_, _, None)) => None,
+            Some((_, _, Some(older_text))) => Some(kept_lines(older_text, &text)),
+            None => Some(vec![None; byte_lines(&text).count()]),
         };
-        let mut named = false;
-        for (source, at) in lines.iter_mut().filter(|(source, _)| source.is_none()) {
-            if let Some(older_at) = kept[*at] {
-                *at = older_at;
-            } else {
-                *source = Some(id);
-                named = true;
+        if let Some(kept) = kept {
+            let mut named = false;
+            for (source, at) in lines.iter_mut().filter(|(source, _)| source.is_none()) {
+                if let Some(older_at) = kept[*at] {
+                    *at = older_at;
+                } else {
+                    *source = Some(id);
+                    named = true;
+                }
+            }
+            if named {
+                changesets.push((id, changeset.author, path.clone()));
             }
         }
-        if named {
-            changesets.push((id, changeset.author, path.clone()));
-        }
-        if let Some(older) = older {
-            (path, blob, text) = older;
+        if let Some((older_path, older_blob, older_text)) = older {
+            (path, blob) = (older_path, older_blob);
+            if let Some(older_text) = older_text {
+                text = older_text;
+            }
         }
     }
     if lines.iter().all(|(source, _)| source.is_some()) {
@@ -221,10 +240,19 @@ pub fn blame(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Res
 /// error says why not: it has more than [`MAX_BLAME_BYTES`] bytes or
 /// [`MAX_BLAME_LINES`] lines.
 ///
+/// Every read costs one per 64 bytes. The caller adds the cost of a text it
+/// uses, when it diffs or compares it ([`diff_cost`], [`chunks`]). A text
+/// read and then refused for its lines adds it to `cost` here.
+///
 /// # Errors
 ///
 /// The outer error is a failure to read.
-fn read_text(store: &Store, blob: BlobId, path: &RepoPath) -> Result<Result<Vec<u8>>> {
+fn read_text(
+    store: &Store,
+    blob: BlobId,
+    path: &RepoPath,
+    cost: &mut usize,
+) -> Result<Result<Vec<u8>>> {
     if store.blobs().size(blob)? > MAX_BLAME_BYTES {
         return Ok(Err(Error::InvalidArgument(format!(
             "{path:?} is larger than {MAX_BLAME_BYTES} bytes"
@@ -232,6 +260,7 @@ fn read_text(store: &Store, blob: BlobId, path: &RepoPath) -> Result<Result<Vec<
     }
     let text = store.blobs().get(blob)?;
     if byte_lines(&text).nth(MAX_BLAME_LINES).is_some() {
+        *cost += text.len().div_ceil(64);
         return Ok(Err(Error::InvalidArgument(format!(
             "{path:?} has more than {MAX_BLAME_LINES} lines"
         ))));
@@ -248,8 +277,8 @@ fn diff_cost(text: &[u8]) -> usize {
 /// The version of the file before `changeset`, which puts `blob` and `text`
 /// at `path`: the file at `path` in `root`, the tree of its first parent, or
 /// else the file that `changeset` renamed to `path` ([`renamed_from`]).
-/// `None` if there is none, or blame cannot read it. Adds the chunks a
-/// rename search compared to `cost`.
+/// `None` if there is none, or blame cannot read it. Adds the cost of what
+/// it reads and does not return, and of a rename search, to `cost`.
 fn older_version(
     store: &Store,
     root: TreeId,
@@ -260,9 +289,13 @@ fn older_version(
     cost: &mut usize,
 ) -> Result<Option<Version>> {
     match store.read(|c| tree::lookup(c, root, path))? {
+        // Only the mode changed: nothing to read.
+        Some(Entry::File(FileState::Regular { content, .. })) if content == blob => {
+            Ok(Some((path.clone(), content, None)))
+        }
         Some(Entry::File(FileState::Regular { content, .. })) => {
-            let text = read_text(store, content, path)?.ok();
-            Ok(text.map(|text| (path.clone(), content, text)))
+            let text = read_text(store, content, path, cost)?.ok();
+            Ok(text.map(|text| (path.clone(), content, Some(text))))
         }
         // As in git, only a path with no file before can be a rename. A
         // symlink or submodule that becomes a regular file is not one.
@@ -283,10 +316,11 @@ fn older_version(
 /// 3. If the changeset deletes at most [`MAX_RENAME_SOURCES`] files, the
 ///    most similar one, if it is at least 50% similar. On a tie, one with
 ///    the same name, then the first by path. Files are compared by path
-///    until about [`MAX_BLAME_DIFF_LINES`] chunks are compared.
+///    until the search has read [`MAX_RENAME_BYTES`].
 ///
 /// Only a regular file can be the source, and only one that blame can read
-/// can be similar. Adds the chunks compared to `cost`.
+/// can be similar. Adds the chunks compared, and the files read and
+/// refused, to `cost`.
 fn renamed_from(
     store: &Store,
     root: TreeId,
@@ -319,7 +353,7 @@ fn renamed_from(
         .filter(|(_, other)| *other == Some(blob))
         .min_by_key(|(other, _)| !same_name(other));
     if let Some(&(other, _)) = identical {
-        return Ok(Some((other.clone(), blob, text.to_vec())));
+        return Ok(Some((other.clone(), blob, None)));
     }
     let named: Vec<_> = deleted
         .iter()
@@ -333,17 +367,18 @@ fn renamed_from(
     if unique.is_none() && !(compare_all && deleted.iter().any(|(_, b)| b.is_some())) {
         return Ok(None);
     }
-    let start = *cost;
     let (new, count) = chunks(text);
     *cost += count;
+    // The bytes this search read.
+    let mut read = 0;
     // The most similar file so far, ranked by likeness, then by name.
     let mut best: Option<((u64, bool), Version)> = None;
     // Step 2 first, as in git, so a match there reads no other file.
     if let Some((other, other_blob)) = unique
         && let Some((likeness, other_text)) =
-            similarity(store, other, other_blob, &new, text.len(), cost)?
+            similarity(store, other, other_blob, &new, text.len(), cost, &mut read)?
     {
-        let version = (other.clone(), other_blob, other_text);
+        let version = (other.clone(), other_blob, Some(other_text));
         if likeness >= SAME * 3 / 4 {
             return Ok(Some(version));
         }
@@ -353,22 +388,20 @@ fn renamed_from(
         return Ok(None);
     }
     for &(other, other_blob) in &deleted {
-        // The same bound for every search, so the source does not depend on
-        // where a call stops.
-        if *cost - start > MAX_BLAME_DIFF_LINES {
+        if read > MAX_RENAME_BYTES {
             break;
         }
         let Some(other_blob) = other_blob.filter(|_| unique.is_none_or(|(u, _)| u != other)) else {
             continue;
         };
         let Some((likeness, other_text)) =
-            similarity(store, other, other_blob, &new, text.len(), cost)?
+            similarity(store, other, other_blob, &new, text.len(), cost, &mut read)?
         else {
             continue;
         };
         let rank = (likeness, same_name(other));
         if likeness >= SAME / 2 && best.as_ref().is_none_or(|(best_rank, _)| rank > *best_rank) {
-            best = Some((rank, (other.clone(), other_blob, other_text)));
+            best = Some((rank, (other.clone(), other_blob, Some(other_text))));
         }
     }
     Ok(best.map(|(_, version)| version))
@@ -378,7 +411,8 @@ fn renamed_from(
 /// `blob`, the file at `path`, is, and its text. Likeness is the bytes of
 /// the chunks they share, over the size of the larger one, on git's scale
 /// ([`SAME`]). `None` if blame cannot read `blob`, or the sizes differ too
-/// much for 50%. Adds the chunks read to `cost`.
+/// much for 50%. Adds the chunks compared, or a refused file, to `cost`, and
+/// the bytes read to `read`.
 ///
 /// # Errors
 ///
@@ -390,13 +424,15 @@ fn similarity(
     new: &HashMap<(&[u8], bool), usize>,
     new_len: usize,
     cost: &mut usize,
+    read: &mut usize,
 ) -> Result<Option<(u64, Vec<u8>)>> {
     let size = store.blobs().size(blob)?;
     let larger = size.max(new_len);
-    if 2 * size.min(new_len) < larger {
+    if size > MAX_BLAME_BYTES || 2 * size.min(new_len) < larger {
         return Ok(None);
     }
-    let Some(text) = read_text(store, blob, path)?.ok() else {
+    *read += size;
+    let Some(text) = read_text(store, blob, path, cost)?.ok() else {
         return Ok(None);
     };
     let (old, count) = chunks(&text);
