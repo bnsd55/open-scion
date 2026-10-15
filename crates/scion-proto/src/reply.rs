@@ -339,7 +339,13 @@ mod tests {
             let budget = Arc::new(Semaphore::new(IN_FLIGHT_BYTES));
             let permit = take(&budget, len, BUSY_TIMEOUT).await.unwrap();
             let (tx, mut stream) = channel();
-            let first = (Ok(blob(len, whole)), permit);
+            let object = blob(len, whole);
+            // Where the bytes of a whole buffer are.
+            let buffer = match &object.body {
+                Body::Whole(buffer) => buffer.as_ptr_range(),
+                Body::Chunks(_) => std::ptr::null()..std::ptr::null(),
+            };
+            let first = (Ok(object), permit);
             let stall = Duration::from_secs(10);
             let reply = tokio::spawn(send_objects(first, [(); 0], tx, stall, |()| async { None }));
             let held = || IN_FLIGHT_BYTES - budget.available_permits();
@@ -357,6 +363,9 @@ mod tests {
             got.push(stream.next().await.unwrap().unwrap());
             let lens: Vec<usize> = got.iter().map(|p| p.data.len()).collect();
             assert_eq!(lens, [chunk, chunk, chunk, 10]);
+            // A part of a whole buffer is a copy, not a slice that keeps it.
+            let inside = |part: &ObjectPart| buffer.contains(&part.data.as_ptr());
+            assert!(!got.iter().any(inside), "whole: {whole}");
             assert_eq!(got[0].encoded_size, len as u64);
             assert!(got[1..].iter().all(|p| p.encoded_size == 0));
             assert!(stream.next().await.is_none());

@@ -412,7 +412,10 @@ mod tests {
         assert_eq!(lock(&store.lru).bytes, 2 * n);
 
         // An object larger than the whole limit is not kept, and drops nothing.
-        let big = (Key::Blob(BlobId::of(b"big")), Bytes::from(vec![b'x'; 3 * n]));
+        let big = (
+            Key::Blob(BlobId::of(b"big")),
+            Bytes::from(vec![b'x'; 3 * n]),
+        );
         store.put(big.0, &big.1).unwrap();
         assert_eq!(store.size(big.0).unwrap(), None);
         assert_eq!(store.size(a.0).unwrap(), Some(n));
@@ -491,11 +494,16 @@ mod tests {
         let (tree_bytes, tree_id) = Tree::default().encode_with_id();
         let tree_key = Key::Tree(tree_id);
         store.put(blob_key, &frame).unwrap();
-        store.put(tree_key, &Bytes::from(tree_bytes.clone())).unwrap();
+        store
+            .put(tree_key, &Bytes::from(tree_bytes.clone()))
+            .unwrap();
         assert_eq!(store.size(blob_key).unwrap(), Some(n));
         assert_eq!(store.get(blob_key, n).unwrap(), Some(frame.clone()));
         let tree_size = tree_bytes.len();
-        assert_eq!(store.get(tree_key, tree_size).unwrap(), Some(tree_bytes.into()));
+        assert_eq!(
+            store.get(tree_key, tree_size).unwrap(),
+            Some(tree_bytes.into())
+        );
         let (missing, _) = blob(b"never stored");
         assert_eq!(store.size(missing).unwrap(), None);
         assert_eq!(store.get(missing, 12).unwrap(), None);
@@ -527,6 +535,26 @@ mod tests {
         // A file longer than its recorded size is not read past it.
         fs::write(store.path(blob_key), [&frame[..], b" and more"].concat()).unwrap();
         assert_eq!(store.get(blob_key, n).unwrap(), None);
+    }
+
+    #[test]
+    fn a_put_of_an_object_that_was_just_dropped_keeps_its_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (blob(b"aaaa"), blob(b"bbbb"));
+        let n = a.1.len();
+        // Room for one object.
+        let store = DiskStore::open(&dir.path().join("data"), n).unwrap();
+        store.put(a.0, &a.1).unwrap();
+        // `b` comes in and drops `a`, whose file leaves its name at once.
+        let dropped = store.add(&mut lock(&store.lru), b.0, n).unwrap();
+        assert_eq!(dropped.len(), 1);
+        assert!(!store.path(a.0).exists());
+        // `a` is put again before the dropped file is removed. Removing it
+        // then does not touch the new file.
+        store.put(a.0, &a.1).unwrap();
+        remove_all(dropped).unwrap();
+        assert_eq!(store.get(a.0, n).unwrap(), Some(a.1.clone()));
+        assert_eq!(fs::read_dir(&store.tmp).unwrap().count(), 0);
     }
 
     #[test]

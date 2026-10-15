@@ -736,7 +736,8 @@ impl Objects for Liar {
                 "truncated" => {
                     let mut header = honest[0].header(Encoding::Raw, CHUNK_BYTES + 4);
                     header.size = CHUNK_BYTES + 4;
-                    let mut parts = header.parts(vec![vec![0; CHUNK_BYTES].into(), vec![0; 4].into()]);
+                    let mut parts =
+                        header.parts(vec![vec![0; CHUNK_BYTES].into(), vec![0; 4].into()]);
                     parts.truncate(1);
                     let parts = parts.into_iter().map(Ok);
                     return Ok(Response::new(Box::pin(tokio_stream::iter(parts))));

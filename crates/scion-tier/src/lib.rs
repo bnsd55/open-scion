@@ -196,7 +196,8 @@ impl Key {
             Self::Tree(id) => Tree::decode_with_id(stored).is_ok_and(|(_, actual)| actual == id),
             Self::Blob(id) => {
                 let size = object::frame_size(stored)?;
-                let unpacked = object::unpacker(stored).map_err(|e| format!("cannot unpack: {e}"))?;
+                let unpacked =
+                    object::unpacker(stored).map_err(|e| format!("cannot unpack: {e}"))?;
                 // One byte over the size is enough to see that it is larger.
                 let mut unpacked = unpacked.take(size as u64 + 1);
                 let actual =
@@ -344,6 +345,8 @@ struct Inner<S> {
     upstream: Upstream,
     /// How long to wait for upstream.
     timeout: Duration,
+    /// How long to wait for room in a budget: [`BUSY_TIMEOUT`].
+    busy: Duration,
     /// Calls sent upstream, of every kind.
     upstream_calls: Arc<AtomicU64>,
     /// The reply budget, as on the server: object bytes read or copied for a
@@ -409,6 +412,7 @@ impl<S: Store> Tier<S> {
                 store,
                 upstream,
                 timeout,
+                busy: BUSY_TIMEOUT,
                 upstream_calls,
                 in_flight: Arc::new(Semaphore::new(IN_FLIGHT_BYTES)),
                 fetch_slots: Arc::new(Semaphore::new(FETCH_SLOTS)),
@@ -511,7 +515,7 @@ impl<S: Store> Tier<S> {
     // hop, or keep a few reads in flight.
     async fn produce(&self, ask: &Ask, i: usize, progress: &Progress) -> Option<Found> {
         let key = *ask.keys.get(i)?;
-        let take = |bytes| reply::take(&self.inner.in_flight, bytes, BUSY_TIMEOUT);
+        let take = |bytes| reply::take(&self.inner.in_flight, bytes, self.inner.busy);
         let size = match self.blocking(move |store| store.size(key)).await {
             Ok(size) => size,
             Err(status) => return Some((Err(status.into()), take(1).await?)),
@@ -609,7 +613,7 @@ impl<S: Store> Tier<S> {
     async fn cover(&self, permit: &mut OwnedSemaphorePermit, bytes: usize) -> Option<()> {
         let held = permit.num_permits();
         if bytes > held {
-            let more = reply::take(&self.inner.in_flight, bytes - held, BUSY_TIMEOUT).await?;
+            let more = reply::take(&self.inner.in_flight, bytes - held, self.inner.busy).await?;
             permit.merge(more);
         }
         Some(())
@@ -860,12 +864,12 @@ impl<S: Store> Flight<S> {
         // The upstream reply waits meanwhile, so the wait is bounded as a
         // reply's is. Then the fetch ends, and every object it holds fails
         // with `UNAVAILABLE`: the callers ask again.
-        let fetching = &self.tier.inner.fetching;
-        let permit = reply::take(fetching, key.check_bytes(&header), BUSY_TIMEOUT)
+        let Inner { fetching, busy, .. } = &*self.tier.inner;
+        let permit = reply::take(fetching, key.check_bytes(&header), *busy)
             .await
             .ok_or_else(|| {
                 Status::unavailable(format!(
-                    "no memory within {BUSY_TIMEOUT:?} for an object from upstream; ask again"
+                    "no memory within {busy:?} for an object from upstream; ask again"
                 ))
             })?;
         let mut object = Assembler::new(header, first);
@@ -1326,18 +1330,46 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_fetch_takes_what_the_first_part_announces_before_the_rest_arrives() {
-        let data = vec![7; 3 * scion_proto::CHUNK_BYTES];
-        let key = Key::Blob(BlobId::of(&data));
+    /// A tier in front of [`Stalls`] that sends the first part of `data`.
+    async fn stalled_upstream(data: &[u8]) -> Tier<MemoryStore> {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(
             Server::builder()
-                .add_service(ObjectsServer::new(Stalls(data.clone())))
+                .add_service(ObjectsServer::new(Stalls(data.to_vec())))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
-        let tier = Tier::new(MemoryStore::new(0), &url, "token", CACHE_UPSTREAM_TIMEOUT).unwrap();
+        Tier::new(MemoryStore::new(0), &url, "token", CACHE_UPSTREAM_TIMEOUT).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_fetch_that_finds_no_memory_ends_with_unavailable() {
+        let data = vec![7; 3 * scion_proto::CHUNK_BYTES];
+        let key = Key::Blob(BlobId::of(&data));
+        let mut tier = stalled_upstream(&data).await;
+        Arc::get_mut(&mut tier.inner).unwrap().busy = Duration::from_millis(50);
+        // Other fetches hold the whole fetch budget.
+        let others = reply::try_take(&tier.inner.fetching, FETCH_BYTES).unwrap();
+
+        // The upstream reply stays open meanwhile, so the wait is bounded:
+        // the fetch fails, and so does every object it holds.
+        let (keys, progress) = ([key], Progress::default());
+        let fetch = tier.fetch("r", &keys, 0, &progress);
+        let failed = tokio::time::timeout(Duration::from_secs(10), fetch)
+            .await
+            .expect("the wait for memory is bounded")
+            .unwrap_err();
+        assert_eq!(failed.status.code(), Code::Unavailable, "{failed:?}");
+        assert!(failed.whole_call);
+        assert!(lock(&tier.inner.flights).is_empty());
+        drop(others);
+    }
+
+    #[tokio::test]
+    async fn a_fetch_takes_what_the_first_part_announces_before_the_rest_arrives() {
+        let data = vec![7; 3 * scion_proto::CHUNK_BYTES];
+        let key = Key::Blob(BlobId::of(&data));
+        let tier = stalled_upstream(&data).await;
         let fetching = tier.clone();
         let fetch =
             tokio::spawn(async move { fetching.fetch("r", &[key], 0, &Progress::default()).await });
