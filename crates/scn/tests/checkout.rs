@@ -637,7 +637,7 @@ fn raw_parts(objects: Vec<Result<Object, Status>>) -> Vec<Result<ObjectPart, Sta
             Ok(object) => {
                 let header = object.header(Encoding::Raw, object.data.len());
                 header
-                    .parts(object::chunks(object.data))
+                    .parts(object::chunks(object.data.into()))
                     .into_iter()
                     .map(Ok)
                     .collect()
@@ -718,7 +718,7 @@ impl Objects for Liar {
                     let frame = object::pack(b"evil\n").unwrap();
                     let mut header = honest[0].header(Encoding::Zstd, frame.len());
                     header.size = 5;
-                    let parts = header.parts(vec![frame]).into_iter().map(Ok);
+                    let parts = header.parts(vec![frame.into()]).into_iter().map(Ok);
                     return Ok(Response::new(Box::pin(tokio_stream::iter(parts))));
                 }
                 // The first blob as a frame whose header gives one byte more
@@ -729,14 +729,14 @@ impl Objects for Liar {
                     frame[5] += 1;
                     let mut header = honest[0].header(Encoding::Zstd, frame.len());
                     header.size += 1;
-                    let parts = header.parts(vec![frame]).into_iter().map(Ok);
+                    let parts = header.parts(vec![frame.into()]).into_iter().map(Ok);
                     return Ok(Response::new(Box::pin(tokio_stream::iter(parts))));
                 }
                 // The first part of an object of two parts, then the end.
                 "truncated" => {
                     let mut header = honest[0].header(Encoding::Raw, CHUNK_BYTES + 4);
                     header.size = CHUNK_BYTES + 4;
-                    let mut parts = header.parts(vec![vec![0; CHUNK_BYTES], vec![0; 4]]);
+                    let mut parts = header.parts(vec![vec![0; CHUNK_BYTES].into(), vec![0; 4].into()]);
                     parts.truncate(1);
                     let parts = parts.into_iter().map(Ok);
                     return Ok(Response::new(Box::pin(tokio_stream::iter(parts))));

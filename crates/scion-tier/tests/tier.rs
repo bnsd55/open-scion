@@ -51,13 +51,13 @@ impl Object {
     /// The parts that send it RAW.
     fn raw(&self) -> Vec<ObjectPart> {
         let header = self.header(Encoding::Raw, self.data.len());
-        header.parts(object::chunks(self.data.clone()))
+        header.parts(object::chunks(self.data.clone().into()))
     }
 
     /// The parts that send `frame` as its zstd form.
     fn zstd(&self, frame: Vec<u8>) -> Vec<ObjectPart> {
         self.header(Encoding::Zstd, frame.len())
-            .parts(object::chunks(frame))
+            .parts(object::chunks(frame.into()))
     }
 }
 
@@ -408,10 +408,13 @@ async fn a_tier_refuses_a_bad_zstd_frame_or_part_sequence() {
     let mut parts = big.raw();
     parts.truncate(1);
     bad.push(("a truncated part sequence", parts));
-    // A later part that is too short.
+    // A later part past the encoded size, and an empty one.
     let mut parts = big.raw();
-    parts[1].data.pop();
-    bad.push(("a short part", parts));
+    parts[1].data = vec![0; 11].into();
+    bad.push(("a part past the end", parts));
+    let mut parts = big.raw();
+    parts[1].data = scion_proto::Bytes::new();
+    bad.push(("an empty part", parts));
 
     for (what, parts) in bad {
         let id = parts[0].id.clone();

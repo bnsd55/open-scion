@@ -11,10 +11,12 @@ use std::fs;
 use std::io::{self, ErrorKind, Read as _, Write as _};
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use hashlink::LruCache;
 use rustix::fs::FlockOperation;
+use scion_proto::Bytes;
 use scion_proto::object::MAX_ENCODED_BYTES;
 
 use crate::Key;
@@ -38,7 +40,7 @@ pub trait Store: Send + Sync + 'static {
     /// # Errors
     ///
     /// I/O errors.
-    fn get(&self, key: Key, size: usize) -> io::Result<Option<Vec<u8>>>;
+    fn get(&self, key: Key, size: usize) -> io::Result<Option<Bytes>>;
 
     /// Stores an object in its stored form. The caller has checked `data`
     /// against `key`. An object larger than the store's limit is not kept.
@@ -46,7 +48,7 @@ pub trait Store: Send + Sync + 'static {
     /// # Errors
     ///
     /// I/O errors.
-    fn put(&self, key: Key, data: &Arc<Vec<u8>>) -> io::Result<()>;
+    fn put(&self, key: Key, data: &Bytes) -> io::Result<()>;
 }
 
 /// Objects by key, least recently used first, each with its size.
@@ -104,7 +106,7 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// without work.
 pub struct MemoryStore {
     limit: usize,
-    lru: Mutex<Lru<Arc<Vec<u8>>>>,
+    lru: Mutex<Lru<Bytes>>,
 }
 
 impl MemoryStore {
@@ -124,17 +126,15 @@ impl Store for MemoryStore {
         Ok(lock(&self.lru).get(key).map(|&(_, size)| size))
     }
 
-    fn get(&self, key: Key, size: usize) -> io::Result<Option<Vec<u8>>> {
-        let data = lock(&self.lru).get(key).map(|(data, _)| Arc::clone(data));
-        // Copied outside the lock.
-        Ok(data
-            .filter(|data| data.len() <= size)
-            .map(|data| data.to_vec()))
+    /// The stored buffer itself, not a copy.
+    fn get(&self, key: Key, size: usize) -> io::Result<Option<Bytes>> {
+        let data = lock(&self.lru).get(key).map(|(data, _)| data.clone());
+        Ok(data.filter(|data| data.len() <= size))
     }
 
-    fn put(&self, key: Key, data: &Arc<Vec<u8>>) -> io::Result<()> {
+    fn put(&self, key: Key, data: &Bytes) -> io::Result<()> {
         if data.len() <= self.limit {
-            lock(&self.lru).insert(key, Arc::clone(data), data.len(), self.limit);
+            lock(&self.lru).insert(key, data.clone(), data.len(), self.limit);
         }
         Ok(())
     }
@@ -163,6 +163,8 @@ pub struct DiskStore {
     tmp: PathBuf,
     limit: usize,
     lru: Mutex<Lru<()>>,
+    /// Names files that the limit drops, in `tmp/`.
+    dropped: AtomicU64,
     _lock: fs::File,
 }
 
@@ -196,15 +198,18 @@ impl DiskStore {
             tmp,
             limit,
             lru: Mutex::new(Lru::new()),
+            dropped: AtomicU64::default(),
             _lock: lock_file,
         };
         let mut found = store.scan()?;
         found.sort_by_key(|&(modified, ..)| modified);
         let mut lru = lock(&store.lru);
+        let mut dropped = Vec::new();
         for (_, key, size) in found {
-            store.add(&mut lru, key, size)?;
+            dropped.extend(store.add(&mut lru, key, size)?);
         }
         drop(lru);
+        remove_all(dropped)?;
         Ok(store)
     }
 
@@ -259,13 +264,23 @@ impl DiskStore {
         Ok(found)
     }
 
-    /// Records a stored file in the index, then removes the files that the
-    /// limit drops. The caller holds the index lock.
-    fn add(&self, lru: &mut Lru<()>, key: Key, size: usize) -> io::Result<()> {
+    /// Records a stored file in the index. The caller holds the index lock.
+    /// The files that the limit drops leave their names now, by a rename into
+    /// `tmp/`, so a later put of the same object keeps its new file. Returns
+    /// them, for the caller to remove once it has let go of the lock: a
+    /// rename is quick, but removing a large file may not be.
+    fn add(&self, lru: &mut Lru<()>, key: Key, size: usize) -> io::Result<Vec<PathBuf>> {
+        let mut dropped = Vec::new();
         for key in lru.insert(key, (), size, self.limit) {
-            ignore_missing(fs::remove_file(self.path(key)))?;
+            let n = self.dropped.fetch_add(1, Ordering::Relaxed);
+            let to = self.tmp.join(format!("dropped-{n}"));
+            match fs::rename(self.path(key), &to) {
+                Ok(()) => dropped.push(to),
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
-        Ok(())
+        Ok(dropped)
     }
 }
 
@@ -274,7 +289,7 @@ impl Store for DiskStore {
         Ok(lock(&self.lru).get(key).map(|&((), size)| size))
     }
 
-    fn get(&self, key: Key, size: usize) -> io::Result<Option<Vec<u8>>> {
+    fn get(&self, key: Key, size: usize) -> io::Result<Option<Bytes>> {
         let path = self.path(key);
         let mut data = Vec::with_capacity(size + 1);
         match fs::File::open(&path) {
@@ -302,10 +317,10 @@ impl Store for DiskStore {
             ignore_missing(fs::remove_file(&path))?;
             return Ok(None);
         }
-        Ok(Some(data))
+        Ok(Some(Bytes::from(data)))
     }
 
-    fn put(&self, key: Key, data: &Arc<Vec<u8>>) -> io::Result<()> {
+    fn put(&self, key: Key, data: &Bytes) -> io::Result<()> {
         if data.len() > self.limit {
             return Ok(());
         }
@@ -320,8 +335,18 @@ impl Store for DiskStore {
         let mut lru = lock(&self.lru);
         // The rename replaces a bad copy, if there is one, in one step.
         tmp.persist(&path).map_err(|e| e.error)?;
-        self.add(&mut lru, key, data.len())
+        let dropped = self.add(&mut lru, key, data.len())?;
+        drop(lru);
+        remove_all(dropped)
     }
+}
+
+/// Removes files that the limit dropped.
+fn remove_all(files: Vec<PathBuf>) -> io::Result<()> {
+    for file in files {
+        ignore_missing(fs::remove_file(file))?;
+    }
+    Ok(())
 }
 
 /// `Ok` if `result` failed only because the path is missing.
@@ -360,9 +385,9 @@ mod tests {
     use super::*;
 
     /// A blob's key and stored form: one zstd frame of `data`.
-    fn blob(data: &[u8]) -> (Key, Arc<Vec<u8>>) {
+    fn blob(data: &[u8]) -> (Key, Bytes) {
         let frame = object::pack(data).unwrap();
-        (Key::Blob(BlobId::of(data)), Arc::new(frame))
+        (Key::Blob(BlobId::of(data)), Bytes::from(frame))
     }
 
     #[test]
@@ -374,7 +399,7 @@ mod tests {
         store.put(a.0, &a.1).unwrap();
         store.put(b.0, &b.1).unwrap();
         // Reading `a` makes `b` the least recently used.
-        assert_eq!(store.get(a.0, n).unwrap().as_ref(), Some(&*a.1));
+        assert_eq!(store.get(a.0, n).unwrap(), Some(a.1.clone()));
         // Three are over the limit: `b` goes.
         store.put(c.0, &c.1).unwrap();
         assert_eq!(store.size(a.0).unwrap(), Some(n));
@@ -387,7 +412,7 @@ mod tests {
         assert_eq!(lock(&store.lru).bytes, 2 * n);
 
         // An object larger than the whole limit is not kept, and drops nothing.
-        let big = (Key::Blob(BlobId::of(b"big")), Arc::new(vec![b'x'; 3 * n]));
+        let big = (Key::Blob(BlobId::of(b"big")), Bytes::from(vec![b'x'; 3 * n]));
         store.put(big.0, &big.1).unwrap();
         assert_eq!(store.size(big.0).unwrap(), None);
         assert_eq!(store.size(a.0).unwrap(), Some(n));
@@ -437,8 +462,8 @@ mod tests {
 
         // A restart finds what is on disk, and empties tmp/.
         let store = DiskStore::open(&data, limit).unwrap();
-        assert_eq!(store.get(a.0, n).unwrap(), Some(a.1.to_vec()));
-        assert_eq!(store.get(c.0, n).unwrap(), Some(c.1.to_vec()));
+        assert_eq!(store.get(a.0, n).unwrap(), Some(a.1.clone()));
+        assert_eq!(store.get(c.0, n).unwrap(), Some(c.1.clone()));
         assert_eq!(store.size(b.0).unwrap(), None);
         assert_eq!(fs::read_dir(&store.tmp).unwrap().count(), 0);
         drop(store);
@@ -466,11 +491,11 @@ mod tests {
         let (tree_bytes, tree_id) = Tree::default().encode_with_id();
         let tree_key = Key::Tree(tree_id);
         store.put(blob_key, &frame).unwrap();
-        store.put(tree_key, &Arc::new(tree_bytes.clone())).unwrap();
+        store.put(tree_key, &Bytes::from(tree_bytes.clone())).unwrap();
         assert_eq!(store.size(blob_key).unwrap(), Some(n));
-        assert_eq!(store.get(blob_key, n).unwrap(), Some(frame.to_vec()));
+        assert_eq!(store.get(blob_key, n).unwrap(), Some(frame.clone()));
         let tree_size = tree_bytes.len();
-        assert_eq!(store.get(tree_key, tree_size).unwrap(), Some(tree_bytes));
+        assert_eq!(store.get(tree_key, tree_size).unwrap(), Some(tree_bytes.into()));
         let (missing, _) = blob(b"never stored");
         assert_eq!(store.size(missing).unwrap(), None);
         assert_eq!(store.get(missing, 12).unwrap(), None);
@@ -498,7 +523,7 @@ mod tests {
         // A put replaces a bad copy.
         fs::write(store.path(blob_key), b"torn").unwrap();
         store.put(blob_key, &frame).unwrap();
-        assert_eq!(store.get(blob_key, n).unwrap(), Some(frame.to_vec()));
+        assert_eq!(store.get(blob_key, n).unwrap(), Some(frame.clone()));
         // A file longer than its recorded size is not read past it.
         fs::write(store.path(blob_key), [&frame[..], b" and more"].concat()).unwrap();
         assert_eq!(store.get(blob_key, n).unwrap(), None);
