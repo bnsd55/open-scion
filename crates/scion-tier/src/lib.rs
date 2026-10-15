@@ -609,7 +609,9 @@ impl<S: Store> Tier<S> {
     /// not keep, is fetched alone, so such a store costs one fetch per
     /// object, not one per remaining call. The wait is bounded: each step of
     /// a fetch has the tier's timeout, and a fetch always settles every
-    /// object it holds.
+    /// object it holds. A fetch that ended after the caller found no stored
+    /// copy has stored the object: it is read from the store, not fetched
+    /// again.
     async fn fetch(
         &self,
         repo: &str,
@@ -618,44 +620,64 @@ impl<S: Store> Tier<S> {
         progress: &Progress,
     ) -> Result<Arc<Vec<u8>>, Failed> {
         let key = keys[i];
-        let joined = lock(&self.inner.flights)
-            .get(&(repo.to_owned(), key))
-            .cloned();
-        let mut flight = if let Some(flight) = joined {
-            flight
-        } else if i < progress.fetched_to.load(Ordering::Relaxed) {
-            self.start(repo, key, Vec::new())
-        } else {
-            let end = keys.len().min(i + MAX_BATCH);
-            progress.fetched_to.store(end, Ordering::Relaxed);
-            let later = keys[i + 1..end].to_vec();
-            let missing = self
-                .blocking(move |store| {
-                    Ok(later
-                        .into_iter()
-                        .filter(|&k| !matches!(store.size(k), Ok(Some(_))))
-                        .collect())
-                })
-                .await?;
-            self.start(repo, key, missing)
-        };
-        let outcome = flight
-            .wait_for(Option::is_some)
-            .await
-            .ok()
-            .and_then(|outcome| outcome.clone());
-        outcome.unwrap_or_else(|| {
-            Err(Status::internal("a fetch from upstream ended without a result").into())
-        })
+        loop {
+            let joined = lock(&self.inner.flights)
+                .get(&(repo.to_owned(), key))
+                .cloned();
+            let flight = if let Some(flight) = joined {
+                Some(flight)
+            } else if i < progress.fetched_to.load(Ordering::Relaxed) {
+                self.start(repo, key, Vec::new())
+            } else {
+                let end = keys.len().min(i + MAX_BATCH);
+                progress.fetched_to.store(end, Ordering::Relaxed);
+                self.start(repo, key, keys[i + 1..end].to_vec())
+            };
+            let Some(mut flight) = flight else {
+                let stored = self
+                    .blocking(move |store| match store.size(key)? {
+                        Some(size) => store.get(key, size),
+                        None => Ok(None),
+                    })
+                    .await?;
+                match stored {
+                    Some(data) => return Ok(Arc::new(data)),
+                    // Dropped from the store meanwhile: fetch it.
+                    None => continue,
+                }
+            };
+            let outcome = flight
+                .wait_for(Option::is_some)
+                .await
+                .ok()
+                .and_then(|outcome| outcome.clone());
+            return outcome.unwrap_or_else(|| {
+                Err(Status::internal("a fetch from upstream ended without a result").into())
+            });
+        }
     }
 
     /// Starts one fetch for `key` and `later`, minus the objects that another
-    /// fetch already has. Returns the receiver for `key`.
-    fn start(&self, repo: &str, key: Key, later: Vec<Key>) -> watch::Receiver<Outcome> {
+    /// fetch already has or the store holds. Returns the receiver for `key`,
+    /// or `None` if the store holds it.
+    ///
+    /// The store is asked under the fetch table's lock. A fetch stores each
+    /// object before it takes the object out of the table, so an object in
+    /// neither has not been fetched yet, and only one fetch starts for it.
+    fn start(&self, repo: &str, key: Key, later: Vec<Key>) -> Option<watch::Receiver<Outcome>> {
+        let stored = |k| matches!(self.inner.store.size(k), Ok(Some(_)));
         let mut flights = lock(&self.inner.flights);
+        if let Some(rx) = flights.get(&(repo.to_owned(), key)) {
+            return Some(rx.clone());
+        }
+        if stored(key) {
+            return None;
+        }
         let mut waiting = VecDeque::new();
         for k in iter::once(key).chain(later) {
-            if let Entry::Vacant(slot) = flights.entry((repo.to_owned(), k)) {
+            if let Entry::Vacant(slot) = flights.entry((repo.to_owned(), k))
+                && (k == key || !stored(k))
+            {
                 let (tx, rx) = watch::channel(None);
                 slot.insert(rx);
                 waiting.push_back((k, tx));
@@ -663,15 +685,13 @@ impl<S: Store> Tier<S> {
         }
         let rx = flights[&(repo.to_owned(), key)].clone();
         drop(flights);
-        if !waiting.is_empty() {
-            let flight = Flight {
-                tier: self.clone(),
-                repo: repo.to_owned(),
-                waiting,
-            };
-            tokio::spawn(flight.run());
-        }
-        rx
+        let flight = Flight {
+            tier: self.clone(),
+            repo: repo.to_owned(),
+            waiting,
+        };
+        tokio::spawn(flight.run());
+        Some(rx)
     }
 }
 
@@ -1116,6 +1136,34 @@ mod tests {
         }
         // The first fetch asked for all four; each later one only for itself.
         assert_eq!(fake.asked.load(Ordering::SeqCst), 4 + 3);
+    }
+
+    #[tokio::test]
+    async fn an_object_that_a_fetch_has_stored_is_never_fetched_again() {
+        let (blobs, keys, fake, tier) = setup(3, 1 << 20).await;
+        let asked = || fake.asked.load(Ordering::SeqCst);
+        let settled = || async {
+            while !lock(&tier.inner.flights).is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+
+        // A fetch of the last two objects ends, and stores them.
+        tier.fetch("r", &keys, 1, &Progress::default()).await.unwrap();
+        settled().await;
+        assert_eq!(asked(), 2);
+        // A batch that starts at the first object leaves out the two stored.
+        tier.fetch("r", &keys, 0, &Progress::default()).await.unwrap();
+        settled().await;
+        assert_eq!(asked(), 3);
+        // A reply that missed an object just before its fetch stored it, and
+        // asks after the fetch has ended, gets it from the store. This is the
+        // window between a reply's store check and its fetch.
+        for (i, blob) in blobs.iter().enumerate() {
+            let stored = tier.fetch("r", &keys, i, &Progress::default()).await;
+            assert_eq!(object::unpack(&stored.unwrap(), blob.len()).unwrap(), *blob);
+        }
+        assert_eq!(asked(), 3, "nothing was fetched twice");
     }
 
     #[tokio::test]

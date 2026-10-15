@@ -23,7 +23,8 @@ use crate::Key;
 /// blocking thread.
 pub trait Store: Send + Sync + 'static {
     /// The size of a stored object in its stored form, without reading it.
-    /// `None` if it is not stored.
+    /// `None` if it is not stored. Must be quick: a tier calls it while it
+    /// holds its table of fetches.
     ///
     /// # Errors
     ///
