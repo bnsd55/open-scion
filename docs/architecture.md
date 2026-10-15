@@ -100,7 +100,7 @@ One data directory holds everything (`store.rs`):
 <data>/lock                    locked by the one process that uses <data>
 <data>/scion.db                metadata and trees (SQLite)
 <data>/objects/blob/ab/cd..    one zstd file per blob, named by its ID in hex
-<data>/tmp/                    staging for atomic blob writes
+<data>/tmp/                    staging for atomic blob writes and uploads
 ```
 
 **SQLite tables** ([`migrations/`](../crates/scion-server/migrations)):
@@ -126,13 +126,24 @@ with a newer version. All database access goes through one connection behind
 a mutex. Write transactions use `BEGIN IMMEDIATE`.
 
 **Blob folder.** One zstd file per blob, at most 100 MiB uncompressed. A write
-goes to a temp file in `tmp/`, is flushed, and is renamed into place. A read
-unpacks the file and checks its hash. A check that does not need the content
-(`Blobs::verify`, used by puts, `CreateChangeset` and import) streams the file
-through the decoder into the hasher, so it holds the zstd window and small
-buffers, not the whole blob. A file that does not match its ID, or that
-unpacks to more than 100 MiB, is corrupt, and the next put of that content
-replaces it.
+goes to a temp file in `tmp/`, is flushed, and is renamed into place. The zstd
+frame header holds the uncompressed size, so `Blobs::size` reads only the
+header. A read unpacks the file and checks its hash. A check that does not
+need the content (`Blobs::verify`, used by puts, `CreateChangeset` and
+import) streams the file through the decoder into the hasher, so it holds the
+zstd window and small buffers, not the whole blob. A file that does not match
+its ID, or that unpacks to more than 100 MiB, is corrupt, and the next put of
+that content replaces it.
+
+**Uploads.** `PutBlob` streams (`Blobs::upload`). Each message goes into the
+hasher and to a spool file in `tmp/` before the server reads the next one, so
+an upload holds one message in memory, not the whole blob. The spool file
+holds raw bytes, because the frame header needs the size before the first
+compressed byte. After the last message, the server keeps an intact stored
+copy if there is one. Otherwise it streams the spool file through the
+compressor into the temp file. The spool file has no name, so a dropped
+upload or a crash leaves nothing behind. `Store::open` removes any temp file
+that a crash left before its rename.
 
 **Durability rules.**
 
@@ -594,7 +605,7 @@ an untrusted network.
 | Network | Listens on `127.0.0.1:7878` by default. A non-loopback address is refused unless `--insecure-listen` is given. | No TLS: the token and all data travel unencrypted ([#14](https://github.com/bnsd55/open-scion/issues/14)). |
 | Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. | Trees and blobs are shared by all repos. `GetObjects` reads any tree or blob by ID, and a changeset can name another repo's blob and then read it ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
-| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once, 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget, and a reply whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 1 MiB, diffs at most 100 versions and about 1M lines, and at most 4 run at once. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object inside HTTP/2 until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
+| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once (each holds one message in memory), 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget, and a reply whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 1 MiB, diffs at most 100 versions and about 1M lines, and at most 4 run at once. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object inside HTTP/2 until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. | The client trusts the server for a ref's target and for a changeset's root tree, which it cannot check by hash. Tiers ([#5](https://github.com/bnsd55/open-scion/issues/5)) must forward these answers, not compute them. |
 | Checkout | `scn checkout` writes into a private temp directory with a random name and renames it onto a new or empty destination, never follows a symlink while writing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure the destination stays as it was. | The destination's parent must not be writable by other users, unless it has the sticky bit: they could swap the temp directory before the rename. No Windows rules: device names and names that end in a dot or a space pass. |
 | Errors | Internal errors reply `internal error`. The detail stays in the server log. | |
@@ -611,7 +622,6 @@ limit and its upgrade path. This is the list on `main` today.
 | File | Shortcut | Upgrade | Issue |
 |---|---|---|---|
 | `scion-core/src/codec.rs` (`put_len`) | Encoding panics if a field is longer than `u32::MAX`. Every ingest path caps sizes far below that. | `try_encode` returning `Result`, if a path ever does not. | |
-| `scion-server/src/store.rs` (`MAX_OBJECT_BYTES`) | An upload is buffered in memory, up to 100 MiB, before it is hashed and written. | Stream to a temp file and hash the chunks. | [#16](https://github.com/bnsd55/open-scion/issues/16) |
 | `scion-server/src/store.rs` (`Inner::db`) | One SQLite connection behind a mutex, so reads wait for writes. | A pool of read-only connections. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
 | `scion-server/src/store.rs` (`Store::open`) | One process per data directory, so an import needs the server stopped. | Let a separate importer process share the directory. Lands already re-plan when the ref moves (`MAX_ATTEMPTS`). | [#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
