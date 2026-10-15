@@ -19,6 +19,11 @@ release.
   drive flush.
 - One-way git import. Imported commits are checked against git, and a
   re-import never moves a ref off later lands.
+- `scion-server import` can run while the server runs on the same data
+  directory. It moves the ref by compare-and-swap, as a land does, and its
+  commits are durable before the server can see them. A second server, or
+  a process of another build, is refused. A request that waits for the
+  import's write lock for more than 5 s fails with `UNAVAILABLE`.
 - Server-side commits (`CreateChangeset`) and lands: path-level conflict
   checks through a per-ref index, one transaction per land, retries by
   request key, and bounded retry when the ref moves.
@@ -37,8 +42,13 @@ release.
   Where the filesystem has no rename that never replaces (NFS on Linux),
   a checkout into an existing directory still works: each top-level file
   or symlink moves up by a hard link, and each top-level directory by a
-  rename onto a new empty directory that claims its name. This is tested
-  by forcing it, not on a real NFS mount.
+  rename onto a new empty directory that claims its name. Where it has no
+  hard links either (some FUSE filesystems), each top-level file is copied
+  to a new name made with `O_EXCL`, and each symlink is made again. On NFS
+  version 3, a lost reply while the checkout moves into place does not fail
+  it. A lost reply while it is written still fails it, and the destination
+  stays as it was (#106). This is tested by forcing it, not on a real NFS
+  mount.
 - Path history and blame on first-parent history: `Log` takes an optional
   path and says where to continue, and a new `Blame` RPC gives each line's
   last changeset. `scn log --path` and `scn blame`. Each call has a bound,
@@ -63,8 +73,10 @@ release.
 - `ReadFile` streams a file in 1 MiB parts from the zstd decoder, under a
   256 MiB budget for all replies. It checks the content against its ID
   before the last part, and ends a stalled reply with `DEADLINE_EXCEEDED`.
-- The path index of each ref stays within a budget of 128 MiB. When it is
-  full, it starts over at the tip, and the lands still get the same answers.
+- The path indexes of all refs share one budget of 128 MiB. When it is
+  full, the indexes of idle refs go first, least recently used first. Else
+  the growing index starts over at the tip. The lands still get the same
+  answers.
 - A land walks at most 100,000 changesets below the path index. A base
   further back is `REJECTED` as too old, and the client must rebase.
 - A land stops in its long loops 600 s after its call started, or as soon
