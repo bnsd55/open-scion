@@ -285,7 +285,8 @@ fn record(c: &Connection, caller: &Caller, req: &LandRequest) -> Result<(RepoId,
 
 /// Deletes up to [`EXPIRE_PER_LAND`] lands that finished more than
 /// [`LAND_RETENTION_SECS`] ago, oldest first. A pending land has no
-/// `finished_at`, so it never expires.
+/// `finished_at`, so it never expires. It runs in the transaction that
+/// records a new land, so the flush before that land's reply covers it.
 ///
 /// The newest land always stays. `land_id` has no AUTOINCREMENT: a new row
 /// gets the highest ID plus one. So keeping the newest row means a land ID
