@@ -159,7 +159,8 @@ impl Lands {
         Ok(outcome)
     }
 
-    /// [`Lands::land`], up to commits that are not durable yet.
+    /// [`Lands::land`], up to commits that are not durable yet. Its reads do
+    /// not wait for a flush either: `land` flushes before it replies.
     fn land_committed(
         &self,
         store: &Store,
@@ -182,7 +183,7 @@ impl Lands {
         // A call with the same key may have finished the land while this one
         // waited for the lock.
         let land_id = recorded.land_id;
-        let row = store.read(|c| load(c, repo, caller, land_id))?;
+        let row = store.read_unflushed(|c| load(c, repo, caller, land_id))?;
         if row.state != LandState::Pending {
             return Ok(row);
         }
@@ -401,7 +402,7 @@ fn finish(
 ) -> Result<LandOutcome> {
     let mut attempt = 1;
     loop {
-        let plan = store.read(|c| plan(c, repo, req, index))?;
+        let plan = store.read_unflushed(|c| plan(c, repo, req, index))?;
         match settle(store, repo, land_id, &req.target_ref, plan, index) {
             Err(Error::Aborted(detail)) if attempt < MAX_ATTEMPTS => {
                 tracing::info!(land_id, attempt, %detail, "planning the land again");
