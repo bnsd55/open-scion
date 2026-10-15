@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use anyhow::{Context, Result, bail};
-use rustix::fs::{AtFlags, Dir, Mode, OFlags, RenameFlags, Stat};
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, RenameFlags, Stat};
 use rustix::io::Errno;
 use scion_core::RepoPath;
 
@@ -204,9 +204,24 @@ pub struct Checkout {
     /// How many directories this checkout has opened.
     #[cfg(test)]
     opens: usize,
-    /// Makes the rename that never replaces fail with EINVAL, as on NFS.
+    /// Makes the checkout act as on NFS.
     #[cfg(test)]
-    no_noreplace: bool,
+    nfs: Option<Nfs>,
+}
+
+/// How a test makes a checkout act as on NFS. In each case, the rename that
+/// never replaces fails with EINVAL.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum Nfs {
+    /// Every other call works.
+    Plain,
+    /// The step of a move after the one that made the name in the
+    /// destination fails.
+    StepFails,
+    /// Each step works, but its reply is lost. NFS sends the call again, and
+    /// that call fails.
+    ReplyLost,
 }
 
 /// How a finished temp directory becomes the destination.
@@ -294,7 +309,7 @@ impl Checkout {
             #[cfg(test)]
             opens: 0,
             #[cfg(test)]
-            no_noreplace: false,
+            nfs: None,
         })
     }
 
@@ -394,7 +409,10 @@ impl Checkout {
             };
             match moved {
                 Ok(()) => self.moved.push(name),
-                Err(Errno::EXIST | Errno::NOTEMPTY) => bail!("{shown} is no longer empty"),
+                // NOTDIR: a file or symlink took the place of a claimed name.
+                Err(Errno::EXIST | Errno::NOTEMPTY | Errno::NOTDIR) => {
+                    bail!("{shown} is no longer empty")
+                }
                 Err(e) => {
                     let why = if fallback {
                         ": this filesystem has no rename that never replaces, and the \
@@ -423,7 +441,7 @@ impl Checkout {
     /// replaces: `RENAME_NOREPLACE` on Linux, `RENAME_EXCL` on macOS.
     fn rename_up(&self, name: &[u8]) -> rustix::io::Result<()> {
         #[cfg(test)]
-        if self.no_noreplace {
+        if self.nfs.is_some() {
             return Err(Errno::INVAL);
         }
         rustix::fs::renameat_with(&self.root, name, &self.base, name, RenameFlags::NOREPLACE)
@@ -437,21 +455,71 @@ impl Checkout {
     /// [`open_dest`] already trusts can swap the claimed directory before the
     /// rename, and a rename replaces only an empty directory.
     ///
-    /// If a later step fails, the name made in the destination is removed,
-    /// so the entry is only in the temp directory, where the cleanup finds
-    /// it.
+    /// On NFS version 3, a lost reply makes the client send a call again, and
+    /// a call that worked then fails: `linkat` with EEXIST, `renameat` or
+    /// `unlinkat` with ENOENT. So after an error, the entry has moved if
+    /// `name` in the destination has its inode. If a later step fails, the
+    /// name made in the destination is removed, so the entry is only in the
+    /// temp directory, where the cleanup finds it.
     // SHORTCUT: a filesystem that has no hard links either (some FUSE
     // filesystems) fails here. Upgrade (issue #91): copy each file into place
     // with `O_EXCL`.
     fn move_up_without_rename(&self, name: &[u8]) -> rustix::io::Result<()> {
-        if self.made.get(name) == Some(&true) {
+        // Its type from the filesystem, not from `made`: a filesystem can
+        // give back a name in another Unicode form. Only this checkout can
+        // write the temp directory.
+        let entry = rustix::fs::statat(&self.root, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        let moved = |result: rustix::io::Result<()>| {
+            result.or_else(|e| {
+                match rustix::fs::statat(&self.base, name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(now) if (now.st_dev, now.st_ino) == (entry.st_dev, entry.st_ino) => Ok(()),
+                    _ => Err(e),
+                }
+            })
+        };
+        if FileType::from_raw_mode(entry.st_mode) == FileType::Directory {
+            // SHORTCUT: on NFSv3, a lost reply to this `mkdirat` gives EEXIST
+            // for the claim it made. The checkout then fails as "no longer
+            // empty", and the empty claim stays. Upgrade (issue #99): accept
+            // an empty 0700 directory of this user that is new.
             rustix::fs::mkdirat(&self.base, name, Mode::from_raw_mode(0o700))?;
-            return rustix::fs::renameat(&self.root, name, &self.base, name)
-                .inspect_err(|_| self.remove_from_base(name, true));
+            let renamed = self.step(true, Errno::NOENT, || {
+                rustix::fs::renameat(&self.root, name, &self.base, name)
+            });
+            return moved(renamed).inspect_err(|_| self.remove_from_base(name, true));
         }
-        rustix::fs::linkat(&self.root, name, &self.base, name, AtFlags::empty())?;
-        rustix::fs::unlinkat(&self.root, name, AtFlags::empty())
-            .inspect_err(|_| self.remove_from_base(name, false))
+        moved(self.step(false, Errno::EXIST, || {
+            rustix::fs::linkat(&self.root, name, &self.base, name, AtFlags::empty())
+        }))?;
+        match self.step(true, Errno::NOENT, || {
+            rustix::fs::unlinkat(&self.root, name, AtFlags::empty())
+        }) {
+            // Gone already: its reply was lost.
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(e) => {
+                self.remove_from_base(name, false);
+                Err(e)
+            }
+        }
+    }
+
+    /// Runs `call`, one step of [`Checkout::move_up_without_rename`]. `again`
+    /// is the error that the call gives when NFS sends it again after it
+    /// worked. Tests make a step `after_claim` fail, or lose each reply.
+    #[cfg_attr(not(test), allow(unused_variables, clippy::unused_self))]
+    fn step(
+        &self,
+        after_claim: bool,
+        again: Errno,
+        call: impl FnOnce() -> rustix::io::Result<()>,
+    ) -> rustix::io::Result<()> {
+        #[cfg(test)]
+        match self.nfs {
+            Some(Nfs::StepFails) if after_claim => return Err(Errno::IO),
+            Some(Nfs::ReplyLost) => return call().and(Err(again)),
+            _ => {}
+        }
+        call()
     }
 
     /// Removes `name` from `base`, and warns if it cannot. A directory must
@@ -776,25 +844,30 @@ mod tests {
         assert_eq!(temp_dirs(tmp.path()), Vec::<String>::new());
     }
 
-    /// Starts a checkout into `dest`. With `no_noreplace`, the filesystem
-    /// acts as NFS does: it has no rename that never replaces.
-    fn start(dest: &Path, no_noreplace: bool) -> Result<Checkout> {
+    /// Starts a checkout into `dest`. With `nfs`, the filesystem acts as NFS
+    /// does: it has no rename that never replaces.
+    fn start(dest: &Path, nfs: Option<Nfs>) -> Result<Checkout> {
         let mut checkout = Checkout::start(dest)?;
-        checkout.no_noreplace = no_noreplace;
+        checkout.nfs = nfs;
         Ok(checkout)
     }
 
     #[test]
     fn an_existing_empty_directory_is_kept() {
-        existing_empty_directory_is_kept(false);
+        existing_empty_directory_is_kept(None);
     }
 
     #[test]
     fn an_existing_empty_directory_is_kept_without_a_no_replace_rename() {
-        existing_empty_directory_is_kept(true);
+        existing_empty_directory_is_kept(Some(Nfs::Plain));
     }
 
-    fn existing_empty_directory_is_kept(no_noreplace: bool) {
+    #[test]
+    fn an_existing_empty_directory_is_kept_when_replies_are_lost() {
+        existing_empty_directory_is_kept(Some(Nfs::ReplyLost));
+    }
+
+    fn existing_empty_directory_is_kept(nfs: Option<Nfs>) {
         let tmp = tempfile::tempdir().unwrap();
         let parent = tmp.path().join("parent");
         let dest = parent.join("dest");
@@ -806,7 +879,7 @@ mod tests {
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
         let written = (|| {
             check_dest(&dest)?;
-            let mut checkout = start(&dest, no_noreplace)?;
+            let mut checkout = start(&dest, nfs)?;
             checkout.file(&path("a/b/c"), false, b"c\n")?;
             checkout.symlink(&path("a/link"), b"b/c")?;
             // Moves up while its target is still in the temp directory.
@@ -834,24 +907,25 @@ mod tests {
     #[test]
     fn a_failed_checkout_leaves_an_existing_directory_as_it_was() {
         let tmp = tempfile::tempdir().unwrap();
-        let begin = |name: &str, no_noreplace: bool| {
+        let begin = |name: &str, nfs: Option<Nfs>| {
             let dest = tmp.path().join(name);
             fs::create_dir(&dest).unwrap();
-            let mut checkout = start(&dest, no_noreplace).unwrap();
+            let mut checkout = start(&dest, nfs).unwrap();
             for file in ["a/x", "b", "c/y"] {
                 checkout.file(&path(file), false, b"ours\n").unwrap();
             }
             (dest, checkout)
         };
 
-        let (dest, checkout) = begin("dropped", false);
+        let (dest, checkout) = begin("dropped", None);
         drop(checkout);
         assert_eq!(names(&dest), Vec::<String>::new());
 
         // An entry appears during the checkout, at a name that the checkout
         // uses for a file or a directory, or at another one. It stays as it
         // was, and what moved up is removed. A plain rename would replace
-        // the empty directory.
+        // the empty directory. With lost replies, an entry that appeared is
+        // not taken for one that moved.
         let cases = [
             ("b", "file"),
             ("d", "file"),
@@ -860,10 +934,9 @@ mod tests {
             ("b", "symlink"),
             ("a", "symlink"),
         ];
-        for no_noreplace in [false, true] {
+        for nfs in [None, Some(Nfs::Plain), Some(Nfs::ReplyLost)] {
             for (theirs, kind) in cases {
-                let (dest, checkout) =
-                    begin(&format!("{no_noreplace}-{theirs}-{kind}"), no_noreplace);
+                let (dest, checkout) = begin(&format!("{nfs:?}-{theirs}-{kind}"), nfs);
                 let at = dest.join(theirs);
                 match kind {
                     "file" => fs::write(&at, "theirs\n").unwrap(),
@@ -872,7 +945,7 @@ mod tests {
                 }
                 let inode = fs::symlink_metadata(&at).unwrap().ino();
                 let err = checkout.finish().unwrap_err();
-                let case = format!("{theirs} as a {kind}, no_noreplace {no_noreplace}");
+                let case = format!("{theirs} as a {kind}, {nfs:?}");
                 assert!(
                     format!("{err:#}").contains("no longer empty"),
                     "{case}: {err:#}"
@@ -887,6 +960,24 @@ mod tests {
                     _ => assert_eq!(names(&at), Vec::<String>::new(), "{case}"),
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_failed_move_without_rename_leaves_an_existing_directory_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The step after the claim fails, for a directory and for a file.
+        for first in ["a/x", "b"] {
+            let dest = tmp.path().join(first.replace('/', "-"));
+            fs::create_dir(&dest).unwrap();
+            let mut checkout = start(&dest, Some(Nfs::StepFails)).unwrap();
+            checkout.file(&path(first), false, b"ours\n").unwrap();
+            let err = checkout.finish().unwrap_err();
+            assert!(
+                format!("{err:#}").contains("fallback failed too"),
+                "{err:#}"
+            );
+            assert_eq!(names(&dest), Vec::<String>::new(), "{first}");
         }
     }
 
