@@ -16,7 +16,7 @@ use scion_proto::v1::{
     ResolveRefRequest, ResolveRefResponse,
 };
 use scion_proto::{MAX_MESSAGE_BYTES, MAX_OBJECT_MESSAGE_BYTES};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 
 use crate::error::{Error, Result};
@@ -107,31 +107,54 @@ fn read_object(store: &Store, key: Key, size: usize) -> Result<Object> {
     })
 }
 
-/// Sends `keys` one at a time, as the client takes them (see
-/// [`reply::send_objects`]). For each object it looks up the size, takes that
-/// share of `in_flight`, and only then reads the bytes.
-// SHORTCUT: two blocking hops per object and no read-ahead, so many small
-// objects are read one after another. Upgrade: read a batch capped by bytes
-// per hop, or keep a few reads in flight.
-async fn send_objects(
+/// Starts the reply to `keys`: finds the first object before the call
+/// answers, then sends the rest on a task of its own, one at a time, as the
+/// client takes them (see [`reply::send_objects`]). If the first object gets
+/// no share of `in_flight` within `stall`, the call fails with
+/// [`reply::busy`], so a reply never ends `OK` with no object.
+async fn start_reply(
     worker: Worker,
     keys: Vec<Key>,
-    tx: mpsc::Sender<Sent>,
     in_flight: Arc<Semaphore>,
     stall: Duration,
     read: Read,
-) {
-    let (worker, in_flight) = (&worker, &in_flight);
-    reply::send_objects(keys, tx, stall, |key| async move {
-        let size = worker.run(move |store| object_size(&store, key)).await;
-        let permit = reply::take(in_flight, *size.as_ref().unwrap_or(&1), stall).await?;
-        let object = match size {
-            Ok(size) => worker.run(move |store| read(&store, key, size)).await,
-            Err(status) => Err(status),
-        };
-        Some((object, permit))
-    })
-    .await;
+) -> Result<ObjectStream, Status> {
+    let mut rest = keys.into_iter();
+    let Some(key) = rest.next() else {
+        return Err(Status::invalid_argument("a call names at least one object"));
+    };
+    let first = find(&worker, &in_flight, stall, read, key)
+        .await
+        .ok_or_else(reply::busy)?;
+    let (tx, stream) = reply::channel();
+    tokio::spawn(async move {
+        let (worker, in_flight) = (&worker, &in_flight);
+        let produce = |key| find(worker, in_flight, stall, read, key);
+        reply::send_objects(first, rest, tx, stall, produce).await;
+    });
+    Ok(stream)
+}
+
+/// Finds one object for a reply: looks up its size, takes that share of
+/// `in_flight`, and only then reads the bytes. `None` if the share is not
+/// free within `stall`.
+// SHORTCUT: two blocking hops per object and no read-ahead, so many small
+// objects are read one after another. Upgrade: read a batch capped by bytes
+// per hop, or keep a few reads in flight (issue #6).
+async fn find(
+    worker: &Worker,
+    in_flight: &Arc<Semaphore>,
+    stall: Duration,
+    read: Read,
+    key: Key,
+) -> Option<Sent> {
+    let size = worker.run(move |store| object_size(&store, key)).await;
+    let permit = reply::take(in_flight, *size.as_ref().unwrap_or(&1), stall).await?;
+    let object = match size {
+        Ok(size) => worker.run(move |store| read(&store, key, size)).await,
+        Err(status) => Err(status),
+    };
+    Some((object, permit))
 }
 
 #[tonic::async_trait]
@@ -174,16 +197,15 @@ impl Objects for ObjectsService {
         self.worker
             .run(move |store| store.read(|c| db::repo_id(c, &repo)))
             .await?;
-        let (tx, stream) = reply::channel();
-        tokio::spawn(send_objects(
+        let in_flight = Arc::clone(&self.in_flight);
+        let reply = start_reply(
             self.worker.clone(),
             keys,
-            tx,
-            Arc::clone(&self.in_flight),
+            in_flight,
             STALL_TIMEOUT,
             read_object,
-        ));
-        Ok(Response::new(stream))
+        );
+        Ok(Response::new(reply.await?))
     }
 }
 
@@ -191,7 +213,19 @@ impl Objects for ObjectsService {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use tokio_stream::StreamExt as _;
+    use tonic::Code;
+
     use super::*;
+
+    /// Waits until `done` holds, at most 10 s.
+    async fn until(done: impl Fn() -> bool) {
+        let started = tokio::time::Instant::now();
+        while !done() {
+            assert!(started.elapsed() < Duration::from_secs(10), "timed out");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
 
     #[tokio::test]
     async fn a_client_that_stops_reading_is_cut_off_and_frees_its_budget() {
@@ -203,29 +237,27 @@ mod tests {
             .collect();
         let budget = 1000;
         let in_flight = Arc::new(Semaphore::new(budget));
-        let (tx, rx) = mpsc::channel(1);
-        let task = tokio::spawn(send_objects(
+        let stall = Duration::from_millis(50);
+        let reply = start_reply(
             Worker::new(store),
             keys,
-            tx,
             Arc::clone(&in_flight),
-            Duration::from_millis(50),
+            stall,
             read_object,
-        ));
+        );
+        let mut stream = reply.await.unwrap();
 
-        // Nobody reads: the first object waits in the channel, the second
-        // send stalls and ends the reply.
-        tokio::time::timeout(Duration::from_secs(10), task)
-            .await
-            .expect("a stalled reply ends")
-            .unwrap();
-        assert_eq!(in_flight.available_permits(), budget - b"one".len());
-        drop(rx);
+        // Nobody reads: the first object waits in the channel. The second
+        // takes its share, its send stalls, and the reply ends.
+        until(|| in_flight.available_permits() == budget - 6).await;
+        until(|| in_flight.available_permits() == budget - 3).await;
+        assert_eq!(stream.next().await.unwrap().unwrap().data, b"one");
+        assert!(stream.next().await.is_none(), "the reply ended");
         assert_eq!(in_flight.available_permits(), budget);
     }
 
     #[tokio::test]
-    async fn a_reply_that_waits_for_budget_has_not_read_its_object() {
+    async fn a_call_with_no_budget_for_its_first_object_fails_and_reads_nothing() {
         static READS: AtomicUsize = AtomicUsize::new(0);
         fn counted(store: &Store, key: Key, size: usize) -> Result<Object> {
             READS.fetch_add(1, Ordering::SeqCst);
@@ -242,43 +274,19 @@ mod tests {
         let in_flight = Arc::new(Semaphore::new(budget));
         let worker = Worker::new(store);
         let stall = Duration::from_millis(100);
-        let reply = |keys, tx| {
-            tokio::spawn(send_objects(
-                worker.clone(),
-                keys,
-                tx,
-                Arc::clone(&in_flight),
-                stall,
-                counted,
-            ))
+        let reply = |keys| {
+            let reply = start_reply(worker.clone(), keys, Arc::clone(&in_flight), stall, counted);
+            tokio::time::timeout(Duration::from_secs(10), reply)
         };
 
-        // Two replies whose clients never read. The first sends `a` into its
-        // channel, where it keeps its share; then neither reply can get
-        // budget for its next object.
-        let (tx_first, rx_first) = mpsc::channel(1);
-        let first = reply(vec![a, a], tx_first);
-        let started = tokio::time::Instant::now();
-        while in_flight.available_permits() == budget {
-            assert!(started.elapsed() < Duration::from_secs(10));
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        let (tx_second, rx_second) = mpsc::channel(1);
-        let second = reply(vec![b], tx_second);
-        for task in [first, second] {
-            tokio::time::timeout(Duration::from_secs(10), task)
-                .await
-                .expect("a reply that cannot get budget ends after the stall")
-                .unwrap();
-        }
-
-        assert_eq!(
-            READS.load(Ordering::SeqCst),
-            1,
-            "only the first `a` was read"
-        );
-        assert_eq!(in_flight.available_permits(), budget - size);
-        drop((rx_first, rx_second));
-        assert_eq!(in_flight.available_permits(), budget);
+        // A call whose client never reads keeps `a` and its share. The next
+        // call gets no budget within the stall limit: it fails, and never
+        // ends `OK` with no object.
+        let held = reply(vec![a]).await.unwrap().unwrap();
+        let status = reply(vec![b]).await.unwrap().unwrap_err();
+        assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+        assert_eq!(READS.load(Ordering::SeqCst), 1, "`b` was never read");
+        drop(held);
+        until(|| in_flight.available_permits() == budget).await;
     }
 }

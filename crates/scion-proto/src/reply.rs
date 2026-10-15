@@ -4,9 +4,13 @@
 //! A reply hands objects to its client one at a time, through a one-slot
 //! channel. Before a reply reads an object's bytes, it takes the object's
 //! share of a byte budget. The object keeps that share until the client takes
-//! it. A reply stops once it has sent [`REPLY_BUDGET_BYTES`], always after at
-//! least one object. It ends when its client takes no object for
+//! it. A reply sends the next object only while it has sent less than
+//! [`REPLY_BUDGET_BYTES`]. It ends when its client takes no object for
 //! [`STALL_TIMEOUT`], or when the budget has no room for that long.
+//!
+//! A reply finds its first object before the call answers. If the budget has
+//! no room for it, the call fails with [`busy`]. So a reply always holds at
+//! least one object, and never ends `OK` with none.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -21,8 +25,9 @@ use tonic::Status;
 use crate::v1::Object;
 use crate::{MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES};
 
-/// A reply stops before the next object once it has sent this many bytes.
-/// The client asks again for the rest, so one call stays short.
+/// A reply stops before the next object once it has sent this many bytes,
+/// so it holds less than this plus one object. The client asks again for the
+/// rest, so one call stays short.
 pub const REPLY_BUDGET_BYTES: usize = MAX_MESSAGE_BYTES;
 
 /// The byte budget of one process: the most object bytes that all its
@@ -74,6 +79,13 @@ pub async fn take(
     tokio::time::timeout(stall, acquire).await.ok()?.ok()
 }
 
+/// The status of a call whose first object found no room in the budget
+/// within the stall limit. The client asks again later.
+#[must_use]
+pub fn busy() -> Status {
+    Status::resource_exhausted("busy: no memory for this reply; retry later")
+}
+
 /// Takes the share of `budget` for an object of `size` bytes if it is free
 /// now.
 #[must_use]
@@ -81,14 +93,16 @@ pub fn try_take(budget: &Arc<Semaphore>, size: usize) -> Option<OwnedSemaphorePe
     Arc::clone(budget).try_acquire_many_owned(share(size)).ok()
 }
 
-/// Sends one object per key, as the client takes them. `produce` finds an
-/// object, takes its share of the budget with [`take`], and only then reads
-/// the bytes, so a reply that waits for budget holds no object. Stops after
-/// an error, once the reply has sent [`REPLY_BUDGET_BYTES`], when the client
-/// has gone, when `produce` returns `None`, or when the client does not take
-/// an object within `stall`. Finding an object has no time limit here: a
-/// cache tier bounds its upstream fetches itself.
+/// Sends `first`, which the caller found before the call answered, then one
+/// object per key, as the client takes them. `produce` finds an object, takes
+/// its share of the budget with [`take`], and only then reads the bytes, so a
+/// reply that waits for budget holds no object. Stops after an error, once
+/// the reply has sent [`REPLY_BUDGET_BYTES`], when the client has gone, when
+/// `produce` returns `None`, or when the client does not take an object
+/// within `stall`. Finding an object has no time limit here: a cache tier
+/// bounds its upstream fetches itself.
 pub async fn send_objects<K, F>(
+    first: Sent,
     keys: impl IntoIterator<Item = K>,
     tx: mpsc::Sender<Sent>,
     stall: Duration,
@@ -96,19 +110,21 @@ pub async fn send_objects<K, F>(
 ) where
     F: Future<Output = Option<Sent>>,
 {
+    let mut keys = keys.into_iter();
+    let mut next = Some(first);
     let mut sent = 0;
-    for key in keys {
-        if sent >= REPLY_BUDGET_BYTES {
-            break;
-        }
-        let Some((object, permit)) = produce(key).await else {
-            break;
-        };
+    while let Some((object, permit)) = next.take() {
         let len = object.as_ref().map_or(0, |o| o.data.len());
         let failed = object.is_err();
         match tokio::time::timeout(stall, tx.send((object, permit))).await {
             Ok(Ok(())) if !failed => sent += len,
             _ => break,
+        }
+        if sent >= REPLY_BUDGET_BYTES {
+            break;
+        }
+        if let Some(key) = keys.next() {
+            next = produce(key).await;
         }
     }
 }

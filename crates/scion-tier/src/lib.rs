@@ -348,17 +348,13 @@ impl<S: Store> Tier<S> {
         tx: mpsc::Sender<Sent>,
     ) {
         let (tier, repo, keys, progress) = (&self, &repo, &keys, &progress);
-        let items = iter::once((0, Some(first))).chain((1..keys.len()).map(|i| (i, None)));
-        let produce = |(i, first): (usize, Option<Sent>)| async move {
-            if first.is_some() {
-                return first;
-            }
+        let produce = |i| async move {
             match tier.produce(repo, keys, i, progress).await? {
                 (Err(failed), _) if failed.whole_call => None,
                 (object, permit) => Some((object.map_err(|failed| failed.status), permit)),
             }
         };
-        reply::send_objects(items, tx, STALL_TIMEOUT, produce).await;
+        reply::send_objects(first, 1..keys.len(), tx, STALL_TIMEOUT, produce).await;
         tracing::info!(
             objects = keys.len(),
             hits = progress.hits.load(Ordering::Relaxed),
@@ -713,15 +709,15 @@ impl<S: Store> Objects for Tier<S> {
         check_repo(&repo)?;
         check::object_count(refs.len())?;
         let keys = refs.iter().map(Key::parse).collect::<Result<Vec<_>, _>>()?;
-        // The first object is found before the reply starts. So when the
-        // whole upstream call fails (for example, upstream has no such repo),
-        // that is this call's status too, as on the server, and a tier below
-        // fails its fetch once instead of asking again per object.
+        // The first object is found before the reply starts, as on the
+        // server. So when the whole upstream call fails (for example,
+        // upstream has no such repo), that is this call's status too, and a
+        // tier below fails its fetch once instead of asking again per object.
         let progress = Progress::default();
         let (first, permit) = self
             .produce(&repo, &keys, 0, &progress)
             .await
-            .ok_or_else(|| Status::unavailable("the reply budget stayed full"))?;
+            .ok_or_else(reply::busy)?;
         let first = match first {
             Err(failed) if failed.whole_call => return Err(failed.status),
             first => first.map_err(|failed| failed.status),

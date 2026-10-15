@@ -58,7 +58,9 @@ finish its work on the server (section 6.3).
 **Queues.** The server queues work instead of failing it. At most 256 jobs run
 at once across both services, at most 16 `PutBlob` uploads are read at once,
 and at most 4 `Blame` calls run at once. Time in a queue counts toward the
-timeout.
+timeout. One wait has its own limit: a `GetObjects` call that gets no memory
+for its first object within 120 s fails with `RESOURCE_EXHAUSTED` (section
+7.3).
 
 ## 3. Common rules
 
@@ -106,7 +108,9 @@ contract. A client MUST NOT depend on its text.
 | `ABORTED` | `Land` only: other writers kept moving the ref. The land stays `PENDING`. | Yes, with the same request key |
 | `OUT_OF_RANGE` | A message is larger than its limit. | After the cause is fixed |
 | `CANCELLED` | The server's 600 s limit or the client's `grpc-timeout` ran out. A client library can report its own deadline as `DEADLINE_EXCEEDED`. | Yes. A `Land` retry uses the same request key. |
-| `UNAVAILABLE` | The server cannot be reached or is shutting down. | Yes |
+| `UNAVAILABLE` | The server cannot be reached or is shutting down. A tier also replies `UNAVAILABLE` when its upstream does not answer in time (section 8). | Yes |
+| `RESOURCE_EXHAUSTED` | `GetObjects` only: no memory for the first object within 120 s (section 7.3). | Yes, after a wait |
+| `DATA_LOSS` | From a tier only: its upstream sent bytes that are not the object asked for (section 8). | MAY |
 | `INTERNAL` | A database, I/O or stored-data error, or a server bug. The message is `internal error`; the detail stays in the server log. | MAY |
 | `UNIMPLEMENTED` | The server does not have the call, or the request is compressed. | After the cause is fixed |
 
@@ -451,19 +455,27 @@ request before it sends any object.
 - Objects come in request order, one per message. So a reply is always a
   prefix of `refs`.
 - Each `Object` repeats the `kind` and `id` of its ref.
-- The reply stops before the next object once it has sent at least 64 MiB of
-  object data. A reply that stops this way holds at least one object, and at
-  most 64 MiB plus one object.
-- The reply also stops when the next object does not reach the client
-  within 120 s (the stall limit): because the client takes no object, or
-  because the server waits that long for memory. All replies share a budget of
-  400 MiB of object data. A reply that stops this way can hold no object.
-- A reply that stops early ends with status `OK`. The client MUST ask again
-  for the objects it did not get. After a reply with no object, the client
-  SHOULD wait before it asks again.
-- A missing object ends the reply with `NOT_FOUND`, after the objects before
-  it. A damaged stored object ends it with `INTERNAL`. The client MAY keep
-  the objects it got before the error.
+- The reply sends the next object only while it has sent less than 64 MiB
+  of object data. So a reply holds at least one object, and at most 64 MiB
+  plus one object of up to 100 MiB.
+- All replies share a budget of 400 MiB of object data. The server finds the
+  first object before it answers the call. If it has no memory for that
+  object within 120 s, the call fails with `RESOURCE_EXHAUSTED` and sends no
+  object. The client SHOULD wait before it asks again.
+- The reply stops when a later object does not reach the client within
+  120 s (the stall limit): because the client takes no object, or because
+  the server waits that long for memory.
+- A reply that stops early ends with status `OK`, after at least one object.
+  A server or tier MUST NOT end a reply with `OK` and no object. The client
+  MUST ask again for the objects it did not get.
+
+**Errors.** An error status of the call is about the whole call, and no
+object was sent: for example a repo that does not exist, or no memory for
+the first object. An error in the stream is about the next object, and ends
+the reply after the objects before it. A server or tier MUST NOT put an
+error about the whole call in the stream. A missing object ends the reply
+with `NOT_FOUND`. A damaged stored object ends it with `INTERNAL`. The
+client MAY keep the objects it got before the error.
 
 **Object data.**
 
@@ -475,15 +487,17 @@ request before it sends any object.
 | Error | When |
 |---|---|
 | `INVALID_ARGUMENT` | A bad repo name; no ref or more than 1,000; a kind that is not `TREE` or `BLOB`; an ID that is not 32 bytes. |
-| `NOT_FOUND` | The repo does not exist; a named object does not exist (after the objects before it). |
+| `NOT_FOUND` | The repo does not exist (the call's status); a named object does not exist (in the stream, after the objects before it). |
+| `RESOURCE_EXHAUSTED` | No memory for the first object within 120 s. No object was sent. |
 
 ## 8. Cache tiers
 
 The article says each node runs a `scion-daemon` that talks only to a
 regional `scion-cache`, which asks the servers on a miss, and that all three
-answer identical calls. The tiers themselves are in review
-([#64](https://github.com/bnsd55/open-scion/pull/64)). These rules hold for
-any tier:
+answer identical calls. This project builds both: `scion-cache` keeps
+objects in memory and listens on TCP; `scion-daemon` keeps them on disk and
+listens on a Unix socket. Each sends its misses to one upstream, so the
+order is daemon, cache, server. These rules hold for any tier:
 
 - A tier MUST serve the `Objects` service with the same calls, fields, limits
   and reply rules as the server. A client MUST NOT need to know whether it
@@ -496,8 +510,30 @@ any tier:
 - A tier MAY keep objects forever. A tier never trusts upstream bytes: it
   MUST check each object from its upstream against its ID, as a client does
   (section 5), before it stores, forwards or sends it. An object that fails
-  the check MUST NOT be stored or sent, and the call fails.
+  the check MUST NOT be stored or sent. It ends the reply with `DATA_LOSS`,
+  after the objects before it.
+- An error status of an upstream call is about every object in that call.
+  If it comes for the first object of a reply, the tier MUST fail its own
+  call with that status. If it comes later, the tier ends its reply with
+  `OK` there, and the client's next call gets the status. So a missing repo
+  costs one upstream call per tier, not one per object.
+- An error in an upstream stream is about the next object. A tier MAY treat
+  one with a code other than `NOT_FOUND` or `DATA_LOSS` as a failure of the
+  whole call, because a broken connection also ends a stream with an error.
+  `scion-tier` does.
+- A tier SHOULD wait longer for its upstream than that upstream may wait for
+  its own, so it does not give up on a slow but healthy path. `scion-cache`
+  waits at most 60 s for each step of the server (an answer, or the next
+  object), and `scion-daemon` 200 s for each step of the cache. On a
+  timeout, the tier fails with `UNAVAILABLE`.
 - The `Scion` service goes only to the server.
+
+**The daemon's socket.** `scion-daemon` listens on a Unix socket with mode
+0600, in a directory that only its user can reach. A client sends its token
+to the socket, so it SHOULD check first that the socket file is a socket
+(not a symlink) owned by its own user or by root. `scn` does, for every
+`unix://` address. Neither `scn` nor the daemon checks the directories above
+the socket yet ([#70](https://github.com/bnsd55/open-scion/issues/70)).
 
 Tiers are trusted in v0.1. A client cannot check a `ResolveRef` or
 `GetRootTree` answer by hash, so it trusts every tier on its path for them.

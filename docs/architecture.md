@@ -517,14 +517,20 @@ starting at the root tree, and never says what it already has.
   live in `scion-proto/src/reply.rs`, so the tiers follow the same rules. It keeps the share until the
   reply takes it from the channel. With the budget spent, a reply waits
   holding no object bytes. A reply whose client takes no object for 120 s
-  ends and frees its share. A blob read back larger than its header said is
+  ends and frees its share. The server finds the first object before the
+  call answers. If the budget has no room for it within 120 s, the call
+  fails with `RESOURCE_EXHAUSTED`, so a reply never ends `OK` with no
+  object. A later object that finds no room ends the reply `OK`, and the
+  client asks again. A blob read back larger than its header said is
   corrupt and is never sent. Not counted: one encoded object per reply inside
   HTTP/2, which stays until the connection closes
   ([#42](https://github.com/bnsd55/open-scion/issues/42)).
-- A reply stops early once it has sent 64 MiB, always after at least one
-  object. The client asks again for the rest, so one call stays short and a
-  transfer can resume. A reply message fits one object of up to 100 MiB.
-- A missing object fails the call with `NOT_FOUND`. Trees and blobs are
+- A reply sends the next object only while it has sent less than 64 MiB.
+  So it holds at least one object, and at most 64 MiB plus one object of up
+  to 100 MiB (a reply message fits one such object). The client asks again
+  for the rest, so one call stays short and a transfer can resume.
+- A missing repo fails the call with `NOT_FOUND`. A missing object ends the
+  reply with `NOT_FOUND`, after the objects before it. Trees and blobs are
   global: any repo name that exists can read any object by ID
   ([#13](https://github.com/bnsd55/open-scion/issues/13)).
 
@@ -596,10 +602,12 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
 - **The server's limits.** A tier refuses what the server refuses (1 to
   1,000 objects per call, the repo name rules; the checks are shared code
   in `scion-proto/src/check.rs`). Its replies run the same loop
-  (`reply.rs`): a reply stops after 64 MiB, always after one object. Each
-  object takes its share of a 400 MiB budget before its bytes are read or
-  copied. A reply ends when its client takes no object for 120 s, or when
-  the budget has no room for that long.
+  (`reply.rs`): a reply holds at least one object, and sends the next only
+  while it has sent less than 64 MiB. Each object takes its share of a
+  400 MiB budget before its bytes are read or copied. A reply ends when its
+  client takes no object for 120 s, or when the budget has no room for that
+  long. If that happens at the first object, the call fails with
+  `RESOURCE_EXHAUSTED`.
 - **Fetches.** On a miss, the tier starts one fetch for that object and the
   later objects of the call that its store lacks, at most 128 in all (a
   reply sends at most 64 MiB, so more would only fill the store). A later
@@ -707,7 +715,7 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/land.rs` (`MAX_DEPTH`) | A land on a base more than `MAX_DEPTH` generations below the tip walks the history from the index floor back to the base, each time, and holds the database lock while it walks. | Per-path history in the database, so the check reads only the paths that the land changes. | [#38](https://github.com/bnsd55/open-scion/issues/38) |
 | `scion-server/src/objects.rs` (`read_object`) | An object ID is treated as permission to read it; trees and blobs are shared by all repos. Safe with one principal. | A read ticket bound to a principal, a repo and a root tree, checked by the server and every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-proto/src/reply.rs` (`STALL_TIMEOUT`) | A stalled `GetObjects` reply ends, but HTTP/2 keeps the one encoded object it was sending until the connection closes. | A response body timeout that resets the stream. | [#42](https://github.com/bnsd55/open-scion/issues/42) |
-| `scion-server/src/objects.rs` (`send_objects`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
+| `scion-server/src/objects.rs` (`find`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
 | `scion-server/src/read.rs` (`MAX_SCAN`) | Path history and blame walk first parents on every call, at most 1,000 changesets per call. A path changed long ago costs many calls. | Path history as derived data. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_VERSIONS`) | One call diffs at most 100 versions of a file. A file with more versions costs more calls. | Blame as derived data, kept per file version. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_DIFF_LINES`) | One call diffs about 1M lines. A diff of many repeated lines grows faster than its lines, so one diff of two 1 MiB files is the worst case of a call. | Blame from derived data, so a call does not diff whole versions. | [#62](https://github.com/bnsd55/open-scion/issues/62) |

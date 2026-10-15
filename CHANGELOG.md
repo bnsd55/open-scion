@@ -39,6 +39,10 @@ release.
   tier answers the `Objects` calls, checks every object from upstream
   against its ID before it stores or sends it, forwards `ResolveRef`, keeps
   `GetRootTree` answers, fetches a shared miss once, and needs a token.
-- `scn` reaches a daemon with `--server unix:///PATH`.
+- `scn` reaches a daemon with `--server unix:///PATH`. It first refuses a
+  path that is not a socket owned by its user or by root.
+- A `GetObjects` reply never ends `OK` with no object. If the server or a
+  tier has no memory for the first object within 120 s, the call fails
+  with `RESOURCE_EXHAUSTED`.
 - `docs/protocol-v1.md`: the contract of the `Scion` and `Objects` services,
   for independent clients, tiers and servers.

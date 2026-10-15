@@ -55,12 +55,15 @@ service Objects {
   rpc ResolveRef(ResolveRefRequest) returns (ResolveRefResponse);
   // The root tree of a changeset.
   rpc GetRootTree(GetRootTreeRequest) returns (GetRootTreeResponse);
-  // Streams the requested objects in request order, one per message. Stops
-  // early once the reply is large, after at least one object; the client asks
-  // again for the rest. An error status of the call itself is about the whole
-  // call: for example NOT_FOUND for a repo that does not exist. An error in
-  // the stream, after the call started, is about the next object (NOT_FOUND
-  // if it does not exist), and ends the reply.
+  // Streams the requested objects in request order, one per message. A reply
+  // sends the next object only while it has sent less than 64 MiB of object
+  // data. So it holds at least one object, and at most 64 MiB plus one object
+  // of up to 100 MiB. The client asks again for the rest. An error status of
+  // the call itself is about the whole call: for example NOT_FOUND for a
+  // repo that does not exist, or RESOURCE_EXHAUSTED when the server has no
+  // memory for the first object (ask again later). An error in the stream,
+  // after the call started, is about the next object (NOT_FOUND if it does
+  // not exist), and ends the reply.
   rpc GetObjects(GetObjectsRequest) returns (stream Object);
 }
 
@@ -113,7 +116,9 @@ message LandResponse {
   bytes result_changeset_id = 3;
   // Why the land is CONFLICT or REJECTED.
   string detail = 4;
-  // Paths that conflict. Set when CONFLICT.
+  // Paths that conflict with a change on the ref after the base. Empty for a
+  // CONFLICT whose changes do not apply to the head's tree (detail says why),
+  // and for every other state.
   repeated bytes conflict_paths = 5;
 }
 
