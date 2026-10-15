@@ -398,7 +398,7 @@ impl BlobBatch<'_> {
             // SHORTCUT: so keeping a stored blob costs a full flush, shared
             // with concurrent batches. Upgrade: track the blobs written but
             // not yet synced, and flush every blob directory and the drive at
-            // open; a stored blob outside that set is then durable.
+            // open; a stored blob outside that set is then durable (#35).
             self.dirs.insert(self.blobs.location(id).0);
         }
         Ok(status)
