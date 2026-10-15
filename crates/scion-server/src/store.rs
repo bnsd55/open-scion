@@ -1826,4 +1826,15 @@ mod tests {
         // Its transaction ended, so the connection reads again.
         assert_eq!(store.read(repos).unwrap(), 0);
     }
+
+    #[test]
+    fn the_last_store_to_close_moves_the_log_into_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.write(add_repo("a")).unwrap();
+        assert_eq!(store.read(repos).unwrap(), 1);
+        drop(store);
+        // So a copy of `scion.db` alone holds every commit.
+        assert!(!dir.path().join("scion.db-wal").exists());
+    }
 }
