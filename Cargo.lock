@@ -2549,6 +2549,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "zstd",
 ]
 
 [[package]]
