@@ -1,0 +1,551 @@
+# Scion protocol v1
+
+This file is the contract of the two gRPC services in
+[`proto/scion.proto`](../proto/scion.proto): `scion.v1.Scion` and
+`scion.v1.Objects`. It is written so that someone can build an independent
+client, cache tier or server from it. It describes the code on `main`. The
+bytes of changesets and trees, and how IDs are computed, are in
+[`format-v1.md`](format-v1.md). [`architecture.md`](architecture.md) explains
+how the server implements this contract.
+
+The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are to be interpreted
+as described in BCP 14 ([RFC 2119](https://www.rfc-editor.org/rfc/rfc2119),
+[RFC 8174](https://www.rfc-editor.org/rfc/rfc8174)) when, and only when, they
+appear in capitals. Other sentences describe what the server on `main` does.
+
+Where a rule comes from Anthropic's article
+[Redesigning source control](https://www.anthropic.com/engineering/redesigning-source-control),
+this file says so. Every other rule is this project's choice.
+
+## 1. Services
+
+| Service | Calls | Who answers |
+|---|---|---|
+| `Scion` | Writes (`PutBlob`, `CreateChangeset`, `Land`, `GetLand`) and path reads (`ResolveRef`, `GetChangeset`, `ReadFile`, `ListDir`, `Log`, `Blame`) | The server only |
+| `Objects` | `ResolveRef`, `GetRootTree`, `GetObjects` | The server, or any cache tier (section 8) |
+
+Both services are on one address. Every read except `ResolveRef` and
+`GetLand` names an immutable object by ID, never a ref, so its answer never
+changes. A client resolves a ref first. `Scion.ResolveRef` is deprecated: a
+client SHOULD use `Objects.ResolveRef`, which a tier forwards. A v1 server
+MUST keep both.
+
+## 2. Transport and authentication
+
+**Transport.** gRPC over HTTP/2 without TLS. The server listens on
+`127.0.0.1:7878` by default. It refuses a non-loopback address unless it is
+started with `--insecure-listen`. The token and all data travel unencrypted,
+so a client SHOULD reach a server only over loopback or a trusted network.
+TLS is not in v1 ([#14](https://github.com/bnsd55/open-scion/issues/14)).
+
+**No message compression.** The server enables no gRPC message compression.
+A request with a `grpc-encoding` other than `identity` fails with
+`UNIMPLEMENTED`, so a client MUST NOT compress requests.
+
+**Authentication.** Every call on both services MUST carry the metadata
+`authorization: Bearer <token>`: the exact prefix `Bearer `, then the token.
+A missing or wrong token fails the call with `UNAUTHENTICATED` before the
+request is read. A server has one token and one principal. Land request keys
+and land IDs are scoped by (repo, principal), so in v1 every client of a repo
+shares one scope.
+
+**Timeouts.** The server ends a call with `CANCELLED` when its reply has not
+started after 600 s, or earlier if the client's `grpc-timeout` is shorter.
+For `PutBlob` this covers the whole upload. For a streamed reply (`ReadFile`,
+`GetObjects`) it covers only the start. A call that ends this way may still
+finish its work on the server (section 6.3).
+
+**Queues.** The server queues work instead of failing it. At most 256 jobs run
+at once across both services, at most 16 `PutBlob` uploads are read at once,
+and at most 4 `Blame` calls run at once. Time in a queue counts toward the
+timeout.
+
+## 3. Common rules
+
+**Names.** `repo`, `ResolveRefRequest.name`, `LandRequest.target_ref` and
+`LandRequest.request_key` are strings of 1 to 256 bytes with no control
+character (Unicode category Cc: U+0000 to U+001F and U+007F to U+009F).
+Another value is `INVALID_ARGUMENT`. A repo that does not exist is
+`NOT_FOUND`. No v1 call creates a repo or a ref.
+
+**IDs.** Every ID field is 32 raw bytes: a `ChangesetId`, a `TreeId` or a
+`BlobId` ([`format-v1.md`](format-v1.md)). An ID of another length in a
+request is `INVALID_ARGUMENT`. In a reply, an empty ID field means "none".
+
+**Paths.** A path is raw bytes and follows the path rules of
+[`format-v1.md`](format-v1.md). A path that breaks them is
+`INVALID_ARGUMENT`. Where a path is optional (`ListDirRequest.path`,
+`LogRequest.path`), empty means "none".
+
+**Visibility.** A repo sees only its own changesets. A changeset that the
+repo does not have is `NOT_FOUND`, the same as one that does not exist. Trees
+and blobs are not scoped to a repo in v1 (section 5).
+
+**Message size limits.**
+
+| Message | Largest |
+|---|---|
+| Any request message, both services | 64 MiB |
+| Any `Scion` reply message | 64 MiB |
+| One `Objects` reply message | 100 MiB + 1 KiB: one object of up to 100 MiB, plus its kind and ID |
+
+A message over its limit fails the call with `OUT_OF_RANGE`, on whichever
+side finds it. A client MUST accept received messages up to these sizes.
+Many gRPC libraries accept only 4 MiB by default. An object (a blob's
+content or a tree's `TreeV1` bytes) is at most 100 MiB. Streamed file content
+moves in chunks of 1 MiB.
+
+**Status codes.** The status message is for people and is not part of the
+contract. A client MUST NOT depend on its text.
+
+| Code | When | Retry |
+|---|---|---|
+| `INVALID_ARGUMENT` | The request is malformed, or the state does not accept it. Each call lists its cases. | After the cause is fixed |
+| `NOT_FOUND` | A repo, ref, changeset, path, object or land does not exist, or the caller may not see it. | After the cause is fixed |
+| `UNAUTHENTICATED` | The token is missing or wrong. | After the cause is fixed |
+| `ABORTED` | `Land` only: other writers kept moving the ref. The land stays `PENDING`. | Yes, with the same request key |
+| `OUT_OF_RANGE` | A message is larger than its limit. | After the cause is fixed |
+| `CANCELLED` | The server's 600 s limit or the client's `grpc-timeout` ran out. A client library can report its own deadline as `DEADLINE_EXCEEDED`. | Yes. A `Land` retry uses the same request key. |
+| `UNAVAILABLE` | The server cannot be reached or is shutting down. | Yes |
+| `INTERNAL` | A database, I/O or stored-data error, or a server bug. The message is `internal error`; the detail stays in the server log. | MAY |
+| `UNIMPLEMENTED` | The server does not have the call, or the request is compressed. | After the cause is fixed |
+
+A land that conflicts or is rejected is not an error. It is a state in a
+successful `Land` reply (section 6.3).
+
+## 4. Durability
+
+A successful reply never shows state that a power loss can undo:
+
+- `PutBlob` replies after the blob is on disk.
+- `CreateChangeset` replies after the changeset, its trees and every blob it
+  names are on disk.
+- `Land` replies after every transaction of the land is on disk, whatever
+  the state of the land.
+- A read that saw a commit replies only after that commit is on disk. This is
+  true for an error reply too, for example `NOT_FOUND` after a read.
+
+One exception: derived data that a read computes MAY be returned before it is
+on disk, because the server computes the same value again. Today this is a
+root tree that the server derives during a read because no stored value
+exists. After a power loss, `GetObjects` can then return `NOT_FOUND` for that
+tree until a `GetRootTree` of its changeset derives it again.
+
+A call that fails or is cut off MAY have done part of its work. In particular
+a `Land` that returned `ABORTED` or `CANCELLED`, or whose reply was lost, can
+be pending or finished on the server. The client finds out with a retry under
+the same request key (section 6.3).
+
+## 5. Object IDs and verification
+
+The article says all source control data is content-addressed, so any cache
+can answer a request for an object. A client checks what it can by hash.
+
+**A client MUST check:**
+
+- every object from `GetObjects`. A tree's `data` MUST decode as strict
+  `TreeV1` and hash to the requested tree ID. A blob's `data` MUST hash to the
+  requested blob ID.
+- that each `Object`'s `kind` and `id` match a ref that the client asked for.
+  An object that the client did not ask for is an error.
+
+**A client SHOULD check:**
+
+- that `GetChangesetResponse.changeset` hashes to the requested changeset ID,
+  and that each `LogEntry.changeset` hashes to its `changeset_id`.
+- that the IDs from `PutBlob` and `CreateChangeset` equal the IDs it computes
+  itself from the bytes it sent.
+
+**A client trusts, because it cannot check them by hash:**
+
+- `ResolveRef`: which changeset a ref points at.
+- `GetRootTree`: which tree belongs to a changeset. This mapping is private
+  derived data ([`format-v1.md`](format-v1.md)).
+- the computed answers of the `Scion` service: the content from `ReadFile`
+  and the tree from `ListDir` (unless the client knows their IDs from
+  elsewhere), which changesets `Log` selects, `Blame`, and `Land` outcomes.
+
+In v0.1 a client also trusts every tier on its path for the `ResolveRef` and
+`GetRootTree` answers that the tier passes on (section 8).
+
+**An object ID is not a permission.** In v1 the server sends any stored tree
+or blob to any caller with the token that names an existing repo, and a
+changeset can name a blob that another repo uploaded. Read tickets and
+per-repo blobs are not in v1
+([#13](https://github.com/bnsd55/open-scion/issues/13)).
+
+## 6. The `Scion` service
+
+### 6.1 PutBlob
+
+`rpc PutBlob(stream PutBlobRequest) returns (PutBlobResponse)`. Stores one
+file's content.
+
+- The first message MUST name the repo. Every later message MUST leave `repo`
+  empty.
+- Each message's `data` is the next bytes of the file, in order. A message
+  can hold any size within the message limit. A client SHOULD send chunks of
+  1 MiB. An empty file is one message with empty `data`.
+- The server checks the repo when the first message arrives, before it reads
+  the rest.
+- The reply's `blob_id` is the `BlobId` of all the bytes together
+  ([`format-v1.md`](format-v1.md)).
+- Safe to repeat. The same bytes always give the same ID. Blobs are not
+  scoped to a repo in v1.
+
+| Error | When |
+|---|---|
+| `INVALID_ARGUMENT` | No message; a bad repo name; a later message names a repo; more than 100 MiB in total. |
+| `NOT_FOUND` | The repo does not exist. |
+
+### 6.2 CreateChangeset
+
+`rpc CreateChangeset(CreateChangesetRequest) returns (CreateChangesetResponse)`.
+Stores a changeset. Moves no ref.
+
+The request's `changeset` is `ChangesetV1` bytes. The server accepts it only
+if all of these hold:
+
+- it decodes strictly, with at most 100,000 changes;
+- it has exactly one parent, and the repo has that parent;
+- it has no committer (only git import sets one);
+- its message is at most 1 MiB, and the author's name and email are at most
+  1 KiB each;
+- every regular-file or symlink put names a blob that the server has stored
+  intact (upload it first with `PutBlob`);
+- its changes apply to the parent's tree. For example, a delete of a missing
+  path or of a directory does not apply.
+
+The reply's `changeset_id` is the `ChangesetId` of the bytes. Safe to repeat:
+the same bytes give the same ID and no second copy.
+
+| Error | When |
+|---|---|
+| `INVALID_ARGUMENT` | Any rule above fails, including a parent that the repo does not have. For a missing or damaged blob, the message names the first such path in path order. |
+| `NOT_FOUND` | The repo does not exist. |
+
+### 6.3 Land
+
+`rpc Land(LandRequest) returns (LandResponse)`. Rebases a changeset onto a
+ref and moves the ref.
+
+**Request.** `repo`; `changeset_id`, a changeset that the repo has;
+`target_ref`; and `request_key`, chosen by the client.
+
+**What the server does.** The changeset's first parent is its *base*. The
+server checks, in order:
+
+1. The ref exists. If not, the land is `REJECTED` at once.
+2. The changeset has exactly one parent. If not (an imported root or merge),
+   `REJECTED`.
+3. The base is on the ref's first-parent history. If not, `REJECTED`.
+4. Each path P that the changeset changes is checked. P conflicts when a
+   changeset on the ref after the base changed P itself, a path below P, or a
+   file at a directory above P. If any path conflicts, the land is
+   `CONFLICT`, and `conflict_paths` lists the changeset's paths that conflict.
+   Conflicts are path-level only. The server does not merge text.
+5. The server makes the rebased changeset: the same changeset with its parent
+   replaced by the ref's head. Author, message and changes stay the same. If
+   the base is the head, the result is the input changeset itself. If the
+   changes do not apply to the head's tree, the land is `CONFLICT` with no
+   `conflict_paths`, and `detail` says why.
+6. The server stores the rebased changeset and moves the ref by
+   compare-and-swap, in one transaction. The land is `LANDED`.
+
+Lands to one ref run one at a time. If the ref moves between step 4 and the
+swap (in v1 only git import does this), the server checks again from the new
+head, up to 3 times in all. Then the call fails with `ABORTED`, and the land
+stays `PENDING`.
+
+**Reply.**
+
+| Field | Meaning |
+|---|---|
+| `land_id` | A decimal integer, as a string. The server never gives the same ID to two lands. |
+| `state` | `LANDED`, `CONFLICT` or `REJECTED`. A `Land` reply never has `PENDING`; only `GetLand` returns it. |
+| `result_changeset_id` | When `LANDED`: the rebased changeset, which was the tip of the ref when the land finished. Empty otherwise. |
+| `detail` | Why the land is `CONFLICT` or `REJECTED`, for people. Empty when `LANDED`. |
+| `conflict_paths` | When `CONFLICT` from step 4: the paths that conflict. Empty otherwise. |
+
+| State | Meaning | Final |
+|---|---|---|
+| `PENDING` | Recorded, not finished. | No |
+| `LANDED` | The ref moved to `result_changeset_id`. | Yes |
+| `CONFLICT` | A change on the ref after the base touched the same paths, or the changes do not apply to the head's tree. The client re-reads those paths on the ref, makes a new changeset on the new head, and lands that. | Yes |
+| `REJECTED` | The land cannot succeed as asked. | Yes |
+
+**Request keys and retries.**
+
+- A request key names one land within (repo, principal). The first call with
+  a key records a land. A later call with the same key, the same
+  `changeset_id` and the same `target_ref` returns that land. If the land
+  finished, the reply is the stored outcome, field for field. If it is
+  pending, this call finishes it. Calls with the same key at the same time
+  wait for each other and return the same land.
+- A key MUST NOT be reused for a different changeset or ref. That is
+  `INVALID_ARGUMENT`.
+- A finished outcome is final for its key. A retry returns it even if the ref
+  has changed since. To try again, a client uses a new key.
+- A client that retries after `ABORTED`, `CANCELLED`, `UNAVAILABLE` or a
+  lost reply MUST use the same key, so that it never lands the same change
+  twice. `scn land` uses `<changeset ID>:<ref>` as its default key.
+- The server keeps a finished land for at least 7 days after it finished. A
+  pending land is kept until it finishes. Within that time a retry with the
+  same key is safe.
+- After that, the server MAY delete the land. A retry with the same key is
+  then a new land with a new `land_id`, checked like any other, and `GetLand`
+  with the old ID returns `NOT_FOUND`. A changeset that landed already is then
+  normally `CONFLICT`, because its own landed copy changed its paths after its
+  base. A changeset with no changes lands again.
+
+| Error | When |
+|---|---|
+| `INVALID_ARGUMENT` | A bad name or ID; a request key already used for a different changeset or ref. |
+| `NOT_FOUND` | The repo does not exist, or the repo does not have the changeset. |
+| `ABORTED` | The ref kept moving. The land stays `PENDING`. Retry with the same key. |
+
+### 6.4 GetLand
+
+`rpc GetLand(GetLandRequest) returns (LandResponse)`. Returns the stored state
+of a land, in the same form as `Land`, and can return `PENDING`. It only
+reads: it does not finish a pending land. A `Land` retry with the same key
+does.
+
+| Error | When |
+|---|---|
+| `INVALID_ARGUMENT` | A bad repo name, or `land_id` is not a decimal integer. |
+| `NOT_FOUND` | The repo does not exist; the repo has no such land; it was deleted after its retention period; another principal started it. |
+
+### 6.5 ResolveRef (deprecated)
+
+The same call as `Objects.ResolveRef` (section 7.1), with one shared
+implementation.
+
+### 6.6 GetChangeset
+
+`rpc GetChangeset(GetChangesetRequest) returns (GetChangesetResponse)`.
+Returns the `ChangesetV1` bytes of a changeset that the repo has.
+`NOT_FOUND` if the repo or the changeset does not exist for that repo.
+
+### 6.7 ReadFile
+
+`rpc ReadFile(ReadFileRequest) returns (stream ReadFileResponse)`. Streams the
+content of a regular file, or the target of a symlink, at `path` in
+`changeset_id`.
+
+- Messages come in file order. Each holds at most 1 MiB. Together they are
+  the whole content.
+- An empty file is a reply with no message.
+- Every error comes before the first message.
+
+| Error | When |
+|---|---|
+| `INVALID_ARGUMENT` | A bad or empty path; the path is a directory or a submodule. |
+| `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
+
+### 6.8 ListDir
+
+`rpc ListDir(ListDirRequest) returns (ListDirResponse)`. Returns one directory
+level as `TreeV1` bytes. An empty path is the repo root.
+
+| Error | When |
+|---|---|
+| `INVALID_ARGUMENT` | A bad path; the path is a file. |
+| `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
+
+### 6.9 Log
+
+`rpc Log(LogRequest) returns (LogResponse)`. Walks first parents from
+`changeset_id`, newest first, starting with `changeset_id` itself.
+
+- With a `path`, the reply holds only the changesets whose changes include
+  the path or a path below it. The test uses each changeset's own list of
+  changes against its first parent, so a changeset on a merged branch never
+  appears, and a merge appears when its first-parent diff touches the path.
+- `limit` is the most entries the client wants. 0 means 1. A reply holds at
+  most `limit` entries and at most 1,000.
+- A call checks at most 1,000 changesets. A reply stops before an entry that
+  would take its changeset bytes over 32 MiB, but always holds the first
+  entry it found.
+- `next_changeset_id` is the first changeset that this reply does not cover,
+  or empty when the history ends. To continue, a client calls `Log` again
+  with `changeset_id` set to it and the same `path`. A reply can have no
+  entries and still set `next_changeset_id`, so a client MUST continue until
+  it has enough entries or `next_changeset_id` is empty.
+
+| Error | When |
+|---|---|
+| `INVALID_ARGUMENT` | A bad path. |
+| `NOT_FOUND` | The repo or changeset does not exist. |
+
+### 6.10 Blame
+
+`rpc Blame(BlameRequest) returns (BlameResponse)`. For each line of a file,
+the changeset that last changed it on first-parent history.
+
+**Lines.** A line ends after a `\n` byte, or at the end of the file. An empty
+file has no lines and gets no ranges.
+
+**Reply.**
+
+- `ranges` are in file order and cover every line exactly once.
+  `start_line` counts from 1 in the requested file. `changeset_id` is the
+  changeset that last changed those lines, and `origin_line` is the first of
+  them, counting from 1, in the file at that changeset.
+- `changesets` holds the author of each changeset that a range names, once
+  each.
+- `next_changeset_id` is set when the call stopped at a bound before every
+  line had a changeset. The ranges with an empty `changeset_id` came from that
+  changeset or an older one, and their `origin_line` is their line in the file
+  at `next_changeset_id`. To continue, a client blames the same path at
+  `next_changeset_id` and maps those lines through `origin_line`.
+
+**Bounds per call.** At most 1,000 changesets checked, 100 versions diffed,
+and about 1M lines diffed (both sides of each diff). The first diff of a call
+always runs, so every call makes progress.
+
+**Rules.** The server walks first parents to each changeset that changed the
+file, and diffs that version with the version in its first parent. The lines
+that the changeset added go to it. The other lines are traced further back.
+The diff is Myers with an indent heuristic. Where several minimal
+diffs exist, which one the server picks is not part of v1. Renames are not
+followed. An older version that is absent, not a regular file, larger than
+1 MiB or holds a NUL byte counts as absent: the changeset that replaced it
+gets its lines.
+
+| Error | When |
+|---|---|
+| `INVALID_ARGUMENT` | A bad or empty path; the file is not a regular file, is larger than 1 MiB, or holds a NUL byte. |
+| `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
+
+## 7. The `Objects` service
+
+The article says the client never tells the server what it already has: it
+asks only for the trees and blobs it wants. A client resolves a ref, gets the
+root tree, then asks for trees and blobs by ID, and checks each against its
+ID (section 5).
+
+### 7.1 ResolveRef
+
+`rpc ResolveRef(ResolveRefRequest) returns (ResolveRefResponse)`. The
+changeset that a ref points at now. The only mutable answer in the protocol.
+`NOT_FOUND` if the repo or the ref does not exist.
+
+### 7.2 GetRootTree
+
+`rpc GetRootTree(GetRootTreeRequest) returns (GetRootTreeResponse)`. The ID of
+the root tree of a changeset that the repo has. `NOT_FOUND` if the repo or the
+changeset does not exist for that repo. The answer never changes.
+
+### 7.3 GetObjects
+
+`rpc GetObjects(GetObjectsRequest) returns (stream Object)`. Streams the
+trees and blobs named by `refs`.
+
+**Request.** `refs` names 1 to 1,000 objects, each a `kind` (`TREE` or
+`BLOB`) and a 32-byte `id`. A ref can repeat. The server checks the whole
+request before it sends any object.
+
+**Reply.**
+
+- Objects come in request order, one per message. So a reply is always a
+  prefix of `refs`.
+- Each `Object` repeats the `kind` and `id` of its ref.
+- The reply stops before the next object once it has sent at least 64 MiB of
+  object data. A reply that stops this way holds at least one object, and at
+  most 64 MiB plus one object.
+- The reply also stops when the next object does not reach the client
+  within 120 s (the stall limit): because the client takes no object, or
+  because the server waits that long for memory. All replies share a budget of
+  400 MiB of object data. A reply that stops this way can hold no object.
+- A reply that stops early ends with status `OK`. The client MUST ask again
+  for the objects it did not get. After a reply with no object, the client
+  SHOULD wait before it asks again.
+- A missing object ends the reply with `NOT_FOUND`, after the objects before
+  it. A damaged stored object ends it with `INTERNAL`. The client MAY keep
+  the objects it got before the error.
+
+**Object data.**
+
+> Changes with [#53](https://github.com/bnsd55/open-scion/issues/53).
+
+- A tree's `data` is its `TreeV1` bytes.
+- A blob's `data` is the file's raw content, uncompressed, at most 100 MiB.
+
+| Error | When |
+|---|---|
+| `INVALID_ARGUMENT` | A bad repo name; no ref or more than 1,000; a kind that is not `TREE` or `BLOB`; an ID that is not 32 bytes. |
+| `NOT_FOUND` | The repo does not exist; a named object does not exist (after the objects before it). |
+
+## 8. Cache tiers
+
+The article says each node runs a `scion-daemon` that talks only to a
+regional `scion-cache`, which asks the servers on a miss, and that all three
+answer identical calls. The tiers themselves are in review
+([#64](https://github.com/bnsd55/open-scion/pull/64)). These rules hold for
+any tier:
+
+- A tier MUST serve the `Objects` service with the same calls, fields, limits
+  and reply rules as the server. A client MUST NOT need to know whether it
+  talks to a tier or to the server.
+- A tier MUST require a bearer token on every call, as the server does.
+- A tier MUST forward every `ResolveRef` call to its upstream, and MUST NOT
+  keep the answer.
+- A tier MAY keep a `GetRootTree` answer forever, keyed by (repo,
+  changeset), but only as its upstream gave it. It MUST NOT compute one.
+- A tier MAY keep objects forever. A tier never trusts upstream bytes: it
+  MUST check each object from its upstream against its ID, as a client does
+  (section 5), before it stores, forwards or sends it. An object that fails
+  the check MUST NOT be stored or sent, and the call fails.
+- The `Scion` service goes only to the server.
+
+Tiers are trusted in v0.1. A client cannot check a `ResolveRef` or
+`GetRootTree` answer by hash, so it trusts every tier on its path for them.
+Access tickets that a tier checks are not in v1
+([#13](https://github.com/bnsd55/open-scion/issues/13)).
+
+## 9. Compatibility
+
+Version 1 is the `scion.v1` package together with object format v1. A server,
+tier or client MUST ignore fields that it does not know, as proto3 does.
+
+Because unknown fields are ignored, an older server drops a new request field
+without an error. For example, a server from before `LogRequest.path` ignores
+the path and returns the history unfiltered. So a new request field is safe
+only if an answer that ignores it is still correct for the client.
+
+| Change | Needs a new version |
+|---|---|
+| A new call. An older server replies `UNIMPLEMENTED`. | No |
+| A new reply field that an older client can ignore | No |
+| A new request field whose empty value means today's behavior, and that an older server can safely ignore | No |
+| A higher limit on requests that the server accepts | No |
+| Deprecating a call that keeps working | No |
+| A field's number, type or meaning, or the meaning of its empty value | Yes |
+| Removing or renaming a call, service, field or enum value | Yes |
+| A new enum value in a reply, such as a new `LandState` | Yes |
+| Object bytes or ID rules ([`format-v1.md`](format-v1.md)) | Yes, a new format version |
+| A lower request limit, or a larger reply message than a client must accept today | Yes |
+| What a client must check or may trust (section 5), or what a status code means | Yes |
+| Request-key rules, or a land retention shorter than 7 days | Yes |
+
+A new version is a new package, `scion.v2`. A server MAY serve both.
+
+## 10. Not in v1
+
+- TLS ([#14](https://github.com/bnsd55/open-scion/issues/14)).
+- More than one principal, per-path write rules, read tickets and per-repo
+  blobs ([#13](https://github.com/bnsd55/open-scion/issues/13)).
+- Per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)).
+- Calls that create a repo or a ref, delete a ref, move a ref other than by
+  `Land`, or list repos or refs. `scion-server import` creates repos and refs.
+- Client changesets with no parent, several parents or a committer. Only git
+  import makes them.
+- Text merge. Conflicts are path-level.
+- Merge base, ancestry and diff queries
+  ([#58](https://github.com/bnsd55/open-scion/issues/58)).
+- `Log` and `Blame` without per-call bounds
+  ([#61](https://github.com/bnsd55/open-scion/issues/61)), and `Blame` that
+  follows renames ([#69](https://github.com/bnsd55/open-scion/issues/69)).
+- Blobs sent in their stored, compressed form
+  ([#53](https://github.com/bnsd55/open-scion/issues/53)).

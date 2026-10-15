@@ -40,3 +40,5 @@ release.
   against its ID before it stores or sends it, forwards `ResolveRef`, keeps
   `GetRootTree` answers, fetches a shared miss once, and needs a token.
 - `scn` reaches a daemon with `--server unix:///PATH`.
+- `docs/protocol-v1.md`: the contract of the `Scion` and `Objects` services,
+  for independent clients, tiers and servers.
