@@ -231,35 +231,74 @@ fn chain(store: &Store, changes: Vec<BTreeMap<RepoPath, Option<FileState>>>) -> 
 }
 
 #[test]
-fn graph_walks_stop_at_max_walk() {
+fn a_history_with_no_merges_has_no_walk_bound() {
     let (_data, store) = open_store();
     let ids = chain(&store, vec![BTreeMap::new(); MAX_WALK + 2]);
     let tip = ids[MAX_WALK + 1];
 
-    // From the tip down to ids[1] is MAX_WALK changesets to read.
-    assert!(read::is_ancestor(&store, REPO, ids[1], tip).unwrap());
-    let deeper = read::is_ancestor(&store, REPO, ids[0], tip);
-    assert!(
-        matches!(deeper, Err(Error::ResourceExhausted(_))),
-        "{deeper:?}"
-    );
-    // The merge base walk also takes the base itself from the queue.
+    // The old walks read MAX_WALK changesets from the tip down to ids[1].
+    // The commit graph reads a few nodes, at any depth.
+    assert!(read::is_ancestor(&store, REPO, ids[0], tip).unwrap());
     assert_eq!(
-        read::merge_base(&store, REPO, ids[2], tip).unwrap(),
-        [ids[2]]
+        read::merge_base(&store, REPO, ids[0], tip).unwrap(),
+        [ids[0]]
     );
-    let deeper = read::merge_base(&store, REPO, ids[1], tip);
-    assert!(
-        matches!(deeper, Err(Error::ResourceExhausted(_))),
-        "{deeper:?}"
-    );
-
-    // Generations prune both walks: a descendant is never below its
-    // ancestor's generation, and the walk stops at the first base.
     let below = ids[MAX_WALK];
     assert!(!read::is_ancestor(&store, REPO, tip, below).unwrap());
     assert_eq!(read::merge_base(&store, REPO, tip, below).unwrap(), [below]);
     assert_eq!(read::merge_base(&store, REPO, tip, tip).unwrap(), [tip]);
+}
+
+fn exhausted<T>(result: &Result<T, Error>) -> bool {
+    matches!(result, Err(Error::ResourceExhausted(_)))
+}
+
+#[test]
+fn graph_queries_across_many_merges_stop_at_max_walk() {
+    // A ladder: each changeset on main merges a side changeset that
+    // branched from main's previous changeset.
+    let merges = MAX_WALK / 2 + 1;
+    let (_data, store) = open_store();
+    let (main, sides) = store
+        .write(|c| {
+            let repo = db::create_repo(c, REPO)?;
+            let store = |parents: Vec<ChangesetId>, message: String| {
+                let cs = Changeset {
+                    parents,
+                    author: author(),
+                    committer: None,
+                    message: message.into_bytes(),
+                    changes: BTreeMap::new(),
+                };
+                Ok::<_, Error>(tree::store_changeset(c, repo, &cs)?.0)
+            };
+            let mut main = vec![store(vec![], "root".into())?];
+            let mut sides = Vec::new();
+            for i in 0..merges {
+                let last = *main.last().unwrap();
+                let side = store(vec![last], format!("side {i}"))?;
+                main.push(store(vec![last, side], format!("merge {i}"))?);
+                sides.push(side);
+            }
+            Ok((main, sides))
+        })
+        .unwrap();
+    let tip = *main.last().unwrap();
+
+    // IsAncestor reads three rows for each merge newer than the ancestor,
+    // and MergeBase walks every changeset down to the merge base.
+    assert!(exhausted(&read::is_ancestor(&store, REPO, sides[0], tip)));
+    assert!(exhausted(&read::merge_base(&store, REPO, sides[0], tip)));
+    assert!(exhausted(&read::merge_base(&store, REPO, main[0], tip)));
+    // Near the tip, both answer.
+    let newest = sides[merges - 1];
+    assert!(read::is_ancestor(&store, REPO, newest, tip).unwrap());
+    assert_eq!(
+        read::merge_base(&store, REPO, newest, tip).unwrap(),
+        [newest]
+    );
+    // An ancestor on the first-parent history needs no merge.
+    assert!(read::is_ancestor(&store, REPO, main[0], tip).unwrap());
 }
 
 /// Git's `--name-status` letter for an entry.
