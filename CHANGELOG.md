@@ -39,5 +39,7 @@ release.
   `DEADLINE_EXCEEDED`.
 - The path index of each ref stays within a budget of 128 MiB. When it is
   full, it starts over at the tip, and the lands still get the same answers.
+- A land walks at most 100,000 changesets below the path index. A base
+  further back is `REJECTED` as too old, and the client must rebase.
 - `docs/protocol-v1.md`: the contract of the `Scion` and `Objects` services,
   for independent clients, tiers and servers.

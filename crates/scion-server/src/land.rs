@@ -62,13 +62,24 @@ const PRUNE_EVERY: i64 = if cfg!(test) { 4 } else { 10_000 };
 /// growing the [`PathIndex`], so it never holds the floor down. One prune
 /// cycle, so bases keep at most about three cycles of history in the index.
 /// A client lands soon after it reads the head, so an older base is rare.
-/// Tests use a depth longer than the history in their pruned index.
-// SHORTCUT: each land on such a base walks the history from the floor back
-// to the base, and holds the database lock while it walks. Ceiling: a client
-// that lands on a base millions of generations old makes each of its lands
-// slow, and other requests wait. Upgrade: per-path history in the database,
-// so the check reads only the paths it changes.
+/// Each land on such a base walks the history from the floor back to the
+/// base, up to [`MAX_WALK`] changesets. Tests use a depth longer than the
+/// history in their pruned index.
 const MAX_DEPTH: i64 = if cfg!(test) { 16 } else { PRUNE_EVERY };
+
+/// Most changesets that one land walks below the floor of the
+/// [`PathIndex`]. A land whose base is further back is rejected, and the
+/// client must rebase it. Tests use a walk longer than their other walks.
+// SHORTCUT: each land on an old base walks the history again, and holds the
+// database lock while it walks, so a client that lands on such bases makes
+// other requests wait. Ceiling: a base more than this far back is rejected.
+// Upgrade (issue #38): per-path history in the database, so the check reads
+// only the paths that the land changes.
+const MAX_WALK: usize = if cfg!(test) { 1000 } else { 100_000 };
+
+// A base within `MAX_DEPTH` of the tip is never too old: the walk from the
+// floor to it takes at most `MAX_DEPTH` steps.
+const _: () = assert!(MAX_DEPTH.unsigned_abs() <= MAX_WALK as u64);
 
 /// Most bytes that one ref's [`PathIndex`] holds, counted by
 /// [`entry_bytes`]: about 1M entries of short paths. An advance or a land
@@ -445,10 +456,19 @@ fn plan(
         None => index.insert(PathIndex::new(c, repo, head.target)?),
     };
     index.advance_to(c, repo, head.target)?;
-    let Some(conflicts) = index.check(c, repo, base, &cs.changes)? else {
-        return Ok(Plan::Reject(format!(
-            "base {base} is not on the first-parent history of {target:?}"
-        )));
+    let conflicts = match index.check(c, repo, base, &cs.changes)? {
+        Checked::Paths(conflicts) => conflicts,
+        Checked::NotOnHistory => {
+            return Ok(Plan::Reject(format!(
+                "base {base} is not on the first-parent history of {target:?}"
+            )));
+        }
+        Checked::TooOld => {
+            return Ok(Plan::Reject(format!(
+                "base {base} is too old: it is not within {MAX_WALK} changesets of the \
+                 head of {target:?}; rebase onto a newer head and land again"
+            )));
+        }
     };
     if !conflicts.is_empty() {
         let detail = format!(
@@ -616,8 +636,8 @@ impl PathIndex {
         Ok(())
     }
 
-    /// The paths in `changes` that changed on the history after `base`, or
-    /// `None` if `base` is not on the history. Then prunes.
+    /// The paths in `changes` that changed on the history after `base`, if
+    /// `base` is on the history. Then prunes.
     ///
     /// A base below the floor is reached: the changesets from the floor back
     /// to it are added to the index, while they fit in [`MAX_INDEX_BYTES`].
@@ -630,7 +650,7 @@ impl PathIndex {
         repo: RepoId,
         base: ChangesetId,
         changes: &BTreeMap<RepoPath, Option<FileState>>,
-    ) -> Result<Option<Vec<RepoPath>>> {
+    ) -> Result<Checked> {
         let base_gen = db::generation(c, repo, base)?;
         let tip_gen = match self.chain.last_key_value() {
             Some((&generation, _)) => generation,
@@ -647,8 +667,10 @@ impl PathIndex {
             if walk == Walk::Stopped {
                 walk = touched_below(c, repo, self.floor, base, base_gen, changes, &mut below)?;
             }
-            if walk != Walk::Reached {
-                return Ok(None);
+            match walk {
+                Walk::Reached => {}
+                Walk::Missed => return Ok(Checked::NotOnHistory),
+                Walk::Stopped => return Ok(Checked::TooOld),
             }
         }
         // The index holds the changesets after the floor, and `below` the paths
@@ -666,7 +688,7 @@ impl PathIndex {
             self.oldest_base = self.oldest_base.min(base_gen);
         }
         self.prune();
-        Ok(Some(conflicts))
+        Ok(Checked::Paths(conflicts))
     }
 
     /// Walks from the floor back to `base`, adding each changeset and moving
@@ -790,6 +812,17 @@ fn added_bytes(changes: &BTreeMap<RepoPath, Option<FileState>>) -> usize {
     entry_bytes(&[]) + paths.sum::<usize>()
 }
 
+/// What [`PathIndex::check`] found.
+enum Checked {
+    /// The base is on the history, and these paths of the land changed
+    /// after it.
+    Paths(Vec<RepoPath>),
+    /// The base is not on the first-parent history.
+    NotOnHistory,
+    /// The base is more than [`MAX_WALK`] changesets below the floor.
+    TooOld,
+}
+
 /// How a [`walk_back`] ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Walk {
@@ -833,7 +866,7 @@ fn walk_back(
 /// back to `base`, and adds to `hits` each path in `land` that the walked
 /// changesets touched, by the rule of [`PathIndex::touches`]. Keeps only the
 /// land's own paths and directories, so memory follows the land, not the
-/// depth.
+/// depth. Stops after [`MAX_WALK`] changesets.
 fn touched_below<'a>(
     c: &Connection,
     repo: RepoId,
@@ -849,8 +882,11 @@ fn touched_below<'a>(
     // where `touches` reads them for the land's paths.
     let mut files: HashSet<&[u8]> = HashSet::new();
     let mut dirs: HashSet<&[u8]> = HashSet::new();
-    let mut walked = 0_u64;
+    let mut walked = 0;
     let walk = walk_back(c, repo, floor, base, base_gen, |_, _, cs| {
+        if walked == MAX_WALK {
+            return false;
+        }
         walked += 1;
         for path in cs.changes.keys() {
             let path = path.as_bytes();
@@ -861,7 +897,11 @@ fn touched_below<'a>(
         }
         true
     })?;
-    tracing::debug!(base_gen, walked, ?walk, "checked an old base");
+    if walk == Walk::Stopped {
+        tracing::info!(base_gen, walked, "a base is too old to check");
+    } else {
+        tracing::debug!(base_gen, walked, ?walk, "checked an old base");
+    }
     hits.extend(paths.into_iter().filter(|&path| {
         files.contains(path) || dirs.contains(path) || ancestors(path).any(|d| files.contains(d))
     }));
@@ -1395,6 +1435,42 @@ mod tests {
             let moved = f.index(|index| index.floor);
             assert!(f.generation(moved) > f.generation(floor), "round {round}");
         }
+    }
+
+    #[test]
+    fn a_base_beyond_the_walk_limit_is_rejected() {
+        use LandState::{Conflict, Landed, Rejected};
+        // An import moves main to root ─ C1 ─ … ─ Cn, where Ci puts `ci`.
+        let f = fixture();
+        let n = MAX_WALK + 1;
+        let mut history = vec![f.root];
+        f.store
+            .write(|c| {
+                for i in 1..=n {
+                    let cs = changeset(vec![history[i - 1]], &[put(&format!("c{i}"), "x")]);
+                    history.push(db::insert_changeset(c, f.repo, &cs)?);
+                }
+                Ok(())
+            })
+            .unwrap();
+        f.move_main(history[n]);
+        // A land on the head builds the index there, so Cn is the floor.
+        let out = f.land(f.commit(history[n], &[put("warm", "x")]), "warm");
+        assert_eq!(out.state, Landed);
+        assert_eq!(f.index(|index| index.floor), history[n]);
+
+        // The walk from the floor reaches C1 with its last step, which visits
+        // C2, and C2 put `c2`.
+        let out = f.land(f.commit(history[1], &[put("c2", "mine")]), "c1");
+        assert_eq!(out.state, Conflict, "{}", out.detail);
+        assert_eq!(out.conflict_paths, [RepoPath::new("c2").unwrap()]);
+
+        // Root is one more step back, so the client must rebase.
+        let before = f.main();
+        let out = f.land(f.commit(f.root, &[put("b/y", "mine")]), "root");
+        assert_eq!(out.state, Rejected);
+        assert!(out.detail.contains("too old"), "{}", out.detail);
+        assert_eq!(f.main(), before);
     }
 
     #[test]

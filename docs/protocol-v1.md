@@ -240,7 +240,11 @@ server checks, in order:
 1. The ref exists. If not, the land is `REJECTED` at once.
 2. The changeset has exactly one parent. If not (an imported root or merge),
    `REJECTED`.
-3. The base is on the ref's first-parent history. If not, `REJECTED`.
+3. The base is on the ref's first-parent history. If not, `REJECTED`. A base
+   more than 100,000 changesets behind the head on that history MAY be
+   `REJECTED` as too old. Then the client makes a new changeset on a newer
+   head and lands that. A base within 100,000 changesets of the head is never
+   too old.
 4. Each path P that the changeset changes is checked. P conflicts when a
    changeset on the ref after the base changed P itself, a path below P, or a
    file at a directory above P. If any path conflicts, the land is
