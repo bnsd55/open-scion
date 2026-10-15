@@ -4,7 +4,8 @@
 //! resolve the revision, get its root tree, fetch one tree level per batch,
 //! then fetch the blobs in batches. Every object is checked against its ID on
 //! arrival. Nothing is written until the whole tree is walked and every name
-//! has passed the checkout path rules.
+//! has passed the checkout path rules, and then only into a temp directory
+//! that becomes the destination by one rename (see [`crate::materialize`]).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -16,7 +17,7 @@ use scion_proto::v1::{GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectR
 use serde_json::json;
 
 use crate::client::{Ctx, Objects, id_from};
-use crate::materialize::{Root, check_name};
+use crate::materialize::{Checkout, check_dest, check_name};
 
 /// Arguments of `scn checkout`.
 #[derive(clap::Args)]
@@ -40,8 +41,9 @@ fn parse_dir(dir: &str) -> Result<RepoPath> {
 type Files = HashMap<BlobId, Vec<(RepoPath, FileState)>>;
 
 /// Writes the files of a changeset into a new or empty directory, and prints
-/// how many it wrote.
+/// how many it wrote. On failure the destination is left as it was.
 pub async fn checkout(ctx: &mut Ctx, args: CheckoutArgs) -> Result<()> {
+    check_dest(&args.into)?;
     let id = ctx.resolve(&args.rev).await?;
     let reply = ctx
         .objects
@@ -54,8 +56,9 @@ pub async fn checkout(ctx: &mut Ctx, args: CheckoutArgs) -> Result<()> {
         .into_inner();
     let root = id_from(&reply.tree_id)?;
     let files = walk(&mut ctx.objects, &ctx.repo, root, &args.sparse).await?;
-    let dest = Root::create(&args.into)?;
-    write_files(&mut ctx.objects, &ctx.repo, &dest, &files).await?;
+    let mut dest = Checkout::start(&args.into)?;
+    write_files(&mut ctx.objects, &ctx.repo, &mut dest, &files).await?;
+    dest.finish()?;
     let count: usize = files.values().map(Vec::len).sum();
     let into = args.into.display();
     if ctx.json {
@@ -74,8 +77,9 @@ pub async fn checkout(ctx: &mut Ctx, args: CheckoutArgs) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Fails if a name breaks the checkout path rules, if two names differ only
-/// in ASCII case, if a sparse path is not in the tree, or if a fetch fails.
+/// Fails if a name breaks the checkout path rules, if a sparse path is not in
+/// the tree, or if a fetch fails. Names that fold together on the target
+/// filesystem are caught when written.
 async fn walk(
     objects: &mut Objects,
     repo: &str,
@@ -97,9 +101,6 @@ async fn walk(
         let mut next = Vec::new();
         for (dir, id) in level {
             let tree = trees.get(&id).context("server skipped a tree")?;
-            // Lowercased name -> path, to find names that collide on a
-            // case-insensitive filesystem.
-            let mut names = HashMap::new();
             for (name, entry) in &tree.entries {
                 let path = join(dir.as_ref(), name)?;
                 let inside = sparse.is_empty() || sparse.iter().any(|s| is_within(&path, s));
@@ -119,14 +120,6 @@ async fn walk(
                 }
                 if let Err(why) = check_name(name.as_bytes()) {
                     bail!("refusing to write {path:?}: {why}");
-                }
-                if let Some(other) =
-                    names.insert(name.as_bytes().to_ascii_lowercase(), path.clone())
-                {
-                    bail!(
-                        "refusing to write {other:?} and {path:?}: they differ only in case, \
-                         so they collide on a case-insensitive filesystem"
-                    );
                 }
                 match entry {
                     Entry::Dir(id) => next.push((Some(path), *id)),
@@ -152,7 +145,12 @@ async fn walk(
 /// # Errors
 ///
 /// Fails if a fetch or a write fails.
-async fn write_files(objects: &mut Objects, repo: &str, dest: &Root, files: &Files) -> Result<()> {
+async fn write_files(
+    objects: &mut Objects,
+    repo: &str,
+    dest: &mut Checkout,
+    files: &Files,
+) -> Result<()> {
     let ids = files.keys().map(|id| *id.as_bytes());
     fetch(objects, repo, ObjectKind::Blob, ids, |id, data| {
         let id = BlobId::from_bytes(id);

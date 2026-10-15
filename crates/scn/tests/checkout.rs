@@ -2,18 +2,30 @@
 //! of the same commit.
 #![cfg(unix)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, Output};
 
-use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
+use scion_core::{
+    BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, PathElem, RepoPath, Tree,
+    TreeId,
+};
+use scion_proto::v1::objects_server::{Objects, ObjectsServer};
+use scion_proto::v1::{
+    GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, Object, ObjectKind,
+    ResolveRefRequest, ResolveRefResponse,
+};
 use scion_server::import::{ImportOptions, import_git};
 use scion_server::{Store, db, service, tree};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
+use tokio_stream::Stream;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::{Request, Response, Status};
 
 const REPO: &str = "r";
 const TOKEN: &str = "secret";
@@ -121,13 +133,30 @@ impl Server {
 
     /// Runs `scn` against this server.
     fn scn(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_scn"))
-            .args(["--server", &self.url, "--repo", REPO])
-            .args(args)
-            .env("SCION_TOKEN", TOKEN)
-            .output()
-            .unwrap()
+        scn(&self.url, REPO, args)
     }
+}
+
+/// Runs `scn` against the server at `url`.
+fn scn(url: &str, repo: &str, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_scn"))
+        .args(["--server", url, "--repo", repo])
+        .args(args)
+        .env("SCION_TOKEN", TOKEN)
+        .output()
+        .unwrap()
+}
+
+/// Asserts that a failed checkout left `dest` the empty directory it was,
+/// with no temp directory next to it.
+fn assert_untouched(dest: &Path) {
+    assert_eq!(fs::read_dir(dest).unwrap().count(), 0, "{}", dest.display());
+    let temps: Vec<_> = fs::read_dir(dest.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".scn-checkout-"))
+        .collect();
+    assert!(temps.is_empty(), "left behind: {temps:?}");
 }
 
 fn open_store() -> (TempDir, Store) {
@@ -241,6 +270,18 @@ fn checkout_matches_git_checkout_byte_for_byte() {
     ]);
     assert!(!out.status.success());
     assert!(stderr(&out).contains("wrong token"), "{}", stderr(&out));
+
+    // A destination that is a symlink, even to an empty directory, is
+    // refused, and nothing is written to the link's target.
+    let target = tmp.path().join("target");
+    fs::create_dir(&target).unwrap();
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let out = server.scn(&["checkout", "main", "--into", text(&link)]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("symlink"), "{}", stderr(&out));
+    assert_untouched(&target);
+    assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
 }
 
 #[test]
@@ -329,18 +370,17 @@ fn unsafe_names_fail_before_anything_is_written() {
         content: store.blobs().put(b"x\n").unwrap(),
         executable: false,
     };
-    let link = FileState::Symlink {
-        target: store.blobs().put(b"../../outside").unwrap(),
-    };
-    // Each tree is valid in the object format, and each error names the path.
+    // Each tree is valid in the object format, and each error names the
+    // escaped path.
     let cases: [(Files, &str); 4] = [
-        (&[(b"A", file), (b"a", file)], r#""A" and "a""#),
-        // On a case-insensitive filesystem `link/x` would go through `Link`.
-        (
-            &[(b"Link", link), (b"link/x", file)],
-            r#""Link" and "link""#,
-        ),
         (&[(b"ok", file), (b"ok\x1b[2J", file)], r#""ok\x1b[2J""#),
+        // U+009B, a C1 control (CSI on an 8-bit terminal).
+        (&[(b"ok/\xc2\x9b", file)], r#""ok/\xc2\x9b""#),
+        // U+202E, right-to-left override.
+        (
+            &[(b"\xe2\x80\xaecod.exe", file)],
+            r#""\xe2\x80\xaecod.exe""#,
+        ),
         (&[(b"src/.git/config", file)], r#""src/.git""#),
     ];
     let files: Vec<_> = cases.iter().map(|(files, _)| *files).collect();
@@ -350,11 +390,78 @@ fn unsafe_names_fail_before_anything_is_written() {
 
     for ((_, expected), id) in cases.iter().zip(ids) {
         let dest = tmp.path().join(id.to_string());
+        fs::create_dir(&dest).unwrap();
         let out = server.scn(&["checkout", &id.to_string(), "--into", text(&dest)]);
         assert!(!out.status.success(), "{expected}");
         assert!(stderr(&out).contains(expected), "{}", stderr(&out));
-        assert!(!dest.exists(), "{expected}: wrote {}", dest.display());
+        assert_untouched(&dest);
     }
+}
+
+/// Whether `dir` is on a filesystem that folds ASCII case.
+fn folds_case(dir: &Path) -> bool {
+    fs::write(dir.join("probe"), "").unwrap();
+    let folds = dir.join("PROBE").exists();
+    fs::remove_file(dir.join("probe")).unwrap();
+    folds
+}
+
+#[test]
+fn names_that_fold_together_fail_cleanly_where_the_filesystem_folds_them() {
+    let (data, store) = open_store();
+    let regular = |content: &[u8]| FileState::Regular {
+        content: store.blobs().put(content).unwrap(),
+        executable: false,
+    };
+    let (one, two) = (regular(b"one\n"), regular(b"two\n"));
+    // From the checkout, `../outside` is a directory next to it.
+    let link = FileState::Symlink {
+        target: store.blobs().put(b"../outside").unwrap(),
+    };
+    let cases: [Files; 3] = [
+        &[(b"A", one), (b"a", two)],
+        &[(b"X/f", one), (b"x/g", two)],
+        // Folded together, `link/x` would be written through `Link`.
+        &[(b"Link", link), (b"link/x", one)],
+    ];
+    let ids = store_changesets(&store, &cases);
+    let server = Server::start(data, store);
+    let tmp = tempfile::tempdir().unwrap();
+    let folds = folds_case(tmp.path());
+
+    for (files, id) in cases.iter().zip(ids) {
+        let parent = tmp.path().join(id.to_string());
+        let (dest, outside) = (parent.join("dest"), parent.join("outside"));
+        fs::create_dir_all(&dest).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let out = server.scn(&["checkout", &id.to_string(), "--into", text(&dest)]);
+        if folds {
+            assert!(!out.status.success());
+            let err = stderr(&out);
+            assert!(
+                err.contains("collides with another path on this filesystem"),
+                "{err}"
+            );
+            assert_untouched(&dest);
+        } else {
+            // As git does: every name is written as it is.
+            assert!(out.status.success(), "{}", stderr(&out));
+            let written: Vec<_> = files
+                .iter()
+                .map(|(path, _)| dest.join(text_of(path)))
+                .collect();
+            assert!(
+                written
+                    .iter()
+                    .all(|path| fs::symlink_metadata(path).is_ok())
+            );
+        }
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    }
+}
+
+fn text_of(bytes: &[u8]) -> &str {
+    std::str::from_utf8(bytes).unwrap()
 }
 
 #[test]
@@ -381,4 +488,147 @@ fn objects_larger_than_one_reply_span_several_calls() {
     let written = |name| BlobId::of(&fs::read(dest.join(name)).unwrap());
     assert_eq!(written("a.bin"), BlobId::of(&big_a));
     assert_eq!(written("b.bin"), BlobId::of(&big_b));
+}
+
+/// An `Objects` server that answers trees honestly, then misbehaves on
+/// blobs in the way the repo name says.
+struct Liar {
+    root: TreeId,
+    objects: HashMap<Vec<u8>, Object>,
+}
+
+impl Liar {
+    /// A root tree with two files, and their blobs.
+    fn new() -> Self {
+        let blob = |data: &[u8]| Object {
+            kind: ObjectKind::Blob.into(),
+            id: BlobId::of(data).as_bytes().to_vec(),
+            data: data.to_vec(),
+        };
+        let (one, two) = (blob(b"one\n"), blob(b"two\n"));
+        let file = |object: &Object| {
+            Entry::File(FileState::Regular {
+                content: BlobId::try_from(object.id.as_slice()).unwrap(),
+                executable: false,
+            })
+        };
+        let tree = Tree {
+            entries: [
+                (PathElem::new("one").unwrap(), file(&one)),
+                (PathElem::new("two").unwrap(), file(&two)),
+            ]
+            .into(),
+        };
+        let (data, root) = tree.encode_with_id();
+        let tree = Object {
+            kind: ObjectKind::Tree.into(),
+            id: root.as_bytes().to_vec(),
+            data,
+        };
+        let objects = [tree, one, two]
+            .into_iter()
+            .map(|object| (object.id.clone(), object))
+            .collect();
+        Self { root, objects }
+    }
+}
+
+type Replies = Pin<Box<dyn Stream<Item = Result<Object, Status>> + Send>>;
+
+#[tonic::async_trait]
+impl Objects for Liar {
+    async fn resolve_ref(
+        &self,
+        _: Request<ResolveRefRequest>,
+    ) -> Result<Response<ResolveRefResponse>, Status> {
+        Err(Status::unimplemented("checkout by ID"))
+    }
+
+    async fn get_root_tree(
+        &self,
+        _: Request<GetRootTreeRequest>,
+    ) -> Result<Response<GetRootTreeResponse>, Status> {
+        Ok(Response::new(GetRootTreeResponse {
+            tree_id: self.root.as_bytes().to_vec(),
+        }))
+    }
+
+    type GetObjectsStream = Replies;
+
+    async fn get_objects(
+        &self,
+        request: Request<GetObjectsRequest>,
+    ) -> Result<Response<Replies>, Status> {
+        let GetObjectsRequest { repo, refs } = request.into_inner();
+        let mut honest: Vec<Object> = refs.iter().map(|r| self.objects[&r.id].clone()).collect();
+        let replies: Vec<Result<Object, Status>> = if refs[0].kind == i32::from(ObjectKind::Tree) {
+            honest.into_iter().map(Ok).collect()
+        } else {
+            match repo.as_str() {
+                "extra" => {
+                    let id = BlobId::of(b"extra").as_bytes().to_vec();
+                    honest.push(Object {
+                        kind: ObjectKind::Blob.into(),
+                        id,
+                        data: b"extra".to_vec(),
+                    });
+                    honest.into_iter().map(Ok).collect()
+                }
+                "duplicate" => {
+                    honest.insert(0, honest[0].clone());
+                    honest.into_iter().map(Ok).collect()
+                }
+                "wrong-kind" => {
+                    for object in &mut honest {
+                        object.kind = ObjectKind::Tree.into();
+                    }
+                    honest.into_iter().map(Ok).collect()
+                }
+                "none" => Vec::new(),
+                "error" => vec![
+                    Ok(honest[0].clone()),
+                    Err(Status::internal("lost the disk")),
+                ],
+                other => panic!("no such misbehavior: {other}"),
+            }
+        };
+        Ok(Response::new(Box::pin(tokio_stream::iter(replies))))
+    }
+}
+
+#[test]
+fn a_misbehaving_server_is_caught_and_nothing_is_written() {
+    let runtime = Runtime::new().unwrap();
+    let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    runtime.spawn(
+        tonic::transport::Server::builder()
+            .add_service(ObjectsServer::new(Liar::new()))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let any_changeset = "00".repeat(32);
+
+    for (misbehavior, expected) in [
+        ("extra", "not asked for"),
+        ("duplicate", "not asked for"),
+        ("wrong-kind", "not asked for"),
+        ("none", "none of the requested objects"),
+        ("error", "lost the disk"),
+    ] {
+        let dest = tmp.path().join(misbehavior);
+        fs::create_dir(&dest).unwrap();
+        let out = scn(
+            &url,
+            misbehavior,
+            &["checkout", &any_changeset, "--into", text(&dest)],
+        );
+        assert!(!out.status.success(), "{misbehavior}");
+        assert!(
+            stderr(&out).contains(expected),
+            "{misbehavior}: {}",
+            stderr(&out)
+        );
+        assert_untouched(&dest);
+    }
 }

@@ -1,78 +1,154 @@
-//! Writes checked-out files under one directory, and the name rules that make
-//! that safe.
+//! Writes a checkout to disk, and the name rules that make that safe.
 //!
-//! Every write goes through a handle on the checkout root. Each parent
-//! directory is created and opened one part at a time with `O_NOFOLLOW`, so a
-//! symlink in the way, whether this checkout made it or something else did,
-//! fails the write instead of redirecting it. Files are created with
-//! `O_EXCL`, so nothing that already exists is overwritten.
+//! A checkout is written into a new temp directory next to the destination,
+//! made through a handle on the destination's parent, and renamed onto the
+//! destination name only once every file is written. The rename is the check
+//! that counts: it replaces a missing or empty directory, and fails if the
+//! destination is a non-empty directory, a file or a symlink. On any failure
+//! the temp directory is removed, so the destination stays as it was.
+//!
+//! Inside the temp directory every write goes through directory handles: each
+//! parent is opened one part at a time with `O_NOFOLLOW`, and files are made
+//! with `O_EXCL`, so a symlink or a file in the way fails the write instead of
+//! redirecting it. The temp directory starts empty and the checkout records
+//! every path it makes, so a path that already exists means the filesystem
+//! folded two names into one, by case or by Unicode form.
 
+use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, ErrorKind, Write as _};
 use std::os::fd::OwnedFd;
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rustix::fs::{Mode, OFlags};
+use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 use scion_core::RepoPath;
 
 /// Directory names that tools keep metadata in. A checkout never writes them.
 const RESERVED: [&[u8]; 2] = [b".git", b".scion"];
 
+/// Name prefix of the temp directory a checkout is written into.
+const TEMP_PREFIX: &str = ".scn-checkout-";
+
 /// Checks that a file or directory name is safe to write and to print.
 ///
 /// # Errors
 ///
-/// Says why if the name has an ASCII control byte (it could rewrite a
-/// terminal when printed), or is `.git` or `.scion` in any ASCII case.
-// SHORTCUT: ASCII rules only. Windows device names (`CON`, `NUL`), names that
-// end in a dot or a space, and names that differ only in Unicode case or
-// normalization still pass. Upgrade: per-platform rules before checkout runs
-// on Windows, and Unicode case folding for macOS.
+/// Says why if the name has a control character (C0, DEL or C1: printed, it
+/// can rewrite a terminal), a bidirectional text control (printed, it can make
+/// a name read as another), or is `.git` or `.scion` in any ASCII case. Bytes
+/// that are not UTF-8 are checked one by one: 0x80 to 0x9F are C1 controls on
+/// an 8-bit terminal.
+// SHORTCUT: no Windows rules: device names (`CON`, `NUL`) and names that end
+// in a dot or a space pass. Case and Unicode folding is caught at write time,
+// on the filesystem in use. Upgrade: per-platform rules before checkout runs
+// on Windows.
 pub fn check_name(name: &[u8]) -> Result<(), &'static str> {
-    if name.iter().any(u8::is_ascii_control) {
-        Err("it contains a control byte")
-    } else if RESERVED
+    for chunk in name.utf8_chunks() {
+        let text = chunk.valid();
+        if text.chars().any(char::is_control)
+            || chunk.invalid().iter().any(|b| (0x80..=0x9f).contains(b))
+        {
+            return Err("it contains a control character");
+        }
+        if text
+            .chars()
+            .any(|c| matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+        {
+            return Err("it contains a bidirectional text control");
+        }
+    }
+    if RESERVED
         .iter()
         .any(|reserved| name.eq_ignore_ascii_case(reserved))
     {
-        Err("it uses a reserved metadata name")
-    } else {
-        Ok(())
+        return Err("it uses a reserved metadata name");
+    }
+    Ok(())
+}
+
+/// Checks early that `dest` is missing or an empty directory, to fail before
+/// any work. [`Checkout::finish`] checks again, atomically.
+///
+/// # Errors
+///
+/// Fails if `dest` is a symlink, a file, or a directory that is not empty.
+pub fn check_dest(dest: &Path) -> Result<()> {
+    let shown = dest.display();
+    match fs::symlink_metadata(dest) {
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("cannot read {shown}")),
+        Ok(meta) if meta.is_symlink() => bail!("{shown} is a symlink"),
+        Ok(meta) if !meta.is_dir() => bail!("{shown} exists and is not a directory"),
+        Ok(_) => {
+            let mut entries = fs::read_dir(dest).with_context(|| format!("cannot read {shown}"))?;
+            if entries.next().is_some() {
+                bail!("{shown} is not empty");
+            }
+            Ok(())
+        }
     }
 }
 
-/// The checkout root, open as a directory handle.
-pub struct Root {
-    dir: OwnedFd,
+/// A checkout being written into a temp directory next to its destination.
+/// Dropped without [`Checkout::finish`], it removes the temp directory.
+pub struct Checkout {
+    /// The destination's parent directory.
+    parent: OwnedFd,
+    /// The parent's path, used only to remove the temp directory.
+    parent_path: PathBuf,
+    /// The temp directory's name in `parent`, and a handle on it.
+    temp: Vec<u8>,
+    root: OwnedFd,
+    /// The destination's name in `parent`.
+    name: Vec<u8>,
+    /// Every path this checkout has made, relative to the temp directory.
+    made: HashSet<Vec<u8>>,
+    finished: bool,
 }
 
-impl Root {
-    /// Creates `path` and opens it. An empty directory that already exists is
-    /// used as it is.
+impl Checkout {
+    /// Makes an empty temp directory next to `dest`, through a handle on the
+    /// parent of `dest`.
     ///
     /// # Errors
     ///
-    /// Fails if `path` exists and is not an empty directory, or if it cannot
-    /// be created or opened.
-    pub fn create(path: &Path) -> Result<Self> {
-        let shown = path.display();
-        match fs::create_dir(path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                let mut entries =
-                    fs::read_dir(path).with_context(|| format!("cannot read {shown}"))?;
-                if entries.next().is_some() {
-                    bail!("{shown} is not empty");
-                }
-            }
-            Err(e) => return Err(e).with_context(|| format!("cannot create {shown}")),
-        }
+    /// Fails if `dest` has no final name (for example `..`), or if its parent
+    /// cannot be opened or written.
+    pub fn start(dest: &Path) -> Result<Self> {
+        let shown = dest.display();
+        let name = dest
+            .file_name()
+            .with_context(|| format!("{shown} does not name a directory to create"))?;
+        let parent_path = match dest.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-        let dir = rustix::fs::open(path, flags, Mode::empty())
-            .with_context(|| format!("cannot open {shown}"))?;
-        Ok(Self { dir })
+        let parent = rustix::fs::open(&parent_path, flags, Mode::empty())
+            .with_context(|| format!("cannot open {}", parent_path.display()))?;
+        let temp = make_temp_dir(&parent)
+            .with_context(|| format!("cannot make a directory in {}", parent_path.display()))?;
+        let root = match open_dir(&parent, &temp) {
+            Ok(root) => root,
+            Err(e) => {
+                // Still empty, so a plain rmdir removes it.
+                let _ = rustix::fs::unlinkat(&parent, temp.as_slice(), AtFlags::REMOVEDIR);
+                return Err(e).context("cannot open the new directory");
+            }
+        };
+        Ok(Self {
+            parent,
+            parent_path,
+            temp,
+            root,
+            name: name.as_bytes().to_vec(),
+            made: HashSet::new(),
+            finished: false,
+        })
     }
 
     /// Writes a regular file. Executable files get mode 0777 and others 0666,
@@ -80,65 +156,125 @@ impl Root {
     ///
     /// # Errors
     ///
-    /// Fails if a parent is a symlink or not a directory, if `path` exists,
+    /// Fails if a part breaks [`check_name`], if a parent is a symlink or not
+    /// a directory, if the path collides with another one on this filesystem,
     /// or if the write fails.
-    pub fn file(&self, path: &RepoPath, executable: bool, data: &[u8]) -> Result<()> {
-        let write = || -> io::Result<()> {
+    pub fn file(&mut self, path: &RepoPath, executable: bool, data: &[u8]) -> Result<()> {
+        let mut write = || -> io::Result<()> {
             let (dir, name) = self.parent(path)?;
             let mode = Mode::from_raw_mode(if executable { 0o777 } else { 0o666 });
             let flags =
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-            let file = rustix::fs::openat(&dir, name, flags, mode)?;
+            let file = rustix::fs::openat(&dir, name, flags, mode)
+                .map_err(|e| collision_if_exists(e, path.as_bytes()))?;
+            self.made.insert(path.as_bytes().to_vec());
             fs::File::from(file).write_all(data)
         };
         write().with_context(|| format!("cannot write {path:?}"))
     }
 
-    /// Creates a symlink with `target` as its raw target bytes. The target is
+    /// Makes a symlink with `target` as its raw target bytes. The target is
     /// never resolved.
     ///
     /// # Errors
     ///
-    /// Fails if a parent is a symlink or not a directory, if `path` exists,
-    /// or if the target is not a valid symlink target (empty, or has a NUL).
-    pub fn symlink(&self, path: &RepoPath, target: &[u8]) -> Result<()> {
-        let link = || -> io::Result<()> {
+    /// As [`Checkout::file`], or if the target is not a valid symlink target
+    /// (empty, or has a NUL).
+    pub fn symlink(&mut self, path: &RepoPath, target: &[u8]) -> Result<()> {
+        let mut link = || -> io::Result<()> {
             let (dir, name) = self.parent(path)?;
-            Ok(rustix::fs::symlinkat(target, &dir, name)?)
+            rustix::fs::symlinkat(target, &dir, name)
+                .map_err(|e| collision_if_exists(e, path.as_bytes()))?;
+            self.made.insert(path.as_bytes().to_vec());
+            Ok(())
         };
         link().with_context(|| format!("cannot write {path:?}"))
     }
 
-    /// Opens the directory that holds `path`, creating missing parents, and
-    /// returns it with the last part of `path`. Fails before creating
-    /// anything if a part breaks [`check_name`].
-    // SHORTCUT: one `mkdirat` and one `openat` per parent for every file, and
-    // files arrive in blob order, not path order. Upgrade: create each
-    // directory once from the walk, fetch blobs in path order, and keep the
-    // last directory open.
-    fn parent<'p>(&self, path: &'p RepoPath) -> io::Result<(OwnedFd, &'p [u8])> {
-        let parts = || path.as_bytes().split(|&b| b == b'/');
+    /// Renames the temp directory onto the destination.
+    ///
+    /// # Errors
+    ///
+    /// Fails, and removes the temp directory, if the destination is a
+    /// non-empty directory, a file or a symlink.
+    pub fn finish(mut self) -> Result<()> {
+        let dest = self.parent_path.join(OsStr::from_bytes(&self.name));
+        match rustix::fs::renameat(&self.parent, &self.temp, &self.parent, &self.name) {
+            Ok(()) => {
+                self.finished = true;
+                Ok(())
+            }
+            Err(Errno::NOTEMPTY | Errno::EXIST) => bail!("{} is not empty", dest.display()),
+            Err(Errno::NOTDIR) => {
+                bail!("{} is a symlink or not a directory", dest.display())
+            }
+            Err(e) => Err(io::Error::from(e))
+                .with_context(|| format!("cannot move the checkout to {}", dest.display())),
+        }
+    }
+
+    /// Opens the directory that holds `path` in the temp directory, making
+    /// missing parents, and returns it with the last part of `path`. Fails
+    /// before making anything if a part breaks [`check_name`].
+    // SHORTCUT: one `openat` per parent for every file, and files arrive in
+    // blob order, not path order. Upgrade (issue #41): fetch blobs in path
+    // order and keep the last directory open.
+    fn parent<'p>(&mut self, path: &'p RepoPath) -> io::Result<(OwnedFd, &'p [u8])> {
+        let bytes = path.as_bytes();
+        let parts = || bytes.split(|&b| b == b'/');
         if let Some(why) = parts().find_map(|part| check_name(part).err()) {
             return Err(io::Error::other(why));
         }
         let mut parents = parts();
         // A path has at least one part.
         let name = parents.next_back().unwrap_or_default();
-        let mut dir = self.dir.try_clone()?;
+        let mut dir = self.root.try_clone()?;
+        let mut end = 0;
         for part in parents {
+            end += part.len();
+            let prefix = &bytes[..end];
+            if !self.made.contains(prefix) {
+                rustix::fs::mkdirat(&dir, part, Mode::from_raw_mode(0o777))
+                    .map_err(|e| collision_if_exists(e, prefix))?;
+                self.made.insert(prefix.to_vec());
+            }
             dir = open_dir(&dir, part)?;
+            end += 1;
         }
         Ok((dir, name))
     }
 }
 
-/// Opens directory `name` in `dir`, creating it if missing. Fails if `name` is
-/// a symlink or anything else that is not a directory.
-fn open_dir(dir: &OwnedFd, name: &[u8]) -> io::Result<OwnedFd> {
-    match rustix::fs::mkdirat(dir, name, Mode::from_raw_mode(0o777)) {
-        Ok(()) | Err(Errno::EXIST) => {}
-        Err(e) => return Err(e.into()),
+impl Drop for Checkout {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let temp = self.parent_path.join(OsStr::from_bytes(&self.temp));
+        // Does not follow symlinks inside the directory.
+        if let Err(e) = fs::remove_dir_all(&temp) {
+            eprintln!("warning: cannot remove {}: {e}", temp.display());
+        }
     }
+}
+
+/// Makes a new, empty directory in `parent` with a name no one else uses.
+fn make_temp_dir(parent: &OwnedFd) -> io::Result<Vec<u8>> {
+    let pid = std::process::id();
+    let mut attempt = 0_u32;
+    loop {
+        let name = format!("{TEMP_PREFIX}{pid}-{attempt}").into_bytes();
+        match rustix::fs::mkdirat(parent, name.as_slice(), Mode::from_raw_mode(0o777)) {
+            Ok(()) => return Ok(name),
+            Err(Errno::EXIST) if attempt < 1000 => attempt += 1,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Opens directory `name` in `dir`. Fails if `name` is a symlink or anything
+/// else that is not a directory.
+fn open_dir(dir: &OwnedFd, name: &[u8]) -> io::Result<OwnedFd> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     rustix::fs::openat(dir, name, flags, Mode::empty()).map_err(|e| match e {
         Errno::LOOP | Errno::NOTDIR => io::Error::other(format!(
@@ -149,6 +285,20 @@ fn open_dir(dir: &OwnedFd, name: &[u8]) -> io::Result<OwnedFd> {
     })
 }
 
+/// Maps "already exists" to a folding collision. The temp directory starts
+/// empty and every path this checkout makes is recorded, so a path that
+/// already exists without being recorded is another name folded into it.
+fn collision_if_exists(e: Errno, path: &[u8]) -> io::Error {
+    if e == Errno::EXIST {
+        io::Error::other(format!(
+            "\"{}\" collides with another path on this filesystem (case or Unicode folding)",
+            path.escape_ascii()
+        ))
+    } else {
+        e.into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,48 +307,88 @@ mod tests {
         RepoPath::new(p).unwrap()
     }
 
+    /// Names in `dir` that a checkout's temp directory would have.
+    fn temp_dirs(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(TEMP_PREFIX))
+            .collect()
+    }
+
     #[test]
     fn never_writes_through_a_symlink() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tmp.path().join("outside");
         fs::create_dir(&outside).unwrap();
-        fs::create_dir(tmp.path().join("a")).unwrap();
-        let dest = tmp.path().join("a/dest");
-        let root = Root::create(&dest).unwrap();
-
-        // `dest/link` resolves to `outside`, which exists and is writable.
-        root.symlink(&path("link"), b"../../outside").unwrap();
-        let err = root.file(&path("link/x"), false, b"escaped").unwrap_err();
-        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
-        let err = root.symlink(&path("link/deeper/y"), b"z").unwrap_err();
-        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
-
-        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
-        assert_eq!(
-            fs::read_link(dest.join("link")).unwrap(),
-            Path::new("../../outside")
-        );
-    }
-
-    #[test]
-    fn writes_only_into_a_new_or_empty_directory() {
-        let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("dest");
-        Root::create(&dest).unwrap();
-        Root::create(&dest).unwrap();
-        fs::write(dest.join("x"), "x").unwrap();
-        let err = Root::create(&dest).err().unwrap();
-        assert!(err.to_string().contains("not empty"), "{err:#}");
+        let mut checkout = Checkout::start(&dest).unwrap();
+
+        // From the temp directory next to `dest`, `../outside` exists and is
+        // writable.
+        checkout.symlink(&path("link"), b"../outside").unwrap();
+        let err = checkout
+            .file(&path("link/x"), false, b"escaped")
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+        let err = checkout.symlink(&path("link/deeper/y"), b"z").unwrap_err();
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+
+        drop(checkout);
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        assert!(!dest.exists());
+        assert_eq!(temp_dirs(tmp.path()), Vec::<String>::new());
     }
 
     #[test]
-    fn refuses_control_bytes_and_metadata_names() {
+    fn the_rename_is_the_destination_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |dest: &Path| {
+            let mut checkout = Checkout::start(dest)?;
+            checkout.file(&path("a/b"), false, b"b\n")?;
+            checkout.finish()
+        };
+
+        // Missing, or an empty directory: the checkout takes its place.
+        let missing = tmp.path().join("missing");
+        let empty = tmp.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        for dest in [&missing, &empty] {
+            check_dest(dest).unwrap();
+            write(dest).unwrap();
+            assert_eq!(fs::read(dest.join("a/b")).unwrap(), b"b\n");
+        }
+
+        // A non-empty directory, or a symlink to an empty one: refused, as it was.
+        let full = tmp.path().join("full");
+        fs::create_dir(&full).unwrap();
+        fs::write(full.join("keep"), "keep").unwrap();
+        let target = tmp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        for (dest, why) in [(&full, "not empty"), (&link, "symlink")] {
+            assert!(check_dest(dest).unwrap_err().to_string().contains(why));
+            let err = write(dest).unwrap_err();
+            assert!(format!("{err:#}").contains(why), "{err:#}");
+        }
+        assert_eq!(fs::read_dir(&full).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(temp_dirs(tmp.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn refuses_control_characters_and_metadata_names() {
         for ok in [
             &b"a"[..],
             b"git",
             b".gitignore",
             b".scionrc",
-            b"caf\xc3\xa9",
+            "caf\u{e9}".as_bytes(),
+            "\u{100}".as_bytes(), // UTF-8 C4 80: a 0x80 byte that is not C1
+            b"\xff",
+            b"\xc3",
         ] {
             assert_eq!(check_name(ok), Ok(()), "{}", ok.escape_ascii());
         }
@@ -206,6 +396,13 @@ mod tests {
             &b"a\x1bb"[..],
             b"\x7f",
             b"tab\t",
+            "\u{85}".as_bytes(),
+            "a\u{9b}b".as_bytes(),
+            b"raw\x9b",
+            b"\x80",
+            "\u{202e}cod.exe".as_bytes(),
+            "\u{2066}".as_bytes(),
+            "a\u{2069}".as_bytes(),
             b".git",
             b".GIT",
             b".Scion",
@@ -214,10 +411,11 @@ mod tests {
         }
 
         // The writer applies the rules too, to every part.
-        let tmp = tempfile::tempdir().unwrap();
-        let root = Root::create(tmp.path()).unwrap();
-        assert!(root.file(&path("a/.git/hooks/x"), true, b"x").is_err());
-        assert!(root.symlink(&path("a/b\x1b"), b"x").is_err());
-        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
+        let parent = tempfile::tempdir().unwrap();
+        let mut checkout = Checkout::start(&parent.path().join("dest")).unwrap();
+        assert!(checkout.file(&path("a/.git/hooks/x"), true, b"x").is_err());
+        assert!(checkout.symlink(&path("a/b\x1b"), b"x").is_err());
+        let staging = parent.path().join(OsStr::from_bytes(&checkout.temp));
+        assert_eq!(fs::read_dir(staging).unwrap().count(), 0);
     }
 }
