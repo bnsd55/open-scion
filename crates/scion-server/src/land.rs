@@ -19,7 +19,7 @@
 //! landed one (a retry returns it). The ref and the row move in the same
 //! transaction, so they never disagree.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -41,6 +41,10 @@ const MAX_NAME_BYTES: usize = 256;
 // moves faster than a land commits starves its lands. Upgrade: route every
 // ref move through the per-ref lander, so lands never race.
 const MAX_ATTEMPTS: u32 = 3;
+
+/// How far, in generations, the ref moves in one prune cycle of a
+/// [`PathIndex`]. Tests use a short cycle, so that they prune.
+const PRUNE_EVERY: i64 = if cfg!(test) { 4 } else { 10_000 };
 
 /// Where a land stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -372,7 +376,10 @@ fn plan(
     let Some(head) = db::get_ref(c, repo, target)? else {
         return Ok(Plan::Reject(format!("ref {target:?} does not exist")));
     };
-    let index = index.get_or_insert_with(|| PathIndex::new(head.target));
+    let index = match index {
+        Some(index) => index,
+        None => index.insert(PathIndex::new(c, repo, head.target)?),
+    };
     index.advance_to(c, repo, head.target)?;
     let Some(base_gen) = index.reach(c, repo, base)? else {
         return Ok(Plan::Reject(format!(
@@ -380,6 +387,7 @@ fn plan(
         )));
     };
     let conflicts = index.conflicts(&cs.changes, base_gen);
+    index.prune(base_gen);
     if !conflicts.is_empty() {
         let detail = format!(
             "{} path(s) changed on {target:?} after the base",
@@ -465,28 +473,41 @@ fn settle(
 ///
 /// The index covers the changesets after `floor` up to `tip`. It grows
 /// forward as the ref moves and backward when a land has an older base.
-// SHORTCUT: never pruned, so memory grows with the paths changed since the
-// server started. Upgrade: drop entries older than the oldest base in use.
+/// Each [`PRUNE_EVERY`] generations, [`PathIndex::prune`] moves `floor` up to
+/// the oldest base that the cycle used, so memory follows the bases in use.
+// SHORTCUT: a land with an old base keeps the index back to that base until
+// the next cycle ends. Ceiling: a client that lands on a very old base in
+// every cycle keeps that much history in memory. Upgrade: check bases older
+// than a fixed depth with a walk from the database that keeps no entries.
 struct PathIndex {
     tip: ChangesetId,
     floor: ChangesetId,
-    /// Changesets on the indexed history.
-    chain: HashSet<ChangesetId>,
+    /// Changesets on the indexed history, by generation. A first-parent
+    /// history has at most one changeset per generation.
+    chain: BTreeMap<i64, ChangesetId>,
     /// File path → newest generation that put or deleted it.
     files: HashMap<Vec<u8>, i64>,
     /// Directory path → newest generation that changed anything below it.
     dirs: HashMap<Vec<u8>, i64>,
+    /// Generation of the tip when this prune cycle started.
+    cycle_start: i64,
+    /// Oldest generation this cycle needs: `cycle_start`, or an older base.
+    oldest_base: i64,
 }
 
 impl PathIndex {
-    fn new(head: ChangesetId) -> Self {
-        Self {
+    /// An empty index at `head`. Its first prune cycle starts there.
+    fn new(c: &Connection, repo: RepoId, head: ChangesetId) -> Result<Self> {
+        let head_gen = db::generation(c, repo, head)?;
+        Ok(Self {
             tip: head,
             floor: head,
-            chain: HashSet::new(),
+            chain: BTreeMap::new(),
             files: HashMap::new(),
             dirs: HashMap::new(),
-        }
+            cycle_start: head_gen,
+            oldest_base: head_gen,
+        })
     }
 
     /// Indexes the changesets from the current tip forward to `head`. If
@@ -515,7 +536,7 @@ impl PathIndex {
             cur = cs.parents.first().copied();
             walked.push((id, generation, cs.changes));
         }
-        *self = Self::new(head);
+        *self = Self::new(c, repo, head)?;
         Ok(())
     }
 
@@ -523,7 +544,7 @@ impl PathIndex {
     /// the index backward if needed. `None` if `base` is not on the history.
     fn reach(&mut self, c: &Connection, repo: RepoId, base: ChangesetId) -> Result<Option<i64>> {
         let base_gen = db::generation(c, repo, base)?;
-        if base == self.floor || self.chain.contains(&base) {
+        if base == self.floor || self.chain.get(&base_gen) == Some(&base) {
             return Ok(Some(base_gen));
         }
         let mut cur = self.floor;
@@ -568,6 +589,34 @@ impl PathIndex {
             .collect()
     }
 
+    /// Notes that a land used `base_gen`. Once the tip is [`PRUNE_EVERY`]
+    /// generations past the cycle start, moves `floor` up to the oldest base
+    /// the cycle used, drops what is now below it, and starts a new cycle.
+    ///
+    /// A later base below the new floor is still checked in full:
+    /// [`Self::reach`] adds the dropped changesets back from the database.
+    fn prune(&mut self, base_gen: i64) {
+        self.oldest_base = self.oldest_base.min(base_gen);
+        let Some((&tip_gen, _)) = self.chain.last_key_value() else {
+            return;
+        };
+        if tip_gen - self.cycle_start < PRUNE_EVERY {
+            return;
+        }
+        if let Some((&floor_gen, &floor)) = self.chain.range(..=self.oldest_base).next_back() {
+            self.chain = self.chain.split_off(&(floor_gen + 1));
+            self.floor = floor;
+            for map in [&mut self.files, &mut self.dirs] {
+                map.retain(|_, &mut g| g > floor_gen);
+                // `retain` keeps the capacity, so give it back.
+                map.shrink_to_fit();
+            }
+            tracing::debug!(floor_gen, kept = self.chain.len(), "pruned the path index");
+        }
+        self.cycle_start = tip_gen;
+        self.oldest_base = tip_gen;
+    }
+
     /// Records a changeset that just became the tip.
     fn record(
         &mut self,
@@ -585,7 +634,7 @@ impl PathIndex {
         generation: i64,
         changes: &BTreeMap<RepoPath, Option<FileState>>,
     ) {
-        self.chain.insert(id);
+        self.chain.insert(generation, id);
         for path in changes.keys() {
             let path = path.as_bytes();
             bump(&mut self.files, path, generation);
@@ -767,6 +816,32 @@ mod tests {
             self.store
                 .read(|c| tree::lookup(c, root, &RepoPath::new(path).unwrap()))
                 .unwrap()
+        }
+
+        fn generation(&self, cs: ChangesetId) -> i64 {
+            self.store
+                .read(|c| db::generation(c, self.repo, cs))
+                .unwrap()
+        }
+
+        /// Lands `n` changesets in a row, each on the head. The i-th one,
+        /// from 1, puts `{prefix}{i}`. Returns them in order.
+        fn fill(&self, prefix: &str, n: usize) -> Vec<ChangesetId> {
+            (1..=n)
+                .map(|i| {
+                    let cs = self.commit(self.main().target, &[put(&format!("{prefix}{i}"), "x")]);
+                    let out = self.land(cs, &cs.to_string());
+                    assert_eq!(out.state, LandState::Landed, "{}", out.detail);
+                    cs
+                })
+                .collect()
+        }
+
+        /// Runs `read` on the path index of `main`.
+        fn index<T>(&self, read: impl FnOnce(&PathIndex) -> T) -> T {
+            let slot = self.lands.slot(self.repo, "main");
+            let index = slot.lock().unwrap();
+            read(index.as_ref().expect("main has a path index"))
         }
     }
 
@@ -960,6 +1035,83 @@ mod tests {
         assert_eq!(out.state, LandState::Conflict);
         let out = f.land(f.commit(f.root, &[put("b/y", "mine")]), "3");
         assert_eq!(out.state, LandState::Landed);
+    }
+
+    fn cycle() -> usize {
+        usize::try_from(PRUNE_EVERY).unwrap()
+    }
+
+    /// `main` goes root ─ A ─ F1 ─ F2 ─ …, three prune cycles of F's, each
+    /// landed on the head. A puts `a/x`, and each Fi puts `fi`. By the end,
+    /// the index has pruned A and the first F's. Returns the fixture and the
+    /// history, root first.
+    fn pruned_history() -> (Fixture, Vec<ChangesetId>) {
+        let f = fixture();
+        let a = f.commit(f.root, &[put("a/x", "A")]);
+        assert_eq!(f.land(a, "a").state, LandState::Landed);
+        let mut history = vec![f.root, a];
+        history.extend(f.fill("f", 3 * cycle()));
+        let floor = f.index(|index| index.floor);
+        assert!(
+            f.generation(floor) > f.generation(a),
+            "A is below the floor"
+        );
+        assert!(f.index(|index| !index.files.contains_key(b"a/x".as_slice())));
+        (f, history)
+    }
+
+    #[test]
+    fn a_base_below_the_pruned_floor_still_sees_every_change() {
+        use LandState::{Conflict, Landed};
+        // (base, the path the land puts, the outcome); bases index the history.
+        let cases = [
+            (0, "a/x", Conflict), // A changed it
+            (0, "a", Conflict),   // A changed a path below it
+            (0, "b/y", Landed),   // nothing changed it after root
+            (1, "a/x", Landed),   // A's own change is not after A
+            (2, "f2", Conflict),  // F2 is below the floor too
+            (2, "f1", Landed),
+        ];
+        for (base, path, state) in cases {
+            let (f, history) = pruned_history();
+            let cs = f.commit(history[base], &[put(path, "mine")]);
+            let out = f.land(cs, "k");
+            assert_eq!(out.state, state, "base {base}, {path}: {}", out.detail);
+            if state == Conflict {
+                assert_eq!(out.conflict_paths, [RepoPath::new(path).unwrap()]);
+            }
+        }
+    }
+
+    #[test]
+    fn the_path_index_stays_bounded_under_many_lands() {
+        let f = fixture();
+        let bound = 2 * cycle();
+        for n in 0..10 * cycle() {
+            f.fill(&format!("d{n}/f"), 1);
+            let sizes = f.index(|index| (index.chain.len(), index.files.len(), index.dirs.len()));
+            assert!(
+                sizes.0 <= bound && sizes.1 <= bound && sizes.2 <= bound,
+                "after {} lands: (chain, files, dirs) = {sizes:?}",
+                n + 1
+            );
+        }
+    }
+
+    #[test]
+    fn pruning_keeps_the_oldest_base_that_a_cycle_used() {
+        let (f, history) = pruned_history();
+        let root = history[0];
+        let out = f.land(f.commit(root, &[put("a/x", "mine")]), "old");
+        assert_eq!(out.state, LandState::Conflict);
+        assert_eq!(f.index(|index| index.floor), root);
+        // The cycle that used root keeps it, so the next land on root does
+        // not walk the history again.
+        f.fill("g", cycle());
+        assert_eq!(f.index(|index| index.floor), root, "the cycle used root");
+        // The next cycle does not use it.
+        f.fill("h", cycle());
+        assert_ne!(f.index(|index| index.floor), root, "root is no longer used");
     }
 
     /// Length of the side chain in the merge tests.
