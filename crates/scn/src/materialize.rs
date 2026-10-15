@@ -16,7 +16,9 @@
 //!   of the temp directory is then moved up by a rename that never replaces
 //!   what is there, and the destination must then hold only the checkout.
 //!   The destination itself stays, with its mode, owner and extended
-//!   attributes.
+//!   attributes. Where the filesystem has no such rename (NFS), each entry
+//!   moves up in another way that never replaces: see
+//!   [`Checkout::move_up_without_rename`].
 //!
 //! On any failure, every path the checkout made is removed, deepest first,
 //! through the same bounded directory handles as the writes, and then the
@@ -184,6 +186,9 @@ pub struct Checkout {
     /// How many directories this checkout has opened.
     #[cfg(test)]
     opens: usize,
+    /// Makes the rename that never replaces fail with EINVAL, as on NFS.
+    #[cfg(test)]
+    no_noreplace: bool,
 }
 
 /// How a finished temp directory becomes the destination.
@@ -270,6 +275,8 @@ impl Checkout {
             finished: false,
             #[cfg(test)]
             opens: 0,
+            #[cfg(test)]
+            no_noreplace: false,
         })
     }
 
@@ -350,24 +357,35 @@ impl Checkout {
     /// Moves each entry of the temp directory up into the destination, never
     /// over something already there. Then checks that the destination holds
     /// only the checkout, and removes the temp directory.
-    // SHORTCUT: needs a rename that never replaces (`RENAME_NOREPLACE` on
-    // Linux, `RENAME_EXCL` on macOS). On Linux, NFS has none: `renameat2`
-    // fails with EINVAL. Untested on macOS NFS. Upgrade (issue #74): check,
-    // then rename, on such a filesystem.
     fn move_up(&mut self) -> Result<()> {
         let shown = self.base_path.display();
+        // Set once the filesystem shows it has no rename that never replaces:
+        // NFS on Linux, for example.
+        let mut fallback = false;
         for name in entries(&self.root).context("cannot read the checkout")? {
-            let flags = RenameFlags::NOREPLACE;
-            match rustix::fs::renameat_with(&self.root, &name, &self.base, &name, flags) {
+            let moved = if fallback {
+                self.move_up_without_rename(&name)
+            } else {
+                match self.rename_up(&name) {
+                    Err(Errno::INVAL | Errno::NOTSUP | Errno::NOSYS) => {
+                        fallback = true;
+                        self.move_up_without_rename(&name)
+                    }
+                    moved => moved,
+                }
+            };
+            match moved {
                 Ok(()) => self.moved.push(name),
-                Err(Errno::EXIST) => bail!("{shown} is no longer empty"),
-                Err(Errno::INVAL | Errno::NOTSUP | Errno::NOSYS) => bail!(
-                    "cannot move files into {shown} without replacing what is there on this \
-                     filesystem: check out into a new directory instead"
-                ),
+                Err(Errno::EXIST | Errno::NOTEMPTY) => bail!("{shown} is no longer empty"),
                 Err(e) => {
+                    let why = if fallback {
+                        ": this filesystem has no rename that never replaces, and the \
+                         fallback failed too (a checkout into a new directory works)"
+                    } else {
+                        ""
+                    };
                     return Err(io::Error::from(e)).with_context(|| {
-                        format!("cannot move \"{}\" into {shown}", name.escape_ascii())
+                        format!("cannot move \"{}\" into {shown}{why}", name.escape_ascii())
                     });
                 }
             }
@@ -381,6 +399,55 @@ impl Checkout {
         rustix::fs::unlinkat(&self.base, self.temp.as_slice(), AtFlags::REMOVEDIR)
             .map_err(io::Error::from)
             .with_context(|| format!("cannot remove the temp directory in {shown}"))
+    }
+
+    /// Moves `name` up from the temp directory by a rename that never
+    /// replaces: `RENAME_NOREPLACE` on Linux, `RENAME_EXCL` on macOS.
+    fn rename_up(&self, name: &[u8]) -> rustix::io::Result<()> {
+        #[cfg(test)]
+        if self.no_noreplace {
+            return Err(Errno::INVAL);
+        }
+        rustix::fs::renameat_with(&self.root, name, &self.base, name, RenameFlags::NOREPLACE)
+    }
+
+    /// Moves `name` up from the temp directory where no rename that never
+    /// replaces exists. A file or symlink gets a hard link at `name`, which
+    /// never replaces and never follows a symlink, and then loses its temp
+    /// name. A directory first claims `name` with a new, empty, private
+    /// directory, and then a plain rename replaces that one. Only a user that
+    /// [`open_dest`] already trusts can swap the claimed directory before the
+    /// rename, and a rename replaces only an empty directory.
+    ///
+    /// If a later step fails, the name made in the destination is removed,
+    /// so the entry is only in the temp directory, where the cleanup finds
+    /// it.
+    // SHORTCUT: a filesystem that has no hard links either (some FUSE
+    // filesystems) fails here. Upgrade (issue #91): copy each file into place
+    // with `O_EXCL`.
+    fn move_up_without_rename(&self, name: &[u8]) -> rustix::io::Result<()> {
+        if self.made.get(name) == Some(&true) {
+            rustix::fs::mkdirat(&self.base, name, Mode::from_raw_mode(0o700))?;
+            return rustix::fs::renameat(&self.root, name, &self.base, name)
+                .inspect_err(|_| self.remove_from_base(name, true));
+        }
+        rustix::fs::linkat(&self.root, name, &self.base, name, AtFlags::empty())?;
+        rustix::fs::unlinkat(&self.root, name, AtFlags::empty())
+            .inspect_err(|_| self.remove_from_base(name, false))
+    }
+
+    /// Removes `name` from `base`, and warns if it cannot. A directory must
+    /// be empty.
+    fn remove_from_base(&self, name: &[u8], is_dir: bool) {
+        let flags = if is_dir {
+            AtFlags::REMOVEDIR
+        } else {
+            AtFlags::empty()
+        };
+        if let Err(e) = rustix::fs::unlinkat(&self.base, name, flags) {
+            let path = self.base_path.join(OsStr::from_bytes(name));
+            eprintln!("warning: cannot remove {}: {e}", path.display());
+        }
     }
 
     /// [`Checkout::holder`] that makes missing parents. Fails before making
@@ -482,10 +549,7 @@ impl Drop for Checkout {
                 self.base_path.display()
             );
         }
-        if let Err(e) = rustix::fs::unlinkat(&self.base, self.temp.as_slice(), AtFlags::REMOVEDIR) {
-            let temp = self.base_path.join(OsStr::from_bytes(&self.temp));
-            eprintln!("warning: cannot remove {}: {e}", temp.display());
-        }
+        self.remove_from_base(&self.temp, true);
     }
 }
 
@@ -683,8 +747,25 @@ mod tests {
         assert_eq!(temp_dirs(tmp.path()), Vec::<String>::new());
     }
 
+    /// Starts a checkout into `dest`. With `no_noreplace`, the filesystem
+    /// acts as NFS does: it has no rename that never replaces.
+    fn start(dest: &Path, no_noreplace: bool) -> Result<Checkout> {
+        let mut checkout = Checkout::start(dest)?;
+        checkout.no_noreplace = no_noreplace;
+        Ok(checkout)
+    }
+
     #[test]
     fn an_existing_empty_directory_is_kept() {
+        existing_empty_directory_is_kept(false);
+    }
+
+    #[test]
+    fn an_existing_empty_directory_is_kept_without_a_no_replace_rename() {
+        existing_empty_directory_is_kept(true);
+    }
+
+    fn existing_empty_directory_is_kept(no_noreplace: bool) {
         let tmp = tempfile::tempdir().unwrap();
         let parent = tmp.path().join("parent");
         let dest = parent.join("dest");
@@ -696,21 +777,25 @@ mod tests {
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
         let written = (|| {
             check_dest(&dest)?;
-            let mut checkout = Checkout::start(&dest)?;
+            let mut checkout = start(&dest, no_noreplace)?;
             checkout.file(&path("a/b/c"), false, b"c\n")?;
             checkout.symlink(&path("a/link"), b"b/c")?;
+            // Moves up while its target is still in the temp directory.
+            checkout.symlink(&path("link"), b"top")?;
             checkout.file(&path("top"), true, b"top\n")?;
             checkout.finish()
         })();
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
         written.unwrap();
 
-        assert_eq!(names(&dest), ["a", "top"]);
+        assert_eq!(names(&dest), ["a", "link", "top"]);
         assert_eq!(fs::read(dest.join("a/b/c")).unwrap(), b"c\n");
         assert_eq!(
             fs::read_link(dest.join("a/link")).unwrap(),
             Path::new("b/c")
         );
+        assert_eq!(fs::read_link(dest.join("link")).unwrap(), Path::new("top"));
+        assert_eq!(fs::read(dest.join("top")).unwrap(), b"top\n");
         // The same directory, with its mode.
         assert_eq!(fs::metadata(&dest).unwrap().ino(), inode);
         assert_eq!(mode(&dest), 0o750);
@@ -720,29 +805,59 @@ mod tests {
     #[test]
     fn a_failed_checkout_leaves_an_existing_directory_as_it_was() {
         let tmp = tempfile::tempdir().unwrap();
-        let start = |name: &str| {
+        let begin = |name: &str, no_noreplace: bool| {
             let dest = tmp.path().join(name);
             fs::create_dir(&dest).unwrap();
-            let mut checkout = Checkout::start(&dest).unwrap();
+            let mut checkout = start(&dest, no_noreplace).unwrap();
             for file in ["a/x", "b", "c/y"] {
                 checkout.file(&path(file), false, b"ours\n").unwrap();
             }
             (dest, checkout)
         };
 
-        let (dest, checkout) = start("dropped");
+        let (dest, checkout) = begin("dropped", false);
         drop(checkout);
         assert_eq!(names(&dest), Vec::<String>::new());
 
-        // A file appears during the checkout, at a name that the checkout
-        // uses, or at another one. It stays, and what moved up is removed.
-        for (name, theirs) in [("same-name", "b"), ("other-name", "d")] {
-            let (dest, checkout) = start(name);
-            fs::write(dest.join(theirs), "theirs\n").unwrap();
-            let err = checkout.finish().unwrap_err();
-            assert!(format!("{err:#}").contains("no longer empty"), "{err:#}");
-            assert_eq!(names(&dest), [theirs]);
-            assert_eq!(fs::read(dest.join(theirs)).unwrap(), b"theirs\n");
+        // An entry appears during the checkout, at a name that the checkout
+        // uses for a file or a directory, or at another one. It stays as it
+        // was, and what moved up is removed. A plain rename would replace
+        // the empty directory.
+        let cases = [
+            ("b", "file"),
+            ("d", "file"),
+            ("a", "file"),
+            ("c", "empty directory"),
+            ("b", "symlink"),
+            ("a", "symlink"),
+        ];
+        for no_noreplace in [false, true] {
+            for (theirs, kind) in cases {
+                let (dest, checkout) =
+                    begin(&format!("{no_noreplace}-{theirs}-{kind}"), no_noreplace);
+                let at = dest.join(theirs);
+                match kind {
+                    "file" => fs::write(&at, "theirs\n").unwrap(),
+                    "symlink" => std::os::unix::fs::symlink("theirs", &at).unwrap(),
+                    _ => fs::create_dir(&at).unwrap(),
+                }
+                let inode = fs::symlink_metadata(&at).unwrap().ino();
+                let err = checkout.finish().unwrap_err();
+                let case = format!("{theirs} as a {kind}, no_noreplace {no_noreplace}");
+                assert!(
+                    format!("{err:#}").contains("no longer empty"),
+                    "{case}: {err:#}"
+                );
+                assert_eq!(names(&dest), [theirs], "{case}");
+                assert_eq!(fs::symlink_metadata(&at).unwrap().ino(), inode, "{case}");
+                match kind {
+                    "file" => assert_eq!(fs::read(&at).unwrap(), b"theirs\n", "{case}"),
+                    "symlink" => {
+                        assert_eq!(fs::read_link(&at).unwrap(), Path::new("theirs"), "{case}");
+                    }
+                    _ => assert_eq!(names(&at), Vec::<String>::new(), "{case}"),
+                }
+            }
         }
     }
 

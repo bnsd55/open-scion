@@ -30,7 +30,9 @@ release.
   not be writable. It must not be writable by all users unless it has the
   sticky bit. Writes go through directory handles and never follow a
   symlink, and each directory is opened about once. On failure or Ctrl-C,
-  what was written is removed.
+  what was written is removed. On NFS, which has no rename that never
+  replaces, a checkout into an existing directory moves files up by hard
+  link.
 - Path history and blame on first-parent history: `Log` takes an optional
   path and says where to continue, and a new `Blame` RPC gives each line's
   last changeset. `scn log --path` and `scn blame`. Each call has a bound,
