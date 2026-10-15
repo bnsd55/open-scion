@@ -34,6 +34,11 @@ release.
   dies by the signal, so a shell reports 128 plus its number (130 for
   Ctrl-C) and a shell loop stops too. A second signal stops the removal at
   once, and names the temp directory that it leaves.
+  Where the filesystem has no rename that never replaces (NFS on Linux),
+  a checkout into an existing directory still works: each top-level file
+  or symlink moves up by a hard link, and each top-level directory by a
+  rename onto a new empty directory that claims its name. This is tested
+  by forcing it, not on a real NFS mount.
 - Path history and blame on first-parent history: `Log` takes an optional
   path and says where to continue, and a new `Blame` RPC gives each line's
   last changeset. `scn log --path` and `scn blame`. Each call has a bound,
