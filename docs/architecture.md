@@ -543,22 +543,31 @@ uses only `Objects`:
    directories (each selects itself and everything below it) and the
    directories above them. A sparse path that is not in the tree is an error.
 3. Check every kept name (below). Submodules are skipped with a note.
-4. Only after the whole walk passes: make an empty temp directory next to
-   the destination, fetch the blobs in batches, check each blob's hash, and
-   write each file into the temp directory as its blob arrives.
-5. Rename the temp directory onto the destination. On any failure the temp
-   directory is removed, and the destination stays as it was. So the
-   destination's parent must be writable, the destination cannot be a mount
-   point, and an existing empty destination is replaced: its mode and owner
-   are not kept ([#44](https://github.com/bnsd55/open-scion/issues/44)).
+4. Only after the whole walk passes: make an empty temp directory, next to
+   a new destination or inside an existing empty one. Fetch the blobs in
+   batches, in path order (the order of the first file that uses each),
+   check each blob's hash, and write each file into the temp directory as
+   its blob arrives. The files of a directory arrive together, so each
+   directory is opened about once. A blob that backs files in several
+   directories writes them all when it arrives, so those directories open
+   again later.
+5. Rename the temp directory onto a new destination, or move each of its
+   entries up into an existing one. On any failure the temp directory and
+   what was moved are removed, and the destination stays as it was. An
+   existing destination is kept, with its mode, owner and extended
+   attributes, so it can be a mount point, and its parent need not be
+   writable.
 
 **Checkout-safe writes** (`scn/src/materialize.rs`). The object format
 accepts names that are not safe to write, so the checkout adds its own rules:
 
 | Rule | Why |
 |---|---|
-| The checkout is written into a temp directory, `.scn-checkout-<16 random hex digits>`, made with mode 0700 by `mkdirat` through a handle on the destination's parent. Just before the rename, it gets the mode of a plain `mkdir` (0777 less the umask). One `renameat` then moves it onto the destination name. | The rename is the check: it replaces a missing or empty directory, and fails if the destination is a non-empty directory, a file or a symlink. So "new or empty, not a symlink" holds at the moment the files appear. An early check gives a clear error first, but correctness comes from the rename. Other users cannot guess the temp name, or enter or write the directory. But a user who can write the destination's parent can still rename it and put another directory in its place, so that parent must not be writable by other users, unless it has the sticky bit. A killed `scn` can leave the temp directory behind. |
-| Inside the temp directory, each parent is opened with `O_NOFOLLOW`, one part at a time. Files use `O_CREAT \| O_EXCL`. | A symlink in the way, from this checkout or from anything else, fails the write instead of redirecting it. |
+| The checkout is written into a temp directory, `.scn-checkout-<16 random hex digits>`, made with mode 0700 by `mkdirat` through a directory handle. | Other users cannot guess the temp name, or enter or write the directory. A killed `scn` can leave the temp directory behind. |
+| A new destination: the temp directory is made in its parent. Just before the rename, it gets the mode of a plain `mkdir` (0777 less the umask). One `renameat` then moves it onto the destination name. | The rename is the check: it fails if the destination has appeared meanwhile as a non-empty directory, a file or a symlink. An early check gives a clear error first, but correctness comes from the rename. A user who can write the destination's parent can still rename the temp directory and put another directory in its place, so that parent must not be writable by other users, unless it has the sticky bit. |
+| An existing destination: it is opened with `O_NOFOLLOW`, and must be owned by the user who runs `scn` and be empty, checked through the handle. The temp directory is made inside it, and must be that user's once opened. Each top-level entry then moves up by a `renameat` that never replaces (`RENAME_NOREPLACE`, or `RENAME_EXCL` on macOS), and the destination must then hold only the checkout. | A symlink as the destination is refused. A directory of another user, for example one made in `/tmp` ahead of time, is refused: its owner could change the checkout. The moves go from the temp directory's handle, so a swapped temp name changes nothing. An entry that appears during the checkout is never replaced, and the final check catches one at any other name: the checkout fails and removes what it moved. NFS has no such rename, so there the checkout fails and asks for a new directory ([#74](https://github.com/bnsd55/open-scion/issues/74)). |
+| On a failure, the temp directory and what was moved are removed through directory handles: `unlinkat`, one level at a time, each directory opened with `O_NOFOLLOW`. | The removal never follows a symlink, and needs no path that could be swapped. |
+| Inside the temp directory, each parent is opened with `O_NOFOLLOW`, one part at a time. Files use `O_CREAT \| O_EXCL`. The handles on the parents of the last path stay open, at most 64. | A symlink in the way, from this checkout or from anything else, fails the write instead of redirecting it. Only directories that this checkout made inside its private temp directory stay open. With files in path order, each directory is opened once. 64 handles stay well below the 256 open files that macOS allows by default; a deeper path keeps its innermost ones. |
 | The temp directory starts empty, and the checkout records every path it makes. A path that already exists without being recorded is a collision. | The filesystem folded two names into one, by case or by Unicode form (for example `A` and `a`, or `X/f` and `x/g`, on macOS). The error names the path, and the temp directory is removed. Where nothing folds, every name is written, as git does. |
 | Symlinks are written as symlinks with their raw target bytes, never resolved. | A target such as `../../etc` is data, not a path to follow. |
 | Executable files get mode 0777, others 0666, less the umask. | The same modes as `git checkout`. |
@@ -596,7 +605,7 @@ an untrusted network.
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
 | Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once, 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget, and a reply whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 1 MiB, diffs at most 100 versions and about 1M lines, and at most 4 run at once. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object inside HTTP/2 until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. | The client trusts the server for a ref's target and for a changeset's root tree, which it cannot check by hash. Tiers ([#5](https://github.com/bnsd55/open-scion/issues/5)) must forward these answers, not compute them. |
-| Checkout | `scn checkout` writes into a private temp directory with a random name and renames it onto a new or empty destination, never follows a symlink while writing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure the destination stays as it was. | The destination's parent must not be writable by other users, unless it has the sticky bit: they could swap the temp directory before the rename. No Windows rules: device names and names that end in a dot or a space pass. |
+| Checkout | `scn checkout` writes into a private temp directory with a random name. It renames it onto a new destination, or moves its entries up into an existing empty directory that the user owns, never over an entry already there. It never follows a symlink while writing or removing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure the destination stays as it was. | A new destination's parent must not be writable by other users, unless it has the sticky bit: they could swap the temp directory before the rename. No Windows rules: device names and names that end in a dot or a space pass. |
 | Errors | Internal errors reply `internal error`. The detail stays in the server log. | |
 
 The planned cache tiers will need access tickets, because an object ID is not
@@ -633,5 +642,4 @@ limit and its upgrade path. This is the list on `main` today.
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |
 | `scn/src/cmd/commit.rs` (`commit`) | The author time zone is always UTC. | A time zone crate. | |
 | `scn/src/materialize.rs` (`check_name`) | No Windows rules: device names (`CON`, `NUL`) and names that end in a dot or a space pass. | Per-platform rules before checkout runs on Windows. | [#45](https://github.com/bnsd55/open-scion/issues/45) |
-| `scn/src/materialize.rs` (`Checkout`) | The checkout is renamed onto the destination, which needs a writable parent and replaces an existing empty directory. On an error the temp directory is removed by path. | Build inside an existing empty destination, and work only through directory handles. | [#44](https://github.com/bnsd55/open-scion/issues/44) |
-| `scn/src/materialize.rs` (`Checkout::parent`) | One `openat` per parent for every file, and files arrive in blob order. | Fetch blobs in path order and keep the last directory open. | [#41](https://github.com/bnsd55/open-scion/issues/41) |
+| `scn/src/materialize.rs` (`Checkout::move_up`) | A checkout into an existing directory needs a rename that never replaces, which NFS does not have. There it fails and asks for a new directory. | Check, then rename, on such a filesystem. | [#74](https://github.com/bnsd55/open-scion/issues/74) |

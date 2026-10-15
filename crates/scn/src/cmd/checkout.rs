@@ -2,22 +2,24 @@
 //!
 //! Uses only the `Objects` service, so a cache tier can serve all of it:
 //! resolve the revision, get its root tree, fetch one tree level per batch,
-//! then fetch the blobs in batches. Every object is checked against its ID on
-//! arrival. Nothing is written until the whole tree is walked and every name
-//! has passed the checkout path rules, and then only into a temp directory
-//! that becomes the destination by one rename (see [`crate::materialize`]).
+//! then fetch the blobs in batches, in path order. Every object is checked
+//! against its ID on arrival. Nothing is written until the whole tree is
+//! walked and every name has passed the checkout path rules, and then only
+//! into a temp directory that becomes the destination by renames (see
+//! [`crate::materialize`]).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
+use hashlink::LinkedHashSet;
 use scion_core::{BlobId, Entry, FileState, PathElem, RepoPath, Tree, TreeId};
 use scion_proto::MAX_OBJECT_REFS;
 use scion_proto::v1::{GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
 use serde_json::json;
 
 use crate::client::{Ctx, Objects, id_from};
-use crate::materialize::{Checkout, check_dest, check_name};
+use crate::materialize::{Checkout, check_dest, check_name, is_within};
 
 /// Arguments of `scn checkout`.
 #[derive(clap::Args)]
@@ -27,11 +29,12 @@ pub struct CheckoutArgs {
     /// Write only this directory and everything below it. Repeat for more.
     #[arg(long, value_name = "DIR", value_parser = parse_dir)]
     sparse: Vec<RepoPath>,
-    /// Directory to write into. It must not exist, or be empty. The checkout
-    /// is built next to it and renamed onto it, so its parent must be
-    /// writable, and it cannot be a mount point. Its parent must not be
-    /// writable by other users, unless it has the sticky bit (as /tmp has):
-    /// they could swap the checkout before the rename.
+    /// Directory to write into. It must not exist, or be empty. An empty
+    /// directory is kept, and must be yours: the checkout is built inside it
+    /// and moved up. A new one is built next to it and renamed into place,
+    /// so its parent must be writable, and must not be writable by other
+    /// users unless it has the sticky bit (as /tmp has): they could swap the
+    /// checkout before the rename.
     #[arg(long, value_name = "PATH")]
     into: PathBuf,
 }
@@ -40,9 +43,8 @@ fn parse_dir(dir: &str) -> Result<RepoPath> {
     RepoPath::new(dir.trim_end_matches('/')).with_context(|| format!("bad path {dir:?}"))
 }
 
-/// Files to write, grouped by the blob that holds their content: a blob may
-/// back several files. Never holds a gitlink.
-type Files = HashMap<BlobId, Vec<(RepoPath, FileState)>>;
+/// Files to write, in path order. Never holds a gitlink.
+type Files = BTreeMap<RepoPath, FileState>;
 
 /// Writes the files of a changeset into a new or empty directory, and prints
 /// how many it wrote. On failure the destination is left as it was.
@@ -63,7 +65,7 @@ pub async fn checkout(ctx: &mut Ctx, args: CheckoutArgs) -> Result<()> {
     let mut dest = Checkout::start(&args.into)?;
     write_files(&mut ctx.objects, &ctx.repo, &mut dest, &files).await?;
     dest.finish()?;
-    let count: usize = files.values().map(Vec::len).sum();
+    let count = files.len();
     let into = args.into.display();
     if ctx.json {
         let summary =
@@ -107,9 +109,13 @@ async fn walk(
             let tree = trees.get(&id).context("server skipped a tree")?;
             for (name, entry) in &tree.entries {
                 let path = join(dir.as_ref(), name)?;
-                let inside = sparse.is_empty() || sparse.iter().any(|s| is_within(&path, s));
+                let bytes = path.as_bytes();
+                let inside =
+                    sparse.is_empty() || sparse.iter().any(|s| is_within(bytes, s.as_bytes()));
                 let keep = match entry {
-                    Entry::Dir(_) => inside || sparse.iter().any(|s| is_within(s, &path)),
+                    Entry::Dir(_) => {
+                        inside || sparse.iter().any(|s| is_within(s.as_bytes(), bytes))
+                    }
                     Entry::File(_) => inside,
                 };
                 if !keep {
@@ -128,9 +134,7 @@ async fn walk(
                 match entry {
                     Entry::Dir(id) => next.push((Some(path), *id)),
                     Entry::File(state) => {
-                        if let Some(blob) = state.blob() {
-                            files.entry(blob).or_default().push((path, *state));
-                        }
+                        files.insert(path, *state);
                     }
                 }
             }
@@ -143,8 +147,10 @@ async fn walk(
     Ok(files)
 }
 
-/// Fetches the blobs of `files` in batches and writes each file as its blob
-/// arrives.
+/// Fetches the blobs of `files` in batches, in the order of the first file
+/// that uses each, and writes each file as its blob arrives. So the files of
+/// a directory are written together, and [`Checkout`] opens it about once: a
+/// blob that backs files in several directories writes them all on arrival.
 ///
 /// # Errors
 ///
@@ -155,11 +161,21 @@ async fn write_files(
     dest: &mut Checkout,
     files: &Files,
 ) -> Result<()> {
-    let ids = files.keys().map(|id| *id.as_bytes());
+    // A blob may back several files.
+    let mut by_blob: HashMap<BlobId, Vec<(&RepoPath, &FileState)>> = HashMap::new();
+    for (path, state) in files {
+        if let Some(blob) = state.blob() {
+            by_blob.entry(blob).or_default().push((path, state));
+        }
+    }
+    let ids = files
+        .values()
+        .filter_map(FileState::blob)
+        .map(|id| *id.as_bytes());
     fetch(objects, repo, ObjectKind::Blob, ids, |id, data| {
         let id = BlobId::from_bytes(id);
         check_blob(id, &data)?;
-        for (path, state) in files.get(&id).into_iter().flatten() {
+        for &(path, state) in by_blob.get(&id).into_iter().flatten() {
             match *state {
                 FileState::Regular { executable, .. } => dest.file(path, executable, &data)?,
                 FileState::Symlink { .. } => dest.symlink(path, &data)?,
@@ -172,8 +188,9 @@ async fn write_files(
     .await
 }
 
-/// Fetches objects of one kind and calls `got` with each object's ID and bytes
-/// as it arrives. A reply may stop early; the rest are asked for again.
+/// Fetches objects of one kind, each once and in the order given, and calls
+/// `got` with each object's ID and bytes as it arrives. A reply may stop
+/// early; the rest are asked for again.
 ///
 /// # Errors
 ///
@@ -186,7 +203,7 @@ async fn fetch(
     ids: impl IntoIterator<Item = [u8; 32]>,
     mut got: impl FnMut([u8; 32], Vec<u8>) -> Result<()>,
 ) -> Result<()> {
-    let mut want: BTreeSet<[u8; 32]> = ids.into_iter().collect();
+    let mut want: LinkedHashSet<[u8; 32]> = ids.into_iter().collect();
     while !want.is_empty() {
         let refs = want
             .iter()
@@ -247,13 +264,6 @@ fn join(dir: Option<&RepoPath>, name: &PathElem) -> Result<RepoPath> {
     RepoPath::new(bytes).map_err(|e| anyhow!("a path in {dir:?} is too long or too deep: {e}"))
 }
 
-/// Whether `path` is `dir` or below it.
-fn is_within(path: &RepoPath, dir: &RepoPath) -> bool {
-    path.as_bytes()
-        .strip_prefix(dir.as_bytes())
-        .is_some_and(|rest| rest.first().is_none_or(|&b| b == b'/'))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,7 +295,7 @@ mod tests {
 
     #[test]
     fn a_sparse_path_selects_itself_and_what_is_below_it() {
-        let dir = RepoPath::new("src/a").unwrap();
+        let dir = b"src/a";
         for (path, within) in [
             ("src/a", true),
             ("src/a/b", true),
@@ -293,11 +303,7 @@ mod tests {
             ("src", false),
             ("srC/a", false),
         ] {
-            assert_eq!(
-                is_within(&RepoPath::new(path).unwrap(), &dir),
-                within,
-                "{path}"
-            );
+            assert_eq!(is_within(path.as_bytes(), dir), within, "{path}");
         }
     }
 }

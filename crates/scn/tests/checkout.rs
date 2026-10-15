@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Output};
@@ -285,6 +285,27 @@ fn checkout_matches_git_checkout_byte_for_byte() {
 }
 
 #[test]
+fn checkout_into_an_existing_empty_directory_keeps_it() {
+    let repo = fixture();
+    let server = Server::with_import(repo.path());
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("parent");
+    let ours = parent.join("ours");
+    fs::create_dir_all(&ours).unwrap();
+    let inode = fs::metadata(&ours).unwrap().ino();
+
+    // Nothing can be made next to it, as next to a mount point.
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+    let out = server.scn(&["checkout", "main", "--into", text(&ours)]);
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let expected = git_checkout(repo.path(), &tmp.path().join("theirs"));
+    assert_eq!(snapshot(&ours), expected);
+    assert_eq!(fs::metadata(&ours).unwrap().ino(), inode);
+}
+
+#[test]
 fn sparse_checkout_writes_only_the_requested_directories() {
     let repo = fixture();
     let server = Server::with_import(repo.path());
@@ -414,9 +435,10 @@ fn names_that_fold_together_fail_cleanly_where_the_filesystem_folds_them() {
         executable: false,
     };
     let (one, two) = (regular(b"one\n"), regular(b"two\n"));
-    // From the checkout, `../outside` is a directory next to it.
+    // From the temp directory inside `dest`, `../../outside` is a directory
+    // next to `dest`.
     let link = FileState::Symlink {
-        target: store.blobs().put(b"../outside").unwrap(),
+        target: store.blobs().put(b"../../outside").unwrap(),
     };
     let cases: [Files; 3] = [
         &[(b"A", one), (b"a", two)],
@@ -495,10 +517,12 @@ fn objects_larger_than_one_reply_span_several_calls() {
 struct Liar {
     root: TreeId,
     objects: HashMap<Vec<u8>, Object>,
+    /// The blob IDs, in the order of their paths.
+    in_path_order: Vec<Vec<u8>>,
 }
 
 impl Liar {
-    /// A root tree with two files, and their blobs.
+    /// A root tree with two files, `a` and `b`, and their blobs.
     fn new() -> Self {
         let blob = |data: &[u8]| Object {
             kind: ObjectKind::Blob.into(),
@@ -506,6 +530,13 @@ impl Liar {
             data: data.to_vec(),
         };
         let (one, two) = (blob(b"one\n"), blob(b"two\n"));
+        // Path order is the opposite of ID order, so a fetch in ID order is
+        // caught.
+        let (low, high) = if one.id < two.id {
+            (one, two)
+        } else {
+            (two, one)
+        };
         let file = |object: &Object| {
             Entry::File(FileState::Regular {
                 content: BlobId::try_from(object.id.as_slice()).unwrap(),
@@ -514,8 +545,8 @@ impl Liar {
         };
         let tree = Tree {
             entries: [
-                (PathElem::new("one").unwrap(), file(&one)),
-                (PathElem::new("two").unwrap(), file(&two)),
+                (PathElem::new("a").unwrap(), file(&high)),
+                (PathElem::new("b").unwrap(), file(&low)),
             ]
             .into(),
         };
@@ -525,11 +556,16 @@ impl Liar {
             id: root.as_bytes().to_vec(),
             data,
         };
-        let objects = [tree, one, two]
+        let in_path_order = vec![high.id.clone(), low.id.clone()];
+        let objects = [tree, high, low]
             .into_iter()
             .map(|object| (object.id.clone(), object))
             .collect();
-        Self { root, objects }
+        Self {
+            root,
+            objects,
+            in_path_order,
+        }
     }
 }
 
@@ -565,6 +601,13 @@ impl Objects for Liar {
             honest.into_iter().map(Ok).collect()
         } else {
             match repo.as_str() {
+                "in-order" => {
+                    let asked: Vec<_> = refs.iter().map(|r| r.id.clone()).collect();
+                    if asked != self.in_path_order {
+                        return Err(Status::invalid_argument("blobs not asked in path order"));
+                    }
+                    honest.into_iter().map(Ok).collect()
+                }
                 "extra" => {
                     let id = BlobId::of(b"extra").as_bytes().to_vec();
                     honest.push(Object {
@@ -596,8 +639,8 @@ impl Objects for Liar {
     }
 }
 
-#[test]
-fn a_misbehaving_server_is_caught_and_nothing_is_written() {
+/// Serves a [`Liar`] until the returned runtime is dropped, and returns its URL.
+fn start_liar() -> (Runtime, String) {
     let runtime = Runtime::new().unwrap();
     let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -606,6 +649,31 @@ fn a_misbehaving_server_is_caught_and_nothing_is_written() {
             .add_service(ObjectsServer::new(Liar::new()))
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
+    (runtime, url)
+}
+
+#[test]
+fn blobs_are_asked_for_in_path_order() {
+    let (_runtime, url) = start_liar();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("dest");
+    let any_changeset = "00".repeat(32);
+    let out = scn(
+        &url,
+        "in-order",
+        &["checkout", &any_changeset, "--into", text(&dest)],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let mut written: Vec<_> = ["a", "b"]
+        .map(|name| fs::read(dest.join(name)).unwrap())
+        .into();
+    written.sort();
+    assert_eq!(written, [b"one\n", b"two\n"]);
+}
+
+#[test]
+fn a_misbehaving_server_is_caught_and_nothing_is_written() {
+    let (_runtime, url) = start_liar();
     let tmp = tempfile::tempdir().unwrap();
     let any_changeset = "00".repeat(32);
 
