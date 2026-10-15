@@ -23,10 +23,11 @@
 //! transaction, so they never disagree.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::Instant;
 
+use hashlink::LruCache;
 use rusqlite::{Connection, OptionalExtension, params};
 use scion_core::{Changeset, ChangesetId, FileState, RepoPath};
 
@@ -85,14 +86,13 @@ const MAX_WALK: usize = if cfg!(test) { 1000 } else { 100_000 };
 // floor to it takes at most `MAX_DEPTH` steps.
 const _: () = assert!(MAX_DEPTH.unsigned_abs() <= MAX_WALK as u64);
 
-/// Most bytes that one ref's [`PathIndex`] holds, counted by
-/// [`entry_bytes`]: about 1M entries of short paths. An advance or a land
-/// that would go over moves the floor up to the tip. A reach back to a base
-/// that would go over stops, and [`touched_below`] checks the rest. Tests use
-/// a small budget, so that they reach it.
-// SHORTCUT: the budget is per ref, so the memory of all indexes grows with
-// the refs that take lands. Upgrade (issue #75): one budget for all indexes,
-// which drops the least recently used.
+/// Most bytes that the [`PathIndex`]es of all refs hold together, counted by
+/// [`entry_bytes`]: about 1M entries of short paths. An index that would go
+/// over first drops the indexes of other refs that no land uses, least
+/// recently used first ([`Lands::reserve`]). If that is not enough, an
+/// advance or a land moves its floor up to the tip, and a reach back to a
+/// base stops, and [`touched_below`] checks the rest. Tests use a small
+/// budget, so that they reach it.
 const MAX_INDEX_BYTES: usize = if cfg!(test) { 64 << 10 } else { 128 << 20 };
 
 /// Where a land stands.
@@ -219,9 +219,21 @@ pub struct LandOutcome {
 type RefSlot = Arc<Mutex<Option<PathIndex>>>;
 
 /// Serializes lands per ref and keeps each ref's [`PathIndex`].
-#[derive(Default)]
 pub struct Lands {
-    refs: Mutex<HashMap<(RepoId, String), RefSlot>>,
+    /// Each ref's slot, the least recently landed on first.
+    refs: Mutex<LruCache<(RepoId, String), RefSlot>>,
+    /// What all path indexes hold, by [`entry_bytes`]: the sum of their
+    /// `bytes`. At most [`MAX_INDEX_BYTES`].
+    used: Arc<AtomicUsize>,
+}
+
+impl Default for Lands {
+    fn default() -> Self {
+        Self {
+            refs: Mutex::new(LruCache::new_unbounded()),
+            used: Arc::default(),
+        }
+    }
 }
 
 impl Lands {
@@ -271,7 +283,7 @@ impl Lands {
         if row.state != LandState::Pending {
             return Ok(row);
         }
-        let result = finish(store, repo, land_id, req, &mut index);
+        let result = finish(self, store, repo, land_id, req, &mut index);
         // The index may be ahead of the database; rebuild it next time. A lost
         // race wrote nothing, so the index is still good. So is an index that
         // a deadline stopped: an advance adds nothing until it reaches the
@@ -286,9 +298,84 @@ impl Lands {
         result
     }
 
+    /// The slot of a ref, which becomes the most recently used one.
     fn slot(&self, repo: RepoId, name: &str) -> RefSlot {
-        let mut refs = self.refs.lock().unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(refs.entry((repo, name.to_owned())).or_default())
+        let mut refs = self.lock_refs();
+        let key = (repo, name.to_owned());
+        if let Some(slot) = refs.get(&key) {
+            return Arc::clone(slot);
+        }
+        let slot = RefSlot::default();
+        refs.insert(key, Arc::clone(&slot));
+        slot
+    }
+
+    fn lock_refs(&self) -> MutexGuard<'_, LruCache<(RepoId, String), RefSlot>> {
+        self.refs.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Takes `bytes` from the budget that all path indexes share. If too few
+    /// are free, first drops the indexes of other refs, least recently used
+    /// first, but only if that frees enough. It skips each index whose ref's
+    /// lock is held, because a land uses it. The caller holds the lock of the
+    /// index that grows, so that one stays too. Returns false if it could
+    /// not take the bytes.
+    fn reserve(&self, bytes: usize) -> bool {
+        if self.take(bytes) {
+            return true;
+        }
+        let slots: Vec<RefSlot> = self
+            .lock_refs()
+            .iter()
+            .map(|(_, slot)| Arc::clone(slot))
+            .collect();
+        let free = MAX_INDEX_BYTES - self.used.load(Ordering::Acquire);
+        let short = bytes.saturating_sub(free);
+        let mut idle = Vec::new();
+        let mut freed = 0;
+        for slot in &slots {
+            if freed >= short {
+                break;
+            }
+            let index = match slot.try_lock() {
+                Ok(index) => index,
+                Err(TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(TryLockError::WouldBlock) => continue,
+            };
+            if let Some(held) = index.as_ref() {
+                freed += held.bytes;
+                idle.push(index);
+            }
+        }
+        if freed < short {
+            return false;
+        }
+        tracing::info!(
+            dropped = idle.len(),
+            freed,
+            "the path indexes are full; dropped the least recently used ones"
+        );
+        for mut index in idle {
+            // Dropping an index gives its bytes back.
+            *index = None;
+        }
+        self.take(bytes)
+    }
+
+    /// Takes `bytes` from the budget if they are free.
+    fn take(&self, bytes: usize) -> bool {
+        let mut used = self.used.load(Ordering::Acquire);
+        while bytes <= MAX_INDEX_BYTES - used {
+            let sum = used + bytes;
+            match self
+                .used
+                .compare_exchange_weak(used, sum, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(now) => used = now,
+            }
+        }
+        false
     }
 }
 
@@ -481,6 +568,7 @@ enum Plan {
 /// the transaction. The land is then planned again from the new head, and
 /// that plan advances the index to it.
 fn finish(
+    lands: &Lands,
     store: &Store,
     repo: RepoId,
     land_id: i64,
@@ -489,8 +577,8 @@ fn finish(
 ) -> Result<LandOutcome> {
     let mut attempt = 1;
     loop {
-        let plan = store.read_unflushed(|c| plan(c, repo, req, index))?;
-        match settle(store, repo, land_id, &req.target_ref, plan, index) {
+        let plan = store.read_unflushed(|c| plan(lands, c, repo, req, index))?;
+        match settle(lands, store, repo, land_id, &req.target_ref, plan, index) {
             Err(Error::Aborted(detail)) if attempt < MAX_ATTEMPTS => {
                 tracing::info!(land_id, attempt, %detail, "planning the land again");
                 attempt += 1;
@@ -502,6 +590,7 @@ fn finish(
 
 /// Step 4: decides the land against the ref's current head.
 fn plan(
+    lands: &Lands,
     c: &Connection,
     repo: RepoId,
     req: &LandRequest,
@@ -519,10 +608,10 @@ fn plan(
     };
     let index = match index {
         Some(index) => index,
-        None => index.insert(PathIndex::new(c, repo, head.target)?),
+        None => index.insert(PathIndex::new(c, repo, head.target, &lands.used)?),
     };
-    index.advance_to(c, repo, head.target, &req.deadline)?;
-    let conflicts = match index.check(c, repo, base, &cs.changes, &req.deadline)? {
+    index.advance_to(lands, c, repo, head.target, &req.deadline)?;
+    let conflicts = match index.check(lands, c, repo, base, &cs.changes, &req.deadline)? {
         Checked::Paths(conflicts) => conflicts,
         Checked::NotOnHistory => {
             return Ok(Plan::Reject(format!(
@@ -553,6 +642,7 @@ fn plan(
 /// Step 5: records what the plan decided. If the ref moved since the plan,
 /// writes nothing and returns [`Error::Aborted`].
 fn settle(
+    lands: &Lands,
     store: &Store,
     repo: RepoId,
     land_id: i64,
@@ -598,7 +688,7 @@ fn settle(
     match landed {
         Ok((outcome, generation)) => {
             if let (Some(index), Some(id)) = (index.as_mut(), outcome.result) {
-                index.record(id, generation, &rebased.changes);
+                index.record(lands, id, generation, &rebased.changes);
             }
             tracing::info!(land_id, id = ?outcome.result, target = %target, "landed");
             Ok(outcome)
@@ -625,7 +715,8 @@ fn settle(
 /// forward as the ref moves and backward when a land has an older base, up
 /// to [`MAX_DEPTH`] below the tip. Each [`PRUNE_EVERY`] generations,
 /// [`PathIndex::prune`] moves `floor` up to the oldest base that the cycle
-/// used, so memory follows the bases in use. [`MAX_INDEX_BYTES`] bounds it.
+/// used, so memory follows the bases in use. [`MAX_INDEX_BYTES`] bounds all
+/// indexes together.
 struct PathIndex {
     tip: ChangesetId,
     floor: ChangesetId,
@@ -642,16 +733,30 @@ struct PathIndex {
     oldest_base: i64,
     /// What `chain`, `files` and `dirs` hold, by [`entry_bytes`].
     bytes: usize,
+    /// [`Lands::used`], which counts `bytes` too.
+    used: Arc<AtomicUsize>,
+}
+
+impl Drop for PathIndex {
+    fn drop(&mut self) {
+        self.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
 }
 
 impl PathIndex {
-    /// An empty index at `head`. Its first prune cycle starts there.
-    fn new(c: &Connection, repo: RepoId, head: ChangesetId) -> Result<Self> {
-        Ok(Self::at(head, db::generation(c, repo, head)?))
+    /// An empty index at `head`, counted in `used`. Its first prune cycle
+    /// starts there.
+    fn new(
+        c: &Connection,
+        repo: RepoId,
+        head: ChangesetId,
+        used: &Arc<AtomicUsize>,
+    ) -> Result<Self> {
+        Ok(Self::at(head, db::generation(c, repo, head)?, used))
     }
 
     /// An empty index at `head`, of generation `head_gen`.
-    fn at(head: ChangesetId, head_gen: i64) -> Self {
+    fn at(head: ChangesetId, head_gen: i64, used: &Arc<AtomicUsize>) -> Self {
         Self {
             tip: head,
             floor: head,
@@ -661,6 +766,7 @@ impl PathIndex {
             cycle_start: head_gen,
             oldest_base: head_gen,
             bytes: 0,
+            used: Arc::clone(used),
         }
     }
 
@@ -672,6 +778,7 @@ impl PathIndex {
     /// the database lock for little gain.
     fn advance_to(
         &mut self,
+        lands: &Lands,
         c: &Connection,
         repo: RepoId,
         head: ChangesetId,
@@ -682,16 +789,23 @@ impl PathIndex {
         }
         let tip_gen = db::generation(c, repo, self.tip)?;
         let mut walked = Vec::new();
-        let mut needed = self.bytes;
+        // The most that the walked changesets add.
+        let mut most = 0;
         let mut steps = 0;
         let mut cur = Some(head);
         while let Some(id) = cur {
             if id == self.tip {
-                for (id, generation, changes) in walked {
-                    self.add(id, generation, &changes);
+                let grew = self.grow(lands, most, |index| {
+                    for (id, generation, changes) in walked {
+                        index.add(id, generation, &changes);
+                    }
+                });
+                if grew {
+                    self.tip = head;
+                    return Ok(());
                 }
-                self.tip = head;
-                return Ok(());
+                tracing::info!("the path indexes are full; it starts over at the head");
+                break;
             }
             deadline.check()?;
             steps += 1;
@@ -707,18 +821,18 @@ impl PathIndex {
                 break;
             }
             let cs = db::get_changeset(c, repo, id)?;
-            needed += added_bytes(&cs.changes);
-            if needed > MAX_INDEX_BYTES {
+            most += added_bytes(&cs.changes);
+            if self.bytes + most > MAX_INDEX_BYTES {
                 tracing::info!(
                     generation,
-                    "the path index is full; it starts over at the head"
+                    "the path indexes are full; it starts over at the head"
                 );
                 break;
             }
             cur = cs.parents.first().copied();
             walked.push((id, generation, cs.changes));
         }
-        *self = Self::new(c, repo, head)?;
+        *self = Self::new(c, repo, head, &self.used)?;
         Ok(())
     }
 
@@ -732,6 +846,7 @@ impl PathIndex {
     /// base does not count as used for pruning.
     fn check(
         &mut self,
+        lands: &Lands,
         c: &Connection,
         repo: RepoId,
         base: ChangesetId,
@@ -750,7 +865,7 @@ impl PathIndex {
             let mut walk = if deep {
                 Walk::Stopped
             } else {
-                self.reach(c, repo, base, base_gen, deadline)?
+                self.reach(lands, c, repo, base, base_gen, deadline)?
             };
             if walk == Walk::Stopped {
                 (walk, below) =
@@ -786,6 +901,7 @@ impl PathIndex {
     /// that `base` is not the floor and not in the index.
     fn reach(
         &mut self,
+        lands: &Lands,
         c: &Connection,
         repo: RepoId,
         base: ChangesetId,
@@ -800,10 +916,10 @@ impl PathIndex {
             base_gen,
             deadline,
             |id, generation, cs| {
-                if !self.fits(&cs.changes) {
+                let most = added_bytes(&cs.changes);
+                if !self.grow(lands, most, |index| index.add(id, generation, &cs.changes)) {
                     return false;
                 }
-                self.add(id, generation, &cs.changes);
                 if let Some(&parent) = cs.parents.first() {
                     self.floor = parent;
                 }
@@ -843,7 +959,9 @@ impl PathIndex {
                 // `retain` keeps the capacity, so give it back.
                 map.shrink_to_fit();
             }
-            self.bytes = self.measure();
+            let kept = self.measure();
+            self.used.fetch_sub(self.bytes - kept, Ordering::AcqRel);
+            self.bytes = kept;
             tracing::debug!(floor_gen, kept = self.chain.len(), "pruned the path index");
         }
         self.cycle_start = tip_gen;
@@ -854,20 +972,37 @@ impl PathIndex {
     /// [`MAX_INDEX_BYTES`], the index starts over at it.
     fn record(
         &mut self,
+        lands: &Lands,
         id: ChangesetId,
         generation: i64,
         changes: &BTreeMap<RepoPath, Option<FileState>>,
     ) {
-        if !self.fits(changes) {
+        let most = added_bytes(changes);
+        if !self.grow(lands, most, |index| index.add(id, generation, changes)) {
             tracing::info!(
                 generation,
-                "the path index is full; it starts over at the tip"
+                "the path indexes are full; it starts over at the tip"
             );
-            *self = Self::at(id, generation);
+            *self = Self::at(id, generation, &self.used);
             return;
         }
-        self.add(id, generation, changes);
         self.tip = id;
+    }
+
+    /// Runs `add`, which adds at most `most` bytes, if the budget of all
+    /// indexes has room for them ([`Lands::reserve`]). Returns false, and
+    /// runs nothing, if it has not.
+    fn grow(&mut self, lands: &Lands, most: usize, add: impl FnOnce(&mut Self)) -> bool {
+        if !lands.reserve(most) {
+            return false;
+        }
+        let before = self.bytes;
+        add(self);
+        // A path that the index holds already adds nothing, so give the rest
+        // back.
+        let added = self.bytes - before;
+        self.used.fetch_sub(most - added, Ordering::AcqRel);
+        true
     }
 
     fn add(
@@ -886,11 +1021,6 @@ impl PathIndex {
                 self.bytes += bump(&mut self.dirs, dir, generation);
             }
         }
-    }
-
-    /// Whether a changeset with `changes` fits in [`MAX_INDEX_BYTES`].
-    fn fits(&self, changes: &BTreeMap<RepoPath, Option<FileState>>) -> bool {
-        self.bytes + added_bytes(changes) <= MAX_INDEX_BYTES
     }
 
     /// What the index holds, by [`entry_bytes`]. Counted from scratch.
@@ -1234,9 +1364,46 @@ mod tests {
 
         /// Runs `read` on the path index of `main`.
         fn index<T>(&self, read: impl FnOnce(&PathIndex) -> T) -> T {
-            let slot = self.lands.slot(self.repo, "main");
+            let slot = self.slot("main");
             let index = slot.lock().unwrap();
             read(index.as_ref().expect("main has a path index"))
+        }
+
+        /// The slot of ref `name`. Unlike a land, this does not count as a
+        /// use of the ref.
+        fn slot(&self, name: &str) -> RefSlot {
+            let refs = self.lands.lock_refs();
+            Arc::clone(refs.peek(&(self.repo, name.to_owned())).unwrap())
+        }
+
+        /// Checks the byte counts of all path indexes against the shared
+        /// budget. Returns whether each ref, by name, has an index.
+        fn held(&self) -> BTreeMap<String, bool> {
+            let slots: Vec<(String, RefSlot)> = (self.lands.lock_refs().iter())
+                .map(|((_, name), slot)| (name.clone(), Arc::clone(slot)))
+                .collect();
+            let mut sum = 0;
+            let mut held = BTreeMap::new();
+            for (name, slot) in slots {
+                let index = slot.lock().unwrap();
+                if let Some(index) = index.as_ref() {
+                    assert_eq!(index.bytes, index.measure(), "{name}");
+                    sum += index.bytes;
+                }
+                held.insert(name, index.is_some());
+            }
+            assert_eq!(self.lands.used.load(Ordering::Acquire), sum);
+            assert!(sum <= MAX_INDEX_BYTES, "{sum} bytes");
+            held
+        }
+
+        /// Lands `cs` on ref `name`.
+        fn land_on(&self, name: &str, cs: ChangesetId, key: &str) -> LandOutcome {
+            let req = LandRequest {
+                target_ref: name.into(),
+                ..req(cs, key)
+            };
+            self.lands.land(&self.store, &caller(), &req).unwrap()
         }
     }
 
@@ -1358,14 +1525,16 @@ mod tests {
             assert_eq!(recorded.state, LandState::Pending);
             if crash != Crash::AfterRecord {
                 let mut index = None;
-                let plan = f.store.read(|c| plan(c, repo, &req, &mut index)).unwrap();
+                let plan = f.store.read(|c| plan(&f.lands, c, repo, &req, &mut index));
+                let plan = plan.unwrap();
                 let Plan::Land { rebased, .. } = &plan else {
                     panic!("{crash:?}: the land should plan to land");
                 };
                 let rebased = rebased.id();
                 if crash == Crash::RefMoved {
                     f.move_main(f.commit(f.main().target, &[put("c", "import")]));
-                    let err = settle(&f.store, repo, recorded.land_id, "main", plan, &mut index)
+                    let land_id = recorded.land_id;
+                    let err = settle(&f.lands, &f.store, repo, land_id, "main", plan, &mut index)
                         .unwrap_err();
                     assert!(matches!(err, Error::Aborted(_)), "{crash:?}: {err}");
                     let kept = f.store.read(|c| db::has_changeset(c, repo, rebased));
@@ -1431,7 +1600,8 @@ mod tests {
         assert_eq!(out.state, LandState::Rejected);
         assert_eq!(f.lands.land(&f.store, &caller(), &missing).unwrap(), out);
         let slots = f.lands.refs.lock().unwrap();
-        assert_eq!(slots.keys().collect::<Vec<_>>(), [&(f.repo, "main".into())]);
+        let keys: Vec<_> = slots.iter().map(|(key, _)| key).collect();
+        assert_eq!(keys, [&(f.repo, "main".into())]);
     }
 
     #[test]
@@ -1676,14 +1846,81 @@ mod tests {
         (0..n).map(|i| put(&format!("{dir}/f{i}"), "x")).collect()
     }
 
-    /// Checks that the index of `main` counts its bytes right and stays
-    /// within its budget. Returns its floor.
+    /// Checks that every path index counts its bytes right, and that all of
+    /// them stay within the shared budget. Returns the floor of `main`.
     fn within_budget(f: &Fixture) -> ChangesetId {
-        f.index(|index| {
-            assert_eq!(index.bytes, index.measure());
-            assert!(index.bytes <= MAX_INDEX_BYTES, "{} bytes", index.bytes);
-            index.floor
-        })
+        f.held();
+        f.index(|index| index.floor)
+    }
+
+    #[test]
+    fn the_path_indexes_of_all_refs_share_one_budget() {
+        use LandState::{Conflict, Landed};
+        // A land of this many new paths reserves a fifth of the budget, and
+        // its index keeps about half of that.
+        const WIDE: usize = 100;
+        let one = added_bytes(&wide("r0", WIDE).into_iter().collect());
+        assert!(4 * one < MAX_INDEX_BYTES && 5 * one > MAX_INDEX_BYTES);
+        let f = fixture();
+        let names: Vec<String> = (0..12).map(|i| format!("r{i}")).collect();
+        for name in &names {
+            let moved = f
+                .store
+                .write(|c| db::cas_ref(c, f.repo, name, None, f.root));
+            assert!(moved.unwrap());
+        }
+        let land_wide = |name: &str| {
+            let cs = f.commit(f.root, &wide(name, WIDE));
+            assert_eq!(f.land_on(name, cs, name).state, Landed);
+        };
+
+        // One land on each ref, in order, until the budget is spent. A second
+        // land on r0 makes r1 the least recently used, so its index goes
+        // first.
+        let mut rest = names.iter();
+        land_wide(rest.next().unwrap());
+        land_wide(rest.next().unwrap());
+        let again = f.commit(f.root, &[put("r0/again", "x")]);
+        assert_eq!(f.land_on("r0", again, "again").state, Landed);
+        let dropped = loop {
+            let name = rest.next().expect("the lands spend the budget");
+            land_wide(name);
+            let held = f.held();
+            let dropped: Vec<String> = held
+                .into_iter()
+                .filter(|(_, h)| !h)
+                .map(|(n, _)| n)
+                .collect();
+            if !dropped.is_empty() {
+                break dropped;
+            }
+        };
+        assert_eq!(dropped, ["r1"]);
+
+        // An index whose ref's lock is held is in use, so the next one goes.
+        let busy = f.slot("r0");
+        let lock = busy.lock().unwrap();
+        assert!(rest.len() >= 2);
+        rest.for_each(|name| land_wide(name));
+        drop(lock);
+        let held = f.held();
+        assert!(held["r0"] && !held["r2"], "{held:?}");
+        let newest = &names[names.len() - 3..];
+        assert!(newest.iter().all(|name| held[name]), "{held:?}");
+
+        // A land on each ref, on a base before its wide land, sees that
+        // land's changes, whether its index was dropped or not.
+        for name in &names {
+            let mine = format!("{name}/f7");
+            let cs = f.commit(f.root, &[put(&mine, "mine")]);
+            let out = f.land_on(name, cs, &format!("{name} conflict"));
+            assert_eq!(out.state, Conflict, "{name}: {}", out.detail);
+            assert_eq!(out.conflict_paths, [RepoPath::new(mine.as_str()).unwrap()]);
+            let cs = f.commit(f.root, &[put(&format!("{name}/g"), "mine")]);
+            let out = f.land_on(name, cs, &format!("{name} land"));
+            assert_eq!(out.state, Landed, "{name}: {}", out.detail);
+            f.held();
+        }
     }
 
     #[test]
@@ -1695,6 +1932,14 @@ mod tests {
         let one = added_bytes(&wide("d0", WIDE).into_iter().collect());
         assert!(3 * one > MAX_INDEX_BYTES && PRUNE_EVERY > 3);
         let f = fixture();
+        // The index of another ref. A restart of main's index does not need
+        // its room, so it stays.
+        assert!(
+            f.store
+                .write(|c| db::cas_ref(c, f.repo, "other", None, f.root))
+                .unwrap()
+        );
+        f.land_on("other", f.commit(f.root, &[put("o", "x")]), "other");
         let mut history = vec![f.root];
         let mut restarts = 0;
         for n in 0..8 {
@@ -1705,6 +1950,7 @@ mod tests {
             restarts += usize::from(within_budget(&f) == cs);
         }
         assert!(restarts > 0, "a land moved the floor up to the tip");
+        assert!(f.held()["other"]);
 
         // Bases below the floor. Each check reaches back while the index has
         // room, and walks the rest.
