@@ -51,11 +51,12 @@ pub trait Kind {
 }
 
 /// The value of `K` for a changeset that `repo` may see, derived if needed.
+/// Returns once the value, and what it names, is durable.
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
-/// [`Kind::derive`].
+/// [`Kind::derive`], or of [`Store::flush`].
 pub fn get<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
     let known = store.read(|c| {
         require(c, repo, cs)?;
@@ -63,9 +64,11 @@ pub fn get<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::V
     })?;
     match known {
         Some(value) => Ok(value),
-        // Derived data can be derived again, so a read does not wait for a
-        // flush; a later write's flush covers it.
-        None => store.commit(|tx| derive::<K>(tx, repo, cs)),
+        // A value can name rows that the derivation wrote, such as trees,
+        // and the caller can send it to a client. So it waits for one full
+        // flush, shared with concurrent commits. `derive` and `put` never
+        // flush: inside a write, the write's own flush covers them.
+        None => store.write(|tx| derive::<K>(tx, repo, cs)),
     }
 }
 

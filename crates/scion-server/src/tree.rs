@@ -522,6 +522,39 @@ mod tests {
         }
     }
 
+    /// `GetRootTree` sends a tree ID that the client then fetches. So a tree
+    /// derived during the read is durable before the reply, or a power loss
+    /// could lose a tree that the client was told about.
+    #[test]
+    fn get_root_tree_flushes_once_after_it_derives() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        // A changeset with no root tree row yet.
+        let cs = store
+            .write(|c| {
+                let repo = db::create_repo(c, "r")?;
+                let cs = Changeset {
+                    parents: vec![],
+                    author: author(),
+                    committer: None,
+                    message: vec![],
+                    changes: changes(&[("a/b", Some("1"))]),
+                };
+                db::insert_changeset(c, repo, &cs)
+            })
+            .unwrap();
+        let get_root_tree = || {
+            let before = store.blobs().full_flushes();
+            let tree = crate::read::root_tree(&store, "r", cs).unwrap();
+            (tree, store.blobs().full_flushes() - before)
+        };
+        let (tree, flushes) = get_root_tree();
+        // None where the commit's own fsync flushes the drive cache.
+        let want = u64::from(crate::store::FSYNC_LEAVES_DRIVE_CACHE);
+        assert_eq!(flushes, want, "the derivation is durable before the reply");
+        assert_eq!(get_root_tree(), (tree, 0), "a stored tree needs no flush");
+    }
+
     #[test]
     fn root_tree_derives_a_long_chain_and_caches_it() {
         let dir = tempfile::tempdir().unwrap();
