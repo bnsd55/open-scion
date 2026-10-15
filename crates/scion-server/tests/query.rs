@@ -515,6 +515,7 @@ fn diff_pages_stop_at_max_diff_entries_and_resume() {
             )
             .unwrap();
             pages += 1;
+            assert!(got.len() <= expected.len(), "the pages repeat entries");
             got.extend(page.entries);
             match page.next_after {
                 Some(next) => {
