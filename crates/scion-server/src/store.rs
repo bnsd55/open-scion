@@ -22,13 +22,15 @@ use scion_core::BlobId;
 
 use crate::error::{Error, Result};
 
-const SCHEMA_VERSION: u32 = 2;
+/// The schema version this build makes and reads.
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database from
 /// version `n - 1` to version `n`. A released migration never changes.
 const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_land_retention.sql"),
+    include_str!("../migrations/0003_derived_values.sql"),
 ];
 
 /// Largest object accepted or read back, uncompressed: 100 MiB, the hard
