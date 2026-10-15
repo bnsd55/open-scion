@@ -6,7 +6,7 @@
 //! - [`tree`]: apply changesets to trees and derive each changeset's root tree.
 //! - [`read`], [`write`], [`land`]: the operations behind the RPCs.
 //! - [`import`]: one-way import from a git repository.
-//! - [`service`] and [`auth`]: the gRPC front end.
+//! - [`service`], [`objects`] and [`auth`]: the gRPC front end.
 
 pub mod auth;
 pub mod db;
@@ -14,6 +14,7 @@ pub mod error;
 pub mod import;
 pub mod land;
 pub mod names;
+pub mod objects;
 pub mod read;
 pub mod service;
 pub mod store;

@@ -2515,9 +2515,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "rustix",
  "scion-core",
  "scion-proto",
+ "scion-server",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",

@@ -102,6 +102,7 @@ export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
 
 ./target/release/scn log -n 5
 ./target/release/scn cat main:README.md
+./target/release/scn checkout main --into /tmp/work   # --sparse DIR for part of it
 echo hello > hello.txt
 cs=$(./target/release/scn commit -m "add hello" --put hello.txt=hello.txt)
 ./target/release/scn land "$cs"

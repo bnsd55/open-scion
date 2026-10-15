@@ -1,6 +1,6 @@
 //! Reads. Each takes a changeset ID, so each answer is immutable.
 
-use scion_core::{Changeset, ChangesetId, Entry, RepoPath, Tree};
+use scion_core::{Changeset, ChangesetId, Entry, RepoPath, Tree, TreeId};
 
 use crate::db;
 use crate::error::{Error, Result};
@@ -33,6 +33,16 @@ pub fn get_changeset(store: &Store, repo: &str, id: ChangesetId) -> Result<Chang
     })
 }
 
+/// The root tree of a changeset the repo may see.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if the repo or changeset does not exist.
+pub fn root_tree(store: &Store, repo: &str, cs: ChangesetId) -> Result<TreeId> {
+    let repo = store.read(|c| db::repo_id(c, repo))?;
+    tree::root_tree(store, repo, cs)
+}
+
 /// The content of a regular file, or the target of a symlink.
 ///
 /// # Errors
@@ -40,8 +50,7 @@ pub fn get_changeset(store: &Store, repo: &str, id: ChangesetId) -> Result<Chang
 /// [`Error::NotFound`] if nothing is at `path`. [`Error::InvalidArgument`] if
 /// `path` is a directory or a submodule.
 pub fn read_file(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Result<Vec<u8>> {
-    let repo = store.read(|c| db::repo_id(c, repo))?;
-    let root = tree::root_tree(store, repo, cs)?;
+    let root = root_tree(store, repo, cs)?;
     match store.read(|c| tree::lookup(c, root, path))? {
         Some(Entry::File(state)) => match state.blob() {
             Some(blob) => store.blobs().get(blob),
@@ -64,8 +73,7 @@ pub fn list_dir(
     cs: ChangesetId,
     path: Option<&RepoPath>,
 ) -> Result<Tree> {
-    let repo = store.read(|c| db::repo_id(c, repo))?;
-    let root = tree::root_tree(store, repo, cs)?;
+    let root = root_tree(store, repo, cs)?;
     store.read(|c| {
         let Some(path) = path else {
             return db::get_tree(c, root);

@@ -26,6 +26,7 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::auth::{Auth, Caller};
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
+use crate::objects::ObjectsService;
 use crate::store::{MAX_OBJECT_BYTES, Store};
 use crate::{db, names, read, write};
 
@@ -51,32 +52,35 @@ pub async fn serve(
     token: &str,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
-    let service = InterceptedService::new(ScionService::new(store).into_server(), Auth::new(token));
+    let auth = Auth::new(token);
+    let worker = Worker::new(store);
+    let scion = InterceptedService::new(
+        ScionService::new(worker.clone()).into_server(),
+        auth.clone(),
+    );
+    let objects = InterceptedService::new(ObjectsService::new(worker).into_server(), auth);
     tonic::transport::Server::builder()
         .timeout(REQUEST_TIMEOUT)
-        .add_service(service)
+        .add_service(scion)
+        .add_service(objects)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
         .await
 }
 
 /// Implements the Scion RPCs.
 pub struct ScionService {
-    store: Store,
+    worker: Worker,
     lands: Arc<Lands>,
-    /// Bounds blocking work, so a flood of requests queues instead of
-    /// spawning unbounded threads.
-    work: Arc<Semaphore>,
     /// Bounds buffered uploads, so their memory stays under
     /// `MAX_UPLOADS * MAX_OBJECT_BYTES`.
     uploads: Arc<Semaphore>,
 }
 
 impl ScionService {
-    fn new(store: Store) -> Self {
+    fn new(worker: Worker) -> Self {
         Self {
-            store,
+            worker,
             lands: Arc::default(),
-            work: Arc::new(Semaphore::new(MAX_BLOCKING)),
             uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
         }
     }
@@ -86,14 +90,33 @@ impl ScionService {
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES)
     }
+}
 
-    /// Runs synchronous store work off the async runtime.
-    async fn blocking<T, F>(&self, f: F) -> Result<T, Status>
+/// Runs synchronous store work off the async runtime. Clones share one bound
+/// on the work in flight, so both services queue behind the same limit.
+#[derive(Clone)]
+pub(crate) struct Worker {
+    store: Store,
+    /// Bounds blocking work, so a flood of requests queues instead of
+    /// spawning unbounded threads.
+    permits: Arc<Semaphore>,
+}
+
+impl Worker {
+    pub(crate) fn new(store: Store) -> Self {
+        Self {
+            store,
+            permits: Arc::new(Semaphore::new(MAX_BLOCKING)),
+        }
+    }
+
+    /// Runs `f` on a blocking thread once a permit is free.
+    pub(crate) async fn run<T, F>(&self, f: F) -> Result<T, Status>
     where
         T: Send + 'static,
         F: FnOnce(Store) -> Result<T> + Send + 'static,
     {
-        let permit = Arc::clone(&self.work)
+        let permit = Arc::clone(&self.permits)
             .acquire_owned()
             .await
             .map_err(|_| Status::unavailable("server is shutting down"))?;
@@ -108,12 +131,31 @@ impl ScionService {
     }
 }
 
-fn parse_id<T: for<'a> TryFrom<&'a [u8]>>(bytes: &[u8], what: &str) -> Result<T, Status> {
+pub(crate) fn parse_id<T: for<'a> TryFrom<&'a [u8]>>(
+    bytes: &[u8],
+    what: &str,
+) -> Result<T, Status> {
     T::try_from(bytes).map_err(|_| Status::invalid_argument(format!("{what} must be 32 bytes")))
 }
 
-fn check_name(what: &str, value: &str) -> Result<(), Status> {
+pub(crate) fn check_name(what: &str, value: &str) -> Result<(), Status> {
     names::check(what, value).map_err(Status::from)
+}
+
+/// `ResolveRef`, served by both services.
+pub(crate) async fn resolve_ref(
+    worker: &Worker,
+    request: ResolveRefRequest,
+) -> Result<ResolveRefResponse, Status> {
+    let ResolveRefRequest { repo, name } = request;
+    check_name("repo", &repo)?;
+    check_name("ref", &name)?;
+    let id = worker
+        .run(move |store| read::resolve_ref(&store, &repo, &name))
+        .await?;
+    Ok(ResolveRefResponse {
+        changeset_id: id.as_bytes().to_vec(),
+    })
 }
 
 fn parse_path(bytes: Vec<u8>) -> Result<RepoPath, Status> {
@@ -173,7 +215,8 @@ impl Scion for ScionService {
         let repo = first.repo;
         // Check the repo before buffering any more data.
         let lookup = repo.clone();
-        self.blocking(move |store| store.read(|c| db::repo_id(c, &lookup)))
+        self.worker
+            .run(move |store| store.read(|c| db::repo_id(c, &lookup)))
             .await?;
         let mut data = first.data;
         while let Some(chunk) = stream.next().await {
@@ -191,7 +234,8 @@ impl Scion for ScionService {
             data.extend_from_slice(&chunk.data);
         }
         let id = self
-            .blocking(move |store| write::put_blob(&store, &repo, &data))
+            .worker
+            .run(move |store| write::put_blob(&store, &repo, &data))
             .await?;
         Ok(Response::new(PutBlobResponse {
             blob_id: id.as_bytes().to_vec(),
@@ -205,7 +249,8 @@ impl Scion for ScionService {
         let CreateChangesetRequest { repo, changeset } = request.into_inner();
         check_name("repo", &repo)?;
         let id = self
-            .blocking(move |store| write::create_changeset(&store, &repo, &changeset))
+            .worker
+            .run(move |store| write::create_changeset(&store, &repo, &changeset))
             .await?;
         Ok(Response::new(CreateChangesetResponse {
             changeset_id: id.as_bytes().to_vec(),
@@ -229,7 +274,8 @@ impl Scion for ScionService {
         };
         let lands = Arc::clone(&self.lands);
         let outcome = self
-            .blocking(move |store| lands.land(&store, &caller, &req))
+            .worker
+            .run(move |store| lands.land(&store, &caller, &req))
             .await?;
         Ok(Response::new(land_response(outcome)))
     }
@@ -245,7 +291,8 @@ impl Scion for ScionService {
             .parse()
             .map_err(|_| Status::invalid_argument("land_id must be a number"))?;
         let outcome = self
-            .blocking(move |store| land::get_land(&store, &caller, &repo, land_id))
+            .worker
+            .run(move |store| land::get_land(&store, &caller, &repo, land_id))
             .await?;
         Ok(Response::new(land_response(outcome)))
     }
@@ -254,15 +301,9 @@ impl Scion for ScionService {
         &self,
         request: Request<ResolveRefRequest>,
     ) -> Result<Response<ResolveRefResponse>, Status> {
-        let ResolveRefRequest { repo, name } = request.into_inner();
-        check_name("repo", &repo)?;
-        check_name("ref", &name)?;
-        let id = self
-            .blocking(move |store| read::resolve_ref(&store, &repo, &name))
-            .await?;
-        Ok(Response::new(ResolveRefResponse {
-            changeset_id: id.as_bytes().to_vec(),
-        }))
+        resolve_ref(&self.worker, request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn get_changeset(
@@ -273,7 +314,8 @@ impl Scion for ScionService {
         check_name("repo", &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let changeset = self
-            .blocking(move |store| read::get_changeset(&store, &req.repo, id))
+            .worker
+            .run(move |store| read::get_changeset(&store, &req.repo, id))
             .await?;
         Ok(Response::new(GetChangesetResponse {
             changeset: changeset.encode(),
@@ -291,7 +333,8 @@ impl Scion for ScionService {
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_path(req.path)?;
         let data = self
-            .blocking(move |store| read::read_file(&store, &req.repo, id, &path))
+            .worker
+            .run(move |store| read::read_file(&store, &req.repo, id, &path))
             .await?;
         // Copies one chunk at a time, as the stream is read.
         let chunks = (0..data.len().div_ceil(CHUNK_BYTES)).map(move |i| {
@@ -316,7 +359,8 @@ impl Scion for ScionService {
             Some(parse_path(req.path)?)
         };
         let tree = self
-            .blocking(move |store| read::list_dir(&store, &req.repo, id, path.as_ref()))
+            .worker
+            .run(move |store| read::list_dir(&store, &req.repo, id, path.as_ref()))
             .await?;
         Ok(Response::new(ListDirResponse {
             tree: tree.encode(),
@@ -329,7 +373,8 @@ impl Scion for ScionService {
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let limit = (req.limit as usize).clamp(1, MAX_LOG);
         let changesets = self
-            .blocking(move |store| read::log(&store, &req.repo, id, limit))
+            .worker
+            .run(move |store| read::log(&store, &req.repo, id, limit))
             .await?;
         // Always send the first entry; stop before the reply gets too big.
         let mut budget = LOG_BUDGET_BYTES;

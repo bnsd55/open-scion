@@ -280,9 +280,7 @@ impl Blobs {
     /// [`Error::NotFound`] if absent, [`Error::Corrupt`] if the file is not
     /// this blob, [`Error::Io`] if it cannot be read.
     pub fn get(&self, id: BlobId) -> Result<Vec<u8>> {
-        let Some(file) = self.open_file(id)? else {
-            return Err(Error::NotFound(format!("blob {id}")));
-        };
+        let file = self.open_file(id)?;
         let corrupt = |why: String| Error::Corrupt(format!("blob {id}: {why}"));
         // The whole file is read before unpacking, so a read failure stays an
         // I/O error and only bad bytes count as corruption.
@@ -300,6 +298,40 @@ impl Blobs {
         Ok(raw)
     }
 
+    /// A blob's uncompressed size, from the zstd frame header, without
+    /// reading the content. Every blob is written with its size in the header.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if absent, [`Error::Corrupt`] if the header is bad,
+    /// has no size, or gives a size above [`MAX_OBJECT_BYTES`], [`Error::Io`]
+    /// if it cannot be read.
+    pub fn size(&self, id: BlobId) -> Result<usize> {
+        /// Longest zstd frame header (`ZSTD_FRAMEHEADERSIZE_MAX`).
+        const FRAME_HEADER_MAX: u64 = 18;
+        let mut header = Vec::new();
+        self.open_file(id)?
+            .take(FRAME_HEADER_MAX)
+            .read_to_end(&mut header)?;
+        let corrupt = |why: &str| Error::Corrupt(format!("blob {id}: {why}"));
+        match zstd::zstd_safe::get_frame_content_size(&header) {
+            Ok(Some(size)) => usize::try_from(size)
+                .ok()
+                .filter(|&size| size <= MAX_OBJECT_BYTES)
+                .ok_or_else(|| corrupt("its header gives a size above the object limit")),
+            Ok(None) => Err(corrupt("its header has no content size")),
+            Err(_) => Err(corrupt("bad zstd frame header")),
+        }
+    }
+
+    /// Opens a blob's file.
+    fn open_file(&self, id: BlobId) -> Result<fs::File> {
+        fs::File::open(self.location(id).1).map_err(|e| match e.kind() {
+            ErrorKind::NotFound => Error::NotFound(format!("blob {id}")),
+            _ => e.into(),
+        })
+    }
+
     /// Whether a blob is stored intact. Streams the file through the decoder
     /// into the hasher, so it holds the zstd window and small buffers, not
     /// the whole blob. It gives the same answer as [`Blobs::get`].
@@ -308,8 +340,10 @@ impl Blobs {
     ///
     /// [`Error::Io`] if the file exists but cannot be read.
     pub fn verify(&self, id: BlobId) -> Result<BlobStatus> {
-        let Some(file) = self.open_file(id)? else {
-            return Ok(BlobStatus::Missing);
+        let file = match self.open_file(id) {
+            Ok(file) => file,
+            Err(Error::NotFound(_)) => return Ok(BlobStatus::Missing),
+            Err(e) => return Err(e),
         };
         let corrupt = |why: String| {
             tracing::warn!(blob = %id, %why, "stored blob is corrupt");
@@ -342,15 +376,6 @@ impl Blobs {
             Ok(_) if oversized => corrupt(format!("unpacks to more than {MAX_OBJECT_BYTES} bytes")),
             Ok(got) if got != id => corrupt("content does not match the ID".into()),
             Ok(_) => Ok(BlobStatus::Valid),
-        }
-    }
-
-    /// Opens a blob's file, or returns `None` if there is none.
-    fn open_file(&self, id: BlobId) -> io::Result<Option<fs::File>> {
-        match fs::File::open(self.location(id).1) {
-            Ok(file) => Ok(Some(file)),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
         }
     }
 
@@ -562,6 +587,28 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn a_blob_size_comes_from_its_frame_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        for raw in [b"".to_vec(), b"hello".to_vec(), vec![7; 100_000]] {
+            let id = store.blobs().put(&raw).unwrap();
+            assert_eq!(store.blobs().size(id).unwrap(), raw.len());
+        }
+
+        // A frame with no size in its header is refused, not guessed.
+        let id = BlobId::of(b"streamed");
+        let (fan_out, file) = store.blobs().location(id);
+        fs::create_dir_all(fan_out).unwrap();
+        fs::write(file, zstd::stream::encode_all(&b"streamed"[..], 3).unwrap()).unwrap();
+        assert!(matches!(store.blobs().size(id), Err(Error::Corrupt(_))));
+        let absent = BlobId::of(b"absent");
+        assert!(matches!(
+            store.blobs().size(absent),
+            Err(Error::NotFound(_))
+        ));
+    }
 
     #[test]
     fn a_data_directory_opens_in_one_store_at_a_time() {

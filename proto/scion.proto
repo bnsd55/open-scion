@@ -30,6 +30,8 @@ service Scion {
 
   // Read path.
 
+  // Deprecated: use Objects.ResolveRef, which a cache tier forwards. Kept so
+  // existing clients still work; both share one implementation.
   rpc ResolveRef(ResolveRefRequest) returns (ResolveRefResponse);
   rpc GetChangeset(GetChangesetRequest) returns (GetChangesetResponse);
   // Streams the content of a regular file or the target of a symlink.
@@ -38,6 +40,21 @@ service Scion {
   rpc ListDir(ListDirRequest) returns (ListDirResponse);
   // Walks first parents, newest first.
   rpc Log(LogRequest) returns (LogResponse);
+}
+
+// Object reads that any cache tier can answer. Every call but ResolveRef names
+// an immutable object, so a tier may cache its answer forever. A client asks
+// only for the objects it wants, starting at the root tree, and checks each
+// object against its ID on arrival.
+service Objects {
+  // Where a ref points. Mutable: a tier forwards it and never caches it.
+  rpc ResolveRef(ResolveRefRequest) returns (ResolveRefResponse);
+  // The root tree of a changeset.
+  rpc GetRootTree(GetRootTreeRequest) returns (GetRootTreeResponse);
+  // Streams the requested objects in request order, one per message. Stops
+  // early once the reply is large, after at least one object; the client asks
+  // again for the rest. Fails with NOT_FOUND if an object does not exist.
+  rpc GetObjects(GetObjectsRequest) returns (stream Object);
 }
 
 message PutBlobRequest {
@@ -148,4 +165,37 @@ message LogEntry {
   bytes changeset_id = 1;
   // ChangesetV1 bytes.
   bytes changeset = 2;
+}
+
+message GetRootTreeRequest {
+  string repo = 1;
+  bytes changeset_id = 2;
+}
+
+message GetRootTreeResponse {
+  bytes tree_id = 1;
+}
+
+enum ObjectKind {
+  OBJECT_KIND_UNSPECIFIED = 0;
+  OBJECT_KIND_TREE = 1;
+  OBJECT_KIND_BLOB = 2;
+}
+
+message ObjectRef {
+  ObjectKind kind = 1;
+  bytes id = 2;
+}
+
+message GetObjectsRequest {
+  string repo = 1;
+  // 1 to 1000 objects.
+  repeated ObjectRef refs = 2;
+}
+
+message Object {
+  ObjectKind kind = 1;
+  bytes id = 2;
+  // The stored form: TreeV1 bytes for a tree, the raw content for a blob.
+  bytes data = 3;
 }

@@ -12,15 +12,15 @@ The README lists where this project makes its own choices.
 | Crate | Role |
 |---|---|
 | [`scion-core`](../crates/scion-core) | Object model (`Changeset`, `Tree`, IDs, `RepoPath`) and the v1 encoder and strict decoder. No I/O. |
-| [`scion-proto`](../crates/scion-proto) | gRPC types generated from [`proto/scion.proto`](../proto/scion.proto). Largest message 64 MiB, stream chunk 1 MiB. |
+| [`scion-proto`](../crates/scion-proto) | gRPC types generated from [`proto/scion.proto`](../proto/scion.proto): the `Scion` and `Objects` services. Largest message 64 MiB (a `GetObjects` reply message: one object of up to 100 MiB), stream chunk 1 MiB. |
 | [`scion-server`](../crates/scion-server) | One binary with two commands: `serve` (the API) and `import` (git import). |
-| [`scn`](../crates/scn) | Command-line client: `cat`, `ls`, `log`, `show`, `commit`, `land`, `bench`. |
+| [`scn`](../crates/scn) | Command-line client: `cat`, `ls`, `log`, `show`, `checkout`, `commit`, `land`, `bench`. |
 
 ```mermaid
 flowchart LR
     scn["scn"] -->|"gRPC, bearer token"| svc
     subgraph serve["scion-server serve"]
-        svc["service.rs + auth.rs"] --> ops["write.rs, land.rs, read.rs"]
+        svc["service.rs, objects.rs + auth.rs"] --> ops["write.rs, land.rs, read.rs"]
         ops --> tree["tree.rs: apply, root trees"]
         ops --> db["db.rs, store.rs"]
         tree --> db
@@ -35,9 +35,12 @@ flowchart LR
 How one request flows through the server:
 
 1. `auth.rs` checks the bearer token and tags the request with a `Caller`.
-2. `service.rs` checks names, IDs and paths, then runs `write.rs`, `land.rs`
-   or `read.rs` on a blocking thread (SQLite and the blob folder are
-   synchronous). At most 256 run at once. A request times out after 600 s.
+2. `service.rs` (the `Scion` service) or `objects.rs` (the `Objects` service)
+   checks names, IDs and paths, then runs `write.rs`, `land.rs` or `read.rs`
+   on a blocking thread (SQLite and the blob folder are synchronous). Both
+   services share one bound: at most 256 run at once. A request times out
+   after 600 s; for a streamed reply that covers only its start. A
+   `GetObjects` reply ends when its client takes no object for 120 s.
 3. `error.rs` maps errors to gRPC codes. Database, I/O, git and corruption
    errors reply `INTERNAL`. The detail goes only to the server log.
 
@@ -404,10 +407,12 @@ stored intact.
 
 ## 7. The read path
 
-**Today.** Every read except `ResolveRef` takes a changeset ID, not a ref
-name, so its answer is about an immutable object. A client resolves a ref
-first. `scn` accepts a
-ref name or a 64-digit changeset ID wherever it takes a revision.
+Every read except `ResolveRef` names an immutable object (a changeset, tree
+or blob ID), never a ref, so any cache tier can answer it. A client resolves
+a ref first. `scn` accepts a ref name or a 64-digit changeset ID wherever it
+takes a revision, and resolves refs through `Objects`.
+
+**Path reads (`Scion` service).**
 
 | RPC | Answer |
 |---|---|
@@ -423,23 +428,80 @@ at a time. `ReadFile` then reads the blob file, unpacks it, checks its hash,
 and streams it. Every read checks that the repo has the changeset. `scn`
 checks that each changeset it receives hashes to its ID.
 
-**Planned** ([#4](https://github.com/bnsd55/open-scion/issues/4),
-[#5](https://github.com/bnsd55/open-scion/issues/5)): an `Objects` service
-with three calls:
+**Object reads (`Objects` service, `objects.rs`).** The calls that every
+cache tier will answer. The client asks only for the objects it wants,
+starting at the root tree, and never says what it already has.
 
-- `ResolveRef`: mutable, so no tier caches it and every tier forwards it.
-- `GetRootTree(changeset)`: cacheable, because a changeset never changes.
-- `GetObjects`: streams trees and blobs in their stored form. The client
-  checks each one by its hash.
+| RPC | Answer | Cache |
+|---|---|---|
+| `ResolveRef` | Same as on `Scion` (one shared implementation). | Never: a tier forwards it. |
+| `GetRootTree(changeset)` | The root tree ID, from `derived`. Checks that the repo has the changeset. | Forever: a changeset never changes. |
+| `GetObjects(refs)` | Streams the trees (`TreeV1` bytes) and blobs (raw content) named by `(kind, id)`, one object per message, in request order. | Forever. |
 
-`scn checkout` will walk one tree level per batch, then fetch blobs in
-batches, with optional sparse directories.
+- A call names 1 to 1,000 objects. A task reads them one at a time, checks
+  each against its ID, and hands it to the reply through a one-slot channel.
+  A tree goes out as its stored bytes, which are canonical.
+- Memory: before an object is read, its size comes from the store (a blob's
+  zstd frame header, a tree's stored length), and the object takes that
+  share of a server-wide budget of 400 MiB. It keeps the share until the
+  reply takes it from the channel. With the budget spent, a reply waits
+  holding no object bytes. A reply whose client takes no object for 120 s
+  ends and frees its share. A blob read back larger than its header said is
+  corrupt and is never sent. Not counted: one encoded object per reply inside
+  HTTP/2, which stays until the connection closes
+  ([#42](https://github.com/bnsd55/open-scion/issues/42)).
+- A reply stops early once it has sent 64 MiB, always after at least one
+  object. The client asks again for the rest, so one call stays short and a
+  transfer can resume. A reply message fits one object of up to 100 MiB.
+- A missing object fails the call with `NOT_FOUND`. Trees and blobs are
+  global: any repo name that exists can read any object by ID
+  ([#13](https://github.com/bnsd55/open-scion/issues/13)).
+
+**What the client checks, and what it trusts.** Every tree and blob is
+checked against its ID on arrival, so no tier can change an object. Two
+answers cannot be checked that way: the changeset a ref points at
+(`ResolveRef`) and the root tree of a changeset (`GetRootTree`). The client
+trusts the server for both. The tiers
+([#5](https://github.com/bnsd55/open-scion/issues/5)) must forward these
+answers, or cache what the server said; they must never compute or invent
+them.
+
+**`scn checkout REV [--sparse DIR]... --into PATH`** (`scn/src/cmd/checkout.rs`)
+uses only `Objects`:
+
+1. Resolve REV, then `GetRootTree`.
+2. Fetch one tree level per `GetObjects` batch. Each tree must hash to the
+   ID that was asked for. Keep only the entries inside the sparse
+   directories (each selects itself and everything below it) and the
+   directories above them. A sparse path that is not in the tree is an error.
+3. Check every kept name (below). Submodules are skipped with a note.
+4. Only after the whole walk passes: make an empty temp directory next to
+   the destination, fetch the blobs in batches, check each blob's hash, and
+   write each file into the temp directory as its blob arrives.
+5. Rename the temp directory onto the destination. On any failure the temp
+   directory is removed, and the destination stays as it was. So the
+   destination's parent must be writable, the destination cannot be a mount
+   point, and an existing empty destination is replaced: its mode and owner
+   are not kept ([#44](https://github.com/bnsd55/open-scion/issues/44)).
+
+**Checkout-safe writes** (`scn/src/materialize.rs`). The object format
+accepts names that are not safe to write, so the checkout adds its own rules:
+
+| Rule | Why |
+|---|---|
+| The checkout is written into a temp directory, `.scn-checkout-<pid>-<n>`, made with `mkdirat` through a handle on the destination's parent. One `renameat` then moves it onto the destination name. | The rename is the check: it replaces a missing or empty directory, and fails if the destination is a non-empty directory, a file or a symlink. So "new or empty, not a symlink" holds at the moment the files appear. An early check gives a clear error first, but correctness comes from the rename. A killed `scn` can leave the temp directory behind. |
+| Inside the temp directory, each parent is opened with `O_NOFOLLOW`, one part at a time. Files use `O_CREAT \| O_EXCL`. | A symlink in the way, from this checkout or from anything else, fails the write instead of redirecting it. |
+| The temp directory starts empty, and the checkout records every path it makes. A path that already exists without being recorded is a collision. | The filesystem folded two names into one, by case or by Unicode form (for example `A` and `a`, or `X/f` and `x/g`, on macOS). The error names the path, and the temp directory is removed. Where nothing folds, every name is written, as git does. |
+| Symlinks are written as symlinks with their raw target bytes, never resolved. | A target such as `../../etc` is data, not a path to follow. |
+| Executable files get mode 0777, others 0666, less the umask. | The same modes as `git checkout`. |
+| No control character (C0, DEL, C1, or a byte 0x80 to 0x9F that is not UTF-8), no bidirectional text control (U+202A to U+202E, U+2066 to U+2069), and no `.git` or `.scion` part, in any ASCII case. The walk checks every name before anything is written, and the writer checks every part again. | Names are printed, escaped, in errors and notes, and must not rewrite a terminal or read as another name. Tools trust metadata directories. |
 
 The article says one `scion-daemon` stores objects for the whole node and is
 reached over a socket. It talks only to a regional `scion-cache`, which serves
 objects from memory. Every tier answers identical calls, and no tier skips the
-next one. The Unix socket, the call names above and access tickets are this
-project's choices:
+next one. **Planned** ([#5](https://github.com/bnsd55/open-scion/issues/5)):
+both tiers, answering the `Objects` calls above. The Unix socket, the call
+names and access tickets are this project's choices:
 
 ```mermaid
 flowchart LR
@@ -448,10 +510,9 @@ flowchart LR
     cache -->|"miss"| server["scion-server"]
 ```
 
-Related planned work: a benchmark against `git clone`
-([#6](https://github.com/bnsd55/open-scion/issues/6)), a checkout-safe path
-policy ([#7](https://github.com/bnsd55/open-scion/issues/7)), and virtual
-checkout, where files load when first read
+Related planned work: a checkout benchmark against `git clone`
+([#6](https://github.com/bnsd55/open-scion/issues/6)), and virtual checkout,
+where files load when first read
 ([#11](https://github.com/bnsd55/open-scion/issues/11)).
 
 ## 8. Security model
@@ -463,9 +524,11 @@ an untrusted network.
 |---|---|---|
 | Authentication | One static bearer token (`--token` or `SCION_TOKEN`). The server compares BLAKE3 digests of the tokens in constant time. | Every caller is the same principal, `default`. No users or per-folder rules ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Network | Listens on `127.0.0.1:7878` by default. A non-loopback address is refused unless `--insecure-listen` is given. | No TLS: the token and all data travel unencrypted ([#14](https://github.com/bnsd55/open-scion/issues/14)). |
-| Repo isolation | Changesets, trees and derived trees are reached only through `repo_changesets`. No RPC takes a tree or blob ID. | Blobs are shared by all repos. A changeset can name another repo's blob by ID and then read it ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
+| Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. | Trees and blobs are shared by all repos. `GetObjects` reads any tree or blob by ID, and a changeset can name another repo's blob and then read it ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
-| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB, blobs up to 100 MiB, 16 uploads at once. Names of 1 to 256 bytes with no control characters. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). |
+| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once, 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget, and a reply whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object inside HTTP/2 until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
+| Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. | The client trusts the server for a ref's target and for a changeset's root tree, which it cannot check by hash. Tiers ([#5](https://github.com/bnsd55/open-scion/issues/5)) must forward these answers, not compute them. |
+| Checkout | `scn checkout` writes into a temp directory and renames it onto a new or empty destination, never follows a symlink while writing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure the destination stays as it was. | No Windows rules: device names and names that end in a dot or a space pass. |
 | Errors | Internal errors reply `internal error`. The detail stays in the server log. | |
 
 The planned cache tiers will need access tickets, because an object ID is not
@@ -489,8 +552,14 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/land.rs` (`MAX_ATTEMPTS`) | Imports move refs without the land lock, so a land retries 3 times, then returns `ABORTED`. | Route every ref move through the per-ref lander. | [#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | One lander per ref that rebases a batch and moves the ref once. | [#18](https://github.com/bnsd55/open-scion/issues/18) |
 | `scion-server/src/land.rs` (`MAX_DEPTH`) | A land on a base more than `MAX_DEPTH` generations below the tip walks the history from the index floor back to the base, each time, and holds the database lock while it walks. | Per-path history in the database, so the check reads only the paths that the land changes. | [#38](https://github.com/bnsd55/open-scion/issues/38) |
+| `scion-server/src/objects.rs` (`read_object`) | An object ID is treated as permission to read it; trees and blobs are shared by all repos. Safe with one principal. | A read ticket bound to a principal, a repo and a root tree, checked by the server and every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
+| `scion-server/src/objects.rs` (`STALL_TIMEOUT`) | A stalled `GetObjects` reply ends, but HTTP/2 keeps the one encoded object it was sending until the connection closes. | A response body timeout that resets the stream. | [#42](https://github.com/bnsd55/open-scion/issues/42) |
+| `scion-server/src/objects.rs` (`send_objects`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
 | `scion-server/src/auth.rs` (`Auth`) | One static token, one principal. | A token-to-principal map, then per-path write rules. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/main.rs` (`serve`) | No TLS. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
 | `scn/src/client.rs` (`lossy`) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | Escape or base64 raw bytes in JSON. | |
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |
 | `scn/src/cmd/commit.rs` (`commit`) | The author time zone is always UTC. | A time zone crate. | |
+| `scn/src/materialize.rs` (`check_name`) | No Windows rules: device names (`CON`, `NUL`) and names that end in a dot or a space pass. | Per-platform rules before checkout runs on Windows. | [#45](https://github.com/bnsd55/open-scion/issues/45) |
+| `scn/src/materialize.rs` (`Checkout`) | The checkout is renamed onto the destination, which needs a writable parent and replaces an existing empty directory. On an error the temp directory is removed by path. | Build inside an existing empty destination, and work only through directory handles. | [#44](https://github.com/bnsd55/open-scion/issues/44) |
+| `scn/src/materialize.rs` (`Checkout::parent`) | One `openat` per parent for every file, and files arrive in blob order. | Fetch blobs in path order and keep the last directory open. | [#41](https://github.com/bnsd55/open-scion/issues/41) |

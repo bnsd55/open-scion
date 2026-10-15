@@ -14,12 +14,17 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+rustix.workspace = true
 scion-core.workspace = true
 scion-proto.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
+
+[dev-dependencies]
+scion-server.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
