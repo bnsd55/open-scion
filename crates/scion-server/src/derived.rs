@@ -336,7 +336,15 @@ mod tests {
             let (repo, ids) = store_history(&c).unwrap();
             (repo, ids, rows(&c))
         };
-        assert_eq!(before.len(), 3, "a root tree for each changeset");
+        // The rows that version 2 holds: a root tree for each changeset.
+        // Their kind and version must stay, or every root tree is derived
+        // again.
+        assert_eq!(before.len(), 3);
+        assert!(
+            before
+                .iter()
+                .all(|(kind, v, ..)| kind == "root_tree" && *v == 1)
+        );
 
         let store = Store::open(dir.path()).unwrap();
         let version: u32 = store
