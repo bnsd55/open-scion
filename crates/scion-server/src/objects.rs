@@ -5,6 +5,9 @@
 //! `TreeV1` bytes and a blob as its raw content, so the client checks each one
 //! against its ID.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use scion_core::{BlobId, TreeId};
 use scion_proto::v1::objects_server::{Objects, ObjectsServer};
 use scion_proto::v1::{
@@ -12,7 +15,9 @@ use scion_proto::v1::{
     ResolveRefRequest, ResolveRefResponse,
 };
 use scion_proto::{MAX_MESSAGE_BYTES, MAX_OBJECT_MESSAGE_BYTES, MAX_OBJECT_REFS};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio_stream::StreamExt as _;
+use tokio_stream::adapters::Map;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
@@ -25,8 +30,30 @@ use crate::{db, read};
 /// many bytes. The client asks again for the rest, so one call stays short.
 const REPLY_BUDGET_BYTES: usize = MAX_MESSAGE_BYTES;
 
+/// Most object bytes that all `GetObjects` replies together hold after a read
+/// and before their stream hands the object on.
+const IN_FLIGHT_BYTES: usize = 4 * scion_proto::MAX_OBJECT_BYTES;
+
+/// A reply ends when its client takes no object for this long, so a client
+/// that stops reading does not hold memory and budget. (The server's request
+/// timeout covers only the start of a streamed reply.)
+// SHORTCUT: a stalled reply ends, but HTTP/2 keeps the one encoded object it
+// was sending until the connection closes. Upgrade: a response body timeout
+// that resets the stream.
+const STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
 // The store keeps exactly the objects that the API promises to send.
 const _: () = assert!(store::MAX_OBJECT_BYTES == scion_proto::MAX_OBJECT_BYTES);
+// Any one object fits in the budget, and the budget counts in u32 permits.
+const _: () = assert!(scion_proto::MAX_OBJECT_BYTES <= IN_FLIGHT_BYTES);
+const _: () = assert!(IN_FLIGHT_BYTES <= u32::MAX as usize);
+
+/// An object on its way to the client, with the share of the byte budget
+/// that it holds until the stream hands it on.
+type Sent = (Result<Object, Status>, OwnedSemaphorePermit);
+
+/// The `GetObjects` reply: the channel, minus the budget each object held.
+type ObjectStream = Map<ReceiverStream<Sent>, fn(Sent) -> Result<Object, Status>>;
 
 /// One object to read.
 #[derive(Clone, Copy)]
@@ -38,11 +65,16 @@ enum Key {
 /// Implements the `Objects` RPCs.
 pub struct ObjectsService {
     worker: Worker,
+    /// `IN_FLIGHT_BYTES` permits, one per object byte, shared by all replies.
+    in_flight: Arc<Semaphore>,
 }
 
 impl ObjectsService {
     pub(crate) fn new(worker: Worker) -> Self {
-        Self { worker }
+        Self {
+            worker,
+            in_flight: Arc::new(Semaphore::new(IN_FLIGHT_BYTES)),
+        }
     }
 
     pub(crate) fn into_server(self) -> ObjectsServer<Self> {
@@ -70,10 +102,11 @@ fn read_object(store: &Store, key: Key) -> Result<Object> {
     // Upgrade (issue #13): a read ticket bound to a principal, a repo and a
     // root tree, checked here and by every cache tier.
     let (kind, id, data) = match key {
-        Key::Tree(id) => {
-            let tree = store.read(|c| db::get_tree(c, id))?;
-            (ObjectKind::Tree, *id.as_bytes(), tree.encode())
-        }
+        Key::Tree(id) => (
+            ObjectKind::Tree,
+            *id.as_bytes(),
+            store.read(|c| db::get_tree_body(c, id))?,
+        ),
         Key::Blob(id) => (ObjectKind::Blob, *id.as_bytes(), store.blobs().get(id)?),
     };
     Ok(Object {
@@ -81,6 +114,43 @@ fn read_object(store: &Store, key: Key) -> Result<Object> {
         id: id.to_vec(),
         data,
     })
+}
+
+/// Reads `keys` one at a time, as the client takes them, and sends each with
+/// its share of `in_flight`. Stops after an error, once the reply has sent
+/// `REPLY_BUDGET_BYTES`, when the client has gone, or when the client takes
+/// no object for `stall`.
+// SHORTCUT: one blocking hop per object and no read-ahead, so many small
+// objects are read one after another. Upgrade: read a batch capped by bytes
+// per hop, or keep a few reads in flight.
+async fn send_objects(
+    worker: Worker,
+    keys: Vec<Key>,
+    tx: mpsc::Sender<Sent>,
+    in_flight: Arc<Semaphore>,
+    stall: Duration,
+) {
+    let mut sent = 0;
+    for key in keys {
+        if sent >= REPLY_BUDGET_BYTES {
+            break;
+        }
+        let object = worker.run(move |store| read_object(&store, key)).await;
+        let len = object.as_ref().map_or(0, |o| o.data.len());
+        let failed = object.is_err();
+        sent += len;
+        let handed_on = async {
+            // Clamped to the budget, which the asserts above keep within u32.
+            let permits = u32::try_from(len.clamp(1, IN_FLIGHT_BYTES)).unwrap_or(u32::MAX);
+            let Ok(permit) = Arc::clone(&in_flight).acquire_many_owned(permits).await else {
+                return false;
+            };
+            tx.send((object, permit)).await.is_ok()
+        };
+        if !matches!(tokio::time::timeout(stall, handed_on).await, Ok(true)) || failed {
+            break;
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -110,7 +180,7 @@ impl Objects for ObjectsService {
         }))
     }
 
-    type GetObjectsStream = ReceiverStream<Result<Object, Status>>;
+    type GetObjectsStream = ObjectStream;
 
     async fn get_objects(
         &self,
@@ -127,28 +197,50 @@ impl Objects for ObjectsService {
         self.worker
             .run(move |store| store.read(|c| db::repo_id(c, &repo)))
             .await?;
-        // Reads one object at a time, as the client takes them, so a call
-        // holds at most two objects in memory.
-        // SHORTCUT: one blocking hop per object and no read-ahead, so many
-        // small objects are read one after another. Upgrade: read a batch
-        // capped by bytes per hop, or keep a few reads in flight.
         let (tx, rx) = mpsc::channel(1);
-        let worker = self.worker.clone();
-        tokio::spawn(async move {
-            let mut sent = 0;
-            for key in keys {
-                if sent >= REPLY_BUDGET_BYTES {
-                    break;
-                }
-                let object = worker.run(move |store| read_object(&store, key)).await;
-                let failed = object.is_err();
-                sent += object.as_ref().map_or(0, |o| o.data.len());
-                // A send fails once the client has gone; an error ends the reply.
-                if tx.send(object).await.is_err() || failed {
-                    break;
-                }
-            }
-        });
-        Ok(Response::new(ReceiverStream::new(rx)))
+        tokio::spawn(send_objects(
+            self.worker.clone(),
+            keys,
+            tx,
+            Arc::clone(&self.in_flight),
+            STALL_TIMEOUT,
+        ));
+        let release: fn(Sent) -> Result<Object, Status> = |(object, _permit)| object;
+        Ok(Response::new(ReceiverStream::new(rx).map(release)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_client_that_stops_reading_is_cut_off_and_frees_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let keys: Vec<Key> = [b"one".as_slice(), b"two", b"three"]
+            .iter()
+            .map(|data| Key::Blob(store.blobs().put(data).unwrap()))
+            .collect();
+        let budget = 1000;
+        let in_flight = Arc::new(Semaphore::new(budget));
+        let (tx, rx) = mpsc::channel(1);
+        let task = tokio::spawn(send_objects(
+            Worker::new(store),
+            keys,
+            tx,
+            Arc::clone(&in_flight),
+            Duration::from_millis(50),
+        ));
+
+        // Nobody reads: the first object waits in the channel, the second
+        // send stalls and ends the reply.
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("a stalled reply ends")
+            .unwrap();
+        assert_eq!(in_flight.available_permits(), budget - b"one".len());
+        drop(rx);
+        assert_eq!(in_flight.available_permits(), budget);
     }
 }

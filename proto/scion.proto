@@ -30,6 +30,8 @@ service Scion {
 
   // Read path.
 
+  // Deprecated: use Objects.ResolveRef, which a cache tier forwards. Kept so
+  // existing clients still work; both share one implementation.
   rpc ResolveRef(ResolveRefRequest) returns (ResolveRefResponse);
   rpc GetChangeset(GetChangesetRequest) returns (GetChangesetResponse);
   // Streams the content of a regular file or the target of a symlink.

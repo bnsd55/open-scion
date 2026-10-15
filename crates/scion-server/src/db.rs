@@ -299,6 +299,20 @@ pub fn put_tree(c: &Connection, tree: &Tree) -> Result<TreeId> {
 /// [`Error::NotFound`] if absent, [`Error::Corrupt`] if it does not decode or
 /// match.
 pub fn get_tree(c: &Connection, id: TreeId) -> Result<Tree> {
+    load_tree(c, id).map(|(tree, _)| tree)
+}
+
+/// Reads a tree's stored `TreeV1` bytes and checks them against its ID. The
+/// strict decoder accepts only canonical bytes, so they are sent as they are.
+///
+/// # Errors
+///
+/// As [`get_tree`].
+pub fn get_tree_body(c: &Connection, id: TreeId) -> Result<Vec<u8>> {
+    load_tree(c, id).map(|(_, body)| body)
+}
+
+fn load_tree(c: &Connection, id: TreeId) -> Result<(Tree, Vec<u8>)> {
     let body: Vec<u8> = c
         .prepare_cached("SELECT body FROM trees WHERE id = ?1")?
         .query_row([id.as_bytes()], |row| row.get(0))
@@ -309,7 +323,7 @@ pub fn get_tree(c: &Connection, id: TreeId) -> Result<Tree> {
     if actual != id {
         return Err(Error::Corrupt(format!("tree {id} does not match its ID")));
     }
-    Ok(tree)
+    Ok((tree, body))
 }
 
 fn to_id(bytes: &[u8]) -> Result<ChangesetId> {

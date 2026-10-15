@@ -103,7 +103,7 @@ pub(crate) struct Worker {
 }
 
 impl Worker {
-    fn new(store: Store) -> Self {
+    pub(crate) fn new(store: Store) -> Self {
         Self {
             store,
             permits: Arc::new(Semaphore::new(MAX_BLOCKING)),
