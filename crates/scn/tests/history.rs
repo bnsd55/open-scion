@@ -2,6 +2,7 @@
 //! compared with `git blame --first-parent` of the same history.
 #![cfg(unix)]
 
+use std::cmp::Ordering;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -87,10 +88,10 @@ impl Server {
         }
     }
 
-    /// Runs `scn --json` and parses its output.
-    fn json(&self, args: &[&str]) -> Value {
+    /// Runs `scn` and returns its output.
+    fn run(&self, args: &[&str]) -> String {
         let out: Output = Command::new(env!("CARGO_BIN_EXE_scn"))
-            .args(["--server", &self.url, "--repo", REPO, "--json"])
+            .args(["--server", &self.url, "--repo", REPO])
             .args(args)
             .env("SCION_TOKEN", TOKEN)
             .output()
@@ -100,12 +101,18 @@ impl Server {
             "scn {args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        serde_json::from_slice(&out.stdout).unwrap()
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// Runs `scn --json` and parses its output.
+    fn json(&self, args: &[&str]) -> Value {
+        serde_json::from_str(&self.run(&[&["--json"], args].concat())).unwrap()
     }
 }
 
-/// `scn blame --json` as one `(changeset, origin line)` per line.
-fn blame_lines(server: &Server, spec: &str) -> Vec<(String, u64)> {
+/// `scn blame --json` as one `(changeset, origin line, path there)` per
+/// line.
+fn blame_lines(server: &Server, spec: &str) -> Vec<(String, u64, String)> {
     let mut lines = Vec::new();
     for range in server.json(&["blame", spec]).as_array().unwrap() {
         assert_eq!(
@@ -113,9 +120,10 @@ fn blame_lines(server: &Server, spec: &str) -> Vec<(String, u64)> {
             lines.len() as u64 + 1
         );
         let id = range["changeset"].as_str().unwrap().to_owned();
+        let path = range["path"].as_str().unwrap().to_owned();
         let origin = range["origin_line"].as_u64().unwrap();
         for n in 0..range["line_count"].as_u64().unwrap() {
-            lines.push((id.clone(), origin + n));
+            lines.push((id.clone(), origin + n, path.clone()));
         }
     }
     lines
@@ -139,20 +147,24 @@ fn changeset_of(store: &Store, commit: &str) -> String {
         .unwrap()
 }
 
-/// `git blame --first-parent --porcelain` as one `(changeset, origin
-/// line)` per line, with each commit mapped to its changeset.
-fn git_blame_lines(store: &Store, dir: &Path, file: &str) -> Vec<(String, u64)> {
-    git(dir, &["blame", "--first-parent", "--porcelain", file])
-        .lines()
-        .filter(|line| !line.starts_with('\t'))
-        .filter_map(|line| {
+/// `git blame --first-parent --line-porcelain` as one `(changeset, origin
+/// line, path there)` per line, with each commit mapped to its changeset.
+fn git_blame_lines(store: &Store, dir: &Path, file: &str) -> Vec<(String, u64, String)> {
+    let mut lines = Vec::new();
+    // Each line starts with "<commit> <origin line> <line> [<count>]".
+    let mut header = None;
+    for line in git(dir, &["blame", "--first-parent", "--line-porcelain", file]).lines() {
+        if line.starts_with('\t') {
+            header = None;
+        } else if header.is_none() {
             let fields: Vec<&str> = line.split(' ').collect();
-            let is_header = fields[0].len() == 40
-                && fields[0].bytes().all(|b| b.is_ascii_hexdigit())
-                && (3..=4).contains(&fields.len());
-            is_header.then(|| (changeset_of(store, fields[0]), fields[1].parse().unwrap()))
-        })
-        .collect()
+            header = Some((changeset_of(store, fields[0]), fields[1].parse().unwrap()));
+        } else if let Some(name) = line.strip_prefix("filename ") {
+            let (id, origin) = header.clone().unwrap();
+            lines.push((id, origin, name.to_owned()));
+        }
+    }
+    lines
 }
 
 /// A git history of edits that blame must follow: inserts, edits, a merge,
@@ -263,7 +275,7 @@ fn blame_fixture(dir: &Path) {
 #[test]
 fn blame_matches_git_blame_first_parent() {
     const FILES: [&str; 6] = [
-        "lib.rs",
+        "src/lib.rs",
         "b.txt",
         "slide.txt",
         "crlf.txt",
@@ -273,6 +285,16 @@ fn blame_matches_git_blame_first_parent() {
     let git_dir = tempfile::tempdir().unwrap();
     let dir = git_dir.path();
     blame_fixture(dir);
+    // Then a rename into a new directory, with an edit.
+    let lib = fs::read_to_string(dir.join("lib.rs")).unwrap();
+    commit(
+        dir,
+        "rename lib.rs into a new directory, with an edit",
+        &[
+            ("lib.rs", None),
+            ("src/lib.rs", Some(&lib.replace("header 2", "header 3"))),
+        ],
+    );
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
     let opts = ImportOptions {
@@ -286,13 +308,25 @@ fn blame_matches_git_blame_first_parent() {
         .map(|file| git_blame_lines(&store, dir, file))
         .collect();
     let server = Server::start(data, store);
-    for (file, expected) in FILES.iter().zip(expected) {
+    for (file, expected) in FILES.iter().zip(&expected) {
         assert_eq!(
-            blame_lines(&server, &format!("main:{file}")),
+            &blame_lines(&server, &format!("main:{file}")),
             expected,
             "{file}"
         );
     }
+    // As in git, the text output shows each line's path when some line
+    // came from another path, after the changeset.
+    let paths = |file: &str| -> Vec<String> {
+        let out = server.run(&["blame", &format!("main:{file}")]);
+        out.lines()
+            .map(|line| line.split(' ').nth(1).unwrap().to_owned())
+            .collect()
+    };
+    let renamed: Vec<String> = expected[0].iter().map(|(_, _, p)| p.clone()).collect();
+    assert!(renamed.contains(&"lib.rs".into()) && renamed.contains(&"src/lib.rs".into()));
+    assert_eq!(paths("src/lib.rs"), renamed);
+    assert!(paths("b.txt").iter().all(|field| field.starts_with('(')));
 }
 
 fn regular(content: BlobId) -> FileState {
@@ -302,12 +336,15 @@ fn regular(content: BlobId) -> FileState {
     }
 }
 
-/// A changeset's message and the files it puts.
-type Puts<'a> = (Vec<u8>, Vec<(&'a str, FileState)>);
+/// A changeset's message and the files it puts, or deletes (`None`).
+type Puts<'a, S> = (Vec<u8>, Vec<(&'a str, S)>);
 
 /// Stores a first-parent chain in a new repo, one changeset per entry.
 /// Returns the IDs, oldest first.
-fn chain(store: &Store, changesets: Vec<Puts<'_>>) -> Vec<ChangesetId> {
+fn chain<S: Into<Option<FileState>>>(
+    store: &Store,
+    changesets: Vec<Puts<'_, S>>,
+) -> Vec<ChangesetId> {
     store
         .write(|c| {
             let repo = db::create_repo(c, REPO)?;
@@ -325,7 +362,7 @@ fn chain(store: &Store, changesets: Vec<Puts<'_>>) -> Vec<ChangesetId> {
                     message,
                     changes: files
                         .into_iter()
-                        .map(|(p, state)| (RepoPath::new(p).unwrap(), Some(state)))
+                        .map(|(p, state)| (RepoPath::new(p).unwrap(), state.into()))
                         .collect(),
                 };
                 ids.push(tree::store_changeset(c, repo, &cs)?.0);
@@ -393,8 +430,46 @@ fn log_path_and_blame_continue_past_the_server_bounds() {
     // Each line came from the changeset that added it, as line 1 there. The
     // last line is line 2 of the root's file.
     let root = ids[0].to_string();
-    let mut expected: Vec<(String, u64)> = f_history.into_iter().map(|id| (id, 1)).collect();
-    expected.push((root, 2));
+    let mut expected: Vec<_> = f_history
+        .into_iter()
+        .map(|id| (id, 1, "f".into()))
+        .collect();
+    expected.push((root, 2, "f".into()));
+    assert_eq!(blame_lines(&server, &format!("{tip}:f")), expected);
+}
+
+#[test]
+fn blame_continues_at_the_old_path_after_a_rename() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    // Each changeset adds one line at the top. The one at `before` also
+    // renames `a` to `f`. One `Blame` call diffs MAX_BLAME_VERSIONS
+    // versions, so it passes the rename and stops on the history of `a`.
+    let before = MAX_BLAME_VERSIONS / 2 + 10;
+    let mut text = String::new();
+    let changes = (0..=before + MAX_BLAME_VERSIONS / 2)
+        .map(|n| {
+            text.insert_str(0, &format!("line {n}\n"));
+            let put = Some(regular(store.blobs().put(text.as_bytes()).unwrap()));
+            let files = match n.cmp(&before) {
+                Ordering::Less => vec![("a", put)],
+                Ordering::Equal => vec![("a", None), ("f", put)],
+                Ordering::Greater => vec![("f", put)],
+            };
+            (b"change\n".to_vec(), files)
+        })
+        .collect();
+    let ids = chain(&store, changes);
+    let tip = ids.last().unwrap().to_string();
+    let server = Server::start(data, store);
+    // Line k came from changeset `len - k`, where it was line 1.
+    let len = ids.len();
+    let expected: Vec<_> = (1..=len)
+        .map(|k| {
+            let at = if len - k < before { "a" } else { "f" };
+            (ids[len - k].to_string(), 1, at.to_owned())
+        })
+        .collect();
     assert_eq!(blame_lines(&server, &format!("{tip}:f")), expected);
 }
 

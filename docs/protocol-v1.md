@@ -52,15 +52,16 @@ shares one scope.
 **Timeouts.** The server ends a call with `CANCELLED` when its reply has not
 started after 600 s, or earlier if the client's `grpc-timeout` is shorter.
 For `PutBlob` this covers the whole upload. For a streamed reply (`ReadFile`,
-`GetObjects`) it covers only the start. A call that ends this way may still
-finish its work on the server (section 6.3).
+`GetObjects`) it covers only the start. A `ReadFile` reply has its own limits
+(section 6.7). A call that ends this way may still finish its work on the
+server (section 6.3).
 
 **Queues.** The server queues work instead of failing it. At most 256 jobs run
 at once across both services, at most 16 `PutBlob` uploads are read at once,
-and at most 4 `Blame` calls run at once. Time in a queue counts toward the
-timeout. One wait has its own limit: a `GetObjects` call that gets no memory
-for its first object within 120 s fails with `RESOURCE_EXHAUSTED` (section
-7.3).
+and at most 4 `Blame` calls run at once. A `ReadFile` call waits for its share
+of a memory budget (section 6.7). Time in a queue counts toward the timeout.
+One wait has its own limit: a `GetObjects` call that gets no memory for its
+first object within 120 s fails with `RESOURCE_EXHAUSTED` (section 7.3).
 
 ## 3. Common rules
 
@@ -110,6 +111,7 @@ contract. A client MUST NOT depend on its text.
 | `OUT_OF_RANGE` | A message is larger than its limit. | After the cause is fixed |
 | `RESOURCE_EXHAUSTED` | `MergeBase` or `IsAncestor` only: the answer needs more work than one call may do. | No: the same request fails again |
 | `CANCELLED` | The server's 600 s limit or the client's `grpc-timeout` ran out. A client library can report its own deadline as `DEADLINE_EXCEEDED`. | Yes. A `Land` retry uses the same request key. |
+| `DEADLINE_EXCEEDED` | `ReadFile`: the client took no message for 120 s. `Land`: the land ran past 600 s from the start of the call. The land stays `PENDING`. | Yes. A `Land` retry uses the same request key. |
 | `UNAVAILABLE` | The server cannot be reached or is shutting down. A tier also replies `UNAVAILABLE` when its upstream does not answer in time (section 8). | Yes |
 | `RESOURCE_EXHAUSTED` | `GetObjects` only: no memory for the first object within 120 s (section 7.3). | Yes, after a wait |
 | `DATA_LOSS` | From a tier only: its upstream sent bytes that are not the object asked for (section 8). | MAY |
@@ -134,9 +136,9 @@ A successful reply never shows state that a power loss can undo:
   no stored value yet, replies after that data is on disk.
 
 A call that fails or is cut off MAY have done part of its work. In particular
-a `Land` that returned `ABORTED` or `CANCELLED`, or whose reply was lost, can
-be pending or finished on the server. The client finds out with a retry under
-the same request key (section 6.3).
+a `Land` that returned `ABORTED`, `CANCELLED` or `DEADLINE_EXCEEDED`, or whose
+reply was lost, can be pending or finished on the server. The client finds
+out with a retry under the same request key (section 6.3).
 
 ## 5. Object IDs and verification
 
@@ -241,7 +243,12 @@ server checks, in order:
 1. The ref exists. If not, the land is `REJECTED` at once.
 2. The changeset has exactly one parent. If not (an imported root or merge),
    `REJECTED`.
-3. The base is on the ref's first-parent history. If not, `REJECTED`.
+3. The base is on the ref's first-parent history. If not, `REJECTED`. A base
+   more than 100,000 changesets behind the head on that history MAY be
+   `REJECTED` as too old. Then the client makes a new changeset on a newer
+   head and lands that. A base within 100,000 changesets of the head is never
+   too old. Further back, the answer depends on what the server holds in
+   memory at the time, so the same base can pass later under a new key.
 4. Each path P that the changeset changes is checked. P conflicts when a
    changeset on the ref after the base changed P itself, a path below P, or a
    file at a directory above P. If any path conflicts, the land is
@@ -259,6 +266,10 @@ Lands to one ref run one at a time. If the ref moves between step 4 and the
 swap (in v1 only git import does this), the server checks again from the new
 head, up to 3 times in all. Then the call fails with `ABORTED`, and the land
 stays `PENDING`.
+
+A `Land` past the 600 s limit, or cancelled by its client (for example by a
+shorter `grpc-timeout`), replies `CANCELLED` or `DEADLINE_EXCEEDED`. The
+server stops the land at its next check, and the land stays `PENDING`.
 
 **Reply.**
 
@@ -289,9 +300,10 @@ stays `PENDING`.
   `INVALID_ARGUMENT`.
 - A finished outcome is final for its key. A retry returns it even if the ref
   has changed since. To try again, a client uses a new key.
-- A client that retries after `ABORTED`, `CANCELLED`, `UNAVAILABLE` or a
-  lost reply MUST use the same key, so that it never lands the same change
-  twice. `scn land` uses `<changeset ID>:<ref>` as its default key.
+- A client that retries after `ABORTED`, `CANCELLED`, `DEADLINE_EXCEEDED`,
+  `UNAVAILABLE` or a lost reply MUST use the same key, so that it never
+  lands the same change twice. `scn land` uses `<changeset ID>:<ref>` as its
+  default key.
 - The server keeps a finished land for at least 7 days after it finished. A
   pending land is kept until it finishes. Within that time a retry with the
   same key is safe.
@@ -306,6 +318,7 @@ stays `PENDING`.
 | `INVALID_ARGUMENT` | A bad name or ID; a request key already used for a different changeset or ref. |
 | `NOT_FOUND` | The repo does not exist, or the repo does not have the changeset. |
 | `ABORTED` | The ref kept moving. The land stays `PENDING`. Retry with the same key. |
+| `CANCELLED`, `DEADLINE_EXCEEDED` | The call ran past 600 s, or the client cancelled it. The land stays `PENDING`. Retry with the same key. |
 
 ### 6.4 GetLand
 
@@ -339,12 +352,25 @@ content of a regular file, or the target of a symlink, at `path` in
 - Messages come in file order. Each holds at most 1 MiB. Together they are
   the whole content.
 - An empty file is a reply with no message.
-- Every error comes before the first message.
+- An error in the request comes before the first message. `INTERNAL` and
+  `DEADLINE_EXCEEDED` can end the reply after zero or more messages. A client
+  MUST take the content as whole only when the reply ends with `OK`.
+- The server checks the content against the blob ID as it sends it. A
+  damaged stored blob ends the reply with `INTERNAL` before its last message,
+  so a client never gets all of a damaged file.
+- The reply ends with `DEADLINE_EXCEEDED` when the client takes no message
+  for 120 s (the stall limit). A client that keeps reading has no time
+  limit.
+- Before the reply starts, the call waits for its share of a memory budget of
+  256 MiB that all `ReadFile` replies share: the file's size for a file of at
+  most 1 MiB, 5 MiB for a larger one.
 
 | Error | When |
 |---|---|
 | `INVALID_ARGUMENT` | A bad or empty path; the path is a directory or a submodule. |
 | `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
+| `DEADLINE_EXCEEDED` | After zero or more messages: the client took no message for 120 s. |
+| `INTERNAL` | After zero or more messages: the stored blob is damaged. |
 
 ### 6.8 ListDir
 
@@ -384,7 +410,7 @@ level as `TreeV1` bytes. An empty path is the repo root.
 ### 6.10 Blame
 
 `rpc Blame(BlameRequest) returns (BlameResponse)`. For each line of a file,
-the changeset that last changed it on first-parent history.
+the changeset that last changed it on first-parent history, across renames.
 
 **Lines.** A line ends after a `\n` byte, or at the end of the file. An empty
 file has no lines and gets no ranges.
@@ -395,26 +421,41 @@ file has no lines and gets no ranges.
   `start_line` counts from 1 in the requested file. `changeset_id` is the
   changeset that last changed those lines, and `origin_line` is the first of
   them, counting from 1, in the file at that changeset.
-- `changesets` holds the author of each changeset that a range names, once
-  each.
+- `changesets` holds each changeset that a range names, once each: its
+  author, and `path`, the path of the file at that changeset, where
+  `origin_line` counts. The path differs from the requested path when the
+  walk followed a rename.
 - `next_changeset_id` is set when the call stopped at a bound before every
-  line had a changeset. The ranges with an empty `changeset_id` came from that
-  changeset or an older one, and their `origin_line` is their line in the file
-  at `next_changeset_id`. To continue, a client blames the same path at
-  `next_changeset_id` and maps those lines through `origin_line`.
+  line had a changeset. `next_path` is then the path of the file there. The
+  ranges with an empty `changeset_id` came from that changeset or an older
+  one, and their `origin_line` is their line in the file at
+  `next_changeset_id` and `next_path`. To continue, a client blames
+  `next_path` at `next_changeset_id` and maps those lines through
+  `origin_line`.
+- An empty `path` or `next_path` comes from a server that does not follow
+  renames: it means the requested path.
 
 **Bounds per call.** At most 1,000 changesets checked, 100 versions diffed,
-and about 1M lines diffed (both sides of each diff). The first diff of a call
-always runs, so every call makes progress.
+and about 1M lines diffed (both sides of each diff). A rename search counts
+each chunk of up to 64 bytes it compares as a line, and compares at most 100
+deleted files. The first diff of a call always runs, so every call makes
+progress.
 
 **Rules.** The server walks first parents to each changeset that changed the
-file, and diffs that version with the version in its first parent. The lines
-that the changeset added go to it. The other lines are traced further back.
-The diff is Myers with an indent heuristic. Where several minimal
-diffs exist, which one the server picks is not part of v1. Renames are not
-followed. An older version that is absent, not a regular file, larger than
-1 MiB or holds a NUL byte counts as absent: the changeset that replaced it
-gets its lines.
+file, and diffs that version with the older version. The older version is
+the file at the same path in the first parent. Where the changeset adds the
+file (no file was at the path), it is the file that the changeset renamed
+to the path: a deleted file with the same content, else a similar one, as
+`git blame` finds it by default. The lines that the changeset added go to
+it. The other lines are traced further back, at the older path. The diff is
+Myers with an indent heuristic. Where several minimal diffs exist, which one
+the server picks is not part of v1, and neither is which deleted file it
+picks as the source. An older version that is absent, not a regular file,
+larger than 1 MiB or holds a NUL byte counts as absent: the changeset that
+replaced it gets its lines.
+
+A client that ignores `next_path` continues at the requested path after a
+rename. Its next call then fails with `NOT_FOUND`, or blames another file.
 
 | Error | When |
 |---|---|
@@ -670,7 +711,7 @@ A new version is a new package, `scion.v2`. A server MAY serve both.
   ([#72](https://github.com/bnsd55/open-scion/issues/72)), and `Diff` with
   rename detection ([#79](https://github.com/bnsd55/open-scion/issues/79)).
 - `Log` and `Blame` without per-call bounds
-  ([#61](https://github.com/bnsd55/open-scion/issues/61)), and `Blame` that
-  follows renames ([#69](https://github.com/bnsd55/open-scion/issues/69)).
+  ([#61](https://github.com/bnsd55/open-scion/issues/61)), and `Log` that
+  follows renames.
 - Blobs sent in their stored, compressed form
   ([#53](https://github.com/bnsd55/open-scion/issues/53)).
