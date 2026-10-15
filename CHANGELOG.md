@@ -37,5 +37,7 @@ release.
   256 MiB budget for all replies. It checks the content against its ID
   before the last part, and ends a stalled or late reply with
   `DEADLINE_EXCEEDED`.
+- The path index of each ref stays within a budget of 128 MiB. When it is
+  full, it starts over at the tip, and the lands still get the same answers.
 - `docs/protocol-v1.md`: the contract of the `Scion` and `Objects` services,
   for independent clients, tiers and servers.

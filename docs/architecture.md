@@ -356,6 +356,20 @@ index and does not count as used. So however old the bases are, they keep
 at most about three cycles of history in the index. Such a base is rare: a
 client lands soon after it reads the head.
 
+**Size budget.** Pruning bounds the generations, not the paths: one cycle of
+changesets with many paths each could fill memory. So each index also has a
+budget of 128 MiB (`MAX_INDEX_BYTES`), about 1M entries of short paths. An
+entry costs its path plus 64 bytes. Every addition is checked against the
+budget before it is made:
+
+- An advance or a land that would go over moves the floor up to the tip:
+  the index starts over, empty, at the head.
+- A `reach` back to an older base stops at the first changeset that does not
+  fit. That changeset is the floor, and the walk below checks the rest.
+
+So an index never holds more than its budget. Each ref has its own budget
+([#75](https://github.com/bnsd55/open-scion/issues/75)).
+
 **Why pruning cannot hide a conflict.** After a prune, the index still holds,
 for each path, the newest generation that changed it after the floor. A
 land's base is at or above the floor, or below it:
@@ -366,7 +380,8 @@ land's base is at or above the floor, or below it:
 - Below the floor, at most `MAX_DEPTH` below the tip: `reach` walks the
   history in the database from the floor back to the base, and adds each
   changeset it passes. The index then holds every change after the base
-  again.
+  again. If the budget stops `reach` first, the walk of the next case checks
+  the rest, from the new floor.
 - Below the floor and deeper: the same walk runs, but adds nothing to the
   index. It keeps only what the three conflict rules read for the land's own
   paths. The index holds the changes after the floor, and the walk sees the
@@ -374,8 +389,8 @@ land's base is at or above the floor, or below it:
   exactly when one of the two says so, so the answer is the same as with one
   index. Memory follows the size of the land, not the depth of the base.
 
-So the choice of the new floor, and of `MAX_DEPTH`, changes only the speed,
-never the answer.
+So the choice of the new floor, of `MAX_DEPTH` and of the budget changes
+only the speed, never the answer.
 
 **Planned:** a lander that rebases a batch of pending lands and moves the ref
 once ([#18](https://github.com/bnsd55/open-scion/issues/18)).
@@ -614,7 +629,7 @@ an untrusted network.
 | Network | Listens on `127.0.0.1:7878` by default. A non-loopback address is refused unless `--insecure-listen` is given. | No TLS: the token and all data travel unencrypted ([#14](https://github.com/bnsd55/open-scion/issues/14)). |
 | Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. | Trees and blobs are shared by all repos. `GetObjects` reads any tree or blob by ID, and a changeset can name another repo's blob and then read it ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
-| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once, 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget and `ReadFile` replies a 256 MiB budget. A reply of either whose client stops reading ends after 120 s, and a `ReadFile` reply ends 600 s after its call started. Names of 1 to 256 bytes with no control characters. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 1 MiB, diffs at most 100 versions and about 1M lines, and at most 4 run at once. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object or part inside HTTP/2 until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
+| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once, 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget and `ReadFile` replies a 256 MiB budget. A reply of either whose client stops reading ends after 120 s, and a `ReadFile` reply ends 600 s after its call started. Names of 1 to 256 bytes with no control characters. A ref's path index holds at most 128 MiB. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 1 MiB, diffs at most 100 versions and about 1M lines, and at most 4 run at once. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object or part inside HTTP/2 until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. | The client trusts the server for a ref's target and for a changeset's root tree, which it cannot check by hash. Tiers ([#5](https://github.com/bnsd55/open-scion/issues/5)) must forward these answers, not compute them. |
 | Checkout | `scn checkout` writes into a private temp directory with a random name and renames it onto a new or empty destination, never follows a symlink while writing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure the destination stays as it was. | The destination's parent must not be writable by other users, unless it has the sticky bit: they could swap the temp directory before the rename. No Windows rules: device names and names that end in a dot or a space pass. |
 | Errors | Internal errors reply `internal error`. The detail stays in the server log. | |
@@ -638,6 +653,7 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/land.rs` (`MAX_ATTEMPTS`) | Imports move refs without the land lock, so a land retries 3 times, then returns `ABORTED`. | Route every ref move through the per-ref lander. | [#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | One lander per ref that rebases a batch and moves the ref once. | [#18](https://github.com/bnsd55/open-scion/issues/18) |
+| `scion-server/src/land.rs` (`MAX_INDEX_BYTES`) | Each ref's path index has its own 128 MiB budget, so the memory of all indexes grows with the refs that take lands. | One budget for all indexes, which drops the least recently used. | [#75](https://github.com/bnsd55/open-scion/issues/75) |
 | `scion-server/src/land.rs` (`MAX_DEPTH`) | A land on a base more than `MAX_DEPTH` generations below the tip walks the history from the index floor back to the base, each time, and holds the database lock while it walks. | Per-path history in the database, so the check reads only the paths that the land changes. | [#38](https://github.com/bnsd55/open-scion/issues/38) |
 | `scion-server/src/objects.rs` (`read_object`) | An object ID is treated as permission to read it; trees and blobs are shared by all repos. Safe with one principal. | A read ticket bound to a principal, a repo and a root tree, checked by the server and every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/objects.rs` (`STALL_TIMEOUT`) | A stalled `GetObjects` reply ends, but HTTP/2 keeps the one encoded object it was sending until the connection closes. | A response body timeout that resets the stream. | [#42](https://github.com/bnsd55/open-scion/issues/42) |

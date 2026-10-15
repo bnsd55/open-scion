@@ -70,6 +70,16 @@ const PRUNE_EVERY: i64 = if cfg!(test) { 4 } else { 10_000 };
 // so the check reads only the paths it changes.
 const MAX_DEPTH: i64 = if cfg!(test) { 16 } else { PRUNE_EVERY };
 
+/// Most bytes that one ref's [`PathIndex`] holds, counted by
+/// [`entry_bytes`]: about 1M entries of short paths. An advance or a land
+/// that would go over moves the floor up to the tip. A reach back to a base
+/// that would go over stops, and [`touched_below`] checks the rest. Tests use
+/// a small budget, so that they reach it.
+// SHORTCUT: the budget is per ref, so the memory of all indexes grows with
+// the refs that take lands. Upgrade (issue #75): one budget for all indexes,
+// which drops the least recently used.
+const MAX_INDEX_BYTES: usize = if cfg!(test) { 64 << 10 } else { 128 << 20 };
+
 /// Where a land stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LandState {
@@ -527,7 +537,7 @@ fn settle(
 /// forward as the ref moves and backward when a land has an older base, up
 /// to [`MAX_DEPTH`] below the tip. Each [`PRUNE_EVERY`] generations,
 /// [`PathIndex::prune`] moves `floor` up to the oldest base that the cycle
-/// used, so memory follows the bases in use.
+/// used, so memory follows the bases in use. [`MAX_INDEX_BYTES`] bounds it.
 struct PathIndex {
     tip: ChangesetId,
     floor: ChangesetId,
@@ -542,13 +552,19 @@ struct PathIndex {
     cycle_start: i64,
     /// Oldest generation this cycle needs: `cycle_start`, or an older base.
     oldest_base: i64,
+    /// What `chain`, `files` and `dirs` hold, by [`entry_bytes`].
+    bytes: usize,
 }
 
 impl PathIndex {
     /// An empty index at `head`. Its first prune cycle starts there.
     fn new(c: &Connection, repo: RepoId, head: ChangesetId) -> Result<Self> {
-        let head_gen = db::generation(c, repo, head)?;
-        Ok(Self {
+        Ok(Self::at(head, db::generation(c, repo, head)?))
+    }
+
+    /// An empty index at `head`, of generation `head_gen`.
+    fn at(head: ChangesetId, head_gen: i64) -> Self {
+        Self {
             tip: head,
             floor: head,
             chain: BTreeMap::new(),
@@ -556,18 +572,21 @@ impl PathIndex {
             dirs: HashMap::new(),
             cycle_start: head_gen,
             oldest_base: head_gen,
-        })
+            bytes: 0,
+        }
     }
 
-    /// Indexes the changesets from the current tip forward to `head`. If
-    /// `head` does not descend from the tip (the ref moved to other history),
-    /// starts over at `head`.
+    /// Indexes the changesets from the current tip forward to `head`. Starts
+    /// over at `head` if `head` does not descend from the tip (the ref moved
+    /// to other history), or if those changesets would not fit in
+    /// [`MAX_INDEX_BYTES`].
     fn advance_to(&mut self, c: &Connection, repo: RepoId, head: ChangesetId) -> Result<()> {
         if head == self.tip {
             return Ok(());
         }
         let tip_gen = db::generation(c, repo, self.tip)?;
         let mut walked = Vec::new();
+        let mut needed = self.bytes;
         let mut cur = Some(head);
         while let Some(id) = cur {
             if id == self.tip {
@@ -582,6 +601,14 @@ impl PathIndex {
                 break;
             }
             let cs = db::get_changeset(c, repo, id)?;
+            needed += added_bytes(&cs.changes);
+            if needed > MAX_INDEX_BYTES {
+                tracing::info!(
+                    generation,
+                    "the path index is full; it starts over at the head"
+                );
+                break;
+            }
             cur = cs.parents.first().copied();
             walked.push((id, generation, cs.changes));
         }
@@ -593,9 +620,10 @@ impl PathIndex {
     /// `None` if `base` is not on the history. Then prunes.
     ///
     /// A base below the floor is reached: the changesets from the floor back
-    /// to it are added to the index. A base more than [`MAX_DEPTH`] below the
-    /// tip is not. [`touched_below`] checks those changesets without keeping
-    /// them, and the base does not count as used for pruning.
+    /// to it are added to the index, while they fit in [`MAX_INDEX_BYTES`].
+    /// [`touched_below`] checks the rest without keeping them. It checks all
+    /// of them for a base more than [`MAX_DEPTH`] below the tip, and such a
+    /// base does not count as used for pruning.
     fn check(
         &mut self,
         c: &Connection,
@@ -611,12 +639,15 @@ impl PathIndex {
         let deep = tip_gen - base_gen > MAX_DEPTH;
         let mut below = HashSet::new();
         if base != self.floor && self.chain.get(&base_gen) != Some(&base) {
-            let reached = if deep {
-                touched_below(c, repo, self.floor, base, base_gen, changes, &mut below)?
+            let mut walk = if deep {
+                Walk::Stopped
             } else {
                 self.reach(c, repo, base, base_gen)?
             };
-            if !reached {
+            if walk == Walk::Stopped {
+                walk = touched_below(c, repo, self.floor, base, base_gen, changes, &mut below)?;
+            }
+            if walk != Walk::Reached {
                 return Ok(None);
             }
         }
@@ -638,21 +669,26 @@ impl PathIndex {
         Ok(Some(conflicts))
     }
 
-    /// Whether `base` is on the history, adding the changesets from the floor
-    /// back to it. The caller has checked that `base` is not the floor and not
-    /// in the index.
+    /// Walks from the floor back to `base`, adding each changeset and moving
+    /// the floor down past it. Stops at the first changeset that does not fit
+    /// in [`MAX_INDEX_BYTES`], which is then the floor. The caller has checked
+    /// that `base` is not the floor and not in the index.
     fn reach(
         &mut self,
         c: &Connection,
         repo: RepoId,
         base: ChangesetId,
         base_gen: i64,
-    ) -> Result<bool> {
+    ) -> Result<Walk> {
         walk_back(c, repo, self.floor, base, base_gen, |id, generation, cs| {
+            if self.bytes + added_bytes(&cs.changes) > MAX_INDEX_BYTES {
+                return false;
+            }
             self.add(id, generation, &cs.changes);
             if let Some(&parent) = cs.parents.first() {
                 self.floor = parent;
             }
+            true
         })
     }
 
@@ -687,19 +723,29 @@ impl PathIndex {
                 // `retain` keeps the capacity, so give it back.
                 map.shrink_to_fit();
             }
+            self.bytes = self.measure();
             tracing::debug!(floor_gen, kept = self.chain.len(), "pruned the path index");
         }
         self.cycle_start = tip_gen;
         self.oldest_base = tip_gen;
     }
 
-    /// Records a changeset that just became the tip.
+    /// Records a changeset that just became the tip. If it does not fit in
+    /// [`MAX_INDEX_BYTES`], the index starts over at it.
     fn record(
         &mut self,
         id: ChangesetId,
         generation: i64,
         changes: &BTreeMap<RepoPath, Option<FileState>>,
     ) {
+        if self.bytes + added_bytes(changes) > MAX_INDEX_BYTES {
+            tracing::info!(
+                generation,
+                "the path index is full; it starts over at the tip"
+            );
+            *self = Self::at(id, generation);
+            return;
+        }
         self.add(id, generation, changes);
         self.tip = id;
     }
@@ -710,49 +756,84 @@ impl PathIndex {
         generation: i64,
         changes: &BTreeMap<RepoPath, Option<FileState>>,
     ) {
-        self.chain.insert(generation, id);
+        if self.chain.insert(generation, id).is_none() {
+            self.bytes += entry_bytes(&[]);
+        }
         for path in changes.keys() {
             let path = path.as_bytes();
-            bump(&mut self.files, path, generation);
+            self.bytes += bump(&mut self.files, path, generation);
             for dir in ancestors(path) {
-                bump(&mut self.dirs, dir, generation);
+                self.bytes += bump(&mut self.dirs, dir, generation);
             }
         }
     }
+
+    /// What the index holds, by [`entry_bytes`]. Counted from scratch.
+    fn measure(&self) -> usize {
+        let keys = |map: &HashMap<Vec<u8>, i64>| map.keys().map(|k| entry_bytes(k)).sum::<usize>();
+        self.chain.len() * entry_bytes(&[]) + keys(&self.files) + keys(&self.dirs)
+    }
+}
+
+/// What one index entry costs, roughly: its key, plus the map slot, the
+/// key's length and its allocation. A chain entry has no key.
+fn entry_bytes(key: &[u8]) -> usize {
+    key.len() + 64
+}
+
+/// The most that [`PathIndex::add`] adds for a changeset with `changes`.
+fn added_bytes(changes: &BTreeMap<RepoPath, Option<FileState>>) -> usize {
+    let paths = changes.keys().map(|path| {
+        let path = path.as_bytes();
+        entry_bytes(path) + ancestors(path).map(entry_bytes).sum::<usize>()
+    });
+    entry_bytes(&[]) + paths.sum::<usize>()
+}
+
+/// How a [`walk_back`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Walk {
+    /// It reached the base: the base is on the history.
+    Reached,
+    /// The base is not on the history.
+    Missed,
+    /// The visit stopped it before it reached the base.
+    Stopped,
 }
 
 /// Walks first parents from `from` back to `base`, and passes each changeset
-/// after `base` to `visit`, newest first. `false` if `base` is not on that
-/// history.
+/// after `base` to `visit`, newest first, while `visit` returns `true`.
 fn walk_back(
     c: &Connection,
     repo: RepoId,
     from: ChangesetId,
     base: ChangesetId,
     base_gen: i64,
-    mut visit: impl FnMut(ChangesetId, i64, &Changeset),
-) -> Result<bool> {
+    mut visit: impl FnMut(ChangesetId, i64, &Changeset) -> bool,
+) -> Result<Walk> {
     let mut cur = from;
     loop {
         let generation = db::generation(c, repo, cur)?;
         if generation <= base_gen {
-            return Ok(false);
+            return Ok(Walk::Missed);
         }
         let cs = db::get_changeset(c, repo, cur)?;
-        visit(cur, generation, &cs);
+        if !visit(cur, generation, &cs) {
+            return Ok(Walk::Stopped);
+        }
         match cs.parents.first() {
-            Some(&parent) if parent == base => return Ok(true),
+            Some(&parent) if parent == base => return Ok(Walk::Reached),
             Some(&parent) => cur = parent,
-            None => return Ok(false),
+            None => return Ok(Walk::Missed),
         }
     }
 }
 
-/// For a base more than [`MAX_DEPTH`] below the tip: walks the history from
-/// `floor` back to `base`, and adds to `hits` each path in `land` that the
-/// walked changesets touched, by the rule of [`PathIndex::touches`]. Keeps
-/// only the land's own paths and directories, so memory follows the land,
-/// not the depth. `false` if `base` is not on the history.
+/// For a base that the index cannot reach: walks the history from `floor`
+/// back to `base`, and adds to `hits` each path in `land` that the walked
+/// changesets touched, by the rule of [`PathIndex::touches`]. Keeps only the
+/// land's own paths and directories, so memory follows the land, not the
+/// depth.
 fn touched_below<'a>(
     c: &Connection,
     repo: RepoId,
@@ -761,7 +842,7 @@ fn touched_below<'a>(
     base_gen: i64,
     land: &'a BTreeMap<RepoPath, Option<FileState>>,
     hits: &mut HashSet<&'a [u8]>,
-) -> Result<bool> {
+) -> Result<Walk> {
     let paths: HashSet<&[u8]> = land.keys().map(RepoPath::as_bytes).collect();
     let parents: HashSet<&[u8]> = paths.iter().flat_map(|p| ancestors(p)).collect();
     // What `files` and `dirs` of an index over the walk would hold, kept only
@@ -769,7 +850,7 @@ fn touched_below<'a>(
     let mut files: HashSet<&[u8]> = HashSet::new();
     let mut dirs: HashSet<&[u8]> = HashSet::new();
     let mut walked = 0_u64;
-    let reached = walk_back(c, repo, floor, base, base_gen, |_, _, cs| {
+    let walk = walk_back(c, repo, floor, base, base_gen, |_, _, cs| {
         walked += 1;
         for path in cs.changes.keys() {
             let path = path.as_bytes();
@@ -778,17 +859,24 @@ fn touched_below<'a>(
             }
             dirs.extend(ancestors(path).filter_map(|dir| paths.get(dir)));
         }
+        true
     })?;
-    tracing::debug!(base_gen, walked, reached, "checked an old base");
+    tracing::debug!(base_gen, walked, ?walk, "checked an old base");
     hits.extend(paths.into_iter().filter(|&path| {
         files.contains(path) || dirs.contains(path) || ancestors(path).any(|d| files.contains(d))
     }));
-    Ok(reached)
+    Ok(walk)
 }
 
-fn bump(map: &mut HashMap<Vec<u8>, i64>, key: &[u8], generation: i64) {
-    let slot = map.entry(key.to_vec()).or_insert(generation);
-    *slot = (*slot).max(generation);
+/// Raises `key` to `generation`. Returns the bytes added: those of a new
+/// entry, else 0.
+fn bump(map: &mut HashMap<Vec<u8>, i64>, key: &[u8], generation: i64) -> usize {
+    if let Some(slot) = map.get_mut(key) {
+        *slot = (*slot).max(generation);
+        return 0;
+    }
+    map.insert(key.to_vec(), generation);
+    entry_bytes(key)
 }
 
 /// The proper directory prefixes of a path: `a/b/c` gives `a`, `a/b`.
@@ -1315,6 +1403,7 @@ mod tests {
         let bound = 2 * cycle();
         for n in 0..10 * cycle() {
             f.fill(&format!("d{n}/f"), 1);
+            within_budget(&f);
             let sizes = f.index(|index| (index.chain.len(), index.files.len(), index.dirs.len()));
             assert!(
                 sizes.0 <= bound && sizes.1 <= bound && sizes.2 <= bound,
@@ -1322,6 +1411,71 @@ mod tests {
                 n + 1
             );
         }
+    }
+
+    /// `n` puts below `dir`: `dir/f0` to `dir/f{n-1}`.
+    fn wide(dir: &str, n: usize) -> Vec<Change> {
+        (0..n).map(|i| put(&format!("{dir}/f{i}"), "x")).collect()
+    }
+
+    /// Checks that the index of `main` counts its bytes right and stays
+    /// within its budget. Returns its floor.
+    fn within_budget(f: &Fixture) -> ChangesetId {
+        f.index(|index| {
+            assert_eq!(index.bytes, index.measure());
+            assert!(index.bytes <= MAX_INDEX_BYTES, "{} bytes", index.bytes);
+            index.floor
+        })
+    }
+
+    #[test]
+    fn the_path_index_stays_within_its_byte_budget() {
+        use LandState::{Conflict, Landed};
+        // Three lands of this many new paths fill the budget, before a prune
+        // cycle ends.
+        const WIDE: usize = 400;
+        let one = added_bytes(&wide("d0", WIDE).into_iter().collect());
+        assert!(3 * one > MAX_INDEX_BYTES && PRUNE_EVERY > 3);
+        let f = fixture();
+        let mut history = vec![f.root];
+        let mut restarts = 0;
+        for n in 0..8 {
+            let cs = f.commit(f.main().target, &wide(&format!("d{n}"), WIDE));
+            assert_eq!(f.land(cs, &format!("d{n}")).state, Landed);
+            history.push(cs);
+            // A prune moves the floor to an older base, never to the tip.
+            restarts += usize::from(within_budget(&f) == cs);
+        }
+        assert!(restarts > 0, "a land moved the floor up to the tip");
+
+        // Bases below the floor. Each check reaches back while the index has
+        // room, and walks the rest.
+        let base = history[1];
+        assert!(f.generation(base) < f.generation(within_budget(&f)));
+        let cases = [
+            ("d5/f3", Conflict), // the land of d5 put it
+            ("d6", Conflict),    // the land of d6 put paths below it
+            ("d0/f3", Landed),   // only the base put it
+        ];
+        for (path, state) in cases {
+            let out = f.land(f.commit(base, &[put(path, "mine")]), &format!("old {path}"));
+            assert_eq!(out.state, state, "{path}: {}", out.detail);
+            if state == Conflict {
+                assert_eq!(out.conflict_paths, [RepoPath::new(path).unwrap()]);
+            }
+            within_budget(&f);
+        }
+
+        // An import moves main by more than the budget holds. The index
+        // starts over at the new head and still sees the imported changes.
+        let before = f.main().target;
+        for n in 0..3 {
+            f.move_main(f.commit(f.main().target, &wide(&format!("e{n}"), WIDE)));
+        }
+        let out = f.land(f.commit(before, &[put("e1/f7", "mine")]), "after import");
+        assert_eq!(out.state, Conflict, "{}", out.detail);
+        assert_eq!(out.conflict_paths, [RepoPath::new("e1/f7").unwrap()]);
+        within_budget(&f);
     }
 
     #[test]
