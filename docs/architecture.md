@@ -191,7 +191,7 @@ computed eagerly or on demand. The rest is this project's choice.
 | Part | Here |
 |---|---|
 | A kind | `derived::Kind`: a name, a version, and `derive`, a function from a changeset and its first parent's value to a value. Each kind encodes its value as bytes. |
-| Inputs | The first parent's value only, because a changeset stores only its changes against its first parent (section 2). The article says "parents". |
+| Inputs | The first parent's value only, because a changeset stores only its changes against its first parent (section 2). The article says "parents". A kind over the full graph does not fit yet ([#76](https://github.com/bnsd55/open-scion/issues/76)). |
 | On demand | `derived::get` reads the stored value. If there is none, `derived::derive` walks first parents back to the nearest changeset with a stored value, then derives forward, oldest first, and stores each value. It is a loop, not recursion, so a long chain is safe. |
 | Eager | A kind can also store its value when the changeset is written. `root_tree` does (below). |
 | Storage | One `derived` row per (kind, version, changeset), written in the transaction that derives it. A large structure belongs in its own table, and the value is its ID, as `root_tree` keeps trees in `trees`. |
@@ -642,6 +642,7 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/store.rs` (`Inner::db`) | One SQLite connection behind a mutex, so reads wait for writes. | A pool of read-only connections. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
 | `scion-server/src/store.rs` (`Store::open`) | One process per data directory, so an import needs the server stopped. | Let a separate importer process share the directory. Lands already re-plan when the ref moves (`MAX_ATTEMPTS`). | [#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
+| `scion-server/src/derived.rs` (`Kind::derive`) | A kind gets only its first parent's value, so a kind over the full commit graph, such as a generation number, does not fit. | Pass every parent's value, and derive ancestors in generation order. | [#76](https://github.com/bnsd55/open-scion/issues/76) |
 | `scion-server/src/derived.rs` (`derive`) | One transaction derives every missing value on the chain, and holds the database lock. So the first read after a new kind or a version bump derives the whole history at once. Rows of old versions are never removed. | A backfill that derives a bounded number of changesets per transaction, and a bounded delete of old versions. | [#71](https://github.com/bnsd55/open-scion/issues/71) |
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/land.rs` (`MAX_ATTEMPTS`) | Imports move refs without the land lock, so a land retries 3 times, then returns `ABORTED`. | Route every ref move through the per-ref lander. | [#27](https://github.com/bnsd55/open-scion/issues/27) |

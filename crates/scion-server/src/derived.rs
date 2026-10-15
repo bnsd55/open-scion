@@ -36,6 +36,11 @@ pub trait Kind {
     ///
     /// Database errors, or [`Error::Corrupt`] if the stored changeset does
     /// not fit its parent's value.
+    // SHORTCUT: only the first parent's value, because a changeset stores
+    // only its changes against its first parent. A kind over the full graph,
+    // such as a generation number, does not fit. Upgrade: pass every
+    // parent's value and derive ancestors in generation order
+    // (https://github.com/bnsd55/open-scion/issues/76).
     fn derive(
         c: &Connection,
         id: ChangesetId,
@@ -147,7 +152,8 @@ mod tests {
     use scion_core::{BlobId, FileState, IdentityTime, RepoPath};
 
     use super::*;
-    use crate::tree;
+    use crate::store::{FSYNC_LEAVES_DRIVE_CACHE, SCHEMA_VERSION, migrate};
+    use crate::tree::{self, RootTree};
 
     thread_local! {
         /// Calls to a test kind's `derive` on this thread.
@@ -156,12 +162,13 @@ mod tests {
 
     /// A test kind: how many paths the first-parent history has changed, up
     /// to and including this changeset. Not stored at write time, and its
-    /// value is not 32 bytes.
-    struct ChangedPaths;
+    /// value is not 32 bytes. Version 2 gives a new answer: it counts puts
+    /// only.
+    struct ChangedPaths<const VERSION: u32>;
 
-    impl Kind for ChangedPaths {
+    impl<const V: u32> Kind for ChangedPaths<V> {
         const NAME: &'static str = "changed_paths";
-        const VERSION: u32 = 1;
+        const VERSION: u32 = V;
         type Value = u64;
 
         fn derive(
@@ -171,7 +178,11 @@ mod tests {
             parent: Option<u64>,
         ) -> Result<u64> {
             DERIVES.set(DERIVES.get() + 1);
-            Ok(parent.unwrap_or(0) + cs.changes.len() as u64)
+            let counted = cs
+                .changes
+                .values()
+                .filter(|state| V == 1 || state.is_some());
+            Ok(parent.unwrap_or(0) + counted.count() as u64)
         }
 
         fn encode(count: &u64) -> Vec<u8> {
@@ -183,33 +194,8 @@ mod tests {
         }
     }
 
-    /// Version 2 of the test kind, with a new answer: it counts puts only.
-    struct PutPaths;
-
-    impl Kind for PutPaths {
-        const NAME: &'static str = ChangedPaths::NAME;
-        const VERSION: u32 = 2;
-        type Value = u64;
-
-        fn derive(
-            _: &Connection,
-            _: ChangesetId,
-            cs: &Changeset,
-            parent: Option<u64>,
-        ) -> Result<u64> {
-            DERIVES.set(DERIVES.get() + 1);
-            let puts = cs.changes.values().filter(|state| state.is_some()).count();
-            Ok(parent.unwrap_or(0) + puts as u64)
-        }
-
-        fn encode(count: &u64) -> Vec<u8> {
-            ChangedPaths::encode(count)
-        }
-
-        fn decode(bytes: &[u8]) -> Option<u64> {
-            ChangedPaths::decode(bytes)
-        }
-    }
+    type ChangedPathsV1 = ChangedPaths<1>;
+    type ChangedPathsV2 = ChangedPaths<2>;
 
     /// A first-parent chain: `(path, true)` puts a file, `(path, false)`
     /// deletes it. Changed paths: 2, 4, 5. Puts: 2, 3, 4.
@@ -269,7 +255,7 @@ mod tests {
     fn kind_rows(store: &Store, version: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
         let all = store.read(|c| Ok(rows(c))).unwrap();
         all.into_iter()
-            .filter(|(kind, v, ..)| kind == ChangedPaths::NAME && *v == version)
+            .filter(|(kind, v, ..)| kind == ChangedPathsV1::NAME && *v == version)
             .map(|(_, _, cs, value)| (cs, value))
             .collect()
     }
@@ -282,14 +268,20 @@ mod tests {
         assert!(kind_rows(&store, 1).is_empty(), "nothing derived yet");
 
         DERIVES.set(0);
-        assert_eq!(get::<ChangedPaths>(&store, repo, ids[2]).unwrap(), 5);
+        let start = store.blobs().full_flushes();
+        let flushes = || store.blobs().full_flushes() - start;
+        assert_eq!(get::<ChangedPathsV1>(&store, repo, ids[2]).unwrap(), 5);
         assert_eq!(DERIVES.get(), 3, "each changeset once, from the root");
+        // None where the commit's own fsync flushes the drive cache.
+        let one = u64::from(FSYNC_LEAVES_DRIVE_CACHE);
+        assert_eq!(flushes(), one, "durable before get returns");
         let counts: Vec<u64> = ids
             .iter()
-            .map(|&cs| get::<ChangedPaths>(&store, repo, cs).unwrap())
+            .map(|&cs| get::<ChangedPathsV1>(&store, repo, cs).unwrap())
             .collect();
         assert_eq!(counts, [2, 4, 5]);
         assert_eq!(DERIVES.get(), 3, "later reads use the stored values");
+        assert_eq!(flushes(), one, "and run no flush");
         let stored = kind_rows(&store, 1);
         assert_eq!(stored.len(), 3);
         assert!(stored.iter().all(|(_, value)| value.len() == 8));
@@ -298,11 +290,11 @@ mod tests {
         let other = store.write(|c| db::create_repo(c, "other")).unwrap();
         let tip = ids[2];
         assert!(matches!(
-            get::<ChangedPaths>(&store, other, tip),
+            get::<ChangedPathsV1>(&store, other, tip),
             Err(Error::NotFound(_))
         ));
         assert!(matches!(
-            store.commit(|c| derive::<ChangedPaths>(c, other, tip)),
+            store.commit(|c| derive::<ChangedPathsV1>(c, other, tip)),
             Err(Error::NotFound(_))
         ));
     }
@@ -313,15 +305,15 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         let (repo, ids) = store.write(store_history).unwrap();
         let tip = ids[2];
-        assert_eq!(get::<ChangedPaths>(&store, repo, tip).unwrap(), 5);
+        assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), 5);
         let v1 = kind_rows(&store, 1);
 
         DERIVES.set(0);
-        assert_eq!(get::<PutPaths>(&store, repo, tip).unwrap(), 4);
+        assert_eq!(get::<ChangedPathsV2>(&store, repo, tip).unwrap(), 4);
         assert_eq!(DERIVES.get(), 3, "version 2 derives every value again");
         assert_eq!(kind_rows(&store, 2).len(), 3);
         assert_eq!(kind_rows(&store, 1), v1, "version 1 rows are not rewritten");
-        assert_eq!(get::<ChangedPaths>(&store, repo, tip).unwrap(), 5);
+        assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), 5);
         assert_eq!(DERIVES.get(), 3, "and version 1 still reads them");
     }
 
@@ -330,12 +322,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (repo, ids, before) = {
             let c = Connection::open(dir.path().join("scion.db")).unwrap();
-            let v1 = include_str!("../migrations/0001_init.sql");
-            let v2 = include_str!("../migrations/0002_land_retention.sql");
-            c.execute_batch(&format!(
-                "BEGIN; {v1} {v2} PRAGMA user_version = 2; COMMIT;"
-            ))
-            .unwrap();
+            migrate(&c, 2).unwrap();
             let (repo, ids) = store_history(&c).unwrap();
             (repo, ids, rows(&c))
         };
@@ -353,20 +340,20 @@ mod tests {
         let version: u32 = store
             .read(|c| Ok(c.pragma_query_value(None, "user_version", |row| row.get(0))?))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(store.read(|c| Ok(rows(c))).unwrap(), before);
         // Each root tree is read from its copied row.
         for &cs in &ids {
             let tree = tree::root_tree(&store, repo, cs).unwrap();
             let row = (
-                tree::RootTree::NAME.to_owned(),
-                tree::RootTree::VERSION,
+                RootTree::NAME.to_owned(),
+                RootTree::VERSION,
                 cs.as_bytes().to_vec(),
                 tree.as_bytes().to_vec(),
             );
             assert!(before.contains(&row), "{cs}");
         }
         // The table now holds a value that is not 32 bytes.
-        assert_eq!(get::<ChangedPaths>(&store, repo, ids[2]).unwrap(), 5);
+        assert_eq!(get::<ChangedPathsV1>(&store, repo, ids[2]).unwrap(), 5);
     }
 }

@@ -239,12 +239,11 @@ pub fn get_derived(
     version: u32,
     cs: ChangesetId,
 ) -> Result<Option<Vec<u8>>> {
-    Ok(c.query_row(
-        "SELECT value FROM derived WHERE kind = ?1 AND version = ?2 AND cs = ?3",
-        params![kind, version, cs.as_bytes()],
-        |row| row.get(0),
+    Ok(
+        c.prepare_cached("SELECT value FROM derived WHERE kind = ?1 AND version = ?2 AND cs = ?3")?
+            .query_row(params![kind, version, cs.as_bytes()], |row| row.get(0))
+            .optional()?,
     )
-    .optional()?)
 }
 
 /// Records a derived value. A second write must agree with the first:

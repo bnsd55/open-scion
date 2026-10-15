@@ -86,7 +86,7 @@ impl Kind for RootTree {
     }
 
     fn decode(bytes: &[u8]) -> Option<TreeId> {
-        <[u8; 32]>::try_from(bytes).ok().map(TreeId::from_bytes)
+        TreeId::try_from(bytes).ok()
     }
 }
 
@@ -489,13 +489,7 @@ mod tests {
                     let repo = db::create_repo(c, "r")?;
                     let mut ids: Vec<ChangesetId> = Vec::new();
                     for edits in history {
-                        let cs = Changeset {
-                            parents: ids.last().copied().into_iter().collect(),
-                            author: author(),
-                            committer: None,
-                            message: vec![],
-                            changes: changes(edits),
-                        };
+                        let cs = changeset(ids.last().copied(), edits);
                         ids.push(if stored {
                             store_changeset(c, repo, &cs)?.0
                         } else {
@@ -513,12 +507,18 @@ mod tests {
         }
     }
 
-    fn author() -> IdentityTime {
-        IdentityTime {
-            name: b"a".to_vec(),
-            email: b"a@x".to_vec(),
-            unix_secs: 0,
-            tz_offset_minutes: 0,
+    fn changeset(parent: Option<ChangesetId>, edits: Edits<'_>) -> Changeset {
+        Changeset {
+            parents: parent.into_iter().collect(),
+            author: IdentityTime {
+                name: b"a".to_vec(),
+                email: b"a@x".to_vec(),
+                unix_secs: 0,
+                tz_offset_minutes: 0,
+            },
+            committer: None,
+            message: vec![],
+            changes: changes(edits),
         }
     }
 
@@ -533,14 +533,7 @@ mod tests {
         let cs = store
             .write(|c| {
                 let repo = db::create_repo(c, "r")?;
-                let cs = Changeset {
-                    parents: vec![],
-                    author: author(),
-                    committer: None,
-                    message: vec![],
-                    changes: changes(&[("a/b", Some("1"))]),
-                };
-                db::insert_changeset(c, repo, &cs)
+                db::insert_changeset(c, repo, &changeset(None, &[("a/b", Some("1"))]))
             })
             .unwrap();
         let get_root_tree = || {
@@ -559,7 +552,12 @@ mod tests {
     fn root_tree_derives_a_long_chain_and_caches_it() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let author = author();
+        let author = IdentityTime {
+            name: b"a".to_vec(),
+            email: b"a@x".to_vec(),
+            unix_secs: 0,
+            tz_offset_minutes: 0,
+        };
         let (repo, tip) = store
             .write(|c| {
                 let repo = db::create_repo(c, "r")?;

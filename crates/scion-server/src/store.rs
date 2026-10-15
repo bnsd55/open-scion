@@ -96,7 +96,7 @@ impl Store {
         )?;
         // Enough for every hot statement, so none is prepared twice.
         db.set_prepared_statement_cache_capacity(64);
-        migrate(&db)?;
+        migrate(&db, SCHEMA_VERSION)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 db: Mutex::new(db),
@@ -227,7 +227,9 @@ fn lock_dir(dir: &Path) -> Result<fs::File> {
     }
 }
 
-fn migrate(db: &Connection) -> Result<()> {
+/// Runs the migrations from the database's version up to `target`. Only
+/// tests stop below [`SCHEMA_VERSION`], to make an older database.
+pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
     let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(Error::Corrupt(format!(
@@ -235,7 +237,7 @@ fn migrate(db: &Connection) -> Result<()> {
         )));
     }
     // Each migration runs in its own transaction, with the version it sets.
-    for (to, sql) in (1..=SCHEMA_VERSION).zip(MIGRATIONS).skip(version as usize) {
+    for (to, sql) in (1..=target).zip(MIGRATIONS).skip(version as usize) {
         db.execute_batch(&format!("BEGIN; {sql} PRAGMA user_version = {to}; COMMIT;"))?;
     }
     Ok(())
