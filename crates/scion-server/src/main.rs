@@ -38,7 +38,8 @@ enum Command {
         #[arg(long)]
         insecure_listen: bool,
     },
-    /// Import a local git repository, one way. Safe to repeat.
+    /// Import a local git repository, one way. Safe to repeat. It can run
+    /// while the server runs.
     Import {
         /// Scion repository to import into. Created if missing.
         #[arg(long, default_value = "main")]
@@ -89,7 +90,14 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let cli = Cli::parse();
-    let store = Store::open(&cli.data)
+    // An import does not land, so it can run beside the server. `derive`
+    // removes rows of older versions of a kind, which a running server of an
+    // older build may read, so it opens as the server.
+    let open = match cli.command {
+        Command::Import { .. } => Store::open_shared,
+        Command::Serve { .. } | Command::Derive { .. } => Store::open,
+    };
+    let store = open(&cli.data)
         .with_context(|| format!("cannot open data directory {}", cli.data.display()))?;
     match cli.command {
         Command::Serve {

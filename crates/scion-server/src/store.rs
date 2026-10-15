@@ -2,7 +2,9 @@
 //! blobs.
 //!
 //! ```text
-//! <data>/lock                      locked by the one process that uses <data>
+//! <data>/lock                      shared by every process that uses <data>
+//! <data>/open.lock                 held while a process opens <data>
+//! <data>/server.lock               held by the one process that may land
 //! <data>/scion.db                  metadata and trees (see migrations/)
 //! <data>/objects/blob/ab/cd..      one zstd file per blob, named by ID
 //! <data>/tmp/                      staging for atomic blob writes and uploads
@@ -62,47 +64,110 @@ struct Inner {
     /// How many of those commits a finished full flush covers.
     flushed: AtomicU64,
     blobs: Blobs,
-    /// Keeps the data directory locked until the last clone is dropped.
+    /// `<data>/lock`, shared, until the last clone is dropped.
     _lock: fs::File,
+    /// `<data>/server.lock`, for a server `Store`.
+    _server_lock: Option<fs::File>,
 }
 
 impl Store {
-    /// Opens or creates a data directory and locks it for this `Store`.
+    /// Opens or creates a data directory as its server: the one `Store` that
+    /// may land. Lands are serialized in memory, so a second server `Store`,
+    /// in this process or another, is refused. Shared `Store`s
+    /// ([`Store::open_shared`]) may use the directory at the same time.
     ///
-    /// Lands are serialized in memory, so only one `Store` may use a data
-    /// directory at a time. The lock is released when the last clone of the
-    /// returned `Store` is dropped.
+    /// The locks are released when the last clone of the returned `Store` is
+    /// dropped.
     ///
     /// # Errors
     ///
-    /// Fails if another `Store`, in this process or another, has the
-    /// directory open, if the directory or database cannot be created, or if
-    /// the schema is newer than this build.
+    /// Fails if another server `Store` has the directory open, or a process
+    /// of an older build that holds it alone. Fails if the directory or
+    /// database cannot be created, or if the schema is newer than this build,
+    /// or older while another `Store` uses the directory.
     pub fn open(dir: &Path) -> Result<Self> {
+        Self::open_as(dir, true)
+    }
+
+    /// Opens or creates a data directory for a process that does not land,
+    /// such as `scion-server import`. Any number of shared `Store`s may use
+    /// the directory, beside one server `Store`.
+    ///
+    /// Each commit of a shared `Store` is durable before any other process
+    /// can read it: the commit runs a full flush of the drive cache
+    /// (`fullfsync`). A server replies with what it reads without a flush of
+    /// its own, so this keeps its replies durable. The other way round,
+    /// [`Store::read`] of a shared `Store` waits only for its own commits: a
+    /// caller that relies on a commit of the server calls [`Store::flush`].
+    /// A shared `Store` must not land.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::open`], except that a server `Store` is no conflict.
+    pub fn open_shared(dir: &Path) -> Result<Self> {
+        Self::open_as(dir, false)
+    }
+
+    fn open_as(dir: &Path, server: bool) -> Result<Self> {
         fs::create_dir_all(dir)?;
-        // SHORTCUT: one process per data directory, so an import needs the
-        // server stopped. Upgrade: allow a separate importer process. Lands
-        // already re-plan when the ref moves (`MAX_ATTEMPTS`).
-        let lock = lock_dir(dir)?;
+        // A second server fails here, before it waits for anything.
+        let server_lock = if server {
+            let file = lock_file(dir, "server.lock")?;
+            if !flock(&file, FlockOperation::NonBlockingLockExclusive)? {
+                return Err(in_use(dir, "server.lock", "another server"));
+            }
+            Some(file)
+        } else {
+            None
+        };
+        // Opens take turns, so no other open of this build runs until this
+        // one ends. If `lock` can be taken exclusive, no other process uses
+        // the directory. Shared from then on, it keeps out a process of an
+        // older build, which holds it exclusive for its whole life.
+        let opening = lock_file(dir, "open.lock")?;
+        flock(&opening, FlockOperation::LockExclusive)?;
+        let lock = lock_file(dir, "lock")?;
+        let alone = flock(&lock, FlockOperation::NonBlockingLockExclusive)?;
+        if !flock(&lock, FlockOperation::NonBlockingLockShared)? {
+            return Err(in_use(dir, "lock", "a process that holds it alone"));
+        }
         let blobs = Blobs::open(dir)?;
+        if alone {
+            blobs.sweep_tmp()?;
+        }
         let db = Connection::open(dir.join("scion.db"))?;
-        db.execute_batch(
-            // `fullfsync = OFF`: a commit ends with a plain fsync, and
-            // `write` then waits for a full flush of the drive cache that it
-            // shares with concurrent commits and blob syncs. With `ON`, each
-            // commit would run its own full flush under the database mutex.
-            // `checkpoint_fullfsync`: a checkpoint, which is rare, fully
-            // flushes the pages it copies before the log can be reused.
+        // `fullfsync = OFF` for a server: a commit ends with a plain fsync,
+        // and `write` then waits for a full flush of the drive cache that it
+        // shares with concurrent commits and blob syncs. With `ON`, each
+        // commit runs its own full flush under the database mutex, which a
+        // shared `Store` needs (see `open_shared`). Its commits are few and
+        // large. `checkpoint_fullfsync`: a checkpoint, which is rare, fully
+        // flushes the pages it copies before the log can be reused. Writes of
+        // the processes take turns: one waits up to `busy_timeout` for the
+        // other's transaction.
+        db.execute_batch(&format!(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;
-             PRAGMA fullfsync = OFF;
+             PRAGMA fullfsync = {};
              PRAGMA checkpoint_fullfsync = ON;
              PRAGMA foreign_keys = ON;
              PRAGMA busy_timeout = 5000;",
-        )?;
+            if server { "OFF" } else { "ON" }
+        ))?;
         // Enough for every hot statement, so none is prepared twice.
         db.set_prepared_statement_cache_capacity(64);
+        // Only a `Store` that is alone changes the schema.
+        let version = user_version(&db)?;
+        if !alone && version < SCHEMA_VERSION {
+            return Err(Error::FailedPrecondition(format!(
+                "database schema version {version} is older than this build \
+                 ({SCHEMA_VERSION}); stop the other processes that use {} so \
+                 that this one can upgrade it",
+                dir.display()
+            )));
+        }
         migrate(&db, SCHEMA_VERSION)?;
+        drop(opening);
         Ok(Self {
             inner: Arc::new(Inner {
                 db: Mutex::new(db),
@@ -110,6 +175,7 @@ impl Store {
                 flushed: AtomicU64::new(0),
                 blobs,
                 _lock: lock,
+                _server_lock: server_lock,
             }),
         })
     }
@@ -215,34 +281,47 @@ impl Store {
     }
 }
 
-/// Takes an exclusive lock on `<dir>/lock` without waiting. The lock lasts as
-/// long as the returned file is open.
-fn lock_dir(dir: &Path) -> Result<fs::File> {
-    let path = dir.join("lock");
-    let file = fs::OpenOptions::new()
+/// Opens the lock file `<dir>/<name>`, made if missing. A lock on it lasts as
+/// long as the file is open.
+fn lock_file(dir: &Path, name: &str) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&path)?;
-    match rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(file),
-        Err(Errno::WOULDBLOCK) => Err(io::Error::new(
-            ErrorKind::WouldBlock,
-            format!(
-                "data directory {} is in use by another server or import ({} is locked)",
-                dir.display(),
-                path.display()
-            ),
-        )
-        .into()),
-        Err(e) => Err(io::Error::from(e).into()),
+        .open(dir.join(name))
+}
+
+/// Locks `file` with `op`. Returns false if `op` does not wait and another
+/// holder's lock conflicts. Locks on two opens of a file conflict, even in
+/// one process.
+fn flock(file: &fs::File, op: FlockOperation) -> io::Result<bool> {
+    match rustix::fs::flock(file, op) {
+        Ok(()) => Ok(true),
+        Err(Errno::WOULDBLOCK) => Ok(false),
+        Err(e) => Err(e.into()),
     }
+}
+
+fn in_use(dir: &Path, name: &str, by: &str) -> Error {
+    io::Error::new(
+        ErrorKind::WouldBlock,
+        format!(
+            "data directory {} is in use by {by} ({} is locked)",
+            dir.display(),
+            dir.join(name).display()
+        ),
+    )
+    .into()
+}
+
+fn user_version(db: &Connection) -> Result<u32> {
+    Ok(db.pragma_query_value(None, "user_version", |row| row.get(0))?)
 }
 
 /// Runs the migrations from the database's version up to `target`. Only
 /// tests stop below [`SCHEMA_VERSION`], to make an older database.
 pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
-    let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let version = user_version(db)?;
     if version > SCHEMA_VERSION {
         return Err(Error::Corrupt(format!(
             "database schema version {version} is newer than this build ({SCHEMA_VERSION})"
@@ -288,17 +367,6 @@ impl Blobs {
         for path in [&root, &objects, &tmp, dir] {
             fsync_dir(path)?;
         }
-        // A crash can leave the temp file of a blob write that was never
-        // renamed. No blob name points at it, and the data directory lock
-        // keeps out every other writer, so it can go.
-        let mut removed = 0;
-        for entry in fs::read_dir(&tmp)? {
-            fs::remove_file(entry?.path())?;
-            removed += 1;
-        }
-        if removed > 0 {
-            tracing::info!(removed, "removed temp files that a crash left behind");
-        }
         Ok(Self {
             root,
             tmp,
@@ -306,6 +374,26 @@ impl Blobs {
             #[cfg(test)]
             verifies: std::sync::atomic::AtomicU64::default(),
         })
+    }
+
+    /// Removes the temp files that a crash left: blob writes that were never
+    /// renamed. No blob name points at them. Only for a `Store` that opened
+    /// the data directory alone: the temp files of a live process are there
+    /// too.
+    // SHORTCUT: so the temp files of a crashed import stay while the server
+    // runs. Ceiling: the writes in flight at each crash, each at most one
+    // blob. Upgrade (issue #101): a `tmp/` folder per process, under its own
+    // lock, so that any open removes those of dead processes.
+    fn sweep_tmp(&self) -> io::Result<()> {
+        let mut removed = 0;
+        for entry in fs::read_dir(&self.tmp)? {
+            fs::remove_file(entry?.path())?;
+            removed += 1;
+        }
+        if removed > 0 {
+            tracing::info!(removed, "removed temp files that a crash left behind");
+        }
+        Ok(())
     }
 
     /// Waits for a full flush that starts after this call: the blob root
@@ -874,18 +962,13 @@ mod tests {
     }
 
     #[test]
-    fn a_data_directory_opens_in_one_store_at_a_time() {
+    fn a_data_directory_opens_in_one_server_store_at_a_time() {
         let dir = tempfile::tempdir().unwrap();
         let first = Store::open(dir.path()).unwrap();
         let clone = first.clone();
-        match Store::open(dir.path()) {
-            Err(Error::Io(e)) => {
-                let msg = e.to_string();
-                assert!(msg.contains(&dir.path().display().to_string()), "{msg}");
-                assert!(msg.contains("in use"), "{msg}");
-            }
-            other => panic!("expected the second open to fail, got {:?}", other.err()),
-        }
+        assert_in_use(Store::open(dir.path()), dir.path(), "another server");
+        // Shared stores open beside it, and a server beside them.
+        let shared = [0, 1].map(|_| Store::open_shared(dir.path()).unwrap());
         drop(first);
         assert!(
             Store::open(dir.path()).is_err(),
@@ -893,6 +976,115 @@ mod tests {
         );
         drop(clone);
         Store::open(dir.path()).unwrap();
+        drop(shared);
+    }
+
+    /// Asserts that an open failed because `by` uses the directory.
+    fn assert_in_use(opened: Result<Store>, dir: &Path, by: &str) {
+        match opened {
+            Err(Error::Io(e)) => {
+                let msg = e.to_string();
+                assert!(msg.contains(&dir.display().to_string()), "{msg}");
+                assert!(msg.contains(&format!("in use by {by}")), "{msg}");
+            }
+            other => panic!("expected the open to fail, got {:?}", other.err()),
+        }
+    }
+
+    /// Holds `<dir>/lock` as a process of another build would, with `op`.
+    fn hold_lock(dir: &Path, op: FlockOperation) -> fs::File {
+        let file = lock_file(dir, "lock").unwrap();
+        assert!(flock(&file, op).unwrap());
+        file
+    }
+
+    #[test]
+    fn only_an_open_that_is_alone_removes_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("tmp");
+        let server = Store::open(dir.path()).unwrap();
+        // The temp file of a write that the server has not renamed yet.
+        fs::write(tmp.join("live"), b"x").unwrap();
+        let shared = Store::open_shared(dir.path()).unwrap();
+        assert!(tmp.join("live").exists(), "another process uses it");
+        drop(server);
+        drop(shared);
+        // Now it is what a crash left behind.
+        Store::open_shared(dir.path()).unwrap();
+        assert!(!tmp.join("live").exists());
+    }
+
+    #[test]
+    fn only_an_open_that_is_alone_upgrades_the_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let c = Connection::open(dir.path().join("scion.db")).unwrap();
+            migrate(&c, 1).unwrap();
+        }
+        let version = |store: &Store| store.read(user_version).unwrap();
+        // Another process of this build uses the directory.
+        let live = hold_lock(dir.path(), FlockOperation::NonBlockingLockShared);
+        for open in [Store::open, Store::open_shared] {
+            match open(dir.path()) {
+                Err(Error::FailedPrecondition(msg)) => {
+                    assert!(msg.contains("version 1 is older"), "{msg}");
+                }
+                other => panic!("expected the open to fail, got {:?}", other.err()),
+            }
+        }
+        drop(live);
+        let store = Store::open_shared(dir.path()).unwrap();
+        assert_eq!(version(&store), SCHEMA_VERSION);
+        // A newer schema is refused, alone or not.
+        store
+            .write(|c| Ok(c.pragma_update(None, "user_version", 99)?))
+            .unwrap();
+        drop(store);
+        for open in [Store::open, Store::open_shared] {
+            assert!(matches!(open(dir.path()), Err(Error::Corrupt(_))));
+        }
+    }
+
+    #[test]
+    fn a_process_that_holds_the_directory_alone_keeps_every_store_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = hold_lock(dir.path(), FlockOperation::NonBlockingLockExclusive);
+        let by = "a process that holds it alone";
+        assert_in_use(Store::open(dir.path()), dir.path(), by);
+        assert_in_use(Store::open_shared(dir.path()), dir.path(), by);
+        drop(old);
+        // A store of this build holds the directory shared once it is open,
+        // so an older build, which takes it alone, is kept out in turn.
+        let store = Store::open(dir.path()).unwrap();
+        let file = lock_file(dir.path(), "lock").unwrap();
+        assert!(!flock(&file, FlockOperation::NonBlockingLockExclusive).unwrap());
+        drop(store);
+    }
+
+    #[test]
+    fn opens_take_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        // Another store is opening the directory.
+        let opening = lock_file(dir.path(), "open.lock").unwrap();
+        assert!(flock(&opening, FlockOperation::NonBlockingLockExclusive).unwrap());
+        let path = dir.path().to_owned();
+        let open = thread::spawn(move || Store::open_shared(&path).map(drop));
+        thread::sleep(Duration::from_millis(200));
+        assert!(!open.is_finished(), "an open waits for the one in progress");
+        drop(opening);
+        open.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_shared_store_commits_with_full_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let fullfsync = |store: &Store| -> bool {
+            store
+                .read(|c| Ok(c.pragma_query_value(None, "fullfsync", |row| row.get(0))?))
+                .unwrap()
+        };
+        assert!(!fullfsync(&Store::open(dir.path()).unwrap()));
+        assert!(fullfsync(&Store::open_shared(dir.path()).unwrap()));
     }
 
     #[test]
