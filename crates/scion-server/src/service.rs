@@ -25,6 +25,7 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth::{Auth, Caller};
+use crate::deadline::Deadline;
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
 use crate::objects::ObjectsService;
@@ -42,6 +43,10 @@ const MAX_UPLOADS: usize = 16;
 /// blames never take more than this many of the `MAX_BLOCKING` permits that
 /// writes and lands share.
 const MAX_BLAMES: usize = 4;
+/// Most `MergeBase` and `IsAncestor` calls running at once. A call has no
+/// bound on its reads, only its deadline, so these queries never take more
+/// than this many of the `MAX_BLOCKING` permits.
+const MAX_GRAPH_QUERIES: usize = 4;
 /// Longest a request may take before the server gives up on it.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// Most bytes that all `ReadFile` replies together hold: the parts read and
@@ -94,6 +99,8 @@ pub struct ScionService {
     uploads: Arc<Semaphore>,
     /// Bounds blames running at once (`MAX_BLAMES`).
     blames: Arc<Semaphore>,
+    /// Bounds graph queries running at once (`MAX_GRAPH_QUERIES`).
+    graph_queries: Arc<Semaphore>,
     /// `READ_BUDGET_BYTES` permits, one per byte, shared by all `ReadFile`
     /// replies.
     reads: Arc<Semaphore>,
@@ -106,6 +113,7 @@ impl ScionService {
             lands: Arc::default(),
             uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
             blames: Arc::new(Semaphore::new(MAX_BLAMES)),
+            graph_queries: Arc::new(Semaphore::new(MAX_GRAPH_QUERIES)),
             reads: Arc::new(Semaphore::new(READ_BUDGET_BYTES)),
         }
     }
@@ -114,6 +122,32 @@ impl ScionService {
         ScionServer::new(self)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES)
+    }
+
+    /// Runs a `MergeBase` or `IsAncestor` query: at most `MAX_GRAPH_QUERIES`
+    /// at once, each until its call ends or `REQUEST_TIMEOUT` passes.
+    async fn graph_query<T, F>(&self, query: F) -> Result<T, Status>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Store, &Deadline) -> Result<T> + Send + 'static,
+    {
+        // The query checks it at each read: a request timeout, or a client
+        // that cancels, drops this call but not a job that is running. The
+        // guard ends the deadline when this call ends or is dropped.
+        let deadline = Deadline::new(Instant::now() + REQUEST_TIMEOUT);
+        let _call = deadline.guard();
+        // Taken before the worker permit, and held until the job ends, also
+        // when the client leaves first.
+        let slot = Arc::clone(&self.graph_queries)
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("server is shutting down"))?;
+        self.worker
+            .run(move |store| {
+                let _slot = slot;
+                query(&store, &deadline)
+            })
+            .await
     }
 }
 
@@ -365,7 +399,7 @@ impl Scion for ScionService {
         // The job checks it in its walks: a request timeout, or a client
         // that cancels, drops this call but not a job that is running. The
         // guard ends the deadline when this call ends or is dropped.
-        let deadline = land::Deadline::new(Instant::now() + REQUEST_TIMEOUT);
+        let deadline = Deadline::new(Instant::now() + REQUEST_TIMEOUT);
         let _call = deadline.guard();
         let caller = caller(&request)?;
         let req = request.into_inner();
@@ -577,8 +611,7 @@ impl Scion for ScionService {
         let a = parse_id(&req.a_changeset_id, "a_changeset_id")?;
         let b = parse_id(&req.b_changeset_id, "b_changeset_id")?;
         let bases = self
-            .worker
-            .run(move |store| read::merge_base(&store, &req.repo, a, b))
+            .graph_query(move |store, deadline| read::merge_base(store, &req.repo, a, b, deadline))
             .await?;
         Ok(Response::new(MergeBaseResponse {
             changeset_ids: bases.iter().map(|id| id.as_bytes().to_vec()).collect(),
@@ -594,8 +627,9 @@ impl Scion for ScionService {
         let ancestor = parse_id(&req.ancestor_id, "ancestor_id")?;
         let descendant = parse_id(&req.descendant_id, "descendant_id")?;
         let is_ancestor = self
-            .worker
-            .run(move |store| read::is_ancestor(&store, &req.repo, ancestor, descendant))
+            .graph_query(move |store, deadline| {
+                read::is_ancestor(store, &req.repo, ancestor, descendant, deadline)
+            })
             .await?;
         Ok(Response::new(IsAncestorResponse { is_ancestor }))
     }
@@ -922,6 +956,80 @@ mod tests {
             .expect("the first reply freed its share")
             .unwrap();
         assert!(read_all(second).await == data, "the second reply");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn at_most_max_graph_queries_run_at_once() {
+        // root ─ a, and root ─ b.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let ids = store
+            .write(|c| {
+                let repo = db::create_repo(c, "r")?;
+                db::testing::insert_graph(c, repo, &[vec![], vec![0], vec![0]])
+            })
+            .unwrap();
+        let bytes = |i: usize| ids[i].as_bytes().to_vec();
+        let service = Arc::new(ScionService::new(Worker::new(store.clone())));
+        let busy = || MAX_BLOCKING - service.worker.permits.available_permits();
+
+        // Hold the database, so each job waits at its first read.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let blocker = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                store.read(|_| {
+                    held_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    Ok(())
+                })
+            }
+        });
+        held_rx.recv().unwrap();
+        // One call more than the limit, of both kinds.
+        let calls: Vec<_> = (0..=MAX_GRAPH_QUERIES)
+            .map(|i| {
+                let service = Arc::clone(&service);
+                let (root, a, b) = (bytes(0), bytes(1), bytes(2));
+                tokio::spawn(async move {
+                    if i % 2 == 0 {
+                        let request = Request::new(MergeBaseRequest {
+                            repo: "r".into(),
+                            a_changeset_id: a,
+                            b_changeset_id: b,
+                        });
+                        let reply = service.merge_base(request).await.unwrap();
+                        reply.into_inner().changeset_ids == [root]
+                    } else {
+                        let request = Request::new(IsAncestorRequest {
+                            repo: "r".into(),
+                            ancestor_id: root,
+                            descendant_id: a,
+                        });
+                        let reply = service.is_ancestor(request).await.unwrap();
+                        reply.into_inner().is_ancestor
+                    }
+                })
+            })
+            .collect();
+        let started = Instant::now();
+        while busy() < MAX_GRAPH_QUERIES {
+            assert!(started.elapsed() < Duration::from_secs(10), "the jobs run");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(busy(), MAX_GRAPH_QUERIES, "the last call waits for a slot");
+
+        go_tx.send(()).unwrap();
+        blocker.join().unwrap().unwrap();
+        for call in calls {
+            let answer = tokio::time::timeout(Duration::from_secs(10), call)
+                .await
+                .expect("every call ends")
+                .unwrap();
+            assert!(answer, "every call answers");
+        }
     }
 
     #[tokio::test]

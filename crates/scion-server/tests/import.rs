@@ -17,8 +17,9 @@ use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileState, GitOid, IdentityTime, PathElem, RepoPath,
 };
 use scion_server::auth::Caller;
+use scion_server::deadline::Deadline;
 use scion_server::import::{ImportOptions, ImportReport, import_git};
-use scion_server::land::{Deadline, LandRequest, LandState, Lands};
+use scion_server::land::{LandRequest, LandState, Lands};
 use scion_server::{Error, Store, db, read, tree, write};
 use tempfile::TempDir;
 
