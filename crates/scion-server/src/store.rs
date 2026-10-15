@@ -357,22 +357,50 @@ impl Blobs {
         })
     }
 
-    /// Whether a blob is stored intact. Reads, unpacks and hashes the file.
+    /// Whether a blob is stored intact. Streams the file through the decoder
+    /// into the hasher, so it holds the zstd window and small buffers, not
+    /// the whole blob. It gives the same answer as [`Blobs::get`].
     ///
     /// # Errors
     ///
     /// [`Error::Io`] if the file exists but cannot be read.
-    // SHORTCUT: holds the packed and the unpacked bytes, up to about 200 MiB
-    // per call. Upgrade: stream the unpacked bytes into the hasher.
     pub fn verify(&self, id: BlobId) -> Result<BlobStatus> {
-        match self.get(id) {
+        let file = match self.open_file(id) {
+            Ok(file) => file,
+            Err(Error::NotFound(_)) => return Ok(BlobStatus::Missing),
+            Err(e) => return Err(e),
+        };
+        let corrupt = |why: String| {
+            tracing::warn!(blob = %id, %why, "stored blob is corrupt");
+            Ok(BlobStatus::Corrupt)
+        };
+        let len = file.metadata()?.len();
+        let limit = zstd::zstd_safe::compress_bound(MAX_OBJECT_BYTES);
+        if len > limit as u64 {
+            return corrupt(format!("file is larger than {limit} bytes"));
+        }
+        // `get` unpacks an empty file to empty content, though it holds no
+        // zstd frame. The streaming decoder would call it torn.
+        if len == 0 && id == BlobId::of(b"") {
+            return Ok(BlobStatus::Valid);
+        }
+        let mut file = Watched {
+            inner: file,
+            failed: false,
+        };
+        // One byte over the limit is enough to know the blob is too large.
+        let mut unpacked =
+            zstd::stream::read::Decoder::new(&mut file)?.take(MAX_OBJECT_BYTES as u64 + 1);
+        let hashed = BlobId::of_reader(&mut unpacked);
+        let oversized = unpacked.limit() == 0;
+        drop(unpacked);
+        match hashed {
+            // A read error of the file is not bad bytes.
+            Err(e) if file.failed => Err(e.into()),
+            Err(e) => corrupt(format!("cannot unpack: {e}")),
+            Ok(_) if oversized => corrupt(format!("unpacks to more than {MAX_OBJECT_BYTES} bytes")),
+            Ok(got) if got != id => corrupt("content does not match the ID".into()),
             Ok(_) => Ok(BlobStatus::Valid),
-            Err(Error::NotFound(_)) => Ok(BlobStatus::Missing),
-            Err(Error::Corrupt(why)) => {
-                tracing::warn!(%why, "stored blob is corrupt");
-                Ok(BlobStatus::Corrupt)
-            }
-            Err(e) => Err(e),
         }
     }
 
@@ -393,6 +421,22 @@ impl Blobs {
     #[cfg(test)]
     pub(crate) fn full_flushes(&self) -> u64 {
         self.group_flush.lock().finished
+    }
+}
+
+/// A reader that notes whether it failed, so [`Blobs::verify`] can tell a
+/// read error of the file from bad bytes in it.
+struct Watched<R> {
+    inner: R,
+    failed: bool,
+}
+
+impl<R: Read> Read for Watched<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf);
+        // An interrupted read is retried, so it is not a failure.
+        self.failed |= matches!(&read, Err(e) if e.kind() != ErrorKind::Interrupted);
+        read
     }
 }
 
@@ -680,6 +724,74 @@ mod tests {
         for id in ids {
             assert_eq!(blobs.verify(id).unwrap(), BlobStatus::Valid);
         }
+    }
+
+    /// What [`Blobs::get`] says about a blob, as a status.
+    fn status_by_get(blobs: &Blobs, id: BlobId) -> Result<BlobStatus> {
+        match blobs.get(id) {
+            Ok(_) => Ok(BlobStatus::Valid),
+            Err(Error::NotFound(_)) => Ok(BlobStatus::Missing),
+            Err(Error::Corrupt(_)) => Ok(BlobStatus::Corrupt),
+            Err(e) => Err(e),
+        }
+    }
+
+    #[test]
+    fn verify_gives_the_same_answer_as_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        let packed = zstd::bulk::compress(b"content", 3).unwrap();
+        let mut flipped = packed.clone();
+        *flipped.last_mut().unwrap() ^= 1;
+        // One byte more than a blob may hold, built with zstd directly, as
+        // `put` refuses it.
+        let too_large = || io::repeat(0).take(MAX_OBJECT_BYTES as u64 + 1);
+        let content = BlobId::of(b"content");
+        let truncated = packed[..packed.len() - 1].to_vec();
+        let cases = [
+            ("valid", content, Some(packed), BlobStatus::Valid),
+            ("missing", content, None, BlobStatus::Missing),
+            (
+                "a flipped byte",
+                content,
+                Some(flipped),
+                BlobStatus::Corrupt,
+            ),
+            ("truncated", content, Some(truncated), BlobStatus::Corrupt),
+            (
+                "too large",
+                BlobId::of_reader(too_large()).unwrap(),
+                Some(zstd::stream::encode_all(too_large(), 1).unwrap()),
+                BlobStatus::Corrupt,
+            ),
+            (
+                "empty, empty blob",
+                BlobId::of(b""),
+                Some(vec![]),
+                BlobStatus::Valid,
+            ),
+        ];
+        for (case, id, file, want) in cases {
+            let (dir, path) = blobs.location(id);
+            fs::create_dir_all(dir).unwrap();
+            match &file {
+                Some(bytes) => fs::write(&path, bytes).unwrap(),
+                None => fs::remove_file(&path).unwrap(),
+            }
+            assert_eq!(blobs.verify(id).unwrap(), want, "{case}");
+            assert_eq!(status_by_get(&blobs, id).unwrap(), want, "{case}");
+        }
+    }
+
+    #[test]
+    fn verify_reports_a_read_error_as_io_not_as_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        // A directory opens like a file, but every read of it fails.
+        let id = BlobId::of(b"content");
+        fs::create_dir_all(blobs.location(id).1).unwrap();
+        assert!(matches!(blobs.verify(id), Err(Error::Io(_))));
+        assert!(matches!(status_by_get(&blobs, id), Err(Error::Io(_))));
     }
 
     #[test]
