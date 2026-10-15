@@ -445,14 +445,21 @@ changesets with many paths each could fill memory. So the indexes of all refs
 share one budget of 128 MiB (`MAX_INDEX_BYTES`), about 1M entries of short
 paths. An entry costs its path plus 64 bytes. One atomic counter in `Lands`
 holds the sum of all indexes. An index gives its bytes back when it is
-pruned, starts over or is dropped. Every addition takes its bytes from the
-counter before it is made (`Lands::reserve`):
+pruned, starts over or is dropped. Every addition takes its exact cost from
+the counter before it is made (`Lands::reserve`): the keys that the index does
+not hold yet, each once (`PathIndex::cost`).
 
 - If too few bytes are free, the indexes of other refs are dropped, least
   recently landed on first, until the addition fits. An index whose ref lock
   is held is in use, so it stays. If dropping all the others that are not in
-  use would not free enough, none is dropped. A dropped index is built again
-  at the head on the next land to its ref.
+  use would not free enough, none is dropped. A dropped index gives its bytes
+  back at once, and a land frees its memory after it releases the database
+  lock and the ref lock. It is built again at the head on the next land to
+  its ref. A concurrent land can take the freed room first, so a reservation
+  drops indexes at most twice.
+- The least-recently-used list holds only the refs that have an index or
+  that a land uses. A reservation that drops indexes first removes the
+  others, so it looks only at refs with an index.
 - If the addition still does not fit, an advance or a land moves the floor
   up to the tip: the index starts over, empty, at the head. So does an
   advance of more than `MAX_DEPTH` changesets, so it never holds the

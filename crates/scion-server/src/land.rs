@@ -23,6 +23,7 @@
 //! transaction, so they never disagree.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::Instant;
@@ -220,11 +221,16 @@ type RefSlot = Arc<Mutex<Option<PathIndex>>>;
 
 /// Serializes lands per ref and keeps each ref's [`PathIndex`].
 pub struct Lands {
-    /// Each ref's slot, the least recently landed on first.
+    /// The slot of each ref that holds a path index or that a land uses,
+    /// the least recently landed on first. [`Lands::evict`] removes the
+    /// others.
     refs: Mutex<LruCache<(RepoId, String), RefSlot>>,
     /// What all path indexes hold, by [`entry_bytes`]: the sum of their
     /// `bytes`. At most [`MAX_INDEX_BYTES`].
     used: Arc<AtomicUsize>,
+    /// Indexes that [`Lands::evict`] dropped. Their bytes are back in
+    /// `used`. A land frees them after its database lock and ref lock.
+    evicted: Mutex<Vec<PathIndex>>,
 }
 
 impl Default for Lands {
@@ -232,6 +238,7 @@ impl Default for Lands {
         Self {
             refs: Mutex::new(LruCache::new_unbounded()),
             used: Arc::default(),
+            evicted: Mutex::default(),
         }
     }
 }
@@ -248,7 +255,12 @@ impl Lands {
     /// the request's deadline. The land then stays pending, and a retry with
     /// the same request key resumes it. Store errors otherwise.
     pub fn land(&self, store: &Store, caller: &Caller, req: &LandRequest) -> Result<LandOutcome> {
-        let outcome = self.land_committed(store, caller, req)?;
+        let outcome = self.land_committed(store, caller, req);
+        // An index can hold up to the whole budget, and freeing it takes a
+        // while, so it happens here, outside every lock.
+        let evicted = mem::take(&mut *self.evicted.lock().unwrap_or_else(PoisonError::into_inner));
+        drop(evicted);
+        let outcome = outcome?;
         // Lands on one ref commit one at a time. Waiting for the flush after
         // the ref lock is released lets them share it.
         store.flush()?;
@@ -315,20 +327,39 @@ impl Lands {
     }
 
     /// Takes `bytes` from the budget that all path indexes share. If too few
-    /// are free, first drops the indexes of other refs, least recently used
-    /// first, but only if that frees enough. It skips each index whose ref's
-    /// lock is held, because a land uses it. The caller holds the lock of the
-    /// index that grows, so that one stays too. Returns false if it could
-    /// not take the bytes.
+    /// are free, first drops the indexes of other refs ([`Lands::evict`]).
+    /// The caller holds the lock of the index that grows, so that one stays.
+    /// Returns false if it could not take the bytes.
     fn reserve(&self, bytes: usize) -> bool {
-        if self.take(bytes) {
-            return true;
+        // A concurrent land can take the room that an eviction freed, so
+        // this evicts twice at most.
+        for _ in 0..2 {
+            if self.take(bytes) {
+                return true;
+            }
+            if !self.evict(bytes) {
+                return false;
+            }
         }
-        let slots: Vec<RefSlot> = self
-            .lock_refs()
-            .iter()
-            .map(|(_, slot)| Arc::clone(slot))
-            .collect();
+        self.take(bytes)
+    }
+
+    /// Drops the indexes of other refs, least recently used first, until
+    /// `bytes` are free, but only if that frees enough. It skips each index
+    /// whose ref's lock is held, because a land uses it. Returns false if it
+    /// could not free enough. Also removes the slots that hold no index and
+    /// that no land uses, so the next eviction does not look at them.
+    fn evict(&self, bytes: usize) -> bool {
+        let slots: Vec<RefSlot> = {
+            let mut refs = self.lock_refs();
+            // No land can clone a slot while `refs` is locked, so a slot that
+            // only `refs` holds is not in use.
+            refs.retain(|_, slot| {
+                Arc::strong_count(slot) > 1
+                    || !matches!(slot.try_lock(), Ok(index) if index.is_none())
+            });
+            refs.iter().map(|(_, slot)| Arc::clone(slot)).collect()
+        };
         let free = MAX_INDEX_BYTES - self.used.load(Ordering::Acquire);
         let short = bytes.saturating_sub(free);
         let mut idle = Vec::new();
@@ -350,16 +381,22 @@ impl Lands {
         if freed < short {
             return false;
         }
-        tracing::info!(
-            dropped = idle.len(),
-            freed,
-            "the path indexes are full; dropped the least recently used ones"
-        );
-        for mut index in idle {
-            // Dropping an index gives its bytes back.
-            *index = None;
+        if !idle.is_empty() {
+            tracing::info!(
+                dropped = idle.len(),
+                freed,
+                "the path indexes are full; dropped the least recently used ones"
+            );
         }
-        self.take(bytes)
+        let mut evicted = self.evicted.lock().unwrap_or_else(PoisonError::into_inner);
+        for mut index in idle {
+            let mut dropped = index.take().expect("an index was picked");
+            // Its bytes go back now; the land frees its memory later.
+            self.used.fetch_sub(dropped.bytes, Ordering::AcqRel);
+            dropped.bytes = 0;
+            evicted.push(dropped);
+        }
+        true
     }
 
     /// Takes `bytes` from the budget if they are free.
@@ -788,14 +825,15 @@ impl PathIndex {
             return Ok(());
         }
         let tip_gen = db::generation(c, repo, self.tip)?;
-        let mut walked = Vec::new();
-        // The most that the walked changesets add.
+        let mut walked: Vec<(ChangesetId, i64, BTreeMap<RepoPath, Option<FileState>>)> = Vec::new();
+        // The most that the walked changesets can add, to stop the walk early.
         let mut most = 0;
         let mut steps = 0;
         let mut cur = Some(head);
         while let Some(id) = cur {
             if id == self.tip {
-                let grew = self.grow(lands, most, |index| {
+                let cost = self.cost(walked.iter().map(|(_, g, changes)| (*g, changes)));
+                let grew = self.grow(lands, cost, |index| {
                     for (id, generation, changes) in walked {
                         index.add(id, generation, &changes);
                     }
@@ -916,8 +954,8 @@ impl PathIndex {
             base_gen,
             deadline,
             |id, generation, cs| {
-                let most = added_bytes(&cs.changes);
-                if !self.grow(lands, most, |index| index.add(id, generation, &cs.changes)) {
+                let cost = self.cost([(generation, &cs.changes)]);
+                if !self.grow(lands, cost, |index| index.add(id, generation, &cs.changes)) {
                     return false;
                 }
                 if let Some(&parent) = cs.parents.first() {
@@ -977,8 +1015,8 @@ impl PathIndex {
         generation: i64,
         changes: &BTreeMap<RepoPath, Option<FileState>>,
     ) {
-        let most = added_bytes(changes);
-        if !self.grow(lands, most, |index| index.add(id, generation, changes)) {
+        let cost = self.cost([(generation, changes)]);
+        if !self.grow(lands, cost, |index| index.add(id, generation, changes)) {
             tracing::info!(
                 generation,
                 "the path indexes are full; it starts over at the tip"
@@ -989,20 +1027,47 @@ impl PathIndex {
         self.tip = id;
     }
 
-    /// Runs `add`, which adds at most `most` bytes, if the budget of all
-    /// indexes has room for them ([`Lands::reserve`]). Returns false, and
-    /// runs nothing, if it has not.
-    fn grow(&mut self, lands: &Lands, most: usize, add: impl FnOnce(&mut Self)) -> bool {
-        if !lands.reserve(most) {
+    /// Runs `add`, which adds `bytes`, as [`PathIndex::cost`] counts them,
+    /// if the budget of all indexes has room for them ([`Lands::reserve`]).
+    /// Returns false, and runs nothing, if it has not.
+    fn grow(&mut self, lands: &Lands, bytes: usize, add: impl FnOnce(&mut Self)) -> bool {
+        if !lands.reserve(bytes) {
             return false;
         }
         let before = self.bytes;
         add(self);
-        // A path that the index holds already adds nothing, so give the rest
-        // back.
-        let added = self.bytes - before;
-        self.used.fetch_sub(most - added, Ordering::AcqRel);
+        debug_assert_eq!(self.bytes - before, bytes, "the cost of an addition");
         true
+    }
+
+    /// What adding changesets with these generations and changes adds to the
+    /// index, by [`entry_bytes`]: only the keys that it does not hold, each
+    /// once. The changesets are on the index's history, so each generation
+    /// is a new chain entry unless the chain holds it.
+    fn cost<'c>(
+        &self,
+        changesets: impl IntoIterator<Item = (i64, &'c BTreeMap<RepoPath, Option<FileState>>)>,
+    ) -> usize {
+        let mut files = HashSet::new();
+        let mut dirs = HashSet::new();
+        let mut bytes = 0;
+        for (generation, changes) in changesets {
+            if !self.chain.contains_key(&generation) {
+                bytes += entry_bytes(&[]);
+            }
+            for path in changes.keys() {
+                let path = path.as_bytes();
+                if !self.files.contains_key(path) && files.insert(path) {
+                    bytes += entry_bytes(path);
+                }
+                for dir in ancestors(path) {
+                    if !self.dirs.contains_key(dir) && dirs.insert(dir) {
+                        bytes += entry_bytes(dir);
+                    }
+                }
+            }
+        }
+        bytes
     }
 
     fn add(
@@ -1856,12 +1921,13 @@ mod tests {
     #[test]
     fn the_path_indexes_of_all_refs_share_one_budget() {
         use LandState::{Conflict, Landed};
-        // A land of this many new paths reserves a fifth of the budget, and
-        // its index keeps about half of that.
+        // The index of a ref after one land of this many new paths takes
+        // about a ninth of the budget, so twelve refs spend it.
         const WIDE: usize = 100;
-        let one = added_bytes(&wide("r0", WIDE).into_iter().collect());
-        assert!(4 * one < MAX_INDEX_BYTES && 5 * one > MAX_INDEX_BYTES);
         let f = fixture();
+        let changes = wide("r0", WIDE).into_iter().collect();
+        let one = PathIndex::at(f.root, 0, &Arc::default()).cost([(1, &changes)]);
+        assert!(8 * one < MAX_INDEX_BYTES && 10 * one > MAX_INDEX_BYTES);
         let names: Vec<String> = (0..12).map(|i| format!("r{i}")).collect();
         for name in &names {
             let moved = f
@@ -1882,20 +1948,26 @@ mod tests {
         land_wide(rest.next().unwrap());
         let again = f.commit(f.root, &[put("r0/again", "x")]);
         assert_eq!(f.land_on("r0", again, "again").state, Landed);
-        let dropped = loop {
+        let (last, held) = loop {
             let name = rest.next().expect("the lands spend the budget");
             land_wide(name);
             let held = f.held();
-            let dropped: Vec<String> = held
-                .into_iter()
-                .filter(|(_, h)| !h)
-                .map(|(n, _)| n)
-                .collect();
-            if !dropped.is_empty() {
-                break dropped;
+            if held.values().any(|&h| !h) {
+                break (name, held);
             }
         };
+        let dropped: Vec<&String> = held.iter().filter(|&(_, &h)| !h).map(|(n, _)| n).collect();
         assert_eq!(dropped, ["r1"]);
+
+        // A land that rewrites every path of the last ref's index adds only
+        // a chain entry. It takes only that, so it drops nothing.
+        let tip = f.store.read(|c| db::get_ref(c, f.repo, last)).unwrap();
+        let rewrite: Vec<Change> = (0..WIDE)
+            .map(|i| put(&format!("{last}/f{i}"), "y"))
+            .collect();
+        let out = f.land_on(last, f.commit(tip.unwrap().target, &rewrite), "rewrite");
+        assert_eq!(out.state, Landed);
+        assert_eq!(f.held(), held);
 
         // An index whose ref's lock is held is in use, so the next one goes.
         let busy = f.slot("r0");
@@ -1904,9 +1976,13 @@ mod tests {
         rest.for_each(|name| land_wide(name));
         drop(lock);
         let held = f.held();
-        assert!(held["r0"] && !held["r2"], "{held:?}");
+        let kept = |name: &str| held.get(name) == Some(&true);
+        assert!(kept("r0") && !kept("r2"), "{held:?}");
         let newest = &names[names.len() - 3..];
-        assert!(newest.iter().all(|name| held[name]), "{held:?}");
+        assert!(newest.iter().all(|name| kept(name)), "{held:?}");
+        // The slot of r1 held no index and no land used it, so an eviction
+        // removed it.
+        assert!(!held.contains_key("r1"), "{held:?}");
 
         // A land on each ref, on a base before its wide land, sees that
         // land's changes, whether its index was dropped or not.
@@ -1921,6 +1997,80 @@ mod tests {
             assert_eq!(out.state, Landed, "{name}: {}", out.detail);
             f.held();
         }
+    }
+
+    #[test]
+    fn an_advance_starts_over_when_a_busy_ref_holds_the_budget() {
+        let f = fixture();
+        assert!(
+            f.store
+                .write(|c| db::cas_ref(c, f.repo, "big", None, f.root))
+                .unwrap()
+        );
+        // main's index has its tip at L.
+        let l = f.commit(f.root, &[put("m/seed", "x")]);
+        let l = f.land(l, "seed").result.unwrap();
+        // big holds most of the budget.
+        let flat: Vec<Change> = (0..600).map(|j| put(&format!("big{j:05}"), "x")).collect();
+        let cs = f.commit(f.root, &flat);
+        assert_eq!(f.land_on("big", cs, "big").state, LandState::Landed);
+        assert!(f.lands.used.load(Ordering::Acquire) > MAX_INDEX_BYTES / 2);
+        // An import moves main past L with a changeset that does not fit in
+        // what is free.
+        let free = MAX_INDEX_BYTES - f.lands.used.load(Ordering::Acquire);
+        let generation = f.generation(l) + 1;
+        let mut n = 10;
+        while f.index(|index| index.cost([(generation, &wide("imp", n).into_iter().collect())]))
+            <= free
+        {
+            n += 10;
+        }
+        f.move_main(f.commit(l, &wide("imp", n)));
+        // big is in use, so nothing can be dropped, and the index starts over
+        // at the head. A land on L still sees the import's change.
+        let busy = f.slot("big");
+        let _lock = busy.lock().unwrap();
+        let out = f.land(f.commit(l, &[put("imp/f7", "mine")]), "mine");
+        assert_eq!(out.state, LandState::Conflict, "{}", out.detail);
+        assert_eq!(out.conflict_paths, [RepoPath::new("imp/f7").unwrap()]);
+    }
+
+    #[test]
+    fn concurrent_lands_on_many_refs_keep_the_byte_count_exact() {
+        let f = Arc::new(fixture());
+        let refs: Vec<String> = (0..8).map(|t| format!("t{t}")).collect();
+        for name in &refs {
+            assert!(
+                f.store
+                    .write(|c| db::cas_ref(c, f.repo, name, None, f.root))
+                    .unwrap()
+            );
+        }
+        let threads: Vec<_> = refs
+            .iter()
+            .cloned()
+            .map(|name| {
+                let f = Arc::clone(&f);
+                std::thread::spawn(move || {
+                    for i in 0..30 {
+                        let head = f.store.read(|c| db::get_ref(c, f.repo, &name));
+                        let head = head.unwrap().unwrap().target;
+                        let dir = format!("{name}/w{i}");
+                        let cs = f.commit(head, &wide(&dir, 15 + (i % 4) * 10));
+                        let out = f.land_on(&name, cs, &format!("{dir}a"));
+                        assert_eq!(out.state, LandState::Landed);
+                        // A land on the old head of a path that the wide land put.
+                        let cs = f.commit(head, &[put(&format!("{dir}/f3"), "mine")]);
+                        let out = f.land_on(&name, cs, &format!("{dir}b"));
+                        assert_eq!(out.state, LandState::Conflict, "{name} {i}: {}", out.detail);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        f.held();
     }
 
     #[test]
