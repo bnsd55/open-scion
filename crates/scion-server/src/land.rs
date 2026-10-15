@@ -43,10 +43,6 @@ const MAX_NAME_BYTES: usize = 256;
 // ref move through the per-ref lander, so lands never race.
 const MAX_ATTEMPTS: u32 = 3;
 
-/// How far, in generations, the ref moves in one prune cycle of a
-/// [`PathIndex`]. Tests use a short cycle, so that they prune.
-const PRUNE_EVERY: i64 = if cfg!(test) { 4 } else { 10_000 };
-
 /// How long a finished land is kept, in seconds: 7 days. Until then a retry
 /// with the same request key returns the stored outcome. A client retries
 /// within minutes, and a week also covers a client that is down over a long
@@ -57,6 +53,10 @@ const LAND_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 /// expiry keeps up, and no land does much work after a long pause. Tests use
 /// a small batch, so that they reach the limit.
 const EXPIRE_PER_LAND: i64 = if cfg!(test) { 2 } else { 100 };
+
+/// How far, in generations, the ref moves in one prune cycle of a
+/// [`PathIndex`]. Tests use a short cycle, so that they prune.
+const PRUNE_EVERY: i64 = if cfg!(test) { 4 } else { 10_000 };
 
 /// Where a land stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
