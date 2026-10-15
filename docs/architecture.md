@@ -6,6 +6,7 @@ not exist yet are marked **planned**, with the issue that tracks them.
 The design follows Anthropic's article
 [Redesigning source control](https://www.anthropic.com/engineering/redesigning-source-control).
 The README lists where this project makes its own choices.
+[`design/scalable-backend.md`](design/scalable-backend.md) proposes a backend that scales out to many servers (not built).
 
 ## 1. Overview
 

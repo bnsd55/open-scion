@@ -143,6 +143,7 @@ repository with 23,871 commits took 50 seconds.
 | [`docs/architecture.md`](docs/architecture.md) | How the parts fit together: storage, lands, reads, and the planned cache tiers |
 | [`docs/format-v1.md`](docs/format-v1.md) | The v1 byte format. Object IDs are hashes of these bytes. |
 | [`docs/protocol-v1.md`](docs/protocol-v1.md) | The v1 API contract: calls, limits, status codes, retries, durability and what a client checks |
+| [`docs/design/scalable-backend.md`](docs/design/scalable-backend.md) | A design proposal, not built: stateless servers on a shared metadata store and object store |
 
 ## Design notes
 
