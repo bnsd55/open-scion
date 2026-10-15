@@ -888,7 +888,10 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
   fetches only that object. A fetch runs on its own task and asks upstream
   again until it has all of its objects. A concurrent call of the same repo
   that misses one of these objects waits for that fetch instead of starting
-  another. A fetch runs to its end even if its callers have gone.
+  another. A fetch stores each object before it leaves the fetch table, and
+  a new fetch asks the store under the table's lock, so an object is
+  fetched once even when a miss races with the end of its fetch. A fetch
+  runs to its end even if its callers have gone.
 - **Errors from upstream.** An error about one object (`NOT_FOUND`,
   `DATA_LOSS`) fails only that object; the fetch asks again for the rest.
   Any other error (transport, timeout, a protocol error) fails every object
