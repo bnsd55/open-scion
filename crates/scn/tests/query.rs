@@ -139,18 +139,23 @@ fn changesets(store: &Store, dir: &Path) -> HashMap<String, String> {
         .collect()
 }
 
-/// `scn diff --json` as git's `--name-status` lines, sorted.
+/// `scn diff --json` as git's `--name-status` lines, sorted. A rename is
+/// `R<similarity>`, the old path and the new path.
 fn name_status(diff: &Value) -> Vec<String> {
     let mut lines: Vec<String> = diff
         .as_array()
         .unwrap()
         .iter()
         .map(|e| {
-            format!(
-                "{}\t{}",
-                e["status"].as_str().unwrap(),
-                e["path"].as_str().unwrap()
-            )
+            let (status, path) = (e["status"].as_str().unwrap(), e["path"].as_str().unwrap());
+            match status {
+                "R" => format!(
+                    "R{:03}\t{}\t{path}",
+                    e["similarity"].as_u64().unwrap(),
+                    e["old_path"].as_str().unwrap()
+                ),
+                _ => format!("{status}\t{path}"),
+            }
         })
         .collect();
     lines.sort();
@@ -170,6 +175,7 @@ fn merge_base_is_ancestor_and_diff_match_git() {
             ("a/b", Some("b")),
             ("del", Some("d")),
             ("kind", Some("k")),
+            ("moved.txt", Some("1\n2\n3\n4\n5\n")),
         ],
     );
     git(dir, &["checkout", "-q", "-b", "side"]);
@@ -181,7 +187,17 @@ fn merge_base_is_ancestor_and_diff_match_git() {
     symlink("a.txt", dir.join("link")).unwrap();
     fs::write(dir.join("run.sh"), "x").unwrap();
     fs::set_permissions(dir.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
-    commit(dir, "m1", &[("a.txt", Some("a2")), ("del", None)]);
+    // A rename with an edit: 80% similar.
+    commit(
+        dir,
+        "m1",
+        &[
+            ("a.txt", Some("a2")),
+            ("del", None),
+            ("moved.txt", None),
+            ("moved/renamed.txt", Some("1\n2\n3\n4\n6\n")),
+        ],
+    );
     let m1 = git(dir, &["rev-parse", "HEAD"]);
     // Criss-cross: x1 and x2 have two best common ancestors, m1 and s1.
     git(dir, &["merge", "-q", "--no-ff", "side", "-m", "x1"]);
@@ -235,7 +251,7 @@ fn merge_base_is_ancestor_and_diff_match_git() {
         // 0 is yes, 1 is no.
         assert_eq!(code, Some(i32::from(!yes)), "is-ancestor {x} {y}");
 
-        let git_diff = git(dir, &["diff", "--name-status", "--no-renames", x, y]);
+        let git_diff = git(dir, &["diff", "--name-status", x, y]);
         let mut expected: Vec<&str> = git_diff.lines().collect();
         expected.sort_unstable();
         assert_eq!(
@@ -251,12 +267,23 @@ fn merge_base_is_ancestor_and_diff_match_git() {
     assert_eq!(server.text(&["is-ancestor", &ids[&m1], "main"]), "");
     let text = server.text(&["diff", &ids[&root], "main", "--path", "a/"]);
     assert_eq!(text, "M\ta/b\n");
+    let text = server.text(&["diff", &ids[&root], &ids[&m1]]);
+    assert!(
+        text.contains("R\tmoved.txt -> moved/renamed.txt\n"),
+        "{text}"
+    );
+    assert!(!text.contains("\tmoved.txt\n"), "{text}");
     // An error exits 2, so it never reads as the "no" of is-ancestor.
     let out = server.scn(&["is-ancestor", "no-such-ref", "main"]);
     assert_eq!(out.status.code(), Some(2));
 
-    // The file states, as `scn ls --json` prints them.
-    let diff = server.json(&["diff", &ids[&root], &ids[&m1]]);
+    assert_diff_json(&server, &ids[&root], &ids[&m1]);
+}
+
+/// Checks the file states of `scn diff --json` from `root` to `m1`, as
+/// `scn ls --json` prints them, and its one rename.
+fn assert_diff_json(server: &Server, root: &str, m1: &str) {
+    let diff = server.json(&["diff", root, m1]);
     let by_path: HashMap<&str, &Value> = diff
         .as_array()
         .unwrap()
@@ -272,6 +299,14 @@ fn merge_base_is_ancestor_and_diff_match_git() {
     assert_eq!(by_path["run.sh"]["new"]["executable"], true);
     assert_eq!(by_path["del"]["old"]["kind"], "file");
     assert_eq!(by_path["del"]["new"], Value::Null);
+    // A rename is one entry, at the new path, with the old file.
+    let renamed = by_path["moved/renamed.txt"];
+    assert_eq!(renamed["status"], "R");
+    assert_eq!(renamed["old_path"], "moved.txt");
+    assert_eq!(renamed["similarity"], 80);
+    assert_eq!(renamed["old"]["id"], blob(b"1\n2\n3\n4\n5\n"));
+    assert_eq!(renamed["new"]["id"], blob(b"1\n2\n3\n4\n6\n"));
+    assert!(!by_path.contains_key("moved.txt"));
 }
 
 #[test]
@@ -346,4 +381,68 @@ fn diff_continues_past_one_reply() {
             .filter(|p| p.as_bytes().starts_with(b"d3/"))
             .count()
     );
+}
+
+#[test]
+fn diff_prints_a_rename_split_across_replies() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    // `zzz/old` becomes `a/new`, and the paths between fill the first
+    // reply, so the two halves of the rename come in different replies.
+    // Blobs are never read: the rename has the same content.
+    let state = |n: usize| {
+        Some(FileState::Regular {
+            content: BlobId::of(&n.to_le_bytes()),
+            executable: false,
+        })
+    };
+    let base = BTreeMap::from([(RepoPath::new("zzz/old").unwrap(), state(usize::MAX))]);
+    let mut change = BTreeMap::from([
+        (RepoPath::new("zzz/old").unwrap(), None),
+        (RepoPath::new("a/new").unwrap(), state(usize::MAX)),
+    ]);
+    for n in 0..MAX_DIFF_ENTRIES {
+        change.insert(RepoPath::new(format!("d/f{n:05}")).unwrap(), state(n));
+    }
+    let (old, new) = store
+        .write(|c| {
+            let repo = db::create_repo(c, REPO)?;
+            let mut parents = Vec::new();
+            for changes in [base, change] {
+                let cs = Changeset {
+                    parents: parents.last().copied().into_iter().collect(),
+                    author: IdentityTime {
+                        name: b"Ada".to_vec(),
+                        email: b"ada@example.com".to_vec(),
+                        unix_secs: 1_700_000_000,
+                        tz_offset_minutes: 0,
+                    },
+                    committer: None,
+                    message: b"change".to_vec(),
+                    changes,
+                };
+                parents.push(tree::store_changeset(c, repo, &cs)?.0);
+            }
+            Ok((parents[0], parents[1]))
+        })
+        .unwrap();
+    let server = Server::start(data, store);
+    let (old, new) = (old.to_string(), new.to_string());
+
+    let text = server.text(&["diff", &old, &new]);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), MAX_DIFF_ENTRIES + 1);
+    assert_eq!(lines[0], "R\tzzz/old -> a/new");
+    assert!(lines[1..].iter().all(|line| line.starts_with("A\td/")));
+
+    let diff = server.json(&["diff", &old, &new]);
+    let entries = diff.as_array().unwrap();
+    assert_eq!(entries.len(), MAX_DIFF_ENTRIES + 1);
+    assert_eq!(entries[0]["path"], "a/new");
+    assert_eq!(entries[0]["status"], "R");
+    assert_eq!(entries[0]["old_path"], "zzz/old");
+    assert_eq!(entries[0]["similarity"], 100);
+    let id = BlobId::of(&usize::MAX.to_le_bytes()).to_string();
+    assert_eq!(entries[0]["old"]["id"], id.as_str());
+    assert_eq!(entries[0]["new"]["id"], id.as_str());
 }

@@ -42,6 +42,10 @@ const MAX_UPLOADS: usize = 16;
 /// blames never take more than this many of the `MAX_BLOCKING` permits that
 /// writes and lands share.
 const MAX_BLAMES: usize = 4;
+/// Most `Diff` calls running at once. One call can read and compare files
+/// for about a second to find renames (`read::MAX_RENAME_CHUNKS`), so diffs
+/// never take more than this many of the `MAX_BLOCKING` permits either.
+const MAX_DIFFS: usize = 4;
 /// Longest a request may take before the server gives up on it.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// Most bytes that all `ReadFile` replies together hold: the parts read and
@@ -94,6 +98,8 @@ pub struct ScionService {
     uploads: Arc<Semaphore>,
     /// Bounds blames running at once (`MAX_BLAMES`).
     blames: Arc<Semaphore>,
+    /// Bounds diffs running at once (`MAX_DIFFS`).
+    diffs: Arc<Semaphore>,
     /// `READ_BUDGET_BYTES` permits, one per byte, shared by all `ReadFile`
     /// replies.
     reads: Arc<Semaphore>,
@@ -106,6 +112,7 @@ impl ScionService {
             lands: Arc::default(),
             uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
             blames: Arc::new(Semaphore::new(MAX_BLAMES)),
+            diffs: Arc::new(Semaphore::new(MAX_DIFFS)),
             reads: Arc::new(Semaphore::new(READ_BUDGET_BYTES)),
         }
     }
@@ -607,19 +614,42 @@ impl Scion for ScionService {
         let new = parse_id(&req.new_changeset_id, "new_changeset_id")?;
         let path = parse_optional_path(req.path)?;
         let after = parse_optional_path(req.after)?;
+        // Held until the job ends, as for `Blame`.
+        let slot = Arc::clone(&self.diffs)
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("server is shutting down"))?;
         let page = self
             .worker
             .run(move |store| {
+                let _slot = slot;
                 read::diff(&store, &req.repo, old, new, path.as_ref(), after.as_ref())
             })
             .await?;
         let entries = page
             .entries
             .into_iter()
-            .map(|entry| DiffEntry {
-                path: entry.path.as_bytes().to_vec(),
-                old: entry.old.map(file_state),
-                new: entry.new.map(file_state),
+            .map(|entry| {
+                // The other path goes in `rename_from` on the added file,
+                // and in `rename_to` on the deleted one.
+                let (mut rename_from, mut rename_to, mut similarity) = (vec![], vec![], 0);
+                if let Some(rename) = entry.rename {
+                    let other = rename.path.as_bytes().to_vec();
+                    if entry.old.is_none() {
+                        rename_from = other;
+                    } else {
+                        rename_to = other;
+                    }
+                    similarity = rename.similarity;
+                }
+                DiffEntry {
+                    path: entry.path.as_bytes().to_vec(),
+                    old: entry.old.map(file_state),
+                    new: entry.new.map(file_state),
+                    rename_from,
+                    rename_to,
+                    similarity,
+                }
             })
             .collect();
         Ok(Response::new(DiffResponse {

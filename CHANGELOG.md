@@ -107,3 +107,16 @@ release.
   history has a merge newer than where the two meet; otherwise it still
   walks, up to 10,000 changesets. `scion-server derive --kind commit_graph`
   fills it ahead of the first query on an older database.
+- `Diff` finds renames as `git diff` does by default: same content, then the
+  one file of a name on each side at 75%, then the most similar files at
+  50%. A rename keeps its two entries. The added one has `rename_from`, the
+  deleted one `rename_to`, and both `similarity`, so a client that ignores
+  them still sees a delete and an add. Each call finds the renames of the
+  whole diff below its path, so an entry has the same rename in every reply.
+  A diff of more than 10,000 entries has no renames, and the search for
+  similar files has a fixed budget per call. At most 4 `Diff` calls run at
+  once. `scn diff` prints a rename once, as `R`, a tab and `old -> new`, and
+  `--json` gives it `status` `R`, `old_path` and `similarity`.
+- `Blame` and `Diff` find renames with one implementation. Chunks now go to
+  git's hash buckets, as in git, so a score can change where two different
+  chunks share a bucket.

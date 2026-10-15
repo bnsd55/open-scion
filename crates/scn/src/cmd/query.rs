@@ -1,5 +1,6 @@
 //! `merge-base`, `is-ancestor`, `diff`.
 
+use std::collections::HashMap;
 use std::io::{BufWriter, Write as _};
 
 use anyhow::{Context, Result, bail};
@@ -65,15 +66,19 @@ pub async fn is_ancestor(ctx: &mut Ctx, ancestor: &str, descendant: &str) -> Res
 
 /// Prints the paths whose file differs between two revisions, one per line:
 /// a status letter as `git diff --name-status` (`A`dded, `D`eleted,
-/// `M`odified, `T` for a kind change), a tab, the path. A reply that stops
-/// at the server's bound names the last path it holds, so this asks again
-/// after it until the diff is complete. Text prints each reply as it
-/// arrives; JSON is one array, printed after the last reply.
+/// `M`odified, `T` for a kind change), a tab, the path. A rename prints once,
+/// as `R`, a tab, and `old -> new`, where the new path would print. A reply
+/// that stops at the server's bound names the last path it holds, so this
+/// asks again after it until the diff is complete. Text prints each reply as
+/// it arrives; JSON is one array, printed after the last reply.
 pub async fn diff(ctx: &mut Ctx, old: &str, new: &str, path: Option<&RepoPath>) -> Result<()> {
     let old_id = ctx.resolve(old).await?;
     let new_id = ctx.resolve(new).await?;
     let path = path.map(|p| p.as_bytes().to_vec()).unwrap_or_default();
     let mut json_entries = Vec::new();
+    // For JSON: the old file of each rename, by its path. The two halves of a
+    // rename can come in different replies.
+    let mut sources = HashMap::new();
     let mut after = Vec::new();
     loop {
         let reply = ctx
@@ -91,15 +96,29 @@ pub async fn diff(ctx: &mut Ctx, old: &str, new: &str, path: Option<&RepoPath>) 
         let mut out = BufWriter::new(std::io::stdout().lock());
         for entry in reply.entries {
             let (old, new) = (file_state(entry.old)?, file_state(entry.new)?);
-            let (status, path) = (status(old, new), lossy(&entry.path));
+            let side = |state: Option<FileState>| state.map(|s| entry_json(&Entry::File(s)));
+            // The deleted half of a rename prints with the added half.
+            if !entry.rename_to.is_empty() {
+                sources.insert(entry.path, side(old));
+                continue;
+            }
+            let path = lossy(&entry.path);
+            let renamed = !entry.rename_from.is_empty();
+            let status = if renamed { 'R' } else { status(old, new) };
             if ctx.json {
-                let side = |state: Option<FileState>| state.map(|s| entry_json(&Entry::File(s)));
-                json_entries.push(json!({
+                let mut value = json!({
                     "path": path,
                     "status": status.to_string(),
                     "old": side(old),
                     "new": side(new),
-                }));
+                });
+                if renamed {
+                    value["old_path"] = lossy(&entry.rename_from).into();
+                    value["similarity"] = entry.similarity.into();
+                }
+                json_entries.push((entry.rename_from, value));
+            } else if renamed {
+                writeln!(out, "R\t{} -> {path}", lossy(&entry.rename_from))?;
             } else {
                 writeln!(out, "{status}\t{path}")?;
             }
@@ -115,7 +134,20 @@ pub async fn diff(ctx: &mut Ctx, old: &str, new: &str, path: Option<&RepoPath>) 
         after = reply.next_after;
     }
     if ctx.json {
-        println!("{}", Value::from(json_entries));
+        let mut values = Vec::new();
+        for (from, mut value) in json_entries {
+            if !from.is_empty() {
+                let Some(old) = sources.remove(&from) else {
+                    bail!(
+                        "server sent a rename from {} but no delete there",
+                        lossy(&from)
+                    );
+                };
+                value["old"] = old.into();
+            }
+            values.push(value);
+        }
+        println!("{}", Value::from(values));
     }
     Ok(())
 }

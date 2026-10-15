@@ -437,10 +437,12 @@ file has no lines and gets no ranges.
 
 **Bounds per call.** At most 1,000 changesets checked, 100 versions diffed,
 and about 1M lines diffed (both sides of each diff; a line counts once per
-64 bytes). A rename search counts each chunk of up to 64 bytes it compares as
-a line, compares at most 100 deleted files, and stops after it has read about
-100 MiB of them. The first step of a call always runs, so every call makes
-progress.
+64 bytes). A rename search counts as a line each chunk of up to 64 bytes
+that it reads, and each row of a chunk table that it compares. It compares
+at most 100 deleted files, and stops after it has read about 100 MiB of
+them. The first step of a call always runs, so every call makes progress.
+The rules of a rename search are those of `Diff` (section 6.13) for one
+added file.
 
 **Rules.** The server walks first parents to each changeset that changed the
 file, and diffs that version with the older version. The older version is
@@ -528,7 +530,7 @@ merge base for a CI job.
 - A file is anything at a path that is not a directory: a regular file, a
   symlink or a gitlink. A path differs when its `FileState` differs: kind,
   ID or executable flag. Content is compared by ID; there is no line diff.
-  Renames are not detected: a rename is a delete and an add.
+  Renames are found, as below.
 - Each `DiffEntry` has the `path`, the file there in the old changeset
   (`old`) and in the new one (`new`). An unset side means no file is there:
   nothing, or a directory. The two sides always differ.
@@ -551,6 +553,55 @@ merge base for a CI job.
 1,000 entries. To continue, a client sends the same request with `after` set
 to `next_after`, until `next_after` is empty. Snapshots never change, so the
 pages together are the whole diff, each entry once.
+
+**Renames.** The server finds renames as `git diff` does by default, among
+the added and deleted files of the whole diff below `path`. A rename keeps
+its two entries: the deleted file at the old path and the added file at the
+new path.
+
+- The added entry (`old` unset) has `rename_from`, the old path. The deleted
+  entry (`new` unset) has `rename_to`, the new path. Both have
+  `similarity`: how similar the two files are, in percent, as git prints it.
+  100 is the same content.
+- A client that ignores these fields sees a delete and an add, as from a
+  server that does not find renames. Then all three fields are empty.
+- The two entries are in tree order like all others, so they can come in
+  different replies. To print a rename once, as `git diff --name-status`
+  does, a client prints it at the added entry and skips the deleted entry.
+- Each call finds the renames of the whole diff below `path`, not of its
+  page. So an entry has the same rename in every reply, whatever `after` is.
+
+The rules are git's (`diffcore-rename.c`). Path order here is the byte order
+of the whole path, git's order, not tree order. A deleted file is the source
+of at most one rename.
+
+1. Same content: a deleted file of the same kind and ID. A regular file can
+   change its executable bit. Added files take their turn in path order.
+   Each takes, among the first 100 deleted files left with that content, the
+   first with the same name (the last part of the path), else the first.
+2. Same name: a deleted and an added regular file whose name no other file
+   left on its side has, if they are at least 75% similar.
+3. Similar: each added regular file keeps the four deleted regular files
+   most similar to it, of those at least 50% similar. Then those pairs, most
+   similar first, become renames while both files are free. On a tie, a pair
+   with the same name comes first, then by added path, then by deleted path.
+   git breaks some ties among more than four files another way. Which file
+   of such a tie the server pairs is not part of v1.
+
+Similarity is git's: each file is cut into chunks that end after a newline or
+after 64 bytes. In text (no NUL byte in the first 8,000 bytes), a CR before a
+newline does not count. Each chunk is hashed as git hashes it. Similarity is
+the bytes of the chunks that both files have, over the size of the larger
+file. A symlink or a gitlink is a rename only with the same content.
+
+**Rename bounds.** The server finds renames only in a diff of at most 10,000
+entries below `path`; a larger diff has none. As in git, step 3 runs only
+when the added files left times the deleted files left are at most
+1,000,000. Step 3 also has a budget per call: about 4M, where each chunk of
+a file read and each row of a chunk table compared count one (64 MiB of text
+in lines of 64 bytes costs 1M). Past it, the server reads no more files. The
+budget is the same on every call, so every reply gives the same renames. The
+search never ends a page early.
 
 | Error | When |
 |---|---|
@@ -714,8 +765,9 @@ A new version is a new package, `scion.v2`. A server MAY serve both.
   import makes them.
 - Text merge. Conflicts are path-level.
 - `MergeBase` and `IsAncestor` without a bound across many merges
-  ([#72](https://github.com/bnsd55/open-scion/issues/72)), and `Diff` with
-  rename detection ([#79](https://github.com/bnsd55/open-scion/issues/79)).
+  ([#72](https://github.com/bnsd55/open-scion/issues/72)), and `Diff`
+  renames in a diff of more than 10,000 entries or past the search budget
+  ([#107](https://github.com/bnsd55/open-scion/issues/107)).
 - `Log` and `Blame` without per-call bounds
   ([#61](https://github.com/bnsd55/open-scion/issues/61)), and `Log` that
   follows renames.

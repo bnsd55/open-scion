@@ -550,7 +550,7 @@ takes a revision, and resolves refs through `Objects`.
 | `Blame` | For each range of lines in a file, the changeset that last changed it on first-parent history, across renames, and that changeset's author, time and path of the file. |
 | `MergeBase` | The best common ancestors of two changesets, over all parents. |
 | `IsAncestor` | Whether one changeset is an ancestor of another, over all parents. |
-| `Diff` | The paths whose file differs between two changesets' snapshots, with the old and new file state. At most 1,000 paths per reply. `next_after` says where to continue. |
+| `Diff` | The paths whose file differs between two changesets' snapshots, with the old and new file state, and renames as `git diff` finds them. At most 1,000 paths per reply. `next_after` says where to continue. |
 
 **Path history** (`Log` with a path, `read::log_page`). The walk follows
 first parents from the given changeset, newest first. It returns each
@@ -581,10 +581,13 @@ choices. For a file at a changeset:
    to C. So a file deleted and added again starts over, as in git.
 
 **Renames.** Blame follows a rename, as `git blame` does by default. Where C
-adds the path, the source is one of the files that C deletes:
+adds the path, the source is one of the files that C deletes. `Blame` and
+`Diff` find renames with one implementation (`similar.rs`), git's rules from
+`diffcore-rename.c`. Blame gives it one added file:
 
 1. A file with the same blob ID. This reads no file. On a tie, a file with
-   the same name (the last part of the path) wins, then the first by path.
+   the same name (the last part of the path) wins, then the first by path,
+   among the first 100.
 2. Else, if exactly one deleted file has the same name: that file, if it is
    at least 75% similar.
 3. Else, if C deletes at most 100 files (`MAX_RENAME_SOURCES`): the most
@@ -593,20 +596,21 @@ adds the path, the source is one of the files that C deletes:
 
 Similarity is git's. Each file is cut into chunks that end after a newline or
 after 64 bytes. In text (no NUL byte in the first 8,000 bytes, git's test for
-binary), a CR before a newline does not count. Similarity is the
-bytes of the chunks that both files have, over the size of the larger file.
-A file less than half the size of the other is not read. A symlink or a
-submodule that becomes a regular file is a type change, not a rename, as in
-git. Each changeset that a range names comes with the path of the file there.
-`Log` with a path does not follow renames, as `git log` without `--follow`.
+binary), a CR before a newline does not count. Each chunk goes to one of
+107,927 buckets with git's hash, so two different chunks can count as the
+same, as in git, and a file's table has at most that many rows. Similarity
+is the bytes of the chunks that both files have, over the size of the larger
+file. A file less than half the size of the other is not read. A symlink or
+a submodule that becomes a regular file is a type change, not a rename, as
+in git. Each changeset that a range names comes with the path of the file
+there. `Log` with a path does not follow renames, as `git log` without
+`--follow`.
 
 Where rename following differs from `git blame`:
 
 - git compares every deleted file. Here a changeset that deletes more than
   100 files gets only steps 1 and 2
   ([#87](https://github.com/bnsd55/open-scion/issues/87)).
-- git puts each chunk in one of about 100,000 hash buckets, so two different
-  chunks can count as the same. Here chunks compare byte for byte.
 - A deleted file over a limit of step 1 is never similar here, and one
   search reads files, in path order, only until it has read about 100 MiB
   (`MAX_RENAME_BYTES`: 100 files of the old 1 MiB limit, so it still reads
@@ -614,8 +618,8 @@ Where rename following differs from `git blame`:
   ([#87](https://github.com/bnsd55/open-scion/issues/87)).
 - git also treats a file as binary, so a CR counts, when `.gitattributes`
   marks it `binary` or `-diff`. Here only the NUL byte test counts.
-- git checks only a few of many files with the same content, and keeps only
-  the four best similar files while it compares. So on a tie among many
+- git keeps the four best similar files while it compares, and on a tie the
+  one it keeps first can be a later file. So on a tie among more than four
   files it can pick another one.
 - Neither finds copies or moved lines by default (`git blame -C`, `-M`).
   Here there is no option for them.
@@ -633,8 +637,9 @@ changesets (`MAX_SCAN`), so it holds the database lock no longer than a plain
 `Log` of 1,000 entries. A `Blame` call also diffs at most 100 versions, and
 about 1M lines (`MAX_BLAME_DIFF_LINES`, both sides of each diff). Every byte
 that blame reads counts against this budget, once per 64 bytes: a diffed
-line counts once per 64 bytes, a rename search counts each chunk it
-compares, and a file read and then refused for its lines counts its size. A
+line counts once per 64 bytes, a rename search counts each chunk it reads
+and each row of a chunk table it compares, and a file read and then refused
+for its lines counts its size. A
 version with the same content as the newer one (a mode change, or a rename
 with no edit) is not read and costs nothing. The first step of a call always
 runs, so a call always makes progress.
@@ -644,7 +649,9 @@ steps past it: the first, which always runs, and the one that stops the call,
 which is read and then dropped. One step reads one older version of at most
 16 MiB, or one rename search: the size of at most 100 deleted files, and
 their content until it has read about 100 MiB, plus the file that crosses
-that bound. So one call reads at most about 300 MiB. To find the deleted
+that bound. The search keeps only chunk tables, so it reads the source it
+finds once more, to diff it. So one call reads at most about 320 MiB. To
+find the deleted
 files, a search reads each directory on their paths once, about the work of
 applying C to its parent tree.
 
@@ -654,10 +661,10 @@ release builds, that diff takes about 1.5 times as long as the worst diff
 under the old 1 MiB limit (a 1 MiB file of about 700,000 such lines). A
 rename search that reads up to its bound takes about a tenth of the old
 worst diff, a 16 MiB file with one line changed about 1/100 of it, and 100
-mode changes of a 16 MiB file less than that. Memory per call is at most four
-versions (two to diff, two rename sources) of 16 MiB, the chunk tables of two
-of them, about 50 bytes per line of the blamed file, and the tables of one
-diff.
+mode changes of a 16 MiB file less than that. Memory per call is at most two
+versions of 16 MiB (two to diff, or one and a rename source), the chunk
+tables of two files, about 50 bytes per line of the blamed file, and the
+tables of one diff.
 
 At most 4 `Blame` calls run at once, so they never take more than 4 of the
 permits that writes and lands share. When a call stops at a bound,
@@ -725,13 +732,42 @@ and their bounds, are this project's choices.
   as `git diff --name-status`. A reply holds at most 1,000 paths
   (`MAX_DIFF_ENTRIES`). The walk finds one more to know whether more follow,
   and then `next_after` is the last path sent. The next call walks down to
-  that path again and continues after it. Renames are not detected, so a
-  rename is a delete and an add
-  ([#79](https://github.com/bnsd55/open-scion/issues/79)).
+  that path again and continues after it. Each tree read takes the database
+  lock on its own, so a long walk does not hold it.
+- `Diff` finds renames as `git diff` does by default, with the code that
+  blame uses (`similar.rs`, above): same content, then the one file of a
+  name on each side at 75%, then the most similar pairs at 50%. With many
+  added files, the pairs go most similar first, so two added files never
+  take one deleted file. The rule for pages is this project's choice: a call
+  finds the renames of the whole diff below its path, not of its page. So
+  an entry gets the same rename in every reply, whatever `after` is, and a
+  rename can join two entries in different replies. A rename keeps both
+  entries; the added one names the old path (`rename_from`), and the deleted
+  one the new path (`rename_to`). A client that does not know renames still
+  sees a correct delete and add. If the page holds no added or deleted file,
+  the call skips this. If the page is the whole diff, it uses the page.
+  Else it walks the whole diff below the path, up to 10,000 entries
+  (`MAX_RENAME_ENTRIES`); a larger diff has no renames. Step 3 compares
+  files only while the added files left times the deleted files left are at
+  most 1,000,000, git's default limit. It reads the added files that some
+  deleted file could be like into one index by chunk hash, then reads each
+  deleted file and looks up its chunks there, so it never compares two
+  files row by row. Its budget, about 4M chunks read and table rows
+  compared (`MAX_RENAME_CHUNKS`), is the same on every call, so every call
+  finds the same renames; past it, the search reads no more files
+  ([#107](https://github.com/bnsd55/open-scion/issues/107)). So one call
+  reads at most about 256 MiB of text in lines of 64 bytes or more, plus
+  one file past the budget. Reading a file costs far more than looking up
+  its chunks, so the budget goes mostly to reading. At most 4 `Diff` calls
+  run at once (`MAX_DIFFS`), as for `Blame`.
 
 Tests compare all three with git (`merge-base --all`,
 `merge-base --is-ancestor`, `diff --name-status --no-renames`) on a history
 with branches, a criss-cross, an octopus merge and an unrelated history.
+Rename tests compare `Diff` with `git diff -M --name-status`, both ways and
+below paths: pure renames, edits, a mode change, symlinks, empty files, CR
+line ends, many candidates, ties, two added files that want one deleted
+file, and git's limit of 1,000,000 pairs.
 `scn merge-base`, `scn is-ancestor` and `scn diff` call them. `scn diff`
 asks again until `next_after` is empty. `scn is-ancestor` exits 0 for yes
 and 1 for no. Every `scn` error exits 2. A checkout that a signal stops
@@ -1002,7 +1038,8 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/service.rs` (`READ_STALL_TIMEOUT`) | A stalled `ReadFile` reply frees its share, but the part in its channel and the part inside HTTP/2 stay in memory until the connection closes, up to 2 MiB per reply. | A response body timeout that resets the stream. | [#42](https://github.com/bnsd55/open-scion/issues/42) |
 | `scion-server/src/read.rs` (`MAX_SCAN`) | Path history and blame walk first parents on every call, at most 1,000 changesets per call. A path changed long ago costs many calls. | Path history as derived data. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
 | `scion-server/src/read.rs` (`MAX_WALK`) | `MergeBase` walks every changeset down to the merge bases unless neither first-parent history has a merge newer than where the two meet. `IsAncestor` reads every merge newer than the ancestor. Both fail with `RESOURCE_EXHAUSTED` past 10,000 steps, so two changesets with thousands of merges between get no answer. | A merge-base search that moves along first-parent histories of the commit graph, as `IsAncestor` does. | [#72](https://github.com/bnsd55/open-scion/issues/72) |
-| `scion-server/src/read.rs` (`diff`) | Renames are not detected: a rename is a delete and an add. `git diff` detects them by default. | Pair deletes and adds with the same blob, then by similarity, with a bound per call. | [#79](https://github.com/bnsd55/open-scion/issues/79) |
+| `scion-server/src/read.rs` (`MAX_RENAME_ENTRIES`) | Each `Diff` call walks the whole diff below its path to find renames. A diff of more than 10,000 entries has no renames: a rename there is a delete and an add. `git diff` finds renames in a diff of any size. | Renames of a diff as derived data, found in steps over calls and kept. | [#107](https://github.com/bnsd55/open-scion/issues/107) |
+| `scion-server/src/read.rs` (`MAX_RENAME_CHUNKS`) | The search for similar files in one `Diff` call reads and compares about 4M chunks, then reads no more files. A diff with many large files that could be similar can miss renames that `git diff` finds. | The same derived data. | [#107](https://github.com/bnsd55/open-scion/issues/107) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_VERSIONS`) | One call diffs at most 100 versions of a file. A file with more versions costs more calls. | Blame as derived data, kept per file version. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_DIFF_LINES`) | One call diffs about 1M lines, and a long line counts once per 64 bytes. A diff of many repeated lines grows faster than its lines, so one diff of two files of 1,048,576 lines is the worst case of a call. | Blame from derived data, so a call does not diff whole versions. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
 | `scion-server/src/blame.rs` (`MAX_RENAME_SOURCES`) | A changeset that deletes more than 100 files is searched only for a rename source with the same content, or the one deleted file with the same name. `git blame` compares every deleted file. | An index of each changeset's deleted files by chunk, as derived data, so a search compares only files that share chunks with the new file. | [#87](https://github.com/bnsd55/open-scion/issues/87) |

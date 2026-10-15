@@ -7,6 +7,7 @@
 //! - [`tree`]: apply changesets to trees and derive each changeset's root tree.
 //! - [`graph`]: the commit-graph index, and the graph queries that read it.
 //! - [`read`], [`blame`], [`write`], [`land`]: the operations behind the RPCs.
+//!   [`similar`] finds renames for `Diff` and `Blame`.
 //! - [`import`]: one-way import from a git repository.
 //! - [`service`], [`objects`] and [`auth`]: the gRPC front end.
 
@@ -22,6 +23,7 @@ pub mod names;
 pub mod objects;
 pub mod read;
 pub mod service;
+pub mod similar;
 pub mod store;
 pub mod tree;
 pub mod write;
