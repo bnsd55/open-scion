@@ -207,7 +207,7 @@ message LogEntry {
 message BlameRequest {
   string repo = 1;
   bytes changeset_id = 2;
-  // A regular file of at most 1 MiB with no NUL byte.
+  // A regular file of at most 16 MiB and 1,048,576 lines.
   bytes path = 3;
 }
 

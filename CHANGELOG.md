@@ -34,6 +34,11 @@ release.
   dies by the signal, so a shell reports 128 plus its number (130 for
   Ctrl-C) and a shell loop stops too. A second signal stops the removal at
   once, and names the temp directory that it leaves.
+  Where the filesystem has no rename that never replaces (NFS on Linux),
+  a checkout into an existing directory still works: each top-level file
+  or symlink moves up by a hard link, and each top-level directory by a
+  rename onto a new empty directory that claims its name. This is tested
+  by forcing it, not on a real NFS mount.
 - Path history and blame on first-parent history: `Log` takes an optional
   path and says where to continue, and a new `Blame` RPC gives each line's
   last changeset. `scn log --path` and `scn blame`. Each call has a bound,
@@ -47,6 +52,12 @@ release.
   each line's path when some line came from another path, as git does, and
   `--json` adds `path` to each range. A client that ignores `next_path`
   continues at the wrong path after a rename.
+- `Blame` reads files of up to 16 MiB and 1,048,576 lines (was 1 MiB), and
+  blames a binary file line by line, as `git blame` does. Every byte read
+  counts against the per-call budget, once per 64 bytes. A rename search now
+  stops after it has read about 100 MiB of deleted files, so with large files
+  it can miss a source and the answer can change. Every search that the old
+  1 MiB limit allowed still reads every file.
 - Bearer-token auth, loopback-only listening by default, request limits and
   name validation at the RPC boundary.
 - `ReadFile` streams a file in 1 MiB parts from the zstd decoder, under a
