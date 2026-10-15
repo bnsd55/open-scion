@@ -22,6 +22,7 @@ anyhow = "1.0"
 blake3 = "1.8"
 clap = { version = "4.6", features = ["derive", "env"] }
 gix = "0.89"
+hashlink = "0.12"
 prost = "0.14"
 proptest = "1.12"
 rusqlite = { version = "0.40", features = ["bundled"] }

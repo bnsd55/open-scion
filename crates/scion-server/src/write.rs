@@ -35,10 +35,7 @@ pub fn put_blob(store: &Store, repo: &str, data: &[u8]) -> Result<BlobId> {
 /// stored intact. [`Error::Apply`] if the changes do not apply to the parent's
 /// tree. [`Error::Io`] if a blob cannot be read.
 pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<ChangesetId> {
-    // SHORTCUT: limits are checked after a full decode, so one request can
-    // still decode as many changes as fit in one gRPC message. Upgrade: a
-    // decoder that stops at a count limit.
-    let (cs, id) = Changeset::decode_with_id(bytes)
+    let (cs, id) = Changeset::decode_with_id_max_changes(bytes, MAX_CHANGES)
         .map_err(|e| Error::InvalidArgument(format!("bad changeset: {e}")))?;
     let parent = check_request(&cs)?;
     // The blob check touches only the object folder, so it runs before the
@@ -74,11 +71,6 @@ fn check_request(cs: &Changeset) -> Result<ChangesetId> {
         return Err(Error::InvalidArgument(
             "committer must be empty: only git import sets it".into(),
         ));
-    }
-    if cs.changes.len() > MAX_CHANGES {
-        return Err(Error::InvalidArgument(format!(
-            "more than {MAX_CHANGES} changes"
-        )));
     }
     if cs.message.len() > MAX_COMMIT_MESSAGE_BYTES {
         return Err(Error::InvalidArgument(format!(
