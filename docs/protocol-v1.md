@@ -410,7 +410,7 @@ level as `TreeV1` bytes. An empty path is the repo root.
 ### 6.10 Blame
 
 `rpc Blame(BlameRequest) returns (BlameResponse)`. For each line of a file,
-the changeset that last changed it on first-parent history.
+the changeset that last changed it on first-parent history, across renames.
 
 **Lines.** A line ends after a `\n` byte, or at the end of the file. An empty
 file has no lines and gets no ranges.
@@ -421,26 +421,41 @@ file has no lines and gets no ranges.
   `start_line` counts from 1 in the requested file. `changeset_id` is the
   changeset that last changed those lines, and `origin_line` is the first of
   them, counting from 1, in the file at that changeset.
-- `changesets` holds the author of each changeset that a range names, once
-  each.
+- `changesets` holds each changeset that a range names, once each: its
+  author, and `path`, the path of the file at that changeset, where
+  `origin_line` counts. The path differs from the requested path when the
+  walk followed a rename.
 - `next_changeset_id` is set when the call stopped at a bound before every
-  line had a changeset. The ranges with an empty `changeset_id` came from that
-  changeset or an older one, and their `origin_line` is their line in the file
-  at `next_changeset_id`. To continue, a client blames the same path at
-  `next_changeset_id` and maps those lines through `origin_line`.
+  line had a changeset. `next_path` is then the path of the file there. The
+  ranges with an empty `changeset_id` came from that changeset or an older
+  one, and their `origin_line` is their line in the file at
+  `next_changeset_id` and `next_path`. To continue, a client blames
+  `next_path` at `next_changeset_id` and maps those lines through
+  `origin_line`.
+- An empty `path` or `next_path` comes from a server that does not follow
+  renames: it means the requested path.
 
 **Bounds per call.** At most 1,000 changesets checked, 100 versions diffed,
-and about 1M lines diffed (both sides of each diff). The first diff of a call
-always runs, so every call makes progress.
+and about 1M lines diffed (both sides of each diff). A rename search counts
+each chunk of up to 64 bytes it compares as a line, and compares at most 100
+deleted files. The first diff of a call always runs, so every call makes
+progress.
 
 **Rules.** The server walks first parents to each changeset that changed the
-file, and diffs that version with the version in its first parent. The lines
-that the changeset added go to it. The other lines are traced further back.
-The diff is Myers with an indent heuristic. Where several minimal
-diffs exist, which one the server picks is not part of v1. Renames are not
-followed. An older version that is absent, not a regular file, larger than
-1 MiB or holds a NUL byte counts as absent: the changeset that replaced it
-gets its lines.
+file, and diffs that version with the older version. The older version is
+the file at the same path in the first parent. Where the changeset adds the
+file (no file was at the path), it is the file that the changeset renamed
+to the path: a deleted file with the same content, else a similar one, as
+`git blame` finds it by default. The lines that the changeset added go to
+it. The other lines are traced further back, at the older path. The diff is
+Myers with an indent heuristic. Where several minimal diffs exist, which one
+the server picks is not part of v1, and neither is which deleted file it
+picks as the source. An older version that is absent, not a regular file,
+larger than 1 MiB or holds a NUL byte counts as absent: the changeset that
+replaced it gets its lines.
+
+A client that ignores `next_path` continues at the requested path after a
+rename. Its next call then fails with `NOT_FOUND`, or blames another file.
 
 | Error | When |
 |---|---|
@@ -696,7 +711,7 @@ A new version is a new package, `scion.v2`. A server MAY serve both.
   ([#72](https://github.com/bnsd55/open-scion/issues/72)), and `Diff` with
   rename detection ([#79](https://github.com/bnsd55/open-scion/issues/79)).
 - `Log` and `Blame` without per-call bounds
-  ([#61](https://github.com/bnsd55/open-scion/issues/61)), and `Blame` that
-  follows renames ([#69](https://github.com/bnsd55/open-scion/issues/69)).
+  ([#61](https://github.com/bnsd55/open-scion/issues/61)), and `Log` that
+  follows renames.
 - Blobs sent in their stored, compressed form
   ([#53](https://github.com/bnsd55/open-scion/issues/53)).
