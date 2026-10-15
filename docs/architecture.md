@@ -101,7 +101,7 @@ One data directory holds everything (`store.rs`):
 <data>/tmp/                    staging for atomic blob writes
 ```
 
-**SQLite tables** ([`migrations/0001_init.sql`](../crates/scion-server/migrations/0001_init.sql)):
+**SQLite tables** ([`migrations/`](../crates/scion-server/migrations)):
 
 | Table | Holds |
 |---|---|
@@ -110,16 +110,18 @@ One data directory holds everything (`store.rs`):
 | `changeset_parents` | Parent `n` of each changeset, also indexed by parent. |
 | `repo_changesets` | Which changesets a repo may read. Every changeset read checks this table. |
 | `refs` | Ref name to target and `version`. A ref moves only by compare-and-swap on `version`. A foreign key keeps the target in the repo. |
-| `lands` | One row per land request, unique on (repo, caller, request key): state, result, detail, conflict paths. |
+| `lands` | One row per land request, unique on (repo, caller, request key): state, result, detail, conflict paths, and when it finished. A finished row expires after 7 days (section 5). |
 | `trees` | `TreeV1` bytes by tree ID. Global. |
 | `derived` | Derived values by (kind, version, changeset). Rebuildable. |
 | `git_import` | Git commit ID to changeset, per repo, so a re-import skips known commits. |
 
 Trees live in SQLite, not in the blob folder, so a derivation that writes many
 trees commits them in one transaction. The schema version is
-`PRAGMA user_version`. A build refuses a database with a newer version. All
-database access goes through one connection behind a mutex. Write
-transactions use `BEGIN IMMEDIATE`.
+`PRAGMA user_version`. When a database opens, each migration in
+`migrations/` that is newer than its version runs, in order, in its own
+transaction. A released migration never changes. A build refuses a database
+with a newer version. All database access goes through one connection behind
+a mutex. Write transactions use `BEGIN IMMEDIATE`.
 
 **Blob folder.** One zstd file per blob, at most 100 MiB uncompressed. A write
 goes to a temp file in `tmp/`, is flushed, and is renamed into place. A read
@@ -216,7 +218,7 @@ sequenceDiagram
     participant L as land.rs
     participant DB as SQLite
     A->>L: Land(changeset, ref, request key)
-    L->>DB: transaction: insert a pending row, or find the row for this key
+    L->>DB: transaction: insert a pending row and expire old lands, or find the row for this key
     alt row is not pending
         L-->>A: the stored outcome
     end
@@ -248,6 +250,18 @@ sequenceDiagram
   land returns its outcome, a pending one resumes. The same key with a
   different changeset or ref is `INVALID_ARGUMENT`. `scn land` uses
   `<changeset ID>:<ref>` as the default key.
+- **Retention.** A finished land (landed, conflict or rejected) is kept for
+  7 days after it finished (`LAND_RETENTION_SECS`). A pending land is kept
+  until a retry finishes it. Each new land deletes up to 100 expired lands,
+  oldest first, in the transaction that records it. The newest land always
+  stays, so a land ID is never given out twice. The upgrade to schema
+  version 2 gives older finished lands the time of the upgrade, so their
+  7 days start then.
+- **A retry after expiry** is a new land with a new ID, and `GetLand` with
+  the old ID returns `NOT_FOUND`. It cannot land the changeset twice: the
+  landed copy changed every path of the changeset after its base, so the new
+  land is a conflict. The exception is a changeset with no changes: it lands
+  again as one more empty changeset, and no file changes.
 - **The rebase** is the input changeset with its parent replaced by the ref
   head. Changes, author and message stay the same. If the base is already the
   head, the result is the input changeset itself.
@@ -502,7 +516,7 @@ an untrusted network.
 | Network | Listens on `127.0.0.1:7878` by default. A non-loopback address is refused unless `--insecure-listen` is given. | No TLS: the token and all data travel unencrypted ([#14](https://github.com/bnsd55/open-scion/issues/14)). |
 | Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. | Trees and blobs are shared by all repos. `GetObjects` reads any tree or blob by ID, and a changeset can name another repo's blob and then read it ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
-| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once, 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget, and a reply whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. | No per-principal quotas. Every request key leaves a permanent `lands` row ([#15](https://github.com/bnsd55/open-scion/issues/15)). Each stalled reply keeps one encoded object inside HTTP/2 until its connection closes. |
+| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once, 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget, and a reply whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object inside HTTP/2 until its connection closes. |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. | The client trusts the server for a ref's target and for a changeset's root tree, which it cannot check by hash. Tiers ([#5](https://github.com/bnsd55/open-scion/issues/5)) must forward these answers, not compute them. |
 | Checkout | `scn checkout` writes into a temp directory and renames it onto a new or empty destination, never follows a symlink while writing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure the destination stays as it was. | No Windows rules: device names and names that end in a dot or a space pass. |
 | Errors | Internal errors reply `internal error`. The detail stays in the server log. | |
