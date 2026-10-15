@@ -44,6 +44,22 @@ service Scion {
   // Which changeset last changed each line of a file, on first-parent
   // history.
   rpc Blame(BlameRequest) returns (BlameResponse);
+
+  // Queries on the changeset graph and on snapshots. Each call has a bound
+  // on its work.
+
+  // The best common ancestors of two changesets, over all parents: every
+  // common ancestor that is not an ancestor of another common ancestor, as
+  // `git merge-base --all`. Fails with RESOURCE_EXHAUSTED if the walk
+  // passes its bound.
+  rpc MergeBase(MergeBaseRequest) returns (MergeBaseResponse);
+  // Whether one changeset is an ancestor of another, over all parents. A
+  // changeset is its own ancestor. Fails with RESOURCE_EXHAUSTED if the
+  // walk passes its bound.
+  rpc IsAncestor(IsAncestorRequest) returns (IsAncestorResponse);
+  // The paths whose file state differs between the snapshots of two
+  // changesets. Compares file states, not lines.
+  rpc Diff(DiffRequest) returns (DiffResponse);
 }
 
 // Object reads that any cache tier can answer. Every call but ResolveRef names
@@ -214,6 +230,81 @@ message BlameChangeset {
   bytes author_email = 3;
   int64 author_unix_secs = 4;
   int32 author_tz_offset_minutes = 5;
+}
+
+message MergeBaseRequest {
+  string repo = 1;
+  bytes a_changeset_id = 2;
+  bytes b_changeset_id = 3;
+}
+
+message MergeBaseResponse {
+  // The best common ancestors: highest generation first, then by ID bytes,
+  // lowest first. Usually one. Criss-cross merges can give several. Empty
+  // when the two histories share no changeset.
+  repeated bytes changeset_ids = 1;
+}
+
+message IsAncestorRequest {
+  string repo = 1;
+  bytes ancestor_id = 2;
+  bytes descendant_id = 3;
+}
+
+message IsAncestorResponse {
+  bool is_ancestor = 1;
+}
+
+message DiffRequest {
+  string repo = 1;
+  // `DiffEntry.old` is the state in this changeset.
+  bytes old_changeset_id = 2;
+  // `DiffEntry.new` is the state in this changeset.
+  bytes new_changeset_id = 3;
+  // Optional. Only this path: the file itself, or anything below it if it
+  // is a directory. Empty means every path.
+  bytes path = 4;
+  // Optional. Only the paths after this one, in the order of
+  // `DiffResponse.entries`. Set it to `next_after` to continue.
+  bytes after = 5;
+}
+
+message DiffResponse {
+  // The paths that differ, in tree order: paths compare part by part, and
+  // parts by raw bytes. So `a/b` comes before `a.txt`, because the part `a`
+  // comes before `a.txt`. A path that is a file on one side and a directory
+  // on the other appears once for the file, then once for each file below
+  // the directory.
+  repeated DiffEntry entries = 1;
+  // Set when the call stopped at its bound: the last path in `entries`.
+  // Ask again with `after` set to it. Empty when the diff is complete.
+  bytes next_after = 2;
+}
+
+message DiffEntry {
+  bytes path = 1;
+  // The file at `path` in the old changeset. Unset when no file is there:
+  // nothing, or a directory.
+  FileState old = 2;
+  // The file at `path` in the new changeset. Unset as for `old`.
+  FileState new = 3;
+}
+
+enum FileKind {
+  FILE_KIND_UNSPECIFIED = 0;
+  FILE_KIND_REGULAR = 1;
+  FILE_KIND_SYMLINK = 2;
+  FILE_KIND_GITLINK = 3;
+}
+
+// What a path holds when it is not a directory, as in a TreeV1 entry.
+message FileState {
+  FileKind kind = 1;
+  // The blob of a regular file or of a symlink's target (32 bytes), or the
+  // git commit of a gitlink (20 bytes for SHA-1, 32 for SHA-256).
+  bytes id = 2;
+  // Regular files only.
+  bool executable = 3;
 }
 
 message GetRootTreeRequest {

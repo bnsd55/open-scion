@@ -43,7 +43,7 @@ mod path;
 use std::collections::BTreeMap;
 
 pub use codec::DecodeError;
-pub use id::{BlobId, ChangesetId, ParseIdError, TreeId};
+pub use id::{BlobHasher, BlobId, ChangesetId, ParseIdError, TreeId};
 pub use path::{PathElem, PathError, RepoPath};
 
 /// A person and the moment they acted, as recorded on a changeset.

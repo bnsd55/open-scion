@@ -6,6 +6,7 @@ not exist yet are marked **planned**, with the issue that tracks them.
 The design follows Anthropic's article
 [Redesigning source control](https://www.anthropic.com/engineering/redesigning-source-control).
 The README lists where this project makes its own choices.
+[`design/scalable-backend.md`](design/scalable-backend.md) proposes a backend that scales out to many servers (not built).
 
 ## 1. Overview
 
@@ -14,7 +15,7 @@ The README lists where this project makes its own choices.
 | [`scion-core`](../crates/scion-core) | Object model (`Changeset`, `Tree`, IDs, `RepoPath`) and the v1 encoder and strict decoder. No I/O. |
 | [`scion-proto`](../crates/scion-proto) | gRPC types generated from [`proto/scion.proto`](../proto/scion.proto): the `Scion` and `Objects` services, whose contract is [`protocol-v1.md`](protocol-v1.md). Largest message 64 MiB (a `GetObjects` reply message: one object of up to 100 MiB), stream chunk 1 MiB. |
 | [`scion-server`](../crates/scion-server) | One binary with two commands: `serve` (the API) and `import` (git import). |
-| [`scn`](../crates/scn) | Command-line client: `cat`, `ls`, `log`, `blame`, `show`, `checkout`, `commit`, `land`, `bench`. |
+| [`scn`](../crates/scn) | Command-line client: `cat`, `ls`, `log`, `blame`, `show`, `merge-base`, `is-ancestor`, `diff`, `checkout`, `commit`, `land`, `bench`. |
 
 ```mermaid
 flowchart LR
@@ -100,7 +101,7 @@ One data directory holds everything (`store.rs`):
 <data>/lock                    locked by the one process that uses <data>
 <data>/scion.db                metadata and trees (SQLite)
 <data>/objects/blob/ab/cd..    one zstd file per blob, named by its ID in hex
-<data>/tmp/                    staging for atomic blob writes
+<data>/tmp/                    staging for atomic blob writes and uploads
 ```
 
 **SQLite tables** ([`migrations/`](../crates/scion-server/migrations)):
@@ -127,13 +128,24 @@ upgrade copies every row. All database access goes through one connection behind
 a mutex. Write transactions use `BEGIN IMMEDIATE`.
 
 **Blob folder.** One zstd file per blob, at most 100 MiB uncompressed. A write
-goes to a temp file in `tmp/`, is flushed, and is renamed into place. A read
-unpacks the file and checks its hash. A check that does not need the content
-(`Blobs::verify`, used by puts, `CreateChangeset` and import) streams the file
-through the decoder into the hasher, so it holds the zstd window and small
-buffers, not the whole blob. A file that does not match its ID, or that
-unpacks to more than 100 MiB, is corrupt, and the next put of that content
-replaces it.
+goes to a temp file in `tmp/`, is flushed, and is renamed into place. The zstd
+frame header holds the uncompressed size, so `Blobs::size` reads only the
+header. A read unpacks the file and checks its hash. A check that does not
+need the content (`Blobs::verify`, used by puts, `CreateChangeset` and
+import) streams the file through the decoder into the hasher, so it holds the
+zstd window and small buffers, not the whole blob. A file that does not match
+its ID, or that unpacks to more than 100 MiB, is corrupt, and the next put of
+that content replaces it.
+
+**Uploads.** `PutBlob` streams (`Blobs::upload`). Each message goes into the
+hasher and to a spool file in `tmp/` before the server reads the next one, so
+an upload holds one message in memory, not the whole blob. The spool file
+holds raw bytes, because the frame header needs the size before the first
+compressed byte. After the last message, the server keeps an intact stored
+copy if there is one. Otherwise it streams the spool file through the
+compressor into the temp file. The spool file has no name, so a dropped
+upload or a crash leaves nothing behind. `Store::open` removes any temp file
+that a crash left before its rename.
 
 **Durability rules.**
 
@@ -412,8 +424,11 @@ land's base is at or above the floor, or below it:
 So the choice of the new floor, and of `MAX_DEPTH`, changes only the speed,
 never the answer.
 
-**Planned:** a lander that rebases a batch of pending lands and moves the ref
-once ([#18](https://github.com/bnsd55/open-scion/issues/18)).
+**Not planned now:** a lander that rebases a batch of pending lands and moves
+the ref once ([#18](https://github.com/bnsd55/open-scion/issues/18), closed: one
+machine already gives about 200 durable lands/s). The
+[scalable backend design](design/scalable-backend.md) says when it would be
+needed.
 
 ## 6. Git import
 
@@ -475,6 +490,9 @@ takes a revision, and resolves refs through `Objects`.
 | `ListDir` | One directory level as `TreeV1` bytes. |
 | `Log` | First-parent history, newest first. With a path, only the changesets that change it. A reply holds at most 1,000 entries and about 32 MiB, and checks at most 1,000 changesets. `next_changeset_id` says where to continue. `scn log` asks again until it has `-n` entries. |
 | `Blame` | For each range of lines in a file, the changeset that last changed it on first-parent history, and that changeset's author and time. |
+| `MergeBase` | The best common ancestors of two changesets, over all parents. |
+| `IsAncestor` | Whether one changeset is an ancestor of another, over all parents. |
+| `Diff` | The paths whose file differs between two changesets' snapshots, with the old and new file state. At most 1,000 paths per reply. `next_after` says where to continue. |
 
 **Path history** (`Log` with a path, `read::log_page`). The walk follows
 first parents from the given changeset, newest first. It returns each
@@ -525,6 +543,53 @@ at `next_changeset_id`. A blame of the same path there continues the work
 exactly. `scn log --path` and `scn blame` ask again until they are done.
 Path history and blame as derived data will remove these bounds
 ([#61](https://github.com/bnsd55/open-scion/issues/61)).
+
+**Graph and diff queries** (`read::merge_base`, `read::is_ancestor`,
+`read::diff`). The article lists computing diffs and finding merge bases
+among the server's APIs, so tools need no local repository. For example, a
+CI job asks for the diff between a commit and its merge base. The article
+also mentions skip lists for the commit graph. How these calls work here,
+and their bounds, are this project's choices.
+
+- `MergeBase` returns every best common ancestor: a common ancestor that is
+  not an ancestor of another common ancestor, the rule of
+  `git merge-base --all`. Usually there is one. After criss-cross merges
+  there are several, and all are returned, highest generation first, then
+  lowest ID. The walk takes changesets from a queue, highest generation
+  first, and marks each with the sides (A, B) that reach it. A parent's
+  generation is below its child's, so a changeset leaves the queue only after
+  every descendant that the walk reached, with all its marks. One marked by
+  both sides and not stale is a best common ancestor, and the walk marks its
+  ancestors stale. The walk ends when no queued changeset that is not stale
+  carries A, or none carries B: no other best common ancestor can follow.
+- `IsAncestor` is `db::is_ancestor`: a walk over all parents that never goes
+  below the generation of the ancestor, and visits each changeset once. Git
+  import uses the same walk, with no bound, to move a ref only forward.
+- Both walks read the parents of at most 10,000 changesets per call
+  (`MAX_WALK`). Past that, the call fails with `RESOURCE_EXHAUSTED`. There is
+  no resume: the state of a merge-base walk is its whole queue with marks.
+  **Planned:** a commit-graph index as derived data, such as skip lists, so
+  a call reads a few rows
+  ([#72](https://github.com/bnsd55/open-scion/issues/72)).
+- `Diff` walks both root trees at once and skips a subtree with the same ID
+  on both sides. So it reads only the trees on the paths it returns. It
+  compares file states (kind, ID, executable flag), not lines. Paths come in
+  tree order: part by part, each part by raw bytes, so `a/b` comes before
+  `a.txt`. A path that is a file on one side and a directory on the other
+  gives one entry for the file, then one for each file below the directory,
+  as `git diff --name-status`. A reply holds at most 1,000 paths
+  (`MAX_DIFF_ENTRIES`). The walk finds one more to know whether more follow,
+  and then `next_after` is the last path sent. The next call walks down to
+  that path again and continues after it. Renames are not detected, so a
+  rename is a delete and an add
+  ([#79](https://github.com/bnsd55/open-scion/issues/79)).
+
+Tests compare all three with git (`merge-base --all`,
+`merge-base --is-ancestor`, `diff --name-status --no-renames`) on a history
+with branches, a criss-cross, an octopus merge and an unrelated history.
+`scn merge-base`, `scn is-ancestor` and `scn diff` call them. `scn diff`
+asks again until `next_after` is empty. `scn is-ancestor` exits 0 for yes
+and 1 for no. Every `scn` error exits 2.
 
 `ReadFile` and `ListDir` get the changeset's root tree from `derived`
 (deriving it if the row is missing), then walk trees from SQLite one path part
@@ -630,7 +695,7 @@ an untrusted network.
 | Network | Listens on `127.0.0.1:7878` by default. A non-loopback address is refused unless `--insecure-listen` is given. | No TLS: the token and all data travel unencrypted ([#14](https://github.com/bnsd55/open-scion/issues/14)). |
 | Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. | Trees and blobs are shared by all repos. `GetObjects` reads any tree or blob by ID, and a changeset can name another repo's blob and then read it ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
-| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once, 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget, and a reply whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 1 MiB, diffs at most 100 versions and about 1M lines, and at most 4 run at once. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object inside HTTP/2 until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
+| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once (each holds one message in memory), 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget, and a reply whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 1 MiB, diffs at most 100 versions and about 1M lines, and at most 4 run at once. `MergeBase` and `IsAncestor` walk at most 10,000 changesets; a `Diff` reply holds at most 1,000 paths. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object inside HTTP/2 until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. | The client trusts the server for a ref's target and for a changeset's root tree, which it cannot check by hash. Tiers ([#5](https://github.com/bnsd55/open-scion/issues/5)) must forward these answers, not compute them. |
 | Checkout | `scn checkout` writes into a private temp directory with a random name and renames it onto a new or empty destination, never follows a symlink while writing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure the destination stays as it was. | The destination's parent must not be writable by other users, unless it has the sticky bit: they could swap the temp directory before the rename. No Windows rules: device names and names that end in a dot or a space pass. |
 | Errors | Internal errors reply `internal error`. The detail stays in the server log. | |
@@ -647,19 +712,20 @@ limit and its upgrade path. This is the list on `main` today.
 | File | Shortcut | Upgrade | Issue |
 |---|---|---|---|
 | `scion-core/src/codec.rs` (`put_len`) | Encoding panics if a field is longer than `u32::MAX`. Every ingest path caps sizes far below that. | `try_encode` returning `Result`, if a path ever does not. | |
-| `scion-server/src/store.rs` (`MAX_OBJECT_BYTES`) | An upload is buffered in memory, up to 100 MiB, before it is hashed and written. | Stream to a temp file and hash the chunks. | [#16](https://github.com/bnsd55/open-scion/issues/16) |
 | `scion-server/src/store.rs` (`Inner::db`) | One SQLite connection behind a mutex, so reads wait for writes. | A pool of read-only connections. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
 | `scion-server/src/store.rs` (`Store::open`) | One process per data directory, so an import needs the server stopped. | Let a separate importer process share the directory. Lands already re-plan when the ref moves (`MAX_ATTEMPTS`). | [#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
 | `scion-server/src/derived.rs` (`Kind::derive`) | A kind gets only its first parent's value, so a kind over the full commit graph, such as a generation number, does not fit. | Pass every parent's value, and derive ancestors in generation order. | [#76](https://github.com/bnsd55/open-scion/issues/76) |
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/land.rs` (`MAX_ATTEMPTS`) | Imports move refs without the land lock, so a land retries 3 times, then returns `ABORTED`. | Route every ref move through the per-ref lander. | [#27](https://github.com/bnsd55/open-scion/issues/27) |
-| `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | One lander per ref that rebases a batch and moves the ref once. | [#18](https://github.com/bnsd55/open-scion/issues/18) |
+| `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | Per-ref serialization in a shared database ([design](design/scalable-backend.md)). | [#47](https://github.com/bnsd55/open-scion/issues/47) |
 | `scion-server/src/land.rs` (`MAX_DEPTH`) | A land on a base more than `MAX_DEPTH` generations below the tip walks the history from the index floor back to the base, each time, and holds the database lock while it walks. | Per-path history in the database, so the check reads only the paths that the land changes. | [#38](https://github.com/bnsd55/open-scion/issues/38) |
 | `scion-server/src/objects.rs` (`read_object`) | An object ID is treated as permission to read it; trees and blobs are shared by all repos. Safe with one principal. | A read ticket bound to a principal, a repo and a root tree, checked by the server and every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/objects.rs` (`STALL_TIMEOUT`) | A stalled `GetObjects` reply ends, but HTTP/2 keeps the one encoded object it was sending until the connection closes. | A response body timeout that resets the stream. | [#42](https://github.com/bnsd55/open-scion/issues/42) |
 | `scion-server/src/objects.rs` (`send_objects`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
 | `scion-server/src/read.rs` (`MAX_SCAN`) | Path history and blame walk first parents on every call, at most 1,000 changesets per call. A path changed long ago costs many calls. | Path history as derived data. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
+| `scion-server/src/read.rs` (`MAX_WALK`) | `MergeBase` and `IsAncestor` walk the graph on every call, and fail with `RESOURCE_EXHAUSTED` past 10,000 changesets. Two changesets far apart in a deep history get no answer. | A commit-graph index as derived data, such as skip lists. | [#72](https://github.com/bnsd55/open-scion/issues/72) |
+| `scion-server/src/read.rs` (`diff`) | Renames are not detected: a rename is a delete and an add. `git diff` detects them by default. | Pair deletes and adds with the same blob, then by similarity, with a bound per call. | [#79](https://github.com/bnsd55/open-scion/issues/79) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_VERSIONS`) | One call diffs at most 100 versions of a file. A file with more versions costs more calls. | Blame as derived data, kept per file version. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_DIFF_LINES`) | One call diffs about 1M lines. A diff of many repeated lines grows faster than its lines, so one diff of two 1 MiB files is the worst case of a call. | Blame from derived data, so a call does not diff whole versions. | [#62](https://github.com/bnsd55/open-scion/issues/62) |
 | `scion-server/src/blame.rs` (`blame`) | Renames are not followed: after a rename every line goes to the rename. `git blame` follows it. | Rename detection, so the walk continues at the old path. | [#69](https://github.com/bnsd55/open-scion/issues/69) |

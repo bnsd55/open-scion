@@ -156,7 +156,8 @@ pub fn store_changeset(
     Ok((id, tree))
 }
 
-fn parts(path: &RepoPath) -> Vec<PathElem> {
+/// The parts of a path, as tree entry names.
+pub(crate) fn parts(path: &RepoPath) -> Vec<PathElem> {
     path.as_bytes()
         .split(|&b| b == b'/')
         .map(|part| PathElem::new(part).expect("a RepoPath part is a valid name"))

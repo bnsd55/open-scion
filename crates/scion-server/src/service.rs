@@ -7,14 +7,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use scion_core::{ChangesetId, RepoPath};
+use scion_core::{ChangesetId, FileState, RepoPath};
 use scion_proto::v1::scion_server::{Scion, ScionServer};
 use scion_proto::v1::{
-    BlameChangeset, BlameRange, BlameRequest, BlameResponse, CreateChangesetRequest,
-    CreateChangesetResponse, GetChangesetRequest, GetChangesetResponse, GetLandRequest,
-    LandResponse, ListDirRequest, ListDirResponse, LogEntry, LogRequest, LogResponse,
-    PutBlobRequest, PutBlobResponse, ReadFileRequest, ReadFileResponse, ResolveRefRequest,
-    ResolveRefResponse,
+    self, BlameChangeset, BlameRange, BlameRequest, BlameResponse, CreateChangesetRequest,
+    CreateChangesetResponse, DiffEntry, DiffRequest, DiffResponse, FileKind, GetChangesetRequest,
+    GetChangesetResponse, GetLandRequest, IsAncestorRequest, IsAncestorResponse, LandResponse,
+    ListDirRequest, ListDirResponse, LogEntry, LogRequest, LogResponse, MergeBaseRequest,
+    MergeBaseResponse, PutBlobRequest, PutBlobResponse, ReadFileRequest, ReadFileResponse,
+    ResolveRefRequest, ResolveRefResponse,
 };
 use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES};
 use tokio::net::TcpListener;
@@ -28,14 +29,15 @@ use crate::auth::{Auth, Caller};
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
 use crate::objects::ObjectsService;
-use crate::store::{MAX_OBJECT_BYTES, Store};
+use crate::store::Store;
 use crate::{blame, db, names, read, write};
 
 /// Most changeset bytes in one `Log` reply; the client pages for more.
 const LOG_BUDGET_BYTES: usize = MAX_MESSAGE_BYTES / 2;
 /// Most store operations running at once.
 const MAX_BLOCKING: usize = 256;
-/// Most uploads in flight at once. Each buffers up to `MAX_OBJECT_BYTES`.
+/// Most uploads read at once. Each holds one request message in memory, of up
+/// to `MAX_MESSAGE_BYTES`, and a spool file of up to `MAX_OBJECT_BYTES`.
 const MAX_UPLOADS: usize = 16;
 /// Most `Blame` calls running at once. One call can diff for seconds, so
 /// blames never take more than this many of the `MAX_BLOCKING` permits that
@@ -74,8 +76,8 @@ pub async fn serve(
 pub struct ScionService {
     worker: Worker,
     lands: Arc<Lands>,
-    /// Bounds buffered uploads, so their memory stays under
-    /// `MAX_UPLOADS * MAX_OBJECT_BYTES`.
+    /// Bounds uploads read at once (`MAX_UPLOADS`): their messages in memory
+    /// and their spool files in `tmp/`.
     uploads: Arc<Semaphore>,
     /// Bounds blames running at once (`MAX_BLAMES`).
     blames: Arc<Semaphore>,
@@ -228,13 +230,16 @@ impl Scion for ScionService {
             .await
             .ok_or_else(|| Status::invalid_argument("empty upload"))??;
         check_name("repo", &first.repo)?;
-        let repo = first.repo;
-        // Check the repo before buffering any more data.
-        let lookup = repo.clone();
-        self.worker
-            .run(move |store| store.read(|c| db::repo_id(c, &lookup)))
+        // Check the repo before reading any more data. Each message goes to
+        // the spool file before the next one is read, so an upload holds one
+        // message in memory, not the whole blob.
+        let mut upload = self
+            .worker
+            .run(move |store| {
+                store.read(|c| db::repo_id(c, &first.repo))?;
+                store.blobs().upload()?.append(&first.data)
+            })
             .await?;
-        let mut data = first.data;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             if !chunk.repo.is_empty() {
@@ -242,16 +247,11 @@ impl Scion for ScionService {
                     "only the first PutBlob message names the repo",
                 ));
             }
-            if data.len() + chunk.data.len() > MAX_OBJECT_BYTES {
-                return Err(Status::invalid_argument(format!(
-                    "blob is larger than {MAX_OBJECT_BYTES} bytes"
-                )));
-            }
-            data.extend_from_slice(&chunk.data);
+            upload = self.worker.run(move |_| upload.append(&chunk.data)).await?;
         }
         let id = self
             .worker
-            .run(move |store| write::put_blob(&store, &repo, &data))
+            .run(move |store| store.blobs().put_upload(upload))
             .await?;
         Ok(Response::new(PutBlobResponse {
             blob_id: id.as_bytes().to_vec(),
@@ -461,11 +461,90 @@ impl Scion for ScionService {
             next_changeset_id: id_bytes(blame.next),
         }))
     }
+
+    async fn merge_base(
+        &self,
+        request: Request<MergeBaseRequest>,
+    ) -> Result<Response<MergeBaseResponse>, Status> {
+        let req = request.into_inner();
+        check_name("repo", &req.repo)?;
+        let a = parse_id(&req.a_changeset_id, "a_changeset_id")?;
+        let b = parse_id(&req.b_changeset_id, "b_changeset_id")?;
+        let bases = self
+            .worker
+            .run(move |store| read::merge_base(&store, &req.repo, a, b))
+            .await?;
+        Ok(Response::new(MergeBaseResponse {
+            changeset_ids: bases.iter().map(|id| id.as_bytes().to_vec()).collect(),
+        }))
+    }
+
+    async fn is_ancestor(
+        &self,
+        request: Request<IsAncestorRequest>,
+    ) -> Result<Response<IsAncestorResponse>, Status> {
+        let req = request.into_inner();
+        check_name("repo", &req.repo)?;
+        let ancestor = parse_id(&req.ancestor_id, "ancestor_id")?;
+        let descendant = parse_id(&req.descendant_id, "descendant_id")?;
+        let is_ancestor = self
+            .worker
+            .run(move |store| read::is_ancestor(&store, &req.repo, ancestor, descendant))
+            .await?;
+        Ok(Response::new(IsAncestorResponse { is_ancestor }))
+    }
+
+    async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<DiffResponse>, Status> {
+        let req = request.into_inner();
+        check_name("repo", &req.repo)?;
+        let old = parse_id(&req.old_changeset_id, "old_changeset_id")?;
+        let new = parse_id(&req.new_changeset_id, "new_changeset_id")?;
+        let path = parse_optional_path(req.path)?;
+        let after = parse_optional_path(req.after)?;
+        let page = self
+            .worker
+            .run(move |store| {
+                read::diff(&store, &req.repo, old, new, path.as_ref(), after.as_ref())
+            })
+            .await?;
+        let entries = page
+            .entries
+            .into_iter()
+            .map(|entry| DiffEntry {
+                path: entry.path.as_bytes().to_vec(),
+                old: entry.old.map(file_state),
+                new: entry.new.map(file_state),
+            })
+            .collect();
+        Ok(Response::new(DiffResponse {
+            entries,
+            next_after: page
+                .next_after
+                .map(|path| path.as_bytes().to_vec())
+                .unwrap_or_default(),
+        }))
+    }
 }
 
 /// An optional changeset ID on the wire: empty for `None`.
 fn id_bytes(id: Option<ChangesetId>) -> Vec<u8> {
     id.map(|id| id.as_bytes().to_vec()).unwrap_or_default()
+}
+
+fn file_state(state: FileState) -> v1::FileState {
+    let (kind, id, executable) = match state {
+        FileState::Regular {
+            content,
+            executable,
+        } => (FileKind::Regular, content.as_bytes().to_vec(), executable),
+        FileState::Symlink { target } => (FileKind::Symlink, target.as_bytes().to_vec(), false),
+        FileState::Gitlink { commit } => (FileKind::Gitlink, commit.as_bytes().to_vec(), false),
+    };
+    v1::FileState {
+        kind: kind.into(),
+        id,
+        executable,
+    }
 }
 
 #[cfg(test)]
