@@ -44,6 +44,9 @@ release.
   each line's path when some line came from another path, as git does, and
   `--json` adds `path` to each range. A client that ignores `next_path`
   continues at the wrong path after a rename.
+- `Blame` reads files of up to 16 MiB and 1,048,576 lines (was 1 MiB), and
+  blames a binary file line by line, as `git blame` does. A long line counts
+  once per 64 bytes against the per-call budget.
 - Bearer-token auth, loopback-only listening by default, request limits and
   name validation at the RPC boundary.
 - `scion-tier`: the cache tiers. `scion-cache` keeps objects in memory and
