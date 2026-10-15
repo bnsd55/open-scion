@@ -142,26 +142,47 @@ pub fn first_parent(c: &Connection, id: ChangesetId) -> Result<Option<ChangesetI
     parent.map(|bytes| to_id(&bytes)).transpose()
 }
 
+/// Every parent of a changeset, in order, with its generation. The parents
+/// of a changeset in a repo are in that repo too ([`insert_changeset`]).
+///
+/// # Errors
+///
+/// Database errors.
+pub fn parents(c: &Connection, id: ChangesetId) -> Result<Vec<(ChangesetId, i64)>> {
+    let mut parents = c.prepare_cached(
+        "SELECT parent, gen FROM changeset_parents JOIN changesets ON id = parent
+         WHERE cs = ?1 ORDER BY n",
+    )?;
+    let rows = parents.query_map([id.as_bytes()], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    rows.map(|row| {
+        let (parent, parent_gen) = row?;
+        Ok((to_id(&parent)?, parent_gen))
+    })
+    .collect()
+}
+
 /// Whether `ancestor` is `descendant` or reachable from it through parents.
 ///
 /// Walks every parent, not only first parents. A parent's generation is
 /// always below its child's, so the walk never goes below the generation of
-/// `ancestor`, and visits each changeset at most once.
+/// `ancestor`, and visits each changeset at most once. It reads the parents
+/// of at most `max_visits` changesets.
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] if `repo` does not have either changeset.
+/// [`Error::ResourceExhausted`] if the walk needs more than `max_visits`
+/// changesets.
 pub fn is_ancestor(
     c: &Connection,
     repo: RepoId,
     ancestor: ChangesetId,
     descendant: ChangesetId,
+    max_visits: usize,
 ) -> Result<bool> {
     let floor = generation(c, repo, ancestor)?;
-    let mut parents = c.prepare_cached(
-        "SELECT parent, gen FROM changeset_parents JOIN changesets ON id = parent
-         WHERE cs = ?1",
-    )?;
     let mut seen = HashSet::new();
     let mut stack = vec![(descendant, generation(c, repo, descendant)?)];
     while let Some((id, id_gen)) = stack.pop() {
@@ -171,15 +192,19 @@ pub fn is_ancestor(
         if id_gen <= floor || !seen.insert(id) {
             continue;
         }
-        let rows = parents.query_map([id.as_bytes()], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        for row in rows {
-            let (parent, parent_gen) = row?;
-            stack.push((to_id(&parent)?, parent_gen));
+        if seen.len() > max_visits {
+            return Err(too_deep(max_visits));
         }
+        stack.extend(parents(c, id)?);
     }
     Ok(false)
+}
+
+/// The error of a graph walk that reached its bound.
+pub(crate) fn too_deep(max_visits: usize) -> Error {
+    Error::ResourceExhausted(format!(
+        "the history is too deep: the answer needs more than {max_visits} changesets"
+    ))
 }
 
 /// Where a ref points, if it exists.
