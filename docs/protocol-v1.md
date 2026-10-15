@@ -483,10 +483,13 @@ repository.
 - If one changeset is an ancestor of the other, the answer is that one.
   `changeset_ids` is empty when the two histories share no changeset.
 
-**Bound.** The server walks from both changesets, highest generation first,
-and reads the parents of at most 10,000 changesets. It stops early once no
-other best common ancestor can follow. If the answer needs more, the call
-fails with `RESOURCE_EXHAUSTED`. There is no resume.
+**Bound.** A call takes at most 10,000 steps. A step reads one changeset's
+parents, or one entry of the server's commit-graph index. When neither
+first-parent history has a merge newer than where the two meet, the answer
+takes a few dozen steps, at any depth. Otherwise the server walks from both
+changesets, highest generation first, and stops early once no other best
+common ancestor can follow. If the answer needs more, the call fails with
+`RESOURCE_EXHAUSTED`. There is no resume.
 
 | Error | When |
 |---|---|
@@ -500,11 +503,12 @@ fails with `RESOURCE_EXHAUSTED`. There is no resume.
 `is_ancestor` is true when `ancestor_id` is `descendant_id`, or is reached
 from it through parents. Ancestry follows every parent, as in `MergeBase`.
 
-**Bound.** The server reads the parents of at most 10,000 changesets, and
-never goes below the generation of `ancestor_id`. So when the two differ
-and `ancestor_id`'s generation is not lower, the answer is false without a
-walk. If the answer
-needs more, the call fails with `RESOURCE_EXHAUSTED`.
+**Bound.** A call takes at most 10,000 steps, as in `MergeBase`, and never
+goes below the generation of `ancestor_id`. So when the two differ and
+`ancestor_id`'s generation is not lower, the answer is false. Without a
+merge between the two, the answer takes a few dozen steps, at any depth.
+Each merge newer than `ancestor_id` that the search reaches costs three
+steps. If the answer needs more, the call fails with `RESOURCE_EXHAUSTED`.
 
 | Error | When |
 |---|---|
@@ -707,7 +711,7 @@ A new version is a new package, `scion.v2`. A server MAY serve both.
 - Client changesets with no parent, several parents or a committer. Only git
   import makes them.
 - Text merge. Conflicts are path-level.
-- `MergeBase` and `IsAncestor` without a bound on the walk
+- `MergeBase` and `IsAncestor` without a bound across many merges
   ([#72](https://github.com/bnsd55/open-scion/issues/72)), and `Diff` with
   rename detection ([#79](https://github.com/bnsd55/open-scion/issues/79)).
 - `Log` and `Blame` without per-call bounds

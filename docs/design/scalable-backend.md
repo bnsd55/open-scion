@@ -239,7 +239,9 @@ first-parent skip list as derived data
 extra jump pointer per changeset in a skew-binary scheme. From the head, the
 server finds the first-parent ancestor at B's generation in O(log n) reads,
 and compares it with B. The article keeps "skip lists for the commit graph".
-This proposal needs only a first-parent one for lands.
+This proposal needs only a first-parent one for lands. The commit graph on
+`main` (`graph.rs`) now keeps that skip list, but the land check does not
+read it yet.
 
 Both kinds are keyed by changeset, not by ref. A new ref, or an import that
 moves a ref to a descendant through a second parent, needs no rebuild: the

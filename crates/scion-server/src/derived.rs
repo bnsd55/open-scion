@@ -133,7 +133,8 @@ pub fn fill<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::
         ControlFlow::Break(value) => return Ok(value),
         ControlFlow::Continue(pending) => pending,
     };
-    derive_steps::<K>(store, repo, &pending)?.ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
+    derive_steps::<K>(store, repo, &pending)?
+        .ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
 }
 
 /// Fills `K` for `cs` and its history as [`fill`] does, then removes every
@@ -189,11 +190,11 @@ pub fn put<K: Kind>(c: &Connection, cs: ChangesetId, value: &K::Value) -> Result
 ///
 /// Errors of [`Kind::derive`].
 pub fn on_write<K: Kind>(c: &Connection, id: ChangesetId, changeset: &Changeset) -> Result<()> {
-    if load::<K>(c, id)?.is_none() {
-        if let Some(parents) = parent_values::<K>(c, changeset)? {
-            let value = K::derive(c, id, changeset, parents)?;
-            put::<K>(c, id, &value)?;
-        }
+    if load::<K>(c, id)?.is_none()
+        && let Some(parents) = parent_values::<K>(c, changeset)?
+    {
+        let value = K::derive(c, id, changeset, parents)?;
+        put::<K>(c, id, &value)?;
     }
     remove_old::<K>(c)?;
     Ok(())

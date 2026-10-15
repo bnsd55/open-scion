@@ -225,7 +225,16 @@ pub fn merge_bases(
     let a_node = derived::get::<CommitGraph>(store, repo, a)?;
     let b_node = derived::get::<CommitGraph>(store, repo, b)?;
     store.read(|c| {
-        let (a, b) = (At { id: a, node: a_node }, At { id: b, node: b_node });
+        let (a, b) = (
+            At {
+                id: a,
+                node: a_node,
+            },
+            At {
+                id: b,
+                node: b_node,
+            },
+        );
         match meeting(&mut Index::new(c, max_reads), a, b)? {
             Some(bases) => Ok(bases),
             None => db::merge_bases(c, repo, a.id, b.id, max_reads),
@@ -420,7 +429,11 @@ mod tests {
         for parent in 0..depth {
             let jump = jumps[usize::try_from(parent).unwrap()];
             let after = jumps[usize::try_from(jump).unwrap()];
-            jumps.push(if parent - jump == jump - after { after } else { parent });
+            jumps.push(if parent - jump == jump - after {
+                after
+            } else {
+                parent
+            });
         }
         jumps[usize::try_from(depth).unwrap()]
     }
@@ -617,6 +630,18 @@ mod tests {
         let met = merge_bases(&store, repo, ids[2], ids[4], usize::MAX).unwrap();
         assert_eq!(met, [ids[2]]);
         assert_eq!(store.commits(), commits, "the next queries derive nothing");
+
+        // A write stores the node of a changeset whose parents have one.
+        let cs = Changeset {
+            parents: vec![ids[4], ids[1]],
+            ..store.read(|c| db::get_changeset(c, repo, ids[4])).unwrap()
+        };
+        let (merge, _) = store
+            .write(|c| crate::tree::store_changeset(c, repo, &cs))
+            .unwrap();
+        let commits = store.commits();
+        assert!(is_ancestor(&store, repo, ids[1], merge, usize::MAX).unwrap());
+        assert_eq!(store.commits(), commits, "the write stored the node");
     }
 
     #[test]
