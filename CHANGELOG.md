@@ -41,5 +41,8 @@ release.
   full, it starts over at the tip, and the lands still get the same answers.
 - A land walks at most 100,000 changesets below the path index. A base
   further back is `REJECTED` as too old, and the client must rebase.
+- A land checks the request deadline in its long loops, because a timeout
+  does not stop a running job. Past it, the land fails with
+  `DEADLINE_EXCEEDED` and stays pending.
 - `docs/protocol-v1.md`: the contract of the `Scion` and `Objects` services,
   for independent clients, tiers and servers.

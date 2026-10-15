@@ -372,6 +372,9 @@ impl Scion for ScionService {
         &self,
         request: Request<scion_proto::v1::LandRequest>,
     ) -> Result<Response<LandResponse>, Status> {
+        // The job checks it in its walks: a request timeout does not stop a
+        // job that is already running.
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
         let caller = caller(&request)?;
         let req = request.into_inner();
         check_name("repo", &req.repo)?;
@@ -382,6 +385,7 @@ impl Scion for ScionService {
             repo: req.repo,
             target_ref: req.target_ref,
             request_key: req.request_key,
+            deadline,
         };
         let lands = Arc::clone(&self.lands);
         let outcome = self

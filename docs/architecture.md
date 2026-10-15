@@ -43,7 +43,10 @@ How one request flows through the server:
    request times out after 600 s; for a streamed reply that covers only its
    start. A `GetObjects` reply ends when its client takes no object for
    120 s. A `ReadFile` reply ends when its client takes no part for 120 s,
-   or 600 s after the call started.
+   or 600 s after the call started. A timeout does not stop a job that is
+   already running, so a land checks the same deadline in its long loops
+   (the index advance and the walks back to a base). Past it, the land
+   stops with `DEADLINE_EXCEEDED` and stays pending.
 3. `error.rs` maps errors to gRPC codes. Database, I/O, git and corruption
    errors reply `INTERNAL`. The detail goes only to the server log.
 
@@ -316,8 +319,10 @@ ref's first-parent history, from a `floor` changeset to the `tip`:
 It is built on the first land to a ref. It grows forward when the ref moves,
 and backward when a land has an older base, down to `MAX_DEPTH` (one cycle,
 10,000) generations below the tip. If the head does not descend from the tip,
-it starts over. After an error other than `ABORTED` it is dropped and
-rebuilt, because it may be ahead of the database.
+it starts over. After an error other than `ABORTED` or `DEADLINE_EXCEEDED`
+it is dropped and rebuilt, because it may be ahead of the database. A
+deadline stops it between two whole changesets, so a retry goes on from
+there.
 
 A changed path `p` conflicts when one of these is newer than the base:
 `files[p]` (the same path changed), `dirs[p]` (something below `p` changed),

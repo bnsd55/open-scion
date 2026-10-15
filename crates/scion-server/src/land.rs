@@ -8,7 +8,8 @@
 //!   2. take the ref's lock: one land at a time per ref
 //!   3. if the row is no longer pending, return it (a retry, or a duplicate)
 //!   4. plan: one parent, base on the ref's first-parent history,
-//!      no path changed on the ref after the base
+//!      no path changed on the ref after the base. Its walks stop at the
+//!      request's deadline, and the land stays pending
 //!   5. one transaction: apply to the head tree, store the rebased changeset,
 //!      compare-and-swap the ref, mark the land landed. If an import moved
 //!      the ref since step 4, roll back and go to step 4.
@@ -22,6 +23,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use scion_core::{Changeset, ChangesetId, FileState, RepoPath};
@@ -136,6 +138,9 @@ pub struct LandRequest {
     pub target_ref: String,
     /// Caller-chosen key. A retry with the same key returns the same land.
     pub request_key: String,
+    /// When the server gives up on the request. The plan stops at it with
+    /// [`Error::DeadlineExceeded`], and the land stays pending.
+    pub deadline: Instant,
 }
 
 /// The result of a land.
@@ -170,8 +175,9 @@ impl Lands {
     /// [`Error::NotFound`] if the repo or changeset does not exist.
     /// [`Error::InvalidArgument`] for a malformed request, or a request key
     /// reused for a different land. [`Error::Aborted`] if other writers kept
-    /// moving the ref; the land stays pending and a retry with the same
-    /// request key resumes it. Store errors otherwise.
+    /// moving the ref, and [`Error::DeadlineExceeded`] if the plan ran past
+    /// the request's deadline. The land then stays pending, and a retry with
+    /// the same request key resumes it. Store errors otherwise.
     pub fn land(&self, store: &Store, caller: &Caller, req: &LandRequest) -> Result<LandOutcome> {
         let outcome = self.land_committed(store, caller, req)?;
         // Lands on one ref commit one at a time. Waiting for the flush after
@@ -210,10 +216,12 @@ impl Lands {
         }
         let result = finish(store, repo, land_id, req, &mut index);
         // The index may be ahead of the database; rebuild it next time. A lost
-        // race wrote nothing, so the index is still good.
+        // race wrote nothing, so the index is still good. So is an index that
+        // a deadline stopped: it grows one whole changeset at a time, and a
+        // retry goes on from there.
         if result
             .as_ref()
-            .is_err_and(|e| !matches!(e, Error::Aborted(_)))
+            .is_err_and(|e| !matches!(e, Error::Aborted(_) | Error::DeadlineExceeded(_)))
         {
             *index = None;
         }
@@ -455,8 +463,8 @@ fn plan(
         Some(index) => index,
         None => index.insert(PathIndex::new(c, repo, head.target)?),
     };
-    index.advance_to(c, repo, head.target)?;
-    let conflicts = match index.check(c, repo, base, &cs.changes)? {
+    index.advance_to(c, repo, head.target, req.deadline)?;
+    let conflicts = match index.check(c, repo, base, &cs.changes, req.deadline)? {
         Checked::Paths(conflicts) => conflicts,
         Checked::NotOnHistory => {
             return Ok(Plan::Reject(format!(
@@ -600,7 +608,13 @@ impl PathIndex {
     /// over at `head` if `head` does not descend from the tip (the ref moved
     /// to other history), or if those changesets would not fit in
     /// [`MAX_INDEX_BYTES`].
-    fn advance_to(&mut self, c: &Connection, repo: RepoId, head: ChangesetId) -> Result<()> {
+    fn advance_to(
+        &mut self,
+        c: &Connection,
+        repo: RepoId,
+        head: ChangesetId,
+        deadline: Instant,
+    ) -> Result<()> {
         if head == self.tip {
             return Ok(());
         }
@@ -616,6 +630,7 @@ impl PathIndex {
                 self.tip = head;
                 return Ok(());
             }
+            check_deadline(deadline)?;
             let generation = db::generation(c, repo, id)?;
             if generation <= tip_gen {
                 break;
@@ -650,6 +665,7 @@ impl PathIndex {
         repo: RepoId,
         base: ChangesetId,
         changes: &BTreeMap<RepoPath, Option<FileState>>,
+        deadline: Instant,
     ) -> Result<Checked> {
         let base_gen = db::generation(c, repo, base)?;
         let tip_gen = match self.chain.last_key_value() {
@@ -662,10 +678,11 @@ impl PathIndex {
             let mut walk = if deep {
                 Walk::Stopped
             } else {
-                self.reach(c, repo, base, base_gen)?
+                self.reach(c, repo, base, base_gen, deadline)?
             };
             if walk == Walk::Stopped {
-                walk = touched_below(c, repo, self.floor, base, base_gen, changes, &mut below)?;
+                (walk, below) =
+                    touched_below(c, repo, self.floor, base, base_gen, changes, deadline)?;
             }
             match walk {
                 Walk::Reached => {}
@@ -701,17 +718,27 @@ impl PathIndex {
         repo: RepoId,
         base: ChangesetId,
         base_gen: i64,
+        deadline: Instant,
     ) -> Result<Walk> {
-        walk_back(c, repo, self.floor, base, base_gen, |id, generation, cs| {
-            if self.bytes + added_bytes(&cs.changes) > MAX_INDEX_BYTES {
-                return false;
-            }
-            self.add(id, generation, &cs.changes);
-            if let Some(&parent) = cs.parents.first() {
-                self.floor = parent;
-            }
-            true
-        })
+        let floor = self.floor;
+        walk_back(
+            c,
+            repo,
+            floor,
+            base,
+            base_gen,
+            deadline,
+            |id, generation, cs| {
+                if self.bytes + added_bytes(&cs.changes) > MAX_INDEX_BYTES {
+                    return false;
+                }
+                self.add(id, generation, &cs.changes);
+                if let Some(&parent) = cs.parents.first() {
+                    self.floor = parent;
+                }
+                true
+            },
+        )
     }
 
     /// Whether a changeset after `base_gen` touched `path`: the same path, a
@@ -836,16 +863,19 @@ enum Walk {
 
 /// Walks first parents from `from` back to `base`, and passes each changeset
 /// after `base` to `visit`, newest first, while `visit` returns `true`.
+/// Fails with [`Error::DeadlineExceeded`] once `deadline` has passed.
 fn walk_back(
     c: &Connection,
     repo: RepoId,
     from: ChangesetId,
     base: ChangesetId,
     base_gen: i64,
+    deadline: Instant,
     mut visit: impl FnMut(ChangesetId, i64, &Changeset) -> bool,
 ) -> Result<Walk> {
     let mut cur = from;
     loop {
+        check_deadline(deadline)?;
         let generation = db::generation(c, repo, cur)?;
         if generation <= base_gen {
             return Ok(Walk::Missed);
@@ -863,7 +893,7 @@ fn walk_back(
 }
 
 /// For a base that the index cannot reach: walks the history from `floor`
-/// back to `base`, and adds to `hits` each path in `land` that the walked
+/// back to `base`, and returns each path in `land` that the walked
 /// changesets touched, by the rule of [`PathIndex::touches`]. Keeps only the
 /// land's own paths and directories, so memory follows the land, not the
 /// depth. Stops after [`MAX_WALK`] changesets.
@@ -874,8 +904,8 @@ fn touched_below<'a>(
     base: ChangesetId,
     base_gen: i64,
     land: &'a BTreeMap<RepoPath, Option<FileState>>,
-    hits: &mut HashSet<&'a [u8]>,
-) -> Result<Walk> {
+    deadline: Instant,
+) -> Result<(Walk, HashSet<&'a [u8]>)> {
     let paths: HashSet<&[u8]> = land.keys().map(RepoPath::as_bytes).collect();
     let parents: HashSet<&[u8]> = paths.iter().flat_map(|p| ancestors(p)).collect();
     // What `files` and `dirs` of an index over the walk would hold, kept only
@@ -883,7 +913,7 @@ fn touched_below<'a>(
     let mut files: HashSet<&[u8]> = HashSet::new();
     let mut dirs: HashSet<&[u8]> = HashSet::new();
     let mut walked = 0;
-    let walk = walk_back(c, repo, floor, base, base_gen, |_, _, cs| {
+    let walk = walk_back(c, repo, floor, base, base_gen, deadline, |_, _, cs| {
         if walked == MAX_WALK {
             return false;
         }
@@ -902,10 +932,22 @@ fn touched_below<'a>(
     } else {
         tracing::debug!(base_gen, walked, ?walk, "checked an old base");
     }
-    hits.extend(paths.into_iter().filter(|&path| {
+    let hits = paths.into_iter().filter(|&path| {
         files.contains(path) || dirs.contains(path) || ancestors(path).any(|d| files.contains(d))
-    }));
-    Ok(walk)
+    });
+    Ok((walk, hits.collect()))
+}
+
+/// Fails once `deadline` has passed. A request timeout does not stop a job
+/// already running, so the long loops of a land call this. Nothing has been
+/// written yet, so the land stays pending.
+fn check_deadline(deadline: Instant) -> Result<()> {
+    if Instant::now() < deadline {
+        return Ok(());
+    }
+    Err(Error::DeadlineExceeded(
+        "the land ran past its deadline; it stays pending, retry with the same request key".into(),
+    ))
 }
 
 /// Raises `key` to `generation`. Returns the bytes added: those of a new
@@ -1022,6 +1064,7 @@ mod tests {
             changeset: cs,
             target_ref: "main".into(),
             request_key: key.into(),
+            deadline: Instant::now() + std::time::Duration::from_secs(600),
         }
     }
 
@@ -1434,6 +1477,40 @@ mod tests {
             f.fill(&format!("g{round}/"), cycle());
             let moved = f.index(|index| index.floor);
             assert!(f.generation(moved) > f.generation(floor), "round {round}");
+        }
+    }
+
+    #[test]
+    fn a_land_past_its_deadline_stays_pending_and_a_retry_finishes_it() {
+        use LandState::{Conflict, Landed};
+        let f = fixture();
+        // The index starts at B, so root is below its floor.
+        f.move_main(f.commit(f.root, &[put("b/y", "B")]));
+        f.fill("f", 1);
+        // An import moves main, so the next plan advances the index.
+        f.move_main(f.commit(f.main().target, &[put("c", "import")]));
+        let on_head = f.commit(f.main().target, &[put("a/x", "mine")]);
+        // The plan of this one walks back from the floor.
+        let on_root = f.commit(f.root, &[put("c", "mine")]);
+        for (cs, key, state) in [(on_head, "head", Landed), (on_root, "root", Conflict)] {
+            let before = f.main();
+            let late = LandRequest {
+                deadline: Instant::now(),
+                ..req(cs, key)
+            };
+            let err = f.lands.land(&f.store, &caller(), &late).unwrap_err();
+            assert!(matches!(err, Error::DeadlineExceeded(_)), "{key}: {err}");
+            assert_eq!(f.main(), before, "{key}");
+            let sql = "SELECT state FROM lands WHERE request_key = ?1";
+            let row: String = f
+                .store
+                .read(|c| Ok(c.query_row(sql, [key], |row| row.get(0))?))
+                .unwrap();
+            assert_eq!(row, "pending", "{key}");
+            // The index stays, so a retry goes on from where the plan stopped.
+            f.index(|_| ());
+            let out = f.land(cs, key);
+            assert_eq!(out.state, state, "{key}: {}", out.detail);
         }
     }
 

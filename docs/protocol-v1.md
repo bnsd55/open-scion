@@ -107,7 +107,7 @@ contract. A client MUST NOT depend on its text.
 | `ABORTED` | `Land` only: other writers kept moving the ref. The land stays `PENDING`. | Yes, with the same request key |
 | `OUT_OF_RANGE` | A message is larger than its limit. | After the cause is fixed |
 | `CANCELLED` | The server's 600 s limit or the client's `grpc-timeout` ran out. A client library can report its own deadline as `DEADLINE_EXCEEDED`. | Yes. A `Land` retry uses the same request key. |
-| `DEADLINE_EXCEEDED` | `ReadFile`: the reply ran past 600 s from the start of the call, or the client took no message for 120 s. | Yes |
+| `DEADLINE_EXCEEDED` | `ReadFile`: the reply ran past 600 s from the start of the call, or the client took no message for 120 s. `Land`: the server stopped the land at 600 s from the start of the call. The land stays `PENDING`. | Yes. A `Land` retry uses the same request key. |
 | `UNAVAILABLE` | The server cannot be reached or is shutting down. | Yes |
 | `INTERNAL` | A database, I/O or stored-data error, or a server bug. The message is `internal error`; the detail stays in the server log. | MAY |
 | `UNIMPLEMENTED` | The server does not have the call, or the request is compressed. | After the cause is fixed |
@@ -134,9 +134,9 @@ exists. After a power loss, `GetObjects` can then return `NOT_FOUND` for that
 tree until a `GetRootTree` of its changeset derives it again.
 
 A call that fails or is cut off MAY have done part of its work. In particular
-a `Land` that returned `ABORTED` or `CANCELLED`, or whose reply was lost, can
-be pending or finished on the server. The client finds out with a retry under
-the same request key (section 6.3).
+a `Land` that returned `ABORTED`, `CANCELLED` or `DEADLINE_EXCEEDED`, or whose
+reply was lost, can be pending or finished on the server. The client finds
+out with a retry under the same request key (section 6.3).
 
 ## 5. Object IDs and verification
 
@@ -292,9 +292,10 @@ stays `PENDING`.
   `INVALID_ARGUMENT`.
 - A finished outcome is final for its key. A retry returns it even if the ref
   has changed since. To try again, a client uses a new key.
-- A client that retries after `ABORTED`, `CANCELLED`, `UNAVAILABLE` or a
-  lost reply MUST use the same key, so that it never lands the same change
-  twice. `scn land` uses `<changeset ID>:<ref>` as its default key.
+- A client that retries after `ABORTED`, `CANCELLED`, `DEADLINE_EXCEEDED`,
+  `UNAVAILABLE` or a lost reply MUST use the same key, so that it never
+  lands the same change twice. `scn land` uses `<changeset ID>:<ref>` as its
+  default key.
 - The server keeps a finished land for at least 7 days after it finished. A
   pending land is kept until it finishes. Within that time a retry with the
   same key is safe.
@@ -309,6 +310,7 @@ stays `PENDING`.
 | `INVALID_ARGUMENT` | A bad name or ID; a request key already used for a different changeset or ref. |
 | `NOT_FOUND` | The repo does not exist, or the repo does not have the changeset. |
 | `ABORTED` | The ref kept moving. The land stays `PENDING`. Retry with the same key. |
+| `DEADLINE_EXCEEDED` | The check ran past 600 s from the start of the call. The land stays `PENDING`. Retry with the same key. |
 
 ### 6.4 GetLand
 

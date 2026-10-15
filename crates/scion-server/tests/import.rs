@@ -7,6 +7,7 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use gix::ObjectId;
 use rusqlite::{Connection, params};
@@ -619,6 +620,7 @@ fn import_never_moves_a_ref_off_a_land() {
         changeset: created,
         target_ref: "main".into(),
         request_key: "k".into(),
+        deadline: Instant::now() + Duration::from_secs(600),
     };
     let outcome = Lands::default()
         .land(&store, &Caller("t".into()), &request)
