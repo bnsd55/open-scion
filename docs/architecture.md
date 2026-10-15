@@ -127,8 +127,12 @@ a mutex. Write transactions use `BEGIN IMMEDIATE`.
 
 **Blob folder.** One zstd file per blob, at most 100 MiB uncompressed. A write
 goes to a temp file in `tmp/`, is flushed, and is renamed into place. A read
-unpacks the file and checks its hash. A file that does not match its ID is
-corrupt, and the next put of that content replaces it.
+unpacks the file and checks its hash. A check that does not need the content
+(`Blobs::verify`, used by puts, `CreateChangeset` and import) streams the file
+through the decoder into the hasher, so it holds the zstd window and small
+buffers, not the whole blob. A file that does not match its ID, or that
+unpacks to more than 100 MiB, is corrupt, and the next put of that content
+replaces it.
 
 **Durability rules.**
 
@@ -601,7 +605,6 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/store.rs` (`MAX_OBJECT_BYTES`) | An upload is buffered in memory, up to 100 MiB, before it is hashed and written. | Stream to a temp file and hash the chunks. | [#16](https://github.com/bnsd55/open-scion/issues/16) |
 | `scion-server/src/store.rs` (`Inner::db`) | One SQLite connection behind a mutex, so reads wait for writes. | A pool of read-only connections. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
 | `scion-server/src/store.rs` (`Store::open`) | One process per data directory, so an import needs the server stopped. | Let a separate importer process share the directory. Lands already re-plan when the ref moves (`MAX_ATTEMPTS`). | [#27](https://github.com/bnsd55/open-scion/issues/27) |
-| `scion-server/src/store.rs` (`Blobs::verify`) | Holds the packed and the unpacked bytes, up to about 200 MiB per call. | Stream the unpacked bytes into the hasher. | [#20](https://github.com/bnsd55/open-scion/issues/20) |
 | `scion-server/src/store.rs` (`Store::flush`) | Between a commit and its full flush, other calls can read the commit, and a power loss can undo what they saw. | Hide commits until their flush, or a lander that batches lands. | [#18](https://github.com/bnsd55/open-scion/issues/18) |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |

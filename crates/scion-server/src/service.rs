@@ -126,7 +126,11 @@ impl Worker {
             f(store)
         })
         .await
-        .map_err(|e| Status::internal(format!("worker failed: {e}")))?
+        .map_err(|e| {
+            // A panic's message stays in the server log, not in the reply.
+            tracing::error!(error = %e, "worker failed");
+            Status::internal("internal error")
+        })?
         .map_err(Status::from)
     }
 }
@@ -386,5 +390,22 @@ impl Scion for ScionService {
             });
         }
         Ok(Response::new(LogResponse { entries }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_worker_panic_does_not_reach_the_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker = Worker::new(Store::open(dir.path()).unwrap());
+        let status = worker
+            .run(|_| -> Result<()> { panic!("secret detail") })
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert_eq!(status.message(), "internal error");
     }
 }

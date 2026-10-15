@@ -1,15 +1,19 @@
 use std::fmt;
+use std::io;
 use std::str::FromStr;
 
 const BLOB_DOMAIN: &[u8] = b"scion\0blob\0v1\0";
 const CHANGESET_DOMAIN: &[u8] = b"scion\0changeset\0v1\0";
 const TREE_DOMAIN: &[u8] = b"scion\0tree\0v1\0";
 
-fn domain_hash(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
+fn domain_hasher(domain: &[u8]) -> blake3::Hasher {
     let mut hasher = blake3::Hasher::new();
     hasher.update(domain);
-    hasher.update(bytes);
-    *hasher.finalize().as_bytes()
+    hasher
+}
+
+fn domain_hash(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
+    *domain_hasher(domain).update(bytes).finalize().as_bytes()
 }
 
 macro_rules! object_id {
@@ -104,5 +108,17 @@ impl BlobId {
     #[must_use]
     pub fn of(raw: &[u8]) -> Self {
         Self::hash(raw)
+    }
+
+    /// The ID of the content that `reader` gives until its end. Reads in
+    /// small parts, so it never holds the whole content.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error of `reader`.
+    pub fn of_reader(reader: impl io::Read) -> io::Result<Self> {
+        let mut hasher = domain_hasher(BLOB_DOMAIN);
+        hasher.update_reader(reader)?;
+        Ok(Self(*hasher.finalize().as_bytes()))
     }
 }

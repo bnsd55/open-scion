@@ -170,6 +170,8 @@ fn blob_ids() {
         BlobId::of(b"# demo\n").to_string(),
         "20d3380696d2b5af0b85ae1dc2595c086aecc40db3702c88607725cd8d930c2a"
     );
+    let streamed = BlobId::of_reader(&b"# demo\n"[..]).unwrap();
+    assert_eq!(streamed, BlobId::of(b"# demo\n"));
 }
 
 #[test]
