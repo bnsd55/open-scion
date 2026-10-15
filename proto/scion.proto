@@ -216,8 +216,12 @@ message BlameResponse {
   repeated BlameChangeset changesets = 2;
   // Set when a call stopped at its bound before every line had a
   // changeset. The ranges without a changeset came from this changeset or
-  // an older one. Blame the same path here to continue.
+  // an older one. Blame next_path here to continue.
   bytes next_changeset_id = 3;
+  // The path of the file at next_changeset_id, set with it. It differs from
+  // the requested path when the walk followed a rename. Empty from a server
+  // that does not follow renames: then it is the requested path.
+  bytes next_path = 4;
 }
 
 message BlameRange {
@@ -227,8 +231,9 @@ message BlameRange {
   // The changeset that last changed these lines. Empty when the call
   // stopped first: see BlameResponse.next_changeset_id.
   bytes changeset_id = 3;
-  // The first line, counting from 1, in the file at changeset_id, or at
-  // next_changeset_id when changeset_id is empty.
+  // The first line, counting from 1, in the file at changeset_id (at its
+  // BlameChangeset.path), or at next_changeset_id (at next_path) when
+  // changeset_id is empty.
   uint32 origin_line = 4;
 }
 
@@ -238,6 +243,11 @@ message BlameChangeset {
   bytes author_email = 3;
   int64 author_unix_secs = 4;
   int32 author_tz_offset_minutes = 5;
+  // The path of the file at this changeset, where origin_line counts. It
+  // differs from the requested path when the walk followed a rename. Empty
+  // from a server that does not follow renames: then it is the requested
+  // path.
+  bytes path = 6;
 }
 
 message MergeBaseRequest {

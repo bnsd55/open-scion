@@ -37,8 +37,25 @@ release.
   and the client continues where a call stopped. An older server ignores
   the new `path` field, so `scn log --path` against it prints unfiltered
   history.
+- `Blame` follows renames as `git blame` does by default: a deleted file
+  with the same content, else a similar one (50% or more). Each changeset in
+  a reply names the path of the file there (`BlameChangeset.path`), and a
+  reply that stops says where to continue (`next_path`). `scn blame` shows
+  each line's path when some line came from another path, as git does, and
+  `--json` adds `path` to each range. A client that ignores `next_path`
+  continues at the wrong path after a rename.
 - Bearer-token auth, loopback-only listening by default, request limits and
   name validation at the RPC boundary.
+- `ReadFile` streams a file in 1 MiB parts from the zstd decoder, under a
+  256 MiB budget for all replies. It checks the content against its ID
+  before the last part, and ends a stalled reply with `DEADLINE_EXCEEDED`.
+- The path index of each ref stays within a budget of 128 MiB. When it is
+  full, it starts over at the tip, and the lands still get the same answers.
+- A land walks at most 100,000 changesets below the path index. A base
+  further back is `REJECTED` as too old, and the client must rebase.
+- A land stops in its long loops 600 s after its call started, or as soon
+  as its call is dropped by a timeout or by the client, because neither
+  stops a running job. The land stays pending.
 - `scion-tier`: the cache tiers. `scion-cache` keeps objects in memory and
   `scion-daemon` keeps them on disk, each under a byte limit, least recently
   used out first. The daemon listens on a Unix socket with mode 0600. Each

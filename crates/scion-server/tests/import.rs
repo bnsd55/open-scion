@@ -7,6 +7,7 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use gix::ObjectId;
 use rusqlite::{Connection, params};
@@ -15,7 +16,7 @@ use scion_core::{
 };
 use scion_server::auth::Caller;
 use scion_server::import::{ImportOptions, ImportReport, import_git};
-use scion_server::land::{LandRequest, LandState, Lands};
+use scion_server::land::{Deadline, LandRequest, LandState, Lands};
 use scion_server::{Error, Store, db, read, tree, write};
 use tempfile::TempDir;
 
@@ -619,6 +620,7 @@ fn import_never_moves_a_ref_off_a_land() {
         changeset: created,
         target_ref: "main".into(),
         request_key: "k".into(),
+        deadline: Deadline::new(Instant::now() + Duration::from_secs(600)),
     };
     let outcome = Lands::default()
         .land(&store, &Caller("t".into()), &request)

@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
 use rusqlite::Connection;
-use scion_core::{Changeset, ChangesetId, Entry, FileState, PathElem, RepoPath, Tree, TreeId};
+use scion_core::{
+    BlobId, Changeset, ChangesetId, Entry, FileState, PathElem, RepoPath, Tree, TreeId,
+};
 
 use crate::db::{self, RepoId};
 use crate::error::{Error, Result};
@@ -55,10 +57,19 @@ pub fn root_tree(store: &Store, repo: &str, cs: ChangesetId) -> Result<TreeId> {
 /// [`Error::NotFound`] if nothing is at `path`. [`Error::InvalidArgument`] if
 /// `path` is a directory or a submodule.
 pub fn read_file(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Result<Vec<u8>> {
+    store.blobs().get(file_blob(store, repo, cs, path)?)
+}
+
+/// The blob of a regular file, or of a symlink's target.
+///
+/// # Errors
+///
+/// As [`read_file`], without reading the blob.
+pub fn file_blob(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Result<BlobId> {
     let root = root_tree(store, repo, cs)?;
     match store.read(|c| tree::lookup(c, root, path))? {
         Some(Entry::File(state)) => match state.blob() {
-            Some(blob) => store.blobs().get(blob),
+            Some(blob) => Ok(blob),
             None => Err(Error::InvalidArgument(format!("{path:?} is a submodule"))),
         },
         Some(Entry::Dir(_)) => Err(Error::InvalidArgument(format!("{path:?} is a directory"))),
