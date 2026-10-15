@@ -33,3 +33,5 @@ release.
   history.
 - Bearer-token auth, loopback-only listening by default, request limits and
   name validation at the RPC boundary.
+- `docs/protocol-v1.md`: the contract of the `Scion` and `Objects` services,
+  for independent clients, tiers and servers.
