@@ -217,25 +217,10 @@ async fn connect(url: &str, token: Option<&str>) -> Client {
     ObjectsClient::with_interceptor(channel, auth)
 }
 
-/// The objects a `GetObjects` call returns, or the error it ends with.
+/// The objects a `GetObjects` call in repo `r` returns, or the error it
+/// ends with.
 async fn get(client: &mut Client, objects: &[&Object]) -> Result<Vec<Object>, Status> {
-    let refs = objects
-        .iter()
-        .map(|o| ObjectRef {
-            kind: o.kind,
-            id: o.id.clone(),
-        })
-        .collect();
-    let request = GetObjectsRequest {
-        repo: "r".into(),
-        refs,
-    };
-    let mut stream = client.get_objects(request).await?.into_inner();
-    let mut got = Vec::new();
-    while let Some(object) = stream.message().await? {
-        got.push(object);
-    }
-    Ok(got)
+    get_in(client, "r", objects).await?
 }
 
 fn blob(data: &[u8]) -> Object {

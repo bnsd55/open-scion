@@ -113,7 +113,7 @@ pub async fn send_objects<K, F>(
     let mut keys = keys.into_iter();
     let mut next = Some(first);
     let mut sent = 0;
-    while let Some((object, permit)) = next.take() {
+    while let Some((object, permit)) = next {
         let len = object.as_ref().map_or(0, |o| o.data.len());
         let failed = object.is_err();
         match tokio::time::timeout(stall, tx.send((object, permit))).await {
@@ -123,8 +123,7 @@ pub async fn send_objects<K, F>(
         if sent >= REPLY_BUDGET_BYTES {
             break;
         }
-        if let Some(key) = keys.next() {
-            next = produce(key).await;
-        }
+        let Some(key) = keys.next() else { break };
+        next = produce(key).await;
     }
 }

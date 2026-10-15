@@ -172,6 +172,15 @@ impl From<Status> for Failed {
     }
 }
 
+/// Splits what a reply found: `Err` with the call's status if the whole
+/// upstream call failed, else the object or why this one object failed.
+fn split(found: Result<Object, Failed>) -> Result<Result<Object, Status>, Status> {
+    match found {
+        Err(failed) if failed.whole_call => Err(failed.status),
+        found => Ok(found.map_err(|failed| failed.status)),
+    }
+}
+
 /// An object for a reply, or why the tier could not get it, with its share
 /// of the reply budget.
 type Found = (Result<Object, Failed>, OwnedSemaphorePermit);
@@ -349,10 +358,8 @@ impl<S: Store> Tier<S> {
     ) {
         let (tier, repo, keys, progress) = (&self, &repo, &keys, &progress);
         let produce = |i| async move {
-            match tier.produce(repo, keys, i, progress).await? {
-                (Err(failed), _) if failed.whole_call => None,
-                (object, permit) => Some((object.map_err(|failed| failed.status), permit)),
-            }
+            let (found, permit) = tier.produce(repo, keys, i, progress).await?;
+            Some((split(found).ok()?, permit))
         };
         reply::send_objects(first, 1..keys.len(), tx, STALL_TIMEOUT, produce).await;
         tracing::info!(
@@ -718,10 +725,7 @@ impl<S: Store> Objects for Tier<S> {
             .produce(&repo, &keys, 0, &progress)
             .await
             .ok_or_else(reply::busy)?;
-        let first = match first {
-            Err(failed) if failed.whole_call => return Err(failed.status),
-            first => first.map_err(|failed| failed.status),
-        };
+        let first = split(first)?;
         let (tx, stream) = reply::channel();
         let reply = self
             .clone()
@@ -898,9 +902,9 @@ mod tests {
         for (limit, asked) in [(1 << 20, 1), (0, 2)] {
             let (blobs, keys, fake, tier) = setup(1, limit).await;
             let full = reply::try_take(&tier.inner.in_flight, IN_FLIGHT_BYTES).unwrap();
-            let reply = tier.clone();
+            let waiting = tier.clone();
             let producing = tokio::spawn(async move {
-                let found = reply.produce("r", &keys, 0, &Progress::default()).await;
+                let found = waiting.produce("r", &keys, 0, &Progress::default()).await;
                 found.map(|(object, _permit)| object)
             });
             // The fetch ends; the reply finds no room, lets the bytes go and

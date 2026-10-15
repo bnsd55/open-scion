@@ -198,14 +198,14 @@ impl Objects for ObjectsService {
             .run(move |store| store.read(|c| db::repo_id(c, &repo)))
             .await?;
         let in_flight = Arc::clone(&self.in_flight);
-        let reply = start_reply(
+        let stream = start_reply(
             self.worker.clone(),
             keys,
             in_flight,
             STALL_TIMEOUT,
             read_object,
         );
-        Ok(Response::new(reply.await?))
+        Ok(Response::new(stream.await?))
     }
 }
 
