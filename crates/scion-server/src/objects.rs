@@ -21,7 +21,7 @@ use tokio_stream::adapters::Map;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::service::{Worker, check_name, parse_id, resolve_ref};
 use crate::store::{self, Store};
 use crate::{db, read};
@@ -38,8 +38,8 @@ const IN_FLIGHT_BYTES: usize = 4 * scion_proto::MAX_OBJECT_BYTES;
 /// that stops reading does not hold memory and budget. (The server's request
 /// timeout covers only the start of a streamed reply.)
 // SHORTCUT: a stalled reply ends, but HTTP/2 keeps the one encoded object it
-// was sending until the connection closes. Upgrade: a response body timeout
-// that resets the stream.
+// was sending until the connection closes. Upgrade (issue #42): a response
+// body timeout that resets the stream.
 const STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 // The store keeps exactly the objects that the API promises to send.
@@ -56,7 +56,7 @@ type Sent = (Result<Object, Status>, OwnedSemaphorePermit);
 type ObjectStream = Map<ReceiverStream<Sent>, fn(Sent) -> Result<Object, Status>>;
 
 /// One object to read.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Key {
     Tree(TreeId),
     Blob(BlobId),
@@ -94,9 +94,22 @@ fn parse_ref(object: &ObjectRef) -> Result<Key, Status> {
     }
 }
 
+/// Reads an object, given the size taken from the budget for it.
+/// [`read_object`], except in tests that count reads.
+type Read = fn(&Store, Key, usize) -> Result<Object>;
+
+/// An object's size in its stored form, without reading it.
+fn object_size(store: &Store, key: Key) -> Result<usize> {
+    match key {
+        Key::Tree(id) => store.read(|c| db::tree_size(c, id)),
+        Key::Blob(id) => store.blobs().size(id),
+    }
+}
+
 /// Reads one object in its stored form. Trees and blobs are checked against
-/// their IDs on the way out of the store.
-fn read_object(store: &Store, key: Key) -> Result<Object> {
+/// their IDs on the way out of the store, and the bytes must not exceed
+/// `size`, the share of the budget taken for them.
+fn read_object(store: &Store, key: Key, size: usize) -> Result<Object> {
     // SHORTCUT: an object ID is treated as permission to read the object, and
     // trees and blobs are shared by all repos. Safe with one principal.
     // Upgrade (issue #13): a read ticket bound to a principal, a repo and a
@@ -109,6 +122,12 @@ fn read_object(store: &Store, key: Key) -> Result<Object> {
         ),
         Key::Blob(id) => (ObjectKind::Blob, *id.as_bytes(), store.blobs().get(id)?),
     };
+    if data.len() > size {
+        return Err(Error::Corrupt(format!(
+            "{key:?}: {} bytes, but its stored size is {size}",
+            data.len()
+        )));
+    }
     Ok(Object {
         kind: kind.into(),
         id: id.to_vec(),
@@ -116,11 +135,12 @@ fn read_object(store: &Store, key: Key) -> Result<Object> {
     })
 }
 
-/// Reads `keys` one at a time, as the client takes them, and sends each with
-/// its share of `in_flight`. Stops after an error, once the reply has sent
-/// `REPLY_BUDGET_BYTES`, when the client has gone, or when the client takes
-/// no object for `stall`.
-// SHORTCUT: one blocking hop per object and no read-ahead, so many small
+/// Sends `keys` one at a time, as the client takes them. For each object it
+/// looks up the size, takes that share of `in_flight`, and only then reads
+/// the bytes, so a reply that waits for budget holds no object. Stops after
+/// an error, once the reply has sent `REPLY_BUDGET_BYTES`, when the client
+/// has gone, or when an object is not handed on within `stall`.
+// SHORTCUT: two blocking hops per object and no read-ahead, so many small
 // objects are read one after another. Upgrade: read a batch capped by bytes
 // per hop, or keep a few reads in flight.
 async fn send_objects(
@@ -129,26 +149,36 @@ async fn send_objects(
     tx: mpsc::Sender<Sent>,
     in_flight: Arc<Semaphore>,
     stall: Duration,
+    read: Read,
 ) {
     let mut sent = 0;
     for key in keys {
         if sent >= REPLY_BUDGET_BYTES {
             break;
         }
-        let object = worker.run(move |store| read_object(&store, key)).await;
-        let len = object.as_ref().map_or(0, |o| o.data.len());
-        let failed = object.is_err();
-        sent += len;
         let handed_on = async {
+            let size = worker.run(move |store| object_size(&store, key)).await;
             // Clamped to the budget, which the asserts above keep within u32.
-            let permits = u32::try_from(len.clamp(1, IN_FLIGHT_BYTES)).unwrap_or(u32::MAX);
-            let Ok(permit) = Arc::clone(&in_flight).acquire_many_owned(permits).await else {
-                return false;
+            let share = size
+                .as_ref()
+                .map_or(1, |&size| size.clamp(1, IN_FLIGHT_BYTES));
+            let share = u32::try_from(share).unwrap_or(u32::MAX);
+            let permit = Arc::clone(&in_flight)
+                .acquire_many_owned(share)
+                .await
+                .ok()?;
+            let object = match size {
+                Ok(size) => worker.run(move |store| read(&store, key, size)).await,
+                Err(status) => Err(status),
             };
-            tx.send((object, permit)).await.is_ok()
+            let len = object.as_ref().map_or(0, |o| o.data.len());
+            let failed = object.is_err();
+            tx.send((object, permit)).await.ok()?;
+            Some((len, failed))
         };
-        if !matches!(tokio::time::timeout(stall, handed_on).await, Ok(true)) || failed {
-            break;
+        match tokio::time::timeout(stall, handed_on).await {
+            Ok(Some((len, false))) => sent += len,
+            _ => break,
         }
     }
 }
@@ -204,6 +234,7 @@ impl Objects for ObjectsService {
             tx,
             Arc::clone(&self.in_flight),
             STALL_TIMEOUT,
+            read_object,
         ));
         let release: fn(Sent) -> Result<Object, Status> = |(object, _permit)| object;
         Ok(Response::new(ReceiverStream::new(rx).map(release)))
@@ -212,6 +243,8 @@ impl Objects for ObjectsService {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     #[tokio::test]
@@ -231,6 +264,7 @@ mod tests {
             tx,
             Arc::clone(&in_flight),
             Duration::from_millis(50),
+            read_object,
         ));
 
         // Nobody reads: the first object waits in the channel, the second
@@ -241,6 +275,64 @@ mod tests {
             .unwrap();
         assert_eq!(in_flight.available_permits(), budget - b"one".len());
         drop(rx);
+        assert_eq!(in_flight.available_permits(), budget);
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_waits_for_budget_has_not_read_its_object() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        fn counted(store: &Store, key: Key, size: usize) -> Result<Object> {
+            READS.fetch_add(1, Ordering::SeqCst);
+            read_object(store, key, size)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let size = 1000;
+        let a = Key::Blob(store.blobs().put(&vec![b'a'; size]).unwrap());
+        let b = Key::Blob(store.blobs().put(&vec![b'b'; size]).unwrap());
+        // Room for one object, not two.
+        let budget = size + size / 2;
+        let in_flight = Arc::new(Semaphore::new(budget));
+        let worker = Worker::new(store);
+        let stall = Duration::from_millis(100);
+        let reply = |keys, tx| {
+            tokio::spawn(send_objects(
+                worker.clone(),
+                keys,
+                tx,
+                Arc::clone(&in_flight),
+                stall,
+                counted,
+            ))
+        };
+
+        // Two replies whose clients never read. The first sends `a` into its
+        // channel, where it keeps its share; then neither reply can get
+        // budget for its next object.
+        let (tx_first, rx_first) = mpsc::channel(1);
+        let first = reply(vec![a, a], tx_first);
+        let started = tokio::time::Instant::now();
+        while in_flight.available_permits() == budget {
+            assert!(started.elapsed() < Duration::from_secs(10));
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let (tx_second, rx_second) = mpsc::channel(1);
+        let second = reply(vec![b], tx_second);
+        for task in [first, second] {
+            tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .expect("a reply that cannot get budget ends after the stall")
+                .unwrap();
+        }
+
+        assert_eq!(
+            READS.load(Ordering::SeqCst),
+            1,
+            "only the first `a` was read"
+        );
+        assert_eq!(in_flight.available_permits(), budget - size);
+        drop((rx_first, rx_second));
         assert_eq!(in_flight.available_permits(), budget);
     }
 }

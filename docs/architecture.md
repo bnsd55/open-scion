@@ -437,12 +437,15 @@ starting at the root tree, and never says what it already has.
 - A call names 1 to 1,000 objects. A task reads them one at a time, checks
   each against its ID, and hands it to the reply through a one-slot channel.
   A tree goes out as its stored bytes, which are canonical.
-- Memory: after a read, an object takes a share of a server-wide budget of
-  400 MiB, and keeps it until the reply takes the object from the channel.
-  With the budget spent, a task waits, holding only the one object it read.
-  A reply whose client takes no object for 120 s ends and frees its share.
-  Not counted: one encoded object per reply inside HTTP/2, which stays until
-  the connection closes.
+- Memory: before an object is read, its size comes from the store (a blob's
+  zstd frame header, a tree's stored length), and the object takes that
+  share of a server-wide budget of 400 MiB. It keeps the share until the
+  reply takes it from the channel. With the budget spent, a reply waits
+  holding no object bytes. A reply whose client takes no object for 120 s
+  ends and frees its share. A blob read back larger than its header said is
+  corrupt and is never sent. Not counted: one encoded object per reply inside
+  HTTP/2, which stays until the connection closes
+  ([#42](https://github.com/bnsd55/open-scion/issues/42)).
 - A reply stops early once it has sent 64 MiB, always after at least one
   object. The client asks again for the rest, so one call stays short and a
   transfer can resume. A reply message fits one object of up to 100 MiB.
@@ -516,7 +519,7 @@ an untrusted network.
 | Network | Listens on `127.0.0.1:7878` by default. A non-loopback address is refused unless `--insecure-listen` is given. | No TLS: the token and all data travel unencrypted ([#14](https://github.com/bnsd55/open-scion/issues/14)). |
 | Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. | Trees and blobs are shared by all repos. `GetObjects` reads any tree or blob by ID, and a changeset can name another repo's blob and then read it ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
-| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once, 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget, and a reply whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object inside HTTP/2 until its connection closes. |
+| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once, 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget, and a reply whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object inside HTTP/2 until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. | The client trusts the server for a ref's target and for a changeset's root tree, which it cannot check by hash. Tiers ([#5](https://github.com/bnsd55/open-scion/issues/5)) must forward these answers, not compute them. |
 | Checkout | `scn checkout` writes into a temp directory and renames it onto a new or empty destination, never follows a symlink while writing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure the destination stays as it was. | No Windows rules: device names and names that end in a dot or a space pass. |
 | Errors | Internal errors reply `internal error`. The detail stays in the server log. | |
@@ -544,8 +547,8 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | One lander per ref that rebases a batch and moves the ref once. | [#18](https://github.com/bnsd55/open-scion/issues/18) |
 | `scion-server/src/land.rs` (`MAX_DEPTH`) | A land on a base more than `MAX_DEPTH` generations below the tip walks the history from the index floor back to the base, each time, and holds the database lock while it walks. | Per-path history in the database, so the check reads only the paths that the land changes. | [#38](https://github.com/bnsd55/open-scion/issues/38) |
 | `scion-server/src/objects.rs` (`read_object`) | An object ID is treated as permission to read it; trees and blobs are shared by all repos. Safe with one principal. | A read ticket bound to a principal, a repo and a root tree, checked by the server and every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
-| `scion-server/src/objects.rs` (`STALL_TIMEOUT`) | A stalled `GetObjects` reply ends, but HTTP/2 keeps the one encoded object it was sending until the connection closes. | A response body timeout that resets the stream. | |
-| `scion-server/src/objects.rs` (`send_objects`) | One blocking hop per object and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
+| `scion-server/src/objects.rs` (`STALL_TIMEOUT`) | A stalled `GetObjects` reply ends, but HTTP/2 keeps the one encoded object it was sending until the connection closes. | A response body timeout that resets the stream. | [#42](https://github.com/bnsd55/open-scion/issues/42) |
+| `scion-server/src/objects.rs` (`send_objects`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
 | `scion-server/src/auth.rs` (`Auth`) | One static token, one principal. | A token-to-principal map, then per-path write rules. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/main.rs` (`serve`) | No TLS. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
 | `scn/src/client.rs` (`lossy`) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | Escape or base64 raw bytes in JSON. | |

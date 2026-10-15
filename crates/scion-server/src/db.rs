@@ -312,6 +312,20 @@ pub fn get_tree_body(c: &Connection, id: TreeId) -> Result<Vec<u8>> {
     load_tree(c, id).map(|(_, body)| body)
 }
 
+/// The length of a tree's stored `TreeV1` bytes, without reading them.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if absent.
+pub fn tree_size(c: &Connection, id: TreeId) -> Result<usize> {
+    let size: i64 = c
+        .prepare_cached("SELECT length(body) FROM trees WHERE id = ?1")?
+        .query_row([id.as_bytes()], |row| row.get(0))
+        .optional()?
+        .ok_or_else(|| Error::NotFound(format!("tree {id}")))?;
+    usize::try_from(size).map_err(|_| Error::Corrupt(format!("tree {id}: length {size}")))
+}
+
 fn load_tree(c: &Connection, id: TreeId) -> Result<(Tree, Vec<u8>)> {
     let body: Vec<u8> = c
         .prepare_cached("SELECT body FROM trees WHERE id = ?1")?
