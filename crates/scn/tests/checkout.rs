@@ -4,11 +4,14 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use rustix::process::{Pid, Signal, kill_process};
 use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, PathElem, RepoPath, Tree,
     TreeId,
@@ -23,13 +26,15 @@ use scion_server::{Store, db, service, tree};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
-use tokio_stream::Stream;
 use tokio_stream::wrappers::TcpListenerStream;
+use tokio_stream::{Stream, StreamExt as _};
 use tonic::{Request, Response, Status};
 
 const REPO: &str = "r";
 const TOKEN: &str = "secret";
 const SUBMODULE: &str = "0123456789abcdef0123456789abcdef01234567";
+/// A changeset ID for the `Liar`, which serves the same tree for any ID.
+const ANY_CHANGESET: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Runs git in `dir` with fixed identities and dates and no user or system
 /// config. Fails the test unless git succeeds.
@@ -139,24 +144,37 @@ impl Server {
 
 /// Runs `scn` against the server at `url`.
 fn scn(url: &str, repo: &str, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_scn"))
+    scn_command(url, repo, args).output().unwrap()
+}
+
+/// An `scn` command against the server at `url`.
+fn scn_command(url: &str, repo: &str, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_scn"));
+    command
         .args(["--server", url, "--repo", repo])
         .args(args)
-        .env("SCION_TOKEN", TOKEN)
-        .output()
-        .unwrap()
+        .env("SCION_TOKEN", TOKEN);
+    command
 }
 
 /// Asserts that a failed checkout left `dest` the empty directory it was,
 /// with no temp directory next to it.
 fn assert_untouched(dest: &Path) {
     assert_eq!(fs::read_dir(dest).unwrap().count(), 0, "{}", dest.display());
-    let temps: Vec<_> = fs::read_dir(dest.parent().unwrap())
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .filter(|name| name.to_string_lossy().starts_with(".scn-checkout-"))
-        .collect();
+    let temps = temp_dirs(dest.parent().unwrap());
     assert!(temps.is_empty(), "left behind: {temps:?}");
+}
+
+/// The checkout temp directories in `dir`.
+fn temp_dirs(dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            name.starts_with(".scn-checkout-")
+        })
+        .collect()
 }
 
 fn open_store() -> (TempDir, Store) {
@@ -282,6 +300,27 @@ fn checkout_matches_git_checkout_byte_for_byte() {
     assert!(stderr(&out).contains("symlink"), "{}", stderr(&out));
     assert_untouched(&target);
     assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+}
+
+#[test]
+fn checkout_into_an_existing_empty_directory_keeps_it() {
+    let repo = fixture();
+    let server = Server::with_import(repo.path());
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("parent");
+    let ours = parent.join("ours");
+    fs::create_dir_all(&ours).unwrap();
+    let inode = fs::metadata(&ours).unwrap().ino();
+
+    // Nothing can be made next to it, as next to a mount point.
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+    let out = server.scn(&["checkout", "main", "--into", text(&ours)]);
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let expected = git_checkout(repo.path(), &tmp.path().join("theirs"));
+    assert_eq!(snapshot(&ours), expected);
+    assert_eq!(fs::metadata(&ours).unwrap().ino(), inode);
 }
 
 #[test]
@@ -414,9 +453,10 @@ fn names_that_fold_together_fail_cleanly_where_the_filesystem_folds_them() {
         executable: false,
     };
     let (one, two) = (regular(b"one\n"), regular(b"two\n"));
-    // From the checkout, `../outside` is a directory next to it.
+    // From the temp directory, `../../outside` is `parent/outside` below:
+    // the temp directory is in `parent/existing` or in `parent/next-to`.
     let link = FileState::Symlink {
-        target: store.blobs().put(b"../outside").unwrap(),
+        target: store.blobs().put(b"../../outside").unwrap(),
     };
     let cases: [Files; 3] = [
         &[(b"A", one), (b"a", two)],
@@ -430,33 +470,38 @@ fn names_that_fold_together_fail_cleanly_where_the_filesystem_folds_them() {
     let folds = folds_case(tmp.path());
 
     for (files, id) in cases.iter().zip(ids) {
-        let parent = tmp.path().join(id.to_string());
-        let (dest, outside) = (parent.join("dest"), parent.join("outside"));
-        fs::create_dir_all(&dest).unwrap();
-        fs::create_dir(&outside).unwrap();
-        let out = server.scn(&["checkout", &id.to_string(), "--into", text(&dest)]);
-        if folds {
-            assert!(!out.status.success());
-            let err = stderr(&out);
-            assert!(
-                err.contains("collides with another path on this filesystem"),
-                "{err}"
-            );
-            assert_untouched(&dest);
-        } else {
-            // As git does: every name is written as it is.
-            assert!(out.status.success(), "{}", stderr(&out));
-            let written: Vec<_> = files
-                .iter()
-                .map(|(path, _)| dest.join(text_of(path)))
-                .collect();
-            assert!(
-                written
-                    .iter()
-                    .all(|path| fs::symlink_metadata(path).is_ok())
-            );
+        // Into an existing empty directory, and into a new one.
+        for existing in [true, false] {
+            let parent = tmp.path().join(format!("{id}-{existing}"));
+            let outside = parent.join("outside");
+            fs::create_dir_all(&outside).unwrap();
+            // The empty directory that holds the temp directory.
+            let made = parent.join(if existing { "existing" } else { "next-to" });
+            fs::create_dir(&made).unwrap();
+            let dest = if existing {
+                made.clone()
+            } else {
+                made.join("new")
+            };
+            let out = server.scn(&["checkout", &id.to_string(), "--into", text(&dest)]);
+            if folds {
+                assert!(!out.status.success());
+                let err = stderr(&out);
+                assert!(
+                    err.contains("collides with another path on this filesystem"),
+                    "{err}"
+                );
+                assert_untouched(&made);
+            } else {
+                // As git does: every name is written as it is.
+                assert!(out.status.success(), "{}", stderr(&out));
+                let written = |(path, _): &(&[u8], FileState)| {
+                    fs::symlink_metadata(dest.join(text_of(path))).is_ok()
+                };
+                assert!(files.iter().all(written));
+            }
+            assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
         }
-        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
     }
 }
 
@@ -495,17 +540,27 @@ fn objects_larger_than_one_reply_span_several_calls() {
 struct Liar {
     root: TreeId,
     objects: HashMap<Vec<u8>, Object>,
+    /// The blob IDs, in the order of their paths.
+    in_path_order: Vec<Vec<u8>>,
 }
 
 impl Liar {
-    /// A root tree with two files, and their blobs.
-    fn new() -> Self {
+    /// Two files, `a` and `b`, `depth` directories named `d` below the root,
+    /// with their trees and blobs.
+    fn new(depth: usize) -> Self {
         let blob = |data: &[u8]| Object {
             kind: ObjectKind::Blob.into(),
             id: BlobId::of(data).as_bytes().to_vec(),
             data: data.to_vec(),
         };
         let (one, two) = (blob(b"one\n"), blob(b"two\n"));
+        // Path order is the opposite of ID order, so a fetch in ID order is
+        // caught.
+        let (low, high) = if one.id < two.id {
+            (one, two)
+        } else {
+            (two, one)
+        };
         let file = |object: &Object| {
             Entry::File(FileState::Regular {
                 content: BlobId::try_from(object.id.as_slice()).unwrap(),
@@ -514,22 +569,37 @@ impl Liar {
         };
         let tree = Tree {
             entries: [
-                (PathElem::new("one").unwrap(), file(&one)),
-                (PathElem::new("two").unwrap(), file(&two)),
+                (PathElem::new("a").unwrap(), file(&high)),
+                (PathElem::new("b").unwrap(), file(&low)),
             ]
             .into(),
         };
-        let (data, root) = tree.encode_with_id();
-        let tree = Object {
-            kind: ObjectKind::Tree.into(),
-            id: root.as_bytes().to_vec(),
-            data,
+        let in_path_order = vec![high.id.clone(), low.id.clone()];
+        let mut objects = vec![high, low];
+        let mut push = |tree: Tree| {
+            let (data, id) = tree.encode_with_id();
+            objects.push(Object {
+                kind: ObjectKind::Tree.into(),
+                id: id.as_bytes().to_vec(),
+                data,
+            });
+            id
         };
-        let objects = [tree, one, two]
+        let mut root = push(tree);
+        for _ in 0..depth {
+            root = push(Tree {
+                entries: [(PathElem::new("d").unwrap(), Entry::Dir(root))].into(),
+            });
+        }
+        let objects = objects
             .into_iter()
             .map(|object| (object.id.clone(), object))
             .collect();
-        Self { root, objects }
+        Self {
+            root,
+            objects,
+            in_path_order,
+        }
     }
 }
 
@@ -565,6 +635,13 @@ impl Objects for Liar {
             honest.into_iter().map(Ok).collect()
         } else {
             match repo.as_str() {
+                "in-order" => {
+                    let asked: Vec<_> = refs.iter().map(|r| r.id.clone()).collect();
+                    if asked != self.in_path_order {
+                        return Err(Status::invalid_argument("blobs not asked in path order"));
+                    }
+                    honest.into_iter().map(Ok).collect()
+                }
                 "extra" => {
                     let id = BlobId::of(b"extra").as_bytes().to_vec();
                     honest.push(Object {
@@ -585,6 +662,11 @@ impl Objects for Liar {
                     honest.into_iter().map(Ok).collect()
                 }
                 "none" => Vec::new(),
+                "stall" => {
+                    let first = tokio_stream::iter([Ok(honest[0].clone())]);
+                    let stalled: Replies = Box::pin(first.chain(tokio_stream::pending()));
+                    return Ok(Response::new(stalled));
+                }
                 "error" => vec![
                     Ok(honest[0].clone()),
                     Err(Status::internal("lost the disk")),
@@ -596,18 +678,42 @@ impl Objects for Liar {
     }
 }
 
-#[test]
-fn a_misbehaving_server_is_caught_and_nothing_is_written() {
+/// Serves a [`Liar`] with its files `depth` directories deep until the
+/// returned runtime is dropped, and returns its URL.
+fn start_liar(depth: usize) -> (Runtime, String) {
     let runtime = Runtime::new().unwrap();
     let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     runtime.spawn(
         tonic::transport::Server::builder()
-            .add_service(ObjectsServer::new(Liar::new()))
+            .add_service(ObjectsServer::new(Liar::new(depth)))
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
+    (runtime, url)
+}
+
+#[test]
+fn blobs_are_asked_for_in_path_order() {
+    let (_runtime, url) = start_liar(0);
     let tmp = tempfile::tempdir().unwrap();
-    let any_changeset = "00".repeat(32);
+    let dest = tmp.path().join("dest");
+    let out = scn(
+        &url,
+        "in-order",
+        &["checkout", ANY_CHANGESET, "--into", text(&dest)],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let mut written: Vec<_> = ["a", "b"]
+        .map(|name| fs::read(dest.join(name)).unwrap())
+        .into();
+    written.sort();
+    assert_eq!(written, [b"one\n", b"two\n"]);
+}
+
+#[test]
+fn a_misbehaving_server_is_caught_and_nothing_is_written() {
+    let (_runtime, url) = start_liar(0);
+    let tmp = tempfile::tempdir().unwrap();
 
     for (misbehavior, expected) in [
         ("extra", "not asked for"),
@@ -621,7 +727,7 @@ fn a_misbehaving_server_is_caught_and_nothing_is_written() {
         let out = scn(
             &url,
             misbehavior,
-            &["checkout", &any_changeset, "--into", text(&dest)],
+            &["checkout", ANY_CHANGESET, "--into", text(&dest)],
         );
         assert!(!out.status.success(), "{misbehavior}");
         assert!(
@@ -631,4 +737,63 @@ fn a_misbehaving_server_is_caught_and_nothing_is_written() {
         );
         assert_untouched(&dest);
     }
+}
+
+#[test]
+fn ctrl_c_removes_what_the_checkout_wrote() {
+    let (_runtime, url) = start_liar(0);
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("dest");
+    fs::create_dir(&dest).unwrap();
+    let child = scn_command(
+        &url,
+        "stall",
+        &["checkout", ANY_CHANGESET, "--into", text(&dest)],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+
+    // The server sends `a`, then never sends `b`.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !temp_dirs(&dest).iter().any(|temp| temp.join("a").exists()) {
+        assert!(Instant::now() < deadline, "the checkout never wrote a");
+        thread::sleep(Duration::from_millis(10));
+    }
+    kill_process(Pid::from_child(&child), Signal::INT).unwrap();
+    let out = child.wait_with_output().unwrap();
+
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("interrupted"), "{}", stderr(&out));
+    assert_untouched(&dest);
+}
+
+#[test]
+fn a_deep_failed_checkout_is_removed_with_few_open_files() {
+    // 255 directories, the most a path can have above a file.
+    let (_runtime, url) = start_liar(255);
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("dest");
+    fs::create_dir(&dest).unwrap();
+    // Fewer open files than the tree has levels. The server sends `a`, then
+    // fails.
+    let scn = scn_command(
+        &url,
+        "error",
+        &["checkout", ANY_CHANGESET, "--into", text(&dest)],
+    );
+    let out = Command::new("sh")
+        .args(["-c", "ulimit -n 128 && exec \"$@\"", "sh"])
+        .arg(scn.get_program())
+        .args(scn.get_args())
+        .env("SCION_TOKEN", TOKEN)
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("lost the disk"), "{err}");
+    assert!(!err.contains("warning"), "{err}");
+    assert_untouched(&dest);
 }

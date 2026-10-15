@@ -21,7 +21,7 @@ this file says so. Every other rule is this project's choice.
 
 | Service | Calls | Who answers |
 |---|---|---|
-| `Scion` | Writes (`PutBlob`, `CreateChangeset`, `Land`, `GetLand`) and path reads (`ResolveRef`, `GetChangeset`, `ReadFile`, `ListDir`, `Log`, `Blame`) | The server only |
+| `Scion` | Writes (`PutBlob`, `CreateChangeset`, `Land`, `GetLand`), path reads (`ResolveRef`, `GetChangeset`, `ReadFile`, `ListDir`, `Log`, `Blame`) and queries (`MergeBase`, `IsAncestor`, `Diff`) | The server only |
 | `Objects` | `ResolveRef`, `GetRootTree`, `GetObjects` | The server, or any cache tier (section 8) |
 
 Both services are on one address. Every read except `ResolveRef` and
@@ -58,7 +58,9 @@ finish its work on the server (section 6.3).
 **Queues.** The server queues work instead of failing it. At most 256 jobs run
 at once across both services, at most 16 `PutBlob` uploads are read at once,
 and at most 4 `Blame` calls run at once. Time in a queue counts toward the
-timeout.
+timeout. One wait has its own limit: a `GetObjects` call that gets no memory
+for its first object within 120 s fails with `RESOURCE_EXHAUSTED` (section
+7.3).
 
 ## 3. Common rules
 
@@ -75,7 +77,8 @@ request is `INVALID_ARGUMENT`. In a reply, an empty ID field means "none".
 **Paths.** A path is raw bytes and follows the path rules of
 [`format-v1.md`](format-v1.md). A path that breaks them is
 `INVALID_ARGUMENT`. Where a path is optional (`ListDirRequest.path`,
-`LogRequest.path`), empty means "none".
+`LogRequest.path`, `DiffRequest.path`, `DiffRequest.after`), empty means
+"none".
 
 **Visibility.** A repo sees only its own changesets. A changeset that the
 repo does not have is `NOT_FOUND`, the same as one that does not exist. Trees
@@ -105,8 +108,11 @@ contract. A client MUST NOT depend on its text.
 | `UNAUTHENTICATED` | The token is missing or wrong. | After the cause is fixed |
 | `ABORTED` | `Land` only: other writers kept moving the ref. The land stays `PENDING`. | Yes, with the same request key |
 | `OUT_OF_RANGE` | A message is larger than its limit. | After the cause is fixed |
+| `RESOURCE_EXHAUSTED` | `MergeBase` or `IsAncestor` only: the answer needs more work than one call may do. | No: the same request fails again |
 | `CANCELLED` | The server's 600 s limit or the client's `grpc-timeout` ran out. A client library can report its own deadline as `DEADLINE_EXCEEDED`. | Yes. A `Land` retry uses the same request key. |
-| `UNAVAILABLE` | The server cannot be reached or is shutting down. | Yes |
+| `UNAVAILABLE` | The server cannot be reached or is shutting down. A tier also replies `UNAVAILABLE` when its upstream does not answer in time (section 8). | Yes |
+| `RESOURCE_EXHAUSTED` | `GetObjects` only: no memory for the first object within 120 s (section 7.3). | Yes, after a wait |
+| `DATA_LOSS` | From a tier only: its upstream sent bytes that are not the object asked for (section 8). | MAY |
 | `INTERNAL` | A database, I/O or stored-data error, or a server bug. The message is `internal error`; the detail stays in the server log. | MAY |
 | `UNIMPLEMENTED` | The server does not have the call, or the request is compressed. | After the cause is fixed |
 
@@ -159,7 +165,8 @@ can answer a request for an object. A client checks what it can by hash.
   derived data ([`format-v1.md`](format-v1.md)).
 - the computed answers of the `Scion` service: the content from `ReadFile`
   and the tree from `ListDir` (unless the client knows their IDs from
-  elsewhere), which changesets `Log` selects, `Blame`, and `Land` outcomes.
+  elsewhere), which changesets `Log` selects, `Blame`, `MergeBase`,
+  `IsAncestor`, which paths `Diff` lists, and `Land` outcomes.
 
 In v0.1 a client also trusts every tier on its path for the `ResolveRef` and
 `GetRootTree` answers that the tier passes on (section 8).
@@ -429,6 +436,95 @@ rename. Its next call then fails with `NOT_FOUND`, or blames another file.
 | `INVALID_ARGUMENT` | A bad or empty path; the file is not a regular file, is larger than 1 MiB, or holds a NUL byte. |
 | `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
 
+### 6.11 MergeBase
+
+`rpc MergeBase(MergeBaseRequest) returns (MergeBaseResponse)`. The best
+common ancestors of `a_changeset_id` and `b_changeset_id`. The article lists
+finding merge bases among the server's APIs, so that tools need no local
+repository.
+
+- Ancestry follows every parent, not only first parents. A changeset is its
+  own ancestor.
+- A common ancestor is an ancestor of both changesets. A best common
+  ancestor is a common ancestor that is not an ancestor of another common
+  ancestor. This is the set that `git merge-base --all` prints.
+- `changeset_ids` holds each best common ancestor once: highest generation
+  first, then by ID bytes, lowest first. The generation of a changeset is 1
+  for a root, else 1 + the highest generation of its parents.
+- Usually there is one. After criss-cross merges there can be several, and
+  the client chooses which to use. The order is fixed, so the first is a
+  stable choice.
+- If one changeset is an ancestor of the other, the answer is that one.
+  `changeset_ids` is empty when the two histories share no changeset.
+
+**Bound.** The server walks from both changesets, highest generation first,
+and reads the parents of at most 10,000 changesets. It stops early once no
+other best common ancestor can follow. If the answer needs more, the call
+fails with `RESOURCE_EXHAUSTED`. There is no resume.
+
+| Error | When |
+|---|---|
+| `INVALID_ARGUMENT` | A bad repo name or ID. |
+| `NOT_FOUND` | The repo or a changeset does not exist. |
+| `RESOURCE_EXHAUSTED` | The walk passed its bound. |
+
+### 6.12 IsAncestor
+
+`rpc IsAncestor(IsAncestorRequest) returns (IsAncestorResponse)`.
+`is_ancestor` is true when `ancestor_id` is `descendant_id`, or is reached
+from it through parents. Ancestry follows every parent, as in `MergeBase`.
+
+**Bound.** The server reads the parents of at most 10,000 changesets, and
+never goes below the generation of `ancestor_id`. So when the two differ
+and `ancestor_id`'s generation is not lower, the answer is false without a
+walk. If the answer
+needs more, the call fails with `RESOURCE_EXHAUSTED`.
+
+| Error | When |
+|---|---|
+| `INVALID_ARGUMENT` | A bad repo name or ID. |
+| `NOT_FOUND` | The repo or a changeset does not exist. |
+| `RESOURCE_EXHAUSTED` | The walk passed its bound. |
+
+### 6.13 Diff
+
+`rpc Diff(DiffRequest) returns (DiffResponse)`. The paths whose file differs
+between the snapshots of `old_changeset_id` and `new_changeset_id`. The
+article says the server computes diffs, for example between a commit and its
+merge base for a CI job.
+
+- A file is anything at a path that is not a directory: a regular file, a
+  symlink or a gitlink. A path differs when its `FileState` differs: kind,
+  ID or executable flag. Content is compared by ID; there is no line diff.
+  Renames are not detected: a rename is a delete and an add.
+- Each `DiffEntry` has the `path`, the file there in the old changeset
+  (`old`) and in the new one (`new`). An unset side means no file is there:
+  nothing, or a directory. The two sides always differ.
+- A `FileState` has a `kind` (`REGULAR`, `SYMLINK` or `GITLINK`) and an
+  `id`: the 32-byte blob ID of a regular file's content or of a symlink's
+  target, or the gitlink's git commit ID (20 bytes for SHA-1, 32 for
+  SHA-256). `executable` is set only for a regular file.
+- Entries are in tree order: paths compare part by part, and parts by raw
+  bytes. So `a/b` comes before `a.txt`. This is not git's order, nor the byte
+  order of whole paths. A path that is a file on one side and a directory on
+  the other gives one entry for the file, then one for each file below the
+  directory.
+- With `path`, only that file, or the files below that directory. A path
+  that exists on neither side gives an empty reply.
+- With `after`, only the entries after that path in tree order. It need not
+  be in the diff, nor below `path`.
+
+**Bound and resume.** A reply holds at most 1,000 entries. When more follow,
+`next_after` is the last path in `entries`, and the reply holds exactly
+1,000 entries. To continue, a client sends the same request with `after` set
+to `next_after`, until `next_after` is empty. Snapshots never change, so the
+pages together are the whole diff, each entry once.
+
+| Error | When |
+|---|---|
+| `INVALID_ARGUMENT` | A bad repo name, ID, `path` or `after`. |
+| `NOT_FOUND` | The repo or a changeset does not exist. |
+
 ## 7. The `Objects` service
 
 The article says the client never tells the server what it already has: it
@@ -462,19 +558,27 @@ request before it sends any object.
 - Objects come in request order, one per message. So a reply is always a
   prefix of `refs`.
 - Each `Object` repeats the `kind` and `id` of its ref.
-- The reply stops before the next object once it has sent at least 64 MiB of
-  object data. A reply that stops this way holds at least one object, and at
-  most 64 MiB plus one object.
-- The reply also stops when the next object does not reach the client
-  within 120 s (the stall limit): because the client takes no object, or
-  because the server waits that long for memory. All replies share a budget of
-  400 MiB of object data. A reply that stops this way can hold no object.
-- A reply that stops early ends with status `OK`. The client MUST ask again
-  for the objects it did not get. After a reply with no object, the client
-  SHOULD wait before it asks again.
-- A missing object ends the reply with `NOT_FOUND`, after the objects before
-  it. A damaged stored object ends it with `INTERNAL`. The client MAY keep
-  the objects it got before the error.
+- The reply sends the next object only while it has sent less than 64 MiB
+  of object data. So a reply holds at least one object, and at most 64 MiB
+  plus one object of up to 100 MiB.
+- All replies share a budget of 400 MiB of object data. The server finds the
+  first object before it answers the call. If it has no memory for that
+  object within 120 s, the call fails with `RESOURCE_EXHAUSTED` and sends no
+  object. The client SHOULD wait before it asks again.
+- The reply stops when a later object does not reach the client within
+  120 s (the stall limit): because the client takes no object, or because
+  the server waits that long for memory.
+- A reply that stops early ends with status `OK`, after at least one object.
+  A server or tier MUST NOT end a reply with `OK` and no object. The client
+  MUST ask again for the objects it did not get.
+
+**Errors.** An error status of the call is about the whole call, and no
+object was sent: for example a repo that does not exist, or no memory for
+the first object. An error in the stream is about the next object, and ends
+the reply after the objects before it. A server or tier MUST NOT put an
+error about the whole call in the stream. A missing object ends the reply
+with `NOT_FOUND`. A damaged stored object ends it with `INTERNAL`. The
+client MAY keep the objects it got before the error.
 
 **Object data.**
 
@@ -486,15 +590,17 @@ request before it sends any object.
 | Error | When |
 |---|---|
 | `INVALID_ARGUMENT` | A bad repo name; no ref or more than 1,000; a kind that is not `TREE` or `BLOB`; an ID that is not 32 bytes. |
-| `NOT_FOUND` | The repo does not exist; a named object does not exist (after the objects before it). |
+| `NOT_FOUND` | The repo does not exist (the call's status); a named object does not exist (in the stream, after the objects before it). |
+| `RESOURCE_EXHAUSTED` | No memory for the first object within 120 s. No object was sent. |
 
 ## 8. Cache tiers
 
 The article says each node runs a `scion-daemon` that talks only to a
 regional `scion-cache`, which asks the servers on a miss, and that all three
-answer identical calls. The tiers themselves are in review
-([#64](https://github.com/bnsd55/open-scion/pull/64)). These rules hold for
-any tier:
+answer identical calls. This project builds both: `scion-cache` keeps
+objects in memory and listens on TCP; `scion-daemon` keeps them on disk and
+listens on a Unix socket. Each sends its misses to one upstream, so the
+order is daemon, cache, server. These rules hold for any tier:
 
 - A tier MUST serve the `Objects` service with the same calls, fields, limits
   and reply rules as the server. A client MUST NOT need to know whether it
@@ -507,8 +613,30 @@ any tier:
 - A tier MAY keep objects forever. A tier never trusts upstream bytes: it
   MUST check each object from its upstream against its ID, as a client does
   (section 5), before it stores, forwards or sends it. An object that fails
-  the check MUST NOT be stored or sent, and the call fails.
+  the check MUST NOT be stored or sent. It ends the reply with `DATA_LOSS`,
+  after the objects before it.
+- An error status of an upstream call is about every object in that call.
+  If it comes for the first object of a reply, the tier MUST fail its own
+  call with that status. If it comes later, the tier ends its reply with
+  `OK` there, and the client's next call gets the status. So a missing repo
+  costs one upstream call per tier, not one per object.
+- An error in an upstream stream is about the next object. A tier MAY treat
+  one with a code other than `NOT_FOUND` or `DATA_LOSS` as a failure of the
+  whole call, because a broken connection also ends a stream with an error.
+  `scion-tier` does.
+- A tier SHOULD wait longer for its upstream than that upstream may wait for
+  its own, so it does not give up on a slow but healthy path. `scion-cache`
+  waits at most 60 s for each step of the server (an answer, or the next
+  object), and `scion-daemon` 200 s for each step of the cache. On a
+  timeout, the tier fails with `UNAVAILABLE`.
 - The `Scion` service goes only to the server.
+
+**The daemon's socket.** `scion-daemon` listens on a Unix socket with mode
+0600, in a directory that only its user can reach. A client sends its token
+to the socket, so it SHOULD check first that the socket file is a socket
+(not a symlink) owned by its own user or by root. `scn` does, for every
+`unix://` address. Neither `scn` nor the daemon checks the directories above
+the socket yet ([#70](https://github.com/bnsd55/open-scion/issues/70)).
 
 Tiers are trusted in v0.1. A client cannot check a `ResolveRef` or
 `GetRootTree` answer by hash, so it trusts every tier on its path for them.
@@ -553,8 +681,9 @@ A new version is a new package, `scion.v2`. A server MAY serve both.
 - Client changesets with no parent, several parents or a committer. Only git
   import makes them.
 - Text merge. Conflicts are path-level.
-- Merge base, ancestry and diff queries
-  ([#58](https://github.com/bnsd55/open-scion/issues/58)).
+- `MergeBase` and `IsAncestor` without a bound on the walk
+  ([#72](https://github.com/bnsd55/open-scion/issues/72)), and `Diff` with
+  rename detection ([#79](https://github.com/bnsd55/open-scion/issues/79)).
 - `Log` and `Blame` without per-call bounds
   ([#61](https://github.com/bnsd55/open-scion/issues/61)), and `Log` that
   follows renames.

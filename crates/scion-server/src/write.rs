@@ -34,13 +34,15 @@ pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<Chang
     let parent = check_request(&cs)?;
     // A cheap read first, so a request on a missing repo or parent reads no
     // blob. The transaction checks again.
-    store.read(|c| check_parent(c, repo, parent))?;
+    let repo_id = store.read(|c| check_parent(c, repo, parent))?;
     // The blob check touches only the object folder, so it runs before the
     // database lock is taken.
     // SHORTCUT: blobs are shared by all repos, so a changeset may name a blob
     // that another repo uploaded and then read it. Safe with one principal.
     // Upgrade before multi-tenant auth: a repo_blobs table checked here.
     check_blobs(store, &cs)?;
+    // See `tree::store_changeset`. The write's flush covers these steps.
+    tree::fill_root_tree(store, repo_id, parent)?;
     store.write(|c| {
         let repo_id = check_parent(c, repo, parent)?;
         if db::has_changeset(c, repo_id, id)? {
@@ -183,6 +185,24 @@ mod tests {
             store.blobs().full_flushes() - before,
             1 + u64::from(FSYNC_LEAVES_DRIVE_CACHE)
         );
+    }
+
+    #[test]
+    fn a_parent_without_a_root_tree_is_derived_in_steps_before_the_write() {
+        let (_dir, store, root) = store_with_root();
+        // Changesets without root trees, as after a version bump of the kind.
+        let tip = store
+            .write(|c| {
+                let repo = db::repo_id(c, "main")?;
+                (0..4).try_fold(root, |tip, _| {
+                    db::insert_changeset(c, repo, &changeset(vec![tip]))
+                })
+            })
+            .unwrap();
+        let commits = store.commits();
+        create_changeset(&store, "main", &child(tip, &[])).unwrap();
+        // Five root trees in steps, then the write.
+        assert_eq!(store.commits() - commits, crate::derived::steps(5) + 1);
     }
 
     #[test]

@@ -12,7 +12,10 @@ categories.workspace = true
 authors.workspace = true
 
 [dependencies]
+blake3.workspace = true
 prost.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
 

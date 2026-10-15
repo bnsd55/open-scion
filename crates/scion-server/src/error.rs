@@ -57,6 +57,10 @@ pub enum Error {
     /// request may succeed if retried.
     #[error("{0}")]
     Aborted(String),
+    /// The call reached its bound on work before it found the answer. The
+    /// same request fails again.
+    #[error("{0}")]
+    ResourceExhausted(String),
 }
 
 /// Result with the server [`Error`].
@@ -69,6 +73,7 @@ impl From<Error> for Status {
             Error::InvalidArgument(_) | Error::Apply(_) => Status::invalid_argument(e.to_string()),
             Error::Aborted(_) => Status::aborted(e.to_string()),
             Error::FailedPrecondition(_) => Status::failed_precondition(e.to_string()),
+            Error::ResourceExhausted(_) => Status::resource_exhausted(e.to_string()),
             Error::Corrupt(_) | Error::Db(_) | Error::Io(_) | Error::Git(_) => {
                 // Details stay in the server log, not in the reply.
                 tracing::error!(error = %e, "internal error");

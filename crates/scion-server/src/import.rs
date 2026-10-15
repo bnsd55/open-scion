@@ -321,10 +321,11 @@ fn point_ref(c: &Connection, repo: RepoId, name: &str, tip: ChangesetId) -> Resu
     if let Some(current) = current {
         // Already there, or the ref already contains the tip (changes were
         // landed on top of an earlier import): nothing to do.
-        if current.target == tip || db::is_ancestor(c, repo, tip, current.target)? {
+        // Import runs with the server stopped, so its walks have no bound.
+        if current.target == tip || db::is_ancestor(c, repo, tip, current.target, usize::MAX)? {
             return Ok(());
         }
-        if !db::is_ancestor(c, repo, current.target, tip)? {
+        if !db::is_ancestor(c, repo, current.target, tip, usize::MAX)? {
             return Err(Error::FailedPrecondition(format!(
                 "ref {name:?} has diverged from git: it points at {}, which is not \
                  an ancestor of the imported tip {tip}; import into another ref",

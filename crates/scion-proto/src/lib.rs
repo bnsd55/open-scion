@@ -1,4 +1,11 @@
-//! gRPC API for Scion, generated from `proto/scion.proto`.
+//! gRPC API for Scion, generated from `proto/scion.proto`, plus the rules that
+//! every server of the API shares: bearer tokens ([`auth`]), checks on request
+//! fields ([`check`]), and how a `GetObjects` reply streams objects
+//! ([`reply`]).
+
+pub mod auth;
+pub mod check;
+pub mod reply;
 
 /// Largest single gRPC message either side sends or accepts, except a
 /// `GetObjects` reply (see [`MAX_OBJECT_MESSAGE_BYTES`]).
