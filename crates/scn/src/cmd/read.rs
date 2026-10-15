@@ -3,9 +3,12 @@
 use std::io::Write as _;
 
 use anyhow::{Context, Result, bail};
-use scion_core::{Changeset, ChangesetId, Entry, FileState, IdentityTime, Tree};
-use scion_proto::v1::{GetChangesetRequest, ListDirRequest, LogRequest, ReadFileRequest};
+use scion_core::{Changeset, ChangesetId, Entry, FileState, IdentityTime, RepoPath, Tree};
+use scion_proto::v1::{
+    GetChangesetRequest, ListDirRequest, LogRequest, ReadFileRequest, ReadFileResponse,
+};
 use serde_json::{Value, json};
+use tonic::{Status, Streaming};
 
 use crate::client::{Ctx, id_from, lossy, split_spec};
 
@@ -15,16 +18,9 @@ pub async fn cat(ctx: &mut Ctx, spec: &str) -> Result<()> {
     let (rev, path) = split_spec(spec)?;
     let path = path.with_context(|| format!("{spec:?}: expected REV:PATH"))?;
     let changeset_id = ctx.resolve(rev).await?;
-    let mut stream = ctx
-        .client
-        .read_file(ReadFileRequest {
-            repo: ctx.repo.clone(),
-            changeset_id: changeset_id.as_bytes().to_vec(),
-            path: path.as_bytes().to_vec(),
-        })
+    let mut stream = read_stream(ctx, changeset_id, &path)
         .await
-        .with_context(|| format!("cannot read {spec}"))?
-        .into_inner();
+        .with_context(|| format!("cannot read {spec}"))?;
     let mut stdout = std::io::stdout();
     while let Some(chunk) = stream
         .message()
@@ -35,6 +31,23 @@ pub async fn cat(ctx: &mut Ctx, spec: &str) -> Result<()> {
     }
     stdout.flush()?;
     Ok(())
+}
+
+/// Starts streaming the content of the file at `path` in a changeset.
+pub(crate) async fn read_stream(
+    ctx: &mut Ctx,
+    changeset_id: ChangesetId,
+    path: &RepoPath,
+) -> Result<Streaming<ReadFileResponse>, Status> {
+    let reply = ctx
+        .client
+        .read_file(ReadFileRequest {
+            repo: ctx.repo.clone(),
+            changeset_id: changeset_id.as_bytes().to_vec(),
+            path: path.as_bytes().to_vec(),
+        })
+        .await?;
+    Ok(reply.into_inner())
 }
 
 /// Lists a directory, one entry per line: git-style mode, kind, name.
@@ -79,26 +92,30 @@ pub async fn ls(ctx: &mut Ctx, spec: &str) -> Result<()> {
 }
 
 /// Prints first-parent history, newest first: short ID, author, subject.
-pub async fn log(ctx: &mut Ctx, rev: &str, limit: u32) -> Result<()> {
-    let changeset_id = ctx.resolve(rev).await?;
-    let reply = ctx
-        .client
-        .log(LogRequest {
-            repo: ctx.repo.clone(),
-            changeset_id: changeset_id.as_bytes().to_vec(),
-            limit,
-        })
-        .await
-        .with_context(|| format!("cannot read the log of {rev}"))?
-        .into_inner();
-    let entries = reply
-        .entries
-        .iter()
-        .map(|entry| {
+/// With a `path`, only the changesets that change it. Asks again from where
+/// each reply stopped until it has `limit` changesets or the history ends.
+pub async fn log(ctx: &mut Ctx, rev: &str, path: Option<&RepoPath>, limit: u32) -> Result<()> {
+    let path = path.map(|p| p.as_bytes().to_vec()).unwrap_or_default();
+    let mut next = Some(ctx.resolve(rev).await?);
+    let mut entries = Vec::new();
+    while let Some(from) = next.filter(|_| entries.len() < limit as usize) {
+        let reply = ctx
+            .client
+            .log(LogRequest {
+                repo: ctx.repo.clone(),
+                changeset_id: from.as_bytes().to_vec(),
+                limit: limit - u32::try_from(entries.len())?,
+                path: path.clone(),
+            })
+            .await
+            .with_context(|| format!("cannot read the log of {rev}"))?
+            .into_inner();
+        for entry in &reply.entries {
             let id = id_from(&entry.changeset_id)?;
-            Ok((id, decode_changeset(id, &entry.changeset)?))
-        })
-        .collect::<Result<Vec<_>>>()?;
+            entries.push((id, decode_changeset(id, &entry.changeset)?));
+        }
+        next = opt_id(&reply.next_changeset_id)?;
+    }
     if ctx.json {
         let entries: Vec<Value> = entries
             .iter()
@@ -174,6 +191,15 @@ pub async fn show(ctx: &mut Ctx, rev: &str) -> Result<()> {
     Ok(())
 }
 
+/// An optional changeset ID from a reply: empty means `None`.
+pub(crate) fn opt_id(bytes: &[u8]) -> Result<Option<ChangesetId>> {
+    if bytes.is_empty() {
+        Ok(None)
+    } else {
+        id_from(bytes).map(Some)
+    }
+}
+
 /// Decodes a changeset and checks it against the ID it was asked for.
 fn decode_changeset(id: ChangesetId, bytes: &[u8]) -> Result<Changeset> {
     let cs = Changeset::decode(bytes)
@@ -213,7 +239,7 @@ fn identity(who: &IdentityTime) -> String {
     )
 }
 
-fn identity_json(who: &IdentityTime) -> Value {
+pub(crate) fn identity_json(who: &IdentityTime) -> Value {
     json!({
         "name": lossy(&who.name),
         "email": lossy(&who.email),

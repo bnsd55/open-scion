@@ -38,8 +38,12 @@ service Scion {
   rpc ReadFile(ReadFileRequest) returns (stream ReadFileResponse);
   // Returns one directory level as a TreeV1 object.
   rpc ListDir(ListDirRequest) returns (ListDirResponse);
-  // Walks first parents, newest first.
+  // Walks first parents, newest first. With a path, returns only the
+  // changesets that change it.
   rpc Log(LogRequest) returns (LogResponse);
+  // Which changeset last changed each line of a file, on first-parent
+  // history.
+  rpc Blame(BlameRequest) returns (BlameResponse);
 }
 
 // Object reads that any cache tier can answer. Every call but ResolveRef names
@@ -158,16 +162,61 @@ message LogRequest {
   string repo = 1;
   bytes changeset_id = 2;
   uint32 limit = 3;
+  // Optional. Only changesets that change this path: the file itself, or
+  // anything below it if it is a directory. Empty means every changeset.
+  bytes path = 4;
 }
 
 message LogResponse {
   repeated LogEntry entries = 1;
+  // Where the next call starts: the first changeset this reply does not
+  // cover. Empty when the history ends. A call checks a bounded number of
+  // changesets, so a path log can return no entries and still set this.
+  bytes next_changeset_id = 2;
 }
 
 message LogEntry {
   bytes changeset_id = 1;
   // ChangesetV1 bytes.
   bytes changeset = 2;
+}
+
+message BlameRequest {
+  string repo = 1;
+  bytes changeset_id = 2;
+  // A regular file of at most 1 MiB with no NUL byte.
+  bytes path = 3;
+}
+
+message BlameResponse {
+  // Line ranges in file order. Together they cover every line once.
+  repeated BlameRange ranges = 1;
+  // The author of each changeset that a range names, once each.
+  repeated BlameChangeset changesets = 2;
+  // Set when a call stopped at its bound before every line had a
+  // changeset. The ranges without a changeset came from this changeset or
+  // an older one. Blame the same path here to continue.
+  bytes next_changeset_id = 3;
+}
+
+message BlameRange {
+  // The first line, counting from 1, in the requested file.
+  uint32 start_line = 1;
+  uint32 line_count = 2;
+  // The changeset that last changed these lines. Empty when the call
+  // stopped first: see BlameResponse.next_changeset_id.
+  bytes changeset_id = 3;
+  // The first line, counting from 1, in the file at changeset_id, or at
+  // next_changeset_id when changeset_id is empty.
+  uint32 origin_line = 4;
+}
+
+message BlameChangeset {
+  bytes changeset_id = 1;
+  bytes author_name = 2;
+  bytes author_email = 3;
+  int64 author_unix_secs = 4;
+  int32 author_tz_offset_minutes = 5;
 }
 
 message GetRootTreeRequest {

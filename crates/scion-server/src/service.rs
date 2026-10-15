@@ -7,13 +7,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use scion_core::RepoPath;
+use scion_core::{ChangesetId, RepoPath};
 use scion_proto::v1::scion_server::{Scion, ScionServer};
 use scion_proto::v1::{
-    CreateChangesetRequest, CreateChangesetResponse, GetChangesetRequest, GetChangesetResponse,
-    GetLandRequest, LandResponse, ListDirRequest, ListDirResponse, LogEntry, LogRequest,
-    LogResponse, PutBlobRequest, PutBlobResponse, ReadFileRequest, ReadFileResponse,
-    ResolveRefRequest, ResolveRefResponse,
+    BlameChangeset, BlameRange, BlameRequest, BlameResponse, CreateChangesetRequest,
+    CreateChangesetResponse, GetChangesetRequest, GetChangesetResponse, GetLandRequest,
+    LandResponse, ListDirRequest, ListDirResponse, LogEntry, LogRequest, LogResponse,
+    PutBlobRequest, PutBlobResponse, ReadFileRequest, ReadFileResponse, ResolveRefRequest,
+    ResolveRefResponse,
 };
 use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES};
 use tokio::net::TcpListener;
@@ -28,16 +29,18 @@ use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
 use crate::objects::ObjectsService;
 use crate::store::{MAX_OBJECT_BYTES, Store};
-use crate::{db, names, read, write};
+use crate::{blame, db, names, read, write};
 
-/// Most changesets one `Log` call returns.
-const MAX_LOG: usize = 1000;
 /// Most changeset bytes in one `Log` reply; the client pages for more.
 const LOG_BUDGET_BYTES: usize = MAX_MESSAGE_BYTES / 2;
 /// Most store operations running at once.
 const MAX_BLOCKING: usize = 256;
 /// Most uploads in flight at once. Each buffers up to `MAX_OBJECT_BYTES`.
 const MAX_UPLOADS: usize = 16;
+/// Most `Blame` calls running at once. One call can diff for seconds, so
+/// blames never take more than this many of the `MAX_BLOCKING` permits that
+/// writes and lands share.
+const MAX_BLAMES: usize = 4;
 /// Longest a request may take before the server gives up on it.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -74,6 +77,8 @@ pub struct ScionService {
     /// Bounds buffered uploads, so their memory stays under
     /// `MAX_UPLOADS * MAX_OBJECT_BYTES`.
     uploads: Arc<Semaphore>,
+    /// Bounds blames running at once (`MAX_BLAMES`).
+    blames: Arc<Semaphore>,
 }
 
 impl ScionService {
@@ -82,6 +87,7 @@ impl ScionService {
             worker,
             lands: Arc::default(),
             uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
+            blames: Arc::new(Semaphore::new(MAX_BLAMES)),
         }
     }
 
@@ -161,6 +167,15 @@ fn parse_path(bytes: Vec<u8>) -> Result<RepoPath, Status> {
     RepoPath::new(bytes).map_err(|e| Status::invalid_argument(format!("bad path: {e}")))
 }
 
+/// An optional path on the wire: empty for `None`.
+fn parse_optional_path(bytes: Vec<u8>) -> Result<Option<RepoPath>, Status> {
+    if bytes.is_empty() {
+        Ok(None)
+    } else {
+        parse_path(bytes).map(Some)
+    }
+}
+
 fn caller<T>(request: &Request<T>) -> Result<Caller, Status> {
     request
         .extensions()
@@ -180,10 +195,7 @@ fn land_response(outcome: LandOutcome) -> LandResponse {
     LandResponse {
         land_id: outcome.land_id.to_string(),
         state: state.into(),
-        result_changeset_id: outcome
-            .result
-            .map(|id| id.as_bytes().to_vec())
-            .unwrap_or_default(),
+        result_changeset_id: id_bytes(outcome.result),
         detail: outcome.detail,
         conflict_paths: outcome
             .conflict_paths
@@ -352,11 +364,7 @@ impl Scion for ScionService {
         let req = request.into_inner();
         check_name("repo", &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
-        let path = if req.path.is_empty() {
-            None
-        } else {
-            Some(parse_path(req.path)?)
-        };
+        let path = parse_optional_path(req.path)?;
         let tree = self
             .worker
             .run(move |store| read::list_dir(&store, &req.repo, id, path.as_ref()))
@@ -370,17 +378,22 @@ impl Scion for ScionService {
         let req = request.into_inner();
         check_name("repo", &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
-        let limit = (req.limit as usize).clamp(1, MAX_LOG);
-        let changesets = self
+        // `read::MAX_SCAN` also bounds the entries.
+        let limit = (req.limit as usize).max(1);
+        let path = parse_optional_path(req.path)?;
+        let page = self
             .worker
-            .run(move |store| read::log(&store, &req.repo, id, limit))
+            .run(move |store| read::log_page(&store, &req.repo, id, path.as_ref(), limit))
             .await?;
         // Always send the first entry; stop before the reply gets too big.
+        let mut next = page.next;
         let mut budget = LOG_BUDGET_BYTES;
         let mut entries = Vec::new();
-        for (id, changeset) in changesets {
+        for (id, changeset) in page.entries {
             let body = changeset.encode();
             if !entries.is_empty() && body.len() > budget {
+                // Not sent, so the next call starts here.
+                next = Some(id);
                 break;
             }
             budget = budget.saturating_sub(body.len());
@@ -389,8 +402,65 @@ impl Scion for ScionService {
                 changeset: body,
             });
         }
-        Ok(Response::new(LogResponse { entries }))
+        Ok(Response::new(LogResponse {
+            entries,
+            next_changeset_id: id_bytes(next),
+        }))
     }
+
+    async fn blame(
+        &self,
+        request: Request<BlameRequest>,
+    ) -> Result<Response<BlameResponse>, Status> {
+        let req = request.into_inner();
+        check_name("repo", &req.repo)?;
+        let id = parse_id(&req.changeset_id, "changeset_id")?;
+        let path = parse_path(req.path)?;
+        // Taken before the worker permit, and held until the job ends, also
+        // when the client leaves first.
+        let slot = Arc::clone(&self.blames)
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("server is shutting down"))?;
+        let blame = self
+            .worker
+            .run(move |store| {
+                let _slot = slot;
+                blame::blame(&store, &req.repo, id, &path)
+            })
+            .await?;
+        let ranges = blame
+            .ranges
+            .into_iter()
+            .map(|range| BlameRange {
+                start_line: range.start_line,
+                line_count: range.line_count,
+                changeset_id: id_bytes(range.changeset),
+                origin_line: range.origin_line,
+            })
+            .collect();
+        let changesets = blame
+            .authors
+            .into_iter()
+            .map(|(id, author)| BlameChangeset {
+                changeset_id: id.as_bytes().to_vec(),
+                author_name: author.name,
+                author_email: author.email,
+                author_unix_secs: author.unix_secs,
+                author_tz_offset_minutes: author.tz_offset_minutes,
+            })
+            .collect();
+        Ok(Response::new(BlameResponse {
+            ranges,
+            changesets,
+            next_changeset_id: id_bytes(blame.next),
+        }))
+    }
+}
+
+/// An optional changeset ID on the wire: empty for `None`.
+fn id_bytes(id: Option<ChangesetId>) -> Vec<u8> {
+    id.map(|id| id.as_bytes().to_vec()).unwrap_or_default()
 }
 
 #[cfg(test)]

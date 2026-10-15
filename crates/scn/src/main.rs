@@ -7,6 +7,7 @@ mod materialize;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use scion_core::RepoPath;
 
 use crate::client::Ctx;
 
@@ -52,9 +53,19 @@ enum Command {
         /// Ref name or changeset ID.
         #[arg(default_value = "main")]
         rev: String,
+        /// Show only the changesets that change this file, or anything
+        /// below this directory.
+        #[arg(long, value_parser = client::parse_repo_path)]
+        path: Option<RepoPath>,
         /// How many changesets to show.
         #[arg(short = 'n', long, default_value_t = 10)]
         limit: u32,
+    },
+    /// Show the changeset that last changed each line of a file, on
+    /// first-parent history: `scn blame main:src/lib.rs`.
+    Blame {
+        /// `REV:PATH`.
+        spec: String,
     },
     /// Show one changeset and its changed paths.
     Show {
@@ -89,7 +100,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Cat { spec } => cmd::read::cat(&mut ctx, &spec).await,
         Command::Ls { spec } => cmd::read::ls(&mut ctx, &spec).await,
-        Command::Log { rev, limit } => cmd::read::log(&mut ctx, &rev, limit).await,
+        Command::Log { rev, path, limit } => {
+            cmd::read::log(&mut ctx, &rev, path.as_ref(), limit).await
+        }
+        Command::Blame { spec } => cmd::blame::blame(&mut ctx, &spec).await,
         Command::Show { rev } => cmd::read::show(&mut ctx, &rev).await,
         Command::Checkout(args) => cmd::checkout::checkout(&mut ctx, args).await,
         Command::Commit(args) => cmd::commit::commit(&mut ctx, args).await,

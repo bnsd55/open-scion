@@ -4,11 +4,12 @@
 //!
 //! - [`store`] and [`db`]: `SQLite` for metadata and trees, a folder for blobs.
 //! - [`tree`]: apply changesets to trees and derive each changeset's root tree.
-//! - [`read`], [`write`], [`land`]: the operations behind the RPCs.
+//! - [`read`], [`blame`], [`write`], [`land`]: the operations behind the RPCs.
 //! - [`import`]: one-way import from a git repository.
 //! - [`service`], [`objects`] and [`auth`]: the gRPC front end.
 
 pub mod auth;
+pub mod blame;
 pub mod db;
 pub mod error;
 pub mod import;

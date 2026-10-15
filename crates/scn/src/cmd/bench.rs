@@ -156,6 +156,7 @@ async fn verify(mut ctx: Ctx, start: ChangesetId, landed: &[ChangesetId]) -> Res
                 repo: ctx.repo.clone(),
                 changeset_id: from.as_bytes().to_vec(),
                 limit: 1000,
+                path: Vec::new(),
             })
             .await?
             .into_inner();

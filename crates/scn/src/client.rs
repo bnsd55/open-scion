@@ -160,6 +160,11 @@ pub fn split_spec(spec: &str) -> Result<(&str, Option<RepoPath>)> {
     }
 }
 
+/// Parses a path given on the command line. A trailing `/` is allowed.
+pub fn parse_repo_path(path: &str) -> Result<RepoPath> {
+    RepoPath::new(path.trim_end_matches('/')).with_context(|| format!("bad path {path:?}"))
+}
+
 /// Raw bytes as text for display.
 // SHORTCUT: lossy, also in JSON output, so non-UTF-8 names and messages print
 // with replacement characters. Upgrade: escape or base64 raw bytes in JSON.
