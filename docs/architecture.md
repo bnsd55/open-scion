@@ -147,6 +147,12 @@ replaces it.
   (`fullfsync = OFF`), except in checkpoints (`checkpoint_fullfsync`).
   Elsewhere the commit's `fsync` already flushes the cache. A land waits for
   the flush after it releases the ref's lock, so queued lands share it.
+- A read waits too. If `Store::read` saw a commit that no full flush covers
+  yet, it waits for one after it releases the database lock. So no reply
+  shows a commit that a power loss can undo, such as a ref target from
+  `ResolveRef` or a land state from `GetLand`. Where `fsync` already flushes
+  the drive cache, no read waits. A land reads with `Store::read_unflushed`,
+  because it flushes before it replies.
 - A blob is durable after `BlobBatch::sync`: a plain `fsync` of each blob file
   when written, then of each changed fan-out directory, then a shared full
   flush.
@@ -214,9 +220,13 @@ started.
    refused before any change is read.
 2. Check the request: exactly one parent, no committer, a message of at most
    1 MiB, author name and email of at most 1 KiB each.
-3. Read back every blob it names, outside the database lock.
-4. In one write transaction: if the repo already has this ID, return it (a
-   retry). The parent must be in the repo. Then `tree::store_changeset`.
+3. Check that the repo exists and has the parent, so a bad request reads no
+   blob.
+4. Read back each blob it names, outside the database lock. A blob that many
+   paths name is read once. The error names the first path, in path order,
+   whose blob is missing or corrupt.
+5. In one write transaction: check the repo and the parent again. If the repo
+   already has this ID, return it (a retry). Then `tree::store_changeset`.
    Changes that do not apply to the parent's tree are `INVALID_ARGUMENT`.
 
 **Land** (`land.rs`):
@@ -535,7 +545,7 @@ accepts names that are not safe to write, so the checkout adds its own rules:
 
 | Rule | Why |
 |---|---|
-| The checkout is written into a temp directory, `.scn-checkout-<pid>-<n>`, made with `mkdirat` through a handle on the destination's parent. One `renameat` then moves it onto the destination name. | The rename is the check: it replaces a missing or empty directory, and fails if the destination is a non-empty directory, a file or a symlink. So "new or empty, not a symlink" holds at the moment the files appear. An early check gives a clear error first, but correctness comes from the rename. A killed `scn` can leave the temp directory behind. |
+| The checkout is written into a temp directory, `.scn-checkout-<16 random hex digits>`, made with mode 0700 by `mkdirat` through a handle on the destination's parent. Just before the rename, it gets the mode of a plain `mkdir` (0777 less the umask). One `renameat` then moves it onto the destination name. | The rename is the check: it replaces a missing or empty directory, and fails if the destination is a non-empty directory, a file or a symlink. So "new or empty, not a symlink" holds at the moment the files appear. An early check gives a clear error first, but correctness comes from the rename. Other users cannot guess the temp name, or enter or write the directory. But a user who can write the destination's parent can still rename it and put another directory in its place, so that parent must not be writable by other users, unless it has the sticky bit. A killed `scn` can leave the temp directory behind. |
 | Inside the temp directory, each parent is opened with `O_NOFOLLOW`, one part at a time. Files use `O_CREAT \| O_EXCL`. | A symlink in the way, from this checkout or from anything else, fails the write instead of redirecting it. |
 | The temp directory starts empty, and the checkout records every path it makes. A path that already exists without being recorded is a collision. | The filesystem folded two names into one, by case or by Unicode form (for example `A` and `a`, or `X/f` and `x/g`, on macOS). The error names the path, and the temp directory is removed. Where nothing folds, every name is written, as git does. |
 | Symlinks are written as symlinks with their raw target bytes, never resolved. | A target such as `../../etc` is data, not a path to follow. |
@@ -574,7 +584,7 @@ an untrusted network.
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
 | Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once, 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget, and a reply whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 1 MiB and diffs at most 100 versions. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object inside HTTP/2 until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. | The client trusts the server for a ref's target and for a changeset's root tree, which it cannot check by hash. Tiers ([#5](https://github.com/bnsd55/open-scion/issues/5)) must forward these answers, not compute them. |
-| Checkout | `scn checkout` writes into a temp directory and renames it onto a new or empty destination, never follows a symlink while writing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure the destination stays as it was. | No Windows rules: device names and names that end in a dot or a space pass. |
+| Checkout | `scn checkout` writes into a private temp directory with a random name and renames it onto a new or empty destination, never follows a symlink while writing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure the destination stays as it was. | The destination's parent must not be writable by other users, unless it has the sticky bit: they could swap the temp directory before the rename. No Windows rules: device names and names that end in a dot or a space pass. |
 | Errors | Internal errors reply `internal error`. The detail stays in the server log. | |
 
 The planned cache tiers will need access tickets, because an object ID is not
@@ -592,7 +602,6 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/store.rs` (`MAX_OBJECT_BYTES`) | An upload is buffered in memory, up to 100 MiB, before it is hashed and written. | Stream to a temp file and hash the chunks. | [#16](https://github.com/bnsd55/open-scion/issues/16) |
 | `scion-server/src/store.rs` (`Inner::db`) | One SQLite connection behind a mutex, so reads wait for writes. | A pool of read-only connections. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
 | `scion-server/src/store.rs` (`Store::open`) | One process per data directory, so an import needs the server stopped. | Let a separate importer process share the directory. Lands already re-plan when the ref moves (`MAX_ATTEMPTS`). | [#27](https://github.com/bnsd55/open-scion/issues/27) |
-| `scion-server/src/store.rs` (`Store::flush`) | Between a commit and its full flush, other calls can read the commit, and a power loss can undo what they saw. | Hide commits until their flush, or a lander that batches lands. | [#18](https://github.com/bnsd55/open-scion/issues/18) |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/land.rs` (`MAX_ATTEMPTS`) | Imports move refs without the land lock, so a land retries 3 times, then returns `ABORTED`. | Route every ref move through the per-ref lander. | [#27](https://github.com/bnsd55/open-scion/issues/27) |

@@ -1,8 +1,9 @@
 //! Writes a checkout to disk, and the name rules that make that safe.
 //!
 //! A checkout is written into a new temp directory next to the destination,
-//! made through a handle on the destination's parent, and renamed onto the
-//! destination name only once every file is written. The rename is the check
+//! made through a handle on the destination's parent, with a random name and
+//! mode 0700. It is renamed onto the destination name only once every file is
+//! written, with the mode a plain `mkdir` would give. The rename is the check
 //! that counts: it replaces a missing or empty directory, and fails if the
 //! destination is a non-empty directory, a file or a symlink. On any failure
 //! the temp directory is removed, so the destination stays as it was.
@@ -17,7 +18,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, ErrorKind, Write as _};
+use std::io::{self, ErrorKind, Read as _, Write as _};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
@@ -103,6 +104,8 @@ pub struct Checkout {
     /// The temp directory's name in `parent`, and a handle on it.
     temp: Vec<u8>,
     root: OwnedFd,
+    /// The mode the destination gets: what a plain `mkdir` gives.
+    mode: Mode,
     /// The destination's name in `parent`.
     name: Vec<u8>,
     /// Every path this checkout has made, relative to the temp directory.
@@ -111,8 +114,8 @@ pub struct Checkout {
 }
 
 impl Checkout {
-    /// Makes an empty temp directory next to `dest`, through a handle on the
-    /// parent of `dest`.
+    /// Makes an empty, private temp directory next to `dest`, through a
+    /// handle on the parent of `dest`.
     ///
     /// # Errors
     ///
@@ -132,12 +135,18 @@ impl Checkout {
             .with_context(|| format!("cannot open {}", parent_path.display()))?;
         let temp = make_temp_dir(&parent)
             .with_context(|| format!("cannot make a directory in {}", parent_path.display()))?;
-        let root = match open_dir(&parent, &temp) {
-            Ok(root) => root,
+        let set_up = || -> io::Result<(OwnedFd, Mode)> {
+            let root = open_dir(&parent, &temp)?;
+            let mode = mkdir_mode(&root)?;
+            Ok((root, mode))
+        };
+        let (root, mode) = match set_up() {
+            Ok(set) => set,
             Err(e) => {
-                // Still empty, so a plain rmdir removes it.
+                // The probe removes itself, so the directory is empty and a
+                // plain rmdir removes it.
                 let _ = rustix::fs::unlinkat(&parent, temp.as_slice(), AtFlags::REMOVEDIR);
-                return Err(e).context("cannot open the new directory");
+                return Err(e).context("cannot set up the new directory");
             }
         };
         Ok(Self {
@@ -145,6 +154,7 @@ impl Checkout {
             parent_path,
             temp,
             root,
+            mode,
             name: name.as_bytes().to_vec(),
             made: HashSet::new(),
             finished: false,
@@ -191,7 +201,8 @@ impl Checkout {
         link().with_context(|| format!("cannot write {path:?}"))
     }
 
-    /// Renames the temp directory onto the destination.
+    /// Gives the temp directory the mode of a plain `mkdir`, and renames it
+    /// onto the destination.
     ///
     /// # Errors
     ///
@@ -199,6 +210,9 @@ impl Checkout {
     /// non-empty directory, a file or a symlink.
     pub fn finish(mut self) -> Result<()> {
         let dest = self.parent_path.join(OsStr::from_bytes(&self.name));
+        rustix::fs::fchmod(&self.root, self.mode)
+            .map_err(io::Error::from)
+            .with_context(|| format!("cannot set the mode of {}", dest.display()))?;
         match rustix::fs::renameat(&self.parent, &self.temp, &self.parent, &self.name) {
             Ok(()) => {
                 self.finished = true;
@@ -261,18 +275,25 @@ impl Drop for Checkout {
     }
 }
 
-/// Makes a new, empty directory in `parent` with a name no one else uses.
+/// Makes a new, empty directory in `parent` with a random name and mode 0700,
+/// so other users cannot guess its name, enter it, or add to it.
 fn make_temp_dir(parent: &OwnedFd) -> io::Result<Vec<u8>> {
-    let pid = std::process::id();
-    let mut attempt = 0_u32;
-    loop {
-        let name = format!("{TEMP_PREFIX}{pid}-{attempt}").into_bytes();
-        match rustix::fs::mkdirat(parent, name.as_slice(), Mode::from_raw_mode(0o777)) {
-            Ok(()) => return Ok(name),
-            Err(Errno::EXIST) if attempt < 1000 => attempt += 1,
-            Err(e) => return Err(e.into()),
-        }
-    }
+    let mut random = [0_u8; 8];
+    fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let name = format!("{TEMP_PREFIX}{:016x}", u64::from_ne_bytes(random)).into_bytes();
+    rustix::fs::mkdirat(parent, name.as_slice(), Mode::from_raw_mode(0o700))?;
+    Ok(name)
+}
+
+/// The mode a plain `mkdir` gives in `dir`: 0777 less the umask, and the
+/// setgid bit where `dir` passes it on. Reading the umask changes it for the
+/// whole process, so this makes a probe directory in `dir`, which must be
+/// empty and private, and reads its mode.
+fn mkdir_mode(dir: &OwnedFd) -> io::Result<Mode> {
+    rustix::fs::mkdirat(dir, "probe", Mode::from_raw_mode(0o777))?;
+    let stat = rustix::fs::statat(dir, "probe", AtFlags::SYMLINK_NOFOLLOW);
+    rustix::fs::unlinkat(dir, "probe", AtFlags::REMOVEDIR)?;
+    Ok(Mode::from_raw_mode(stat?.st_mode & 0o7777))
 }
 
 /// Opens directory `name` in `dir`. Fails if `name` is a symlink or anything
@@ -379,6 +400,38 @@ mod tests {
         assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
         assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
         assert_eq!(temp_dirs(tmp.path()), Vec::<String>::new());
+    }
+
+    /// The permission bits of `path`, setgid included.
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn the_temp_directory_is_private_with_a_random_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let first = Checkout::start(&dest).unwrap();
+        let [name] = temp_dirs(tmp.path()).try_into().unwrap();
+        assert_eq!(mode(&tmp.path().join(&name)), 0o700);
+        drop(first);
+        // A second checkout from the same process gets another name.
+        let _second = Checkout::start(&dest).unwrap();
+        assert_ne!(temp_dirs(tmp.path()), [name]);
+    }
+
+    #[test]
+    fn the_result_has_the_mode_of_a_plain_mkdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let mut checkout = Checkout::start(&dest).unwrap();
+        checkout.file(&path("a/b"), false, b"b\n").unwrap();
+        checkout.finish().unwrap();
+        let plain = tmp.path().join("plain");
+        fs::create_dir(&plain).unwrap();
+        // With a umask of 077 both are 0700, and a missing chmod passes.
+        assert_eq!(mode(&dest), mode(&plain));
     }
 
     #[test]

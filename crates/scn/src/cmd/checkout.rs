@@ -29,7 +29,9 @@ pub struct CheckoutArgs {
     sparse: Vec<RepoPath>,
     /// Directory to write into. It must not exist, or be empty. The checkout
     /// is built next to it and renamed onto it, so its parent must be
-    /// writable, and it cannot be a mount point.
+    /// writable, and it cannot be a mount point. Its parent must not be
+    /// writable by other users, unless it has the sticky bit (as /tmp has):
+    /// they could swap the checkout before the rename.
     #[arg(long, value_name = "PATH")]
     into: PathBuf,
 }

@@ -12,6 +12,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use rusqlite::{Connection, TransactionBehavior};
@@ -47,6 +48,11 @@ struct Inner {
     // SHORTCUT: one connection behind a mutex, so reads wait for writes.
     // Upgrade: a pool of read-only connections (WAL allows parallel readers).
     db: Mutex<Connection>,
+    /// Commits made so far. It grows under the `db` lock, right after each
+    /// commit.
+    committed: AtomicU64,
+    /// How many of those commits a finished full flush covers.
+    flushed: AtomicU64,
     blobs: Blobs,
     /// Keeps the data directory locked until the last clone is dropped.
     _lock: fs::File,
@@ -92,6 +98,8 @@ impl Store {
         Ok(Self {
             inner: Arc::new(Inner {
                 db: Mutex::new(db),
+                committed: AtomicU64::new(0),
+                flushed: AtomicU64::new(0),
                 blobs,
                 _lock: lock,
             }),
@@ -104,12 +112,34 @@ impl Store {
         &self.inner.blobs
     }
 
-    /// Runs `f` on the database, outside any explicit transaction.
+    /// Runs `f` on the database, outside any explicit transaction. Returns
+    /// once every commit that `f` could see is durable, so a reply never
+    /// shows a commit that a power loss can undo.
+    ///
+    /// # Errors
+    ///
+    /// Returns what `f` returns, or an error from [`Store::flush`].
+    pub fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let (result, seen) = {
+            let db = self.lock();
+            // Commits are counted under this lock, so `seen` counts every
+            // commit that `f` could see.
+            (f(&db), self.inner.committed.load(Ordering::Acquire))
+        };
+        // An error is an answer too. The flush runs outside the lock.
+        if seen > self.inner.flushed.load(Ordering::Acquire) {
+            self.flush()?;
+        }
+        result
+    }
+
+    /// Like [`Store::read`], but returns before what `f` saw is durable. Use
+    /// it only inside a write that calls [`Store::flush`] before it replies.
     ///
     /// # Errors
     ///
     /// Returns what `f` returns.
-    pub fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub fn read_unflushed<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         f(&self.lock())
     }
 
@@ -137,6 +167,7 @@ impl Store {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = f(&tx)?;
         tx.commit()?;
+        self.inner.committed.fetch_add(1, Ordering::Release);
         Ok(value)
     }
 
@@ -152,14 +183,14 @@ impl Store {
     ///
     /// Fails if the flush fails. The commits stay, but may not be durable; a
     /// retry sees them.
-    // SHORTCUT: between a commit and its flush, other calls can read the
-    // commit, and a power loss can then undo what they saw. Upgrade: hide
-    // commits until their flush, or a lander that batches lands (#18).
     pub fn flush(&self) -> Result<()> {
+        // The full flush starts after this load, so it covers these commits.
+        let covers = self.inner.committed.load(Ordering::Acquire);
         // Concurrent calls share one flush, made outside the database lock.
         if FSYNC_LEAVES_DRIVE_CACHE {
             self.inner.blobs.full_flush()?;
         }
+        self.inner.flushed.fetch_max(covers, Ordering::Release);
         Ok(())
     }
 
@@ -224,6 +255,9 @@ pub struct Blobs {
     root: PathBuf,
     tmp: PathBuf,
     group_flush: GroupFlush,
+    /// Calls to [`Blobs::verify`] so far.
+    #[cfg(test)]
+    verifies: std::sync::atomic::AtomicU64,
 }
 
 impl Blobs {
@@ -242,6 +276,8 @@ impl Blobs {
             root,
             tmp,
             group_flush: GroupFlush::default(),
+            #[cfg(test)]
+            verifies: std::sync::atomic::AtomicU64::default(),
         })
     }
 
@@ -340,6 +376,9 @@ impl Blobs {
     ///
     /// [`Error::Io`] if the file exists but cannot be read.
     pub fn verify(&self, id: BlobId) -> Result<BlobStatus> {
+        #[cfg(test)]
+        self.verifies
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let file = match self.open_file(id) {
             Ok(file) => file,
             Err(Error::NotFound(_)) => return Ok(BlobStatus::Missing),
@@ -391,6 +430,12 @@ impl Blobs {
     #[cfg(test)]
     pub(crate) fn full_flushes(&self) -> u64 {
         self.group_flush.lock().finished
+    }
+
+    /// Calls to [`Blobs::verify`] so far.
+    #[cfg(test)]
+    pub(crate) fn verifies(&self) -> u64 {
+        self.verifies.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -804,5 +849,44 @@ mod tests {
             store.blobs().full_flushes(),
             before + u64::from(FSYNC_LEAVES_DRIVE_CACHE)
         );
+    }
+
+    /// Full flushes that one read runs.
+    fn flushes_in_read(store: &Store) -> u64 {
+        let before = store.blobs().full_flushes();
+        store
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM repos", [], |_| Ok(()))?))
+            .unwrap();
+        store.blobs().full_flushes() - before
+    }
+
+    fn create_repo(c: &Connection) -> Result<()> {
+        crate::db::create_repo(c, "main").map(drop)
+    }
+
+    #[test]
+    fn a_read_with_no_unflushed_commit_runs_no_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(flushes_in_read(&store), 0);
+    }
+
+    #[test]
+    fn a_read_of_an_unflushed_commit_waits_for_a_full_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.commit(create_repo).unwrap();
+        // None where the commit's own fsync flushes the drive cache.
+        assert_eq!(flushes_in_read(&store), u64::from(FSYNC_LEAVES_DRIVE_CACHE));
+        // That flush covers the commit.
+        assert_eq!(flushes_in_read(&store), 0);
+    }
+
+    #[test]
+    fn a_read_after_a_write_runs_no_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.write(create_repo).unwrap();
+        assert_eq!(flushes_in_read(&store), 0);
     }
 }
