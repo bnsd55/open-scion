@@ -1149,11 +1149,15 @@ mod tests {
         };
 
         // A fetch of the last two objects ends, and stores them.
-        tier.fetch("r", &keys, 1, &Progress::default()).await.unwrap();
+        tier.fetch("r", &keys, 1, &Progress::default())
+            .await
+            .unwrap();
         settled().await;
         assert_eq!(asked(), 2);
         // A batch that starts at the first object leaves out the two stored.
-        tier.fetch("r", &keys, 0, &Progress::default()).await.unwrap();
+        tier.fetch("r", &keys, 0, &Progress::default())
+            .await
+            .unwrap();
         settled().await;
         assert_eq!(asked(), 3);
         // A reply that missed an object just before its fetch stored it, and
