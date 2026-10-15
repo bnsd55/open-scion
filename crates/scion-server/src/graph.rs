@@ -21,14 +21,22 @@
 //!   changeset between two merges.
 //! - [`merge_bases`] answers from where the two first-parent histories meet,
 //!   when neither has a merge newer than that point. Else it walks the graph
-//!   ([`db::merge_bases`]).
+//!   from both changesets, highest generation first (`Paint`). It jumps
+//!   over each run of first parents that no other part of the walk reaches.
+//!
+//! Neither query has a bound on its reads. Each fails once its [`Deadline`]
+//! has passed, and runs in steps of about 1,000 reads (`STEPS`). A step holds
+//! the database lock, and other requests run between steps.
 
-use std::collections::HashSet;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::time::Duration;
 
 use rusqlite::Connection;
 use scion_core::{Changeset, ChangesetId};
 
 use crate::db::{self, RepoId};
+use crate::deadline::Deadline;
 use crate::derived::{self, Kind};
 use crate::error::{Error, Result};
 use crate::store::Store;
@@ -185,84 +193,156 @@ impl Kind for CommitGraph {
 /// # Errors
 ///
 /// [`Error::NotFound`] if `repo` does not have either changeset.
-/// [`Error::ResourceExhausted`] if the answer needs more than `max_reads`
-/// reads of nodes and parents.
+/// [`Error::DeadlineExceeded`] once `deadline` has passed.
 pub fn is_ancestor(
     store: &Store,
     repo: RepoId,
     ancestor: ChangesetId,
     descendant: ChangesetId,
-    max_reads: usize,
+    deadline: &Deadline,
 ) -> Result<bool> {
-    let node = derived::get::<CommitGraph>(store, repo, descendant)?;
-    store.read(|c| {
-        let floor = db::generation(c, repo, ancestor)?;
-        let from = At {
-            id: descendant,
-            node,
-        };
-        reaches(&mut Index::new(c, max_reads), from, ancestor, floor)
-    })
+    let from = At::get(store, repo, descendant)?;
+    let floor = store.read(|c| db::generation(c, repo, ancestor))?;
+    let mut search = Search::new(from, ancestor, floor);
+    Ok(in_steps(store, deadline, STEPS, |index| search.next(index))?.0)
 }
 
-/// The best common ancestors of `a` and `b`, as [`db::merge_bases`] gives
-/// them. Derives the commit graph first if `a` or `b` has no node. Reads a
-/// few nodes when neither first-parent history has a merge newer than where
-/// the two meet. Else walks at most `max_reads` changesets.
+/// The best common ancestors of `a` and `b`, over all parents: every common
+/// ancestor that is not an ancestor of another common ancestor. Highest
+/// generation first, then lowest ID. Derives the commit graph first if `a`
+/// or `b` has no node. Reads a few nodes when neither first-parent history
+/// has a merge newer than where the two meet. Else walks the graph
+/// (`Paint`).
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] if `repo` does not have either changeset.
-/// [`Error::ResourceExhausted`] if the answer needs more than `max_reads`
-/// reads.
+/// [`Error::DeadlineExceeded`] once `deadline` has passed.
 pub fn merge_bases(
     store: &Store,
     repo: RepoId,
     a: ChangesetId,
     b: ChangesetId,
-    max_reads: usize,
+    deadline: &Deadline,
 ) -> Result<Vec<ChangesetId>> {
-    let a_node = derived::get::<CommitGraph>(store, repo, a)?;
-    let b_node = derived::get::<CommitGraph>(store, repo, b)?;
-    store.read(|c| {
-        let (a, b) = (
-            At {
-                id: a,
-                node: a_node,
-            },
-            At {
-                id: b,
-                node: b_node,
-            },
-        );
-        match meeting(&mut Index::new(c, max_reads), a, b)? {
-            Some(bases) => Ok(bases),
-            None => db::merge_bases(c, repo, a.id, b.id, max_reads),
-        }
-    })
+    let (a, b) = (At::get(store, repo, a)?, At::get(store, repo, b)?);
+    if let Some(bases) = store.read(|c| meeting(&mut Index::new(c, deadline), a, b))? {
+        return Ok(bases);
+    }
+    let mut paint = Paint::new(a, b);
+    Ok(in_steps(store, deadline, STEPS, |index| paint.next(index))?.0)
 }
 
-/// Whether `from` is `ancestor`, of generation `floor`, or reaches it
-/// through parents.
-///
-/// A path from `from` to `ancestor` follows first parents all the way, or
-/// leaves the first-parent history at a merge newer than `ancestor`,
-/// through another parent of the merge. So this searches the first-parent
-/// history of `from`, then does the same from each such parent. It takes
-/// each merge once.
-fn reaches(index: &mut Index, from: At, ancestor: ChangesetId, floor: i64) -> Result<bool> {
-    let mut next = vec![from];
-    let mut merges = HashSet::new();
-    while let Some(from) = next.pop() {
-        if index.descend(from, floor, |link| link.generation)?.id == ancestor {
-            return Ok(true);
+/// What a query read: nodes and parents, in steps.
+#[derive(Clone, Copy, Debug, Default)]
+struct Cost {
+    reads: usize,
+    steps: usize,
+}
+
+/// How a walk shares the database lock: it holds it for moves of up to
+/// `reads` reads, then leaves it free for `pause`.
+#[derive(Clone, Copy, Debug)]
+struct Steps {
+    reads: usize,
+    pause: Duration,
+}
+
+/// The steps of the queries. A step ends after the move that reaches 1,000
+/// reads, and a move reads at most a few dozen rows: O(log n) nodes, or the
+/// parents of a merge. The lock is not fair: a thread that frees it and
+/// takes it again at once keeps it, before a request that waits for it
+/// wakes up. The pause lets that request in, for a few percent of the time
+/// of a step.
+// SHORTCUT: a pause, not a handoff, so a request that wakes later than the
+// pause waits for one more step. Upgrade: a pool of read-only connections,
+// so a walk holds no lock that others wait for
+// (https://github.com/bnsd55/open-scion/issues/17).
+const STEPS: Steps = Steps {
+    reads: 1000,
+    pause: Duration::from_micros(100),
+};
+
+/// Makes the moves of a walk with `next` until it gives the answer, in
+/// `steps`. Other requests take the database lock between steps. A
+/// changeset's parents and node never change, so a walk goes on in the next
+/// step from where it stopped.
+fn in_steps<T>(
+    store: &Store,
+    deadline: &Deadline,
+    steps: Steps,
+    mut next: impl FnMut(&mut Index) -> Result<Option<T>>,
+) -> Result<(T, Cost)> {
+    let mut cost = Cost::default();
+    let result = loop {
+        cost.steps += 1;
+        // The read at the end waits for the flush, once for all steps.
+        let step = store.read_unflushed(|c| {
+            let mut index = Index::new(c, deadline);
+            let answer = loop {
+                match next(&mut index) {
+                    Ok(None) if index.reads < steps.reads => {}
+                    answer => break answer,
+                }
+            };
+            cost.reads += index.reads;
+            answer
+        });
+        if let Some(result) = step.transpose() {
+            break result;
         }
-        let mut merge = from.node.merge;
-        while let Some(at) = merge {
+        std::thread::sleep(steps.pause);
+    };
+    // As `Store::read`: the reply waits until each commit that a step could
+    // see is durable.
+    store.read(|_| Ok(()))?;
+    let Cost { reads, steps } = cost;
+    if let Err(Error::DeadlineExceeded(why)) = &result {
+        tracing::info!(reads, steps, %why, "a graph query stopped");
+    } else {
+        tracing::debug!(reads, steps, "graph query");
+    }
+    result.map(|answer| (answer, cost))
+}
+
+/// The search of [`is_ancestor`] for `ancestor`, of generation `floor`.
+///
+/// A path from a changeset to `ancestor` follows first parents all the way,
+/// or leaves the first-parent history at a merge newer than `ancestor`,
+/// through another parent of the merge. So this searches the first-parent
+/// history of the descendant, then does the same from each such parent. It
+/// takes each merge once.
+struct Search {
+    ancestor: ChangesetId,
+    floor: i64,
+    /// Changesets whose first-parent history is still to search.
+    next: Vec<At>,
+    /// The next merge to take on the history being searched.
+    merge: Option<Link>,
+    /// The merges taken.
+    merges: HashSet<ChangesetId>,
+}
+
+impl Search {
+    fn new(from: At, ancestor: ChangesetId, floor: i64) -> Self {
+        Self {
+            ancestor,
+            floor,
+            next: vec![from],
+            merge: None,
+            merges: HashSet::new(),
+        }
+    }
+
+    /// One move: takes the next merge on the history being searched, or
+    /// searches the next history down to `floor`. Then `Some(found)` if the
+    /// search has ended.
+    fn next(&mut self, index: &mut Index) -> Result<Option<bool>> {
+        if let Some(at) = self.merge.take() {
             // An older merge has older parents only. A merge seen before had
             // the history below it searched then.
-            if at.generation <= floor || !merges.insert(at.id) {
-                break;
+            if at.generation <= self.floor || !self.merges.insert(at.id) {
+                return Ok(None);
             }
             let parents = index.parents(at)?;
             let Some((&(first, _), others)) = parents.split_first() else {
@@ -272,14 +352,22 @@ fn reaches(index: &mut Index, from: At, ancestor: ChangesetId, floor: i64) -> Re
                 )));
             };
             for &(parent, generation) in others {
-                if generation >= floor {
-                    next.push(index.at(parent)?);
+                if generation >= self.floor {
+                    self.next.push(index.at(parent)?);
                 }
             }
-            merge = index.at(first)?.node.merge;
+            self.merge = index.at(first)?.node.merge;
+            return Ok(None);
         }
+        let Some(from) = self.next.pop() else {
+            return Ok(Some(false));
+        };
+        if index.descend(from, self.floor, |link| link.generation)?.id == self.ancestor {
+            return Ok(Some(true));
+        }
+        self.merge = from.node.merge;
+        Ok(None)
     }
-    Ok(false)
 }
 
 /// The best common ancestors of `a` and `b` when neither first-parent
@@ -301,6 +389,122 @@ fn meeting(index: &mut Index, a: At, b: At) -> Result<Option<Vec<ChangesetId>>> 
     Ok(Some(met.map(|at| at.id).into_iter().collect()))
 }
 
+/// Reached from `a`.
+const FROM_A: u8 = 1;
+/// Reached from `b`.
+const FROM_B: u8 = 2;
+/// Reached from a common ancestor already found, so not a best one.
+const STALE: u8 = 4;
+
+/// The walk of [`merge_bases`] from `a` and `b`. It paints the graph as
+/// `git merge-base --all` does.
+///
+/// The walk takes changesets from a queue, highest generation first, and
+/// marks each with the sides that reach it. A parent's generation is below
+/// its child's, so a changeset leaves the queue only after every descendant
+/// the walk reached, with all its marks. One marked from both sides and not
+/// stale is a best common ancestor, and its ancestors become stale. The walk
+/// ends when no queued changeset that is not stale is marked from `a`, or
+/// none from `b`: no other best common ancestor can follow.
+///
+/// It jumps over runs of first parents. Each changeset that the rest of the
+/// walk reaches has a generation of at most `next`, the highest one still
+/// queued. So the first parents of a changeset taken, down to generation
+/// `next + 1`, get no other mark. The walk would take them one after the
+/// other, with the mark of the one taken, and find no base among them. Down
+/// to the newest merge on that history, each has one parent. So the walk
+/// jumps down to the oldest of them, or to that merge if it comes first,
+/// and goes on from its parents.
+struct Paint {
+    /// The marks of the queued changesets. So the walk holds memory for
+    /// its queue, not for the history it walked.
+    marks: HashMap<ChangesetId, u8>,
+    queue: BinaryHeap<(i64, Reverse<ChangesetId>)>,
+    /// Queued changesets that are not stale, marked from `a` and from `b`.
+    live: [usize; 2],
+    bases: Vec<ChangesetId>,
+}
+
+impl Paint {
+    fn new(a: At, b: At) -> Self {
+        let mut paint = Self {
+            marks: HashMap::new(),
+            queue: BinaryHeap::new(),
+            // One each to start, also when `a` is `b`.
+            live: [1, 1],
+            bases: Vec::new(),
+        };
+        for (at, side) in [(a, FROM_A), (b, FROM_B)] {
+            let mark = paint.marks.entry(at.id).or_insert(0);
+            if *mark == 0 {
+                paint.queue.push((at.node.generation, Reverse(at.id)));
+            }
+            *mark |= side;
+        }
+        paint
+    }
+
+    /// One move: takes the next changeset from the queue. Then the bases if
+    /// the walk has ended.
+    fn next(&mut self, index: &mut Index) -> Result<Option<Vec<ChangesetId>>> {
+        let Some((_, Reverse(id))) = self.queue.pop().filter(|_| !self.live.contains(&0)) else {
+            return Ok(Some(std::mem::take(&mut self.bases)));
+        };
+        // No changeset taken later has it as a parent: its generation is
+        // higher. So its mark goes, and the marks are the queue's.
+        let mut mark = self
+            .marks
+            .remove(&id)
+            .expect("a queued changeset has a mark");
+        tally(&mut self.live, mark, false);
+        if mark == FROM_A | FROM_B {
+            self.bases.push(id);
+            mark |= STALE;
+        }
+        let next = self.queue.peek().map_or(0, |&(generation, _)| generation);
+        let from = index.at(id)?;
+        let merge = from.node.merge.map_or(0, |merge| merge.generation);
+        let last = index.descend(from, merge.max(next + 1), |link| link.generation)?;
+        let parents = match last.node.merge {
+            Some(merge) if merge.id == last.id => index.parents(merge)?,
+            _ if last.node.depth > 0 => vec![(last.node.parent.id, last.node.parent.generation)],
+            _ => Vec::new(),
+        };
+        for (parent, parent_gen) in parents {
+            let old = self.marks.get(&parent).copied();
+            let new = old.unwrap_or(0) | mark;
+            if old == Some(new) {
+                continue;
+            }
+            match old {
+                // Still queued: its generation is below the one taken.
+                Some(old) => tally(&mut self.live, old, false),
+                None => self.queue.push((parent_gen, Reverse(parent))),
+            }
+            tally(&mut self.live, new, true);
+            self.marks.insert(parent, new);
+        }
+        Ok(None)
+    }
+}
+
+/// Adds a queued changeset's marks to `live`, or removes them. A stale
+/// changeset counts for neither side.
+fn tally(live: &mut [usize; 2], mark: u8, add: bool) {
+    if mark & STALE != 0 {
+        return;
+    }
+    for (count, side) in live.iter_mut().zip([FROM_A, FROM_B]) {
+        if mark & side != 0 {
+            if add {
+                *count += 1;
+            } else {
+                *count -= 1;
+            }
+        }
+    }
+}
+
 /// A changeset and its node.
 #[derive(Clone, Copy, Debug)]
 struct At {
@@ -308,28 +512,35 @@ struct At {
     node: Node,
 }
 
-/// Reads nodes and parents for one query, at most `max_reads` of them.
-struct Index<'c> {
-    c: &'c Connection,
-    reads: usize,
-    max_reads: usize,
+impl At {
+    /// A changeset of `repo` and its node. Derives the commit graph first if
+    /// it has no node.
+    fn get(store: &Store, repo: RepoId, id: ChangesetId) -> Result<Self> {
+        let node = derived::get::<CommitGraph>(store, repo, id)?;
+        Ok(Self { id, node })
+    }
 }
 
-impl<'c> Index<'c> {
-    fn new(c: &'c Connection, max_reads: usize) -> Self {
+/// Reads nodes and parents for one step of a query, until its deadline.
+struct Index<'a> {
+    c: &'a Connection,
+    deadline: &'a Deadline,
+    reads: usize,
+}
+
+impl<'a> Index<'a> {
+    fn new(c: &'a Connection, deadline: &'a Deadline) -> Self {
         Self {
             c,
+            deadline,
             reads: 0,
-            max_reads,
         }
     }
 
+    /// Counts a read. Fails once the deadline has passed.
     fn count(&mut self) -> Result<()> {
         self.reads += 1;
-        if self.reads > self.max_reads {
-            return Err(db::too_deep(self.max_reads));
-        }
-        Ok(())
+        self.deadline.check()
     }
 
     /// The node of a changeset that a node points to.
@@ -402,11 +613,27 @@ fn node(c: &Connection, id: ChangesetId) -> Result<Node> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    use proptest::prelude::Strategy;
     use scion_core::{BlobId, FileState, IdentityTime, RepoPath};
 
     use super::*;
     use crate::db::testing;
     use crate::derived::steps;
+
+    /// Steps of a few reads, so that walks go on across steps.
+    const SMALL: Steps = Steps {
+        reads: 4,
+        pause: Duration::ZERO,
+    };
+
+    /// A deadline that a test does not reach.
+    fn later() -> Deadline {
+        Deadline::new(Instant::now() + Duration::from_secs(600))
+    }
 
     /// A new store with the graph `parents` in repo `r`, with no derived
     /// rows, as in a database from before the commit graph.
@@ -417,6 +644,22 @@ mod tests {
             .write(|c| {
                 let repo = db::create_repo(c, "r")?;
                 Ok((repo, testing::insert_graph(c, repo, parents)?))
+            })
+            .unwrap();
+        (dir, store, repo, ids)
+    }
+
+    /// As [`store_graph`], then stores each node as a write does.
+    fn store_graph_with_nodes(
+        parents: &[Vec<usize>],
+    ) -> (tempfile::TempDir, Store, RepoId, Vec<ChangesetId>) {
+        let (dir, store, repo, ids) = store_graph(parents);
+        store
+            .write(|c| {
+                for &id in &ids {
+                    derived::on_write::<CommitGraph>(c, id, &db::get_changeset(c, repo, id)?)?;
+                }
+                Ok(())
             })
             .unwrap();
         (dir, store, repo, ids)
@@ -452,16 +695,45 @@ mod tests {
         out
     }
 
+    /// The ancestors of each changeset of `parents`, itself included.
+    fn ancestors(parents: &[Vec<usize>]) -> Vec<HashSet<usize>> {
+        let mut out: Vec<HashSet<usize>> = Vec::new();
+        for (i, of) in parents.iter().enumerate() {
+            let mut all: HashSet<usize> = of.iter().flat_map(|&p| out[p].clone()).collect();
+            all.insert(i);
+            out.push(all);
+        }
+        out
+    }
+
+    /// Graphs of [`testing::graphs`] with most merges taken out, so that
+    /// first-parent runs are long and the merge-base walk jumps over them.
+    fn sparse_graphs(max: usize) -> impl Strategy<Value = Vec<Vec<usize>>> {
+        let merges = proptest::collection::vec(proptest::bool::weighted(0.15), max);
+        (testing::graphs(max), merges).prop_map(|(mut parents, merges)| {
+            for (of, merge) in parents.iter_mut().zip(merges) {
+                if !merge {
+                    of.truncate(1);
+                }
+            }
+            parents
+        })
+    }
+
     proptest::proptest! {
         // Each case checks every pair of changesets.
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
 
         /// On any graph, each node holds what a walk of the graph finds, and
-        /// the queries give the answers of the walks with no bound.
+        /// the queries give the answers that the sets of ancestors define.
+        /// A step here takes a few reads, so the walks go on across steps.
         #[test]
-        fn queries_match_the_graph_walks(parents in testing::graphs(20)) {
+        fn queries_match_the_graph(
+            parents in proptest::prop_oneof![testing::graphs(20), sparse_graphs(20)],
+        ) {
             let (_dir, store, repo, ids) = store_graph(&parents);
             let histories = histories(&parents);
+            let ancestors = ancestors(&parents);
             let nodes: Vec<Node> = ids
                 .iter()
                 .map(|&id| derived::get::<CommitGraph>(&store, repo, id).unwrap())
@@ -483,28 +755,44 @@ mod tests {
             for x in 0..ids.len() {
                 for y in 0..ids.len() {
                     let (a, b) = (ids[x], ids[y]);
-                    let walked = store
-                        .read(|c| {
-                            Ok((
-                                db::is_ancestor(c, repo, a, b, usize::MAX)?,
-                                db::merge_bases(c, repo, a, b, usize::MAX)?,
-                            ))
-                        })
-                        .unwrap();
-                    let ancestry = is_ancestor(&store, repo, a, b, usize::MAX).unwrap();
-                    proptest::prop_assert_eq!(ancestry, walked.0, "{} {}", x, y);
-                    let bases = merge_bases(&store, repo, a, b, usize::MAX).unwrap();
-                    proptest::prop_assert_eq!(bases, walked.1, "{} {}", x, y);
+                    // The best common ancestors, by their definition.
+                    let common: Vec<usize> = (0..ids.len())
+                        .filter(|c| ancestors[x].contains(c) && ancestors[y].contains(c))
+                        .collect();
+                    let mut best: Vec<usize> = common
+                        .iter()
+                        .copied()
+                        .filter(|&c| !common.iter().any(|&d| d != c && ancestors[d].contains(&c)))
+                        .collect();
+                    best.sort_by_key(|&c| (Reverse(nodes[c].generation), ids[c]));
+                    let best: Vec<ChangesetId> = best.into_iter().map(|c| ids[c]).collect();
+                    let ancestry = ancestors[y].contains(&x);
 
-                    // The walks down first-parent histories.
+                    let walked = store.read(|c| db::is_ancestor(c, repo, a, b, usize::MAX)).unwrap();
+                    proptest::prop_assert_eq!(walked, ancestry, "{} {}", x, y);
+                    let mut search = Search::new(At { id: b, node: nodes[y] }, a, nodes[x].generation);
+                    let (found, _) = in_steps(&store, &later(), SMALL, |index| search.next(index)).unwrap();
+                    proptest::prop_assert_eq!(found, ancestry, "{} {}", x, y);
+                    // `merge_bases` answers from where the first-parent
+                    // histories meet, or else from the walk. Each that
+                    // answers is right, and the walk always answers.
                     let (from, other) = (At { id: b, node: nodes[y] }, At { id: a, node: nodes[x] });
-                    let (down, met) = store
+                    let mut paint = Paint::new(other, from);
+                    let (painted, _) = in_steps(&store, &later(), SMALL, |index| paint.next(index)).unwrap();
+                    proptest::prop_assert_eq!(&painted, &best, "{} {}", x, y);
+                    let (bases, down, met) = store
                         .read(|c| {
-                            let mut index = Index::new(c, usize::MAX);
+                            let deadline = later();
+                            let mut index = Index::new(c, &deadline);
+                            let bases = meeting(&mut index, other, from)?;
+                            // The walks down first-parent histories.
                             let down = index.descend(from, nodes[x].generation, |l| l.generation)?;
-                            Ok((down.id, index.meet(from, other)?.map(|at| at.id)))
+                            Ok((bases, down.id, index.meet(from, other)?.map(|at| at.id)))
                         })
                         .unwrap();
+                    if let Some(bases) = bases {
+                        proptest::prop_assert_eq!(&bases, &best, "{} {}", x, y);
+                    }
                     let oldest = histories[y]
                         .iter()
                         .take_while(|&&h| nodes[h].generation >= nodes[x].generation)
@@ -573,20 +861,22 @@ mod tests {
 
         // Each query counts its reads of nodes and parents.
         let ancestry = |ancestor: ChangesetId, descendant: ChangesetId| {
-            store
-                .read(|c| {
-                    let mut index = Index::new(c, usize::MAX);
-                    let from = index.at(descendant)?;
-                    let floor = db::generation(c, repo, ancestor)?;
-                    Ok((reaches(&mut index, from, ancestor, floor)?, index.reads))
-                })
-                .unwrap()
+            let floor = store.read(|c| db::generation(c, repo, ancestor)).unwrap();
+            let mut search =
+                Search::new(At::get(&store, repo, descendant).unwrap(), ancestor, floor);
+            let (found, cost) =
+                in_steps(&store, &later(), STEPS, |index| search.next(index)).unwrap();
+            (found, cost.reads)
         };
         let bases = |a: ChangesetId, b: ChangesetId| {
+            let (a, b) = (
+                At::get(&store, repo, a).unwrap(),
+                At::get(&store, repo, b).unwrap(),
+            );
             store
                 .read(|c| {
-                    let mut index = Index::new(c, usize::MAX);
-                    let (a, b) = (index.at(a)?, index.at(b)?);
+                    let deadline = later();
+                    let mut index = Index::new(c, &deadline);
                     Ok((meeting(&mut index, a, b)?, index.reads))
                 })
                 .unwrap()
@@ -610,10 +900,10 @@ mod tests {
         most = most.max(reads);
         assert!(most <= bound, "{most} reads, more than {bound}");
 
-        // The calls agree, within that bound.
-        assert!(is_ancestor(&store, repo, ids[0], tip, bound).unwrap());
-        assert!(!is_ancestor(&store, repo, side, tip, bound).unwrap());
-        let met = merge_bases(&store, repo, side, tip, bound).unwrap();
+        // The calls agree.
+        assert!(is_ancestor(&store, repo, ids[0], tip, &later()).unwrap());
+        assert!(!is_ancestor(&store, repo, side, tip, &later()).unwrap());
+        let met = merge_bases(&store, repo, side, tip, &later()).unwrap();
         assert_eq!(met, [ids[N / 2]]);
     }
 
@@ -622,12 +912,12 @@ mod tests {
         let parents: Vec<Vec<usize>> = vec![vec![], vec![0], vec![0], vec![1, 2], vec![3], vec![]];
         let (_dir, store, repo, ids) = store_graph(&parents);
         let commits = store.commits();
-        assert!(is_ancestor(&store, repo, ids[2], ids[4], usize::MAX).unwrap());
+        assert!(is_ancestor(&store, repo, ids[2], ids[4], &later()).unwrap());
         // Changesets 0 to 4 in steps, and nothing for 5.
         assert_eq!(store.commits() - commits, steps(5));
         let commits = store.commits();
-        assert!(!is_ancestor(&store, repo, ids[5], ids[4], usize::MAX).unwrap());
-        let met = merge_bases(&store, repo, ids[2], ids[4], usize::MAX).unwrap();
+        assert!(!is_ancestor(&store, repo, ids[5], ids[4], &later()).unwrap());
+        let met = merge_bases(&store, repo, ids[2], ids[4], &later()).unwrap();
         assert_eq!(met, [ids[2]]);
         assert_eq!(store.commits(), commits, "the next queries derive nothing");
 
@@ -640,27 +930,164 @@ mod tests {
             .write(|c| crate::tree::store_changeset(c, repo, &cs))
             .unwrap();
         let commits = store.commits();
-        assert!(is_ancestor(&store, repo, ids[1], merge, usize::MAX).unwrap());
+        assert!(is_ancestor(&store, repo, ids[1], merge, &later()).unwrap());
         assert_eq!(store.commits(), commits, "the write stored the node");
     }
 
     #[test]
-    fn a_search_past_its_bound_fails() {
-        // A ladder: each changeset on the first-parent history merges a
-        // side changeset that branched from its parent.
+    fn a_merge_base_walk_jumps_over_runs_between_merges() {
+        // A first-parent history of N changesets. Every 1,000th merges a side
+        // changeset that branched from the one before. `side` branched from
+        // the 100th, and is not merged.
+        const N: usize = 20_000;
         let mut parents: Vec<Vec<usize>> = vec![vec![]];
-        for _ in 0..10 {
+        let mut history = vec![0];
+        for i in 1..N {
+            let last = *history.last().unwrap();
+            parents.push(vec![last]);
+            if i % 1000 == 0 {
+                // A merge of the side changeset just pushed.
+                parents.push(vec![last, parents.len() - 1]);
+            }
+            history.push(parents.len() - 1);
+        }
+        parents.push(vec![history[100]]);
+        let (_dir, store, repo, ids) = store_graph_with_nodes(&parents);
+        let (side, tip) = (*ids.last().unwrap(), ids[history[N - 1]]);
+        let (a, b) = (
+            At::get(&store, repo, side).unwrap(),
+            At::get(&store, repo, tip).unwrap(),
+        );
+        let deadline = later();
+        let met = store.read(|c| meeting(&mut Index::new(c, &deadline), a, b));
+        assert_eq!(met.unwrap(), None, "a merge is newer than where they meet");
+
+        let mut paint = Paint::new(a, b);
+        let (bases, cost) = in_steps(&store, &deadline, STEPS, |index| paint.next(index)).unwrap();
+        assert_eq!(bases, [ids[history[100]]]);
+        // A walk of one changeset at a time takes all 20,000. This one jumps
+        // down to each merge in about 3 log2 n reads (Myers), and takes a
+        // few changesets around it.
+        let move_reads = 3 * (N.ilog2() as usize + 1);
+        let bound = (N / 1000 + 1) * (move_reads + 4);
+        assert!(cost.reads <= bound, "{cost:?}, more than {bound} reads");
+        assert_eq!(
+            merge_bases(&store, repo, tip, side, &later()).unwrap(),
+            [ids[history[100]]]
+        );
+    }
+
+    /// A ladder of `merges` merges: each changeset on the first-parent
+    /// history merges a side changeset that branched from its parent.
+    fn ladder(merges: usize) -> Vec<Vec<usize>> {
+        let mut parents: Vec<Vec<usize>> = vec![vec![]];
+        for _ in 0..merges {
             let parent = parents.len() - 1;
             parents.push(vec![parent]);
             parents.push(vec![parent, parent + 1]);
         }
-        let (_dir, store, repo, ids) = store_graph(&parents);
-        let tip = *ids.last().unwrap();
-        // Ten merges, three reads each, before the side changeset 1.
-        let deep = is_ancestor(&store, repo, ids[1], tip, 20);
-        assert!(matches!(deep, Err(Error::ResourceExhausted(_))), "{deep:?}");
-        assert!(is_ancestor(&store, repo, ids[1], tip, 40).unwrap());
-        // On the first-parent history, it reads no merge.
-        assert!(is_ancestor(&store, repo, ids[0], tip, 20).unwrap());
+        parents
+    }
+
+    /// Makes the moves of a walk with `next`, and lets its call go after
+    /// `stop` moves. Returns the answer, and the moves made.
+    fn walk_until<T>(
+        store: &Store,
+        stop: usize,
+        mut next: impl FnMut(&mut Index) -> Result<Option<T>>,
+    ) -> (Result<T>, usize) {
+        let deadline = later();
+        let mut call = Some(deadline.guard());
+        let mut moves = 0;
+        let answer = in_steps(store, &deadline, SMALL, |index| {
+            if moves == stop {
+                drop(call.take());
+            }
+            moves += 1;
+            next(index)
+        });
+        (answer.map(|(answer, _)| answer), moves)
+    }
+
+    #[test]
+    fn a_walk_stops_at_its_deadline() {
+        // The walks from the tip go through every merge down to `side`.
+        let (_dir, store, repo, ids) = store_graph(&ladder(100));
+        let (side, tip) = (ids[1], *ids.last().unwrap());
+        let passed = Deadline::new(Instant::now());
+        let late = is_ancestor(&store, repo, side, tip, &passed);
+        assert!(matches!(late, Err(Error::DeadlineExceeded(_))), "{late:?}");
+        let late = merge_bases(&store, repo, side, tip, &passed);
+        assert!(matches!(late, Err(Error::DeadlineExceeded(_))), "{late:?}");
+
+        // A call that goes in the middle of a walk stops it at its next read.
+        let floor = store.read(|c| db::generation(c, repo, side)).unwrap();
+        let search = || Search::new(At::get(&store, repo, tip).unwrap(), side, floor);
+        let mut whole = search();
+        let (found, all) = walk_until(&store, usize::MAX, |index| whole.next(index));
+        assert!(found.unwrap());
+        let mut stopped = search();
+        let (late, moves) = walk_until(&store, 50, |index| stopped.next(index));
+        assert!(matches!(late, Err(Error::DeadlineExceeded(_))), "{late:?}");
+        assert!(50 < moves && moves < all, "{moves} of {all} moves");
+
+        let paint = || {
+            Paint::new(
+                At::get(&store, repo, side).unwrap(),
+                At::get(&store, repo, tip).unwrap(),
+            )
+        };
+        let mut whole = paint();
+        let (bases, all) = walk_until(&store, usize::MAX, |index| whole.next(index));
+        assert_eq!(bases.unwrap(), [side]);
+        let mut stopped = paint();
+        let (late, moves) = walk_until(&store, 50, |index| stopped.next(index));
+        assert!(matches!(late, Err(Error::DeadlineExceeded(_))), "{late:?}");
+        assert!(50 < moves && moves < all, "{moves} of {all} moves");
+    }
+
+    #[test]
+    fn a_request_that_waits_gets_the_lock_between_steps() {
+        // Steps of a few reads with the pause of the queries.
+        let steps = Steps {
+            reads: SMALL.reads,
+            pause: STEPS.pause,
+        };
+        let (_dir, store, repo, ids) = store_graph_with_nodes(&ladder(200));
+        let (side, tip) = (ids[1], *ids.last().unwrap());
+        let mut paint = Paint::new(
+            At::get(&store, repo, side).unwrap(),
+            At::get(&store, repo, tip).unwrap(),
+        );
+        let done = Arc::new(AtomicBool::new(false));
+        let mut other = None;
+        let mut let_in = false;
+        // The shortest time from the last move of a step to the first move
+        // of the next: the lock is free for at least that long.
+        let (mut moved, mut free) = (None::<Instant>, Duration::MAX);
+        let (bases, cost) = in_steps(&store, &later(), steps, |index| {
+            // In the first step, a read starts and waits for the lock.
+            other.get_or_insert_with(|| {
+                let (store, done) = (store.clone(), Arc::clone(&done));
+                std::thread::spawn(move || {
+                    store.read(|_| Ok(())).unwrap();
+                    done.store(true, Ordering::Relaxed);
+                })
+            });
+            let_in |= done.load(Ordering::Relaxed);
+            // Each move of this walk reads, so a step starts at no reads.
+            if let Some(moved) = moved.filter(|_| index.reads == 0) {
+                free = free.min(moved.elapsed());
+            }
+            let answer = paint.next(index);
+            moved = Some(Instant::now());
+            answer
+        })
+        .unwrap();
+        other.unwrap().join().unwrap();
+        assert_eq!(bases, [side]);
+        assert!(cost.steps > 100, "{cost:?}");
+        assert!(free >= steps.pause, "the lock was free for only {free:?}");
+        assert!(let_in, "the read waited for all {} steps", cost.steps);
     }
 }

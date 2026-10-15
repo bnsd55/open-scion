@@ -9,6 +9,7 @@ use scion_core::{
 };
 
 use crate::db::{self, RepoId};
+use crate::deadline::Deadline;
 use crate::error::{Error, Result};
 use crate::graph;
 use crate::store::Store;
@@ -208,57 +209,49 @@ pub fn changes_path(cs: &Changeset, path: &RepoPath) -> bool {
     })
 }
 
-/// Most steps of one `MergeBase` or `IsAncestor` call. A step reads one
-/// changeset's parents, or its node in the commit graph ([`graph`]), while
-/// the call holds the database lock.
-// SHORTCUT: `MergeBase` walks every changeset between its inputs and their
-// merge bases, unless neither first-parent history has a merge above where
-// the two meet. `IsAncestor` reads every merge between. Both fail past this
-// many steps. Upgrade: a merge-base search that moves along first-parent
-// histories of the commit graph, as `IsAncestor` does
-// (https://github.com/bnsd55/open-scion/issues/72).
-pub const MAX_WALK: usize = 10_000;
-
 /// Whether `ancestor` is `descendant` or one of its ancestors, over all
 /// parents ([`graph::is_ancestor`]). Reads O(log n) nodes of the commit
 /// graph for each first-parent history it searches, and three rows for each
-/// merge newer than `ancestor` that it finds: at most [`MAX_WALK`].
+/// merge newer than `ancestor` that it finds.
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or a changeset does not exist.
-/// [`Error::ResourceExhausted`] if the search passes [`MAX_WALK`].
+/// [`Error::DeadlineExceeded`] once `deadline` has passed.
 pub fn is_ancestor(
     store: &Store,
     repo: &str,
     ancestor: ChangesetId,
     descendant: ChangesetId,
+    deadline: &Deadline,
 ) -> Result<bool> {
     let repo = store.read(|c| db::repo_id(c, repo))?;
-    graph::is_ancestor(store, repo, ancestor, descendant, MAX_WALK)
+    graph::is_ancestor(store, repo, ancestor, descendant, deadline)
 }
 
 /// The best common ancestors of `a` and `b`, over all parents: every common
 /// ancestor that is not an ancestor of another common ancestor
-/// ([`db::merge_bases`]). This is the rule of `git merge-base --all`.
+/// ([`graph::merge_bases`]). This is the rule of `git merge-base --all`.
 /// Usually there is one. After criss-cross merges there can be several, and
 /// all are returned. Highest generation first, then lowest ID. Empty if the
 /// histories share no changeset. Reads a few nodes of the commit graph if
-/// neither first-parent history has a merge above where the two meet
-/// ([`graph::merge_bases`]). Else walks at most [`MAX_WALK`] changesets.
+/// neither first-parent history has a merge above where the two meet. Else
+/// walks the graph, and jumps over each run of first parents that no other
+/// part of the walk reaches.
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or a changeset does not exist.
-/// [`Error::ResourceExhausted`] if the walk passes [`MAX_WALK`].
+/// [`Error::DeadlineExceeded`] once `deadline` has passed.
 pub fn merge_base(
     store: &Store,
     repo: &str,
     a: ChangesetId,
     b: ChangesetId,
+    deadline: &Deadline,
 ) -> Result<Vec<ChangesetId>> {
     let repo = store.read(|c| db::repo_id(c, repo))?;
-    graph::merge_bases(store, repo, a, b, MAX_WALK)
+    graph::merge_bases(store, repo, a, b, deadline)
 }
 
 /// Most paths one `Diff` call returns. Each path costs at most one tree read
