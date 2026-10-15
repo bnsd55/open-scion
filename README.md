@@ -32,6 +32,17 @@ This project rebuilds the ideas from that public article.
   to [GoogleCloudPlatform/scion](https://github.com/GoogleCloudPlatform/scion),
   or to the `scion` crate on crates.io.
 
+**Scope of v0.1.** v0.1 is one server process on one machine. The article
+describes a horizontally scalable system: a small fleet of servers that need
+little coordination, with metadata in Spanner and file contents in blob
+storage, and a cache tier per region and a daemon per node in front of them.
+Here, all data is in one SQLite file and one blob folder on one machine, all
+writes go through one database connection, and lands to a ref are serialized
+by a lock in the server's memory. So a second server process cannot share the
+data. A backend that scales out is not built
+([#47](https://github.com/bnsd55/open-scion/issues/47)). The cache tiers are
+in review ([#64](https://github.com/bnsd55/open-scion/pull/64)).
+
 ## Why
 
 Git assumes that every clone is a full, offline copy of the repository, and
@@ -131,6 +142,7 @@ repository with 23,871 commits took 50 seconds.
 | [`crates/scn`](crates/scn) | Command-line client |
 | [`docs/architecture.md`](docs/architecture.md) | How the parts fit together: storage, lands, reads, and the planned cache tiers |
 | [`docs/format-v1.md`](docs/format-v1.md) | The v1 byte format. Object IDs are hashes of these bytes. |
+| [`docs/protocol-v1.md`](docs/protocol-v1.md) | The v1 API contract: calls, limits, status codes, retries, durability and what a client checks |
 
 ## Design notes
 
