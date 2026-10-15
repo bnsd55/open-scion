@@ -420,7 +420,9 @@ entry costs its path plus 64 bytes. Every addition is checked against the
 budget before it is made:
 
 - An advance or a land that would go over moves the floor up to the tip:
-  the index starts over, empty, at the head.
+  the index starts over, empty, at the head. So does an advance of more
+  than `MAX_DEPTH` changesets, so it never holds the database lock for a
+  long walk.
 - A `reach` back to an older base stops at the first changeset that does not
   fit. That changeset is the floor, and the walk below checks the rest.
 

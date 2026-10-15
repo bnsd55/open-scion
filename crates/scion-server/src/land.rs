@@ -104,7 +104,10 @@ pub enum LandState {
     Landed,
     /// A changed path also changed on the ref after the base.
     Conflict,
-    /// The land can never succeed.
+    /// The land cannot succeed as asked. The outcome is final for its
+    /// request key. Most reasons hold forever, but a base that is too old to
+    /// check depends on what the path index holds at the time, so the same
+    /// base can pass later under a new key.
     Rejected,
 }
 
@@ -663,8 +666,10 @@ impl PathIndex {
 
     /// Indexes the changesets from the current tip forward to `head`. Starts
     /// over at `head` if `head` does not descend from the tip (the ref moved
-    /// to other history), or if those changesets would not fit in
-    /// [`MAX_INDEX_BYTES`].
+    /// to other history), if `head` is more than [`MAX_DEPTH`] changesets
+    /// ahead, or if those changesets would not fit in [`MAX_INDEX_BYTES`].
+    /// An index at the head is always correct, and a longer walk would hold
+    /// the database lock for little gain.
     fn advance_to(
         &mut self,
         c: &Connection,
@@ -678,6 +683,7 @@ impl PathIndex {
         let tip_gen = db::generation(c, repo, self.tip)?;
         let mut walked = Vec::new();
         let mut needed = self.bytes;
+        let mut steps = 0;
         let mut cur = Some(head);
         while let Some(id) = cur {
             if id == self.tip {
@@ -688,6 +694,14 @@ impl PathIndex {
                 return Ok(());
             }
             deadline.check()?;
+            steps += 1;
+            if steps > MAX_DEPTH {
+                tracing::info!(
+                    steps,
+                    "the ref moved far; the path index starts over at the head"
+                );
+                break;
+            }
             let generation = db::generation(c, repo, id)?;
             if generation <= tip_gen {
                 break;
@@ -1545,6 +1559,30 @@ mod tests {
             let moved = f.index(|index| index.floor);
             assert!(f.generation(moved) > f.generation(floor), "round {round}");
         }
+    }
+
+    #[test]
+    fn an_index_starts_over_when_the_ref_moved_far() {
+        use LandState::{Conflict, Landed};
+        let f = fixture();
+        f.fill("f", 1);
+        let before = f.main().target;
+        // An import moves main by more than MAX_DEPTH small changesets.
+        let mut head = before;
+        for n in 0..=MAX_DEPTH {
+            head = f.commit(head, &[put(&format!("i{n}"), "x")]);
+        }
+        f.move_main(head);
+
+        // The plan does not walk back to the old tip: the index starts over
+        // at the head.
+        let out = f.land(f.commit(head, &[put("x", "x")]), "on head");
+        assert_eq!(out.state, Landed, "{}", out.detail);
+        assert_eq!(f.index(|index| index.floor), head);
+        // A base before the import still sees the imported changes.
+        let out = f.land(f.commit(before, &[put("i3", "mine")]), "old");
+        assert_eq!(out.state, Conflict, "{}", out.detail);
+        assert_eq!(out.conflict_paths, [RepoPath::new("i3").unwrap()]);
     }
 
     #[test]
