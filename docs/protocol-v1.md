@@ -111,7 +111,7 @@ contract. A client MUST NOT depend on its text.
 | `OUT_OF_RANGE` | A message is larger than its limit. | After the cause is fixed |
 | `RESOURCE_EXHAUSTED` | `MergeBase` or `IsAncestor` only: the answer needs more work than one call may do. | No: the same request fails again |
 | `CANCELLED` | The server's 600 s limit or the client's `grpc-timeout` ran out. A client library can report its own deadline as `DEADLINE_EXCEEDED`. | Yes. A `Land` retry uses the same request key. |
-| `DEADLINE_EXCEEDED` | `ReadFile`: the client took no message for 120 s. `Land`: the server stopped the land at 600 s from the start of the call. The land stays `PENDING`. | Yes. A `Land` retry uses the same request key. |
+| `DEADLINE_EXCEEDED` | `ReadFile`: the client took no message for 120 s. `Land`: the land ran past 600 s from the start of the call. The land stays `PENDING`. | Yes. A `Land` retry uses the same request key. |
 | `UNAVAILABLE` | The server cannot be reached or is shutting down. A tier also replies `UNAVAILABLE` when its upstream does not answer in time (section 8). | Yes |
 | `RESOURCE_EXHAUSTED` | `GetObjects` only: no memory for the first object within 120 s (section 7.3). | Yes, after a wait |
 | `DATA_LOSS` | From a tier only: its upstream sent bytes that are not the object asked for (section 8). | MAY |
@@ -266,6 +266,10 @@ swap (in v1 only git import does this), the server checks again from the new
 head, up to 3 times in all. Then the call fails with `ABORTED`, and the land
 stays `PENDING`.
 
+A `Land` past the 600 s limit, or cancelled by its client (for example by a
+shorter `grpc-timeout`), replies `CANCELLED` or `DEADLINE_EXCEEDED`. The
+server stops the land at its next check, and the land stays `PENDING`.
+
 **Reply.**
 
 | Field | Meaning |
@@ -313,7 +317,7 @@ stays `PENDING`.
 | `INVALID_ARGUMENT` | A bad name or ID; a request key already used for a different changeset or ref. |
 | `NOT_FOUND` | The repo does not exist, or the repo does not have the changeset. |
 | `ABORTED` | The ref kept moving. The land stays `PENDING`. Retry with the same key. |
-| `DEADLINE_EXCEEDED` | The check ran past 600 s from the start of the call. The land stays `PENDING`. Retry with the same key. |
+| `CANCELLED`, `DEADLINE_EXCEEDED` | The call ran past 600 s, or the client cancelled it. The land stays `PENDING`. Retry with the same key. |
 
 ### 6.4 GetLand
 

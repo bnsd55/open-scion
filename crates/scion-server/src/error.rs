@@ -57,9 +57,9 @@ pub enum Error {
     /// request may succeed if retried.
     #[error("{0}")]
     Aborted(String),
-    /// The request's deadline passed before the work was done. A blocking
-    /// job checks it in its long loops, because a timed-out request does not
-    /// stop the job.
+    /// The request's deadline passed, or its call has gone, before the work
+    /// was done. A blocking job checks this in its long loops, because a
+    /// dropped call does not stop the job.
     #[error("{0}")]
     DeadlineExceeded(String),
     /// The call reached its bound on work before it found the answer. The

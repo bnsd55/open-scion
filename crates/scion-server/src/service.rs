@@ -362,9 +362,11 @@ impl Scion for ScionService {
         &self,
         request: Request<scion_proto::v1::LandRequest>,
     ) -> Result<Response<LandResponse>, Status> {
-        // The job checks it in its walks: a request timeout does not stop a
-        // job that is already running.
-        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        // The job checks it in its walks: a request timeout, or a client
+        // that cancels, drops this call but not a job that is running. The
+        // guard ends the deadline when this call ends or is dropped.
+        let deadline = land::Deadline::new(Instant::now() + REQUEST_TIMEOUT);
+        let _call = deadline.guard();
         let caller = caller(&request)?;
         let req = request.into_inner();
         check_name("repo", &req.repo)?;
@@ -788,6 +790,94 @@ mod tests {
             task.await.unwrap();
             assert_eq!(reads.available_permits(), budget, "bit {flip}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_land_whose_call_is_dropped_stops_and_stays_pending() {
+        // main goes root ─ B. The land's base is root, below the floor of a
+        // new path index at B, so its plan walks back.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let blob = store.blobs().put(b"x").unwrap();
+        let put = |parents, path: &str| Changeset {
+            parents,
+            author: IdentityTime {
+                name: b"t".to_vec(),
+                email: b"t@x".to_vec(),
+                unix_secs: 0,
+                tz_offset_minutes: 0,
+            },
+            committer: None,
+            message: path.as_bytes().to_vec(),
+            changes: [(
+                RepoPath::new(path).unwrap(),
+                Some(FileState::Regular {
+                    content: blob,
+                    executable: false,
+                }),
+            )]
+            .into(),
+        };
+        let (b, cs) = store
+            .write(|c| {
+                let repo = db::create_repo(c, "r")?;
+                let root = db::insert_changeset(c, repo, &put(vec![], "a"))?;
+                let b = db::insert_changeset(c, repo, &put(vec![root], "b"))?;
+                assert!(db::cas_ref(c, repo, "main", None, b)?);
+                Ok((b, db::insert_changeset(c, repo, &put(vec![root], "c"))?))
+            })
+            .unwrap();
+        let service = Arc::new(ScionService::new(Worker::new(store.clone())));
+        let idle = || service.worker.permits.available_permits() == MAX_BLOCKING;
+
+        // Hold the database, so the job waits at its first step.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let blocker = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                store.read(|_| {
+                    held_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    Ok(())
+                })
+            }
+        });
+        held_rx.recv().unwrap();
+        let mut request = Request::new(scion_proto::v1::LandRequest {
+            repo: "r".into(),
+            changeset_id: cs.as_bytes().to_vec(),
+            target_ref: "main".into(),
+            request_key: "k".into(),
+        });
+        request.extensions_mut().insert(Caller("t".into()));
+        let call = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.land(request).await }
+        });
+        let started = Instant::now();
+        while idle() {
+            assert!(started.elapsed() < Duration::from_secs(10), "the job runs");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // The client goes away while the job runs. The job stops at its next
+        // check and leaves the land pending.
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        go_tx.send(()).unwrap();
+        blocker.join().unwrap().unwrap();
+        while !idle() {
+            assert!(started.elapsed() < Duration::from_secs(10), "the job ends");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let sql = "SELECT state FROM lands WHERE request_key = 'k'";
+        let state: String = store
+            .read(|c| Ok(c.query_row(sql, [], |row| row.get(0))?))
+            .unwrap();
+        assert_eq!(state, "pending");
+        let main = store.read(|c| db::get_ref(c, db::repo_id(c, "r")?, "main"));
+        assert_eq!(main.unwrap().unwrap().target, b, "main did not move");
     }
 
     #[tokio::test]

@@ -46,10 +46,12 @@ How one request flows through the server:
    request times out after 600 s; for a streamed reply that covers only its
    start. A `GetObjects` reply ends when its client takes no object for
    120 s, and a `ReadFile` reply when its client takes no part for 120 s.
-   A timeout does not stop a job that is
-   already running, so a land checks the same deadline in its long loops
-   (the index advance and the walks back to a base). Past it, the land
-   stops with `DEADLINE_EXCEEDED` and stays pending.
+   A timeout, or a client that cancels,
+   drops the call but not a job that is already running. So a land checks
+   a deadline in its long loops (the index advance and the walks back to a
+   base): 600 s after the call started, or as soon as a guard that the call
+   holds has dropped. Then the land stops and stays pending, and the client
+   sees `CANCELLED` or `DEADLINE_EXCEEDED`.
 3. `error.rs` maps errors to gRPC codes. Database, I/O, git and corruption
    errors reply `INTERNAL`. The detail goes only to the server log.
 

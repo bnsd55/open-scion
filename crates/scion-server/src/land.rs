@@ -9,7 +9,8 @@
 //!   3. if the row is no longer pending, return it (a retry, or a duplicate)
 //!   4. plan: one parent, base on the ref's first-parent history,
 //!      no path changed on the ref after the base. Its walks stop at the
-//!      request's deadline, and the land stays pending
+//!      request's deadline or once its call has gone, and the land stays
+//!      pending
 //!   5. one transaction: apply to the head tree, store the rebased changeset,
 //!      compare-and-swap the ref, mark the land landed. If an import moved
 //!      the ref since step 4, roll back and go to step 4.
@@ -22,6 +23,7 @@
 //! transaction, so they never disagree.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
@@ -140,7 +142,59 @@ pub struct LandRequest {
     pub request_key: String,
     /// When the server gives up on the request. The plan stops at it with
     /// [`Error::DeadlineExceeded`], and the land stays pending.
-    pub deadline: Instant,
+    pub deadline: Deadline,
+}
+
+/// When a land gives up: at an instant, or once the call that asked for it
+/// has gone. A request timeout or a client that cancels drops the call, but
+/// not a job that is already running, so the long loops of a land check
+/// this.
+#[derive(Clone, Debug)]
+pub struct Deadline {
+    at: Instant,
+    gone: Arc<AtomicBool>,
+}
+
+impl Deadline {
+    /// A deadline at `at`.
+    #[must_use]
+    pub fn new(at: Instant) -> Self {
+        Self {
+            at,
+            gone: Arc::default(),
+        }
+    }
+
+    /// A guard for the call to hold. When it drops, the deadline has passed.
+    pub fn guard(&self) -> CallGuard {
+        CallGuard(Arc::clone(&self.gone))
+    }
+
+    /// Fails once the deadline has passed. Nothing has been written yet, so
+    /// the land stays pending.
+    fn check(&self) -> Result<()> {
+        let why = if self.gone.load(Ordering::Relaxed) {
+            "the call of the land has gone"
+        } else if Instant::now() >= self.at {
+            "the land ran past its deadline"
+        } else {
+            return Ok(());
+        };
+        Err(Error::DeadlineExceeded(format!(
+            "{why}; it stays pending, retry with the same request key"
+        )))
+    }
+}
+
+/// Held by the call of a land. Dropping it, when the call ends or is
+/// dropped, ends the land's [`Deadline`].
+#[must_use = "the deadline ends when the guard drops"]
+pub struct CallGuard(Arc<AtomicBool>);
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 /// The result of a land.
@@ -464,8 +518,8 @@ fn plan(
         Some(index) => index,
         None => index.insert(PathIndex::new(c, repo, head.target)?),
     };
-    index.advance_to(c, repo, head.target, req.deadline)?;
-    let conflicts = match index.check(c, repo, base, &cs.changes, req.deadline)? {
+    index.advance_to(c, repo, head.target, &req.deadline)?;
+    let conflicts = match index.check(c, repo, base, &cs.changes, &req.deadline)? {
         Checked::Paths(conflicts) => conflicts,
         Checked::NotOnHistory => {
             return Ok(Plan::Reject(format!(
@@ -616,7 +670,7 @@ impl PathIndex {
         c: &Connection,
         repo: RepoId,
         head: ChangesetId,
-        deadline: Instant,
+        deadline: &Deadline,
     ) -> Result<()> {
         if head == self.tip {
             return Ok(());
@@ -633,7 +687,7 @@ impl PathIndex {
                 self.tip = head;
                 return Ok(());
             }
-            check_deadline(deadline)?;
+            deadline.check()?;
             let generation = db::generation(c, repo, id)?;
             if generation <= tip_gen {
                 break;
@@ -668,7 +722,7 @@ impl PathIndex {
         repo: RepoId,
         base: ChangesetId,
         changes: &BTreeMap<RepoPath, Option<FileState>>,
-        deadline: Instant,
+        deadline: &Deadline,
     ) -> Result<Checked> {
         let base_gen = db::generation(c, repo, base)?;
         let tip_gen = match self.chain.last_key_value() {
@@ -722,7 +776,7 @@ impl PathIndex {
         repo: RepoId,
         base: ChangesetId,
         base_gen: i64,
-        deadline: Instant,
+        deadline: &Deadline,
     ) -> Result<Walk> {
         walk_back(
             c,
@@ -878,12 +932,12 @@ fn walk_back(
     from: ChangesetId,
     base: ChangesetId,
     base_gen: i64,
-    deadline: Instant,
+    deadline: &Deadline,
     mut visit: impl FnMut(ChangesetId, i64, &Changeset) -> bool,
 ) -> Result<Walk> {
     let mut cur = from;
     loop {
-        check_deadline(deadline)?;
+        deadline.check()?;
         let generation = db::generation(c, repo, cur)?;
         if generation <= base_gen {
             return Ok(Walk::Missed);
@@ -912,7 +966,7 @@ fn touched_below<'a>(
     base: ChangesetId,
     base_gen: i64,
     land: &'a BTreeMap<RepoPath, Option<FileState>>,
-    deadline: Instant,
+    deadline: &Deadline,
 ) -> Result<(Walk, HashSet<&'a [u8]>)> {
     let paths: HashSet<&[u8]> = land.keys().map(RepoPath::as_bytes).collect();
     let parents: HashSet<&[u8]> = paths.iter().flat_map(|p| ancestors(p)).collect();
@@ -944,18 +998,6 @@ fn touched_below<'a>(
         files.contains(path) || dirs.contains(path) || ancestors(path).any(|d| files.contains(d))
     });
     Ok((walk, hits.collect()))
-}
-
-/// Fails once `deadline` has passed. A request timeout does not stop a job
-/// already running, so the long loops of a land call this. Nothing has been
-/// written yet, so the land stays pending.
-fn check_deadline(deadline: Instant) -> Result<()> {
-    if Instant::now() < deadline {
-        return Ok(());
-    }
-    Err(Error::DeadlineExceeded(
-        "the land ran past its deadline; it stays pending, retry with the same request key".into(),
-    ))
 }
 
 /// Raises `key` to `generation`. Returns the bytes added: those of a new
@@ -1072,7 +1114,7 @@ mod tests {
             changeset: cs,
             target_ref: "main".into(),
             request_key: key.into(),
-            deadline: Instant::now() + std::time::Duration::from_secs(600),
+            deadline: Deadline::new(Instant::now() + std::time::Duration::from_secs(600)),
         }
     }
 
@@ -1520,7 +1562,7 @@ mod tests {
         for (cs, key, state) in [(on_head, "head", Landed), (on_root, "root", Conflict)] {
             let before = f.main();
             let late = LandRequest {
-                deadline: Instant::now(),
+                deadline: Deadline::new(Instant::now()),
                 ..req(cs, key)
             };
             let err = f.lands.land(&f.store, &caller(), &late).unwrap_err();
