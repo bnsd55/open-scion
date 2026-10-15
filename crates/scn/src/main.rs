@@ -14,7 +14,8 @@ use crate::client::Ctx;
 #[derive(Parser)]
 #[command(version, about = "Client for the Scion version control system")]
 struct Cli {
-    /// Server address.
+    /// Server address: `http://HOST:PORT`, or `unix:///PATH` for a
+    /// scion-daemon on this node.
     #[arg(
         long,
         env = "SCION_SERVER",
@@ -80,23 +81,53 @@ enum Command {
     Land(cmd::land::LandArgs),
     /// Many agents commit and land at the same time; print throughput.
     Bench(cmd::bench::BenchArgs),
+    /// Print the best common ancestors of two revisions, over all parents,
+    /// as `git merge-base --all`.
+    MergeBase {
+        /// Ref name or changeset ID.
+        a: String,
+        /// Ref name or changeset ID.
+        b: String,
+    },
+    /// Exit 0 if ANCESTOR is DESCENDANT or one of its ancestors, 1 if not.
+    IsAncestor {
+        /// Ref name or changeset ID.
+        ancestor: String,
+        /// Ref name or changeset ID.
+        descendant: String,
+    },
+    /// Print the paths whose file differs between two revisions, as
+    /// `git diff --name-status`.
+    Diff {
+        /// The old revision: a ref name or a changeset ID.
+        old: String,
+        /// The new revision.
+        new: String,
+        /// Only this file, or the files below this directory.
+        #[arg(long, value_parser = client::parse_repo_path)]
+        path: Option<RepoPath>,
+    },
 }
+
+/// The exit code of an error. 1 is the "no" of `scn is-ancestor`, so an
+/// error is 2, as for a bad command line.
+const ERROR_EXIT: u8 = 2;
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("scn: {e:#}");
-            ExitCode::FAILURE
+            ExitCode::from(ERROR_EXIT)
         }
     }
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let mut ctx = Ctx::connect(&cli.server, &cli.token, cli.repo, cli.json).await?;
-    match cli.command {
+    let done = match cli.command {
         Command::Cat { spec } => cmd::read::cat(&mut ctx, &spec).await,
         Command::Ls { spec } => cmd::read::ls(&mut ctx, &spec).await,
         Command::Log { rev, path, limit } => {
@@ -108,5 +139,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Commit(args) => cmd::commit::commit(&mut ctx, args).await,
         Command::Land(args) => cmd::land::land(&mut ctx, args).await,
         Command::Bench(args) => cmd::bench::bench(&ctx, args).await,
-    }
+        Command::MergeBase { a, b } => cmd::query::merge_base(&mut ctx, &a, &b).await,
+        Command::IsAncestor {
+            ancestor,
+            descendant,
+        } => {
+            let yes = cmd::query::is_ancestor(&mut ctx, &ancestor, &descendant).await?;
+            // 0 for yes, 1 for no.
+            return Ok(ExitCode::from(u8::from(!yes)));
+        }
+        Command::Diff { old, new, path } => {
+            cmd::query::diff(&mut ctx, &old, &new, path.as_ref()).await
+        }
+    };
+    done.map(|()| ExitCode::SUCCESS)
 }

@@ -100,6 +100,16 @@ pub fn root_tree(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<TreeId>
     derived::get::<RootTree>(store, repo, cs)
 }
 
+/// Derives the root tree of `cs` in steps if it is missing, as
+/// [`derived::fill`] does. Returns before it is durable.
+///
+/// # Errors
+///
+/// As [`derive_root_tree`].
+pub fn fill_root_tree(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
+    derived::fill::<RootTree>(store, repo, cs)
+}
+
 /// Derives the root tree of `cs` inside the caller's transaction, as
 /// [`derived::derive`] does.
 ///
@@ -114,6 +124,15 @@ pub fn derive_root_tree(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result
 /// Stores a changeset in `repo` with its root tree: the first parent's tree
 /// plus the changes. Every parent must be in `repo`. Safe to repeat. This is
 /// the one write path for changesets, used by commits, lands and imports.
+///
+/// If the first parent has no root tree, for example after a version bump,
+/// this derives it in the caller's transaction, with no bound, and holds
+/// the database lock while it runs. So a request calls [`fill_root_tree`]
+/// on the first parent before its transaction. Git import does not: it
+/// runs with the server stopped.
+///
+/// Like each step of [`derived::fill`], it also removes a few root trees of
+/// older versions.
 ///
 /// # Errors
 ///
@@ -133,10 +152,12 @@ pub fn store_changeset(
     let tree = apply(c, base, &cs.changes)?;
     let id = db::insert_changeset(c, repo, cs)?;
     derived::put::<RootTree>(c, id, &tree)?;
+    derived::remove_old::<RootTree>(c)?;
     Ok((id, tree))
 }
 
-fn parts(path: &RepoPath) -> Vec<PathElem> {
+/// The parts of a path, as tree entry names.
+pub(crate) fn parts(path: &RepoPath) -> Vec<PathElem> {
     path.as_bytes()
         .split(|&b| b == b'/')
         .map(|part| PathElem::new(part).expect("a RepoPath part is a valid name"))

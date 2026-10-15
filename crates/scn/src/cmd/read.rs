@@ -259,7 +259,7 @@ fn changeset_json(id: ChangesetId, cs: &Changeset) -> Value {
 }
 
 /// An entry as JSON: kind, ID, and the executable flag of a regular file.
-fn entry_json(entry: &Entry) -> Value {
+pub(crate) fn entry_json(entry: &Entry) -> Value {
     let id = match entry {
         Entry::Dir(id) => id.to_string(),
         Entry::File(

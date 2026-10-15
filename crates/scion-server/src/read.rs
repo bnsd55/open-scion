@@ -1,7 +1,12 @@
 //! Reads. Each takes a changeset ID, so each answer is immutable.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
+
 use rusqlite::Connection;
-use scion_core::{BlobId, Changeset, ChangesetId, Entry, RepoPath, Tree, TreeId};
+use scion_core::{
+    BlobId, Changeset, ChangesetId, Entry, FileState, PathElem, RepoPath, Tree, TreeId,
+};
 
 use crate::db::{self, RepoId};
 use crate::error::{Error, Result};
@@ -200,4 +205,243 @@ pub fn changes_path(cs: &Changeset, path: &RepoPath) -> bool {
         let changed = changed.as_bytes();
         changed.starts_with(path) && matches!(changed.get(path.len()), None | Some(b'/'))
     })
+}
+
+/// Most changesets one `MergeBase` or `IsAncestor` call walks. Each step
+/// reads the parents of one changeset while the call holds the database
+/// lock.
+// SHORTCUT: graph queries walk the history on every call, and fail past
+// this many changesets. Upgrade: a commit-graph index as derived data, such
+// as the skip lists the article describes, so a call reads a few rows
+// (https://github.com/bnsd55/open-scion/issues/72).
+pub const MAX_WALK: usize = 10_000;
+
+/// Whether `ancestor` is `descendant` or one of its ancestors, over all
+/// parents. Walks at most [`MAX_WALK`] changesets, and none if `ancestor`
+/// has the higher generation.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if the repo or a changeset does not exist.
+/// [`Error::ResourceExhausted`] if the walk passes [`MAX_WALK`].
+pub fn is_ancestor(
+    store: &Store,
+    repo: &str,
+    ancestor: ChangesetId,
+    descendant: ChangesetId,
+) -> Result<bool> {
+    store.read(|c| {
+        let repo = db::repo_id(c, repo)?;
+        db::is_ancestor(c, repo, ancestor, descendant, MAX_WALK)
+    })
+}
+
+/// The best common ancestors of `a` and `b`, over all parents: every common
+/// ancestor that is not an ancestor of another common ancestor
+/// ([`db::merge_bases`]). This is the rule of `git merge-base --all`.
+/// Usually there is one. After criss-cross merges there can be several, and
+/// all are returned. Highest generation first, then lowest ID. Empty if the
+/// histories share no changeset. Walks at most [`MAX_WALK`] changesets.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if the repo or a changeset does not exist.
+/// [`Error::ResourceExhausted`] if the walk passes [`MAX_WALK`].
+pub fn merge_base(
+    store: &Store,
+    repo: &str,
+    a: ChangesetId,
+    b: ChangesetId,
+) -> Result<Vec<ChangesetId>> {
+    store.read(|c| {
+        let repo = db::repo_id(c, repo)?;
+        db::merge_bases(c, repo, a, b, MAX_WALK)
+    })
+}
+
+/// Most paths one `Diff` call returns. Each path costs at most one tree read
+/// per part on each side, while the call holds the database lock.
+pub const MAX_DIFF_ENTRIES: usize = 1000;
+
+/// A path whose file differs between two snapshots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffEntry {
+    /// The path.
+    pub path: RepoPath,
+    /// The file at `path` in the old snapshot. `None` when no file is there:
+    /// nothing, or a directory.
+    pub old: Option<FileState>,
+    /// The file at `path` in the new snapshot. `None` as for `old`.
+    pub new: Option<FileState>,
+}
+
+/// One page of a diff.
+#[derive(Debug)]
+pub struct DiffPage {
+    /// The paths that differ, in tree order ([`diff`]).
+    pub entries: Vec<DiffEntry>,
+    /// Set when the call stopped at [`MAX_DIFF_ENTRIES`]: the last path in
+    /// `entries`. Diff again with `after` set to it to continue.
+    pub next_after: Option<RepoPath>,
+}
+
+/// The paths whose file differs between the snapshots of `old` and `new`, in
+/// tree order: paths compare part by part, and parts by raw bytes. A path
+/// that is a file on one side and a directory on the other gives one entry
+/// for the file, then one for each file below the directory. With `path`,
+/// only that file or the files below that directory. With `after`, only the
+/// paths after it. Returns at most [`MAX_DIFF_ENTRIES`] entries.
+///
+/// Walks both trees at once and skips a subtree with the same ID on both
+/// sides. So it reads only the trees on the paths it returns, and on the
+/// way down to `path` and `after`.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if the repo or a changeset does not exist.
+// SHORTCUT: renames are not detected, so a rename is a delete and an add;
+// `git diff` detects them by default. Upgrade: pair deletes and adds with
+// the same blob first, then by similarity, with a bound per call
+// (https://github.com/bnsd55/open-scion/issues/79).
+pub fn diff(
+    store: &Store,
+    repo: &str,
+    old: ChangesetId,
+    new: ChangesetId,
+    path: Option<&RepoPath>,
+    after: Option<&RepoPath>,
+) -> Result<DiffPage> {
+    let old_root = root_tree(store, repo, old)?;
+    let new_root = root_tree(store, repo, new)?;
+    let under = path.map(tree::parts).unwrap_or_default();
+    let after = after.map(tree::parts);
+    // The parts of the resume path below `path`, or `None` when every path
+    // below `path` comes after it. Paths compare part by part.
+    let after = match &after {
+        Some(after) if after.starts_with(&under) => Some(&after[under.len()..]),
+        Some(after) if after.as_slice() > under.as_slice() => {
+            return Ok(DiffPage {
+                entries: Vec::new(),
+                next_after: None,
+            });
+        }
+        _ => None,
+    };
+    let mut walk = DiffWalk {
+        path: path.map(|p| p.as_bytes().to_vec()).unwrap_or_default(),
+        entries: Vec::new(),
+    };
+    store.read(|c| {
+        let (old, new) = match path {
+            Some(path) => (
+                tree::lookup(c, old_root, path)?,
+                tree::lookup(c, new_root, path)?,
+            ),
+            None => (Some(Entry::Dir(old_root)), Some(Entry::Dir(new_root))),
+        };
+        walk.walk(c, old, new, after)
+    })?;
+    let mut entries = walk.entries;
+    // The walk finds one entry more than a page, to know whether more follow.
+    let next_after = if entries.len() > MAX_DIFF_ENTRIES {
+        entries.truncate(MAX_DIFF_ENTRIES);
+        entries.last().map(|entry| entry.path.clone())
+    } else {
+        None
+    };
+    Ok(DiffPage {
+        entries,
+        next_after,
+    })
+}
+
+/// The state of one [`diff`] walk.
+struct DiffWalk {
+    /// The path of the entries being compared, as raw bytes.
+    path: Vec<u8>,
+    /// What the walk found, up to one more than [`MAX_DIFF_ENTRIES`].
+    entries: Vec<DiffEntry>,
+}
+
+impl DiffWalk {
+    fn full(&self) -> bool {
+        self.entries.len() > MAX_DIFF_ENTRIES
+    }
+
+    /// Compares `old` and `new`, the entries at `self.path`. `after` holds
+    /// the parts of the resume path below here, or is `None` once every path
+    /// here comes after it.
+    ///
+    /// The recursion is as deep as a path has parts: at most 256, by the
+    /// path rules.
+    fn walk(
+        &mut self,
+        c: &Connection,
+        old: Option<Entry>,
+        new: Option<Entry>,
+        after: Option<&[PathElem]>,
+    ) -> Result<()> {
+        if old == new || self.full() {
+            return Ok(());
+        }
+        let (old_file, new_file) = (file(old), file(new));
+        // A file here is the resume path or before it, unless `after` is
+        // `None`.
+        if old_file != new_file && after.is_none() {
+            let path = RepoPath::new(self.path.clone())
+                .map_err(|e| Error::Corrupt(format!("a tree path breaks the path rules: {e}")))?;
+            self.entries.push(DiffEntry {
+                path,
+                old: old_file,
+                new: new_file,
+            });
+        }
+        let (old_dir, new_dir) = (children(c, old)?, children(c, new)?);
+        // Names before the resume path do not matter.
+        let start = match after {
+            Some([first, ..]) => Bound::Included(first),
+            _ => Bound::Unbounded,
+        };
+        let names: BTreeSet<&PathElem> = old_dir
+            .range::<PathElem, _>((start, Bound::Unbounded))
+            .chain(new_dir.range::<PathElem, _>((start, Bound::Unbounded)))
+            .map(|(name, _)| name)
+            .collect();
+        for name in names {
+            let name_after = match after {
+                Some([first, rest @ ..]) if name == first => Some(rest),
+                // Past the resume path, or here is the resume path: every
+                // name follows.
+                _ => None,
+            };
+            let len = self.path.len();
+            if len > 0 {
+                self.path.push(b'/');
+            }
+            self.path.extend_from_slice(name.as_bytes());
+            let (old_entry, new_entry) = (old_dir.get(name).copied(), new_dir.get(name).copied());
+            self.walk(c, old_entry, new_entry, name_after)?;
+            self.path.truncate(len);
+            if self.full() {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The file state of an entry, if it is a file.
+fn file(entry: Option<Entry>) -> Option<FileState> {
+    match entry {
+        Some(Entry::File(state)) => Some(state),
+        _ => None,
+    }
+}
+
+/// The entries of a directory. Empty for anything else.
+fn children(c: &Connection, entry: Option<Entry>) -> Result<BTreeMap<PathElem, Entry>> {
+    match entry {
+        Some(Entry::Dir(id)) => Ok(db::get_tree(c, id)?.entries),
+        _ => Ok(BTreeMap::new()),
+    }
 }

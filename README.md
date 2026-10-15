@@ -118,11 +118,31 @@ export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
 ./target/release/scn checkout main --into /tmp/work   # --sparse DIR for part of it
 echo hello > hello.txt
 cs=$(./target/release/scn commit -m "add hello" --put hello.txt=hello.txt)
+./target/release/scn diff main "$cs"              # A hello.txt, as git diff --name-status
+./target/release/scn merge-base main "$cs"        # as git merge-base --all
+./target/release/scn is-ancestor main "$cs"       # exits 0 for yes, 1 for no
 ./target/release/scn land "$cs"
 ./target/release/scn bench --agents 200 --lands 10000
 ```
 
-Every `scn` command takes `--json` for machine-readable output.
+Every `scn` command takes `--json` for machine-readable output. A `scn`
+error exits 2.
+
+Checkouts can go through the cache tiers: a `scion-daemon` per machine, on a
+Unix socket, in front of a regional `scion-cache`, in front of the server.
+Each tier keeps what it fetched, so a second checkout on the machine sends
+nothing past the daemon. The tiers serve only checkouts; the other `scn`
+commands talk to the server. The daemon's data directory must be private to
+your user (mode 0700, not a shared path such as `/tmp`), because its socket
+lives there.
+
+```sh
+export SCION_UPSTREAM_TOKEN=dev                  # what each tier sends upstream
+./target/release/scion-cache &                   # memory, 127.0.0.1:7879
+./target/release/scion-daemon --data "$HOME/.scion-daemon" &   # disk, Unix socket
+SCION_SERVER="unix://$HOME/.scion-daemon/daemon.sock" \
+  ./target/release/scn checkout main --into /tmp/work2
+```
 
 `scn bench` runs many agents that land changes at the same time, then checks
 that `main` gained each landed change exactly once. With one server process on
@@ -139,10 +159,12 @@ repository with 23,871 commits took 50 seconds.
 | [`crates/scion-core`](crates/scion-core) | Object model and canonical byte format |
 | [`crates/scion-proto`](crates/scion-proto) | gRPC API ([`proto/scion.proto`](proto/scion.proto)) |
 | [`crates/scion-server`](crates/scion-server) | Storage, commits, lands, reads, git import |
+| [`crates/scion-tier`](crates/scion-tier) | Cache tiers: `scion-cache` and `scion-daemon` |
 | [`crates/scn`](crates/scn) | Command-line client |
-| [`docs/architecture.md`](docs/architecture.md) | How the parts fit together: storage, lands, reads, and the planned cache tiers |
+| [`docs/architecture.md`](docs/architecture.md) | How the parts fit together: storage, lands, reads, and the cache tiers |
 | [`docs/format-v1.md`](docs/format-v1.md) | The v1 byte format. Object IDs are hashes of these bytes. |
 | [`docs/protocol-v1.md`](docs/protocol-v1.md) | The v1 API contract: calls, limits, status codes, retries, durability and what a client checks |
+| [`docs/design/scalable-backend.md`](docs/design/scalable-backend.md) | A design proposal, not built: stateless servers on a shared metadata store and object store |
 
 ## Design notes
 
@@ -156,6 +178,7 @@ These are this project's choices where the article does not give details.
 | Landing | One land at a time per ref, inside one process. A changeset can be created in parallel without any lock. |
 | Retries | Each land has a caller-chosen request key, so a retry returns the first result |
 | Git | One-way import. Commit IDs are not kept identical to git commit IDs. |
+| Cache tiers | As in the article, a daemon per machine on a socket and a regional cache in memory. The Unix socket, TCP between tiers, the disk store, the byte limits, and one shared fetch per missed object are this project's choices. |
 | History and blame | Computed on each call from first-parent changes, with a bound per call. Renames are not followed. The article keeps them as derived data; that is planned ([#61](https://github.com/bnsd55/open-scion/issues/61)). |
 
 Deliberate simplifications are marked `SHORTCUT:` in the code, each with its

@@ -516,6 +516,8 @@ fn settle(
         Plan::Land { rebased, head } => (rebased, head),
     };
 
+    // See `tree::store_changeset`. The land's flush covers these steps.
+    tree::fill_root_tree(store, repo, head.target)?;
     let landed = store.commit(|c| {
         let (id, _) = tree::store_changeset(c, repo, &rebased)?;
         if !db::cas_ref(c, repo, target, Some(head.version), id)? {
@@ -1203,6 +1205,23 @@ mod tests {
             f.store.blobs().full_flushes() - before,
             u64::from(FSYNC_LEAVES_DRIVE_CACHE)
         );
+    }
+
+    #[test]
+    fn a_head_without_a_root_tree_is_derived_in_steps_before_the_land() {
+        let f = fixture();
+        // The fixture stores changesets without root trees, as after a
+        // version bump of the kind.
+        let head = (0..4).fold(f.root, |head, i| {
+            f.commit(head, &[put("c", &i.to_string())])
+        });
+        f.move_main(head);
+        let cs = f.commit(head, &[put("d", "new")]);
+        let commits = f.store.commits();
+        assert_eq!(f.land(cs, "k").state, LandState::Landed);
+        // Record the land, five root trees in steps, then the land itself.
+        let steps = crate::derived::steps(5);
+        assert_eq!(f.store.commits() - commits, 1 + steps + 1);
     }
 
     #[test]

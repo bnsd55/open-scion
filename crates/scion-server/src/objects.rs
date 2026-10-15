@@ -9,16 +9,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use scion_core::{BlobId, TreeId};
+use scion_proto::reply::{self, IN_FLIGHT_BYTES, ObjectStream, STALL_TIMEOUT, Sent};
 use scion_proto::v1::objects_server::{Objects, ObjectsServer};
 use scion_proto::v1::{
     GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, Object, ObjectKind, ObjectRef,
     ResolveRefRequest, ResolveRefResponse,
 };
-use scion_proto::{MAX_MESSAGE_BYTES, MAX_OBJECT_MESSAGE_BYTES, MAX_OBJECT_REFS};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
-use tokio_stream::StreamExt as _;
-use tokio_stream::adapters::Map;
-use tokio_stream::wrappers::ReceiverStream;
+use scion_proto::{MAX_MESSAGE_BYTES, MAX_OBJECT_MESSAGE_BYTES};
+use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 
 use crate::error::{Error, Result};
@@ -26,34 +24,8 @@ use crate::service::{Worker, check_name, parse_id, resolve_ref};
 use crate::store::{self, Store};
 use crate::{db, read};
 
-/// A `GetObjects` reply stops before the next object once it has sent this
-/// many bytes. The client asks again for the rest, so one call stays short.
-const REPLY_BUDGET_BYTES: usize = MAX_MESSAGE_BYTES;
-
-/// Most object bytes that all `GetObjects` replies together hold after a read
-/// and before their stream hands the object on.
-const IN_FLIGHT_BYTES: usize = 4 * scion_proto::MAX_OBJECT_BYTES;
-
-/// A reply ends when its client takes no object for this long, so a client
-/// that stops reading does not hold memory and budget. (The server's request
-/// timeout covers only the start of a streamed reply.)
-// SHORTCUT: a stalled reply ends, but HTTP/2 keeps the one encoded object it
-// was sending until the connection closes. Upgrade (issue #42): a response
-// body timeout that resets the stream.
-const STALL_TIMEOUT: Duration = Duration::from_secs(120);
-
 // The store keeps exactly the objects that the API promises to send.
 const _: () = assert!(store::MAX_OBJECT_BYTES == scion_proto::MAX_OBJECT_BYTES);
-// Any one object fits in the budget, and the budget counts in u32 permits.
-const _: () = assert!(scion_proto::MAX_OBJECT_BYTES <= IN_FLIGHT_BYTES);
-const _: () = assert!(IN_FLIGHT_BYTES <= u32::MAX as usize);
-
-/// An object on its way to the client, with the share of the byte budget
-/// that it holds until the stream hands it on.
-type Sent = (Result<Object, Status>, OwnedSemaphorePermit);
-
-/// The `GetObjects` reply: the channel, minus the budget each object held.
-type ObjectStream = Map<ReceiverStream<Sent>, fn(Sent) -> Result<Object, Status>>;
 
 /// One object to read.
 #[derive(Clone, Copy, Debug)]
@@ -135,52 +107,54 @@ fn read_object(store: &Store, key: Key, size: usize) -> Result<Object> {
     })
 }
 
-/// Sends `keys` one at a time, as the client takes them. For each object it
-/// looks up the size, takes that share of `in_flight`, and only then reads
-/// the bytes, so a reply that waits for budget holds no object. Stops after
-/// an error, once the reply has sent `REPLY_BUDGET_BYTES`, when the client
-/// has gone, or when an object is not handed on within `stall`.
-// SHORTCUT: two blocking hops per object and no read-ahead, so many small
-// objects are read one after another. Upgrade: read a batch capped by bytes
-// per hop, or keep a few reads in flight.
-async fn send_objects(
+/// Starts the reply to `keys`: finds the first object before the call
+/// answers, then sends the rest on a task of its own, one at a time, as the
+/// client takes them (see [`reply::send_objects`]). If the first object gets
+/// no share of `in_flight` within `stall`, the call fails with
+/// [`reply::busy`], so a reply never ends `OK` with no object.
+async fn start_reply(
     worker: Worker,
     keys: Vec<Key>,
-    tx: mpsc::Sender<Sent>,
     in_flight: Arc<Semaphore>,
     stall: Duration,
     read: Read,
-) {
-    let mut sent = 0;
-    for key in keys {
-        if sent >= REPLY_BUDGET_BYTES {
-            break;
-        }
-        let handed_on = async {
-            let size = worker.run(move |store| object_size(&store, key)).await;
-            // Clamped to the budget, which the asserts above keep within u32.
-            let share = size
-                .as_ref()
-                .map_or(1, |&size| size.clamp(1, IN_FLIGHT_BYTES));
-            let share = u32::try_from(share).unwrap_or(u32::MAX);
-            let permit = Arc::clone(&in_flight)
-                .acquire_many_owned(share)
-                .await
-                .ok()?;
-            let object = match size {
-                Ok(size) => worker.run(move |store| read(&store, key, size)).await,
-                Err(status) => Err(status),
-            };
-            let len = object.as_ref().map_or(0, |o| o.data.len());
-            let failed = object.is_err();
-            tx.send((object, permit)).await.ok()?;
-            Some((len, failed))
-        };
-        match tokio::time::timeout(stall, handed_on).await {
-            Ok(Some((len, false))) => sent += len,
-            _ => break,
-        }
-    }
+) -> Result<ObjectStream, Status> {
+    let mut rest = keys.into_iter();
+    let Some(key) = rest.next() else {
+        return Err(Status::invalid_argument("a call names at least one object"));
+    };
+    let first = find(&worker, &in_flight, stall, read, key)
+        .await
+        .ok_or_else(reply::busy)?;
+    let (tx, stream) = reply::channel();
+    tokio::spawn(async move {
+        let (worker, in_flight) = (&worker, &in_flight);
+        let produce = |key| find(worker, in_flight, stall, read, key);
+        reply::send_objects(first, rest, tx, stall, produce).await;
+    });
+    Ok(stream)
+}
+
+/// Finds one object for a reply: looks up its size, takes that share of
+/// `in_flight`, and only then reads the bytes. `None` if the share is not
+/// free within `stall`.
+// SHORTCUT: two blocking hops per object and no read-ahead, so many small
+// objects are read one after another. Upgrade: read a batch capped by bytes
+// per hop, or keep a few reads in flight (issue #6).
+async fn find(
+    worker: &Worker,
+    in_flight: &Arc<Semaphore>,
+    stall: Duration,
+    read: Read,
+    key: Key,
+) -> Option<Sent> {
+    let size = worker.run(move |store| object_size(&store, key)).await;
+    let permit = reply::take(in_flight, *size.as_ref().unwrap_or(&1), stall).await?;
+    let object = match size {
+        Ok(size) => worker.run(move |store| read(&store, key, size)).await,
+        Err(status) => Err(status),
+    };
+    Some((object, permit))
 }
 
 #[tonic::async_trait]
@@ -218,26 +192,20 @@ impl Objects for ObjectsService {
     ) -> Result<Response<Self::GetObjectsStream>, Status> {
         let GetObjectsRequest { repo, refs } = request.into_inner();
         check_name("repo", &repo)?;
-        if refs.is_empty() || refs.len() > MAX_OBJECT_REFS {
-            return Err(Status::invalid_argument(format!(
-                "a call names 1 to {MAX_OBJECT_REFS} objects"
-            )));
-        }
+        scion_proto::check::object_count(refs.len())?;
         let keys = refs.iter().map(parse_ref).collect::<Result<Vec<_>, _>>()?;
         self.worker
             .run(move |store| store.read(|c| db::repo_id(c, &repo)))
             .await?;
-        let (tx, rx) = mpsc::channel(1);
-        tokio::spawn(send_objects(
+        let in_flight = Arc::clone(&self.in_flight);
+        let stream = start_reply(
             self.worker.clone(),
             keys,
-            tx,
-            Arc::clone(&self.in_flight),
+            in_flight,
             STALL_TIMEOUT,
             read_object,
-        ));
-        let release: fn(Sent) -> Result<Object, Status> = |(object, _permit)| object;
-        Ok(Response::new(ReceiverStream::new(rx).map(release)))
+        );
+        Ok(Response::new(stream.await?))
     }
 }
 
@@ -245,7 +213,19 @@ impl Objects for ObjectsService {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use tokio_stream::StreamExt as _;
+    use tonic::Code;
+
     use super::*;
+
+    /// Waits until `done` holds, at most 10 s.
+    async fn until(done: impl Fn() -> bool) {
+        let started = tokio::time::Instant::now();
+        while !done() {
+            assert!(started.elapsed() < Duration::from_secs(10), "timed out");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
 
     #[tokio::test]
     async fn a_client_that_stops_reading_is_cut_off_and_frees_its_budget() {
@@ -257,29 +237,27 @@ mod tests {
             .collect();
         let budget = 1000;
         let in_flight = Arc::new(Semaphore::new(budget));
-        let (tx, rx) = mpsc::channel(1);
-        let task = tokio::spawn(send_objects(
+        let stall = Duration::from_millis(50);
+        let reply = start_reply(
             Worker::new(store),
             keys,
-            tx,
             Arc::clone(&in_flight),
-            Duration::from_millis(50),
+            stall,
             read_object,
-        ));
+        );
+        let mut stream = reply.await.unwrap();
 
-        // Nobody reads: the first object waits in the channel, the second
-        // send stalls and ends the reply.
-        tokio::time::timeout(Duration::from_secs(10), task)
-            .await
-            .expect("a stalled reply ends")
-            .unwrap();
-        assert_eq!(in_flight.available_permits(), budget - b"one".len());
-        drop(rx);
+        // Nobody reads: the first object waits in the channel. The second
+        // takes its share, its send stalls, and the reply ends.
+        until(|| in_flight.available_permits() == budget - 6).await;
+        until(|| in_flight.available_permits() == budget - 3).await;
+        assert_eq!(stream.next().await.unwrap().unwrap().data, b"one");
+        assert!(stream.next().await.is_none(), "the reply ended");
         assert_eq!(in_flight.available_permits(), budget);
     }
 
     #[tokio::test]
-    async fn a_reply_that_waits_for_budget_has_not_read_its_object() {
+    async fn a_call_with_no_budget_for_its_first_object_fails_and_reads_nothing() {
         static READS: AtomicUsize = AtomicUsize::new(0);
         fn counted(store: &Store, key: Key, size: usize) -> Result<Object> {
             READS.fetch_add(1, Ordering::SeqCst);
@@ -296,43 +274,19 @@ mod tests {
         let in_flight = Arc::new(Semaphore::new(budget));
         let worker = Worker::new(store);
         let stall = Duration::from_millis(100);
-        let reply = |keys, tx| {
-            tokio::spawn(send_objects(
-                worker.clone(),
-                keys,
-                tx,
-                Arc::clone(&in_flight),
-                stall,
-                counted,
-            ))
+        let reply = |keys| {
+            let reply = start_reply(worker.clone(), keys, Arc::clone(&in_flight), stall, counted);
+            tokio::time::timeout(Duration::from_secs(10), reply)
         };
 
-        // Two replies whose clients never read. The first sends `a` into its
-        // channel, where it keeps its share; then neither reply can get
-        // budget for its next object.
-        let (tx_first, rx_first) = mpsc::channel(1);
-        let first = reply(vec![a, a], tx_first);
-        let started = tokio::time::Instant::now();
-        while in_flight.available_permits() == budget {
-            assert!(started.elapsed() < Duration::from_secs(10));
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        let (tx_second, rx_second) = mpsc::channel(1);
-        let second = reply(vec![b], tx_second);
-        for task in [first, second] {
-            tokio::time::timeout(Duration::from_secs(10), task)
-                .await
-                .expect("a reply that cannot get budget ends after the stall")
-                .unwrap();
-        }
-
-        assert_eq!(
-            READS.load(Ordering::SeqCst),
-            1,
-            "only the first `a` was read"
-        );
-        assert_eq!(in_flight.available_permits(), budget - size);
-        drop((rx_first, rx_second));
-        assert_eq!(in_flight.available_permits(), budget);
+        // A call whose client never reads keeps `a` and its share. The next
+        // call gets no budget within the stall limit: it fails, and never
+        // ends `OK` with no object.
+        let held = reply(vec![a]).await.unwrap().unwrap();
+        let status = reply(vec![b]).await.unwrap().unwrap_err();
+        assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+        assert_eq!(READS.load(Ordering::SeqCst), 1, "`b` was never read");
+        drop(held);
+        until(|| in_flight.available_permits() == budget).await;
     }
 }

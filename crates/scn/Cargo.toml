@@ -14,6 +14,7 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+hashlink.workspace = true
 rustix.workspace = true
 scion-core.workspace = true
 scion-proto.workspace = true
@@ -24,6 +25,7 @@ tonic.workspace = true
 
 [dev-dependencies]
 scion-server.workspace = true
+scion-tier.workspace = true
 tempfile.workspace = true
 
 [lints]

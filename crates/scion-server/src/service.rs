@@ -6,14 +6,15 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use scion_core::{BlobId, ChangesetId, RepoPath};
+use scion_core::{BlobId, ChangesetId, FileState, RepoPath};
 use scion_proto::v1::scion_server::{Scion, ScionServer};
 use scion_proto::v1::{
-    BlameChangeset, BlameRange, BlameRequest, BlameResponse, CreateChangesetRequest,
-    CreateChangesetResponse, GetChangesetRequest, GetChangesetResponse, GetLandRequest,
-    LandResponse, ListDirRequest, ListDirResponse, LogEntry, LogRequest, LogResponse,
-    PutBlobRequest, PutBlobResponse, ReadFileRequest, ReadFileResponse, ResolveRefRequest,
-    ResolveRefResponse,
+    self, BlameChangeset, BlameRange, BlameRequest, BlameResponse, CreateChangesetRequest,
+    CreateChangesetResponse, DiffEntry, DiffRequest, DiffResponse, FileKind, GetChangesetRequest,
+    GetChangesetResponse, GetLandRequest, IsAncestorRequest, IsAncestorResponse, LandResponse,
+    ListDirRequest, ListDirResponse, LogEntry, LogRequest, LogResponse, MergeBaseRequest,
+    MergeBaseResponse, PutBlobRequest, PutBlobResponse, ReadFileRequest, ReadFileResponse,
+    ResolveRefRequest, ResolveRefResponse,
 };
 use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES};
 use tokio::net::TcpListener;
@@ -159,12 +160,7 @@ impl Worker {
     }
 }
 
-pub(crate) fn parse_id<T: for<'a> TryFrom<&'a [u8]>>(
-    bytes: &[u8],
-    what: &str,
-) -> Result<T, Status> {
-    T::try_from(bytes).map_err(|_| Status::invalid_argument(format!("{what} must be 32 bytes")))
-}
+pub(crate) use scion_proto::check::id as parse_id;
 
 pub(crate) fn check_name(what: &str, value: &str) -> Result<(), Status> {
     names::check(what, value).map_err(Status::from)
@@ -585,11 +581,90 @@ impl Scion for ScionService {
             next_changeset_id: id_bytes(blame.next),
         }))
     }
+
+    async fn merge_base(
+        &self,
+        request: Request<MergeBaseRequest>,
+    ) -> Result<Response<MergeBaseResponse>, Status> {
+        let req = request.into_inner();
+        check_name("repo", &req.repo)?;
+        let a = parse_id(&req.a_changeset_id, "a_changeset_id")?;
+        let b = parse_id(&req.b_changeset_id, "b_changeset_id")?;
+        let bases = self
+            .worker
+            .run(move |store| read::merge_base(&store, &req.repo, a, b))
+            .await?;
+        Ok(Response::new(MergeBaseResponse {
+            changeset_ids: bases.iter().map(|id| id.as_bytes().to_vec()).collect(),
+        }))
+    }
+
+    async fn is_ancestor(
+        &self,
+        request: Request<IsAncestorRequest>,
+    ) -> Result<Response<IsAncestorResponse>, Status> {
+        let req = request.into_inner();
+        check_name("repo", &req.repo)?;
+        let ancestor = parse_id(&req.ancestor_id, "ancestor_id")?;
+        let descendant = parse_id(&req.descendant_id, "descendant_id")?;
+        let is_ancestor = self
+            .worker
+            .run(move |store| read::is_ancestor(&store, &req.repo, ancestor, descendant))
+            .await?;
+        Ok(Response::new(IsAncestorResponse { is_ancestor }))
+    }
+
+    async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<DiffResponse>, Status> {
+        let req = request.into_inner();
+        check_name("repo", &req.repo)?;
+        let old = parse_id(&req.old_changeset_id, "old_changeset_id")?;
+        let new = parse_id(&req.new_changeset_id, "new_changeset_id")?;
+        let path = parse_optional_path(req.path)?;
+        let after = parse_optional_path(req.after)?;
+        let page = self
+            .worker
+            .run(move |store| {
+                read::diff(&store, &req.repo, old, new, path.as_ref(), after.as_ref())
+            })
+            .await?;
+        let entries = page
+            .entries
+            .into_iter()
+            .map(|entry| DiffEntry {
+                path: entry.path.as_bytes().to_vec(),
+                old: entry.old.map(file_state),
+                new: entry.new.map(file_state),
+            })
+            .collect();
+        Ok(Response::new(DiffResponse {
+            entries,
+            next_after: page
+                .next_after
+                .map(|path| path.as_bytes().to_vec())
+                .unwrap_or_default(),
+        }))
+    }
 }
 
 /// An optional changeset ID on the wire: empty for `None`.
 fn id_bytes(id: Option<ChangesetId>) -> Vec<u8> {
     id.map(|id| id.as_bytes().to_vec()).unwrap_or_default()
+}
+
+fn file_state(state: FileState) -> v1::FileState {
+    let (kind, id, executable) = match state {
+        FileState::Regular {
+            content,
+            executable,
+        } => (FileKind::Regular, content.as_bytes().to_vec(), executable),
+        FileState::Symlink { target } => (FileKind::Symlink, target.as_bytes().to_vec(), false),
+        FileState::Gitlink { commit } => (FileKind::Gitlink, commit.as_bytes().to_vec(), false),
+    };
+    v1::FileState {
+        kind: kind.into(),
+        id,
+        executable,
+    }
 }
 
 #[cfg(test)]
