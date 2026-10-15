@@ -492,8 +492,9 @@ takes a few dozen steps, at any depth. Otherwise the server walks from both
 changesets, highest generation first, and stops once no other best common
 ancestor can follow. It reads each merge on the way, and the changesets
 where two parts of the walk are at the same generations. It jumps over the
-other runs of first parents, a few dozen steps for each run. A call stops at the 600 s limit
-(section 2), or when its client cancels it. There is no resume.
+other runs of first parents, a few dozen steps for each run. A call stops at
+the 600 s limit (section 2), or when its client cancels it. There is no
+resume.
 
 | Error | When |
 |---|---|

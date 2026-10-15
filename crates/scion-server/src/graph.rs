@@ -617,7 +617,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
 
-    use proptest::prelude::Strategy;
+    use proptest::prelude::{Strategy, any};
+    use proptest::sample::Index as Sample;
     use scion_core::{BlobId, FileState, IdentityTime, RepoPath};
 
     use super::*;
@@ -720,8 +721,11 @@ mod tests {
         })
     }
 
+    /// Pairs of changesets that each case of [`queries_match_the_graph`]
+    /// checks, of the up to 400 of a graph. CI runs 2,000 cases.
+    const PAIRS: usize = 40;
+
     proptest::proptest! {
-        // Each case checks every pair of changesets.
         #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
 
         /// On any graph, each node holds what a walk of the graph finds, and
@@ -730,6 +734,7 @@ mod tests {
         #[test]
         fn queries_match_the_graph(
             parents in proptest::prop_oneof![testing::graphs(20), sparse_graphs(20)],
+            pairs in proptest::collection::vec(any::<(Sample, Sample)>(), PAIRS),
         ) {
             let (_dir, store, repo, ids) = store_graph(&parents);
             let histories = histories(&parents);
@@ -752,57 +757,82 @@ mod tests {
                 let merge = history.iter().find(|&&h| parents[h].len() > 1);
                 proptest::prop_assert_eq!(node.merge.map(|m| index_of(m.id)), merge.copied());
             }
-            for x in 0..ids.len() {
-                for y in 0..ids.len() {
-                    let (a, b) = (ids[x], ids[y]);
-                    // The best common ancestors, by their definition.
-                    let common: Vec<usize> = (0..ids.len())
-                        .filter(|c| ancestors[x].contains(c) && ancestors[y].contains(c))
-                        .collect();
-                    let mut best: Vec<usize> = common
-                        .iter()
-                        .copied()
-                        .filter(|&c| !common.iter().any(|&d| d != c && ancestors[d].contains(&c)))
-                        .collect();
-                    best.sort_by_key(|&c| (Reverse(nodes[c].generation), ids[c]));
-                    let best: Vec<ChangesetId> = best.into_iter().map(|c| ids[c]).collect();
-                    let ancestry = ancestors[y].contains(&x);
-
-                    let walked = store.read(|c| db::is_ancestor(c, repo, a, b, usize::MAX)).unwrap();
-                    proptest::prop_assert_eq!(walked, ancestry, "{} {}", x, y);
-                    let mut search = Search::new(At { id: b, node: nodes[y] }, a, nodes[x].generation);
-                    let (found, _) = in_steps(&store, &later(), SMALL, |index| search.next(index)).unwrap();
-                    proptest::prop_assert_eq!(found, ancestry, "{} {}", x, y);
-                    // `merge_bases` answers from where the first-parent
-                    // histories meet, or else from the walk. Each that
-                    // answers is right, and the walk always answers.
-                    let (from, other) = (At { id: b, node: nodes[y] }, At { id: a, node: nodes[x] });
-                    let mut paint = Paint::new(other, from);
-                    let (painted, _) = in_steps(&store, &later(), SMALL, |index| paint.next(index)).unwrap();
-                    proptest::prop_assert_eq!(&painted, &best, "{} {}", x, y);
-                    let (bases, down, met) = store
-                        .read(|c| {
-                            let deadline = later();
-                            let mut index = Index::new(c, &deadline);
-                            let bases = meeting(&mut index, other, from)?;
-                            // The walks down first-parent histories.
-                            let down = index.descend(from, nodes[x].generation, |l| l.generation)?;
-                            Ok((bases, down.id, index.meet(from, other)?.map(|at| at.id)))
-                        })
-                        .unwrap();
-                    if let Some(bases) = bases {
-                        proptest::prop_assert_eq!(&bases, &best, "{} {}", x, y);
+            // Ancestry for every pair, in one read: some histories reach the
+            // ancestor only through an older merge, and few pairs show it.
+            let searched = store
+                .read(|c| {
+                    let deadline = later();
+                    let mut index = Index::new(c, &deadline);
+                    let mut out = Vec::new();
+                    for (x, y) in (0..ids.len()).flat_map(|x| (0..ids.len()).map(move |y| (x, y))) {
+                        let (a, b) = (ids[x], ids[y]);
+                        let walked = db::is_ancestor(c, repo, a, b, usize::MAX)?;
+                        let mut search = Search::new(At { id: b, node: nodes[y] }, a, nodes[x].generation);
+                        let found = loop {
+                            if let Some(found) = search.next(&mut index)? {
+                                break found;
+                            }
+                        };
+                        out.push((x, y, walked, found));
                     }
-                    let oldest = histories[y]
-                        .iter()
-                        .take_while(|&&h| nodes[h].generation >= nodes[x].generation)
-                        .last()
-                        .copied()
-                        .unwrap_or(y);
-                    proptest::prop_assert_eq!(index_of(down), oldest);
-                    let shared = histories[y].iter().find(|h| histories[x].contains(h));
-                    proptest::prop_assert_eq!(met.map(index_of), shared.copied());
+                    Ok(out)
+                })
+                .unwrap();
+            for (x, y, walked, found) in searched {
+                let ancestry = ancestors[y].contains(&x);
+                proptest::prop_assert_eq!(walked, ancestry, "{} {}", x, y);
+                proptest::prop_assert_eq!(found, ancestry, "{} {}", x, y);
+            }
+            // The rest for a sample of the pairs. The walks here go on
+            // across steps.
+            for (x, y) in pairs.iter().map(|(x, y)| (x.index(ids.len()), y.index(ids.len()))) {
+                let (a, b) = (ids[x], ids[y]);
+                // The best common ancestors, by their definition.
+                let common: Vec<usize> = (0..ids.len())
+                    .filter(|c| ancestors[x].contains(c) && ancestors[y].contains(c))
+                    .collect();
+                let mut best: Vec<usize> = common
+                    .iter()
+                    .copied()
+                    .filter(|&c| !common.iter().any(|&d| d != c && ancestors[d].contains(&c)))
+                    .collect();
+                best.sort_by_key(|&c| (Reverse(nodes[c].generation), ids[c]));
+                let best: Vec<ChangesetId> = best.into_iter().map(|c| ids[c]).collect();
+                let ancestry = ancestors[y].contains(&x);
+                let mut search = Search::new(At { id: b, node: nodes[y] }, a, nodes[x].generation);
+                let (found, _) =
+                    in_steps(&store, &later(), SMALL, |index| search.next(index)).unwrap();
+                proptest::prop_assert_eq!(found, ancestry, "{} {}", x, y);
+                // `merge_bases` answers from where the first-parent
+                // histories meet, or else from the walk. Each that
+                // answers is right, and the walk always answers.
+                let (from, other) = (At { id: b, node: nodes[y] }, At { id: a, node: nodes[x] });
+                let mut paint = Paint::new(other, from);
+                let (painted, _) =
+                    in_steps(&store, &later(), SMALL, |index| paint.next(index)).unwrap();
+                proptest::prop_assert_eq!(&painted, &best, "{} {}", x, y);
+                let (bases, down, met) = store
+                    .read(|c| {
+                        let deadline = later();
+                        let mut index = Index::new(c, &deadline);
+                        let bases = meeting(&mut index, other, from)?;
+                        // The walks down first-parent histories.
+                        let down = index.descend(from, nodes[x].generation, |l| l.generation)?;
+                        Ok((bases, down.id, index.meet(from, other)?.map(|at| at.id)))
+                    })
+                    .unwrap();
+                if let Some(bases) = bases {
+                    proptest::prop_assert_eq!(&bases, &best, "{} {}", x, y);
                 }
+                let oldest = histories[y]
+                    .iter()
+                    .take_while(|&&h| nodes[h].generation >= nodes[x].generation)
+                    .last()
+                    .copied()
+                    .unwrap_or(y);
+                proptest::prop_assert_eq!(index_of(down), oldest);
+                let shared = histories[y].iter().find(|h| histories[x].contains(h));
+                proptest::prop_assert_eq!(met.map(index_of), shared.copied());
             }
         }
     }
