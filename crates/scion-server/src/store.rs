@@ -37,6 +37,15 @@ const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [
 /// per-file limit on GitHub, so any file from a GitHub repository fits.
 pub const MAX_OBJECT_BYTES: usize = 100 << 20;
 
+/// Largest zstd window that a [`BlobReader`] accepts, as a power of two: 2 MiB,
+/// the most that [`Blobs::put`] writes at its level. A frame that needs a
+/// larger window is refused as corrupt.
+const READER_WINDOW_LOG: u32 = 21;
+
+/// Most memory that a [`BlobReader`] holds between parts: its zstd window and
+/// the decoder's buffers and tables, which take less than 1 MiB.
+pub const READER_BYTES: usize = (1 << READER_WINDOW_LOG) + (1 << 20);
+
 /// Handle to one data directory. Cheap to clone.
 #[derive(Clone)]
 pub struct Store {
@@ -389,6 +398,7 @@ impl Blobs {
 
     /// A blob's uncompressed size, from the zstd frame header, without
     /// reading the content. Every blob is written with its size in the header.
+    /// An empty file gives 0, because [`Blobs::get`] reads it as empty.
     ///
     /// # Errors
     ///
@@ -396,21 +406,39 @@ impl Blobs {
     /// has no size, or gives a size above [`MAX_OBJECT_BYTES`], [`Error::Io`]
     /// if it cannot be read.
     pub fn size(&self, id: BlobId) -> Result<usize> {
-        /// Longest zstd frame header (`ZSTD_FRAMEHEADERSIZE_MAX`).
-        const FRAME_HEADER_MAX: u64 = 18;
-        let mut header = Vec::new();
-        self.open_file(id)?
-            .take(FRAME_HEADER_MAX)
-            .read_to_end(&mut header)?;
-        let corrupt = |why: &str| Error::Corrupt(format!("blob {id}: {why}"));
-        match zstd::zstd_safe::get_frame_content_size(&header) {
-            Ok(Some(size)) => usize::try_from(size)
-                .ok()
-                .filter(|&size| size <= MAX_OBJECT_BYTES)
-                .ok_or_else(|| corrupt("its header gives a size above the object limit")),
-            Ok(None) => Err(corrupt("its header has no content size")),
-            Err(_) => Err(corrupt("bad zstd frame header")),
+        frame_size(id, &mut self.open_file(id)?)
+    }
+
+    /// Opens a blob to read in parts with [`BlobReader::read_part`]. Between
+    /// parts the reader holds at most [`READER_BYTES`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Blobs::size`]. An empty file that is not the empty blob is
+    /// [`Error::Corrupt`].
+    pub fn reader(&self, id: BlobId) -> Result<BlobReader> {
+        let mut file = self.open_file(id)?;
+        let size = frame_size(id, &mut file)?;
+        let mut reader = BlobReader {
+            id,
+            left: size,
+            unpacked: None,
+            hasher: BlobHasher::default(),
+        };
+        // As in `verify`: an empty file holds no zstd frame.
+        if file.metadata()?.len() == 0 {
+            reader.end()?;
+            return Ok(reader);
         }
+        file.rewind()?;
+        let watched = Watched {
+            inner: file,
+            failed: false,
+        };
+        let mut unpacked = zstd::stream::read::Decoder::new(watched)?;
+        unpacked.window_log_max(READER_WINDOW_LOG)?;
+        reader.unpacked = Some(unpacked);
+        Ok(reader)
     }
 
     /// Opens a blob's file: one zstd frame, which nothing here unpacks or
@@ -473,7 +501,7 @@ impl Blobs {
     }
 
     /// The fan-out directory and the file path of a blob.
-    fn location(&self, id: BlobId) -> (PathBuf, PathBuf) {
+    pub(crate) fn location(&self, id: BlobId) -> (PathBuf, PathBuf) {
         let hex = id.to_string();
         let dir = self.root.join(&hex[..2]);
         let path = dir.join(&hex[2..]);
@@ -490,6 +518,102 @@ impl Blobs {
     #[cfg(test)]
     pub(crate) fn verifies(&self) -> u64 {
         self.verifies.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// The content size in a blob file's zstd frame header. An empty file holds
+/// empty content, as in [`Blobs::get`].
+fn frame_size(id: BlobId, file: &mut fs::File) -> Result<usize> {
+    /// Longest zstd frame header (`ZSTD_FRAMEHEADERSIZE_MAX`).
+    const FRAME_HEADER_MAX: u64 = 18;
+    let mut header = Vec::new();
+    file.take(FRAME_HEADER_MAX).read_to_end(&mut header)?;
+    if header.is_empty() {
+        return Ok(0);
+    }
+    let corrupt = |why: &str| Error::Corrupt(format!("blob {id}: {why}"));
+    match zstd::zstd_safe::get_frame_content_size(&header) {
+        Ok(Some(size)) => usize::try_from(size)
+            .ok()
+            .filter(|&size| size <= MAX_OBJECT_BYTES)
+            .ok_or_else(|| corrupt("its header gives a size above the object limit")),
+        Ok(None) => Err(corrupt("its header has no content size")),
+        Err(_) => Err(corrupt("bad zstd frame header")),
+    }
+}
+
+/// The streaming zstd decoder over a blob file.
+type Unpacked = zstd::stream::read::Decoder<'static, io::BufReader<Watched<fs::File>>>;
+
+/// A blob's content, read in parts and checked against its ID. Made by
+/// [`Blobs::reader`]. It holds the zstd window, not the whole blob.
+pub struct BlobReader {
+    id: BlobId,
+    /// Bytes of the content not read yet, from the frame header.
+    left: usize,
+    /// `None` once the content has ended, or for an empty file.
+    unpacked: Option<Unpacked>,
+    hasher: BlobHasher,
+}
+
+impl BlobReader {
+    /// The next part of the content, of at most `max` bytes (`max > 0`), or
+    /// `None` after the end. The part that reaches the end comes only after
+    /// the whole content matched the ID, so a caller never gets all of a blob
+    /// that is not intact. At the end the reader frees its decoder.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if the content does not unpack, is not the size in
+    /// its header, or does not match the ID. [`Error::Io`] if the file cannot
+    /// be read.
+    pub fn read_part(&mut self, max: usize) -> Result<Option<Vec<u8>>> {
+        let Some(unpacked) = self.unpacked.as_mut() else {
+            return Ok(None);
+        };
+        let mut part = vec![0; self.left.min(max)];
+        if let Err(e) = unpacked.read_exact(&mut part) {
+            return Err(unpack_error(self.id, unpacked, e));
+        }
+        self.hasher.update(&part);
+        self.left -= part.len();
+        if self.left == 0 {
+            self.end()?;
+        }
+        Ok((!part.is_empty()).then_some(part))
+    }
+
+    /// Whether the whole content has been read and checked.
+    #[must_use]
+    pub fn ended(&self) -> bool {
+        self.unpacked.is_none()
+    }
+
+    /// Checks that nothing follows the content and that the content matches
+    /// the ID, then frees the decoder.
+    fn end(&mut self) -> Result<()> {
+        let id = self.id;
+        let corrupt = |why: &str| Error::Corrupt(format!("blob {id}: {why}"));
+        if let Some(mut unpacked) = self.unpacked.take() {
+            match unpacked.read(&mut [0]) {
+                Ok(0) => {}
+                Ok(_) => return Err(corrupt("it unpacks to more than its header says")),
+                Err(e) => return Err(unpack_error(id, &unpacked, e)),
+            }
+        }
+        if self.hasher.finalize() != id {
+            return Err(corrupt("content does not match the ID"));
+        }
+        Ok(())
+    }
+}
+
+/// A read error of the file is I/O; anything else is bad bytes.
+fn unpack_error(id: BlobId, unpacked: &Unpacked, e: io::Error) -> Error {
+    if unpacked.get_ref().get_ref().failed {
+        e.into()
+    } else {
+        Error::Corrupt(format!("blob {id}: cannot unpack: {e}"))
     }
 }
 
@@ -832,6 +956,48 @@ mod tests {
         }
     }
 
+    /// What a [`BlobReader`] says about a blob, read in parts of 3 bytes.
+    /// Checks that it gives all of the content only for an intact blob.
+    fn status_by_reader(blobs: &Blobs, id: BlobId) -> Result<BlobStatus> {
+        let mut content = Vec::new();
+        let mut read = || -> Result<()> {
+            let mut reader = blobs.reader(id)?;
+            while let Some(part) = reader.read_part(3)? {
+                assert!((1..=3).contains(&part.len()), "a part of 1 to 3 bytes");
+                content.extend(part);
+            }
+            assert!(reader.ended());
+            Ok(())
+        };
+        let status = match read() {
+            Ok(()) => BlobStatus::Valid,
+            Err(Error::NotFound(_)) => BlobStatus::Missing,
+            Err(Error::Corrupt(_)) => BlobStatus::Corrupt,
+            Err(e) => return Err(e),
+        };
+        let whole = BlobId::of(&content) == id;
+        assert_eq!(whole, status == BlobStatus::Valid, "{content:?}");
+        Ok(status)
+    }
+
+    #[test]
+    fn a_reader_gives_what_put_wrote_in_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        // Larger than the window, so the frame uses the whole window.
+        let raw: Vec<u8> = (0..5_u32 << 20)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let id = blobs.put(&raw).unwrap();
+        let mut reader = blobs.reader(id).unwrap();
+        let mut read = Vec::new();
+        while let Some(part) = reader.read_part(1 << 20).unwrap() {
+            assert!(part.len() <= 1 << 20);
+            read.extend(part);
+        }
+        assert!(read == raw, "read {} bytes of {}", read.len(), raw.len());
+    }
+
     #[test]
     fn verify_gives_the_same_answer_as_get() {
         let dir = tempfile::tempdir().unwrap();
@@ -855,6 +1021,18 @@ mod tests {
             ),
             ("truncated", content, Some(truncated), BlobStatus::Corrupt),
             (
+                "another blob's file",
+                content,
+                Some(zstd::bulk::compress(b"another blob", 3).unwrap()),
+                BlobStatus::Corrupt,
+            ),
+            (
+                "empty, not the empty blob",
+                content,
+                Some(vec![]),
+                BlobStatus::Corrupt,
+            ),
+            (
                 "too large",
                 BlobId::of_reader(too_large()).unwrap(),
                 Some(zstd::stream::encode_all(too_large(), 1).unwrap()),
@@ -876,6 +1054,7 @@ mod tests {
             }
             assert_eq!(blobs.verify(id).unwrap(), want, "{case}");
             assert_eq!(status_by_get(&blobs, id).unwrap(), want, "{case}");
+            assert_eq!(status_by_reader(&blobs, id).unwrap(), want, "{case}");
         }
     }
 
@@ -888,6 +1067,7 @@ mod tests {
         fs::create_dir_all(blobs.location(id).1).unwrap();
         assert!(matches!(blobs.verify(id), Err(Error::Io(_))));
         assert!(matches!(status_by_get(&blobs, id), Err(Error::Io(_))));
+        assert!(matches!(status_by_reader(&blobs, id), Err(Error::Io(_))));
     }
 
     /// Entries in the temp directory.

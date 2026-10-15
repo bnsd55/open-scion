@@ -52,15 +52,16 @@ shares one scope.
 **Timeouts.** The server ends a call with `CANCELLED` when its reply has not
 started after 600 s, or earlier if the client's `grpc-timeout` is shorter.
 For `PutBlob` this covers the whole upload. For a streamed reply (`ReadFile`,
-`GetObjects`) it covers only the start. A call that ends this way may still
-finish its work on the server (section 6.3).
+`GetObjects`) it covers only the start. A `ReadFile` reply has its own limits
+(section 6.7). A call that ends this way may still finish its work on the
+server (section 6.3).
 
 **Queues.** The server queues work instead of failing it. At most 256 jobs run
 at once across both services, at most 16 `PutBlob` uploads are read at once,
-and at most 4 `Blame` calls run at once. Time in a queue counts toward the
-timeout. One wait has its own limit: a `GetObjects` call that gets no memory
-for its first object within 30 s fails with `RESOURCE_EXHAUSTED` (section
-7.3).
+and at most 4 `Blame` calls run at once. A `ReadFile` call waits for its share
+of a memory budget (section 6.7). Time in a queue counts toward the timeout.
+One wait has its own limit: a `GetObjects` call that gets no memory for its
+first object within 30 s fails with `RESOURCE_EXHAUSTED` (section 7.3).
 
 ## 3. Common rules
 
@@ -110,7 +111,8 @@ contract. A client MUST NOT depend on its text.
 | `ABORTED` | `Land` only: other writers kept moving the ref. The land stays `PENDING`. | Yes, with the same request key |
 | `OUT_OF_RANGE` | A message is larger than its limit. | After the cause is fixed |
 | `RESOURCE_EXHAUSTED` | `MergeBase` or `IsAncestor` only: the answer needs more work than one call may do. | No: the same request fails again |
-| `CANCELLED` | The server's 600 s limit or the client's `grpc-timeout` ran out, or a `GetObjects` reply stopped in the middle of an object because its client took no part for 120 s (section 7.3). A client library can report its own deadline as `DEADLINE_EXCEEDED`. | Yes. A `Land` retry uses the same request key. |
+| `CANCELLED` | The server's 600 s limit or the client's `grpc-timeout` ran out. A client library can report its own deadline as `DEADLINE_EXCEEDED`. | Yes. A `Land` retry uses the same request key. |
+| `DEADLINE_EXCEEDED` | `ReadFile`: the client took no message for 120 s. `GetObjects`: the client took no part for 120 s in the middle of an object (section 7.3). `Land`: the land ran past 600 s from the start of the call. The land stays `PENDING`. | Yes. A `Land` retry uses the same request key. |
 | `UNAVAILABLE` | The server cannot be reached or is shutting down. A tier also replies `UNAVAILABLE` when its upstream does not answer in time (section 8). | Yes |
 | `RESOURCE_EXHAUSTED` | `GetObjects` only: no memory for the first object within 30 s (section 7.3). | Yes, after a wait |
 | `DATA_LOSS` | From a tier only: its upstream sent bytes that are not the object asked for (section 8). | MAY |
@@ -135,9 +137,9 @@ A successful reply never shows state that a power loss can undo:
   no stored value yet, replies after that data is on disk.
 
 A call that fails or is cut off MAY have done part of its work. In particular
-a `Land` that returned `ABORTED` or `CANCELLED`, or whose reply was lost, can
-be pending or finished on the server. The client finds out with a retry under
-the same request key (section 6.3).
+a `Land` that returned `ABORTED`, `CANCELLED` or `DEADLINE_EXCEEDED`, or whose
+reply was lost, can be pending or finished on the server. The client finds
+out with a retry under the same request key (section 6.3).
 
 ## 5. Object IDs and verification
 
@@ -244,7 +246,12 @@ server checks, in order:
 1. The ref exists. If not, the land is `REJECTED` at once.
 2. The changeset has exactly one parent. If not (an imported root or merge),
    `REJECTED`.
-3. The base is on the ref's first-parent history. If not, `REJECTED`.
+3. The base is on the ref's first-parent history. If not, `REJECTED`. A base
+   more than 100,000 changesets behind the head on that history MAY be
+   `REJECTED` as too old. Then the client makes a new changeset on a newer
+   head and lands that. A base within 100,000 changesets of the head is never
+   too old. Further back, the answer depends on what the server holds in
+   memory at the time, so the same base can pass later under a new key.
 4. Each path P that the changeset changes is checked. P conflicts when a
    changeset on the ref after the base changed P itself, a path below P, or a
    file at a directory above P. If any path conflicts, the land is
@@ -262,6 +269,10 @@ Lands to one ref run one at a time. If the ref moves between step 4 and the
 swap (in v1 only git import does this), the server checks again from the new
 head, up to 3 times in all. Then the call fails with `ABORTED`, and the land
 stays `PENDING`.
+
+A `Land` past the 600 s limit, or cancelled by its client (for example by a
+shorter `grpc-timeout`), replies `CANCELLED` or `DEADLINE_EXCEEDED`. The
+server stops the land at its next check, and the land stays `PENDING`.
 
 **Reply.**
 
@@ -292,9 +303,10 @@ stays `PENDING`.
   `INVALID_ARGUMENT`.
 - A finished outcome is final for its key. A retry returns it even if the ref
   has changed since. To try again, a client uses a new key.
-- A client that retries after `ABORTED`, `CANCELLED`, `UNAVAILABLE` or a
-  lost reply MUST use the same key, so that it never lands the same change
-  twice. `scn land` uses `<changeset ID>:<ref>` as its default key.
+- A client that retries after `ABORTED`, `CANCELLED`, `DEADLINE_EXCEEDED`,
+  `UNAVAILABLE` or a lost reply MUST use the same key, so that it never
+  lands the same change twice. `scn land` uses `<changeset ID>:<ref>` as its
+  default key.
 - The server keeps a finished land for at least 7 days after it finished. A
   pending land is kept until it finishes. Within that time a retry with the
   same key is safe.
@@ -309,6 +321,7 @@ stays `PENDING`.
 | `INVALID_ARGUMENT` | A bad name or ID; a request key already used for a different changeset or ref. |
 | `NOT_FOUND` | The repo does not exist, or the repo does not have the changeset. |
 | `ABORTED` | The ref kept moving. The land stays `PENDING`. Retry with the same key. |
+| `CANCELLED`, `DEADLINE_EXCEEDED` | The call ran past 600 s, or the client cancelled it. The land stays `PENDING`. Retry with the same key. |
 
 ### 6.4 GetLand
 
@@ -342,12 +355,25 @@ content of a regular file, or the target of a symlink, at `path` in
 - Messages come in file order. Each holds at most 1 MiB. Together they are
   the whole content.
 - An empty file is a reply with no message.
-- Every error comes before the first message.
+- An error in the request comes before the first message. `INTERNAL` and
+  `DEADLINE_EXCEEDED` can end the reply after zero or more messages. A client
+  MUST take the content as whole only when the reply ends with `OK`.
+- The server checks the content against the blob ID as it sends it. A
+  damaged stored blob ends the reply with `INTERNAL` before its last message,
+  so a client never gets all of a damaged file.
+- The reply ends with `DEADLINE_EXCEEDED` when the client takes no message
+  for 120 s (the stall limit). A client that keeps reading has no time
+  limit.
+- Before the reply starts, the call waits for its share of a memory budget of
+  256 MiB that all `ReadFile` replies share: the file's size for a file of at
+  most 1 MiB, 5 MiB for a larger one.
 
 | Error | When |
 |---|---|
 | `INVALID_ARGUMENT` | A bad or empty path; the path is a directory or a submodule. |
 | `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
+| `DEADLINE_EXCEEDED` | After zero or more messages: the client took no message for 120 s. |
+| `INTERNAL` | After zero or more messages: the stored blob is damaged. |
 
 ### 6.8 ListDir
 
@@ -460,10 +486,13 @@ repository.
 - If one changeset is an ancestor of the other, the answer is that one.
   `changeset_ids` is empty when the two histories share no changeset.
 
-**Bound.** The server walks from both changesets, highest generation first,
-and reads the parents of at most 10,000 changesets. It stops early once no
-other best common ancestor can follow. If the answer needs more, the call
-fails with `RESOURCE_EXHAUSTED`. There is no resume.
+**Bound.** A call takes at most 10,000 steps. A step reads one changeset's
+parents, or one entry of the server's commit-graph index. When neither
+first-parent history has a merge newer than where the two meet, the answer
+takes a few dozen steps, at any depth. Otherwise the server walks from both
+changesets, highest generation first, and stops early once no other best
+common ancestor can follow. If the answer needs more, the call fails with
+`RESOURCE_EXHAUSTED`. There is no resume.
 
 | Error | When |
 |---|---|
@@ -477,11 +506,12 @@ fails with `RESOURCE_EXHAUSTED`. There is no resume.
 `is_ancestor` is true when `ancestor_id` is `descendant_id`, or is reached
 from it through parents. Ancestry follows every parent, as in `MergeBase`.
 
-**Bound.** The server reads the parents of at most 10,000 changesets, and
-never goes below the generation of `ancestor_id`. So when the two differ
-and `ancestor_id`'s generation is not lower, the answer is false without a
-walk. If the answer
-needs more, the call fails with `RESOURCE_EXHAUSTED`.
+**Bound.** A call takes at most 10,000 steps, as in `MergeBase`, and never
+goes below the generation of `ancestor_id`. So when the two differ and
+`ancestor_id`'s generation is not lower, the answer is false. Without a
+merge between the two, the answer takes a few dozen steps, at any depth.
+Each merge newer than `ancestor_id` that the search reaches costs three
+steps. If the answer needs more, the call fails with `RESOURCE_EXHAUSTED`.
 
 | Error | When |
 |---|---|
@@ -615,7 +645,8 @@ object takes, before the rest arrives.
   one object. A server or tier MUST NOT end a reply with `OK` and no object,
   or with `OK` in the middle of an object. A reply that stops in the middle
   of an object, because its client took no part for 120 s, ends with
-  `CANCELLED`. The client MUST ask again for the objects it did not get.
+  `DEADLINE_EXCEEDED`, as `ReadFile` does. The client MUST ask again for the
+  objects it did not get.
 
 **Errors.** An error status of the call is about the whole call, and no
 object was sent: for example a repo that does not exist, or no memory for
@@ -633,7 +664,7 @@ MAY keep the objects it got before the error.
 | `INVALID_ARGUMENT` | A bad repo name; no ref or more than 1,000; a kind that is not `TREE` or `BLOB`; an ID that is not 32 bytes. |
 | `NOT_FOUND` | The repo does not exist (the call's status); a named object does not exist (in the stream, after the objects before it). |
 | `RESOURCE_EXHAUSTED` | No memory for the first object within 30 s. No object was sent. |
-| `CANCELLED` | In the stream: the client took no part for 120 s in the middle of an object. |
+| `DEADLINE_EXCEEDED` | In the stream: the client took no part for 120 s in the middle of an object. |
 
 ## 8. Cache tiers
 
@@ -733,7 +764,7 @@ A new version is a new package, `scion.v2`. A server MAY serve both.
 - Client changesets with no parent, several parents or a committer. Only git
   import makes them.
 - Text merge. Conflicts are path-level.
-- `MergeBase` and `IsAncestor` without a bound on the walk
+- `MergeBase` and `IsAncestor` without a bound across many merges
   ([#72](https://github.com/bnsd55/open-scion/issues/72)), and `Diff` with
   rename detection ([#79](https://github.com/bnsd55/open-scion/issues/79)).
 - `Log` and `Blame` without per-call bounds

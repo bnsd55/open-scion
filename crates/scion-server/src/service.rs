@@ -3,11 +3,10 @@
 //! codes.
 
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use scion_core::{ChangesetId, FileState, RepoPath};
+use scion_core::{BlobId, ChangesetId, FileState, RepoPath};
 use scion_proto::v1::scion_server::{Scion, ScionServer};
 use scion_proto::v1::{
     self, BlameChangeset, BlameRange, BlameRequest, BlameResponse, CreateChangesetRequest,
@@ -19,9 +18,9 @@ use scion_proto::v1::{
 };
 use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
-use tokio_stream::wrappers::TcpListenerStream;
-use tokio_stream::{Stream, StreamExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -29,7 +28,7 @@ use crate::auth::{Auth, Caller};
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
 use crate::objects::ObjectsService;
-use crate::store::Store;
+use crate::store::{MAX_OBJECT_BYTES, READER_BYTES, Store};
 use crate::{blame, db, names, read, write};
 
 /// Most changeset bytes in one `Log` reply; the client pages for more.
@@ -45,6 +44,20 @@ const MAX_UPLOADS: usize = 16;
 const MAX_BLAMES: usize = 4;
 /// Longest a request may take before the server gives up on it.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+/// Most bytes that all `ReadFile` replies together hold: the parts read and
+/// not yet sent, and the readers of files of more than one part.
+const READ_BUDGET_BYTES: usize = 256 << 20;
+/// A `ReadFile` reply ends when its client takes no part for this long, and
+/// frees its share, so a client that stops reading does not hold budget.
+// SHORTCUT: the reply frees its share, but the part that waits in its
+// channel and the part inside HTTP/2 stay in memory, outside the budget,
+// until the connection closes: up to 2 MiB per stalled reply. Upgrade
+// (issue #42): a response body timeout that resets the stream.
+const READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+// Any one reply fits in the budget, and the budget counts in u32 permits.
+const _: () = assert!(read_share(MAX_OBJECT_BYTES) <= READ_BUDGET_BYTES);
+const _: () = assert!(READ_BUDGET_BYTES <= u32::MAX as usize);
 
 /// Serves the API on `listener`, requiring `token`, until `shutdown` resolves.
 ///
@@ -81,6 +94,9 @@ pub struct ScionService {
     uploads: Arc<Semaphore>,
     /// Bounds blames running at once (`MAX_BLAMES`).
     blames: Arc<Semaphore>,
+    /// `READ_BUDGET_BYTES` permits, one per byte, shared by all `ReadFile`
+    /// replies.
+    reads: Arc<Semaphore>,
 }
 
 impl ScionService {
@@ -90,6 +106,7 @@ impl ScionService {
             lands: Arc::default(),
             uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
             blames: Arc::new(Semaphore::new(MAX_BLAMES)),
+            reads: Arc::new(Semaphore::new(READ_BUDGET_BYTES)),
         }
     }
 
@@ -207,7 +224,80 @@ fn land_response(outcome: LandOutcome) -> LandResponse {
     }
 }
 
-type ReadFileStream = Pin<Box<dyn Stream<Item = Result<ReadFileResponse, Status>> + Send>>;
+/// A part of a `ReadFile` reply, or the error that ends it early.
+type Part = Result<ReadFileResponse, Status>;
+
+type ReadFileStream = ReceiverStream<Part>;
+
+/// The share of `READ_BUDGET_BYTES` that a `ReadFile` reply of a `size`-byte
+/// file holds. A file of one part is read in one job, so the reply holds only
+/// that part. A longer file keeps its reader between parts, and reads the
+/// next part while the client takes the one before.
+const fn read_share(size: usize) -> usize {
+    if size <= CHUNK_BYTES {
+        size
+    } else {
+        READER_BYTES + 2 * CHUNK_BYTES
+    }
+}
+
+/// Sends a blob to `tx` in parts of up to `CHUNK_BYTES`, as the client takes
+/// them. Holds `share` until the client has taken the last part, or until no
+/// part is taken within `stall`. A part goes into the channel only when the
+/// channel is empty, so its second slot is always free for the error that
+/// ends a reply early: a store error, or the stall. A client never takes a
+/// short file for a whole one.
+async fn send_file(
+    worker: Worker,
+    blob: BlobId,
+    _share: OwnedSemaphorePermit,
+    tx: mpsc::Sender<Part>,
+    stall: Duration,
+) {
+    let fail = |status: Status| {
+        // Fails only if the client has gone.
+        let _ = tx.try_send(Err(status));
+    };
+    let mut open = None;
+    loop {
+        let read = worker
+            .run(move |store| {
+                let mut reader = match open {
+                    Some(reader) => reader,
+                    None => store.blobs().reader(blob)?,
+                };
+                let part = reader.read_part(CHUNK_BYTES)?;
+                // A reader that has ended has freed its decoder.
+                Ok((part, (!reader.ended()).then_some(reader)))
+            })
+            .await;
+        let (part, reader) = match read {
+            Ok(read) => read,
+            Err(status) => return fail(status),
+        };
+        open = reader;
+        if let Some(data) = part {
+            // Both slots free: the client has taken the part before.
+            match tokio::time::timeout(stall, tx.reserve_many(2)).await {
+                Ok(Ok(mut slots)) => {
+                    if let Some(slot) = slots.next() {
+                        slot.send(Ok(ReadFileResponse { data }));
+                    }
+                }
+                Ok(Err(_)) => return,
+                Err(_) => {
+                    let detail = format!("the client took no data for {stall:?}");
+                    return fail(Status::deadline_exceeded(detail));
+                }
+            }
+        }
+        if open.is_none() {
+            // Keeps the share until the client has taken the last part.
+            let _ = tokio::time::timeout(stall, tx.reserve_many(2)).await;
+            return;
+        }
+    }
+}
 
 #[tonic::async_trait]
 impl Scion for ScionService {
@@ -272,6 +362,11 @@ impl Scion for ScionService {
         &self,
         request: Request<scion_proto::v1::LandRequest>,
     ) -> Result<Response<LandResponse>, Status> {
+        // The job checks it in its walks: a request timeout, or a client
+        // that cancels, drops this call but not a job that is running. The
+        // guard ends the deadline when this call ends or is dropped.
+        let deadline = land::Deadline::new(Instant::now() + REQUEST_TIMEOUT);
+        let _call = deadline.guard();
         let caller = caller(&request)?;
         let req = request.into_inner();
         check_name("repo", &req.repo)?;
@@ -282,6 +377,7 @@ impl Scion for ScionService {
             repo: req.repo,
             target_ref: req.target_ref,
             request_key: req.request_key,
+            deadline,
         };
         let lands = Arc::clone(&self.lands);
         let outcome = self
@@ -343,18 +439,28 @@ impl Scion for ScionService {
         check_name("repo", &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_path(req.path)?;
-        let data = self
+        let (blob, size) = self
             .worker
-            .run(move |store| read::read_file(&store, &req.repo, id, &path))
-            .await?;
-        // Copies one chunk at a time, as the stream is read.
-        let chunks = (0..data.len().div_ceil(CHUNK_BYTES)).map(move |i| {
-            let end = data.len().min((i + 1) * CHUNK_BYTES);
-            Ok(ReadFileResponse {
-                data: data[i * CHUNK_BYTES..end].to_vec(),
+            .run(move |store| {
+                let blob = read::file_blob(&store, &req.repo, id, &path)?;
+                Ok((blob, store.blobs().size(blob)?))
             })
-        });
-        Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
+            .await?;
+        // Taken before any content is read, so a call that waits holds none.
+        let share = u32::try_from(read_share(size)).expect("asserted to fit in u32");
+        let share = Arc::clone(&self.reads)
+            .acquire_many_owned(share)
+            .await
+            .map_err(|_| Status::unavailable("server is shutting down"))?;
+        let (tx, rx) = mpsc::channel(2);
+        tokio::spawn(send_file(
+            self.worker.clone(),
+            blob,
+            share,
+            tx,
+            READ_STALL_TIMEOUT,
+        ));
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn list_dir(
@@ -549,7 +655,274 @@ fn file_state(state: FileState) -> v1::FileState {
 
 #[cfg(test)]
 mod tests {
+    use scion_core::{Changeset, FileState, IdentityTime};
+    use tonic::Code;
+
     use super::*;
+
+    /// A store whose repo `r` has one changeset, which puts `f` with
+    /// `content`. Also returns the changeset and the blob.
+    fn file_store(content: &[u8]) -> (tempfile::TempDir, Store, ChangesetId, BlobId) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let blob = store.blobs().put(content).unwrap();
+        let state = FileState::Regular {
+            content: blob,
+            executable: false,
+        };
+        let changeset = Changeset {
+            parents: vec![],
+            author: IdentityTime {
+                name: b"t".to_vec(),
+                email: b"t@x".to_vec(),
+                unix_secs: 0,
+                tz_offset_minutes: 0,
+            },
+            committer: None,
+            message: vec![],
+            changes: [(RepoPath::new("f").unwrap(), Some(state))].into(),
+        };
+        let cs = store
+            .write(|c| db::insert_changeset(c, db::create_repo(c, "r")?, &changeset))
+            .unwrap();
+        (dir, store, cs, blob)
+    }
+
+    /// `parts` parts of `CHUNK_BYTES`, each filled with its own byte.
+    fn content(parts: u8) -> Vec<u8> {
+        (0..parts).flat_map(|i| vec![i; CHUNK_BYTES]).collect()
+    }
+
+    /// Starts [`send_file`] for `blob` with all of a budget of `budget`.
+    /// Returns the task, the reply and the budget.
+    async fn reply(
+        store: Store,
+        blob: BlobId,
+        budget: usize,
+        stall: Duration,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        mpsc::Receiver<Part>,
+        Arc<Semaphore>,
+    ) {
+        let reads = Arc::new(Semaphore::new(budget));
+        let share = u32::try_from(budget).unwrap();
+        let share = Arc::clone(&reads).acquire_many_owned(share).await.unwrap();
+        let (tx, rx) = mpsc::channel(2);
+        let task = tokio::spawn(send_file(Worker::new(store), blob, share, tx, stall));
+        (task, rx, reads)
+    }
+
+    #[tokio::test]
+    async fn a_read_file_reply_whose_client_stops_reading_ends_with_an_error() {
+        let data = content(3);
+        let (_dir, store, _, blob) = file_store(&data);
+        let budget = read_share(data.len());
+        let (task, mut rx, reads) = reply(store, blob, budget, Duration::from_millis(50)).await;
+
+        // Nobody reads: the first part waits in the channel, and the second
+        // stalls and ends the reply, which frees its share.
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("a stalled reply ends")
+            .unwrap();
+        assert_eq!(reads.available_permits(), budget, "the share is free");
+        // A client that comes back gets the part and then the error, so it
+        // never takes the file for a whole one.
+        let first = rx.recv().await.unwrap().unwrap();
+        assert!(first.data == data[..CHUNK_BYTES], "the first part");
+        let status = rx.recv().await.unwrap().unwrap_err();
+        assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_last_part_holds_the_share_until_the_client_takes_it() {
+        let data = content(1);
+        let (_dir, store, _, blob) = file_store(&data);
+        let budget = read_share(data.len());
+
+        // A client that takes the part: the share comes back then.
+        let stall = Duration::from_secs(60);
+        let (task, mut rx, reads) = reply(store.clone(), blob, budget, stall).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(reads.available_permits(), 0, "the part is not taken yet");
+        assert!(rx.recv().await.unwrap().unwrap().data == data, "the file");
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the reply ends once the client has the last part")
+            .unwrap();
+        assert_eq!(reads.available_permits(), budget);
+        assert!(rx.recv().await.is_none());
+
+        // A client that never takes it: the share comes back after the
+        // stall, and the reply still ends whole.
+        let stall = Duration::from_millis(50);
+        let (task, mut rx, reads) = reply(store, blob, budget, stall).await;
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the reply ends after the stall")
+            .unwrap();
+        assert_eq!(reads.available_permits(), budget);
+        assert!(rx.recv().await.unwrap().unwrap().data == data, "the file");
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_damaged_blob_ends_the_reply_with_internal_before_its_last_part() {
+        let data = content(3);
+        for flip in [10, data.len() / 2, data.len() - 10] {
+            let (_dir, store, _, blob) = file_store(&data);
+            // A valid zstd frame of other content, under the blob's ID.
+            let mut damaged = data.clone();
+            damaged[flip] ^= 1;
+            let packed = zstd::bulk::compress(&damaged, 3).unwrap();
+            std::fs::write(store.blobs().location(blob).1, packed).unwrap();
+
+            let budget = read_share(data.len());
+            let stall = Duration::from_secs(60);
+            let (task, mut rx, reads) = reply(store, blob, budget, stall).await;
+            let mut parts = 0;
+            let status = loop {
+                match rx.recv().await.expect("the reply ends with an error") {
+                    Ok(_) => parts += 1,
+                    Err(status) => break status,
+                }
+            };
+            assert_eq!(status.code(), Code::Internal, "bit {flip}: {status:?}");
+            assert_eq!(parts, 2, "bit {flip}: every part but the last");
+            assert!(rx.recv().await.is_none());
+            task.await.unwrap();
+            assert_eq!(reads.available_permits(), budget, "bit {flip}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_land_whose_call_is_dropped_stops_and_stays_pending() {
+        // main goes root ─ B. The land's base is root, below the floor of a
+        // new path index at B, so its plan walks back.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let blob = store.blobs().put(b"x").unwrap();
+        let put = |parents, path: &str| Changeset {
+            parents,
+            author: IdentityTime {
+                name: b"t".to_vec(),
+                email: b"t@x".to_vec(),
+                unix_secs: 0,
+                tz_offset_minutes: 0,
+            },
+            committer: None,
+            message: path.as_bytes().to_vec(),
+            changes: [(
+                RepoPath::new(path).unwrap(),
+                Some(FileState::Regular {
+                    content: blob,
+                    executable: false,
+                }),
+            )]
+            .into(),
+        };
+        let (b, cs) = store
+            .write(|c| {
+                let repo = db::create_repo(c, "r")?;
+                let root = db::insert_changeset(c, repo, &put(vec![], "a"))?;
+                let b = db::insert_changeset(c, repo, &put(vec![root], "b"))?;
+                assert!(db::cas_ref(c, repo, "main", None, b)?);
+                Ok((b, db::insert_changeset(c, repo, &put(vec![root], "c"))?))
+            })
+            .unwrap();
+        let service = Arc::new(ScionService::new(Worker::new(store.clone())));
+        let idle = || service.worker.permits.available_permits() == MAX_BLOCKING;
+
+        // Hold the database, so the job waits at its first step.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let blocker = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                store.read(|_| {
+                    held_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    Ok(())
+                })
+            }
+        });
+        held_rx.recv().unwrap();
+        let mut request = Request::new(scion_proto::v1::LandRequest {
+            repo: "r".into(),
+            changeset_id: cs.as_bytes().to_vec(),
+            target_ref: "main".into(),
+            request_key: "k".into(),
+        });
+        request.extensions_mut().insert(Caller("t".into()));
+        let call = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.land(request).await }
+        });
+        let started = Instant::now();
+        while idle() {
+            assert!(started.elapsed() < Duration::from_secs(10), "the job runs");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // The client goes away while the job runs. The job stops at its next
+        // check and leaves the land pending.
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        go_tx.send(()).unwrap();
+        blocker.join().unwrap().unwrap();
+        while !idle() {
+            assert!(started.elapsed() < Duration::from_secs(10), "the job ends");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let sql = "SELECT state FROM lands WHERE request_key = 'k'";
+        let state: String = store
+            .read(|c| Ok(c.query_row(sql, [], |row| row.get(0))?))
+            .unwrap();
+        assert_eq!(state, "pending");
+        let main = store.read(|c| db::get_ref(c, db::repo_id(c, "r")?, "main"));
+        assert_eq!(main.unwrap().unwrap().target, b, "main did not move");
+    }
+
+    #[tokio::test]
+    async fn a_read_file_call_waits_for_its_share_before_it_reads() {
+        let data = content(2);
+        let (_dir, store, cs, _) = file_store(&data);
+        // Room for one reply of this file, not two.
+        let service = Arc::new(ScionService {
+            reads: Arc::new(Semaphore::new(read_share(data.len()))),
+            ..ScionService::new(Worker::new(store))
+        });
+        let request = move || {
+            Request::new(ReadFileRequest {
+                repo: "r".into(),
+                changeset_id: cs.as_bytes().to_vec(),
+                path: b"f".to_vec(),
+            })
+        };
+        let read_all = |mut reply: ReadFileStream| async move {
+            let mut read = Vec::new();
+            while let Some(part) = reply.next().await {
+                read.extend(part.unwrap().data);
+            }
+            read
+        };
+
+        let first = service.read_file(request()).await.unwrap().into_inner();
+        let second = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.read_file(request()).await.unwrap().into_inner() }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!second.is_finished(), "the second call waits for budget");
+        assert!(read_all(first).await == data, "the first reply");
+        let second = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("the first reply freed its share")
+            .unwrap();
+        assert!(read_all(second).await == data, "the second reply");
+    }
 
     #[tokio::test]
     async fn a_worker_panic_does_not_reach_the_client() {

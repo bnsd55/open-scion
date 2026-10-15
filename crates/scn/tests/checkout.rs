@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Output, Stdio};
@@ -814,33 +815,44 @@ fn a_misbehaving_server_is_caught_and_nothing_is_written() {
 }
 
 #[test]
-fn ctrl_c_removes_what_the_checkout_wrote() {
+fn a_signal_removes_what_the_checkout_wrote_and_then_kills_it() {
     let (_runtime, url) = start_liar(0);
     let tmp = tempfile::tempdir().unwrap();
-    let dest = tmp.path().join("dest");
-    fs::create_dir(&dest).unwrap();
-    let child = scn_command(
-        &url,
-        "stall",
-        &["checkout", ANY_CHANGESET, "--into", text(&dest)],
-    )
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .unwrap();
+    for (signal, name) in [
+        (Signal::INT, "SIGINT"),
+        (Signal::TERM, "SIGTERM"),
+        (Signal::HUP, "SIGHUP"),
+    ] {
+        let dest = tmp.path().join(name);
+        fs::create_dir(&dest).unwrap();
+        let child = scn_command(
+            &url,
+            "stall",
+            &["checkout", ANY_CHANGESET, "--into", text(&dest)],
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
 
-    // The server sends `a`, then never sends `b`.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !temp_dirs(&dest).iter().any(|temp| temp.join("a").exists()) {
-        assert!(Instant::now() < deadline, "the checkout never wrote a");
-        thread::sleep(Duration::from_millis(10));
+        // The server sends `a`, then never sends `b`.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !temp_dirs(&dest).iter().any(|temp| temp.join("a").exists()) {
+            assert!(
+                Instant::now() < deadline,
+                "{name}: the checkout never wrote a"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        kill_process(Pid::from_child(&child), signal).unwrap();
+        let out = child.wait_with_output().unwrap();
+
+        let err = stderr(&out);
+        // Killed by the signal, so a shell reports 128 plus its number.
+        assert_eq!(out.status.signal(), Some(signal.as_raw()), "{name}: {err}");
+        assert!(err.contains(&format!("interrupted by {name}")), "{err}");
+        assert_untouched(&dest);
     }
-    kill_process(Pid::from_child(&child), Signal::INT).unwrap();
-    let out = child.wait_with_output().unwrap();
-
-    assert!(!out.status.success());
-    assert!(stderr(&out).contains("interrupted"), "{}", stderr(&out));
-    assert_untouched(&dest);
 }
 
 #[test]

@@ -1,19 +1,24 @@
 //! Derived data: values computed from changesets, not part of them.
 //!
 //! One mechanism for every kind. A [`Kind`] has a name, a version, and a
-//! function from a changeset and its first parent's value to a value. A
-//! value is computed when it is first needed and stored by (kind, version,
-//! changeset). A kind that must always be ready, such as the root tree,
-//! also stores its value when the changeset is written.
+//! function from a changeset and its parents' values to a value. A kind reads
+//! the value of its first parent only, or of every parent
+//! ([`Kind::ALL_PARENTS`]). A value is computed when it is first needed and
+//! stored by (kind, version, changeset). A kind that must always be ready,
+//! such as the root tree, also stores its value when the changeset is written.
 //!
-//! A long history without values is derived in steps of at most [`STEP`]
-//! changesets. Each step is its own transaction, so other requests run
-//! between steps, and a crash loses at most one step.
+//! A history without values is derived in steps of at most [`STEP`]
+//! changesets, parents first. Each step is its own transaction, so other
+//! requests run between steps, and a crash loses at most one step. A value
+//! is stored only after the values of the parents that its kind reads. So
+//! each changeset with a value has older changesets with values, back to the
+//! roots, through those parents.
 //!
 //! Each version has its own rows. So a version bump makes the old rows
 //! unused, and nothing rewrites them: the new version derives its values
 //! again. Each step also removes some rows of older versions of its kind.
 
+use std::collections::HashSet;
 use std::ops::ControlFlow;
 
 use rusqlite::Connection;
@@ -42,27 +47,32 @@ pub trait Kind {
     /// Bump it when [`Kind::derive`] gives a different answer. Rows of other
     /// versions are never read. Rows of older versions are removed.
     const VERSION: u32;
+    /// Whether [`Kind::derive`] reads the value of every parent. If not, it
+    /// reads the first parent's value only, and only first-parent history is
+    /// derived. A changeset stores only its changes against its first
+    /// parent, so a kind over snapshots, such as the root tree, needs no
+    /// more.
+    const ALL_PARENTS: bool = false;
     /// The value for one changeset.
     type Value;
 
-    /// The value for changeset `id`, from the changeset and from the value
-    /// for its first parent (`None` for a root). Writes that it makes, such
-    /// as trees, go in the caller's transaction.
+    /// The value for changeset `id`, from the changeset and from the values
+    /// for its parents, in parent order: every parent if
+    /// [`Kind::ALL_PARENTS`], else the first parent only. Empty for a root.
+    /// Writes that it makes, such as trees, go in the caller's transaction.
+    ///
+    /// It may also read the stored value of an older changeset that it
+    /// reaches through those parents ([`load`]). Each one has a value.
     ///
     /// # Errors
     ///
     /// Database errors, or [`Error::Corrupt`] if the stored changeset does
-    /// not fit its parent's value.
-    // SHORTCUT: only the first parent's value, because a changeset stores
-    // only its changes against its first parent. A kind over the full graph,
-    // such as a generation number, does not fit. Upgrade: pass every
-    // parent's value and derive ancestors in generation order
-    // (https://github.com/bnsd55/open-scion/issues/76).
+    /// not fit its parents' values.
     fn derive(
         c: &Connection,
         id: ChangesetId,
         changeset: &Changeset,
-        parent: Option<Self::Value>,
+        parents: Vec<Self::Value>,
     ) -> Result<Self::Value>;
 
     /// The stored bytes of a value.
@@ -97,33 +107,39 @@ pub fn get<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::V
     value
 }
 
-/// Derives every missing value of `K` on the first-parent history of `cs`,
-/// in steps, and returns the value for `cs`. Returns before the values are
+/// Derives every missing value of `K` that the value for `cs` needs, in
+/// steps, and returns the value for `cs`. Returns before the values are
 /// durable: call [`Store::flush`] before replying with anything they name.
 ///
-/// First it walks first parents back to the nearest changeset with a stored
-/// value, through at most [`STEP`] changesets per hold of the database
-/// lock. Then it derives forward, oldest first, at most [`STEP`] changesets
-/// per transaction. Each of these transactions also removes up to [`STEP`]
-/// rows of older versions of `K`. So an error or a crash keeps every step
-/// before it, and the next call goes on from there.
+/// First it walks from `cs` through the parents that `K` reads, and stops at
+/// each changeset with a stored value. It visits at most [`STEP`] changesets
+/// per hold of the database lock. Then it derives the changesets without a
+/// value in generation order, oldest first, at most [`STEP`] per
+/// transaction. A parent's generation is below its child's, so each
+/// changeset comes after its parents. Each of these transactions also
+/// removes up to [`STEP`] rows of older versions of `K`. So an error or a
+/// crash keeps every step before it, and the next call goes on from there.
 ///
-/// The walk keeps the changesets without a value in memory, 32 bytes each,
-/// so that it visits each one once.
+/// The walk keeps the changesets without a value in memory, 40 bytes each,
+/// so that it visits each one once. A walk over every parent also keeps the
+/// set of the changesets it visited.
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`].
 pub fn fill<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
-    let (pending, value) = walk_all::<K>(store, repo, cs)?;
-    derive_steps::<K>(store, repo, &pending, value)?
+    let pending = match walk_all::<K>(store, repo, cs)? {
+        ControlFlow::Break(value) => return Ok(value),
+        ControlFlow::Continue(pending) => pending,
+    };
+    derive_steps::<K>(store, repo, &pending)?
         .ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
 }
 
-/// Fills `K` for `cs` and its first-parent history as [`fill`] does, then
-/// removes every row of an older version of `K`, at most [`STEP`] rows per
-/// transaction. Returns once all of it is durable.
+/// Fills `K` for `cs` and its history as [`fill`] does, then removes every
+/// row of an older version of `K`, at most [`STEP`] rows per transaction.
+/// Returns once all of it is durable.
 ///
 /// # Errors
 ///
@@ -144,13 +160,12 @@ pub fn backfill<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`].
 pub fn derive<K: Kind>(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
-    require(c, repo, cs)?;
-    let mut pending = Vec::new();
-    let ControlFlow::Break(value) = walk::<K>(c, cs, usize::MAX, &mut pending)? else {
-        unreachable!("a walk with no limit ends");
+    let mut walk = match Walk::start::<K>(c, repo, cs)? {
+        ControlFlow::Break(value) => return Ok(value),
+        ControlFlow::Continue(walk) => walk,
     };
-    pending.reverse();
-    derive_chain::<K>(c, repo, &pending, value)?
+    walk.step::<K>(c, usize::MAX)?;
+    derive_chain::<K>(c, repo, &walk.into_pending())?
         .ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
 }
 
@@ -164,65 +179,131 @@ pub fn put<K: Kind>(c: &Connection, cs: ChangesetId, value: &K::Value) -> Result
     db::put_derived(c, K::NAME, K::VERSION, cs, &K::encode(value))
 }
 
-/// The walk of [`fill`]: the changesets from `cs` back to the nearest one
-/// with a stored value, oldest first, and that value (`None` past a root).
+/// For a kind that is stored when a changeset is written: derives and stores
+/// the value of `K` for `id`, which the caller's transaction just stored, if
+/// each parent that `K` reads has a value. Otherwise it stores nothing, and
+/// [`fill`] derives the value when it is first needed. So a write never
+/// derives a long history. Like each step of [`fill`], it also removes a few
+/// rows of older versions of `K`.
+///
+/// # Errors
+///
+/// Errors of [`Kind::derive`].
+pub fn on_write<K: Kind>(c: &Connection, id: ChangesetId, changeset: &Changeset) -> Result<()> {
+    if load::<K>(c, id)?.is_none()
+        && let Some(parents) = parent_values::<K>(c, changeset)?
+    {
+        let value = K::derive(c, id, changeset, parents)?;
+        put::<K>(c, id, &value)?;
+    }
+    remove_old::<K>(c)?;
+    Ok(())
+}
+
+/// The walk of [`fill`]: the stored value for `cs`, or else the changesets
+/// to derive, parents first.
 fn walk_all<K: Kind>(
     store: &Store,
     repo: RepoId,
     cs: ChangesetId,
-) -> Result<(Vec<ChangesetId>, Option<K::Value>)> {
-    let mut pending = Vec::new();
-    let mut next = cs;
-    let value = loop {
-        // Rows are keyed by changeset alone, so check the repo: a stored
-        // value must not leak to a repo that cannot see the changeset.
-        let step = store.read_unflushed(|c| {
-            require(c, repo, next)?;
-            walk::<K>(c, next, STEP, &mut pending)
-        })?;
-        match step {
-            ControlFlow::Continue(id) => next = id,
-            ControlFlow::Break(value) => break value,
-        }
+) -> Result<ControlFlow<K::Value, Vec<ChangesetId>>> {
+    let first = store.read_unflushed(|c| {
+        Ok(match Walk::start::<K>(c, repo, cs)? {
+            ControlFlow::Continue(mut walk) => {
+                walk.step::<K>(c, STEP)?;
+                ControlFlow::Continue(walk)
+            }
+            stored @ ControlFlow::Break(_) => stored,
+        })
+    })?;
+    let mut walk = match first {
+        ControlFlow::Break(value) => return Ok(ControlFlow::Break(value)),
+        ControlFlow::Continue(walk) => walk,
     };
-    pending.reverse();
-    Ok((pending, value))
-}
-
-/// Follows first parents from `from` through at most `limit` changesets,
-/// and pushes each one without a stored value onto `pending`. Breaks with
-/// the stored value where the walk ends (`None` past a root), or continues
-/// with the changeset where the next walk starts.
-fn walk<K: Kind>(
-    c: &Connection,
-    from: ChangesetId,
-    limit: usize,
-    pending: &mut Vec<ChangesetId>,
-) -> Result<ControlFlow<Option<K::Value>, ChangesetId>> {
-    let mut next = Some(from);
-    for _ in 0..limit {
-        let Some(id) = next else { break };
-        if let Some(value) = load::<K>(c, id)? {
-            return Ok(ControlFlow::Break(Some(value)));
-        }
-        pending.push(id);
-        next = db::first_parent(c, id)?;
+    while !walk.next.is_empty() {
+        store.read_unflushed(|c| walk.step::<K>(c, STEP))?;
     }
-    Ok(next.map_or(ControlFlow::Break(None), ControlFlow::Continue))
+    Ok(ControlFlow::Continue(walk.into_pending()))
 }
 
-/// The derivation of [`fill`]: derives `pending`, oldest first, from
-/// `value`, the value for the first one's parent, at most [`STEP`]
-/// changesets per transaction. Returns the value for the last one.
+/// Where a walk of [`fill`] stands.
+#[derive(Debug)]
+struct Walk {
+    /// Changesets to visit, with their generation.
+    next: Vec<(ChangesetId, i64)>,
+    /// Changesets without a stored value, with their generation.
+    pending: Vec<(i64, ChangesetId)>,
+    /// Changesets visited. Only a walk over every parent keeps them: a
+    /// first-parent walk reaches each changeset once.
+    seen: HashSet<ChangesetId>,
+}
+
+impl Walk {
+    /// The stored value for `cs`, or a walk that starts there.
+    ///
+    /// Rows are keyed by changeset alone, so this checks the repo: a stored
+    /// value must not leak to a repo that cannot see the changeset. Every
+    /// parent of a changeset in a repo is in that repo too, so the rest of
+    /// the walk stays in it.
+    fn start<K: Kind>(
+        c: &Connection,
+        repo: RepoId,
+        cs: ChangesetId,
+    ) -> Result<ControlFlow<K::Value, Self>> {
+        let generation = db::generation(c, repo, cs)?;
+        if let Some(value) = load::<K>(c, cs)? {
+            return Ok(ControlFlow::Break(value));
+        }
+        Ok(ControlFlow::Continue(Self {
+            next: vec![(cs, generation)],
+            pending: Vec::new(),
+            seen: HashSet::new(),
+        }))
+    }
+
+    /// Visits at most `limit` changesets. Each one without a stored value
+    /// goes to `pending`, and the walk goes on to the parents that `K`
+    /// reads.
+    fn step<K: Kind>(&mut self, c: &Connection, limit: usize) -> Result<()> {
+        for _ in 0..limit {
+            let Some((id, generation)) = self.next.pop() else {
+                break;
+            };
+            if K::ALL_PARENTS && !self.seen.insert(id) {
+                continue;
+            }
+            if db::get_derived(c, K::NAME, K::VERSION, id)?.is_some() {
+                continue;
+            }
+            self.pending.push((generation, id));
+            let mut parents = db::parents(c, id, generation)?;
+            if !K::ALL_PARENTS {
+                parents.truncate(1);
+            }
+            self.next.extend(parents);
+        }
+        Ok(())
+    }
+
+    /// The changesets without a value, in generation order, so that each
+    /// comes after its parents.
+    fn into_pending(mut self) -> Vec<ChangesetId> {
+        self.pending.sort_unstable();
+        self.pending.into_iter().map(|(_, id)| id).collect()
+    }
+}
+
+/// The derivation of [`fill`]: derives `pending`, parents first, at most
+/// [`STEP`] changesets per transaction. Returns the value for the last one.
 fn derive_steps<K: Kind>(
     store: &Store,
     repo: RepoId,
     pending: &[ChangesetId],
-    mut value: Option<K::Value>,
 ) -> Result<Option<K::Value>> {
+    let mut value = None;
     for step in pending.chunks(STEP) {
         value = store.commit(|c| {
-            let value = derive_chain::<K>(c, repo, step, value)?;
+            let value = derive_chain::<K>(c, repo, step)?;
             remove_old::<K>(c)?;
             Ok(value)
         })?;
@@ -230,26 +311,49 @@ fn derive_steps<K: Kind>(
     Ok(value)
 }
 
-/// Derives and stores the value of `K` for each of `ids`, oldest first, from
-/// `value`, the value for the first one's parent. A value that is already
-/// stored, for example by a concurrent [`fill`], is read, not derived again.
+/// Derives and stores the value of `K` for each of `ids`, in order, from
+/// the stored values of their parents. Each parent that `K` reads has a
+/// stored value already, or comes earlier in `ids`. A value that is already
+/// stored, for example by a concurrent [`fill`], is read, not derived
+/// again. Returns the value for the last one.
 fn derive_chain<K: Kind>(
     c: &Connection,
     repo: RepoId,
     ids: &[ChangesetId],
-    mut value: Option<K::Value>,
 ) -> Result<Option<K::Value>> {
+    let mut value = None;
     for &id in ids {
         if let Some(known) = load::<K>(c, id)? {
             value = Some(known);
             continue;
         }
         let changeset = db::get_changeset(c, repo, id)?;
-        let next = K::derive(c, id, &changeset, value)?;
+        let parents = parent_values::<K>(c, &changeset)?.ok_or_else(|| {
+            Error::Corrupt(format!(
+                "derived {} v{} is missing for a parent of {id}",
+                K::NAME,
+                K::VERSION
+            ))
+        })?;
+        let next = K::derive(c, id, &changeset, parents)?;
         put::<K>(c, id, &next)?;
         value = Some(next);
     }
     Ok(value)
+}
+
+/// The stored values of `K` for the parents of `changeset` that `K` reads,
+/// in parent order, or `None` if one of them has no value.
+fn parent_values<K: Kind>(c: &Connection, changeset: &Changeset) -> Result<Option<Vec<K::Value>>> {
+    let read = if K::ALL_PARENTS { usize::MAX } else { 1 };
+    let mut values = Vec::new();
+    for &parent in changeset.parents.iter().take(read) {
+        match load::<K>(c, parent)? {
+            Some(value) => values.push(value),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(values))
 }
 
 /// Removes up to [`STEP`] rows of older versions of `K` in the caller's
@@ -273,7 +377,13 @@ pub fn remove_old<K: Kind>(c: &Connection) -> Result<usize> {
     Ok(removed)
 }
 
-fn load<K: Kind>(c: &Connection, cs: ChangesetId) -> Result<Option<K::Value>> {
+/// The stored value of `K` for `cs`, if any. It does not check a repo: the
+/// caller reaches `cs` from a changeset whose repo it checked.
+///
+/// # Errors
+///
+/// [`Error::Corrupt`] if the stored bytes are not a value.
+pub(crate) fn load<K: Kind>(c: &Connection, cs: ChangesetId) -> Result<Option<K::Value>> {
     db::get_derived(c, K::NAME, K::VERSION, cs)?
         .map(|bytes| {
             K::decode(&bytes).ok_or_else(|| {
@@ -294,10 +404,12 @@ fn require(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::collections::HashMap;
 
     use scion_core::{BlobId, FileState, IdentityTime, RepoPath};
 
     use super::*;
+    use crate::db::testing;
     use crate::store::{FSYNC_LEAVES_DRIVE_CACHE, SCHEMA_VERSION, migrate};
     use crate::tree::{self, RootTree};
 
@@ -323,17 +435,18 @@ mod tests {
             _: &Connection,
             id: ChangesetId,
             cs: &Changeset,
-            parent: Option<u64>,
+            parents: Vec<u64>,
         ) -> Result<u64> {
             if FAIL_AT.get() == Some(id) {
                 return Err(Error::Corrupt(format!("injected failure at {id}")));
             }
             DERIVES.set(DERIVES.get() + 1);
+            assert!(parents.len() <= 1, "a first-parent kind gets one value");
             let counted = cs
                 .changes
                 .values()
                 .filter(|state| V == 1 || state.is_some());
-            Ok(parent.unwrap_or(0) + counted.count() as u64)
+            Ok(parents.first().copied().unwrap_or(0) + counted.count() as u64)
         }
 
         fn encode(count: &u64) -> Vec<u8> {
@@ -347,6 +460,49 @@ mod tests {
 
     type ChangedPathsV1 = ChangedPaths<1>;
     type ChangedPathsV2 = ChangedPaths<2>;
+
+    /// A test kind over every parent: the changeset, then the lists of its
+    /// parents in parent order, each changeset once, at its first place. So
+    /// the value depends on every parent's value and on their order.
+    struct Ancestry;
+
+    impl Kind for Ancestry {
+        const NAME: &'static str = "ancestry";
+        const VERSION: u32 = 1;
+        const ALL_PARENTS: bool = true;
+        type Value = Vec<ChangesetId>;
+
+        fn derive(
+            _: &Connection,
+            id: ChangesetId,
+            cs: &Changeset,
+            parents: Vec<Vec<ChangesetId>>,
+        ) -> Result<Vec<ChangesetId>> {
+            DERIVES.set(DERIVES.get() + 1);
+            assert_eq!(parents.len(), cs.parents.len(), "a value for each parent");
+            Ok(ancestry(id, parents))
+        }
+
+        fn encode(ids: &Vec<ChangesetId>) -> Vec<u8> {
+            ids.iter().flat_map(|id| *id.as_bytes()).collect()
+        }
+
+        fn decode(bytes: &[u8]) -> Option<Vec<ChangesetId>> {
+            bytes
+                .chunks(32)
+                .map(|id| ChangesetId::try_from(id).ok())
+                .collect()
+        }
+    }
+
+    /// The rule of [`Ancestry`], shared with the model in the tests.
+    fn ancestry(id: ChangesetId, parents: Vec<Vec<ChangesetId>>) -> Vec<ChangesetId> {
+        let mut seen = HashSet::new();
+        std::iter::once(id)
+            .chain(parents.into_iter().flatten())
+            .filter(|id| seen.insert(*id))
+            .collect()
+    }
 
     /// The changes of one changeset: `(path, true)` puts a file, `(path,
     /// false)` deletes it.
@@ -378,8 +534,21 @@ mod tests {
     }
 
     /// Stores `history` in a new repo `r` through the one write path, which
-    /// stores root trees and nothing else. Returns the IDs, oldest first.
+    /// stores root trees and the commit graph, and nothing else. Returns the
+    /// IDs, oldest first.
     fn store_chain(c: &Connection, history: &[Edits]) -> Result<(RepoId, Vec<ChangesetId>)> {
+        chain_with(c, history, |c, repo, cs| {
+            Ok(tree::store_changeset(c, repo, cs)?.0)
+        })
+    }
+
+    /// Stores `history` in a new repo `r` with `store`. Returns the IDs,
+    /// oldest first.
+    fn chain_with(
+        c: &Connection,
+        history: &[Edits],
+        store: impl Fn(&Connection, RepoId, &Changeset) -> Result<ChangesetId>,
+    ) -> Result<(RepoId, Vec<ChangesetId>)> {
         let repo = db::create_repo(c, "r")?;
         let mut ids: Vec<ChangesetId> = Vec::new();
         for edits in history {
@@ -405,7 +574,7 @@ mod tests {
                 message: vec![],
                 changes,
             };
-            ids.push(tree::store_changeset(c, repo, &cs)?.0);
+            ids.push(store(c, repo, &cs)?);
         }
         Ok((repo, ids))
     }
@@ -423,13 +592,18 @@ mod tests {
         .unwrap()
     }
 
-    /// The rows of the test kind at `version`, as (changeset, value).
-    fn kind_rows(store: &Store, version: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+    /// The rows of kind `name` at `version`, as (changeset, value).
+    fn rows_of(store: &Store, name: &str, version: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
         let all = store.read(|c| Ok(rows(c))).unwrap();
         all.into_iter()
-            .filter(|(kind, v, ..)| kind == ChangedPathsV1::NAME && *v == version)
+            .filter(|(kind, v, ..)| kind == name && *v == version)
             .map(|(_, _, cs, value)| (cs, value))
             .collect()
+    }
+
+    /// The rows of the test kind at `version`, as (changeset, value).
+    fn kind_rows(store: &Store, version: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+        rows_of(store, ChangedPathsV1::NAME, version)
     }
 
     #[test]
@@ -491,7 +665,13 @@ mod tests {
         let (repo, ids, before) = {
             let c = Connection::open(dir.path().join("scion.db")).unwrap();
             migrate(&c, 2).unwrap();
-            let (repo, ids) = store_chain(&c, &HISTORY).unwrap();
+            // The write path of version 2 stored root trees only.
+            let (repo, ids) = chain_with(&c, &HISTORY, |c, repo, cs| {
+                let id = db::insert_changeset(c, repo, cs)?;
+                tree::derive_root_tree(c, repo, id)?;
+                Ok(id)
+            })
+            .unwrap();
             (repo, ids, rows(&c))
         };
         // The rows that version 2 holds: a root tree for each changeset.
@@ -501,7 +681,7 @@ mod tests {
         assert!(
             before
                 .iter()
-                .all(|(kind, v, ..)| kind == "root_tree" && *v == 1)
+                .all(|(kind, v, ..)| kind == RootTree::NAME && *v == RootTree::VERSION)
         );
 
         let store = Store::open(dir.path()).unwrap();
@@ -539,12 +719,20 @@ mod tests {
         let tip = ids[6];
 
         // One step of the walk goes through at most STEP changesets.
-        let mut pending = Vec::new();
-        let step = store
-            .read(|c| walk::<ChangedPathsV1>(c, tip, STEP, &mut pending))
+        let walk = store
+            .read(|c| {
+                let ControlFlow::Continue(mut walk) = Walk::start::<ChangedPathsV1>(c, repo, tip)?
+                else {
+                    panic!("no value is stored yet");
+                };
+                walk.step::<ChangedPathsV1>(c, STEP)?;
+                Ok(walk)
+            })
             .unwrap();
-        assert_eq!(step, ControlFlow::Continue(ids[6 - STEP]));
+        let next: Vec<ChangesetId> = walk.next.iter().map(|&(id, _)| id).collect();
+        assert_eq!(next, [ids[6 - STEP]]);
         let newest: Vec<ChangesetId> = ids.iter().rev().take(STEP).copied().collect();
+        let pending: Vec<ChangesetId> = walk.pending.iter().map(|&(_, id)| id).collect();
         assert_eq!(pending, newest);
 
         DERIVES.set(0);
@@ -592,13 +780,16 @@ mod tests {
         let tip = ids[4];
         // One fill walks. Another fill derives the history before the first
         // one's steps run.
-        let (pending, value) = walk_all::<ChangedPathsV1>(&store, repo, tip).unwrap();
-        assert_eq!((pending.len(), value), (5, None));
+        let ControlFlow::Continue(pending) = walk_all::<ChangedPathsV1>(&store, repo, tip).unwrap()
+        else {
+            panic!("no value is stored yet");
+        };
+        assert_eq!(pending, ids);
         DERIVES.set(0);
         assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), 5);
         assert_eq!(DERIVES.get(), 5);
 
-        let late = derive_steps::<ChangedPathsV1>(&store, repo, &pending, value).unwrap();
+        let late = derive_steps::<ChangedPathsV1>(&store, repo, &pending).unwrap();
         assert_eq!(late, Some(5));
         assert_eq!(DERIVES.get(), 5, "the late steps derive nothing again");
     }
@@ -672,5 +863,132 @@ mod tests {
         // The new row of version 1, and seven rows of version 0 less one
         // step.
         assert_eq!(root_trees(&store), 7 + 1 + 7 - STEP);
+    }
+
+    /// A new store with the graph `parents` in repo `r`, with no derived
+    /// rows. Each changeset puts one file.
+    fn store_graph(parents: &[Vec<usize>]) -> (tempfile::TempDir, Store, RepoId, Vec<ChangesetId>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let (repo, ids) = store
+            .write(|c| {
+                let repo = db::create_repo(c, "r")?;
+                Ok((repo, testing::insert_graph(c, repo, parents)?))
+            })
+            .unwrap();
+        (dir, store, repo, ids)
+    }
+
+    /// The value of [`Ancestry`] for each changeset of `parents`, by the
+    /// same rule, without the store.
+    fn ancestry_model(parents: &[Vec<usize>], ids: &[ChangesetId]) -> Vec<Vec<ChangesetId>> {
+        let mut model: Vec<Vec<ChangesetId>> = Vec::new();
+        for (i, of) in parents.iter().enumerate() {
+            let values = of.iter().map(|&p| model[p].clone()).collect();
+            model.push(ancestry(ids[i], values));
+        }
+        model
+    }
+
+    /// Two roots, a criss-cross (3 and 4 merge 1 and 2 in both orders), and
+    /// a merge of the second root.
+    fn criss_cross() -> Vec<Vec<usize>> {
+        vec![
+            vec![],
+            vec![0],
+            vec![0],
+            vec![1, 2],
+            vec![2, 1],
+            vec![3, 4],
+            vec![],
+            vec![5, 6],
+        ]
+    }
+
+    #[test]
+    fn a_kind_over_every_parent_derives_the_graph_parents_first() {
+        let parents = criss_cross();
+        let (_dir, store, repo, ids) = store_graph(&parents);
+        let model = ancestry_model(&parents, &ids);
+        let tip = ids[7];
+
+        // One step of the walk visits at most STEP changesets.
+        let walk = store
+            .read(|c| {
+                let ControlFlow::Continue(mut walk) = Walk::start::<Ancestry>(c, repo, tip)? else {
+                    panic!("no value is stored yet");
+                };
+                walk.step::<Ancestry>(c, STEP)?;
+                Ok(walk)
+            })
+            .unwrap();
+        assert_eq!(walk.pending.len(), STEP);
+
+        DERIVES.set(0);
+        let commits = store.commits();
+        assert_eq!(get::<Ancestry>(&store, repo, tip).unwrap(), model[7]);
+        assert_eq!(DERIVES.get(), 8, "each changeset once");
+        assert_eq!(store.commits() - commits, steps(8), "one per step");
+        for (i, &cs) in ids.iter().enumerate() {
+            assert_eq!(get::<Ancestry>(&store, repo, cs).unwrap(), model[i]);
+        }
+        assert_eq!(DERIVES.get(), 8, "later reads use the stored values");
+
+        // A first-parent kind derives only the first-parent history: 7, 5,
+        // 3, 1, 0.
+        DERIVES.set(0);
+        get::<ChangedPathsV1>(&store, repo, tip).unwrap();
+        assert_eq!(DERIVES.get(), 5);
+        assert_eq!(kind_rows(&store, 1).len(), 5);
+    }
+
+    #[test]
+    fn a_write_stores_a_value_only_when_its_parents_have_one() {
+        let parents = criss_cross();
+        let (_dir, store, repo, ids) = store_graph(&parents);
+        let model = ancestry_model(&parents, &ids);
+        let stored = |cs| store.read(|c| load::<Ancestry>(c, cs)).unwrap();
+
+        // The parents of 3 have no value yet.
+        let on_write = |cs: ChangesetId| {
+            store
+                .write(|c| on_write::<Ancestry>(c, cs, &db::get_changeset(c, repo, cs)?))
+                .unwrap();
+        };
+        on_write(ids[3]);
+        assert_eq!(stored(ids[3]), None);
+        // A root needs no other value, and then 1 and 2 have what they need.
+        on_write(ids[0]);
+        on_write(ids[1]);
+        on_write(ids[2]);
+        on_write(ids[3]);
+        for i in 0..4 {
+            assert_eq!(stored(ids[i]).as_ref(), Some(&model[i]), "{i}");
+        }
+        assert_eq!(stored(ids[4]), None);
+    }
+
+    proptest::proptest! {
+        /// On any graph, a kind over every parent gets the value of each
+        /// parent, in order, and derives each ancestor once, in steps.
+        #[test]
+        fn a_kind_over_every_parent_matches_a_model(
+            parents in testing::graphs(24),
+            starts in proptest::collection::vec(proptest::prelude::any::<proptest::sample::Index>(), 1..4),
+        ) {
+            let (_dir, store, repo, ids) = store_graph(&parents);
+            let model = ancestry_model(&parents, &ids);
+            let mut derived: HashMap<ChangesetId, usize> = HashMap::new();
+            for start in starts {
+                let i = start.index(ids.len());
+                let missing = model[i].iter().filter(|id| !derived.contains_key(id)).count();
+                DERIVES.set(0);
+                let commits = store.commits();
+                proptest::prop_assert_eq!(&get::<Ancestry>(&store, repo, ids[i]).unwrap(), &model[i]);
+                proptest::prop_assert_eq!(DERIVES.get(), missing);
+                proptest::prop_assert_eq!(store.commits() - commits, steps(missing));
+                derived.extend(model[i].iter().map(|&id| (id, i)));
+            }
+        }
     }
 }

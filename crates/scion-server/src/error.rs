@@ -57,6 +57,11 @@ pub enum Error {
     /// request may succeed if retried.
     #[error("{0}")]
     Aborted(String),
+    /// The request's deadline passed, or its call has gone, before the work
+    /// was done. A blocking job checks this in its long loops, because a
+    /// dropped call does not stop the job.
+    #[error("{0}")]
+    DeadlineExceeded(String),
     /// The call reached its bound on work before it found the answer. The
     /// same request fails again.
     #[error("{0}")]
@@ -72,6 +77,7 @@ impl From<Error> for Status {
             Error::NotFound(_) => Status::not_found(e.to_string()),
             Error::InvalidArgument(_) | Error::Apply(_) => Status::invalid_argument(e.to_string()),
             Error::Aborted(_) => Status::aborted(e.to_string()),
+            Error::DeadlineExceeded(_) => Status::deadline_exceeded(e.to_string()),
             Error::FailedPrecondition(_) => Status::failed_precondition(e.to_string()),
             Error::ResourceExhausted(_) => Status::resource_exhausted(e.to_string()),
             Error::Corrupt(_) | Error::Db(_) | Error::Io(_) | Error::Git(_) => {

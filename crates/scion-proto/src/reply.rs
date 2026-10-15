@@ -13,7 +13,8 @@
 //! A reply finds its first object before the call answers. If the budget has
 //! no room for it, the call fails with [`busy`]. So a reply always holds at
 //! least one object, and never ends `OK` with none. A reply that ends in the
-//! middle of an object ends with `CANCELLED`, never `OK`.
+//! middle of an object ends with `DEADLINE_EXCEEDED`, as `ReadFile` does,
+//! never `OK`.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -74,7 +75,7 @@ pub struct Sent {
 
 /// The `GetObjects` reply: the parts from the channel, minus the budget each
 /// held. If the channel closes in the middle of an object, the reply ends
-/// with `CANCELLED`.
+/// with `DEADLINE_EXCEEDED`.
 #[derive(Debug)]
 pub struct ObjectStream {
     rx: mpsc::Receiver<Sent>,
@@ -95,8 +96,8 @@ impl Stream for ObjectStream {
             }
             Poll::Ready(None) if this.in_object => {
                 this.in_object = false;
-                Poll::Ready(Some(Err(Status::cancelled(
-                    "the reply was cut off in the middle of an object; ask again",
+                Poll::Ready(Some(Err(Status::deadline_exceeded(
+                    "the client took no part for the stall limit, in the middle of an object; ask again",
                 ))))
             }
             Poll::Ready(None) => Poll::Ready(None),
@@ -199,7 +200,7 @@ pub async fn send_objects<K, F>(
             match tokio::time::timeout(stall, tx.send(part)).await {
                 Ok(Ok(())) => sent += len,
                 // The client is gone or stalled. In the middle of an object,
-                // the stream then ends with `CANCELLED`.
+                // the stream then ends with `DEADLINE_EXCEEDED`.
                 _ => return,
             }
         }
@@ -265,7 +266,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_client_that_stops_in_the_middle_of_an_object_gets_cancelled_and_frees_the_budget() {
+    async fn a_client_that_stops_in_the_middle_of_an_object_gets_an_error_and_frees_the_budget() {
         let len = 2 * crate::CHUNK_BYTES + 1;
         let budget = Arc::new(Semaphore::new(IN_FLIGHT_BYTES));
         let permit = take(&budget, len, BUSY_TIMEOUT).await.unwrap();
@@ -282,7 +283,7 @@ mod tests {
         assert_eq!(held, crate::CHUNK_BYTES, "only the part in the channel");
         stream.next().await.unwrap().unwrap();
         let status = stream.next().await.unwrap().unwrap_err();
-        assert_eq!(status.code(), Code::Cancelled, "{status:?}");
+        assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
         assert!(stream.next().await.is_none());
         assert_eq!(budget.available_permits(), IN_FLIGHT_BYTES);
     }

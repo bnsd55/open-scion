@@ -29,8 +29,11 @@ release.
   existing directory is kept, with its mode and owner, and its parent need
   not be writable. It must not be writable by all users unless it has the
   sticky bit. Writes go through directory handles and never follow a
-  symlink, and each directory is opened about once. On failure or Ctrl-C,
-  what was written is removed.
+  symlink, and each directory is opened about once. On failure, or on
+  SIGINT, SIGTERM or SIGHUP, what was written is removed, and then `scn`
+  dies by the signal, so a shell reports 128 plus its number (130 for
+  Ctrl-C) and a shell loop stops too. A second signal stops the removal at
+  once, and names the temp directory that it leaves.
 - Path history and blame on first-parent history: `Log` takes an optional
   path and says where to continue, and a new `Blame` RPC gives each line's
   last changeset. `scn log --path` and `scn blame`. Each call has a bound,
@@ -46,6 +49,16 @@ release.
   continues at the wrong path after a rename.
 - Bearer-token auth, loopback-only listening by default, request limits and
   name validation at the RPC boundary.
+- `ReadFile` streams a file in 1 MiB parts from the zstd decoder, under a
+  256 MiB budget for all replies. It checks the content against its ID
+  before the last part, and ends a stalled reply with `DEADLINE_EXCEEDED`.
+- The path index of each ref stays within a budget of 128 MiB. When it is
+  full, it starts over at the tip, and the lands still get the same answers.
+- A land walks at most 100,000 changesets below the path index. A base
+  further back is `REJECTED` as too old, and the client must rebase.
+- A land stops in its long loops 600 s after its call started, or as soon
+  as its call is dropped by a timeout or by the client, because neither
+  stops a running job. The land stays pending.
 - `scion-tier`: the cache tiers. `scion-cache` keeps objects in memory and
   `scion-daemon` keeps them on disk, each under a byte limit, least recently
   used out first. The daemon listens on a Unix socket with mode 0600. Each
@@ -65,7 +78,7 @@ release.
   and sizes, so every receiver reserves memory before the bytes arrive and
   unpacks within that size. A tier now fetches up to 64 objects at once
   from upstream instead of 4, within the same 400 MiB. A reply cut off in
-  the middle of an object ends with `CANCELLED`.
+  the middle of an object ends with `DEADLINE_EXCEEDED`.
 - The tier timeouts nest: the server and tiers wait 30 s for reply memory,
   the cache 60 s per step of the server, the daemon 120 s per step of the
   cache.
@@ -83,3 +96,15 @@ release.
   requests run between steps after a new kind or a version bump. Each step
   removes some rows of older versions. `scion-server derive --kind
   root_tree` fills a ref's history ahead of reads and removes the rest.
+- `scripts/demo.sh`, a demo that anyone can rerun on a fixed public
+  repository, and `scripts/bench-checkout.sh`, a checkout benchmark against
+  git. `docs/benchmarks.md` gives the method.
+- A kind of derived data can read the value of every parent, not only the
+  first. Its history is derived parents first, in generation order.
+- A commit-graph index as derived data (`commit_graph`): skip-list jumps
+  over each first-parent history and a link to the newest merge on it.
+  `IsAncestor` reads a few dozen entries at any depth, and three rows per
+  merge between. `MergeBase` does the same when neither first-parent
+  history has a merge newer than where the two meet; otherwise it still
+  walks, up to 10,000 changesets. `scion-server derive --kind commit_graph`
+  fills it ahead of the first query on an older database.
