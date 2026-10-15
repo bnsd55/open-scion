@@ -47,6 +47,9 @@ const MAX_BLAMES: usize = 4;
 /// bound on its reads, only its deadline, so these queries never take more
 /// than this many of the `MAX_BLOCKING` permits.
 const MAX_GRAPH_QUERIES: usize = 4;
+// A graph query holds one read connection at a time, through a walk with no
+// bound on its reads. So the walks never take every one.
+const _: () = assert!(MAX_GRAPH_QUERIES < crate::store::READERS);
 /// Longest a request may take before the server gives up on it.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// Most bytes that all `ReadFile` replies together hold: the parts read and

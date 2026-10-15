@@ -105,8 +105,8 @@ pub fn list_dir(
 
 /// Most changesets one call checks on a first-parent walk: a `Log` call, or
 /// the walk of a `Blame` call. So it is also the most entries a `Log` reply
-/// holds. Each check reads one changeset while the call holds the database
-/// lock.
+/// holds. Each check reads one changeset while the call holds one read
+/// connection.
 // SHORTCUT: path history and blame walk first parents on every call, so a
 // path changed long ago costs one call per 1,000 changesets since. Upgrade:
 // per-path history as derived data, so a call reads only the changesets that
@@ -255,7 +255,7 @@ pub fn merge_base(
 }
 
 /// Most paths one `Diff` call returns. Each path costs at most one tree read
-/// per part on each side, while the call holds the database lock.
+/// per part on each side, while the call holds one read connection.
 pub const MAX_DIFF_ENTRIES: usize = 1000;
 
 /// A path whose file differs between two snapshots.

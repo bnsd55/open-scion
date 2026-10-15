@@ -13,12 +13,10 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, ErrorKind, Read, Seek, Write};
-use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::thread;
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
@@ -58,9 +56,10 @@ pub struct Store {
     inner: Arc<Inner>,
 }
 
-/// Most read-only connections of one [`Store`]. Each has its own page cache,
-/// so they are few.
-const MAX_READERS: usize = 8;
+/// Read-only connections of one [`Store`]: so many reads run at once. Each
+/// has its own page cache, so they are few. More than the long reads that
+/// can run at once, so those never take every one.
+pub(crate) const READERS: usize = 8;
 
 struct Inner {
     /// Read-only connections for [`Store::read`]. They come before `db`, so
@@ -355,8 +354,7 @@ fn connect(path: &Path, flags: OpenFlags) -> Result<Connection> {
     Ok(db)
 }
 
-/// The read-only connections of a [`Store`]: one per CPU, from 2, so that a
-/// long read leaves one for others, to [`MAX_READERS`]. In WAL mode they
+/// The [`READERS`] read-only connections of a [`Store`]. In WAL mode they
 /// read beside the write connection.
 struct Readers {
     idle: Mutex<Vec<Connection>>,
@@ -365,11 +363,8 @@ struct Readers {
 
 impl Readers {
     fn open(path: &Path) -> Result<Self> {
-        let count = thread::available_parallelism()
-            .map_or(2, NonZeroUsize::get)
-            .clamp(2, MAX_READERS);
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let idle = (0..count)
+        let idle = (0..READERS)
             .map(|_| connect(path, flags))
             .collect::<Result<_>>()?;
         Ok(Self {
@@ -1095,11 +1090,11 @@ fn fsync_dir(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
-    use std::ffi::c_int;
     use std::panic;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Barrier, mpsc};
+    use std::thread;
 
     use super::*;
 
@@ -1766,15 +1761,8 @@ mod tests {
     }
 
     thread_local! {
-        /// What [`on_commit`] runs.
+        /// What the WAL hook of a test runs.
         static ON_COMMIT: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
-    }
-
-    /// A WAL hook. SQLite runs it on the thread that commits, once the
-    /// commit is visible to other connections, before COMMIT returns.
-    fn on_commit(_: &rusqlite::hooks::Wal, _pages: c_int) -> rusqlite::Result<()> {
-        ON_COMMIT.with_borrow_mut(|f| f.as_mut().map(|f| f()));
-        Ok(())
     }
 
     #[test]
@@ -1794,10 +1782,15 @@ mod tests {
         assert_eq!(seen.unwrap(), 1);
         assert_eq!(store.blobs().full_flushes() - before, flush);
 
-        // A commit that is visible while its COMMIT still runs.
+        // A commit that is visible while its COMMIT still runs. SQLite runs
+        // a WAL hook on the thread that commits, once the commit is visible
+        // to other connections, before COMMIT returns.
         store
             .read_unflushed(|c| {
-                c.wal_hook(Some(on_commit));
+                c.wal_hook(Some(|_, _| {
+                    ON_COMMIT.with_borrow_mut(|f| f.as_mut().map(|f| f()));
+                    Ok(())
+                }));
                 Ok(())
             })
             .unwrap();
