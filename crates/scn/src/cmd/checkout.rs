@@ -15,7 +15,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use hashlink::LinkedHashSet;
 use scion_core::{BlobId, Entry, FileState, PathElem, RepoPath, Tree, TreeId};
 use scion_proto::MAX_OBJECT_REFS;
-use scion_proto::v1::{GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
+use scion_proto::object::{self, Assembler, Header};
+use scion_proto::v1::{Encoding, GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
 use serde_json::json;
 
 use crate::client::{Ctx, Objects, id_from};
@@ -202,13 +203,14 @@ async fn write_files(
 }
 
 /// Fetches objects of one kind, each once and in the order given, and calls
-/// `got` with each object's ID and bytes as it arrives. A reply may stop
-/// early; the rest are asked for again.
+/// `got` with each object's ID and bytes as it arrives, unpacked within the
+/// object limit. A reply may stop early; the rest are asked for again.
 ///
 /// # Errors
 ///
 /// Fails if a call fails, if the server sends an object that was not asked
-/// for or none of those asked for, or if `got` fails.
+/// for or none of those asked for, if an object's parts or encoding are bad,
+/// or if `got` fails.
 async fn fetch(
     objects: &mut Objects,
     repo: &str,
@@ -226,21 +228,36 @@ async fn fetch(
                 id: id.to_vec(),
             })
             .collect();
+        // Blobs come as the zstd files that the server and the daemon store,
+        // and are unpacked here, once.
         let mut stream = objects
             .get_objects(GetObjectsRequest {
                 repo: repo.to_owned(),
                 refs,
+                accept: vec![Encoding::Zstd.into()],
             })
             .await
             .context("cannot fetch objects")?
             .into_inner();
         let before = want.len();
-        while let Some(object) = stream.message().await.context("cannot fetch objects")? {
-            let id = id_from(&object.id)?;
-            if object.kind != i32::from(kind) || !want.remove(&id) {
+        while let Some(first) = stream.message().await.context("cannot fetch objects")? {
+            let id: [u8; 32] = id_from(&first.id)?;
+            if first.kind != i32::from(kind) || !want.remove(&id) {
                 bail!("server sent an object that was not asked for");
             }
-            got(id, object.data)?;
+            let name = match kind {
+                ObjectKind::Tree => format!("tree {}", TreeId::from_bytes(id)),
+                _ => format!("blob {}", BlobId::from_bytes(id)),
+            };
+            let bad = |why| anyhow!("server sent a bad object for {name}: {why}");
+            let mut object = Assembler::new(Header::of(&first, true).map_err(bad)?, first);
+            while !object.is_done() {
+                let part = stream.message().await.context("cannot fetch objects")?;
+                let part = part.context("the reply ended in the middle of an object")?;
+                object.push(&part).map_err(bad)?;
+            }
+            let (header, data) = object.finish();
+            got(id, object::decode(&header, data).map_err(bad)?)?;
         }
         if want.len() == before {
             bail!("server sent none of the requested objects");

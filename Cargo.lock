@@ -2486,6 +2486,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "zstd",
 ]
 
 [[package]]
@@ -2528,6 +2529,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]

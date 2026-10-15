@@ -1,24 +1,27 @@
 //! gRPC API for Scion, generated from `proto/scion.proto`, plus the rules that
 //! every server of the API shares: bearer tokens ([`auth`]), checks on request
-//! fields ([`check`]), and how a `GetObjects` reply streams objects
-//! ([`reply`]).
+//! fields ([`check`]), how one object travels in parts and encodings
+//! ([`object`]), and how a `GetObjects` reply streams objects ([`reply`]).
 
 pub mod auth;
 pub mod check;
+pub mod object;
 pub mod reply;
 
-/// Largest single gRPC message either side sends or accepts, except a
-/// `GetObjects` reply (see [`MAX_OBJECT_MESSAGE_BYTES`]).
+/// Largest single gRPC message either side sends or accepts. A message of an
+/// `Objects` reply is smaller (see [`MAX_PART_MESSAGE_BYTES`]).
 pub const MAX_MESSAGE_BYTES: usize = 64 << 20;
 
-/// Chunk size for streamed file content (`PutBlob`, `ReadFile`).
+/// Chunk size for streamed file content (`PutBlob`, `ReadFile`), and the
+/// most encoded bytes in one part of an object in a `GetObjects` reply.
 pub const CHUNK_BYTES: usize = 1 << 20;
 
 /// Largest object a server stores or sends, uncompressed: 100 MiB.
 pub const MAX_OBJECT_BYTES: usize = 100 << 20;
 
-/// Largest `GetObjects` reply message: one object plus its kind and ID.
-pub const MAX_OBJECT_MESSAGE_BYTES: usize = MAX_OBJECT_BYTES + 1024;
+/// Largest message of an `Objects` reply: one part of an object (at most
+/// [`CHUNK_BYTES`]) plus its header.
+pub const MAX_PART_MESSAGE_BYTES: usize = CHUNK_BYTES + 1024;
 
 /// Most objects one `GetObjects` call may name.
 pub const MAX_OBJECT_REFS: usize = 1000;

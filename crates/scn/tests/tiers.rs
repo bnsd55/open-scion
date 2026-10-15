@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
+use scion_proto::CHUNK_BYTES;
 use scion_proto::auth::Bearer;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::{GetObjectsRequest, ObjectKind, ObjectRef};
@@ -36,7 +37,7 @@ struct Tiers {
     /// `unix://` address of the daemon.
     socket: String,
     runtime: Runtime,
-    _dirs: [TempDir; 2],
+    dirs: [TempDir; 2],
 }
 
 impl Tiers {
@@ -75,7 +76,7 @@ impl Tiers {
             daemon,
             socket: format!("unix://{}", path.display()),
             runtime,
-            _dirs: [data, node],
+            dirs: [data, node],
         }
     }
 
@@ -83,6 +84,28 @@ impl Tiers {
     fn upstream_calls(&self) -> (u64, u64) {
         (self.daemon.upstream_calls(), self.cache.upstream_calls())
     }
+
+    /// The file of blob `id` on the server, and on the daemon's disk.
+    fn blob_files(&self, id: BlobId) -> [Vec<u8>; 2] {
+        let hex = id.to_string();
+        let path = Path::new("objects/blob").join(&hex[..2]).join(&hex[2..]);
+        let [server, node] = &self.dirs;
+        [server.path().to_path_buf(), node.path().join("data")]
+            .map(|dir| fs::read(dir.join(&path)).unwrap())
+    }
+}
+
+/// `len` bytes that zstd cannot make smaller.
+fn noise(len: usize) -> Vec<u8> {
+    let mut state = 1_u64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[3]
+        })
+        .collect()
 }
 
 /// `scn checkout REV --into dest` against the server at `url`.
@@ -174,10 +197,13 @@ fn checkout_through_the_daemon_and_the_cache_matches_a_direct_checkout() {
         executable,
     };
     let readme = regular(b"hello\n", false);
+    // Over three parts of 1 MiB, packed or not.
+    let big = noise(3 * CHUNK_BYTES + 7);
     let first = changeset(
         None,
         &[
             ("README.md", readme),
+            ("big.bin", regular(&big, false)),
             ("run.sh", regular(b"#!/bin/sh\necho hi\n", true)),
             ("src/lib.rs", regular(b"pub fn f() {}\n", false)),
             ("src/nested/deep/file.txt", regular(b"deep\n", false)),
@@ -202,8 +228,16 @@ fn checkout_through_the_daemon_and_the_cache_matches_a_direct_checkout() {
     checkout(&tiers.socket, "main", &dest("through-tiers"));
     checkout(&tiers.server, "main", &dest("direct"));
     let direct = snapshot(&dest("direct"));
-    assert_eq!(direct.len(), 9, "{direct:?}");
+    assert_eq!(direct.len(), 10, "{direct:?}");
     assert_eq!(snapshot(&dest("through-tiers")), direct);
+    assert_eq!(
+        fs::read(dest("through-tiers").join("big.bin")).unwrap(),
+        big
+    );
+    // The daemon keeps each blob in the server's disk format, byte for byte:
+    // the zstd file went through the cache unchanged.
+    let [on_server, on_node] = tiers.blob_files(BlobId::of(&big));
+    assert_eq!(on_server, on_node);
     // The first checkout missed at each tier: calls went up to the server.
     let before = tiers.upstream_calls();
     assert!(before.0 > 0 && before.1 > 0, "{before:?}");
@@ -240,6 +274,7 @@ fn a_missing_repo_fails_the_call_once_at_each_tier() {
     let request = GetObjectsRequest {
         repo: "no-such-repo".into(),
         refs,
+        accept: Vec::new(),
     };
 
     let reply = tiers.runtime.block_on(async {

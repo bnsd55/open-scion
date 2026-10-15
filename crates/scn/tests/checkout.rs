@@ -16,9 +16,11 @@ use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, PathElem, RepoPath, Tree,
     TreeId,
 };
+use scion_proto::CHUNK_BYTES;
+use scion_proto::object::{self, Header};
 use scion_proto::v1::objects_server::{Objects, ObjectsServer};
 use scion_proto::v1::{
-    GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, Object, ObjectKind,
+    Encoding, GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, ObjectKind, ObjectPart,
     ResolveRefRequest, ResolveRefResponse,
 };
 use scion_server::import::{ImportOptions, import_git};
@@ -603,7 +605,46 @@ impl Liar {
     }
 }
 
-type Replies = Pin<Box<dyn Stream<Item = Result<Object, Status>> + Send>>;
+type Replies = Pin<Box<dyn Stream<Item = Result<ObjectPart, Status>> + Send>>;
+
+/// An object as the [`Liar`] sends it RAW, before it misbehaves.
+#[derive(Clone)]
+struct Object {
+    kind: i32,
+    id: Vec<u8>,
+    data: Vec<u8>,
+}
+
+impl Object {
+    /// Its header, for `encoded_size` bytes in `encoding`.
+    fn header(&self, encoding: Encoding, encoded_size: usize) -> Header {
+        Header {
+            kind: ObjectKind::try_from(self.kind).unwrap(),
+            id: self.id.clone().try_into().unwrap(),
+            encoding,
+            encoded_size,
+            size: self.data.len(),
+        }
+    }
+}
+
+/// The parts of `objects`, each sent RAW, or the error that ends the reply.
+fn raw_parts(objects: Vec<Result<Object, Status>>) -> Vec<Result<ObjectPart, Status>> {
+    objects
+        .into_iter()
+        .flat_map(|object| match object {
+            Ok(object) => {
+                let header = object.header(Encoding::Raw, object.data.len());
+                header
+                    .parts(object::chunks(object.data))
+                    .into_iter()
+                    .map(Ok)
+                    .collect()
+            }
+            Err(status) => vec![Err(status)],
+        })
+        .collect()
+}
 
 #[tonic::async_trait]
 impl Objects for Liar {
@@ -629,7 +670,7 @@ impl Objects for Liar {
         &self,
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<Replies>, Status> {
-        let GetObjectsRequest { repo, refs } = request.into_inner();
+        let GetObjectsRequest { repo, refs, .. } = request.into_inner();
         let mut honest: Vec<Object> = refs.iter().map(|r| self.objects[&r.id].clone()).collect();
         let replies: Vec<Result<Object, Status>> = if refs[0].kind == i32::from(ObjectKind::Tree) {
             honest.into_iter().map(Ok).collect()
@@ -663,7 +704,7 @@ impl Objects for Liar {
                 }
                 "none" => Vec::new(),
                 "stall" => {
-                    let first = tokio_stream::iter([Ok(honest[0].clone())]);
+                    let first = tokio_stream::iter(raw_parts(vec![Ok(honest[0].clone())]));
                     let stalled: Replies = Box::pin(first.chain(tokio_stream::pending()));
                     return Ok(Response::new(stalled));
                 }
@@ -671,10 +712,40 @@ impl Objects for Liar {
                     Ok(honest[0].clone()),
                     Err(Status::internal("lost the disk")),
                 ],
+                // The first blob as a good zstd frame of other bytes.
+                "zstd-other" => {
+                    let frame = object::pack(b"evil\n").unwrap();
+                    let mut header = honest[0].header(Encoding::Zstd, frame.len());
+                    header.size = 5;
+                    let parts = header.parts(vec![frame]).into_iter().map(Ok);
+                    return Ok(Response::new(Box::pin(tokio_stream::iter(parts))));
+                }
+                // The first blob as a frame whose header gives one byte more
+                // than it holds, as the object's size does. Byte 5 is the
+                // content size of a small frame.
+                "zstd-lying" => {
+                    let mut frame = object::pack(&honest[0].data).unwrap();
+                    frame[5] += 1;
+                    let mut header = honest[0].header(Encoding::Zstd, frame.len());
+                    header.size += 1;
+                    let parts = header.parts(vec![frame]).into_iter().map(Ok);
+                    return Ok(Response::new(Box::pin(tokio_stream::iter(parts))));
+                }
+                // The first part of an object of two parts, then the end.
+                "truncated" => {
+                    let mut header = honest[0].header(Encoding::Raw, CHUNK_BYTES + 4);
+                    header.size = CHUNK_BYTES + 4;
+                    let mut parts = header.parts(vec![vec![0; CHUNK_BYTES], vec![0; 4]]);
+                    parts.truncate(1);
+                    let parts = parts.into_iter().map(Ok);
+                    return Ok(Response::new(Box::pin(tokio_stream::iter(parts))));
+                }
                 other => panic!("no such misbehavior: {other}"),
             }
         };
-        Ok(Response::new(Box::pin(tokio_stream::iter(replies))))
+        Ok(Response::new(Box::pin(tokio_stream::iter(raw_parts(
+            replies,
+        )))))
     }
 }
 
@@ -721,6 +792,9 @@ fn a_misbehaving_server_is_caught_and_nothing_is_written() {
         ("wrong-kind", "not asked for"),
         ("none", "none of the requested objects"),
         ("error", "lost the disk"),
+        ("zstd-other", "server sent blob"),
+        ("zstd-lying", "server sent a bad object"),
+        ("truncated", "in the middle of an object"),
     ] {
         let dest = tmp.path().join(misbehavior);
         fs::create_dir(&dest).unwrap();

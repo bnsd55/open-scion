@@ -12,7 +12,7 @@ use scion_proto::auth::Bearer;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ResolveRefRequest};
-use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_OBJECT_MESSAGE_BYTES};
+use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_PART_MESSAGE_BYTES};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Endpoint};
 
@@ -53,7 +53,7 @@ impl Ctx {
             .with_context(|| format!("cannot connect to {server}"))?;
         let bearer = Bearer::new(token).context("token is not valid ASCII")?;
         let objects = ObjectsClient::with_interceptor(channel.clone(), bearer.clone())
-            .max_decoding_message_size(MAX_OBJECT_MESSAGE_BYTES)
+            .max_decoding_message_size(MAX_PART_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
         let client = ScionClient::with_interceptor(channel, bearer)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
