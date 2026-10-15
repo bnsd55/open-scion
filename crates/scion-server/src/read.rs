@@ -373,6 +373,10 @@ pub struct DiffPage {
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or a changeset does not exist.
+// SHORTCUT: renames are not detected, so a rename is a delete and an add;
+// `git diff` detects them by default. Upgrade: pair deletes and adds with
+// the same blob first, then by similarity, with a bound per call
+// (https://github.com/bnsd55/open-scion/issues/79).
 pub fn diff(
     store: &Store,
     repo: &str,

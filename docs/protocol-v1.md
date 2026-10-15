@@ -636,7 +636,7 @@ A new version is a new package, `scion.v2`. A server MAY serve both.
 - Text merge. Conflicts are path-level.
 - `MergeBase` and `IsAncestor` without a bound on the walk
   ([#72](https://github.com/bnsd55/open-scion/issues/72)), and `Diff` with
-  rename detection.
+  rename detection ([#79](https://github.com/bnsd55/open-scion/issues/79)).
 - `Log` and `Blame` without per-call bounds
   ([#61](https://github.com/bnsd55/open-scion/issues/61)), and `Blame` that
   follows renames ([#69](https://github.com/bnsd55/open-scion/issues/69)).

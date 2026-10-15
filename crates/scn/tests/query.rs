@@ -220,7 +220,8 @@ fn merge_base_is_ancestor_and_diff_match_git() {
 
             let (yes, _) = git_status(dir, &["merge-base", "--is-ancestor", x, y]);
             let code = server.scn(&["is-ancestor", cx, cy]).status.code();
-            assert_eq!(code, Some(if yes { 0 } else { 1 }), "is-ancestor {x} {y}");
+            // 0 is yes, 1 is no.
+            assert_eq!(code, Some(i32::from(!yes)), "is-ancestor {x} {y}");
 
             let git_diff = git(dir, &["diff", "--name-status", "--no-renames", x, y]);
             let mut expected: Vec<&str> = git_diff.lines().collect();
