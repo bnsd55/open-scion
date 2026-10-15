@@ -29,8 +29,11 @@ release.
   existing directory is kept, with its mode and owner, and its parent need
   not be writable. It must not be writable by all users unless it has the
   sticky bit. Writes go through directory handles and never follow a
-  symlink, and each directory is opened about once. On failure or Ctrl-C,
-  what was written is removed.
+  symlink, and each directory is opened about once. On failure, or on
+  SIGINT, SIGTERM or SIGHUP, what was written is removed, and then `scn`
+  dies by the signal, so a shell reports 128 plus its number (130 for
+  Ctrl-C) and a shell loop stops too. A second signal stops the removal at
+  once, and names the temp directory that it leaves.
 - Path history and blame on first-parent history: `Log` takes an optional
   path and says where to continue, and a new `Blame` RPC gives each line's
   last changeset. `scn log --path` and `scn blame`. Each call has a bound,
@@ -83,3 +86,6 @@ release.
   requests run between steps after a new kind or a version bump. Each step
   removes some rows of older versions. `scion-server derive --kind
   root_tree` fills a ref's history ahead of reads and removes the rest.
+- `scripts/demo.sh`, a demo that anyone can rerun on a fixed public
+  repository, and `scripts/bench-checkout.sh`, a checkout benchmark against
+  git. `docs/benchmarks.md` gives the method.

@@ -19,6 +19,7 @@ rustix.workspace = true
 scion-core.workspace = true
 scion-proto.workspace = true
 serde_json.workspace = true
+signal-hook.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true

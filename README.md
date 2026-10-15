@@ -105,6 +105,10 @@ the server returns the first result.
 
 ## Try it
 
+`scripts/demo.sh` does all of the steps below on a fixed public repository,
+prints the numbers, and removes what it made. The method and the checkout
+benchmark against git are in [docs/benchmarks.md](docs/benchmarks.md).
+
 ```sh
 cargo build --release
 export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
@@ -126,7 +130,8 @@ cs=$(./target/release/scn commit -m "add hello" --put hello.txt=hello.txt)
 ```
 
 Every `scn` command takes `--json` for machine-readable output. A `scn`
-error exits 2.
+error exits 2. A checkout that a signal stops removes what it wrote, and
+then dies by the signal (a shell reports 130 for Ctrl-C).
 
 Checkouts can go through the cache tiers: a `scion-daemon` per machine, on a
 Unix socket, in front of a regional `scion-cache`, in front of the server.
@@ -161,9 +166,11 @@ repository with 23,871 commits took 50 seconds.
 | [`crates/scion-server`](crates/scion-server) | Storage, commits, lands, reads, git import |
 | [`crates/scion-tier`](crates/scion-tier) | Cache tiers: `scion-cache` and `scion-daemon` |
 | [`crates/scn`](crates/scn) | Command-line client |
+| [`scripts`](scripts) | The demo and the checkout benchmark against git |
 | [`docs/architecture.md`](docs/architecture.md) | How the parts fit together: storage, lands, reads, and the cache tiers |
 | [`docs/format-v1.md`](docs/format-v1.md) | The v1 byte format. Object IDs are hashes of these bytes. |
 | [`docs/protocol-v1.md`](docs/protocol-v1.md) | The v1 API contract: calls, limits, status codes, retries, durability and what a client checks |
+| [`docs/benchmarks.md`](docs/benchmarks.md) | How the demo and the benchmarks run, what each number means, and how to rerun them |
 | [`docs/design/scalable-backend.md`](docs/design/scalable-backend.md) | A design proposal, not built: stateless servers on a shared metadata store and object store |
 
 ## Design notes
