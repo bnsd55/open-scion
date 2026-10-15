@@ -8,7 +8,9 @@
 //!   2. take the ref's lock: one land at a time per ref
 //!   3. if the row is no longer pending, return it (a retry, or a duplicate)
 //!   4. plan: one parent, base on the ref's first-parent history,
-//!      no path changed on the ref after the base
+//!      no path changed on the ref after the base. Its walks stop at the
+//!      request's deadline or once its call has gone, and the land stays
+//!      pending
 //!   5. one transaction: apply to the head tree, store the rebased changeset,
 //!      compare-and-swap the ref, mark the land landed. If an import moved
 //!      the ref since step 4, roll back and go to step 4.
@@ -21,7 +23,9 @@
 //! transaction, so they never disagree.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use scion_core::{Changeset, ChangesetId, FileState, RepoPath};
@@ -62,13 +66,34 @@ const PRUNE_EVERY: i64 = if cfg!(test) { 4 } else { 10_000 };
 /// growing the [`PathIndex`], so it never holds the floor down. One prune
 /// cycle, so bases keep at most about three cycles of history in the index.
 /// A client lands soon after it reads the head, so an older base is rare.
-/// Tests use a depth longer than the history in their pruned index.
-// SHORTCUT: each land on such a base walks the history from the floor back
-// to the base, and holds the database lock while it walks. Ceiling: a client
-// that lands on a base millions of generations old makes each of its lands
-// slow, and other requests wait. Upgrade: per-path history in the database,
-// so the check reads only the paths it changes.
+/// Each land on such a base walks the history from the floor back to the
+/// base, up to [`MAX_WALK`] changesets. Tests use a depth longer than the
+/// history in their pruned index.
 const MAX_DEPTH: i64 = if cfg!(test) { 16 } else { PRUNE_EVERY };
+
+/// Most changesets that one land walks below the floor of the
+/// [`PathIndex`]. A land whose base is further back is rejected, and the
+/// client must rebase it. Tests use a walk longer than their other walks.
+// SHORTCUT: each land on an old base walks the history again, and holds the
+// database lock while it walks, so a client that lands on such bases makes
+// other requests wait. Ceiling: a base more than this far back is rejected.
+// Upgrade (issue #38): per-path history in the database, so the check reads
+// only the paths that the land changes.
+const MAX_WALK: usize = if cfg!(test) { 1000 } else { 100_000 };
+
+// A base within `MAX_DEPTH` of the tip is never too old: the walk from the
+// floor to it takes at most `MAX_DEPTH` steps.
+const _: () = assert!(MAX_DEPTH.unsigned_abs() <= MAX_WALK as u64);
+
+/// Most bytes that one ref's [`PathIndex`] holds, counted by
+/// [`entry_bytes`]: about 1M entries of short paths. An advance or a land
+/// that would go over moves the floor up to the tip. A reach back to a base
+/// that would go over stops, and [`touched_below`] checks the rest. Tests use
+/// a small budget, so that they reach it.
+// SHORTCUT: the budget is per ref, so the memory of all indexes grows with
+// the refs that take lands. Upgrade (issue #75): one budget for all indexes,
+// which drops the least recently used.
+const MAX_INDEX_BYTES: usize = if cfg!(test) { 64 << 10 } else { 128 << 20 };
 
 /// Where a land stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,7 +104,10 @@ pub enum LandState {
     Landed,
     /// A changed path also changed on the ref after the base.
     Conflict,
-    /// The land can never succeed.
+    /// The land cannot succeed as asked. The outcome is final for its
+    /// request key. Most reasons hold forever, but a base that is too old to
+    /// check depends on what the path index holds at the time, so the same
+    /// base can pass later under a new key.
     Rejected,
 }
 
@@ -115,6 +143,61 @@ pub struct LandRequest {
     pub target_ref: String,
     /// Caller-chosen key. A retry with the same key returns the same land.
     pub request_key: String,
+    /// When the server gives up on the request. The plan stops at it with
+    /// [`Error::DeadlineExceeded`], and the land stays pending.
+    pub deadline: Deadline,
+}
+
+/// When a land gives up: at an instant, or once the call that asked for it
+/// has gone. A request timeout or a client that cancels drops the call, but
+/// not a job that is already running, so the long loops of a land check
+/// this.
+#[derive(Clone, Debug)]
+pub struct Deadline {
+    at: Instant,
+    gone: Arc<AtomicBool>,
+}
+
+impl Deadline {
+    /// A deadline at `at`.
+    #[must_use]
+    pub fn new(at: Instant) -> Self {
+        Self {
+            at,
+            gone: Arc::default(),
+        }
+    }
+
+    /// A guard for the call to hold. When it drops, the deadline has passed.
+    pub fn guard(&self) -> CallGuard {
+        CallGuard(Arc::clone(&self.gone))
+    }
+
+    /// Fails once the deadline has passed. Nothing has been written yet, so
+    /// the land stays pending.
+    fn check(&self) -> Result<()> {
+        let why = if self.gone.load(Ordering::Relaxed) {
+            "the call of the land has gone"
+        } else if Instant::now() >= self.at {
+            "the land ran past its deadline"
+        } else {
+            return Ok(());
+        };
+        Err(Error::DeadlineExceeded(format!(
+            "{why}; it stays pending, retry with the same request key"
+        )))
+    }
+}
+
+/// Held by the call of a land. Dropping it, when the call ends or is
+/// dropped, ends the land's [`Deadline`].
+#[must_use = "the deadline ends when the guard drops"]
+pub struct CallGuard(Arc<AtomicBool>);
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 /// The result of a land.
@@ -149,8 +232,9 @@ impl Lands {
     /// [`Error::NotFound`] if the repo or changeset does not exist.
     /// [`Error::InvalidArgument`] for a malformed request, or a request key
     /// reused for a different land. [`Error::Aborted`] if other writers kept
-    /// moving the ref; the land stays pending and a retry with the same
-    /// request key resumes it. Store errors otherwise.
+    /// moving the ref, and [`Error::DeadlineExceeded`] if the plan ran past
+    /// the request's deadline. The land then stays pending, and a retry with
+    /// the same request key resumes it. Store errors otherwise.
     pub fn land(&self, store: &Store, caller: &Caller, req: &LandRequest) -> Result<LandOutcome> {
         let outcome = self.land_committed(store, caller, req)?;
         // Lands on one ref commit one at a time. Waiting for the flush after
@@ -189,10 +273,13 @@ impl Lands {
         }
         let result = finish(store, repo, land_id, req, &mut index);
         // The index may be ahead of the database; rebuild it next time. A lost
-        // race wrote nothing, so the index is still good.
+        // race wrote nothing, so the index is still good. So is an index that
+        // a deadline stopped: an advance adds nothing until it reaches the
+        // tip, and a reach adds one whole changeset at a time, so a retry
+        // goes on from where the reach stopped.
         if result
             .as_ref()
-            .is_err_and(|e| !matches!(e, Error::Aborted(_)))
+            .is_err_and(|e| !matches!(e, Error::Aborted(_) | Error::DeadlineExceeded(_)))
         {
             *index = None;
         }
@@ -434,11 +521,20 @@ fn plan(
         Some(index) => index,
         None => index.insert(PathIndex::new(c, repo, head.target)?),
     };
-    index.advance_to(c, repo, head.target)?;
-    let Some(conflicts) = index.check(c, repo, base, &cs.changes)? else {
-        return Ok(Plan::Reject(format!(
-            "base {base} is not on the first-parent history of {target:?}"
-        )));
+    index.advance_to(c, repo, head.target, &req.deadline)?;
+    let conflicts = match index.check(c, repo, base, &cs.changes, &req.deadline)? {
+        Checked::Paths(conflicts) => conflicts,
+        Checked::NotOnHistory => {
+            return Ok(Plan::Reject(format!(
+                "base {base} is not on the first-parent history of {target:?}"
+            )));
+        }
+        Checked::TooOld => {
+            return Ok(Plan::Reject(format!(
+                "base {base} is too old: it is not within {MAX_WALK} changesets of the \
+                 head of {target:?}; rebase onto a newer head and land again"
+            )));
+        }
     };
     if !conflicts.is_empty() {
         let detail = format!(
@@ -529,7 +625,7 @@ fn settle(
 /// forward as the ref moves and backward when a land has an older base, up
 /// to [`MAX_DEPTH`] below the tip. Each [`PRUNE_EVERY`] generations,
 /// [`PathIndex::prune`] moves `floor` up to the oldest base that the cycle
-/// used, so memory follows the bases in use.
+/// used, so memory follows the bases in use. [`MAX_INDEX_BYTES`] bounds it.
 struct PathIndex {
     tip: ChangesetId,
     floor: ChangesetId,
@@ -544,13 +640,19 @@ struct PathIndex {
     cycle_start: i64,
     /// Oldest generation this cycle needs: `cycle_start`, or an older base.
     oldest_base: i64,
+    /// What `chain`, `files` and `dirs` hold, by [`entry_bytes`].
+    bytes: usize,
 }
 
 impl PathIndex {
     /// An empty index at `head`. Its first prune cycle starts there.
     fn new(c: &Connection, repo: RepoId, head: ChangesetId) -> Result<Self> {
-        let head_gen = db::generation(c, repo, head)?;
-        Ok(Self {
+        Ok(Self::at(head, db::generation(c, repo, head)?))
+    }
+
+    /// An empty index at `head`, of generation `head_gen`.
+    fn at(head: ChangesetId, head_gen: i64) -> Self {
+        Self {
             tip: head,
             floor: head,
             chain: BTreeMap::new(),
@@ -558,18 +660,30 @@ impl PathIndex {
             dirs: HashMap::new(),
             cycle_start: head_gen,
             oldest_base: head_gen,
-        })
+            bytes: 0,
+        }
     }
 
-    /// Indexes the changesets from the current tip forward to `head`. If
-    /// `head` does not descend from the tip (the ref moved to other history),
-    /// starts over at `head`.
-    fn advance_to(&mut self, c: &Connection, repo: RepoId, head: ChangesetId) -> Result<()> {
+    /// Indexes the changesets from the current tip forward to `head`. Starts
+    /// over at `head` if `head` does not descend from the tip (the ref moved
+    /// to other history), if `head` is more than [`MAX_DEPTH`] changesets
+    /// ahead, or if those changesets would not fit in [`MAX_INDEX_BYTES`].
+    /// An index at the head is always correct, and a longer walk would hold
+    /// the database lock for little gain.
+    fn advance_to(
+        &mut self,
+        c: &Connection,
+        repo: RepoId,
+        head: ChangesetId,
+        deadline: &Deadline,
+    ) -> Result<()> {
         if head == self.tip {
             return Ok(());
         }
         let tip_gen = db::generation(c, repo, self.tip)?;
         let mut walked = Vec::new();
+        let mut needed = self.bytes;
+        let mut steps = 0;
         let mut cur = Some(head);
         while let Some(id) = cur {
             if id == self.tip {
@@ -579,11 +693,28 @@ impl PathIndex {
                 self.tip = head;
                 return Ok(());
             }
+            deadline.check()?;
+            steps += 1;
+            if steps > MAX_DEPTH {
+                tracing::info!(
+                    steps,
+                    "the ref moved far; the path index starts over at the head"
+                );
+                break;
+            }
             let generation = db::generation(c, repo, id)?;
             if generation <= tip_gen {
                 break;
             }
             let cs = db::get_changeset(c, repo, id)?;
+            needed += added_bytes(&cs.changes);
+            if needed > MAX_INDEX_BYTES {
+                tracing::info!(
+                    generation,
+                    "the path index is full; it starts over at the head"
+                );
+                break;
+            }
             cur = cs.parents.first().copied();
             walked.push((id, generation, cs.changes));
         }
@@ -591,20 +722,22 @@ impl PathIndex {
         Ok(())
     }
 
-    /// The paths in `changes` that changed on the history after `base`, or
-    /// `None` if `base` is not on the history. Then prunes.
+    /// The paths in `changes` that changed on the history after `base`, if
+    /// `base` is on the history. Then prunes.
     ///
     /// A base below the floor is reached: the changesets from the floor back
-    /// to it are added to the index. A base more than [`MAX_DEPTH`] below the
-    /// tip is not. [`touched_below`] checks those changesets without keeping
-    /// them, and the base does not count as used for pruning.
+    /// to it are added to the index, while they fit in [`MAX_INDEX_BYTES`].
+    /// [`touched_below`] checks the rest without keeping them. It checks all
+    /// of them for a base more than [`MAX_DEPTH`] below the tip, and such a
+    /// base does not count as used for pruning.
     fn check(
         &mut self,
         c: &Connection,
         repo: RepoId,
         base: ChangesetId,
         changes: &BTreeMap<RepoPath, Option<FileState>>,
-    ) -> Result<Option<Vec<RepoPath>>> {
+        deadline: &Deadline,
+    ) -> Result<Checked> {
         let base_gen = db::generation(c, repo, base)?;
         let tip_gen = match self.chain.last_key_value() {
             Some((&generation, _)) => generation,
@@ -613,13 +746,20 @@ impl PathIndex {
         let deep = tip_gen - base_gen > MAX_DEPTH;
         let mut below = HashSet::new();
         if base != self.floor && self.chain.get(&base_gen) != Some(&base) {
-            let reached = if deep {
-                touched_below(c, repo, self.floor, base, base_gen, changes, &mut below)?
+            // A deep base does not grow the index: the walk checks it all.
+            let mut walk = if deep {
+                Walk::Stopped
             } else {
-                self.reach(c, repo, base, base_gen)?
+                self.reach(c, repo, base, base_gen, deadline)?
             };
-            if !reached {
-                return Ok(None);
+            if walk == Walk::Stopped {
+                (walk, below) =
+                    touched_below(c, repo, self.floor, base, base_gen, changes, deadline)?;
+            }
+            match walk {
+                Walk::Reached => {}
+                Walk::Missed => return Ok(Checked::NotOnHistory),
+                Walk::Stopped => return Ok(Checked::TooOld),
             }
         }
         // The index holds the changesets after the floor, and `below` the paths
@@ -637,25 +777,39 @@ impl PathIndex {
             self.oldest_base = self.oldest_base.min(base_gen);
         }
         self.prune();
-        Ok(Some(conflicts))
+        Ok(Checked::Paths(conflicts))
     }
 
-    /// Whether `base` is on the history, adding the changesets from the floor
-    /// back to it. The caller has checked that `base` is not the floor and not
-    /// in the index.
+    /// Walks from the floor back to `base`, adding each changeset and moving
+    /// the floor down past it. Stops at the first changeset that does not fit
+    /// in [`MAX_INDEX_BYTES`], which is then the floor. The caller has checked
+    /// that `base` is not the floor and not in the index.
     fn reach(
         &mut self,
         c: &Connection,
         repo: RepoId,
         base: ChangesetId,
         base_gen: i64,
-    ) -> Result<bool> {
-        walk_back(c, repo, self.floor, base, base_gen, |id, generation, cs| {
-            self.add(id, generation, &cs.changes);
-            if let Some(&parent) = cs.parents.first() {
-                self.floor = parent;
-            }
-        })
+        deadline: &Deadline,
+    ) -> Result<Walk> {
+        walk_back(
+            c,
+            repo,
+            self.floor,
+            base,
+            base_gen,
+            deadline,
+            |id, generation, cs| {
+                if !self.fits(&cs.changes) {
+                    return false;
+                }
+                self.add(id, generation, &cs.changes);
+                if let Some(&parent) = cs.parents.first() {
+                    self.floor = parent;
+                }
+                true
+            },
+        )
     }
 
     /// Whether a changeset after `base_gen` touched `path`: the same path, a
@@ -689,19 +843,29 @@ impl PathIndex {
                 // `retain` keeps the capacity, so give it back.
                 map.shrink_to_fit();
             }
+            self.bytes = self.measure();
             tracing::debug!(floor_gen, kept = self.chain.len(), "pruned the path index");
         }
         self.cycle_start = tip_gen;
         self.oldest_base = tip_gen;
     }
 
-    /// Records a changeset that just became the tip.
+    /// Records a changeset that just became the tip. If it does not fit in
+    /// [`MAX_INDEX_BYTES`], the index starts over at it.
     fn record(
         &mut self,
         id: ChangesetId,
         generation: i64,
         changes: &BTreeMap<RepoPath, Option<FileState>>,
     ) {
+        if !self.fits(changes) {
+            tracing::info!(
+                generation,
+                "the path index is full; it starts over at the tip"
+            );
+            *self = Self::at(id, generation);
+            return;
+        }
         self.add(id, generation, changes);
         self.tip = id;
     }
@@ -712,49 +876,103 @@ impl PathIndex {
         generation: i64,
         changes: &BTreeMap<RepoPath, Option<FileState>>,
     ) {
-        self.chain.insert(generation, id);
+        if self.chain.insert(generation, id).is_none() {
+            self.bytes += entry_bytes(&[]);
+        }
         for path in changes.keys() {
             let path = path.as_bytes();
-            bump(&mut self.files, path, generation);
+            self.bytes += bump(&mut self.files, path, generation);
             for dir in ancestors(path) {
-                bump(&mut self.dirs, dir, generation);
+                self.bytes += bump(&mut self.dirs, dir, generation);
             }
         }
     }
+
+    /// Whether a changeset with `changes` fits in [`MAX_INDEX_BYTES`].
+    fn fits(&self, changes: &BTreeMap<RepoPath, Option<FileState>>) -> bool {
+        self.bytes + added_bytes(changes) <= MAX_INDEX_BYTES
+    }
+
+    /// What the index holds, by [`entry_bytes`]. Counted from scratch.
+    fn measure(&self) -> usize {
+        let keys = |map: &HashMap<Vec<u8>, i64>| map.keys().map(|k| entry_bytes(k)).sum::<usize>();
+        self.chain.len() * entry_bytes(&[]) + keys(&self.files) + keys(&self.dirs)
+    }
+}
+
+/// What one index entry costs, roughly: its key, plus the map slot, the
+/// key's length and its allocation. A chain entry has no key.
+fn entry_bytes(key: &[u8]) -> usize {
+    key.len() + 64
+}
+
+/// The most that [`PathIndex::add`] adds for a changeset with `changes`.
+fn added_bytes(changes: &BTreeMap<RepoPath, Option<FileState>>) -> usize {
+    let paths = changes.keys().map(|path| {
+        let path = path.as_bytes();
+        entry_bytes(path) + ancestors(path).map(entry_bytes).sum::<usize>()
+    });
+    entry_bytes(&[]) + paths.sum::<usize>()
+}
+
+/// What [`PathIndex::check`] found.
+enum Checked {
+    /// The base is on the history, and these paths of the land changed
+    /// after it.
+    Paths(Vec<RepoPath>),
+    /// The base is not on the first-parent history.
+    NotOnHistory,
+    /// The base is more than [`MAX_WALK`] changesets below the floor.
+    TooOld,
+}
+
+/// How a [`walk_back`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Walk {
+    /// It reached the base: the base is on the history.
+    Reached,
+    /// The base is not on the history.
+    Missed,
+    /// The visit stopped it before it reached the base.
+    Stopped,
 }
 
 /// Walks first parents from `from` back to `base`, and passes each changeset
-/// after `base` to `visit`, newest first. `false` if `base` is not on that
-/// history.
+/// after `base` to `visit`, newest first, while `visit` returns `true`.
+/// Fails with [`Error::DeadlineExceeded`] once `deadline` has passed.
 fn walk_back(
     c: &Connection,
     repo: RepoId,
     from: ChangesetId,
     base: ChangesetId,
     base_gen: i64,
-    mut visit: impl FnMut(ChangesetId, i64, &Changeset),
-) -> Result<bool> {
+    deadline: &Deadline,
+    mut visit: impl FnMut(ChangesetId, i64, &Changeset) -> bool,
+) -> Result<Walk> {
     let mut cur = from;
     loop {
+        deadline.check()?;
         let generation = db::generation(c, repo, cur)?;
         if generation <= base_gen {
-            return Ok(false);
+            return Ok(Walk::Missed);
         }
         let cs = db::get_changeset(c, repo, cur)?;
-        visit(cur, generation, &cs);
+        if !visit(cur, generation, &cs) {
+            return Ok(Walk::Stopped);
+        }
         match cs.parents.first() {
-            Some(&parent) if parent == base => return Ok(true),
+            Some(&parent) if parent == base => return Ok(Walk::Reached),
             Some(&parent) => cur = parent,
-            None => return Ok(false),
+            None => return Ok(Walk::Missed),
         }
     }
 }
 
-/// For a base more than [`MAX_DEPTH`] below the tip: walks the history from
-/// `floor` back to `base`, and adds to `hits` each path in `land` that the
-/// walked changesets touched, by the rule of [`PathIndex::touches`]. Keeps
-/// only the land's own paths and directories, so memory follows the land,
-/// not the depth. `false` if `base` is not on the history.
+/// For a base that the index cannot reach: walks the history from `floor`
+/// back to `base`, and returns each path in `land` that the walked
+/// changesets touched, by the rule of [`PathIndex::touches`]. Keeps only the
+/// land's own paths and directories, so memory follows the land, not the
+/// depth. Stops after [`MAX_WALK`] changesets.
 fn touched_below<'a>(
     c: &Connection,
     repo: RepoId,
@@ -762,16 +980,19 @@ fn touched_below<'a>(
     base: ChangesetId,
     base_gen: i64,
     land: &'a BTreeMap<RepoPath, Option<FileState>>,
-    hits: &mut HashSet<&'a [u8]>,
-) -> Result<bool> {
+    deadline: &Deadline,
+) -> Result<(Walk, HashSet<&'a [u8]>)> {
     let paths: HashSet<&[u8]> = land.keys().map(RepoPath::as_bytes).collect();
     let parents: HashSet<&[u8]> = paths.iter().flat_map(|p| ancestors(p)).collect();
     // What `files` and `dirs` of an index over the walk would hold, kept only
     // where `touches` reads them for the land's paths.
     let mut files: HashSet<&[u8]> = HashSet::new();
     let mut dirs: HashSet<&[u8]> = HashSet::new();
-    let mut walked = 0_u64;
-    let reached = walk_back(c, repo, floor, base, base_gen, |_, _, cs| {
+    let mut walked = 0;
+    let walk = walk_back(c, repo, floor, base, base_gen, deadline, |_, _, cs| {
+        if walked == MAX_WALK {
+            return false;
+        }
         walked += 1;
         for path in cs.changes.keys() {
             let path = path.as_bytes();
@@ -780,17 +1001,28 @@ fn touched_below<'a>(
             }
             dirs.extend(ancestors(path).filter_map(|dir| paths.get(dir)));
         }
+        true
     })?;
-    tracing::debug!(base_gen, walked, reached, "checked an old base");
-    hits.extend(paths.into_iter().filter(|&path| {
+    if walk == Walk::Stopped {
+        tracing::info!(base_gen, walked, "a base is too old to check");
+    } else {
+        tracing::debug!(base_gen, walked, ?walk, "checked an old base");
+    }
+    let hits = paths.into_iter().filter(|&path| {
         files.contains(path) || dirs.contains(path) || ancestors(path).any(|d| files.contains(d))
-    }));
-    Ok(reached)
+    });
+    Ok((walk, hits.collect()))
 }
 
-fn bump(map: &mut HashMap<Vec<u8>, i64>, key: &[u8], generation: i64) {
-    let slot = map.entry(key.to_vec()).or_insert(generation);
-    *slot = (*slot).max(generation);
+/// Raises `key` to `generation`. Returns the bytes added: those of a new
+/// entry, else 0.
+fn bump(map: &mut HashMap<Vec<u8>, i64>, key: &[u8], generation: i64) -> usize {
+    if let Some(slot) = map.get_mut(key) {
+        *slot = (*slot).max(generation);
+        return 0;
+    }
+    map.insert(key.to_vec(), generation);
+    entry_bytes(key)
 }
 
 /// The proper directory prefixes of a path: `a/b/c` gives `a`, `a/b`.
@@ -896,6 +1128,7 @@ mod tests {
             changeset: cs,
             target_ref: "main".into(),
             request_key: key.into(),
+            deadline: Deadline::new(Instant::now() + std::time::Duration::from_secs(600)),
         }
     }
 
@@ -1329,11 +1562,106 @@ mod tests {
     }
 
     #[test]
+    fn an_index_starts_over_when_the_ref_moved_far() {
+        use LandState::{Conflict, Landed};
+        let f = fixture();
+        f.fill("f", 1);
+        let before = f.main().target;
+        // An import moves main by more than MAX_DEPTH small changesets.
+        let mut head = before;
+        for n in 0..=MAX_DEPTH {
+            head = f.commit(head, &[put(&format!("i{n}"), "x")]);
+        }
+        f.move_main(head);
+
+        // The plan does not walk back to the old tip: the index starts over
+        // at the head.
+        let out = f.land(f.commit(head, &[put("x", "x")]), "on head");
+        assert_eq!(out.state, Landed, "{}", out.detail);
+        assert_eq!(f.index(|index| index.floor), head);
+        // A base before the import still sees the imported changes.
+        let out = f.land(f.commit(before, &[put("i3", "mine")]), "old");
+        assert_eq!(out.state, Conflict, "{}", out.detail);
+        assert_eq!(out.conflict_paths, [RepoPath::new("i3").unwrap()]);
+    }
+
+    #[test]
+    fn a_land_past_its_deadline_stays_pending_and_a_retry_finishes_it() {
+        use LandState::{Conflict, Landed};
+        let f = fixture();
+        // The index starts at B, so root is below its floor.
+        f.move_main(f.commit(f.root, &[put("b/y", "B")]));
+        f.fill("f", 1);
+        // An import moves main, so the next plan advances the index.
+        f.move_main(f.commit(f.main().target, &[put("c", "import")]));
+        let on_head = f.commit(f.main().target, &[put("a/x", "mine")]);
+        // The plan of this one walks back from the floor.
+        let on_root = f.commit(f.root, &[put("c", "mine")]);
+        for (cs, key, state) in [(on_head, "head", Landed), (on_root, "root", Conflict)] {
+            let before = f.main();
+            let late = LandRequest {
+                deadline: Deadline::new(Instant::now()),
+                ..req(cs, key)
+            };
+            let err = f.lands.land(&f.store, &caller(), &late).unwrap_err();
+            assert!(matches!(err, Error::DeadlineExceeded(_)), "{key}: {err}");
+            assert_eq!(f.main(), before, "{key}");
+            let sql = "SELECT state FROM lands WHERE request_key = ?1";
+            let row: String = f
+                .store
+                .read(|c| Ok(c.query_row(sql, [key], |row| row.get(0))?))
+                .unwrap();
+            assert_eq!(row, "pending", "{key}");
+            // The index stays, so a retry goes on from where the plan stopped.
+            f.index(|_| ());
+            let out = f.land(cs, key);
+            assert_eq!(out.state, state, "{key}: {}", out.detail);
+        }
+    }
+
+    #[test]
+    fn a_base_beyond_the_walk_limit_is_rejected() {
+        use LandState::{Conflict, Landed, Rejected};
+        // An import moves main to root ─ C1 ─ … ─ Cn, where Ci puts `ci`.
+        let f = fixture();
+        let n = MAX_WALK + 1;
+        let mut history = vec![f.root];
+        f.store
+            .write(|c| {
+                for i in 1..=n {
+                    let cs = changeset(vec![history[i - 1]], &[put(&format!("c{i}"), "x")]);
+                    history.push(db::insert_changeset(c, f.repo, &cs)?);
+                }
+                Ok(())
+            })
+            .unwrap();
+        f.move_main(history[n]);
+        // A land on the head builds the index there, so Cn is the floor.
+        let out = f.land(f.commit(history[n], &[put("warm", "x")]), "warm");
+        assert_eq!(out.state, Landed);
+        assert_eq!(f.index(|index| index.floor), history[n]);
+
+        // The walk from the floor reaches C1 with its last step, which visits
+        // C2, and C2 put `c2`.
+        let out = f.land(f.commit(history[1], &[put("c2", "mine")]), "c1");
+        assert_eq!(out.state, Conflict, "{}", out.detail);
+        assert_eq!(out.conflict_paths, [RepoPath::new("c2").unwrap()]);
+
+        // Root is one more step back, so the client must rebase.
+        let before = f.main();
+        let out = f.land(f.commit(f.root, &[put("b/y", "mine")]), "root");
+        assert_eq!(out.state, Rejected);
+        assert!(out.detail.contains("too old"), "{}", out.detail);
+        assert_eq!(f.main(), before);
+    }
+
+    #[test]
     fn the_path_index_stays_bounded_under_many_lands() {
         let f = fixture();
         let bound = 2 * cycle();
         for n in 0..10 * cycle() {
             f.fill(&format!("d{n}/f"), 1);
+            within_budget(&f);
             let sizes = f.index(|index| (index.chain.len(), index.files.len(), index.dirs.len()));
             assert!(
                 sizes.0 <= bound && sizes.1 <= bound && sizes.2 <= bound,
@@ -1341,6 +1669,71 @@ mod tests {
                 n + 1
             );
         }
+    }
+
+    /// `n` puts below `dir`: `dir/f0` to `dir/f{n-1}`.
+    fn wide(dir: &str, n: usize) -> Vec<Change> {
+        (0..n).map(|i| put(&format!("{dir}/f{i}"), "x")).collect()
+    }
+
+    /// Checks that the index of `main` counts its bytes right and stays
+    /// within its budget. Returns its floor.
+    fn within_budget(f: &Fixture) -> ChangesetId {
+        f.index(|index| {
+            assert_eq!(index.bytes, index.measure());
+            assert!(index.bytes <= MAX_INDEX_BYTES, "{} bytes", index.bytes);
+            index.floor
+        })
+    }
+
+    #[test]
+    fn the_path_index_stays_within_its_byte_budget() {
+        use LandState::{Conflict, Landed};
+        // Three lands of this many new paths fill the budget, before a prune
+        // cycle ends.
+        const WIDE: usize = 400;
+        let one = added_bytes(&wide("d0", WIDE).into_iter().collect());
+        assert!(3 * one > MAX_INDEX_BYTES && PRUNE_EVERY > 3);
+        let f = fixture();
+        let mut history = vec![f.root];
+        let mut restarts = 0;
+        for n in 0..8 {
+            let cs = f.commit(f.main().target, &wide(&format!("d{n}"), WIDE));
+            assert_eq!(f.land(cs, &format!("d{n}")).state, Landed);
+            history.push(cs);
+            // A prune moves the floor to an older base, never to the tip.
+            restarts += usize::from(within_budget(&f) == cs);
+        }
+        assert!(restarts > 0, "a land moved the floor up to the tip");
+
+        // Bases below the floor. Each check reaches back while the index has
+        // room, and walks the rest.
+        let base = history[1];
+        assert!(f.generation(base) < f.generation(within_budget(&f)));
+        let cases = [
+            ("d5/f3", Conflict), // the land of d5 put it
+            ("d6", Conflict),    // the land of d6 put paths below it
+            ("d0/f3", Landed),   // only the base put it
+        ];
+        for (path, state) in cases {
+            let out = f.land(f.commit(base, &[put(path, "mine")]), &format!("old {path}"));
+            assert_eq!(out.state, state, "{path}: {}", out.detail);
+            if state == Conflict {
+                assert_eq!(out.conflict_paths, [RepoPath::new(path).unwrap()]);
+            }
+            within_budget(&f);
+        }
+
+        // An import moves main by more than the budget holds. The index
+        // starts over at the new head and still sees the imported changes.
+        let before = f.main().target;
+        for n in 0..3 {
+            f.move_main(f.commit(f.main().target, &wide(&format!("e{n}"), WIDE)));
+        }
+        let out = f.land(f.commit(before, &[put("e1/f7", "mine")]), "after import");
+        assert_eq!(out.state, Conflict, "{}", out.detail);
+        assert_eq!(out.conflict_paths, [RepoPath::new("e1/f7").unwrap()]);
+        within_budget(&f);
     }
 
     #[test]

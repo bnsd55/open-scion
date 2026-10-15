@@ -49,6 +49,16 @@ release.
   once per 64 bytes against the per-call budget.
 - Bearer-token auth, loopback-only listening by default, request limits and
   name validation at the RPC boundary.
+- `ReadFile` streams a file in 1 MiB parts from the zstd decoder, under a
+  256 MiB budget for all replies. It checks the content against its ID
+  before the last part, and ends a stalled reply with `DEADLINE_EXCEEDED`.
+- The path index of each ref stays within a budget of 128 MiB. When it is
+  full, it starts over at the tip, and the lands still get the same answers.
+- A land walks at most 100,000 changesets below the path index. A base
+  further back is `REJECTED` as too old, and the client must rebase.
+- A land stops in its long loops 600 s after its call started, or as soon
+  as its call is dropped by a timeout or by the client, because neither
+  stops a running job. The land stays pending.
 - `scion-tier`: the cache tiers. `scion-cache` keeps objects in memory and
   `scion-daemon` keeps them on disk, each under a byte limit, least recently
   used out first. The daemon listens on a Unix socket with mode 0600. Each
