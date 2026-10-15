@@ -417,8 +417,9 @@ fn log_follows_git_first_parents() {
         .lines()
         .map(|commit| changeset_of(&store, commit))
         .collect();
-    let log: Vec<ChangesetId> = read::log(&store, "r", report.tip, 100)
+    let log: Vec<ChangesetId> = read::log_page(&store, "r", report.tip, None, 100)
         .unwrap()
+        .entries
         .into_iter()
         .map(|(id, _)| id)
         .collect();

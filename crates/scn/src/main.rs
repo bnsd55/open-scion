@@ -54,7 +54,7 @@ enum Command {
         rev: String,
         /// Show only the changesets that change this file, or anything
         /// below this directory.
-        #[arg(long, value_parser = cmd::checkout::parse_dir)]
+        #[arg(long, value_parser = client::parse_repo_path)]
         path: Option<RepoPath>,
         /// How many changesets to show.
         #[arg(short = 'n', long, default_value_t = 10)]

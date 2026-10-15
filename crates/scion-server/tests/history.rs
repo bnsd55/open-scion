@@ -6,7 +6,9 @@ use std::path::Path;
 use std::process::Command;
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
-use scion_server::blame::{self, Blame, BlameRange, MAX_BLAME_BYTES, MAX_BLAME_VERSIONS};
+use scion_server::blame::{
+    self, Blame, BlameRange, MAX_BLAME_BYTES, MAX_BLAME_DIFF_LINES, MAX_BLAME_VERSIONS,
+};
 use scion_server::import::{ImportOptions, import_git};
 use scion_server::read::{self, MAX_SCAN};
 use scion_server::{Error, Store, db, tree};
@@ -48,8 +50,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim_end().to_owned()
 }
 
-/// Writes the files (`None` deletes), commits everything, and returns the
-/// commit name.
+/// Writes the files in order (`None` deletes a file or a directory),
+/// commits everything, and returns the commit name.
 fn commit(dir: &Path, message: &str, files: &[(&str, Option<&str>)]) -> String {
     for (name, content) in files {
         let file = dir.join(name);
@@ -58,6 +60,7 @@ fn commit(dir: &Path, message: &str, files: &[(&str, Option<&str>)]) -> String {
                 fs::create_dir_all(file.parent().unwrap()).unwrap();
                 fs::write(file, content).unwrap();
             }
+            None if file.is_dir() => fs::remove_dir_all(file).unwrap(),
             None => fs::remove_file(file).unwrap(),
         }
     }
@@ -111,12 +114,30 @@ fn path_log_follows_files_directories_deletes_and_first_parents() {
             ("dir/x", Some("x\n")),
             ("dir/sub/y", Some("y\n")),
             ("other", Some("o\n")),
+            ("swap", Some("s\n")),
         ],
     );
     let edit_a = commit(dir, "edit a", &[("a.txt", Some("2\n"))]);
-    let edit_y = commit(dir, "edit y", &[("dir/sub/y", Some("y2\n"))]);
+    // `swap` becomes a directory here, and a file again in `readd_a`.
+    let edit_y = commit(
+        dir,
+        "edit y",
+        &[
+            ("dir/sub/y", Some("y2\n")),
+            ("swap", None),
+            ("swap/inner", Some("i\n")),
+        ],
+    );
     let delete_a = commit(dir, "delete a", &[("a.txt", None)]);
-    let readd_a = commit(dir, "re-add a", &[("a.txt", Some("3\n"))]);
+    let readd_a = commit(
+        dir,
+        "re-add a",
+        &[
+            ("a.txt", Some("3\n")),
+            ("swap", None),
+            ("swap", Some("s2\n")),
+        ],
+    );
     git(dir, &["checkout", "-q", "-b", "side"]);
     commit(
         dir,
@@ -141,8 +162,10 @@ fn path_log_follows_files_directories_deletes_and_first_parents() {
     };
     // First parent only: the side commit never appears, the merge does when
     // its diff against its first parent changes the path.
-    let cases: [(&str, &[&str]); 5] = [
+    let cases: [(&str, &[&str]); 7] = [
         ("a.txt", &[&readd_a, &delete_a, &edit_a, &add]),
+        ("swap", &[&readd_a, &edit_y, &add]),
+        ("swap/inner", &[&readd_a, &edit_y]),
         ("dir", &[&siblings, &merge, &edit_y, &add]),
         ("dir/sub", &[&edit_y, &add]),
         ("dir/x", &[&merge, &add]),
@@ -198,10 +221,10 @@ fn chain(store: &Store, puts: Vec<Vec<(&str, FileState)>>) -> Vec<ChangesetId> {
 }
 
 /// `count` lines from line `start`, from line `origin` of `id`.
-fn range(start: usize, count: u32, id: Option<ChangesetId>, origin: u32) -> BlameRange {
+fn range(start: usize, count: usize, id: Option<ChangesetId>, origin: u32) -> BlameRange {
     BlameRange {
         start_line: u32::try_from(start).unwrap(),
-        line_count: count,
+        line_count: u32::try_from(count).unwrap(),
         changeset: id,
         origin_line: origin,
     }
@@ -224,11 +247,6 @@ fn walks_stop_after_max_scan_changesets_and_resume() {
 
     assert_eq!(path_log(&store, tip, "f"), (vec![], Some(root)));
     assert_eq!(path_log(&store, root, "f"), (vec![root], None));
-    // `read::log` reads page after page until its limit.
-    assert_eq!(
-        read::log(&store, REPO, tip, usize::MAX).unwrap().len(),
-        MAX_SCAN + 1
-    );
 
     let first = blame(&store, tip, "f");
     assert_eq!(first.ranges, [range(1, 2, None, 1)]);
@@ -345,4 +363,98 @@ fn blame_refuses_what_it_cannot_diff() {
     }
     let missing = blame::blame(&store, REPO, cs, &path("missing"));
     assert!(matches!(missing, Err(Error::NotFound(_))), "{missing:?}");
+}
+
+#[test]
+fn blame_and_path_log_do_not_follow_renames() {
+    let git_dir = tempfile::tempdir().unwrap();
+    let dir = git_dir.path();
+    git(dir, &["init", "-q", "-b", "main"]);
+    let add = commit(dir, "add", &[("old.txt", Some("1\n2\n3\n"))]);
+    let rename = commit(
+        dir,
+        "rename",
+        &[("old.txt", None), ("new.txt", Some("1\n2\n3\n"))],
+    );
+    let (_data, store) = open_store();
+    let tip = import(&store, dir);
+    let rename_id = changeset_of(&store, &rename);
+    // SHORTCUT (#69): git follows the rename and gives the lines to `add`.
+    // Here the rename takes them.
+    let porcelain = git(dir, &["blame", "--first-parent", "--porcelain", "new.txt"]);
+    assert!(porcelain.starts_with(&add), "{porcelain}");
+    assert_eq!(
+        blame(&store, tip, "new.txt").ranges,
+        [range(1, 3, Some(rename_id), 1)]
+    );
+    assert_eq!(path_log(&store, tip, "new.txt"), (vec![rename_id], None));
+}
+
+#[test]
+fn blame_of_an_empty_file_has_no_ranges() {
+    let (_data, store) = open_store();
+    let empty = store.blobs().put(b"").unwrap();
+    let ids = chain(&store, vec![vec![("f", regular(empty))]]);
+    let result = blame(&store, ids[0], "f");
+    assert_eq!(result.ranges, Vec::<BlameRange>::new());
+    assert_eq!(result.next, None);
+}
+
+#[test]
+fn blame_stops_when_its_diff_budget_runs_out() {
+    let (_data, store) = open_store();
+    // Each version adds one line at the top of about 300,000 lines. One diff
+    // costs about 600,000 lines, so a second one would pass
+    // MAX_BLAME_DIFF_LINES. Lines count, not their content: repeated lines
+    // like these are the slow case for a diff.
+    let n = 300_000;
+    assert!(4 * n > MAX_BLAME_DIFF_LINES && 2 * n < MAX_BLAME_DIFF_LINES);
+    let mut text = "\n".repeat(n);
+    let mut changes = vec![vec![(
+        "f",
+        regular(store.blobs().put(text.as_bytes()).unwrap()),
+    )]];
+    for k in 2..=3 {
+        text.insert_str(0, &format!("{k}\n"));
+        changes.push(vec![(
+            "f",
+            regular(store.blobs().put(text.as_bytes()).unwrap()),
+        )]);
+    }
+    let ids = chain(&store, changes);
+
+    let first = blame(&store, ids[2], "f");
+    // One diff: the newest line. The rest is still in the file at ids[1],
+    // which the call did not diff.
+    assert_eq!(
+        first.ranges,
+        [range(1, 1, Some(ids[2]), 1), range(2, n + 1, None, 1)]
+    );
+    assert_eq!(first.next, Some(ids[1]));
+    let rest = blame(&store, ids[1], "f");
+    assert_eq!(
+        rest.ranges,
+        [range(1, 1, Some(ids[1]), 1), range(2, n, Some(ids[0]), 1)]
+    );
+    assert_eq!(rest.next, None);
+
+    // The first diff of a call runs even when it alone is over the budget,
+    // so every call makes progress.
+    let big = 2 * n;
+    assert!(2 * big > MAX_BLAME_DIFF_LINES);
+    let old = "\n".repeat(big);
+    let new = format!("x\n{old}");
+    let ids = chain(
+        &store,
+        vec![
+            vec![("big", regular(store.blobs().put(old.as_bytes()).unwrap()))],
+            vec![("big", regular(store.blobs().put(new.as_bytes()).unwrap()))],
+        ],
+    );
+    let result = blame(&store, ids[1], "big");
+    assert_eq!(
+        result.ranges,
+        [range(1, 1, Some(ids[1]), 1), range(2, big, Some(ids[0]), 1)]
+    );
+    assert_eq!(result.next, None);
 }

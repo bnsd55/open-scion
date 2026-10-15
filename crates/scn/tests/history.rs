@@ -44,7 +44,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
-/// Writes the files (`None` deletes) and commits everything.
+/// Writes the files in order (`None` deletes a file or a directory) and
+/// commits everything.
 fn commit(dir: &Path, message: &str, files: &[(&str, Option<&str>)]) {
     for (name, content) in files {
         let file = dir.join(name);
@@ -53,6 +54,7 @@ fn commit(dir: &Path, message: &str, files: &[(&str, Option<&str>)]) {
                 fs::create_dir_all(file.parent().unwrap()).unwrap();
                 fs::write(file, content).unwrap();
             }
+            None if file.is_dir() => fs::remove_dir_all(file).unwrap(),
             None => fs::remove_file(file).unwrap(),
         }
     }
@@ -154,8 +156,9 @@ fn git_blame_lines(store: &Store, dir: &Path, file: &str) -> Vec<(String, u64)> 
 }
 
 /// A git history of edits that blame must follow: inserts, edits, a merge,
-/// a mode change, a delete and re-add, a last line with no newline, and
-/// lines that a diff can place in more than one way.
+/// a mode change, a delete and re-add, a file that becomes a directory and
+/// a file again, CRLF line ends, an empty file, a last line with no newline,
+/// and lines that a diff can place in more than one way.
 fn blame_fixture(dir: &Path) {
     git(dir, &["init", "-q", "-b", "main"]);
     commit(
@@ -171,17 +174,24 @@ fn blame_fixture(dir: &Path) {
                 "slide.txt",
                 Some("top\n\n    y();\n}\n        z();\n        z();\nend\n"),
             ),
+            ("crlf.txt", Some("one\r\ntwo\r\nthree\r\n")),
+            ("empty.txt", Some("")),
+            ("swap", Some("s1\ns2\n")),
         ],
     );
     commit(
         dir,
-        "insert a function",
-        &[(
-            "lib.rs",
-            Some(
-                "fn a() {\n    one(1);\n}\n\nfn new() {\n    three();\n}\n\nfn b() {\n    two();\n}\n",
+        "insert a function, swap becomes a directory",
+        &[
+            (
+                "lib.rs",
+                Some(
+                    "fn a() {\n    one(1);\n}\n\nfn new() {\n    three();\n}\n\nfn b() {\n    two();\n}\n",
+                ),
             ),
-        )],
+            ("swap", None),
+            ("swap/inner", Some("i\n")),
+        ],
     );
     git(dir, &["checkout", "-q", "-b", "side"]);
     commit(
@@ -197,8 +207,11 @@ fn blame_fixture(dir: &Path) {
     git(dir, &["checkout", "-q", "main"]);
     commit(
         dir,
-        "header, insert, no newline at the end, delete b.txt",
+        "header, insert, no newline at the end, delete b.txt, swap is a file again",
         &[
+            ("swap", None),
+            ("swap", Some("s1\ns2\ns3\n")),
+            ("crlf.txt", Some("one\r\nTWO\r\nthree\n")),
             (
                 "lib.rs",
                 Some(
@@ -226,8 +239,9 @@ fn blame_fixture(dir: &Path) {
         )],
     );
     // Both ends change, so the diff cannot trim them. The two lines added
-    // to slide.txt fit in more than one place. Only a Myers diff with the
-    // indent heuristic places them where git does.
+    // to slide.txt fit in more than one place. Here a Myers diff with the
+    // indent heuristic places them where git does; Histogram, or no
+    // heuristic, does not.
     commit(
         dir,
         "both ends, and lines that can slide",
@@ -248,6 +262,14 @@ fn blame_fixture(dir: &Path) {
 
 #[test]
 fn blame_matches_git_blame_first_parent() {
+    const FILES: [&str; 6] = [
+        "lib.rs",
+        "b.txt",
+        "slide.txt",
+        "crlf.txt",
+        "empty.txt",
+        "swap",
+    ];
     let git_dir = tempfile::tempdir().unwrap();
     let dir = git_dir.path();
     blame_fixture(dir);
@@ -259,12 +281,12 @@ fn blame_matches_git_blame_first_parent() {
         verify_sample: 0,
     };
     import_git(&store, REPO, dir, &opts).unwrap();
-    let expected: Vec<_> = ["lib.rs", "b.txt", "slide.txt"]
+    let expected: Vec<_> = FILES
         .iter()
         .map(|file| git_blame_lines(&store, dir, file))
         .collect();
     let server = Server::start(data, store);
-    for (file, expected) in ["lib.rs", "b.txt", "slide.txt"].iter().zip(expected) {
+    for (file, expected) in FILES.iter().zip(expected) {
         assert_eq!(
             blame_lines(&server, &format!("main:{file}")),
             expected,

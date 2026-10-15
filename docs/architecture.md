@@ -38,7 +38,8 @@ How one request flows through the server:
 2. `service.rs` (the `Scion` service) or `objects.rs` (the `Objects` service)
    checks names, IDs and paths, then runs `write.rs`, `land.rs`, `read.rs`
    or `blame.rs` on a blocking thread (SQLite and the blob folder are
-   synchronous). Both services share one bound: at most 256 run at once. A
+   synchronous). Both services share one bound: at most 256 run at once,
+   and at most 4 of them are `Blame` calls. A
    request times out after 600 s; for a streamed reply that covers only its
    start. A `GetObjects` reply ends when its client takes no object for
    120 s.
@@ -462,16 +463,27 @@ choices. For a file at a changeset:
    older version does not exist, or is not text that blame reads, every line
    left goes to C. So a file deleted and added again starts over, as in git.
 
-The diff is Myers with git's indent heuristic, as `git blame` uses by
-default. It comes from `gix` (`gix::diff::blob`), already a dependency for
-the import. A test compares the result with `git blame --first-parent`,
-line by line.
+Renames are not followed: the walk looks at one path, so after a rename
+every line goes to the rename. `git blame` follows renames
+([#69](https://github.com/bnsd55/open-scion/issues/69)).
+
+The diff is Myers with an indent heuristic, from `gix` (`gix::diff::blob`),
+already a dependency for the import. `git blame` also uses Myers by default.
+Where several minimal diffs exist, for example around repeated lines, the
+two can place a line differently, so the blame can differ from git there. A
+test compares the result with `git blame --first-parent`, line by line, on a
+history where they agree.
 
 **Bounds and resume.** A `Log` or `Blame` call checks at most 1,000
 changesets (`MAX_SCAN`), so it holds the database lock no longer than a plain
-`Log` of 1,000 entries. A `Blame` call also diffs at most 100 versions. When
-a call stops at a bound, `next_changeset_id` names the first changeset it did
-not check. A `Log` reply can then have no entries. In a `Blame` reply, the
+`Log` of 1,000 entries. A `Blame` call also diffs at most 100 versions, and
+about 1M lines (`MAX_BLAME_DIFF_LINES`, both sides of each diff). The first
+diff of a call always runs, so a call always makes progress. A diff of many
+repeated lines is slow, so the worst case of one call is one diff of two
+1 MiB files. At most 4 `Blame` calls run at once, so they never take more
+than 4 of the permits that writes and lands share. When a call stops at a
+bound, `next_changeset_id` names where to continue. A `Log` reply can then
+have no entries. In a `Blame` reply, the
 ranges left have no changeset, and `origin_line` gives their line in the file
 at `next_changeset_id`. A blame of the same path there continues the work
 exactly. `scn log --path` and `scn blame` ask again until they are done.
@@ -582,7 +594,7 @@ an untrusted network.
 | Network | Listens on `127.0.0.1:7878` by default. A non-loopback address is refused unless `--insecure-listen` is given. | No TLS: the token and all data travel unencrypted ([#14](https://github.com/bnsd55/open-scion/issues/14)). |
 | Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. | Trees and blobs are shared by all repos. `GetObjects` reads any tree or blob by ID, and a changeset can name another repo's blob and then read it ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
-| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once, 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget, and a reply whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 1 MiB and diffs at most 100 versions. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object inside HTTP/2 until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
+| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once, 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget, and a reply whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 1 MiB, diffs at most 100 versions and about 1M lines, and at most 4 run at once. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object inside HTTP/2 until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. | The client trusts the server for a ref's target and for a changeset's root tree, which it cannot check by hash. Tiers ([#5](https://github.com/bnsd55/open-scion/issues/5)) must forward these answers, not compute them. |
 | Checkout | `scn checkout` writes into a private temp directory with a random name and renames it onto a new or empty destination, never follows a symlink while writing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure the destination stays as it was. | The destination's parent must not be writable by other users, unless it has the sticky bit: they could swap the temp directory before the rename. No Windows rules: device names and names that end in a dot or a space pass. |
 | Errors | Internal errors reply `internal error`. The detail stays in the server log. | |
@@ -612,6 +624,8 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/objects.rs` (`send_objects`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
 | `scion-server/src/read.rs` (`MAX_SCAN`) | Path history and blame walk first parents on every call, at most 1,000 changesets per call. A path changed long ago costs many calls. | Path history as derived data. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_VERSIONS`) | One call diffs at most 100 versions of a file. A file with more versions costs more calls. | Blame as derived data, kept per file version. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
+| `scion-server/src/blame.rs` (`MAX_BLAME_DIFF_LINES`) | One call diffs about 1M lines. A diff of many repeated lines grows faster than its lines, so one diff of two 1 MiB files is the worst case of a call. | Blame from derived data, so a call does not diff whole versions. | [#62](https://github.com/bnsd55/open-scion/issues/62) |
+| `scion-server/src/blame.rs` (`blame`) | Renames are not followed: after a rename every line goes to the rename. `git blame` follows it. | Rename detection, so the walk continues at the old path. | [#69](https://github.com/bnsd55/open-scion/issues/69) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_BYTES`) | A file over 1 MiB, or with a NUL byte, is refused. An older version like that counts as absent, so its lines go to the changeset that replaced it. | Blame from derived data, so a call does not diff whole versions, then a higher limit. | [#62](https://github.com/bnsd55/open-scion/issues/62) |
 | `scion-server/src/auth.rs` (`Auth`) | One static token, one principal. | A token-to-principal map, then per-path write rules. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/main.rs` (`serve`) | No TLS. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |

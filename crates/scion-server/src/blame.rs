@@ -28,6 +28,14 @@ pub const MAX_BLAME_BYTES: usize = 1 << 20;
 // Upgrade: blame as derived data, kept per file version.
 pub const MAX_BLAME_VERSIONS: usize = 100;
 
+/// Most lines one call diffs, counting both sides of each diff. A diff of
+/// many repeated lines can take seconds, so this bounds the time of a call.
+/// The first diff of a call always runs, so a call always makes progress.
+// SHORTCUT: the cost of a diff grows faster than its lines when lines
+// repeat, so one diff of two 1 MiB files is the worst case of a call.
+// Upgrade: blame from derived data, so a call does not diff whole versions.
+pub const MAX_BLAME_DIFF_LINES: usize = 1 << 20;
+
 /// Consecutive lines with the same source.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlameRange {
@@ -56,7 +64,8 @@ pub struct Blame {
 }
 
 /// Blames the file at `path` in `cs`. Diffs at most [`MAX_BLAME_VERSIONS`]
-/// versions and checks at most [`MAX_SCAN`] changesets.
+/// versions and about [`MAX_BLAME_DIFF_LINES`] lines, and checks at most
+/// [`MAX_SCAN`] changesets.
 ///
 /// # Errors
 ///
@@ -74,6 +83,7 @@ pub fn blame(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Res
     let mut authors = Vec::new();
     let mut next = Some(cs);
     let mut budget = MAX_SCAN;
+    let mut diffed = 0;
     for _ in 0..MAX_BLAME_VERSIONS {
         if lines.iter().all(|(source, _)| source.is_some()) {
             break;
@@ -94,12 +104,24 @@ pub fn blame(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Res
         }
         // The version before `id`. If nothing is there, or no text blame can
         // diff, `id` added every line.
+        // SHORTCUT: renames are not followed, so after a rename every line
+        // goes to the rename; git blame follows it. Upgrade: rename
+        // detection, so the walk continues at the old path.
         let older = match next {
             Some(parent) => text_at(store, repo, parent, path)?.ok(),
             None => None,
         };
         let kept = match &older {
-            Some((_, older_text)) => kept_lines(older_text, &text),
+            Some((_, older_text)) => {
+                let cost = byte_lines(older_text).count() + byte_lines(&text).count();
+                if diffed > 0 && diffed + cost > MAX_BLAME_DIFF_LINES {
+                    // Not diffed, so the next call starts at `id`.
+                    next = Some(id);
+                    break;
+                }
+                diffed += cost;
+                kept_lines(older_text, &text)
+            }
             None => vec![None; byte_lines(&text).count()],
         };
         let mut named = false;
@@ -169,8 +191,9 @@ fn text_at(
 }
 
 /// For each line of `new`: its line in `old` if the diff keeps it, `None` if
-/// `new` adds it. A Myers diff with git's indent heuristic, as `git blame`
-/// uses by default.
+/// `new` adds it. A Myers diff with an indent heuristic, as `git blame` uses
+/// by default. Where several minimal diffs exist, it can place a line
+/// differently from git.
 fn kept_lines(old: &[u8], new: &[u8]) -> Vec<Option<usize>> {
     let input = InternedInput::new(old, new);
     let mut diff = Diff::compute(Algorithm::Myers, &input);

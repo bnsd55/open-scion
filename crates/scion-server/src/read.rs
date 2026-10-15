@@ -108,12 +108,12 @@ pub struct LogPage {
 }
 
 /// Up to `limit` changesets, walking first parents from `cs`, newest first.
-/// Reads one [`log_page`] at a time, so it holds the database lock for at
-/// most [`MAX_SCAN`] changesets at once.
+/// For tests; the server reads one [`log_page`] per call.
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or changeset does not exist.
+#[cfg(test)]
 pub fn log(
     store: &Store,
     repo: &str,

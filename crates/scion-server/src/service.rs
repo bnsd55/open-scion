@@ -37,6 +37,10 @@ const LOG_BUDGET_BYTES: usize = MAX_MESSAGE_BYTES / 2;
 const MAX_BLOCKING: usize = 256;
 /// Most uploads in flight at once. Each buffers up to `MAX_OBJECT_BYTES`.
 const MAX_UPLOADS: usize = 16;
+/// Most `Blame` calls running at once. One call can diff for seconds, so
+/// blames never take more than this many of the `MAX_BLOCKING` permits that
+/// writes and lands share.
+const MAX_BLAMES: usize = 4;
 /// Longest a request may take before the server gives up on it.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -73,6 +77,8 @@ pub struct ScionService {
     /// Bounds buffered uploads, so their memory stays under
     /// `MAX_UPLOADS * MAX_OBJECT_BYTES`.
     uploads: Arc<Semaphore>,
+    /// Bounds blames running at once (`MAX_BLAMES`).
+    blames: Arc<Semaphore>,
 }
 
 impl ScionService {
@@ -81,6 +87,7 @@ impl ScionService {
             worker,
             lands: Arc::default(),
             uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
+            blames: Arc::new(Semaphore::new(MAX_BLAMES)),
         }
     }
 
@@ -414,9 +421,18 @@ impl Scion for ScionService {
         check_name("repo", &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_path(req.path)?;
+        // Taken before the worker permit, and held until the job ends, also
+        // when the client leaves first.
+        let slot = Arc::clone(&self.blames)
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("server is shutting down"))?;
         let blame = self
             .worker
-            .run(move |store| blame::blame(&store, &req.repo, id, &path))
+            .run(move |store| {
+                let _slot = slot;
+                blame::blame(&store, &req.repo, id, &path)
+            })
             .await?;
         let ranges = blame
             .ranges

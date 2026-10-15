@@ -166,8 +166,8 @@ message LogRequest {
 
 message LogResponse {
   repeated LogEntry entries = 1;
-  // Where the next call starts: the first changeset this call did not
-  // check. Empty when the history ends. A call checks a bounded number of
+  // Where the next call starts: the first changeset this reply does not
+  // cover. Empty when the history ends. A call checks a bounded number of
   // changesets, so a path log can return no entries and still set this.
   bytes next_changeset_id = 2;
 }
