@@ -41,3 +41,11 @@ release.
   name validation at the RPC boundary.
 - `docs/protocol-v1.md`: the contract of the `Scion` and `Objects` services,
   for independent clients, tiers and servers.
+- Query API: `MergeBase` (every best common ancestor, as
+  `git merge-base --all`), `IsAncestor`, and `Diff` (the paths whose file
+  differs between two changesets, optionally below a path). The graph walks
+  use generation numbers and stop at 10,000 changesets with
+  `RESOURCE_EXHAUSTED`. A `Diff` reply holds at most 1,000 paths and says
+  where to continue. `scn merge-base`, `scn is-ancestor` (exit 0 or 1) and
+  `scn diff`. Every `scn` error now exits 2, so it never reads as the "no"
+  of `scn is-ancestor`.

@@ -21,7 +21,7 @@ this file says so. Every other rule is this project's choice.
 
 | Service | Calls | Who answers |
 |---|---|---|
-| `Scion` | Writes (`PutBlob`, `CreateChangeset`, `Land`, `GetLand`) and path reads (`ResolveRef`, `GetChangeset`, `ReadFile`, `ListDir`, `Log`, `Blame`) | The server only |
+| `Scion` | Writes (`PutBlob`, `CreateChangeset`, `Land`, `GetLand`), path reads (`ResolveRef`, `GetChangeset`, `ReadFile`, `ListDir`, `Log`, `Blame`) and queries (`MergeBase`, `IsAncestor`, `Diff`) | The server only |
 | `Objects` | `ResolveRef`, `GetRootTree`, `GetObjects` | The server, or any cache tier (section 8) |
 
 Both services are on one address. Every read except `ResolveRef` and
@@ -75,7 +75,8 @@ request is `INVALID_ARGUMENT`. In a reply, an empty ID field means "none".
 **Paths.** A path is raw bytes and follows the path rules of
 [`format-v1.md`](format-v1.md). A path that breaks them is
 `INVALID_ARGUMENT`. Where a path is optional (`ListDirRequest.path`,
-`LogRequest.path`), empty means "none".
+`LogRequest.path`, `DiffRequest.path`, `DiffRequest.after`), empty means
+"none".
 
 **Visibility.** A repo sees only its own changesets. A changeset that the
 repo does not have is `NOT_FOUND`, the same as one that does not exist. Trees
@@ -105,6 +106,7 @@ contract. A client MUST NOT depend on its text.
 | `UNAUTHENTICATED` | The token is missing or wrong. | After the cause is fixed |
 | `ABORTED` | `Land` only: other writers kept moving the ref. The land stays `PENDING`. | Yes, with the same request key |
 | `OUT_OF_RANGE` | A message is larger than its limit. | After the cause is fixed |
+| `RESOURCE_EXHAUSTED` | `MergeBase` or `IsAncestor` only: the answer needs more work than one call may do. | No: the same request fails again |
 | `CANCELLED` | The server's 600 s limit or the client's `grpc-timeout` ran out. A client library can report its own deadline as `DEADLINE_EXCEEDED`. | Yes. A `Land` retry uses the same request key. |
 | `UNAVAILABLE` | The server cannot be reached or is shutting down. | Yes |
 | `INTERNAL` | A database, I/O or stored-data error, or a server bug. The message is `internal error`; the detail stays in the server log. | MAY |
@@ -159,7 +161,8 @@ can answer a request for an object. A client checks what it can by hash.
   derived data ([`format-v1.md`](format-v1.md)).
 - the computed answers of the `Scion` service: the content from `ReadFile`
   and the tree from `ListDir` (unless the client knows their IDs from
-  elsewhere), which changesets `Log` selects, `Blame`, and `Land` outcomes.
+  elsewhere), which changesets `Log` selects, `Blame`, `MergeBase`,
+  `IsAncestor`, which paths `Diff` lists, and `Land` outcomes.
 
 In v0.1 a client also trusts every tier on its path for the `ResolveRef` and
 `GetRootTree` answers that the tier passes on (section 8).
@@ -414,6 +417,95 @@ gets its lines.
 | `INVALID_ARGUMENT` | A bad or empty path; the file is not a regular file, is larger than 1 MiB, or holds a NUL byte. |
 | `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
 
+### 6.11 MergeBase
+
+`rpc MergeBase(MergeBaseRequest) returns (MergeBaseResponse)`. The best
+common ancestors of `a_changeset_id` and `b_changeset_id`. The article lists
+finding merge bases among the server's APIs, so that tools need no local
+repository.
+
+- Ancestry follows every parent, not only first parents. A changeset is its
+  own ancestor.
+- A common ancestor is an ancestor of both changesets. A best common
+  ancestor is a common ancestor that is not an ancestor of another common
+  ancestor. This is the set that `git merge-base --all` prints.
+- `changeset_ids` holds each best common ancestor once: highest generation
+  first, then by ID bytes, lowest first. The generation of a changeset is 1
+  for a root, else 1 + the highest generation of its parents.
+- Usually there is one. After criss-cross merges there can be several, and
+  the client chooses which to use. The order is fixed, so the first is a
+  stable choice.
+- If one changeset is an ancestor of the other, the answer is that one.
+  `changeset_ids` is empty when the two histories share no changeset.
+
+**Bound.** The server walks from both changesets, highest generation first,
+and reads the parents of at most 10,000 changesets. It stops early once no
+other best common ancestor can follow. If the answer needs more, the call
+fails with `RESOURCE_EXHAUSTED`. There is no resume.
+
+| Error | When |
+|---|---|
+| `INVALID_ARGUMENT` | A bad repo name or ID. |
+| `NOT_FOUND` | The repo or a changeset does not exist. |
+| `RESOURCE_EXHAUSTED` | The walk passed its bound. |
+
+### 6.12 IsAncestor
+
+`rpc IsAncestor(IsAncestorRequest) returns (IsAncestorResponse)`.
+`is_ancestor` is true when `ancestor_id` is `descendant_id`, or is reached
+from it through parents. Ancestry follows every parent, as in `MergeBase`.
+
+**Bound.** The server reads the parents of at most 10,000 changesets, and
+never goes below the generation of `ancestor_id`. So when the two differ
+and `ancestor_id`'s generation is not lower, the answer is false without a
+walk. If the answer
+needs more, the call fails with `RESOURCE_EXHAUSTED`.
+
+| Error | When |
+|---|---|
+| `INVALID_ARGUMENT` | A bad repo name or ID. |
+| `NOT_FOUND` | The repo or a changeset does not exist. |
+| `RESOURCE_EXHAUSTED` | The walk passed its bound. |
+
+### 6.13 Diff
+
+`rpc Diff(DiffRequest) returns (DiffResponse)`. The paths whose file differs
+between the snapshots of `old_changeset_id` and `new_changeset_id`. The
+article says the server computes diffs, for example between a commit and its
+merge base for a CI job.
+
+- A file is anything at a path that is not a directory: a regular file, a
+  symlink or a gitlink. A path differs when its `FileState` differs: kind,
+  ID or executable flag. Content is compared by ID; there is no line diff.
+  Renames are not detected: a rename is a delete and an add.
+- Each `DiffEntry` has the `path`, the file there in the old changeset
+  (`old`) and in the new one (`new`). An unset side means no file is there:
+  nothing, or a directory. The two sides always differ.
+- A `FileState` has a `kind` (`REGULAR`, `SYMLINK` or `GITLINK`) and an
+  `id`: the 32-byte blob ID of a regular file's content or of a symlink's
+  target, or the gitlink's git commit ID (20 bytes for SHA-1, 32 for
+  SHA-256). `executable` is set only for a regular file.
+- Entries are in tree order: paths compare part by part, and parts by raw
+  bytes. So `a/b` comes before `a.txt`. This is not git's order, nor the byte
+  order of whole paths. A path that is a file on one side and a directory on
+  the other gives one entry for the file, then one for each file below the
+  directory.
+- With `path`, only that file, or the files below that directory. A path
+  that exists on neither side gives an empty reply.
+- With `after`, only the entries after that path in tree order. It need not
+  be in the diff, nor below `path`.
+
+**Bound and resume.** A reply holds at most 1,000 entries. When more follow,
+`next_after` is the last path in `entries`, and the reply holds exactly
+1,000 entries. To continue, a client sends the same request with `after` set
+to `next_after`, until `next_after` is empty. Snapshots never change, so the
+pages together are the whole diff, each entry once.
+
+| Error | When |
+|---|---|
+| `INVALID_ARGUMENT` | A bad repo name, ID, `path` or `after`. |
+| `NOT_FOUND` | The repo or a changeset does not exist. |
+
 ## 7. The `Objects` service
 
 The article says the client never tells the server what it already has: it
@@ -538,8 +630,9 @@ A new version is a new package, `scion.v2`. A server MAY serve both.
 - Client changesets with no parent, several parents or a committer. Only git
   import makes them.
 - Text merge. Conflicts are path-level.
-- Merge base, ancestry and diff queries
-  ([#58](https://github.com/bnsd55/open-scion/issues/58)).
+- `MergeBase` and `IsAncestor` without a bound on the walk
+  ([#72](https://github.com/bnsd55/open-scion/issues/72)), and `Diff` with
+  rename detection ([#79](https://github.com/bnsd55/open-scion/issues/79)).
 - `Log` and `Blame` without per-call bounds
   ([#61](https://github.com/bnsd55/open-scion/issues/61)), and `Blame` that
   follows renames ([#69](https://github.com/bnsd55/open-scion/issues/69)).
