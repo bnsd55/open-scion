@@ -3,19 +3,26 @@
 //!
 //! A reply hands the parts of its objects ([`crate::object`]) to its client
 //! one at a time, through a one-slot channel. Before a reply reads an
-//! object's bytes, it takes the object's share of a byte budget: the bytes
-//! that the reply will hold for it. Each part carries its piece of that
-//! share, and frees it when the client takes the part. A reply sends the next
-//! object only while it has sent less than [`REPLY_BUDGET_BYTES`]. It ends
-//! when its client takes no part for [`STALL_TIMEOUT`], or when the budget
-//! has no room for the next object for [`BUSY_TIMEOUT`].
+//! object's bytes, it takes the object's share of a byte budget: all the
+//! memory that the reply holds for the object. The reply keeps the object,
+//! and its share, until it has handed the object's last part to the channel.
+//! Each part that goes into the channel is a buffer of its own, so a part
+//! that waits for a client that stopped reading never keeps the rest of its
+//! object in memory.
 //!
-//! A reply finds its first object before the call answers. If the budget has
-//! no room for it, the call fails with [`busy`]. So a reply always holds at
-//! least one object, and never ends `OK` with none. A reply that ends in the
-//! middle of an object ends with `DEADLINE_EXCEEDED`, as `ReadFile` does,
-//! never `OK`.
+//! A reply sends the next object only while it has sent less than
+//! [`REPLY_BUDGET_BYTES`]. It ends when its client takes no part for
+//! [`STALL_TIMEOUT`], or when the budget has no room for the next object for
+//! [`BUSY_TIMEOUT`]. A reply finds its first object before the call answers.
+//! If the budget has no room for it, the call fails with [`busy`]. So a reply
+//! always holds at least one object, and never ends `OK` with none. A reply
+//! that ends in the middle of an object ends with `DEADLINE_EXCEEDED`, as
+//! `ReadFile` does, never `OK`.
+//!
+//! Not counted in the budget: the part in a reply's channel and the part that
+//! HTTP/2 is sending, at most 1 MiB each.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -26,26 +33,26 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::Stream;
 use tonic::Status;
 
-use crate::object::MAX_ENCODED_BYTES;
+use crate::object::{Header, MAX_ENCODED_BYTES, UNPACK_BYTES};
 use crate::v1::ObjectPart;
-use crate::{MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES};
+use crate::{Bytes, CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES};
 
 /// A reply stops before the next object once it has sent this many encoded
 /// bytes, so it holds less than this plus one object. The client asks again
 /// for the rest, so one call stays short.
 pub const REPLY_BUDGET_BYTES: usize = MAX_MESSAGE_BYTES;
 
-/// The byte budget of one process: the most object bytes that all its
-/// replies together hold after a read and before their client takes them.
+/// The byte budget of one process: the most memory that all its replies
+/// together hold for their objects.
 pub const IN_FLIGHT_BYTES: usize = 4 * MAX_OBJECT_BYTES;
 
 /// A reply ends when its client takes no part for this long, so a client
 /// that stops reading does not hold the budget. (A request timeout covers
 /// only the start of a streamed reply.)
-// SHORTCUT: a stalled reply ends, but HTTP/2 keeps the one part (at most
-// 1 MiB) that it was sending until the connection closes, and the number of
-// stalled replies has no bound. Upgrade (issue #42): a response body timeout
-// that resets the stream.
+// SHORTCUT: a stalled reply ends, but its channel and HTTP/2 keep the part
+// each holds (at most 1 MiB each) until the connection closes, and the
+// number of stalled replies has no bound. Upgrade (issue #42): a response
+// body timeout that resets the stream.
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long a reply waits for room in the budget for its next object. For
@@ -55,27 +62,45 @@ pub const STALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// only busy.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
-// Any one object fits in the budget, even when a tier holds it both packed
-// and unpacked, and the budget counts in u32 permits.
-const _: () = assert!(MAX_ENCODED_BYTES + MAX_OBJECT_BYTES <= IN_FLIGHT_BYTES);
+// Any one object fits in the budget, even when a tier holds it packed and
+// unpacked with a decoder, and the budget counts in u32 permits.
+const _: () = assert!(MAX_ENCODED_BYTES + MAX_OBJECT_BYTES + UNPACK_BYTES <= IN_FLIGHT_BYTES);
 const _: () = assert!(IN_FLIGHT_BYTES <= u32::MAX as usize);
 
-/// An object for a reply: its parts, or why it cannot be sent, with its share
-/// of the budget.
-pub type Found = (Result<Vec<ObjectPart>, Status>, OwnedSemaphorePermit);
+/// The encoded bytes of an object for a reply.
+#[derive(Debug)]
+pub enum Body {
+    /// Chunks of [`CHUNK_BYTES`] (the last shorter), each a buffer of its
+    /// own, as [`crate::object::read_chunks`] makes them. Each goes out as a
+    /// part as it is.
+    Chunks(Vec<Bytes>),
+    /// One buffer. Each part is copied out of it as it goes, so a part never
+    /// keeps the whole buffer.
+    Whole(Bytes),
+}
 
-/// A part on its way to the client, with its piece of the budget.
+/// An object for a reply.
+#[derive(Debug)]
+pub struct Outgoing {
+    /// What its first part says.
+    pub header: Header,
+    /// Its encoded bytes.
+    pub body: Body,
+}
+
+/// An object for a reply, or why it cannot be sent, with its share of the
+/// budget.
+pub type Found = (Result<Outgoing, Status>, OwnedSemaphorePermit);
+
+/// A part on its way to the client.
 pub struct Sent {
     part: Result<ObjectPart, Status>,
-    /// Freed when the client takes the part.
-    _share: Option<OwnedSemaphorePermit>,
     /// Whether the part ends its object (or is an error).
     last: bool,
 }
 
-/// The `GetObjects` reply: the parts from the channel, minus the budget each
-/// held. If the channel closes in the middle of an object, the reply ends
-/// with `DEADLINE_EXCEEDED`.
+/// The `GetObjects` reply: the parts from the channel. If the channel closes
+/// in the middle of an object, the reply ends with `DEADLINE_EXCEEDED`.
 #[derive(Debug)]
 pub struct ObjectStream {
     rx: mpsc::Receiver<Sent>,
@@ -134,6 +159,19 @@ pub async fn take(
     tokio::time::timeout(wait, acquire).await.ok()?.ok()
 }
 
+/// Takes the share of `budget` for `bytes` bytes if it is free now.
+#[must_use]
+pub fn try_take(budget: &Arc<Semaphore>, bytes: usize) -> Option<OwnedSemaphorePermit> {
+    Arc::clone(budget).try_acquire_many_owned(share(bytes)).ok()
+}
+
+/// Gives back the part of `permit` above the share for `bytes` bytes, once
+/// the work that needed more memory is done.
+pub fn trim(permit: &mut OwnedSemaphorePermit, bytes: usize) {
+    let keep = share(bytes) as usize;
+    drop(permit.split(permit.num_permits().saturating_sub(keep)));
+}
+
 /// The status of a call whose first object found no room in the budget
 /// within [`BUSY_TIMEOUT`]. The client asks again later.
 #[must_use]
@@ -141,10 +179,65 @@ pub fn busy() -> Status {
     Status::resource_exhausted("busy: no memory for this reply; retry later")
 }
 
-/// Takes the share of `budget` for `bytes` bytes if it is free now.
-#[must_use]
-pub fn try_take(budget: &Arc<Semaphore>, bytes: usize) -> Option<OwnedSemaphorePermit> {
-    Arc::clone(budget).try_acquire_many_owned(share(bytes)).ok()
+/// The parts of an object, made one at a time as the reply sends them.
+struct Parts {
+    /// Until the first part is made.
+    header: Option<Header>,
+    rest: Rest,
+}
+
+/// The encoded bytes of an object that are not in a part yet.
+enum Rest {
+    Chunks(VecDeque<Bytes>),
+    Whole { buffer: Bytes, offset: usize },
+}
+
+impl Parts {
+    fn new(object: Outgoing) -> Self {
+        let rest = match object.body {
+            Body::Chunks(chunks) => Rest::Chunks(chunks.into()),
+            Body::Whole(buffer) => Rest::Whole { buffer, offset: 0 },
+        };
+        Self {
+            header: Some(object.header),
+            rest,
+        }
+    }
+
+    /// The next part, and whether it is the last. `None` after the last.
+    fn next(&mut self) -> Option<(ObjectPart, bool)> {
+        let header = self.header.take();
+        let (data, last) = match &mut self.rest {
+            Rest::Chunks(chunks) => match chunks.pop_front() {
+                Some(data) => (data, chunks.is_empty()),
+                None if header.is_some() => (Bytes::new(), true),
+                None => return None,
+            },
+            Rest::Whole { buffer, offset } => {
+                if *offset == buffer.len() && header.is_none() {
+                    return None;
+                }
+                let end = buffer.len().min(*offset + CHUNK_BYTES);
+                // A part that is the whole buffer goes as it is. Any other
+                // is copied out, so it does not keep the whole buffer.
+                let data = if *offset == 0 && end == buffer.len() {
+                    buffer.clone()
+                } else {
+                    Bytes::copy_from_slice(&buffer[*offset..end])
+                };
+                *offset = end;
+                (data, end == buffer.len())
+            }
+        };
+        let part = match header {
+            Some(header) => header.first_part(data),
+            None => ObjectPart {
+                data,
+                ..ObjectPart::default()
+            },
+        };
+        Some((part, last))
+    }
 }
 
 /// Sends `first`, which the caller found before the call answered, then one
@@ -168,33 +261,21 @@ pub async fn send_objects<K, F>(
     let mut next = Some(first);
     let mut sent = 0;
     while let Some((object, permit)) = next {
-        let parts = match object {
-            Ok(parts) => parts,
+        let mut parts = match object {
+            Ok(object) => Parts::new(object),
             Err(status) => {
                 let error = Sent {
                     part: Err(status),
-                    _share: Some(permit),
                     last: true,
                 };
                 tokio::time::timeout(stall, tx.send(error)).await.ok();
                 return;
             }
         };
-        let count = parts.len();
-        let mut rest = Some(permit);
-        for (i, part) in parts.into_iter().enumerate() {
+        while let Some((part, last)) = parts.next() {
             let len = part.data.len();
-            let last = i + 1 == count;
-            // Each part takes its piece of the share; the last one the rest.
-            let piece = if last {
-                rest.take()
-            } else {
-                rest.as_mut()
-                    .and_then(|rest| rest.split(len.min(rest.num_permits() - 1)))
-            };
             let part = Sent {
                 part: Ok(part),
-                _share: piece,
                 last,
             };
             match tokio::time::timeout(stall, tx.send(part)).await {
@@ -204,6 +285,8 @@ pub async fn send_objects<K, F>(
                 _ => return,
             }
         }
+        // The object's bytes are gone, and so is its share.
+        drop((parts, permit));
         if sent >= REPLY_BUDGET_BYTES {
             return;
         }
@@ -218,11 +301,11 @@ mod tests {
     use tonic::Code;
 
     use super::*;
-    use crate::object::{Header, chunks};
+    use crate::object::read_chunks;
     use crate::v1::{Encoding, ObjectKind};
 
-    /// The parts of a raw blob of `len` bytes.
-    fn parts(len: usize) -> Vec<ObjectPart> {
+    /// A raw blob of `len` bytes, in one buffer or in chunks.
+    fn blob(len: usize, whole: bool) -> Outgoing {
         let header = Header {
             kind: ObjectKind::Blob,
             id: [1; 32],
@@ -230,7 +313,13 @@ mod tests {
             encoded_size: len,
             size: len,
         };
-        header.parts(chunks(vec![9; len]))
+        let data = vec![9; len];
+        let body = if whole {
+            Body::Whole(Bytes::from(data))
+        } else {
+            Body::Chunks(read_chunks(&data[..], len).unwrap())
+        };
+        Outgoing { header, body }
     }
 
     /// Waits until `done` holds, at most 10 s.
@@ -243,48 +332,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_part_frees_its_piece_of_the_share_when_taken() {
-        let chunk = crate::CHUNK_BYTES;
+    async fn an_object_keeps_its_share_until_its_last_part_is_handed_on() {
+        let chunk = CHUNK_BYTES;
         let len = 3 * chunk + 10;
-        let budget = Arc::new(Semaphore::new(IN_FLIGHT_BYTES));
-        let permit = take(&budget, len, BUSY_TIMEOUT).await.unwrap();
-        let (tx, mut stream) = channel();
-        let first = (Ok(parts(len)), permit);
-        let stall = Duration::from_secs(10);
-        let reply = tokio::spawn(send_objects(first, [(); 0], tx, stall, |()| async { None }));
-        let held = || IN_FLIGHT_BYTES - budget.available_permits();
+        for whole in [true, false] {
+            let budget = Arc::new(Semaphore::new(IN_FLIGHT_BYTES));
+            let permit = take(&budget, len, BUSY_TIMEOUT).await.unwrap();
+            let (tx, mut stream) = channel();
+            let first = (Ok(blob(len, whole)), permit);
+            let stall = Duration::from_secs(10);
+            let reply = tokio::spawn(send_objects(first, [(); 0], tx, stall, |()| async { None }));
+            let held = || IN_FLIGHT_BYTES - budget.available_permits();
 
-        // The whole share is taken before the first part goes. Each part the
-        // client takes frees exactly its own bytes.
-        until(|| held() == len).await;
-        for left in [len - chunk, len - 2 * chunk, len - 3 * chunk, 0] {
-            stream.next().await.unwrap().unwrap();
-            until(|| held() == left).await;
+            // Each part is a buffer of its own. The share stays until the
+            // reply has handed on the last part: after the client took the
+            // third.
+            let mut got = Vec::new();
+            for _ in 0..2 {
+                got.push(stream.next().await.unwrap().unwrap());
+                assert_eq!(held(), len, "whole: {whole}");
+            }
+            got.push(stream.next().await.unwrap().unwrap());
+            until(|| held() == 0).await;
+            got.push(stream.next().await.unwrap().unwrap());
+            let lens: Vec<usize> = got.iter().map(|p| p.data.len()).collect();
+            assert_eq!(lens, [chunk, chunk, chunk, 10]);
+            assert_eq!(got[0].encoded_size, len as u64);
+            assert!(got[1..].iter().all(|p| p.encoded_size == 0));
+            assert!(stream.next().await.is_none());
+            reply.await.unwrap();
         }
-        assert!(stream.next().await.is_none());
-        reply.await.unwrap();
     }
 
     #[tokio::test]
     async fn a_client_that_stops_in_the_middle_of_an_object_gets_an_error_and_frees_the_budget() {
-        let len = 2 * crate::CHUNK_BYTES + 1;
+        let len = 2 * CHUNK_BYTES + 1;
         let budget = Arc::new(Semaphore::new(IN_FLIGHT_BYTES));
         let permit = take(&budget, len, BUSY_TIMEOUT).await.unwrap();
         let (tx, mut stream) = channel();
         let stall = Duration::from_millis(50);
-        let first = (Ok(parts(len)), permit);
+        let first = (Ok(blob(len, true)), permit);
         let reply = tokio::spawn(send_objects(first, [(); 0], tx, stall, |()| async { None }));
 
         // The client takes one part and stops. The second part waits in the
-        // channel, the third stalls, and the reply ends.
-        stream.next().await.unwrap().unwrap();
+        // channel, the third stalls, and the reply ends. Its object and its
+        // share go; the part in the channel is a copy of 1 MiB.
+        let first = stream.next().await.unwrap().unwrap();
         reply.await.unwrap();
-        let held = IN_FLIGHT_BYTES - budget.available_permits();
-        assert_eq!(held, crate::CHUNK_BYTES, "only the part in the channel");
-        stream.next().await.unwrap().unwrap();
+        assert_eq!(budget.available_permits(), IN_FLIGHT_BYTES);
+        let second = stream.next().await.unwrap().unwrap();
+        assert_eq!(second.data.len(), CHUNK_BYTES);
+        drop(first);
         let status = stream.next().await.unwrap().unwrap_err();
         assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
         assert!(stream.next().await.is_none());
-        assert_eq!(budget.available_permits(), IN_FLIGHT_BYTES);
+    }
+
+    #[test]
+    fn trim_gives_back_the_share_above_what_stays() {
+        let budget = Arc::new(Semaphore::new(100));
+        let mut permit = try_take(&budget, 60).unwrap();
+        trim(&mut permit, 20);
+        assert_eq!(budget.available_permits(), 80);
+        trim(&mut permit, 0);
+        assert_eq!(budget.available_permits(), 99);
     }
 }

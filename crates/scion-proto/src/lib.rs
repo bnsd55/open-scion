@@ -8,6 +8,10 @@ pub mod check;
 pub mod object;
 pub mod reply;
 
+/// The buffer type of `ObjectPart.data`: parts of one object are slices of one
+/// buffer.
+pub use prost::bytes::Bytes;
+
 /// Largest single gRPC message either side sends or accepts. A message of an
 /// `Objects` reply is smaller (see [`MAX_PART_MESSAGE_BYTES`]).
 pub const MAX_MESSAGE_BYTES: usize = 64 << 20;

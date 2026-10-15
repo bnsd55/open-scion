@@ -10,13 +10,15 @@ use std::time::Duration;
 
 use scion_core::{BlobId, TreeId};
 use scion_proto::object::{self, Header, zstd_bound};
-use scion_proto::reply::{self, BUSY_TIMEOUT, Found, IN_FLIGHT_BYTES, ObjectStream, STALL_TIMEOUT};
+use scion_proto::reply::{
+    self, BUSY_TIMEOUT, Body, Found, IN_FLIGHT_BYTES, ObjectStream, Outgoing, STALL_TIMEOUT,
+};
 use scion_proto::v1::objects_server::{Objects, ObjectsServer};
 use scion_proto::v1::{
-    Encoding, GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, ObjectKind, ObjectPart,
-    ObjectRef, ResolveRefRequest, ResolveRefResponse,
+    Encoding, GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, ObjectKind, ObjectRef,
+    ResolveRefRequest, ResolveRefResponse,
 };
-use scion_proto::{MAX_MESSAGE_BYTES, MAX_PART_MESSAGE_BYTES};
+use scion_proto::{Bytes, CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_PART_MESSAGE_BYTES};
 use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 
@@ -43,6 +45,17 @@ struct Plan {
     encoded: usize,
     /// The size of the object's bytes.
     size: usize,
+}
+
+impl Plan {
+    /// The most memory that reading the object holds: its bytes, and the
+    /// decoder of a blob that goes out unpacked.
+    fn read_bytes(&self, key: Key) -> usize {
+        match (key, self.encoding) {
+            (Key::Blob(_), Encoding::Raw) => self.encoded + store::READER_BYTES,
+            _ => self.encoded,
+        }
+    }
 }
 
 /// Implements the `Objects` RPCs.
@@ -77,9 +90,9 @@ fn parse_ref(object: &ObjectRef) -> Result<Key, Status> {
     }
 }
 
-/// Reads an object's parts, as planned. [`read_object`], except in tests
-/// that count reads.
-type Read = fn(&Store, Key, Plan) -> Result<Vec<ObjectPart>>;
+/// Reads an object, as planned. [`read_object`], except in tests that count
+/// reads.
+type Read = fn(&Store, Key, Plan) -> Result<Outgoing>;
 
 /// How `key` goes out, without reading its bytes. A blob goes out as its
 /// stored zstd file if the client accepts `zstd`.
@@ -118,18 +131,23 @@ fn plan(store: &Store, key: Key, zstd: bool) -> Result<Plan> {
     }
 }
 
-/// Reads one object's parts, as planned. A tree and a RAW blob are checked
-/// against their IDs on the way out of the store. A ZSTD blob is its stored
-/// file, read in parts and not unpacked: the receiver checks it.
-fn read_object(store: &Store, key: Key, plan: Plan) -> Result<Vec<ObjectPart>> {
+/// Reads one object, as planned. A tree and a RAW blob are checked against
+/// their IDs on the way out of the store. A ZSTD blob is its stored file,
+/// read in chunks and not unpacked: the receiver checks it. A RAW blob is
+/// unpacked in chunks, so it is never in memory twice.
+fn read_object(store: &Store, key: Key, plan: Plan) -> Result<Outgoing> {
     // SHORTCUT: an object ID is treated as permission to read the object, and
     // trees and blobs are shared by all repos. Safe with one principal.
     // Upgrade (issue #13): a read ticket bound to a principal, a repo and a
     // root tree, checked here and by every cache tier.
-    let (kind, id, chunks) = match key {
+    let (kind, id, body) = match key {
         Key::Tree(id) => {
             let data = store.read(|c| db::get_tree_body(c, id))?;
-            (ObjectKind::Tree, *id.as_bytes(), object::chunks(data))
+            (
+                ObjectKind::Tree,
+                *id.as_bytes(),
+                Body::Whole(Bytes::from(data)),
+            )
         }
         Key::Blob(id) if plan.encoding == Encoding::Zstd => {
             let file = store.blobs().open_file(id)?;
@@ -137,14 +155,23 @@ fn read_object(store: &Store, key: Key, plan: Plan) -> Result<Vec<ObjectPart>> {
                 return Err(Error::Corrupt(format!("blob {id}: its file changed size")));
             }
             let chunks = object::read_chunks(file, plan.encoded)?;
-            (ObjectKind::Blob, *id.as_bytes(), chunks)
+            (ObjectKind::Blob, *id.as_bytes(), Body::Chunks(chunks))
         }
         Key::Blob(id) => {
-            let data = store.blobs().get(id)?;
-            (ObjectKind::Blob, *id.as_bytes(), object::chunks(data))
+            // The last chunk comes only once the whole content matched the
+            // ID.
+            let mut reader = store.blobs().reader(id)?;
+            let mut chunks = Vec::new();
+            while let Some(chunk) = reader.read_part(CHUNK_BYTES)? {
+                chunks.push(Bytes::from(chunk));
+            }
+            (ObjectKind::Blob, *id.as_bytes(), Body::Chunks(chunks))
         }
     };
-    let read: usize = chunks.iter().map(Vec::len).sum();
+    let read = match &body {
+        Body::Whole(data) => data.len(),
+        Body::Chunks(chunks) => chunks.iter().map(Bytes::len).sum(),
+    };
     if read != plan.encoded {
         return Err(Error::Corrupt(format!(
             "{key:?}: {read} bytes, but its stored size is {}",
@@ -158,7 +185,7 @@ fn read_object(store: &Store, key: Key, plan: Plan) -> Result<Vec<ObjectPart>> {
         encoded_size: plan.encoded,
         size: plan.size,
     };
-    Ok(header.parts(chunks))
+    Ok(Outgoing { header, body })
 }
 
 /// How long a reply waits: for room in the budget, and for its client.
@@ -203,8 +230,9 @@ async fn start_reply(
 }
 
 /// Finds one object for a reply: plans how it goes out, takes the share of
-/// `in_flight` for the bytes it sends, and only then reads them. `None` if
-/// the share is not free within `busy`.
+/// `in_flight` for the memory that reading it holds, and only then reads it.
+/// Then keeps only the share of the bytes it sends. `None` if the share is
+/// not free within `busy`.
 // SHORTCUT: two blocking hops per object and no read-ahead, so many small
 // objects are read one after another. Upgrade: read a batch capped by bytes
 // per hop, or keep a few reads in flight (issue #6).
@@ -217,13 +245,17 @@ async fn find(
     key: Key,
 ) -> Option<Found> {
     let plan = worker.run(move |store| plan(&store, key, zstd)).await;
-    let bytes = plan.as_ref().map_or(1, |plan| plan.encoded);
-    let permit = reply::take(in_flight, bytes, busy).await?;
-    let parts = match plan {
-        Ok(plan) => worker.run(move |store| read(&store, key, plan)).await,
+    let bytes = plan.as_ref().map_or(1, |plan| plan.read_bytes(key));
+    let mut permit = reply::take(in_flight, bytes, busy).await?;
+    let object = match plan {
+        Ok(plan) => {
+            let object = worker.run(move |store| read(&store, key, plan)).await;
+            reply::trim(&mut permit, plan.encoded);
+            object
+        }
         Err(status) => Err(status),
     };
-    Some((parts, permit))
+    Some((object, permit))
 }
 
 #[tonic::async_trait]
@@ -310,6 +342,21 @@ mod tests {
         }
     }
 
+    /// The length of a blob's stored file.
+    fn packed_len(store: &Store, key: Key) -> usize {
+        let Key::Blob(id) = key else {
+            panic!("not a blob")
+        };
+        let len = store
+            .blobs()
+            .open_file(id)
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .len();
+        usize::try_from(len).unwrap()
+    }
+
     #[tokio::test]
     async fn a_client_that_stops_reading_is_cut_off_and_frees_its_budget() {
         let dir = tempfile::tempdir().unwrap();
@@ -318,6 +365,7 @@ mod tests {
             .iter()
             .map(|data| Key::Blob(store.blobs().put(data).unwrap()))
             .collect();
+        let second = packed_len(&store, keys[1]);
         let budget = 1000;
         let in_flight = Arc::new(Semaphore::new(budget));
         let stall = Duration::from_millis(50);
@@ -327,58 +375,92 @@ mod tests {
             Arc::clone(&in_flight),
             waits(stall),
             read_object,
-            false,
+            true,
         );
         let mut stream = reply.await.unwrap();
 
-        // Nobody reads: the first object waits in the channel. The second
-        // takes its share, its send stalls, and the reply ends.
-        until(|| in_flight.available_permits() == budget - 6).await;
-        until(|| in_flight.available_permits() == budget - 3).await;
-        assert_eq!(stream.next().await.unwrap().unwrap().data, b"one");
+        // Nobody reads: the first object waits in the channel, and its share
+        // is back. The second holds its share while its send stalls, then
+        // the reply ends and gives it back.
+        until(|| in_flight.available_permits() == budget - second).await;
+        until(|| in_flight.available_permits() == budget).await;
+        let first = stream.next().await.unwrap().unwrap();
+        let (header, data) = Assembler::new(Header::of(&first, true).unwrap(), first).finish();
+        assert_eq!(object::decode(&header, data).unwrap(), b"one");
         assert!(stream.next().await.is_none(), "the reply ended");
-        assert_eq!(in_flight.available_permits(), budget);
     }
 
     #[tokio::test]
     async fn a_call_with_no_budget_for_its_first_object_fails_and_reads_nothing() {
         static READS: AtomicUsize = AtomicUsize::new(0);
-        fn counted(store: &Store, key: Key, plan: Plan) -> Result<Vec<ObjectPart>> {
+        fn counted(store: &Store, key: Key, plan: Plan) -> Result<Outgoing> {
             READS.fetch_add(1, Ordering::SeqCst);
             read_object(store, key, plan)
         }
 
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let size = 1000;
-        let a = Key::Blob(store.blobs().put(&vec![b'a'; size]).unwrap());
-        let b = Key::Blob(store.blobs().put(&vec![b'b'; size]).unwrap());
-        // Room for one object, not two.
-        let budget = size + size / 2;
+        let a = Key::Blob(store.blobs().put(b"a blob").unwrap());
+        let budget = 1000;
         let in_flight = Arc::new(Semaphore::new(budget));
         let worker = Worker::new(store);
         let wait = waits(Duration::from_millis(100));
-        let reply = |keys| {
+        let reply = || {
             let reply = start_reply(
                 worker.clone(),
-                keys,
+                vec![a],
                 Arc::clone(&in_flight),
                 wait,
                 counted,
-                false,
+                true,
             );
             tokio::time::timeout(Duration::from_secs(10), reply)
         };
 
-        // A call whose client never reads keeps `a` and its share. The next
-        // call gets no budget within the busy limit: it fails, and never
-        // ends `OK` with no object.
-        let held = reply(vec![a]).await.unwrap().unwrap();
-        let status = reply(vec![b]).await.unwrap().unwrap_err();
+        // Other replies hold the whole budget. The call gets no room within
+        // the busy limit: it fails, reads nothing, and never ends `OK` with
+        // no object.
+        let others = reply::try_take(&in_flight, budget).unwrap();
+        let status = reply().await.unwrap().unwrap_err();
         assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
-        assert_eq!(READS.load(Ordering::SeqCst), 1, "`b` was never read");
-        drop(held);
-        until(|| in_flight.available_permits() == budget).await;
+        assert_eq!(READS.load(Ordering::SeqCst), 0, "nothing was read");
+        drop(others);
+        reply().await.unwrap().unwrap();
+        assert_eq!(READS.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reading_a_blob_to_unpack_it_takes_the_decoder_too() {
+        static HELD: AtomicUsize = AtomicUsize::new(0);
+        static BUDGET: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+        fn watched(store: &Store, key: Key, plan: Plan) -> Result<Outgoing> {
+            let free = BUDGET.get().unwrap().available_permits();
+            HELD.store(IN_FLIGHT_BYTES - free, Ordering::SeqCst);
+            read_object(store, key, plan)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let content = vec![b'x'; 5000];
+        let key = Key::Blob(store.blobs().put(&content).unwrap());
+        let in_flight =
+            Arc::clone(BUDGET.get_or_init(|| Arc::new(Semaphore::new(IN_FLIGHT_BYTES))));
+        let reply = start_reply(
+            Worker::new(store),
+            vec![key],
+            Arc::clone(&in_flight),
+            WAITS,
+            watched,
+            false,
+        );
+        let objects = collect(reply.await.unwrap(), false).await;
+        assert_eq!(objects[0].1, content);
+        // While it read, the reply held the content and the decoder.
+        assert_eq!(
+            HELD.load(Ordering::SeqCst),
+            content.len() + store::READER_BYTES
+        );
+        assert_eq!(in_flight.available_permits(), IN_FLIGHT_BYTES);
     }
 
     /// Every part of a reply, as a whole object: its header and bytes.

@@ -3,14 +3,17 @@
 //!
 //! The first part carries a [`Header`]: the object's kind and ID, its
 //! encoding, all its encoded bytes and its size. So a receiver knows how much
-//! memory the object takes before the rest arrives. Every part but the last
-//! holds exactly [`CHUNK_BYTES`]. A sender builds the parts with
+//! memory the object takes before the rest arrives. A part holds 1 to
+//! [`CHUNK_BYTES`] bytes (an empty object is one empty part), and the parts
+//! add up to the encoded size. A sender builds the parts with
 //! [`Header::parts`]. A receiver checks the header with [`Header::of`],
-//! collects the parts with [`Assembler`], unpacks with [`decode`] within the
-//! object limit, and then checks the bytes against the ID itself.
+//! collects the parts with [`Assembler`], unpacks with [`decode`] or
+//! [`unpacker`] within the object limit, and then checks the bytes against
+//! the ID itself.
 
 use std::io::{self, Read};
 
+use crate::Bytes;
 use crate::v1::{Encoding, ObjectKind, ObjectPart};
 use crate::{CHUNK_BYTES, MAX_OBJECT_BYTES};
 
@@ -29,6 +32,20 @@ pub const fn zstd_bound(size: usize) -> usize {
 
 /// Largest encoded object: a zstd frame of an object of [`MAX_OBJECT_BYTES`].
 pub const MAX_ENCODED_BYTES: usize = zstd_bound(MAX_OBJECT_BYTES);
+
+/// The magic number of a Zstandard frame (RFC 8878), as it is on the wire.
+/// Skippable frames and the legacy formats have other numbers.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Largest window of a zstd frame that a receiver accepts: 8 MiB, the window
+/// that RFC 8878 asks every decoder to support. libzstd stays within it at
+/// every level up to 19.
+pub const MAX_WINDOW_BYTES: usize = 1 << MAX_WINDOW_LOG;
+const MAX_WINDOW_LOG: u32 = 23;
+
+/// Most memory that [`unpacker`] holds besides the bytes it returns: the
+/// window, a block, and the decoder's tables.
+pub const UNPACK_BYTES: usize = MAX_WINDOW_BYTES + (1 << 20);
 
 /// What the first part of an object says about it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,7 +71,7 @@ impl Header {
     /// Why the part cannot start an object: no kind, an ID that is not 32
     /// bytes, an encoding that the request did not accept, a size above
     /// [`MAX_OBJECT_BYTES`], an encoded size that does not fit the size, or
-    /// a part of the wrong length.
+    /// a part of a length that [`Assembler::push`] refuses.
     pub fn of(first: &ObjectPart, zstd: bool) -> Result<Self, String> {
         let Ok(kind @ (ObjectKind::Tree | ObjectKind::Blob)) = ObjectKind::try_from(first.kind)
         else {
@@ -98,73 +115,80 @@ impl Header {
         Ok(header)
     }
 
-    /// How many encoded bytes the part that starts at `offset` holds.
-    fn part_len(&self, offset: usize) -> usize {
-        (self.encoded_size - offset).min(CHUNK_BYTES)
-    }
-
+    /// Checks the length of a part that starts at `offset`: 1 to
+    /// [`CHUNK_BYTES`], and not past the encoded size. Only the one part of
+    /// an empty object is empty.
     fn check_part(&self, offset: usize, len: usize) -> Result<(), String> {
-        let due = self.part_len(offset);
-        if len != due {
-            return Err(format!("a part of {len} bytes where {due} were due"));
+        let left = self.encoded_size - offset;
+        if len > CHUNK_BYTES || len > left || (len == 0 && left > 0) {
+            return Err(format!(
+                "a part of {len} bytes, with {left} of {} bytes left",
+                self.encoded_size
+            ));
         }
         Ok(())
     }
 
-    /// The parts of this object, from its encoded bytes in `chunks`: every
-    /// chunk but the last of exactly [`CHUNK_BYTES`], as [`chunks`] and
-    /// [`read_chunks`] make them.
+    /// The parts of this object, from its encoded bytes in `chunks` of 1 to
+    /// [`CHUNK_BYTES`] bytes, as [`chunks`] and [`read_chunks`] make them.
     #[must_use]
-    pub fn parts(&self, chunks: Vec<Vec<u8>>) -> Vec<ObjectPart> {
+    pub fn parts(&self, chunks: Vec<Bytes>) -> Vec<ObjectPart> {
         debug_assert_eq!(
-            chunks.iter().map(Vec::len).sum::<usize>(),
+            chunks.iter().map(Bytes::len).sum::<usize>(),
             self.encoded_size
         );
-        let mut parts: Vec<ObjectPart> = chunks
-            .into_iter()
-            .map(|data| ObjectPart {
-                data,
-                ..ObjectPart::default()
-            })
-            .collect();
-        if parts.is_empty() {
-            parts.push(ObjectPart::default());
+        let mut chunks = chunks.into_iter();
+        let first = self.first_part(chunks.next().unwrap_or_default());
+        let later = chunks.map(|data| ObjectPart {
+            data,
+            ..ObjectPart::default()
+        });
+        std::iter::once(first).chain(later).collect()
+    }
+
+    /// The first part of this object, with `data`.
+    #[must_use]
+    pub fn first_part(&self, data: Bytes) -> ObjectPart {
+        ObjectPart {
+            kind: self.kind.into(),
+            id: self.id.to_vec(),
+            data,
+            encoding: self.encoding.into(),
+            encoded_size: self.encoded_size as u64,
+            size: self.size as u64,
         }
-        let first = &mut parts[0];
-        first.kind = self.kind.into();
-        first.id = self.id.to_vec();
-        first.encoding = self.encoding.into();
-        first.encoded_size = self.encoded_size as u64;
-        first.size = self.size as u64;
-        parts
     }
 }
 
-/// Cuts `data` into chunks of [`CHUNK_BYTES`], the last one shorter. Data
-/// that fits one chunk is not copied.
+/// Cuts `data` into chunks of [`CHUNK_BYTES`], the last one shorter. The
+/// chunks are slices of `data`, not copies, so `data` stays in memory until
+/// the last of them is dropped.
 #[must_use]
-pub fn chunks(data: Vec<u8>) -> Vec<Vec<u8>> {
-    if data.len() <= CHUNK_BYTES {
+pub fn chunks(data: Bytes) -> Vec<Bytes> {
+    if data.is_empty() {
         return vec![data];
     }
-    data.chunks(CHUNK_BYTES).map(<[u8]>::to_vec).collect()
+    (0..data.len())
+        .step_by(CHUNK_BYTES)
+        .map(|start| data.slice(start..data.len().min(start + CHUNK_BYTES)))
+        .collect()
 }
 
 /// Reads exactly `len` bytes from `reader` in chunks of [`CHUNK_BYTES`], the
-/// last one shorter, so they are never all in one buffer.
+/// last one shorter, each in its own buffer.
 ///
 /// # Errors
 ///
 /// [`io::ErrorKind::UnexpectedEof`] if `reader` ends before `len` bytes, or
 /// a read error.
-pub fn read_chunks(mut reader: impl Read, len: usize) -> io::Result<Vec<Vec<u8>>> {
+pub fn read_chunks(mut reader: impl Read, len: usize) -> io::Result<Vec<Bytes>> {
     let mut chunks = Vec::with_capacity(len.div_ceil(CHUNK_BYTES).max(1));
     let mut left = len;
     loop {
         let mut chunk = vec![0; left.min(CHUNK_BYTES)];
         reader.read_exact(&mut chunk)?;
         left -= chunk.len();
-        chunks.push(chunk);
+        chunks.push(Bytes::from(chunk));
         if left == 0 {
             return Ok(chunks);
         }
@@ -184,8 +208,8 @@ impl Assembler {
     /// that memory first.
     #[must_use]
     pub fn new(header: Header, first: ObjectPart) -> Self {
-        let mut data = first.data;
-        data.reserve_exact(header.encoded_size - data.len());
+        let mut data = Vec::with_capacity(header.encoded_size);
+        data.extend_from_slice(&first.data);
         Self { header, data }
     }
 
@@ -206,7 +230,9 @@ impl Assembler {
     /// # Errors
     ///
     /// Why it is not the next part: the object is done, the part sets a
-    /// field other than `data`, or it has the wrong length.
+    /// field of the first part (`kind`, `id`, `encoding`, `encoded_size` or
+    /// `size`), or its length is not 1 to [`CHUNK_BYTES`] within the encoded
+    /// size.
     pub fn push(&mut self, part: &ObjectPart) -> Result<(), String> {
         if self.is_done() {
             return Err("a part after the last part of an object".into());
@@ -220,7 +246,7 @@ impl Assembler {
             size,
         } = part;
         if *kind != 0 || !id.is_empty() || *encoding != 0 || *encoded_size != 0 || *size != 0 {
-            return Err("a part after the first sets more than data".into());
+            return Err("a part after the first sets a field of the first part".into());
         }
         self.header.check_part(self.data.len(), data.len())?;
         self.data.extend_from_slice(data);
@@ -249,14 +275,20 @@ pub fn decode(header: &Header, data: Vec<u8>) -> Result<Vec<u8>, String> {
     }
 }
 
-/// The size in the header of `frame`, which must be exactly one zstd frame
-/// with its size in its header, at most [`MAX_OBJECT_BYTES`]. Reads only the
-/// frame's headers, not its content.
+/// The size in the header of `frame`, which must be exactly one Zstandard
+/// frame (RFC 8878): the frame magic number, so not a skippable frame or a
+/// legacy format; no dictionary ID; a window of at most
+/// [`MAX_WINDOW_BYTES`]; its size in its header, at most
+/// [`MAX_OBJECT_BYTES`]; and no bytes after it. Reads only the frame's
+/// headers, not its content.
 ///
 /// # Errors
 ///
 /// Why `frame` is not one such frame.
 pub fn frame_size(frame: &[u8]) -> Result<usize, String> {
+    if !frame.starts_with(&ZSTD_MAGIC) {
+        return Err("not a Zstandard frame".into());
+    }
     let size = match zstd::zstd_safe::get_frame_content_size(frame) {
         Ok(Some(size)) => size,
         Ok(None) => return Err("the zstd frame header gives no size".into()),
@@ -266,6 +298,22 @@ pub fn frame_size(frame: &[u8]) -> Result<usize, String> {
         .ok()
         .filter(|&size| size <= MAX_OBJECT_BYTES)
         .ok_or_else(|| "the zstd frame header gives a size above the object limit".to_owned())?;
+    // The header is whole, so its descriptor and window byte are there.
+    let descriptor = frame[4];
+    if descriptor & 0b11 != 0 {
+        return Err("the zstd frame names a dictionary".into());
+    }
+    // A single-segment frame has no window byte: its window is its size.
+    let window = if descriptor & 0b10_0000 == 0 {
+        let byte = frame[5];
+        let base = 1_u64 << (10 + u32::from(byte >> 3));
+        base + base / 8 * u64::from(byte & 0b111)
+    } else {
+        size as u64
+    };
+    if window > MAX_WINDOW_BYTES as u64 {
+        return Err(format!("the zstd window of {window} bytes is above 8 MiB"));
+    }
     match zstd::zstd_safe::find_frame_compressed_size(frame) {
         Ok(len) if len == frame.len() => Ok(size),
         Ok(_) => Err("bytes follow the zstd frame".into()),
@@ -294,6 +342,19 @@ pub fn unpack(frame: &[u8], size: usize) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
+/// Unpacks a frame that passed [`frame_size`] as a stream, holding at most
+/// [`UNPACK_BYTES`] besides what the caller reads. The caller reads at most
+/// the frame's size.
+///
+/// # Errors
+///
+/// If the decoder cannot start.
+pub fn unpacker(frame: &[u8]) -> io::Result<impl Read + '_> {
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(frame)?;
+    decoder.window_log_max(MAX_WINDOW_LOG)?;
+    Ok(decoder)
+}
+
 /// Packs `data` into one zstd frame with its size in the header, as the
 /// server stores blobs.
 ///
@@ -318,9 +379,9 @@ mod tests {
         }
     }
 
-    /// The parts of `data`, then the object they make again.
-    fn round_trip(header: &Header, data: &[u8]) -> Result<(Header, Vec<u8>), String> {
-        let mut parts = header.parts(chunks(data.to_vec())).into_iter();
+    /// `parts`, then the object they make again.
+    fn assemble(parts: Vec<ObjectPart>) -> Result<(Header, Vec<u8>), String> {
+        let mut parts = parts.into_iter();
         let first = parts.next().unwrap();
         let mut object = Assembler::new(Header::of(&first, true)?, first);
         for part in parts {
@@ -350,27 +411,32 @@ mod tests {
     }
 
     #[test]
-    fn an_object_goes_in_parts_of_exactly_one_chunk_but_the_last() {
+    fn an_object_goes_in_parts_of_one_chunk_but_the_last() {
         for len in [0, 1, CHUNK_BYTES, CHUNK_BYTES + 1, 3 * CHUNK_BYTES + 5] {
             let data: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect();
             let header = header(Encoding::Raw, len, len);
-            let parts = header.parts(chunks(data.clone()));
+            let parts = header.parts(chunks(Bytes::from(data.clone())));
             assert_eq!(parts.len(), len.div_ceil(CHUNK_BYTES).max(1), "{len}");
             assert!(parts.iter().all(|p| p.data.len() <= CHUNK_BYTES));
-            assert_eq!(round_trip(&header, &data).unwrap(), (header, data));
-            let read = read_chunks(&parts_bytes(&parts)[..], len).unwrap();
-            assert_eq!(read, chunks(parts_bytes(&parts)), "{len}");
+            assert_eq!(assemble(parts).unwrap(), (header, data.clone()));
+            let read = read_chunks(&data[..], len).unwrap();
+            assert_eq!(read, chunks(Bytes::from(data)), "{len}");
         }
     }
 
-    fn parts_bytes(parts: &[ObjectPart]) -> Vec<u8> {
-        parts.iter().flat_map(|p| p.data.clone()).collect()
+    #[test]
+    fn parts_may_be_shorter_than_a_chunk() {
+        // One byte at a time: any length from 1 to a chunk is a part.
+        let data = b"abc".to_vec();
+        let header = header(Encoding::Raw, 3, 3);
+        let bytes: Vec<Bytes> = data.iter().map(|&b| Bytes::from(vec![b])).collect();
+        assert_eq!(assemble(header.parts(bytes)).unwrap(), (header, data));
     }
 
     #[test]
     fn a_header_out_of_the_limits_is_refused() {
         let ok = header(Encoding::Raw, 3, 3)
-            .parts(vec![b"abc".to_vec()])
+            .parts(vec![Bytes::from_static(b"abc")])
             .remove(0);
         assert!(Header::of(&ok, false).is_ok());
         let bad = |change: fn(&mut ObjectPart)| {
@@ -384,8 +450,8 @@ mod tests {
         });
         bad(|p| p.encoding = Encoding::Zstd.into());
         bad(|p| p.encoding = 7);
-        bad(|p| p.encoded_size = 4);
-        bad(|p| p.data.push(b'd'));
+        bad(|p| p.encoded_size = 2);
+        bad(|p| p.data = Bytes::from_static(b"abcd"));
         // ZSTD, if asked for: a size over the limit, or more encoded bytes
         // than a frame of its size may take, is refused.
         let mut zstd = ok.clone();
@@ -396,7 +462,7 @@ mod tests {
         let why = Header::of(&huge, true).unwrap_err();
         assert!(why.contains("above the object limit"), "{why}");
         let mut long = zstd;
-        long.data = vec![0; zstd_bound(0) + 1];
+        long.data = Bytes::from(vec![0; zstd_bound(0) + 1]);
         long.encoded_size = long.data.len() as u64;
         long.size = 0;
         let why = Header::of(&long, true).unwrap_err();
@@ -407,16 +473,15 @@ mod tests {
     fn a_wrong_part_sequence_is_refused() {
         let data = vec![1; CHUNK_BYTES + 10];
         let header = header(Encoding::Raw, data.len(), data.len());
-        let mut parts = header.parts(chunks(data));
+        let mut parts = header.parts(chunks(Bytes::from(data)));
         let first = parts.remove(0);
         let start = || Assembler::new(Header::of(&first, false).unwrap(), first.clone());
 
-        // A short or long last part, or one that sets a header field.
+        // A part past the encoded size, an empty part, or one that sets a
+        // field of the first part.
         for change in [
-            (|p: &mut ObjectPart| p.data.push(0)) as fn(&mut ObjectPart),
-            |p| {
-                p.data.pop();
-            },
+            (|p: &mut ObjectPart| p.data = Bytes::from(vec![0; 11])) as fn(&mut ObjectPart),
+            |p| p.data = Bytes::new(),
             |p| p.size = 1,
             |p| p.kind = ObjectKind::Blob.into(),
         ] {
@@ -432,6 +497,15 @@ mod tests {
         assert!(object.push(&parts[0]).is_err());
     }
 
+    /// `data` packed at `level` with a window of 2^`window_log` bytes.
+    fn pack_with(data: &[u8], level: i32, window_log: u32) -> Vec<u8> {
+        let mut packer = zstd::bulk::Compressor::new(level).unwrap();
+        packer
+            .set_parameter(zstd::zstd_safe::CParameter::WindowLog(window_log))
+            .unwrap();
+        packer.compress(data).unwrap()
+    }
+
     #[test]
     fn a_frame_unpacks_only_to_the_size_its_header_and_the_object_give() {
         let data = b"some content, some content, some content".to_vec();
@@ -440,6 +514,12 @@ mod tests {
         assert_eq!(unpack(&frame, data.len()), Ok(data.clone()));
         let header = header(Encoding::Zstd, frame.len(), data.len());
         assert_eq!(decode(&header, frame.clone()), Ok(data.clone()));
+        let mut streamed = Vec::new();
+        unpacker(&frame)
+            .unwrap()
+            .read_to_end(&mut streamed)
+            .unwrap();
+        assert_eq!(streamed, data);
 
         // The object says another size than the frame header.
         assert!(unpack(&frame, data.len() - 1).is_err());
@@ -465,10 +545,61 @@ mod tests {
         )
         .unwrap();
         encoder.finish().unwrap();
-        assert!(
-            frame_size(&frame)
-                .unwrap_err()
-                .contains("above the object limit")
-        );
+        let why = frame_size(&frame).unwrap_err();
+        assert!(why.contains("above the object limit"), "{why}");
+    }
+
+    #[test]
+    fn only_a_plain_zstd_frame_is_accepted() {
+        let data = b"some content, some content, some content".to_vec();
+        let frame = pack(&data).unwrap();
+        // A skippable frame, which unpacks to nothing: the empty blob.
+        let skippable = [0x50, 0x2A, 0x4D, 0x18, 0, 0, 0, 0];
+        let why = frame_size(&skippable).unwrap_err();
+        assert!(why.contains("not a Zstandard frame"), "{why}");
+        // The magic number of the legacy v0.7 format.
+        let mut legacy = frame.clone();
+        legacy[0] = 0x27;
+        let why = frame_size(&legacy).unwrap_err();
+        assert!(why.contains("not a Zstandard frame"), "{why}");
+        // A dictionary ID of one byte, after the descriptor of a small
+        // single-segment frame.
+        assert_eq!(frame[4] & 0b10_0011, 0b10_0000, "{:#x}", frame[4]);
+        let mut named = frame.clone();
+        named[4] |= 1;
+        named.insert(5, 7);
+        let named_size = zstd::zstd_safe::get_frame_content_size(&named)
+            .ok()
+            .flatten();
+        assert_eq!(named_size, Some(data.len() as u64));
+        let why = frame_size(&named).unwrap_err();
+        assert!(why.contains("dictionary"), "{why}");
+    }
+
+    #[test]
+    fn a_frame_with_a_window_over_8_mib_is_refused() {
+        // A window of 8 MiB is the largest accepted, in a frame larger than
+        // it (not single-segment), and in a single-segment frame of 8 MiB.
+        let big = vec![0; (8 << 20) + 1];
+        let frame = pack_with(&big, 1, 23);
+        assert_eq!(frame_size(&frame), Ok(big.len()));
+        let mut streamed = Vec::new();
+        unpacker(&frame)
+            .unwrap()
+            .read_to_end(&mut streamed)
+            .unwrap();
+        assert!(streamed == big);
+        let fits = vec![0; 8 << 20];
+        assert_eq!(frame_size(&pack_with(&fits, 1, 24)), Ok(fits.len()));
+        // A single-segment frame of 8 MiB and a byte, and a window byte of
+        // 16 MiB.
+        let why = frame_size(&pack_with(&big, 1, 24)).unwrap_err();
+        assert!(why.contains("window"), "{why}");
+        let mut wide = pack_with(&vec![0; 9 << 20], 1, 23);
+        assert_eq!(wide[4] & 0b10_0000, 0, "not single-segment");
+        // The window byte of the frame, set to 16 MiB.
+        wide[5] = (24 - 10) << 3;
+        let why = frame_size(&wide).unwrap_err();
+        assert!(why.contains("window"), "{why}");
     }
 }
