@@ -40,6 +40,7 @@ use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 use anyhow::{Context, Result, bail};
 use rustix::fs::{AtFlags, Dir, Mode, OFlags, RenameFlags, Stat};
@@ -55,6 +56,23 @@ const TEMP_PREFIX: &str = ".scn-checkout-";
 /// The most directory handles a checkout keeps open. A deeper path keeps the
 /// innermost ones. macOS allows 256 open files by default.
 const MAX_OPEN_DIRS: usize = 64;
+
+/// The temp directory that a dropped [`Checkout`] is removing now. A process
+/// that exits during the removal names it as left. `scn` removes at most one
+/// checkout at a time.
+static REMOVING: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// The temp directory that a dropped [`Checkout`] is removing now, if any.
+pub fn removing() -> Option<PathBuf> {
+    REMOVING
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+fn set_removing(temp: Option<PathBuf>) {
+    *REMOVING.lock().unwrap_or_else(PoisonError::into_inner) = temp;
+}
 
 /// Checks that a file or directory name is safe to write and to print.
 ///
@@ -446,7 +464,13 @@ impl Checkout {
         };
         if let Err(e) = rustix::fs::unlinkat(&self.base, name, flags) {
             let path = self.base_path.join(OsStr::from_bytes(name));
-            eprintln!("warning: cannot remove {}: {e}", path.display());
+            // After SIGHUP the terminal can be gone. A failed warning must
+            // not stop the removal.
+            let _ = writeln!(
+                io::stderr(),
+                "warning: cannot remove {}: {e}",
+                path.display()
+            );
         }
     }
 
@@ -535,6 +559,7 @@ impl Drop for Checkout {
         if self.finished {
             return;
         }
+        set_removing(Some(self.base_path.join(OsStr::from_bytes(&self.temp))));
         // In reverse path order, a directory comes after everything in it.
         let (mut first, mut failed) = (None, 0);
         for (path, is_dir) in std::mem::take(&mut self.made).into_iter().rev() {
@@ -543,13 +568,17 @@ impl Drop for Checkout {
                 failed += 1;
             }
         }
+        // After SIGHUP the terminal can be gone. A failed warning must not
+        // stop the removal.
         if let Some(first) = first {
-            eprintln!(
+            let _ = writeln!(
+                io::stderr(),
                 "warning: cannot remove {failed} paths of the checkout in {}, first {first}",
                 self.base_path.display()
             );
         }
         self.remove_from_base(&self.temp, true);
+        set_removing(None);
     }
 }
 

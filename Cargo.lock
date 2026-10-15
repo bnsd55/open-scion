@@ -2543,6 +2543,7 @@ dependencies = [
  "scion-server",
  "scion-tier",
  "serde_json",
+ "signal-hook",
  "tempfile",
  "tokio",
  "tokio-stream",

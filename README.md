@@ -126,7 +126,8 @@ cs=$(./target/release/scn commit -m "add hello" --put hello.txt=hello.txt)
 ```
 
 Every `scn` command takes `--json` for machine-readable output. A `scn`
-error exits 2.
+error exits 2. A checkout that a signal stops removes what it wrote, and
+then dies by the signal (a shell reports 130 for Ctrl-C).
 
 Checkouts can go through the cache tiers: a `scion-daemon` per machine, on a
 Unix socket, in front of a regional `scion-cache`, in front of the server.
