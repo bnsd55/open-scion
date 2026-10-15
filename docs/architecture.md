@@ -149,8 +149,14 @@ corrupt, and the next put of that content replaces it.
   syncs its blob before it replies. `CreateChangeset` reads back, hashes and
   syncs every blob it names before its transaction. Git import syncs one blob
   batch per 1,000 commits before the transaction that records them.
-- A stored blob still costs a full flush when it is put again or named by a
-  changeset: another batch may have written it and not synced yet.
+- A stored blob is durable unless a batch that wrote it has not ended its
+  sync. `Blobs` counts such blobs in memory: a batch counts a blob before its
+  rename, and uncounts it after its full flush ends. A batch that fails or is
+  dropped leaves its blobs counted. `Blobs::open` flushes every fan-out
+  directory and the drive once, so every blob stored before it is durable.
+- A keep (a put of a stored blob, or a blob that a changeset names) reads the
+  file, then checks the count. An uncounted blob costs no flush. A counted one
+  waits for a shared full flush that starts after the keep.
 
 **Data-directory lock.** `Store::open` takes an exclusive, non-blocking
 `flock` on `<data>/lock` and holds it until the last `Store` clone is dropped.
@@ -544,7 +550,6 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/store.rs` (`Store::open`) | One process per data directory, so an import needs the server stopped. | Let a separate importer process share the directory. Lands already re-plan when the ref moves (`MAX_ATTEMPTS`). | [#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/store.rs` (`Blobs::verify`) | Holds the packed and the unpacked bytes, up to about 200 MiB per call. | Stream the unpacked bytes into the hasher. | [#20](https://github.com/bnsd55/open-scion/issues/20) |
 | `scion-server/src/store.rs` (`Store::flush`) | Between a commit and its full flush, other calls can read the commit, and a power loss can undo what they saw. | Hide commits until their flush, or a lander that batches lands. | [#18](https://github.com/bnsd55/open-scion/issues/18) |
-| `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/land.rs` (`MAX_ATTEMPTS`) | Imports move refs without the land lock, so a land retries 3 times, then returns `ABORTED`. | Route every ref move through the per-ref lander. | [#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | One lander per ref that rebases a batch and moves the ref once. | [#18](https://github.com/bnsd55/open-scion/issues/18) |

@@ -8,7 +8,7 @@
 //! <data>/tmp/                      staging for atomic blob writes
 //! ```
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -224,6 +224,20 @@ pub struct Blobs {
     root: PathBuf,
     tmp: PathBuf,
     group_flush: GroupFlush,
+    /// The blobs that a batch renamed into place and has not made durable
+    /// yet, each with the number of such batches. A count, not a set: two
+    /// batches can write the same blob, and the first one to sync must not
+    /// hide the other.
+    ///
+    /// Invariant: a stored blob that is not in this map is durable.
+    /// - `open` flushes every fan-out directory and the drive, so every
+    ///   file stored before it is durable.
+    /// - A batch adds a blob before its rename, and removes it only after
+    ///   its full flush ends. A batch that fails or is dropped leaves it.
+    /// - [`BlobBatch::keep`] reads the file first and checks this map after.
+    ///   If the map does not have the blob then, every rename of it so far
+    ///   has ended its flush.
+    unsynced: Mutex<HashMap<BlobId, usize>>,
 }
 
 impl Blobs {
@@ -235,14 +249,24 @@ impl Blobs {
         fs::create_dir_all(&tmp)?;
         // A blob file is only as durable as the directories above it. A batch
         // flushes the fan-out directories it writes to; these are made once.
-        for path in [&root, &objects, &tmp, dir] {
+        // The full flush below covers the blob root.
+        for path in [&objects, &tmp, dir] {
             fsync_dir(path)?;
         }
-        Ok(Self {
+        // A crash can stop a batch after its rename and before its flush. So
+        // flush every fan-out directory and the drive once: then every blob
+        // stored before now is durable (see `unsynced`).
+        for entry in fs::read_dir(&root)? {
+            fsync_dir(&entry?.path())?;
+        }
+        let blobs = Self {
             root,
             tmp,
             group_flush: GroupFlush::default(),
-        })
+            unsynced: Mutex::default(),
+        };
+        blobs.full_flush()?;
+        Ok(blobs)
     }
 
     /// Waits for a full flush that starts after this call: the blob root
@@ -270,6 +294,7 @@ impl Blobs {
         BlobBatch {
             blobs: self,
             dirs: BTreeSet::new(),
+            written: Vec::new(),
         }
     }
 
@@ -351,6 +376,11 @@ impl Blobs {
         }
     }
 
+    fn unsynced(&self) -> MutexGuard<'_, HashMap<BlobId, usize>> {
+        // Nothing panics while the lock is held.
+        self.unsynced.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The fan-out directory and the file path of a blob.
     fn location(&self, id: BlobId) -> (PathBuf, PathBuf) {
         let hex = id.to_string();
@@ -374,11 +404,14 @@ impl Blobs {
 /// flush of the drive cache for the whole batch. On macOS a full flush
 /// (`F_FULLFSYNC`) costs about 3 ms, so one per batch, not one per blob, is
 /// what makes a large import fast. Batches that sync at the same time share
-/// one full flush, so many small uploads are fast too.
+/// one full flush, so many small uploads are fast too. A batch that only
+/// keeps blobs that are durable already syncs with no flush.
 #[must_use = "blobs in a batch are not durable until `sync`"]
 pub struct BlobBatch<'a> {
     blobs: &'a Blobs,
     dirs: BTreeSet<PathBuf>,
+    /// The blobs this batch renamed into place.
+    written: Vec<BlobId>,
 }
 
 impl BlobBatch<'_> {
@@ -410,6 +443,9 @@ impl BlobBatch<'_> {
         tmp.write_all(&compressed)?;
         fsync(tmp.as_file())?;
         fs::create_dir_all(&dir)?;
+        // Counted before the rename (see `Blobs::unsynced`).
+        *self.blobs.unsynced().entry(id).or_default() += 1;
+        self.written.push(id);
         tmp.persist(&path).map_err(|e| e.error)?;
         self.dirs.insert(dir);
         Ok(id)
@@ -417,20 +453,18 @@ impl BlobBatch<'_> {
 
     /// Checks a stored blob and, if it is intact, keeps it: `sync` makes it
     /// durable too. Use it before committing metadata that names a blob this
-    /// batch did not write.
+    /// batch did not write. Most stored blobs are durable already, and then
+    /// keeping one costs no flush.
     ///
     /// # Errors
     ///
     /// [`Error::Io`] if the file exists but cannot be read.
     pub fn keep(&mut self, id: BlobId) -> Result<BlobStatus> {
         let status = self.blobs.verify(id)?;
-        if status == BlobStatus::Valid {
-            // Another batch may have written it and not synced yet, so this
-            // batch flushes its directory too.
-            // SHORTCUT: so keeping a stored blob costs a full flush, shared
-            // with concurrent batches. Upgrade: track the blobs written but
-            // not yet synced, and flush every blob directory and the drive at
-            // open; a stored blob outside that set is then durable (#35).
+        // Checked after the file is read (see `Blobs::unsynced`).
+        if status == BlobStatus::Valid && self.blobs.unsynced().contains_key(&id) {
+            // Another batch wrote it and its flush has not ended. Do not skip
+            // it: this batch waits for a full flush that starts later.
             self.dirs.insert(self.blobs.location(id).0);
         }
         Ok(status)
@@ -449,6 +483,16 @@ impl BlobBatch<'_> {
             fsync_dir(dir)?;
         }
         self.blobs.full_flush()?;
+        // Only now are the blobs this batch wrote durable.
+        let mut unsynced = self.blobs.unsynced();
+        for id in &self.written {
+            if let Some(batches) = unsynced.get_mut(id) {
+                *batches -= 1;
+                if *batches == 0 {
+                    unsynced.remove(id);
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -639,14 +683,88 @@ mod tests {
     }
 
     #[test]
-    fn a_put_of_a_stored_blob_still_waits_for_a_full_flush() {
-        // Another put may have renamed the file and not synced it yet.
+    fn a_keep_of_a_durable_blob_runs_no_flush() {
         let dir = tempfile::tempdir().unwrap();
         let blobs = Blobs::open(dir.path()).unwrap();
-        blobs.put(b"stored").unwrap();
+        // One full flush at open makes every blob stored before it durable.
+        assert_eq!(blobs.full_flushes(), 1);
+        let id = blobs.put(b"stored").unwrap();
         let before = blobs.full_flushes();
-        blobs.put(b"stored").unwrap();
-        assert_eq!(blobs.full_flushes(), before + 1);
+        assert_eq!(blobs.put(b"stored").unwrap(), id);
+        let mut batch = blobs.batch();
+        assert_eq!(batch.keep(id).unwrap(), BlobStatus::Valid);
+        batch.sync().unwrap();
+        assert_eq!(blobs.full_flushes(), before);
+    }
+
+    #[test]
+    fn a_keep_of_a_blob_not_synced_yet_waits_for_a_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        let flushes_to_put = |raw: &[u8]| {
+            let before = blobs.full_flushes();
+            blobs.put(raw).unwrap();
+            blobs.full_flushes() - before
+        };
+        // Written by a batch that has not synced yet.
+        let mut first = blobs.batch();
+        let id = first.put(b"new").unwrap();
+        assert_eq!(flushes_to_put(b"new"), 1);
+
+        // A second batch writes it again, over a damaged file. The first
+        // batch's sync does not make the second one's file durable.
+        fs::write(blobs.location(id).1, b"torn").unwrap();
+        let mut second = blobs.batch();
+        second.put(b"new").unwrap();
+        first.sync().unwrap();
+        assert_eq!(flushes_to_put(b"new"), 1);
+        second.sync().unwrap();
+        assert_eq!(flushes_to_put(b"new"), 0);
+
+        // A batch dropped without a sync leaves its blob not durable.
+        let mut dropped = blobs.batch();
+        dropped.put(b"dropped").unwrap();
+        drop(dropped);
+        assert_eq!(flushes_to_put(b"dropped"), 1);
+    }
+
+    #[test]
+    fn concurrent_puts_of_a_new_blob_all_wait_for_its_flush() {
+        const PUTS: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        let path = blobs.location(BlobId::of(b"new")).1;
+        let running = Barrier::new(2);
+        thread::scope(|s| {
+            // A slow flush runs while the puts arrive, so each put must wait
+            // for the flush after it.
+            let slow = s.spawn(|| {
+                blobs.group_flush.run(|| {
+                    running.wait();
+                    thread::sleep(Duration::from_millis(200));
+                    Ok(())
+                })
+            });
+            running.wait();
+            let slow_flush = blobs.group_flush.lock().started;
+            let put = || {
+                blobs.put(b"new").unwrap();
+                blobs.full_flushes()
+            };
+            let first = s.spawn(put);
+            // The other puts find the file that the first one renamed. They
+            // start once the first one waits for its flush.
+            while !path.exists() {
+                thread::yield_now();
+            }
+            thread::sleep(Duration::from_millis(20));
+            let rest: Vec<_> = (1..PUTS).map(|_| s.spawn(put)).collect();
+            for put in std::iter::once(first).chain(rest) {
+                let seen = put.join().unwrap();
+                assert!(seen > slow_flush, "a put returned before its flush");
+            }
+            slow.join().unwrap().unwrap();
+        });
     }
 
     #[test]

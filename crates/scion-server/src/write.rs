@@ -163,5 +163,15 @@ mod tests {
             store.blobs().full_flushes() - before,
             1 + u64::from(FSYNC_LEAVES_DRIVE_CACHE)
         );
+
+        // A blob that is durable already costs no flush: only the commit's.
+        let synced = store.blobs().put(b"synced").unwrap();
+        let before = store.blobs().full_flushes();
+        let child = changeset(vec![root], Some(synced)).encode();
+        create_changeset(&store, "main", &child).unwrap();
+        assert_eq!(
+            store.blobs().full_flushes() - before,
+            u64::from(FSYNC_LEAVES_DRIVE_CACHE)
+        );
     }
 }
