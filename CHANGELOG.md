@@ -124,5 +124,9 @@ release.
   `DEADLINE_EXCEEDED` at 600 s or once its call is dropped. The merge-base
   walk jumps over runs of first parents that only one part of the walk
   reaches: a few dozen reads for a run, not one for each changeset. A walk
-  holds the database lock for about 1,000 reads at a time, then leaves it
-  free for other requests.
+  holds one read connection (below), so writes and other reads run beside
+  it.
+- Reads use a pool of 8 read-only SQLite connections. A read no longer
+  waits for a write, for a long read such as a graph walk, or for a server
+  write that waits for an import's write lock. Each read sees one
+  snapshot. Writes still take turns on one connection.
