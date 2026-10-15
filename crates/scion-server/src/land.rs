@@ -1656,7 +1656,7 @@ mod tests {
         let version: u32 = store
             .read(|c| Ok(c.pragma_query_value(None, "user_version", |row| row.get(0))?))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, crate::store::SCHEMA_VERSION);
         // Finished lands start their retention at the upgrade; the pending
         // one has no finish time.
         let rows: Vec<(String, Option<bool>)> = store

@@ -3,6 +3,7 @@
 //! Modules from the bottom up:
 //!
 //! - [`store`] and [`db`]: `SQLite` for metadata and trees, a folder for blobs.
+//! - [`derived`]: one mechanism for every kind of derived data.
 //! - [`tree`]: apply changesets to trees and derive each changeset's root tree.
 //! - [`read`], [`blame`], [`write`], [`land`]: the operations behind the RPCs.
 //! - [`import`]: one-way import from a git repository.
@@ -11,6 +12,7 @@
 pub mod auth;
 pub mod blame;
 pub mod db;
+pub mod derived;
 pub mod error;
 pub mod import;
 pub mod land;
