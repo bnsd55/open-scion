@@ -21,8 +21,14 @@ use scion_core::BlobId;
 
 use crate::error::{Error, Result};
 
-const SCHEMA: &str = include_str!("../migrations/0001_init.sql");
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
+
+/// Schema migrations in order. Migration `n`, from 1, moves the database from
+/// version `n - 1` to version `n`. A released migration never changes.
+const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_land_retention.sql"),
+];
 
 /// Largest object accepted or read back, uncompressed: 100 MiB, the hard
 /// per-file limit on GitHub, so any file from a GitHub repository fits.
@@ -150,18 +156,16 @@ fn lock_dir(dir: &Path) -> Result<fs::File> {
 
 fn migrate(db: &Connection) -> Result<()> {
     let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    match version {
-        0 => {
-            db.execute_batch(&format!(
-                "BEGIN; {SCHEMA} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
-            ))?;
-            Ok(())
-        }
-        SCHEMA_VERSION => Ok(()),
-        newer => Err(Error::Corrupt(format!(
-            "database schema version {newer} is newer than this build ({SCHEMA_VERSION})"
-        ))),
+    if version > SCHEMA_VERSION {
+        return Err(Error::Corrupt(format!(
+            "database schema version {version} is newer than this build ({SCHEMA_VERSION})"
+        )));
     }
+    // Each migration runs in its own transaction, with the version it sets.
+    for (to, sql) in (1..=SCHEMA_VERSION).zip(MIGRATIONS).skip(version as usize) {
+        db.execute_batch(&format!("BEGIN; {sql} PRAGMA user_version = {to}; COMMIT;"))?;
+    }
+    Ok(())
 }
 
 /// What is stored under a blob ID.

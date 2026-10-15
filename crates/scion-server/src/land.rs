@@ -3,7 +3,8 @@
 //! ```text
 //! land(req)
 //!   1. record the land as pending, or find it by (repo, caller, request key);
-//!      a land to a ref that does not exist is rejected here
+//!      a land to a ref that does not exist is rejected here. A new land
+//!      also deletes a few lands that finished more than 7 days ago
 //!   2. take the ref's lock: one land at a time per ref
 //!   3. if the row is no longer pending, return it (a retry, or a duplicate)
 //!   4. plan: one parent, base on the ref's first-parent history,
@@ -43,6 +44,17 @@ const MAX_ATTEMPTS: u32 = 3;
 /// How far, in generations, the ref moves in one prune cycle of a
 /// [`PathIndex`]. Tests use a short cycle, so that they prune.
 const PRUNE_EVERY: i64 = if cfg!(test) { 4 } else { 10_000 };
+
+/// How long a finished land is kept, in seconds: 7 days. Until then a retry
+/// with the same request key returns the stored outcome. A client retries
+/// within minutes, and a week also covers a client that is down over a long
+/// weekend. Pending lands are kept until they finish.
+const LAND_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// Most expired lands that one new land deletes. A land adds one row, so
+/// expiry keeps up, and no land does much work after a long pause. Tests use
+/// a small batch, so that they reach the limit.
+const EXPIRE_PER_LAND: i64 = if cfg!(test) { 2 } else { 100 };
 
 /// Where a land stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,7 +200,7 @@ fn check_name(what: &str, value: &str) -> Result<()> {
 
 /// Inserts a land, or finds the land for the same request key. A land to a
 /// ref that does not exist is recorded as rejected at once, so only real refs
-/// ever get a lock slot in [`Lands`].
+/// ever get a lock slot in [`Lands`]. A new land also expires old ones.
 fn record(c: &Connection, caller: &Caller, req: &LandRequest) -> Result<(RepoId, LandOutcome)> {
     let repo = db::repo_id(c, &req.repo)?;
     db::generation(c, repo, req.changeset)?;
@@ -221,22 +233,49 @@ fn record(c: &Connection, caller: &Caller, req: &LandRequest) -> Result<(RepoId,
             let detail = format!("ref {:?} does not exist", req.target_ref);
             (LandState::Rejected, detail)
         };
-        c.execute(
-            "INSERT INTO lands (repo_id, caller, request_key, target_ref, input_cs, state, detail)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                repo.0,
-                caller.0,
-                req.request_key,
-                req.target_ref,
-                req.changeset.as_bytes(),
-                state.as_str(),
-                detail
-            ],
-        )?;
-        c.last_insert_rowid()
+        c.prepare_cached(
+            "INSERT INTO lands
+                 (repo_id, caller, request_key, target_ref, input_cs, state, detail, finished_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                 CASE ?6 WHEN 'pending' THEN NULL ELSE unixepoch() END)",
+        )?
+        .execute(params![
+            repo.0,
+            caller.0,
+            req.request_key,
+            req.target_ref,
+            req.changeset.as_bytes(),
+            state.as_str(),
+            detail
+        ])?;
+        let land_id = c.last_insert_rowid();
+        expire(c)?;
+        land_id
     };
     Ok((repo, load(c, repo, caller, land_id)?))
+}
+
+/// Deletes up to [`EXPIRE_PER_LAND`] lands that finished more than
+/// [`LAND_RETENTION_SECS`] ago, oldest first. A pending land has no
+/// `finished_at`, so it never expires.
+///
+/// The newest land always stays. `land_id` has no AUTOINCREMENT: a new row
+/// gets the highest ID plus one. So keeping the newest row means a land ID
+/// is never given out twice.
+fn expire(c: &Connection) -> Result<()> {
+    let deleted = c
+        .prepare_cached(
+            "DELETE FROM lands WHERE land_id IN (
+                 SELECT land_id FROM lands
+                 WHERE finished_at < unixepoch() - ?1
+                     AND land_id < (SELECT max(land_id) FROM lands)
+                 ORDER BY finished_at LIMIT ?2)",
+        )?
+        .execute(params![LAND_RETENTION_SECS, EXPIRE_PER_LAND])?;
+    if deleted > 0 {
+        tracing::debug!(deleted, "expired finished lands");
+    }
+    Ok(())
 }
 
 /// A land that `caller` started in `repo`.
@@ -283,7 +322,8 @@ fn set_state(
 ) -> Result<LandOutcome> {
     let updated = c
         .prepare_cached(
-            "UPDATE lands SET state = ?3, result_cs = ?4, detail = ?5, conflict_paths = ?6
+            "UPDATE lands SET state = ?3, result_cs = ?4, detail = ?5, conflict_paths = ?6,
+                 finished_at = unixepoch()
              WHERE repo_id = ?1 AND land_id = ?2 AND state = 'pending'",
         )?
         .execute(params![
@@ -786,6 +826,25 @@ mod tests {
                 .unwrap()
         }
 
+        fn get(&self, land_id: i64) -> Result<LandOutcome> {
+            get_land(&self.store, &caller(), "r", land_id)
+        }
+
+        /// Whether the land expired: `GetLand` no longer finds it.
+        fn gone(&self, out: &LandOutcome) -> bool {
+            matches!(self.get(out.land_id), Err(Error::NotFound(_)))
+        }
+
+        /// Moves the time a land finished `secs` into the past.
+        fn age(&self, land_id: i64, secs: i64) {
+            let sql = "UPDATE lands SET finished_at = finished_at - ?2 WHERE land_id = ?1";
+            let aged = self
+                .store
+                .write(|c| Ok(c.execute(sql, params![land_id, secs])?))
+                .unwrap();
+            assert_eq!(aged, 1);
+        }
+
         fn main(&self) -> db::RefState {
             self.store
                 .read(|c| db::get_ref(c, self.repo, "main"))
@@ -1263,6 +1322,177 @@ mod tests {
         landed.sort();
         assert_eq!(results, landed);
         assert!(f.file(f.main().target, "t15/f24").is_some());
+    }
+
+    #[test]
+    fn finished_lands_expire_after_the_retention_period() {
+        use LandState::{Conflict, Landed, Pending, Rejected};
+        let f = fixture();
+        let landed = f.land(f.commit(f.root, &[put("a/x", "1")]), "landed");
+        let conflict = f.land(f.commit(f.root, &[put("a/x", "2")]), "conflict");
+        let missing = LandRequest {
+            target_ref: "nope".into(),
+            ..req(f.root, "rejected")
+        };
+        let rejected = f.lands.land(&f.store, &caller(), &missing).unwrap();
+        let states = [landed.state, conflict.state, rejected.state];
+        assert_eq!(states, [Landed, Conflict, Rejected]);
+        // All three expired; landed is the oldest, rejected the newest.
+        for (extra, out) in [(3, &landed), (2, &conflict), (1, &rejected)] {
+            f.age(out.land_id, LAND_RETENTION_SECS + extra);
+        }
+
+        // A land that a crash left pending. Recording it expires the two
+        // oldest lands, the limit for one land.
+        let cs = f.commit(f.root, &[put("b/y", "pending")]);
+        let (_, pending) = f
+            .store
+            .write(|c| record(c, &caller(), &req(cs, "pending")))
+            .unwrap();
+        assert_eq!(pending.state, Pending);
+        assert!(f.gone(&landed) && f.gone(&conflict));
+        assert_eq!(f.get(rejected.land_id).unwrap(), rejected);
+
+        // The next land expires the third. A land that is almost expired
+        // stays, and so does the pending one.
+        let recent = f.land(f.commit(f.main().target, &[put("c", "1")]), "recent");
+        assert!(f.gone(&rejected));
+        f.age(recent.land_id, LAND_RETENTION_SECS - 60);
+        f.land(f.commit(f.main().target, &[put("d", "1")]), "next");
+        assert_eq!(f.get(recent.land_id).unwrap(), recent);
+        assert_eq!(f.get(pending.land_id).unwrap(), pending);
+    }
+
+    #[test]
+    fn expiry_never_gives_out_a_land_id_twice() {
+        let f = fixture();
+        let first = f.land(f.commit(f.root, &[put("f1", "x")]), "1");
+        f.age(first.land_id, LAND_RETENTION_SECS + 1);
+        // The only land expired, but it is the newest, so it stays.
+        f.store.write(expire).unwrap();
+        assert_eq!(f.get(first.land_id).unwrap(), first);
+        // The next land gets a higher ID, and then the first one expires.
+        let second = f.land(f.commit(f.root, &[put("f2", "x")]), "2");
+        assert!(second.land_id > first.land_id);
+        assert!(f.gone(&first));
+    }
+
+    #[test]
+    fn a_retry_after_its_land_expired_does_not_land_twice() {
+        let f = fixture();
+        // Main moves past the base, so this land rebases.
+        f.move_main(f.commit(f.root, &[put("b/y", "moved")]));
+        let rebased = f.commit(f.root, &[put("a/x", "mine")]);
+        let first_rebased = f.land(rebased, "rebased");
+        // These two land on the head, so each lands as itself.
+        let direct = f.commit(f.main().target, &[put("c", "mine")]);
+        let first_direct = f.land(direct, "direct");
+        let empty = f.commit(f.main().target, &[]);
+        let first_empty = f.land(empty, "empty");
+        assert_ne!(first_rebased.result, Some(rebased));
+        assert_eq!(first_direct.result, Some(direct));
+        assert_eq!(first_empty.result, Some(empty));
+        let first = [first_rebased, first_direct, first_empty];
+
+        // The rows expire. Each new land expires at most 2.
+        for out in &first {
+            f.age(out.land_id, LAND_RETENTION_SECS + 1);
+        }
+        f.fill("t", 2);
+        assert!(first.iter().all(|out| f.gone(out)));
+
+        // A retry with the same key is a new land. Its own landed copy
+        // changed each of its paths after its base, so it conflicts.
+        let before = f.main();
+        for (cs, key, path) in [(rebased, "rebased", "a/x"), (direct, "direct", "c")] {
+            let out = f.land(cs, key);
+            assert_eq!(out.state, LandState::Conflict, "{key}: {}", out.detail);
+            assert_eq!(out.conflict_paths, [RepoPath::new(path).unwrap()], "{key}");
+            assert!(first.iter().all(|old| old.land_id != out.land_id));
+        }
+        assert_eq!(f.main(), before, "nothing landed twice");
+
+        // A changeset with no changes has nothing to conflict, so it lands
+        // again: one more empty changeset, and no file changes.
+        let out = f.land(empty, "empty");
+        assert_eq!(out.state, LandState::Landed);
+        let tip = out.result.unwrap();
+        assert_ne!(tip, empty);
+        let tree = |cs| tree::root_tree(&f.store, f.repo, cs).unwrap();
+        assert_eq!(tree(tip), tree(before.target));
+    }
+
+    #[test]
+    fn a_version_1_database_upgrades_and_keeps_its_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let (child, pending_cs) = {
+            let c = Connection::open(dir.path().join("scion.db")).unwrap();
+            let v1 = include_str!("../migrations/0001_init.sql");
+            c.execute_batch(&format!("BEGIN; {v1} PRAGMA user_version = 1; COMMIT;"))
+                .unwrap();
+            let repo = db::create_repo(&c, "r").unwrap();
+            let insert = |cs: &Changeset| db::insert_changeset(&c, repo, cs).unwrap();
+            let root = insert(&changeset(vec![], &[put("a/x", "1")]));
+            let child = insert(&changeset(vec![root], &[put("a/x", "2")]));
+            let pending_cs = insert(&changeset(vec![root], &[put("b", "3")]));
+            assert!(db::cas_ref(&c, repo, "main", None, child).unwrap());
+            c.execute(
+                "INSERT INTO lands
+                     (repo_id, caller, request_key, target_ref, input_cs, state, result_cs,
+                      detail, conflict_paths)
+                 VALUES (?1, 't', 'landed', 'main', ?2, 'landed', ?2, '', x''),
+                        (?1, 't', 'conflict', 'main', ?3, 'conflict', NULL, 'clash', ?4),
+                        (?1, 't', 'pending', 'main', ?3, 'pending', NULL, '', x'')",
+                params![
+                    repo.0,
+                    child.as_bytes(),
+                    pending_cs.as_bytes(),
+                    b"a/x".as_slice()
+                ],
+            )
+            .unwrap();
+            (child, pending_cs)
+        };
+
+        let store = Store::open(dir.path()).unwrap();
+        let version: u32 = store
+            .read(|c| Ok(c.pragma_query_value(None, "user_version", |row| row.get(0))?))
+            .unwrap();
+        assert_eq!(version, 2);
+        // Finished lands start their retention at the upgrade; the pending
+        // one has no finish time.
+        let rows: Vec<(String, Option<bool>)> = store
+            .read(|c| {
+                let sql = "SELECT state, abs(finished_at - unixepoch()) < 60 FROM lands
+                           ORDER BY land_id";
+                let mut stmt = c.prepare(sql)?;
+                let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                Ok(rows.collect::<rusqlite::Result<_>>()?)
+            })
+            .unwrap();
+        let want = [
+            ("landed", Some(true)),
+            ("conflict", Some(true)),
+            ("pending", None),
+        ];
+        assert_eq!(rows, want.map(|(state, now)| (state.to_owned(), now)));
+
+        // The lands are 1, 2 and 3, in insert order.
+        let get = |id| get_land(&store, &caller(), "r", id).unwrap();
+        let landed = get(1);
+        let pair = (landed.state, landed.result);
+        assert_eq!(pair, (LandState::Landed, Some(child)));
+        let conflict = get(2);
+        assert_eq!(conflict.state, LandState::Conflict);
+        assert_eq!(conflict.conflict_paths, [RepoPath::new("a/x").unwrap()]);
+        assert_eq!(conflict.detail, "clash");
+
+        // The pending land finishes, and the old finished ones stay.
+        let out = Lands::default()
+            .land(&store, &caller(), &req(pending_cs, "pending"))
+            .unwrap();
+        assert_eq!((out.land_id, out.state), (3, LandState::Landed));
+        assert_eq!((get(1), get(2)), (landed, conflict));
     }
 
     #[test]
