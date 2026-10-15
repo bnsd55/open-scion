@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use rusqlite::{Connection, TransactionBehavior};
 use rustix::fs::FlockOperation;
@@ -73,12 +73,16 @@ impl Store {
         let blobs = Blobs::open(dir)?;
         let db = Connection::open(dir.join("scion.db"))?;
         db.execute_batch(
-            // `fullfsync`: on macOS a plain fsync leaves the commit in the
-            // drive cache, so a power loss could drop a land that replied
-            // LANDED. Blobs already use F_FULLFSYNC. No effect elsewhere.
+            // `fullfsync = OFF`: a commit ends with a plain fsync, and
+            // `write` then waits for a full flush of the drive cache that it
+            // shares with concurrent commits and blob syncs. With `ON`, each
+            // commit would run its own full flush under the database mutex.
+            // `checkpoint_fullfsync`: a checkpoint, which is rare, fully
+            // flushes the pages it copies before the log can be reused.
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;
-             PRAGMA fullfsync = ON;
+             PRAGMA fullfsync = OFF;
+             PRAGMA checkpoint_fullfsync = ON;
              PRAGMA foreign_keys = ON;
              PRAGMA busy_timeout = 5000;",
         )?;
@@ -110,17 +114,53 @@ impl Store {
     }
 
     /// Runs `f` in one write transaction. Commits if `f` returns `Ok`, rolls
-    /// back otherwise.
+    /// back otherwise. Returns once the commit is durable: [`Store::commit`],
+    /// then [`Store::flush`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::commit`] and [`Store::flush`].
+    pub fn write<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let value = self.commit(f)?;
+        self.flush()?;
+        Ok(value)
+    }
+
+    /// Like [`Store::write`], but returns before the commit is durable. Call
+    /// [`Store::flush`] before replying with anything the commit wrote.
     ///
     /// # Errors
     ///
     /// Returns what `f` returns, or a database error from begin or commit.
-    pub fn write<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub fn commit<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let mut db = self.lock();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = f(&tx)?;
         tx.commit()?;
         Ok(value)
+    }
+
+    /// Returns once every commit made before this call is durable.
+    ///
+    /// No write acknowledged after a flush is lost. A full flush of the drive
+    /// cache covers every commit before it, and the log recovered after a
+    /// crash is a prefix of the commits (the write-ahead log's checksums are
+    /// chained). So a land that builds on a head that is not durable yet
+    /// replies only after a flush that covers that head too.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the flush fails. The commits stay, but may not be durable; a
+    /// retry sees them.
+    // SHORTCUT: between a commit and its flush, other calls can read the
+    // commit, and a power loss can then undo what they saw. Upgrade: hide
+    // commits until their flush, or a lander that batches lands (#18).
+    pub fn flush(&self) -> Result<()> {
+        // Concurrent calls share one flush, made outside the database lock.
+        if FSYNC_LEAVES_DRIVE_CACHE {
+            self.inner.blobs.full_flush()?;
+        }
+        Ok(())
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
@@ -183,6 +223,7 @@ pub enum BlobStatus {
 pub struct Blobs {
     root: PathBuf,
     tmp: PathBuf,
+    group_flush: GroupFlush,
 }
 
 impl Blobs {
@@ -197,7 +238,19 @@ impl Blobs {
         for path in [&root, &objects, &tmp, dir] {
             fsync_dir(path)?;
         }
-        Ok(Self { root, tmp })
+        Ok(Self {
+            root,
+            tmp,
+            group_flush: GroupFlush::default(),
+        })
+    }
+
+    /// Waits for a full flush that starts after this call: the blob root
+    /// directory, then the drive cache. That covers everything that reached
+    /// the drive before it, the database too, which lives on the same drive.
+    fn full_flush(&self) -> io::Result<()> {
+        self.group_flush
+            .run(|| fs::File::open(&self.root)?.sync_all())
     }
 
     /// Stores one file's content durably. Safe to repeat.
@@ -277,16 +330,23 @@ impl Blobs {
         let path = dir.join(&hex[2..]);
         (dir, path)
     }
+
+    /// Full flushes finished so far.
+    #[cfg(test)]
+    pub(crate) fn full_flushes(&self) -> u64 {
+        self.group_flush.lock().finished
+    }
 }
 
 /// Blobs written but not yet durable. Call [`BlobBatch::sync`] before
 /// committing any metadata that names them.
 ///
 /// Each blob is flushed to the drive when written (a plain `fsync`, cheap);
-/// `sync` then flushes the directories that changed and issues one full flush
-/// of the drive cache for the whole batch. On macOS a full flush
+/// `sync` then flushes the directories that changed and waits for one full
+/// flush of the drive cache for the whole batch. On macOS a full flush
 /// (`F_FULLFSYNC`) costs about 3 ms, so one per batch, not one per blob, is
-/// what makes a large import fast.
+/// what makes a large import fast. Batches that sync at the same time share
+/// one full flush, so many small uploads are fast too.
 #[must_use = "blobs in a batch are not durable until `sync`"]
 pub struct BlobBatch<'a> {
     blobs: &'a Blobs,
@@ -308,18 +368,13 @@ impl BlobBatch<'_> {
             )));
         }
         let id = BlobId::of(raw);
-        let (dir, path) = self.blobs.location(id);
-        match self.blobs.verify(id)? {
-            BlobStatus::Valid => {
-                // Another batch may have written it and not synced yet, so
-                // this batch flushes its directory too.
-                self.dirs.insert(dir);
-                return Ok(id);
-            }
+        match self.keep(id)? {
+            BlobStatus::Valid => return Ok(id),
             // The rename below replaces it in one step.
             BlobStatus::Corrupt => tracing::warn!(blob = %id, "rewriting a corrupt blob file"),
             BlobStatus::Missing => {}
         }
+        let (dir, path) = self.blobs.location(id);
         let compressed = zstd::bulk::compress(raw, 3)?;
         // Write a temp file and flush it before the rename, so the name never
         // points at data that is not on the drive.
@@ -330,6 +385,27 @@ impl BlobBatch<'_> {
         tmp.persist(&path).map_err(|e| e.error)?;
         self.dirs.insert(dir);
         Ok(id)
+    }
+
+    /// Checks a stored blob and, if it is intact, keeps it: `sync` makes it
+    /// durable too. Use it before committing metadata that names a blob this
+    /// batch did not write.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the file exists but cannot be read.
+    pub fn keep(&mut self, id: BlobId) -> Result<BlobStatus> {
+        let status = self.blobs.verify(id)?;
+        if status == BlobStatus::Valid {
+            // Another batch may have written it and not synced yet, so this
+            // batch flushes its directory too.
+            // SHORTCUT: so keeping a stored blob costs a full flush, shared
+            // with concurrent batches. Upgrade: track the blobs written but
+            // not yet synced, and flush every blob directory and the drive at
+            // open; a stored blob outside that set is then durable (#35).
+            self.dirs.insert(self.blobs.location(id).0);
+        }
+        Ok(status)
     }
 
     /// Makes every blob written or kept in this batch durable.
@@ -344,12 +420,82 @@ impl BlobBatch<'_> {
         for dir in &self.dirs {
             fsync_dir(dir)?;
         }
-        // Flushes the root directory, then the drive cache, which covers
-        // everything above.
-        fs::File::open(&self.blobs.root)?.sync_all()?;
+        self.blobs.full_flush()?;
         Ok(())
     }
 }
+
+/// Group commit: concurrent callers share one full flush of the drive cache.
+///
+/// A full flush is slow, and one covers every write that reached the drive
+/// before it started. So a caller first makes its writes reach the drive (a
+/// plain `fsync`), then waits for a flush that starts after that; one waiting
+/// caller runs it for all the others.
+///
+/// ```text
+/// A: fsync │ runs flush 1 ────────┤ Ok
+/// B:      fsync │ waits ──────────┤ runs flush 2 ────────┤ Ok
+/// C:          fsync │ waits ──────┴──────────────────────┤ Ok
+/// ```
+///
+/// B and C arrive while flush 1 runs. It may have started before their writes,
+/// so they need flush 2, and B runs it for both.
+#[derive(Default)]
+struct GroupFlush {
+    state: Mutex<FlushState>,
+    finished: Condvar,
+}
+
+/// Flushes are numbered from 1. One runs while `started > finished`.
+#[derive(Default)]
+struct FlushState {
+    started: u64,
+    finished: u64,
+    /// The latest flush that failed, and its error.
+    failed: Option<(u64, Arc<io::Error>)>,
+}
+
+impl GroupFlush {
+    /// Waits for a run of `flush` that starts after this call, and returns its
+    /// result. Only one caller's `flush` runs (as in `OnceLock::get_or_init`),
+    /// so every caller must pass the same operation, and it must not panic or
+    /// later callers wait forever. A caller may also see the error of a later
+    /// failed run, which errs on the safe side.
+    fn run(&self, flush: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        let mut state = self.lock();
+        // A running flush may have started before this caller's writes.
+        let target = state.started + 1;
+        state = self
+            .finished
+            .wait_while(state, |s| s.started > s.finished && s.finished < target)
+            .unwrap_or_else(PoisonError::into_inner);
+        if state.finished < target {
+            // No flush is running and `target` is the next one: lead it.
+            state.started = target;
+            drop(state);
+            let result = flush();
+            state = self.lock();
+            state.finished = target;
+            if let Err(e) = result {
+                state.failed = Some((target, Arc::new(e)));
+            }
+            self.finished.notify_all();
+        }
+        match &state.failed {
+            Some((failed, e)) if *failed >= target => Err(io::Error::new(e.kind(), Arc::clone(e))),
+            _ => Ok(()),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, FlushState> {
+        // Nothing panics while the lock is held.
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Whether [`fsync`] can leave data in the drive cache: true on Apple
+/// platforms. Elsewhere it flushes the cache too.
+pub(crate) const FSYNC_LEAVES_DRIVE_CACHE: bool = cfg!(target_vendor = "apple");
 
 /// A plain `fsync`: data reaches the drive, not necessarily past its cache.
 /// (`File::sync_all` is a full cache flush on macOS, about 20x slower.)
@@ -363,6 +509,11 @@ fn fsync_dir(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -388,20 +539,108 @@ mod tests {
     }
 
     #[test]
-    fn commits_flush_through_the_drive_cache() {
+    fn concurrent_puts_share_full_flushes() {
+        const WRITERS: u64 = 32;
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        // Odd writers put a blob that is already stored.
+        blobs.put(b"stored").unwrap();
+        let content = |i: u64| {
+            if i.is_multiple_of(2) {
+                format!("blob {i}")
+            } else {
+                "stored".to_owned()
+            }
+        };
+        let before = blobs.full_flushes();
+        let running = Barrier::new(2);
+        let ids: Vec<BlobId> = thread::scope(|s| {
+            // A slow first flush, as on a busy drive, so the writers arrive
+            // while it runs whatever the speed of the test machine's drive.
+            let slow = s.spawn(|| {
+                blobs.group_flush.run(|| {
+                    running.wait();
+                    thread::sleep(Duration::from_millis(200));
+                    Ok(())
+                })
+            });
+            running.wait();
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|i| {
+                    let (blobs, content) = (&blobs, &content);
+                    s.spawn(move || blobs.put(content(i).as_bytes()))
+                })
+                .collect();
+            slow.join().unwrap().unwrap();
+            writers
+                .into_iter()
+                .map(|w| w.join().unwrap().unwrap())
+                .collect()
+        });
+        // Not counting the slow flush.
+        let flushes = blobs.full_flushes() - before - 1;
+        assert!(
+            flushes <= WRITERS / 4,
+            "{WRITERS} writers ran {flushes} full flushes"
+        );
+        for id in ids {
+            assert_eq!(blobs.verify(id).unwrap(), BlobStatus::Valid);
+        }
+    }
+
+    #[test]
+    fn a_put_of_a_stored_blob_still_waits_for_a_full_flush() {
+        // Another put may have renamed the file and not synced it yet.
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        blobs.put(b"stored").unwrap();
+        let before = blobs.full_flushes();
+        blobs.put(b"stored").unwrap();
+        assert_eq!(blobs.full_flushes(), before + 1);
+    }
+
+    #[test]
+    fn a_failed_full_flush_fails_every_caller_that_shares_it() {
+        const CALLERS: usize = 8;
+        let group = GroupFlush::default();
+        let runs = AtomicUsize::new(0);
+        let arrive = Barrier::new(CALLERS);
+        let results: Vec<io::Result<()>> = thread::scope(|s| {
+            let callers: Vec<_> = (0..CALLERS)
+                .map(|_| {
+                    s.spawn(|| {
+                        arrive.wait();
+                        // Slow, so the other callers arrive while it runs.
+                        group.run(|| {
+                            runs.fetch_add(1, Ordering::Relaxed);
+                            thread::sleep(Duration::from_millis(100));
+                            Err(io::Error::other("the drive is gone"))
+                        })
+                    })
+                })
+                .collect();
+            callers.into_iter().map(|c| c.join().unwrap()).collect()
+        });
+        let runs = runs.into_inner();
+        assert!(runs < CALLERS, "{CALLERS} callers ran {runs} flushes");
+        for result in results {
+            let err = result.expect_err("every caller sees the failure");
+            assert_eq!(err.to_string(), "the drive is gone");
+        }
+    }
+
+    #[test]
+    fn a_write_returns_after_a_full_flush_where_fsync_leaves_the_cache() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let (sync, full): (i64, i64) = store
-            .read(|db| {
-                let sync = db.pragma_query_value(None, "synchronous", |r| r.get(0))?;
-                let full = db.pragma_query_value(None, "fullfsync", |r| r.get(0))?;
-                Ok((sync, full))
-            })
+        let before = store.blobs().full_flushes();
+        store
+            .write(|c| Ok(c.execute_batch("CREATE TABLE t (x)")?))
             .unwrap();
+        // Elsewhere the commit's own fsync flushes the cache: no extra flush.
         assert_eq!(
-            (sync, full),
-            (2, 1),
-            "synchronous = FULL and fullfsync = ON"
+            store.blobs().full_flushes(),
+            before + u64::from(FSYNC_LEAVES_DRIVE_CACHE)
         );
     }
 }
