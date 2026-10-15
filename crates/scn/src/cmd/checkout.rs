@@ -32,9 +32,9 @@ pub struct CheckoutArgs {
     /// Directory to write into. It must not exist, or be empty. An empty
     /// directory is kept, and must be yours: the checkout is built inside it
     /// and moved up. A new one is built next to it and renamed into place,
-    /// so its parent must be writable, and must not be writable by other
-    /// users unless it has the sticky bit (as /tmp has): they could swap the
-    /// checkout before the rename.
+    /// so its parent must be writable. The empty one, or the new one's
+    /// parent, must not be writable by all users unless it has the sticky
+    /// bit (as /tmp has). Members of a group that can write it are trusted.
     #[arg(long, value_name = "PATH")]
     into: PathBuf,
 }
@@ -47,8 +47,21 @@ fn parse_dir(dir: &str) -> Result<RepoPath> {
 type Files = BTreeMap<RepoPath, FileState>;
 
 /// Writes the files of a changeset into a new or empty directory, and prints
-/// how many it wrote. On failure the destination is left as it was.
+/// how many it wrote. On failure, or on Ctrl-C, the destination is left as
+/// it was.
 pub async fn checkout(ctx: &mut Ctx, args: CheckoutArgs) -> Result<()> {
+    // Listening for Ctrl-C replaces the default exit, so start it first. On
+    // Ctrl-C the checkout is dropped at its next wait, and the drop removes
+    // what it wrote. If listening fails, that branch is off and Ctrl-C exits
+    // as usual.
+    tokio::select! {
+        biased;
+        Ok(()) = tokio::signal::ctrl_c() => bail!("interrupted: nothing was checked out"),
+        done = run(ctx, &args) => done,
+    }
+}
+
+async fn run(ctx: &mut Ctx, args: &CheckoutArgs) -> Result<()> {
     check_dest(&args.into)?;
     let id = ctx.resolve(&args.rev).await?;
     let reply = ctx

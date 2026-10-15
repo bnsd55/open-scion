@@ -27,8 +27,10 @@ release.
   `land` and `bench`, with `--json` output.
 - `scn checkout`, into a new directory or an existing empty one. An
   existing directory is kept, with its mode and owner, and its parent need
-  not be writable. Writes go through directory handles and never follow a
-  symlink, and each directory is opened about once.
+  not be writable. It must not be writable by all users unless it has the
+  sticky bit. Writes go through directory handles and never follow a
+  symlink, and each directory is opened about once. On failure or Ctrl-C,
+  what was written is removed.
 - Path history and blame on first-parent history: `Log` takes an optional
   path and says where to continue, and a new `Blame` RPC gives each line's
   last changeset. `scn log --path` and `scn blame`. Each call has a bound,

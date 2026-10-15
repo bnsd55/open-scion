@@ -10,15 +10,17 @@
 //!   that counts: it fails if the destination has appeared meanwhile as a
 //!   non-empty directory, a file or a symlink.
 //! - If the destination is an empty directory, it is opened with
-//!   `O_NOFOLLOW`, so a symlink is refused, and it must be owned by the user
-//!   who runs the checkout. The temp directory is made inside it. Each entry
+//!   `O_NOFOLLOW`, so a symlink is refused. It must be owned by the user who
+//!   runs the checkout, and must not be writable by all users unless it has
+//!   the sticky bit. The temp directory is made inside it. Each entry
 //!   of the temp directory is then moved up by a rename that never replaces
 //!   what is there, and the destination must then hold only the checkout.
 //!   The destination itself stays, with its mode, owner and extended
 //!   attributes.
 //!
-//! On any failure, the temp directory and what was moved up are removed
-//! through directory handles, so the destination stays as it was.
+//! On any failure, every path the checkout made is removed, deepest first,
+//! through the same bounded directory handles as the writes, and then the
+//! temp directory. So the destination stays as it was.
 //!
 //! Inside the temp directory every write goes through directory handles: each
 //! parent is opened one part at a time with `O_NOFOLLOW`, and files are made
@@ -29,7 +31,7 @@
 //! already exists means the filesystem folded two names into one, by case or
 //! by Unicode form.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
@@ -38,7 +40,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, RenameFlags};
+use rustix::fs::{AtFlags, Dir, Mode, OFlags, RenameFlags, Stat};
 use rustix::io::Errno;
 use scion_core::RepoPath;
 
@@ -95,8 +97,9 @@ pub fn check_name(name: &[u8]) -> Result<(), &'static str> {
 ///
 /// # Errors
 ///
-/// Fails if `dest` is a symlink, a file, or a directory that is not empty or
-/// that another user owns.
+/// Fails if `dest` is a symlink, a file, or a directory that is not empty,
+/// that another user owns, or that all users can write without the sticky
+/// bit.
 pub fn check_dest(dest: &Path) -> Result<()> {
     open_dest(dest).map(drop)
 }
@@ -119,20 +122,42 @@ fn open_dest(dest: &Path) -> Result<Option<OwnedFd>> {
         Err(Errno::LOOP | Errno::NOTDIR) => bail!("{shown} is a symlink or not a directory"),
         Err(e) => return Err(io::Error::from(e)).with_context(|| format!("cannot open {shown}")),
     };
-    if !is_mine(&dir).with_context(|| format!("cannot read {shown}"))? {
+    let stat = rustix::fs::fstat(&dir)
+        .map_err(io::Error::from)
+        .with_context(|| format!("cannot read {shown}"))?;
+    if !is_mine(&stat) {
         bail!("{shown} is owned by another user");
     }
-    if !entries(&dir)
-        .with_context(|| format!("cannot read {shown}"))?
-        .is_empty()
-    {
-        bail!("{shown} is not empty");
+    // Any user could rename a file of their own over one that has moved up,
+    // and the final check compares only names. Group members are trusted,
+    // as they are in a new destination's parent.
+    let mode = Mode::from_raw_mode(stat.st_mode);
+    if mode.contains(Mode::WOTH) && !mode.contains(Mode::SVTX) {
+        bail!("{shown} is writable by all users: remove that, or set the sticky bit");
     }
-    Ok(Some(dir))
+    let names = entries(&dir).with_context(|| format!("cannot read {shown}"))?;
+    if names.is_empty() {
+        return Ok(Some(dir));
+    }
+    if names
+        .iter()
+        .all(|name| name.starts_with(TEMP_PREFIX.as_bytes()))
+    {
+        let left: Vec<_> = names
+            .iter()
+            .map(|name| format!("\"{}\"", name.escape_ascii()))
+            .collect();
+        bail!(
+            "{shown} is not empty: a stopped checkout left {} in it. Remove that, then try again",
+            left.join(", ")
+        );
+    }
+    bail!("{shown} is not empty")
 }
 
 /// A checkout being written into a temp directory. Dropped without
-/// [`Checkout::finish`], it removes the temp directory and what it moved up.
+/// [`Checkout::finish`], it removes every path it made, wherever it is now,
+/// and then the temp directory.
 pub struct Checkout {
     /// The directory that holds the temp directory: the destination if it
     /// exists, or else its parent.
@@ -144,13 +169,16 @@ pub struct Checkout {
     root: OwnedFd,
     /// How the temp directory becomes the destination.
     dest: Dest,
-    /// Every path this checkout has made, relative to the temp directory.
-    made: HashSet<Vec<u8>>,
+    /// Every path this checkout has made, relative to the temp directory,
+    /// and whether it is a directory. A path sorts after each of its
+    /// parents.
+    made: BTreeMap<Vec<u8>, bool>,
     /// Handles on the directories that hold the last path written, outermost
     /// first, with their paths relative to the temp directory. Each is the
-    /// parent of the next.
+    /// parent of the next. A handle follows its directory when it moves up.
     open: VecDeque<(Vec<u8>, OwnedFd)>,
-    /// Names moved up into an existing destination so far.
+    /// Names moved up into an existing destination so far, sorted, as
+    /// [`entries`] gives them.
     moved: Vec<Vec<u8>>,
     finished: bool,
     /// How many directories this checkout has opened.
@@ -215,7 +243,7 @@ impl Checkout {
                 },
                 // Opened by name: a user who can write `base` could have put
                 // their own directory in its place.
-                None if is_mine(&root)? => Dest::Existing,
+                None if is_mine(&rustix::fs::fstat(&root)?) => Dest::Existing,
                 None => return Err(io::Error::other("another user replaced it")),
             };
             Ok((root, dest))
@@ -236,7 +264,7 @@ impl Checkout {
             temp,
             root,
             dest,
-            made: HashSet::new(),
+            made: BTreeMap::new(),
             open: VecDeque::new(),
             moved: Vec::new(),
             finished: false,
@@ -261,7 +289,7 @@ impl Checkout {
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
             let file = rustix::fs::openat(dir, name, flags, mode)
                 .map_err(|e| collision_if_exists(e, path.as_bytes()))?;
-            self.made.insert(path.as_bytes().to_vec());
+            self.made.insert(path.as_bytes().to_vec(), false);
             fs::File::from(file).write_all(data)
         };
         write().with_context(|| format!("cannot write {path:?}"))
@@ -279,7 +307,7 @@ impl Checkout {
             let (dir, name) = self.parent(path)?;
             rustix::fs::symlinkat(target, dir, name)
                 .map_err(|e| collision_if_exists(e, path.as_bytes()))?;
-            self.made.insert(path.as_bytes().to_vec());
+            self.made.insert(path.as_bytes().to_vec(), false);
             Ok(())
         };
         link().with_context(|| format!("cannot write {path:?}"))
@@ -323,8 +351,9 @@ impl Checkout {
     /// over something already there. Then checks that the destination holds
     /// only the checkout, and removes the temp directory.
     // SHORTCUT: needs a rename that never replaces (`RENAME_NOREPLACE` on
-    // Linux, `RENAME_EXCL` on macOS), which NFS does not have. Upgrade
-    // (issue #74): check, then rename, on such a filesystem.
+    // Linux, `RENAME_EXCL` on macOS). On Linux, NFS has none: `renameat2`
+    // fails with EINVAL. Untested on macOS NFS. Upgrade (issue #74): check,
+    // then rename, on such a filesystem.
     fn move_up(&mut self) -> Result<()> {
         let shown = self.base_path.display();
         for name in entries(&self.root).context("cannot read the checkout")? {
@@ -354,22 +383,36 @@ impl Checkout {
             .with_context(|| format!("cannot remove the temp directory in {shown}"))
     }
 
-    /// Opens the directory that holds `path` in the temp directory, making
-    /// missing parents, and returns it with the last part of `path`. Fails
-    /// before making anything if a part breaks [`check_name`].
-    ///
-    /// The handles on the directories of the last path stay open, so a path
-    /// in the same directory, or below it, opens only what is new.
+    /// [`Checkout::holder`] that makes missing parents. Fails before making
+    /// anything if a part breaks [`check_name`].
     fn parent<'p>(&mut self, path: &'p RepoPath) -> io::Result<(BorrowedFd<'_>, &'p [u8])> {
         let bytes = path.as_bytes();
         let mut parts = bytes.split(|&b| b == b'/');
         if let Some(why) = parts.find_map(|part| check_name(part).err()) {
             return Err(io::Error::other(why));
         }
-        let (dir, name) = match bytes.iter().rposition(|&b| b == b'/') {
-            Some(slash) => (&bytes[..slash], &bytes[slash + 1..]),
-            None => (&b""[..], bytes),
+        self.holder(bytes, true)
+    }
+
+    /// Opens the directory that holds `path`, a path relative to the temp
+    /// directory, and returns it with the last part of `path`. With `make`,
+    /// makes the parents that this checkout has not made yet.
+    ///
+    /// The handles on the directories of the last path stay open, so a path
+    /// in the same directory, or below it, opens only what is new. A
+    /// top-level entry that has moved up is opened in the destination.
+    fn holder<'p>(&mut self, path: &'p [u8], make: bool) -> io::Result<(BorrowedFd<'_>, &'p [u8])> {
+        let (dir, name) = match path.iter().rposition(|&b| b == b'/') {
+            Some(slash) => (&path[..slash], &path[slash + 1..]),
+            None => (&b""[..], path),
         };
+        let first = path.split(|&b| b == b'/').next().unwrap_or_default();
+        let moved = self
+            .moved
+            .binary_search_by(|name| name.as_slice().cmp(first))
+            .is_ok();
+        // Where the first part of `path` is: what the handles start from.
+        let top = if moved { &self.base } else { &self.root };
         while self
             .open
             .back()
@@ -385,11 +428,11 @@ impl Checkout {
                 .position(|&b| b == b'/')
                 .map_or(dir.len(), |i| start + i);
             let (part, prefix) = (&dir[start..end], &dir[..end]);
-            let at = self.open.back().map_or(&self.root, |(_, dir)| dir);
-            if !self.made.contains(prefix) {
+            let at = self.open.back().map_or(top, |(_, dir)| dir);
+            if make && !self.made.contains_key(prefix) {
                 rustix::fs::mkdirat(at, part, Mode::from_raw_mode(0o777))
                     .map_err(|e| collision_if_exists(e, prefix))?;
-                self.made.insert(prefix.to_vec());
+                self.made.insert(prefix.to_vec(), true);
             }
             let opened = open_dir(at, part)?;
             #[cfg(test)]
@@ -402,8 +445,21 @@ impl Checkout {
             self.open.push_back((prefix.to_vec(), opened));
             start = end + 1;
         }
-        let dir = self.open.back().map_or(&self.root, |(_, dir)| dir);
+        let dir = self.open.back().map_or(top, |(_, dir)| dir);
         Ok((dir.as_fd(), name))
+    }
+
+    /// Removes `path`, which this checkout made, through the handles that
+    /// stay open. `unlinkat` never follows a symlink. A directory must be
+    /// empty.
+    fn remove(&mut self, path: &[u8], is_dir: bool) -> io::Result<()> {
+        let (dir, name) = self.holder(path, false)?;
+        let flags = if is_dir {
+            AtFlags::REMOVEDIR
+        } else {
+            AtFlags::empty()
+        };
+        Ok(rustix::fs::unlinkat(dir, name, flags)?)
     }
 }
 
@@ -412,13 +468,23 @@ impl Drop for Checkout {
         if self.finished {
             return;
         }
-        // The removal opens a handle per level, so close these first.
-        self.open.clear();
-        for name in self.moved.iter().chain([&self.temp]) {
-            if let Err(e) = remove_all(&self.base, name) {
-                let path = self.base_path.join(OsStr::from_bytes(name));
-                eprintln!("warning: cannot remove {}: {e}", path.display());
+        // In reverse path order, a directory comes after everything in it.
+        let (mut first, mut failed) = (None, 0);
+        for (path, is_dir) in std::mem::take(&mut self.made).into_iter().rev() {
+            if let Err(e) = self.remove(&path, is_dir) {
+                first.get_or_insert_with(|| format!("\"{}\": {e}", path.escape_ascii()));
+                failed += 1;
             }
+        }
+        if let Some(first) = first {
+            eprintln!(
+                "warning: cannot remove {failed} paths of the checkout in {}, first {first}",
+                self.base_path.display()
+            );
+        }
+        if let Err(e) = rustix::fs::unlinkat(&self.base, self.temp.as_slice(), AtFlags::REMOVEDIR) {
+            let temp = self.base_path.join(OsStr::from_bytes(&self.temp));
+            eprintln!("warning: cannot remove {}: {e}", temp.display());
         }
     }
 }
@@ -444,9 +510,9 @@ fn mkdir_mode(dir: &OwnedFd) -> io::Result<Mode> {
     Ok(Mode::from_raw_mode(stat?.st_mode & 0o7777))
 }
 
-/// Whether the user who runs this process owns `dir`.
-fn is_mine(dir: &OwnedFd) -> io::Result<bool> {
-    Ok(rustix::fs::fstat(dir)?.st_uid == rustix::process::geteuid().as_raw())
+/// Whether the user who runs this process owns what `stat` describes.
+fn is_mine(stat: &Stat) -> bool {
+    stat.st_uid == rustix::process::geteuid().as_raw()
 }
 
 /// Opens directory `name` in `dir`. Fails if `name` is a symlink or anything
@@ -473,22 +539,6 @@ fn entries(dir: &OwnedFd) -> io::Result<Vec<Vec<u8>>> {
     }
     names.sort_unstable();
     Ok(names)
-}
-
-/// Removes `name` from `dir`, and everything in it if it is a directory, all
-/// through handles. Never follows a symlink.
-fn remove_all(dir: &OwnedFd, name: &[u8]) -> io::Result<()> {
-    let stat = rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
-    if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
-        let inner = open_dir(dir, name)?;
-        for entry in entries(&inner)? {
-            remove_all(&inner, &entry)?;
-        }
-        rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR)?;
-    } else {
-        rustix::fs::unlinkat(dir, name, AtFlags::empty())?;
-    }
-    Ok(())
 }
 
 /// Whether `path` is `dir` or below it.
@@ -708,6 +758,59 @@ mod tests {
             Checkout::start(root).err().unwrap(),
         ] {
             assert!(err.to_string().contains("owned by another user"), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn a_directory_that_all_users_can_write_needs_the_sticky_bit() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (mode, ok) in [(0o777, false), (0o1777, true), (0o775, true), (0o700, true)] {
+            let dest = tmp.path().join(format!("{mode:o}"));
+            fs::create_dir(&dest).unwrap();
+            fs::set_permissions(&dest, fs::Permissions::from_mode(mode)).unwrap();
+            let results = [check_dest(&dest), Checkout::start(&dest).map(drop)];
+            for result in results {
+                match result {
+                    Ok(()) => assert!(ok, "{mode:o} was accepted"),
+                    Err(e) => {
+                        assert!(!ok, "{mode:o}: {e:#}");
+                        assert!(e.to_string().contains("writable by all users"), "{e:#}");
+                    }
+                }
+            }
+            assert_eq!(names(&dest), Vec::<String>::new());
+        }
+    }
+
+    #[test]
+    fn a_temp_directory_left_behind_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let left = format!("{TEMP_PREFIX}0123456789abcdef");
+        fs::create_dir_all(dest.join(&left)).unwrap();
+        let err = check_dest(&dest).unwrap_err().to_string();
+        assert!(err.contains("stopped checkout"), "{err}");
+        assert!(err.contains(&left), "{err}");
+        // Next to anything else, it is a plain "not empty".
+        fs::write(dest.join("other"), "").unwrap();
+        let err = check_dest(&dest).unwrap_err().to_string();
+        assert!(!err.contains("stopped checkout"), "{err}");
+    }
+
+    #[test]
+    fn sibling_directories_that_share_a_prefix_stay_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let mut checkout = Checkout::start(&dest).unwrap();
+        // In path order: `-` sorts before `/`, and `/` before `b`. So `a` is
+        // open when `ab/z` comes, and `ab` starts with `a`.
+        for file in ["a-b/y", "a/x", "ab/z"] {
+            checkout.file(&path(file), false, file.as_bytes()).unwrap();
+        }
+        checkout.finish().unwrap();
+        assert_eq!(names(&dest), ["a", "a-b", "ab"]);
+        for (dir, file) in [("a", "x"), ("a-b", "y"), ("ab", "z")] {
+            assert_eq!(names(&dest.join(dir)), [file], "{dir}");
         }
     }
 
