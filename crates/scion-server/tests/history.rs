@@ -9,8 +9,8 @@ use std::process::Command;
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_server::blame::{
-    self, Blame, BlameRange, MAX_BLAME_BYTES, MAX_BLAME_DIFF_LINES, MAX_BLAME_VERSIONS,
-    MAX_RENAME_SOURCES,
+    self, Blame, BlameRange, MAX_BLAME_BYTES, MAX_BLAME_DIFF_LINES, MAX_BLAME_LINES,
+    MAX_BLAME_VERSIONS, MAX_RENAME_BYTES, MAX_RENAME_SOURCES,
 };
 use scion_server::import::{ImportOptions, import_git};
 use scion_server::read::{self, MAX_SCAN};
@@ -295,19 +295,20 @@ fn blame_stops_after_max_versions_and_resumes() {
 #[test]
 fn blame_gives_every_line_to_the_change_after_a_version_it_cannot_diff() {
     let (_data, store) = open_store();
-    let binary = store.blobs().put(b"a\n\0\n").unwrap();
+    let too_long = format!("a\nb\n{}", "\n".repeat(MAX_BLAME_LINES));
+    let over_limit = store.blobs().put(too_long.as_bytes()).unwrap();
     let text = store.blobs().put(b"a\nb\n").unwrap();
     let edit = store.blobs().put(b"a\nb\nc\n").unwrap();
     let ids = chain(
         &store,
         vec![
-            vec![("f", regular(binary))],
+            vec![("f", regular(over_limit))],
             vec![("f", regular(text))],
             vec![("f", regular(edit))],
         ],
     );
-    // A line diff would keep "a" from the first version; a binary version
-    // is not diffed, so "a" belongs to the change that made the file text.
+    // A line diff would keep "a" and "b" from the first version. It has
+    // more lines than blame reads, so they belong to the change after it.
     let result = blame(&store, ids[2], "f");
     assert_eq!(
         result.ranges,
@@ -335,15 +336,15 @@ fn a_change_that_only_deletes_lines_is_not_named() {
 #[test]
 fn blame_refuses_what_it_cannot_diff() {
     let (_data, store) = open_store();
-    let at_limit = vec![b'x'; MAX_BLAME_BYTES];
-    let over_limit = vec![b'x'; MAX_BLAME_BYTES + 1];
     let put = |data: &[u8]| regular(store.blobs().put(data).unwrap());
+    let lines = |n: usize| "\n".repeat(n).into_bytes();
     let ids = chain(
         &store,
         vec![vec![
-            ("at-limit", put(&at_limit)),
-            ("over-limit", put(&over_limit)),
-            ("binary", put(b"text\0more\n")),
+            ("bytes-at-limit", put(&vec![b'x'; MAX_BLAME_BYTES])),
+            ("bytes-over-limit", put(&vec![b'x'; MAX_BLAME_BYTES + 1])),
+            ("lines-at-limit", put(&lines(MAX_BLAME_LINES))),
+            ("lines-over-limit", put(&lines(MAX_BLAME_LINES + 1))),
             ("dir/file", put(b"x\n")),
             (
                 "link",
@@ -355,10 +356,14 @@ fn blame_refuses_what_it_cannot_diff() {
     );
     let cs = ids[0];
     assert_eq!(
-        blame(&store, cs, "at-limit").ranges,
+        blame(&store, cs, "bytes-at-limit").ranges,
         [range(1, 1, Some(cs), 1)]
     );
-    for p in ["over-limit", "binary", "dir", "link"] {
+    assert_eq!(
+        blame(&store, cs, "lines-at-limit").ranges,
+        [range(1, MAX_BLAME_LINES, Some(cs), 1)]
+    );
+    for p in ["bytes-over-limit", "lines-over-limit", "dir", "link"] {
         let result = blame::blame(&store, REPO, cs, &path(p));
         assert!(
             matches!(result, Err(Error::InvalidArgument(_))),
@@ -408,19 +413,28 @@ fn blame_lines(store: &Store, cs: ChangesetId, p: &str) -> Vec<(ChangesetId, u32
 
 /// `git blame --first-parent` of `file`, in the form of [`blame_lines`].
 fn git_blame_lines(store: &Store, dir: &Path, file: &str) -> Vec<(ChangesetId, u32, RepoPath)> {
-    let out = git(dir, &["blame", "--first-parent", "--line-porcelain", file]);
+    // `--porcelain`, not `--line-porcelain`, which is slow on large files.
+    let out = git(dir, &["blame", "--first-parent", "--porcelain", file]);
     let mut lines = Vec::new();
-    // Each line starts with "<commit> <origin line> <line> [<count>]".
-    let mut header = None;
+    // Each commit's changeset, and its path as git last named it. git names
+    // the path the first time it shows a commit, and each time if the
+    // commit has lines from more than one path.
+    let mut commits: HashMap<String, (ChangesetId, RepoPath)> = HashMap::new();
+    // Each line starts with "<commit> <origin line> <line> [<count>]", and
+    // its text comes after a tab.
+    let mut header: Option<(String, u32)> = None;
     for line in out.lines() {
         if line.starts_with('\t') {
-            header = None;
-        } else if header.is_none() {
+            let (commit, origin) = header.take().unwrap();
+            let (id, name) = commits[&commit].clone();
+            lines.push((id, origin, name));
+        } else if let Some((commit, _)) = &header {
+            if let Some(name) = line.strip_prefix("filename ") {
+                commits.insert(commit.clone(), (changeset_of(store, commit), path(name)));
+            }
+        } else {
             let fields: Vec<&str> = line.split(' ').collect();
-            header = Some((changeset_of(store, fields[0]), fields[1].parse().unwrap()));
-        } else if let Some(name) = line.strip_prefix("filename ") {
-            let (id, origin) = header.unwrap();
-            lines.push((id, origin, path(name)));
+            header = Some((fields[0].to_owned(), fields[1].parse().unwrap()));
         }
     }
     lines
@@ -624,6 +638,99 @@ fn blame_picks_the_rename_source_as_git_blame_does() {
 }
 
 #[test]
+fn a_rename_search_reads_every_file_the_old_limit_read() {
+    let git_dir = tempfile::tempdir().unwrap();
+    let dir = git_dir.path();
+    git(dir, &["init", "-q", "-b", "main"]);
+    // Nine deleted files of 1 MiB, in 8-byte lines: 1,179,648 chunks, more
+    // than one call's budget. `new` is `big/8`, the last by path, with one
+    // line changed. git compares all nine and follows `big/8`.
+    let file = |k: usize| format!("{k}aaaaaa\n").repeat((1 << 20) / 8);
+    let sources: Vec<(String, String)> = (0..9).map(|k| (format!("big/{k}"), file(k))).collect();
+    let sources: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(p, text)| (p.as_str(), text.as_str()))
+        .collect();
+    let new = file(8).replacen("8aaaaaa\n", "changed\n", 1);
+    commit_cases(
+        dir,
+        &[("rename one of nine large files", &sources, ("new", &new))],
+    );
+    assert_blame_matches_git(dir, &["new"]);
+}
+
+#[test]
+fn binary_files_are_blamed_as_git_blame_does() {
+    let git_dir = tempfile::tempdir().unwrap();
+    let dir = git_dir.path();
+    git(dir, &["init", "-q", "-b", "main"]);
+    // A NUL byte makes a file binary to git, but `git blame` still diffs it
+    // line by line.
+    commit(
+        dir,
+        "add",
+        &[
+            ("bin", Some("a\nb\n\0c\nd\n")),
+            ("mixed", Some("a\nb\n\0c\n")),
+        ],
+    );
+    commit(
+        dir,
+        "edit, and mixed becomes text",
+        &[
+            ("bin", Some("a\nb\n\0c\nd\ne\n")),
+            ("mixed", Some("a\nb\nc\n")),
+        ],
+    );
+    // In a binary file, a CR before a newline counts when git scores a
+    // rename. These are 86% similar as text, but 3% as binary.
+    let lines = |count: usize, end: &str| -> String {
+        (1..=count)
+            .map(|n| format!("k{n:04}{end}"))
+            .collect::<Vec<_>>()
+            .concat()
+    };
+    let (crlf, lf) = (
+        format!("\0\n{}", lines(9, "\r\n")),
+        format!("\0\n{}", lines(9, "\n")),
+    );
+    // git looks for a NUL byte in the first 8,000 bytes only. 1,142 lines
+    // of 7 bytes, then a NUL byte at offset 7,999 (binary: under 1% similar)
+    // or 8,000 (text: 86% similar).
+    let nul_at = |offset: usize, end: &str| {
+        format!("{}{}\0\n", lines(1142, end), &"abcdef"[..offset - 7994])
+    };
+    commit_cases(
+        dir,
+        &[
+            (
+                "rename a binary file, and change its line ends",
+                &[("crlf.bin", &crlf)],
+                ("lf.bin", &lf),
+            ),
+            (
+                "the same, with a NUL byte at offset 7,999",
+                &[("nul-7999.bin", &nul_at(7999, "\r\n"))],
+                ("nul-7999-lf.bin", &nul_at(7999, "\n")),
+            ),
+            (
+                "the same, with a NUL byte at offset 8,000",
+                &[("nul-8000.bin", &nul_at(8000, "\r\n"))],
+                ("nul-8000-lf.bin", &nul_at(8000, "\n")),
+            ),
+        ],
+    );
+    let files = [
+        "bin",
+        "mixed",
+        "lf.bin",
+        "nul-7999-lf.bin",
+        "nul-8000-lf.bin",
+    ];
+    assert_blame_matches_git(dir, &files);
+}
+
+#[test]
 fn blame_continues_at_the_old_path_after_a_rename() {
     let (_data, store) = open_store();
     // Each changeset adds one line at the top. The one at `before` also
@@ -693,28 +800,107 @@ fn a_rename_search_counts_against_the_diff_budget() {
 }
 
 #[test]
-fn a_rename_with_no_edit_costs_no_diff() {
+fn a_long_line_costs_once_per_64_bytes() {
     let (_data, store) = open_store();
-    // `ids[1]` renames `a` to `f` with the same content. A diff of it would
-    // cost about 2n lines, and the call would stop after the first diff.
+    // 2,000 lines of 6,400 bytes cost 200,000 each side. Each version adds
+    // one short line at the top, so each diff costs about 400,000, and a
+    // call stops before its third diff. Counted by lines, all would fit.
+    let n = 2_000;
+    let pieces = n * 100;
+    assert!(4 * pieces < MAX_BLAME_DIFF_LINES && 6 * pieces > MAX_BLAME_DIFF_LINES);
+    let mut text = format!("{}\n", "x".repeat(6_399)).repeat(n);
+    let mut changes = vec![vec![(
+        "f",
+        regular(store.blobs().put(text.as_bytes()).unwrap()),
+    )]];
+    for k in 1..=3 {
+        text.insert_str(0, &format!("{k}\n"));
+        changes.push(vec![(
+            "f",
+            regular(store.blobs().put(text.as_bytes()).unwrap()),
+        )]);
+    }
+    let ids = chain(&store, changes);
+    assert_eq!(blame(&store, ids[3], "f").next, Some((ids[1], path("f"))));
+}
+
+#[test]
+fn a_rename_search_stops_after_its_bound() {
+    let (_data, store) = open_store();
+    // Files of MAX_BLAME_BYTES, in lines of 64 bytes. `new` is a rename of
+    // `old/7` with one line changed. `old/0` to `old/6` come first by path
+    // and are not like it. After seven of them, the search has read more
+    // than MAX_RENAME_BYTES, so it stops.
+    const { assert!(6 * MAX_BLAME_BYTES <= MAX_RENAME_BYTES && 7 * MAX_BLAME_BYTES > MAX_RENAME_BYTES) };
+    let lines = MAX_BLAME_BYTES / 64;
+    let line = |byte: char| format!("{}\n", byte.to_string().repeat(63));
+    let put = |text: &str| Some(regular(store.blobs().put(text.as_bytes()).unwrap()));
+    let names: Vec<String> = (0..=7).map(|k| format!("old/{k}")).collect();
+    let unlike = put(&line('a').repeat(lines));
+    let mut root: Vec<_> = names[..7].iter().map(|p| (p.as_str(), unlike)).collect();
+    root.push((names[7].as_str(), put(&line('n').repeat(lines))));
+    let mut rename: Vec<_> = names.iter().map(|p| (p.as_str(), None)).collect();
+    let new = format!("{}{}", line('c'), line('n').repeat(lines - 1));
+    rename.push(("new", put(&new)));
+    let ids = chain(&store, vec![root, rename]);
+    assert_eq!(
+        blame(&store, ids[1], "new").ranges,
+        [range(1, lines, Some(ids[1]), 1)]
+    );
+}
+
+#[test]
+fn a_mode_change_or_a_rename_with_no_edit_costs_nothing() {
+    let (_data, store) = open_store();
+    // `ids[1]` makes `a` executable, and `ids[2]` renames it to `f`, both
+    // with the same content. A diff of either would cost about 2n lines,
+    // and the call would stop after the first diff.
     let n = 300_000;
     assert!(4 * n > MAX_BLAME_DIFF_LINES && 2 * n < MAX_BLAME_DIFF_LINES);
+    let empty = "\n".repeat(n);
+    let blob = store.blobs().put(empty.as_bytes()).unwrap();
+    let executable = FileState::Regular {
+        content: blob,
+        executable: true,
+    };
+    let edit = store.blobs().put(format!("x\n{empty}").as_bytes()).unwrap();
+    let ids = chain(
+        &store,
+        vec![
+            vec![("a", Some(regular(blob)))],
+            vec![("a", Some(executable))],
+            vec![("a", None), ("f", Some(executable))],
+            vec![("f", Some(regular(edit)))],
+        ],
+    );
+    let result = blame(&store, ids[3], "f");
+    assert_eq!(
+        result.ranges,
+        [range(1, 1, Some(ids[3]), 1), range(2, n, Some(ids[0]), 1)]
+    );
+    assert_eq!(result.next, None);
+}
+
+#[test]
+fn a_file_read_and_refused_costs_its_size() {
+    let (_data, store) = open_store();
+    // `ids[0]` has more lines than blame reads. It is read, then refused,
+    // and that costs about 16,000. With the diff of `ids[2]` before it, the
+    // call passes its budget and stops at `ids[1]`.
+    let n = 520_000;
+    let refused = MAX_BLAME_LINES.div_ceil(64);
+    assert!(2 * n < MAX_BLAME_DIFF_LINES && 2 * n + 1 + refused > MAX_BLAME_DIFF_LINES);
     let put = |text: &str| Some(regular(store.blobs().put(text.as_bytes()).unwrap()));
     let empty = "\n".repeat(n);
     let ids = chain(
         &store,
         vec![
-            vec![("a", put(&empty))],
-            vec![("a", None), ("f", put(&empty))],
+            vec![("f", put(&"\n".repeat(MAX_BLAME_LINES + 1)))],
+            vec![("f", put(&empty))],
             vec![("f", put(&format!("x\n{empty}")))],
         ],
     );
-    let result = blame(&store, ids[2], "f");
-    assert_eq!(
-        result.ranges,
-        [range(1, 1, Some(ids[2]), 1), range(2, n, Some(ids[0]), 1)]
-    );
-    assert_eq!(result.next, None);
+    assert_eq!(blame(&store, ids[2], "f").next, Some((ids[1], path("f"))));
 }
 
 #[test]
