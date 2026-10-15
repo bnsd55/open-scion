@@ -20,7 +20,6 @@ use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::StreamExt;
-use tokio_stream::adapters::Map;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Response, Status, Streaming};
@@ -48,11 +47,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// Most bytes that all `ReadFile` replies together hold: the parts read and
 /// not yet sent, and the readers of files of more than one part.
 const READ_BUDGET_BYTES: usize = 256 << 20;
-/// A `ReadFile` reply ends when its client takes no part for this long, so a
-/// client that stops reading does not hold memory and budget.
-// SHORTCUT: the reply ends, but HTTP/2 keeps the part it was sending until
-// the connection closes. Upgrade (issue #42): a response body timeout that
-// resets the stream.
+/// A `ReadFile` reply ends when its client takes no part for this long, and
+/// frees its share, so a client that stops reading does not hold budget.
+// SHORTCUT: the reply frees its share, but the part that waits in its
+// channel and the part inside HTTP/2 stay in memory, outside the budget,
+// until the connection closes: up to 2 MiB per stalled reply. Upgrade
+// (issue #42): a response body timeout that resets the stream.
 const READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 // Any one reply fits in the budget, and the budget counts in u32 permits.
@@ -227,13 +227,7 @@ fn land_response(outcome: LandOutcome) -> LandResponse {
 /// A part of a `ReadFile` reply, or the error that ends it early.
 type Part = Result<ReadFileResponse, Status>;
 
-/// A part on its way to the client. The last item of a reply also holds the
-/// share of the budget for the part that may wait in the channel, so that
-/// share stays taken until the client has the part.
-type Sent = (Part, Option<OwnedSemaphorePermit>);
-
-/// The `ReadFile` reply: the channel, minus the shares the items held.
-type ReadFileStream = Map<ReceiverStream<Sent>, fn(Sent) -> Part>;
+type ReadFileStream = ReceiverStream<Part>;
 
 /// The share of `READ_BUDGET_BYTES` that a `ReadFile` reply of a `size`-byte
 /// file holds. A file of one part is read in one job, so the reply holds only
@@ -248,32 +242,24 @@ const fn read_share(size: usize) -> usize {
 }
 
 /// Sends a blob to `tx` in parts of up to `CHUNK_BYTES`, as the client takes
-/// them, and holds `share` until it stops. The last item it sends takes the
-/// part of `share` that covers a part still in the channel, and the rest is
-/// freed. A part goes into the channel only when the channel is empty, so
-/// its second slot is always free for the error that ends a reply early: a
-/// store error, no part taken within `stall`, or the `deadline`. A client
-/// never takes a short file for a whole one.
+/// them. Holds `share` until the client has taken the last part, or until no
+/// part is taken within `stall`. A part goes into the channel only when the
+/// channel is empty, so its second slot is always free for the error that
+/// ends a reply early: a store error, or the stall. A client never takes a
+/// short file for a whole one.
 async fn send_file(
     worker: Worker,
     blob: BlobId,
-    mut share: OwnedSemaphorePermit,
-    tx: mpsc::Sender<Sent>,
+    _share: OwnedSemaphorePermit,
+    tx: mpsc::Sender<Part>,
     stall: Duration,
-    deadline: Instant,
 ) {
-    // Bytes of the last part sent, which may still be in the channel.
-    let mut queued = 0;
-    let fail = |status: Status, held: Option<OwnedSemaphorePermit>| {
+    let fail = |status: Status| {
         // Fails only if the client has gone.
-        let _ = tx.try_send((Err(status), held));
+        let _ = tx.try_send(Err(status));
     };
-    let late = || Status::deadline_exceeded("the reply ran past its deadline");
     let mut open = None;
     loop {
-        if Instant::now() >= deadline {
-            return fail(late(), share.split(queued));
-        }
         let read = worker
             .run(move |store| {
                 let mut reader = match open {
@@ -287,31 +273,27 @@ async fn send_file(
             .await;
         let (part, reader) = match read {
             Ok(read) => read,
-            Err(status) => return fail(status, share.split(queued)),
+            Err(status) => return fail(status),
         };
         open = reader;
         if let Some(data) = part {
             // Both slots free: the client has taken the part before.
-            let wait = deadline.min(Instant::now() + stall);
-            match tokio::time::timeout_at(wait.into(), tx.reserve_many(2)).await {
+            match tokio::time::timeout(stall, tx.reserve_many(2)).await {
                 Ok(Ok(mut slots)) => {
                     if let Some(slot) = slots.next() {
-                        queued = data.len();
-                        let held = open.is_none().then(|| share.split(queued)).flatten();
-                        slot.send((Ok(ReadFileResponse { data }), held));
+                        slot.send(Ok(ReadFileResponse { data }));
                     }
                 }
                 Ok(Err(_)) => return,
-                Err(_) if Instant::now() >= deadline => {
-                    return fail(late(), share.split(queued));
-                }
                 Err(_) => {
                     let detail = format!("the client took no data for {stall:?}");
-                    return fail(Status::deadline_exceeded(detail), share.split(queued));
+                    return fail(Status::deadline_exceeded(detail));
                 }
             }
         }
         if open.is_none() {
+            // Keeps the share until the client has taken the last part.
+            let _ = tokio::time::timeout(stall, tx.reserve_many(2)).await;
             return;
         }
     }
@@ -451,7 +433,6 @@ impl Scion for ScionService {
         &self,
         request: Request<ReadFileRequest>,
     ) -> Result<Response<ReadFileStream>, Status> {
-        let deadline = Instant::now() + REQUEST_TIMEOUT;
         let req = request.into_inner();
         check_name("repo", &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
@@ -476,10 +457,8 @@ impl Scion for ScionService {
             share,
             tx,
             READ_STALL_TIMEOUT,
-            deadline,
         ));
-        let release: fn(Sent) -> Part = |(part, _held)| part;
-        Ok(Response::new(ReceiverStream::new(rx).map(release)))
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn list_dir(
@@ -707,102 +686,108 @@ mod tests {
         (0..parts).flat_map(|i| vec![i; CHUNK_BYTES]).collect()
     }
 
+    /// Starts [`send_file`] for `blob` with all of a budget of `budget`.
+    /// Returns the task, the reply and the budget.
+    async fn reply(
+        store: Store,
+        blob: BlobId,
+        budget: usize,
+        stall: Duration,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        mpsc::Receiver<Part>,
+        Arc<Semaphore>,
+    ) {
+        let reads = Arc::new(Semaphore::new(budget));
+        let share = u32::try_from(budget).unwrap();
+        let share = Arc::clone(&reads).acquire_many_owned(share).await.unwrap();
+        let (tx, rx) = mpsc::channel(2);
+        let task = tokio::spawn(send_file(Worker::new(store), blob, share, tx, stall));
+        (task, rx, reads)
+    }
+
     #[tokio::test]
     async fn a_read_file_reply_whose_client_stops_reading_ends_with_an_error() {
         let data = content(3);
         let (_dir, store, _, blob) = file_store(&data);
         let budget = read_share(data.len());
-        let reads = Arc::new(Semaphore::new(budget));
-        let share = u32::try_from(budget).unwrap();
-        let share = Arc::clone(&reads).acquire_many_owned(share).await.unwrap();
-        let (tx, mut rx) = mpsc::channel(2);
-        let stall = Duration::from_millis(50);
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let task = tokio::spawn(send_file(
-            Worker::new(store),
-            blob,
-            share,
-            tx,
-            stall,
-            deadline,
-        ));
+        let (task, mut rx, reads) = reply(store, blob, budget, Duration::from_millis(50)).await;
 
         // Nobody reads: the first part waits in the channel, and the second
-        // stalls and ends the reply. Only the waiting part keeps its share.
+        // stalls and ends the reply, which frees its share.
         tokio::time::timeout(Duration::from_secs(10), task)
             .await
             .expect("a stalled reply ends")
             .unwrap();
-        assert_eq!(reads.available_permits(), budget - CHUNK_BYTES);
+        assert_eq!(reads.available_permits(), budget, "the share is free");
         // A client that comes back gets the part and then the error, so it
         // never takes the file for a whole one.
-        let (first, _) = rx.recv().await.unwrap();
-        assert!(first.unwrap().data == data[..CHUNK_BYTES], "the first part");
-        let (status, held) = rx.recv().await.unwrap();
-        let status = status.unwrap_err();
+        let first = rx.recv().await.unwrap().unwrap();
+        assert!(first.data == data[..CHUNK_BYTES], "the first part");
+        let status = rx.recv().await.unwrap().unwrap_err();
         assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
         assert!(rx.recv().await.is_none());
-        drop(held);
-        assert_eq!(reads.available_permits(), budget, "the share is free");
     }
 
     #[tokio::test]
-    async fn the_last_part_keeps_its_share_until_the_client_takes_it() {
+    async fn the_last_part_holds_the_share_until_the_client_takes_it() {
         let data = content(1);
         let (_dir, store, _, blob) = file_store(&data);
         let budget = read_share(data.len());
-        let reads = Arc::new(Semaphore::new(budget));
-        let share = u32::try_from(budget).unwrap();
-        let share = Arc::clone(&reads).acquire_many_owned(share).await.unwrap();
-        let (tx, mut rx) = mpsc::channel(2);
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let stall = Duration::from_secs(60);
-        let task = send_file(Worker::new(store), blob, share, tx, stall, deadline);
-        tokio::spawn(task).await.unwrap();
 
-        // The task has ended, but its only part is still in the channel.
-        assert_eq!(reads.available_permits(), 0);
-        let (part, held) = rx.recv().await.unwrap();
-        assert!(part.unwrap().data == data, "the whole file");
-        drop(held);
+        // A client that takes the part: the share comes back then.
+        let stall = Duration::from_secs(60);
+        let (task, mut rx, reads) = reply(store.clone(), blob, budget, stall).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(reads.available_permits(), 0, "the part is not taken yet");
+        assert!(rx.recv().await.unwrap().unwrap().data == data, "the file");
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the reply ends once the client has the last part")
+            .unwrap();
         assert_eq!(reads.available_permits(), budget);
+        assert!(rx.recv().await.is_none());
+
+        // A client that never takes it: the share comes back after the
+        // stall, and the reply still ends whole.
+        let stall = Duration::from_millis(50);
+        let (task, mut rx, reads) = reply(store, blob, budget, stall).await;
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the reply ends after the stall")
+            .unwrap();
+        assert_eq!(reads.available_permits(), budget);
+        assert!(rx.recv().await.unwrap().unwrap().data == data, "the file");
         assert!(rx.recv().await.is_none());
     }
 
     #[tokio::test]
-    async fn a_read_file_reply_ends_at_its_deadline() {
+    async fn a_damaged_blob_ends_the_reply_with_internal_before_its_last_part() {
         let data = content(3);
-        let (_dir, store, _, blob) = file_store(&data);
-        let worker = Worker::new(store);
-        let reads = Arc::new(Semaphore::new(2));
-        let stall = Duration::from_secs(60);
-        let reply = |deadline| {
-            let share = Arc::clone(&reads).try_acquire_owned().unwrap();
-            let (tx, rx) = mpsc::channel(2);
-            let task = send_file(worker.clone(), blob, share, tx, stall, deadline);
-            (tokio::spawn(task), rx)
-        };
-        let deadline_exceeded = |sent: Option<Sent>| {
-            let status = sent.unwrap().0.unwrap_err();
-            assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
-        };
+        for flip in [10, data.len() / 2, data.len() - 10] {
+            let (_dir, store, _, blob) = file_store(&data);
+            // A valid zstd frame of other content, under the blob's ID.
+            let mut damaged = data.clone();
+            damaged[flip] ^= 1;
+            let packed = zstd::bulk::compress(&damaged, 3).unwrap();
+            std::fs::write(store.blobs().location(blob).1, packed).unwrap();
 
-        // Past its deadline, a reply sends nothing, though its client reads.
-        let (_, mut rx) = reply(Instant::now());
-        deadline_exceeded(rx.recv().await);
-        assert!(rx.recv().await.is_none());
-
-        // A client that takes nothing: the reply ends at its deadline, long
-        // before the stall limit.
-        let (task, mut rx) = reply(Instant::now() + Duration::from_millis(200));
-        tokio::time::timeout(Duration::from_secs(10), task)
-            .await
-            .expect("the reply ends at its deadline")
-            .unwrap();
-        let first = rx.recv().await.unwrap().0.unwrap();
-        assert!(first.data == data[..CHUNK_BYTES], "the first part");
-        deadline_exceeded(rx.recv().await);
-        assert!(rx.recv().await.is_none());
+            let budget = read_share(data.len());
+            let stall = Duration::from_secs(60);
+            let (task, mut rx, reads) = reply(store, blob, budget, stall).await;
+            let mut parts = 0;
+            let status = loop {
+                match rx.recv().await.expect("the reply ends with an error") {
+                    Ok(_) => parts += 1,
+                    Err(status) => break status,
+                }
+            };
+            assert_eq!(status.code(), Code::Internal, "bit {flip}: {status:?}");
+            assert_eq!(parts, 2, "bit {flip}: every part but the last");
+            assert!(rx.recv().await.is_none());
+            task.await.unwrap();
+            assert_eq!(reads.available_permits(), budget, "bit {flip}");
+        }
     }
 
     #[tokio::test]

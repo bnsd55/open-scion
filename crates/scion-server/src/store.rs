@@ -500,7 +500,7 @@ impl Blobs {
     }
 
     /// The fan-out directory and the file path of a blob.
-    fn location(&self, id: BlobId) -> (PathBuf, PathBuf) {
+    pub(crate) fn location(&self, id: BlobId) -> (PathBuf, PathBuf) {
         let hex = id.to_string();
         let dir = self.root.join(&hex[..2]);
         let path = dir.join(&hex[2..]);

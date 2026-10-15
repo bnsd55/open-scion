@@ -41,8 +41,7 @@ release.
   name validation at the RPC boundary.
 - `ReadFile` streams a file in 1 MiB parts from the zstd decoder, under a
   256 MiB budget for all replies. It checks the content against its ID
-  before the last part, and ends a stalled or late reply with
-  `DEADLINE_EXCEEDED`.
+  before the last part, and ends a stalled reply with `DEADLINE_EXCEEDED`.
 - The path index of each ref stays within a budget of 128 MiB. When it is
   full, it starts over at the tip, and the lands still get the same answers.
 - A land walks at most 100,000 changesets below the path index. A base
