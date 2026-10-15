@@ -7,11 +7,13 @@ use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
+use scion_server::deadline::Deadline;
 use scion_server::import::{ImportOptions, import_git};
 use scion_server::read::{
-    self, DiffEntry, MAX_DIFF_ENTRIES, MAX_RENAME_CHUNKS, MAX_RENAME_ENTRIES, MAX_WALK, Rename,
+    self, DiffEntry, MAX_DIFF_ENTRIES, MAX_RENAME_CHUNKS, MAX_RENAME_ENTRIES, Rename,
 };
 use scion_server::{Error, Store, db, tree};
 use tempfile::TempDir;
@@ -22,6 +24,11 @@ fn open_store() -> (TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     (dir, store)
+}
+
+/// A deadline that a test does not reach.
+fn later() -> Deadline {
+    Deadline::new(Instant::now() + Duration::from_secs(600))
 }
 
 fn path(p: &str) -> RepoPath {
@@ -180,7 +187,7 @@ fn merge_base_and_is_ancestor_match_git() {
             seen_unrelated |= expected.is_empty();
             for (x, y) in [(x, y), (y, x)] {
                 let (cx, cy) = (changeset_of(&store, x), changeset_of(&store, y));
-                let bases = read::merge_base(&store, REPO, cx, cy).unwrap();
+                let bases = read::merge_base(&store, REPO, cx, cy, &later()).unwrap();
                 let mut sorted = bases.clone();
                 sorted.sort();
                 assert_eq!(sorted, expected, "merge-base {x} {y}");
@@ -191,7 +198,7 @@ fn merge_base_and_is_ancestor_match_git() {
                 // `git merge-base --is-ancestor x y` holds exactly when the
                 // only merge base is x.
                 assert_eq!(
-                    read::is_ancestor(&store, REPO, cx, cy).unwrap(),
+                    read::is_ancestor(&store, REPO, cx, cy, &later()).unwrap(),
                     expected == [cx],
                     "is-ancestor {x} {y}"
                 );
@@ -234,34 +241,35 @@ fn chain(store: &Store, changes: Vec<BTreeMap<RepoPath, Option<FileState>>>) -> 
 
 #[test]
 fn a_history_with_no_merges_has_no_walk_bound() {
+    // Deeper than the bound of 10,000 steps that the queries had.
+    const N: usize = 10_002;
     let (_data, store) = open_store();
-    let ids = chain(&store, vec![BTreeMap::new(); MAX_WALK + 2]);
-    let tip = ids[MAX_WALK + 1];
+    let ids = chain(&store, vec![BTreeMap::new(); N]);
+    let tip = ids[N - 1];
 
-    // The old walks read MAX_WALK changesets from the tip down to ids[1].
     // The commit graph reads a few nodes, at any depth.
-    assert!(read::is_ancestor(&store, REPO, ids[0], tip).unwrap());
+    assert!(read::is_ancestor(&store, REPO, ids[0], tip, &later()).unwrap());
     assert_eq!(
-        read::merge_base(&store, REPO, ids[0], tip).unwrap(),
+        read::merge_base(&store, REPO, ids[0], tip, &later()).unwrap(),
         [ids[0]]
     );
-    let below = ids[MAX_WALK];
-    assert!(!read::is_ancestor(&store, REPO, tip, below).unwrap());
-    assert_eq!(read::merge_base(&store, REPO, tip, below).unwrap(), [below]);
-    assert_eq!(read::merge_base(&store, REPO, tip, tip).unwrap(), [tip]);
-}
-
-fn exhausted<T>(result: &Result<T, Error>) -> bool {
-    matches!(result, Err(Error::ResourceExhausted(_)))
+    let below = ids[N - 2];
+    assert!(!read::is_ancestor(&store, REPO, tip, below, &later()).unwrap());
+    let bases = read::merge_base(&store, REPO, tip, below, &later()).unwrap();
+    assert_eq!(bases, [below]);
+    let bases = read::merge_base(&store, REPO, tip, tip, &later()).unwrap();
+    assert_eq!(bases, [tip]);
 }
 
 #[test]
-fn graph_queries_across_many_merges_stop_at_max_walk() {
+fn graph_queries_across_many_merges_answer() {
     // A ladder: each changeset on main merges a side changeset that
-    // branched from main's previous changeset.
-    let merges = MAX_WALK / 2 + 1;
+    // branched from main's previous changeset. 20,001 changesets, each a
+    // merge or the parent of one, so the walks take every one. With a bound
+    // of 10,000 steps, these queries failed with RESOURCE_EXHAUSTED.
+    let merges = 10_000;
     let (_data, store) = open_store();
-    let (main, sides) = store
+    let (main, sides, late, early) = store
         .write(|c| {
             let repo = db::create_repo(c, REPO)?;
             let store = |parents: Vec<ChangesetId>, message: String| {
@@ -282,25 +290,24 @@ fn graph_queries_across_many_merges_stop_at_max_walk() {
                 main.push(store(vec![last, side], format!("merge {i}"))?);
                 sides.push(side);
             }
-            Ok((main, sides))
+            // Not merged: one from the oldest side changeset, one from root.
+            let late = store(vec![sides[0]], "late".into())?;
+            let early = store(vec![main[0]], "early".into())?;
+            Ok((main, sides, late, early))
         })
         .unwrap();
     let tip = *main.last().unwrap();
 
-    // IsAncestor reads three rows for each merge newer than the ancestor,
-    // and MergeBase walks every changeset down to the merge base.
-    assert!(exhausted(&read::is_ancestor(&store, REPO, sides[0], tip)));
-    assert!(exhausted(&read::merge_base(&store, REPO, sides[0], tip)));
-    assert!(exhausted(&read::merge_base(&store, REPO, main[0], tip)));
-    // Near the tip, both answer.
-    let newest = sides[merges - 1];
-    assert!(read::is_ancestor(&store, REPO, newest, tip).unwrap());
-    assert_eq!(
-        read::merge_base(&store, REPO, newest, tip).unwrap(),
-        [newest]
-    );
-    // An ancestor on the first-parent history needs no merge.
-    assert!(read::is_ancestor(&store, REPO, main[0], tip).unwrap());
+    assert!(read::is_ancestor(&store, REPO, sides[0], tip, &later()).unwrap());
+    assert!(!read::is_ancestor(&store, REPO, late, tip, &later()).unwrap());
+    for (a, b, base) in [
+        (sides[0], tip, sides[0]),
+        (late, tip, sides[0]),
+        (tip, early, main[0]),
+    ] {
+        let bases = read::merge_base(&store, REPO, a, b, &later()).unwrap();
+        assert_eq!(bases, [base]);
+    }
 }
 
 /// Git's `--name-status` letter for an entry.
@@ -1051,11 +1058,11 @@ fn queries_check_the_repo_and_the_changesets() {
     let ids = chain(&store, vec![BTreeMap::new()]);
     let missing = ChangesetId::from_bytes([7; 32]);
     let errors = [
-        read::merge_base(&store, REPO, ids[0], missing).err(),
-        read::merge_base(&store, REPO, missing, ids[0]).err(),
-        read::merge_base(&store, "nope", ids[0], ids[0]).err(),
-        read::is_ancestor(&store, REPO, missing, ids[0]).err(),
-        read::is_ancestor(&store, REPO, ids[0], missing).err(),
+        read::merge_base(&store, REPO, ids[0], missing, &later()).err(),
+        read::merge_base(&store, REPO, missing, ids[0], &later()).err(),
+        read::merge_base(&store, "nope", ids[0], ids[0], &later()).err(),
+        read::is_ancestor(&store, REPO, missing, ids[0], &later()).err(),
+        read::is_ancestor(&store, REPO, ids[0], missing, &later()).err(),
         read::diff(&store, REPO, ids[0], missing, None, None).err(),
         read::diff(&store, REPO, missing, ids[0], None, None).err(),
     ];
