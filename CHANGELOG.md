@@ -55,6 +55,12 @@ release.
   each line's path when some line came from another path, as git does, and
   `--json` adds `path` to each range. A client that ignores `next_path`
   continues at the wrong path after a rename.
+- `Blame` reads files of up to 16 MiB and 1,048,576 lines (was 1 MiB), and
+  blames a binary file line by line, as `git blame` does. Every byte read
+  counts against the per-call budget, once per 64 bytes. A rename search now
+  stops after it has read about 100 MiB of deleted files, so with large files
+  it can miss a source and the answer can change. Every search that the old
+  1 MiB limit allowed still reads every file.
 - Bearer-token auth, loopback-only listening by default, request limits and
   name validation at the RPC boundary.
 - `ReadFile` streams a file in 1 MiB parts from the zstd decoder, under a

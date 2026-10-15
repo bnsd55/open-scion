@@ -436,9 +436,10 @@ file has no lines and gets no ranges.
   renames: it means the requested path.
 
 **Bounds per call.** At most 1,000 changesets checked, 100 versions diffed,
-and about 1M lines diffed (both sides of each diff). A rename search counts
-each chunk of up to 64 bytes it compares as a line, and compares at most 100
-deleted files. The first diff of a call always runs, so every call makes
+and about 1M lines diffed (both sides of each diff; a line counts once per
+64 bytes). A rename search counts each chunk of up to 64 bytes it compares as
+a line, compares at most 100 deleted files, and stops after it has read about
+100 MiB of them. The first step of a call always runs, so every call makes
 progress.
 
 **Rules.** The server walks first parents to each changeset that changed the
@@ -450,8 +451,9 @@ to the path: a deleted file with the same content, else a similar one, as
 it. The other lines are traced further back, at the older path. The diff is
 Myers with an indent heuristic. Where several minimal diffs exist, which one
 the server picks is not part of v1, and neither is which deleted file it
-picks as the source. An older version that is absent, not a regular file,
-larger than 1 MiB or holds a NUL byte counts as absent: the changeset that
+picks as the source. A binary file is diffed line by line, as `git blame`
+does. An older version that is absent, not a regular file, larger than
+16 MiB or longer than 1,048,576 lines counts as absent: the changeset that
 replaced it gets its lines.
 
 A client that ignores `next_path` continues at the requested path after a
@@ -459,7 +461,7 @@ rename. Its next call then fails with `NOT_FOUND`, or blames another file.
 
 | Error | When |
 |---|---|
-| `INVALID_ARGUMENT` | A bad or empty path; the file is not a regular file, is larger than 1 MiB, or holds a NUL byte. |
+| `INVALID_ARGUMENT` | A bad or empty path; the file is not a regular file, is larger than 16 MiB, or has more than 1,048,576 lines. |
 | `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
 
 ### 6.11 MergeBase
