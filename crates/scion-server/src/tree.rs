@@ -482,16 +482,67 @@ mod tests {
         }
     }
 
+    /// Root trees of a fixed history, stored when written and derived when
+    /// read, are pinned IDs. So a change to derivation that changes a tree
+    /// fails here.
     #[test]
-    fn root_tree_derives_a_long_chain_and_caches_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        let author = IdentityTime {
+    fn root_trees_match_golden_ids() {
+        let history: [Edits<'_>; 3] = [
+            &[("a/b/c", Some("1")), ("a/d", Some("2")), ("e", Some("3"))],
+            &[("a/b/c", None), ("a/b", Some("4")), ("f/g/h", Some("5"))],
+            &[("e", None), ("a/d", Some("6")), ("f/g/h", None)],
+        ];
+        let golden = [
+            "512cf237e5e62fc7d013ee67bd701857d637c2c7b3c60897ee9f57d4f63212b5",
+            "8e7be185763f5990a6b48bca674e5766e80aa28a5769f46c530d8e4de2b1c8be",
+            "27d510c1cac510175ac54737191dab75dbc4e3de391ee9c3b56233d74a70124c",
+        ];
+        for stored in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path()).unwrap();
+            let (repo, ids) = store
+                .write(|c| {
+                    let repo = db::create_repo(c, "r")?;
+                    let mut ids: Vec<ChangesetId> = Vec::new();
+                    for edits in history {
+                        let cs = Changeset {
+                            parents: ids.last().copied().into_iter().collect(),
+                            author: author(),
+                            committer: None,
+                            message: vec![],
+                            changes: changes(edits),
+                        };
+                        ids.push(if stored {
+                            store_changeset(c, repo, &cs)?.0
+                        } else {
+                            db::insert_changeset(c, repo, &cs)?
+                        });
+                    }
+                    Ok((repo, ids))
+                })
+                .unwrap();
+            let trees: Vec<String> = ids
+                .iter()
+                .map(|&cs| root_tree(&store, repo, cs).unwrap().to_string())
+                .collect();
+            assert_eq!(trees, golden, "stored when written: {stored}");
+        }
+    }
+
+    fn author() -> IdentityTime {
+        IdentityTime {
             name: b"a".to_vec(),
             email: b"a@x".to_vec(),
             unix_secs: 0,
             tz_offset_minutes: 0,
-        };
+        }
+    }
+
+    #[test]
+    fn root_tree_derives_a_long_chain_and_caches_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let author = author();
         let (repo, tip) = store
             .write(|c| {
                 let repo = db::create_repo(c, "r")?;
