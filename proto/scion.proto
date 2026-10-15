@@ -53,7 +53,10 @@ service Objects {
   rpc GetRootTree(GetRootTreeRequest) returns (GetRootTreeResponse);
   // Streams the requested objects in request order, one per message. Stops
   // early once the reply is large, after at least one object; the client asks
-  // again for the rest. Fails with NOT_FOUND if an object does not exist.
+  // again for the rest. An error status of the call itself is about the whole
+  // call: for example NOT_FOUND for a repo that does not exist. An error in
+  // the stream, after the call started, is about the next object (NOT_FOUND
+  // if it does not exist), and ends the reply.
   rpc GetObjects(GetObjectsRequest) returns (stream Object);
 }
 

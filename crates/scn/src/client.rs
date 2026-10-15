@@ -1,6 +1,9 @@
 //! Connection to the server, plus helpers every command shares.
 
 use std::borrow::Cow;
+use std::fs;
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -36,6 +39,12 @@ impl Ctx {
     /// Connects to `server`: `http://HOST:PORT`, or `unix:///PATH` for a
     /// daemon on this node.
     pub async fn connect(server: &str, token: &str, repo: String, json: bool) -> Result<Self> {
+        if let Some(socket) = server
+            .strip_prefix("unix://")
+            .or_else(|| server.strip_prefix("unix:"))
+        {
+            check_socket(Path::new(socket), rustix::process::geteuid().as_raw())?;
+        }
         // `Endpoint` reads `unix:` addresses too, unlike `Channel::from_shared`.
         let channel = Endpoint::from_shared(server.to_owned())
             .context("bad server address")?
@@ -111,6 +120,29 @@ impl Ctx {
     }
 }
 
+/// Refuses a socket that is not a socket file owned by user `me` or by root,
+/// so the token is never sent to another user's socket. A symlink is
+/// refused too.
+// SHORTCUT: checks only the socket file. Another user who can write to a
+// directory above it can swap the socket between the check and the connect.
+// Upgrade (issue #70): check every directory up to `/` too: owned by root or
+// this user, and not writable by others unless sticky.
+fn check_socket(path: &Path, me: u32) -> Result<()> {
+    let meta = fs::symlink_metadata(path)
+        .with_context(|| format!("cannot use socket {}", path.display()))?;
+    if !meta.file_type().is_socket() {
+        bail!("refusing {}: it is not a socket", path.display());
+    }
+    let owner = meta.uid();
+    if owner != me && owner != 0 {
+        bail!(
+            "refusing socket {}: another user (uid {owner}) owns it",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Parses 32 raw ID bytes from a reply.
 pub fn id_from<T: for<'a> TryFrom<&'a [u8]>>(bytes: &[u8]) -> Result<T> {
     T::try_from(bytes).map_err(|_| anyhow::anyhow!("server sent a bad ID"))
@@ -142,4 +174,24 @@ pub fn now_unix_secs() -> Result<i64> {
         .context("the system clock is before 1970")?
         .as_secs();
     i64::try_from(secs).context("the system clock is too far in the future")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_socket_that_another_user_owns_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("daemon.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let owner = fs::symlink_metadata(&path).unwrap().uid();
+        check_socket(&path, owner).unwrap();
+        // The same socket, as another user sees it. A socket that root owns
+        // is accepted for every user.
+        if owner != 0 {
+            let err = check_socket(&path, owner + 1).unwrap_err();
+            assert!(err.to_string().contains("another user"), "{err:#}");
+        }
+    }
 }

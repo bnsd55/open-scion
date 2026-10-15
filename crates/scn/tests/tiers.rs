@@ -8,7 +8,10 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use scion_core::{Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
+use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
+use scion_proto::auth::Bearer;
+use scion_proto::v1::objects_client::ObjectsClient;
+use scion_proto::v1::{GetObjectsRequest, ObjectKind, ObjectRef};
 use scion_server::{Store, db, service, tree};
 use scion_tier::{
     CACHE_UPSTREAM_TIMEOUT, DAEMON_UPSTREAM_TIMEOUT, DiskStore, MemoryStore, Tier, bind_unix,
@@ -17,6 +20,8 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio_stream::wrappers::{TcpListenerStream, UnixListenerStream};
+use tonic::Code;
+use tonic::transport::Endpoint;
 
 const REPO: &str = "r";
 const TOKEN: &str = "secret";
@@ -30,7 +35,7 @@ struct Tiers {
     daemon: Tier<DiskStore>,
     /// `unix://` address of the daemon.
     socket: String,
-    _runtime: Runtime,
+    runtime: Runtime,
     _dirs: [TempDir; 2],
 }
 
@@ -69,7 +74,7 @@ impl Tiers {
             cache,
             daemon,
             socket: format!("unix://{}", path.display()),
-            _runtime: runtime,
+            runtime,
             _dirs: [data, node],
         }
     }
@@ -219,4 +224,63 @@ fn checkout_through_the_daemon_and_the_cache_matches_a_direct_checkout() {
         fs::read(dest("moved").join("run.sh")).unwrap(),
         b"#!/bin/sh\necho hi\n"
     );
+}
+
+#[test]
+fn a_missing_repo_fails_the_call_once_at_each_tier() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let tiers = Tiers::start(data, store);
+    let refs = (0..3u8)
+        .map(|i| ObjectRef {
+            kind: ObjectKind::Blob.into(),
+            id: BlobId::of(&[i]).as_bytes().to_vec(),
+        })
+        .collect();
+    let request = GetObjectsRequest {
+        repo: "no-such-repo".into(),
+        refs,
+    };
+
+    let reply = tiers.runtime.block_on(async {
+        let channel = Endpoint::from_shared(tiers.socket.clone())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut daemon = ObjectsClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap());
+        daemon.get_objects(request).await
+    });
+    // The call itself fails, as it does on the server, not one object of it.
+    let Err(status) = reply else {
+        panic!("the call started a stream");
+    };
+    assert_eq!(status.code(), Code::NotFound, "{status:?}");
+    // One call past the daemon and one to the server: no tier asked again
+    // once per object.
+    assert_eq!(tiers.upstream_calls(), (1, 1));
+}
+
+#[test]
+fn scn_refuses_a_unix_address_that_is_not_a_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("real.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    // A symlink to a real socket, and a plain file.
+    let link = tmp.path().join("link.sock");
+    std::os::unix::fs::symlink(&socket, &link).unwrap();
+    let file = tmp.path().join("file.sock");
+    fs::write(&file, b"").unwrap();
+
+    for path in [&link, &file] {
+        let url = format!("unix://{}", path.display());
+        let out = Command::new(env!("CARGO_BIN_EXE_scn"))
+            .args(["--server", &url, "--repo", REPO, "log"])
+            .env("SCION_TOKEN", TOKEN)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("it is not a socket"), "{err}");
+    }
 }

@@ -114,8 +114,13 @@ impl Objects for Fake {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             tokio::time::sleep(self.delay).await;
         }
+        let request = request.into_inner();
+        // A repo that upstream does not have fails the call, as on the server.
+        if request.repo == "gone" {
+            return Err(Status::not_found("no such repo"));
+        }
         let mut replies = Vec::new();
-        for r in request.into_inner().refs {
+        for r in request.refs {
             if let Some(object) = self.objects.get(&r.id) {
                 replies.push(Ok(object.clone()));
             } else {
@@ -147,6 +152,35 @@ async fn serve_fake(fake: Fake) -> String {
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
     url
+}
+
+/// A `GetObjects` call for `objects` in `repo`: the objects it returns, or
+/// the error that ends it. `Err` from the outer result is the call's status.
+async fn get_in(
+    client: &mut Client,
+    repo: &str,
+    objects: &[&Object],
+) -> Result<Result<Vec<Object>, Status>, Status> {
+    let refs = objects
+        .iter()
+        .map(|o| ObjectRef {
+            kind: o.kind,
+            id: o.id.clone(),
+        })
+        .collect();
+    let request = GetObjectsRequest {
+        repo: repo.into(),
+        refs,
+    };
+    let mut stream = client.get_objects(request).await?.into_inner();
+    let mut got = Vec::new();
+    loop {
+        match stream.message().await {
+            Ok(Some(object)) => got.push(object),
+            Ok(None) => return Ok(Ok(got)),
+            Err(status) => return Ok(Err(status)),
+        }
+    }
 }
 
 /// A cache that waits at most `timeout` for `upstream`, and its address.
@@ -490,4 +524,23 @@ async fn a_slow_upstream_fails_the_call_with_unavailable() {
     let status = get(&mut client, &[&object]).await.unwrap_err();
     assert_eq!(status.code(), Code::Unavailable, "{status:?}");
     assert!(status.message().contains("upstream did not"), "{status:?}");
+}
+
+#[tokio::test]
+async fn a_call_level_failure_is_the_status_of_a_call_never_an_error_in_its_stream() {
+    let (kept, other) = (blob(b"kept\n"), blob(b"not kept\n"));
+    let fake = Fake::new(&[&kept, &other], Duration::ZERO);
+    let (_cache, url) = cache_for(&fake).await;
+    let mut client = connect(&url, Some(TOKEN)).await;
+    get(&mut client, &[&kept]).await.unwrap();
+
+    // The first object is a miss: the call's status is upstream's.
+    let status = get_in(&mut client, "gone", &[&other]).await.unwrap_err();
+    assert_eq!(status.code(), Code::NotFound, "{status:?}");
+    // A hit first, then a miss: the reply sends the hit and ends without an
+    // error. Asking again for the rest gets the call's status.
+    let first = get_in(&mut client, "gone", &[&kept, &other]).await.unwrap();
+    assert_eq!(first.unwrap(), vec![kept]);
+    let status = get_in(&mut client, "gone", &[&other]).await.unwrap_err();
+    assert_eq!(status.code(), Code::NotFound, "{status:?}");
 }
