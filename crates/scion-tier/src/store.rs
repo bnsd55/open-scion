@@ -206,7 +206,7 @@ impl DiskStore {
         let mut lru = lock(&store.lru);
         let mut dropped = Vec::new();
         for (_, key, size) in found {
-            dropped.extend(store.add(&mut lru, key, size)?);
+            store.add(&mut lru, key, size, &mut dropped)?;
         }
         drop(lru);
         remove_all(dropped)?;
@@ -265,22 +265,42 @@ impl DiskStore {
     }
 
     /// Records a stored file in the index. The caller holds the index lock.
-    /// The files that the limit drops leave their names now, by a rename into
-    /// `tmp/`, so a later put of the same object keeps its new file. Returns
-    /// them, for the caller to remove once it has let go of the lock: a
-    /// rename is quick, but removing a large file may not be.
-    fn add(&self, lru: &mut Lru<()>, key: Key, size: usize) -> io::Result<Vec<PathBuf>> {
-        let mut dropped = Vec::new();
+    /// The files that the limit drops leave their names now (see
+    /// [`DiskStore::take_out`]) and go into `dropped`, for the caller to
+    /// remove once it has let go of the lock. Every dropped file is tried;
+    /// the first error is returned at the end.
+    fn add(
+        &self,
+        lru: &mut Lru<()>,
+        key: Key,
+        size: usize,
+        dropped: &mut Vec<PathBuf>,
+    ) -> io::Result<()> {
+        let mut first = None;
         for key in lru.insert(key, (), size, self.limit) {
-            let n = self.dropped.fetch_add(1, Ordering::Relaxed);
-            let to = self.tmp.join(format!("dropped-{n}"));
-            match fs::rename(self.path(key), &to) {
-                Ok(()) => dropped.push(to),
-                Err(e) if e.kind() == ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
+            match self.take_out(key) {
+                Ok(file) => dropped.extend(file),
+                Err(e) => {
+                    first.get_or_insert(e);
+                }
             }
         }
-        Ok(dropped)
+        first.map_or(Ok(()), Err)
+    }
+
+    /// Moves the file of `key` out of its name, into `tmp/`, under the index
+    /// lock, so that a later put of the same object keeps its new file. The
+    /// caller removes the returned file once it has let go of the lock: a
+    /// rename is quick, but removing a large file may not be. `None` if there
+    /// is no file.
+    fn take_out(&self, key: Key) -> io::Result<Option<PathBuf>> {
+        let n = self.dropped.fetch_add(1, Ordering::Relaxed);
+        let to = self.tmp.join(format!("dropped-{n}"));
+        match fs::rename(self.path(key), &to) {
+            Ok(()) => Ok(Some(to)),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -314,7 +334,9 @@ impl Store for DiskStore {
             tracing::warn!(%key, %why, "dropping a stored copy that does not match its ID");
             let mut lru = lock(&self.lru);
             lru.remove(key);
-            ignore_missing(fs::remove_file(&path))?;
+            let file = self.take_out(key);
+            drop(lru);
+            remove_all(file?.into_iter().collect())?;
             return Ok(None);
         }
         Ok(Some(Bytes::from(data)))
@@ -335,9 +357,11 @@ impl Store for DiskStore {
         let mut lru = lock(&self.lru);
         // The rename replaces a bad copy, if there is one, in one step.
         tmp.persist(&path).map_err(|e| e.error)?;
-        let dropped = self.add(&mut lru, key, data.len())?;
+        let mut dropped = Vec::new();
+        let added = self.add(&mut lru, key, data.len(), &mut dropped);
         drop(lru);
-        remove_all(dropped)
+        remove_all(dropped)?;
+        added
     }
 }
 
@@ -521,11 +545,13 @@ mod tests {
         ] {
             fs::write(store.path(blob_key), &bad).unwrap();
             store
-                .add(&mut lock(&store.lru), blob_key, bad.len())
+                .add(&mut lock(&store.lru), blob_key, bad.len(), &mut Vec::new())
                 .unwrap();
             assert_eq!(store.get(blob_key, bad.len()).unwrap(), None);
             assert_eq!(store.size(blob_key).unwrap(), None);
             assert!(!store.path(blob_key).exists());
+            // Moved out under the lock, then removed.
+            assert_eq!(fs::read_dir(&store.tmp).unwrap().count(), 0);
         }
         // A put replaces a bad copy.
         fs::write(store.path(blob_key), b"torn").unwrap();
@@ -545,7 +571,10 @@ mod tests {
         let store = DiskStore::open(&dir.path().join("data"), n).unwrap();
         store.put(a.0, &a.1).unwrap();
         // `b` comes in and drops `a`, whose file leaves its name at once.
-        let dropped = store.add(&mut lock(&store.lru), b.0, n).unwrap();
+        let mut dropped = Vec::new();
+        store
+            .add(&mut lock(&store.lru), b.0, n, &mut dropped)
+            .unwrap();
         assert_eq!(dropped.len(), 1);
         assert!(!store.path(a.0).exists());
         // `a` is put again before the dropped file is removed. Removing it
@@ -554,6 +583,37 @@ mod tests {
         remove_all(dropped).unwrap();
         assert_eq!(store.get(a.0, n).unwrap(), Some(a.1.clone()));
         assert_eq!(fs::read_dir(&store.tmp).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_file_that_cannot_leave_does_not_keep_the_others_in_place() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Root may rename out of a read-only directory.
+        if rustix::process::geteuid().as_raw() == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (blob(b"aaaa"), blob(b"bbbb"));
+        let n = a.1.len();
+        let store = DiskStore::open(&dir.path().join("data"), 2 * n).unwrap();
+        store.put(a.0, &a.1).unwrap();
+        store.put(b.0, &b.1).unwrap();
+        let fan_out = |key: Key| store.path(key).parent().unwrap().to_path_buf();
+        assert_ne!(fan_out(a.0), fan_out(b.0));
+        // The file of `a` cannot leave its directory.
+        let mode = |m| fs::Permissions::from_mode(m);
+        fs::set_permissions(fan_out(a.0), mode(0o500)).unwrap();
+
+        // An object of `2n` bytes drops both: `a` fails, `b` still leaves.
+        let big = Key::Blob(BlobId::of(b"big"));
+        let mut dropped = Vec::new();
+        let added = store.add(&mut lock(&store.lru), big, 2 * n, &mut dropped);
+        fs::set_permissions(fan_out(a.0), mode(0o700)).unwrap();
+        assert!(added.is_err());
+        assert_eq!(dropped.len(), 1);
+        assert!(!store.path(b.0).exists());
+        remove_all(dropped).unwrap();
     }
 
     #[test]

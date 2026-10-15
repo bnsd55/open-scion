@@ -637,7 +637,7 @@ fn raw_parts(objects: Vec<Result<Object, Status>>) -> Vec<Result<ObjectPart, Sta
             Ok(object) => {
                 let header = object.header(Encoding::Raw, object.data.len());
                 header
-                    .parts(object::chunks(object.data.into()))
+                    .parts(object::read_chunks(&object.data[..], object.data.len()).unwrap())
                     .into_iter()
                     .map(Ok)
                     .collect()

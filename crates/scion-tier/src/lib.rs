@@ -89,10 +89,10 @@ const _: () = assert!(MAX_ENCODED_BYTES + MAX_OBJECT_BYTES + UNPACK_BYTES <= FET
 pub const CACHE_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long `scion-daemon` waits for each step of its cache. Before the cache
-/// sends the first part of an object, it may wait one step of the server,
-/// [`BUSY_TIMEOUT`] for room in its fetch budget, and [`BUSY_TIMEOUT`] for
-/// room in its reply budget.
-pub const DAEMON_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(150);
+/// sends the first part of an object, it may wait [`BUSY_TIMEOUT`] for a
+/// fetch slot, one step of the server, [`BUSY_TIMEOUT`] for room in its
+/// fetch budget, and [`BUSY_TIMEOUT`] for room in its reply budget.
+pub const DAEMON_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(180);
 
 // The limits nest: a busy server answers the cache before the cache gives
 // up, and a cache that waits on the server answers the daemon before the
@@ -107,8 +107,14 @@ const _: () = {
     let margin = 30;
     let (busy, cache) = (BUSY_TIMEOUT.as_secs(), CACHE_UPSTREAM_TIMEOUT.as_secs());
     assert!(busy + margin <= cache);
-    assert!(cache + 2 * busy + margin <= DAEMON_UPSTREAM_TIMEOUT.as_secs());
+    assert!(cache + 3 * busy + margin <= DAEMON_UPSTREAM_TIMEOUT.as_secs());
 };
+
+/// Most memory that decoding a tree holds, per byte of its `TreeV1` bytes.
+/// An entry takes at least 38 bytes encoded; decoded, it is a name and an
+/// entry in a list and again in a map, plus the name's own buffer (see the
+/// test `decoding_a_tree_fits_its_factor`).
+const TREE_DECODE_FACTOR: usize = 6;
 
 /// One object, by kind and ID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -215,10 +221,11 @@ impl Key {
     }
 
     /// The memory that reading this object from a store holds besides its
-    /// stored form: the disk store unpacks a blob to check it.
-    fn read_bytes(self) -> usize {
+    /// stored form of `size` bytes: the disk store decodes a tree, and
+    /// unpacks a blob, to check it.
+    fn read_bytes(self, size: usize) -> usize {
         match self {
-            Self::Tree(_) => 0,
+            Self::Tree(_) => TREE_DECODE_FACTOR * size,
             Self::Blob(_) => UNPACK_BYTES,
         }
     }
@@ -251,9 +258,10 @@ impl Key {
     /// `header`: its encoded bytes, its other form, and a codec at work.
     fn check_bytes(self, header: &Header) -> usize {
         let other = match (self, header.encoding) {
-            (Self::Tree(_), Encoding::Raw) => 0,
-            // Unpacked whole, to decode it.
-            (Self::Tree(_), Encoding::Zstd) => header.size,
+            // Decoded, to check it.
+            (Self::Tree(_), Encoding::Raw) => TREE_DECODE_FACTOR * header.size,
+            // Unpacked whole, then decoded.
+            (Self::Tree(_), Encoding::Zstd) => (1 + TREE_DECODE_FACTOR) * header.size,
             // Unpacked as a stream to check it.
             (Self::Blob(_), Encoding::Zstd) => UNPACK_BYTES,
             // Packed here, then checked as a stream.
@@ -515,54 +523,75 @@ impl<S: Store> Tier<S> {
     // hop, or keep a few reads in flight.
     async fn produce(&self, ask: &Ask, i: usize, progress: &Progress) -> Option<Found> {
         let key = *ask.keys.get(i)?;
-        let take = |bytes| reply::take(&self.inner.in_flight, bytes, self.inner.busy);
-        let size = match self.blocking(move |store| store.size(key)).await {
-            Ok(size) => size,
-            Err(status) => return Some((Err(status.into()), take(1).await?)),
-        };
-        if let Some(size) = size {
-            let mut permit = take(size + key.read_bytes()).await?;
-            let stored = self.stored(key, size).await;
-            reply::trim(&mut permit, size);
-            match stored {
-                Ok(Some(stored)) => {
-                    progress.hits.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(%key, "hit");
-                    return self.outgoing(key, stored, permit, ask.zstd).await;
+        // A share taken before the object was in hand.
+        let mut held = None;
+        let mut missed = false;
+        loop {
+            let size = match self.blocking(move |store| store.size(key)).await {
+                Ok(size) => size,
+                Err(status) => return Some((Err(status.into()), self.share(held, 1).await?)),
+            };
+            if let Some(size) = size {
+                let mut permit = self.share(held.take(), size + key.read_bytes(size)).await?;
+                let stored = self.stored(key, size).await;
+                reply::trim(&mut permit, size);
+                match stored {
+                    Ok(Some(stored)) => {
+                        if !missed {
+                            progress.hits.fetch_add(1, Ordering::Relaxed);
+                            tracing::debug!(%key, "hit");
+                        }
+                        return self.outgoing(key, stored, permit, ask.zstd).await;
+                    }
+                    // The stored copy went (dropped, or bad) after its size
+                    // was read: fetch it.
+                    Ok(None) => held = Some(permit),
+                    Err(status) => return Some((Err(status.into()), permit)),
                 }
-                // The stored copy went (dropped, or bad) after its size was
-                // read: fetch it.
-                Ok(None) => {}
-                Err(status) => return Some((Err(status.into()), permit)),
             }
+            if !missed {
+                missed = true;
+                progress.misses.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(%key, "miss");
+            }
+            let data = match self.fetch(&ask.repo, &ask.keys, i, progress).await {
+                Ok(Some(data)) => data,
+                // A fetch stored it a moment ago: read it from the store,
+                // with its share, as a hit is.
+                Ok(None) => continue,
+                Err(failed) => return Some((Err(failed), self.share(held, 1).await?)),
+            };
+            // The bytes were counted in the fetch budget until stored. Take
+            // them into the reply now if the reply budget has room. Else let
+            // them go, wait for room, and read them again.
+            let permit = match held.take() {
+                Some(permit) => self.share(Some(permit), data.len()).await,
+                None => reply::try_take(&self.inner.in_flight, data.len()),
+            };
+            if let Some(permit) = permit {
+                return self.outgoing(key, data, permit, ask.zstd).await;
+            }
+            let size = data.len();
+            drop(data);
+            held = Some(self.share(None, size + key.read_bytes(size)).await?);
         }
-        progress.misses.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(%key, "miss");
-        let data = match self.fetch(&ask.repo, &ask.keys, i, progress).await {
-            Ok(data) => data,
-            Err(failed) => return Some((Err(failed), take(1).await?)),
-        };
-        // The bytes were counted in the fetch budget until stored. Take them
-        // into the reply now if the reply budget has room. Else let them go,
-        // wait for room, and read them again.
-        if let Some(permit) = reply::try_take(&self.inner.in_flight, data.len()) {
-            return self.outgoing(key, data, permit, ask.zstd).await;
+    }
+
+    /// `held` grown to `bytes` of the reply budget, or a new share of
+    /// `bytes`. Waits at most [`BUSY_TIMEOUT`]; `None` if the room does not
+    /// come.
+    async fn share(
+        &self,
+        held: Option<OwnedSemaphorePermit>,
+        bytes: usize,
+    ) -> Option<OwnedSemaphorePermit> {
+        match held {
+            Some(mut permit) => {
+                self.cover(&mut permit, bytes).await?;
+                Some(permit)
+            }
+            None => reply::take(&self.inner.in_flight, bytes, self.inner.busy).await,
         }
-        let size = data.len();
-        drop(data);
-        let mut permit = take(size + key.read_bytes()).await?;
-        let stored = self.stored(key, size).await;
-        reply::trim(&mut permit, size);
-        let stored = match stored {
-            Ok(Some(stored)) => stored,
-            // Dropped from the store meanwhile.
-            Ok(None) => match self.fetch(&ask.repo, &ask.keys, i, progress).await {
-                Ok(data) => data,
-                Err(failed) => return Some((Err(failed), permit)),
-            },
-            Err(status) => return Some((Err(status.into()), permit)),
-        };
-        self.outgoing(key, stored, permit, ask.zstd).await
     }
 
     /// `key` for a reply, from its stored form, in an encoding that the
@@ -586,6 +615,7 @@ impl<S: Store> Tier<S> {
         };
         if header.encoding == Encoding::Raw || zstd {
             self.cover(&mut permit, stored.len()).await?;
+            reply::trim(&mut permit, stored.len());
             let body = Body::Whole(stored);
             return Some((Ok(Outgoing { header, body }), permit));
         }
@@ -632,52 +662,41 @@ impl<S: Store> Tier<S> {
     /// not keep, is fetched alone, so such a store costs one fetch per
     /// object, not one per remaining call. The wait is bounded: each step of
     /// a fetch has the tier's timeout, and a fetch always settles every
-    /// object it holds. A fetch that ended after the caller found no stored
-    /// copy has stored the object: it is read from the store, not fetched
-    /// again.
+    /// object it holds. `None` if a fetch that ended after the caller found
+    /// no stored copy has stored the object: the caller reads it from the
+    /// store, with its share, and does not fetch it again.
     async fn fetch(
         &self,
         repo: &str,
         keys: &[Key],
         i: usize,
         progress: &Progress,
-    ) -> Result<Bytes, Failed> {
+    ) -> Result<Option<Bytes>, Failed> {
         let key = keys[i];
-        loop {
-            let joined = lock(&self.inner.flights)
-                .get(&(repo.to_owned(), key))
-                .cloned();
-            let flight = if let Some(flight) = joined {
-                Some(flight)
-            } else if i < progress.fetched_to.load(Ordering::Relaxed) {
-                self.start(repo, key, Vec::new())
-            } else {
-                let end = keys.len().min(i + MAX_BATCH);
-                progress.fetched_to.store(end, Ordering::Relaxed);
-                self.start(repo, key, keys[i + 1..end].to_vec())
-            };
-            let Some(mut flight) = flight else {
-                let stored = self
-                    .blocking(move |store| match store.size(key)? {
-                        Some(size) => store.get(key, size),
-                        None => Ok(None),
-                    })
-                    .await?;
-                match stored {
-                    Some(data) => return Ok(data),
-                    // Dropped from the store meanwhile: fetch it.
-                    None => continue,
-                }
-            };
-            let outcome = flight
-                .wait_for(Option::is_some)
-                .await
-                .ok()
-                .and_then(|outcome| outcome.clone());
-            return outcome.unwrap_or_else(|| {
-                Err(Status::internal("a fetch from upstream ended without a result").into())
-            });
-        }
+        let joined = lock(&self.inner.flights)
+            .get(&(repo.to_owned(), key))
+            .cloned();
+        let flight = if let Some(flight) = joined {
+            Some(flight)
+        } else if i < progress.fetched_to.load(Ordering::Relaxed) {
+            self.start(repo, key, Vec::new())
+        } else {
+            let end = keys.len().min(i + MAX_BATCH);
+            progress.fetched_to.store(end, Ordering::Relaxed);
+            self.start(repo, key, keys[i + 1..end].to_vec())
+        };
+        let Some(mut flight) = flight else {
+            return Ok(None);
+        };
+        let outcome = flight
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|outcome| outcome.clone());
+        outcome.map_or_else(
+            || Err(Status::internal("a fetch from upstream ended without a result").into()),
+            |outcome| outcome.map(Some),
+        )
     }
 
     /// Starts one fetch for `key` and `later`, minus the objects that another
@@ -776,12 +795,21 @@ impl<S: Store> Flight<S> {
     /// again. An error status of the call itself, a transport error, a
     /// timeout or an object out of order fails every object still waiting.
     async fn fetch_all(&mut self) -> Result<(), Status> {
-        // No time limit: a slot frees up as another fetch ends, and each step
-        // of a fetch has a limit.
-        let _slot = Arc::clone(&self.tier.inner.fetch_slots)
-            .acquire_owned()
-            .await
-            .map_err(|_| Status::unavailable("the tier is shutting down"))?;
+        // Bounded as a reply's wait for memory is. Then every object of the
+        // fetch fails with `UNAVAILABLE`, and the callers ask again.
+        let Inner {
+            fetch_slots, busy, ..
+        } = &*self.tier.inner;
+        let slot = Arc::clone(fetch_slots).acquire_owned();
+        let _slot = match tokio::time::timeout(*busy, slot).await {
+            Ok(Ok(slot)) => slot,
+            Ok(Err(_)) => return Err(Status::unavailable("the tier is shutting down")),
+            Err(_) => {
+                return Err(Status::unavailable(format!(
+                    "no fetch slot within {busy:?}; ask again"
+                )));
+            }
+        };
         while !self.waiting.is_empty() {
             let refs = self.waiting.iter().map(|(key, _)| key.to_ref()).collect();
             let request = GetObjectsRequest {
@@ -1106,7 +1134,7 @@ mod tests {
                         encoded_size: data.len(),
                         size: data.len(),
                     };
-                    header.parts(object::chunks(data.into()))
+                    header.parts(object::read_chunks(&data[..], data.len()).unwrap())
                 })
                 .map(Ok)
                 .collect();
@@ -1155,7 +1183,7 @@ mod tests {
         // has ended, so none can join a fetch in progress.
         let progress = Progress::default();
         for (i, blob) in blobs.iter().enumerate() {
-            let stored = tier.fetch("r", &keys, i, &progress).await.unwrap();
+            let stored = tier.fetch("r", &keys, i, &progress).await.unwrap().unwrap();
             // A RAW blob from upstream is kept packed.
             assert_eq!(object::unpack(&stored, blob.len()).unwrap(), *blob);
             while !lock(&tier.inner.flights).is_empty() {
@@ -1189,13 +1217,26 @@ mod tests {
         settled().await;
         assert_eq!(asked(), 3);
         // A reply that missed an object just before its fetch stored it, and
-        // asks after the fetch has ended, gets it from the store. This is the
+        // asks after the fetch has ended, is sent to the store. This is the
         // window between a reply's store check and its fetch.
-        for (i, blob) in blobs.iter().enumerate() {
-            let stored = tier.fetch("r", &keys, i, &Progress::default()).await;
-            assert_eq!(object::unpack(&stored.unwrap(), blob.len()).unwrap(), *blob);
+        for i in 0..blobs.len() {
+            let fetched = tier.fetch("r", &keys, i, &Progress::default()).await;
+            assert!(fetched.unwrap().is_none(), "read it from the store");
         }
         assert_eq!(asked(), 3, "nothing was fetched twice");
+        // Through a reply, the object comes from the store, with its share.
+        for (i, blob) in blobs.iter().enumerate() {
+            let (object, _permit) = tier
+                .produce(&ask(&keys), i, &Progress::default())
+                .await
+                .unwrap();
+            // Unpacked for a client that takes only RAW.
+            let Body::Chunks(chunks) = object.unwrap().body else {
+                panic!("unpacked into chunks")
+            };
+            assert_eq!(chunks, std::slice::from_ref(blob));
+        }
+        assert_eq!(asked(), 3);
     }
 
     #[tokio::test]
@@ -1324,7 +1365,9 @@ mod tests {
                 encoded_size: data.len(),
                 size: data.len(),
             };
-            let first = header.parts(object::chunks(data.into())).remove(0);
+            let first = header
+                .parts(object::read_chunks(&data[..], data.len()).unwrap())
+                .remove(0);
             let parts = tokio_stream::iter([Ok(first)]).chain(tokio_stream::pending());
             Ok(Response::new(Box::pin(parts)))
         }
@@ -1340,6 +1383,81 @@ mod tests {
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
         Tier::new(MemoryStore::new(0), &url, "token", CACHE_UPSTREAM_TIMEOUT).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_fetch_that_finds_no_slot_ends_with_unavailable() {
+        let data = b"an object".to_vec();
+        let key = Key::Blob(BlobId::of(&data));
+        let mut tier = stalled_upstream(&data).await;
+        Arc::get_mut(&mut tier.inner).unwrap().busy = Duration::from_millis(50);
+        // Other fetches hold every slot.
+        let slots = Arc::clone(&tier.inner.fetch_slots);
+        let others = slots
+            .acquire_many_owned(u32::try_from(FETCH_SLOTS).unwrap())
+            .await
+            .unwrap();
+
+        let (keys, progress) = ([key], Progress::default());
+        let fetch = tier.fetch("r", &keys, 0, &progress);
+        let failed = tokio::time::timeout(Duration::from_secs(10), fetch)
+            .await
+            .expect("the wait for a slot is bounded")
+            .unwrap_err();
+        assert_eq!(failed.status.code(), Code::Unavailable, "{failed:?}");
+        assert!(failed.status.message().contains("slot"), "{failed:?}");
+        assert!(failed.whole_call);
+        drop(others);
+    }
+
+    #[test]
+    fn a_blob_packed_here_keeps_no_room_for_the_worst_case() {
+        // Content that packs small.
+        let data = vec![0; 1 << 20];
+        let key = Key::Blob(BlobId::of(&data));
+        let header = Header {
+            kind: ObjectKind::Blob,
+            id: key.id(),
+            encoding: Encoding::Raw,
+            encoded_size: data.len(),
+            size: data.len(),
+        };
+        let stored = key.to_stored(&header, data).unwrap();
+        assert!(stored.len() < 1024, "{}", stored.len());
+        assert!(
+            stored.capacity() <= stored.len() + 64,
+            "{}",
+            stored.capacity()
+        );
+    }
+
+    #[test]
+    fn decoding_a_tree_fits_its_factor() {
+        use scion_core::{Entry, PathElem};
+        // The smallest entry: a one-byte name of a directory.
+        let tree = |names: &[&str]| Tree {
+            entries: names
+                .iter()
+                .map(|name| {
+                    (
+                        PathElem::new(*name).unwrap(),
+                        Entry::Dir(Tree::default().id()),
+                    )
+                })
+                .collect(),
+        };
+        let entry = tree(&["a", "b"]).encode().len() - tree(&["a"]).encode().len();
+        assert_eq!(entry, 38);
+        // Decoded: the pair in a list and in a map node, and the name's
+        // buffer (a small allocation takes 16 bytes or more).
+        let pair = std::mem::size_of::<(PathElem, Entry)>();
+        let node = 2 * pair;
+        let decoded = pair + node + 32;
+        assert!(
+            decoded <= TREE_DECODE_FACTOR * entry,
+            "{decoded} > {}",
+            TREE_DECODE_FACTOR * entry
+        );
     }
 
     #[tokio::test]

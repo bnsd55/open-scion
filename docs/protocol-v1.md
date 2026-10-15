@@ -681,6 +681,7 @@ MAY keep the objects it got before the error.
 | `NOT_FOUND` | The repo does not exist (the call's status); a named object does not exist (in the stream, after the objects before it). |
 | `RESOURCE_EXHAUSTED` | No memory for the first object within 30 s. No object was sent. |
 | `DEADLINE_EXCEEDED` | In the stream: the client took no part for 120 s in the middle of an object. |
+| `UNAVAILABLE` | From a tier: its upstream did not answer in time, or it found no fetch slot or no memory for an object from upstream within 30 s (section 8). The call's status for the first object, else in the stream. Ask again. |
 
 ## 8. Cache tiers
 
@@ -721,13 +722,14 @@ order is daemon, cache, server. These rules hold for any tier:
 - A tier SHOULD wait longer for its upstream than that upstream may wait for
   its own, so it does not give up on a slow but healthy path. The limits of
   `scion-tier` nest. The server and each tier wait at most 30 s for memory
-  before an object, and a tier at most 30 s for memory for an object from
+  before an object. A tier waits at most 30 s for one of its 64 fetch slots
+  before it calls upstream, and at most 30 s for memory for an object from
   upstream, while that upstream reply waits. `scion-cache` waits at most
   60 s for each step of the server (an answer, or the next part), so a busy
-  server answers first. `scion-daemon` waits 150 s for each step of the
-  cache, which covers one step of the server, the cache's own two waits of
-  30 s, and 30 s to spare. On a timeout,
-  the tier fails with `UNAVAILABLE`. A deadline that the client passes down
+  server answers first. `scion-daemon` waits 180 s for each step of the
+  cache, which covers one step of the server, the cache's own three waits
+  of 30 s, and 30 s to spare. On a timeout or a wait that ends, the tier
+  fails with `UNAVAILABLE`. A deadline that the client passes down
   is not in v0.1 ([#98](https://github.com/bnsd55/open-scion/issues/98)).
 - The `Scion` service goes only to the server.
 

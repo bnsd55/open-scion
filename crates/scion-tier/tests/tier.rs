@@ -51,13 +51,13 @@ impl Object {
     /// The parts that send it RAW.
     fn raw(&self) -> Vec<ObjectPart> {
         let header = self.header(Encoding::Raw, self.data.len());
-        header.parts(object::chunks(self.data.clone().into()))
+        header.parts(object::read_chunks(&self.data[..], self.data.len()).unwrap())
     }
 
     /// The parts that send `frame` as its zstd form.
-    fn zstd(&self, frame: Vec<u8>) -> Vec<ObjectPart> {
+    fn zstd(&self, frame: &[u8]) -> Vec<ObjectPart> {
         self.header(Encoding::Zstd, frame.len())
-            .parts(object::chunks(frame.into()))
+            .parts(object::read_chunks(frame, frame.len()).unwrap())
     }
 }
 
@@ -386,9 +386,12 @@ async fn a_tier_refuses_a_bad_zstd_frame_or_part_sequence() {
     let frame = object::pack(content).unwrap();
     let mut bad: Vec<(&str, Vec<ObjectPart>)> = Vec::new();
     // A good frame of other bytes.
-    bad.push(("other bytes", target.zstd(object::pack(b"evil\n").unwrap())));
+    bad.push((
+        "other bytes",
+        target.zstd(&object::pack(b"evil\n").unwrap()),
+    ));
     // The object's size says one byte more than the frame header.
-    let mut parts = target.zstd(frame.clone());
+    let mut parts = target.zstd(&frame);
     parts[0].size += 1;
     bad.push(("size above the header", parts));
     // The frame header says one byte more than the frame holds. Byte 5 is the
@@ -396,13 +399,13 @@ async fn a_tier_refuses_a_bad_zstd_frame_or_part_sequence() {
     let mut lying = frame.clone();
     lying[5] += 1;
     assert_eq!(object::frame_size(&lying), Ok(content.len() + 1));
-    let mut parts = target.zstd(lying);
+    let mut parts = target.zstd(&lying);
     parts[0].size += 1;
     bad.push(("a lying frame header", parts));
     // A frame with no size in its header.
     let mut streamed = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
     std::io::Write::write_all(&mut streamed, content).unwrap();
-    bad.push(("no size", target.zstd(streamed.finish().unwrap())));
+    bad.push(("no size", target.zstd(&streamed.finish().unwrap())));
     // Two parts announced, one sent: the reply ends in the middle.
     let big = blob(&noise(CHUNK_BYTES + 10));
     let mut parts = big.raw();
@@ -442,7 +445,7 @@ async fn a_large_blob_arrives_in_parts_is_checked_and_sent_on_as_it_came() {
     let big = blob(&noise(3 * CHUNK_BYTES + 5));
     let frame = object::pack(&big.data).unwrap();
     assert!(frame.len() > 3 * CHUNK_BYTES);
-    let fake = Fake::sending([(big.id.clone(), big.zstd(frame))], Duration::ZERO);
+    let fake = Fake::sending([(big.id.clone(), big.zstd(&frame))], Duration::ZERO);
     let (_cache, url) = cache_for(&fake).await;
     let mut client = connect(&url, Some(TOKEN)).await;
 

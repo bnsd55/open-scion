@@ -103,8 +103,8 @@ release.
   from upstream instead of 4, within the same 400 MiB. A reply cut off in
   the middle of an object ends with `DEADLINE_EXCEEDED`.
 - The tier timeouts nest: the server and tiers wait 30 s for reply memory,
-  a tier 30 s for fetch memory, the cache 60 s per step of the server, the
-  daemon 150 s per step of the cache.
+  a tier 30 s for a fetch slot and 30 s for fetch memory, the cache 60 s per
+  step of the server, the daemon 180 s per step of the cache.
 - Receivers accept only plain Zstandard frames, with no dictionary and a
   window of at most 8 MiB; the zstd library is built without its legacy
   decoders.

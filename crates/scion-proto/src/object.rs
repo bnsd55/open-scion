@@ -130,7 +130,7 @@ impl Header {
     }
 
     /// The parts of this object, from its encoded bytes in `chunks` of 1 to
-    /// [`CHUNK_BYTES`] bytes, as [`chunks`] and [`read_chunks`] make them.
+    /// [`CHUNK_BYTES`] bytes, as [`read_chunks`] makes them.
     #[must_use]
     pub fn parts(&self, chunks: Vec<Bytes>) -> Vec<ObjectPart> {
         debug_assert_eq!(
@@ -158,20 +158,6 @@ impl Header {
             size: self.size as u64,
         }
     }
-}
-
-/// Cuts `data` into chunks of [`CHUNK_BYTES`], the last one shorter. The
-/// chunks are slices of `data`, not copies, so `data` stays in memory until
-/// the last of them is dropped.
-#[must_use]
-pub fn chunks(data: Bytes) -> Vec<Bytes> {
-    if data.is_empty() {
-        return vec![data];
-    }
-    (0..data.len())
-        .step_by(CHUNK_BYTES)
-        .map(|start| data.slice(start..data.len().min(start + CHUNK_BYTES)))
-        .collect()
 }
 
 /// Reads exactly `len` bytes from `reader` in chunks of [`CHUNK_BYTES`], the
@@ -357,13 +343,17 @@ pub fn unpacker(frame: &[u8]) -> io::Result<impl Read + '_> {
 }
 
 /// Packs `data` into one zstd frame with its size in the header, as the
-/// server stores blobs.
+/// server stores blobs. The frame's buffer is no larger than the frame: the
+/// compressor makes room for the worst case, which a buffer kept as `Bytes`
+/// would hold on to.
 ///
 /// # Errors
 ///
 /// If the compressor fails.
 pub fn pack(data: &[u8]) -> io::Result<Vec<u8>> {
-    zstd::bulk::compress(data, zstd::DEFAULT_COMPRESSION_LEVEL)
+    let mut frame = zstd::bulk::compress(data, zstd::DEFAULT_COMPRESSION_LEVEL)?;
+    frame.shrink_to_fit();
+    Ok(frame)
 }
 
 #[cfg(test)]
@@ -416,12 +406,10 @@ mod tests {
         for len in [0, 1, CHUNK_BYTES, CHUNK_BYTES + 1, 3 * CHUNK_BYTES + 5] {
             let data: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect();
             let header = header(Encoding::Raw, len, len);
-            let parts = header.parts(chunks(Bytes::from(data.clone())));
+            let parts = header.parts(read_chunks(&data[..], len).unwrap());
             assert_eq!(parts.len(), len.div_ceil(CHUNK_BYTES).max(1), "{len}");
             assert!(parts.iter().all(|p| p.data.len() <= CHUNK_BYTES));
             assert_eq!(assemble(parts).unwrap(), (header, data.clone()));
-            let read = read_chunks(&data[..], len).unwrap();
-            assert_eq!(read, chunks(Bytes::from(data)), "{len}");
         }
     }
 
@@ -474,7 +462,7 @@ mod tests {
     fn a_wrong_part_sequence_is_refused() {
         let data = vec![1; CHUNK_BYTES + 10];
         let header = header(Encoding::Raw, data.len(), data.len());
-        let mut parts = header.parts(chunks(Bytes::from(data)));
+        let mut parts = header.parts(read_chunks(&data[..], data.len()).unwrap());
         let first = parts.remove(0);
         let start = || Assembler::new(Header::of(&first, false).unwrap(), first.clone());
 
@@ -575,6 +563,25 @@ mod tests {
         assert_eq!(named_size, Some(data.len() as u64));
         let why = frame_size(&named).unwrap_err();
         assert!(why.contains("dictionary"), "{why}");
+    }
+
+    #[test]
+    fn a_packed_buffer_is_no_larger_than_its_frame() {
+        // Content that packs small, in a buffer made for the worst case.
+        let frame = pack(&vec![0; 1 << 20]).unwrap();
+        assert!(frame.len() < 1024, "{}", frame.len());
+        assert!(frame.capacity() <= frame.len() + 64, "{}", frame.capacity());
+    }
+
+    #[test]
+    fn the_unpacker_refuses_a_window_over_8_mib_by_itself() {
+        // A frame with a window of 16 MiB, unpacked without `frame_size`
+        // first: the decoder does not take the memory.
+        let frame = pack_with(&vec![0; 17 << 20], 1, 24);
+        assert!(frame_size(&frame).is_err());
+        let mut out = Vec::new();
+        let read = unpacker(&frame).unwrap().read_to_end(&mut out);
+        assert!(read.is_err(), "{} bytes unpacked", out.len());
     }
 
     #[test]

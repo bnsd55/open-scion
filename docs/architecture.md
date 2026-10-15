@@ -1017,7 +1017,9 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
   1 MiB plus its header. From that header, the object takes what checking it
   needs from a fetch budget of the rest of 400 MiB: its encoded bytes, its
   other form (the frame packed from a `RAW` blob, or the content of a zstd
-  tree) and a codec (9 MiB: a zstd window is at most 8 MiB). It keeps that
+  tree), and a blob's codec (9 MiB: a zstd window is at most 8 MiB) or a
+  tree's decoded entries (counted as six times its bytes). A read from the
+  store counts the same work. It keeps that
   share until it is stored. If the room does not come within 30 s, the
   fetch ends, its upstream reply with it, and each of its objects fails
   with `UNAVAILABLE`. So all fetches
@@ -1032,13 +1034,13 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
   upstream: an answer, or the next part of a fetch. Then the fetch fails
   with `UNAVAILABLE`, which says so. A reply that waits for a fetch has no
   limit of its own, because a fetch always settles every object it holds.
-  A fetch that waits for a fetch slot or for room in the fetch budget has no
-  limit either: they free up as other fetches finish their steps, and each
-  step has a limit. The limits nest, and const asserts keep them so: the
-  server and each tier wait at most 30 s for reply memory, and a tier 30 s
-  for fetch memory; the cache waits 60 s per step for the server, so a busy
-  server answers first; the daemon waits 150 s per step for the cache,
-  which covers one step of the server, the cache's own two waits and 30 s
+  A fetch waits at most 30 s for one of the 64 fetch slots, and 30 s for
+  room in the fetch budget; then it fails with `UNAVAILABLE`, and its
+  callers ask again. The limits nest, and const asserts keep them so: the
+  server and each tier wait at most 30 s for reply memory; the cache waits
+  60 s per step for the server, so a busy server answers first; the daemon
+  waits 180 s per step for the cache, which covers one step of the server,
+  the cache's own three waits (slot, fetch memory, reply memory) and 30 s
   to spare. A fetch joined in the middle of
   its batch can still wait for the objects ahead of it, and a client's own
   deadline does not reach the tiers
