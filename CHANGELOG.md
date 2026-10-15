@@ -15,6 +15,8 @@ release.
 - `scion-server`: SQLite metadata and trees, a blob folder with batched,
   verified durability, and one write path for changesets and their root
   trees.
+- Group commit: concurrent blob syncs and database commits share one full
+  drive flush.
 - One-way git import. Imported commits are checked against git, and a
   re-import never moves a ref off later lands.
 - Server-side commits (`CreateChangeset`) and lands: path-level conflict
