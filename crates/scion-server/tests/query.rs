@@ -430,6 +430,38 @@ fn diff_matches_git_name_status_and_resumes_after_any_path() {
 }
 
 #[test]
+fn diff_skips_a_subtree_with_the_same_id_on_both_sides() {
+    let (_data, store) = open_store();
+    let state = |data: &[u8]| {
+        Some(FileState::Regular {
+            content: BlobId::of(data),
+            executable: false,
+        })
+    };
+    let ids = chain(
+        &store,
+        vec![
+            BTreeMap::from([(path("keep/x"), state(b"x")), (path("f"), state(b"1"))]),
+            BTreeMap::from([(path("f"), state(b"2"))]),
+        ],
+    );
+    // Delete the shared subtree: a walk that reads it fails.
+    let root = read::root_tree(&store, REPO, ids[0]).unwrap();
+    store
+        .write(|c| {
+            let Some(scion_core::Entry::Dir(keep)) = tree::lookup(c, root, &path("keep"))? else {
+                panic!("keep is a directory");
+            };
+            c.execute("DELETE FROM trees WHERE id = ?1", [keep.as_bytes()])?;
+            Ok(())
+        })
+        .unwrap();
+    let entries = diff_all(&store, ids[0], ids[1], None, None);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, path("f"));
+}
+
+#[test]
 fn diff_pages_stop_at_max_diff_entries_and_resume() {
     let (_data, store) = open_store();
     // 1,515 paths below `big` and 1,000 beside it, so pages end inside
