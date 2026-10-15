@@ -265,7 +265,9 @@ fn a_missing_repo_fails_the_call_once_at_each_tier() {
 fn scn_refuses_a_unix_address_that_is_not_a_socket() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("real.sock");
-    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    // A socket file that nothing listens on, so a connect fails at once
+    // instead of hanging if the check lets it through.
+    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
     // A symlink to a real socket, and a plain file.
     let link = tmp.path().join("link.sock");
     std::os::unix::fs::symlink(&socket, &link).unwrap();
