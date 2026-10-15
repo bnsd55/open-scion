@@ -19,6 +19,9 @@ tokio-stream.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [build-dependencies]
 tonic-prost-build.workspace = true
 

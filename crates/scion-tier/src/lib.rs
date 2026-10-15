@@ -737,14 +737,15 @@ impl<S: Store> Objects for Tier<S> {
 
 /// Checks that only this user can reach `dir`: a real directory (not a
 /// symlink), owned by the effective user, with no access for group or
-/// others. Then nobody else can read what is inside, or put a file there.
+/// others, under directories that no other user can change
+/// ([`check_ancestors`](scion_proto::auth::check_ancestors)). Then nobody
+/// else can read what is inside, or put a file there. Returns `dir` with its
+/// parent resolved: use it, not `dir`, so no symlink is followed again.
 /// Fails with `PermissionDenied`, naming the rule that `dir` breaks.
-// SHORTCUT: checks only `dir`. Another user who can write to a directory
-// above it can put their own directory in its place after the check.
-// Upgrade (issue #70): check every directory up to `/` too: owned by root or
-// this user, and not writable by others unless sticky.
-pub(crate) fn check_private_dir(dir: &Path) -> io::Result<()> {
-    let meta = fs::symlink_metadata(dir)?;
+pub(crate) fn check_private_dir(dir: &Path) -> io::Result<std::path::PathBuf> {
+    let me = rustix::process::geteuid().as_raw();
+    let dir = scion_proto::auth::check_ancestors(dir, me)?;
+    let meta = fs::symlink_metadata(&dir)?;
     let refuse = |why: &str| {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -754,13 +755,13 @@ pub(crate) fn check_private_dir(dir: &Path) -> io::Result<()> {
     if !meta.is_dir() {
         return refuse("is not a directory (a symlink is refused too)");
     }
-    if meta.uid() != rustix::process::geteuid().as_raw() {
+    if meta.uid() != me {
         return refuse("is owned by another user");
     }
     if meta.mode() & 0o077 != 0 {
         return refuse("is open to other users; make it mode 0700");
     }
-    Ok(())
+    Ok(dir)
 }
 
 /// Listens on a Unix socket at `path`, in a directory that only this user
@@ -779,7 +780,14 @@ pub async fn bind_unix(path: &Path) -> io::Result<UnixListener> {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
     };
-    check_private_dir(dir)?;
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} names no socket file", path.display()),
+        )
+    })?;
+    // The checked directory, so no symlink in `path` is followed again.
+    let path = &check_private_dir(dir)?.join(name);
     if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket()) {
         if UnixStream::connect(path).await.is_ok() {
             return Err(io::Error::new(
