@@ -12,6 +12,7 @@ use scion_core::{Changeset, ChangesetId, Entry, FileState, PathElem, RepoPath, T
 use crate::db::{self, RepoId};
 use crate::derived::{self, Kind};
 use crate::error::{ApplyError, Error, Result};
+use crate::graph::CommitGraph;
 use crate::store::Store;
 
 /// Applies `changes` to `base` (`None` is the empty tree), stores the new
@@ -73,9 +74,9 @@ impl Kind for RootTree {
         c: &Connection,
         id: ChangesetId,
         changeset: &Changeset,
-        parent: Option<TreeId>,
+        parents: Vec<TreeId>,
     ) -> Result<TreeId> {
-        apply(c, parent, &changeset.changes).map_err(|e| match e {
+        apply(c, parents.first().copied(), &changeset.changes).map_err(|e| match e {
             Error::Apply(e) => Error::Corrupt(format!("stored changeset {id} does not apply: {e}")),
             other => other,
         })
@@ -134,6 +135,9 @@ pub fn derive_root_tree(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result
 /// Like each step of [`derived::fill`], it also removes a few root trees of
 /// older versions.
 ///
+/// It also stores the changeset's node in the commit graph, if each parent
+/// has one ([`derived::on_write`]).
+///
 /// # Errors
 ///
 /// [`Error::Apply`] if the changes do not apply to the first parent's tree;
@@ -153,6 +157,7 @@ pub fn store_changeset(
     let id = db::insert_changeset(c, repo, cs)?;
     derived::put::<RootTree>(c, id, &tree)?;
     derived::remove_old::<RootTree>(c)?;
+    derived::on_write::<CommitGraph>(c, id, cs)?;
     Ok((id, tree))
 }
 

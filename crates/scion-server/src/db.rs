@@ -148,7 +148,11 @@ pub fn first_parent(c: &Connection, id: ChangesetId) -> Result<Option<ChangesetI
 /// # Errors
 ///
 /// [`Error::Corrupt`] if a parent's generation is not below `id_gen`.
-fn parents(c: &Connection, id: ChangesetId, id_gen: i64) -> Result<Vec<(ChangesetId, i64)>> {
+pub(crate) fn parents(
+    c: &Connection,
+    id: ChangesetId,
+    id_gen: i64,
+) -> Result<Vec<(ChangesetId, i64)>> {
     let mut parents = c.prepare_cached(
         "SELECT parent, gen FROM changeset_parents JOIN changesets ON id = parent
          WHERE cs = ?1 ORDER BY n",
@@ -302,7 +306,7 @@ fn tally(live: &mut [usize; 2], mark: u8, add: bool) {
 }
 
 /// The error of a graph walk that reached its bound.
-fn too_deep(max_visits: usize) -> Error {
+pub(crate) fn too_deep(max_visits: usize) -> Error {
     Error::ResourceExhausted(format!(
         "the history is too deep: the answer needs more than {max_visits} changesets"
     ))
@@ -482,4 +486,76 @@ fn load_tree(c: &Connection, id: TreeId) -> Result<(Tree, Vec<u8>)> {
 
 fn to_id(bytes: &[u8]) -> Result<ChangesetId> {
     ChangesetId::try_from(bytes).map_err(|e| Error::Corrupt(format!("stored changeset ID: {e}")))
+}
+
+/// Commit graphs for tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use proptest::prelude::{Strategy, any};
+    use proptest::sample::Index;
+    use scion_core::{BlobId, FileState, IdentityTime, RepoPath};
+
+    use super::*;
+
+    /// Stores a graph of changesets in `repo` with [`insert_changeset`], so
+    /// with no derived rows. Changeset `i` has the parents `parents[i]`, in
+    /// order, each an earlier changeset, and puts the file `f{i}`. Returns
+    /// the IDs.
+    pub(crate) fn insert_graph(
+        c: &Connection,
+        repo: RepoId,
+        parents: &[Vec<usize>],
+    ) -> Result<Vec<ChangesetId>> {
+        let mut ids: Vec<ChangesetId> = Vec::new();
+        for (i, of) in parents.iter().enumerate() {
+            let path = format!("f{i}");
+            let state = FileState::Regular {
+                content: BlobId::of(path.as_bytes()),
+                executable: false,
+            };
+            let cs = Changeset {
+                parents: of.iter().map(|&p| ids[p]).collect(),
+                author: IdentityTime {
+                    name: b"a".to_vec(),
+                    email: b"a@x".to_vec(),
+                    unix_secs: 0,
+                    tz_offset_minutes: 0,
+                },
+                committer: None,
+                message: path.clone().into_bytes(),
+                changes: [(RepoPath::new(path).unwrap(), Some(state))].into(),
+            };
+            ids.push(insert_changeset(c, repo, &cs)?);
+        }
+        Ok(ids)
+    }
+
+    /// Graphs of 1 to `max` changesets for [`insert_graph`]. Most have a
+    /// first parent a few changesets back, so first-parent histories are
+    /// long. Some have no parent, and some have up to two more parents
+    /// anywhere before them, so there are several roots, merges and
+    /// criss-crosses.
+    pub(crate) fn graphs(max: usize) -> impl Strategy<Value = Vec<Vec<usize>>> {
+        let node = (
+            proptest::option::weighted(0.9, 1..4_usize),
+            proptest::collection::vec(any::<Index>(), 0..3),
+        );
+        proptest::collection::vec(node, 1..=max).prop_map(|nodes| {
+            (0..)
+                .zip(nodes)
+                .map(|(i, (back, others))| {
+                    let mut parents: Vec<usize> = Vec::new();
+                    if i > 0 {
+                        let first = back.map(|back| i - back.min(i));
+                        for p in first.into_iter().chain(others.iter().map(|o| o.index(i))) {
+                            if !parents.contains(&p) {
+                                parents.push(p);
+                            }
+                        }
+                    }
+                    parents
+                })
+                .collect()
+        })
+    }
 }

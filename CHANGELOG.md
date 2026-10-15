@@ -87,3 +87,15 @@ release.
   requests run between steps after a new kind or a version bump. Each step
   removes some rows of older versions. `scion-server derive --kind
   root_tree` fills a ref's history ahead of reads and removes the rest.
+- `scripts/demo.sh`, a demo that anyone can rerun on a fixed public
+  repository, and `scripts/bench-checkout.sh`, a checkout benchmark against
+  git. `docs/benchmarks.md` gives the method.
+- A kind of derived data can read the value of every parent, not only the
+  first. Its history is derived parents first, in generation order.
+- A commit-graph index as derived data (`commit_graph`): skip-list jumps
+  over each first-parent history and a link to the newest merge on it.
+  `IsAncestor` reads a few dozen entries at any depth, and three rows per
+  merge between. `MergeBase` does the same when neither first-parent
+  history has a merge newer than where the two meet; otherwise it still
+  walks, up to 10,000 changesets. `scion-server derive --kind commit_graph`
+  fills it ahead of the first query on an older database.
