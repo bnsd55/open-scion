@@ -835,13 +835,13 @@ mod tests {
         let service = Arc::new(ScionService::new(Worker::new(store.clone())));
         let idle = || service.worker.permits.available_permits() == MAX_BLOCKING;
 
-        // Hold the database, so the job waits at its first step.
+        // Hold the write connection, so the job waits at its first step.
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
         let blocker = std::thread::spawn({
             let store = store.clone();
             move || {
-                store.read(|_| {
+                store.read_unflushed(|_| {
                     held_tx.send(()).unwrap();
                     go_rx.recv().unwrap();
                     Ok(())
