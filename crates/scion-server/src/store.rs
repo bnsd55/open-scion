@@ -1100,10 +1100,8 @@ mod tests {
     fn processes_of_two_builds_never_share_a_directory() {
         let dir = tempfile::tempdir().unwrap();
         let ours = build();
-        // root_tree 2 would remove the rows of root_tree 1 that our server
-        // reads.
-        let other = ours.replace("root_tree 1", "root_tree 2");
-        assert_ne!(other, ours);
+        // A build with one more kind.
+        let other = format!("{ours}, blame 1");
         let refused = |opened: Result<Store>| match opened {
             Err(Error::FailedPrecondition(msg)) => {
                 assert!(msg.contains("another build"), "{msg}");
