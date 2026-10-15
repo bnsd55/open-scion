@@ -1,6 +1,8 @@
 //! Path history (`Log` with a path) and blame, with their bounds.
 #![cfg(unix)]
 
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -8,6 +10,7 @@ use std::process::Command;
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_server::blame::{
     self, Blame, BlameRange, MAX_BLAME_BYTES, MAX_BLAME_DIFF_LINES, MAX_BLAME_VERSIONS,
+    MAX_RENAME_SOURCES,
 };
 use scion_server::import::{ImportOptions, import_git};
 use scion_server::read::{self, MAX_SCAN};
@@ -199,8 +202,9 @@ fn regular(content: BlobId) -> FileState {
 }
 
 /// Stores a first-parent chain in a new repo: one changeset per entry of
-/// `puts`. Returns the IDs, oldest first.
-fn chain(store: &Store, puts: Vec<Vec<(&str, FileState)>>) -> Vec<ChangesetId> {
+/// `puts`, which puts files or deletes them (`None`). Returns the IDs,
+/// oldest first.
+fn chain<S: Into<Option<FileState>>>(store: &Store, puts: Vec<Vec<(&str, S)>>) -> Vec<ChangesetId> {
     store
         .write(|c| {
             let repo = db::create_repo(c, REPO)?;
@@ -211,7 +215,7 @@ fn chain(store: &Store, puts: Vec<Vec<(&str, FileState)>>) -> Vec<ChangesetId> {
                     author: author(),
                     committer: None,
                     message: format!("change {}", ids.len()).into_bytes(),
-                    changes: puts.into_iter().map(|(p, s)| (path(p), Some(s))).collect(),
+                    changes: puts.into_iter().map(|(p, s)| (path(p), s.into())).collect(),
                 };
                 ids.push(tree::store_changeset(c, repo, &cs)?.0);
             }
@@ -250,11 +254,11 @@ fn walks_stop_after_max_scan_changesets_and_resume() {
 
     let first = blame(&store, tip, "f");
     assert_eq!(first.ranges, [range(1, 2, None, 1)]);
-    assert_eq!(first.next, Some(root));
+    assert_eq!(first.next, Some((root, path("f"))));
     let rest = blame(&store, root, "f");
     assert_eq!(rest.ranges, [range(1, 2, Some(root), 1)]);
     assert_eq!(rest.next, None);
-    assert_eq!(rest.authors, [(root, author())]);
+    assert_eq!(rest.changesets, [(root, author(), path("f"))]);
 }
 
 #[test]
@@ -280,8 +284,8 @@ fn blame_stops_after_max_versions_and_resumes() {
         .collect();
     expected.push(range(len, 1, None, 1));
     assert_eq!(first.ranges, expected);
-    assert_eq!(first.next, Some(ids[0]));
-    assert_eq!(first.authors.len(), MAX_BLAME_VERSIONS);
+    assert_eq!(first.next, Some((ids[0], path("f"))));
+    assert_eq!(first.changesets.len(), MAX_BLAME_VERSIONS);
 
     let rest = blame(&store, ids[0], "f");
     assert_eq!(rest.ranges, [range(1, 1, Some(ids[0]), 1)]);
@@ -325,7 +329,7 @@ fn a_change_that_only_deletes_lines_is_not_named() {
         result.ranges,
         [range(1, 1, Some(ids[0]), 1), range(2, 1, Some(ids[0]), 3),]
     );
-    assert_eq!(result.authors, [(ids[0], author())]);
+    assert_eq!(result.changesets, [(ids[0], author(), path("f"))]);
 }
 
 #[test]
@@ -365,29 +369,411 @@ fn blame_refuses_what_it_cannot_diff() {
     assert!(matches!(missing, Err(Error::NotFound(_))), "{missing:?}");
 }
 
+/// Blames `p` at `cs` to the end, and continues where a call stops, as a
+/// client does. Each line as its changeset, its line there and the path
+/// there.
+fn blame_lines(store: &Store, cs: ChangesetId, p: &str) -> Vec<(ChangesetId, u32, RepoPath)> {
+    let mut at = (cs, path(p));
+    let mut paths = HashMap::new();
+    // Each line's changeset once known, and until then its line at `at`.
+    let mut lines: Vec<(Option<ChangesetId>, u32)> = Vec::new();
+    loop {
+        let result = blame::blame(store, REPO, at.0, &at.1).unwrap();
+        paths.extend(result.changesets.into_iter().map(|(id, _, p)| (id, p)));
+        let here: Vec<_> = result
+            .ranges
+            .iter()
+            .flat_map(|r| (0..r.line_count).map(move |n| (r.changeset, r.origin_line + n)))
+            .collect();
+        if lines.is_empty() {
+            lines = here;
+        } else {
+            for line in lines.iter_mut().filter(|(id, _)| id.is_none()) {
+                *line = here[line.1 as usize - 1];
+            }
+        }
+        match result.next {
+            Some(next) => at = next,
+            None => break,
+        }
+    }
+    lines
+        .into_iter()
+        .map(|(id, origin)| {
+            let id = id.unwrap();
+            (id, origin, paths[&id].clone())
+        })
+        .collect()
+}
+
+/// `git blame --first-parent` of `file`, in the form of [`blame_lines`].
+fn git_blame_lines(store: &Store, dir: &Path, file: &str) -> Vec<(ChangesetId, u32, RepoPath)> {
+    let out = git(dir, &["blame", "--first-parent", "--line-porcelain", file]);
+    let mut lines = Vec::new();
+    // Each line starts with "<commit> <origin line> <line> [<count>]".
+    let mut header = None;
+    for line in out.lines() {
+        if line.starts_with('\t') {
+            header = None;
+        } else if header.is_none() {
+            let fields: Vec<&str> = line.split(' ').collect();
+            header = Some((changeset_of(store, fields[0]), fields[1].parse().unwrap()));
+        } else if let Some(name) = line.strip_prefix("filename ") {
+            let (id, origin) = header.unwrap();
+            lines.push((id, origin, path(name)));
+        }
+    }
+    lines
+}
+
+/// A rename case: a commit message, the files the commit deletes, with
+/// their text, and the file it adds.
+type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], (&'a str, &'a str));
+
+/// Commits the files that `cases` delete, all at once. Then commits each
+/// case on its own: it deletes its files and adds its file.
+fn commit_cases(dir: &Path, cases: &[Case<'_>]) {
+    let sources: Vec<_> = cases
+        .iter()
+        .flat_map(|(_, deleted, _)| deleted.iter().map(|&(p, text)| (p, Some(text))))
+        .collect();
+    commit(dir, "add the sources", &sources);
+    for &(message, deleted, (added, text)) in cases {
+        let mut files: Vec<_> = deleted.iter().map(|&(p, _)| (p, None)).collect();
+        files.push((added, Some(text)));
+        commit(dir, message, &files);
+    }
+}
+
+/// Imports the git history in `dir`, and checks that the blame of each of
+/// `files` at the tip matches `git blame --first-parent`: the changeset,
+/// line and path of each line.
+fn assert_blame_matches_git(dir: &Path, files: &[&str]) -> (TempDir, Store, ChangesetId) {
+    let (data, store) = open_store();
+    let tip = import(&store, dir);
+    for file in files {
+        let expected = git_blame_lines(&store, dir, file);
+        assert_eq!(blame_lines(&store, tip, file), expected, "{file}");
+    }
+    (data, store, tip)
+}
+
 #[test]
-fn blame_and_path_log_do_not_follow_renames() {
+fn blame_follows_renames_as_git_blame_first_parent_does() {
     let git_dir = tempfile::tempdir().unwrap();
     let dir = git_dir.path();
     git(dir, &["init", "-q", "-b", "main"]);
-    let add = commit(dir, "add", &[("old.txt", Some("1\n2\n3\n"))]);
-    let rename = commit(
+    commit_cases(
         dir,
-        "rename",
-        &[("old.txt", None), ("new.txt", Some("1\n2\n3\n"))],
+        &[
+            (
+                "pure rename",
+                &[("pure.txt", "p1\np2\np3\n")],
+                ("renamed.txt", "p1\np2\np3\n"),
+            ),
+            (
+                "rename with an edit, 77% similar",
+                &[("edit.txt", "e1\ne2\ne3\ne4\ne5\ne6\ne7\ne8\ne9\ne10\n")],
+                (
+                    "edited.txt",
+                    "e1\ne2\ne3\ne4\ne5\ne6\ne7\ne8\ne9\nchanged\n",
+                ),
+            ),
+            (
+                "rename into a new directory, with an edit",
+                &[("top.txt", "t1\nt2\nt3\n")],
+                ("new/dir/top.txt", "t1\nt2\nt3\nt4\n"),
+            ),
+            (
+                "a delete and an unrelated add",
+                &[("gone.txt", "g1\ng2\ng3\n")],
+                ("fresh.txt", "f1\nf2\nf3\n"),
+            ),
+        ],
     );
+    commit(dir, "add swap", &[("swap", Some("s1\ns2\ns3\n"))]);
+    commit(
+        dir,
+        "swap becomes a directory",
+        &[("swap", None), ("swap/inner", Some("s1\ns2\ns3\ns4\n"))],
+    );
+    commit(
+        dir,
+        "and a file again",
+        &[("swap", None), ("swap", Some("s0\ns1\ns2\ns3\ns4\n"))],
+    );
+    std::os::unix::fs::symlink("nowhere", dir.join("link")).unwrap();
+    commit(
+        dir,
+        "add a symlink",
+        &[("link-source.txt", Some("k1\nk2\n"))],
+    );
+    // A type change, not a rename.
+    commit(
+        dir,
+        "the symlink becomes a regular file",
+        &[
+            ("link-source.txt", None),
+            ("link", None),
+            ("link", Some("k1\nk2\n")),
+        ],
+    );
+    let files = [
+        "renamed.txt",
+        "edited.txt",
+        "new/dir/top.txt",
+        "fresh.txt",
+        "swap",
+        "link",
+    ];
+    let (_data, store, tip) = assert_blame_matches_git(dir, &files);
+    // `Log` with a path does not follow renames, as `git log` without
+    // `--follow`.
+    let (log, next) = path_log(&store, tip, "renamed.txt");
+    assert_eq!((log.len(), next), (1, None));
+}
+
+#[test]
+fn blame_picks_the_rename_source_as_git_blame_does() {
+    let git_dir = tempfile::tempdir().unwrap();
+    let dir = git_dir.path();
+    git(dir, &["init", "-q", "-b", "main"]);
+    // One line of 192 bytes in three 64-byte chunks, then "a".
+    let long = |end: &str| {
+        format!(
+            "{}{}{}\na\n",
+            "x".repeat(64),
+            "y".repeat(64),
+            end.repeat(64)
+        )
+    };
+    // 20 lines of 4 bytes. The new file keeps 9 of them: 45%.
+    let line = |n: usize, kept: bool| format!("{}{n:02}\n", if kept { 'l' } else { 'X' });
+    let twenty: String = (1..=20).map(|n| line(n, true)).collect();
+    let nine_of_twenty: String = (1..=20).map(|n| line(n, n <= 9)).collect();
+    // 10 CRLF lines of 4 bytes, 5 kept: 50% of the bytes, but a CR does
+    // not count, so 37.5%.
+    let crlf_line = |n: usize, other: char| format!("{}{n}\r\n", if n < 5 { 'k' } else { other });
+    let crlf = |other| -> String { (0..10).map(|n| crlf_line(n, other)).collect() };
+    let cases: [Case<'_>; 9] = [
+        (
+            "two sources with the same content: the same name wins",
+            &[("tie/d/w.txt", "w1\nw2\n"), ("tie/e/v.txt", "w1\nw2\n")],
+            ("tie/f/v.txt", "w1\nw2\n"),
+        ),
+        (
+            "the one source with the same name wins at 80%, over 90%",
+            &[
+                ("name/a/o.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\nT\n"),
+                ("name/b/z.txt", "1\n2\n3\n4\n5\n6\n7\n8\nW\nX\n"),
+            ],
+            ("name/c/z.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\nD\n"),
+        ),
+        (
+            "two sources at 60%: the same name wins",
+            &[
+                ("even/a/o.txt", "1\n2\n3\n4\n5\n6\nQ\nR\nS\nT\n"),
+                ("even/b/z.txt", "1\n2\n3\n4\n5\n6\nU\nV\nW\nX\n"),
+            ],
+            ("even/c/z.txt", "1\n2\n3\n4\n5\n6\nA\nB\nC\nD\n"),
+        ),
+        (
+            "three sources at 60%, two with the same name: the first of them wins",
+            &[
+                ("twice/a/o.txt", "1\n2\n3\n4\n5\n6\nQ\nR\nS\nT\n"),
+                ("twice/b/z.txt", "1\n2\n3\n4\n5\n6\nU\nV\nW\nX\n"),
+                ("twice/c/z.txt", "1\n2\n3\n4\n5\n6\nK\nL\nM\nN\n"),
+            ],
+            ("twice/d/z.txt", "1\n2\n3\n4\n5\n6\nA\nB\nC\nD\n"),
+        ),
+        (
+            "line ends change: a CR before a newline does not count",
+            &[("crlf.txt", "aaa\r\nbbb\r\nccc\r\nddd\r\neee\nfff\n")],
+            ("lf.txt", "aaa\nbbb\nccc\nddd\neee\nfff\n"),
+        ),
+        (
+            "CRLF on both sides: 50% of the bytes, under 50% without the CRs",
+            &[("crlf-half.txt", &crlf('o'))],
+            ("crlf-half-new.txt", &crlf('n')),
+        ),
+        (
+            "a long line counts in chunks of 64 bytes",
+            &[("long.txt", &long("z"))],
+            ("long-new.txt", &long("Q")),
+        ),
+        (
+            "exactly 50% similar",
+            &[(
+                "half.txt",
+                "aaa\nbbb\nccc\nddd\neee\nfff\nggg\nhhh\niii\njjj\n",
+            )],
+            (
+                "half-new.txt",
+                "aaa\nbbb\nccc\nddd\neee\nFFF\nGGG\nHHH\nIII\nJJJ\n",
+            ),
+        ),
+        (
+            "45% similar",
+            &[("under.txt", &twenty)],
+            ("under-new.txt", &nine_of_twenty),
+        ),
+    ];
+    commit_cases(dir, &cases);
+    let files = cases.map(|(_, _, (added, _))| added);
+    assert_blame_matches_git(dir, &files);
+}
+
+#[test]
+fn blame_continues_at_the_old_path_after_a_rename() {
     let (_data, store) = open_store();
-    let tip = import(&store, dir);
-    let rename_id = changeset_of(&store, &rename);
-    // SHORTCUT (#69): git follows the rename and gives the lines to `add`.
-    // Here the rename takes them.
-    let porcelain = git(dir, &["blame", "--first-parent", "--porcelain", "new.txt"]);
-    assert!(porcelain.starts_with(&add), "{porcelain}");
-    assert_eq!(
-        blame(&store, tip, "new.txt").ranges,
-        [range(1, 3, Some(rename_id), 1)]
+    // Each changeset adds one line at the top. The one at `before` also
+    // renames `a` to `f`. One call diffs MAX_BLAME_VERSIONS versions, so it
+    // passes the rename and stops on the history of `a`.
+    let before = MAX_BLAME_VERSIONS / 2 + 10;
+    let mut text = String::new();
+    let changes = (0..=before + MAX_BLAME_VERSIONS / 2)
+        .map(|n| {
+            text.insert_str(0, &format!("line {n}\n"));
+            let put = Some(regular(store.blobs().put(text.as_bytes()).unwrap()));
+            match n.cmp(&before) {
+                Ordering::Less => vec![("a", put)],
+                Ordering::Equal => vec![("a", None), ("f", put)],
+                Ordering::Greater => vec![("f", put)],
+            }
+        })
+        .collect();
+    let ids = chain(&store, changes);
+    let tip = *ids.last().unwrap();
+
+    let (next, next_path) = blame(&store, tip, "f").next.unwrap();
+    assert!(ids[..before].contains(&next), "{next}");
+    assert_eq!(next_path, path("a"));
+    // Line k came from changeset `len - k`, where it was line 1.
+    let len = ids.len();
+    let expected: Vec<_> = (1..=len)
+        .map(|k| {
+            let at = if len - k < before { "a" } else { "f" };
+            (ids[len - k], 1, path(at))
+        })
+        .collect();
+    assert_eq!(blame_lines(&store, tip, "f"), expected);
+}
+
+#[test]
+fn a_rename_search_counts_against_the_diff_budget() {
+    let (_data, store) = open_store();
+    // `ids[1]` renames `a` to `f` and adds a line, so finding the source
+    // compares about 2n chunks, and the diff after it about 2n lines. The
+    // diff of `ids[2]` costs about 2n lines first. Without the search, the
+    // call fits in its budget.
+    let n = 200_000;
+    assert!(4 * n + 4 <= MAX_BLAME_DIFF_LINES && 6 * n > MAX_BLAME_DIFF_LINES);
+    let put = |text: &str| Some(regular(store.blobs().put(text.as_bytes()).unwrap()));
+    let empty = "\n".repeat(n);
+    let ids = chain(
+        &store,
+        vec![
+            vec![("a", put(&empty))],
+            vec![("a", None), ("f", put(&format!("1\n{empty}")))],
+            vec![("f", put(&format!("2\n1\n{empty}")))],
+        ],
     );
-    assert_eq!(path_log(&store, tip, "new.txt"), (vec![rename_id], None));
+    let first = blame(&store, ids[2], "f");
+    assert_eq!(
+        first.ranges,
+        [range(1, 1, Some(ids[2]), 1), range(2, n + 1, None, 1)]
+    );
+    assert_eq!(first.next, Some((ids[1], path("f"))));
+    let rest = blame(&store, ids[1], "f");
+    assert_eq!(
+        rest.ranges,
+        [range(1, 1, Some(ids[1]), 1), range(2, n, Some(ids[0]), 1)]
+    );
+    assert_eq!(rest.changesets[1], (ids[0], author(), path("a")));
+}
+
+#[test]
+fn a_rename_with_no_edit_costs_no_diff() {
+    let (_data, store) = open_store();
+    // `ids[1]` renames `a` to `f` with the same content. A diff of it would
+    // cost about 2n lines, and the call would stop after the first diff.
+    let n = 300_000;
+    assert!(4 * n > MAX_BLAME_DIFF_LINES && 2 * n < MAX_BLAME_DIFF_LINES);
+    let put = |text: &str| Some(regular(store.blobs().put(text.as_bytes()).unwrap()));
+    let empty = "\n".repeat(n);
+    let ids = chain(
+        &store,
+        vec![
+            vec![("a", put(&empty))],
+            vec![("a", None), ("f", put(&empty))],
+            vec![("f", put(&format!("x\n{empty}")))],
+        ],
+    );
+    let result = blame(&store, ids[2], "f");
+    assert_eq!(
+        result.ranges,
+        [range(1, 1, Some(ids[2]), 1), range(2, n, Some(ids[0]), 1)]
+    );
+    assert_eq!(result.next, None);
+}
+
+#[test]
+fn a_changeset_with_many_deletes_is_searched_only_for_the_same_content_or_name() {
+    let (_data, store) = open_store();
+    let put = |data: &str| Some(regular(store.blobs().put(data.as_bytes()).unwrap()));
+    let ten = "1\n2\n3\n4\n5\n6\n7\n8\n9\n0\n";
+    let edited = "1\n2\n3\n4\n5\n6\n7\n8\n9\nX\n";
+    // Small files, too small to be like any blamed file.
+    let fillers: Vec<String> = (0..4 * MAX_RENAME_SOURCES)
+        .map(|n| format!("filler/{n}"))
+        .collect();
+    let mut fillers = fillers.iter().map(String::as_str);
+    let mut root: Vec<_> = fillers.clone().map(|f| (f, put("f\n"))).collect();
+    root.extend(["a.txt", "b.txt", "c/same.txt", "e.txt"].map(|p| (p, put(ten))));
+    // Each changeset deletes a source and fillers, and adds one file.
+    let mut step = |source: &'static str, deletes: usize, added: &'static str, text: &str| {
+        let mut changes: Vec<_> = fillers
+            .by_ref()
+            .take(deletes - 1)
+            .map(|f| (f, None))
+            .collect();
+        changes.extend([(source, None), (added, put(text))]);
+        changes
+    };
+    let changes = vec![
+        root,
+        step("a.txt", MAX_RENAME_SOURCES, "a2.txt", edited),
+        step("b.txt", MAX_RENAME_SOURCES + 1, "b2.txt", edited),
+        step("c/same.txt", MAX_RENAME_SOURCES + 1, "d/same.txt", edited),
+        step("e.txt", MAX_RENAME_SOURCES + 1, "e2.txt", ten),
+    ];
+    let ids = chain(&store, changes);
+    let tip = ids[4];
+    let renamed = |p: &str, at: usize, source: &str| {
+        let result = blame(&store, tip, p);
+        assert_eq!(
+            result.ranges,
+            [
+                range(1, 9, Some(ids[0]), 1),
+                range(10, 1, Some(ids[at]), 10)
+            ],
+            "{p}"
+        );
+        assert_eq!(result.changesets[1], (ids[0], author(), path(source)));
+    };
+    // Up to MAX_RENAME_SOURCES deletes, every deleted file is compared.
+    renamed("a2.txt", 1, "a.txt");
+    // Over it, a file that is only similar, under another name, is not.
+    assert_eq!(
+        blame(&store, tip, "b2.txt").ranges,
+        [range(1, 10, Some(ids[2]), 1)]
+    );
+    // The one deleted file with the same name still is, and the same
+    // content is always found.
+    renamed("d/same.txt", 3, "c/same.txt");
+    let exact = blame(&store, tip, "e2.txt");
+    assert_eq!(exact.ranges, [range(1, 10, Some(ids[0]), 1)]);
+    assert_eq!(exact.changesets, [(ids[0], author(), path("e.txt"))]);
 }
 
 #[test]
@@ -430,7 +816,7 @@ fn blame_stops_when_its_diff_budget_runs_out() {
         first.ranges,
         [range(1, 1, Some(ids[2]), 1), range(2, n + 1, None, 1)]
     );
-    assert_eq!(first.next, Some(ids[1]));
+    assert_eq!(first.next, Some((ids[1], path("f"))));
     let rest = blame(&store, ids[1], "f");
     assert_eq!(
         rest.ranges,

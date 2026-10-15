@@ -31,6 +31,13 @@ release.
   and the client continues where a call stopped. An older server ignores
   the new `path` field, so `scn log --path` against it prints unfiltered
   history.
+- `Blame` follows renames as `git blame` does by default: a deleted file
+  with the same content, else a similar one (50% or more). Each changeset in
+  a reply names the path of the file there (`BlameChangeset.path`), and a
+  reply that stops says where to continue (`next_path`). `scn blame` shows
+  each line's path when some line came from another path, as git does, and
+  `--json` adds `path` to each range. A client that ignores `next_path`
+  continues at the wrong path after a rename.
 - Bearer-token auth, loopback-only listening by default, request limits and
   name validation at the RPC boundary.
 - `docs/protocol-v1.md`: the contract of the `Scion` and `Objects` services,

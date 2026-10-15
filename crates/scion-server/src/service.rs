@@ -444,20 +444,25 @@ impl Scion for ScionService {
             })
             .collect();
         let changesets = blame
-            .authors
+            .changesets
             .into_iter()
-            .map(|(id, author)| BlameChangeset {
+            .map(|(id, author, path)| BlameChangeset {
                 changeset_id: id.as_bytes().to_vec(),
                 author_name: author.name,
                 author_email: author.email,
                 author_unix_secs: author.unix_secs,
                 author_tz_offset_minutes: author.tz_offset_minutes,
+                path: path.as_bytes().to_vec(),
             })
             .collect();
+        let (next, next_path) = blame.next.unzip();
         Ok(Response::new(BlameResponse {
             ranges,
             changesets,
-            next_changeset_id: id_bytes(blame.next),
+            next_changeset_id: id_bytes(next),
+            next_path: next_path
+                .map(|path| path.as_bytes().to_vec())
+                .unwrap_or_default(),
         }))
     }
 }
