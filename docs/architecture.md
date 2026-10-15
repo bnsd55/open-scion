@@ -321,8 +321,8 @@ and backward when a land has an older base, down to `MAX_DEPTH` (one cycle,
 10,000) generations below the tip. If the head does not descend from the tip,
 it starts over. After an error other than `ABORTED` or `DEADLINE_EXCEEDED`
 it is dropped and rebuilt, because it may be ahead of the database. A
-deadline stops it between two whole changesets, so a retry goes on from
-there.
+deadline leaves it whole: an advance adds nothing until it reaches the tip,
+and a `reach` adds one changeset at a time, so a retry goes on from there.
 
 A changed path `p` conflicts when one of these is newer than the base:
 `files[p]` (the same path changed), `dirs[p]` (something below `p` changed),
@@ -535,10 +535,12 @@ that each changeset it receives hashes to its ID.
 - The reply channel has two slots, and a part goes in only when it is
   empty. So the second slot is always free for the error that ends a reply
   early. A reply ends with `DEADLINE_EXCEEDED` when its client takes no part
-  for 120 s, or 600 s after the call started, and frees its share. So a
-  client never takes a short file for a whole one. Not counted: the last
-  part of a stalled reply inside HTTP/2, which stays until the connection
-  closes ([#42](https://github.com/bnsd55/open-scion/issues/42)).
+  for 120 s, or 600 s after the call started. So a client never takes a
+  short file for a whole one. When a reply stops, it frees its share except
+  for the part still in the channel, which keeps its share until the client
+  takes it. Not counted: one encoded part of a stalled reply inside HTTP/2,
+  which stays until the connection closes
+  ([#42](https://github.com/bnsd55/open-scion/issues/42)).
 
 **Object reads (`Objects` service, `objects.rs`).** The calls that every
 cache tier will answer. The client asks only for the objects it wants,

@@ -217,8 +217,9 @@ impl Lands {
         let result = finish(store, repo, land_id, req, &mut index);
         // The index may be ahead of the database; rebuild it next time. A lost
         // race wrote nothing, so the index is still good. So is an index that
-        // a deadline stopped: it grows one whole changeset at a time, and a
-        // retry goes on from there.
+        // a deadline stopped: an advance adds nothing until it reaches the
+        // tip, and a reach adds one whole changeset at a time, so a retry
+        // goes on from where the reach stopped.
         if result
             .as_ref()
             .is_err_and(|e| !matches!(e, Error::Aborted(_) | Error::DeadlineExceeded(_)))
@@ -675,6 +676,7 @@ impl PathIndex {
         let deep = tip_gen - base_gen > MAX_DEPTH;
         let mut below = HashSet::new();
         if base != self.floor && self.chain.get(&base_gen) != Some(&base) {
+            // A deep base does not grow the index: the walk checks it all.
             let mut walk = if deep {
                 Walk::Stopped
             } else {
@@ -720,16 +722,15 @@ impl PathIndex {
         base_gen: i64,
         deadline: Instant,
     ) -> Result<Walk> {
-        let floor = self.floor;
         walk_back(
             c,
             repo,
-            floor,
+            self.floor,
             base,
             base_gen,
             deadline,
             |id, generation, cs| {
-                if self.bytes + added_bytes(&cs.changes) > MAX_INDEX_BYTES {
+                if !self.fits(&cs.changes) {
                     return false;
                 }
                 self.add(id, generation, &cs.changes);
@@ -787,7 +788,7 @@ impl PathIndex {
         generation: i64,
         changes: &BTreeMap<RepoPath, Option<FileState>>,
     ) {
-        if self.bytes + added_bytes(changes) > MAX_INDEX_BYTES {
+        if !self.fits(changes) {
             tracing::info!(
                 generation,
                 "the path index is full; it starts over at the tip"
@@ -815,6 +816,11 @@ impl PathIndex {
                 self.bytes += bump(&mut self.dirs, dir, generation);
             }
         }
+    }
+
+    /// Whether a changeset with `changes` fits in [`MAX_INDEX_BYTES`].
+    fn fits(&self, changes: &BTreeMap<RepoPath, Option<FileState>>) -> bool {
+        self.bytes + added_bytes(changes) <= MAX_INDEX_BYTES
     }
 
     /// What the index holds, by [`entry_bytes`]. Counted from scratch.
