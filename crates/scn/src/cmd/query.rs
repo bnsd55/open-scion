@@ -1,5 +1,7 @@
 //! `merge-base`, `is-ancestor`, `diff`.
 
+use std::io::{BufWriter, Write as _};
+
 use anyhow::{Context, Result, bail};
 use scion_core::{ChangesetId, Entry, FileState, GitOid, RepoPath};
 use scion_proto::v1::{self, DiffRequest, FileKind, IsAncestorRequest, MergeBaseRequest};
@@ -65,12 +67,13 @@ pub async fn is_ancestor(ctx: &mut Ctx, ancestor: &str, descendant: &str) -> Res
 /// a status letter as `git diff --name-status` (`A`dded, `D`eleted,
 /// `M`odified, `T` for a kind change), a tab, the path. A reply that stops
 /// at the server's bound names the last path it holds, so this asks again
-/// after it until the diff is complete.
+/// after it until the diff is complete. Text prints each reply as it
+/// arrives; JSON is one array, printed after the last reply.
 pub async fn diff(ctx: &mut Ctx, old: &str, new: &str, path: Option<&RepoPath>) -> Result<()> {
     let old_id = ctx.resolve(old).await?;
     let new_id = ctx.resolve(new).await?;
     let path = path.map(|p| p.as_bytes().to_vec()).unwrap_or_default();
-    let mut entries = Vec::new();
+    let mut json_entries = Vec::new();
     let mut after = Vec::new();
     loop {
         let reply = ctx
@@ -85,9 +88,24 @@ pub async fn diff(ctx: &mut Ctx, old: &str, new: &str, path: Option<&RepoPath>) 
             .await
             .with_context(|| format!("cannot diff {old} and {new}"))?
             .into_inner();
+        let mut out = BufWriter::new(std::io::stdout().lock());
         for entry in reply.entries {
-            entries.push((entry.path, file_state(entry.old)?, file_state(entry.new)?));
+            let (old, new) = (file_state(entry.old)?, file_state(entry.new)?);
+            let (status, path) = (status(old, new), lossy(&entry.path));
+            if ctx.json {
+                let side = |state: Option<FileState>| state.map(|s| entry_json(&Entry::File(s)));
+                json_entries.push(json!({
+                    "path": path,
+                    "status": status.to_string(),
+                    "old": side(old),
+                    "new": side(new),
+                }));
+            } else {
+                writeln!(out, "{status}\t{path}")?;
+            }
         }
+        out.flush()?;
+        drop(out);
         if reply.next_after.is_empty() {
             break;
         }
@@ -97,23 +115,7 @@ pub async fn diff(ctx: &mut Ctx, old: &str, new: &str, path: Option<&RepoPath>) 
         after = reply.next_after;
     }
     if ctx.json {
-        let entries: Vec<Value> = entries
-            .iter()
-            .map(|(path, old, new)| {
-                let side = |state: &Option<FileState>| state.map(|s| entry_json(&Entry::File(s)));
-                json!({
-                    "path": lossy(path),
-                    "status": status(*old, *new).to_string(),
-                    "old": side(old),
-                    "new": side(new),
-                })
-            })
-            .collect();
-        println!("{}", Value::from(entries));
-        return Ok(());
-    }
-    for (path, old, new) in &entries {
-        println!("{}\t{}", status(*old, *new), lossy(path));
+        println!("{}", Value::from(json_entries));
     }
     Ok(())
 }

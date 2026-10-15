@@ -203,42 +203,52 @@ fn merge_base_is_ancestor_and_diff_match_git() {
     let ids = changesets(&store, dir);
     let server = Server::start(data, store);
 
-    for (x, cx) in &ids {
-        for (y, cy) in &ids {
-            let (_, out) = git_status(dir, &["merge-base", "--all", x, y]);
-            let mut expected: Vec<&str> = out.lines().map(|c| ids[c].as_str()).collect();
-            expected.sort_unstable();
-            let bases = server.json(&["merge-base", cx, cy]);
-            let mut bases: Vec<&str> = bases
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|id| id.as_str().unwrap())
-                .collect();
-            bases.sort_unstable();
-            assert_eq!(bases, expected, "merge-base {x} {y}");
+    // The server tests compare every pair; these check the wire and the
+    // command line.
+    let root = git(dir, &["rev-list", "--max-parents=0", "HEAD"]);
+    let tip = git(dir, &["rev-parse", "HEAD"]);
+    let pairs = [
+        (&x1, &x2),
+        (&x2, &x1),
+        (&root, &tip),
+        (&tip, &root),
+        (&m1, &x2),
+        (&x1, &x1),
+    ];
+    for (x, y) in pairs {
+        let (cx, cy) = (&ids[x], &ids[y]);
+        let (_, out) = git_status(dir, &["merge-base", "--all", x, y]);
+        let mut expected: Vec<&str> = out.lines().map(|c| ids[c].as_str()).collect();
+        expected.sort_unstable();
+        let bases = server.json(&["merge-base", cx, cy]);
+        let mut bases: Vec<&str> = bases
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap())
+            .collect();
+        bases.sort_unstable();
+        assert_eq!(bases, expected, "merge-base {x} {y}");
 
-            let (yes, _) = git_status(dir, &["merge-base", "--is-ancestor", x, y]);
-            let code = server.scn(&["is-ancestor", cx, cy]).status.code();
-            // 0 is yes, 1 is no.
-            assert_eq!(code, Some(i32::from(!yes)), "is-ancestor {x} {y}");
+        let (yes, _) = git_status(dir, &["merge-base", "--is-ancestor", x, y]);
+        let code = server.scn(&["is-ancestor", cx, cy]).status.code();
+        // 0 is yes, 1 is no.
+        assert_eq!(code, Some(i32::from(!yes)), "is-ancestor {x} {y}");
 
-            let git_diff = git(dir, &["diff", "--name-status", "--no-renames", x, y]);
-            let mut expected: Vec<&str> = git_diff.lines().collect();
-            expected.sort_unstable();
-            assert_eq!(
-                name_status(&server.json(&["diff", cx, cy])),
-                expected,
-                "diff {x} {y}"
-            );
-        }
+        let git_diff = git(dir, &["diff", "--name-status", "--no-renames", x, y]);
+        let mut expected: Vec<&str> = git_diff.lines().collect();
+        expected.sort_unstable();
+        assert_eq!(
+            name_status(&server.json(&["diff", cx, cy])),
+            expected,
+            "diff {x} {y}"
+        );
     }
 
     // Text output, refs, and a path.
     let text = server.text(&["merge-base", &ids[&x1], &ids[&x2]]);
     assert_eq!(text.lines().count(), 2, "{text}");
     assert_eq!(server.text(&["is-ancestor", &ids[&m1], "main"]), "");
-    let root = git(dir, &["rev-list", "--max-parents=0", "HEAD"]);
     let text = server.text(&["diff", &ids[&root], "main", "--path", "a/"]);
     assert_eq!(text, "M\ta/b\n");
     // An error exits 2, so it never reads as the "no" of is-ancestor.

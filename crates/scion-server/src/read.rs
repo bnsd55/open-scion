@@ -1,7 +1,6 @@
 //! Reads. Each takes a changeset ID, so each answer is immutable.
 
-use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
 use rusqlite::Connection;
@@ -226,27 +225,12 @@ pub fn is_ancestor(
     })
 }
 
-/// Reached from `a`.
-const FROM_A: u8 = 1;
-/// Reached from `b`.
-const FROM_B: u8 = 2;
-/// Reached from a common ancestor already found, so not a best one.
-const STALE: u8 = 4;
-
 /// The best common ancestors of `a` and `b`, over all parents: every common
-/// ancestor that is not an ancestor of another common ancestor. This is the
-/// rule of `git merge-base --all`. Usually there is one. After criss-cross
-/// merges there can be several, and all are returned. Highest generation
-/// first, then lowest ID. Empty if the histories share no changeset.
-///
-/// The walk takes changesets from a queue, highest generation first, and
-/// marks each with the sides that reach it. A parent's generation is below
-/// its child's, so a changeset leaves the queue only after every
-/// descendant the walk reached, with all its marks. One marked from both
-/// sides and not stale is a best common ancestor, and its ancestors become
-/// stale. The walk ends when no queued changeset that is not stale is
-/// marked from `a`, or none from `b`: no other best common ancestor can
-/// follow. It takes at most [`MAX_WALK`] changesets from the queue.
+/// ancestor that is not an ancestor of another common ancestor
+/// ([`db::merge_bases`]). This is the rule of `git merge-base --all`.
+/// Usually there is one. After criss-cross merges there can be several, and
+/// all are returned. Highest generation first, then lowest ID. Empty if the
+/// histories share no changeset. Walks at most [`MAX_WALK`] changesets.
 ///
 /// # Errors
 ///
@@ -260,77 +244,8 @@ pub fn merge_base(
 ) -> Result<Vec<ChangesetId>> {
     store.read(|c| {
         let repo = db::repo_id(c, repo)?;
-        let mut marks: HashMap<ChangesetId, u8> = HashMap::new();
-        let mut queue = BinaryHeap::new();
-        for (id, side) in [(a, FROM_A), (b, FROM_B)] {
-            let generation = db::generation(c, repo, id)?;
-            let mark = marks.entry(id).or_insert(0);
-            if *mark == 0 {
-                queue.push((generation, Reverse(id)));
-            }
-            *mark |= side;
-        }
-        // Queued changesets that are not stale, marked from `a` and from `b`.
-        let mut live = [0, 0];
-        for mark in marks.values() {
-            tally(&mut live, *mark, true);
-        }
-        let mut bases = Vec::new();
-        let mut taken = 0;
-        while let Some((generation, Reverse(id))) = queue.pop() {
-            if live.contains(&0) {
-                break;
-            }
-            let mut mark = marks[&id];
-            tally(&mut live, mark, false);
-            taken += 1;
-            if taken > MAX_WALK {
-                return Err(db::too_deep(MAX_WALK));
-            }
-            if mark & STALE == 0 && mark & (FROM_A | FROM_B) == FROM_A | FROM_B {
-                bases.push(id);
-                mark |= STALE;
-            }
-            for (parent, parent_generation) in db::parents(c, id)? {
-                if parent_generation >= generation {
-                    return Err(Error::Corrupt(format!(
-                        "changeset {id} has generation {generation}, its parent {parent} \
-                         {parent_generation}"
-                    )));
-                }
-                let old = marks.get(&parent).copied();
-                let new = old.unwrap_or(0) | mark;
-                if old == Some(new) {
-                    continue;
-                }
-                match old {
-                    // Still queued: its generation is below the one taken.
-                    Some(old) => tally(&mut live, old, false),
-                    None => queue.push((parent_generation, Reverse(parent))),
-                }
-                tally(&mut live, new, true);
-                marks.insert(parent, new);
-            }
-        }
-        Ok(bases)
+        db::merge_bases(c, repo, a, b, MAX_WALK)
     })
-}
-
-/// Adds a queued changeset's marks to `live`, or removes them. A stale
-/// changeset counts for neither side.
-fn tally(live: &mut [usize; 2], mark: u8, add: bool) {
-    if mark & STALE != 0 {
-        return;
-    }
-    for (count, side) in live.iter_mut().zip([FROM_A, FROM_B]) {
-        if mark & side != 0 {
-            if add {
-                *count += 1;
-            } else {
-                *count -= 1;
-            }
-        }
-    }
 }
 
 /// Most paths one `Diff` call returns. Each path costs at most one tree read
@@ -385,23 +300,35 @@ pub fn diff(
     path: Option<&RepoPath>,
     after: Option<&RepoPath>,
 ) -> Result<DiffPage> {
-    let repo = store.read(|c| db::repo_id(c, repo))?;
-    let old_root = tree::root_tree(store, repo, old)?;
-    let new_root = tree::root_tree(store, repo, new)?;
-    let under = path.map(parts).unwrap_or_default();
-    let after = after.map(parts);
+    let old_root = root_tree(store, repo, old)?;
+    let new_root = root_tree(store, repo, new)?;
+    let under = path.map(tree::parts).unwrap_or_default();
+    let after = after.map(tree::parts);
+    // The parts of the resume path below `path`, or `None` when every path
+    // below `path` comes after it. Paths compare part by part.
+    let after = match &after {
+        Some(after) if after.starts_with(&under) => Some(&after[under.len()..]),
+        Some(after) if after.as_slice() > under.as_slice() => {
+            return Ok(DiffPage {
+                entries: Vec::new(),
+                next_after: None,
+            });
+        }
+        _ => None,
+    };
     let mut walk = DiffWalk {
-        path: Vec::new(),
+        path: path.map(|p| p.as_bytes().to_vec()).unwrap_or_default(),
         entries: Vec::new(),
     };
     store.read(|c| {
-        walk.walk(
-            c,
-            Some(Entry::Dir(old_root)),
-            Some(Entry::Dir(new_root)),
-            &under,
-            after.as_deref(),
-        )
+        let (old, new) = match path {
+            Some(path) => (
+                tree::lookup(c, old_root, path)?,
+                tree::lookup(c, new_root, path)?,
+            ),
+            None => (Some(Entry::Dir(old_root)), Some(Entry::Dir(new_root))),
+        };
+        walk.walk(c, old, new, after)
     })?;
     let mut entries = walk.entries;
     // The walk finds one entry more than a page, to know whether more follow.
@@ -417,10 +344,6 @@ pub fn diff(
     })
 }
 
-fn parts(path: &RepoPath) -> Vec<&[u8]> {
-    path.as_bytes().split(|&b| b == b'/').collect()
-}
-
 /// The state of one [`diff`] walk.
 struct DiffWalk {
     /// The path of the entries being compared, as raw bytes.
@@ -434,10 +357,9 @@ impl DiffWalk {
         self.entries.len() > MAX_DIFF_ENTRIES
     }
 
-    /// Compares `old` and `new`, the entries at `self.path`. `under` holds
-    /// the parts of the requested path below here: it is empty once the walk
-    /// is at or below that path. `after` holds the parts of the resume path
-    /// below here, or is `None` once every path here comes after it.
+    /// Compares `old` and `new`, the entries at `self.path`. `after` holds
+    /// the parts of the resume path below here, or is `None` once every path
+    /// here comes after it.
     ///
     /// The recursion is as deep as a path has parts: at most 256, by the
     /// path rules.
@@ -446,15 +368,15 @@ impl DiffWalk {
         c: &Connection,
         old: Option<Entry>,
         new: Option<Entry>,
-        under: &[&[u8]],
-        after: Option<&[&[u8]]>,
+        after: Option<&[PathElem]>,
     ) -> Result<()> {
         if old == new || self.full() {
             return Ok(());
         }
         let (old_file, new_file) = (file(old), file(new));
-        // Here is in the requested path, and after the resume path.
-        if old_file != new_file && under.is_empty() && after.is_none() {
+        // A file here is the resume path or before it, unless `after` is
+        // `None`.
+        if old_file != new_file && after.is_none() {
             let path = RepoPath::new(self.path.clone())
                 .map_err(|e| Error::Corrupt(format!("a tree path breaks the path rules: {e}")))?;
             self.entries.push(DiffEntry {
@@ -464,32 +386,21 @@ impl DiffWalk {
             });
         }
         let (old_dir, new_dir) = (children(c, old)?, children(c, new)?);
-        // Names before the requested path or the resume path do not matter.
-        let start = match under.first().or_else(|| after.and_then(<[_]>::first)) {
-            Some(name) => Bound::Included(
-                PathElem::new(name.to_vec()).expect("a RepoPath part is a valid name"),
-            ),
-            None => Bound::Unbounded,
+        // Names before the resume path do not matter.
+        let start = match after {
+            Some([first, ..]) => Bound::Included(first),
+            _ => Bound::Unbounded,
         };
         let names: BTreeSet<&PathElem> = old_dir
-            .range((start.clone(), Bound::Unbounded))
-            .chain(new_dir.range((start, Bound::Unbounded)))
+            .range::<PathElem, _>((start, Bound::Unbounded))
+            .chain(new_dir.range::<PathElem, _>((start, Bound::Unbounded)))
             .map(|(name, _)| name)
             .collect();
         for name in names {
-            let name_under = match under.split_first() {
-                Some((first, rest)) if name.as_bytes() == *first => rest,
-                // Past the one name on the requested path.
-                Some(_) => break,
-                None => &[],
-            };
             let name_after = match after {
-                Some([first, rest @ ..]) => match name.as_bytes().cmp(first) {
-                    Ordering::Less => continue,
-                    Ordering::Equal => Some(rest),
-                    Ordering::Greater => None,
-                },
-                // Here is the resume path, or after it: every name follows.
+                Some([first, rest @ ..]) if name == first => Some(rest),
+                // Past the resume path, or here is the resume path: every
+                // name follows.
                 _ => None,
             };
             let len = self.path.len();
@@ -498,7 +409,7 @@ impl DiffWalk {
             }
             self.path.extend_from_slice(name.as_bytes());
             let (old_entry, new_entry) = (old_dir.get(name).copied(), new_dir.get(name).copied());
-            self.walk(c, old_entry, new_entry, name_under, name_after)?;
+            self.walk(c, old_entry, new_entry, name_after)?;
             self.path.truncate(len);
             if self.full() {
                 break;

@@ -165,31 +165,35 @@ fn merge_base_and_is_ancestor_match_git() {
     );
     let mut seen_criss_cross = false;
     let mut seen_unrelated = false;
-    for x in &commits {
-        for y in &commits {
-            let (cx, cy) = (changeset_of(&store, x), changeset_of(&store, y));
+    for (i, x) in commits.iter().enumerate() {
+        // The merge base does not depend on the order of the two, so git
+        // runs once per pair.
+        for y in &commits[i..] {
             // `git merge-base --all` fails when there is no merge base.
             let (_, out) = git_status(dir, &["merge-base", "--all", x, y]);
             let mut expected: Vec<ChangesetId> =
                 out.lines().map(|c| changeset_of(&store, c)).collect();
             expected.sort();
-            let bases = read::merge_base(&store, REPO, cx, cy).unwrap();
-            let mut sorted = bases.clone();
-            sorted.sort();
-            assert_eq!(sorted, expected, "merge-base {x} {y}");
-            // Highest generation first, then lowest ID.
-            let mut ordered = bases.clone();
-            ordered.sort_by_key(|&id| (std::cmp::Reverse(generation(&store, id)), id));
-            assert_eq!(bases, ordered, "order of merge-base {x} {y}");
-            seen_criss_cross |= bases.len() > 1;
-            seen_unrelated |= bases.is_empty();
-
-            let (yes, _) = git_status(dir, &["merge-base", "--is-ancestor", x, y]);
-            assert_eq!(
-                read::is_ancestor(&store, REPO, cx, cy).unwrap(),
-                yes,
-                "is-ancestor {x} {y}"
-            );
+            seen_criss_cross |= expected.len() > 1;
+            seen_unrelated |= expected.is_empty();
+            for (x, y) in [(x, y), (y, x)] {
+                let (cx, cy) = (changeset_of(&store, x), changeset_of(&store, y));
+                let bases = read::merge_base(&store, REPO, cx, cy).unwrap();
+                let mut sorted = bases.clone();
+                sorted.sort();
+                assert_eq!(sorted, expected, "merge-base {x} {y}");
+                // Highest generation first, then lowest ID.
+                let mut ordered = bases.clone();
+                ordered.sort_by_key(|&id| (std::cmp::Reverse(generation(&store, id)), id));
+                assert_eq!(bases, ordered, "order of merge-base {x} {y}");
+                // `git merge-base --is-ancestor x y` holds exactly when the
+                // only merge base is x.
+                assert_eq!(
+                    read::is_ancestor(&store, REPO, cx, cy).unwrap(),
+                    expected == [cx],
+                    "is-ancestor {x} {y}"
+                );
+            }
         }
     }
     assert!(seen_criss_cross && seen_unrelated);

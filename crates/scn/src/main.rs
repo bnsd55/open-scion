@@ -144,11 +144,8 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             descendant,
         } => {
             let yes = cmd::query::is_ancestor(&mut ctx, &ancestor, &descendant).await?;
-            return Ok(if yes {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            });
+            // 0 for yes, 1 for no.
+            return Ok(ExitCode::from(u8::from(!yes)));
         }
         Command::Diff { old, new, path } => {
             cmd::query::diff(&mut ctx, &old, &new, path.as_ref()).await
