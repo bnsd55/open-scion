@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 
 use scion_core::{
-    BlobId, Changeset, DecodeError, Entry, FileState, GitOid, IdentityTime, PathElem, PathError,
-    RepoPath, Tree, TreeId,
+    BlobHasher, BlobId, Changeset, DecodeError, Entry, FileState, GitOid, IdentityTime, PathElem,
+    PathError, RepoPath, Tree, TreeId,
 };
 
 /// Builds expected bytes straight from the grammar.
@@ -172,6 +172,10 @@ fn blob_ids() {
     );
     let streamed = BlobId::of_reader(&b"# demo\n"[..]).unwrap();
     assert_eq!(streamed, BlobId::of(b"# demo\n"));
+    let mut parts = BlobHasher::new();
+    parts.update(b"# de");
+    parts.update(b"mo\n");
+    assert_eq!(parts.finish(), BlobId::of(b"# demo\n"));
 }
 
 #[test]

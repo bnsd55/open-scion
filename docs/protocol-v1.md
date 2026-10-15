@@ -52,13 +52,14 @@ shares one scope.
 **Timeouts.** The server ends a call with `CANCELLED` when its reply has not
 started after 600 s, or earlier if the client's `grpc-timeout` is shorter.
 For `PutBlob` this covers the whole upload. For a streamed reply (`ReadFile`,
-`GetObjects`) it covers only the start. A call that ends this way may still
-finish its work on the server (section 6.3).
+`GetObjects`) it covers only the start. A `ReadFile` reply has its own limits
+(section 6.7). A call that ends this way may still finish its work on the
+server (section 6.3).
 
 **Queues.** The server queues work instead of failing it. At most 256 jobs run
 at once across both services, at most 16 `PutBlob` uploads are read at once,
-and at most 4 `Blame` calls run at once. Time in a queue counts toward the
-timeout.
+and at most 4 `Blame` calls run at once. A `ReadFile` call waits for its share
+of a memory budget (section 6.7). Time in a queue counts toward the timeout.
 
 ## 3. Common rules
 
@@ -106,6 +107,7 @@ contract. A client MUST NOT depend on its text.
 | `ABORTED` | `Land` only: other writers kept moving the ref. The land stays `PENDING`. | Yes, with the same request key |
 | `OUT_OF_RANGE` | A message is larger than its limit. | After the cause is fixed |
 | `CANCELLED` | The server's 600 s limit or the client's `grpc-timeout` ran out. A client library can report its own deadline as `DEADLINE_EXCEEDED`. | Yes. A `Land` retry uses the same request key. |
+| `DEADLINE_EXCEEDED` | `ReadFile`: the reply ran past 600 s from the start of the call, or the client took no message for 120 s. | Yes |
 | `UNAVAILABLE` | The server cannot be reached or is shutting down. | Yes |
 | `INTERNAL` | A database, I/O or stored-data error, or a server bug. The message is `internal error`; the detail stays in the server log. | MAY |
 | `UNIMPLEMENTED` | The server does not have the call, or the request is compressed. | After the cause is fixed |
@@ -336,12 +338,24 @@ content of a regular file, or the target of a symlink, at `path` in
 - Messages come in file order. Each holds at most 1 MiB. Together they are
   the whole content.
 - An empty file is a reply with no message.
-- Every error comes before the first message.
+- An error in the request comes before the first message. Other errors can
+  end the reply after some messages. A client MUST take the content as whole
+  only when the reply ends with `OK`.
+- The server checks the content against the blob ID as it sends it. A
+  damaged stored blob ends the reply with `INTERNAL` before its last message,
+  so a client never gets all of a damaged file.
+- The reply ends with `DEADLINE_EXCEEDED` 600 s after the call started, or
+  when the client takes no message for 120 s (the stall limit).
+- Before the reply starts, the call waits for its share of a memory budget of
+  256 MiB that all `ReadFile` replies share: the file's size for a file of at
+  most 1 MiB, 5 MiB for a larger one.
 
 | Error | When |
 |---|---|
 | `INVALID_ARGUMENT` | A bad or empty path; the path is a directory or a submodule. |
 | `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
+| `DEADLINE_EXCEEDED` | After some messages: the reply ran past its deadline or stalled. |
+| `INTERNAL` | After some messages: the stored blob is damaged. |
 
 ### 6.8 ListDir
 

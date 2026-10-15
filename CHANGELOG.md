@@ -33,5 +33,9 @@ release.
   history.
 - Bearer-token auth, loopback-only listening by default, request limits and
   name validation at the RPC boundary.
+- `ReadFile` streams a file in 1 MiB parts from the zstd decoder, under a
+  256 MiB budget for all replies. It checks the content against its ID
+  before the last part, and ends a stalled or late reply with
+  `DEADLINE_EXCEEDED`.
 - `docs/protocol-v1.md`: the contract of the `Scion` and `Objects` services,
   for independent clients, tiers and servers.

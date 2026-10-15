@@ -3,11 +3,10 @@
 //! codes.
 
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use scion_core::{ChangesetId, RepoPath};
+use scion_core::{BlobId, ChangesetId, RepoPath};
 use scion_proto::v1::scion_server::{Scion, ScionServer};
 use scion_proto::v1::{
     BlameChangeset, BlameRange, BlameRequest, BlameResponse, CreateChangesetRequest,
@@ -18,9 +17,9 @@ use scion_proto::v1::{
 };
 use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
-use tokio_stream::wrappers::TcpListenerStream;
-use tokio_stream::{Stream, StreamExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -28,7 +27,7 @@ use crate::auth::{Auth, Caller};
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
 use crate::objects::ObjectsService;
-use crate::store::{MAX_OBJECT_BYTES, Store};
+use crate::store::{MAX_OBJECT_BYTES, READER_BYTES, Store};
 use crate::{blame, db, names, read, write};
 
 /// Most changeset bytes in one `Log` reply; the client pages for more.
@@ -43,6 +42,19 @@ const MAX_UPLOADS: usize = 16;
 const MAX_BLAMES: usize = 4;
 /// Longest a request may take before the server gives up on it.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+/// Most bytes that all `ReadFile` replies together hold: the parts read and
+/// not yet sent, and the readers of files of more than one part.
+const READ_BUDGET_BYTES: usize = 256 << 20;
+/// A `ReadFile` reply ends when its client takes no part for this long, so a
+/// client that stops reading does not hold memory and budget.
+// SHORTCUT: the reply ends, but HTTP/2 keeps the part it was sending until
+// the connection closes. Upgrade (issue #42): a response body timeout that
+// resets the stream.
+const READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+// Any one reply fits in the budget, and the budget counts in u32 permits.
+const _: () = assert!(read_share(MAX_OBJECT_BYTES) <= READ_BUDGET_BYTES);
+const _: () = assert!(READ_BUDGET_BYTES <= u32::MAX as usize);
 
 /// Serves the API on `listener`, requiring `token`, until `shutdown` resolves.
 ///
@@ -79,6 +91,9 @@ pub struct ScionService {
     uploads: Arc<Semaphore>,
     /// Bounds blames running at once (`MAX_BLAMES`).
     blames: Arc<Semaphore>,
+    /// `READ_BUDGET_BYTES` permits, one per byte, shared by all `ReadFile`
+    /// replies.
+    reads: Arc<Semaphore>,
 }
 
 impl ScionService {
@@ -88,6 +103,7 @@ impl ScionService {
             lands: Arc::default(),
             uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
             blames: Arc::new(Semaphore::new(MAX_BLAMES)),
+            reads: Arc::new(Semaphore::new(READ_BUDGET_BYTES)),
         }
     }
 
@@ -210,7 +226,86 @@ fn land_response(outcome: LandOutcome) -> LandResponse {
     }
 }
 
-type ReadFileStream = Pin<Box<dyn Stream<Item = Result<ReadFileResponse, Status>> + Send>>;
+/// A part of a `ReadFile` reply, or the error that ends it early.
+type Part = Result<ReadFileResponse, Status>;
+
+type ReadFileStream = ReceiverStream<Part>;
+
+/// The share of `READ_BUDGET_BYTES` that a `ReadFile` reply of a `size`-byte
+/// file holds. A file of one part is read in one job, so the reply holds only
+/// that part. A longer file keeps its reader between parts, and reads the
+/// next part while the client takes the one before.
+const fn read_share(size: usize) -> usize {
+    if size <= CHUNK_BYTES {
+        size
+    } else {
+        READER_BYTES + 2 * CHUNK_BYTES
+    }
+}
+
+/// Sends a blob to `tx` in parts of up to `CHUNK_BYTES`, as the client takes
+/// them, and holds `share` until it stops. A part goes into the channel only
+/// when the channel is empty, so its second slot is always free for the
+/// error that ends a reply early: a store error, no part taken within
+/// `stall`, or the `deadline`. A client never takes a short file for a whole
+/// one.
+async fn send_file(
+    worker: Worker,
+    blob: BlobId,
+    share: OwnedSemaphorePermit,
+    tx: mpsc::Sender<Part>,
+    stall: Duration,
+    deadline: Instant,
+) {
+    let _share = share;
+    let fail = |status: Status| {
+        // Fails only if the client has gone.
+        let _ = tx.try_send(Err(status));
+    };
+    let late = || Status::deadline_exceeded("the reply ran past its deadline");
+    let mut open = None;
+    loop {
+        if Instant::now() >= deadline {
+            return fail(late());
+        }
+        let read = worker
+            .run(move |store| {
+                let mut reader = match open {
+                    Some(reader) => reader,
+                    None => store.blobs().reader(blob)?,
+                };
+                let part = reader.read_part(CHUNK_BYTES)?;
+                // A reader that has ended has freed its decoder.
+                Ok((part, (!reader.ended()).then_some(reader)))
+            })
+            .await;
+        let (part, reader) = match read {
+            Ok(read) => read,
+            Err(status) => return fail(status),
+        };
+        open = reader;
+        if let Some(data) = part {
+            // Both slots free: the client has taken the part before.
+            let wait = deadline.min(Instant::now() + stall);
+            match tokio::time::timeout_at(wait.into(), tx.reserve_many(2)).await {
+                Ok(Ok(mut slots)) => {
+                    if let Some(slot) = slots.next() {
+                        slot.send(Ok(ReadFileResponse { data }));
+                    }
+                }
+                Ok(Err(_)) => return,
+                Err(_) if Instant::now() >= deadline => return fail(late()),
+                Err(_) => {
+                    let detail = format!("the client took no data for {stall:?}");
+                    return fail(Status::deadline_exceeded(detail));
+                }
+            }
+        }
+        if open.is_none() {
+            return;
+        }
+    }
+}
 
 #[tonic::async_trait]
 impl Scion for ScionService {
@@ -344,22 +439,35 @@ impl Scion for ScionService {
         &self,
         request: Request<ReadFileRequest>,
     ) -> Result<Response<ReadFileStream>, Status> {
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
         let req = request.into_inner();
         check_name("repo", &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_path(req.path)?;
-        let data = self
+        let (blob, size) = self
             .worker
-            .run(move |store| read::read_file(&store, &req.repo, id, &path))
-            .await?;
-        // Copies one chunk at a time, as the stream is read.
-        let chunks = (0..data.len().div_ceil(CHUNK_BYTES)).map(move |i| {
-            let end = data.len().min((i + 1) * CHUNK_BYTES);
-            Ok(ReadFileResponse {
-                data: data[i * CHUNK_BYTES..end].to_vec(),
+            .run(move |store| {
+                let blob = read::file_blob(&store, &req.repo, id, &path)?;
+                Ok((blob, store.blobs().size(blob)?))
             })
-        });
-        Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
+            .await?;
+        // Taken before any content is read, so a call that waits holds none.
+        // The asserts at the top keep the share within u32.
+        let share = u32::try_from(read_share(size)).unwrap_or(u32::MAX);
+        let share = Arc::clone(&self.reads)
+            .acquire_many_owned(share)
+            .await
+            .map_err(|_| Status::unavailable("server is shutting down"))?;
+        let (tx, rx) = mpsc::channel(2);
+        tokio::spawn(send_file(
+            self.worker.clone(),
+            blob,
+            share,
+            tx,
+            READ_STALL_TIMEOUT,
+            deadline,
+        ));
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn list_dir(
@@ -470,7 +578,154 @@ fn id_bytes(id: Option<ChangesetId>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use scion_core::{Changeset, FileState, IdentityTime};
+    use tonic::Code;
+
     use super::*;
+
+    /// A store whose repo `r` has one changeset, which puts `f` with
+    /// `content`. Also returns the changeset and the blob.
+    fn file_store(content: &[u8]) -> (tempfile::TempDir, Store, ChangesetId, BlobId) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let blob = store.blobs().put(content).unwrap();
+        let state = FileState::Regular {
+            content: blob,
+            executable: false,
+        };
+        let changeset = Changeset {
+            parents: vec![],
+            author: IdentityTime {
+                name: b"t".to_vec(),
+                email: b"t@x".to_vec(),
+                unix_secs: 0,
+                tz_offset_minutes: 0,
+            },
+            committer: None,
+            message: vec![],
+            changes: [(RepoPath::new("f").unwrap(), Some(state))].into(),
+        };
+        let cs = store
+            .write(|c| db::insert_changeset(c, db::create_repo(c, "r")?, &changeset))
+            .unwrap();
+        (dir, store, cs, blob)
+    }
+
+    /// `parts` parts of `CHUNK_BYTES`, each filled with its own byte.
+    fn content(parts: u8) -> Vec<u8> {
+        (0..parts).flat_map(|i| vec![i; CHUNK_BYTES]).collect()
+    }
+
+    #[tokio::test]
+    async fn a_read_file_reply_whose_client_stops_reading_ends_with_an_error() {
+        let data = content(3);
+        let (_dir, store, _, blob) = file_store(&data);
+        let budget = read_share(data.len());
+        let reads = Arc::new(Semaphore::new(budget));
+        let share = u32::try_from(budget).unwrap();
+        let share = Arc::clone(&reads).acquire_many_owned(share).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(2);
+        let stall = Duration::from_millis(50);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let task = tokio::spawn(send_file(
+            Worker::new(store),
+            blob,
+            share,
+            tx,
+            stall,
+            deadline,
+        ));
+
+        // Nobody reads: the first part waits in the channel, and the second
+        // stalls and ends the reply.
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("a stalled reply ends")
+            .unwrap();
+        assert_eq!(reads.available_permits(), budget, "the share is free");
+        // A client that comes back gets the part and then the error, so it
+        // never takes the file for a whole one.
+        let first = rx.recv().await.unwrap().unwrap();
+        assert!(first.data == data[..CHUNK_BYTES], "the first part");
+        let status = rx.recv().await.unwrap().unwrap_err();
+        assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_read_file_reply_ends_at_its_deadline() {
+        let data = content(3);
+        let (_dir, store, _, blob) = file_store(&data);
+        let worker = Worker::new(store);
+        let reads = Arc::new(Semaphore::new(2));
+        let stall = Duration::from_secs(60);
+        let reply = |deadline| {
+            let share = Arc::clone(&reads).try_acquire_owned().unwrap();
+            let (tx, rx) = mpsc::channel(2);
+            let task = send_file(worker.clone(), blob, share, tx, stall, deadline);
+            (tokio::spawn(task), rx)
+        };
+        let deadline_exceeded = |part: Option<Part>| {
+            let status = part.unwrap().unwrap_err();
+            assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
+        };
+
+        // Past its deadline, a reply sends nothing, though its client reads.
+        let (_, mut rx) = reply(Instant::now());
+        deadline_exceeded(rx.recv().await);
+        assert!(rx.recv().await.is_none());
+
+        // A client that takes nothing: the reply ends at its deadline, long
+        // before the stall limit.
+        let (task, mut rx) = reply(Instant::now() + Duration::from_millis(200));
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the reply ends at its deadline")
+            .unwrap();
+        let first = rx.recv().await.unwrap().unwrap();
+        assert!(first.data == data[..CHUNK_BYTES], "the first part");
+        deadline_exceeded(rx.recv().await);
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_read_file_call_waits_for_its_share_before_it_reads() {
+        let data = content(2);
+        let (_dir, store, cs, _) = file_store(&data);
+        // Room for one reply of this file, not two.
+        let service = Arc::new(ScionService {
+            reads: Arc::new(Semaphore::new(read_share(data.len()))),
+            ..ScionService::new(Worker::new(store))
+        });
+        let request = move || {
+            Request::new(ReadFileRequest {
+                repo: "r".into(),
+                changeset_id: cs.as_bytes().to_vec(),
+                path: b"f".to_vec(),
+            })
+        };
+        let read_all = |mut reply: ReadFileStream| async move {
+            let mut read = Vec::new();
+            while let Some(part) = reply.next().await {
+                read.extend(part.unwrap().data);
+            }
+            read
+        };
+
+        let first = service.read_file(request()).await.unwrap().into_inner();
+        let second = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.read_file(request()).await.unwrap().into_inner() }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!second.is_finished(), "the second call waits for budget");
+        assert!(read_all(first).await == data, "the first reply");
+        let second = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("the first reply freed its share")
+            .unwrap();
+        assert!(read_all(second).await == data, "the second reply");
+    }
 
     #[tokio::test]
     async fn a_worker_panic_does_not_reach_the_client() {
