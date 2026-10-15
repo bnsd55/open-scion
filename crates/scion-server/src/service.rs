@@ -131,12 +131,7 @@ impl Worker {
     }
 }
 
-pub(crate) fn parse_id<T: for<'a> TryFrom<&'a [u8]>>(
-    bytes: &[u8],
-    what: &str,
-) -> Result<T, Status> {
-    T::try_from(bytes).map_err(|_| Status::invalid_argument(format!("{what} must be 32 bytes")))
-}
+pub(crate) use scion_proto::check::id as parse_id;
 
 pub(crate) fn check_name(what: &str, value: &str) -> Result<(), Status> {
     names::check(what, value).map_err(Status::from)

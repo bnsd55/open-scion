@@ -5,36 +5,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use scion_core::{BlobId, Changeset, ChangesetId, RepoPath};
+use scion_proto::auth::Bearer;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ResolveRefRequest};
 use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_OBJECT_MESSAGE_BYTES};
-use tonic::metadata::{Ascii, MetadataValue};
-use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 
 /// A connected client.
 pub type Client = ScionClient<InterceptedService<Channel, Bearer>>;
 
 /// A connected client for the object reads that a cache tier can answer.
 pub type Objects = ObjectsClient<InterceptedService<Channel, Bearer>>;
-
-/// Adds the bearer token to every request.
-#[derive(Clone)]
-pub struct Bearer(MetadataValue<Ascii>);
-
-impl Interceptor for Bearer {
-    fn call(
-        &mut self,
-        mut request: tonic::Request<()>,
-    ) -> Result<tonic::Request<()>, tonic::Status> {
-        request
-            .metadata_mut()
-            .insert("authorization", self.0.clone());
-        Ok(request)
-    }
-}
 
 /// What every command needs.
 #[derive(Clone)]
@@ -50,20 +33,20 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    /// Connects to `server`.
+    /// Connects to `server`: `http://HOST:PORT`, or `unix:///PATH` for a
+    /// daemon on this node.
     pub async fn connect(server: &str, token: &str, repo: String, json: bool) -> Result<Self> {
-        let channel = Channel::from_shared(server.to_owned())
+        // `Endpoint` reads `unix:` addresses too, unlike `Channel::from_shared`.
+        let channel = Endpoint::from_shared(server.to_owned())
             .context("bad server address")?
             .connect()
             .await
             .with_context(|| format!("cannot connect to {server}"))?;
-        let bearer: MetadataValue<Ascii> = format!("Bearer {token}")
-            .parse()
-            .context("token is not valid ASCII")?;
-        let objects = ObjectsClient::with_interceptor(channel.clone(), Bearer(bearer.clone()))
+        let bearer = Bearer::new(token).context("token is not valid ASCII")?;
+        let objects = ObjectsClient::with_interceptor(channel.clone(), bearer.clone())
             .max_decoding_message_size(MAX_OBJECT_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
-        let client = ScionClient::with_interceptor(channel, Bearer(bearer))
+        let client = ScionClient::with_interceptor(channel, bearer)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
         Ok(Self {

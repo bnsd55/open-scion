@@ -27,3 +27,10 @@ release.
   `land` and `bench`, with `--json` output.
 - Bearer-token auth, loopback-only listening by default, request limits and
   name validation at the RPC boundary.
+- `scion-tier`: the cache tiers. `scion-cache` keeps objects in memory and
+  `scion-daemon` keeps them on disk, each under a byte limit, least recently
+  used out first. The daemon listens on a Unix socket with mode 0600. Each
+  tier answers the `Objects` calls, checks every object from upstream
+  against its ID before it stores or sends it, forwards `ResolveRef`, keeps
+  `GetRootTree` answers, fetches a shared miss once, and needs a token.
+- `scn` reaches a daemon with `--server unix:///PATH`.

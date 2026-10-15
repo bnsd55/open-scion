@@ -13,7 +13,8 @@ use crate::client::Ctx;
 #[derive(Parser)]
 #[command(version, about = "Client for the Scion version control system")]
 struct Cli {
-    /// Server address.
+    /// Server address: `http://HOST:PORT`, or `unix:///PATH` for a
+    /// scion-daemon on this node.
     #[arg(
         long,
         env = "SCION_SERVER",

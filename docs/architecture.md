@@ -12,8 +12,9 @@ The README lists where this project makes its own choices.
 | Crate | Role |
 |---|---|
 | [`scion-core`](../crates/scion-core) | Object model (`Changeset`, `Tree`, IDs, `RepoPath`) and the v1 encoder and strict decoder. No I/O. |
-| [`scion-proto`](../crates/scion-proto) | gRPC types generated from [`proto/scion.proto`](../proto/scion.proto): the `Scion` and `Objects` services. Largest message 64 MiB (a `GetObjects` reply message: one object of up to 100 MiB), stream chunk 1 MiB. |
+| [`scion-proto`](../crates/scion-proto) | gRPC types generated from [`proto/scion.proto`](../proto/scion.proto): the `Scion` and `Objects` services. Largest message 64 MiB (a `GetObjects` reply message: one object of up to 100 MiB), stream chunk 1 MiB. Also the code that the server and the tiers share: the bearer-token check (`auth.rs`) and the `GetObjects` reply rules (`reply.rs`). |
 | [`scion-server`](../crates/scion-server) | One binary with two commands: `serve` (the API) and `import` (git import). |
+| [`scion-tier`](../crates/scion-tier) | The cache tiers (section 7): a `Tier` library and two binaries, `scion-cache` (memory) and `scion-daemon` (disk, Unix socket). |
 | [`scn`](../crates/scn) | Command-line client: `cat`, `ls`, `log`, `show`, `checkout`, `commit`, `land`, `bench`. |
 
 ```mermaid
@@ -34,7 +35,8 @@ flowchart LR
 
 How one request flows through the server:
 
-1. `auth.rs` checks the bearer token and tags the request with a `Caller`.
+1. The bearer-token check (`scion-proto/src/auth.rs`) tags the request with
+   a `Caller`.
 2. `service.rs` (the `Scion` service) or `objects.rs` (the `Objects` service)
    checks names, IDs and paths, then runs `write.rs`, `land.rs` or `read.rs`
    on a blocking thread (SQLite and the blob folder are synchronous). Both
@@ -425,13 +427,13 @@ and streams it. Every read checks that the repo has the changeset. `scn`
 checks that each changeset it receives hashes to its ID.
 
 **Object reads (`Objects` service, `objects.rs`).** The calls that every
-cache tier will answer. The client asks only for the objects it wants,
+cache tier answers too. The client asks only for the objects it wants,
 starting at the root tree, and never says what it already has.
 
 | RPC | Answer | Cache |
 |---|---|---|
 | `ResolveRef` | Same as on `Scion` (one shared implementation). | Never: a tier forwards it. |
-| `GetRootTree(changeset)` | The root tree ID, from `derived`. Checks that the repo has the changeset. | Forever: a changeset never changes. |
+| `GetRootTree(changeset)` | The root tree ID, from `derived`. Checks that the repo has the changeset. | Forever, by repo and changeset, and only as upstream answered: a changeset never changes. |
 | `GetObjects(refs)` | Streams the trees (`TreeV1` bytes) and blobs (raw content) named by `(kind, id)`, one object per message, in request order. | Forever. |
 
 - A call names 1 to 1,000 objects. A task reads them one at a time, checks
@@ -439,7 +441,8 @@ starting at the root tree, and never says what it already has.
   A tree goes out as its stored bytes, which are canonical.
 - Memory: before an object is read, its size comes from the store (a blob's
   zstd frame header, a tree's stored length), and the object takes that
-  share of a server-wide budget of 400 MiB. It keeps the share until the
+  share of a server-wide budget of 400 MiB. The reply loop and the budget
+  live in `scion-proto/src/reply.rs`, so the tiers follow the same rules. It keeps the share until the
   reply takes it from the channel. With the budget spent, a reply waits
   holding no object bytes. A reply whose client takes no object for 120 s
   ends and frees its share. A blob read back larger than its header said is
@@ -457,10 +460,9 @@ starting at the root tree, and never says what it already has.
 checked against its ID on arrival, so no tier can change an object. Two
 answers cannot be checked that way: the changeset a ref points at
 (`ResolveRef`) and the root tree of a changeset (`GetRootTree`). The client
-trusts the server for both. The tiers
-([#5](https://github.com/bnsd55/open-scion/issues/5)) must forward these
-answers, or cache what the server said; they must never compute or invent
-them.
+trusts the server for both, and in v0.1 it trusts the tiers to pass them on
+unchanged. A tier forwards `ResolveRef`, and keeps only the `GetRootTree`
+answers that upstream gave. It never computes or invents either answer.
 
 **`scn checkout REV [--sparse DIR]... --into PATH`** (`scn/src/cmd/checkout.rs`)
 uses only `Objects`:
@@ -492,19 +494,75 @@ accepts names that are not safe to write, so the checkout adds its own rules:
 | Executable files get mode 0777, others 0666, less the umask. | The same modes as `git checkout`. |
 | No control character (C0, DEL, C1, or a byte 0x80 to 0x9F that is not UTF-8), no bidirectional text control (U+202A to U+202E, U+2066 to U+2069), and no `.git` or `.scion` part, in any ASCII case. The walk checks every name before anything is written, and the writer checks every part again. | Names are printed, escaped, in errors and notes, and must not rewrite a terminal or read as another name. Tools trust metadata directories. |
 
-The article says one `scion-daemon` stores objects for the whole node and is
-reached over a socket. It talks only to a regional `scion-cache`, which serves
-objects from memory. Every tier answers identical calls, and no tier skips the
-next one. **Planned** ([#5](https://github.com/bnsd55/open-scion/issues/5)):
-both tiers, answering the `Objects` calls above. The Unix socket, the call
-names and access tickets are this project's choices:
+**Cache tiers (`scion-tier`).** What the article says: one `scion-daemon`
+per node stores objects for every job on it and is reached over a socket. It
+talks only to a regional `scion-cache`, which serves objects from memory.
+Every tier answers identical calls, and the order daemon, cache, server is
+strict: no tier skips the next one.
 
 ```mermaid
 flowchart LR
-    job["scn checkout"] -->|"Unix socket"| daemon["scion-daemon<br/>one per node, disk store"]
-    daemon -->|"miss"| cache["scion-cache<br/>regional, memory store"]
-    cache -->|"miss"| server["scion-server"]
+    job["scn checkout"] -->|"Unix socket, mode 0600"| daemon["scion-daemon<br/>one per node, disk store"]
+    daemon -->|"miss, TCP"| cache["scion-cache<br/>regional, memory store"]
+    cache -->|"miss, TCP"| server["scion-server"]
 ```
+
+Both binaries are thin wrappers around one type, `Tier`. It serves the
+`Objects` calls from a store and sends every miss to its one upstream.
+
+| Call | What a tier does |
+|---|---|
+| `ResolveRef` | Always forwards. Never kept: a ref moves. |
+| `GetRootTree` | Answers from memory if upstream gave the answer for this repo and changeset before (at most 10,000 kept). Else forwards, then keeps the answer. |
+| `GetObjects` | Serves hits from its store. Fetches the misses from upstream in batched calls, checks each object against its ID, stores it, then sends it. |
+
+- **A tier never trusts its upstream's bytes.** Every tree and blob from
+  upstream is checked against its ID before the tier stores it or sends it
+  on. A bad object fails the call with `DATA_LOSS` and is not stored.
+  Objects must arrive in request order, as the protocol says.
+- **The server's limits.** A tier refuses what the server refuses (1 to
+  1,000 objects per call, the repo name rules), and its replies run the
+  same loop (`reply.rs`): a reply stops after 64 MiB, always after one
+  object, each object takes its share of a 400 MiB budget before its bytes
+  are read or copied, and a reply ends when its client takes no object for
+  120 s. Objects that arrive from upstream use a second 400 MiB budget: a
+  fetch takes 100 MiB before the next object arrives, then keeps only the
+  object's size until it is stored. So at most four objects come from
+  upstream at once, however small they are
+  ([#6](https://github.com/bnsd55/open-scion/issues/6)). The name, ID and
+  object-count checks are shared code (`scion-proto/src/check.rs`).
+- **One fetch per object.** On a call's first miss, the tier starts one
+  fetch for that object and for every later object of the call that its
+  store lacks. A later miss of the same call (the store did not keep the
+  object) fetches only that object. A fetch runs on its own task and asks
+  upstream again until it has all of its objects. A concurrent call of the same repo that misses one of these objects
+  waits for that fetch instead of starting another. If upstream fails, every
+  object still waiting fails with it and nothing is kept, so the next call
+  starts anew. A fetch runs to its end even if its callers have gone.
+- **Timeouts.** A tier gives up on upstream after 120 s without an answer or
+  without the next object. A reply that waits 120 s for one object ends, as
+  a stalled reply does.
+- **Auth.** A tier requires its own bearer token (`--token`, `SCION_TOKEN`),
+  checked by the server's code, and sends its own token upstream
+  (`--upstream-token`, `SCION_UPSTREAM_TOKEN`). A tier does not ask whether
+  a repo exists: it serves a stored object for any valid repo name
+  ([#13](https://github.com/bnsd55/open-scion/issues/13)).
+- **Logs.** Each `GetObjects` reply logs its hits and misses at `info`, and
+  each object at `debug`.
+
+| | `scion-cache` | `scion-daemon` |
+|---|---|---|
+| Listens on | TCP, `127.0.0.1:7879`. Another address needs `--insecure-listen`. | A Unix socket, by default `<data>/daemon.sock`, with mode 0600. A stale socket file is replaced; a live one is an error. |
+| Upstream | `--upstream`, by default the server at `127.0.0.1:7878`. | `--upstream`, by default the cache at `127.0.0.1:7879`. |
+| Store | Memory, at most `--max-bytes` (1 GiB) of objects. | Disk, at most `--max-bytes` (10 GiB): one file per object under `<data>/objects/`, written to a temp file and renamed, checked against its ID when read back. `<data>` is made with mode 0700 and locked by one daemon. |
+| Eviction | Least recently used first. | Least recently used first, from an index in memory that a scan rebuilds at start, oldest write first ([#63](https://github.com/bnsd55/open-scion/issues/63)). |
+
+This project's choices, not the article's: the Unix socket and its mode,
+TCP between tiers, the stores and their limits, keeping `GetRootTree`
+answers, one fetch per object, the tokens, and the order itself, which each
+tier's `--upstream` sets and nothing checks. `scn` reaches a daemon with
+`--server unix:///PATH`. A tier serves only `Objects`, so of the `scn`
+commands only `checkout` works through it; the others need the server.
 
 Related planned work: a checkout benchmark against `git clone`
 ([#6](https://github.com/bnsd55/open-scion/issues/6)), and virtual checkout,
@@ -518,17 +576,18 @@ an untrusted network.
 
 | Area | Today | Limit |
 |---|---|---|
-| Authentication | One static bearer token (`--token` or `SCION_TOKEN`). The server compares BLAKE3 digests of the tokens in constant time. | Every caller is the same principal, `default`. No users or per-folder rules ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
-| Network | Listens on `127.0.0.1:7878` by default. A non-loopback address is refused unless `--insecure-listen` is given. | No TLS: the token and all data travel unencrypted ([#14](https://github.com/bnsd55/open-scion/issues/14)). |
+| Authentication | One static bearer token (`--token` or `SCION_TOKEN`). The server and each tier compare BLAKE3 digests of the tokens in constant time. A tier sends its own token upstream. | Every caller is the same principal, `default`. No users or per-folder rules ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
+| Network | The server listens on `127.0.0.1:7878` and `scion-cache` on `127.0.0.1:7879` by default. A non-loopback address is refused unless `--insecure-listen` is given. `scion-daemon` listens only on a Unix socket with mode 0600, in its 0700 data directory by default. | No TLS: the token and all data travel unencrypted, also between tiers ([#14](https://github.com/bnsd55/open-scion/issues/14)). |
 | Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. | Trees and blobs are shared by all repos. `GetObjects` reads any tree or blob by ID, and a changeset can name another repo's blob and then read it ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
 | Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once, 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget, and a reply whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object inside HTTP/2 until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
-| Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. | The client trusts the server for a ref's target and for a changeset's root tree, which it cannot check by hash. Tiers ([#5](https://github.com/bnsd55/open-scion/issues/5)) must forward these answers, not compute them. |
+| Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. Each tier also checks every object from upstream before it stores or sends it, and the daemon checks each object again when it reads it from disk. | Tiers are trusted in v0.1: the client trusts the `ResolveRef` and `GetRootTree` answers that a tier passes on, which it cannot check by hash. A tier forwards them, and keeps only what upstream answered. |
 | Checkout | `scn checkout` writes into a temp directory and renames it onto a new or empty destination, never follows a symlink while writing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure the destination stays as it was. | No Windows rules: device names and names that end in a dot or a space pass. |
-| Errors | Internal errors reply `internal error`. The detail stays in the server log. | |
+| Cache tiers | A tier refuses calls without its token, and serves only objects that match their IDs. | A tier serves a stored object for any valid repo name and does not ask whether the repo exists. Safe with one principal ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
+| Errors | Internal errors reply `internal error`. The detail stays in the server or tier log. | |
 
-The planned cache tiers will need access tickets, because an object ID is not
-a permission ([#13](https://github.com/bnsd55/open-scion/issues/13)). Report
+The cache tiers will need access tickets, because an object ID is not a
+permission ([#13](https://github.com/bnsd55/open-scion/issues/13)). Report
 security problems as described in [SECURITY.md](../SECURITY.md).
 
 ## 9. Deliberate shortcuts
@@ -550,10 +609,15 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | One lander per ref that rebases a batch and moves the ref once. | [#18](https://github.com/bnsd55/open-scion/issues/18) |
 | `scion-server/src/land.rs` (`MAX_DEPTH`) | A land on a base more than `MAX_DEPTH` generations below the tip walks the history from the index floor back to the base, each time, and holds the database lock while it walks. | Per-path history in the database, so the check reads only the paths that the land changes. | [#38](https://github.com/bnsd55/open-scion/issues/38) |
 | `scion-server/src/objects.rs` (`read_object`) | An object ID is treated as permission to read it; trees and blobs are shared by all repos. Safe with one principal. | A read ticket bound to a principal, a repo and a root tree, checked by the server and every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
-| `scion-server/src/objects.rs` (`STALL_TIMEOUT`) | A stalled `GetObjects` reply ends, but HTTP/2 keeps the one encoded object it was sending until the connection closes. | A response body timeout that resets the stream. | [#42](https://github.com/bnsd55/open-scion/issues/42) |
+| `scion-proto/src/reply.rs` (`STALL_TIMEOUT`) | A stalled `GetObjects` reply ends, but HTTP/2 keeps the one encoded object it was sending until the connection closes. | A response body timeout that resets the stream. | [#42](https://github.com/bnsd55/open-scion/issues/42) |
 | `scion-server/src/objects.rs` (`send_objects`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
-| `scion-server/src/auth.rs` (`Auth`) | One static token, one principal. | A token-to-principal map, then per-path write rules. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
+| `scion-proto/src/auth.rs` (`Auth`) | One static token, one principal. | A token-to-principal map, then per-path write rules. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/main.rs` (`serve`) | No TLS. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
+| `scion-tier/src/lib.rs` (`produce`) | Two blocking hops per hit (size, then read) and no read-ahead, as on the server. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
+| `scion-tier/src/lib.rs` (`Flight::fetch_all`) | Each object from upstream takes 100 MiB of the 400 MiB fetch budget before it arrives, so at most four come at once for the whole tier. | Learn an object's size before its bytes, and take only that. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
+| `scion-tier/src/lib.rs` (`check_repo`) | A tier does not ask whether a repo exists, and serves a stored object to any caller with the token. Safe with one principal. | Read tickets, checked by every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
+| `scion-tier/src/store.rs` (`DiskStore`) | The daemon's recency index lives in memory and a scan of every file rebuilds it at start. Memory and start time grow with the object count, and a restart forgets which objects were read last. | A persistent index. | [#63](https://github.com/bnsd55/open-scion/issues/63) |
+| `scion-tier/src/bin/scion-cache.rs` (`main`) | No TLS between tiers. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
 | `scn/src/client.rs` (`lossy`) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | Escape or base64 raw bytes in JSON. | |
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |
 | `scn/src/cmd/commit.rs` (`commit`) | The author time zone is always UTC. | A time zone crate. | |

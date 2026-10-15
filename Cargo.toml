@@ -17,6 +17,7 @@ authors = ["Ben Shaharizad <bnsd55@gmail.com>"]
 scion-core = { path = "crates/scion-core" }
 scion-proto = { path = "crates/scion-proto" }
 scion-server = { path = "crates/scion-server" }
+scion-tier = { path = "crates/scion-tier" }
 
 anyhow = "1.0"
 blake3 = "1.8"

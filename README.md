@@ -111,6 +111,20 @@ cs=$(./target/release/scn commit -m "add hello" --put hello.txt=hello.txt)
 
 Every `scn` command takes `--json` for machine-readable output.
 
+Checkouts can go through the cache tiers: a `scion-daemon` per machine, on a
+Unix socket, in front of a regional `scion-cache`, in front of the server.
+Each tier keeps what it fetched, so a second checkout on the machine sends
+nothing past the daemon. The tiers serve only checkouts; the other `scn`
+commands talk to the server.
+
+```sh
+export SCION_UPSTREAM_TOKEN=dev                    # what each tier sends upstream
+./target/release/scion-cache &                     # memory, 127.0.0.1:7879
+./target/release/scion-daemon --data /tmp/scion-daemon &   # disk, Unix socket
+SCION_SERVER=unix:///tmp/scion-daemon/daemon.sock \
+  ./target/release/scn checkout main --into /tmp/work2
+```
+
 `scn bench` runs many agents that land changes at the same time, then checks
 that `main` gained each landed change exactly once. With one server process on
 one machine, 200 agents landed 10,000 changes at about 200 lands per second,
@@ -126,8 +140,9 @@ repository with 23,871 commits took 50 seconds.
 | [`crates/scion-core`](crates/scion-core) | Object model and canonical byte format |
 | [`crates/scion-proto`](crates/scion-proto) | gRPC API ([`proto/scion.proto`](proto/scion.proto)) |
 | [`crates/scion-server`](crates/scion-server) | Storage, commits, lands, reads, git import |
+| [`crates/scion-tier`](crates/scion-tier) | Cache tiers: `scion-cache` and `scion-daemon` |
 | [`crates/scn`](crates/scn) | Command-line client |
-| [`docs/architecture.md`](docs/architecture.md) | How the parts fit together: storage, lands, reads, and the planned cache tiers |
+| [`docs/architecture.md`](docs/architecture.md) | How the parts fit together: storage, lands, reads, and the cache tiers |
 | [`docs/format-v1.md`](docs/format-v1.md) | The v1 byte format. Object IDs are hashes of these bytes. |
 
 ## Design notes
@@ -142,6 +157,7 @@ These are this project's choices where the article does not give details.
 | Landing | One land at a time per ref, inside one process. A changeset can be created in parallel without any lock. |
 | Retries | Each land has a caller-chosen request key, so a retry returns the first result |
 | Git | One-way import. Commit IDs are not kept identical to git commit IDs. |
+| Cache tiers | As in the article, a daemon per machine on a socket and a regional cache in memory. The Unix socket, TCP between tiers, the disk store, the byte limits, and one shared fetch per missed object are this project's choices. |
 
 Deliberate simplifications are marked `SHORTCUT:` in the code, each with its
 limit and its upgrade path.

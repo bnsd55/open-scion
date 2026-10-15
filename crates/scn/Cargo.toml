@@ -24,6 +24,7 @@ tonic.workspace = true
 
 [dev-dependencies]
 scion-server.workspace = true
+scion-tier.workspace = true
 tempfile.workspace = true
 
 [lints]
