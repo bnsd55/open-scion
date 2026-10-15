@@ -28,13 +28,14 @@ pub trait Store: Send + Sync + 'static {
     /// I/O errors.
     fn size(&self, key: Key) -> io::Result<Option<usize>>;
 
-    /// The bytes of a stored object. `None` if it is not stored, or if the
-    /// stored copy is bad (it is then dropped).
+    /// The bytes of a stored object whose size [`Store::size`] gave as
+    /// `size`. Returns at most `size` bytes. `None` if it is not stored, or
+    /// if the stored copy is bad (it is then dropped).
     ///
     /// # Errors
     ///
     /// I/O errors.
-    fn get(&self, key: Key) -> io::Result<Option<Vec<u8>>>;
+    fn get(&self, key: Key, size: usize) -> io::Result<Option<Vec<u8>>>;
 
     /// Stores an object. The caller has checked `data` against `key`. An
     /// object larger than the store's limit is not kept.
@@ -118,10 +119,12 @@ impl Store for MemoryStore {
         Ok(lock(&self.lru).get(key).map(|&(_, size)| size))
     }
 
-    fn get(&self, key: Key) -> io::Result<Option<Vec<u8>>> {
+    fn get(&self, key: Key, size: usize) -> io::Result<Option<Vec<u8>>> {
         let data = lock(&self.lru).get(key).map(|(data, _)| Arc::clone(data));
         // Copied outside the lock.
-        Ok(data.map(|data| data.to_vec()))
+        Ok(data
+            .filter(|data| data.len() <= size)
+            .map(|data| data.to_vec()))
     }
 
     fn put(&self, key: Key, data: &Arc<Vec<u8>>) -> io::Result<()> {
@@ -143,7 +146,9 @@ impl Store for MemoryStore {
 ///
 /// A write goes to a temp file and is renamed into place, so a reader never
 /// sees half a file. Files are not synced: a crash can leave a bad file, and
-/// the hash check on read catches it.
+/// the hash check on read catches it. The limit counts object bytes, not the
+/// disk blocks that hold them. Every rename and unlink of an object file
+/// happens under the index lock, so the index and the files agree.
 // SHORTCUT: the recency index lives in memory and is rebuilt by a scan of
 // every file at start, oldest write first. Memory and start time grow with
 // the number of objects, and a restart forgets which objects were read last.
@@ -158,18 +163,22 @@ pub struct DiskStore {
 
 impl DiskStore {
     /// Opens the store in `dir`, keeping at most `limit` bytes of objects.
-    /// Creates `dir` with mode 0700 if it is missing, so only this user can
-    /// read the objects. If the stored objects add up to more than `limit`,
-    /// the oldest are dropped.
+    /// Creates `dir` with mode 0700 if it is missing. Refuses a `dir` that
+    /// other users can reach (not a real directory owned by this user and
+    /// closed to others): only this user may read the objects or place files
+    /// there. If the stored objects add
+    /// up to more than `limit`, the oldest are dropped.
     ///
     /// # Errors
     ///
+    /// [`ErrorKind::PermissionDenied`] if `dir` is not private,
     /// [`ErrorKind::WouldBlock`] if another process uses `dir`, or I/O errors.
     pub fn open(dir: &Path, limit: usize) -> io::Result<Self> {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(dir)?;
+        crate::check_private_dir(dir)?;
         let lock_file = lock_dir(dir)?;
         let objects = dir.join("objects");
         let tmp = dir.join("tmp");
@@ -186,9 +195,11 @@ impl DiskStore {
         };
         let mut found = store.scan()?;
         found.sort_by_key(|&(modified, ..)| modified);
+        let mut lru = lock(&store.lru);
         for (_, key, size) in found {
-            store.add(key, size)?;
+            store.add(&mut lru, key, size)?;
         }
+        drop(lru);
         Ok(store)
     }
 
@@ -226,6 +237,11 @@ impl DiskStore {
                         _ => hex.parse().map(Key::Blob),
                     };
                     let meta = file.metadata()?;
+                    // Larger than any object: never a good copy.
+                    if meta.len() > MAX_OBJECT_BYTES as u64 {
+                        ignore_missing(fs::remove_file(file.path()))?;
+                        continue;
+                    }
                     if let Ok(key) = key
                         && meta.is_file()
                     {
@@ -238,10 +254,10 @@ impl DiskStore {
         Ok(found)
     }
 
-    /// Records a stored file, then removes the files that the limit drops.
-    fn add(&self, key: Key, size: usize) -> io::Result<()> {
-        let dropped = lock(&self.lru).insert(key, (), size, self.limit);
-        for key in dropped {
+    /// Records a stored file in the index, then removes the files that the
+    /// limit drops. The caller holds the index lock.
+    fn add(&self, lru: &mut Lru<()>, key: Key, size: usize) -> io::Result<()> {
+        for key in lru.insert(key, (), size, self.limit) {
             ignore_missing(fs::remove_file(self.path(key)))?;
         }
         Ok(())
@@ -253,22 +269,26 @@ impl Store for DiskStore {
         Ok(lock(&self.lru).get(key).map(|&((), size)| size))
     }
 
-    fn get(&self, key: Key) -> io::Result<Option<Vec<u8>>> {
+    fn get(&self, key: Key, size: usize) -> io::Result<Option<Vec<u8>>> {
         let path = self.path(key);
-        let mut data = Vec::new();
+        let mut data = Vec::with_capacity(size + 1);
         match fs::File::open(&path) {
-            Ok(file) => file
-                .take(MAX_OBJECT_BYTES as u64 + 1)
-                .read_to_end(&mut data)?,
+            // One byte more than `size`, to see that the file is longer.
+            Ok(file) => file.take(size as u64 + 1).read_to_end(&mut data)?,
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                lock(&self.lru).remove(key);
+                let mut lru = lock(&self.lru);
+                // A put may have renamed the file into place since.
+                if !path.exists() {
+                    lru.remove(key);
+                }
                 return Ok(None);
             }
             Err(e) => return Err(e),
         };
-        if data.len() > MAX_OBJECT_BYTES || !key.matches(&data) {
+        if data.len() != size || !key.matches(&data) {
             tracing::warn!(%key, "dropping a stored copy that does not match its ID");
-            lock(&self.lru).remove(key);
+            let mut lru = lock(&self.lru);
+            lru.remove(key);
             ignore_missing(fs::remove_file(&path))?;
             return Ok(None);
         }
@@ -285,9 +305,12 @@ impl Store for DiskStore {
         }
         let mut tmp = tempfile::NamedTempFile::new_in(&self.tmp)?;
         tmp.write_all(data)?;
+        // Closed here, outside the lock; only the rename is under it.
+        let tmp = tmp.into_temp_path();
+        let mut lru = lock(&self.lru);
         // The rename replaces a bad copy, if there is one, in one step.
         tmp.persist(&path).map_err(|e| e.error)?;
-        self.add(key, data.len())
+        self.add(&mut lru, key, data.len())
     }
 }
 
@@ -336,7 +359,7 @@ mod tests {
         store.put(a.0, &a.1).unwrap();
         store.put(b.0, &b.1).unwrap();
         // Reading `a` makes `b` the least recently used.
-        assert_eq!(store.get(a.0).unwrap().as_deref(), Some(&b"aaaa"[..]));
+        assert_eq!(store.get(a.0, 4).unwrap().as_deref(), Some(&b"aaaa"[..]));
         // 12 bytes is over the limit of 10: `b` goes.
         store.put(c.0, &c.1).unwrap();
         assert_eq!(store.size(a.0).unwrap(), Some(4));
@@ -397,8 +420,8 @@ mod tests {
 
         // A restart finds what is on disk, and empties tmp/.
         let store = DiskStore::open(&data, 10).unwrap();
-        assert_eq!(store.get(a.0).unwrap(), Some(a.1.to_vec()));
-        assert_eq!(store.get(c.0).unwrap(), Some(c.1.to_vec()));
+        assert_eq!(store.get(a.0, 4).unwrap(), Some(a.1.to_vec()));
+        assert_eq!(store.get(c.0, 4).unwrap(), Some(c.1.to_vec()));
         assert_eq!(store.size(b.0).unwrap(), None);
         assert_eq!(fs::read_dir(&store.tmp).unwrap().count(), 0);
         drop(store);
@@ -427,20 +450,74 @@ mod tests {
         store.put(blob_key, &blob_data).unwrap();
         store.put(tree_key, &Arc::new(tree_bytes.clone())).unwrap();
         assert_eq!(store.size(blob_key).unwrap(), Some(6));
-        assert_eq!(store.get(blob_key).unwrap(), Some(b"hello\n".to_vec()));
-        assert_eq!(store.get(tree_key).unwrap(), Some(tree_bytes));
+        assert_eq!(store.get(blob_key, 6).unwrap(), Some(b"hello\n".to_vec()));
+        let tree_size = tree_bytes.len();
+        assert_eq!(store.get(tree_key, tree_size).unwrap(), Some(tree_bytes));
         let (missing, _) = blob(b"never stored");
         assert_eq!(store.size(missing).unwrap(), None);
-        assert_eq!(store.get(missing).unwrap(), None);
+        assert_eq!(store.get(missing, 12).unwrap(), None);
 
         // A file that does not match its ID is never returned, and is removed.
         fs::write(store.path(blob_key), b"hellO\n").unwrap();
-        assert_eq!(store.get(blob_key).unwrap(), None);
+        assert_eq!(store.get(blob_key, 6).unwrap(), None);
         assert_eq!(store.size(blob_key).unwrap(), None);
         assert!(!store.path(blob_key).exists());
         // A put replaces a bad copy.
         fs::write(store.path(blob_key), b"torn").unwrap();
         store.put(blob_key, &blob_data).unwrap();
-        assert_eq!(store.get(blob_key).unwrap(), Some(b"hello\n".to_vec()));
+        assert_eq!(store.get(blob_key, 6).unwrap(), Some(b"hello\n".to_vec()));
+        // A file longer than its recorded size is not read past it.
+        fs::write(store.path(blob_key), b"hello\n and more").unwrap();
+        assert_eq!(store.get(blob_key, 6).unwrap(), None);
+    }
+
+    #[test]
+    fn a_torn_file_found_at_start_is_dropped_when_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let (key, bytes) = blob(b"a whole object\n");
+        let path = {
+            let store = DiskStore::open(&data, 1 << 20).unwrap();
+            store.put(key, &bytes).unwrap();
+            store.path(key)
+        };
+        // A crash left the first bytes only.
+        fs::write(&path, &bytes[..4]).unwrap();
+
+        let store = DiskStore::open(&data, 1 << 20).unwrap();
+        assert_eq!(store.size(key).unwrap(), Some(4));
+        assert_eq!(store.get(key, 4).unwrap(), None);
+        assert_eq!(store.size(key).unwrap(), None);
+        assert!(!path.exists());
+        assert_eq!(lock(&store.lru).bytes, 0);
+    }
+
+    #[test]
+    fn a_data_directory_that_others_can_reach_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let open = dir.path().join("open");
+        fs::create_dir(&open).unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
+        let err = DiskStore::open(&open, 1 << 20).err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{err}");
+        assert!(!open.join("objects").exists());
+
+        // A symlink to a private directory is refused too.
+        let private = dir.path().join("private");
+        fs::create_dir(&private).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&private, &link).unwrap();
+        let err = DiskStore::open(&link, 1 << 20).err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{err}");
+
+        // A directory owned by someone else: the root directory, unless the
+        // test runs as root.
+        if rustix::process::geteuid().as_raw() != 0 {
+            let err = DiskStore::open(Path::new("/"), 1 << 20).err().unwrap();
+            assert!(err.to_string().contains("owned by another user"), "{err}");
+        }
     }
 }

@@ -27,7 +27,7 @@ hashlink = "0.12"
 prost = "0.14"
 proptest = "1.12"
 rusqlite = { version = "0.40", features = ["bundled"] }
-rustix = { version = "1.1", features = ["fs"] }
+rustix = { version = "1.1", features = ["fs", "process"] }
 serde_json = "1.0"
 tempfile = "3.27"
 thiserror = "2.0"

@@ -21,9 +21,9 @@ mod store;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{fmt, fs, io, iter};
@@ -49,7 +49,7 @@ use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::server::Connected;
 use tonic::transport::{Channel, Endpoint, Server};
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 
 use store::lock;
 pub use store::{DiskStore, MemoryStore, Store};
@@ -57,9 +57,19 @@ pub use store::{DiskStore, MemoryStore, Store};
 /// Most `GetRootTree` answers a tier keeps.
 const MAX_ROOT_TREES: usize = 10_000;
 
-/// A tier gives up on its upstream when a call, or the next object of a
-/// reply, takes longer than this.
-const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(120);
+/// Most objects that one fetch asks upstream for. A reply sends at most
+/// 64 MiB, so fetching far ahead of it only fills the store.
+const MAX_BATCH: usize = 128;
+
+/// How long `scion-cache` waits for the server: for an answer, for the next
+/// object of a fetch, and for one object that a reply needs.
+pub const CACHE_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long `scion-daemon` waits for its cache. Shorter than the cache's
+/// wait, so the two tiers never give up at the same moment.
+pub const DAEMON_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
+
+const _: () = assert!(DAEMON_UPSTREAM_TIMEOUT.as_secs() < CACHE_UPSTREAM_TIMEOUT.as_secs());
 
 /// One object, by kind and ID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -175,6 +185,8 @@ impl<S> Clone for Tier<S> {
 struct Inner<S> {
     store: S,
     upstream: Upstream,
+    /// How long to wait for upstream.
+    timeout: Duration,
     /// Calls sent upstream, of every kind.
     upstream_calls: Arc<AtomicU64>,
     /// The reply budget, as on the server: object bytes read or copied for a
@@ -187,24 +199,30 @@ struct Inner<S> {
     root_trees: Mutex<LruCache<(String, ChangesetId), TreeId>>,
 }
 
-/// What one reply has done: hits and misses for the log, and whether it has
-/// started a batched fetch.
+/// What one reply has done: hits and misses for the log, and how far into
+/// its keys the fetches it started reach.
 #[derive(Default)]
 struct Progress {
     hits: AtomicUsize,
     misses: AtomicUsize,
-    batched: AtomicBool,
+    /// Keys below this index were in a fetch that this reply started.
+    fetched_to: AtomicUsize,
 }
 
 impl<S: Store> Tier<S> {
     /// A tier that keeps objects in `store` and sends misses to `upstream`
-    /// (`http://HOST:PORT` or `unix:///PATH`) with `upstream_token`. It
-    /// connects on the first call.
+    /// (`http://HOST:PORT` or `unix:///PATH`) with `upstream_token`. It waits
+    /// at most `timeout` for upstream, and connects on the first call.
     ///
     /// # Errors
     ///
     /// A bad upstream address, or a token that is not ASCII.
-    pub fn new(store: S, upstream: &str, upstream_token: &str) -> anyhow::Result<Self> {
+    pub fn new(
+        store: S,
+        upstream: &str,
+        upstream_token: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<Self> {
         let channel = Endpoint::from_shared(upstream.to_owned())
             .with_context(|| format!("bad upstream address {upstream:?}"))?
             .connect_lazy();
@@ -221,6 +239,7 @@ impl<S: Store> Tier<S> {
             inner: Arc::new(Inner {
                 store,
                 upstream,
+                timeout,
                 upstream_calls,
                 in_flight: Arc::new(Semaphore::new(IN_FLIGHT_BYTES)),
                 fetching: Arc::new(Semaphore::new(IN_FLIGHT_BYTES)),
@@ -278,10 +297,22 @@ impl<S: Store> Tier<S> {
             })
     }
 
+    /// Waits at most the tier's timeout for an upstream call.
+    async fn within<T>(&self, call: impl Future<Output = Result<T, Status>>) -> Result<T, Status> {
+        tokio::time::timeout(self.inner.timeout, call)
+            .await
+            .unwrap_or_else(|_| {
+                Err(Status::unavailable(format!(
+                    "upstream did not answer within {:?}",
+                    self.inner.timeout
+                )))
+            })
+    }
+
     /// Streams the objects named by `keys` into `tx`.
     async fn reply(self, repo: String, keys: Vec<Key>, tx: mpsc::Sender<Sent>) {
         let progress = Progress::default();
-        let produce = |i| self.produce(&repo, &keys[i..], &progress);
+        let produce = |i| self.produce(&repo, &keys, i, &progress);
         reply::send_objects(0..keys.len(), tx, STALL_TIMEOUT, produce).await;
         tracing::info!(
             objects = keys.len(),
@@ -291,65 +322,100 @@ impl<S: Store> Tier<S> {
         );
     }
 
-    /// Finds the first object of `rest` for a reply: in the store, or else
-    /// from upstream. Takes the object's share of the reply budget before its
-    /// bytes are read from the store or copied into the reply.
+    /// Finds `keys[i]` for a reply: in the store, or else from upstream. Takes
+    /// the object's share of the reply budget before its bytes are read from
+    /// the store or copied into the reply.
     // SHORTCUT: two blocking hops per hit (size, then read) and no read-ahead,
     // as on the server. Upgrade (issue #6): read a batch capped by bytes per
     // hop, or keep a few reads in flight.
-    async fn produce(&self, repo: &str, rest: &[Key], progress: &Progress) -> Option<Sent> {
-        let (&key, later) = rest.split_first()?;
+    async fn produce(
+        &self,
+        repo: &str,
+        keys: &[Key],
+        i: usize,
+        progress: &Progress,
+    ) -> Option<Sent> {
+        let key = *keys.get(i)?;
+        let take = |size| reply::take(&self.inner.in_flight, size, STALL_TIMEOUT);
         let size = match self.blocking(move |store| store.size(key)).await {
             Ok(size) => size,
-            Err(status) => {
-                return Some((Err(status), reply::take(&self.inner.in_flight, 1).await?));
-            }
+            Err(status) => return Some((Err(status), take(1).await?)),
         };
         if let Some(size) = size {
-            let permit = reply::take(&self.inner.in_flight, size).await?;
-            match self.blocking(move |store| store.get(key)).await {
-                Ok(Some(data)) if data.len() <= size => {
+            let permit = take(size).await?;
+            match self.stored(key, size).await {
+                Ok(Some(object)) => {
                     progress.hits.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(%key, "hit");
-                    return Some((Ok(key.object(data)), permit));
+                    return Some((Ok(object), permit));
                 }
                 // The stored copy went (dropped, or bad) after its size was
                 // read: fetch it.
-                Ok(_) => {}
+                Ok(None) => {}
                 Err(status) => return Some((Err(status), permit)),
             }
         }
         progress.misses.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(%key, "miss");
-        // The fetched bytes were counted in the fetch budget until stored.
-        // The share taken here counts the reply's copy of them.
-        let fetched = self.fetch(repo, key, later, progress).await;
-        let size = fetched.as_ref().map_or(1, |data| data.len());
-        let permit = reply::take(&self.inner.in_flight, size).await?;
-        Some((fetched.map(|data| key.object(data.to_vec())), permit))
+        let data = match self.fetch(repo, keys, i, progress).await {
+            Ok(data) => data,
+            Err(status) => return Some((Err(status), take(1).await?)),
+        };
+        // The bytes were counted in the fetch budget until stored. Copy them
+        // into the reply now if the reply budget has room. Else let them go,
+        // wait for room, and read them again.
+        if let Some(permit) = reply::try_take(&self.inner.in_flight, data.len()) {
+            return Some((Ok(key.object(data.to_vec())), permit));
+        }
+        let size = data.len();
+        drop(data);
+        let permit = take(size).await?;
+        let object = match self.stored(key, size).await {
+            Ok(Some(object)) => Ok(object),
+            // Dropped from the store meanwhile. A key has one size, so the
+            // bytes fit the share taken.
+            Ok(None) => self
+                .fetch(repo, keys, i, progress)
+                .await
+                .map(|data| key.object(data.to_vec())),
+            Err(status) => Err(status),
+        };
+        Some((object, permit))
     }
 
-    /// Gets `key` from upstream. Joins the fetch in progress for it, or
-    /// starts one. A reply's first fetch also takes every object in `later`
-    /// that the store lacks, so one upstream call serves many misses. Its
-    /// later fetches take only their own object, so a store that does not
-    /// keep objects costs one fetch per object, not one per remaining call.
+    /// Reads `key` from the store, at most `size` bytes. `None` if it is not
+    /// there.
+    async fn stored(&self, key: Key, size: usize) -> Result<Option<Object>, Status> {
+        let data = self.blocking(move |store| store.get(key, size)).await?;
+        Ok(data.map(|data| key.object(data)))
+    }
+
+    /// Gets `keys[i]` from upstream. Joins the fetch in progress for it, or
+    /// starts one. A fetch that a reply starts also takes the later keys, up
+    /// to [`MAX_BATCH`] in all, that the store lacks. A key that an earlier
+    /// fetch of the same reply covered, but the store did not keep, is
+    /// fetched alone, so such a store costs one fetch per object, not one per
+    /// remaining call. The wait is bounded: each step of a fetch has the
+    /// tier's timeout, and a fetch always settles every object it holds.
     async fn fetch(
         &self,
         repo: &str,
-        key: Key,
-        later: &[Key],
+        keys: &[Key],
+        i: usize,
         progress: &Progress,
     ) -> Result<Arc<Vec<u8>>, Status> {
+        let key = keys[i];
         let joined = lock(&self.inner.flights)
             .get(&(repo.to_owned(), key))
             .cloned();
         let mut flight = if let Some(flight) = joined {
             flight
-        } else if progress.batched.swap(true, Ordering::Relaxed) {
+        } else if i < progress.fetched_to.load(Ordering::Relaxed) {
             self.start(repo, key, Vec::new())
         } else {
-            let later = later.to_vec();
+            let end = keys.len().min(i + MAX_BATCH);
+            progress.fetched_to.store(end, Ordering::Relaxed);
+            let later = keys[i + 1..end].to_vec();
             let missing = self
                 .blocking(move |store| {
                     Ok(later
@@ -400,8 +466,8 @@ impl<S: Store> Tier<S> {
 
 /// One fetch from upstream: a few objects of one repo, which other replies
 /// can wait for. It runs on its own task, so it never waits for a reply, and
-/// it ends when every object is fetched or upstream fails. Objects still
-/// waiting when it ends leave the fetch table, so a later call starts anew.
+/// it ends when every object is fetched or failed. Objects still waiting when
+/// it ends leave the fetch table, so a later call starts anew.
 struct Flight<S: Store> {
     tier: Tier<S>,
     repo: String,
@@ -421,9 +487,23 @@ impl<S: Store> Flight<S> {
         }
     }
 
+    /// Hands the first waiting object, or why upstream could not give it, to
+    /// its waiters. The other objects keep waiting.
+    fn settle_front(&mut self, outcome: Result<Arc<Vec<u8>>, Status>) {
+        if let Some((key, tx)) = self.waiting.pop_front() {
+            if let Err(status) = &outcome {
+                tracing::warn!(%key, %status, "upstream could not give an object");
+            }
+            tx.send_replace(Some(outcome));
+            lock(&self.tier.inner.flights).remove(&(self.repo.clone(), key));
+        }
+    }
+
     /// Fetches every waiting object. Checks each against its ID, stores it,
-    /// and hands it to its waiters. An upstream reply may stop early; the
-    /// rest are asked for again.
+    /// and hands it to its waiters. An error about one object fails only that
+    /// object. An upstream reply may stop early; the rest are asked for
+    /// again. Other errors (transport, timeout, an object out of order) fail
+    /// every object still waiting.
     async fn fetch_all(&mut self) -> Result<(), Status> {
         while !self.waiting.is_empty() {
             let refs = self.waiting.iter().map(|(key, _)| key.to_ref()).collect();
@@ -432,20 +512,33 @@ impl<S: Store> Flight<S> {
                 refs,
             };
             let mut upstream = self.tier.inner.upstream.clone();
-            let mut stream = within(upstream.get_objects(request)).await?.into_inner();
+            let mut stream = self
+                .tier
+                .within(upstream.get_objects(request))
+                .await?
+                .into_inner();
             let before = self.waiting.len();
             loop {
                 // Budget for the largest object, taken before the next object
                 // arrives, then cut to its size.
                 // SHORTCUT: so at most four objects come from upstream at
                 // once, for the whole tier, however small they are. Upgrade
-                // (issue #6): learn an object's size before its bytes, and
+                // (issue #53): learn an object's size before its bytes, and
                 // take only that.
-                let mut permit = reply::take(&self.tier.inner.fetching, MAX_OBJECT_BYTES)
+                let inner = &self.tier.inner;
+                let mut permit = reply::take(&inner.fetching, MAX_OBJECT_BYTES, inner.timeout)
                     .await
-                    .ok_or_else(|| Status::unavailable("shutting down"))?;
-                let Some(object) = within(stream.message()).await? else {
-                    break;
+                    .ok_or_else(|| Status::unavailable("too many objects coming from upstream"))?;
+                let object = match self.tier.within(stream.message()).await {
+                    Ok(Some(object)) => object,
+                    Ok(None) => break,
+                    // Upstream ends its reply after an error about one
+                    // object: fail that object, and ask again for the rest.
+                    Err(status) if about_one_object(&status) => {
+                        self.settle_front(Err(status));
+                        break;
+                    }
+                    Err(status) => return Err(status),
                 };
                 let Some(&(key, _)) = self.waiting.front().filter(|(key, _)| key.names(&object))
                 else {
@@ -472,15 +565,13 @@ impl<S: Store> Flight<S> {
                         Ok(true)
                     })
                     .await?;
-                if !matches {
-                    return Err(Status::data_loss(format!(
+                self.settle_front(if matches {
+                    Ok(data)
+                } else {
+                    Err(Status::data_loss(format!(
                         "upstream sent bytes that are not {key}"
-                    )));
-                }
-                if let Some((key, tx)) = self.waiting.pop_front() {
-                    tx.send_replace(Some(Ok(data)));
-                    lock(&self.tier.inner.flights).remove(&(self.repo.clone(), key));
-                }
+                    )))
+                });
             }
             if self.waiting.len() == before {
                 return Err(Status::unavailable(
@@ -501,11 +592,9 @@ impl<S: Store> Drop for Flight<S> {
     }
 }
 
-/// Waits at most [`UPSTREAM_TIMEOUT`] for an upstream call.
-async fn within<T>(call: impl Future<Output = Result<T, Status>>) -> Result<T, Status> {
-    tokio::time::timeout(UPSTREAM_TIMEOUT, call)
-        .await
-        .unwrap_or_else(|_| Err(Status::unavailable("upstream did not answer in time")))
+/// Whether an upstream error is about one object, not the whole call.
+fn about_one_object(status: &Status) -> bool {
+    matches!(status.code(), Code::NotFound | Code::DataLoss)
 }
 
 /// Checks a repo name by the server's rule, so a tier refuses the calls that
@@ -526,7 +615,9 @@ impl<S: Store> Objects for Tier<S> {
     ) -> Result<Response<ResolveRefResponse>, Status> {
         // A ref moves, so its answer is always forwarded and never kept.
         let mut upstream = self.inner.upstream.clone();
-        let reply = within(upstream.resolve_ref(request.into_inner())).await?;
+        let reply = self
+            .within(upstream.resolve_ref(request.into_inner()))
+            .await?;
         Ok(Response::new(reply.into_inner()))
     }
 
@@ -545,7 +636,10 @@ impl<S: Store> Objects for Tier<S> {
         } else {
             tracing::debug!(%changeset, "root tree miss");
             let mut upstream = self.inner.upstream.clone();
-            let reply = within(upstream.get_root_tree(request)).await?.into_inner();
+            let reply = self
+                .within(upstream.get_root_tree(request))
+                .await?
+                .into_inner();
             let tree: TreeId = TreeId::try_from(reply.tree_id.as_slice())
                 .map_err(|_| Status::internal("upstream sent a bad tree id"))?;
             // Only an answer from upstream is kept, never one made here.
@@ -573,15 +667,47 @@ impl<S: Store> Objects for Tier<S> {
     }
 }
 
-/// Listens on a Unix socket at `path` with mode 0600, so only this user can
-/// connect. Replaces a socket file that nothing listens on, such as one left
-/// by a crash. Put the socket in a directory that only this user can enter,
-/// so nobody connects before the mode is set.
+/// Checks that only this user can reach `dir`: a real directory (not a
+/// symlink), owned by the effective user, with no access for group or
+/// others. Then nobody else can read what is inside, or put a file there.
+/// Fails with `PermissionDenied`, naming the rule that `dir` breaks.
+pub(crate) fn check_private_dir(dir: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(dir)?;
+    let refuse = |why: &str| {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} {why}", dir.display()),
+        ))
+    };
+    if !meta.is_dir() {
+        return refuse("is not a directory (a symlink is refused too)");
+    }
+    if meta.uid() != rustix::process::geteuid().as_raw() {
+        return refuse("is owned by another user");
+    }
+    if meta.mode() & 0o077 != 0 {
+        return refuse("is open to other users; make it mode 0700");
+    }
+    Ok(())
+}
+
+/// Listens on a Unix socket at `path`, in a directory that only this user
+/// can reach: a real directory, owned by this user, closed to others. So
+/// nobody else can connect, even in the
+/// moment before the socket gets mode 0600, or put another socket in its
+/// place. Replaces a socket file that nothing listens on, such as one left
+/// by a crash.
 ///
 /// # Errors
 ///
+/// [`io::ErrorKind::PermissionDenied`] if the directory is not private,
 /// [`io::ErrorKind::AddrInUse`] if a process listens on `path`, or I/O errors.
 pub async fn bind_unix(path: &Path) -> io::Result<UnixListener> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    check_private_dir(dir)?;
     if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket()) {
         if UnixStream::connect(path).await.is_ok() {
             return Err(io::Error::new(
@@ -601,15 +727,18 @@ mod tests {
     use std::pin::Pin;
 
     use tokio::net::TcpListener;
+    use tokio_stream::StreamExt as _;
     use tokio_stream::wrappers::TcpListenerStream;
 
     use super::*;
 
-    /// An upstream that serves fixed blobs and counts the objects asked for.
+    /// An upstream that serves fixed blobs, and counts the objects asked for
+    /// and the most in one call.
     #[derive(Clone)]
     struct Fake {
         blobs: Arc<HashMap<Vec<u8>, Vec<u8>>>,
         asked: Arc<AtomicUsize>,
+        largest: Arc<AtomicUsize>,
     }
 
     type Replies = Pin<Box<dyn Stream<Item = Result<Object, Status>> + Send>>;
@@ -638,6 +767,7 @@ mod tests {
         ) -> Result<Response<Replies>, Status> {
             let refs = request.into_inner().refs;
             self.asked.fetch_add(refs.len(), Ordering::SeqCst);
+            self.largest.fetch_max(refs.len(), Ordering::SeqCst);
             let replies: Vec<_> = refs
                 .into_iter()
                 .map(|r| {
@@ -652,18 +782,16 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_store_that_keeps_nothing_costs_one_fetch_per_later_miss() {
-        let blobs: Vec<Vec<u8>> = (0..4).map(|i| vec![i; 3]).collect();
+    /// `count` small blobs, their keys, an upstream that serves them, and a
+    /// tier in front of it with a store of `limit` bytes.
+    async fn setup(count: u32, limit: usize) -> (Vec<Vec<u8>>, Vec<Key>, Fake, Tier<MemoryStore>) {
+        let blobs: Vec<Vec<u8>> = (0..count).map(|i| i.to_le_bytes().to_vec()).collect();
         let keys: Vec<Key> = blobs.iter().map(|b| Key::Blob(BlobId::of(b))).collect();
+        let ids = keys.iter().map(|k| k.id().to_vec());
         let fake = Fake {
-            blobs: Arc::new(
-                keys.iter()
-                    .map(|k| k.id().to_vec())
-                    .zip(blobs.clone())
-                    .collect(),
-            ),
+            blobs: Arc::new(ids.zip(blobs.clone()).collect()),
             asked: Arc::default(),
+            largest: Arc::default(),
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -672,14 +800,21 @@ mod tests {
                 .add_service(ObjectsServer::new(fake.clone()))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
+        let store = MemoryStore::new(limit);
+        let tier = Tier::new(store, &url, "token", CACHE_UPSTREAM_TIMEOUT).unwrap();
+        (blobs, keys, fake, tier)
+    }
+
+    #[tokio::test]
+    async fn a_store_that_keeps_nothing_costs_one_fetch_per_later_miss() {
         // A limit of 0 bytes: the store keeps nothing.
-        let tier = Tier::new(MemoryStore::new(0), &url, "token").unwrap();
+        let (blobs, keys, fake, tier) = setup(4, 0).await;
 
         // The objects of one call, each reached after the fetch before it
         // has ended, so none can join a fetch in progress.
         let progress = Progress::default();
-        for (i, (&key, blob)) in keys.iter().zip(&blobs).enumerate() {
-            let data = tier.fetch("r", key, &keys[i + 1..], &progress).await;
+        for (i, blob) in blobs.iter().enumerate() {
+            let data = tier.fetch("r", &keys, i, &progress).await;
             assert_eq!(*data.unwrap(), *blob);
             while !lock(&tier.inner.flights).is_empty() {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -687,5 +822,21 @@ mod tests {
         }
         // The first fetch asked for all four; each later one only for itself.
         assert_eq!(fake.asked.load(Ordering::SeqCst), 4 + 3);
+    }
+
+    #[tokio::test]
+    async fn a_cold_call_fetches_in_batches_of_at_most_max_batch() {
+        let (_, keys, fake, tier) = setup(300, 1 << 20).await;
+        let (tx, mut stream) = reply::channel();
+        tokio::spawn(tier.clone().reply("r".into(), keys.clone(), tx));
+        let mut got = 0;
+        while let Some(object) = stream.next().await {
+            object.unwrap();
+            got += 1;
+        }
+        assert_eq!(got, 300);
+        assert_eq!(fake.asked.load(Ordering::SeqCst), 300);
+        assert_eq!(fake.largest.load(Ordering::SeqCst), MAX_BATCH);
+        assert_eq!(tier.upstream_calls(), 3);
     }
 }

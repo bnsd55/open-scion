@@ -115,13 +115,15 @@ Checkouts can go through the cache tiers: a `scion-daemon` per machine, on a
 Unix socket, in front of a regional `scion-cache`, in front of the server.
 Each tier keeps what it fetched, so a second checkout on the machine sends
 nothing past the daemon. The tiers serve only checkouts; the other `scn`
-commands talk to the server.
+commands talk to the server. The daemon's data directory must be private to
+your user (mode 0700, not a shared path such as `/tmp`), because its socket
+lives there.
 
 ```sh
-export SCION_UPSTREAM_TOKEN=dev                    # what each tier sends upstream
-./target/release/scion-cache &                     # memory, 127.0.0.1:7879
-./target/release/scion-daemon --data /tmp/scion-daemon &   # disk, Unix socket
-SCION_SERVER=unix:///tmp/scion-daemon/daemon.sock \
+export SCION_UPSTREAM_TOKEN=dev                  # what each tier sends upstream
+./target/release/scion-cache &                   # memory, 127.0.0.1:7879
+./target/release/scion-daemon --data "$HOME/.scion-daemon" &   # disk, Unix socket
+SCION_SERVER="unix://$HOME/.scion-daemon/daemon.sock" \
   ./target/release/scn checkout main --into /tmp/work2
 ```
 

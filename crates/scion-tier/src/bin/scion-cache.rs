@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 
 use anyhow::Context as _;
 use clap::Parser;
-use scion_tier::{MemoryStore, Tier};
+use scion_tier::{CACHE_UPSTREAM_TIMEOUT, MemoryStore, Tier};
 use tokio_stream::wrappers::TcpListenerStream;
 use tracing_subscriber::EnvFilter;
 
@@ -52,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         MemoryStore::new(cli.max_bytes),
         &cli.upstream,
         &cli.upstream_token,
+        CACHE_UPSTREAM_TIMEOUT,
     )?;
     let listener = tokio::net::TcpListener::bind(cli.listen)
         .await

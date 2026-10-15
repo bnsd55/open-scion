@@ -10,7 +10,9 @@ use std::process::Command;
 
 use scion_core::{Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_server::{Store, db, service, tree};
-use scion_tier::{DiskStore, MemoryStore, Tier, bind_unix};
+use scion_tier::{
+    CACHE_UPSTREAM_TIMEOUT, DAEMON_UPSTREAM_TIMEOUT, DiskStore, MemoryStore, Tier, bind_unix,
+};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -46,14 +48,17 @@ impl Tiers {
         let (listener, server) = tcp();
         runtime.spawn(service::serve(store.clone(), listener, TOKEN, pending()));
 
-        let cache = Tier::new(MemoryStore::new(64 << 20), &server, TOKEN).unwrap();
+        let memory = MemoryStore::new(64 << 20);
+        let cache = Tier::new(memory, &server, TOKEN, CACHE_UPSTREAM_TIMEOUT).unwrap();
         let (listener, cache_url) = tcp();
         let incoming = TcpListenerStream::new(listener);
         runtime.spawn(cache.clone().serve(TOKEN, incoming, pending()));
 
         let node = tempfile::tempdir().unwrap();
         let store_dir = DiskStore::open(&node.path().join("data"), 64 << 20).unwrap();
-        let daemon = Tier::new(store_dir, &cache_url, TOKEN).unwrap();
+        let daemon = Tier::new(store_dir, &cache_url, TOKEN, DAEMON_UPSTREAM_TIMEOUT).unwrap();
+        // The socket's directory must be private.
+        fs::set_permissions(node.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let path = node.path().join("daemon.sock");
         let incoming = UnixListenerStream::new(runtime.block_on(bind_unix(&path)).unwrap());
         runtime.spawn(daemon.clone().serve(TOKEN, incoming, pending()));

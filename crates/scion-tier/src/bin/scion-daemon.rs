@@ -6,18 +6,19 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use clap::Parser;
-use scion_tier::{DiskStore, Tier, bind_unix};
+use scion_tier::{DAEMON_UPSTREAM_TIMEOUT, DiskStore, Tier, bind_unix};
 use tokio_stream::wrappers::UnixListenerStream;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(version, about = "Node daemon for the Scion version control system")]
 struct Cli {
-    /// Data directory for stored objects. Created with mode 0700 if missing.
+    /// Data directory for stored objects. Created with mode 0700 if missing;
+    /// refused if other users can reach it.
     #[arg(long, env = "SCION_DAEMON_DATA", default_value = "scion-daemon-data")]
     data: PathBuf,
-    /// Unix socket to listen on, made with mode 0600 [default: daemon.sock in
-    /// the data directory].
+    /// Unix socket to listen on, with mode 0600, in a directory that only
+    /// this user can reach [default: daemon.sock in the data directory].
     #[arg(long)]
     socket: Option<PathBuf>,
     /// Most object bytes to keep on disk.
@@ -43,7 +44,12 @@ async fn main() -> anyhow::Result<()> {
     anyhow::ensure!(!cli.token.is_empty(), "--token must not be empty");
     let store = DiskStore::open(&cli.data, cli.max_bytes)
         .with_context(|| format!("cannot open data directory {}", cli.data.display()))?;
-    let tier = Tier::new(store, &cli.upstream, &cli.upstream_token)?;
+    let tier = Tier::new(
+        store,
+        &cli.upstream,
+        &cli.upstream_token,
+        DAEMON_UPSTREAM_TIMEOUT,
+    )?;
     let socket = cli.socket.unwrap_or_else(|| cli.data.join("daemon.sock"));
     let listener = bind_unix(&socket)
         .await

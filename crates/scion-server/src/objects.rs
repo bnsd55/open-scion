@@ -124,7 +124,7 @@ async fn send_objects(
     let (worker, in_flight) = (&worker, &in_flight);
     reply::send_objects(keys, tx, stall, |key| async move {
         let size = worker.run(move |store| object_size(&store, key)).await;
-        let permit = reply::take(in_flight, *size.as_ref().unwrap_or(&1)).await?;
+        let permit = reply::take(in_flight, *size.as_ref().unwrap_or(&1), stall).await?;
         let object = match size {
             Ok(size) => worker.run(move |store| read(&store, key, size)).await,
             Err(status) => Err(status),

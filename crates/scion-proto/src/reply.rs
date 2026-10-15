@@ -2,10 +2,11 @@
 //! follow the same rules, so they share this code.
 //!
 //! A reply hands objects to its client one at a time, through a one-slot
-//! channel. Each object holds a share of a byte budget, taken before its bytes
-//! are read, until the client takes it. A reply stops once it has sent
-//! [`REPLY_BUDGET_BYTES`], always after at least one object, and ends when its
-//! client takes no object for [`STALL_TIMEOUT`].
+//! channel. Before a reply reads an object's bytes, it takes the object's
+//! share of a byte budget. The object keeps that share until the client takes
+//! it. A reply stops once it has sent [`REPLY_BUDGET_BYTES`], always after at
+//! least one object. It ends when its client takes no object for
+//! [`STALL_TIMEOUT`], or when the budget has no room for that long.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -55,21 +56,38 @@ pub fn channel() -> (mpsc::Sender<Sent>, ObjectStream) {
     (tx, ReceiverStream::new(rx).map(release))
 }
 
-/// Takes the share of `budget` for an object of `size` bytes: at least 1, at
-/// most [`IN_FLIGHT_BYTES`]. Waits until the share is free. `None` if the
-/// budget is closed.
-pub async fn take(budget: &Arc<Semaphore>, size: usize) -> Option<OwnedSemaphorePermit> {
-    // Clamped to the budget, which the asserts above keep within u32.
-    let share = u32::try_from(size.clamp(1, IN_FLIGHT_BYTES)).unwrap_or(u32::MAX);
-    Arc::clone(budget).acquire_many_owned(share).await.ok()
+/// The share of the budget for an object of `size` bytes: at least 1, at most
+/// [`IN_FLIGHT_BYTES`], which the asserts above keep within u32.
+fn share(size: usize) -> u32 {
+    u32::try_from(size.clamp(1, IN_FLIGHT_BYTES)).unwrap_or(u32::MAX)
+}
+
+/// Takes the share of `budget` for an object of `size` bytes. Waits until the
+/// share is free, at most `stall`: the budget is held by objects that clients
+/// have not taken yet. `None` if the wait ends, or the budget is closed.
+pub async fn take(
+    budget: &Arc<Semaphore>,
+    size: usize,
+    stall: Duration,
+) -> Option<OwnedSemaphorePermit> {
+    let acquire = Arc::clone(budget).acquire_many_owned(share(size));
+    tokio::time::timeout(stall, acquire).await.ok()?.ok()
+}
+
+/// Takes the share of `budget` for an object of `size` bytes if it is free
+/// now.
+#[must_use]
+pub fn try_take(budget: &Arc<Semaphore>, size: usize) -> Option<OwnedSemaphorePermit> {
+    Arc::clone(budget).try_acquire_many_owned(share(size)).ok()
 }
 
 /// Sends one object per key, as the client takes them. `produce` finds an
 /// object, takes its share of the budget with [`take`], and only then reads
 /// the bytes, so a reply that waits for budget holds no object. Stops after
 /// an error, once the reply has sent [`REPLY_BUDGET_BYTES`], when the client
-/// has gone, when `produce` returns `None`, or when an object is not handed
-/// on within `stall`.
+/// has gone, when `produce` returns `None`, or when the client does not take
+/// an object within `stall`. Finding an object has no time limit here: a
+/// cache tier bounds its upstream fetches itself.
 pub async fn send_objects<K, F>(
     keys: impl IntoIterator<Item = K>,
     tx: mpsc::Sender<Sent>,
@@ -83,15 +101,13 @@ pub async fn send_objects<K, F>(
         if sent >= REPLY_BUDGET_BYTES {
             break;
         }
-        let handed_on = async {
-            let (object, permit) = produce(key).await?;
-            let len = object.as_ref().map_or(0, |o| o.data.len());
-            let failed = object.is_err();
-            tx.send((object, permit)).await.ok()?;
-            Some((len, failed))
+        let Some((object, permit)) = produce(key).await else {
+            break;
         };
-        match tokio::time::timeout(stall, handed_on).await {
-            Ok(Some((len, false))) => sent += len,
+        let len = object.as_ref().map_or(0, |o| o.data.len());
+        let failed = object.is_err();
+        match tokio::time::timeout(stall, tx.send((object, permit))).await {
+            Ok(Ok(())) if !failed => sent += len,
             _ => break,
         }
     }
