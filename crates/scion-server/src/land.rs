@@ -43,10 +43,12 @@ const MAX_NAME_BYTES: usize = 256;
 
 /// Plans per land call when other writers keep moving the ref. After the
 /// last one the call fails with [`Error::Aborted`] and the land stays pending.
-// SHORTCUT: imports move refs without the land lock, so a land retries a few
-// times, then hands the retry to the client. Ceiling: a ref that an import
-// moves faster than a land commits starves its lands. Upgrade: route every
-// ref move through the per-ref lander, so lands never race.
+///
+/// A git import, in this process or in another one that shares the data
+/// directory, moves a ref by compare-and-swap without the land lock, which
+/// is in memory. It moves the ref once, at its end. So a land loses a swap
+/// only to an import that ends while the land plans, and three in a row are
+/// unlikely.
 const MAX_ATTEMPTS: u32 = 3;
 
 /// How long a finished land is kept, in seconds: 7 days. Until then a retry
@@ -554,9 +556,10 @@ enum Plan {
 
 /// Runs steps 4 and 5 for a pending land. The caller holds the ref's lock.
 ///
-/// Imports do not take that lock, so the ref can move between the plan and
-/// the transaction. The land is then planned again from the new head, and
-/// that plan advances the index to it.
+/// Imports do not take that lock, and may run in another process, so the ref
+/// can move between the plan and the transaction. The land is then planned
+/// again from the new head, and that plan advances the index to it: each
+/// plan reads the head from the database.
 fn finish(
     lands: &Lands,
     store: &Store,

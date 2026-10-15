@@ -70,7 +70,7 @@ v0.1 is one `scion-server serve` process on one machine.
 | Path index | `PathIndex`: per ref, in memory, built on the first land and pruned in cycles of 10,000 generations. | Each process builds its own copy for each ref, and a restart loses it. A base more than `MAX_DEPTH` below the tip walks history on each land ([#38](https://github.com/bnsd55/open-scion/issues/38)). |
 | Blobs | One zstd file per blob in `<data>/objects/blob/` on the local disk. | Other machines cannot read them, and one drive holds the only copy. |
 | Land IDs | SQLite row IDs. The newest land row is never deleted, so an ID is never given out twice. | A counter in one file. |
-| Data directory | `Store::open` takes an exclusive `flock` on `<data>/lock`. | One process by design. An import needs the server stopped ([#27](https://github.com/bnsd55/open-scion/issues/27)). |
+| Data directory | `Store::open` takes `<data>/server.lock`, so one server uses a directory. An import process shares it (`Store::open_shared`). | Both processes are on one machine, and the land lock is in the server's memory. |
 
 **What makes a land correct today.** The compare-and-swap on the ref's
 `version` decides each land, not the mutex. `settle` moves the ref only if

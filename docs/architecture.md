@@ -106,7 +106,9 @@ and the decoder rules.
 One data directory holds everything (`store.rs`):
 
 ```text
-<data>/lock                    locked by the one process that uses <data>
+<data>/lock                    shared by every process that uses <data>
+<data>/open.lock               held while a process opens <data>
+<data>/server.lock             held by the one server process
 <data>/scion.db                metadata and trees (SQLite)
 <data>/objects/blob/ab/cd..    one zstd file per blob, named by its ID in hex
 <data>/tmp/                    staging for atomic blob writes and uploads
@@ -132,8 +134,8 @@ trees commits them in one transaction. The schema version is
 `migrations/` that is newer than its version runs, in order, in its own
 transaction. A released migration never changes. A build refuses a database
 with a newer version. Version 3 lets a derived value have any length; the
-upgrade copies every row. All database access goes through one connection behind
-a mutex. Write transactions use `BEGIN IMMEDIATE`.
+upgrade copies every row. All database access of a process goes through one
+connection behind a mutex. Write transactions use `BEGIN IMMEDIATE`.
 
 **Blob folder.** One zstd file per blob, at most 100 MiB uncompressed. A write
 goes to a temp file in `tmp/`, is flushed, and is renamed into place. The zstd
@@ -152,8 +154,9 @@ holds raw bytes, because the frame header needs the size before the first
 compressed byte. After the last message, the server keeps an intact stored
 copy if there is one. Otherwise it streams the spool file through the
 compressor into the temp file. The spool file has no name, so a dropped
-upload or a crash leaves nothing behind. `Store::open` removes any temp file
-that a crash left before its rename.
+upload or a crash leaves nothing behind. An open that finds no other process
+in the data directory removes any temp file that a crash left before its
+rename (see below).
 
 **Durability rules.**
 
@@ -165,8 +168,9 @@ that a crash left before its rename.
 - A database transaction is durable when `Store::write` returns, or after a
   later `Store::flush`. WAL with `synchronous = FULL` ends each commit with a
   plain `fsync`. On macOS that can leave the commit in the drive cache, so
-  `flush` waits for a shared full flush. SQLite runs no full flush of its own
-  (`fullfsync = OFF`), except in checkpoints (`checkpoint_fullfsync`).
+  `flush` waits for a shared full flush. In the server, SQLite runs no full
+  flush of its own (`fullfsync = OFF`), except in checkpoints
+  (`checkpoint_fullfsync`). An import process is different (below).
   Elsewhere the commit's `fsync` already flushes the cache. A land waits for
   the flush after it releases the ref's lock, so queued lands share it.
 - A read waits too. If `Store::read` saw a commit that no full flush covers
@@ -188,10 +192,53 @@ that a crash left before its rename.
 - A stored blob still costs a full flush when it is put again or named by a
   changeset: another batch may have written it and not synced yet.
 
-**Data-directory lock.** `Store::open` takes an exclusive, non-blocking
-`flock` on `<data>/lock` and holds it until the last `Store` clone is dropped.
-Lands are serialized by an in-memory lock (section 5), which a second process
-would not see. So `scion-server import` needs the server stopped.
+**Processes that share a data directory.** `scion-server import` can run
+while the server runs. The server opens the directory with `Store::open`, an
+import with `Store::open_shared`. Each holds its `flock`s until the last
+`Store` clone is dropped:
+
+| Lock file | Held by |
+|---|---|
+| `<data>/server.lock` | The server, exclusive. Lands are serialized in its memory (section 5), so a second server is refused. `derive` opens as the server too: it removes rows of older versions of a kind, which a running server of an older build may still read. |
+| `<data>/lock` | Every process, shared, for its whole life. An open first tries to take it exclusive, to learn whether another process uses the directory. An older build holds it exclusive for its whole life, so it and this build keep each other out. The file holds the build of the processes that use the directory (below). |
+| `<data>/open.lock` | A process while it opens the directory, so opens take turns. |
+
+- **Alone at open.** Only a process that opens the directory alone removes
+  the files in `tmp/` and runs schema migrations. While another process runs,
+  its temp files are live, and its statements need the schema it knows. So
+  the temp files that a crashed import leaves stay until an open finds the
+  directory unused ([#101](https://github.com/bnsd55/open-scion/issues/101)).
+  A shared open of an older schema fails: stop the other processes to
+  upgrade it.
+- **One build.** Each process removes the derived rows of older versions of
+  a kind (section 4), which a process of an older build may still read. So
+  the first process writes its build into `<data>/lock`: the schema version
+  and the version of each kind (`store::build`). An open while other
+  processes run fails unless its build is the same.
+- **Writes take turns.** SQLite in WAL mode lets one process read while the
+  other writes. A write waits for the write transaction of the other
+  process, up to `busy_timeout` (5 s), and then fails with `UNAVAILABLE`, so
+  the client retries. An import holds the
+  write lock for one batch of 1,000 commits, verification included. While a
+  server write waits, it holds the server's one connection, so the server's
+  reads wait too ([#100](https://github.com/bnsd55/open-scion/issues/100)).
+- **Refs.** Both processes move a ref by compare-and-swap on its `version`,
+  each in a write transaction. The server sees a move that the import made at
+  its next land on the ref: each plan reads the head from the database and
+  advances the path index to it (section 5).
+- **Durability.** Each process counts and flushes its own commits, and group
+  commit shares a full flush only within one process. A server reply that
+  only reads does not flush for a commit of another process. So a shared
+  `Store` commits with `fullfsync = ON`: SQLite syncs the log with a full
+  flush of the drive cache before the commit becomes visible. The server
+  never sees an import commit that a power loss can undo. In turn, a server
+  commit reaches the drive before the import can see it. So the import runs
+  a full flush before it reports, which covers every write that reached the
+  drive. Its report rests on no server commit that a power loss can undo.
+- **Blobs.** The import syncs each blob batch before the transaction that
+  names its blobs, as in one process. So a blob that the server reaches
+  through metadata is durable. The server reads blob files directly, and
+  checks each against its ID.
 
 ## 4. Derived data
 
@@ -217,7 +264,7 @@ computed eagerly or on demand. The rest is this project's choice.
 | Eager | A kind can also store its value when the changeset is written. `root_tree` does (below). `commit_graph` does if each parent has a value (`derived::on_write`), so a write never derives a long history. |
 | Storage | One `derived` row per (kind, version, changeset), written in the transaction that derives it. A large structure belongs in its own table, and the value is its ID, as `root_tree` keeps trees in `trees`. |
 | A version bump | A new version reads and writes only its own rows. So the old rows become unused, and nothing rewrites them. The new version derives its values again, in steps. Each step, and each write of a root tree, also deletes up to `STEP` rows of older versions of its kind, as each new land deletes a few expired lands. Rows of a newer version stay: a newer build that ran on this data may run again, and it reads them. Rows of a kind that the build no longer has also stay. |
-| Backfill | `derived::backfill`, and `scion-server derive --kind root_tree --ref main` (with the server stopped, as for import), fill a ref's history in steps (`--kind commit_graph` fills every ancestor), then delete every row of an older version, `STEP` rows per transaction. It is safe to repeat. |
+| Backfill | `derived::backfill`, and `scion-server derive --kind root_tree --ref main` (with the server stopped: it opens the data directory as the server), fill a ref's history in steps (`--kind commit_graph` fills every ancestor), then delete every row of an older version, `STEP` rows per transaction. It is safe to repeat. |
 | Repos | Rows are keyed by changeset alone. A changeset ID fixes its whole history, so a value is the same in every repo. `get`, `fill` and `derive` check `repo_changesets` first, so a stored value never leaks to a repo that cannot see the changeset. |
 | Durability | A value can name rows that its derivation wrote, such as trees, and a reply can send it to a client. So when `get` derives a value, it waits for one full flush after the last step, shared with concurrent commits, before it returns. It waits on an error too. `fill`, `derive` and `put` never flush: inside a write, the write's own flush covers them. |
 | Crashes | Each step commits on its own, and values never change. So a crash or an error between steps leaves only correct rows. The next read walks back to the stored values and goes on from there. |
@@ -242,8 +289,9 @@ The write needs the first parent's root tree in its transaction. After a
 version bump of `root_tree`, that parent has no row, and the transaction
 would derive its whole history. So `CreateChangeset` and `Land` call
 `tree::fill_root_tree` on the parent before the transaction, and the
-transaction then finds the parent's row. Git import does not: it runs with
-the server stopped, so its transaction blocks no other request.
+transaction then finds the parent's row. Git import does the same for each
+first parent from before its batch: a server that shares the data directory
+waits for the batch's transaction (section 3).
 
 `tree::apply` runs all deletes before all puts, so one changeset can turn a
 file into a directory or back. It loads only the directories on changed paths
@@ -376,9 +424,9 @@ sequenceDiagram
 - **Durable before the reply.** Every reply waits for a full flush that covers
   the land's transactions (`Store::flush`). The land releases the ref lock
   first, so the lands queued behind it share that flush.
-- **ABORTED on contention.** Only git import moves a ref without the ref lock.
-  The data-directory lock keeps the `import` command and the server apart, so
-  this race needs both in one process, as in the tests. If the
+- **ABORTED on contention.** Only git import moves a ref without the ref lock,
+  in the server's process or in an import process beside it (section 3). It
+  moves the ref once, at its end, by compare-and-swap. If the land's
   compare-and-swap fails, the transaction rolls back and the land is planned
   again from the new head. After 3 attempts the call fails with `ABORTED` and
   the row stays pending. The caller retries with the same key. `scn land`
@@ -508,8 +556,8 @@ needed.
 ## 6. Git import
 
 `scion-server --data DIR import [--repo main] [--rev HEAD] [--ref main] [--verify 100] GIT_DIR`
-imports one way, from a local git repository. It needs the server stopped
-(the data-directory lock). Only SHA-1 repositories are supported.
+imports one way, from a local git repository. It can run while the server
+runs (section 3). Only SHA-1 repositories are supported.
 
 **Mapping.**
 
@@ -528,11 +576,15 @@ imports one way, from a local git repository. It needs the server stopped
    stack. Commits already in `git_import` are not imported again.
 2. For each batch of 1,000 commits, build the changesets, write new blobs into
    one blob batch, and sync it.
-3. In one transaction, store each changeset with `tree::store_changeset`
+3. Derive the missing root tree of each first parent from before the batch,
+   in steps, as after a version bump. Then, in one transaction, store each
+   changeset with `tree::store_changeset`
    (with its root tree, and its commit-graph node if each parent has one),
    record its `git_import` row, and verify the sampled commits. A failed check
    rolls back the batch. Earlier batches stay, so a rerun continues.
-4. Point the ref at the tip.
+4. Point the ref at the tip. The checks in the table below run in reads,
+   and the move is a compare-and-swap on the ref's `version`. If a land moved
+   the ref in between, the import checks it again.
 
 **Verification.** Every new root and merge commit is checked, plus `--verify`
 other new commits, evenly spaced and ending at the newest. A check compares
@@ -879,9 +931,9 @@ accepts names that are not safe to write, so the checkout adds its own rules:
 
 | Rule | Why |
 |---|---|
-| The checkout is written into a temp directory, `.scn-checkout-<16 random hex digits>`, made with mode 0700 by `mkdirat` through a directory handle. | Other users cannot guess the temp name, or enter or write the directory. On SIGINT, SIGTERM or SIGHUP the checkout stops and removes it. A second signal during the removal stops it at once, and names the temp directory that it leaves. A `scn` killed in another way, for example by SIGKILL, can leave it behind. Inside an existing destination, a later checkout into it names the leftover in its error. Next to a new one, it does not block a later checkout. |
-| A new destination: the temp directory is made in its parent. Just before the rename, it gets the mode of a plain `mkdir` (0777 less the umask). One `renameat` then moves it onto the destination name. | The rename is the check: it fails if the destination has appeared meanwhile as a non-empty directory, a file or a symlink. An early check gives a clear error first, but correctness comes from the rename. A user who can write the destination's parent can still rename the temp directory and put another directory in its place, so that parent must not be writable by all users, unless it has the sticky bit. Members of a group that can write it are trusted. |
-| An existing destination: it is opened with `O_NOFOLLOW`. It must be owned by the user who runs `scn`, be empty, and not be writable by all users unless it has the sticky bit, all checked through the handle. The temp directory is made inside it, and must be that user's once opened. Each top-level entry then moves up by a `renameat` that never replaces (`RENAME_NOREPLACE`, or `RENAME_EXCL` on macOS), and the destination must then hold only the checkout. Once that rename fails with `EINVAL`, `ENOTSUP` or `ENOSYS`, it is not tried again: a file or symlink moves up by `linkat`, and then loses its temp name. A directory first claims its name with `mkdirat` (mode 0700), and a plain `renameat` then replaces that new empty directory. The type comes from `fstatat` in the temp directory, which also gives the inode. After an error, the entry counts as moved if its name in the destination has that inode. | A symlink as the destination is refused. A directory of another user, for example one made in `/tmp` ahead of time, is refused: its owner could change the checkout. The moves go from the temp directory's handle, so a swapped temp name changes nothing. An entry that appears during the checkout is never replaced, and the final check catches one at any other name: the checkout fails and removes what it moved. Any user who can write the destination could rename a file of their own over one that has moved up, and the final check compares only names, so such a destination is refused. Members of a group that can write it are trusted, as in a new destination's parent: a refusal would break the default umask 002 of some systems. On Linux, NFS has no rename that never replaces (`renameat2` fails with `EINVAL`). There `linkat` and `mkdirat` fail if the name exists, and `linkat` never follows a symlink. Before the plain rename, only a user who can remove the checkout's entries from the destination can swap the claimed directory, and that user is trusted, as above. A rename replaces only an empty directory, so even then no data is lost: a file or symlink in its place fails the rename, and the checkout fails as "no longer empty". On NFS version 3, a lost reply makes the client send a call again, and a call that worked then fails (`linkat` with `EEXIST`, `renameat` or `unlinkat` with `ENOENT`), so the inode check decides. A lost `mkdirat` reply cannot be told from a directory that appeared: the checkout fails, and the empty claim stays ([#99](https://github.com/bnsd55/open-scion/issues/99)). This costs three calls per top-level entry, where moving each file would cost at least two per file. A filesystem with no hard links either (some FUSE filesystems) fails and asks for a new directory ([#91](https://github.com/bnsd55/open-scion/issues/91)). The tests force this path. It is untested on a real NFS mount. |
+| The checkout is written into a temp directory, `.scn-checkout-<16 random hex digits>`, made with mode 0700 by `mkdirat` through a directory handle. | Other users cannot guess the temp name, or enter or write the directory. On SIGINT, SIGTERM or SIGHUP the checkout stops and removes it. A second signal during the removal stops it at once, and names the temp directory that it leaves. A `scn` killed in another way, for example by SIGKILL, can leave it behind. Inside an existing destination, a later checkout into it names the leftover in its error. Next to a new one, it does not block a later checkout. Where top-level files are copied into an existing destination (no hard links), such a kill, or a crash, during a copy can also leave a truncated file at its final name. A move by rename or by hard link cannot. |
+| A new destination: the temp directory is made in its parent. Just before the rename, it gets the mode of a plain `mkdir` (0777 less the umask). One `renameat` then moves it onto the destination name. | The rename is the check: it fails if the destination has appeared meanwhile as a non-empty directory, a file or a symlink. An early check gives a clear error first, but correctness comes from the rename. A user who can write the destination's parent can still rename the temp directory and put another directory in its place, so that parent must not be writable by all users, unless it has the sticky bit. Members of a group that can write it are trusted. On NFS version 3, a rename sent again after a lost reply fails with `ENOENT`: the checkout then counts as moved if the destination name has the temp directory's inode. |
+| An existing destination: it is opened with `O_NOFOLLOW`. It must be owned by the user who runs `scn`, be empty, and not be writable by all users unless it has the sticky bit, all checked through the handle. The temp directory is made inside it, and must be that user's once opened. Each top-level entry then moves up by a `renameat` that never replaces (`RENAME_NOREPLACE`, or `RENAME_EXCL` on macOS), and the destination must then hold only the checkout. Once that rename fails with `EINVAL`, `ENOTSUP` or `ENOSYS`, it is not tried again: a file or symlink moves up by `linkat`, and then loses its temp name. Where `linkat` fails with `EPERM`, `ENOTSUP`, `EXDEV` or `ENOSYS` (no hard links), a file is copied instead: `openat` in the destination with `O_CREAT \| O_EXCL \| O_NOFOLLOW`, the bytes from a handle on the temp file, `fsync`, and then the temp name goes. A symlink is made again by `symlinkat`. A directory first claims its name with `mkdirat` (mode 0700), and a plain `renameat` then replaces that new empty directory. The type comes from `fstatat` in the temp directory, which also gives the inode. After an error, the entry counts as moved if its name in the destination has that inode. | A symlink as the destination is refused. A directory of another user, for example one made in `/tmp` ahead of time, is refused: its owner could change the checkout. The moves go from the temp directory's handle, so a swapped temp name changes nothing. An entry that appears during the checkout is never replaced, and the final check catches one at any other name: the checkout fails and removes what it moved. Any user who can write the destination could rename a file of their own over one that has moved up, and the final check compares only names, so such a destination is refused. Members of a group that can write it are trusted, as in a new destination's parent: a refusal would break the default umask 002 of some systems. On Linux, NFS has no rename that never replaces (`renameat2` fails with `EINVAL`). There `linkat` and `mkdirat` fail if the name exists, and `linkat` never follows a symlink. Before the plain rename, only a user who can remove the checkout's entries from the destination can swap the claimed directory, and that user is trusted, as above. A rename replaces only an empty directory, so even then no data is lost: a file or symlink in its place fails the rename, and the checkout fails as "no longer empty". On NFS version 3, a lost reply makes the client send a call again, and a call that worked then fails (`linkat` with `EEXIST`, `renameat` or `unlinkat` with `ENOENT`), so the inode check decides. A `mkdirat` or `symlinkat` sent again fails with `EEXIST`, and makes no inode to compare. So after `EEXIST`, an empty directory with mode 0700 (the setgid bit aside) that the user owns, checked through a handle, counts as the claim, and a symlink that the user owns with the same target counts as made. Only that user or root can make either, and only a user who can write the destination can move one in: all are trusted, as above. So such an entry that one of them put there is taken too, and no data is lost. A filesystem that shows one owner for every entry (a FUSE or SMB mount with `-o uid=`) passes every ownership check. After the final check, the temp directory's `rmdir` counts as done on `ENOENT`, so a lost reply there does not make the cleanup remove the finished checkout. An exclusive create is safe to send again on NFS version 3: the server keeps a verifier for it. This costs three calls per top-level entry, where moving each file would cost at least two per file. Without hard links (some FUSE filesystems), `O_EXCL` and `symlinkat` never replace, and a copy that fails removes the name it made. A copied file costs its size again in reads and writes. The tests force these paths, and lost replies. They are untested on a real NFS mount or FUSE filesystem. |
 | On a failure or a signal, every path that the checkout made is removed, deepest first, through the same bounded handles as the writes, by `unlinkat` with the kind recorded when the path was made. Then the temp directory is removed. | The removal never follows a symlink, and needs no path that could be swapped. It keeps at most 64 directories open, so a tree 255 levels deep is removed within the 256 open files that macOS allows by default. It removes only what the checkout made: an entry that another user put in a moved directory stays, with a warning. |
 | Inside the temp directory, each parent is opened with `O_NOFOLLOW`, one part at a time. Files use `O_CREAT \| O_EXCL`. The handles on the parents of the last path stay open, at most 64. | A symlink in the way, from this checkout or from anything else, fails the write instead of redirecting it. Only directories that this checkout made inside its private temp directory stay open. With files in path order, each directory is opened once. 64 handles stay well below the 256 open files that macOS allows by default; a deeper path keeps its innermost ones. |
 | The temp directory starts empty, and the checkout records every path it makes. A path that already exists without being recorded is a collision. | The filesystem folded two names into one, by case or by Unicode form (for example `A` and `a`, or `X/f` and `x/g`, on macOS). The error names the path, and the temp directory is removed. Where nothing folds, every name is written, as git does. |
@@ -1012,7 +1064,7 @@ an untrusted network.
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
 | Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once (each holds one message in memory), 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget and `ReadFile` replies a 256 MiB budget. A reply of either whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. The path indexes of all refs hold at most 128 MiB together, and a land walks at most 100,000 changesets below its ref's index. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 16 MiB and 1,048,576 lines, diffs at most 100 versions and about 1M lines (a line counts once per 64 bytes), compares at most 100 deleted files and about 100 MiB to find a rename, and at most 4 run at once. At most 4 `MergeBase` and `IsAncestor` calls run at once, each until its 600 s deadline; a `Diff` reply holds at most 1,000 paths. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object, or up to 2 MiB of a file, in memory until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. Each tier also checks every object from upstream before it stores or sends it, and the daemon checks each object again when it reads it from disk. | Tiers are trusted in v0.1: the client trusts the `ResolveRef` and `GetRootTree` answers that a tier passes on, which it cannot check by hash. A tier forwards them, and keeps only what upstream answered. |
-| Checkout | `scn checkout` writes into a private temp directory with a random name. It renames it onto a new destination, or moves its entries up into an existing empty directory that the user owns, never over an entry already there. It never follows a symlink while writing or removing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure, or on SIGINT, SIGTERM or SIGHUP, the destination stays as it was. | The directory that gets the checkout (an existing destination, or a new one's parent) must not be writable by all users, unless it has the sticky bit: they could swap parts of the checkout. An existing destination that breaks this is refused. Members of a group that can write it are trusted. The check reads only the mode bits, not ACLs: an ACL that lets other users add or delete entries gets past it. No Windows rules: device names and names that end in a dot or a space pass. |
+| Checkout | `scn checkout` writes into a private temp directory with a random name. It renames it onto a new destination, or moves its entries up into an existing empty directory that the user owns, never over an entry already there. It never follows a symlink while writing or removing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure, or on SIGINT, SIGTERM or SIGHUP, the destination stays as it was. | The directory that gets the checkout (an existing destination, or a new one's parent) must not be writable by all users, unless it has the sticky bit: they could swap parts of the checkout. An existing destination that breaks this is refused. Members of a group that can write it are trusted. Where the filesystem has no rename that never replaces (NFS), any empty mode 0700 directory of the user at a top-level directory name counts as the checkout's claim after `mkdirat` fails with `EEXIST`, and is replaced. Where it has no hard links either (some FUSE filesystems), any symlink of the user with the same target at a top-level symlink name counts as made after `symlinkat` fails with `EEXIST`, and is kept. This is for a lost NFS version 3 reply, but a trusted user (the owner, a group member, root) can also put such an entry there: it is taken, and no data is lost. A filesystem that shows one owner for every entry (a FUSE or SMB mount with `-o uid=`) passes every ownership check. A lost reply while the temp directory is written still fails the checkout, safely ([#106](https://github.com/bnsd55/open-scion/issues/106)). The check reads only the mode bits, not ACLs: an ACL that lets other users add or delete entries gets past it. No Windows rules: device names and names that end in a dot or a space pass. |
 | Cache tiers | A tier refuses calls without its token, and serves only objects that match their IDs. | A tier serves a stored object for any valid repo name and does not ask whether the repo exists. Safe with one principal ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Errors | Internal errors reply `internal error`. The detail stays in the server or tier log. | |
 
@@ -1030,10 +1082,10 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-core/src/codec.rs` (`put_len`) | Encoding panics if a field is longer than `u32::MAX`. Every ingest path caps sizes far below that. | `try_encode` returning `Result`, if a path ever does not. | |
 | `scion-server/src/graph.rs` (`STEPS`) | A graph walk leaves the database lock free for 100 µs between steps, because the lock is not fair. A request that wakes later than that waits one more step. | A pool of read-only connections, so a walk holds no lock that others wait for. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
 | `scion-server/src/store.rs` (`Inner::db`) | One SQLite connection behind a mutex, so reads wait for writes. | A pool of read-only connections. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
-| `scion-server/src/store.rs` (`Store::open`) | One process per data directory, so an import needs the server stopped. | Let a separate importer process share the directory. Lands already re-plan when the ref moves (`MAX_ATTEMPTS`). | [#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
-| `scion-server/src/land.rs` (`MAX_ATTEMPTS`) | Imports move refs without the land lock, so a land retries 3 times, then returns `ABORTED`. | Route every ref move through the per-ref lander. | [#27](https://github.com/bnsd55/open-scion/issues/27) |
+| `scion-server/src/import.rs` (`BATCH`) | A server that shares the data directory waits for each import batch transaction, up to `busy_timeout` (5 s), and then its write fails with `UNAVAILABLE`. Its reads wait behind that write. | Shorter import transactions while a server shares the directory. | [#100](https://github.com/bnsd55/open-scion/issues/100) |
+| `scion-server/src/store.rs` (`Blobs::sweep_tmp`) | Only an open that finds no other process removes the temp files that a crash left, so those of a crashed import stay while the server runs. | A `tmp/` folder per process, under its own lock. | [#101](https://github.com/bnsd55/open-scion/issues/101) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | Per-ref serialization in a shared database ([design](design/scalable-backend.md)). | [#47](https://github.com/bnsd55/open-scion/issues/47) |
 | `scion-server/src/land.rs` (`MAX_WALK`) | A land on a base more than `MAX_DEPTH` generations below the tip walks the history from the index floor back to the base, each time, and holds the database lock while it walks. A base more than 100,000 changesets below the floor is rejected. | Per-path history in the database, so the check reads only the paths that the land changes. | [#38](https://github.com/bnsd55/open-scion/issues/38) |
 | `scion-server/src/objects.rs` (`read_object`) | An object ID is treated as permission to read it; trees and blobs are shared by all repos. Safe with one principal. | A read ticket bound to a principal, a repo and a root tree, checked by the server and every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
@@ -1059,5 +1111,4 @@ limit and its upgrade path. This is the list on `main` today.
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |
 | `scn/src/cmd/commit.rs` (`commit`) | The author time zone is always UTC. | A time zone crate. | |
 | `scn/src/materialize.rs` (`check_name`) | No Windows rules: device names (`CON`, `NUL`) and names that end in a dot or a space pass. | Per-platform rules before checkout runs on Windows. | [#45](https://github.com/bnsd55/open-scion/issues/45) |
-| `scn/src/materialize.rs` (`Checkout::move_up_without_rename`) | A checkout into an existing directory needs a rename that never replaces, or hard links. A filesystem with neither (some FUSE filesystems) fails and asks for a new directory. | Copy each file into place with `O_EXCL`. | [#91](https://github.com/bnsd55/open-scion/issues/91) |
-| `scn/src/materialize.rs` (`Checkout::move_up_without_rename`) | On NFS version 3, a lost reply to the `mkdirat` that claims a directory name gives `EEXIST`. The checkout fails as "no longer empty", and the empty claim stays. | Accept an empty 0700 directory of this user that is new. | [#99](https://github.com/bnsd55/open-scion/issues/99) |
+| `scn/src/materialize.rs` (`collision_if_exists`) | On NFS version 3, a `mkdirat` or `symlinkat` in the temp directory, sent again after a lost reply, fails with `EEXIST` and reads as a folding collision. The checkout fails safe, and leaves its temp directory. | An exact name that the checkout has not recorded, holding what the call makes, is the call's own. | [#106](https://github.com/bnsd55/open-scion/issues/106) |

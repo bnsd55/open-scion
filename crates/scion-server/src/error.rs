@@ -80,11 +80,34 @@ impl From<Error> for Status {
             Error::DeadlineExceeded(_) => Status::deadline_exceeded(e.to_string()),
             Error::FailedPrecondition(_) => Status::failed_precondition(e.to_string()),
             Error::ResourceExhausted(_) => Status::resource_exhausted(e.to_string()),
+            // Another process that shares the data directory held the
+            // database's write lock for longer than `busy_timeout`.
+            Error::Db(ref db)
+                if db.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) =>
+            {
+                tracing::warn!(error = %e, "the database stayed busy");
+                Status::unavailable("the database is busy; retry")
+            }
             Error::Corrupt(_) | Error::Db(_) | Error::Io(_) | Error::Git(_) => {
                 // Details stay in the server log, not in the reply.
                 tracing::error!(error = %e, "internal error");
                 Status::internal("internal error")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::ffi;
+    use tonic::Code;
+
+    use super::*;
+
+    #[test]
+    fn a_busy_database_is_unavailable_so_that_the_client_retries() {
+        let db = |code| Error::Db(rusqlite::Error::SqliteFailure(ffi::Error::new(code), None));
+        assert_eq!(Status::from(db(ffi::SQLITE_BUSY)).code(), Code::Unavailable);
+        assert_eq!(Status::from(db(ffi::SQLITE_CORRUPT)).code(), Code::Internal);
     }
 }
