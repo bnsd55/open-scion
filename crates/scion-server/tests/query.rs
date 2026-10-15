@@ -334,16 +334,27 @@ fn diff_all(
     page.entries
 }
 
+/// A regular file whose blob ID comes from `n`. The blob is not stored.
+fn unstored(n: usize) -> FileState {
+    FileState::Regular {
+        content: BlobId::of(&n.to_le_bytes()),
+        executable: false,
+    }
+}
+
+/// Writes `content` at `name` below `dir`, with its directories.
+fn write_file(dir: &Path, name: &str, content: &str) {
+    let file = dir.join(name);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(file, content).unwrap();
+}
+
 /// Two snapshots that differ in each way a path can: added, deleted,
 /// modified, executable bit, regular file to symlink, file to directory and
 /// back, with an unchanged subtree, and names whose tree order is not their
 /// byte order (`a/b` before `a.txt`).
 fn diff_fixture(dir: &Path) -> (String, String) {
-    let write = |name: &str, content: &str| {
-        let file = dir.join(name);
-        fs::create_dir_all(file.parent().unwrap()).unwrap();
-        fs::write(file, content).unwrap();
-    };
+    let write = |name: &str, content: &str| write_file(dir, name, content);
     git(dir, &["init", "-q", "-b", "main"]);
     for name in [
         "a.txt",
@@ -511,23 +522,17 @@ fn diff_pages_stop_at_max_diff_entries_and_resume() {
     let (_data, store) = open_store();
     // 1,515 paths below `big` and 1,000 beside it, so pages end inside
     // directories. Blobs are never read, so they are not stored.
-    let state = |n: usize| {
-        Some(FileState::Regular {
-            content: BlobId::of(&n.to_le_bytes()),
-            executable: false,
-        })
-    };
     let mut changes = BTreeMap::new();
     for i in 0..15 {
         for j in 0..100 {
-            changes.insert(path(&format!("big/d{i:02}/f{j:03}")), state(j));
+            changes.insert(path(&format!("big/d{i:02}/f{j:03}")), Some(unstored(j)));
         }
-        changes.insert(path(&format!("big/d{i:02}.txt")), state(i));
+        changes.insert(path(&format!("big/d{i:02}.txt")), Some(unstored(i)));
     }
     for j in 0..MAX_DIFF_ENTRIES {
-        changes.insert(path(&format!("other/f{j:04}")), state(j));
+        changes.insert(path(&format!("other/f{j:04}")), Some(unstored(j)));
     }
-    let base = BTreeMap::from([(path("base"), state(0))]);
+    let base = BTreeMap::from([(path("base"), Some(unstored(0)))]);
     let ids = chain(&store, vec![base, changes.clone()]);
 
     for prefix in [None, Some(path("big"))] {
@@ -590,6 +595,20 @@ fn text(tag: &str, range: std::ops::Range<usize>) -> String {
     range.fold(String::new(), |text, n| text + &format!("{tag}{n:02}\n"))
 }
 
+/// Ten lines of 128 bytes with their newline. `edited` changes bytes 62 and
+/// 63 of each.
+fn long_lines(edited: bool) -> String {
+    (0..10)
+        .map(|n| {
+            let mut line = format!("ch{n:02}{}\n", "-".repeat(123));
+            if edited {
+                line.replace_range(62..64, "##");
+            }
+            line
+        })
+        .collect()
+}
+
 /// `entries` as git's `--name-status` lines, sorted. A rename is one line,
 /// `R<similarity>`, the old path and the new path.
 fn name_status(entries: &[DiffEntry]) -> Vec<String> {
@@ -632,18 +651,49 @@ fn assert_renames_pair_up(entries: &[DiffEntry]) {
     }
 }
 
+/// Files to write: each path and its content.
+type Files = Vec<(String, String)>;
+
+/// The cases of [`rename_fixture`] that take many files: the deleted files
+/// and the added files.
+fn generated_cases() -> (Files, Files) {
+    let (mut old, mut new) = (Vec::new(), Vec::new());
+    // `top4/x.txt` is 90%, 85%, 80%, 75% and 60% like s0 to s4. Each of
+    // s0 to s3 goes to its own y at 95%, so the four that x keeps are taken,
+    // and x is no rename, though s4 is left.
+    for (i, k) in [18, 17, 16, 15, 12].into_iter().enumerate() {
+        let tag = format!("s{i}");
+        old.push((
+            format!("top4/s{i}.txt"),
+            text("ka", 0..k) + &text(&tag, k..20),
+        ));
+        if i < 4 {
+            let y = text("ka", 0..k) + &text(&tag, k..19) + &text(&format!("t{i}"), 19..20);
+            new.push((format!("top4/y{i}.txt"), y));
+        }
+    }
+    new.push(("top4/x.txt".to_owned(), text("ka", 0..20)));
+    // 101 deleted files with the same content. The added file has the name
+    // of the last; only the first 100 are looked at, so the first wins.
+    for n in 0..=100 {
+        old.push((format!("ident/f{n:03}.txt"), text("ia", 0..2)));
+    }
+    new.push(("ident2/f100.txt".to_owned(), text("ia", 0..2)));
+    // Lines of 128 bytes are two chunks of 64. The new file changes bytes
+    // 62 and 63 of each line, so it keeps the second chunk: exactly 50%.
+    old.push(("chunk/old.txt".to_owned(), long_lines(false)));
+    new.push(("chunk/new.txt".to_owned(), long_lines(true)));
+    (old, new)
+}
+
 /// Two snapshots with each kind of rename that `git diff` finds by default,
 /// and files that are not renames. Each case uses its own lines, so the
 /// cases do not match each other.
 fn rename_fixture(dir: &Path) -> (String, String) {
-    let write = |name: &str, content: &str| {
-        let file = dir.join(name);
-        fs::create_dir_all(file.parent().unwrap()).unwrap();
-        fs::write(file, content).unwrap();
-    };
+    let write = |name: &str, content: &str| write_file(dir, name, content);
     let remove = |name: &str| fs::remove_file(dir.join(name)).unwrap();
     let crlf: String = text("ca", 0..10).replace('\n', "\r\n");
-    let mut old: Vec<(String, String)> = [
+    let mut old: Files = [
         // A pure rename, and one with an edit: 90%.
         ("pure.txt", text("pa", 0..5)),
         ("edit.txt", text("ea", 0..10)),
@@ -696,22 +746,8 @@ fn rename_fixture(dir: &Path) -> (String, String) {
     ]
     .map(|(name, content)| (name.to_owned(), content))
     .into();
-    // `top4/x.txt` is 90%, 85%, 80%, 75% and 60% like s1 to s5. Each of
-    // s1 to s4 goes to its own y at 95%, so the four that x keeps are taken,
-    // and x is no rename, though s5 is left.
-    let shared = [18, 17, 16, 15, 12];
-    for (i, &k) in shared.iter().enumerate() {
-        let tag = format!("s{i}");
-        old.push((
-            format!("top4/s{i}.txt"),
-            text("ka", 0..k) + &text(&tag, k..20),
-        ));
-    }
-    // 101 deleted files with the same content. The added file has the name
-    // of the last; only the first 100 are looked at, so the first wins.
-    for n in 0..=100 {
-        old.push((format!("ident/f{n:03}.txt"), text("ia", 0..2)));
-    }
+    let (more_old, more_new) = generated_cases();
+    old.extend(more_old);
     git(dir, &["init", "-q", "-b", "main"]);
     for (name, content) in &old {
         write(name, content);
@@ -727,7 +763,7 @@ fn rename_fixture(dir: &Path) -> (String, String) {
         }
     }
     remove("link");
-    let mut new: Vec<(String, String)> = [
+    let mut new: Files = [
         ("moved/pure.txt", text("pa", 0..5)),
         ("edited.txt", text("ea", 0..9) + &text("eb", 9..10)),
         ("bin/run.sh", "#!/bin/sh\necho run\n".to_owned()),
@@ -749,17 +785,11 @@ fn rename_fixture(dir: &Path) -> (String, String) {
         ("dup2.txt", text("da", 0..4)),
         ("ex/c/thing.txt", text("xa", 0..4)),
         ("hash/b.txt", "baah\nbaai\nbaaj\n".to_owned()),
-        ("ident2/f100.txt", text("ia", 0..2)),
-        ("top4/x.txt", text("ka", 0..20)),
         ("mod.txt", text("mo", 0..4)),
     ]
     .map(|(name, content)| (name.to_owned(), content))
     .into();
-    for (i, &k) in shared[..4].iter().enumerate() {
-        let tag = format!("s{i}");
-        let y = text("ka", 0..k) + &text(&tag, k..19) + &text(&format!("t{i}"), 19..20);
-        new.push((format!("top4/y{i}.txt"), y));
-    }
+    new.extend(more_new);
     for (name, content) in &new {
         write(name, content);
     }
@@ -867,18 +897,12 @@ fn renames_are_the_same_on_every_page() {
     // 1,500 files move from `old/` to `new/`, so the diff has 3,000 entries
     // over three pages. Blobs are never read: each rename has the same
     // content.
-    let state = |n: usize| {
-        Some(FileState::Regular {
-            content: BlobId::of(&n.to_le_bytes()),
-            executable: false,
-        })
-    };
     let files = 1500;
     let base: BTreeMap<_, _> = (0..files)
-        .map(|n| (path(&format!("old/d{}/f{n:04}", n % 3)), state(n)))
+        .map(|n| (path(&format!("old/d{}/f{n:04}", n % 3)), Some(unstored(n))))
         .collect();
     let mut moves: BTreeMap<_, _> = base.keys().map(|p| (p.clone(), None)).collect();
-    moves.extend((0..files).map(|n| (path(&format!("new/f{n:04}")), state(n))));
+    moves.extend((0..files).map(|n| (path(&format!("new/f{n:04}")), Some(unstored(n)))));
     let ids = chain(&store, vec![base, moves]);
 
     let entries = diff_pages(&store, ids[0], ids[1], None);
@@ -912,22 +936,16 @@ fn a_diff_past_max_rename_entries_has_no_renames() {
     let (_data, store) = open_store();
     // A rename and fillers: MAX_RENAME_ENTRIES entries in all, then one
     // more. Blobs are never read.
-    let state = |n: usize| {
-        Some(FileState::Regular {
-            content: BlobId::of(&n.to_le_bytes()),
-            executable: false,
-        })
-    };
     for (fillers, found) in [
         (MAX_RENAME_ENTRIES - 2, true),
         (MAX_RENAME_ENTRIES - 1, false),
     ] {
-        let base = BTreeMap::from([(path("a/source"), state(usize::MAX))]);
+        let base = BTreeMap::from([(path("a/source"), Some(unstored(usize::MAX)))]);
         let mut change = BTreeMap::from([
             (path("a/source"), None),
-            (path("b/source"), state(usize::MAX)),
+            (path("b/source"), Some(unstored(usize::MAX))),
         ]);
-        change.extend((0..fillers).map(|n| (path(&format!("c/f{n:05}")), state(n))));
+        change.extend((0..fillers).map(|n| (path(&format!("c/f{n:05}")), Some(unstored(n)))));
         let ids = chain(&store, vec![base, change]);
         let entries = diff_pages(&store, ids[0], ids[1], None);
         assert_eq!(entries.len(), fillers + 2);

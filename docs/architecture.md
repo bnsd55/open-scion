@@ -752,7 +752,8 @@ and their bounds, are this project's choices.
   most 1,000,000, git's default limit. It reads the added files that some
   deleted file could be like into one index by chunk hash, then reads each
   deleted file and looks up its chunks there, so it never compares two
-  files row by row. Its budget, about 4M chunks read and table rows
+  files row by row. It reads each file in parts of 1 MiB, so it holds the
+  chunk tables but never a whole file. Its budget, about 4M chunks read and table rows
   compared (`MAX_RENAME_CHUNKS`), is the same on every call, so every call
   finds the same renames; past it, the search reads no more files
   ([#107](https://github.com/bnsd55/open-scion/issues/107)). So one call

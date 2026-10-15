@@ -632,16 +632,13 @@ impl Scion for ScionService {
             .map(|entry| {
                 // The other path goes in `rename_from` on the added file,
                 // and in `rename_to` on the deleted one.
-                let (mut rename_from, mut rename_to, mut similarity) = (vec![], vec![], 0);
-                if let Some(rename) = entry.rename {
-                    let other = rename.path.as_bytes().to_vec();
-                    if entry.old.is_none() {
-                        rename_from = other;
-                    } else {
-                        rename_to = other;
+                let (rename_from, rename_to, similarity) = match entry.rename {
+                    Some(r) if entry.old.is_none() => {
+                        (r.path.as_bytes().to_vec(), vec![], r.similarity)
                     }
-                    similarity = rename.similarity;
-                }
+                    Some(r) => (vec![], r.path.as_bytes().to_vec(), r.similarity),
+                    None => Default::default(),
+                };
                 DiffEntry {
                     path: entry.path.as_bytes().to_vec(),
                     old: entry.old.map(file_state),

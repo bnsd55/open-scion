@@ -99,7 +99,9 @@ pub async fn diff(ctx: &mut Ctx, old: &str, new: &str, path: Option<&RepoPath>) 
             let side = |state: Option<FileState>| state.map(|s| entry_json(&Entry::File(s)));
             // The deleted half of a rename prints with the added half.
             if !entry.rename_to.is_empty() {
-                sources.insert(entry.path, side(old));
+                if ctx.json {
+                    sources.insert(entry.path, side(old));
+                }
                 continue;
             }
             let path = lossy(&entry.path);

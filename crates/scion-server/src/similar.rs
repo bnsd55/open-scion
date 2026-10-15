@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use scion_core::{BlobId, FileState, GitOid, RepoPath};
 
 use crate::error::Result;
-use crate::store::Store;
+use crate::store::{BlobReader, Store};
 
 /// git's similarity scale: this score means the same content.
 pub const SAME: u32 = 60_000;
@@ -36,6 +36,10 @@ const CANDIDATES: usize = 4;
 /// git hashes each chunk to one of this many values.
 const HASHBASE: u32 = 107_927;
 
+/// The parts in which [`Chunks::read`] reads a blob. More than the 8,000
+/// bytes that tell text from binary.
+const PART_BYTES: usize = 1 << 20;
+
 /// A file cut as git's rename detection cuts it. A chunk ends after a
 /// newline or after 64 bytes. In text (no NUL byte in the first 8,000 bytes,
 /// git's test for binary), a CR before a newline does not count, so a line
@@ -53,36 +57,24 @@ impl Chunks {
     /// Cuts `text` into chunks, with git's hash (`diffcore-delta.c`).
     #[must_use]
     pub fn of(text: &[u8]) -> Self {
-        let is_text = !text[..text.len().min(8000)].contains(&0);
-        let mut table: HashMap<u32, u32> = HashMap::new();
-        let mut count = 0;
-        let mut add = |accum1: u32, accum2: u32, bytes: u32| {
-            let hash = accum1.wrapping_add(accum2.wrapping_mul(0x61)) % HASHBASE;
-            *table.entry(hash).or_default() += bytes;
-            count += 1;
-        };
-        let (mut accum1, mut accum2, mut bytes) = (0u32, 0u32, 0u32);
-        for (at, &byte) in text.iter().enumerate() {
-            if is_text && byte == b'\r' && text.get(at + 1) == Some(&b'\n') {
-                continue;
-            }
-            (accum1, accum2) = (
-                (accum1 << 7) ^ (accum2 >> 25),
-                (accum2 << 7) ^ (accum1 >> 25),
-            );
-            accum1 = accum1.wrapping_add(u32::from(byte));
-            bytes += 1;
-            if bytes == 64 || byte == b'\n' {
-                add(accum1, accum2, bytes);
-                (accum1, accum2, bytes) = (0, 0, 0);
-            }
+        let mut chunker = Chunker::default();
+        chunker.push(text);
+        chunker.finish()
+    }
+
+    /// Reads a blob in parts and cuts it into chunks. Holds one part and
+    /// the blob reader ([`crate::store::READER_BYTES`]), not the whole blob.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::store::Blobs::reader`] and [`BlobReader::read_part`].
+    pub fn read(store: &Store, blob: BlobId) -> Result<Self> {
+        let mut reader: BlobReader = store.blobs().reader(blob)?;
+        let mut chunker = Chunker::default();
+        while let Some(part) = reader.read_part(PART_BYTES)? {
+            chunker.push(&part);
         }
-        if bytes > 0 {
-            add(accum1, accum2, bytes);
-        }
-        let mut table: Vec<(u32, u32)> = table.into_iter().collect();
-        table.sort_unstable();
-        Self { table, count }
+        Ok(chunker.finish())
     }
 
     /// The bytes that both files have: for each hash, the fewer bytes of
@@ -99,6 +91,88 @@ impl Chunks {
             j += usize::from(b <= a);
         }
         shared
+    }
+}
+
+/// Cuts a file into [`Chunks`] one part at a time.
+#[derive(Default)]
+struct Chunker {
+    /// For each hash, the bytes of the chunks with that hash.
+    table: HashMap<u32, u32>,
+    count: usize,
+    /// git's two hash accumulators, and the bytes of the chunk so far.
+    accum1: u32,
+    accum2: u32,
+    bytes: u32,
+    /// Whether the file is text, from its first part.
+    is_text: Option<bool>,
+    /// A CR that ended the last part. The next part says whether a newline
+    /// follows it.
+    cr: bool,
+}
+
+impl Chunker {
+    /// The next part of the file. The first part holds the first 8,000
+    /// bytes, or the whole file.
+    fn push(&mut self, part: &[u8]) {
+        let is_text = *self
+            .is_text
+            .get_or_insert_with(|| !part[..part.len().min(8000)].contains(&0));
+        if self.cr {
+            self.cr = false;
+            if part.first() != Some(&b'\n') {
+                self.byte(b'\r');
+            }
+        }
+        for (at, &byte) in part.iter().enumerate() {
+            if is_text && byte == b'\r' {
+                match part.get(at + 1) {
+                    Some(b'\n') => continue,
+                    None => {
+                        self.cr = true;
+                        continue;
+                    }
+                    Some(_) => {}
+                }
+            }
+            self.byte(byte);
+        }
+    }
+
+    fn byte(&mut self, byte: u8) {
+        (self.accum1, self.accum2) = (
+            (self.accum1 << 7) ^ (self.accum2 >> 25),
+            (self.accum2 << 7) ^ (self.accum1 >> 25),
+        );
+        self.accum1 = self.accum1.wrapping_add(u32::from(byte));
+        self.bytes += 1;
+        if self.bytes == 64 || byte == b'\n' {
+            self.end();
+        }
+    }
+
+    /// Ends the chunk so far.
+    fn end(&mut self) {
+        let hash = self.accum1.wrapping_add(self.accum2.wrapping_mul(0x61)) % HASHBASE;
+        *self.table.entry(hash).or_default() += self.bytes;
+        self.count += 1;
+        (self.accum1, self.accum2, self.bytes) = (0, 0, 0);
+    }
+
+    fn finish(mut self) -> Chunks {
+        // A CR at the very end has no newline after it, so it counts.
+        if self.cr {
+            self.byte(b'\r');
+        }
+        if self.bytes > 0 {
+            self.end();
+        }
+        let mut table: Vec<(u32, u32)> = self.table.into_iter().collect();
+        table.sort_unstable();
+        Chunks {
+            table,
+            count: self.count,
+        }
     }
 }
 
@@ -146,7 +220,8 @@ pub struct Budget<'a> {
 /// Similarity is the bytes of the chunks that both files have ([`Chunks`]),
 /// over the size of the larger file. A file less than half the size of the
 /// other (three quarters in step 2) is not compared. `read` reads a regular
-/// file's chunks. When it returns `None`, the file is like no other.
+/// file's chunks, given its path, blob and size. When it returns `None`,
+/// the file is like no other.
 ///
 /// Step 3 reads the added files that some deleted file could be like, in
 /// path order, into one index by chunk hash. Then it reads the deleted
@@ -161,7 +236,7 @@ pub fn renames(
     store: &Store,
     added: &[(&RepoPath, FileState)],
     deleted: &[(&RepoPath, FileState)],
-    read: impl FnMut(&RepoPath, BlobId) -> Result<Option<Chunks>>,
+    read: impl FnMut(&RepoPath, BlobId, usize) -> Result<Option<Chunks>>,
     max_pairs: usize,
     budget: Budget<'_>,
 ) -> Result<Vec<Pair>> {
@@ -212,8 +287,7 @@ fn regular(state: FileState) -> Option<BlobId> {
 }
 
 /// The last part of a path.
-#[must_use]
-pub fn file_name(path: &RepoPath) -> &[u8] {
+fn file_name(path: &RepoPath) -> &[u8] {
     let bytes = path.as_bytes();
     bytes.rsplit(|&b| b == b'/').next().unwrap_or(bytes)
 }
@@ -251,14 +325,14 @@ struct Search<'a, R> {
     pairs: Vec<Pair>,
     /// The size of each file looked at.
     sizes: HashMap<BlobId, usize>,
-    /// The chunks of each added file read, or `None` if `read` refused it.
+    /// The chunks of each added file read, or `None` if it was not read.
     tables: HashMap<BlobId, Option<Chunks>>,
-    /// The scores that step 2 found under 75%, by added and deleted file, so
-    /// step 3 does not compare those files again.
-    known: HashMap<(usize, usize), u32>,
+    /// For each deleted file that step 2 compared and found under 75%: the
+    /// added file and the score, so step 3 does not compare them again.
+    known: HashMap<usize, (usize, u32)>,
 }
 
-impl<R: FnMut(&RepoPath, BlobId) -> Result<Option<Chunks>>> Search<'_, R> {
+impl<R: FnMut(&RepoPath, BlobId, usize) -> Result<Option<Chunks>>> Search<'_, R> {
     fn pair(&mut self, added: usize, deleted: usize, score: u32) {
         (self.taken[added], self.used[deleted]) = (true, true);
         self.pairs.push(Pair {
@@ -329,7 +403,7 @@ impl<R: FnMut(&RepoPath, BlobId) -> Result<Option<Chunks>>> Search<'_, R> {
             if !can_be(from_size, to_size, MIN_NAME_SCORE) || !self.load(self.added[a].0, to)? {
                 continue;
             }
-            let Some(source) = self.read_source(self.deleted[d].0, from)? else {
+            let Some(source) = self.read_file(self.deleted[d].0, from)? else {
                 continue;
             };
             let Some(Some(target)) = self.tables.get(&to) else {
@@ -341,16 +415,32 @@ impl<R: FnMut(&RepoPath, BlobId) -> Result<Option<Chunks>>> Search<'_, R> {
             if value >= MIN_NAME_SCORE {
                 self.pair(a, d, value);
             } else {
-                self.known.insert((a, d), value);
+                self.known.insert(d, (a, value));
             }
         }
         Ok(())
     }
 
+    /// The regular files among `left`, the files of a side at those indexes.
+    fn regular_files(
+        &mut self,
+        files: &[(&RepoPath, FileState)],
+        left: Vec<usize>,
+    ) -> Result<Vec<File>> {
+        let mut regular_files = Vec::new();
+        for at in left {
+            if let Some(blob) = regular(files[at].1) {
+                regular_files.push((at, blob, self.size(blob)?));
+            }
+        }
+        Ok(regular_files)
+    }
+
     /// Whether step 3 compares the added file `to` and the deleted file
     /// `from`: they can be 50% similar, and step 2 did not compare them.
     fn compares(&self, &(a, _, to_size): &File, &(d, _, from_size): &File) -> bool {
-        !self.known.contains_key(&(a, d)) && can_be(from_size, to_size, MIN_SCORE)
+        can_be(from_size, to_size, MIN_SCORE)
+            && self.known.get(&d).is_none_or(|&(known, _)| known != a)
     }
 
     /// Step 3 of [`renames`].
@@ -360,23 +450,16 @@ impl<R: FnMut(&RepoPath, BlobId) -> Result<Option<Chunks>>> Search<'_, R> {
         if count == 0 || count > max_pairs {
             return Ok(());
         }
-        let mut targets = Vec::new();
-        for a in added_left {
-            if let Some(to) = regular(self.added[a].1) {
-                targets.push((a, to, self.size(to)?));
-            }
-        }
-        let mut sources = Vec::new();
-        for d in deleted_left {
-            if let Some(from) = regular(self.deleted[d].1) {
-                sources.push((d, from, self.size(from)?));
-            }
-        }
+        let targets = self.regular_files(self.added, added_left)?;
+        let sources = self.regular_files(self.deleted, deleted_left)?;
         // For each chunk hash, the targets read with it, and their bytes.
         let mut index: HashMap<u32, Vec<(usize, u32)>> = HashMap::new();
+        // Each target's place in `targets`, by its added file.
+        let mut place = vec![None; self.added.len()];
         let mut loaded = vec![false; targets.len()];
         for (t, target) in targets.iter().enumerate() {
             let (a, to, _) = *target;
+            place[a] = Some(t);
             if !sources.iter().any(|source| self.compares(target, source))
                 || !self.load(self.added[a].0, to)?
             {
@@ -397,16 +480,20 @@ impl<R: FnMut(&RepoPath, BlobId) -> Result<Option<Chunks>>> Search<'_, R> {
         for source in &sources {
             let (d, from, from_size) = *source;
             let mut found = Vec::new();
-            for (t, &(a, ..)) in targets.iter().enumerate() {
-                if let Some(&value) = self.known.get(&(a, d)) {
-                    found.push((t, value));
-                }
+            if let Some(&(a, value)) = self.known.get(&d)
+                && let Some(t) = place[a]
+            {
+                found.push((t, value));
             }
-            let wanted: Vec<usize> = (0..targets.len())
-                .filter(|&t| loaded[t] && self.compares(&targets[t], source))
-                .collect();
+            let wanted: Vec<usize> = if self.spent() {
+                Vec::new()
+            } else {
+                (0..targets.len())
+                    .filter(|&t| loaded[t] && self.compares(&targets[t], source))
+                    .collect()
+            };
             if !wanted.is_empty()
-                && let Some(chunks) = self.read_source(self.deleted[d].0, from)?
+                && let Some(chunks) = self.read_file(self.deleted[d].0, from)?
             {
                 shared.fill(0);
                 let mut rows = chunks.table.len();
@@ -466,29 +553,56 @@ impl<R: FnMut(&RepoPath, BlobId) -> Result<Option<Chunks>>> Search<'_, R> {
         *self.budget.cost >= self.budget.cap
     }
 
+    /// Reads the chunks of the file at `path`, unless the budget is spent
+    /// or `read` refuses it.
+    fn read_file(&mut self, path: &RepoPath, blob: BlobId) -> Result<Option<Chunks>> {
+        if self.spent() {
+            return Ok(None);
+        }
+        let size = self.size(blob)?;
+        let chunks = (self.read)(path, blob, size)?;
+        *self.budget.cost += chunks.as_ref().map_or(0, |chunks| chunks.count);
+        Ok(chunks)
+    }
+
     /// Reads the added file at `path` into `tables`, once. Whether its
-    /// chunks are there: not if the budget was spent first, or `read`
-    /// refused it.
+    /// chunks are there.
     fn load(&mut self, path: &RepoPath, blob: BlobId) -> Result<bool> {
         if !self.tables.contains_key(&blob) {
-            if self.spent() {
-                return Ok(false);
-            }
-            let chunks = (self.read)(path, blob)?;
-            *self.budget.cost += chunks.as_ref().map_or(0, |chunks| chunks.count);
+            let chunks = self.read_file(path, blob)?;
             self.tables.insert(blob, chunks);
         }
         Ok(matches!(self.tables.get(&blob), Some(Some(_))))
     }
+}
 
-    /// Reads the deleted file at `path`, unless the budget is spent or
-    /// `read` refuses it.
-    fn read_source(&mut self, path: &RepoPath, blob: BlobId) -> Result<Option<Chunks>> {
-        if self.spent() {
-            return Ok(None);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file cut in two parts anywhere after its first 8,000 bytes has
+    /// the same chunks as when it comes whole, also where a part ends
+    /// between a CR and its newline, or in a CR with no newline.
+    #[test]
+    fn chunks_do_not_depend_on_where_parts_end() {
+        let mut text: Vec<u8> = (0..900)
+            .flat_map(|n| format!("line {n:04}\r\n").into_bytes())
+            .collect();
+        text.extend_from_slice(b"a lone CR\r here\r");
+        let whole = Chunks::of(&text);
+        for at in 8000..=text.len() {
+            let mut chunker = Chunker::default();
+            chunker.push(&text[..at]);
+            chunker.push(&text[at..]);
+            let parts = chunker.finish();
+            assert_eq!(
+                (&parts.table, parts.count),
+                (&whole.table, whole.count),
+                "{at}"
+            );
         }
-        let chunks = (self.read)(path, blob)?;
-        *self.budget.cost += chunks.as_ref().map_or(0, |chunks| chunks.count);
-        Ok(chunks)
+        // Without CRs that do not count, every byte is in some chunk.
+        let counted: u32 = whole.table.iter().map(|&(_, bytes)| bytes).sum();
+        assert_eq!(counted as usize, text.len() - 900);
     }
 }

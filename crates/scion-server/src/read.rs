@@ -402,7 +402,7 @@ fn renames(store: &Store, entries: &[DiffEntry]) -> Result<HashMap<RepoPath, Ren
     added.sort_unstable_by_key(|&(path, _)| path);
     deleted.sort_unstable_by_key(|&(path, _)| path);
     let mut cost = 0;
-    let read = |_: &RepoPath, blob| Ok(Some(Chunks::of(&store.blobs().get(blob)?)));
+    let read = |_: &RepoPath, blob, _| Ok(Some(Chunks::read(store, blob)?));
     let budget = Budget {
         cost: &mut cost,
         cap: MAX_RENAME_CHUNKS,
@@ -418,20 +418,16 @@ fn renames(store: &Store, entries: &[DiffEntry]) -> Result<HashMap<RepoPath, Ren
     for pair in pairs {
         let (to, from) = (added[pair.added].0, deleted[pair.deleted].0);
         let similarity = pair.score * 100 / similar::SAME;
-        renames.insert(
-            to.clone(),
-            Rename {
-                path: from.clone(),
-                similarity,
-            },
-        );
-        renames.insert(
-            from.clone(),
-            Rename {
-                path: to.clone(),
-                similarity,
-            },
-        );
+        for (path, other) in [(to, from), (from, to)] {
+            let other = other.clone();
+            renames.insert(
+                path.clone(),
+                Rename {
+                    path: other,
+                    similarity,
+                },
+            );
+        }
     }
     Ok(renames)
 }

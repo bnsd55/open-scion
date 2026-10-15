@@ -349,11 +349,10 @@ fn renamed_from(
     // The bytes of deleted files read, and the cost of files read and
     // refused for their lines.
     let (mut bytes, mut refused) = (0, 0);
-    let read = |other: &RepoPath, other_blob: BlobId| {
+    let read = |other: &RepoPath, other_blob: BlobId, size: usize| {
         if other_blob == blob {
             return Ok(Some(Chunks::of(text)));
         }
-        let size = store.blobs().size(other_blob)?;
         if bytes > MAX_RENAME_BYTES || size > MAX_BLAME_BYTES {
             return Ok(None);
         }
@@ -372,16 +371,11 @@ fn renamed_from(
     let Some(pair) = found.first() else {
         return Ok(None);
     };
+    // A regular file pairs only with a regular file.
     let (other, state) = deleted[pair.deleted];
-    let FileState::Regular {
-        content: other_blob,
-        ..
-    } = state
-    else {
-        return Err(Error::Corrupt(format!(
-            "rename source {other:?} is not a regular file"
-        )));
-    };
+    let other_blob = state
+        .blob()
+        .ok_or_else(|| Error::Corrupt(format!("rename source {other:?} has no blob")))?;
     if other_blob == blob {
         return Ok(Some((other.clone(), blob, None)));
     }

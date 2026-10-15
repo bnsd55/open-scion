@@ -309,6 +309,36 @@ fn assert_diff_json(server: &Server, root: &str, m1: &str) {
     assert!(!by_path.contains_key("moved.txt"));
 }
 
+/// Stores a changeset with `base`, then a child with `changes`, in a new repo.
+fn two_changesets(
+    store: &Store,
+    base: BTreeMap<RepoPath, Option<FileState>>,
+    changes: BTreeMap<RepoPath, Option<FileState>>,
+) -> (ChangesetId, ChangesetId) {
+    store
+        .write(|c| {
+            let repo = db::create_repo(c, REPO)?;
+            let mut parents = Vec::new();
+            for changes in [base, changes] {
+                let cs = Changeset {
+                    parents: parents.last().copied().into_iter().collect(),
+                    author: IdentityTime {
+                        name: b"Ada".to_vec(),
+                        email: b"ada@example.com".to_vec(),
+                        unix_secs: 1_700_000_000,
+                        tz_offset_minutes: 0,
+                    },
+                    committer: None,
+                    message: b"change".to_vec(),
+                    changes,
+                };
+                parents.push(tree::store_changeset(c, repo, &cs)?.0);
+            }
+            Ok((parents[0], parents[1]))
+        })
+        .unwrap()
+}
+
 #[test]
 fn diff_continues_past_one_reply() {
     let data = tempfile::tempdir().unwrap();
@@ -331,28 +361,7 @@ fn diff_continues_past_one_reply() {
         let path = RepoPath::new(format!("d{}/f{n:05}", n % 7)).unwrap();
         changes.insert(path, Some(state));
     }
-    let (old, new) = store
-        .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
-            let mut parents = Vec::new();
-            for changes in [BTreeMap::new(), changes.clone()] {
-                let cs = Changeset {
-                    parents: parents.last().copied().into_iter().collect(),
-                    author: IdentityTime {
-                        name: b"Ada".to_vec(),
-                        email: b"ada@example.com".to_vec(),
-                        unix_secs: 1_700_000_000,
-                        tz_offset_minutes: 0,
-                    },
-                    committer: None,
-                    message: b"change".to_vec(),
-                    changes,
-                };
-                parents.push(tree::store_changeset(c, repo, &cs)?.0);
-            }
-            Ok((parents[0], parents[1]))
-        })
-        .unwrap();
+    let (old, new) = two_changesets(&store, BTreeMap::new(), changes.clone());
     let server = Server::start(data, store);
 
     // The paths have two parts of plain names, so tree order is path order.
@@ -404,28 +413,7 @@ fn diff_prints_a_rename_split_across_replies() {
     for n in 0..MAX_DIFF_ENTRIES {
         change.insert(RepoPath::new(format!("d/f{n:05}")).unwrap(), state(n));
     }
-    let (old, new) = store
-        .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
-            let mut parents = Vec::new();
-            for changes in [base, change] {
-                let cs = Changeset {
-                    parents: parents.last().copied().into_iter().collect(),
-                    author: IdentityTime {
-                        name: b"Ada".to_vec(),
-                        email: b"ada@example.com".to_vec(),
-                        unix_secs: 1_700_000_000,
-                        tz_offset_minutes: 0,
-                    },
-                    committer: None,
-                    message: b"change".to_vec(),
-                    changes,
-                };
-                parents.push(tree::store_changeset(c, repo, &cs)?.0);
-            }
-            Ok((parents[0], parents[1]))
-        })
-        .unwrap();
+    let (old, new) = two_changesets(&store, base, change);
     let server = Server::start(data, store);
     let (old, new) = (old.to_string(), new.to_string());
 
