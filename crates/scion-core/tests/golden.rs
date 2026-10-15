@@ -172,10 +172,12 @@ fn blob_ids() {
     );
     let streamed = BlobId::of_reader(&b"# demo\n"[..]).unwrap();
     assert_eq!(streamed, BlobId::of(b"# demo\n"));
-    let mut parts = BlobHasher::new();
+    let mut parts = BlobHasher::default();
     parts.update(b"# de");
+    parts.update(b"");
     parts.update(b"mo\n");
-    assert_eq!(parts.finish(), BlobId::of(b"# demo\n"));
+    assert_eq!(parts.finalize(), BlobId::of(b"# demo\n"));
+    assert_eq!(BlobHasher::default().finalize(), BlobId::of(b""));
 }
 
 #[test]

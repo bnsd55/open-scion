@@ -5,7 +5,7 @@
 //! <data>/lock                      locked by the one process that uses <data>
 //! <data>/scion.db                  metadata and trees (see migrations/)
 //! <data>/objects/blob/ab/cd..      one zstd file per blob, named by ID
-//! <data>/tmp/                      staging for atomic blob writes
+//! <data>/tmp/                      staging for atomic blob writes and uploads
 //! ```
 
 use std::collections::BTreeSet;
@@ -22,20 +22,19 @@ use scion_core::{BlobHasher, BlobId};
 
 use crate::error::{Error, Result};
 
-const SCHEMA_VERSION: u32 = 2;
+/// The schema version this build makes and reads.
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database from
 /// version `n - 1` to version `n`. A released migration never changes.
 const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_land_retention.sql"),
+    include_str!("../migrations/0003_derived_values.sql"),
 ];
 
 /// Largest object accepted or read back, uncompressed: 100 MiB, the hard
 /// per-file limit on GitHub, so any file from a GitHub repository fits.
-// SHORTCUT: an upload is buffered in memory up to this size before it is
-// hashed and written, so each concurrent upload can hold 100 MiB. Upgrade:
-// stream uploads to a temp file and hash the chunks as they arrive.
 pub const MAX_OBJECT_BYTES: usize = 100 << 20;
 
 /// Largest zstd window that a [`BlobReader`] accepts, as a power of two: 2 MiB,
@@ -103,7 +102,7 @@ impl Store {
         )?;
         // Enough for every hot statement, so none is prepared twice.
         db.set_prepared_statement_cache_capacity(64);
-        migrate(&db)?;
+        migrate(&db, SCHEMA_VERSION)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 db: Mutex::new(db),
@@ -234,7 +233,9 @@ fn lock_dir(dir: &Path) -> Result<fs::File> {
     }
 }
 
-fn migrate(db: &Connection) -> Result<()> {
+/// Runs the migrations from the database's version up to `target`. Only
+/// tests stop below [`SCHEMA_VERSION`], to make an older database.
+pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
     let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(Error::Corrupt(format!(
@@ -242,7 +243,7 @@ fn migrate(db: &Connection) -> Result<()> {
         )));
     }
     // Each migration runs in its own transaction, with the version it sets.
-    for (to, sql) in (1..=SCHEMA_VERSION).zip(MIGRATIONS).skip(version as usize) {
+    for (to, sql) in (1..=target).zip(MIGRATIONS).skip(version as usize) {
         db.execute_batch(&format!("BEGIN; {sql} PRAGMA user_version = {to}; COMMIT;"))?;
     }
     Ok(())
@@ -281,6 +282,17 @@ impl Blobs {
         for path in [&root, &objects, &tmp, dir] {
             fsync_dir(path)?;
         }
+        // A crash can leave the temp file of a blob write that was never
+        // renamed. No blob name points at it, and the data directory lock
+        // keeps out every other writer, so it can go.
+        let mut removed = 0;
+        for entry in fs::read_dir(&tmp)? {
+            fs::remove_file(entry?.path())?;
+            removed += 1;
+        }
+        if removed > 0 {
+            tracing::info!(removed, "removed temp files that a crash left behind");
+        }
         Ok(Self {
             root,
             tmp,
@@ -306,6 +318,41 @@ impl Blobs {
     pub fn put(&self, raw: &[u8]) -> Result<BlobId> {
         let mut batch = self.batch();
         let id = batch.put(raw)?;
+        batch.sync()?;
+        Ok(id)
+    }
+
+    /// Starts an upload: content that arrives in parts.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the spool file cannot be made.
+    pub fn upload(&self) -> Result<Upload> {
+        Ok(Upload {
+            spool: tempfile::tempfile_in(&self.tmp)?,
+            hasher: BlobHasher::default(),
+            len: 0,
+        })
+    }
+
+    /// Stores a finished upload durably, like [`Blobs::put`]. The content
+    /// streams from the spool file through the compressor, so it is never all
+    /// in memory. Safe to repeat.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a read or write fails.
+    pub fn put_upload(&self, upload: Upload) -> Result<BlobId> {
+        let Upload {
+            mut spool,
+            hasher,
+            len,
+        } = upload;
+        let id = hasher.finalize();
+        spool.rewind()?;
+        let read_bytes = zstd::zstd_safe::CCtx::in_size();
+        let mut batch = self.batch();
+        batch.write(id, len, io::BufReader::with_capacity(read_bytes, spool))?;
         batch.sync()?;
         Ok(id)
     }
@@ -370,7 +417,7 @@ impl Blobs {
             id,
             left: size,
             unpacked: None,
-            hasher: BlobHasher::new(),
+            hasher: BlobHasher::default(),
         };
         // As in `verify`: an empty file holds no zstd frame.
         if file.metadata()?.len() == 0 {
@@ -547,7 +594,7 @@ impl BlobReader {
                 Err(e) => return Err(unpack_error(id, &unpacked, e)),
             }
         }
-        if self.hasher.finish() != id {
+        if self.hasher.finalize() != id {
             return Err(corrupt("content does not match the ID"));
         }
         Ok(())
@@ -579,6 +626,41 @@ impl<R: Read> Read for Watched<R> {
     }
 }
 
+/// A blob that arrives in parts. Each part goes to a spool file in `tmp/` and
+/// into the hasher, so an upload holds no more than one part in memory. The
+/// spool file holds raw bytes: the zstd frame header needs the size before
+/// the first compressed byte, and the size is known only at the end. The
+/// spool file has no name, so a dropped upload, or a crash, leaves nothing
+/// behind. Store it with [`Blobs::put_upload`].
+pub struct Upload {
+    /// The raw content so far.
+    spool: fs::File,
+    hasher: BlobHasher,
+    len: usize,
+}
+
+impl Upload {
+    /// Adds the next part of the content. On an error the upload is dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] if the content gets larger than
+    /// [`MAX_OBJECT_BYTES`], [`Error::Io`] if the write fails.
+    pub fn append(mut self, part: &[u8]) -> Result<Self> {
+        if part.len() > MAX_OBJECT_BYTES - self.len {
+            return Err(too_large());
+        }
+        self.spool.write_all(part)?;
+        self.hasher.update(part);
+        self.len += part.len();
+        Ok(self)
+    }
+}
+
+fn too_large() -> Error {
+    Error::InvalidArgument(format!("blob is larger than {MAX_OBJECT_BYTES} bytes"))
+}
+
 /// Blobs written but not yet durable. Call [`BlobBatch::sync`] before
 /// committing any metadata that names them.
 ///
@@ -604,28 +686,34 @@ impl BlobBatch<'_> {
     /// write fails.
     pub fn put(&mut self, raw: &[u8]) -> Result<BlobId> {
         if raw.len() > MAX_OBJECT_BYTES {
-            return Err(Error::InvalidArgument(format!(
-                "blob is larger than {MAX_OBJECT_BYTES} bytes"
-            )));
+            return Err(too_large());
         }
         let id = BlobId::of(raw);
+        self.write(id, raw.len(), raw)?;
+        Ok(id)
+    }
+
+    /// Writes blob `id`, whose `len` bytes `raw` gives, unless the stored file
+    /// is intact. A file that is not intact is replaced.
+    fn write(&mut self, id: BlobId, len: usize, raw: impl Read) -> Result<()> {
         match self.keep(id)? {
-            BlobStatus::Valid => return Ok(id),
+            BlobStatus::Valid => return Ok(()),
             // The rename below replaces it in one step.
             BlobStatus::Corrupt => tracing::warn!(blob = %id, "rewriting a corrupt blob file"),
             BlobStatus::Missing => {}
         }
         let (dir, path) = self.blobs.location(id);
-        let compressed = zstd::bulk::compress(raw, 3)?;
         // Write a temp file and flush it before the rename, so the name never
-        // points at data that is not on the drive.
+        // points at data that is not on the drive. The frame header holds the
+        // size, for `Blobs::size`. Compression fails if `raw` does not give
+        // exactly `len` bytes.
         let mut tmp = tempfile::NamedTempFile::new_in(&self.blobs.tmp)?;
-        tmp.write_all(&compressed)?;
+        zstd::stream::compress_sized_into(raw, &mut tmp, 3, len as u64)?;
         fsync(tmp.as_file())?;
         fs::create_dir_all(&dir)?;
         tmp.persist(&path).map_err(|e| e.error)?;
         self.dirs.insert(dir);
-        Ok(id)
+        Ok(())
     }
 
     /// Checks a stored blob and, if it is intact, keeps it: `sync` makes it
@@ -973,6 +1061,130 @@ mod tests {
         assert!(matches!(blobs.verify(id), Err(Error::Io(_))));
         assert!(matches!(status_by_get(&blobs, id), Err(Error::Io(_))));
         assert!(matches!(status_by_reader(&blobs, id), Err(Error::Io(_))));
+    }
+
+    /// Entries in the temp directory.
+    fn staged(blobs: &Blobs) -> usize {
+        fs::read_dir(&blobs.tmp).unwrap().count()
+    }
+
+    /// Blob files in the blob folder.
+    fn stored(blobs: &Blobs) -> usize {
+        fs::read_dir(&blobs.root)
+            .unwrap()
+            .map(|dir| fs::read_dir(dir.unwrap().path()).unwrap().count())
+            .sum()
+    }
+
+    /// An upload of `parts`, in order.
+    fn fill<'a>(blobs: &Blobs, parts: impl IntoIterator<Item = &'a [u8]>) -> Result<Upload> {
+        parts.into_iter().try_fold(blobs.upload()?, Upload::append)
+    }
+
+    #[test]
+    fn an_upload_stores_the_blob_of_all_its_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        let cases: [&[&[u8]]; 4] = [&[], &[b""], &[b"a", b"", b"bc"], &[b"abc"]];
+        for parts in cases {
+            let content = parts.concat();
+            let id = blobs
+                .put_upload(fill(&blobs, parts.iter().copied()).unwrap())
+                .unwrap();
+            assert_eq!(id, BlobId::of(&content), "{parts:?}");
+            assert_eq!(blobs.get(id).unwrap(), content, "{parts:?}");
+            assert_eq!(blobs.size(id).unwrap(), content.len(), "{parts:?}");
+        }
+        // `b"abc"` in one part or three is one blob.
+        assert_eq!(stored(&blobs), 2);
+        assert_eq!(staged(&blobs), 0);
+    }
+
+    #[test]
+    fn an_upload_keeps_its_parts_on_disk_not_in_memory() {
+        const PART: usize = 1 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        // A period (251) that does not divide the part size, so parts stored
+        // in the wrong order give other bytes.
+        let content: Vec<u8> = (0..251_u8).cycle().take(3 * PART + 7).collect();
+        let mut upload = blobs.upload().unwrap();
+        let mut sent = 0;
+        for part in content.chunks(PART) {
+            upload = upload.append(part).unwrap();
+            sent += part.len();
+            assert_eq!(upload.spool.metadata().unwrap().len(), sent as u64);
+        }
+        let id = blobs.put_upload(upload).unwrap();
+        assert_eq!(id, BlobId::of(&content));
+        assert!(blobs.get(id).unwrap() == content, "content differs");
+        assert_eq!(blobs.size(id).unwrap(), content.len());
+    }
+
+    #[test]
+    fn one_byte_over_the_limit_fails_an_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        // As if all but one byte of the limit had arrived.
+        let mut upload = blobs.upload().unwrap();
+        upload.len = MAX_OBJECT_BYTES - 1;
+        let at_limit = upload.append(b"x").unwrap();
+        match at_limit.append(b"y").err() {
+            Some(Error::InvalidArgument(why)) => assert!(why.contains("larger than"), "{why}"),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        assert_eq!(staged(&blobs), 0);
+    }
+
+    #[test]
+    fn a_crash_before_the_rename_leaves_no_blob_and_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let content = b"never stored";
+        let id = BlobId::of(content);
+        // A crash during an upload: no destructor runs.
+        std::mem::forget(store.blobs().upload().unwrap().append(content).unwrap());
+        // A crash after the compressed file is written, before its rename.
+        let mut torn = tempfile::NamedTempFile::new_in(&store.blobs().tmp).unwrap();
+        torn.write_all(&zstd::bulk::compress(content, 3).unwrap())
+            .unwrap();
+        torn.keep().unwrap();
+        assert_eq!(staged(store.blobs()), 1, "the spool file has no name");
+        drop(store);
+
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.blobs().verify(id).unwrap(), BlobStatus::Missing);
+        assert_eq!(staged(store.blobs()), 0, "open removes what a crash left");
+    }
+
+    #[test]
+    fn concurrent_uploads_of_one_blob_leave_one_file() {
+        const UPLOADERS: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        let content: Vec<u8> = (0..251_u8).cycle().take(3 << 20).collect();
+        let ready = Barrier::new(UPLOADERS);
+        let ids: Vec<BlobId> = thread::scope(|s| {
+            let uploaders: Vec<_> = (0..UPLOADERS)
+                .map(|_| {
+                    s.spawn(|| {
+                        let upload = fill(&blobs, content.chunks(1 << 20))?;
+                        // All store at once, so their writes overlap.
+                        ready.wait();
+                        blobs.put_upload(upload)
+                    })
+                })
+                .collect();
+            uploaders
+                .into_iter()
+                .map(|u| u.join().unwrap().unwrap())
+                .collect()
+        });
+        let id = BlobId::of(&content);
+        assert!(ids.iter().all(|got| *got == id), "{ids:?}");
+        assert_eq!(blobs.verify(id).unwrap(), BlobStatus::Valid);
+        assert_eq!(stored(&blobs), 1);
+        assert_eq!(staged(&blobs), 0);
     }
 
     #[test]

@@ -126,12 +126,8 @@ A successful reply never shows state that a power loss can undo:
   the state of the land.
 - A read that saw a commit replies only after that commit is on disk. This is
   true for an error reply too, for example `NOT_FOUND` after a read.
-
-One exception: derived data that a read computes MAY be returned before it is
-on disk, because the server computes the same value again. Today this is a
-root tree that the server derives during a read because no stored value
-exists. After a power loss, `GetObjects` can then return `NOT_FOUND` for that
-tree until a `GetRootTree` of its changeset derives it again.
+- A read that computes and stores derived data, such as a root tree that has
+  no stored value yet, replies after that data is on disk.
 
 A call that fails or is cut off MAY have done part of its work. In particular
 a `Land` that returned `ABORTED`, `CANCELLED` or `DEADLINE_EXCEEDED`, or whose

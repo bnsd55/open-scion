@@ -117,37 +117,30 @@ impl BlobId {
     ///
     /// Returns the first error of `reader`.
     pub fn of_reader(reader: impl io::Read) -> io::Result<Self> {
-        let mut hasher = BlobHasher::new();
+        let mut hasher = BlobHasher::default();
         hasher.0.update_reader(reader)?;
-        Ok(hasher.finish())
+        Ok(hasher.finalize())
     }
 }
 
-/// The [`BlobId`] of content that arrives in parts.
-#[derive(Clone)]
+/// Computes a [`BlobId`] from content that arrives in parts.
 pub struct BlobHasher(blake3::Hasher);
 
-impl BlobHasher {
-    /// A hasher that has seen no content.
-    #[must_use]
-    pub fn new() -> Self {
+impl Default for BlobHasher {
+    fn default() -> Self {
         Self(domain_hasher(BLOB_DOMAIN))
     }
+}
 
+impl BlobHasher {
     /// Adds the next part of the content.
     pub fn update(&mut self, part: &[u8]) {
         self.0.update(part);
     }
 
-    /// The ID of the content added so far.
+    /// The ID of all the parts so far, in order.
     #[must_use]
-    pub fn finish(&self) -> BlobId {
+    pub fn finalize(&self) -> BlobId {
         BlobId(*self.0.finalize().as_bytes())
-    }
-}
-
-impl Default for BlobHasher {
-    fn default() -> Self {
-        Self::new()
     }
 }
