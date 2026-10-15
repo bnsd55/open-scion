@@ -139,7 +139,9 @@ Each tier keeps what it fetched, so a second checkout on the machine sends
 nothing past the daemon. The tiers serve only checkouts; the other `scn`
 commands talk to the server. The daemon's data directory must be private to
 your user (mode 0700, not a shared path such as `/tmp`), because its socket
-lives there.
+lives there. Each directory above it must be owned by root or by you, and
+must not be writable by group or others unless it has the sticky bit (as
+`/tmp` has).
 
 ```sh
 export SCION_UPSTREAM_TOKEN=dev                  # what each tier sends upstream

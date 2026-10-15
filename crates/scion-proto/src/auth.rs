@@ -103,8 +103,8 @@ pub fn check_ancestors(path: &Path, me: u32) -> io::Result<PathBuf> {
     } else {
         parent
     };
-    // The resolved directory has no symlink, and each directory on it is
-    // checked, so none can change under another user's hand.
+    // The resolved directory has no symlink. Each directory on it is checked,
+    // so no other user can change it after the check.
     let parent = fs::canonicalize(parent)?;
     for dir in parent.ancestors() {
         let meta = fs::symlink_metadata(dir)?;

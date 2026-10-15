@@ -666,9 +666,14 @@ order is daemon, cache, server. These rules hold for any tier:
 **The daemon's socket.** `scion-daemon` listens on a Unix socket with mode
 0600, in a directory that only its user can reach. A client sends its token
 to the socket, so it SHOULD check first that the socket file is a socket
-(not a symlink) owned by its own user or by root. `scn` does, for every
-`unix://` address. Neither `scn` nor the daemon checks the directories above
-the socket yet ([#70](https://github.com/bnsd55/open-scion/issues/70)).
+(not a symlink) owned by its own user or by root. It SHOULD also check each
+directory above the socket, up to `/`: owned by root or by its own user,
+and not writable by group or others unless it has the sticky bit. Else
+another user could swap the socket after the check. It SHOULD resolve the
+socket's directory before this check and connect to the resolved path, so
+that it follows no symlink after the check. `scn` does all of this, for
+every `unix://` address. The daemon checks the directories above its socket
+and its data directory in the same way.
 
 Tiers are trusted in v0.1. A client cannot check a `ResolveRef` or
 `GetRootTree` answer by hash, so it trusts every tier on its path for them.

@@ -84,7 +84,11 @@ release.
   against its ID before it stores or sends it, forwards `ResolveRef`, keeps
   `GetRootTree` answers, fetches a shared miss once, and needs a token.
 - `scn` reaches a daemon with `--server unix:///PATH`. It first refuses a
-  path that is not a socket owned by its user or by root.
+  path that is not a socket owned by its user or by root. `scn` and the
+  daemon also refuse a socket or data directory under a directory that
+  another user can change: each directory up to `/` must be owned by root
+  or by their user, and not writable by group or others unless it has the
+  sticky bit.
 - A `GetObjects` reply never ends `OK` with no object. If the server or a
   tier has no memory for the first object within 120 s, the call fails
   with `RESOURCE_EXHAUSTED`.
