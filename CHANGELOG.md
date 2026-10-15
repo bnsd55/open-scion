@@ -40,8 +40,10 @@ release.
   rename onto a new empty directory that claims its name. Where it has no
   hard links either (some FUSE filesystems), each top-level file is copied
   to a new name made with `O_EXCL`, and each symlink is made again. On NFS
-  version 3, a lost reply does not fail the checkout. This is tested by
-  forcing it, not on a real NFS mount.
+  version 3, a lost reply while the checkout moves into place does not fail
+  it. A lost reply while it is written still fails it, and the destination
+  stays as it was (#106). This is tested by forcing it, not on a real NFS
+  mount.
 - Path history and blame on first-parent history: `Log` takes an optional
   path and says where to continue, and a new `Blame` RPC gives each line's
   last changeset. `scn log --path` and `scn blame`. Each call has a bound,

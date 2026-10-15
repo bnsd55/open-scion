@@ -222,6 +222,9 @@ pub struct Checkout {
     /// links.
     #[cfg(test)]
     no_links: bool,
+    /// Makes the checkout take entries of this user ID for its own.
+    #[cfg(test)]
+    uid: Option<u32>,
 }
 
 /// How a test makes a checkout act as on NFS. In each case, the rename that
@@ -327,6 +330,8 @@ impl Checkout {
             nfs: None,
             #[cfg(test)]
             no_links: false,
+            #[cfg(test)]
+            uid: None,
         })
     }
 
@@ -393,8 +398,14 @@ impl Checkout {
         rustix::fs::fchmod(&self.root, mode)
             .map_err(io::Error::from)
             .with_context(|| format!("cannot set the mode of {shown}"))?;
-        match rustix::fs::renameat(&self.base, &self.temp, &self.base, name) {
+        // On NFS version 3, a rename sent again after a lost reply fails with
+        // ENOENT. It worked if `name` now has the temp directory's inode.
+        let moved = || rustix::fs::fstat(&self.root).is_ok_and(|temp| self.has_inode(name, &temp));
+        match self.step(false, Some(Errno::NOENT), || {
+            rustix::fs::renameat(&self.base, &self.temp, &self.base, name)
+        }) {
             Ok(()) => Ok(()),
+            Err(Errno::NOENT) if moved() => Ok(()),
             Err(Errno::NOTEMPTY | Errno::EXIST) => bail!("{shown} is not empty"),
             Err(Errno::NOTDIR) => bail!("{shown} is a symlink or not a directory"),
             Err(e) => Err(io::Error::from(e))
@@ -447,9 +458,15 @@ impl Checkout {
         if now != self.moved {
             bail!("{shown} is no longer empty");
         }
-        rustix::fs::unlinkat(&self.base, self.temp.as_slice(), AtFlags::REMOVEDIR)
-            .map_err(io::Error::from)
-            .with_context(|| format!("cannot remove the temp directory in {shown}"))
+        match self.step(false, Some(Errno::NOENT), || {
+            rustix::fs::unlinkat(&self.base, self.temp.as_slice(), AtFlags::REMOVEDIR)
+        }) {
+            // Gone already: its reply was lost. Failing here would make the
+            // drop remove the finished checkout.
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(e) => Err(io::Error::from(e))
+                .with_context(|| format!("cannot remove the temp directory in {shown}")),
+        }
     }
 
     /// Moves `name` up from the temp directory by a rename that never
@@ -487,9 +504,10 @@ impl Checkout {
         let entry = rustix::fs::statat(&self.root, name, AtFlags::SYMLINK_NOFOLLOW)?;
         let moved = |result: rustix::io::Result<()>| {
             result.or_else(|e| {
-                match rustix::fs::statat(&self.base, name, AtFlags::SYMLINK_NOFOLLOW) {
-                    Ok(now) if (now.st_dev, now.st_ino) == (entry.st_dev, entry.st_ino) => Ok(()),
-                    _ => Err(e),
+                if self.has_inode(name, &entry) {
+                    Ok(())
+                } else {
+                    Err(e)
                 }
             })
         };
@@ -583,23 +601,42 @@ impl Checkout {
         };
         // Without the setgid bit, which the destination can pass on.
         rustix::fs::fstat(&dir).is_ok_and(|stat| {
-            is_mine(&stat) && Mode::from_raw_mode(stat.st_mode & 0o777) == CLAIM_MODE
+            self.owns(&stat) && Mode::from_raw_mode(stat.st_mode & 0o777) == CLAIM_MODE
         }) && entries(&dir).is_ok_and(|names| names.is_empty())
+    }
+
+    /// Whether `name` in the destination is the inode that `of` describes:
+    /// after an error, whether the call that NFS sent again had worked.
+    fn has_inode(&self, name: &[u8], of: &Stat) -> bool {
+        rustix::fs::statat(&self.base, name, AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|now| (now.st_dev, now.st_ino) == (of.st_dev, of.st_ino))
+    }
+
+    /// [`is_mine`], as the checkout sees it. Tests can make it run as
+    /// another user.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn owns(&self, stat: &Stat) -> bool {
+        #[cfg(test)]
+        if let Some(uid) = self.uid {
+            return stat.st_uid == uid;
+        }
+        is_mine(stat)
     }
 
     /// Whether `name` in the destination is a symlink to `target` that this
     /// user owns. As [`Checkout::is_claim`], for `symlinkat`.
     fn is_my_symlink(&self, name: &[u8], target: &CStr) -> bool {
         rustix::fs::statat(&self.base, name, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|stat| {
-            FileType::from_raw_mode(stat.st_mode) == FileType::Symlink && is_mine(&stat)
+            FileType::from_raw_mode(stat.st_mode) == FileType::Symlink && self.owns(&stat)
         }) && rustix::fs::readlinkat(&self.base, name, Vec::new())
             .is_ok_and(|now| now.as_c_str() == target)
     }
 
-    /// Runs `call`, one step of [`Checkout::move_up_without_rename`]. `again`
-    /// is the error that the call gives when NFS sends it again after it
-    /// worked, or `None` if it gives none. Tests make a step `after_claim`
-    /// fail, or lose each reply.
+    /// Runs `call`, one call that moves the checkout into place. `again` is
+    /// the error that the call gives when NFS sends it again after it
+    /// worked, or `None` if it gives none. Tests make a step of
+    /// [`Checkout::move_up_without_rename`] `after_claim` fail, or lose each
+    /// reply.
     #[cfg_attr(not(test), allow(unused_variables, clippy::unused_self))]
     fn step(
         &self,
@@ -805,6 +842,10 @@ pub fn is_within(path: &[u8], dir: &[u8]) -> bool {
 /// Maps "already exists" to a folding collision. The temp directory starts
 /// empty and every path this checkout makes is recorded, so a path that
 /// already exists without being recorded is another name folded into it.
+// SHORTCUT: on NFS version 3, a `mkdirat` or `symlinkat` sent again after a
+// lost reply fails with EEXIST, and reads as a collision here. The checkout
+// fails safe, and leaves its temp directory. Upgrade (issue #106): an exact
+// name that is not recorded, with what the call makes, is the call's own.
 fn collision_if_exists(e: Errno, path: &[u8]) -> io::Error {
     if e == Errno::EXIST {
         io::Error::other(format!(
@@ -1110,6 +1151,41 @@ mod tests {
                 assert_eq!(names(&dest), Vec::<String>::new(), "{case}");
             }
         }
+    }
+
+    #[test]
+    fn a_lost_reply_never_takes_the_entry_of_another_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The claim of `a`, and the symlink `s` without hard links, are
+        // made, but their replies are lost. The checkout runs as another
+        // user, so what it finds is not its own.
+        for (first, no_links) in [("a/x", false), ("s", true)] {
+            let dest = tmp.path().join(first.replace('/', "-"));
+            fs::create_dir(&dest).unwrap();
+            let mut checkout = start(&dest, Some(Nfs::ReplyLost), no_links).unwrap();
+            if first == "s" {
+                checkout.symlink(&path(first), b"ours").unwrap();
+            } else {
+                checkout.file(&path(first), false, b"ours\n").unwrap();
+            }
+            checkout.uid = Some(rustix::process::geteuid().as_raw() + 1);
+            let err = checkout.finish().unwrap_err();
+            assert!(
+                format!("{err:#}").contains("no longer empty"),
+                "{first}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_destination_is_made_when_replies_are_lost() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let mut checkout = start(&dest, Some(Nfs::ReplyLost), false).unwrap();
+        checkout.file(&path("a/b"), false, b"b\n").unwrap();
+        checkout.finish().unwrap();
+        assert_eq!(fs::read(dest.join("a/b")).unwrap(), b"b\n");
+        assert_eq!(temp_dirs(tmp.path()), Vec::<String>::new());
     }
 
     #[test]
