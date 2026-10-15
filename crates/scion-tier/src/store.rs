@@ -324,8 +324,7 @@ fn ignore_missing(result: io::Result<()>) -> io::Result<()> {
 }
 
 /// Takes an exclusive lock on `<dir>/lock` without waiting. The lock lasts as
-/// long as the returned file is open. The server locks its data directory
-/// the same way (`scion-server/src/store.rs`).
+/// long as the returned file is open.
 fn lock_dir(dir: &Path) -> io::Result<fs::File> {
     let path = dir.join("lock");
     let file = fs::OpenOptions::new()

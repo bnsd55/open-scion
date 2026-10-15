@@ -45,7 +45,9 @@ pub trait Kind {
     /// The kind's name in the `derived` table.
     const NAME: &'static str;
     /// Bump it when [`Kind::derive`] gives a different answer. Rows of other
-    /// versions are never read. Rows of older versions are removed.
+    /// versions are never read. Rows of older versions are removed. A kind
+    /// of the server is listed in `store::build`, so that processes of two
+    /// builds do not share a data directory.
     const VERSION: u32;
     /// Whether [`Kind::derive`] reads the value of every parent. If not, it
     /// reads the first parent's value only, and only first-parent history is
