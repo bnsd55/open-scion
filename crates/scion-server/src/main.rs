@@ -1,12 +1,15 @@
-//! `scion-server`: serve the Scion API, or import a git repository.
+//! `scion-server`: serve the Scion API, import a git repository, or derive
+//! derived data ahead of reads.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use scion_server::derived::{self, Kind};
 use scion_server::import::{ImportOptions, import_git};
-use scion_server::{Store, service};
+use scion_server::tree::RootTree;
+use scion_server::{Error, Store, db, read, service};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -52,6 +55,27 @@ enum Command {
         /// Path to the git repository.
         git_dir: PathBuf,
     },
+    /// Derive one kind of derived data for the history of a ref, in bounded
+    /// steps, and remove the rows of its older versions. Safe to repeat.
+    Derive {
+        /// The kind to derive.
+        #[arg(long)]
+        kind: KindName,
+        /// Scion repository.
+        #[arg(long, default_value = "main")]
+        repo: String,
+        /// Ref whose first-parent history is derived.
+        #[arg(long = "ref", default_value = "main")]
+        target_ref: String,
+    },
+}
+
+/// The kinds of derived data that `derive` can fill.
+#[derive(Clone, Copy, ValueEnum)]
+enum KindName {
+    /// The root tree of each changeset.
+    #[value(name = "root_tree")]
+    RootTree,
 }
 
 #[tokio::main]
@@ -104,6 +128,25 @@ async fn main() -> anyhow::Result<()> {
                 "imported {} of {} commits, verified {}, tip {}",
                 report.imported, report.commits, report.verified, report.tip
             );
+        }
+        Command::Derive {
+            kind,
+            repo,
+            target_ref,
+        } => {
+            let (name, tip) = tokio::task::spawn_blocking(move || {
+                let tip = read::resolve_ref(&store, &repo, &target_ref)?;
+                let repo_id = store.read(|c| db::repo_id(c, &repo))?;
+                let name = match kind {
+                    KindName::RootTree => {
+                        derived::backfill::<RootTree>(&store, repo_id, tip)?;
+                        RootTree::NAME
+                    }
+                };
+                Ok::<_, Error>((name, tip))
+            })
+            .await??;
+            println!("derived {name} for the history of {tip}; older versions are removed");
         }
     }
     Ok(())

@@ -192,19 +192,21 @@ computed eagerly or on demand. The rest is this project's choice.
 |---|---|
 | A kind | `derived::Kind`: a name, a version, and `derive`, a function from a changeset and its first parent's value to a value. Each kind encodes its value as bytes. |
 | Inputs | The first parent's value only, because a changeset stores only its changes against its first parent (section 2). The article says "parents". A kind over the full graph does not fit yet ([#76](https://github.com/bnsd55/open-scion/issues/76)). |
-| On demand | `derived::get` reads the stored value. If there is none, `derived::derive` walks first parents back to the nearest changeset with a stored value, then derives forward, oldest first, and stores each value. It is a loop, not recursion, so a long chain is safe. |
+| On demand | `derived::get` reads the stored value. If there is none, `derived::fill` derives it in steps (below). |
+| Steps | `fill` walks first parents back to the nearest changeset with a stored value, through at most `derived::STEP` (100) changesets per hold of the database lock. It keeps the list of changesets without a value, 32 bytes each, so it visits each one once. Then it derives forward, oldest first, at most `STEP` changesets per transaction, and commits each one. Other requests run between steps. A step reads a value that is already stored, for example by a concurrent `fill`, and does not derive it again. |
 | Eager | A kind can also store its value when the changeset is written. `root_tree` does (below). |
 | Storage | One `derived` row per (kind, version, changeset), written in the transaction that derives it. A large structure belongs in its own table, and the value is its ID, as `root_tree` keeps trees in `trees`. |
-| A version bump | A new version reads and writes only its own rows. So the old rows become unused, and nothing rewrites them. The new version derives its values again, on demand. Nothing removes the old rows yet ([#71](https://github.com/bnsd55/open-scion/issues/71)). |
-| Repos | Rows are keyed by changeset alone. A changeset ID fixes its whole history, so a value is the same in every repo. `get` and `derive` check `repo_changesets` first, so a stored value never leaks to a repo that cannot see the changeset. |
-| Durability | A value can name rows that its derivation wrote, such as trees, and a reply can send it to a client. So when `get` derives a value, it waits for one full flush, shared with concurrent commits, before it returns. `derive` and `put` never flush: inside a write, the write's own flush covers them. |
+| A version bump | A new version reads and writes only its own rows. So the old rows become unused, and nothing rewrites them. The new version derives its values again, in steps. Each step, and each write of a root tree, also deletes up to `STEP` rows of older versions of its kind, as each new land deletes a few expired lands. Rows of a newer version stay: a newer build that ran on this data may run again, and it reads them. Rows of a kind that the build no longer has also stay. |
+| Backfill | `derived::backfill`, and `scion-server derive --kind root_tree --ref main` (with the server stopped, as for import), fill a ref's first-parent history in steps, then delete every row of an older version, `STEP` rows per transaction. It is safe to repeat. |
+| Repos | Rows are keyed by changeset alone. A changeset ID fixes its whole history, so a value is the same in every repo. `get`, `fill` and `derive` check `repo_changesets` first, so a stored value never leaks to a repo that cannot see the changeset. |
+| Durability | A value can name rows that its derivation wrote, such as trees, and a reply can send it to a client. So when `get` derives a value, it waits for one full flush after the last step, shared with concurrent commits, before it returns. It waits on an error too. `fill`, `derive` and `put` never flush: inside a write, the write's own flush covers them. |
+| Crashes | Each step commits on its own, and values never change. So a crash or an error between steps leaves only correct rows. The next read walks back to the newest stored value and goes on from there. |
 | One answer | A second write of a value must equal the first, or the store reports corruption. |
 
-**Cost of a new kind or version.** The first read derives every missing value
-on the chain in one transaction, and holds the database lock while it runs.
-For a tip with a long history, that is the whole history at once. **Planned:**
-a backfill that derives a bounded number of changesets per transaction
-([#71](https://github.com/bnsd55/open-scion/issues/71)).
+**Cost of a new kind or version.** The first read of a tip with a long history
+still derives the whole history before it replies, so that read waits. Other
+requests wait for at most one step at a time. A backfill before the server
+starts removes that wait.
 
 **Root trees.** Kind `root_tree` version 1 (`tree::RootTree`): the root tree
 of a changeset's full snapshot, as a 32-byte tree ID. It is the first
@@ -215,6 +217,13 @@ changes, store the new trees, insert the changeset, record its `root_tree`.
 If the row is missing, `tree::root_tree` derives it on demand. A golden test
 pins the tree IDs of a fixed history, both when they are stored at write time
 and when they are derived on demand.
+
+The write needs the first parent's root tree in its transaction. After a
+version bump of `root_tree`, that parent has no row, and the transaction
+would derive its whole history. So `CreateChangeset` and `Land` call
+`tree::fill_root_tree` on the parent before the transaction, and the
+transaction then finds the parent's row. Git import does not: it runs with
+the server stopped, so its transaction blocks no other request.
 
 `tree::apply` runs all deletes before all puts, so one changeset can turn a
 file into a directory or back. It loads only the directories on changed paths
@@ -643,7 +652,6 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/store.rs` (`Store::open`) | One process per data directory, so an import needs the server stopped. | Let a separate importer process share the directory. Lands already re-plan when the ref moves (`MAX_ATTEMPTS`). | [#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
 | `scion-server/src/derived.rs` (`Kind::derive`) | A kind gets only its first parent's value, so a kind over the full commit graph, such as a generation number, does not fit. | Pass every parent's value, and derive ancestors in generation order. | [#76](https://github.com/bnsd55/open-scion/issues/76) |
-| `scion-server/src/derived.rs` (`derive`) | One transaction derives every missing value on the chain, and holds the database lock. So the first read after a new kind or a version bump derives the whole history at once. Rows of old versions are never removed. | A backfill that derives a bounded number of changesets per transaction, and a bounded delete of old versions. | [#71](https://github.com/bnsd55/open-scion/issues/71) |
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/land.rs` (`MAX_ATTEMPTS`) | Imports move refs without the land lock, so a land retries 3 times, then returns `ABORTED`. | Route every ref move through the per-ref lander. | [#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | One lander per ref that rebases a batch and moves the ref once. | [#18](https://github.com/bnsd55/open-scion/issues/18) |

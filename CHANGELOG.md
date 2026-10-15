@@ -35,3 +35,7 @@ release.
   name validation at the RPC boundary.
 - `docs/protocol-v1.md`: the contract of the `Scion` and `Objects` services,
   for independent clients, tiers and servers.
+- Derived data is derived in bounded steps, one transaction each, so other
+  requests run between steps after a new kind or a version bump. Each step
+  removes some rows of older versions. `scion-server derive --kind
+  root_tree` fills a ref's history ahead of reads and removes the rest.

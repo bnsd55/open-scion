@@ -133,11 +133,8 @@ pub fn generation(c: &Connection, repo: RepoId, id: ChangesetId) -> Result<i64> 
 /// Database errors.
 pub fn first_parent(c: &Connection, id: ChangesetId) -> Result<Option<ChangesetId>> {
     let parent: Option<Vec<u8>> = c
-        .query_row(
-            "SELECT parent FROM changeset_parents WHERE cs = ?1 AND n = 0",
-            [id.as_bytes()],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT parent FROM changeset_parents WHERE cs = ?1 AND n = 0")?
+        .query_row([id.as_bytes()], |row| row.get(0))
         .optional()?;
     parent.map(|bytes| to_id(&bytes)).transpose()
 }
@@ -270,6 +267,28 @@ pub fn put_derived(
         )));
     }
     Ok(())
+}
+
+/// Deletes up to `limit` derived values of `kind` with a version below
+/// `version`, and returns how many. The primary key starts with (kind,
+/// version), so this reads only the rows it deletes.
+///
+/// # Errors
+///
+/// Database errors.
+pub fn delete_derived_below(
+    c: &Connection,
+    kind: &str,
+    version: u32,
+    limit: usize,
+) -> Result<usize> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    Ok(c.prepare_cached(
+        "DELETE FROM derived WHERE (kind, version, cs) IN (
+             SELECT kind, version, cs FROM derived
+             WHERE kind = ?1 AND version < ?2 LIMIT ?3)",
+    )?
+    .execute(params![kind, version, limit])?)
 }
 
 /// Stores a tree. Safe to repeat.

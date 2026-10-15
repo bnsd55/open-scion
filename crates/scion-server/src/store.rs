@@ -114,6 +114,12 @@ impl Store {
         &self.inner.blobs
     }
 
+    /// Commits made so far.
+    #[cfg(test)]
+    pub(crate) fn commits(&self) -> u64 {
+        self.inner.committed.load(Ordering::Acquire)
+    }
+
     /// Runs `f` on the database, outside any explicit transaction. Returns
     /// once every commit that `f` could see is durable, so a reply never
     /// shows a commit that a power loss can undo.
