@@ -34,6 +34,10 @@ pub enum Error {
     /// The request is malformed.
     #[error("{0}")]
     InvalidArgument(String),
+    /// The caller may read the repo, but not make this change. The message
+    /// names the path.
+    #[error("{0}")]
+    PermissionDenied(String),
     /// The request is well formed, but the state does not allow it (for
     /// example a ref that has diverged from the history being imported).
     #[error("{0}")]
@@ -76,6 +80,7 @@ impl From<Error> for Status {
         match e {
             Error::NotFound(_) => Status::not_found(e.to_string()),
             Error::InvalidArgument(_) | Error::Apply(_) => Status::invalid_argument(e.to_string()),
+            Error::PermissionDenied(_) => Status::permission_denied(e.to_string()),
             Error::Aborted(_) => Status::aborted(e.to_string()),
             Error::DeadlineExceeded(_) => Status::deadline_exceeded(e.to_string()),
             Error::FailedPrecondition(_) => Status::failed_precondition(e.to_string()),

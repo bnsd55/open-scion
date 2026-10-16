@@ -4,3 +4,4 @@ target/
 /crates/scion-core/fuzz/artifacts/
 /crates/scion-core/fuzz/coverage/
 /.claude/
+/scion-data/

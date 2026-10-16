@@ -9,6 +9,19 @@ release.
 
 ### Added
 
+- Principals and access rules (`#13`, part 2). `scion-server serve --access
+  FILE` reads an access file that maps the BLAKE3 digest of each token to a
+  principal, and says which repos each principal may read and which paths it
+  may write: a path prefix by path parts (`src` covers `src/a`, not
+  `srcx`), no prefix meaning the whole repo, and write implying read. A
+  principal with no rule for a repo cannot see the repo: every call answers
+  `NOT_FOUND`, as for a repo that does not exist. A change to a path outside
+  the principal's write prefixes answers `PERMISSION_DENIED` and names the
+  first denied path; `PutBlob` needs a write rule, and `Land` is checked for
+  the principal that lands it. `scion-server hash-token` prints the digest
+  that a `token` line wants, so the file never holds a token. `--token T`
+  stays: one principal, `default`, which may read and write every repo.
+
 - `scion-core`: the object model (changesets, trees, blob IDs) and a frozen,
   canonical v1 byte format, with golden tests, property tests and a fuzz
   target.
