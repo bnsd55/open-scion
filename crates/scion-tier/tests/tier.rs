@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use scion_core::{BlobId, Entry, FileState, PathElem, Tree};
 use scion_proto::CHUNK_BYTES;
-use scion_proto::listen::{self, Limits, TLS_HANDSHAKE_TIMEOUT};
+use scion_proto::listen::Limits;
 use scion_proto::object::{self, Assembler, Header};
 use scion_proto::tls::{ClientTls, ServerTls};
 use scion_proto::v1::objects_client::ObjectsClient;
@@ -873,13 +873,9 @@ async fn serve_tls_cache(
     let url = format!("https://{}", listener.local_addr().unwrap());
     tokio::spawn(cache.serve(
         TOKEN,
-        listen::tls(
-            TcpListenerStream::new(listener),
-            tls.config(),
-            TLS_HANDSHAKE_TIMEOUT,
-        ),
+        TcpListenerStream::new(listener),
         Limits::default(),
-        None,
+        Some(tls),
         std::future::pending(),
     ));
     url

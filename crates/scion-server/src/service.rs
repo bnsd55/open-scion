@@ -105,22 +105,14 @@ pub async fn serve(
             .add_service(scion)
             .add_service(objects)
     };
-    match tls {
-        Some(tls) => {
-            limits
-                .serve(
-                    router,
-                    listen::tls(
-                        listen::tcp(listener),
-                        tls.config(),
-                        listen::TLS_HANDSHAKE_TIMEOUT,
-                    ),
-                    shutdown,
-                )
-                .await
-        }
-        None => limits.serve(router, listen::tcp(listener), shutdown).await,
-    }
+    limits
+        .serve(
+            router,
+            listen::tcp(listener),
+            tls.map(|tls| tls.config()),
+            shutdown,
+        )
+        .await
 }
 
 /// Implements the Scion RPCs.

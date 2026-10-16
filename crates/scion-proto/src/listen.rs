@@ -27,25 +27,29 @@
 //! With TLS, the accept of [`tls`] runs the TLS handshake, under
 //! [`HANDSHAKE_TIMEOUT`], before a connection gets its place: a peer that
 //! never starts or never ends the handshake frees no place, because it
-//! never holds one. [`accept`] then reads the HTTP/2 preface from the
+//! A connection takes its place first, and its TLS handshake then runs on
+//! its own, under [`TLS_HANDSHAKE_TIMEOUT`], while it holds that place. So
+//! at most `--max-connections` silent handshakers can exist at once, and
+//! each gives its place up within the timeout, the same bound as a silent
+//! plain peer. [`accept_tls`] then reads the HTTP/2 preface from the
 //! decrypted connection, so the preface timer covers a peer that stops
 //! right after the handshake too.
 
-use std::error::Error;
 use std::future::Future;
 use std::io;
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Sleep;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::server::TlsStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt as _};
 use tonic::transport::Server;
 use tonic::transport::server::{Connected, Router, TcpIncoming};
@@ -143,33 +147,32 @@ impl Limits {
     /// # Errors
     ///
     /// Transport errors.
-    // TLS (issue #14) adds a handshake of its own, which needs a timeout too.
-    // `router` will then return a `Result`, for the TLS setup.
-    pub async fn serve<I, IO, IE>(
+    pub async fn serve<I, IO>(
         self,
         router: impl FnOnce(Server) -> Router,
         incoming: I,
+        tls: Option<Arc<ServerConfig>>,
         shutdown: impl Future<Output = ()>,
     ) -> Result<(), tonic::transport::Error>
     where
-        I: Stream<Item = Result<IO, IE>>,
+        I: Stream<Item = io::Result<IO>> + Send + 'static,
         IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
-        IE: Into<Box<dyn Error + Send + Sync>>,
     {
-        self.serve_with(&TIMERS, router, incoming, shutdown).await
+        self.serve_with(&TIMERS, router, incoming, tls, shutdown)
+            .await
     }
 
-    async fn serve_with<I, IO, IE>(
+    async fn serve_with<I, IO>(
         self,
         timers: &Timers,
         router: impl FnOnce(Server) -> Router,
         incoming: I,
+        tls: Option<Arc<ServerConfig>>,
         shutdown: impl Future<Output = ()>,
     ) -> Result<(), tonic::transport::Error>
     where
-        I: Stream<Item = Result<IO, IE>>,
+        I: Stream<Item = io::Result<IO>> + Send + 'static,
         IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
-        IE: Into<Box<dyn Error + Send + Sync>>,
     {
         let server = Server::builder()
             .max_concurrent_streams(self.streams.get())
@@ -177,6 +180,12 @@ impl Limits {
             .http2_keepalive_timeout(Some(timers.keepalive_timeout))
             .max_connection_age(timers.age)
             .max_connection_age_grace(timers.grace);
+        if let Some(config) = tls {
+            let incoming = accept_tls(incoming, self.connections, timers.handshake, config);
+            return router(server)
+                .serve_with_incoming_shutdown(incoming, shutdown)
+                .await;
+        }
         let incoming = accept(incoming, self.connections, timers.handshake);
         router(server)
             .serve_with_incoming_shutdown(incoming, shutdown)
@@ -192,46 +201,92 @@ pub fn tcp(listener: TcpListener) -> TcpIncoming {
     TcpIncoming::from(listener).with_nodelay(Some(true))
 }
 
-/// The TLS connections of `incoming`: the TLS handshake of each connection
-/// runs, under `timeout`, with `config`, before the connection goes on to
-/// [`Limits::serve`], which reads the HTTP/2 preface from the decrypted
-/// connection. A peer whose handshake fails or is slow is dropped, with a
-/// warning, so one bad client holds no place and serves no attack.
+/// The TLS connections of `incoming`, at most `max` at once, as
+/// [`accept`] yields plain ones: a connection takes its place first (and
+/// waits at the cap), and then its TLS handshake runs on its own task, under
+/// `handshake`, while it holds that place. So the handshakes of different
+/// connections run at the same time, and a peer that never starts or never
+/// ends its handshake holds at most one of at most `max` places, for at most
+/// `handshake` long. A handshake that failed or timed out drops its place,
+/// with a warning. The decrypted connection goes on with the preface timer
+/// of [`accept`], so a peer that stops right after the handshake is closed
+/// by that timer too.
 ///
 /// The error of `incoming` must be [`io::Error`], which is what a TCP or a
 /// unix listener yields.
-pub fn tls<I, IO>(
+fn accept_tls<I, IO>(
     incoming: I,
+    max: NonZeroUsize,
+    handshake: Duration,
     config: Arc<ServerConfig>,
-    timeout: Duration,
-) -> impl Stream<Item = io::Result<TlsStream<IO>>>
+) -> ReceiverStream<io::Result<Connection<TlsStream<IO>>>>
 where
-    I: Stream<Item = io::Result<IO>>,
-    IO: AsyncRead + AsyncWrite + Unpin,
+    I: Stream<Item = io::Result<IO>> + Send + 'static,
+    IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
 {
+    let places = Arc::new(Semaphore::new(max.get()));
+    let (done, served) = mpsc::channel(max.get());
     let acceptor = tokio_rustls::TlsAcceptor::from(config);
-    incoming
-        .then(move |accepted| {
-            let acceptor = acceptor.clone();
-            async move {
-                let io = match accepted {
-                    Ok(io) => io,
-                    Err(error) => return Some(Err(error)),
-                };
-                match tokio::time::timeout(timeout, acceptor.accept(io)).await {
-                    Ok(Ok(stream)) => Some(Ok(stream)),
+    tokio::spawn(async move {
+        let mut incoming = pin!(incoming);
+        while let Some(accepted) = incoming.next().await {
+            if done.is_closed() {
+                break;
+            }
+            let io = match accepted {
+                Ok(io) => io,
+                Err(error) => {
+                    if done.send(Err(error)).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            // The place first, as the plain path does: a silent peer holds
+            // one of at most `max`, and frees it within the timeout.
+            let place = if let Ok(place) = Arc::clone(&places).try_acquire_owned() {
+                place
+            } else {
+                tracing::warn!(max, "a connection waits: the most connections are open");
+                places
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("the semaphore of places is never closed")
+            };
+            let sender = done.clone();
+            let preface_wait = handshake;
+            let wait = tokio::time::timeout(handshake, acceptor.accept(io));
+            tokio::spawn(async move {
+                match wait.await {
+                    Ok(Ok(stream)) => {
+                        // The place goes with the connection, and frees when
+                        // it is dropped, which the gone receiver also does.
+                        let _ = sender
+                            .send(Ok(Connection {
+                                io: stream,
+                                _place: place,
+                                preface: Some((
+                                    PREFACE_BYTES,
+                                    Box::pin(tokio::time::sleep(preface_wait)),
+                                )),
+                            }))
+                            .await;
+                    }
                     Ok(Err(error)) => {
                         tracing::warn!(%error, "a TLS handshake failed");
-                        None
                     }
                     Err(_) => {
-                        tracing::warn!(timeout = ?timeout, "no TLS handshake within the timeout");
-                        None
+                        tracing::warn!(
+                            timeout = ?preface_wait,
+                            "no TLS handshake within the timeout"
+                        );
                     }
                 }
-            }
-        })
-        .filter_map(core::convert::identity)
+            });
+        }
+    });
+    ReceiverStream::new(served)
 }
 
 /// The connections from `incoming`, at most `max` at once. Each keeps its
@@ -592,9 +647,12 @@ mod tests {
         let config = server_tls.config();
         tokio::spawn(async move {
             let router = |mut server: Server| server.add_service(ObjectsServer::new(Stub));
-            let incoming = tls(tcp(listener), config, tls_timeout);
             let pending = std::future::pending();
-            Box::pin(limits.serve_with(&timers, router, incoming, pending)).await
+            let timers = Timers {
+                handshake: tls_timeout,
+                ..timers
+            };
+            Box::pin(limits.serve_with(&timers, router, tcp(listener), Some(config), pending)).await
         });
         addr
     }
@@ -607,7 +665,7 @@ mod tests {
             let router = |mut server: Server| server.add_service(ObjectsServer::new(Stub));
             let pending = std::future::pending();
             limits
-                .serve_with(&timers, router, tcp(listener), pending)
+                .serve_with(&timers, router, tcp(listener), None, pending)
                 .await
         });
         addr
@@ -903,13 +961,14 @@ mod tests {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, None);
-        // The preface timer is short (timers("age")); the TLS handshake
-        // timeout is long, so only the preface timer can close the peer.
+        // All timers are short (timers("age")), so the peer is closed soon
+        // after it goes silent: the TLS handshake timeout can no longer
+        // reach it once the handshake ended, so only the preface timer can.
         let addr = serve_tls(
             Limits::default(),
             timers("age"),
             &server_tls,
-            Duration::from_secs(10),
+            Duration::from_millis(100),
         )
         .await;
         let mut peer = raw_client(addr, &certs.authority.cert(), None).await;
@@ -919,5 +978,44 @@ mod tests {
         let read =
             tokio::time::timeout(Duration::from_secs(10), peer.read_to_end(&mut Vec::new())).await;
         assert!(read.is_ok(), "the server closed the silent peer");
+    }
+
+    /// A peer that opens a TLS connection and sends nothing holds its place,
+    /// but no accept: a second client is served at once, before the silent
+    /// peer's handshake timeout ends. (The timeouts here are 2 s, so the
+    /// second client must finish within 1.5 s.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_tls_handshake_does_not_block_other_clients() {
+        let certs = test_certs();
+        let dir = tempfile::tempdir().unwrap();
+        let server_tls = server_tls(dir.path(), &certs.server, None);
+        let addr = serve_tls(
+            Limits::default(),
+            TIMERS,
+            &server_tls,
+            Duration::from_secs(2),
+        )
+        .await;
+        // A peer that connects and sends nothing: no ClientHello.
+        let mut silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let served = tokio::time::timeout(Duration::from_millis(1500), async {
+            let mut client = client(addr, &certs.authority.cert(), None).await?;
+            Ok::<_, tonic::transport::Error>(quick(&mut client).await)
+        })
+        .await
+        .expect("a silent handshake does not block the next client")
+        .expect("the client connects");
+        assert_eq!(served, Code::NotFound);
+        // The silent peer is still holding its connection, within its
+        // handshake timeout.
+        let mut buf = [0; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), silent.read(&mut buf))
+                .await
+                .is_err(),
+            "the silent peer is not yet closed"
+        );
+        drop(silent);
     }
 }
