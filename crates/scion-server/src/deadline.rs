@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use scion_proto::deadline::Until;
+use tonic::Request;
 
 use crate::error::{Error, Result};
 
@@ -23,6 +26,14 @@ impl Deadline {
             at,
             gone: Arc::default(),
         }
+    }
+
+    /// The deadline of a job for `request`: at most `cap` from now, and
+    /// before the caller's own deadline, less the margin of [`Until`], so
+    /// the job stops and the call answers before the caller gives up.
+    #[must_use]
+    pub fn of_call<T>(request: &Request<T>, cap: Duration) -> Self {
+        Self::new(Instant::now() + Until::of(request).wait(cap))
     }
 
     /// A guard for the call to hold. When it drops, the deadline has passed.

@@ -52,7 +52,13 @@ pub fn repo_id(c: &Connection, name: &str) -> Result<RepoId> {
     c.prepare_cached("SELECT repo_id FROM repos WHERE name = ?1")?
         .query_row([name], |row| row.get(0).map(RepoId))
         .optional()?
-        .ok_or_else(|| Error::NotFound(format!("repo {name:?}")))
+        .ok_or_else(|| no_repo(name))
+}
+
+/// The error of a repo that does not exist. A caller that may not read a
+/// repo gets it too (`access::Access::check_read`).
+pub(crate) fn no_repo(name: &str) -> Error {
+    Error::NotFound(format!("repo {name:?}"))
 }
 
 /// Stores a changeset and adds it to `repo`. Every parent must already be in

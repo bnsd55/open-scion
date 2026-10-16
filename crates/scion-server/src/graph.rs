@@ -893,7 +893,11 @@ mod tests {
 
     #[test]
     fn a_deep_history_reads_log_n_nodes() {
-        const N: usize = 100_000;
+        // Deep enough that a walk without the jump reads about a hundred
+        // times more than the bound, and small enough to build in under a
+        // second. The test counts reads, so its pass does not depend on how
+        // busy the machine is.
+        const N: usize = 4_096;
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let (repo, ids, side) = deep_chain(&store, N);
