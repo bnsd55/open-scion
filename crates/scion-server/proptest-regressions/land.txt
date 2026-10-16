@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 41e061f9dcc7eff82c38fbfd9d8b7ab745fd357078b5ad1f45e1f79dff59895a # shrinks to (parents, edits) = ([[], [0], [0], [0], [2, 0], [4, 2], [4, 0, 3], [5, 4], [5, 4, 6], [6], [7], [9, 1, 4], [10, 0, 2], [11, 4], [13, 6, 5], [13, 3], [14, 11]], [[(2, true)], [(0, true)], [(1, false), (1, true), (2, true)], [(6, true)], [], [(6, true), (5, false), (1, true)], [], [(7, true), (0, true), (5, true)], [(6, true)], [], [], [(0, false), (1, true)], [(7, false)], [], [(6, false)], [(5, false), (5, true), (5, false)], [(1, false), (3, false), (0, false)]]), room = Some(438)

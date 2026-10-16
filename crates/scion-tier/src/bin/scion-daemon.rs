@@ -4,12 +4,13 @@
 
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::Context as _;
 use clap::Parser;
 use scion_proto::listen::{self, Limits};
 use scion_proto::tls::ClientTls;
-use scion_tier::{DAEMON_UPSTREAM_TIMEOUT, DiskStore, Tier, bind_unix};
+use scion_tier::{DAEMON_UPSTREAM_TIMEOUT, DiskStore, Tier, bind_unix, snapshot};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_stream::wrappers::UnixListenerStream;
 use tracing_subscriber::EnvFilter;
@@ -53,6 +54,11 @@ struct Cli {
     /// Most calls (HTTP/2 streams) that one connection may have open at once.
     #[arg(long, default_value_t = listen::DEFAULT_STREAMS)]
     max_streams: NonZeroU32,
+    /// A snapshot from scion-cache (`--snapshot`) to start from. Read only
+    /// if the store holds no object: each object is checked against its ID
+    /// and stored before the daemon serves. Repeat for more.
+    #[arg(long, value_name = "FILE")]
+    seed: Vec<PathBuf>,
     /// Most bytes that the stalled replies of one connection may hold. A
     /// connection over it is closed with them.
     #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
@@ -73,6 +79,9 @@ async fn main() -> anyhow::Result<()> {
         cli.tls_client_cert.as_deref(),
         cli.tls_client_key.as_deref(),
     )?;
+    for path in &cli.seed {
+        seed(&store, path);
+    }
     let tier = Tier::new(
         store,
         &cli.upstream,
@@ -119,4 +128,32 @@ async fn main() -> anyhow::Result<()> {
     // The store writes its index when the last task that holds the tier ends,
     // as the runtime stops after this.
     Ok(())
+}
+
+/// Seeds a cold `store` from the snapshot at `path`. A seed only saves
+/// fetches, so a failure is logged, and the daemon starts as it is.
+fn seed(store: &DiskStore, path: &std::path::Path) {
+    let started = Instant::now();
+    match snapshot::seed(store, path) {
+        Ok(Some(seeded)) => {
+            let ms = started.elapsed().as_millis();
+            let snapshot::Seeded {
+                repo,
+                stored,
+                bytes,
+                skipped,
+                damaged,
+            } = seeded;
+            tracing::info!(%repo, stored, bytes, skipped, damaged, ms, "seeded the store from a snapshot");
+            if skipped > 0 || damaged {
+                tracing::warn!(path = %path.display(), skipped, damaged, "the snapshot holds bad objects or is torn; they were not stored");
+            }
+        }
+        Ok(None) => {
+            tracing::info!(path = %path.display(), "the store holds objects; the snapshot is not read");
+        }
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "cannot seed the store; it starts cold");
+        }
+    }
 }

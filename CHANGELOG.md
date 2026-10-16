@@ -68,8 +68,8 @@ release.
   forcing it, not on a real NFS mount.
 - Path history and blame on first-parent history: `Log` takes an optional
   path and says where to continue, and a new `Blame` RPC gives each line's
-  last changeset. `scn log --path` and `scn blame`. Each call has a bound,
-  and the client continues where a call stopped. An older server ignores
+  last changeset. `scn log --path` and `scn blame`. Each `Blame` call has a
+  bound, and the client continues where a call stopped. An older server ignores
   the new `path` field, so `scn log --path` against it prints unfiltered
   history.
 - `Blame` follows renames as `git blame` does by default: a deleted file
@@ -120,8 +120,17 @@ release.
   full, the indexes of idle refs go first, least recently used first. Else
   the growing index starts over at the tip. The lands still get the same
   answers.
-- A land walks at most 100,000 changesets below the path index. A base
-  further back is `REJECTED` as too old, and the client must rebase.
+- Path history as derived data (kind `path_history`, schema version 5).
+  `Log` with a path reads only the changesets that change the path, so one
+  call returns up to 1,000 entries however far apart they are. A call stops
+  after about 64 MiB of path history, which a file in a large directory
+  reaches in fewer entries, and it waits in the queue of `MergeBase` and
+  `IsAncestor`. A land on a
+  base more than 10,000 generations below the head checks its paths in the
+  head's path history, so no base is too old to check. Before, such a land
+  walked the history back to its base each time, and a base more than
+  100,000 changesets back was `REJECTED` (#38). `scion-server derive --kind
+  path_history` derives it ahead of the first query.
 - A land stops in its long loops 600 s after its call started, or as soon
   as its call is dropped by a timeout or by the client, because neither
   stops a running job. The land stays pending.
@@ -131,6 +140,11 @@ release.
   tier answers the `Objects` calls, checks every object from upstream
   against its ID before it stores or sends it, forwards `ResolveRef`, keeps
   `GetRootTree` answers, fetches a shared miss once, and needs a token.
+  A `scion-cache --snapshot DIR --snapshot-repo R` writes `DIR/R.scnsnap`
+  every `--snapshot-every` seconds: the most recently used objects of that
+  repo, up to `--snapshot-bytes`. A cold `scion-daemon --seed FILE` imports
+  them before it serves, each checked against its ID; a warm one ignores
+  the file (#59).
 - `scn` reaches a daemon with `--server unix:///PATH`. It first refuses a
   path that is not a socket owned by its user or by root. `scn` and the
   daemon also refuse a socket or data directory under a directory that

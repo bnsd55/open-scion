@@ -48,9 +48,10 @@ const MAX_UPLOADS: usize = 16;
 /// blames never take more than this many of the `MAX_BLOCKING` permits that
 /// writes and lands share.
 const MAX_BLAMES: usize = 4;
-/// Most `MergeBase` and `IsAncestor` calls running at once. A call has no
-/// bound on its reads, only its deadline, so these queries never take more
-/// than this many of the `MAX_BLOCKING` permits.
+/// Most `MergeBase`, `IsAncestor` and `Log` calls with a path running at
+/// once. A call has no bound on its reads, only its deadline: a walk, or the
+/// first derivation of path history on a database from before it. So these
+/// queries never take more than this many of the `MAX_BLOCKING` permits.
 const MAX_GRAPH_QUERIES: usize = 4;
 // A graph query holds one read connection at a time, through a walk with no
 // bound on its reads. So the walks never take every one.
@@ -157,8 +158,9 @@ impl ScionService {
             .max_encoding_message_size(MAX_MESSAGE_BYTES)
     }
 
-    /// Runs a `MergeBase` or `IsAncestor` query: at most `MAX_GRAPH_QUERIES`
-    /// at once, each until its call ends or its `deadline` passes.
+    /// Runs a `MergeBase`, `IsAncestor` or `Log` with a path: at most
+    /// `MAX_GRAPH_QUERIES` at once, each until its call ends or its
+    /// `deadline` passes.
     async fn graph_query<T, F>(&self, deadline: Deadline, query: F) -> Result<T, Status>
     where
         T: Send + 'static,
@@ -601,16 +603,25 @@ impl Scion for ScionService {
 
     async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogResponse>, Status> {
         let caller = caller(&request)?;
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         // `read::MAX_SCAN` also bounds the entries.
         let limit = (req.limit as usize).max(1);
         let path = parse_optional_path(req.path)?;
-        let page = self
-            .worker
-            .run(move |store| read::log_page(&store, &req.repo, id, path.as_ref(), limit))
-            .await?;
+        let page = if let Some(path) = path {
+            // It may derive the path history of a long history first, so it
+            // runs as a graph query, with its slot and its deadline.
+            self.graph_query(deadline, move |store, deadline| {
+                read::log_page(store, &req.repo, id, Some(&path), limit, deadline)
+            })
+            .await?
+        } else {
+            self.worker
+                .run(move |store| read::log_page(&store, &req.repo, id, None, limit, &deadline))
+                .await?
+        };
         // Always send the first entry; stop before the reply gets too big.
         let mut next = page.next;
         let mut budget = LOG_BUDGET_BYTES;
@@ -1127,13 +1138,25 @@ mod tests {
         for _ in &blockers {
             held_rx.recv().unwrap();
         }
-        // One call more than the limit, of both kinds.
+        // One call more than the limit, of each kind.
         let calls: Vec<_> = (0..=MAX_GRAPH_QUERIES)
             .map(|i| {
                 let service = Arc::clone(&service);
                 let (root, a, b) = (bytes(0), bytes(1), bytes(2));
                 tokio::spawn(async move {
-                    if i % 2 == 0 {
+                    if i % 3 == 2 {
+                        // `a` puts `f1`.
+                        let request = as_default(LogRequest {
+                            repo: "r".into(),
+                            changeset_id: a.clone(),
+                            limit: 10,
+                            path: "f1".into(),
+                        });
+                        let reply = service.log(request).await.unwrap().into_inner();
+                        let ids: Vec<Vec<u8>> =
+                            reply.entries.into_iter().map(|e| e.changeset_id).collect();
+                        ids == [a]
+                    } else if i % 3 == 0 {
                         let request = as_default(MergeBaseRequest {
                             repo: "r".into(),
                             a_changeset_id: a,

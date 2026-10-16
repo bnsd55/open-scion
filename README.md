@@ -183,6 +183,14 @@ user), new directories are group-writable, so they are refused until you run
 that. Stop the daemon with Ctrl-C or SIGTERM: it then writes its index, and
 its next start reads that one file instead of every stored object.
 
+A regional cache can also write snapshots, so that a new node's daemon does
+not start empty: give `scion-cache --snapshot DIR --snapshot-repo R` and it
+writes `DIR/R.scnsnap` every `--snapshot-every` seconds, with the most
+recently used objects of that repo, up to `--snapshot-bytes`. Copy the file
+to the node (any copy tool or shared mount) and start the daemon with
+`--seed FILE`: it imports the objects, each checked against its ID, before
+it serves, and only if its store is empty. A warm daemon ignores the file.
+
 ```sh
 export SCION_UPSTREAM_TOKEN=dev                  # what each tier sends upstream
 ./target/release/scion-cache &                   # memory, 127.0.0.1:7879
@@ -251,7 +259,7 @@ These are this project's choices where the article does not give details.
 | Retries | Each land has a caller-chosen request key, so a retry returns the first result |
 | Git | One-way import. Commit IDs are not kept identical to git commit IDs. |
 | Cache tiers | As in the article, a daemon per machine on a socket and a regional cache in memory, and objects sent in the disk format that the daemon keeps. The Unix socket, TCP between tiers, the disk store, zstd as that format, the byte limits, and one shared fetch per missed object are this project's choices. |
-| History and blame | Computed on each call from first-parent changes, with a bound per call. Blame follows renames, as `git blame` does; path history does not, as `git log` without `--follow`. The article keeps them as derived data; that is planned ([#61](https://github.com/bnsd55/open-scion/issues/61)). |
+| History and blame | Path history is derived data, as in the article: the form, one history tree per changeset, is this project's choice. Blame is computed on each call from first-parent changes, with a bound per call; the article keeps it as derived data too, which is planned ([#61](https://github.com/bnsd55/open-scion/issues/61)). Blame follows renames, as `git blame` does; path history does not, as `git log` without `--follow`. |
 | Diff | Compares file states, not lines, in pages of 1,000 paths. Finds renames as `git diff` does, over the whole diff below a path, with a bound per call. |
 
 Deliberate simplifications are marked `SHORTCUT:` in the code, each with its
