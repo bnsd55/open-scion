@@ -68,19 +68,19 @@ step is run by a person.
    cargo publish -p scn
    ```
 
-   The order matters: `scion-server` depends on `scion-core` and
-   `scion-proto`, `scion-tier` on `scion-core` and `scion-proto`, and
-   `scn` on all four. Their `Cargo.toml` entries carry both a `version`
+   The order matters: `open-scion-server` depends on `open-scion-core`
+   and `open-scion-proto`, `open-scion-tier` on the same two, and
+   `open-scion` on all four. Their `Cargo.toml` entries carry both a `version`
    and a `path`, so the workspace builds from the local paths while
    crates.io resolves the version of each published crate.
 
 ## After
 
-- Watch the crates.io pages of the five crates until each shows the
+- Watch the crates.io pages of the five packages until each shows the
   version, then install the client from crates.io and run it:
 
   ```sh
-  cargo install scn --version 0.1.0 --root /tmp/scion-install
+  cargo install open-scion --version 0.1.0 --root /tmp/scion-install
   /tmp/scion-install/bin/scn --version
   ```
 

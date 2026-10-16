@@ -2252,6 +2252,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "open-scion"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hashlink",
+ "open-scion-core",
+ "open-scion-proto",
+ "open-scion-server",
+ "open-scion-tier",
+ "rcgen",
+ "rustix",
+ "serde_json",
+ "signal-hook",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "zstd",
+]
+
+[[package]]
 name = "open-scion-core"
 version = "0.1.0"
 dependencies = [
@@ -2321,28 +2343,6 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
- "zstd",
-]
-
-[[package]]
-name = "open-scn"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "hashlink",
- "open-scion-core",
- "open-scion-proto",
- "open-scion-server",
- "open-scion-tier",
- "rcgen",
- "rustix",
- "serde_json",
- "signal-hook",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tonic",
  "zstd",
 ]
 
