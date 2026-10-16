@@ -1574,3 +1574,34 @@ fn the_worst_cursor_stays_small() {
     );
     assert!(bytes.len() < 8 << 20, "{} bytes", bytes.len());
 }
+
+#[test]
+fn a_call_that_holds_budget_never_waits_for_more() {
+    let (_data, store) = open_store();
+    // The older version is long, the blamed one short: the call takes the
+    // short text and the file's line share first, and the long older text
+    // does not fit what is left. The call must fail at once with
+    // `RESOURCE_EXHAUSTED`, not wait for bytes that only it can free: with
+    // a waiting take and no deadline, this test would hang forever.
+    let long = store.blobs().put("line\n".repeat(100).as_bytes()).unwrap();
+    let put_long = Some(regular(long));
+    let put_short = Some(regular(store.blobs().put(b"a\nb\n").unwrap()));
+    let ids = chain(&store, vec![vec![("f", put_long)], vec![("f", put_short)]]);
+    // 6 bytes of text + 2 lines x 128 bytes of state leave 338 of 600,
+    // and the 500 bytes of the older version do not fit them. The cap is
+    // above 500, so the version is not absent: the take is what misses.
+    let err = blame::blame(
+        &store,
+        REPO,
+        ids[1],
+        &path("f"),
+        &Resume::default(),
+        &Bytes::new(600),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::ResourceExhausted(_)),
+        "a held budget never waits: {err:?}"
+    );
+}

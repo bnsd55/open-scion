@@ -196,11 +196,17 @@ pub fn blame(
     let mut blob = regular_blob(store, root, &start_path)?;
     // The text of the version the walk starts at. Its bytes stay taken for
     // the whole call: each step's older text replaces them when it becomes
-    // the text being explained.
-    let mut text_hold = memory.take(store.blobs().size(blob)?, until)?;
+    // the text being explained. A fresh call's first take may wait for
+    // bytes; every later take of any call must not, so a call that holds
+    // budget never waits for more (two calls could wait for each other to
+    // the deadline). A resumed call's first take was the cursor's.
+    let text_size = store.blobs().size(blob)?;
+    let mut text_hold = match resume.next {
+        None => memory.take(text_size, until)?,
+        Some(_) => memory.try_take(text_size)?,
+    };
     let mut text = store.blobs().get(blob)?;
     let mut path = start_path;
-    let share = Share { memory, until };
     // The lines of the file that the request names. A walk that goes on
     // reads the version at `next`, which can be an older text of another
     // path, so its line count comes from the cursor.
@@ -210,8 +216,8 @@ pub fn blame(
         resume.counted
     };
     // The rows of the answer, and the state of one diff, stay taken for the
-    // whole call.
-    let _state_hold = memory.take(counted * BYTES_PER_LINE, until)?;
+    // whole call. Not a first take: it never waits.
+    let _state_hold = memory.try_take(counted * BYTES_PER_LINE)?;
     if resume.after_line > counted {
         return Err(Error::InvalidArgument(format!(
             "the cursor's line {} is past the {counted} lines of {path:?}",
@@ -282,7 +288,7 @@ pub fn blame(
                     cap: left,
                     progress: always,
                 };
-                older_version(store, root, &changeset, newer, budget, &search, &share)?
+                older_version(store, root, &changeset, newer, budget, &search, memory)?
             }
             None => Older::Found(None, RenameSearch::default()),
         };
@@ -304,11 +310,11 @@ pub fn blame(
             Some((older_path, older_blob, Some(older_text))) => {
                 let both = byte_lines(&older_text).count().max(counted);
                 let need = both.saturating_sub(counted) * BYTES_PER_LINE;
-                if need > share.memory.cap() {
+                if need > memory.cap() {
                     absent_read = older_text.len().div_ceil(64);
                     None
                 } else {
-                    diff_hold = Some(share.memory.take(need, share.until)?);
+                    diff_hold = Some(memory.try_take(need)?);
                     Some((older_path, older_blob, Some(older_text)))
                 }
             }
@@ -484,17 +490,15 @@ impl std::ops::Deref for HeldText {
 /// # Errors
 ///
 /// [`Error::ResourceExhausted`] if a take waited past `until`.
-fn read_version(
-    store: &Store,
-    blob: BlobId,
-    memory: &Bytes,
-    until: Option<Instant>,
-) -> Result<Option<HeldText>> {
+fn read_version(store: &Store, blob: BlobId, memory: &Bytes) -> Result<Option<HeldText>> {
     let size = store.blobs().size(blob)?;
     if size > memory.cap() {
         return Ok(None);
     }
-    let hold = memory.take(size, until)?;
+    // The call holds its shares already, so this take never waits; the
+    // bytes come free when a concurrent call ends, or the call fails with
+    // `RESOURCE_EXHAUSTED` and the client retries.
+    let hold = memory.try_take(size)?;
     Ok(Some(HeldText {
         text: store.blobs().get(blob)?,
         hold,
@@ -524,7 +528,7 @@ fn older_version(
     newer: Newer<'_>,
     budget: Budget<'_>,
     search: &RenameSearch,
-    share: &Share<'_>,
+    memory: &Bytes,
 ) -> Result<Older> {
     let entry = store.read(|c| tree::lookup(c, root, newer.path))?;
     if *search != RenameSearch::default() && matches!(entry, Some(Entry::File(_))) {
@@ -539,13 +543,13 @@ fn older_version(
             Some((newer.path.clone(), content, None))
         }
         Some(Entry::File(FileState::Regular { content, .. })) => {
-            let text = read_version(store, content, share.memory, share.until)?;
+            let text = read_version(store, content, memory)?;
             text.map(|text| (newer.path.clone(), content, Some(text)))
         }
         // As in git, only a path with no file before can be a rename. A
         // symlink or submodule that becomes a regular file is not one.
         None | Some(Entry::Dir(_)) => {
-            return renamed_from(store, root, changeset, newer, budget, search, share);
+            return renamed_from(store, root, changeset, newer, budget, search, memory);
         }
         Some(Entry::File(_)) => None,
     };
@@ -580,7 +584,7 @@ fn renamed_from(
     newer: Newer<'_>,
     budget: Budget<'_>,
     search: &RenameSearch,
-    share: &Share<'_>,
+    memory: &Bytes,
 ) -> Result<Older> {
     let Budget {
         cost,
@@ -618,13 +622,13 @@ fn renamed_from(
             if other_blob == newer.blob {
                 return Ok(Some(Chunks::of(newer.text)));
             }
-            if size > share.memory.cap() {
+            if size > memory.cap() {
                 return Ok(None);
             }
             // The bytes are taken only while the text is read: the chunks
             // hold the lines, and their cost counts against the diff-line
             // budget above.
-            let hold = share.memory.take(size, share.until)?;
+            let hold = memory.try_take(size)?;
             let text = store.blobs().get(other_blob)?;
             let chunks = Chunks::of(&text);
             drop(text);
@@ -672,7 +676,7 @@ fn renamed_from(
     }
     // The search kept only its chunks, so read it again to diff it. Its
     // bytes stay taken for the step that diffs it.
-    let text = read_version(store, other_blob, share.memory, share.until)?;
+    let text = read_version(store, other_blob, memory)?;
     Ok(Older::Found(
         text.map(|text| (other.clone(), other_blob, Some(text))),
         at,
@@ -785,12 +789,6 @@ fn line_u32(line: usize) -> u32 {
 
 // ---- the cursor ----
 //
-/// The memory a call may spend, and when it stops waiting for it.
-struct Share<'a> {
-    memory: &'a Bytes,
-    until: Option<Instant>,
-}
-
 /// The lines the walk starts with: a fresh walk opens every line of the
 /// window at its own place, a walk that goes on takes the window's lines
 /// from the cursor, with each open line's place in the version at `next`.
@@ -1031,7 +1029,9 @@ pub fn encode_cursor(resume: &Resume, repo: &str, cs: ChangesetId, path: &RepoPa
 /// Decodes a cursor that a reply made for a blame of the file at `path` in
 /// `cs` of `repo`. The client sends it back unchanged; anything else is
 /// refused. The bytes and the decoded state count against `memory`, so a
-/// cursor past the budget is refused instead of read. The cursor is small:
+/// cursor past the budget is refused instead of read. This is a call's
+/// first take, so it may wait; the call's later takes must not. The cursor
+/// is small:
 /// a worst-case window of 1,048,576 lines that alternate between the 100
 /// changesets one call can walk and open lines measures 4,187,699 bytes,
 /// because the changesets sit once in a table and a run costs a few bytes.

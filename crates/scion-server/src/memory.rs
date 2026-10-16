@@ -61,7 +61,10 @@ impl Bytes {
 
     /// Takes `n` bytes and returns what holds them: dropping it gives the
     /// bytes back. Waits for them to free up, until `until`; `None` waits
-    /// for as long as it takes.
+    /// for as long as it takes. A call that already holds bytes must use
+    /// [`Bytes::try_take`] instead: two callers that each hold part of the
+    /// pool and wait for more can wait for each other until both their
+    /// deadlines, with nobody able to finish.
     ///
     /// # Errors
     ///
@@ -214,5 +217,18 @@ mod tests {
         assert!(matches!(err, Error::ResourceExhausted(_)), "{err:?}");
         assert!(started.elapsed() >= Duration::from_millis(10));
         drop(held);
+    }
+
+    #[test]
+    fn a_call_that_holds_bytes_never_waits_for_more() {
+        let bytes = Bytes::new(100);
+        let held = bytes.take(60, None).expect("fits");
+        // The rest of the pool is 40: a take of more fails at once, though
+        // a waiting take with no deadline would wait forever.
+        let err = bytes.try_take(50).expect_err("the rest does not fit");
+        assert!(matches!(err, Error::ResourceExhausted(_)), "{err:?}");
+        // What is free now is taken at once.
+        let rest = bytes.try_take(40).expect("fits");
+        drop((held, rest));
     }
 }

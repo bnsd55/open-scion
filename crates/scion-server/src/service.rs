@@ -43,9 +43,11 @@ const MAX_BLOCKING: usize = 256;
 /// Most uploads read at once. Each holds one request message in memory, of up
 /// to `MAX_MESSAGE_BYTES`, and a spool file of up to `MAX_OBJECT_BYTES`.
 const MAX_UPLOADS: usize = 16;
-/// Most `Blame` calls running at once. One call can diff for seconds, so
-/// blames never take more than this many of the `MAX_BLOCKING` permits that
-/// writes and lands share.
+/// Most `Blame` calls running at once. One call can diff for seconds, and
+/// a call that waits for its memory budget holds one of the `MAX_BLOCKING`
+/// permits that writes and lands share for the rest of its deadline. Four
+/// of the 256 permits can never starve a land or a read; a blame queue
+/// beyond this waits here, in async code, for a slot to free.
 const MAX_BLAMES: usize = 4;
 /// The bytes of memory that all `Blame` calls share: a call takes the bytes
 /// of every version it reads, and [`memory::BYTES_PER_LINE`] per line of the

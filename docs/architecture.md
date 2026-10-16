@@ -859,9 +859,11 @@ The memory of all `Blame` calls together holds 1 GiB
 (`BLAME_MEMORY_BUDGET`). A call takes from it the bytes of every version
 it reads, and 128 bytes per line of the blamed file (the answer's rows,
 and the state of one diff, measured at 78 bytes per line on a file of
-1,048,576 lines), for as long as the call runs. A take that would pass the
-budget waits for another call to free bytes, until the call's 600 s
-deadline, then fails with `RESOURCE_EXHAUSTED`. An older version whose
+1,048,576 lines), for as long as the call runs. A call's first take may wait for another call to free bytes, until the
+call's 600 s deadline, then fails with `RESOURCE_EXHAUSTED`. Every later
+take of a call fails at once if the bytes are not free: a call that holds
+budget never waits for more, so two calls can never wait for each other
+with nobody able to finish. An older version whose
 bytes do not fit the whole budget counts as absent, so its lines go to the
 changeset that replaced it, and only its read cost counts (once per 64
 bytes, as before). A blamed file whose share (its bytes, and 128 bytes per
@@ -906,7 +908,8 @@ taken from the shared 1 GiB budget, plus the tables of one diff, which the
 budget takes per step and frees after it.
 
 At most 4 `Blame` calls run at once, so they never take more than 4 of the
-permits that writes and lands share. When a call stops at a bound, its
+permits that writes and lands share, also while a call waits for its
+budget inside the job; a fifth blame waits for a slot in async code. When a call stops at a bound, its
 reply carries an opaque cursor (a `bytes` field) instead of single resume
 fields. It holds where the walk goes on (a changeset and path), where its
 rename search stopped, which lines of the file this call answered (a

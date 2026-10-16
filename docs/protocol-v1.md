@@ -563,9 +563,12 @@ replaced it gets its lines.
 **Memory.** All `Blame` calls of a server share a budget of 1 GiB. A call
 takes from it the bytes of every version it reads and 128 bytes per line of
 the file it blames, from its first step to its last, and a cursor's bytes
-and state while the call runs. A take that would pass the budget waits for
-another call to free bytes, until the call's deadline, then fails with
-`RESOURCE_EXHAUSTED`. A window holds at most 1,048,576 lines: a file with
+and state while the call runs. A call's first take may wait for another
+call to free bytes, until the call's deadline, then fails with
+`RESOURCE_EXHAUSTED`. Every later take of a call fails at once if the
+bytes are not free, so a call that holds budget never waits for more and
+two calls cannot wait for each other. A failed call frees its bytes; the
+client retries it whole. A window holds at most 1,048,576 lines: a file with
 more is blamed over several calls, one window each, and each new window
 re-walks the history from the requested changeset (the cursor carries the
 lines' state, so a call diffs only the versions of its own window). A file

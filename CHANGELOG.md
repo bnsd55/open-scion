@@ -100,9 +100,11 @@ until that section gets its release date.
 - `Blame` blames a binary file line by line, as `git blame` does, and
   files of any size the shared memory budget holds: all `Blame` calls of a
   server share 1 GiB, and a call takes the bytes of every version it reads
-  and 128 bytes per line of the file it blames. An older version that does
-  not fit counts as absent, so its lines go to the changeset that replaced
-  it. A call answers at most 1,048,576 lines of the file; a bigger one is
+  and 128 bytes per line of the file it blames. A call's first take may
+  wait for bytes; every later take fails at once if they are not free, so
+  two calls can never wait for each other. An older version that does not
+  fit counts as absent, so its lines go to the changeset that replaced it.
+  A call answers at most 1,048,576 lines of the file; a bigger one is
   blamed over several calls.
 - A `Blame` reply that stopped at a bound carries an opaque cursor
   (`next_cursor`): where the walk goes on, where its rename search
