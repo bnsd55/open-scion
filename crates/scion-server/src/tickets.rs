@@ -91,30 +91,18 @@ impl Keys {
     }
 }
 
+/// The 32 bytes of `hex`, which must be 64 hex characters, as IDs print.
 fn from_hex(hex: &str, name: &str) -> Result<[u8; 32], String> {
-    let hex = hex.trim();
-    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("{name} must be 64 hex characters"));
-    }
-    let mut out = [0u8; 32];
-    let chars: Vec<char> = hex.chars().collect();
-    for (i, byte) in out.iter_mut().enumerate() {
-        // Both digits are hex, which the caller checked.
-        let hi = u8::try_from(chars[2 * i].to_digit(16).unwrap_or_default()).unwrap_or_default();
-        let lo =
-            u8::try_from(chars[2 * i + 1].to_digit(16).unwrap_or_default()).unwrap_or_default();
-        *byte = (hi << 4) | lo;
-    }
-    Ok(out)
+    blake3::Hash::from_hex(hex.trim())
+        .map(|hash| *hash.as_bytes())
+        .map_err(|_| format!("{name} must be 64 hex characters"))
 }
 
+/// The 32 bytes of `bytes`, as IDs print.
 fn to_hex(bytes: &[u8]) -> String {
-    let mut hex = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        hex.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or_default());
-        hex.push(char::from_digit(u32::from(byte & 0xf), 16).unwrap_or_default());
-    }
-    hex
+    blake3::Hash::from_bytes(bytes.try_into().expect("a key is 32 bytes"))
+        .to_hex()
+        .to_string()
 }
 
 #[cfg(test)]

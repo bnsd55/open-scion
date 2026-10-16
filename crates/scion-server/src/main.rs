@@ -1,8 +1,10 @@
 //! `scion-server`: serve the Scion API, import a git repository, or derive
 //! derived data ahead of reads.
 
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -353,21 +355,53 @@ fn load_tickets(
     Ok(Some(Arc::new(keys)))
 }
 
-/// The file's trimmed text, as a key wants it.
+/// The file's trimmed text, as a key wants it. The file must be readable
+/// by its owner alone: a seed that group or others can read mints
+/// permissions to anyone who can read it.
 fn read_hex(file: &Path) -> anyhow::Result<String> {
+    let meta = std::fs::symlink_metadata(file)
+        .with_context(|| format!("cannot read {}", file.display()))?;
+    anyhow::ensure!(
+        meta.is_file(),
+        "{} is not a file (a symlink is refused too)",
+        file.display()
+    );
+    anyhow::ensure!(
+        meta.mode().trailing_zeros() >= 6,
+        "{} can be read by group or others (fix: chmod 600 {})",
+        file.display(),
+        file.display()
+    );
+    let me = rustix::process::geteuid().as_raw();
+    scion_proto::auth::check_ancestors(file, me)
+        .with_context(|| format!("{} sits in a directory that is not private", file.display()))?;
     let text =
         std::fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))?;
     Ok(text.trim().to_owned())
 }
 
-/// Writes a fresh ticket key to `--out` and prints its public key.
+/// Writes a fresh ticket key to `--out` and prints its public key. The
+/// file is created, never replaced: a second run to the same path fails,
+/// because silently changing the key breaks every tier that was given the
+/// old public half. The file is 0600: the seed mints permissions.
 fn write_ticket_key() -> anyhow::Result<()> {
     let Cli { command, .. } = Cli::parse();
     let Command::TicketKey { out } = command else {
         unreachable!("write_ticket_key handles only the ticket-key command")
     };
     let keys = scion_server::tickets::Keys::generate();
-    std::fs::write(&out, format!("{}\n", keys.seed_hex()))
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&out)
+        .with_context(|| {
+            format!(
+                "cannot create {} (it exists already? the key must not change under the tiers)",
+                out.display()
+            )
+        })?;
+    file.write_all(format!("{}\n", keys.seed_hex()).as_bytes())
         .with_context(|| format!("cannot write {}", out.display()))?;
     println!("{}", keys.public_hex());
     Ok(())

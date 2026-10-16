@@ -579,17 +579,11 @@ async fn tiers() -> (Tiers, tokio::sync::oneshot::Sender<()>, tempfile::TempDir)
 /// Signs a ticket with the server's own key, with `expires` set as if the
 /// server had minted it at `minted_at`.
 fn signed_with(keys: &Keys, repo: &str, root_tree: [u8; 32], minted_at: u64) -> Vec<u8> {
-    let seed: [u8; 32] = hex_of(&keys.seed_hex()).try_into().unwrap();
+    let seed = *blake3::Hash::from_hex(keys.seed_hex().trim())
+        .unwrap()
+        .as_bytes();
     let key = ed25519_dalek::SigningKey::from_bytes(&seed);
     scion_proto::ticket::sign(&key, repo, "default", root_tree, minted_at).unwrap()
-}
-
-/// The bytes of a hex string.
-fn hex_of(hex: &str) -> Vec<u8> {
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-        .collect()
 }
 
 /// Tickets that are not in time, not in shape, or not from this server's
