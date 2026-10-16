@@ -605,10 +605,6 @@ impl Scion for ScionService {
             })
             .collect();
         let (next, next_path) = blame.next.unzip();
-        let path_bytes = |path: Option<RepoPath>| {
-            path.map(|path| path.as_bytes().to_vec())
-                .unwrap_or_default()
-        };
         Ok(Response::new(BlameResponse {
             ranges,
             changesets,
@@ -695,10 +691,7 @@ impl Scion for ScionService {
             .collect();
         Ok(Response::new(DiffResponse {
             entries,
-            next_after: page
-                .next_after
-                .map(|path| path.as_bytes().to_vec())
-                .unwrap_or_default(),
+            next_after: path_bytes(page.next_after),
         }))
     }
 }
@@ -706,6 +699,12 @@ impl Scion for ScionService {
 /// An optional changeset ID on the wire: empty for `None`.
 fn id_bytes(id: Option<ChangesetId>) -> Vec<u8> {
     id.map(|id| id.as_bytes().to_vec()).unwrap_or_default()
+}
+
+/// An optional path on the wire: empty for `None`.
+fn path_bytes(path: Option<RepoPath>) -> Vec<u8> {
+    path.map(|path| path.as_bytes().to_vec())
+        .unwrap_or_default()
 }
 
 fn file_state(state: FileState) -> v1::FileState {

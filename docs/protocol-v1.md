@@ -461,8 +461,10 @@ reads the best file again and goes on from where the search stopped, so it
 finds the file that one search with no budget finds. A call whose first step
 is a rename search looks at one more deleted file even past the budget, so
 the search always moves. When a search ends but the diff after it does not
-fit, the reply names the end of the search, so the next call does not search
-again. A reply sets both fields only with `next_changeset_id`.
+fit, the reply names the end of the search: `next_rename_searched` is the
+number of deleted files, and `next_rename_best` the file found, if any. The
+next call then uses that file and does not search again. A reply sets both
+fields only with `next_changeset_id`.
 
 **Rules.** The server walks first parents to each changeset that changed the
 file, and diffs that version with the older version. The older version is

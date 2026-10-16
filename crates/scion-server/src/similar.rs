@@ -219,7 +219,7 @@ pub struct Progress {
 }
 
 /// What [`renames`] found.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Outcome {
     /// The renames.
     pub pairs: Vec<Pair>,
@@ -495,12 +495,12 @@ impl<R: FnMut(&RepoPath, BlobId, usize) -> Result<Option<Chunks>>> Search<'_, R>
         // index holds each blob once, however many paths add it.
         let mut index: HashMap<u32, Vec<(usize, u32)>> = HashMap::new();
         let mut slots: HashMap<BlobId, usize> = HashMap::new();
-        // Each target's slot, once its blob is read.
-        let mut slot = vec![None; targets.len()];
         // For each target, its best pairs so far: score, same name, and the
         // deleted file.
         let mut best: Vec<Vec<(u32, bool, usize)>> = vec![Vec::new(); targets.len()];
-        let mut shared = Vec::new();
+        // For one deleted file: the scores found, the targets read that it is
+        // compared with and their slots, and the bytes shared with each slot.
+        let (mut found, mut wanted, mut shared) = (Vec::new(), Vec::new(), Vec::new());
         let mut moved = false;
         let mut stopped = None;
         for d in sources {
@@ -515,24 +515,19 @@ impl<R: FnMut(&RepoPath, BlobId, usize) -> Result<Option<Chunks>>> Search<'_, R>
                 continue;
             };
             let from_size = self.size(from)?;
-            let mut found = Vec::new();
-            if let Some(&(a, value)) = self.known.get(&d)
-                && let Some(t) = targets.iter().position(|&(at, ..)| at == a)
-            {
-                found.push((t, value));
-            }
-            let known = self.known.get(&d).map(|&(a, _)| a);
-            // The targets it is compared with, read, and their slots.
-            let mut wanted = Vec::new();
+            // Step 2 has the score of the one added file it compared.
+            let known = self.known.get(&d).copied();
+            found.clear();
+            wanted.clear();
             for (t, &(a, to, to_size)) in targets.iter().enumerate() {
-                if known == Some(a) || !can_be(from_size, to_size, MIN_SCORE) {
-                    continue;
-                }
-                if slot[t].is_none() {
-                    slot[t] = self.slot(&mut index, &mut slots, a, to)?;
-                }
-                if let Some(s) = slot[t] {
-                    wanted.push((t, s));
+                match known {
+                    Some((known_a, value)) if known_a == a => found.push((t, value)),
+                    _ if can_be(from_size, to_size, MIN_SCORE) => {
+                        if let Some(s) = self.slot(&mut index, &mut slots, a, to)? {
+                            wanted.push((t, s));
+                        }
+                    }
+                    _ => {}
                 }
             }
             if !wanted.is_empty()
@@ -557,7 +552,7 @@ impl<R: FnMut(&RepoPath, BlobId, usize) -> Result<Option<Chunks>>> Search<'_, R>
                         .map(|&(t, s)| (t, git_score(shared[s], from_size, targets[t].2))),
                 );
             }
-            for (t, value) in found.into_iter().filter(|&(_, value)| value >= MIN_SCORE) {
+            for (t, value) in found.drain(..).filter(|&(_, value)| value >= MIN_SCORE) {
                 let same_name =
                     file_name(self.added[targets[t].0].0) == file_name(self.deleted[d].0);
                 let kept = &mut best[t];

@@ -719,8 +719,10 @@ answer is that of one search with no budget, and every deleted file is
 looked at, as in git. When the search is the first step of a call, it looks
 at one more deleted file even past the budget, so it always moves. The
 server checks the place it is sent: the count is at most the number of
-deleted files, and the best file is a deleted file before that count. The
-client must send the place back unchanged.
+deleted files, and the best file is a deleted regular file before that
+count. A count of all the deleted files is a search that ended: the next
+call uses its best file and does not search again. The client must send
+the place back unchanged.
 
 So a call reads about 64 MiB in the steps that fit in its budget, plus the
 blamed file, plus a few files past the budget. The first step, which always

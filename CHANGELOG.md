@@ -71,7 +71,9 @@ release.
   that the call has left. Where the budget runs out, the reply says where
   the search stopped (`next_rename_searched`, `next_rename_best`), and the
   next call goes on from there with `rename_searched` and `rename_best`. A
-  client must send both back unchanged. `scn blame` does this.
+  client must send both back unchanged. When the search has looked at every
+  deleted file, the reply says that too, and the next call takes the best
+  file as the answer at once. `scn blame` does this.
 - Bearer-token auth, loopback-only listening by default, request limits and
   name validation at the RPC boundary.
 - `ReadFile` streams a file in 1 MiB parts from the zstd decoder, under a

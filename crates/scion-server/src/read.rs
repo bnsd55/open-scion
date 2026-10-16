@@ -404,8 +404,7 @@ fn renames(store: &Store, entries: &[DiffEntry]) -> Result<HashMap<RepoPath, Ren
         progress: false,
     };
     let from = Progress::default();
-    let found = similar::renames(store, &added, &deleted, read, MAX_PAIRS, from, budget)?;
-    let pairs = found.pairs;
+    let pairs = similar::renames(store, &added, &deleted, read, MAX_PAIRS, from, budget)?.pairs;
     if cost >= MAX_RENAME_CHUNKS {
         tracing::debug!(
             cost,
