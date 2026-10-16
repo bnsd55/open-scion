@@ -184,7 +184,8 @@ async fn main() -> anyhow::Result<()> {
                 max_connections,
                 max_streams,
                 max_stalled_bytes,
-            )            .await?;
+            )
+            .await?;
         }
         Command::HashToken { .. } => unreachable!("handled before the store opens"),
         Command::Import {
@@ -236,7 +237,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// Serves the gRPC API on `listen`, with the TLS files of the flags, until
 /// the caller stops it.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn serve(
     store: Store,
     listen: SocketAddr,

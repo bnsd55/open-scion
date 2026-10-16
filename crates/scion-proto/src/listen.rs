@@ -799,7 +799,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let config = server_tls.config();
         tokio::spawn(async move {
-            let router = |mut server: Server| server.add_service(ObjectsServer::new(Stub));
+            let router = |mut server: Server| server.add_service(ObjectsServer::new(Stalls));
             let pending = std::future::pending();
             let timers = Timers {
                 handshake: tls_timeout,
