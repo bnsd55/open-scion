@@ -730,6 +730,14 @@ impl<S: Store> Tier<S> {
                     }
                 }
                 Ok(Walk::Absent) => {
+                    // Expected when a client asks outside its checkout,
+                    // so it stays at debug.
+                    tracing::debug!(
+                        repo = %ask.ticket.repo,
+                        principal = %ask.ticket.principal,
+                        object = ?key,
+                        "the walk did not reach the object from the ticket's root tree"
+                    );
                     return Err(Failed {
                         status: Status::not_found(format!("{key:?} is not in the ticket")),
                         whole_call: false,
@@ -1234,7 +1242,11 @@ impl<S: Store> Objects for Tier<S> {
         } else {
             scion_proto::ticket::parse(&ticket, &self.inner.ticket_keys, scion_proto::ticket::now())
         }
-        .map_err(|why| Status::permission_denied(format!("bad ticket: {why}")))?;
+        .map_err(|why| {
+            // The reason only: no ticket bytes, and no signature.
+            tracing::warn!(reason = %why, "a GetObjects ticket was refused");
+            Status::permission_denied(format!("bad ticket: {why}"))
+        })?;
         let keys = refs
             .into_iter()
             .map(|r| Ok((Key::parse(&r)?, r.path)))
