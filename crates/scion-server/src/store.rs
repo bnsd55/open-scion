@@ -1905,7 +1905,9 @@ mod tests {
             }
             done.store(true, Ordering::Relaxed);
         });
-        // The log file never shrinks, so its size is the most it held.
+        // The log file never shrinks, so its size is the most it held: about
+        // 4 MiB. With a snapshot held for each whole read, the log never
+        // restarts and holds every commit.
         let log = fs::metadata(dir.path().join("scion.db-wal")).unwrap().len();
         assert!(log < 16 << 20, "the log grew to {} MiB", log >> 20);
     }
