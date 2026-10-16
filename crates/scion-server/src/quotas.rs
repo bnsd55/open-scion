@@ -23,6 +23,10 @@ use crate::error::{Error, Result};
 pub struct Quotas {
     requests: Option<usize>,
     upload_bytes: Option<usize>,
+    // SHORTCUT: the counts live in memory, so a restart forgets them; only
+    // the pending-lands cap counts rows of the store. Count the in-flight
+    // work in the store, or share the counts across processes, if one
+    // process ever stops being the whole server.
     usage: Arc<Mutex<HashMap<String, Usage>>>,
 }
 

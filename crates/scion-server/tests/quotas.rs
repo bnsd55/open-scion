@@ -193,9 +193,7 @@ async fn hold_upload(
         .await
         .unwrap();
     let mut client = client(channel, token);
-    let reply = tokio::spawn(async move {
-        client.put_blob(ReceiverStream::new(receiver)).await
-    });
+    let reply = tokio::spawn(async move { client.put_blob(ReceiverStream::new(receiver)).await });
     (sender, reply)
 }
 
