@@ -1485,7 +1485,11 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-tier/src/lib.rs` (`check_repo`) | A tier does not ask whether a repo exists, and serves a stored object to any caller with its token. It knows one token, so the access rules of the server do not reach it. | Read tickets, checked by every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scn/src/client.rs` (`lossy`) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | Escape or base64 raw bytes in JSON. | |
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |
-| `scn/src/cmd/commit.rs` (`commit`) | The author time zone is always UTC. | A time zone crate. | |
+| `scn/src/cmd/commit.rs` (`commit`) | Reads each symlink target whole, so memory caps the target length. | Stream chunks from the file. | |
+| `scn/src/cmd/commit.rs` (`parse_author`) | The author time zone is always UTC, since `std` cannot read the local time zone. | A time zone crate. | |
+| `scn/src/vfs.rs` (`size_of`) | A file's size comes from its blob, so the first stat of a file that was never read fetches the blob, and `ls -l` of a directory fetches every blob in it. | After #13 PR-C, a `GetSizes` call served from the stored frame's header. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
+| `scn/src/vfs.rs` (`fetch_object`) | A mount sends no ticket with its `GetObjects`, and a mount lives longer than a ticket (15 minutes). | After #13 PR-C: refresh by `GetRootTree` of the mounted changeset — never of the ref, which may have moved — and send the new ticket with the next `GetObjects`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
+| `scn/src/vfs.rs` (`io_err`) | Takes the error by value so `.map_err(io_err)` reads clean. | Take it by reference if the lint allows it one day. | |
 
 ## 10. Testing
 

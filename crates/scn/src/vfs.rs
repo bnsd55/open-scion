@@ -10,11 +10,10 @@
 //! is first read or sized. Writes go to an overlay directory beside the
 //! mount, which is the change list that `scn commit --from-mount` commits.
 //!
-//! // SHORTCUT: a file's size comes from its blob, so the first stat of a
-//! // file that was never read fetches the blob, and `ls -l` of a
-//! // directory fetches every blob in it. Upgrade, after #13 PR-C: a
-//! // `GetSizes` call, served from the stored frame's header. The one
-//! // place to change is `size_of`.
+//! A file's size comes from its blob, so the first stat of a file that
+//! was never read fetches the blob, and `ls -l` of a directory fetches
+//! every blob in it. Upgrade, after #13 PR-C: a `GetSizes` call, served
+//! from the stored frame's header. The one place to change is `size_of`.
 //!
 //! No protection: see `docs/architecture.md`, section 8. Any local user who
 //! can read the mount table can reach the mounted content through the NFS
