@@ -20,12 +20,13 @@ use scion_proto::v1::{
 };
 use scion_proto::{Bytes, CHUNK_BYTES, MAX_MESSAGE_BYTES};
 use tokio::net::TcpListener;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
+use tracing::Instrument as _;
 
 use crate::access::Access;
 use crate::auth::Caller;
@@ -33,6 +34,7 @@ use crate::deadline::Deadline;
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
 use crate::objects::ObjectsService;
+use crate::quotas::{Call, Quotas};
 use crate::store::{MAX_OBJECT_BYTES, READER_BYTES, Store};
 use crate::{blame, db, names, read, write};
 
@@ -76,6 +78,30 @@ const READ_BUDGET_BYTES: usize = 256 << 20;
 /// budget (`scion_proto::listen`).
 const READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How often the stale-land sweep runs after the first one.
+const SWEEP_PERIOD: Duration = Duration::from_secs(60 * 60);
+
+/// Runs the stale-land sweep at once, then once per [`SWEEP_PERIOD`], until
+/// `stop` resolves. The first sweep settles what a restart left pending
+/// before the first client asks.
+async fn sweeps(worker: Worker, lands: Arc<Lands>, stale_secs: i64, mut stop: watch::Receiver<()>) {
+    loop {
+        let (lands, store) = (Arc::clone(&lands), worker.store());
+        let rejected =
+            tokio::task::spawn_blocking(move || lands.sweep_stale(&store, stale_secs)).await;
+        match rejected {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => tracing::info!(rejected = n, "rejected stale pending lands"),
+            Ok(Err(e)) => tracing::warn!(error = %e, "the stale-land sweep failed"),
+            Err(e) => tracing::warn!(error = %e, "the stale-land sweep task failed"),
+        }
+        tokio::select! {
+            () = tokio::time::sleep(SWEEP_PERIOD) => {}
+            _ = stop.changed() => break,
+        }
+    }
+}
+
 // A connection that is asked to close keeps its calls for at least as long
 // as the longest call takes.
 const _: () = assert!(REQUEST_TIMEOUT.as_secs() <= listen::CONNECTION_GRACE.as_secs());
@@ -84,9 +110,29 @@ const _: () = assert!(REQUEST_TIMEOUT.as_secs() <= listen::CONNECTION_GRACE.as_s
 const _: () = assert!(read_share(MAX_OBJECT_BYTES) <= READ_BUDGET_BYTES);
 const _: () = assert!(READ_BUDGET_BYTES <= u32::MAX as usize);
 
-/// Serves the API on `listener` within `limits`, until `shutdown` resolves,
+/// What a server serves with, besides the data directory and the access
+/// rules: its limits, its per-principal quotas, and its TLS.
+pub struct ServeOptions {
+    /// The connection and stream caps of `listen`.
+    pub limits: Limits,
+    /// What one principal may hold at once.
+    pub quotas: Quotas,
+    /// The most pending lands one principal may hold.
+    pub pending_lands: Option<usize>,
+    /// A land pending longer than this is rejected by the sweep.
+    pub land_stale_secs: i64,
+    /// With TLS, every connection is a TLS connection, whose handshake
+    /// `listen` ends within its timeout.
+    pub tls: Option<ServerTls>,
+}
+
+/// Serves the API on `listener` within `options`, until `shutdown` resolves,
 /// to the tokens and with the rules of `access`: an [`Access`], or one token
-/// (`&str`) that may do everything. With `tls`, every connection is a TLS
+/// (`&str`) that may do everything. `options.quotas` bounds what one
+/// principal may hold at once, and each principal at most
+/// `pending_lands` lands pending. A land that has been pending for longer
+/// than `land_stale_secs` is rejected by the sweep that runs at start and
+/// then once per hour. With `options.tls`, every connection is a TLS
 /// connection, whose handshake `listen` ends within its timeout.
 ///
 /// # Errors
@@ -96,23 +142,59 @@ pub async fn serve(
     store: Store,
     listener: TcpListener,
     access: impl Into<Access>,
-    limits: Limits,
-    tls: Option<ServerTls>,
-    shutdown: impl Future<Output = ()>,
+    options: ServeOptions,
+    shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
+    let ServeOptions {
+        limits,
+        quotas,
+        pending_lands,
+        land_stale_secs,
+        tls,
+    } = options;
     let access = Arc::new(access.into());
     let auth = access.auth();
     let worker = Worker::new(store);
+    let lands = Arc::new(Lands::new(pending_lands));
+    // The sweep stops when the server does: the shutdown future resolves,
+    // the watch says so, and the loop breaks. The same watch ends the
+    // server itself.
+    let (stop_tx, stop_rx) = watch::channel(());
+    tokio::spawn(async move {
+        shutdown.await;
+        let _ = stop_tx.send(());
+    });
+    let shutdown = {
+        let mut stopped = stop_rx.clone();
+        async move {
+            let _ = stopped.changed().await;
+        }
+    };
+    tokio::spawn(sweeps(
+        worker.clone(),
+        Arc::clone(&lands),
+        land_stale_secs,
+        stop_rx,
+    ));
     let scion = InterceptedService::new(
-        ScionService::new(worker.clone(), Arc::clone(&access)).into_server(),
+        ScionService::new(worker.clone(), Arc::clone(&access), lands, quotas.clone()).into_server(),
         auth.clone(),
     );
-    let objects = InterceptedService::new(ObjectsService::new(worker, access).into_server(), auth);
+    let objects = InterceptedService::new(
+        ObjectsService::new(worker, access, quotas).into_server(),
+        auth,
+    );
+    // The health service answers `grpc.health.v1.Check` and `Watch` on the
+    // same port, without a token: a probe carries none. The store opens
+    // before this call, so the server starts serving.
+    let (health, shutdown) =
+        listen::health(&["scion.v1.Scion", "scion.v1.Objects"], shutdown).await;
     let router = |server: Server| {
         server
             .timeout(REQUEST_TIMEOUT)
             .add_service(scion)
             .add_service(objects)
+            .add_service(health)
     };
     limits
         .serve(
@@ -129,6 +211,8 @@ pub struct ScionService {
     worker: Worker,
     access: Arc<Access>,
     lands: Arc<Lands>,
+    /// What one principal may hold at once.
+    quotas: Quotas,
     /// Bounds uploads read at once (`MAX_UPLOADS`): their messages in memory
     /// and their spool files in `tmp/`.
     uploads: Arc<Semaphore>,
@@ -175,11 +259,12 @@ impl ScionService {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    fn new(worker: Worker, access: Arc<Access>) -> Self {
+    fn new(worker: Worker, access: Arc<Access>, lands: Arc<Lands>, quotas: Quotas) -> Self {
         Self {
             worker,
             access,
-            lands: Arc::default(),
+            lands,
+            quotas,
             uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
             blames: Arc::new(Semaphore::new(MAX_BLAMES)),
             blame_memory: crate::memory::Bytes::new(BLAME_MEMORY_BUDGET),
@@ -240,6 +325,12 @@ impl Worker {
         }
     }
 
+    /// A handle to the store, for work outside the permit queue, such as the
+    /// stale-land sweep.
+    pub(crate) fn store(&self) -> Store {
+        self.store.clone()
+    }
+
     /// Runs `f` on a blocking thread once a permit is free.
     pub(crate) async fn run<T, F>(&self, f: F) -> Result<T, Status>
     where
@@ -251,8 +342,13 @@ impl Worker {
             .await
             .map_err(|_| Status::unavailable("server is shutting down"))?;
         let store = self.store.clone();
+        // The job runs on another thread, so it takes the call's span with
+        // it: a refusal or a failure that the job decides logs with the
+        // call's fields.
+        let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let _span = span.enter();
             f(store)
         })
         .await
@@ -282,10 +378,14 @@ pub(crate) fn check_reader(access: &Access, caller: &Caller, repo: &str) -> Resu
 pub(crate) async fn resolve_ref(
     worker: &Worker,
     access: &Access,
+    quotas: &Quotas,
     request: Request<ResolveRefRequest>,
 ) -> Result<ResolveRefResponse, Status> {
     let caller = caller(&request)?;
+    let _call = quotas.enter(&caller).map_err(Status::from)?;
     let ResolveRefRequest { repo, name } = request.into_inner();
+    check_reader(access, &caller, &repo)?;
+    check_name("ref", &name)?;
     check_reader(access, &caller, &repo)?;
     check_name("ref", &name)?;
     let id = worker
@@ -310,11 +410,15 @@ fn parse_optional_path(bytes: Vec<u8>) -> Result<Option<RepoPath>, Status> {
 }
 
 pub(crate) fn caller<T>(request: &Request<T>) -> Result<Caller, Status> {
-    request
+    let caller = request
         .extensions()
         .get::<Caller>()
         .cloned()
-        .ok_or_else(|| Status::unauthenticated("no caller"))
+        .ok_or_else(|| Status::unauthenticated("no caller"))?;
+    // The call's span gets the principal once. It shows on every line that
+    // the call makes.
+    tracing::Span::current().record("principal", caller.0.as_str());
+    Ok(caller)
 }
 
 fn land_response(outcome: LandOutcome) -> LandResponse {
@@ -432,6 +536,7 @@ impl Parts {
 async fn send_parts<T: Send + 'static>(
     mut parts: Parts,
     _share: OwnedSemaphorePermit,
+    _call: Call,
     tx: mpsc::Sender<Part<T>>,
     stall: Duration,
     stalled: Option<scion_proto::listen::Stalled>,
@@ -518,6 +623,7 @@ impl Scion for ScionService {
             .await
             .map_err(|_| Status::unavailable("server is shutting down"))?;
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let mut stream = request.into_inner();
         let first = stream
             .next()
@@ -527,7 +633,14 @@ impl Scion for ScionService {
         // An upload names no path, so a caller that may change some path of
         // the repo may upload.
         self.access.check_writer(&caller, &first.repo)?;
+        // The first message's bytes, and the budget that the later messages
+        // of this upload take from. Held until the reply, on every path.
+        let mut quota = self
+            .quotas
+            .upload(&caller, first.data.len())
+            .map_err(Status::from)?;
         // Check the repo before reading any more data. Each message goes to
+
         // the spool file before the next one is read, so an upload holds one
         // message in memory, not the whole blob.
         let (repo, mut upload) = self
@@ -544,6 +657,7 @@ impl Scion for ScionService {
                     "only the first PutBlob message names the repo",
                 ));
             }
+            quota.add(chunk.data.len()).map_err(Status::from)?;
             upload = self.worker.run(move |_| upload.append(&chunk.data)).await?;
         }
         let id = self
@@ -560,6 +674,7 @@ impl Scion for ScionService {
         request: Request<CreateChangesetRequest>,
     ) -> Result<Response<CreateChangesetResponse>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let CreateChangesetRequest { repo, changeset } = request.into_inner();
         check_reader(&self.access, &caller, &repo)?;
         let access = Arc::clone(&self.access);
@@ -589,6 +704,7 @@ impl Scion for ScionService {
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let _call = deadline.guard();
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         check_name("target_ref", &req.target_ref)?;
@@ -620,6 +736,7 @@ impl Scion for ScionService {
         request: Request<GetLandRequest>,
     ) -> Result<Response<LandResponse>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let GetLandRequest { repo, land_id } = request.into_inner();
         check_reader(&self.access, &caller, &repo)?;
         let land_id = land_id
@@ -636,7 +753,7 @@ impl Scion for ScionService {
         &self,
         request: Request<ResolveRefRequest>,
     ) -> Result<Response<ResolveRefResponse>, Status> {
-        resolve_ref(&self.worker, &self.access, request)
+        resolve_ref(&self.worker, &self.access, &self.quotas, request)
             .await
             .map(Response::new)
     }
@@ -646,6 +763,7 @@ impl Scion for ScionService {
         request: Request<GetChangesetRequest>,
     ) -> Result<Response<GetChangesetStream>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         // The handle of the caller's connection, before the request is taken
         // apart: the reply counts what it leaves in HTTP/2 on it.
         let stalled = scion_proto::listen::Stalled::of(&request);
@@ -673,6 +791,7 @@ impl Scion for ScionService {
         request: Request<ReadFileRequest>,
     ) -> Result<Response<ReadFileStream>, Status> {
         let caller = caller(&request)?;
+        let call = self.quotas.enter(&caller).map_err(Status::from)?;
         // The handle of the caller's connection, before the request is taken
         // apart: the reply counts what it leaves in HTTP/2 on it.
         let stalled = scion_proto::listen::Stalled::of(&request);
@@ -693,17 +812,21 @@ impl Scion for ScionService {
             .acquire_many_owned(share)
             .await
             .map_err(|_| Status::unavailable("server is shutting down"))?;
-        // The handle of the caller's connection, before the request is taken
-        // apart: the reply counts what it leaves in HTTP/2 on it.
+        // The request slot lives until the reply ends, not until this
+        // handler returns: the reply's work goes on in the producer.
         let (tx, rx) = mpsc::channel(2);
-        tokio::spawn(send_file(
-            self.worker.clone(),
-            blob,
-            share,
-            tx,
-            READ_STALL_TIMEOUT,
-            stalled,
-        ));
+        tokio::spawn(
+            send_file(
+                self.worker.clone(),
+                blob,
+                share,
+                call,
+                tx,
+                READ_STALL_TIMEOUT,
+                stalled,
+            )
+            .instrument(tracing::Span::current()),
+        );
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -712,6 +835,7 @@ impl Scion for ScionService {
         request: Request<ListDirRequest>,
     ) -> Result<Response<ListDirStream>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         // The handle of the caller's connection, before the request is taken
         // apart: the reply counts what it leaves in HTTP/2 on it.
         let stalled = scion_proto::listen::Stalled::of(&request);
@@ -729,6 +853,7 @@ impl Scion for ScionService {
 
     async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogResponse>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
@@ -776,6 +901,7 @@ impl Scion for ScionService {
         request: Request<BlameRequest>,
     ) -> Result<Response<BlameResponse>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
@@ -857,6 +983,7 @@ impl Scion for ScionService {
         request: Request<MergeBaseRequest>,
     ) -> Result<Response<MergeBaseResponse>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
@@ -877,6 +1004,7 @@ impl Scion for ScionService {
         request: Request<IsAncestorRequest>,
     ) -> Result<Response<IsAncestorResponse>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
@@ -892,6 +1020,7 @@ impl Scion for ScionService {
 
     async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<DiffResponse>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let old = parse_id(&req.old_changeset_id, "old_changeset_id")?;
@@ -977,21 +1106,89 @@ mod tests {
 
     use super::*;
 
+    /// The log of the test binary, into this one buffer.
+    static LOG: std::sync::LazyLock<Captured> = std::sync::LazyLock::new(Captured::default);
+
+    /// One global subscriber, set once, so a line that a worker thread
+    /// logs lands in the same buffer. Each log test reads only the lines
+    /// that name its repo. A test calls [`init_log`] before it makes the
+    /// call that logs.
+    fn init_log() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::level_filters::LevelFilter::TRACE)
+                .with_writer(Captured::clone(&*LOG))
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+        });
+    }
+
     /// A service whose one principal may do everything.
     fn test_service(store: Store) -> ScionService {
-        ScionService::new(Worker::new(store), Arc::new(Access::single("t")))
+        ScionService::new(
+            Worker::new(store),
+            Arc::new(Access::single("t")),
+            Arc::default(),
+            Quotas::off(),
+        )
     }
 
-    /// `message` as a request of that principal.
-    fn as_default<T>(message: T) -> Request<T> {
-        let mut request = Request::new(message);
-        let caller = Caller(scion_proto::auth::DEFAULT_PRINCIPAL.into());
-        request.extensions_mut().insert(caller);
-        request
+    fn log_text() -> String {
+        String::from_utf8(LOG.0.lock().unwrap().clone()).unwrap()
     }
 
-    /// A store whose repo `r` has one changeset, which puts `f` with
-    /// `content`. Also returns the changeset and the blob.
+    /// A log writer that collects what the test binary logs.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The lines that name `repo`, in the order that they were logged.
+    fn log_lines(repo: &str) -> Vec<String> {
+        log_text()
+            .lines()
+            .filter(|line| line.contains(repo))
+            .map(std::borrow::ToOwned::to_owned)
+            .collect()
+    }
+
+    /// An access whose principal `p` may read repo `log-open`, and change
+    /// nothing in it.
+    fn read_only_access() -> Access {
+        let digest = blake3::hash(b"t").to_hex();
+        Access::parse(&format!("token\tp\t{digest}\nread\tp\tlog-open\n")).unwrap()
+    }
+
+    /// The one span per call that the server opens, with `rpc` in it and
+    /// the principal and the repo still empty.
+    fn call_span(rpc: &str) -> tracing::Span {
+        tracing::error_span!(
+            "call",
+            rpc = rpc,
+            peer = tracing::field::Empty,
+            principal = tracing::field::Empty,
+            repo = tracing::field::Empty,
+        )
+    }
+
     fn file_store(content: &[u8]) -> (tempfile::TempDir, Store, ChangesetId, BlobId) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
@@ -1039,7 +1236,15 @@ mod tests {
         let share = u32::try_from(budget).unwrap();
         let share = Arc::clone(&reads).acquire_many_owned(share).await.unwrap();
         let (tx, rx) = mpsc::channel(2);
-        let task = tokio::spawn(send_file(Worker::new(store), blob, share, tx, stall, None));
+        let task = tokio::spawn(send_file(
+            Worker::new(store),
+            blob,
+            share,
+            Call::default(),
+            tx,
+            stall,
+            None,
+        ));
         (task, rx, reads)
     }
 
@@ -1111,6 +1316,124 @@ mod tests {
             .expect("the reply ends when the client goes")
             .unwrap();
         assert_eq!(reads.available_permits(), budget, "the share is free");
+    }
+
+    /// Polls `run` on one thread.
+    fn block_on<T>(run: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run)
+    }
+
+    /// `message` as a request of that principal.
+    fn as_default<T>(message: T) -> Request<T> {
+        let mut request = Request::new(message);
+        let caller = Caller(scion_proto::auth::DEFAULT_PRINCIPAL.into());
+        request.extensions_mut().insert(caller);
+        request
+    }
+
+    #[test]
+    fn a_denied_write_makes_one_line() {
+        init_log();
+        let (_dir, store, _, _) = file_store(b"x");
+        let service = ScionService::new(
+            Worker::new(store.clone()),
+            Arc::new(read_only_access()),
+            Arc::default(),
+            Quotas::off(),
+        );
+        // A valid changeset, which puts `f`: decode succeeds, the rules
+        // deny the write. The check runs in the job, so this also shows
+        // that the job stays in the call's span.
+        let state = FileState::Regular {
+            content: store.blobs().put(b"x").unwrap(),
+            executable: false,
+        };
+        let cs = Changeset {
+            parents: vec![],
+            author: IdentityTime {
+                name: b"t".to_vec(),
+                email: b"t@x".to_vec(),
+                unix_secs: 0,
+                tz_offset_minutes: 0,
+            },
+            committer: None,
+            message: vec![],
+            changes: [(RepoPath::new("f").unwrap(), Some(state))].into(),
+        };
+        let mut request = Request::new(CreateChangesetRequest {
+            repo: "log-open".to_owned(),
+            changeset: cs.encode(),
+        });
+        request.extensions_mut().insert(Caller("p".to_owned()));
+
+        let span = call_span("CreateChangeset");
+        let guard = span.enter();
+        let status = block_on(service.create_changeset(request)).expect_err("denied");
+        drop(guard);
+        assert_eq!(status.code(), Code::PermissionDenied);
+        // One line, with who and what, and no token.
+        let lines = log_lines("repo=\"log-open\"");
+        assert_eq!(lines.len(), 1, "ALL:\n{}", log_text());
+        assert!(lines[0].contains("WARN"), "{}", lines[0]);
+        assert!(lines[0].contains("may not write the path"), "{}", lines[0]);
+        assert!(lines[0].contains("principal=\"p\""), "{}", lines[0]);
+        assert!(lines[0].contains("path=\"f\""), "{}", lines[0]);
+        assert!(lines[0].contains("rpc=\"CreateChangeset\""), "{}", lines[0]);
+    }
+
+    #[test]
+    fn a_failed_call_makes_one_line() {
+        init_log();
+        // The reply of a failure keeps its detail in the log. Inside the
+        // call's span, that line also says who and which repo.
+        let span = call_span("GetLand");
+        let guard = span.enter();
+        tracing::Span::current().record("principal", "default");
+        tracing::Span::current().record("repo", "log-no-such");
+        let status = Status::from(crate::error::Error::Io(std::io::Error::other(
+            "the disk went away",
+        )));
+        drop(guard);
+        assert_eq!(status.code(), Code::Internal);
+        // One line, with who and what, and no token.
+        let lines = log_lines("repo=\"log-no-such\"");
+        assert_eq!(lines.len(), 1, "ALL:\n{}", log_text());
+        assert!(lines[0].contains("ERROR"), "{}", lines[0]);
+        assert!(lines[0].contains("internal error"), "{}", lines[0]);
+        assert!(lines[0].contains("the disk went away"), "{}", lines[0]);
+        assert!(lines[0].contains("rpc=\"GetLand\""), "{}", lines[0]);
+        assert!(lines[0].contains("principal=\"default\""), "{}", lines[0]);
+    }
+
+    #[test]
+    fn a_hidden_repo_makes_one_warn() {
+        init_log();
+        let (_dir, store, _, _) = file_store(b"x");
+        let service = test_service(store);
+        // `p` has no grant on `log-secret`: the reply says that it does not
+        // exist, and the log says why.
+        let mut request = Request::new(GetLandRequest {
+            repo: "log-secret".to_owned(),
+            land_id: "1".to_owned(),
+        });
+        request.extensions_mut().insert(Caller("p".to_owned()));
+
+        let span = call_span("GetLand");
+        let guard = span.enter();
+        let status = block_on(service.get_land(request)).expect_err("hidden");
+        drop(guard);
+        assert_eq!(status.code(), Code::NotFound);
+        // One line, with who and what.
+        let lines = log_lines("repo=\"log-secret\"");
+        assert_eq!(lines.len(), 1, "{}", log_text());
+        assert!(lines[0].contains("WARN"), "{}", lines[0]);
+        assert!(lines[0].contains("may not read the repo"), "{}", lines[0]);
+        assert!(lines[0].contains("principal=\"p\""), "{}", lines[0]);
+        assert!(lines[0].contains("rpc=\"GetLand\""), "{}", lines[0]);
     }
 
     #[tokio::test]
