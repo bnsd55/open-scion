@@ -9,16 +9,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use scion_core::{BlobId, FileState};
-use scion_proto::CHUNK_BYTES;
-use scion_proto::auth::Bearer;
-use scion_proto::v1::objects_client::ObjectsClient;
-use scion_proto::v1::{GetObjectsRequest, ObjectKind, ObjectRef};
+use scion_proto::v1::GetObjectsRequest;
 use scion_server::Store;
 use tonic::Code;
-use tonic::transport::Endpoint;
 
 mod common;
-use common::{REPO, TOKEN, Tiers, blob_path, changeset, land, noise};
+use common::{REPO, TOKEN, Tiers, blob_path, blob_ref, changeset, connect, land};
 
 /// `scn checkout REV --into dest` against the server at `url`.
 fn checkout(url: &str, rev: &str, dest: &Path) {
@@ -76,36 +72,14 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Node> {
 fn checkout_through_the_daemon_and_the_cache_matches_a_direct_checkout() {
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
-    let regular = |content: &[u8], executable| FileState::Regular {
-        content: store.blobs().put(content).unwrap(),
-        executable,
-    };
-    let readme = regular(b"hello\n", false);
-    // Over three parts of 1 MiB, packed or not: noise, then text.
-    let mut big = noise(3 * CHUNK_BYTES);
-    big.extend((0..100_000).flat_map(|i| format!("line {i}\n").into_bytes()));
-    let first = changeset(
-        None,
-        &[
-            ("README.md", readme),
-            ("big.bin", regular(&big, false)),
-            ("run.sh", regular(b"#!/bin/sh\necho hi\n", true)),
-            ("src/lib.rs", regular(b"pub fn f() {}\n", false)),
-            ("src/nested/deep/file.txt", regular(b"deep\n", false)),
-            // The same blob as README.md.
-            ("src/nested/copy.txt", readme),
-            (
-                "link",
-                FileState::Symlink {
-                    target: store.blobs().put(b"README.md").unwrap(),
-                },
-            ),
-        ],
-    );
-    let first = land(&store, &first);
+    let (files, big) = common::files(&store);
+    let first = land(&store, &changeset(None, &files));
     // For a later change. A blob is not part of any tree until a changeset
     // names it.
-    let new_readme = regular(b"hello, again\n", false);
+    let new_readme = FileState::Regular {
+        content: store.blobs().put(b"hello, again\n").unwrap(),
+        executable: false,
+    };
     // The server's file of `big`, packed at another level than a tier would
     // pack it, so a tier that packs again is seen.
     let packed = zstd::bulk::compress(&big, 1).unwrap();
@@ -117,7 +91,7 @@ fn checkout_through_the_daemon_and_the_cache_matches_a_direct_checkout() {
     checkout(&tiers.socket, "main", &dest("through-tiers"));
     checkout(&tiers.server, "main", &dest("direct"));
     let direct = snapshot(&dest("direct"));
-    assert_eq!(direct.len(), 10, "{direct:?}");
+    assert_eq!(direct.len(), 11, "{direct:?}");
     assert_eq!(snapshot(&dest("through-tiers")), direct);
     let written = fs::read(dest("through-tiers").join("big.bin")).unwrap();
     assert_eq!(BlobId::of(&written), BlobId::of(&big));
@@ -152,12 +126,7 @@ fn a_missing_repo_fails_the_call_once_at_each_tier() {
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
     let tiers = Tiers::start(data, store);
-    let refs = (0..3u8)
-        .map(|i| ObjectRef {
-            kind: ObjectKind::Blob.into(),
-            id: BlobId::of(&[i]).as_bytes().to_vec(),
-        })
-        .collect();
+    let refs = (0..3u8).map(|i| blob_ref(BlobId::of(&[i]))).collect();
     let request = GetObjectsRequest {
         repo: "no-such-repo".into(),
         refs,
@@ -165,12 +134,7 @@ fn a_missing_repo_fails_the_call_once_at_each_tier() {
     };
 
     let reply = tiers.runtime.block_on(async {
-        let channel = Endpoint::from_shared(tiers.socket.clone())
-            .unwrap()
-            .connect()
-            .await
-            .unwrap();
-        let mut daemon = ObjectsClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap());
+        let mut daemon = connect(&tiers.socket).await;
         daemon.get_objects(request).await
     });
     // The call itself fails, as it does on the server, not one object of it.

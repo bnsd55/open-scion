@@ -11,34 +11,19 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 
 use scion_core::{BlobId, ChangesetId, Entry, FileState, Tree, TreeId};
-use scion_proto::auth::Bearer;
+use scion_proto::MAX_OBJECT_REFS;
 use scion_proto::object::{self, Assembler, Header};
-use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::{
     Encoding, GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef, ResolveRefRequest,
 };
-use scion_proto::{CHUNK_BYTES, MAX_OBJECT_REFS};
 use scion_server::{Store, db, tree};
 use tonic::Code;
-use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Channel, Endpoint};
 
 mod common;
-use common::{REPO, TOKEN, Tiers, changeset, land, noise};
-
-type Client = ObjectsClient<InterceptedService<Channel, Bearer>>;
-
-async fn connect(url: &str) -> Client {
-    let channel = Endpoint::from_shared(url.to_owned())
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
-    ObjectsClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap())
-}
+use common::{Client, REPO, Tiers, blob_ref, changeset, connect, land, tree_ref};
 
 /// What ends a `GetObjects` answer before its last object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,23 +143,18 @@ async fn ask(url: &str, call: &Call) -> Answer {
     }
 }
 
-/// Asks the daemon (so its misses fill the cache), the cache, the server,
-/// then the daemon and the cache again. Every answer must be the server's.
+/// Asks the server, then the daemon (so its misses fill the cache), the
+/// cache, and the daemon and the cache again. Every tier must give the
+/// server's answer.
 async fn same(tiers: &Tiers, call: &Call) -> Answer {
-    let order = [
+    let server = ask(&tiers.server, call).await;
+    for (name, url) in [
         ("daemon", &tiers.socket),
         ("cache", &tiers.cache_url),
-        ("server", &tiers.server),
         ("daemon, warm", &tiers.socket),
         ("cache, warm", &tiers.cache_url),
-    ];
-    let mut answers = Vec::new();
-    for (name, url) in order {
-        answers.push((name, ask(url, call).await));
-    }
-    let server = answers.remove(2).1;
-    for (name, answer) in answers {
-        assert_eq!(answer, server, "{name}: {call:?}");
+    ] {
+        assert_eq!(ask(url, call).await, server, "{name}: {call:?}");
     }
     server
 }
@@ -205,20 +185,6 @@ fn objects(repo: &str, refs: &[ObjectRef], zstd: bool) -> Call {
     })
 }
 
-fn tree_ref(id: TreeId) -> ObjectRef {
-    ObjectRef {
-        kind: ObjectKind::Tree.into(),
-        id: id.as_bytes().to_vec(),
-    }
-}
-
-fn blob_ref(id: BlobId) -> ObjectRef {
-    ObjectRef {
-        kind: ObjectKind::Blob.into(),
-        id: id.as_bytes().to_vec(),
-    }
-}
-
 /// The ID of a successful `ResolveRef` or `GetRootTree` answer.
 fn id_of(answer: &Answer) -> Vec<u8> {
     match answer {
@@ -227,8 +193,11 @@ fn id_of(answer: &Answer) -> Vec<u8> {
     }
 }
 
-/// The trees and blobs of the snapshot under `root`, read from the server.
-async fn snapshot(tiers: &Tiers, root: TreeId) -> (Vec<TreeId>, Vec<BlobId>) {
+/// The trees and blobs of the snapshot of `changeset`, its root tree first.
+/// Every tier gives the root tree; the rest is read from the server.
+async fn snapshot(tiers: &Tiers, changeset: ChangesetId) -> (Vec<TreeId>, Vec<BlobId>) {
+    let root = same(tiers, &root_tree(REPO, changeset.as_bytes())).await;
+    let root = TreeId::try_from(id_of(&root).as_slice()).unwrap();
     let mut client = connect(&tiers.server).await;
     let (mut trees, mut blobs) = (vec![root], Vec::new());
     let mut next = 0;
@@ -251,38 +220,29 @@ async fn snapshot(tiers: &Tiers, root: TreeId) -> (Vec<TreeId>, Vec<BlobId>) {
     (trees, blobs)
 }
 
+/// Flips one byte in the middle of the file at `path`, so it keeps its
+/// size. Returns the bytes it had.
+fn damage(path: &Path) -> Vec<u8> {
+    let good = fs::read(path).unwrap();
+    let mut bad = good.clone();
+    let middle = bad.len() / 2;
+    bad[middle] ^= 0xff;
+    fs::write(path, bad).unwrap();
+    good
+}
+
 /// A server, cache and daemon whose repo `r` holds files of each kind and
-/// size, and a repo `other` that does not have `r`'s changesets.
+/// size (`common::files`), and a repo `other` that does not have `r`'s
+/// changesets.
 fn fixture() -> (Tiers, ChangesetId) {
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
-    let put = |content: &[u8]| store.blobs().put(content).unwrap();
-    let regular = |content: &[u8], executable| FileState::Regular {
-        content: put(content),
-        executable,
+    let first = land(&store, &changeset(None, &common::files(&store).0));
+    let other = FileState::Regular {
+        content: store.blobs().put(b"other\n").unwrap(),
+        executable: false,
     };
-    // Over three parts of 1 MiB, packed or not: noise, then text.
-    let mut big = noise(3 * CHUNK_BYTES);
-    big.extend((0..100_000).flat_map(|i| format!("line {i}\n").into_bytes()));
-    let readme = regular(b"hello\n", false);
-    let files = [
-        ("README.md", readme),
-        ("big.bin", regular(&big, false)),
-        ("empty", regular(b"", false)),
-        ("run.sh", regular(b"#!/bin/sh\necho hi\n", true)),
-        ("src/lib.rs", regular(b"pub fn f() {}\n", false)),
-        ("src/nested/deep/file.txt", regular(b"deep\n", false)),
-        // The same blob as README.md.
-        ("src/nested/copy.txt", readme),
-        (
-            "link",
-            FileState::Symlink {
-                target: put(b"README.md"),
-            },
-        ),
-    ];
-    let first = land(&store, &changeset(None, &files));
-    let other = changeset(None, &[("other.txt", regular(b"other\n", false))]);
+    let other = changeset(None, &[("other.txt", other)]);
     store
         .write(|c| {
             let repo = db::create_repo(c, "other")?;
@@ -303,10 +263,10 @@ fn shape(answer: &Answer) -> (usize, Option<End>) {
 #[test]
 fn every_tier_resolves_as_the_server_does() {
     let (tiers, first) = fixture();
-    let first = first.as_bytes().to_vec();
+    let first_id = first.as_bytes().to_vec();
     tiers.runtime.block_on(async {
         // A ref is the only answer that changes, so a tier never keeps it.
-        assert_eq!(id_of(&same(&tiers, &resolve(REPO, "main")).await), first);
+        assert_eq!(id_of(&same(&tiers, &resolve(REPO, "main")).await), first_id);
         for (repo, name, code) in [
             (REPO, "no-such-ref", Code::NotFound),
             ("gone", "main", Code::NotFound),
@@ -321,27 +281,29 @@ fn every_tier_resolves_as_the_server_does() {
             content: tiers.store.blobs().put(b"hello, again\n").unwrap(),
             executable: false,
         };
-        let parent = ChangesetId::try_from(first.as_slice()).unwrap();
-        let second = changeset(Some(parent), &[("README.md", new)]);
+        let second = changeset(Some(first), &[("README.md", new)]);
         let second = land(&tiers.store, &second);
         let answer = same(&tiers, &resolve(REPO, "main")).await;
-        assert_eq!(
-            id_of(&answer),
-            second.as_bytes(),
-            "every tier follows the ref"
-        );
+        let moved = id_of(&answer) == second.as_bytes();
+        assert!(moved, "every tier follows the ref");
 
         // A root tree is kept by repo and changeset: `other` never sees
         // `first`, before or after `r` asked for it.
         let not_found = Answer::Id(Err(Code::NotFound));
-        assert_eq!(same(&tiers, &root_tree("other", &first)).await, not_found);
-        id_of(&same(&tiers, &root_tree(REPO, &first)).await);
-        assert_eq!(same(&tiers, &root_tree("other", &first)).await, not_found);
+        assert_eq!(
+            same(&tiers, &root_tree("other", &first_id)).await,
+            not_found
+        );
+        id_of(&same(&tiers, &root_tree(REPO, &first_id)).await);
+        assert_eq!(
+            same(&tiers, &root_tree("other", &first_id)).await,
+            not_found
+        );
         for (repo, id, code) in [
             (REPO, vec![0; 32], Code::NotFound),
-            ("gone", first.clone(), Code::NotFound),
+            ("gone", first_id.clone(), Code::NotFound),
             (REPO, vec![0; 31], Code::InvalidArgument),
-            ("", first.clone(), Code::InvalidArgument),
+            ("", first_id.clone(), Code::InvalidArgument),
         ] {
             let answer = same(&tiers, &root_tree(repo, &id)).await;
             assert_eq!(answer, Answer::Id(Err(code)), "{repo:?} {id:?}");
@@ -354,11 +316,9 @@ fn every_tier_sends_the_objects_of_the_server() {
     let (tiers, first) = fixture();
     let missing = blob_ref(BlobId::of(b"in no repo\n"));
     tiers.runtime.block_on(async {
-        let root = same(&tiers, &root_tree(REPO, first.as_bytes())).await;
-        let root = TreeId::try_from(id_of(&root).as_slice()).unwrap();
         // Every object of the snapshot, a tree level at a time as a checkout
         // asks, then every blob in one call, with a ref that repeats.
-        let (trees, blobs) = snapshot(&tiers, root).await;
+        let (trees, blobs) = snapshot(&tiers, first).await;
         assert_eq!((trees.len(), blobs.len()), (4, 8));
         for zstd in [false, true] {
             for &tree in &trees {
@@ -374,7 +334,7 @@ fn every_tier_sends_the_objects_of_the_server() {
         // A missing object ends the stream after the objects before it. A
         // tree asked for as a blob is missing too.
         let [a, b] = [blobs[0], blobs[1]].map(blob_ref);
-        let tree_as_blob = blob_ref(BlobId::from_bytes(*root.as_bytes()));
+        let tree_as_blob = blob_ref(BlobId::from_bytes(*trees[0].as_bytes()));
         let not_found = Some(End::Stream(Code::NotFound));
         for (refs, sent) in [
             (vec![a.clone(), missing.clone(), b.clone()], 1),
@@ -415,39 +375,27 @@ fn every_tier_sends_the_objects_of_the_server() {
     });
 }
 
-/// The daemon's file of a tree.
-fn daemon_tree_path(tiers: &Tiers, id: TreeId) -> PathBuf {
-    let hex = id.to_string();
-    let objects = tiers.dirs[1].path().join("data/objects/tree");
-    objects.join(&hex[..2]).join(&hex[2..])
-}
-
 #[test]
 fn a_damaged_copy_on_the_daemon_is_fetched_again() {
     let (tiers, first) = fixture();
     tiers.runtime.block_on(async {
-        let root = same(&tiers, &root_tree(REPO, first.as_bytes())).await;
-        let root = TreeId::try_from(id_of(&root).as_slice()).unwrap();
-        let (trees, blobs) = snapshot(&tiers, root).await;
+        let (trees, blobs) = snapshot(&tiers, first).await;
         let refs: Vec<ObjectRef> = trees
             .iter()
             .copied()
             .map(tree_ref)
             .chain(blobs.iter().copied().map(blob_ref))
             .collect();
-        // The daemon now holds every object.
-        let all = same(&tiers, &objects(REPO, &refs, true)).await;
+        let all = ask(&tiers.server, &objects(REPO, &refs, true)).await;
+        // Now the daemon holds every object.
+        assert_eq!(ask(&tiers.socket, &objects(REPO, &refs, true)).await, all);
         let calls = tiers.upstream_calls();
 
-        // Damage one byte of the daemon's copy of a tree and of the large
-        // blob, so each file keeps its size.
+        // One byte of the daemon's copy of the root tree and of the large
+        // blob changes.
         let [on_server, on_node] = tiers.blob_paths(blobs[1]);
-        for path in [&on_node, &daemon_tree_path(&tiers, root)] {
-            let mut bytes = fs::read(path).unwrap();
-            let middle = bytes.len() / 2;
-            bytes[middle] ^= 0xff;
-            fs::write(path, bytes).unwrap();
-        }
+        damage(&on_node);
+        damage(&tiers.daemon_tree_path(trees[0]));
         for zstd in [true, false] {
             assert_eq!(ask(&tiers.socket, &objects(REPO, &refs, zstd)).await, all);
         }
@@ -462,9 +410,7 @@ fn a_damaged_copy_on_the_daemon_is_fetched_again() {
 fn a_damaged_blob_on_the_server_never_passes_a_tier() {
     let (tiers, first) = fixture();
     tiers.runtime.block_on(async {
-        let root = same(&tiers, &root_tree(REPO, first.as_bytes())).await;
-        let root = TreeId::try_from(id_of(&root).as_slice()).unwrap();
-        let (_, blobs) = snapshot(&tiers, root).await;
+        let (_, blobs) = snapshot(&tiers, first).await;
         // README.md, big.bin and the target of link, by name.
         let refs = [blobs[0], blobs[1], blobs[3]].map(blob_ref);
         let big = blobs[1];
@@ -472,12 +418,7 @@ fn a_damaged_blob_on_the_server_never_passes_a_tier() {
         // One byte of the large blob's zstd file changes. Its frame header
         // still reads, so the server sends it, in its stored form.
         let path = &tiers.blob_paths(big)[0];
-        let good = fs::read(path).unwrap();
-        let mut bad = good.clone();
-        let middle = bad.len() / 2;
-        bad[middle] ^= 0xff;
-        fs::write(path, &bad).unwrap();
-
+        let good = damage(path);
         for zstd in [false, true] {
             let call = objects(REPO, &refs, zstd);
             // The server unpacks the blob for a RAW client and finds the

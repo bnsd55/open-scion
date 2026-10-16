@@ -7,7 +7,11 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
-use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
+use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath, TreeId};
+use scion_proto::CHUNK_BYTES;
+use scion_proto::auth::Bearer;
+use scion_proto::v1::objects_client::ObjectsClient;
+use scion_proto::v1::{ObjectKind, ObjectRef};
 use scion_server::{Store, db, service, tree};
 use scion_tier::{
     CACHE_UPSTREAM_TIMEOUT, DAEMON_UPSTREAM_TIMEOUT, DiskStore, MemoryStore, Tier, bind_unix,
@@ -16,9 +20,38 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio_stream::wrappers::{TcpListenerStream, UnixListenerStream};
+use tonic::service::interceptor::InterceptedService;
+use tonic::transport::{Channel, Endpoint};
 
 pub const REPO: &str = "r";
 pub const TOKEN: &str = "secret";
+
+pub type Client = ObjectsClient<InterceptedService<Channel, Bearer>>;
+
+/// An `Objects` client of `url` (`http://` or `unix://`) that sends the
+/// token.
+pub async fn connect(url: &str) -> Client {
+    let channel = Endpoint::from_shared(url.to_owned())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    ObjectsClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap())
+}
+
+pub fn tree_ref(id: TreeId) -> ObjectRef {
+    ObjectRef {
+        kind: ObjectKind::Tree.into(),
+        id: id.as_bytes().to_vec(),
+    }
+}
+
+pub fn blob_ref(id: BlobId) -> ObjectRef {
+    ObjectRef {
+        kind: ObjectKind::Blob.into(),
+        id: id.as_bytes().to_vec(),
+    }
+}
 
 /// A server, a cache in front of it, and a daemon in front of the cache.
 /// Dropping it stops all three.
@@ -92,12 +125,55 @@ impl Tiers {
     pub fn blob_files(&self, id: BlobId) -> [Vec<u8>; 2] {
         self.blob_paths(id).map(|path| fs::read(path).unwrap())
     }
+
+    /// Where the daemon keeps tree `id`. The server keeps trees in its
+    /// database.
+    pub fn daemon_tree_path(&self, id: TreeId) -> PathBuf {
+        let node = self.dirs[1].path().join("data");
+        object_path(&node, "tree", &id.to_string())
+    }
 }
 
 /// Where the server, and the daemon, keep blob `id` under `dir`.
 pub fn blob_path(dir: &Path, id: BlobId) -> PathBuf {
-    let hex = id.to_string();
-    dir.join("objects/blob").join(&hex[..2]).join(&hex[2..])
+    object_path(dir, "blob", &id.to_string())
+}
+
+/// Where an object of `kind` (`tree` or `blob`) with ID `hex` is under `dir`.
+fn object_path(dir: &Path, kind: &str, hex: &str) -> PathBuf {
+    dir.join("objects")
+        .join(kind)
+        .join(&hex[..2])
+        .join(&hex[2..])
+}
+
+/// The files of a snapshot with one of each kind: a large file of four
+/// parts of 1 MiB, packed or not (noise, then text), an executable, nested
+/// directories, two paths with one blob, a symlink and an empty file. Puts
+/// their blobs in `store`, and returns them with the large file's content.
+pub fn files(store: &Store) -> (Vec<(&'static str, FileState)>, Vec<u8>) {
+    let mut big = noise(3 * CHUNK_BYTES + 1);
+    big.extend((0..5_000).flat_map(|i| format!("line {i}\n").into_bytes()));
+    let mut blobs = store.blobs().batch();
+    let mut regular = |content: &[u8], executable| FileState::Regular {
+        content: blobs.put(content).unwrap(),
+        executable,
+    };
+    let readme = regular(b"hello\n", false);
+    let mut files = vec![
+        ("README.md", readme),
+        ("big.bin", regular(&big, false)),
+        ("empty", regular(b"", false)),
+        ("run.sh", regular(b"#!/bin/sh\necho hi\n", true)),
+        ("src/lib.rs", regular(b"pub fn f() {}\n", false)),
+        ("src/nested/deep/file.txt", regular(b"deep\n", false)),
+        // The same blob as README.md.
+        ("src/nested/copy.txt", readme),
+    ];
+    let target = blobs.put(b"README.md").unwrap();
+    files.push(("link", FileState::Symlink { target }));
+    blobs.sync().unwrap();
+    (files, big)
 }
 
 /// `len` bytes that zstd cannot make smaller.

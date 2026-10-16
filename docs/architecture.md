@@ -1179,11 +1179,11 @@ limit and its upgrade path. This is the list on `main` today.
 | Crash suite (`scion-server/tests/crash.rs`) | The real `scion-server` binary, killed with SIGKILL (below). |
 | Conformance (`scn/tests/conformance.rs`) | The server, a `scion-cache` and a `scion-daemon` give the same `Objects` answers (below). |
 
-**The crash suite.** Four clients upload blobs, create changesets and land
-them on two refs. Some lands start from an older base, and some put a shared
-path, so they conflict. The test kills the server six times: at a random
-moment, or soon after a large upload or a land starts. After each restart
-it checks:
+**The crash suite.** Several clients upload blobs, create changesets and
+land them on two refs. Some lands start from an older base, and some put a
+shared path, so they conflict. The test kills the server several times: at
+a random moment, soon after a large upload starts, or while a land is
+pending in the database. After each restart it checks:
 
 - The server removed the temp files that the kill left.
 - A retry with the same request key returns the reply that the land got,
