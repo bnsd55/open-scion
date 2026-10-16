@@ -722,6 +722,8 @@ fn file_state(state: FileState) -> v1::FileState {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use scion_core::{Changeset, FileState, IdentityTime};
     use tonic::Code;
 
