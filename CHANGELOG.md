@@ -71,6 +71,17 @@ release.
   1 MiB limit allowed still reads every file.
 - Bearer-token auth, loopback-only listening by default, request limits and
   name validation at the RPC boundary.
+- Blobs belong to repos (schema version 4, table `repo_blobs`). A repo has
+  the blobs uploaded to it and the blobs that its changesets name.
+  `CreateChangeset` refuses a blob of another repo with the error of content
+  that no repo stored, before it reads any file, so a changeset can no
+  longer name another repo's blob and then read it. `PutBlob` keeps a stored
+  copy only for a blob that its repo has, and else writes the content again,
+  so its time does not show that another repo has the content. The upgrade
+  adds the blobs of every changeset of each repo, in one transaction, and
+  logs its progress. A blob uploaded before the upgrade and named by no
+  changeset must be uploaded again. `GetObjects` still reads any object by
+  ID (#13).
 - `ReadFile` streams a file in 1 MiB parts from the zstd decoder, under a
   256 MiB budget for all replies. It checks the content against its ID
   before the last part, and ends a stalled reply with `DEADLINE_EXCEEDED`.

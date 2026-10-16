@@ -83,8 +83,11 @@ request is `INVALID_ARGUMENT`. In a reply, an empty ID field means "none".
 "none".
 
 **Visibility.** A repo sees only its own changesets. A changeset that the
-repo does not have is `NOT_FOUND`, the same as one that does not exist. Trees
-and blobs are not scoped to a repo in v1 (section 5).
+repo does not have is `NOT_FOUND`, the same as one that does not exist. A
+repo has the blobs uploaded to it and the blobs that its changesets name. A
+changeset names only blobs of its repo (section 6.2), so `ReadFile`,
+`ListDir`, `Log`, `Blame` and `Diff` reach only the repo's own content.
+`GetObjects` is not scoped to a repo in v1 (section 5).
 
 **Message size limits.**
 
@@ -176,10 +179,11 @@ can answer a request for an object. A client checks what it can by hash.
 In v0.1 a client also trusts every tier on its path for the `ResolveRef` and
 `GetRootTree` answers that the tier passes on (section 8).
 
-**An object ID is not a permission.** In v1 the server sends any stored tree
-or blob to any caller with the token that names an existing repo, and a
-changeset can name a blob that another repo uploaded. Read tickets and
-per-repo blobs are not in v1
+**An object ID is not a permission.** A changeset cannot name a blob of
+another repo (section 6.2), and no answer of `PutBlob` or `CreateChangeset`
+shows whether another repo has a blob. But in v1 `GetObjects` sends any
+stored tree or blob to any caller with the token that names an existing
+repo. Read tickets are not in v1
 ([#13](https://github.com/bnsd55/open-scion/issues/13)).
 
 ## 6. The `Scion` service
@@ -198,8 +202,13 @@ file's content.
   the rest.
 - The reply's `blob_id` is the `BlobId` of all the bytes together
   ([`format-v1.md`](format-v1.md)).
-- Safe to repeat. The same bytes always give the same ID. Blobs are not
-  scoped to a repo in v1.
+- The blob then belongs to the repo: a changeset of the repo may name it
+  (section 6.2).
+- Safe to repeat. The same bytes always give the same ID.
+- The reply holds only the ID, which the client can compute itself. The
+  server keeps a stored copy only if the repo has the blob already. Else it
+  writes the content as for new content. So neither the reply nor its time
+  shows whether another repo has the same content.
 
 | Error | When |
 |---|---|
@@ -219,8 +228,10 @@ if all of these hold:
 - it has no committer (only git import sets one);
 - its message is at most 1 MiB, and the author's name and email are at most
   1 KiB each;
-- every regular-file or symlink put names a blob that the server has stored
-  intact (upload it first with `PutBlob`);
+- every regular-file or symlink put names a blob of the repo, which the
+  server has stored intact. A blob of the repo is one uploaded to it with
+  `PutBlob`, or one that a changeset of the repo names, so a rename needs no
+  new upload. A gitlink names no blob, whatever its bytes;
 - its changes apply to the parent's tree. For example, a delete of a missing
   path or of a directory does not apply.
 
@@ -229,7 +240,7 @@ the same bytes give the same ID and no second copy.
 
 | Error | When |
 |---|---|
-| `INVALID_ARGUMENT` | Any rule above fails, including a parent that the repo does not have. For a missing or damaged blob, the message names the first such path in path order. |
+| `INVALID_ARGUMENT` | Any rule above fails, including a parent that the repo does not have. For a blob that is not the repo's, or is missing or damaged, the message names the first such path in path order. A blob of another repo gets the same answer as content that no repo stored, and the server checks every blob for the repo before it reads any, so the answer does not show whether another repo has it. |
 | `NOT_FOUND` | The repo does not exist. |
 
 ### 6.3 Land
@@ -837,8 +848,8 @@ A new version is a new package, `scion.v2`. A server MAY serve both.
 ## 10. Not in v1
 
 - TLS ([#14](https://github.com/bnsd55/open-scion/issues/14)).
-- More than one principal, per-path write rules, read tickets and per-repo
-  blobs ([#13](https://github.com/bnsd55/open-scion/issues/13)).
+- More than one principal, per-path write rules and read tickets
+  ([#13](https://github.com/bnsd55/open-scion/issues/13)).
 - Per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)).
 - Calls that create a repo or a ref, delete a ref, move a ref other than by
   `Land`, or list repos or refs. `scion-server import` creates repos and refs.
