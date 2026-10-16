@@ -537,6 +537,19 @@ impl Disk {
         Ok(())
     }
 
+    /// Sets one meta flag, and logs a failure: a flag that is lost changes
+    /// what the next start walks, so its loss must be visible.
+    fn set_flag_logged(&mut self, name: &str, value: bool) {
+        if let Err(error) = self.set_flag(name, value) {
+            tracing::warn!(
+                flag = name,
+                value,
+                %error,
+                "cannot write the index flag; the next start may not walk"
+            );
+        }
+    }
+
     /// The size that the db gives for `key`, if any. The batch does not
     /// name it: the callers check `newest` first.
     fn settled_size(&self, key: Key) -> io::Result<Option<usize>> {
@@ -1415,7 +1428,7 @@ impl DiskStore {
             // over.
             Err(e) => {
                 self.stray.store(true, Ordering::Relaxed);
-                let _ = disk.set_flag("walk_pending", true);
+                disk.set_flag_logged("walk_pending", true);
                 Err(e)
             }
         }
@@ -1436,7 +1449,7 @@ impl DiskStore {
             // The walk went over every directory. It owes nothing more
             // unless the run stranded a file or lost a batch since.
             if !self.stray.load(Ordering::Relaxed) {
-                let _ = disk.set_flag("walk_pending", false);
+                disk.set_flag_logged("walk_pending", false);
                 self.stray.store(false, Ordering::Relaxed);
             }
         }
@@ -1452,7 +1465,7 @@ impl DiskStore {
             // its puts have no rows now; the walk of the next start finds
             // them.
             self.stray.store(true, Ordering::Relaxed);
-            let _ = disk.set_flag("walk_pending", true);
+            disk.set_flag_logged("walk_pending", true);
             tracing::warn!(
                 %error,
                 "cannot commit the index; a crash now loses what was used last"
@@ -1514,9 +1527,14 @@ impl Drop for DiskStore {
         // Not clean when the run stranded something whose flag write may
         // have failed: the next start then walks.
         let clean = synced.is_ok() && committed.is_ok() && !self.stray.load(Ordering::Relaxed);
-        let _ = disk.set_flag("clean", clean);
-        if committed.is_ok() {
-            let _ = disk.checkpoint();
+        disk.set_flag_logged("clean", clean);
+        if committed.is_ok()
+            && let Err(error) = disk.checkpoint()
+        {
+            tracing::warn!(
+                %error,
+                "cannot checkpoint the index; the next start reads the write-ahead log"
+            );
         }
         tracing::info!(
             objects = disk.objects,
@@ -1592,7 +1610,7 @@ impl Store for DiskStore {
             // The file is in place, but the index may not name it: a walk
             // finds it, this one or the next.
             self.stray.store(true, Ordering::Relaxed);
-            let _ = lock(&self.disk).set_flag("walk_pending", true);
+            lock(&self.disk).set_flag_logged("walk_pending", true);
         }
         added
     }
