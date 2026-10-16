@@ -60,12 +60,25 @@ thread_local! {
 pub struct NodeId([u8; 32]);
 
 impl NodeId {
-    fn of(body: &[u8]) -> Self {
+    /// The ID of `body`: the hash of its bytes.
+    pub(crate) fn of(body: &[u8]) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(DOMAIN);
         hasher.update(body);
         Self(*hasher.finalize().as_bytes())
     }
+}
+
+impl NodeId {
+    /// The bytes of the ID.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Whether `body` decodes as a history node.
+pub(crate) fn node_decodes(body: &[u8]) -> bool {
+    decode_node(body).is_some()
 }
 
 impl fmt::Display for NodeId {

@@ -839,6 +839,11 @@ impl Blobs {
         Ok(reader)
     }
 
+    /// The folder of blob files, `objects/blob`.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Opens a blob's file: one zstd frame, which nothing here unpacks or
     /// checks.
     pub(crate) fn open_file(&self, id: BlobId) -> Result<fs::File> {
