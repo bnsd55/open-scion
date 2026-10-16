@@ -19,6 +19,11 @@ release.
   drive flush.
 - One-way git import. Imported commits are checked against git, and a
   re-import never moves a ref off later lands.
+- `scion-server import` can run while the server runs on the same data
+  directory. It moves the ref by compare-and-swap, as a land does, and its
+  commits are durable before the server can see them. A second server, or
+  a process of another build, is refused. A request that waits for the
+  import's write lock for more than 5 s fails with `UNAVAILABLE`.
 - Server-side commits (`CreateChangeset`) and lands: path-level conflict
   checks through a per-ref index, one transaction per land, retries by
   request key, and bounded retry when the ref moves.
@@ -94,8 +99,7 @@ release.
 - Query API: `MergeBase` (every best common ancestor, as
   `git merge-base --all`), `IsAncestor`, and `Diff` (the paths whose file
   differs between two changesets, optionally below a path). The graph walks
-  use generation numbers and stop at 10,000 changesets with
-  `RESOURCE_EXHAUSTED`. A `Diff` reply holds at most 1,000 paths and says
+  use generation numbers. A `Diff` reply holds at most 1,000 paths and says
   where to continue. `scn merge-base`, `scn is-ancestor` (exit 0 or 1) and
   `scn diff`. Every `scn` error now exits 2, so it never reads as the "no"
   of `scn is-ancestor`.
@@ -112,6 +116,14 @@ release.
   over each first-parent history and a link to the newest merge on it.
   `IsAncestor` reads a few dozen entries at any depth, and three rows per
   merge between. `MergeBase` does the same when neither first-parent
-  history has a merge newer than where the two meet; otherwise it still
-  walks, up to 10,000 changesets. `scion-server derive --kind commit_graph`
-  fills it ahead of the first query on an older database.
+  history has a merge newer than where the two meet; otherwise it walks.
+  `scion-server derive --kind commit_graph` fills it ahead of the first
+  query on an older database.
+- `MergeBase` and `IsAncestor` have no step bound, so they answer across
+  any number of merges, where they failed with `RESOURCE_EXHAUSTED` past
+  10,000 steps. At most 4 run at once, and each stops with
+  `DEADLINE_EXCEEDED` at 600 s or once its call is dropped. The merge-base
+  walk jumps over runs of first parents that only one part of the walk
+  reaches: a few dozen reads for a run, not one for each changeset. A walk
+  holds the database lock for about 1,000 reads at a time, then leaves it
+  free for other requests.

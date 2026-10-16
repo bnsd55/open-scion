@@ -106,7 +106,9 @@ and the decoder rules.
 One data directory holds everything (`store.rs`):
 
 ```text
-<data>/lock                    locked by the one process that uses <data>
+<data>/lock                    shared by every process that uses <data>
+<data>/open.lock               held while a process opens <data>
+<data>/server.lock             held by the one server process
 <data>/scion.db                metadata and trees (SQLite)
 <data>/objects/blob/ab/cd..    one zstd file per blob, named by its ID in hex
 <data>/tmp/                    staging for atomic blob writes and uploads
@@ -132,8 +134,8 @@ trees commits them in one transaction. The schema version is
 `migrations/` that is newer than its version runs, in order, in its own
 transaction. A released migration never changes. A build refuses a database
 with a newer version. Version 3 lets a derived value have any length; the
-upgrade copies every row. All database access goes through one connection behind
-a mutex. Write transactions use `BEGIN IMMEDIATE`.
+upgrade copies every row. All database access of a process goes through one
+connection behind a mutex. Write transactions use `BEGIN IMMEDIATE`.
 
 **Blob folder.** One zstd file per blob, at most 100 MiB uncompressed. A write
 goes to a temp file in `tmp/`, is flushed, and is renamed into place. The zstd
@@ -152,8 +154,9 @@ holds raw bytes, because the frame header needs the size before the first
 compressed byte. After the last message, the server keeps an intact stored
 copy if there is one. Otherwise it streams the spool file through the
 compressor into the temp file. The spool file has no name, so a dropped
-upload or a crash leaves nothing behind. `Store::open` removes any temp file
-that a crash left before its rename.
+upload or a crash leaves nothing behind. An open that finds no other process
+in the data directory removes any temp file that a crash left before its
+rename (see below).
 
 **Durability rules.**
 
@@ -165,8 +168,9 @@ that a crash left before its rename.
 - A database transaction is durable when `Store::write` returns, or after a
   later `Store::flush`. WAL with `synchronous = FULL` ends each commit with a
   plain `fsync`. On macOS that can leave the commit in the drive cache, so
-  `flush` waits for a shared full flush. SQLite runs no full flush of its own
-  (`fullfsync = OFF`), except in checkpoints (`checkpoint_fullfsync`).
+  `flush` waits for a shared full flush. In the server, SQLite runs no full
+  flush of its own (`fullfsync = OFF`), except in checkpoints
+  (`checkpoint_fullfsync`). An import process is different (below).
   Elsewhere the commit's `fsync` already flushes the cache. A land waits for
   the flush after it releases the ref's lock, so queued lands share it.
 - A read waits too. If `Store::read` saw a commit that no full flush covers
@@ -188,10 +192,53 @@ that a crash left before its rename.
 - A stored blob still costs a full flush when it is put again or named by a
   changeset: another batch may have written it and not synced yet.
 
-**Data-directory lock.** `Store::open` takes an exclusive, non-blocking
-`flock` on `<data>/lock` and holds it until the last `Store` clone is dropped.
-Lands are serialized by an in-memory lock (section 5), which a second process
-would not see. So `scion-server import` needs the server stopped.
+**Processes that share a data directory.** `scion-server import` can run
+while the server runs. The server opens the directory with `Store::open`, an
+import with `Store::open_shared`. Each holds its `flock`s until the last
+`Store` clone is dropped:
+
+| Lock file | Held by |
+|---|---|
+| `<data>/server.lock` | The server, exclusive. Lands are serialized in its memory (section 5), so a second server is refused. `derive` opens as the server too: it removes rows of older versions of a kind, which a running server of an older build may still read. |
+| `<data>/lock` | Every process, shared, for its whole life. An open first tries to take it exclusive, to learn whether another process uses the directory. An older build holds it exclusive for its whole life, so it and this build keep each other out. The file holds the build of the processes that use the directory (below). |
+| `<data>/open.lock` | A process while it opens the directory, so opens take turns. |
+
+- **Alone at open.** Only a process that opens the directory alone removes
+  the files in `tmp/` and runs schema migrations. While another process runs,
+  its temp files are live, and its statements need the schema it knows. So
+  the temp files that a crashed import leaves stay until an open finds the
+  directory unused ([#101](https://github.com/bnsd55/open-scion/issues/101)).
+  A shared open of an older schema fails: stop the other processes to
+  upgrade it.
+- **One build.** Each process removes the derived rows of older versions of
+  a kind (section 4), which a process of an older build may still read. So
+  the first process writes its build into `<data>/lock`: the schema version
+  and the version of each kind (`store::build`). An open while other
+  processes run fails unless its build is the same.
+- **Writes take turns.** SQLite in WAL mode lets one process read while the
+  other writes. A write waits for the write transaction of the other
+  process, up to `busy_timeout` (5 s), and then fails with `UNAVAILABLE`, so
+  the client retries. An import holds the
+  write lock for one batch of 1,000 commits, verification included. While a
+  server write waits, it holds the server's one connection, so the server's
+  reads wait too ([#100](https://github.com/bnsd55/open-scion/issues/100)).
+- **Refs.** Both processes move a ref by compare-and-swap on its `version`,
+  each in a write transaction. The server sees a move that the import made at
+  its next land on the ref: each plan reads the head from the database and
+  advances the path index to it (section 5).
+- **Durability.** Each process counts and flushes its own commits, and group
+  commit shares a full flush only within one process. A server reply that
+  only reads does not flush for a commit of another process. So a shared
+  `Store` commits with `fullfsync = ON`: SQLite syncs the log with a full
+  flush of the drive cache before the commit becomes visible. The server
+  never sees an import commit that a power loss can undo. In turn, a server
+  commit reaches the drive before the import can see it. So the import runs
+  a full flush before it reports, which covers every write that reached the
+  drive. Its report rests on no server commit that a power loss can undo.
+- **Blobs.** The import syncs each blob batch before the transaction that
+  names its blobs, as in one process. So a blob that the server reaches
+  through metadata is durable. The server reads blob files directly, and
+  checks each against its ID.
 
 ## 4. Derived data
 
@@ -217,7 +264,7 @@ computed eagerly or on demand. The rest is this project's choice.
 | Eager | A kind can also store its value when the changeset is written. `root_tree` does (below). `commit_graph` does if each parent has a value (`derived::on_write`), so a write never derives a long history. |
 | Storage | One `derived` row per (kind, version, changeset), written in the transaction that derives it. A large structure belongs in its own table, and the value is its ID, as `root_tree` keeps trees in `trees`. |
 | A version bump | A new version reads and writes only its own rows. So the old rows become unused, and nothing rewrites them. The new version derives its values again, in steps. Each step, and each write of a root tree, also deletes up to `STEP` rows of older versions of its kind, as each new land deletes a few expired lands. Rows of a newer version stay: a newer build that ran on this data may run again, and it reads them. Rows of a kind that the build no longer has also stay. |
-| Backfill | `derived::backfill`, and `scion-server derive --kind root_tree --ref main` (with the server stopped, as for import), fill a ref's history in steps (`--kind commit_graph` fills every ancestor), then delete every row of an older version, `STEP` rows per transaction. It is safe to repeat. |
+| Backfill | `derived::backfill`, and `scion-server derive --kind root_tree --ref main` (with the server stopped: it opens the data directory as the server), fill a ref's history in steps (`--kind commit_graph` fills every ancestor), then delete every row of an older version, `STEP` rows per transaction. It is safe to repeat. |
 | Repos | Rows are keyed by changeset alone. A changeset ID fixes its whole history, so a value is the same in every repo. `get`, `fill` and `derive` check `repo_changesets` first, so a stored value never leaks to a repo that cannot see the changeset. |
 | Durability | A value can name rows that its derivation wrote, such as trees, and a reply can send it to a client. So when `get` derives a value, it waits for one full flush after the last step, shared with concurrent commits, before it returns. It waits on an error too. `fill`, `derive` and `put` never flush: inside a write, the write's own flush covers them. |
 | Crashes | Each step commits on its own, and values never change. So a crash or an error between steps leaves only correct rows. The next read walks back to the stored values and goes on from there. |
@@ -242,8 +289,9 @@ The write needs the first parent's root tree in its transaction. After a
 version bump of `root_tree`, that parent has no row, and the transaction
 would derive its whole history. So `CreateChangeset` and `Land` call
 `tree::fill_root_tree` on the parent before the transaction, and the
-transaction then finds the parent's row. Git import does not: it runs with
-the server stopped, so its transaction blocks no other request.
+transaction then finds the parent's row. Git import does the same for each
+first parent from before its batch: a server that shares the data directory
+waits for the batch's transaction (section 3).
 
 `tree::apply` runs all deletes before all puts, so one changeset can turn a
 file into a directory or back. It loads only the directories on changed paths
@@ -376,9 +424,9 @@ sequenceDiagram
 - **Durable before the reply.** Every reply waits for a full flush that covers
   the land's transactions (`Store::flush`). The land releases the ref lock
   first, so the lands queued behind it share that flush.
-- **ABORTED on contention.** Only git import moves a ref without the ref lock.
-  The data-directory lock keeps the `import` command and the server apart, so
-  this race needs both in one process, as in the tests. If the
+- **ABORTED on contention.** Only git import moves a ref without the ref lock,
+  in the server's process or in an import process beside it (section 3). It
+  moves the ref once, at its end, by compare-and-swap. If the land's
   compare-and-swap fails, the transaction rolls back and the land is planned
   again from the new head. After 3 attempts the call fails with `ABORTED` and
   the row stays pending. The caller retries with the same key. `scn land`
@@ -508,8 +556,8 @@ needed.
 ## 6. Git import
 
 `scion-server --data DIR import [--repo main] [--rev HEAD] [--ref main] [--verify 100] GIT_DIR`
-imports one way, from a local git repository. It needs the server stopped
-(the data-directory lock). Only SHA-1 repositories are supported.
+imports one way, from a local git repository. It can run while the server
+runs (section 3). Only SHA-1 repositories are supported.
 
 **Mapping.**
 
@@ -528,11 +576,15 @@ imports one way, from a local git repository. It needs the server stopped
    stack. Commits already in `git_import` are not imported again.
 2. For each batch of 1,000 commits, build the changesets, write new blobs into
    one blob batch, and sync it.
-3. In one transaction, store each changeset with `tree::store_changeset`
+3. Derive the missing root tree of each first parent from before the batch,
+   in steps, as after a version bump. Then, in one transaction, store each
+   changeset with `tree::store_changeset`
    (with its root tree, and its commit-graph node if each parent has one),
    record its `git_import` row, and verify the sampled commits. A failed check
    rolls back the batch. Earlier batches stay, so a rerun continues.
-4. Point the ref at the tip.
+4. Point the ref at the tip. The checks in the table below run in reads,
+   and the move is a compare-and-swap on the ref's `version`. If a land moved
+   the ref in between, the import checks it again.
 
 **Verification.** Every new root and merge commit is checked, plus `--verify`
 other new commits, evenly spaced and ending at the newest. A check compares
@@ -705,14 +757,21 @@ and their bounds, are this project's choices.
   histories do not meet: above it each side has only its own first-parent
   history, and below it every ancestor of either is an ancestor of that
   point. That reads O(log n) nodes, at any depth. Else the call walks the
-  graph (`db::merge_bases`). The walk takes changesets from a queue, highest
+  graph (`graph::Paint`). The walk takes changesets from a queue, highest
   generation first, and marks each with the sides (A, B) that reach it. A
   parent's generation is below its child's, so a changeset leaves the queue
   only after every descendant that the walk reached, with all its marks. One
   marked by both sides and not stale is a best common ancestor, and the walk
   marks its ancestors stale. The walk ends when no queued changeset that is
   not stale carries A, or none carries B: no other best common ancestor can
-  follow.
+  follow. The walk jumps over runs of first parents. Each changeset that the
+  rest of the walk reaches has a generation of at most the highest one still
+  queued. So the first parents of the changeset taken, down to one above
+  that generation and not past the newest merge on its history, get no
+  other mark and hold no base. The walk jumps down to the oldest of them
+  with the jumps of the commit graph, in O(log n) nodes, and goes on from
+  its parents. So it reads each merge on the way, and the changesets where
+  two parts of the walk are at the same generations, not every changeset.
 - `IsAncestor` searches the commit graph (`graph::is_ancestor`). A path from
   the descendant to the ancestor follows first parents all the way, or
   leaves the first-parent history at a merge newer than the ancestor,
@@ -723,17 +782,32 @@ and their bounds, are this project's choices.
   each merge newer than the ancestor. It takes each merge once, and never
   reads a changeset between two merges. Git import still uses the plain walk
   (`db::is_ancestor`), with no bound, to move a ref only forward.
-- A call takes at most 10,000 steps (`MAX_WALK`). A step reads one node of
-  the commit graph or one changeset's parents. Past that, the call fails
-  with `RESOURCE_EXHAUSTED`. With no merge between the two changesets,
-  neither call comes near the bound. Across merges, `IsAncestor` reads
-  three rows for each merge newer than the ancestor, and `MergeBase` walks
-  every changeset down to the merge bases. There is no resume: the state of
-  a merge-base walk is its whole queue with marks. **Planned:** a merge-base
-  search that moves along first-parent histories, as `IsAncestor` does
-  ([#72](https://github.com/bnsd55/open-scion/issues/72)).
+- Neither call has a bound on its reads. They are bounded as `Blame` is:
+  at most 4 run at once (`MAX_GRAPH_QUERIES`), each in a slot taken before
+  the shared worker permit, and each stops at its call's deadline. The
+  deadline is 600 s from the start of the call, or the moment the call is
+  dropped by a timeout or by its client (`deadline::Deadline`, as for a
+  land). The walk checks it at each read and then fails with
+  `DEADLINE_EXCEEDED`, so it never gives a wrong answer. With no merge
+  between the two changesets, a call reads a few dozen rows. Across
+  merges, `IsAncestor` reads three rows for each merge newer than the
+  ancestor, and `MergeBase` reads each merge and the changesets around it
+  (above). There is no resume: the state of a merge-base walk is its whole
+  queue with marks. It keeps marks only for its queue, so its memory follows
+  the width of the history, not its depth.
+- A walk runs in steps of about 1,000 reads (`graph::STEPS`). A step
+  holds the database lock. A changeset's parents and node never change, so
+  the next step goes on from where the last one stopped. The lock is not
+  fair: a thread that frees it and takes it again at once keeps it. So the
+  walk leaves it free for 100 µs between steps, and a request that waits
+  takes it then. The reply waits for one flush that covers every step, as
+  any read does. **Planned:** a pool of read-only connections, so a walk
+  holds no lock that writes wait for
+  ([#17](https://github.com/bnsd55/open-scion/issues/17)).
 - The first query on a changeset without a node derives the commit graph
-  of its whole history, in steps (section 4), before it answers.
+  of its whole history, in steps (section 4), before it answers. Its
+  deadline does not stop that: each step it stored stays for the next
+  query.
 - `Diff` walks both root trees at once and skips a subtree with the same ID
   on both sides. So it reads only the trees on the paths it returns. It
   compares file states (kind, ID, executable flag), not lines. Paths come in
@@ -988,7 +1062,7 @@ an untrusted network.
 | Network | The server listens on `127.0.0.1:7878` and `scion-cache` on `127.0.0.1:7879` by default. A non-loopback address is refused unless `--insecure-listen` is given. `scion-daemon` listens only on a Unix socket with mode 0600, in a directory that only its user can reach; it refuses any other. `scn` refuses a socket that another user owns. | No TLS: the token and all data travel unencrypted, also between tiers ([#14](https://github.com/bnsd55/open-scion/issues/14)). |
 | Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. | Trees and blobs are shared by all repos. `GetObjects` reads any tree or blob by ID, and a changeset can name another repo's blob and then read it ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
-| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once (each holds one message in memory), 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget and `ReadFile` replies a 256 MiB budget. A reply of either whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. The path indexes of all refs hold at most 128 MiB together, and a land walks at most 100,000 changesets below its ref's index. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 16 MiB and 1,048,576 lines, diffs at most 100 versions and about 1M lines (a line counts once per 64 bytes), compares at most 100 deleted files and about 100 MiB to find a rename, and at most 4 run at once. `MergeBase` and `IsAncestor` take at most 10,000 steps; a `Diff` reply holds at most 1,000 paths. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object, or up to 2 MiB of a file, in memory until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
+| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 100 MiB plus 1 KiB), blobs up to 100 MiB, 16 uploads at once (each holds one message in memory), 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget and `ReadFile` replies a 256 MiB budget. A reply of either whose client stops reading ends after 120 s. Names of 1 to 256 bytes with no control characters. The path indexes of all refs hold at most 128 MiB together, and a land walks at most 100,000 changesets below its ref's index. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 16 MiB and 1,048,576 lines, diffs at most 100 versions and about 1M lines (a line counts once per 64 bytes), compares at most 100 deleted files and about 100 MiB to find a rename, and at most 4 run at once. At most 4 `MergeBase` and `IsAncestor` calls run at once, each until its 600 s deadline; a `Diff` reply holds at most 1,000 paths. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps one encoded object, or up to 2 MiB of a file, in memory until its connection closes ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. Each tier also checks every object from upstream before it stores or sends it, and the daemon checks each object again when it reads it from disk. | Tiers are trusted in v0.1: the client trusts the `ResolveRef` and `GetRootTree` answers that a tier passes on, which it cannot check by hash. A tier forwards them, and keeps only what upstream answered. |
 | Checkout | `scn checkout` writes into a private temp directory with a random name. It renames it onto a new destination, or moves its entries up into an existing empty directory that the user owns, never over an entry already there. It never follows a symlink while writing or removing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure, or on SIGINT, SIGTERM or SIGHUP, the destination stays as it was. | The directory that gets the checkout (an existing destination, or a new one's parent) must not be writable by all users, unless it has the sticky bit: they could swap parts of the checkout. An existing destination that breaks this is refused. Members of a group that can write it are trusted. Where the filesystem has no rename that never replaces (NFS), any empty mode 0700 directory of the user at a top-level directory name counts as the checkout's claim after `mkdirat` fails with `EEXIST`, and is replaced. Where it has no hard links either (some FUSE filesystems), any symlink of the user with the same target at a top-level symlink name counts as made after `symlinkat` fails with `EEXIST`, and is kept. This is for a lost NFS version 3 reply, but a trusted user (the owner, a group member, root) can also put such an entry there: it is taken, and no data is lost. A filesystem that shows one owner for every entry (a FUSE or SMB mount with `-o uid=`) passes every ownership check. In the temp directory, an entry found after `EEXIST` that is what the call makes counts as made, unless a recorded path in the same directory has its inode. A filesystem that folds names but shows another inode number under each name would let such a fold through, for directories, empty files and symlinks with one target: the two paths then share one entry, as with git. The check reads only the mode bits, not ACLs: an ACL that lets other users add or delete entries gets past it. No Windows rules: device names and names that end in a dot or a space pass. |
 | Cache tiers | A tier refuses calls without its token, and serves only objects that match their IDs. | A tier serves a stored object for any valid repo name and does not ask whether the repo exists. Safe with one principal ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
@@ -1006,11 +1080,12 @@ limit and its upgrade path. This is the list on `main` today.
 | File | Shortcut | Upgrade | Issue |
 |---|---|---|---|
 | `scion-core/src/codec.rs` (`put_len`) | Encoding panics if a field is longer than `u32::MAX`. Every ingest path caps sizes far below that. | `try_encode` returning `Result`, if a path ever does not. | |
+| `scion-server/src/graph.rs` (`STEPS`) | A graph walk leaves the database lock free for 100 µs between steps, because the lock is not fair. A request that wakes later than that waits one more step. | A pool of read-only connections, so a walk holds no lock that others wait for. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
 | `scion-server/src/store.rs` (`Inner::db`) | One SQLite connection behind a mutex, so reads wait for writes. | A pool of read-only connections. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
-| `scion-server/src/store.rs` (`Store::open`) | One process per data directory, so an import needs the server stopped. | Let a separate importer process share the directory. Lands already re-plan when the ref moves (`MAX_ATTEMPTS`). | [#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
-| `scion-server/src/land.rs` (`MAX_ATTEMPTS`) | Imports move refs without the land lock, so a land retries 3 times, then returns `ABORTED`. | Route every ref move through the per-ref lander. | [#27](https://github.com/bnsd55/open-scion/issues/27) |
+| `scion-server/src/import.rs` (`BATCH`) | A server that shares the data directory waits for each import batch transaction, up to `busy_timeout` (5 s), and then its write fails with `UNAVAILABLE`. Its reads wait behind that write. | Shorter import transactions while a server shares the directory. | [#100](https://github.com/bnsd55/open-scion/issues/100) |
+| `scion-server/src/store.rs` (`Blobs::sweep_tmp`) | Only an open that finds no other process removes the temp files that a crash left, so those of a crashed import stay while the server runs. | A `tmp/` folder per process, under its own lock. | [#101](https://github.com/bnsd55/open-scion/issues/101) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | Per-ref serialization in a shared database ([design](design/scalable-backend.md)). | [#47](https://github.com/bnsd55/open-scion/issues/47) |
 | `scion-server/src/land.rs` (`MAX_WALK`) | A land on a base more than `MAX_DEPTH` generations below the tip walks the history from the index floor back to the base, each time, and holds the database lock while it walks. A base more than 100,000 changesets below the floor is rejected. | Per-path history in the database, so the check reads only the paths that the land changes. | [#38](https://github.com/bnsd55/open-scion/issues/38) |
 | `scion-server/src/objects.rs` (`read_object`) | An object ID is treated as permission to read it; trees and blobs are shared by all repos. Safe with one principal. | A read ticket bound to a principal, a repo and a root tree, checked by the server and every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
@@ -1018,7 +1093,6 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/objects.rs` (`find`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
 | `scion-server/src/service.rs` (`READ_STALL_TIMEOUT`) | A stalled `ReadFile` reply frees its share, but the part in its channel and the part inside HTTP/2 stay in memory until the connection closes, up to 2 MiB per reply. | A response body timeout that resets the stream. | [#42](https://github.com/bnsd55/open-scion/issues/42) |
 | `scion-server/src/read.rs` (`MAX_SCAN`) | Path history and blame walk first parents on every call, at most 1,000 changesets per call. A path changed long ago costs many calls. | Path history as derived data. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
-| `scion-server/src/read.rs` (`MAX_WALK`) | `MergeBase` walks every changeset down to the merge bases unless neither first-parent history has a merge newer than where the two meet. `IsAncestor` reads every merge newer than the ancestor. Both fail with `RESOURCE_EXHAUSTED` past 10,000 steps, so two changesets with thousands of merges between get no answer. | A merge-base search that moves along first-parent histories of the commit graph, as `IsAncestor` does. | [#72](https://github.com/bnsd55/open-scion/issues/72) |
 | `scion-server/src/read.rs` (`diff`) | Renames are not detected: a rename is a delete and an add. `git diff` detects them by default. | Pair deletes and adds with the same blob, then by similarity, with a bound per call. | [#79](https://github.com/bnsd55/open-scion/issues/79) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_VERSIONS`) | One call diffs at most 100 versions of a file. A file with more versions costs more calls. | Blame as derived data, kept per file version. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_DIFF_LINES`) | One call diffs about 1M lines, and a long line counts once per 64 bytes. A diff of many repeated lines grows faster than its lines, so one diff of two files of 1,048,576 lines is the worst case of a call. | Blame from derived data, so a call does not diff whole versions. | [#61](https://github.com/bnsd55/open-scion/issues/61) |

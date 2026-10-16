@@ -24,9 +24,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
-use std::time::Instant;
 
 use hashlink::LruCache;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -34,6 +33,7 @@ use scion_core::{Changeset, ChangesetId, FileState, RepoPath};
 
 use crate::auth::Caller;
 use crate::db::{self, RepoId};
+use crate::deadline::Deadline;
 use crate::error::{Error, Result};
 use crate::store::Store;
 use crate::tree;
@@ -43,10 +43,12 @@ const MAX_NAME_BYTES: usize = 256;
 
 /// Plans per land call when other writers keep moving the ref. After the
 /// last one the call fails with [`Error::Aborted`] and the land stays pending.
-// SHORTCUT: imports move refs without the land lock, so a land retries a few
-// times, then hands the retry to the client. Ceiling: a ref that an import
-// moves faster than a land commits starves its lands. Upgrade: route every
-// ref move through the per-ref lander, so lands never race.
+///
+/// A git import, in this process or in another one that shares the data
+/// directory, moves a ref by compare-and-swap without the land lock, which
+/// is in memory. It moves the ref once, at its end. So a land loses a swap
+/// only to an import that ends while the land plans, and three in a row are
+/// unlikely.
 const MAX_ATTEMPTS: u32 = 3;
 
 /// How long a finished land is kept, in seconds: 7 days. Until then a retry
@@ -149,58 +151,6 @@ pub struct LandRequest {
     pub deadline: Deadline,
 }
 
-/// When a land gives up: at an instant, or once the call that asked for it
-/// has gone. A request timeout or a client that cancels drops the call, but
-/// not a job that is already running, so the long loops of a land check
-/// this.
-#[derive(Clone, Debug)]
-pub struct Deadline {
-    at: Instant,
-    gone: Arc<AtomicBool>,
-}
-
-impl Deadline {
-    /// A deadline at `at`.
-    #[must_use]
-    pub fn new(at: Instant) -> Self {
-        Self {
-            at,
-            gone: Arc::default(),
-        }
-    }
-
-    /// A guard for the call to hold. When it drops, the deadline has passed.
-    pub fn guard(&self) -> CallGuard {
-        CallGuard(Arc::clone(&self.gone))
-    }
-
-    /// Fails once the deadline has passed. Nothing has been written yet, so
-    /// the land stays pending.
-    fn check(&self) -> Result<()> {
-        let why = if self.gone.load(Ordering::Relaxed) {
-            "the call of the land has gone"
-        } else if Instant::now() >= self.at {
-            "the land ran past its deadline"
-        } else {
-            return Ok(());
-        };
-        Err(Error::DeadlineExceeded(format!(
-            "{why}; it stays pending, retry with the same request key"
-        )))
-    }
-}
-
-/// Held by the call of a land. Dropping it, when the call ends or is
-/// dropped, ends the land's [`Deadline`].
-#[must_use = "the deadline ends when the guard drops"]
-pub struct CallGuard(Arc<AtomicBool>);
-
-impl Drop for CallGuard {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-}
-
 /// The result of a land.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LandOutcome {
@@ -295,7 +245,12 @@ impl Lands {
         if row.state != LandState::Pending {
             return Ok(row);
         }
-        let result = finish(self, store, repo, land_id, req, &mut index);
+        let result = finish(self, store, repo, land_id, req, &mut index).map_err(|e| match e {
+            Error::DeadlineExceeded(why) => Error::DeadlineExceeded(format!(
+                "{why}; the land stays pending, retry with the same request key"
+            )),
+            e => e,
+        });
         // The index may be ahead of the database; rebuild it next time. A lost
         // race wrote nothing, so the index is still good. So is an index that
         // a deadline stopped: an advance adds nothing until it reaches the
@@ -601,9 +556,10 @@ enum Plan {
 
 /// Runs steps 4 and 5 for a pending land. The caller holds the ref's lock.
 ///
-/// Imports do not take that lock, so the ref can move between the plan and
-/// the transaction. The land is then planned again from the new head, and
-/// that plan advances the index to it.
+/// Imports do not take that lock, and may run in another process, so the ref
+/// can move between the plan and the transaction. The land is then planned
+/// again from the new head, and that plan advances the index to it: each
+/// plan reads the head from the database.
 fn finish(
     lands: &Lands,
     store: &Store,
@@ -1249,6 +1205,8 @@ fn decode_paths(bytes: &[u8]) -> Option<Vec<RepoPath>> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::store::FSYNC_LEAVES_DRIVE_CACHE;
     use scion_core::{BlobId, Entry, IdentityTime};
