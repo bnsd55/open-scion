@@ -1,0 +1,81 @@
+# An example that runs a scion-server and a scion-cache, both with TLS, and
+# checks a repo out through the cache. One image carries all three binaries;
+# each service picks its own entrypoint.
+#
+# Secrets are made at compose time by docker/demo.sh and are never committed
+# or baked into the image. See docker/README.md.
+#
+# The server's ticket public key arrives as an environment variable that
+# docker/demo.sh exports; the cache refuses to start without it.
+
+name: scion-demo
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: open-scion-demo
+    entrypoint: scion-server
+    command:
+      - --data
+      - /data
+      - serve
+      - --listen
+      - 0.0.0.0:7878
+      - --token
+      - dev
+      - --tls-cert
+      - /certs/server.crt
+      - --tls-key
+      - /certs/server.key
+      - --ticket-key
+      - /data/ticket.key
+    volumes:
+      - server-data:/data
+      - ./certs:/certs:ro
+
+  cache:
+    image: open-scion-demo
+    entrypoint: scion-cache
+    command:
+      - --listen
+      - 0.0.0.0:7879
+      - --token
+      - dev
+      - --tls-cert
+      - /certs/cache.crt
+      - --tls-key
+      - /certs/cache.key
+      - --upstream
+      - https://server:7878
+      - --upstream-token
+      - dev
+      - --ca
+      - /certs/ca.pem
+      - --ticket-public-key
+      - ${SCION_TICKET_PUB:?run docker/demo.sh, which exports it}
+    volumes:
+      - ./certs:/certs:ro
+    depends_on:
+      - server
+
+  # A runner for the demo's one-shot commands:
+  #   docker compose run --rm scn '...a shell command...'
+  scn:
+    image: open-scion-demo
+    entrypoint: ["sh", "-c"]
+    working_dir: /work
+    environment:
+      # scn's globals, so the commands below stay short.
+      SCION_SERVER: https://server:7878
+      SCION_TLS_CA: /certs/ca.pem
+      SCION_TOKEN: dev
+      SCION_REPO: demo
+    volumes:
+      - ./certs:/certs:ro
+      - demo-work:/work
+
+volumes:
+  server-data:
+  demo-work:

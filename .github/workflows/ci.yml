@@ -71,6 +71,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
 
+  docker:
+    name: docker demo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The layer cache holds the release build: the first run takes about
+      # five minutes, a run after an ordinary push about one.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: open-scion-demo
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: run the demo
+        run: sh docker/demo.sh
+
   fuzz:
     name: fuzz smoke (60 s)
     runs-on: ubuntu-latest
