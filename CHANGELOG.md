@@ -45,10 +45,11 @@ release.
   rename onto a new empty directory that claims its name. Where it has no
   hard links either (some FUSE filesystems), each top-level file is copied
   to a new name made with `O_EXCL`, and each symlink is made again. On NFS
-  version 3, a lost reply while the checkout moves into place does not fail
-  it. A lost reply while it is written still fails it, and the destination
-  stays as it was (#106). This is tested by forcing it, not on a real NFS
-  mount.
+  version 3, a lost reply does not fail the checkout, from the temp
+  directory it is written into to the move into place (#106). A name that
+  the filesystem folds into one already written still fails it, also when
+  both hold an empty file or a symlink to one target. This is tested by
+  forcing it, not on a real NFS mount.
 - Path history and blame on first-parent history: `Log` takes an optional
   path and says where to continue, and a new `Blame` RPC gives each line's
   last changeset. `scn log --path` and `scn blame`. Each call has a bound,
@@ -153,3 +154,16 @@ release.
   reaches: a few dozen reads for a run, not one for each changeset. A walk
   holds the database lock for about 1,000 reads at a time, then leaves it
   free for other requests.
+- `Diff` finds renames as `git diff` does by default: same content, then the
+  one file of a name on each side at 75%, then the most similar files at
+  50%. A rename keeps its two entries. The added one has `rename_from`, the
+  deleted one `rename_to`, and both `similarity`, so a client that ignores
+  them still sees a delete and an add. Each call finds the renames of the
+  whole diff below its path, so an entry has the same rename in every reply.
+  A diff of more than 10,000 entries has no renames, and the search for
+  similar files has a fixed budget per call. At most 4 `Diff` calls run at
+  once. `scn diff` prints a rename once, as `R`, a tab and `old -> new`, and
+  `--json` gives it `status` `R`, `old_path` and `similarity`.
+- `Blame` and `Diff` find renames with one implementation. Chunks now go to
+  git's hash buckets, as in git, so a score can change where two different
+  chunks share a bucket.

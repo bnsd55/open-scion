@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_server::deadline::Deadline;
 use scion_server::import::{ImportOptions, import_git};
-use scion_server::read::{self, DiffEntry, MAX_DIFF_ENTRIES};
+use scion_server::read::{
+    self, DiffEntry, MAX_DIFF_ENTRIES, MAX_RENAME_CHUNKS, MAX_RENAME_ENTRIES, Rename,
+};
 use scion_server::{Error, Store, db, tree};
 use tempfile::TempDir;
 
@@ -339,16 +341,27 @@ fn diff_all(
     page.entries
 }
 
+/// A regular file whose blob ID comes from `n`. The blob is not stored.
+fn unstored(n: usize) -> FileState {
+    FileState::Regular {
+        content: BlobId::of(&n.to_le_bytes()),
+        executable: false,
+    }
+}
+
+/// Writes `content` at `name` below `dir`, with its directories.
+fn write_file(dir: &Path, name: &str, content: &str) {
+    let file = dir.join(name);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(file, content).unwrap();
+}
+
 /// Two snapshots that differ in each way a path can: added, deleted,
 /// modified, executable bit, regular file to symlink, file to directory and
 /// back, with an unchanged subtree, and names whose tree order is not their
 /// byte order (`a/b` before `a.txt`).
 fn diff_fixture(dir: &Path) -> (String, String) {
-    let write = |name: &str, content: &str| {
-        let file = dir.join(name);
-        fs::create_dir_all(file.parent().unwrap()).unwrap();
-        fs::write(file, content).unwrap();
-    };
+    let write = |name: &str, content: &str| write_file(dir, name, content);
     git(dir, &["init", "-q", "-b", "main"]);
     for name in [
         "a.txt",
@@ -516,23 +529,17 @@ fn diff_pages_stop_at_max_diff_entries_and_resume() {
     let (_data, store) = open_store();
     // 1,515 paths below `big` and 1,000 beside it, so pages end inside
     // directories. Blobs are never read, so they are not stored.
-    let state = |n: usize| {
-        Some(FileState::Regular {
-            content: BlobId::of(&n.to_le_bytes()),
-            executable: false,
-        })
-    };
     let mut changes = BTreeMap::new();
     for i in 0..15 {
         for j in 0..100 {
-            changes.insert(path(&format!("big/d{i:02}/f{j:03}")), state(j));
+            changes.insert(path(&format!("big/d{i:02}/f{j:03}")), Some(unstored(j)));
         }
-        changes.insert(path(&format!("big/d{i:02}.txt")), state(i));
+        changes.insert(path(&format!("big/d{i:02}.txt")), Some(unstored(i)));
     }
     for j in 0..MAX_DIFF_ENTRIES {
-        changes.insert(path(&format!("other/f{j:04}")), state(j));
+        changes.insert(path(&format!("other/f{j:04}")), Some(unstored(j)));
     }
-    let base = BTreeMap::from([(path("base"), state(0))]);
+    let base = BTreeMap::from([(path("base"), Some(unstored(0)))]);
     let ids = chain(&store, vec![base, changes.clone()]);
 
     for prefix in [None, Some(path("big"))] {
@@ -547,6 +554,7 @@ fn diff_pages_stop_at_max_diff_entries_and_resume() {
                 path: p.clone(),
                 old: None,
                 new: *s,
+                rename: None,
             })
             .collect();
         expected.sort_by_key(|e| tree_order(&e.path));
@@ -586,6 +594,462 @@ fn diff_pages_stop_at_max_diff_entries_and_resume() {
     let page = read::diff(&store, REPO, ids[0], ids[1], None, None).unwrap();
     assert_eq!(page.entries.len(), MAX_DIFF_ENTRIES);
     assert_eq!(page.next_after, None);
+}
+
+/// Lines `<tag><n>` for each `n` of `range`, each 5 bytes with its newline
+/// when `tag` has two bytes.
+fn text(tag: &str, range: std::ops::Range<usize>) -> String {
+    range.fold(String::new(), |text, n| text + &format!("{tag}{n:02}\n"))
+}
+
+/// Ten lines of 128 bytes with their newline. `edited` changes bytes 62 and
+/// 63 of each.
+fn long_lines(edited: bool) -> String {
+    (0..10)
+        .map(|n| {
+            let mut line = format!("ch{n:02}{}\n", "-".repeat(123));
+            if edited {
+                line.replace_range(62..64, "##");
+            }
+            line
+        })
+        .collect()
+}
+
+/// `entries` as git's `--name-status` lines, sorted. A rename is one line,
+/// `R<similarity>`, the old path and the new path.
+fn name_status(entries: &[DiffEntry]) -> Vec<String> {
+    let name = |p: &RepoPath| String::from_utf8_lossy(p.as_bytes()).into_owned();
+    let mut lines: Vec<String> = entries
+        .iter()
+        .filter_map(|e| match &e.rename {
+            Some(rename) if e.old.is_none() => Some(format!(
+                "R{:03}\t{}\t{}",
+                rename.similarity,
+                name(&rename.path),
+                name(&e.path)
+            )),
+            Some(_) => None,
+            None => Some(format!("{}\t{}", status(e), name(&e.path))),
+        })
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// Checks that the two halves of each rename in `entries`, a whole diff,
+/// name each other.
+fn assert_renames_pair_up(entries: &[DiffEntry]) {
+    for entry in entries {
+        let Some(rename) = &entry.rename else {
+            continue;
+        };
+        let other = entries
+            .iter()
+            .find(|e| e.path == rename.path)
+            .unwrap_or_else(|| panic!("no entry at {:?}", rename.path));
+        let back = other.rename.as_ref().unwrap();
+        assert_eq!(
+            (&back.path, back.similarity),
+            (&entry.path, rename.similarity)
+        );
+        assert!(entry.old.is_none() != other.old.is_none(), "{entry:?}");
+        assert!(entry.old.is_none() || entry.new.is_none(), "{entry:?}");
+    }
+}
+
+/// Files to write: each path and its content.
+type Files = Vec<(String, String)>;
+
+/// The cases of [`rename_fixture`] that take many files: the deleted files
+/// and the added files.
+fn generated_cases() -> (Files, Files) {
+    let (mut old, mut new) = (Vec::new(), Vec::new());
+    // `top4/x.txt` is 90%, 85%, 80%, 75% and 60% like s0 to s4. Each of
+    // s0 to s3 goes to its own y at 95%, so the four that x keeps are taken,
+    // and x is no rename, though s4 is left.
+    for (i, k) in [18, 17, 16, 15, 12].into_iter().enumerate() {
+        let tag = format!("s{i}");
+        old.push((
+            format!("top4/s{i}.txt"),
+            text("ka", 0..k) + &text(&tag, k..20),
+        ));
+        if i < 4 {
+            let y = text("ka", 0..k) + &text(&tag, k..19) + &text(&format!("t{i}"), 19..20);
+            new.push((format!("top4/y{i}.txt"), y));
+        }
+    }
+    new.push(("top4/x.txt".to_owned(), text("ka", 0..20)));
+    // 101 deleted files with the same content. The added file has the name
+    // of the last; only the first 100 are looked at, so the first wins.
+    for n in 0..=100 {
+        old.push((format!("ident/f{n:03}.txt"), text("ia", 0..2)));
+    }
+    new.push(("ident2/f100.txt".to_owned(), text("ia", 0..2)));
+    // Lines of 128 bytes are two chunks of 64. The new file changes bytes
+    // 62 and 63 of each line, so it keeps the second chunk: exactly 50%.
+    old.push(("chunk/old.txt".to_owned(), long_lines(false)));
+    new.push(("chunk/new.txt".to_owned(), long_lines(true)));
+    (old, new)
+}
+
+/// Two snapshots with each kind of rename that `git diff` finds by default,
+/// and files that are not renames. Each case uses its own lines, so the
+/// cases do not match each other.
+fn rename_fixture(dir: &Path) -> (String, String) {
+    let write = |name: &str, content: &str| write_file(dir, name, content);
+    let remove = |name: &str| fs::remove_file(dir.join(name)).unwrap();
+    let crlf: String = text("ca", 0..10).replace('\n', "\r\n");
+    let mut old: Files = [
+        // A pure rename, and one with an edit: 90%.
+        ("pure.txt", text("pa", 0..5)),
+        ("edit.txt", text("ea", 0..10)),
+        ("run.sh", "#!/bin/sh\necho run\n".to_owned()),
+        // One added file and six candidates from 55% to 85%.
+        ("many/c1.txt", text("ma", 0..11) + &text("mx", 11..20)),
+        ("many/c2.txt", text("ma", 0..12) + &text("mx", 12..20)),
+        ("many/c3.txt", text("ma", 0..14) + &text("mx", 14..20)),
+        ("many/c4.txt", text("ma", 0..16) + &text("mx", 16..20)),
+        ("many/c5.txt", text("ma", 0..17) + &text("mx", 17..20)),
+        ("many/c6.txt", text("ma", 0..13) + &text("mx", 13..20)),
+        // Three at 80%. Two have the added file's name, which no other
+        // deleted file has alone. The first by path does not.
+        ("tie/a/other.txt", text("ta", 0..8) + &text("ty", 8..10)),
+        ("tie/a/same.txt", text("ta", 0..8) + &text("tx", 8..10)),
+        ("tie/c/same.txt", text("ta", 0..8) + &text("tz", 8..10)),
+        // Two at 70%, no name in common: the first path wins.
+        ("tie2/x.txt", text("ua", 0..7) + &text("ux", 7..10)),
+        ("tie2/y.txt", text("ua", 0..7) + &text("uy", 7..10)),
+        // Two added files want src1: one~src1 85%, two~src1 90%,
+        // one~src2 65%, two~src2 80%. The most similar pair goes first,
+        // though `one` comes first by path.
+        ("g/src1.txt", text("ga", 0..20)),
+        ("g/src2.txt", text("ga", 0..16) + &text("gb", 16..20)),
+        // The only files named name.txt pair at 80%, before better.txt at
+        // 95%.
+        ("n/a/name.txt", text("na", 0..16) + &text("nx", 16..20)),
+        ("n/a/better.txt", text("na", 0..19) + &text("ny", 19..20)),
+        // The same name at 60% is under 75%, so high.txt at 70% wins.
+        ("lo/a/low.txt", text("la", 0..6) + &text("lx", 6..10)),
+        ("lo/a/high.txt", text("la", 0..7) + &text("ly", 7..10)),
+        // A regular file and a symlink with the same bytes: not a rename.
+        ("sym-src.txt", "abc".to_owned()),
+        ("empty-a", String::new()),
+        // A file whose path becomes a directory.
+        ("swap", text("sa", 0..3)),
+        // CRs do not count: 50 shared bytes of 60, 83%.
+        ("crlf.txt", crlf),
+        // 45%: not a rename.
+        ("under.txt", text("ha", 0..20)),
+        // One deleted file and two added files with its content.
+        ("dup.txt", text("da", 0..4)),
+        // Two deleted files with the same content: the same name wins.
+        ("ex/a/file.txt", text("xa", 0..4)),
+        ("ex/b/thing.txt", text("xa", 0..4)),
+        // Different lines in the same hash buckets: 100% similar to git.
+        ("hash/a.txt", "aqca\naqcb\naqcc\n".to_owned()),
+        ("kind", "k\n".to_owned()),
+        ("mod.txt", text("mo", 0..3)),
+    ]
+    .map(|(name, content)| (name.to_owned(), content))
+    .into();
+    let (more_old, more_new) = generated_cases();
+    old.extend(more_old);
+    git(dir, &["init", "-q", "-b", "main"]);
+    for (name, content) in &old {
+        write(name, content);
+    }
+    symlink("pure.txt", dir.join("link")).unwrap();
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-q", "-m", "old"]);
+    let old_commit = git(dir, &["rev-parse", "HEAD"]);
+
+    for (name, _) in &old {
+        if !["kind", "mod.txt"].contains(&name.as_str()) {
+            remove(name);
+        }
+    }
+    remove("link");
+    let mut new: Files = [
+        ("moved/pure.txt", text("pa", 0..5)),
+        ("edited.txt", text("ea", 0..9) + &text("eb", 9..10)),
+        ("bin/run.sh", "#!/bin/sh\necho run\n".to_owned()),
+        ("many/target.txt", text("ma", 0..20)),
+        ("tie/b/same.txt", text("ta", 0..10)),
+        ("tie2/new.txt", text("ua", 0..10)),
+        (
+            "g/one.txt",
+            text("ga", 0..13) + &text("gd", 13..16) + &text("ga", 16..20),
+        ),
+        ("g/two.txt", text("ga", 0..18) + &text("gc", 18..20)),
+        ("n/b/name.txt", text("na", 0..20)),
+        ("lo/b/low.txt", text("la", 0..10)),
+        ("empty-b", String::new()),
+        ("swap/inner", text("sa", 0..3)),
+        ("lf.txt", text("ca", 0..10)),
+        ("under-new.txt", text("ha", 0..9) + &text("hx", 9..20)),
+        ("dup1.txt", text("da", 0..4)),
+        ("dup2.txt", text("da", 0..4)),
+        ("ex/c/thing.txt", text("xa", 0..4)),
+        ("hash/b.txt", "baah\nbaai\nbaaj\n".to_owned()),
+        ("mod.txt", text("mo", 0..4)),
+    ]
+    .map(|(name, content)| (name.to_owned(), content))
+    .into();
+    new.extend(more_new);
+    for (name, content) in &new {
+        write(name, content);
+    }
+    fs::set_permissions(dir.join("bin/run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::create_dir_all(dir.join("links")).unwrap();
+    symlink("pure.txt", dir.join("links/link")).unwrap();
+    symlink("abc", dir.join("sym-new")).unwrap();
+    remove("kind");
+    symlink("pure.txt", dir.join("kind")).unwrap();
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-q", "-m", "new"]);
+    (old_commit, git(dir, &["rev-parse", "HEAD"]))
+}
+
+#[test]
+fn diff_finds_renames_as_git_diff_does() {
+    let git_dir = tempfile::tempdir().unwrap();
+    let dir = git_dir.path();
+    let (old_commit, new_commit) = rename_fixture(dir);
+    let (_data, store) = open_store();
+    import(&store, dir);
+    let old = changeset_of(&store, &old_commit);
+    let new = changeset_of(&store, &new_commit);
+
+    let prefixes = [
+        None,
+        Some("many"),
+        Some("tie"),
+        Some("g"),
+        Some("n/b"),
+        Some("lo"),
+        Some("top4"),
+        Some("hash"),
+    ];
+    let pairs = [
+        (old, new, &old_commit, &new_commit),
+        (new, old, &new_commit, &old_commit),
+    ];
+    for (from, to, from_commit, to_commit) in pairs {
+        for prefix in prefixes {
+            let prefix = prefix.map(path);
+            let mut args = vec!["diff", "-M", "--name-status", from_commit, to_commit];
+            let spec = prefix
+                .as_ref()
+                .map(|p| String::from_utf8_lossy(p.as_bytes()).into_owned());
+            if let Some(spec) = &spec {
+                args.extend(["--", spec]);
+            }
+            let mut expected: Vec<String> = git(dir, &args).lines().map(str::to_owned).collect();
+            expected.sort();
+            let entries = diff_all(&store, from, to, prefix.as_ref(), None);
+            assert_eq!(name_status(&entries), expected, "diff {spec:?}");
+            assert_renames_pair_up(&entries);
+
+            // A page that starts after a path walks the whole diff to find
+            // renames, and gives each entry the same rename. Every 7th path
+            // keeps the test short.
+            let probes = entries.iter().step_by(7).map(|e| e.path.clone());
+            for after in probes.chain([path("a")]) {
+                let rest: Vec<DiffEntry> = entries
+                    .iter()
+                    .filter(|e| tree_order(&e.path) > tree_order(&after))
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    diff_all(&store, from, to, prefix.as_ref(), Some(&after)),
+                    rest,
+                    "diff {spec:?} after {after:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Stores `data` as a blob and returns a regular file state for it.
+fn stored(store: &Store, data: &[u8]) -> FileState {
+    FileState::Regular {
+        content: store.blobs().put(data).unwrap(),
+        executable: false,
+    }
+}
+
+/// Every page of a diff, as a client reads it.
+fn diff_pages(
+    store: &Store,
+    old: ChangesetId,
+    new: ChangesetId,
+    prefix: Option<&RepoPath>,
+) -> Vec<DiffEntry> {
+    let mut entries = Vec::new();
+    let mut after = None;
+    loop {
+        let page = read::diff(store, REPO, old, new, prefix, after.as_ref()).unwrap();
+        entries.extend(page.entries);
+        match page.next_after {
+            Some(next) => after = Some(next),
+            None => return entries,
+        }
+    }
+}
+
+#[test]
+fn renames_are_the_same_on_every_page() {
+    let (_data, store) = open_store();
+    // 1,500 files move from `old/` to `new/`, so the diff has 3,000 entries
+    // over three pages. Blobs are never read: each rename has the same
+    // content.
+    let files = 1500;
+    let base: BTreeMap<_, _> = (0..files)
+        .map(|n| (path(&format!("old/d{}/f{n:04}", n % 3)), Some(unstored(n))))
+        .collect();
+    let mut moves: BTreeMap<_, _> = base.keys().map(|p| (p.clone(), None)).collect();
+    moves.extend((0..files).map(|n| (path(&format!("new/f{n:04}")), Some(unstored(n)))));
+    let ids = chain(&store, vec![base, moves]);
+
+    let entries = diff_pages(&store, ids[0], ids[1], None);
+    assert!(entries.len() > 2 * MAX_DIFF_ENTRIES);
+    assert_renames_pair_up(&entries);
+    for entry in &entries {
+        let rename = entry.rename.as_ref().unwrap();
+        let (to, from) = match entry.new {
+            Some(_) => (&entry.path, &rename.path),
+            None => (&rename.path, &entry.path),
+        };
+        let name = |p: &RepoPath| p.as_bytes().rsplit(|&b| b == b'/').next().unwrap().to_vec();
+        assert_eq!(name(to), name(from));
+        assert_eq!(rename.similarity, 100);
+    }
+    // A page that starts anywhere, also inside another page, agrees.
+    for at in [1, 999, 1000, 1001, 1777, 2999] {
+        let after = &entries[at - 1].path;
+        let page = read::diff(&store, REPO, ids[0], ids[1], None, Some(after)).unwrap();
+        assert_eq!(page.entries[..], entries[at..at + page.entries.len()]);
+    }
+    // Below `new`, the deleted files are outside the diff: no renames, as
+    // `git diff -- new`.
+    let below = diff_pages(&store, ids[0], ids[1], Some(&path("new")));
+    assert_eq!(below.len(), files);
+    assert!(below.iter().all(|e| e.rename.is_none()));
+}
+
+#[test]
+fn a_diff_past_max_rename_entries_has_no_renames() {
+    let (_data, store) = open_store();
+    // A rename and fillers: MAX_RENAME_ENTRIES entries in all, then one
+    // more. Blobs are never read.
+    for (fillers, found) in [
+        (MAX_RENAME_ENTRIES - 2, true),
+        (MAX_RENAME_ENTRIES - 1, false),
+    ] {
+        let base = BTreeMap::from([(path("a/source"), Some(unstored(usize::MAX)))]);
+        let mut change = BTreeMap::from([
+            (path("a/source"), None),
+            (path("b/source"), Some(unstored(usize::MAX))),
+        ]);
+        change.extend((0..fillers).map(|n| (path(&format!("c/f{n:05}")), Some(unstored(n)))));
+        let ids = chain(&store, vec![base, change]);
+        let entries = diff_pages(&store, ids[0], ids[1], None);
+        assert_eq!(entries.len(), fillers + 2);
+        let renamed = entries.iter().filter(|e| e.rename.is_some()).count();
+        assert_eq!(renamed, if found { 2 } else { 0 }, "{fillers} fillers");
+    }
+}
+
+#[test]
+fn the_search_for_similar_files_stops_at_its_budget() {
+    let (_data, store) = open_store();
+    // `zz/new` is `zz/old` with one line changed. Each `a/<k>` has the same
+    // size, so it is read and compared first. It costs n chunks, twice what
+    // `zz/new` or `zz/old` costs. `zz/new` is read first. With three
+    // decoys the search has cost 3.5n before it reads `zz/old`, under the
+    // budget of 4n. With four it has cost 4.5n, and reads no more. A file
+    // of a quarter of the size, `b/<k>`, is never read, so 16 of them cost
+    // nothing.
+    let n = MAX_RENAME_CHUNKS / 4;
+    let unlike = Some(stored(&store, "\n".repeat(n).as_bytes()));
+    let small = Some(stored(&store, "\n".repeat(n / 4).as_bytes()));
+    let source = "y\n".repeat(n / 2);
+    let new = format!("z\n{}", &source[2..]);
+    for (decoys, small_decoys, found) in [(0, 0, true), (3, 0, true), (4, 0, false), (0, 16, true)]
+    {
+        let mut base: BTreeMap<_, _> = (0..decoys)
+            .map(|k| (path(&format!("a/{k}")), unlike))
+            .chain((0..small_decoys).map(|k| (path(&format!("b/{k}")), small)))
+            .collect();
+        base.insert(path("zz/old"), Some(stored(&store, source.as_bytes())));
+        let mut change: BTreeMap<_, _> = base.keys().map(|p| (p.clone(), None)).collect();
+        change.insert(path("zz/new"), Some(stored(&store, new.as_bytes())));
+        let ids = chain(&store, vec![base, change]);
+        let entries = diff_all(&store, ids[0], ids[1], None, None);
+        let renamed = entries.iter().find(|e| e.path == path("zz/new")).unwrap();
+        let expected = found.then(|| Rename {
+            path: path("zz/old"),
+            similarity: 99,
+        });
+        assert_eq!(
+            renamed.rename, expected,
+            "{decoys} and {small_decoys} decoys"
+        );
+    }
+}
+
+#[test]
+fn similar_files_are_not_searched_past_git_rename_limit() {
+    let git_dir = tempfile::tempdir().unwrap();
+    let dir = git_dir.path();
+    git(dir, &["init", "-q", "-b", "main"]);
+    // `old.txt` becomes `new.txt` with an edit. Symlinks with targets of
+    // their own are deleted and added: never similar, but they count
+    // toward git's limit of 1,000 x 1,000 pairs. 1,000 of each fit, 1,001
+    // do not.
+    let mut commits = Vec::new();
+    for links in [999, 1000] {
+        let make = |dir: &Path, side: &str| {
+            fs::create_dir_all(dir.join(side)).unwrap();
+            for n in 0..links {
+                let link = dir.join(format!("{side}/{side}{links}-{n}"));
+                symlink(format!("{side}{links}-{n}"), link).unwrap();
+            }
+        };
+        fs::remove_file(dir.join("new.txt")).ok();
+        fs::remove_dir_all(dir.join("e")).ok();
+        make(dir, "d");
+        fs::write(dir.join("old.txt"), text("oa", 0..10)).unwrap();
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "old"]);
+        let old = git(dir, &["rev-parse", "HEAD"]);
+
+        fs::remove_dir_all(dir.join("d")).unwrap();
+        fs::remove_file(dir.join("old.txt")).unwrap();
+        make(dir, "e");
+        fs::write(dir.join("new.txt"), text("oa", 0..9) + &text("ob", 9..10)).unwrap();
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "new"]);
+        commits.push((old, git(dir, &["rev-parse", "HEAD"])));
+    }
+    let (_data, store) = open_store();
+    import(&store, dir);
+    for ((old, new), found) in commits.iter().zip([true, false]) {
+        let mut expected: Vec<String> = git(dir, &["diff", "-M", "--name-status", old, new])
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        expected.sort();
+        let entries = diff_pages(
+            &store,
+            changeset_of(&store, old),
+            changeset_of(&store, new),
+            None,
+        );
+        assert_eq!(name_status(&entries), expected);
+        assert_eq!(entries.iter().any(|e| e.rename.is_some()), found);
+    }
 }
 
 #[test]

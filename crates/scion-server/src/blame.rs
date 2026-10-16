@@ -22,12 +22,13 @@ use scion_core::{
 use crate::db;
 use crate::error::{Error, Result};
 use crate::read::{self, MAX_SCAN};
+use crate::similar::{self, Budget, Chunks};
 use crate::store::Store;
 use crate::tree;
 
 /// Largest file blame reads, in bytes. Bounds the memory of one version:
-/// a call holds at most four, two versions and two rename sources, and the
-/// chunk tables of two of them.
+/// a call holds at most two, two versions or one and a rename source, and
+/// the chunk tables of two files.
 // SHORTCUT: a larger file is refused, and an older version over the limit
 // counts as absent, so its lines go to the changeset that replaced it. git
 // reads any size. Upgrade: blame from derived data, so a call does not read
@@ -50,7 +51,8 @@ pub const MAX_BLAME_VERSIONS: usize = 100;
 /// Most lines one call diffs, counting both sides of each diff. A diff of
 /// many repeated lines can take seconds, so this bounds the time of a call.
 /// A line counts once per 64 bytes ([`diff_cost`]), a rename search counts
-/// each chunk it compares ([`chunks`]), and a file read and refused counts
+/// each chunk it reads and compares ([`similar::Budget`]), and a file read
+/// and refused counts
 /// once per 64 bytes, so every byte read counts. The first step of a call
 /// always runs, so a call always makes progress. So a call reads about
 /// 64 MiB in steps that fit, plus two steps past the budget: the first, and
@@ -84,9 +86,6 @@ pub const MAX_RENAME_SOURCES: usize = 100;
 // data, so a search reads only files that share chunks with the new file
 // (#87).
 pub const MAX_RENAME_BYTES: usize = MAX_RENAME_SOURCES << 20;
-
-/// git's similarity scale: this score means the same content.
-const SAME: u64 = 60_000;
 
 /// Consecutive lines with the same source.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -307,16 +306,11 @@ fn older_version(
 /// The file that `changeset` renamed to `path`, where it puts `blob` and
 /// `text`. `root` is the tree of its first parent. As `git blame` does by
 /// default (renames, no copies), it picks among the files that `changeset`
-/// deletes:
-///
-/// 1. One with the same content. On a tie, one with the same name, then the
-///    first by path.
-/// 2. If no other deleted file has the same name as `path`, the one that
-///    does, if it is at least 75% similar ([`similarity`]).
-/// 3. If the changeset deletes at most [`MAX_RENAME_SOURCES`] files, the
-///    most similar one, if it is at least 50% similar. On a tie, one with
-///    the same name, then the first by path. Files are compared by path
-///    until the search has read [`MAX_RENAME_BYTES`].
+/// deletes, with [`similar::renames`]: a file with the same content, else
+/// one with the same name if at least 75% similar, else the most similar,
+/// if at least 50% similar. A similar file is looked for only if the
+/// changeset deletes at most [`MAX_RENAME_SOURCES`] files, and only until
+/// the search has read [`MAX_RENAME_BYTES`].
 ///
 /// Only a regular file can be the source, and only one that blame can read
 /// can be similar. Adds the chunks compared, and the files read and
@@ -330,8 +324,8 @@ fn renamed_from(
     text: &[u8],
     cost: &mut usize,
 ) -> Result<Option<Version>> {
-    // Each deleted path, with its blob if it was a regular file.
-    let deleted: Vec<(&RepoPath, Option<BlobId>)> = store.read(|c| {
+    // Each deleted file, in path order.
+    let deleted: Vec<(&RepoPath, FileState)> = store.read(|c| {
         let mut trees = HashMap::new();
         let mut deleted = Vec::new();
         for (other, _) in changeset
@@ -339,155 +333,55 @@ fn renamed_from(
             .iter()
             .filter(|(_, state)| state.is_none())
         {
-            let blob = match lookup_cached(c, &mut trees, root, other)? {
-                Some(Entry::File(FileState::Regular { content, .. })) => Some(content),
-                _ => None,
-            };
-            deleted.push((other, blob));
+            if let Some(Entry::File(state)) = lookup_cached(c, &mut trees, root, other)? {
+                deleted.push((other, state));
+            }
         }
         Ok(deleted)
     })?;
-    let same_name = |other: &RepoPath| file_name(other) == file_name(path);
-    let identical = deleted
-        .iter()
-        .filter(|(_, other)| *other == Some(blob))
-        .min_by_key(|(other, _)| !same_name(other));
-    if let Some(&(other, _)) = identical {
+    let added = [(
+        path,
+        FileState::Regular {
+            content: blob,
+            executable: false,
+        },
+    )];
+    // The bytes of deleted files read, and the cost of files read and
+    // refused for their lines.
+    let (mut bytes, mut refused) = (0, 0);
+    let read = |other: &RepoPath, other_blob: BlobId, size: usize| {
+        if other_blob == blob {
+            return Ok(Some(Chunks::of(text)));
+        }
+        if bytes > MAX_RENAME_BYTES || size > MAX_BLAME_BYTES {
+            return Ok(None);
+        }
+        bytes += size;
+        let text = read_text(store, other_blob, other, &mut refused)?.ok();
+        Ok(text.map(|text| Chunks::of(&text)))
+    };
+    let budget = Budget {
+        cost: &mut *cost,
+        cap: usize::MAX,
+    };
+    // With one added file, at most this many pairs means at most this many
+    // deleted files.
+    let found = similar::renames(store, &added, &deleted, read, MAX_RENAME_SOURCES, budget)?;
+    *cost += refused;
+    let Some(pair) = found.first() else {
+        return Ok(None);
+    };
+    // A regular file pairs only with a regular file.
+    let (other, state) = deleted[pair.deleted];
+    let other_blob = state
+        .blob()
+        .ok_or_else(|| Error::Corrupt(format!("rename source {other:?} has no blob")))?;
+    if other_blob == blob {
         return Ok(Some((other.clone(), blob, None)));
     }
-    let named: Vec<_> = deleted
-        .iter()
-        .filter(|(other, _)| same_name(other))
-        .collect();
-    let unique = match named[..] {
-        [&(other, Some(other_blob))] => Some((other, other_blob)),
-        _ => None,
-    };
-    let compare_all = deleted.len() <= MAX_RENAME_SOURCES;
-    if unique.is_none() && !(compare_all && deleted.iter().any(|(_, b)| b.is_some())) {
-        return Ok(None);
-    }
-    let (new, count) = chunks(text);
-    *cost += count;
-    // The bytes this search read.
-    let mut read = 0;
-    // The most similar file so far, ranked by likeness, then by name.
-    let mut best: Option<((u64, bool), Version)> = None;
-    // Step 2 first, as in git, so a match there reads no other file.
-    if let Some((other, other_blob)) = unique
-        && let Some((likeness, other_text)) =
-            similarity(store, other, other_blob, &new, text.len(), cost, &mut read)?
-    {
-        let version = (other.clone(), other_blob, Some(other_text));
-        if likeness >= SAME * 3 / 4 {
-            return Ok(Some(version));
-        }
-        best = (likeness >= SAME / 2).then_some(((likeness, true), version));
-    }
-    if !compare_all {
-        return Ok(None);
-    }
-    for &(other, other_blob) in &deleted {
-        if read > MAX_RENAME_BYTES {
-            break;
-        }
-        let Some(other_blob) = other_blob.filter(|_| unique.is_none_or(|(u, _)| u != other)) else {
-            continue;
-        };
-        let Some((likeness, other_text)) =
-            similarity(store, other, other_blob, &new, text.len(), cost, &mut read)?
-        else {
-            continue;
-        };
-        let rank = (likeness, same_name(other));
-        if likeness >= SAME / 2 && best.as_ref().is_none_or(|(best_rank, _)| rank > *best_rank) {
-            best = Some((rank, (other.clone(), other_blob, Some(other_text))));
-        }
-    }
-    Ok(best.map(|(_, version)| version))
-}
-
-/// How like a new file of `new_len` bytes, split into `new` ([`chunks`]),
-/// `blob`, the file at `path`, is, and its text. Likeness is the bytes of
-/// the chunks they share, over the size of the larger one, on git's scale
-/// ([`SAME`]). `None` if blame cannot read `blob`, or the sizes differ too
-/// much for 50%. Adds the chunks compared, or a refused file, to `cost`, and
-/// the bytes read to `read`.
-///
-/// # Errors
-///
-/// A failure to read.
-fn similarity(
-    store: &Store,
-    path: &RepoPath,
-    blob: BlobId,
-    new: &HashMap<(&[u8], bool), usize>,
-    new_len: usize,
-    cost: &mut usize,
-    read: &mut usize,
-) -> Result<Option<(u64, Vec<u8>)>> {
-    let size = store.blobs().size(blob)?;
-    let larger = size.max(new_len);
-    if size > MAX_BLAME_BYTES || 2 * size.min(new_len) < larger {
-        return Ok(None);
-    }
-    *read += size;
-    let Some(text) = read_text(store, blob, path, cost)?.ok() else {
-        return Ok(None);
-    };
-    let (old, count) = chunks(&text);
-    *cost += count;
-    let shared: usize = new
-        .iter()
-        .map(|(chunk, &bytes)| old.get(chunk).map_or(0, |&old_bytes| bytes.min(old_bytes)))
-        .sum();
-    let likeness = (shared as u64 * SAME)
-        .checked_div(larger as u64)
-        .unwrap_or(SAME);
-    Ok(Some((likeness, text)))
-}
-
-/// Splits `text` as git's rename detection does: a chunk ends after a
-/// newline, or after 64 bytes. In text, a CR before a newline does not
-/// count, so a line scores the same with either line end. Returns the bytes
-/// each chunk counts, summed by chunk, and the number of chunks. A chunk is
-/// its bytes before the line end, and whether it ends in a newline.
-fn chunks(text: &[u8]) -> (HashMap<(&[u8], bool), usize>, usize) {
-    let mut chunks: HashMap<(&[u8], bool), usize> = HashMap::new();
-    let mut count = 0;
-    let mut start = 0;
-    let mut counted = 0;
-    // git leaves out a CR only in text: a file with no NUL byte in its
-    // first 8,000 bytes.
-    let skip_cr = !text[..text.len().min(8000)].contains(&0);
-    for (at, &byte) in text.iter().enumerate() {
-        if skip_cr && byte == b'\r' && text.get(at + 1) == Some(&b'\n') {
-            continue;
-        }
-        counted += 1;
-        if byte == b'\n' || counted == 64 {
-            let chunk = match &text[start..=at] {
-                [body @ .., b'\r', b'\n'] if skip_cr => (body, true),
-                [body @ .., b'\n'] => (body, true),
-                chunk => (chunk, false),
-            };
-            *chunks.entry(chunk).or_default() += counted;
-            count += 1;
-            start = at + 1;
-            counted = 0;
-        }
-    }
-    if start < text.len() {
-        *chunks.entry((&text[start..], false)).or_default() += counted;
-        count += 1;
-    }
-    (chunks, count)
-}
-
-/// The last part of a path.
-fn file_name(path: &RepoPath) -> &[u8] {
-    let bytes = path.as_bytes();
-    bytes.rsplit(|&b| b == b'/').next().unwrap_or(bytes)
+    // The search read it, and kept only its chunks.
+    let text = read_text(store, other_blob, other, cost)?.ok();
+    Ok(text.map(|text| (other.clone(), other_blob, Some(text))))
 }
 
 /// [`tree::lookup`] that loads each tree at most once across calls.

@@ -442,11 +442,11 @@ fn unsafe_names_fail_before_anything_is_written() {
     }
 }
 
-/// Whether `dir` is on a filesystem that folds ASCII case.
-fn folds_case(dir: &Path) -> bool {
-    fs::write(dir.join("probe"), "").unwrap();
-    let folds = dir.join("PROBE").exists();
-    fs::remove_file(dir.join("probe")).unwrap();
+/// Whether `dir` is on a filesystem that folds `name` and `other` into one.
+fn folds(dir: &Path, name: &str, other: &str) -> bool {
+    fs::write(dir.join(name), "").unwrap();
+    let folds = dir.join(other).exists();
+    fs::remove_file(dir.join(name)).unwrap();
     folds
 }
 
@@ -463,18 +463,32 @@ fn names_that_fold_together_fail_cleanly_where_the_filesystem_folds_them() {
     let link = FileState::Symlink {
         target: store.blobs().put(b"../../outside").unwrap(),
     };
-    let cases: [Files; 3] = [
-        &[(b"A", one), (b"a", two)],
-        &[(b"X/f", one), (b"x/g", two)],
-        // Folded together, `link/x` would be written through `Link`.
-        &[(b"Link", link), (b"link/x", one)],
-    ];
-    let ids = store_changesets(&store, &cases);
-    let server = Server::start(data, store);
+    let (empty, to_t) = (
+        regular(b""),
+        FileState::Symlink {
+            target: store.blobs().put(b"t").unwrap(),
+        },
+    );
     let tmp = tempfile::tempdir().unwrap();
-    let folds = folds_case(tmp.path());
+    let case = folds(tmp.path(), "probe", "PROBE");
+    // U+00E9 in NFC, and in NFD as `e` and U+0301.
+    let unicode = folds(tmp.path(), "caf\u{e9}", "cafe\u{301}");
+    let cases: [(Files, bool); 6] = [
+        (&[(b"A", one), (b"a", two)], case),
+        (&[(b"X/f", one), (b"x/g", two)], case),
+        // Folded together, `link/x` would be written through `Link`.
+        (&[(b"Link", link), (b"link/x", one)], case),
+        // Empty files, and symlinks with one target: as the call sent again
+        // after a lost NFS reply finds, but at another recorded name.
+        (&[(b"E", empty), (b"e", empty)], case),
+        (&[(b"S", to_t), (b"s", to_t)], case),
+        (&[(b"caf\xc3\xa9", one), (b"cafe\xcc\x81", two)], unicode),
+    ];
+    let files: Vec<_> = cases.iter().map(|(files, _)| *files).collect();
+    let ids = store_changesets(&store, &files);
+    let server = Server::start(data, store);
 
-    for (files, id) in cases.iter().zip(ids) {
+    for ((files, folded), id) in cases.iter().zip(ids) {
         // Into an existing empty directory, and into a new one.
         for existing in [true, false] {
             let parent = tmp.path().join(format!("{id}-{existing}"));
@@ -489,7 +503,7 @@ fn names_that_fold_together_fail_cleanly_where_the_filesystem_folds_them() {
                 made.join("new")
             };
             let out = server.scn(&["checkout", &id.to_string(), "--into", text(&dest)]);
-            if folds {
+            if *folded {
                 assert!(!out.status.success());
                 let err = stderr(&out);
                 assert!(

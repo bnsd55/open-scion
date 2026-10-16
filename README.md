@@ -192,6 +192,7 @@ These are this project's choices where the article does not give details.
 | Git | One-way import. Commit IDs are not kept identical to git commit IDs. |
 | Cache tiers | As in the article, a daemon per machine on a socket and a regional cache in memory, and objects sent in the disk format that the daemon keeps. The Unix socket, TCP between tiers, the disk store, zstd as that format, the byte limits, and one shared fetch per missed object are this project's choices. |
 | History and blame | Computed on each call from first-parent changes, with a bound per call. Blame follows renames, as `git blame` does; path history does not, as `git log` without `--follow`. The article keeps them as derived data; that is planned ([#61](https://github.com/bnsd55/open-scion/issues/61)). |
+| Diff | Compares file states, not lines, in pages of 1,000 paths. Finds renames as `git diff` does, over the whole diff below a path, with a bound per call. |
 
 Deliberate simplifications are marked `SHORTCUT:` in the code, each with its
 limit and its upgrade path.
