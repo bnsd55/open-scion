@@ -1,10 +1,12 @@
 //! gRPC API for Scion, generated from `proto/scion.proto`, plus the rules that
 //! every server of the API shares: bearer tokens ([`auth`]), checks on request
-//! fields ([`check`]), how one object travels in parts and encodings
-//! ([`object`]), and how a `GetObjects` reply streams objects ([`reply`]).
+//! fields ([`check`]), how a caller's deadline passes down ([`deadline`]), how
+//! one object travels in parts and encodings ([`object`]), and how a
+//! `GetObjects` reply streams objects ([`reply`]).
 
 pub mod auth;
 pub mod check;
+pub mod deadline;
 pub mod object;
 pub mod reply;
 

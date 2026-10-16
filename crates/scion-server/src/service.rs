@@ -4,7 +4,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use scion_core::{BlobId, ChangesetId, FileState, RepoPath};
 use scion_proto::v1::scion_server::{Scion, ScionServer};
@@ -135,8 +135,8 @@ impl ScionService {
     }
 
     /// Runs a `MergeBase` or `IsAncestor` query: at most `MAX_GRAPH_QUERIES`
-    /// at once, each until its call ends or `REQUEST_TIMEOUT` passes.
-    async fn graph_query<T, F>(&self, query: F) -> Result<T, Status>
+    /// at once, each until its call ends or its `deadline` passes.
+    async fn graph_query<T, F>(&self, deadline: Deadline, query: F) -> Result<T, Status>
     where
         T: Send + 'static,
         F: FnOnce(&Store, &Deadline) -> Result<T> + Send + 'static,
@@ -144,7 +144,6 @@ impl ScionService {
         // The query checks it at each read: a request timeout, or a client
         // that cancels, drops this call but not a job that is running. The
         // guard ends the deadline when this call ends or is dropped.
-        let deadline = Deadline::new(Instant::now() + REQUEST_TIMEOUT);
         let _call = deadline.guard();
         // Taken before the worker permit, and held until the job ends, also
         // when the client leaves first.
@@ -409,7 +408,7 @@ impl Scion for ScionService {
         // The job checks it in its walks: a request timeout, or a client
         // that cancels, drops this call but not a job that is running. The
         // guard ends the deadline when this call ends or is dropped.
-        let deadline = Deadline::new(Instant::now() + REQUEST_TIMEOUT);
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let _call = deadline.guard();
         let caller = caller(&request)?;
         let req = request.into_inner();
@@ -616,12 +615,15 @@ impl Scion for ScionService {
         &self,
         request: Request<MergeBaseRequest>,
     ) -> Result<Response<MergeBaseResponse>, Status> {
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_name("repo", &req.repo)?;
         let a = parse_id(&req.a_changeset_id, "a_changeset_id")?;
         let b = parse_id(&req.b_changeset_id, "b_changeset_id")?;
         let bases = self
-            .graph_query(move |store, deadline| read::merge_base(store, &req.repo, a, b, deadline))
+            .graph_query(deadline, move |store, deadline| {
+                read::merge_base(store, &req.repo, a, b, deadline)
+            })
             .await?;
         Ok(Response::new(MergeBaseResponse {
             changeset_ids: bases.iter().map(|id| id.as_bytes().to_vec()).collect(),
@@ -632,12 +634,13 @@ impl Scion for ScionService {
         &self,
         request: Request<IsAncestorRequest>,
     ) -> Result<Response<IsAncestorResponse>, Status> {
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_name("repo", &req.repo)?;
         let ancestor = parse_id(&req.ancestor_id, "ancestor_id")?;
         let descendant = parse_id(&req.descendant_id, "descendant_id")?;
         let is_ancestor = self
-            .graph_query(move |store, deadline| {
+            .graph_query(deadline, move |store, deadline| {
                 read::is_ancestor(store, &req.repo, ancestor, descendant, deadline)
             })
             .await?;
