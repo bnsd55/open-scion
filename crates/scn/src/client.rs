@@ -98,7 +98,7 @@ impl Ctx {
             .await
             .with_context(|| format!("cannot connect to {server}"))?;
         let call = Call(Bearer::new(token).context("token is not valid ASCII")?);
-        let mut roots = ObjectsClient::with_interceptor(channel.clone(), call.clone())
+        let roots = ObjectsClient::with_interceptor(channel.clone(), call.clone())
             .max_decoding_message_size(MAX_PART_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
         let objects = match objects {
@@ -116,8 +116,7 @@ impl Ctx {
                     let socket = socket.to_str().context("the socket path is not UTF-8")?;
                     address = format!("unix://{socket}");
                 }
-                let endpoint = Endpoint::from_shared(address)
-                    .context("bad --objects address")?;
+                let endpoint = Endpoint::from_shared(address).context("bad --objects address")?;
                 let endpoint = ClientTls::load(ca, None, None)
                     .and_then(|tls| tls.apply_to(objects, endpoint))
                     .with_context(|| format!("cannot trust the certificate of {objects}"))?;
@@ -332,7 +331,7 @@ mod tests {
         let resolved = fs::canonicalize(&real).unwrap().join("daemon.sock");
         assert_eq!(check_socket(&path, owner).unwrap(), resolved);
         let server = format!("unix://{}", path.display());
-        Ctx::connect(&server, "token", None, "r".into(), false)
+        Ctx::connect(&server, None, "token", None, "r".into(), false)
             .await
             .unwrap();
     }

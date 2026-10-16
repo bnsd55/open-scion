@@ -40,19 +40,21 @@ pub async fn connect(url: &str) -> Client {
     ObjectsClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap())
 }
 
-pub fn tree_ref(id: TreeId) -> ObjectRef {
+/// A ref of `id` at `path`, from the root tree of the ticket that carries
+/// it. An empty `path` names the root tree itself.
+pub fn tree_ref(id: TreeId, path: &[u8]) -> ObjectRef {
     ObjectRef {
         kind: ObjectKind::Tree.into(),
         id: id.as_bytes().to_vec(),
-        path: Vec::new(),
+        path: path.to_vec(),
     }
 }
 
-pub fn blob_ref(id: BlobId) -> ObjectRef {
+pub fn blob_ref(id: BlobId, path: &[u8]) -> ObjectRef {
     ObjectRef {
         kind: ObjectKind::Blob.into(),
         id: id.as_bytes().to_vec(),
-        path: Vec::new(),
+        path: path.to_vec(),
     }
 }
 

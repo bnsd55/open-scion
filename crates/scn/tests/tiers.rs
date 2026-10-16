@@ -17,16 +17,29 @@ mod common;
 use common::{REPO, TOKEN, Tiers, blob_path, blob_ref, changeset, connect, land};
 
 /// `scn checkout REV --into dest` against the server at `url`.
-fn checkout(url: &str, rev: &str, dest: &Path) {
+/// Checks out `rev` into `dest`: the ref and the ticket come from the
+/// server, the objects ride `through`, which is the server itself for a
+/// direct checkout, or a tier.
+fn checkout(through: &str, rev: &str, dest: &Path, server: &str) {
     let out = Command::new(env!("CARGO_BIN_EXE_scn"))
-        .args(["--server", url, "--repo", REPO, "checkout", rev, "--into"])
+        .args([
+            "--server",
+            server,
+            "--objects",
+            through,
+            "--repo",
+            REPO,
+            "checkout",
+            rev,
+            "--into",
+        ])
         .arg(dest)
         .env("SCION_TOKEN", TOKEN)
         .output()
         .unwrap();
     assert!(
         out.status.success(),
-        "{url}: {}",
+        "{through}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -69,7 +82,6 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Node> {
 }
 
 #[test]
-#[ignore = "the server fails ticketless GetObjects closed until C5; scn sends tickets in C8"]
 fn checkout_through_the_daemon_and_the_cache_matches_a_direct_checkout() {
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
@@ -89,8 +101,8 @@ fn checkout_through_the_daemon_and_the_cache_matches_a_direct_checkout() {
     let tmp = tempfile::tempdir().unwrap();
     let dest = |name: &str| tmp.path().join(name);
 
-    checkout(&tiers.socket, "main", &dest("through-tiers"));
-    checkout(&tiers.server, "main", &dest("direct"));
+    checkout(&tiers.socket, "main", &dest("through-tiers"), &tiers.server);
+    checkout(&tiers.server, "main", &dest("direct"), &tiers.server);
     let direct = snapshot(&dest("direct"));
     assert_eq!(direct.len(), 11, "{direct:?}");
     assert_eq!(snapshot(&dest("through-tiers")), direct);
@@ -105,7 +117,12 @@ fn checkout_through_the_daemon_and_the_cache_matches_a_direct_checkout() {
     assert!(before.0 > 0 && before.1 > 0, "{before:?}");
 
     // A second checkout on the node sends nothing past the daemon.
-    checkout(&tiers.socket, &first.to_string(), &dest("again"));
+    checkout(
+        &tiers.socket,
+        &first.to_string(),
+        &dest("again"),
+        &tiers.server,
+    );
     assert_eq!(snapshot(&dest("again")), direct);
     assert_eq!(tiers.upstream_calls(), before);
 
@@ -113,7 +130,7 @@ fn checkout_through_the_daemon_and_the_cache_matches_a_direct_checkout() {
     // moves.
     let second = changeset(Some(first), &[("README.md", new_readme)]);
     land(&tiers.store, &second);
-    checkout(&tiers.socket, "main", &dest("moved"));
+    checkout(&tiers.socket, "main", &dest("moved"), &tiers.server);
     let moved = fs::read(dest("moved").join("README.md")).unwrap();
     assert_eq!(moved, b"hello, again\n");
     assert_eq!(
@@ -123,30 +140,31 @@ fn checkout_through_the_daemon_and_the_cache_matches_a_direct_checkout() {
 }
 
 #[test]
-#[ignore = "the server fails ticketless GetObjects closed until C5; scn sends tickets in C8"]
-fn a_missing_repo_fails_the_call_once_at_each_tier() {
+fn a_bad_ticket_fails_the_call_at_the_daemon() {
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
     let tiers = Tiers::start(data, store);
-    let refs = (0..3u8).map(|i| blob_ref(BlobId::of(&[i]))).collect();
+    let refs = (0..3u8)
+        .map(|i| blob_ref(BlobId::of(&[i]), b"nowhere"))
+        .collect();
     let request = GetObjectsRequest {
         refs,
         accept: Vec::new(),
-        ticket: Vec::new(),
+        // Too short to be a ticket, and no tier mints one for a repo that
+        // nobody has.
+        ticket: vec![9; 10],
     };
 
     let reply = tiers.runtime.block_on(async {
         let mut daemon = connect(&tiers.socket).await;
         daemon.get_objects(request).await
     });
-    // The call itself fails, as it does on the server, not one object of it.
+    // The call itself fails at the daemon, before anything goes upstream.
     let Err(status) = reply else {
         panic!("the call started a stream");
     };
-    assert_eq!(status.code(), Code::NotFound, "{status:?}");
-    // One call past the daemon and one to the server: no tier asked again
-    // once per object.
-    assert_eq!(tiers.upstream_calls(), (1, 1));
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    assert_eq!(tiers.upstream_calls(), (0, 0), "no call past the daemon");
 }
 
 #[test]
