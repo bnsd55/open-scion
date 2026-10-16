@@ -194,9 +194,11 @@ fn id_of(answer: &Answer) -> Vec<u8> {
 }
 
 /// The trees and blobs of the snapshot of `changeset`, its root tree first.
-/// Every tier gives the root tree; the rest is read from the server.
+/// All of it comes from the server: the tier answers for `ResolveRef` and
+/// `GetRootTree` are compared in one place,
+/// `every_tier_resolves_as_the_server_does`.
 async fn snapshot(tiers: &Tiers, changeset: ChangesetId) -> (Vec<TreeId>, Vec<BlobId>) {
-    let root = same(tiers, &root_tree(REPO, changeset.as_bytes())).await;
+    let root = ask(&tiers.server, &root_tree(REPO, changeset.as_bytes())).await;
     let root = TreeId::try_from(id_of(&root).as_slice()).unwrap();
     let mut client = connect(&tiers.server).await;
     let (mut trees, mut blobs) = (vec![root], Vec::new());

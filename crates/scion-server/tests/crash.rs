@@ -24,7 +24,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use scion_core::{BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, RepoPath, Tree};
+use scion_core::{
+    BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, RepoPath, Tree, TreeId,
+};
 use scion_proto::auth::Bearer;
 use scion_proto::object::{self, Assembler, Header};
 use scion_proto::v1::objects_client::ObjectsClient;
@@ -161,6 +163,28 @@ async fn connect(url: &str) -> Result<(Scion, Objects), tonic::transport::Error>
     Ok((ScionClient::with_interceptor(channel, bearer), objects))
 }
 
+/// `Objects.ResolveRef` as one call: the changeset ID that `name` names.
+/// The `Objects` calls stay in one place, so a change to the service moves
+/// one helper, not every call.
+async fn resolve_ref(objects: &mut Objects, name: &str) -> Result<ChangesetId, Status> {
+    let request = ResolveRefRequest {
+        repo: REPO.into(),
+        name: name.into(),
+    };
+    let reply = objects.resolve_ref(request).await?;
+    Ok(changeset_id(&reply.into_inner().changeset_id))
+}
+
+/// `Objects.GetRootTree` as one call: the ID of the root tree of `changeset`.
+async fn root_tree(objects: &mut Objects, changeset: ChangesetId) -> TreeId {
+    let request = GetRootTreeRequest {
+        repo: REPO.into(),
+        changeset_id: changeset.as_bytes().to_vec(),
+    };
+    let reply = objects.get_root_tree(request).await.unwrap();
+    TreeId::try_from(reply.into_inner().tree_id.as_slice()).unwrap()
+}
+
 fn author() -> IdentityTime {
     IdentityTime {
         name: b"Ada".to_vec(),
@@ -280,16 +304,10 @@ async fn client(url: String, name: String, mut rng: Rng, signals: Arc<Signals>) 
         // An older base makes the server rebase the land.
         let base = match bases.get(target) {
             Some(&base) if rng.below(4) == 0 => base,
-            _ => {
-                let request = ResolveRefRequest {
-                    repo: REPO.into(),
-                    name: target.into(),
-                };
-                match objects.resolve_ref(request).await {
-                    Ok(reply) => changeset_id(&reply.into_inner().changeset_id),
-                    Err(status) => return cut(ledger, "ResolveRef", &status),
-                }
-            }
+            _ => match resolve_ref(&mut objects, target).await {
+                Ok(id) => id,
+                Err(status) => return cut(ledger, "ResolveRef", &status),
+            },
         };
         bases.insert(target, base);
 
@@ -555,12 +573,7 @@ async fn walk_refs(
 ) -> HashMap<ChangesetId, (&'static str, Changeset)> {
     let mut history = HashMap::new();
     for target in REFS {
-        let request = ResolveRefRequest {
-            repo: REPO.into(),
-            name: target.into(),
-        };
-        let head = objects.resolve_ref(request).await.unwrap().into_inner();
-        let mut at = changeset_id(&head.changeset_id);
+        let mut at = resolve_ref(objects, target).await.unwrap();
         loop {
             let request = GetChangesetRequest {
                 repo: REPO.into(),
@@ -877,17 +890,7 @@ fn a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one() {
     assert_eq!(schema(&data), upgraded);
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let (_, mut objects) = connect(&server.url).await.unwrap();
-        let request = ResolveRefRequest {
-            repo: REPO.into(),
-            name: "main".into(),
-        };
-        let main = objects.resolve_ref(request).await.unwrap().into_inner();
-        assert_eq!(changeset_id(&main.changeset_id), root);
-        let request = GetRootTreeRequest {
-            repo: REPO.into(),
-            changeset_id: root.as_bytes().to_vec(),
-        };
-        let tree = objects.get_root_tree(request).await.unwrap().into_inner();
-        assert_eq!(tree.tree_id, Tree::default().id().as_bytes());
+        assert_eq!(resolve_ref(&mut objects, "main").await.unwrap(), root);
+        assert_eq!(root_tree(&mut objects, root).await, Tree::default().id());
     });
 }
