@@ -25,6 +25,7 @@ use tonic::{Request, Response, Status};
 
 use crate::access::Access;
 use crate::error::{Error, Result};
+use crate::quotas::{Call, Quotas};
 use crate::service::{Worker, caller, check_reader, parse_id, resolve_ref};
 use crate::store::{self, Store};
 use crate::{db, read};
@@ -64,15 +65,18 @@ impl Plan {
 pub struct ObjectsService {
     worker: Worker,
     access: Arc<Access>,
+    /// What one principal may hold at once.
+    quotas: Quotas,
     /// `IN_FLIGHT_BYTES` permits, one per object byte, shared by all replies.
     in_flight: Arc<Semaphore>,
 }
 
 impl ObjectsService {
-    pub(crate) fn new(worker: Worker, access: Arc<Access>) -> Self {
+    pub(crate) fn new(worker: Worker, access: Arc<Access>, quotas: Quotas) -> Self {
         Self {
             worker,
             access,
+            quotas,
             in_flight: Arc::new(Semaphore::new(IN_FLIGHT_BYTES)),
         }
     }
@@ -212,11 +216,15 @@ const WAITS: Waits = Waits {
 /// object. That comes before the caller's deadline, so the caller gets this
 /// status, not a timeout of its own. `stalled` is the handle of the
 /// connection, which counts what a stalled reply leaves in HTTP/2.
+// SHORTCUT: eight knobs in one call. Upgrade: a reply-options struct if a
+// ninth appears.
+#[allow(clippy::too_many_arguments)]
 async fn start_reply(
     worker: Worker,
     keys: Vec<Key>,
     in_flight: Arc<Semaphore>,
     waits: Waits,
+    call: Call,
     read: Read,
     zstd: bool,
     stalled: Option<scion_proto::listen::Stalled>,
@@ -231,7 +239,9 @@ async fn start_reply(
         .ok_or_else(reply::busy)?;
     let (tx, stream) = reply::channel();
     tokio::spawn(async move {
+        // Held to the end of this task, so past the end of the stream.
         let (worker, in_flight) = (&worker, &in_flight);
+        let _keep = call;
         let produce = |key| {
             find(
                 worker,
@@ -282,7 +292,7 @@ impl Objects for ObjectsService {
         &self,
         request: Request<ResolveRefRequest>,
     ) -> Result<Response<ResolveRefResponse>, Status> {
-        resolve_ref(&self.worker, &self.access, request)
+        resolve_ref(&self.worker, &self.access, &self.quotas, request)
             .await
             .map(Response::new)
     }
@@ -292,6 +302,7 @@ impl Objects for ObjectsService {
         request: Request<GetRootTreeRequest>,
     ) -> Result<Response<GetRootTreeResponse>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let GetRootTreeRequest { repo, changeset_id } = request.into_inner();
         check_reader(&self.access, &caller, &repo)?;
         let cs = parse_id(&changeset_id, "changeset_id")?;
@@ -311,6 +322,7 @@ impl Objects for ObjectsService {
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<Self::GetObjectsStream>, Status> {
         let caller = caller(&request)?;
+        let call = self.quotas.enter(&caller).map_err(Status::from)?;
         let waits = Waits {
             until: Until::of(&request),
             ..WAITS
@@ -328,11 +340,14 @@ impl Objects for ObjectsService {
             .run(move |store| store.read(|c| db::repo_id(c, &repo)))
             .await?;
         let in_flight = Arc::clone(&self.in_flight);
+        // The request slot lives until the stream ends, not until this
+        // handler returns: the stream's work goes on in its producer.
         let stream = start_reply(
             self.worker.clone(),
             keys,
             in_flight,
             waits,
+            call,
             read_object,
             zstd,
             stalled,
@@ -410,6 +425,7 @@ mod tests {
             keys,
             Arc::clone(&in_flight),
             waits(stall),
+            Call::default(),
             read_object,
             true,
             None,
@@ -448,6 +464,7 @@ mod tests {
                 vec![a],
                 Arc::clone(&in_flight),
                 wait,
+                Call::default(),
                 counted,
                 true,
                 None,
@@ -486,6 +503,7 @@ mod tests {
             vec![a],
             in_flight,
             waits,
+            Call::default(),
             read_object,
             true,
             None,
@@ -518,6 +536,7 @@ mod tests {
             vec![key],
             Arc::clone(&in_flight),
             WAITS,
+            Call::default(),
             watched,
             false,
             None,
@@ -581,6 +600,7 @@ mod tests {
                 keys,
                 Arc::clone(&in_flight),
                 WAITS,
+                Call::default(),
                 read_object,
                 zstd,
                 None,
