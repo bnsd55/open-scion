@@ -134,8 +134,23 @@ trees commits them in one transaction. The schema version is
 `migrations/` that is newer than its version runs, in order, in its own
 transaction. A released migration never changes. A build refuses a database
 with a newer version. Version 3 lets a derived value have any length; the
-upgrade copies every row. All database access of a process goes through one
-connection behind a mutex. Write transactions use `BEGIN IMMEDIATE`.
+upgrade copies every row.
+
+**Connections.** Each process has one write connection behind a mutex, and
+8 read-only connections (`store::READERS`). Write transactions use
+`BEGIN IMMEDIATE`. The migrations run on the write connection before the
+read connections open. In WAL mode a read connection reads beside a write, so a
+read never waits for a write, and a long read never makes a write wait.
+`Store::read` takes an idle read connection, or waits for one. It runs
+outside any explicit transaction, so each statement sees its own snapshot:
+every commit that it can see when it starts. A caller that needs one
+consistent view reads it in one statement. (A snapshot held across the
+statements of back-to-back reads would keep the auto-checkpoint from ever
+copying the whole log, so the log would never restart and its file would
+grow.) `Store::read_unflushed` runs
+on the write connection. Writes use it to read what they are about to
+change, under the same lock. The read connections close first, so the write
+connection closes last and moves the log into `scion.db`.
 
 **Blob folder.** One zstd file per blob, at most 100 MiB uncompressed. A write
 goes to a temp file in `tmp/`, is flushed, and is renamed into place. The zstd
@@ -174,11 +189,19 @@ rename (see below).
   Elsewhere the commit's `fsync` already flushes the cache. A land waits for
   the flush after it releases the ref's lock, so queued lands share it.
 - A read waits too. If `Store::read` saw a commit that no full flush covers
-  yet, it waits for one after it releases the database lock. So no reply
+  yet, it waits for one after it gives back its connection. So no reply
   shows a commit that a power loss can undo, such as a ref target from
   `ResolveRef` or a land state from `GetLand`. Where `fsync` already flushes
   the drive cache, no read waits. A land reads with `Store::read_unflushed`,
   because it flushes before it replies.
+- A read can see a commit before `commit` returns. So each commit is
+  counted twice, under the write lock: in `committing` before its COMMIT
+  runs, and in `committed` after it ends. A read loads `committing` after it
+  ends, so the count covers every commit it saw. A flush covers only
+  `committed`: a commit still in its COMMIT may not have written its log.
+  With `synchronous = FULL`, a commit's log reaches the drive before the
+  commit is visible, so a flush that starts after a read covers what the
+  read saw. The proof is in `Store::wait_durable`.
 - A read that derives a value, such as the root tree for `GetRootTree`,
   waits for a full flush of that derivation before it replies (section 4).
   So a client never gets a tree ID that a power loss can undo.
@@ -220,8 +243,10 @@ import with `Store::open_shared`. Each holds its `flock`s until the last
   process, up to `busy_timeout` (5 s), and then fails with `UNAVAILABLE`, so
   the client retries. An import holds the
   write lock for one batch of 1,000 commits, verification included. While a
-  server write waits, it holds the server's one connection, so the server's
-  reads wait too ([#100](https://github.com/bnsd55/open-scion/issues/100)).
+  server write waits, it holds the server's write connection, so the
+  server's other writes wait too
+  ([#100](https://github.com/bnsd55/open-scion/issues/100)). Its reads do
+  not: they use the read connections.
 - **Refs.** Both processes move a ref by compare-and-swap on its `version`,
   each in a write transaction. The server sees a move that the import made at
   its next land on the ref: each plan reads the head from the database and
@@ -260,7 +285,7 @@ computed eagerly or on demand. The rest is this project's choice.
 | A kind | `derived::Kind`: a name, a version, and `derive`, a function from a changeset and its parents' values, in parent order, to a value. Each kind encodes its value as bytes. |
 | Inputs | By default the first parent's value only, and only first-parent history is derived: a changeset stores only its changes against its first parent (section 2), so a kind over snapshots needs no more. A kind with `ALL_PARENTS`, such as `commit_graph` (below), gets the value of every parent, and every ancestor is derived. `derive` may also read the stored value of an older changeset that it reaches through those parents. |
 | On demand | `derived::get` reads the stored value. If there is none, `derived::fill` derives it in steps (below). |
-| Steps | `fill` walks from the changeset through the parents that the kind reads, and stops at each changeset with a stored value. It visits at most `derived::STEP` (100) changesets per hold of the database lock. It keeps the changesets without a value, 40 bytes each with the generation, so it visits each one once. A walk over every parent also keeps the set of changesets it visited. Then it derives them in generation order, oldest first, at most `STEP` changesets per transaction, and commits each one. A parent's generation is below its child's, so each changeset comes after its parents. Other requests run between steps. A step reads a value that is already stored, for example by a concurrent `fill`, and does not derive it again. So a changeset has a value only if each parent that its kind reads has one, back to the roots. |
+| Steps | `fill` walks from the changeset through the parents that the kind reads, and stops at each changeset with a stored value. It visits at most `derived::STEP` (100) changesets per hold of the write connection. It keeps the changesets without a value, 40 bytes each with the generation, so it visits each one once. A walk over every parent also keeps the set of changesets it visited. Then it derives them in generation order, oldest first, at most `STEP` changesets per transaction, and commits each one. A parent's generation is below its child's, so each changeset comes after its parents. Other writes run between steps. A step reads a value that is already stored, for example by a concurrent `fill`, and does not derive it again. So a changeset has a value only if each parent that its kind reads has one, back to the roots. |
 | Eager | A kind can also store its value when the changeset is written. `root_tree` does (below). `commit_graph` does if each parent has a value (`derived::on_write`), so a write never derives a long history. |
 | Storage | One `derived` row per (kind, version, changeset), written in the transaction that derives it. A large structure belongs in its own table, and the value is its ID, as `root_tree` keeps trees in `trees`. |
 | A version bump | A new version reads and writes only its own rows. So the old rows become unused, and nothing rewrites them. The new version derives its values again, in steps. Each step, and each write of a root tree, also deletes up to `STEP` rows of older versions of its kind, as each new land deletes a few expired lands. Rows of a newer version stay: a newer build that ran on this data may run again, and it reads them. Rows of a kind that the build no longer has also stay. |
@@ -353,7 +378,7 @@ started.
    1 MiB, author name and email of at most 1 KiB each.
 3. Check that the repo exists and has the parent, so a bad request reads no
    blob.
-4. Read back each blob it names, outside the database lock. A blob that many
+4. Read back each blob it names, before the write transaction. A blob that many
    paths name is read once. The error names the first path, in path order,
    whose blob is missing or corrupt.
 5. In one write transaction: check the repo and the parent again. If the repo
@@ -511,7 +536,7 @@ not hold yet, each once (`PathIndex::cost`).
 - If the addition still does not fit, an advance or a land moves the floor
   up to the tip: the index starts over, empty, at the head. So does an
   advance of more than `MAX_DEPTH` changesets, so it never holds the
-  database lock for a long walk.
+  write connection for a long walk.
 - A `reach` back to an older base stops at the first changeset that does not
   fit. That changeset is the floor, and the walk below checks the rest.
 
@@ -542,7 +567,7 @@ A dropped index, or one that started over, is an index whose floor is the
 head, so a land on an older base is the second or third case. So the choice
 of the new floor, of `MAX_DEPTH` and of the budget changes only the speed,
 never the answer. One limit does change it: the walk takes at most 100,000
-changesets (`MAX_WALK`). It holds the database lock, so a base further back
+changesets (`MAX_WALK`). It holds the write connection, so a base further back
 is `REJECTED` as too old, and the client must rebase onto a newer head.
 Per-path history in the database will remove the walk
 ([#38](https://github.com/bnsd55/open-scion/issues/38)).
@@ -703,7 +728,7 @@ histories where they agree: edits, merges, a file that becomes a directory
 and a file again, and renames for each rule above.
 
 **Bounds and resume.** A `Log` or `Blame` call checks at most 1,000
-changesets (`MAX_SCAN`), so it holds the database lock no longer than a plain
+changesets (`MAX_SCAN`), so it holds a read connection no longer than a plain
 `Log` of 1,000 entries. A `Blame` call also diffs at most 100 versions, and
 about 1M lines (`MAX_BLAME_DIFF_LINES`, both sides of each diff). Every byte
 that blame reads counts against this budget, once per 64 bytes: a diffed
@@ -803,14 +828,11 @@ and their bounds, are this project's choices.
   queue with marks. It keeps marks only for its queue, so its memory follows
   the width of the history, not its depth.
 - A walk runs in steps of about 1,000 reads (`graph::STEPS`). A step
-  holds the database lock. A changeset's parents and node never change, so
-  the next step goes on from where the last one stopped. The lock is not
-  fair: a thread that frees it and takes it again at once keeps it. So the
-  walk leaves it free for 100 µs between steps, and a request that waits
-  takes it then. The reply waits for one flush that covers every step, as
-  any read does. **Planned:** a pool of read-only connections, so a walk
-  holds no lock that writes wait for
-  ([#17](https://github.com/bnsd55/open-scion/issues/17)).
+  holds one read connection, so writes and other reads run beside it. A
+  changeset's parents and node never change, so the next step goes on from
+  where the last one stopped. The reply waits for one flush that covers
+  every step, as any read does. At most 4 queries run at once, fewer than
+  the 8 read connections, so the walks never take every one.
 - The first query on a changeset without a node derives the commit graph
   of its whole history, in steps (section 4), before it answers. Its
   deadline does not stop that: each step it stored stays for the next
@@ -1205,14 +1227,12 @@ limit and its upgrade path. This is the list on `main` today.
 | File | Shortcut | Upgrade | Issue |
 |---|---|---|---|
 | `scion-core/src/codec.rs` (`put_len`) | Encoding panics if a field is longer than `u32::MAX`. Every ingest path caps sizes far below that. | `try_encode` returning `Result`, if a path ever does not. | |
-| `scion-server/src/graph.rs` (`STEPS`) | A graph walk leaves the database lock free for 100 µs between steps, because the lock is not fair. A request that wakes later than that waits one more step. | A pool of read-only connections, so a walk holds no lock that others wait for. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
-| `scion-server/src/store.rs` (`Inner::db`) | One SQLite connection behind a mutex, so reads wait for writes. | A pool of read-only connections. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
-| `scion-server/src/import.rs` (`BATCH`) | A server that shares the data directory waits for each import batch transaction, up to `busy_timeout` (5 s), and then its write fails with `UNAVAILABLE`. Its reads wait behind that write. | Shorter import transactions while a server shares the directory. | [#100](https://github.com/bnsd55/open-scion/issues/100) |
+| `scion-server/src/import.rs` (`BATCH`) | A server that shares the data directory waits for each import batch transaction, up to `busy_timeout` (5 s), and then its write fails with `UNAVAILABLE`. Its other writes wait behind that write. | Shorter import transactions while a server shares the directory. | [#100](https://github.com/bnsd55/open-scion/issues/100) |
 | `scion-server/src/store.rs` (`Blobs::sweep_tmp`) | Only an open that finds no other process removes the temp files that a crash left, so those of a crashed import stay while the server runs. | A `tmp/` folder per process, under its own lock. | [#101](https://github.com/bnsd55/open-scion/issues/101) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | Per-ref serialization in a shared database ([design](design/scalable-backend.md)). | [#47](https://github.com/bnsd55/open-scion/issues/47) |
-| `scion-server/src/land.rs` (`MAX_WALK`) | A land on a base more than `MAX_DEPTH` generations below the tip walks the history from the index floor back to the base, each time, and holds the database lock while it walks. A base more than 100,000 changesets below the floor is rejected. | Per-path history in the database, so the check reads only the paths that the land changes. | [#38](https://github.com/bnsd55/open-scion/issues/38) |
+| `scion-server/src/land.rs` (`MAX_WALK`) | A land on a base more than `MAX_DEPTH` generations below the tip walks the history from the index floor back to the base, each time, and holds the write connection while it walks. A base more than 100,000 changesets below the floor is rejected. | Per-path history in the database, so the check reads only the paths that the land changes. | [#38](https://github.com/bnsd55/open-scion/issues/38) |
 | `scion-server/src/objects.rs` (`read_object`) | An object ID is treated as permission to read it; trees and blobs are shared by all repos. Safe with one principal. | A read ticket bound to a principal, a repo and a root tree, checked by the server and every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-proto/src/reply.rs` (`STALL_TIMEOUT`) | A stalled `GetObjects` reply ends, but its channel and HTTP/2 keep the part each holds (at most 1 MiB each) until the connection closes, and the number of stalled replies has no bound. | A response body timeout that resets the stream. | [#42](https://github.com/bnsd55/open-scion/issues/42) |
 | `scion-server/src/objects.rs` (`find`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |

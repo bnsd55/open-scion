@@ -36,7 +36,7 @@ pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<Chang
     // blob. The transaction checks again.
     let repo_id = store.read(|c| check_parent(c, repo, parent))?;
     // The blob check touches only the object folder, so it runs before the
-    // database lock is taken.
+    // write transaction.
     // SHORTCUT: blobs are shared by all repos, so a changeset may name a blob
     // that another repo uploaded and then read it. Safe with one principal.
     // Upgrade before multi-tenant auth: a repo_blobs table checked here.

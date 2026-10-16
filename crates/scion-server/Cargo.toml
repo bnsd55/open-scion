@@ -32,6 +32,8 @@ zstd.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# A test runs code while a commit is visible and its COMMIT still runs.
+rusqlite = { workspace = true, features = ["hooks"] }
 
 [lints]
 workspace = true
