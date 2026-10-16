@@ -125,8 +125,13 @@ async fn serve_tls(certs: &TestCerts) -> String {
         store,
         listener,
         TOKEN,
-        Limits::default(),
-        Some(tls),
+        service::ServeOptions {
+            limits: Limits::default(),
+            quotas: scion_server::quotas::Quotas::off(),
+            pending_lands: None,
+            land_stale_secs: 1 << 40,
+            tls: Some(tls),
+        },
         std::future::pending(),
     ));
     format!("https://{addr}")

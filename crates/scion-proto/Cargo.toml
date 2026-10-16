@@ -1,5 +1,5 @@
 [package]
-name = "scion-proto"
+name = "open-scion-proto"
 description = "gRPC API definitions for the Scion version control system"
 version.workspace = true
 edition.workspace = true
@@ -11,6 +11,9 @@ keywords.workspace = true
 categories.workspace = true
 authors.workspace = true
 
+[lib]
+name = "scion_proto"
+
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
@@ -19,6 +22,7 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 tokio-stream.workspace = true
 tonic = { workspace = true, features = ["tls-ring"] }
+tonic-health.workspace = true
 tonic-prost.workspace = true
 tracing.workspace = true
 zstd.workspace = true

@@ -230,6 +230,37 @@ const TIMERS: Timers = Timers {
     grace: CONNECTION_GRACE,
 };
 
+/// The gRPC health service (`grpc.health.v1`), on the same port as the
+/// other services and without a token, so a probe needs none. It is
+/// `SERVING` for the whole server (the empty name) and for every name in
+/// `services`; when shutdown starts, every one of these names flips to
+/// `NOT_SERVING`, before the drain, while the server still answers.
+///
+/// Returns the service to add to the router, and the wrapped shutdown.
+pub async fn health(
+    services: &[&'static str],
+    shutdown: impl Future<Output = ()>,
+) -> (
+    tonic_health::pb::health_server::HealthServer<impl tonic_health::pb::health_server::Health>,
+    impl Future<Output = ()>,
+) {
+    let (reporter, service) = tonic_health::server::health_reporter();
+    for name in std::iter::once("").chain(services.iter().copied()) {
+        reporter
+            .set_service_status(name, tonic_health::ServingStatus::Serving)
+            .await;
+    }
+    let shutdown = async move {
+        shutdown.await;
+        for name in std::iter::once("").chain(services.iter().copied()) {
+            reporter
+                .set_service_status(name, tonic_health::ServingStatus::NotServing)
+                .await;
+        }
+    };
+    (service, shutdown)
+}
+
 impl Limits {
     /// Serves the services that `router` adds to a server, on `incoming`
     /// connections, within these limits and with the timers above, until

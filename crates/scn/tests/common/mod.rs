@@ -86,8 +86,13 @@ impl Tiers {
             store.clone(),
             listener,
             TOKEN,
-            Limits::default(),
-            None,
+            service::ServeOptions {
+                limits: Limits::default(),
+                quotas: scion_server::quotas::Quotas::off(),
+                pending_lands: None,
+                land_stale_secs: 1 << 40,
+                tls: None,
+            },
             pending(),
         ));
 

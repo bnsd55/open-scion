@@ -41,7 +41,7 @@ use scion_core::{BlobId, ChangesetId, Tree, TreeId};
 use scion_proto::auth::{Auth, Bearer};
 use scion_proto::check;
 use scion_proto::deadline::Until;
-use scion_proto::listen::Limits;
+use scion_proto::listen::{self, Limits};
 use scion_proto::object::{self, Assembler, Header, MAX_ENCODED_BYTES, UNPACK_BYTES, zstd_bound};
 use scion_proto::reply::{
     self, BUSY_TIMEOUT, Body, IN_FLIGHT_BYTES, ObjectStream, Outgoing, STALL_TIMEOUT,
@@ -491,7 +491,12 @@ impl<S: Store> Tier<S> {
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_PART_MESSAGE_BYTES);
         let objects = InterceptedService::new(objects, Auth::new(token));
-        let router = |mut server: Server| server.add_service(objects);
+        // The health service answers `grpc.health.v1.Check` and `Watch` on
+        // the same port, without a token: a probe carries none. The store
+        // and the upstream channel opened before this call, so the tier
+        // starts serving.
+        let (health, shutdown) = listen::health(&["scion.v1.Objects"], shutdown).await;
+        let router = |mut server: Server| server.add_service(health).add_service(objects);
         limits
             .serve(router, incoming, tls.map(|tls| tls.config()), shutdown)
             .await
