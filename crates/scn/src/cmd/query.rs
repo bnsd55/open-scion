@@ -76,9 +76,11 @@ pub async fn diff(ctx: &mut Ctx, old: &str, new: &str, path: Option<&RepoPath>) 
     let new_id = ctx.resolve(new).await?;
     let path = path.map(|p| p.as_bytes().to_vec()).unwrap_or_default();
     let mut json_entries = Vec::new();
-    // For JSON: the old file of each rename, by its path. The two halves of a
-    // rename can come in different replies.
-    let mut sources = HashMap::new();
+    // The two halves of each rename: the deleted ones by path, and the added
+    // ones. They can come in different replies, so they are matched at the
+    // end.
+    let mut deletes = HashMap::new();
+    let mut adds = Vec::new();
     let mut after = Vec::new();
     loop {
         let reply = ctx
@@ -99,13 +101,14 @@ pub async fn diff(ctx: &mut Ctx, old: &str, new: &str, path: Option<&RepoPath>) 
             let side = |state: Option<FileState>| state.map(|s| entry_json(&Entry::File(s)));
             // The deleted half of a rename prints with the added half.
             if !entry.rename_to.is_empty() {
-                if ctx.json {
-                    sources.insert(entry.path, side(old));
-                }
+                deletes.insert(entry.path, (entry.rename_to, side(old)));
                 continue;
             }
             let path = lossy(&entry.path);
             let renamed = !entry.rename_from.is_empty();
+            if renamed {
+                adds.push((entry.rename_from.clone(), entry.path.clone()));
+            }
             let status = if renamed { 'R' } else { status(old, new) };
             if ctx.json {
                 let mut value = json!({
@@ -135,23 +138,49 @@ pub async fn diff(ctx: &mut Ctx, old: &str, new: &str, path: Option<&RepoPath>) 
         }
         after = reply.next_after;
     }
+    let mut olds = match_renames(deletes, adds)?;
     if ctx.json {
-        let mut values = Vec::new();
-        for (from, mut value) in json_entries {
-            if !from.is_empty() {
-                let Some(old) = sources.remove(&from) else {
-                    bail!(
-                        "server sent a rename from {} but no delete there",
-                        lossy(&from)
-                    );
-                };
+        let values = json_entries.into_iter().map(|(from, mut value)| {
+            if let Some(old) = olds.remove(&from) {
                 value["old"] = old.into();
             }
-            values.push(value);
-        }
-        println!("{}", Value::from(values));
+            value
+        });
+        println!("{}", Value::from_iter(values));
     }
     Ok(())
+}
+
+/// The old file of each rename, by its old path. Matches the two halves of
+/// each rename: `deletes`, each deleted half by its path, with the new path
+/// and the old file, and `adds`, each added half as its old and new path.
+///
+/// # Errors
+///
+/// A half with no other half: the server sent a bad diff.
+fn match_renames(
+    mut deletes: HashMap<Vec<u8>, (Vec<u8>, Option<Value>)>,
+    adds: Vec<(Vec<u8>, Vec<u8>)>,
+) -> Result<HashMap<Vec<u8>, Option<Value>>> {
+    let mut olds = HashMap::new();
+    for (from, to) in adds {
+        match deletes.remove(&from) {
+            Some((rename_to, old)) if rename_to == to => olds.insert(from, old),
+            _ => bail!(
+                "server sent a rename from {} to {}, but no delete there",
+                lossy(&from),
+                lossy(&to)
+            ),
+        };
+    }
+    if let Some((from, (to, _))) = deletes.into_iter().next() {
+        bail!(
+            "server sent a delete of {} as a rename to {}, but no rename there",
+            lossy(&from),
+            lossy(&to)
+        );
+    }
+    Ok(olds)
 }
 
 /// The `git diff --name-status` letter for a change.
@@ -187,4 +216,34 @@ fn file_state(state: Option<v1::FileState>) -> Result<Option<FileState>> {
         FileKind::Unspecified => bail!("server sent a file state with no kind"),
     };
     Ok(Some(state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type Delete = (Vec<u8>, (Vec<u8>, Option<Value>));
+
+    /// A rename from `from` to `to`: its deleted half, and its added half.
+    fn halves(from: &str, to: &str) -> (Delete, (Vec<u8>, Vec<u8>)) {
+        let delete = (from.into(), (to.into(), Some(json!(from))));
+        (delete, (from.into(), to.into()))
+    }
+
+    #[test]
+    fn a_rename_needs_both_halves() {
+        let (delete, add) = halves("old", "new");
+        let (other_delete, other_add) = halves("old", "other");
+        let olds = match_renames(HashMap::from([delete.clone()]), vec![add.clone()]).unwrap();
+        assert_eq!(olds, HashMap::from([(b"old".to_vec(), Some(json!("old")))]));
+        for (deletes, adds) in [
+            (vec![delete.clone()], vec![]),
+            (vec![], vec![add.clone()]),
+            (vec![delete], vec![other_add]),
+            (vec![other_delete], vec![add]),
+        ] {
+            let found = match_renames(deletes.into_iter().collect(), adds);
+            assert!(found.is_err(), "{found:?}");
+        }
+    }
 }

@@ -268,13 +268,15 @@ pub const MAX_DIFF_ENTRIES: usize = 1000;
 // (https://github.com/bnsd55/open-scion/issues/107).
 pub const MAX_RENAME_ENTRIES: usize = 10_000;
 
-/// Most work one `Diff` call does to find similar files: each chunk of a
-/// file read counts once, and each row of a chunk table that a comparison
-/// reads counts once ([`similar::Budget`]). Reading 64 MiB of text in lines
-/// of 64 bytes or more costs 1M. The budget is the same on every call, so
-/// every call finds the same renames.
+/// Most work one `Diff` call does to find similar files, in steps 2 and 3
+/// of [`similar::renames`]: each chunk of a file read counts once, and each
+/// row of a chunk table that the search indexes or compares counts once
+/// ([`similar::Budget`]). Reading 64 MiB of text in lines of 64 bytes or
+/// more costs 1M. The budget is the same on every call, so every call finds
+/// the same renames.
 // SHORTCUT: past it, the search reads no more files, so a diff with many
-// large files that could be similar can miss renames that git finds.
+// large files that could be similar can miss renames that git finds, also
+// renames to a file of the same name.
 // Upgrade: renames of a diff as derived data, found in steps over calls and
 // kept (https://github.com/bnsd55/open-scion/issues/107).
 pub const MAX_RENAME_CHUNKS: usize = 4 << 20;
