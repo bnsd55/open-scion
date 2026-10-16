@@ -7,6 +7,17 @@ release.
 
 ## [Unreleased]
 
+### Changed
+
+- `Diff` finds renames as git does at any size of the diff (`#107`). Exact
+  renames (same content, by blob ID) run at any size, where a diff of more
+  than 10,000 entries before had none. The inexact search (same name, then
+  similar files) keeps git's limit of 1,000 x 1,000 file pairs and its
+  per-call work budget. When it did not run or stopped at the budget, the
+  reply sets `renames_incomplete`, and `scn diff` prints git's warning about
+  skipped inexact rename detection; the exact renames in the reply are
+  still whole. Every call of the same diff reports the flag the same way.
+
 ### Added
 
 - Principals and access rules (`#13`, part 2). `scion-server serve --access

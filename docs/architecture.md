@@ -928,20 +928,24 @@ and their bounds, are this project's choices.
   one the new path (`rename_to`). A client that does not know renames still
   sees a correct delete and add. If the page holds no added or deleted file,
   the call skips this. If the page is the whole diff, it uses the page.
-  Else it walks the whole diff below the path, up to 10,000 entries
-  (`MAX_RENAME_ENTRIES`); a larger diff has no renames. Step 3 compares
-  files only while the added files left times the deleted files left are at
-  most 1,000,000, git's default limit. It reads the added files that some
-  deleted file could be like into one index by chunk hash, then reads each
-  deleted file and looks up its chunks there, so it never compares two
-  files row by row. Added files with the same blob share one place in the
-  index, so a blob added at many paths is read and indexed once. It reads
+  Else it walks the whole diff below the path, with no bound on entries:
+  exact renames (same content, by blob ID) cost no file reads, so a diff of
+  any size finds them. Steps 2 and 3 (inexact) run only while the added
+  files left times the deleted files left are at most 1,000,000, git's
+  default limit. Step 3 compares files only under that limit. It reads the
+  added files that some deleted file could be like into one index by chunk
+  hash, then reads each deleted file and looks up its chunks there, so it
+  never compares two files row by row. Added files with the same blob share
+  one place in the index, so a blob added at many paths is read and indexed
+  once. It reads
   each file in parts of 1 MiB, so it holds the chunk tables but never a
   whole file. Steps 2 and 3 share one budget, about 4M chunks read and
   table rows indexed or compared (`MAX_RENAME_CHUNKS`). It is the same on
   every call, so every call finds the same renames; past it, the search
-  reads no more files, and misses renames, of the same name too
-  ([#107](https://github.com/bnsd55/open-scion/issues/107)). So one call
+  reads no more files. When the inexact search did not run (over the pair
+  limit) or stopped at the budget, the reply sets `renames_incomplete`, as
+  git prints "inexact rename detection was skipped due to too many files"
+  (#107, fixed); `scn diff` prints the same warning. So one call
   reads at most about 256 MiB of text in lines of 64 bytes or more, plus
   one file past the budget. Reading a file costs far more than looking up
   its chunks, so the budget goes mostly to reading. At most 4 `Diff` calls

@@ -259,26 +259,14 @@ pub fn merge_base(
 /// per part on each side.
 pub const MAX_DIFF_ENTRIES: usize = 1000;
 
-/// Most entries a diff can have for `Diff` to find renames in it. To find
-/// them, a call walks the whole diff below its path, up to one entry more
-/// than this. Each tree read takes a read connection on its own.
-// SHORTCUT: a larger diff has no renames: a rename there is a delete and an
-// add. git finds renames in a diff of any size. Upgrade: renames of a diff
-// as derived data, found in steps over calls and kept
-// (https://github.com/bnsd55/open-scion/issues/107).
-pub const MAX_RENAME_ENTRIES: usize = 10_000;
-
 /// Most work one `Diff` call does to find similar files, in steps 2 and 3
 /// of [`similar::renames`]: each chunk of a file read counts once, each row
 /// of a chunk table that the search indexes or compares counts once, and
-/// each file size read counts [`similar::SIZE_COST`] ([`similar::Budget`]).
 /// Reading 64 MiB of text in lines of 64 bytes or more costs 1M. The budget
-/// is the same on every call, so every call finds the same renames.
-// SHORTCUT: past it, the search reads no more files, so a diff with many
-// large files that could be similar can miss renames that git finds, also
-// renames to a file of the same name.
-// Upgrade: renames of a diff as derived data, found in steps over calls and
-// kept (https://github.com/bnsd55/open-scion/issues/107).
+/// is the same on every call, so every call finds the same renames. Past
+/// it, the search reads no more files, and the reply says so
+/// ([`DiffPage::renames_incomplete`]). Exact renames (step 1) cost no file
+/// reads, so they run whatever the size of the diff.
 pub const MAX_RENAME_CHUNKS: usize = 4 << 20;
 
 /// A path whose file differs between two snapshots.
@@ -314,6 +302,11 @@ pub struct DiffPage {
     /// Set when the call stopped at [`MAX_DIFF_ENTRIES`]: the last path in
     /// `entries`. Diff again with `after` set to it to continue.
     pub next_after: Option<RepoPath>,
+    /// Set when renames may be missing: the inexact search did not run
+    /// (more than [`similar::MAX_PAIRS`] pairs were left), or stopped at
+    /// [`MAX_RENAME_CHUNKS`]. The exact renames that `entries` hold are
+    /// still whole.
+    pub renames_incomplete: bool,
 }
 
 /// The paths whose file differs between the snapshots of `old` and `new`, in
@@ -333,9 +326,12 @@ pub struct DiffPage {
 /// rename, whichever page holds it and wherever `after` is. Both halves of a
 /// rename stay in the diff, so a client that does not know renames sees a
 /// delete and an add. If the page has an added or deleted file, the call
-/// walks the whole diff below `path`, unless the page is all of it. A diff
-/// of more than [`MAX_RENAME_ENTRIES`] entries has no renames, and the
-/// search for similar files stops at [`MAX_RENAME_CHUNKS`].
+/// walks the whole diff below `path`, unless the page is all of it. Exact
+/// renames (same content, by blob ID) run at any size of the diff; the
+/// inexact search runs only under git's pair limit
+/// ([`similar::MAX_PAIRS`]) and stops at [`MAX_RENAME_CHUNKS`]. When it did
+/// not run or did not end, the page says so
+/// ([`DiffPage::renames_incomplete`]).
 ///
 /// # Errors
 ///
@@ -357,21 +353,19 @@ pub fn diff(
     } else {
         None
     };
+    let mut renames_incomplete = false;
     if entries.iter().any(|e| e.old.is_none() || e.new.is_none()) {
-        let renames = if after.is_none() && next_after.is_none() {
-            renames(store, &entries)?
+        // The renames are among the adds and deletes of the whole diff, not
+        // of one page, so a page gives each entry the same rename. Exact
+        // renames cost no file reads, so the walk has no bound on entries:
+        // a diff of any size gets them.
+        let all = if after.is_none() && next_after.is_none() {
+            entries.clone()
         } else {
-            let all = diff_walk(store, roots, path, None, MAX_RENAME_ENTRIES)?;
-            if all.len() > MAX_RENAME_ENTRIES {
-                tracing::debug!(
-                    entries = all.len(),
-                    "a diff with too many entries to find renames"
-                );
-                HashMap::new()
-            } else {
-                renames(store, &all)?
-            }
+            diff_walk(store, roots, path, None, usize::MAX)?
         };
+        let (renames, incomplete) = renames(store, &all)?;
+        renames_incomplete = incomplete;
         for entry in &mut entries {
             entry.rename = renames.get(&entry.path).cloned();
         }
@@ -379,12 +373,14 @@ pub fn diff(
     Ok(DiffPage {
         entries,
         next_after,
+        renames_incomplete,
     })
 }
 
 /// The renames among `entries`, a whole diff: each path of a rename, with
-/// the other path.
-fn renames(store: &Store, entries: &[DiffEntry]) -> Result<HashMap<RepoPath, Rename>> {
+/// the other path, and whether renames may be missing (the inexact search
+/// did not run, or stopped at its budget).
+fn renames(store: &Store, entries: &[DiffEntry]) -> Result<(HashMap<RepoPath, Rename>, bool)> {
     let (mut added, mut deleted) = (Vec::new(), Vec::new());
     for entry in entries {
         match (entry.old, entry.new) {
@@ -404,7 +400,14 @@ fn renames(store: &Store, entries: &[DiffEntry]) -> Result<HashMap<RepoPath, Ren
         progress: false,
     };
     let from = Progress::default();
-    let pairs = similar::renames(store, &added, &deleted, read, MAX_PAIRS, from, budget)?.pairs;
+    let outcome = similar::renames(store, &added, &deleted, read, MAX_PAIRS, from, budget)?;
+    if outcome.skipped {
+        tracing::debug!(
+            added = added.len(),
+            deleted = deleted.len(),
+            "a diff with too many file pairs for inexact rename detection"
+        );
+    }
     if cost >= MAX_RENAME_CHUNKS {
         tracing::debug!(
             cost,
@@ -412,7 +415,7 @@ fn renames(store: &Store, entries: &[DiffEntry]) -> Result<HashMap<RepoPath, Ren
         );
     }
     let mut renames = HashMap::new();
-    for pair in pairs {
+    for pair in outcome.pairs {
         let (to, from) = (added[pair.added].0, deleted[pair.deleted].0);
         let similarity = pair.score * 100 / similar::SAME;
         for (path, other) in [(to, from), (from, to)] {
@@ -426,7 +429,7 @@ fn renames(store: &Store, entries: &[DiffEntry]) -> Result<HashMap<RepoPath, Ren
             );
         }
     }
-    Ok(renames)
+    Ok((renames, outcome.skipped || outcome.stopped.is_some()))
 }
 
 /// The entries of the diff of two root trees, as [`diff`] returns them, up
