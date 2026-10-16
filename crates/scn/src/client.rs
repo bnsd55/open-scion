@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use scion_core::{BlobId, Changeset, ChangesetId, RepoPath};
@@ -13,14 +13,37 @@ use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ResolveRefRequest};
 use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_PART_MESSAGE_BYTES};
+use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Endpoint};
+use tonic::{Request, Status};
+
+/// The deadline of every call: the server's own limit for a call, so it
+/// fits the longest call that `scn` makes (a land, a graph query, an upload
+/// of 100 MiB). It goes out as `grpc-timeout`, so each tier on the way waits
+/// no longer than what is left of it, and `scn` gives up on its own then too.
+const CALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long `scn` waits to connect.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A connected client.
-pub type Client = ScionClient<InterceptedService<Channel, Bearer>>;
+pub type Client = ScionClient<InterceptedService<Channel, Call>>;
 
 /// A connected client for the object reads that a cache tier can answer.
-pub type Objects = ObjectsClient<InterceptedService<Channel, Bearer>>;
+pub type Objects = ObjectsClient<InterceptedService<Channel, Call>>;
+
+/// Adds the bearer token and the deadline ([`CALL_TIMEOUT`]) to every call.
+#[derive(Clone)]
+pub struct Call(Bearer);
+
+impl Interceptor for Call {
+    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        let mut request = self.0.call(request)?;
+        request.set_timeout(CALL_TIMEOUT);
+        Ok(request)
+    }
+}
 
 /// What every command needs.
 #[derive(Clone)]
@@ -50,16 +73,20 @@ impl Ctx {
             address = format!("unix://{socket}");
         }
         // `Endpoint` reads `unix:` addresses too, unlike `Channel::from_shared`.
+        // A server at its connection cap leaves a new connection unread, so
+        // a call also has a limit here, until its reply starts.
         let channel = Endpoint::from_shared(address)
             .context("bad server address")?
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(CALL_TIMEOUT)
             .connect()
             .await
             .with_context(|| format!("cannot connect to {server}"))?;
-        let bearer = Bearer::new(token).context("token is not valid ASCII")?;
-        let objects = ObjectsClient::with_interceptor(channel.clone(), bearer.clone())
+        let call = Call(Bearer::new(token).context("token is not valid ASCII")?);
+        let objects = ObjectsClient::with_interceptor(channel.clone(), call.clone())
             .max_decoding_message_size(MAX_PART_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
-        let client = ScionClient::with_interceptor(channel, bearer)
+        let client = ScionClient::with_interceptor(channel, call)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
         Ok(Self {
@@ -187,6 +214,18 @@ pub fn now_unix_secs() -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scion_proto::deadline::Until;
+
+    /// The deadline goes out on every call, so a waiting `scn` never hangs
+    /// silently, and each tier on the way can end its waits in time.
+    #[test]
+    fn every_call_carries_the_deadline() {
+        let mut call = Call(Bearer::new("token").unwrap());
+        let request = call.call(Request::new(())).unwrap();
+        // 600 s less the margin that a reader of `grpc-timeout` keeps.
+        let wait = Until::of(&request).wait(Duration::MAX);
+        assert!(wait > Duration::from_secs(595) && wait <= Duration::from_secs(599));
+    }
 
     #[test]
     fn a_socket_that_another_user_owns_is_refused() {

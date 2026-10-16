@@ -2520,6 +2520,7 @@ name = "scion-tier"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "hashlink",
  "rustix",

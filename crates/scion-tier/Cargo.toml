@@ -13,6 +13,7 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 clap.workspace = true
 hashlink.workspace = true
 rustix.workspace = true

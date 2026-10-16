@@ -133,6 +133,40 @@ Every `scn` command takes `--json` for machine-readable output. A `scn`
 error exits 2. A checkout that a signal stops removes what it wrote, and
 then dies by the signal (a shell reports 130 for Ctrl-C).
 
+### Access file
+
+`--token T` gives one principal, `default`, which may read and write every
+repo. For several principals, write an access file and start the server with
+`--access FILE` (give one of the two, not both). The file is UTF-8 text, one
+rule per line, fields separated by one tab. Empty lines and lines that start
+with `#` are skipped:
+
+```text
+# token <principal> <the BLAKE3 digest of the token>
+token	alice	d4289b3345cfbdfb36fb37ee89e85bd74447f837b04c18aee6233c731b1419a7
+token	ci	<64 hex digits>
+# read <principal> <repo>: every RPC on that repo
+read	ci	main
+# write <principal> <repo> [prefix]: changes at or below the prefix, by
+# path parts. No prefix means the whole repo. Write implies read.
+write	alice	main	src
+write	ci	main
+```
+
+The file holds digests, never tokens. Print the digest of a token with
+`scion-server hash-token`:
+
+```sh
+token=$(read -s -p token: t; echo "$t")
+digest=$(./target/release/scion-server hash-token --token "$token")
+```
+
+A principal with no rule for a repo cannot see the repo: every call answers
+`NOT_FOUND`, as for a repo that does not exist. A change to a path outside
+the principal's write prefixes answers `PERMISSION_DENIED` and names the
+path. A land is checked for the principal that lands it, even when another
+principal made the changeset.
+
 Checkouts can go through the cache tiers: a `scion-daemon` per machine, on a
 Unix socket, in front of a regional `scion-cache`, in front of the server.
 Each tier keeps what it fetched, so a second checkout on the machine sends
@@ -144,7 +178,8 @@ must not be writable by group or others unless it has the sticky bit (as
 `/tmp` has). `scn` checks the same for the socket. The error names the
 directory; `chmod go-w DIR` fixes it. With umask 002 (a private group per
 user), new directories are group-writable, so they are refused until you run
-that.
+that. Stop the daemon with Ctrl-C or SIGTERM: it then writes its index, and
+its next start reads that one file instead of every stored object.
 
 ```sh
 export SCION_UPSTREAM_TOKEN=dev                  # what each tier sends upstream
@@ -186,6 +221,7 @@ These are this project's choices where the article does not give details.
 |---|---|
 | Hash and format | BLAKE3 with a different prefix per object kind, over a written, frozen byte format |
 | Storage | SQLite for metadata and trees, one compressed file per blob. Anthropic uses Spanner and cloud storage; this is the single-machine stand-in. |
+| Blobs per repo | One file per content, shared by all repos. A repo may name only its own blobs: those uploaded to it, and those that its changesets name. No answer of `PutBlob` or `CreateChangeset` shows whether another repo has a blob. `GetObjects` does not check this yet ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Conflicts | Path-level only: the same path, or a directory above or below it. No text merge. |
 | Landing | One land at a time per ref, inside one process. A changeset can be created in parallel without any lock. |
 | Retries | Each land has a caller-chosen request key, so a retry returns the first result |
