@@ -604,14 +604,15 @@ fn check_derived(
                 ));
                 continue;
             }
-            let decodes = match (kind.as_str(), version) {
-                ("root_tree", 1) => RootTree::decode(&value).is_some(),
-                ("commit_graph", 1) => CommitGraph::decode(&value).is_some(),
-                ("path_history", 1) => PathHistory::decode(&value).is_some(),
-                _ => {
-                    report.old.insert((kind, version));
-                    continue;
-                }
+            let decodes = if kind == RootTree::NAME && version == RootTree::VERSION {
+                RootTree::decode(&value).is_some()
+            } else if kind == CommitGraph::NAME && version == CommitGraph::VERSION {
+                CommitGraph::decode(&value).is_some()
+            } else if kind == PathHistory::NAME && version == PathHistory::VERSION {
+                PathHistory::decode(&value).is_some()
+            } else {
+                report.old.insert((kind, version));
+                continue;
             };
             if !decodes {
                 report.problem(Problem::new(

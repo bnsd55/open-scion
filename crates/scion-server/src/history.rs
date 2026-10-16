@@ -113,7 +113,14 @@ impl NodeId {
 
 /// Whether `body` decodes as a history node.
 pub(crate) fn node_decodes(body: &[u8]) -> bool {
-    decode_node(body).is_some()
+    let Some((kind, payload)) = body.split_first() else {
+        return false;
+    };
+    match *kind {
+        LEAF => decode_node(payload).is_some(),
+        INDEX => decode_index(payload).is_some(),
+        _ => false,
+    }
 }
 
 impl fmt::Display for NodeId {
