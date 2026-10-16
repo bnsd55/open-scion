@@ -25,6 +25,7 @@ tokio-stream.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 scion-server.workspace = true
 scion-tier.workspace = true
 tempfile.workspace = true

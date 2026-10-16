@@ -122,11 +122,17 @@ async fn serve_deepest(deepest: Deepest) -> String {
 /// A tier in front of `upstream`, which waits at most `timeout` for each
 /// step of it, and its address.
 async fn serve_tier(upstream: &str, timeout: Duration) -> String {
-    let tier = Tier::new(MemoryStore::new(16 << 20), upstream, TOKEN, timeout).unwrap();
+    let tier = Tier::new(MemoryStore::new(16 << 20), upstream, TOKEN, timeout, None).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let incoming = TcpListenerStream::new(listener);
-    tokio::spawn(tier.serve(TOKEN, incoming, Limits::default(), std::future::pending()));
+    tokio::spawn(tier.serve(
+        TOKEN,
+        incoming,
+        Limits::default(),
+        None,
+        std::future::pending(),
+    ));
     url
 }
 

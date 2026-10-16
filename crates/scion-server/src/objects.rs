@@ -25,7 +25,7 @@ use tonic::{Request, Response, Status};
 
 use crate::access::Access;
 use crate::error::{Error, Result};
-use crate::quotas::Quotas;
+use crate::quotas::{Call, Quotas};
 use crate::service::{Worker, caller, check_reader, parse_id, resolve_ref};
 use crate::store::{self, Store};
 use crate::{db, read};
@@ -225,6 +225,7 @@ async fn start_reply(
     keys: Vec<Key>,
     in_flight: Arc<Semaphore>,
     waits: Waits,
+    call: Call,
     read: Read,
     zstd: bool,
 ) -> Result<ObjectStream, Status> {
@@ -238,7 +239,9 @@ async fn start_reply(
         .ok_or_else(reply::busy)?;
     let (tx, stream) = reply::channel();
     tokio::spawn(async move {
+        // Held to the end of this task, so past the end of the stream.
         let (worker, in_flight) = (&worker, &in_flight);
+        let _keep = call;
         let produce = |key| {
             find(
                 worker,
@@ -319,7 +322,7 @@ impl Objects for ObjectsService {
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<Self::GetObjectsStream>, Status> {
         let caller = caller(&request)?;
-        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
+        let call = self.quotas.enter(&caller).map_err(Status::from)?;
         let waits = Waits {
             until: Until::of(&request),
             ..WAITS
@@ -334,11 +337,14 @@ impl Objects for ObjectsService {
             .run(move |store| store.read(|c| db::repo_id(c, &repo)))
             .await?;
         let in_flight = Arc::clone(&self.in_flight);
+        // The request slot lives until the stream ends, not until this
+        // handler returns: the stream's work goes on in its producer.
         let stream = start_reply(
             self.worker.clone(),
             keys,
             in_flight,
             waits,
+            call,
             read_object,
             zstd,
         );
@@ -415,6 +421,7 @@ mod tests {
             keys,
             Arc::clone(&in_flight),
             waits(stall),
+            Call::default(),
             read_object,
             true,
         );
@@ -452,6 +459,7 @@ mod tests {
                 vec![a],
                 Arc::clone(&in_flight),
                 wait,
+                Call::default(),
                 counted,
                 true,
             );
@@ -489,6 +497,7 @@ mod tests {
             vec![a],
             in_flight,
             waits,
+            Call::default(),
             read_object,
             true,
         );
@@ -520,6 +529,7 @@ mod tests {
             vec![key],
             Arc::clone(&in_flight),
             WAITS,
+            Call::default(),
             watched,
             false,
         );
@@ -582,6 +592,7 @@ mod tests {
                 keys,
                 Arc::clone(&in_flight),
                 WAITS,
+                Call::default(),
                 read_object,
                 zstd,
             );

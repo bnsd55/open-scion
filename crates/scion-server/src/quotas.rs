@@ -136,7 +136,7 @@ struct Usage {
 }
 
 /// What one call holds. Gives it back on drop, on every exit path.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct Call {
     usage: Arc<Mutex<HashMap<String, Usage>>>,
     principal: String,

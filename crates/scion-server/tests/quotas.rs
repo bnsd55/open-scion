@@ -113,10 +113,13 @@ async fn server(store: &Store, access: Access, quotas: Quotas) -> (Stop, Channel
         store.clone(),
         listener,
         access,
-        Limits::default(),
-        quotas,
-        None,
-        1 << 40,
+        service::ServeOptions {
+            limits: Limits::default(),
+            quotas,
+            pending_lands: None,
+            land_stale_secs: 1 << 40,
+            tls: None,
+        },
         async {
             stopped.await.ok();
         },
@@ -293,5 +296,71 @@ async fn an_upload_over_the_byte_cap_is_refused_and_frees_on_exit() {
         }))
         .await
         .unwrap();
+    stop.send(()).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_holds_its_slot_until_the_stream_ends() {
+    let (_dir, store) = store();
+    let access = access(&["alice", "bob"]);
+    // One request in flight per principal.
+    let (stop, channel) = server(&store, access, Quotas::new(Some(1), None)).await;
+    // A file of several parts, so its reply has a producer that stays alive
+    // after the handler has returned, and that waits on a client which
+    // takes no message.
+    let big = vec![b'z'; 3 * 1024 * 1024];
+    let blob = store.blobs().put(&big).unwrap();
+    // The root's `README` is small, so point `main` at a changeset whose
+    // `README` is the big one.
+    store
+        .write(|c| {
+            let repo = db::repo_id(c, REPO)?;
+            db::add_repo_blob(c, repo, blob)?;
+            let cs = Changeset {
+                parents: vec![],
+                author: scion_core::IdentityTime {
+                    name: b"Ada".to_vec(),
+                    email: b"ada@example.com".to_vec(),
+                    unix_secs: 1_700_000_000,
+                    tz_offset_minutes: 0,
+                },
+                committer: None,
+                message: b"big\n".to_vec(),
+                changes: [(
+                    RepoPath::new("README").unwrap(),
+                    Some(FileState::Regular {
+                        content: blob,
+                        executable: false,
+                    }),
+                )]
+                .into(),
+            };
+            let id = db::insert_changeset(c, repo, &cs)?;
+            let version = db::get_ref(c, repo, "main")?.unwrap().version;
+            assert!(db::cas_ref(c, repo, "main", Some(version), id)?);
+            Ok(())
+        })
+        .unwrap();
+    let mut alice = client(channel.clone(), "alice");
+    // Alice opens a reply and stops reading it. The producer of the reply
+    // stays alive, and with it her only request slot.
+    let stream = alice
+        .read_file(scion_proto::v1::ReadFileRequest {
+            repo: REPO.to_string(),
+            changeset_id: main_ref(&store).target.as_bytes().to_vec(),
+            path: b"README".to_vec(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    until(|| async { probe(channel.clone(), "alice").await == Code::ResourceExhausted }).await;
+
+    // Bob is under his own cap: his calls complete while alice holds hers.
+    let _ = probe(channel.clone(), "bob").await;
+
+    // Alice drops her reply, so the stream ends and her slot comes back.
+    drop(stream);
+    drop(alice);
+    until(|| async { probe(channel.clone(), "alice").await == Code::NotFound }).await;
     stop.send(()).ok();
 }

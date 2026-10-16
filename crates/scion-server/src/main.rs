@@ -1,13 +1,13 @@
-//! `scion-server`: serve the Scion API, import a git repository, or derive
-//! derived data ahead of reads.
+//! The `scion-server` binary: `import`, `serve` and `derive`.
 
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use scion_proto::listen::{self, Limits};
+use scion_proto::tls::ServerTls;
 use scion_server::derived::{self, Kind};
 use scion_server::graph::CommitGraph;
 use scion_server::import::{ImportOptions, import_git};
@@ -16,11 +16,12 @@ use scion_server::tree::RootTree;
 use scion_server::{Error, Store, db, read, service};
 use tracing_subscriber::EnvFilter;
 
+/// The scion server: import, serve and derive.
 #[derive(Parser)]
-#[command(version, about = "Server for the Scion version control system")]
+#[command(version, about, long_about = None)]
 struct Cli {
-    /// Data directory. Created if missing.
-    #[arg(long, env = "SCION_DATA", default_value = "scion-data", global = true)]
+    /// The data directory. Holds the SQLite database and the objects.
+    #[arg(long, env = "SCION_DATA", default_value = "scion-data")]
     data: PathBuf,
     #[command(subcommand)]
     command: Command,
@@ -63,10 +64,22 @@ enum Command {
         /// forever. The default is 86400 (24 hours).
         #[arg(long, default_value_t = 24 * 60 * 60)]
         land_stale_secs: i64,
-        /// Allow a non-loopback address. Traffic, including the token, is not
-        /// encrypted, so use this only on a trusted network.
+        /// Allow a non-loopback address. Without TLS, traffic, including the
+        /// token, is not encrypted, so use this only on a trusted network.
+        /// With `--tls-cert` and `--tls-key`, a non-loopback address is
+        /// allowed without this flag.
         #[arg(long)]
         insecure_listen: bool,
+        /// Serve TLS with this certificate (PEM), together with `--tls-key`.
+        /// Then a non-loopback address needs no `--insecure-listen`.
+        #[arg(long, requires = "tls_key", value_name = "FILE")]
+        tls_cert: Option<PathBuf>,
+        /// The key of `--tls-cert` (PEM).
+        #[arg(long, requires = "tls_cert", value_name = "FILE")]
+        tls_key: Option<PathBuf>,
+        /// Require a client certificate (mTLS) that this CA (PEM) signed.
+        #[arg(long, requires = "tls_cert", value_name = "FILE")]
+        tls_client_ca: Option<PathBuf>,
         /// Most connections served at once. More clients wait until one closes.
         #[arg(long, default_value_t = listen::DEFAULT_CONNECTIONS)]
         max_connections: NonZeroUsize,
@@ -127,6 +140,7 @@ enum KindName {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
@@ -148,13 +162,16 @@ async fn main() -> anyhow::Result<()> {
             listen,
             token,
             access,
-            insecure_listen,
-            max_connections,
-            max_streams,
             max_principal_requests,
             max_principal_upload_bytes,
             max_principal_pending_lands,
             land_stale_secs,
+            insecure_listen,
+            tls_cert,
+            tls_key,
+            tls_client_ca,
+            max_connections,
+            max_streams,
         } => {
             // The second reply says whether the mode is one token: with one
             // principal, a per-principal cap is a global one, so the quotas
@@ -166,15 +183,24 @@ async fn main() -> anyhow::Result<()> {
                 max_principal_upload_bytes,
                 max_principal_pending_lands,
             );
-            serve_cli(
+            let server_tls = server_tls(
+                tls_cert.as_deref(),
+                tls_key.as_deref(),
+                tls_client_ca.as_deref(),
+            )?;
+            serve(
                 store,
                 listen,
                 access,
-                caps,
-                land_stale_secs,
-                insecure_listen,
-                max_connections,
-                max_streams,
+                ServeConfig {
+                    insecure_listen,
+                    quotas: caps.quotas,
+                    pending_lands: caps.pending_lands,
+                    land_stale_secs,
+                    server_tls,
+                    max_connections,
+                    max_streams,
+                },
             )
             .await?;
         }
@@ -226,6 +252,24 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The TLS of a `serve` command: none, or the certificate, key and client CA
+/// of the flags. Clap requires the certificate and the key together, and the
+/// client CA on a certificate.
+fn server_tls(
+    cert: Option<&Path>,
+    key: Option<&Path>,
+    client_ca: Option<&Path>,
+) -> anyhow::Result<Option<ServerTls>> {
+    match (cert, key) {
+        (None, None) => Ok(None),
+        (Some(cert), Some(key)) => {
+            let tls = ServerTls::load(cert, key, client_ca)?;
+            Ok(Some(tls))
+        }
+        _ => unreachable!("clap requires --tls-cert and --tls-key together"),
+    }
+}
+
 /// The three per-principal caps, as the flags set them. With one principal
 /// (the `--token` mode) a per-principal cap is a global one, so each cap is
 /// off unless a flag sets it; with an access file the defaults apply.
@@ -256,26 +300,32 @@ fn caps(
     }
 }
 
-/// Serves with the flags of `--serve`. Returns when the server stops.
-// SHORTCUT: eight knobs in one call. Upgrade: a config struct when a ninth
-// appears, or when callers stop passing every knob in tests.
-#[allow(clippy::too_many_arguments)]
-async fn serve_cli(
+/// What a `serve` command serves with, besides the data directory and the
+/// access rules.
+struct ServeConfig {
+    insecure_listen: bool,
+    quotas: Quotas,
+    pending_lands: Option<usize>,
+    land_stale_secs: i64,
+    server_tls: Option<ServerTls>,
+    max_connections: NonZeroUsize,
+    max_streams: NonZeroU32,
+}
+
+/// Serves the gRPC API on `listen`, with the TLS files of the flags, until
+/// the caller stops it.
+#[allow(clippy::too_many_lines)]
+async fn serve(
     store: Store,
     listen: SocketAddr,
     access: scion_server::access::Access,
-    caps: Caps,
-    land_stale_secs: i64,
-    insecure_listen: bool,
-    max_connections: NonZeroUsize,
-    max_streams: NonZeroU32,
+    config: ServeConfig,
 ) -> anyhow::Result<()> {
-    // SHORTCUT: no TLS. Upgrade: tonic TLS or mTLS before any
-    // deployment beyond one machine.
     anyhow::ensure!(
-        listen.ip().is_loopback() || insecure_listen,
-        "{listen} is not a loopback address; traffic and the token would \
-         travel unencrypted. Pass --insecure-listen to allow it."
+        listen.ip().is_loopback() || config.insecure_listen || config.server_tls.is_some(),
+        "{listen} is not a loopback address; without TLS the traffic and the \
+         token would travel unencrypted. Pass --tls-cert and --tls-key, or \
+         --insecure-listen to allow it."
     );
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -283,22 +333,24 @@ async fn serve_cli(
     // The bound address, so port 0 shows the port that the OS chose.
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "serving");
-    let limits = Limits {
-        connections: max_connections,
-        streams: max_streams,
-    };
-    service::serve(
+    Box::pin(service::serve(
         store,
         listener,
         access,
-        limits,
-        caps.quotas,
-        caps.pending_lands,
-        land_stale_secs,
+        service::ServeOptions {
+            limits: Limits {
+                connections: config.max_connections,
+                streams: config.max_streams,
+            },
+            quotas: config.quotas,
+            pending_lands: config.pending_lands,
+            land_stale_secs: config.land_stale_secs,
+            tls: config.server_tls,
+        },
         async {
             tokio::signal::ctrl_c().await.ok();
         },
-    )
+    ))
     .await?;
     Ok(())
 }

@@ -131,10 +131,13 @@ async fn server(store: &Store, access: Access, token: &str) -> (Stop, Scion, Obj
         store.clone(),
         listener,
         access,
-        Limits::default(),
-        scion_server::quotas::Quotas::off(),
-        None,
-        i64::MAX,
+        service::ServeOptions {
+            limits: Limits::default(),
+            quotas: scion_server::quotas::Quotas::off(),
+            pending_lands: None,
+            land_stale_secs: 1 << 40,
+            tls: None,
+        },
         async {
             stopped.await.ok();
         },

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use scion_core::{BlobId, ChangesetId, FileState, RepoPath};
 use scion_proto::listen::{self, Limits};
+use scion_proto::tls::ServerTls;
 use scion_proto::v1::scion_server::{Scion, ScionServer};
 use scion_proto::v1::{
     self, BlameChangeset, BlameRange, BlameRequest, BlameResponse, CreateChangesetRequest,
@@ -33,7 +34,7 @@ use crate::deadline::Deadline;
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
 use crate::objects::ObjectsService;
-use crate::quotas::Quotas;
+use crate::quotas::{Call, Quotas};
 use crate::store::{MAX_OBJECT_BYTES, READER_BYTES, Store};
 use crate::{blame, db, names, read, write};
 
@@ -102,35 +103,52 @@ const _: () = assert!(REQUEST_TIMEOUT.as_secs() <= listen::CONNECTION_GRACE.as_s
 const _: () = assert!(read_share(MAX_OBJECT_BYTES) <= READ_BUDGET_BYTES);
 const _: () = assert!(READ_BUDGET_BYTES <= u32::MAX as usize);
 
-/// Serves the API on `listener` within `limits`, until `shutdown` resolves,
+/// What a server serves with, besides the data directory and the access
+/// rules: its limits, its per-principal quotas, and its TLS.
+pub struct ServeOptions {
+    /// The connection and stream caps of `listen`.
+    pub limits: Limits,
+    /// What one principal may hold at once.
+    pub quotas: Quotas,
+    /// The most pending lands one principal may hold.
+    pub pending_lands: Option<usize>,
+    /// A land pending longer than this is rejected by the sweep.
+    pub land_stale_secs: i64,
+    /// With TLS, every connection is a TLS connection, whose handshake
+    /// `listen` ends within its timeout.
+    pub tls: Option<ServerTls>,
+}
+
+/// Serves the API on `listener` within `options`, until `shutdown` resolves,
 /// to the tokens and with the rules of `access`: an [`Access`], or one token
-/// (`&str`) that may do everything. `quotas` bounds what one principal may
-/// hold at once, and each principal at most `pending_lands` lands pending.
-/// A land that has been pending for longer than `land_stale_secs` is
-/// rejected by the sweep that runs at start and then once per hour.
+/// (`&str`) that may do everything. `options.quotas` bounds what one
+/// principal may hold at once, and each principal at most
+/// `pending_lands` lands pending. A land that has been pending for longer
+/// than `land_stale_secs` is rejected by the sweep that runs at start and
+/// then once per hour. With `options.tls`, every connection is a TLS
+/// connection, whose handshake `listen` ends within its timeout.
 ///
 /// # Errors
 ///
 /// Transport errors.
-// SHORTCUT: eight knobs in one call. Upgrade: a config struct when a ninth
-// appears, or when callers stop passing every knob in tests.
-#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     store: Store,
     listener: TcpListener,
     access: impl Into<Access>,
-    limits: Limits,
-    quotas: Quotas,
-    pending_lands: Option<usize>,
-    land_stale_secs: i64,
+    options: ServeOptions,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
+    let ServeOptions {
+        limits,
+        quotas,
+        pending_lands,
+        land_stale_secs,
+        tls,
+    } = options;
     let access = Arc::new(access.into());
     let auth = access.auth();
     let worker = Worker::new(store);
     let lands = Arc::new(Lands::new(pending_lands));
-    // The sweep stops when the server does: the shutdown future resolves,
-    // the watch says so, and the loop breaks.
     // The sweep stops when the server does: the shutdown future resolves,
     // the watch says so, and the loop breaks. The same watch ends the
     // server itself.
@@ -165,7 +183,14 @@ pub async fn serve(
             .add_service(scion)
             .add_service(objects)
     };
-    limits.serve(router, listen::tcp(listener), shutdown).await
+    limits
+        .serve(
+            router,
+            listen::tcp(listener),
+            tls.map(|tls| tls.config()),
+            shutdown,
+        )
+        .await
 }
 
 /// Implements the Scion RPCs.
@@ -389,6 +414,7 @@ async fn send_file(
     worker: Worker,
     blob: BlobId,
     _share: OwnedSemaphorePermit,
+    _call: Call,
     tx: mpsc::Sender<Part>,
     stall: Duration,
 ) {
@@ -410,7 +436,7 @@ async fn send_file(
             })
             .await;
         let (part, reader) = match read {
-            Ok(read) => read,
+            Ok(part) => part,
             Err(status) => return fail(status),
         };
         open = reader;
@@ -608,7 +634,7 @@ impl Scion for ScionService {
         request: Request<ReadFileRequest>,
     ) -> Result<Response<ReadFileStream>, Status> {
         let caller = caller(&request)?;
-        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
+        let call = self.quotas.enter(&caller).map_err(Status::from)?;
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
@@ -626,11 +652,14 @@ impl Scion for ScionService {
             .acquire_many_owned(share)
             .await
             .map_err(|_| Status::unavailable("server is shutting down"))?;
+        // The request slot lives until the reply ends, not until this
+        // handler returns: the reply's work goes on in the producer.
         let (tx, rx) = mpsc::channel(2);
         tokio::spawn(send_file(
             self.worker.clone(),
             blob,
             share,
+            call,
             tx,
             READ_STALL_TIMEOUT,
         ));
@@ -947,7 +976,14 @@ mod tests {
         let share = u32::try_from(budget).unwrap();
         let share = Arc::clone(&reads).acquire_many_owned(share).await.unwrap();
         let (tx, rx) = mpsc::channel(2);
-        let task = tokio::spawn(send_file(Worker::new(store), blob, share, tx, stall));
+        let task = tokio::spawn(send_file(
+            Worker::new(store),
+            blob,
+            share,
+            Call::default(),
+            tx,
+            stall,
+        ));
         (task, rx, reads)
     }
 
