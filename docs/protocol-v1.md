@@ -62,10 +62,17 @@ closes a connection:
   it. A client MUST handle `GOAWAY` as HTTP/2 says. A call cut this way
   fails, and the client MAY retry it (`GetObjects` and `ReadFile` only
   re-read; a `Land` retry uses the same request key).
+- when the replies of the connection that stopped reading hold more than
+  64 MiB together (`--max-stalled-bytes`). A reply that stalls adds what it
+  leaves in HTTP/2, under 4 MiB, to a count of its connection; a connection
+  over the limit is closed, which frees what every stalled reply of it
+  holds. Other connections are not touched. A unary reply that its client
+  never reads is not counted: hyper gives the server no hook that sees it
+  stall.
 
 So a connection beyond the cap waits at most 40 min. A client that stops reading a reply
-keeps the server's memory for that reply until the stream ends or the
-connection closes, so a client SHOULD reset a stream that it no longer
+keeps the memory that no budget counts for that reply until the stream ends
+or the connection closes, so a client SHOULD reset a stream that it no longer
 reads (gRPC libraries do when the call is dropped). A cache tier keeps the
 same limits (section 8).
 

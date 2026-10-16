@@ -2,7 +2,7 @@
 //! node, serves them over a Unix socket, and fetches misses from its upstream,
 //! a `scion-cache`.
 
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 
 use anyhow::Context as _;
@@ -53,6 +53,10 @@ struct Cli {
     /// Most calls (HTTP/2 streams) that one connection may have open at once.
     #[arg(long, default_value_t = listen::DEFAULT_STREAMS)]
     max_streams: NonZeroU32,
+    /// Most bytes that the stalled replies of one connection may hold. A
+    /// connection over it is closed with them.
+    #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
+    max_stalled_bytes: NonZeroU64,
 }
 
 #[tokio::main]
@@ -95,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
     let limits = Limits {
         connections: cli.max_connections,
         streams: cli.max_streams,
+        stalled_bytes: cli.max_stalled_bytes,
     };
     Box::pin(tier.serve(
         &cli.token,

@@ -58,6 +58,12 @@ pub const STALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// only busy.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// What a reply leaves in HTTP/2 when its client stops reading, as its
+/// connection counts it ([`crate::listen::Stalled`]): the part in the
+/// channel, the parts that hyper has read ahead, and the h2 send buffer —
+/// under 4 MiB, so this pays for it all.
+pub const STALLED_REPLY_BYTES: u64 = 4 << 20;
+
 // Any one object fits in the budget, even when a tier holds it packed and
 // unpacked with a decoder, and the budget counts in u32 permits.
 const _: () = assert!(MAX_ENCODED_BYTES + MAX_OBJECT_BYTES + UNPACK_BYTES <= IN_FLIGHT_BYTES);
@@ -244,11 +250,18 @@ impl Parts {
 /// has gone, when `produce` returns `None`, or when the client does not take
 /// a part within `stall`. Finding an object has no time limit here: a cache
 /// tier bounds its upstream fetches itself.
+///
+/// A stall leaves the reply's parts in HTTP/2, where no budget counts them
+/// ([`crate::listen`]), so `stalled` — the handle of the connection, from
+/// [`crate::listen::Stalled::of`] — takes the estimate
+/// [`STALLED_REPLY_BYTES`] onto its connection's count. `None` when there
+/// is no such connection (tests, or a transport without the count).
 pub async fn send_objects<K, F>(
     first: Found,
     keys: impl IntoIterator<Item = K>,
     tx: mpsc::Sender<Sent>,
     stall: Duration,
+    stalled: Option<crate::listen::Stalled>,
     produce: impl Fn(K) -> F,
 ) where
     F: Future<Output = Option<Found>>,
@@ -264,7 +277,16 @@ pub async fn send_objects<K, F>(
                     part: Err(status),
                     last: true,
                 };
-                tokio::time::timeout(stall, tx.send(error)).await.ok();
+                match tokio::time::timeout(stall, tx.send(error)).await {
+                    // Sent: the client takes it, or has gone with it.
+                    Ok(_) => {}
+                    // It stopped reading: the parts stay in HTTP/2.
+                    Err(_) => {
+                        if let Some(stalled) = &stalled {
+                            stalled.add(STALLED_REPLY_BYTES);
+                        }
+                    }
+                }
                 return;
             }
         };
@@ -278,7 +300,16 @@ pub async fn send_objects<K, F>(
                 Ok(Ok(())) => sent += len,
                 // The client is gone or stalled. In the middle of an object,
                 // the stream then ends with `DEADLINE_EXCEEDED`.
-                _ => return,
+                Ok(Err(_)) => return,
+                // Stalled: the parts stay in HTTP/2 until the connection
+                // ends. Count them, so a connection that stalls too much is
+                // closed with them.
+                Err(_) => {
+                    if let Some(stalled) = &stalled {
+                        stalled.add(STALLED_REPLY_BYTES);
+                    }
+                    return;
+                }
             }
         }
         // The object's bytes are gone, and so is its share.
@@ -343,7 +374,9 @@ mod tests {
             };
             let first = (Ok(object), permit);
             let stall = Duration::from_secs(10);
-            let reply = tokio::spawn(send_objects(first, [(); 0], tx, stall, |()| async { None }));
+            let reply = tokio::spawn(send_objects(first, [(); 0], tx, stall, None, |()| async {
+                None
+            }));
             let held = || IN_FLIGHT_BYTES - budget.available_permits();
 
             // Each part is a buffer of its own. The share stays until the
@@ -377,7 +410,9 @@ mod tests {
         let (tx, mut stream) = channel();
         let stall = Duration::from_millis(50);
         let first = (Ok(blob(len, true)), permit);
-        let reply = tokio::spawn(send_objects(first, [(); 0], tx, stall, |()| async { None }));
+        let reply = tokio::spawn(send_objects(first, [(); 0], tx, stall, None, |()| async {
+            None
+        }));
 
         // The client takes one part and stops. The second part waits in the
         // channel, the third stalls, and the reply ends. Its object and its
