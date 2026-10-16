@@ -23,6 +23,13 @@
 //! - every connection is asked to close (`GOAWAY`) after
 //!   [`MAX_CONNECTION_AGE`], and is closed [`CONNECTION_GRACE`] later, with
 //!   any call still in it. A client then connects again.
+//!
+//! With TLS, the accept of [`tls`] runs the TLS handshake, under
+//! [`HANDSHAKE_TIMEOUT`], before a connection gets its place: a peer that
+//! never starts or never ends the handshake frees no place, because it
+//! never holds one. [`accept`] then reads the HTTP/2 preface from the
+//! decrypted connection, so the preface timer covers a peer that stops
+//! right after the handshake too.
 
 use std::error::Error;
 use std::future::Future;
@@ -37,6 +44,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Sleep;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::server::TlsStream;
 use tokio_stream::{Stream, StreamExt as _};
 use tonic::transport::Server;
 use tonic::transport::server::{Connected, Router, TcpIncoming};
@@ -52,6 +61,11 @@ pub const DEFAULT_STREAMS: NonZeroU32 = NonZeroU32::new(256).unwrap();
 /// A client must send the HTTP/2 preface within this long after it gets its
 /// place, or its connection is closed.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A TLS handshake must end within this long, or the connection is dropped.
+/// The same wait as [`HANDSHAKE_TIMEOUT`], and generous for one round trip
+/// plus a certificate check.
+pub const TLS_HANDSHAKE_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
 
 /// After this long without a frame from a client, the process sends it an
 /// HTTP/2 ping.
@@ -178,6 +192,48 @@ pub fn tcp(listener: TcpListener) -> TcpIncoming {
     TcpIncoming::from(listener).with_nodelay(Some(true))
 }
 
+/// The TLS connections of `incoming`: the TLS handshake of each connection
+/// runs, under `timeout`, with `config`, before the connection goes on to
+/// [`Limits::serve`], which reads the HTTP/2 preface from the decrypted
+/// connection. A peer whose handshake fails or is slow is dropped, with a
+/// warning, so one bad client holds no place and serves no attack.
+///
+/// The error of `incoming` must be [`io::Error`], which is what a TCP or a
+/// unix listener yields.
+pub fn tls<I, IO>(
+    incoming: I,
+    config: Arc<ServerConfig>,
+    timeout: Duration,
+) -> impl Stream<Item = io::Result<TlsStream<IO>>>
+where
+    I: Stream<Item = io::Result<IO>>,
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+    incoming
+        .then(move |accepted| {
+            let acceptor = acceptor.clone();
+            async move {
+                let io = match accepted {
+                    Ok(io) => io,
+                    Err(error) => return Some(Err(error)),
+                };
+                match tokio::time::timeout(timeout, acceptor.accept(io)).await {
+                    Ok(Ok(stream)) => Some(Ok(stream)),
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "a TLS handshake failed");
+                        None
+                    }
+                    Err(_) => {
+                        tracing::warn!(timeout = ?timeout, "no TLS handshake within the timeout");
+                        None
+                    }
+                }
+            }
+        })
+        .filter_map(core::convert::identity)
+}
+
 /// The connections from `incoming`, at most `max` at once. Each keeps its
 /// place until it is dropped, when it closes. Each must send the preface
 /// within `handshake` once it has its place.
@@ -296,13 +352,25 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for Connection<IO> {
 mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::SocketAddr;
+    use std::path::Path;
     use std::pin::pin;
+    use std::sync::Arc;
 
-    use tonic::transport::{Channel, Endpoint};
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+        KeyUsagePurpose,
+    };
+    use tokio::io::AsyncReadExt as _;
+    use tokio_rustls::rustls::pki_types::{
+        CertificateDer, PrivateKeyDer, ServerName, pem::PemObject as _,
+    };
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+    use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
     use tonic::{Code, Request, Response, Status, Streaming};
 
     use super::*;
     use crate::Bytes;
+    use crate::tls::ServerTls;
     use crate::v1::objects_client::ObjectsClient;
     use crate::v1::objects_server::{Objects, ObjectsServer};
     use crate::v1::{
@@ -360,6 +428,175 @@ mod tests {
             };
             Ok(Response::new(tokio_stream::iter(vec![Ok(part)])))
         }
+    }
+
+    /// A leaf certificate and its key, both PEM.
+    struct TestCert {
+        cert_pem: String,
+        key_pem: String,
+    }
+
+    /// A certificate authority for one test run: it signs the server and
+    /// client certificates of the test. Everything stays in memory, except
+    /// the PEM files a test writes into its temp directory.
+    struct TestAuthority {
+        params: CertificateParams,
+        key: KeyPair,
+    }
+
+    impl TestAuthority {
+        fn new() -> Self {
+            let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+            Self {
+                params,
+                key: KeyPair::generate().unwrap(),
+            }
+        }
+
+        /// Signs a leaf for `names`, used as `purpose`.
+        fn sign(&self, names: &[&str], purpose: ExtendedKeyUsagePurpose) -> TestCert {
+            let key = KeyPair::generate().unwrap();
+            let mut params = CertificateParams::new(
+                names
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            params.extended_key_usages = vec![purpose];
+            let issuer = Issuer::from_params(&self.params, &self.key);
+            let cert = params.signed_by(&key, &issuer).unwrap();
+            TestCert {
+                cert_pem: cert.pem(),
+                key_pem: key.serialize_pem(),
+            }
+        }
+
+        /// The certificate of the authority itself, as a client trusts it.
+        fn cert(&self) -> TestCert {
+            let cert = self.params.self_signed(&self.key).unwrap();
+            TestCert {
+                cert_pem: cert.pem(),
+                key_pem: self.key.serialize_pem(),
+            }
+        }
+    }
+
+    /// The certificates of one test: an authority, a server certificate for
+    /// `localhost` and `127.0.0.1`, a client certificate of that authority,
+    /// and a second authority with a client certificate of its own, so a
+    /// test can trust or present the wrong one.
+    struct TestCerts {
+        authority: TestAuthority,
+        server: TestCert,
+        client: TestCert,
+        stranger: TestAuthority,
+        stranger_client: TestCert,
+    }
+
+    fn test_certs() -> TestCerts {
+        let authority = TestAuthority::new();
+        let server = authority.sign(
+            &["localhost", "127.0.0.1"],
+            ExtendedKeyUsagePurpose::ServerAuth,
+        );
+        let client = authority.sign(&["client"], ExtendedKeyUsagePurpose::ClientAuth);
+        let stranger = TestAuthority::new();
+        let stranger_client = stranger.sign(&["client"], ExtendedKeyUsagePurpose::ClientAuth);
+        TestCerts {
+            authority,
+            server,
+            client,
+            stranger,
+            stranger_client,
+        }
+    }
+
+    /// Writes `pem` into the temp directory of a test, as `name`.
+    fn write(dir: &Path, name: &str, pem: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, pem).unwrap();
+        path
+    }
+
+    /// A `ServerTls` for `server`, with mTLS when `client_ca` is given.
+    fn server_tls(dir: &Path, server: &TestCert, client_ca: Option<&TestCert>) -> ServerTls {
+        let cert = write(dir, "server.pem", &server.cert_pem);
+        let key = write(dir, "server.key", &server.key_pem);
+        let client_ca = client_ca.map(|ca| write(dir, "client-ca.pem", &ca.cert_pem));
+        ServerTls::load(&cert, &key, client_ca.as_deref()).unwrap()
+    }
+
+    /// A client of the stub at `addr`, trusting the CA `ca`, presenting
+    /// `identity` with mTLS. Fails when the server refuses the handshake.
+    async fn client(
+        addr: SocketAddr,
+        ca: &TestCert,
+        identity: Option<&TestCert>,
+    ) -> Result<ObjectsClient<Channel>, tonic::transport::Error> {
+        let endpoint = Endpoint::from_shared(format!("https://{addr}")).unwrap();
+        let mut tls = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(&ca.cert_pem));
+        if let Some(cert) = identity {
+            tls = tls.identity(Identity::from_pem(&cert.cert_pem, &cert.key_pem));
+        }
+        let channel = endpoint.tls_config(tls)?.connect().await?;
+        Ok(ObjectsClient::new(channel))
+    }
+
+    /// A raw TLS client of `addr`, trusting the CA `ca`, with `identity`.
+    /// For tests that talk to the server by hand.
+    async fn raw_client(
+        addr: SocketAddr,
+        ca: &TestCert,
+        identity: Option<&TestCert>,
+    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(ca.cert_pem.as_bytes()).unwrap())
+            .unwrap();
+        let builder = ClientConfig::builder_with_provider(crate::tls::provider())
+            .with_safe_default_protocol_versions()
+            .unwrap();
+        let config = match identity {
+            None => builder.with_root_certificates(roots).with_no_client_auth(),
+            Some(cert) => {
+                let der = CertificateDer::from_pem_slice(cert.cert_pem.as_bytes()).unwrap();
+                let key = PrivateKeyDer::from_pem_slice(cert.key_pem.as_bytes()).unwrap();
+                builder
+                    .with_root_certificates(roots)
+                    .with_client_auth_cert(vec![der], key)
+                    .unwrap()
+            }
+        };
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap()
+    }
+
+    /// The stub, served within `limits` with `timers`, TLS with
+    /// `server_tls` whose handshakes end within `tls_timeout`, and its
+    /// address.
+    async fn serve_tls(
+        limits: Limits,
+        timers: Timers,
+        server_tls: &ServerTls,
+        tls_timeout: Duration,
+    ) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = server_tls.config();
+        tokio::spawn(async move {
+            let router = |mut server: Server| server.add_service(ObjectsServer::new(Stub));
+            let incoming = tls(tcp(listener), config, tls_timeout);
+            let pending = std::future::pending();
+            Box::pin(limits.serve_with(&timers, router, incoming, pending)).await
+        });
+        addr
     }
 
     /// The stub, served within `limits` with `timers`, and its address.
@@ -530,5 +767,157 @@ mod tests {
         let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
         let accepted = pin!(tcp(listener)).next().await.unwrap().unwrap();
         assert!(accepted.nodelay().unwrap());
+    }
+
+    /// A client that trusts the CA of the server is served over TLS.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tls_client_is_served() {
+        let certs = test_certs();
+        let dir = tempfile::tempdir().unwrap();
+        let server_tls = server_tls(dir.path(), &certs.server, None);
+        let addr = serve_tls(
+            Limits::default(),
+            TIMERS,
+            &server_tls,
+            TLS_HANDSHAKE_TIMEOUT,
+        )
+        .await;
+        let mut client = client(addr, &certs.authority.cert(), None).await.unwrap();
+        assert_eq!(quick(&mut client).await, Code::NotFound);
+    }
+
+    /// An mTLS server refuses a client without a certificate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mtls_server_refuses_a_client_without_a_certificate() {
+        let certs = test_certs();
+        let dir = tempfile::tempdir().unwrap();
+        let server_tls = server_tls(dir.path(), &certs.server, Some(&certs.authority.cert()));
+        let addr = serve_tls(
+            Limits::default(),
+            TIMERS,
+            &server_tls,
+            TLS_HANDSHAKE_TIMEOUT,
+        )
+        .await;
+        // The connect of a client can end before the server has checked its
+        // certificate, so the refusal may show in the connect or in the
+        // call. A served client gets the stub's `NotFound`; anything else is
+        // the refusal.
+        match client(addr, &certs.authority.cert(), None).await {
+            Err(_) => {}
+            Ok(mut call) => {
+                let code = call
+                    .resolve_ref(ResolveRefRequest::default())
+                    .await
+                    .unwrap_err()
+                    .code();
+                assert_ne!(code, Code::NotFound, "the stub served the client");
+            }
+        }
+    }
+
+    /// An mTLS server serves a client with a certificate of its CA.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mtls_server_serves_a_client_with_a_certificate() {
+        let certs = test_certs();
+        let dir = tempfile::tempdir().unwrap();
+        let server_tls = server_tls(dir.path(), &certs.server, Some(&certs.authority.cert()));
+        let addr = serve_tls(
+            Limits::default(),
+            TIMERS,
+            &server_tls,
+            TLS_HANDSHAKE_TIMEOUT,
+        )
+        .await;
+        let mut client = client(addr, &certs.authority.cert(), Some(&certs.client))
+            .await
+            .unwrap();
+        assert_eq!(quick(&mut client).await, Code::NotFound);
+    }
+
+    /// A client that trusts another CA is refused: the certificate of the
+    /// server does not verify.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_with_the_wrong_ca_is_refused() {
+        let certs = test_certs();
+        let dir = tempfile::tempdir().unwrap();
+        let server_tls = server_tls(dir.path(), &certs.server, None);
+        let addr = serve_tls(
+            Limits::default(),
+            TIMERS,
+            &server_tls,
+            TLS_HANDSHAKE_TIMEOUT,
+        )
+        .await;
+        assert!(client(addr, &certs.stranger.cert(), None).await.is_err());
+    }
+
+    /// An mTLS server refuses a client whose certificate another CA signed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mtls_server_refuses_a_client_of_another_ca() {
+        let certs = test_certs();
+        let dir = tempfile::tempdir().unwrap();
+        let server_tls = server_tls(dir.path(), &certs.server, Some(&certs.authority.cert()));
+        let addr = serve_tls(
+            Limits::default(),
+            TIMERS,
+            &server_tls,
+            TLS_HANDSHAKE_TIMEOUT,
+        )
+        .await;
+        // As above: the refusal may show in the connect or in the call.
+        match client(addr, &certs.authority.cert(), Some(&certs.stranger_client)).await {
+            Err(_) => {}
+            Ok(mut call) => {
+                let code = call
+                    .resolve_ref(ResolveRefRequest::default())
+                    .await
+                    .unwrap_err()
+                    .code();
+                assert_ne!(code, Code::NotFound, "the stub served the client");
+            }
+        }
+    }
+
+    /// A peer that opens a TLS connection and sends nothing is dropped by
+    /// the TLS handshake timeout.
+    #[tokio::test]
+    async fn a_peer_without_the_tls_handshake_is_dropped() {
+        let certs = test_certs();
+        let dir = tempfile::tempdir().unwrap();
+        let server_tls = server_tls(dir.path(), &certs.server, None);
+        let addr = serve_tls(
+            Limits::default(),
+            TIMERS,
+            &server_tls,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(closes_a_peer_that_sends(addr, b"").await);
+    }
+
+    /// A peer that ends the TLS handshake and then sends nothing holds no
+    /// place: the preface timer of the decrypted connection closes it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_silent_after_the_tls_handshake_is_closed() {
+        let certs = test_certs();
+        let dir = tempfile::tempdir().unwrap();
+        let server_tls = server_tls(dir.path(), &certs.server, None);
+        // The preface timer is short (timers("age")); the TLS handshake
+        // timeout is long, so only the preface timer can close the peer.
+        let addr = serve_tls(
+            Limits::default(),
+            timers("age"),
+            &server_tls,
+            Duration::from_secs(10),
+        )
+        .await;
+        let mut peer = raw_client(addr, &certs.authority.cert(), None).await;
+        // The server aborts the connection (no clean TLS close), so the
+        // read ends with an error; what matters is that it ends: the peer
+        // holds no place for life.
+        let read =
+            tokio::time::timeout(Duration::from_secs(10), peer.read_to_end(&mut Vec::new())).await;
+        assert!(read.is_ok(), "the server closed the silent peer");
     }
 }
