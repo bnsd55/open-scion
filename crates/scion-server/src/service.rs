@@ -26,6 +26,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
+use tracing::Instrument as _;
 
 use crate::access::Access;
 use crate::auth::Caller;
@@ -214,8 +215,13 @@ impl Worker {
             .await
             .map_err(|_| Status::unavailable("server is shutting down"))?;
         let store = self.store.clone();
+        // The job runs on another thread, so it takes the call's span with
+        // it: a refusal or a failure that the job decides logs with the
+        // call's fields.
+        let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let _span = span.enter();
             f(store)
         })
         .await
@@ -245,12 +251,10 @@ pub(crate) fn check_reader(access: &Access, caller: &Caller, repo: &str) -> Resu
 pub(crate) async fn resolve_ref(
     worker: &Worker,
     access: &Access,
-    call: &Call,
     request: Request<ResolveRefRequest>,
 ) -> Result<ResolveRefResponse, Status> {
     let caller = caller(&request)?;
     let ResolveRefRequest { repo, name } = request.into_inner();
-    call.about(&caller, Some(&repo));
     check_reader(access, &caller, &repo)?;
     check_name("ref", &name)?;
     let id = worker
@@ -274,91 +278,16 @@ fn parse_optional_path(bytes: Vec<u8>) -> Result<Option<RepoPath>, Status> {
     }
 }
 
-/// The identity of one call, for the one line that its refusal or its
-/// failure makes: the RPC, the repo and the principal once the request
-/// names them, and the peer address. A line never carries the token, not
-/// even its digest.
-pub(crate) struct Call {
-    rpc: &'static str,
-    peer: Option<std::net::SocketAddr>,
-    repo: std::sync::Mutex<Option<String>>,
-    principal: std::sync::Mutex<Option<String>>,
-}
-
-impl Call {
-    pub(crate) fn of(rpc: &'static str, request: &Request<impl Sized>) -> Self {
-        Self {
-            rpc,
-            peer: request.remote_addr(),
-            repo: std::sync::Mutex::new(None),
-            principal: std::sync::Mutex::new(None),
-        }
-    }
-
-    /// Records the repo and principal, once the request names them.
-    pub(crate) fn about(&self, principal: &Caller, repo: Option<&str>) {
-        *self.principal.lock().expect("never poisoned") = Some(principal.0.clone());
-        if let Some(repo) = repo {
-            *self.repo.lock().expect("never poisoned") = Some(repo.to_owned());
-        }
-    }
-
-    /// The one line that the call's refusal or failure makes. The level
-    /// follows the cause: a wrong token or a denied right is an event
-    /// (`WARN`), a malformed request or a missing object is a client bug
-    /// (`DEBUG`), and a server fault is `ERROR`.
-    pub(crate) fn failed(&self, status: Status) -> Status {
-        let level: tracing::Level = match status.code() {
-            tonic::Code::InvalidArgument
-            | tonic::Code::NotFound
-            | tonic::Code::OutOfRange
-            | tonic::Code::AlreadyExists
-            | tonic::Code::Unimplemented => tracing::Level::DEBUG,
-            tonic::Code::Internal | tonic::Code::DataLoss | tonic::Code::Unknown => {
-                tracing::Level::ERROR
-            }
-            _ => tracing::Level::WARN,
-        };
-        let principal = self
-            .principal
-            .lock()
-            .expect("never poisoned")
-            .clone()
-            .unwrap_or_else(|| "unknown".to_owned());
-        let repo = self
-            .repo
-            .lock()
-            .expect("never poisoned")
-            .clone()
-            .unwrap_or_default();
-        macro_rules! line {
-            ($event:ident) => {{
-                tracing::$event!(
-                    rpc = self.rpc,
-                    repo,
-                    principal,
-                    peer = self.peer.map(|p| p.to_string()).unwrap_or_default(),
-                    code = ?status.code(),
-                    reason = %status.message(),
-                    "the call was refused or failed"
-                );
-            }};
-        }
-        match level {
-            tracing::Level::DEBUG => line!(debug),
-            tracing::Level::ERROR => line!(error),
-            _ => line!(warn),
-        }
-        status
-    }
-}
-
 pub(crate) fn caller<T>(request: &Request<T>) -> Result<Caller, Status> {
-    request
+    let caller = request
         .extensions()
         .get::<Caller>()
         .cloned()
-        .ok_or_else(|| Status::unauthenticated("no caller"))
+        .ok_or_else(|| Status::unauthenticated("no caller"))?;
+    // The call's span gets the principal once. It shows on every line that
+    // the call makes.
+    tracing::Span::current().record("principal", caller.0.as_str());
+    Ok(caller)
 }
 
 fn land_response(outcome: LandOutcome) -> LandResponse {
@@ -478,176 +407,149 @@ impl Scion for ScionService {
         &self,
         request: Request<Streaming<PutBlobRequest>>,
     ) -> Result<Response<PutBlobResponse>, Status> {
-        let call = Call::of("PutBlob", &request);
-        let replied = async {
-            let _upload = Arc::clone(&self.uploads)
-                .acquire_owned()
-                .await
-                .map_err(|_| Status::unavailable("server is shutting down"))?;
-            let caller = caller(&request)?;
-            let mut stream = request.into_inner();
-            let first = stream
-                .next()
-                .await
-                .ok_or_else(|| Status::invalid_argument("empty upload"))??;
-            check_name("repo", &first.repo)?;
-            call.about(&caller, Some(&first.repo));
-            // An upload names no path, so a caller that may change some path of
-            // the repo may upload.
-            self.access.check_writer(&caller, &first.repo)?;
-            // Check the repo before reading any more data. Each message goes to
-            // the spool file before the next one is read, so an upload holds one
-            // message in memory, not the whole blob.
-            let (repo, mut upload) = self
-                .worker
-                .run(move |store| {
-                    let repo = store.read(|c| db::repo_id(c, &first.repo))?;
-                    Ok((repo, store.blobs().upload()?.append(&first.data)?))
-                })
-                .await?;
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                if !chunk.repo.is_empty() {
-                    return Err(Status::invalid_argument(
-                        "only the first PutBlob message names the repo",
-                    ));
-                }
-                upload = self.worker.run(move |_| upload.append(&chunk.data)).await?;
+        let _upload = Arc::clone(&self.uploads)
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("server is shutting down"))?;
+        let caller = caller(&request)?;
+        let mut stream = request.into_inner();
+        let first = stream
+            .next()
+            .await
+            .ok_or_else(|| Status::invalid_argument("empty upload"))??;
+        check_name("repo", &first.repo)?;
+        // An upload names no path, so a caller that may change some path of
+        // the repo may upload.
+        self.access.check_writer(&caller, &first.repo)?;
+        // Check the repo before reading any more data. Each message goes to
+        // the spool file before the next one is read, so an upload holds one
+        // message in memory, not the whole blob.
+        let (repo, mut upload) = self
+            .worker
+            .run(move |store| {
+                let repo = store.read(|c| db::repo_id(c, &first.repo))?;
+                Ok((repo, store.blobs().upload()?.append(&first.data)?))
+            })
+            .await?;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if !chunk.repo.is_empty() {
+                return Err(Status::invalid_argument(
+                    "only the first PutBlob message names the repo",
+                ));
             }
-            let id = self
-                .worker
-                .run(move |store| write::put_blob(&store, repo, upload))
-                .await?;
-            Ok(Response::new(PutBlobResponse {
-                blob_id: id.as_bytes().to_vec(),
-            }))
-        };
-        replied.await.map_err(|status| call.failed(status))
+            upload = self.worker.run(move |_| upload.append(&chunk.data)).await?;
+        }
+        let id = self
+            .worker
+            .run(move |store| write::put_blob(&store, repo, upload))
+            .await?;
+        Ok(Response::new(PutBlobResponse {
+            blob_id: id.as_bytes().to_vec(),
+        }))
     }
 
     async fn create_changeset(
         &self,
         request: Request<CreateChangesetRequest>,
     ) -> Result<Response<CreateChangesetResponse>, Status> {
-        let call = Call::of("CreateChangeset", &request);
-        let replied = async {
-            let caller = caller(&request)?;
-            let CreateChangesetRequest { repo, changeset } = request.into_inner();
-            call.about(&caller, Some(&repo));
-            check_reader(&self.access, &caller, &repo)?;
-            let access = Arc::clone(&self.access);
-            let id = self
-                .worker
-                .run(move |store| {
-                    // The rules first, so a change that the caller may not make
-                    // reads no blob. Decoding twice costs little next to reading
-                    // every blob back.
-                    let (cs, _) = write::decode(&changeset)?;
-                    access.check_write(&caller, &repo, cs.changes.keys())?;
-                    write::create_changeset(&store, &repo, &changeset)
-                })
-                .await?;
-            Ok(Response::new(CreateChangesetResponse {
-                changeset_id: id.as_bytes().to_vec(),
-            }))
-        };
-        replied.await.map_err(|status| call.failed(status))
+        let caller = caller(&request)?;
+        let CreateChangesetRequest { repo, changeset } = request.into_inner();
+        check_reader(&self.access, &caller, &repo)?;
+        let access = Arc::clone(&self.access);
+        let id = self
+            .worker
+            .run(move |store| {
+                // The rules first, so a change that the caller may not make
+                // reads no blob. Decoding twice costs little next to reading
+                // every blob back.
+                let (cs, _) = write::decode(&changeset)?;
+                access.check_write(&caller, &repo, cs.changes.keys())?;
+                write::create_changeset(&store, &repo, &changeset)
+            })
+            .await?;
+        Ok(Response::new(CreateChangesetResponse {
+            changeset_id: id.as_bytes().to_vec(),
+        }))
     }
 
     async fn land(
         &self,
         request: Request<scion_proto::v1::LandRequest>,
     ) -> Result<Response<LandResponse>, Status> {
-        let call = Call::of("Land", &request);
-        let replied = async {
-            // The job checks it in its walks: a request timeout, or a client
-            // that cancels, drops this call but not a job that is running. The
-            // guard ends the deadline when this call ends or is dropped.
-            let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
-            let _call = deadline.guard();
-            let caller = caller(&request)?;
-            let req = request.into_inner();
-            call.about(&caller, Some(&req.repo));
-            check_reader(&self.access, &caller, &req.repo)?;
-            check_name("target_ref", &req.target_ref)?;
-            check_name("request_key", &req.request_key)?;
-            let req = land::LandRequest {
-                changeset: parse_id(&req.changeset_id, "changeset_id")?,
-                repo: req.repo,
-                target_ref: req.target_ref,
-                request_key: req.request_key,
-                deadline,
-            };
-            let (lands, access) = (Arc::clone(&self.lands), Arc::clone(&self.access));
-            let outcome = self
-                .worker
-                .run(move |store| {
-                    // A rebase keeps the changes, so these are the paths that the
-                    // land changes, on any ref of the repo. Checked on every call,
-                    // before the land records anything, also on a retry.
-                    let cs = read::get_changeset(&store, &req.repo, req.changeset)?;
-                    access.check_write(&caller, &req.repo, cs.changes.keys())?;
-                    lands.land(&store, &caller, &req)
-                })
-                .await?;
-            Ok(Response::new(land_response(outcome)))
+        // The job checks it in its walks: a request timeout, or a client
+        // that cancels, drops this call but not a job that is running. The
+        // guard ends the deadline when this call ends or is dropped.
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
+        let _call = deadline.guard();
+        let caller = caller(&request)?;
+        let req = request.into_inner();
+        check_reader(&self.access, &caller, &req.repo)?;
+        check_name("target_ref", &req.target_ref)?;
+        check_name("request_key", &req.request_key)?;
+        let req = land::LandRequest {
+            changeset: parse_id(&req.changeset_id, "changeset_id")?,
+            repo: req.repo,
+            target_ref: req.target_ref,
+            request_key: req.request_key,
+            deadline,
         };
-        replied.await.map_err(|status| call.failed(status))
+        let (lands, access) = (Arc::clone(&self.lands), Arc::clone(&self.access));
+        let outcome = self
+            .worker
+            .run(move |store| {
+                // A rebase keeps the changes, so these are the paths that the
+                // land changes, on any ref of the repo. Checked on every call,
+                // before the land records anything, also on a retry.
+                let cs = read::get_changeset(&store, &req.repo, req.changeset)?;
+                access.check_write(&caller, &req.repo, cs.changes.keys())?;
+                lands.land(&store, &caller, &req)
+            })
+            .await?;
+        Ok(Response::new(land_response(outcome)))
     }
 
     async fn get_land(
         &self,
         request: Request<GetLandRequest>,
     ) -> Result<Response<LandResponse>, Status> {
-        let call = Call::of("GetLand", &request);
-        let replied = async {
-            let caller = caller(&request)?;
-            let GetLandRequest { repo, land_id } = request.into_inner();
-            call.about(&caller, Some(&repo));
-            check_reader(&self.access, &caller, &repo)?;
-            let land_id = land_id
-                .parse()
-                .map_err(|_| Status::invalid_argument("land_id must be a number"))?;
-            let outcome = self
-                .worker
-                .run(move |store| land::get_land(&store, &caller, &repo, land_id))
-                .await?;
-            Ok(Response::new(land_response(outcome)))
-        };
-        replied.await.map_err(|status| call.failed(status))
+        let caller = caller(&request)?;
+        let GetLandRequest { repo, land_id } = request.into_inner();
+        check_reader(&self.access, &caller, &repo)?;
+        let land_id = land_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("land_id must be a number"))?;
+        let outcome = self
+            .worker
+            .run(move |store| land::get_land(&store, &caller, &repo, land_id))
+            .await?;
+        Ok(Response::new(land_response(outcome)))
     }
 
     async fn resolve_ref(
         &self,
         request: Request<ResolveRefRequest>,
     ) -> Result<Response<ResolveRefResponse>, Status> {
-        let call = Call::of("ResolveRef", &request);
-        resolve_ref(&self.worker, &self.access, &call, request)
+        resolve_ref(&self.worker, &self.access, request)
             .await
             .map(Response::new)
-            .map_err(|status| call.failed(status))
     }
 
     async fn get_changeset(
         &self,
         request: Request<GetChangesetRequest>,
     ) -> Result<Response<GetChangesetResponse>, Status> {
-        let call = Call::of("GetChangeset", &request);
-        let replied = async {
-            let caller = caller(&request)?;
-            let req = request.into_inner();
-            call.about(&caller, Some(&req.repo));
-            check_reader(&self.access, &caller, &req.repo)?;
-            let id = parse_id(&req.changeset_id, "changeset_id")?;
-            let changeset = self
-                .worker
-                .run(move |store| read::get_changeset(&store, &req.repo, id))
-                .await?;
-            Ok(Response::new(GetChangesetResponse {
-                changeset: changeset.encode(),
-            }))
-        };
-        replied.await.map_err(|status| call.failed(status))
+        let caller = caller(&request)?;
+        let req = request.into_inner();
+        check_reader(&self.access, &caller, &req.repo)?;
+        let id = parse_id(&req.changeset_id, "changeset_id")?;
+        let changeset = self
+            .worker
+            .run(move |store| read::get_changeset(&store, &req.repo, id))
+            .await?;
+        Ok(Response::new(GetChangesetResponse {
+            changeset: changeset.encode(),
+        }))
     }
 
     type ReadFileStream = ReadFileStream;
@@ -656,284 +558,252 @@ impl Scion for ScionService {
         &self,
         request: Request<ReadFileRequest>,
     ) -> Result<Response<ReadFileStream>, Status> {
-        let call = Call::of("ReadFile", &request);
-        let replied = async {
-            let caller = caller(&request)?;
-            // The handle of the caller's connection, before the request is taken
-            // apart: the reply counts what it leaves in HTTP/2 on it.
-            let stalled = scion_proto::listen::Stalled::of(&request);
-            let req = request.into_inner();
-            call.about(&caller, Some(&req.repo));
-            check_reader(&self.access, &caller, &req.repo)?;
-            let id = parse_id(&req.changeset_id, "changeset_id")?;
-            let path = parse_path(req.path)?;
-            let (blob, size) = self
-                .worker
-                .run(move |store| {
-                    let blob = read::file_blob(&store, &req.repo, id, &path)?;
-                    Ok((blob, store.blobs().size(blob)?))
-                })
-                .await?;
-            // Taken before any content is read, so a call that waits holds none.
-            let share = u32::try_from(read_share(size)).expect("asserted to fit in u32");
-            let share = Arc::clone(&self.reads)
-                .acquire_many_owned(share)
-                .await
-                .map_err(|_| Status::unavailable("server is shutting down"))?;
-            // The handle of the caller's connection, before the request is taken
-            // apart: the reply counts what it leaves in HTTP/2 on it.
-            let (tx, rx) = mpsc::channel(2);
-            tokio::spawn(send_file(
+        let caller = caller(&request)?;
+        // The handle of the caller's connection, before the request is taken
+        // apart: the reply counts what it leaves in HTTP/2 on it.
+        let stalled = scion_proto::listen::Stalled::of(&request);
+        let req = request.into_inner();
+        check_reader(&self.access, &caller, &req.repo)?;
+        let id = parse_id(&req.changeset_id, "changeset_id")?;
+        let path = parse_path(req.path)?;
+        let (blob, size) = self
+            .worker
+            .run(move |store| {
+                let blob = read::file_blob(&store, &req.repo, id, &path)?;
+                Ok((blob, store.blobs().size(blob)?))
+            })
+            .await?;
+        // Taken before any content is read, so a call that waits holds none.
+        let share = u32::try_from(read_share(size)).expect("asserted to fit in u32");
+        let share = Arc::clone(&self.reads)
+            .acquire_many_owned(share)
+            .await
+            .map_err(|_| Status::unavailable("server is shutting down"))?;
+        // The handle of the caller's connection, before the request is taken
+        // apart: the reply counts what it leaves in HTTP/2 on it.
+        let (tx, rx) = mpsc::channel(2);
+        tokio::spawn(
+            send_file(
                 self.worker.clone(),
                 blob,
                 share,
                 tx,
                 READ_STALL_TIMEOUT,
                 stalled,
-            ));
-            Ok(Response::new(ReceiverStream::new(rx)))
-        };
-        replied.await.map_err(|status| call.failed(status))
+            )
+            .instrument(tracing::Span::current()),
+        );
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn list_dir(
         &self,
         request: Request<ListDirRequest>,
     ) -> Result<Response<ListDirResponse>, Status> {
-        let call = Call::of("ListDir", &request);
-        let replied = async {
-            let caller = caller(&request)?;
-            let req = request.into_inner();
-            call.about(&caller, Some(&req.repo));
-            check_reader(&self.access, &caller, &req.repo)?;
-            let id = parse_id(&req.changeset_id, "changeset_id")?;
-            let path = parse_optional_path(req.path)?;
-            let tree = self
-                .worker
-                .run(move |store| read::list_dir(&store, &req.repo, id, path.as_ref()))
-                .await?;
-            Ok(Response::new(ListDirResponse {
-                tree: tree.encode(),
-            }))
-        };
-        replied.await.map_err(|status| call.failed(status))
+        let caller = caller(&request)?;
+        let req = request.into_inner();
+        check_reader(&self.access, &caller, &req.repo)?;
+        let id = parse_id(&req.changeset_id, "changeset_id")?;
+        let path = parse_optional_path(req.path)?;
+        let tree = self
+            .worker
+            .run(move |store| read::list_dir(&store, &req.repo, id, path.as_ref()))
+            .await?;
+        Ok(Response::new(ListDirResponse {
+            tree: tree.encode(),
+        }))
     }
 
     async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogResponse>, Status> {
-        let call = Call::of("Log", &request);
-        let replied = async {
-            let caller = caller(&request)?;
-            let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
-            let req = request.into_inner();
-            call.about(&caller, Some(&req.repo));
-            check_reader(&self.access, &caller, &req.repo)?;
-            let id = parse_id(&req.changeset_id, "changeset_id")?;
-            // `read::MAX_SCAN` also bounds the entries.
-            let limit = (req.limit as usize).max(1);
-            let path = parse_optional_path(req.path)?;
-            let page = if let Some(path) = path {
-                // It may derive the path history of a long history first, so it
-                // runs as a graph query, with its slot and its deadline.
-                self.graph_query(deadline, move |store, deadline| {
-                    read::log_page(store, &req.repo, id, Some(&path), limit, deadline)
-                })
+        let caller = caller(&request)?;
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
+        let req = request.into_inner();
+        check_reader(&self.access, &caller, &req.repo)?;
+        let id = parse_id(&req.changeset_id, "changeset_id")?;
+        // `read::MAX_SCAN` also bounds the entries.
+        let limit = (req.limit as usize).max(1);
+        let path = parse_optional_path(req.path)?;
+        let page = if let Some(path) = path {
+            // It may derive the path history of a long history first, so it
+            // runs as a graph query, with its slot and its deadline.
+            self.graph_query(deadline, move |store, deadline| {
+                read::log_page(store, &req.repo, id, Some(&path), limit, deadline)
+            })
+            .await?
+        } else {
+            self.worker
+                .run(move |store| read::log_page(&store, &req.repo, id, None, limit, &deadline))
                 .await?
-            } else {
-                self.worker
-                    .run(move |store| read::log_page(&store, &req.repo, id, None, limit, &deadline))
-                    .await?
-            };
-            // Always send the first entry; stop before the reply gets too big.
-            let mut next = page.next;
-            let mut budget = LOG_BUDGET_BYTES;
-            let mut entries = Vec::new();
-            for (id, changeset) in page.entries {
-                let body = changeset.encode();
-                if !entries.is_empty() && body.len() > budget {
-                    // Not sent, so the next call starts here.
-                    next = Some(id);
-                    break;
-                }
-                budget = budget.saturating_sub(body.len());
-                entries.push(LogEntry {
-                    changeset_id: id.as_bytes().to_vec(),
-                    changeset: body,
-                });
-            }
-            Ok(Response::new(LogResponse {
-                entries,
-                next_changeset_id: id_bytes(next),
-            }))
         };
-        replied.await.map_err(|status| call.failed(status))
+        // Always send the first entry; stop before the reply gets too big.
+        let mut next = page.next;
+        let mut budget = LOG_BUDGET_BYTES;
+        let mut entries = Vec::new();
+        for (id, changeset) in page.entries {
+            let body = changeset.encode();
+            if !entries.is_empty() && body.len() > budget {
+                // Not sent, so the next call starts here.
+                next = Some(id);
+                break;
+            }
+            budget = budget.saturating_sub(body.len());
+            entries.push(LogEntry {
+                changeset_id: id.as_bytes().to_vec(),
+                changeset: body,
+            });
+        }
+        Ok(Response::new(LogResponse {
+            entries,
+            next_changeset_id: id_bytes(next),
+        }))
     }
 
     async fn blame(
         &self,
         request: Request<BlameRequest>,
     ) -> Result<Response<BlameResponse>, Status> {
-        let call = Call::of("Blame", &request);
-        let replied = async {
-            let caller = caller(&request)?;
-            let req = request.into_inner();
-            call.about(&caller, Some(&req.repo));
-            check_reader(&self.access, &caller, &req.repo)?;
-            let id = parse_id(&req.changeset_id, "changeset_id")?;
-            let path = parse_path(req.path)?;
-            let search = RenameSearch {
-                searched: usize::try_from(req.rename_searched)
-                    .map_err(|_| Status::invalid_argument("rename_searched is too large"))?,
-                best: parse_optional_path(req.rename_best)?,
-            };
-            // Taken before the worker permit, and held until the job ends, also
-            // when the client leaves first.
-            let slot = Arc::clone(&self.blames)
-                .acquire_owned()
-                .await
-                .map_err(|_| Status::unavailable("server is shutting down"))?;
-            let blame = self
-                .worker
-                .run(move |store| {
-                    let _slot = slot;
-                    blame::blame(&store, &req.repo, id, &path, &search)
-                })
-                .await?;
-            let ranges = blame
-                .ranges
-                .into_iter()
-                .map(|range| BlameRange {
-                    start_line: range.start_line,
-                    line_count: range.line_count,
-                    changeset_id: id_bytes(range.changeset),
-                    origin_line: range.origin_line,
-                })
-                .collect();
-            let changesets = blame
-                .changesets
-                .into_iter()
-                .map(|(id, author, path)| BlameChangeset {
-                    changeset_id: id.as_bytes().to_vec(),
-                    author_name: author.name,
-                    author_email: author.email,
-                    author_unix_secs: author.unix_secs,
-                    author_tz_offset_minutes: author.tz_offset_minutes,
-                    path: path.as_bytes().to_vec(),
-                })
-                .collect();
-            let (next, next_path) = blame.next.unzip();
-            Ok(Response::new(BlameResponse {
-                ranges,
-                changesets,
-                next_changeset_id: id_bytes(next),
-                next_path: path_bytes(next_path),
-                next_rename_searched: blame.next_search.searched as u64,
-                next_rename_best: path_bytes(blame.next_search.best),
-            }))
+        let caller = caller(&request)?;
+        let req = request.into_inner();
+        check_reader(&self.access, &caller, &req.repo)?;
+        let id = parse_id(&req.changeset_id, "changeset_id")?;
+        let path = parse_path(req.path)?;
+        let search = RenameSearch {
+            searched: usize::try_from(req.rename_searched)
+                .map_err(|_| Status::invalid_argument("rename_searched is too large"))?,
+            best: parse_optional_path(req.rename_best)?,
         };
-        replied.await.map_err(|status| call.failed(status))
+        // Taken before the worker permit, and held until the job ends, also
+        // when the client leaves first.
+        let slot = Arc::clone(&self.blames)
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("server is shutting down"))?;
+        let blame = self
+            .worker
+            .run(move |store| {
+                let _slot = slot;
+                blame::blame(&store, &req.repo, id, &path, &search)
+            })
+            .await?;
+        let ranges = blame
+            .ranges
+            .into_iter()
+            .map(|range| BlameRange {
+                start_line: range.start_line,
+                line_count: range.line_count,
+                changeset_id: id_bytes(range.changeset),
+                origin_line: range.origin_line,
+            })
+            .collect();
+        let changesets = blame
+            .changesets
+            .into_iter()
+            .map(|(id, author, path)| BlameChangeset {
+                changeset_id: id.as_bytes().to_vec(),
+                author_name: author.name,
+                author_email: author.email,
+                author_unix_secs: author.unix_secs,
+                author_tz_offset_minutes: author.tz_offset_minutes,
+                path: path.as_bytes().to_vec(),
+            })
+            .collect();
+        let (next, next_path) = blame.next.unzip();
+        Ok(Response::new(BlameResponse {
+            ranges,
+            changesets,
+            next_changeset_id: id_bytes(next),
+            next_path: path_bytes(next_path),
+            next_rename_searched: blame.next_search.searched as u64,
+            next_rename_best: path_bytes(blame.next_search.best),
+        }))
     }
 
     async fn merge_base(
         &self,
         request: Request<MergeBaseRequest>,
     ) -> Result<Response<MergeBaseResponse>, Status> {
-        let call = Call::of("MergeBase", &request);
-        let replied = async {
-            let caller = caller(&request)?;
-            let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
-            let req = request.into_inner();
-            call.about(&caller, Some(&req.repo));
-            check_reader(&self.access, &caller, &req.repo)?;
-            let a = parse_id(&req.a_changeset_id, "a_changeset_id")?;
-            let b = parse_id(&req.b_changeset_id, "b_changeset_id")?;
-            let bases = self
-                .graph_query(deadline, move |store, deadline| {
-                    read::merge_base(store, &req.repo, a, b, deadline)
-                })
-                .await?;
-            Ok(Response::new(MergeBaseResponse {
-                changeset_ids: bases.iter().map(|id| id.as_bytes().to_vec()).collect(),
-            }))
-        };
-        replied.await.map_err(|status| call.failed(status))
+        let caller = caller(&request)?;
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
+        let req = request.into_inner();
+        check_reader(&self.access, &caller, &req.repo)?;
+        let a = parse_id(&req.a_changeset_id, "a_changeset_id")?;
+        let b = parse_id(&req.b_changeset_id, "b_changeset_id")?;
+        let bases = self
+            .graph_query(deadline, move |store, deadline| {
+                read::merge_base(store, &req.repo, a, b, deadline)
+            })
+            .await?;
+        Ok(Response::new(MergeBaseResponse {
+            changeset_ids: bases.iter().map(|id| id.as_bytes().to_vec()).collect(),
+        }))
     }
 
     async fn is_ancestor(
         &self,
         request: Request<IsAncestorRequest>,
     ) -> Result<Response<IsAncestorResponse>, Status> {
-        let call = Call::of("IsAncestor", &request);
-        let replied = async {
-            let caller = caller(&request)?;
-            let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
-            let req = request.into_inner();
-            call.about(&caller, Some(&req.repo));
-            check_reader(&self.access, &caller, &req.repo)?;
-            let ancestor = parse_id(&req.ancestor_id, "ancestor_id")?;
-            let descendant = parse_id(&req.descendant_id, "descendant_id")?;
-            let is_ancestor = self
-                .graph_query(deadline, move |store, deadline| {
-                    read::is_ancestor(store, &req.repo, ancestor, descendant, deadline)
-                })
-                .await?;
-            Ok(Response::new(IsAncestorResponse { is_ancestor }))
-        };
-        replied.await.map_err(|status| call.failed(status))
+        let caller = caller(&request)?;
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
+        let req = request.into_inner();
+        check_reader(&self.access, &caller, &req.repo)?;
+        let ancestor = parse_id(&req.ancestor_id, "ancestor_id")?;
+        let descendant = parse_id(&req.descendant_id, "descendant_id")?;
+        let is_ancestor = self
+            .graph_query(deadline, move |store, deadline| {
+                read::is_ancestor(store, &req.repo, ancestor, descendant, deadline)
+            })
+            .await?;
+        Ok(Response::new(IsAncestorResponse { is_ancestor }))
     }
 
     async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<DiffResponse>, Status> {
-        let call = Call::of("Diff", &request);
-        let replied = async {
-            let caller = caller(&request)?;
-            let req = request.into_inner();
-            call.about(&caller, Some(&req.repo));
-            check_reader(&self.access, &caller, &req.repo)?;
-            let old = parse_id(&req.old_changeset_id, "old_changeset_id")?;
-            let new = parse_id(&req.new_changeset_id, "new_changeset_id")?;
-            let path = parse_optional_path(req.path)?;
-            let after = parse_optional_path(req.after)?;
-            // Held until the job ends, as for `Blame`.
-            let slot = Arc::clone(&self.diffs)
-                .acquire_owned()
-                .await
-                .map_err(|_| Status::unavailable("server is shutting down"))?;
-            let page = self
-                .worker
-                .run(move |store| {
-                    let _slot = slot;
-                    read::diff(&store, &req.repo, old, new, path.as_ref(), after.as_ref())
-                })
-                .await?;
-            let entries = page
-                .entries
-                .into_iter()
-                .map(|entry| {
-                    // The other path goes in `rename_from` on the added file,
-                    // and in `rename_to` on the deleted one.
-                    let (rename_from, rename_to, similarity) = match entry.rename {
-                        Some(r) if entry.old.is_none() => {
-                            (r.path.as_bytes().to_vec(), vec![], r.similarity)
-                        }
-                        Some(r) => (vec![], r.path.as_bytes().to_vec(), r.similarity),
-                        None => Default::default(),
-                    };
-                    DiffEntry {
-                        path: entry.path.as_bytes().to_vec(),
-                        old: entry.old.map(file_state),
-                        new: entry.new.map(file_state),
-                        rename_from,
-                        rename_to,
-                        similarity,
+        let caller = caller(&request)?;
+        let req = request.into_inner();
+        check_reader(&self.access, &caller, &req.repo)?;
+        let old = parse_id(&req.old_changeset_id, "old_changeset_id")?;
+        let new = parse_id(&req.new_changeset_id, "new_changeset_id")?;
+        let path = parse_optional_path(req.path)?;
+        let after = parse_optional_path(req.after)?;
+        // Held until the job ends, as for `Blame`.
+        let slot = Arc::clone(&self.diffs)
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("server is shutting down"))?;
+        let page = self
+            .worker
+            .run(move |store| {
+                let _slot = slot;
+                read::diff(&store, &req.repo, old, new, path.as_ref(), after.as_ref())
+            })
+            .await?;
+        let entries = page
+            .entries
+            .into_iter()
+            .map(|entry| {
+                // The other path goes in `rename_from` on the added file,
+                // and in `rename_to` on the deleted one.
+                let (rename_from, rename_to, similarity) = match entry.rename {
+                    Some(r) if entry.old.is_none() => {
+                        (r.path.as_bytes().to_vec(), vec![], r.similarity)
                     }
-                })
-                .collect();
-            Ok(Response::new(DiffResponse {
-                entries,
-                next_after: path_bytes(page.next_after),
-                renames_incomplete: page.renames_incomplete,
-            }))
-        };
-        replied.await.map_err(|status| call.failed(status))
+                    Some(r) => (vec![], r.path.as_bytes().to_vec(), r.similarity),
+                    None => Default::default(),
+                };
+                DiffEntry {
+                    path: entry.path.as_bytes().to_vec(),
+                    old: entry.old.map(file_state),
+                    new: entry.new.map(file_state),
+                    rename_from,
+                    rename_to,
+                    similarity,
+                }
+            })
+            .collect();
+        Ok(Response::new(DiffResponse {
+            entries,
+            next_after: path_bytes(page.next_after),
+            renames_incomplete: page.renames_incomplete,
+        }))
     }
 }
 
@@ -966,7 +836,6 @@ fn file_state(state: FileState) -> v1::FileState {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
     use std::time::Instant;
 
     use scion_core::{Changeset, FileState, IdentityTime};
@@ -974,9 +843,32 @@ mod tests {
 
     use super::*;
 
-    /// A log writer that collects what the calls inside one test log.
+    /// The log of the test binary, into this one buffer.
+    static LOG: std::sync::LazyLock<Captured> = std::sync::LazyLock::new(Captured::default);
+
+    /// One global subscriber, set once, so a line that a worker thread
+    /// logs lands in the same buffer. Each log test reads only the lines
+    /// that name its repo. A test calls [`init_log`] before it makes the
+    /// call that logs.
+    fn init_log() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::level_filters::LevelFilter::TRACE)
+                .with_writer(Captured::clone(&*LOG))
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+        });
+    }
+
+    fn log_text() -> String {
+        String::from_utf8(LOG.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// A log writer that collects what the test binary logs.
     #[derive(Clone, Default)]
-    struct Captured(Arc<Mutex<Vec<u8>>>);
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
 
     impl std::io::Write for Captured {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -996,50 +888,34 @@ mod tests {
         }
     }
 
-    /// Runs `run` with a subscriber that captures its log into text.
-    fn capture<T>(run: impl FnOnce() -> T) -> (T, String) {
-        let captured = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_max_level(tracing::level_filters::LevelFilter::TRACE)
-            .with_writer(captured.clone())
-            .finish();
-        let out = tracing::subscriber::with_default(subscriber, run);
-        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
-        (out, text)
+    /// The lines that name `repo`, in the order that they were logged.
+    fn log_lines(repo: &str) -> Vec<String> {
+        log_text()
+            .lines()
+            .filter(|line| line.contains(repo))
+            .map(std::borrow::ToOwned::to_owned)
+            .collect()
     }
 
-    /// Polls `run` on one thread, with the subscriber that `capture` sets.
-    fn block_on<T>(run: impl std::future::Future<Output = T>) -> T {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(run)
-    }
-
-    /// An access whose principal `p` may read repo `open`, and change
+    /// An access whose principal `p` may read repo `log-open`, and change
     /// nothing in it.
     fn read_only_access() -> Access {
         let digest = blake3::hash(b"t").to_hex();
-        Access::parse(&format!("token\tp\t{digest}\nread\tp\topen\n")).unwrap()
+        Access::parse(&format!("token\tp\t{digest}\nread\tp\tlog-open\n")).unwrap()
     }
 
-    /// A service whose one principal may do everything.
-    fn test_service(store: Store) -> ScionService {
-        ScionService::new(Worker::new(store), Arc::new(Access::single("t")))
+    /// The one span per call that the server opens, with `rpc` in it and
+    /// the principal and the repo still empty.
+    fn call_span(rpc: &str) -> tracing::Span {
+        tracing::error_span!(
+            "call",
+            rpc = rpc,
+            peer = tracing::field::Empty,
+            principal = tracing::field::Empty,
+            repo = tracing::field::Empty,
+        )
     }
 
-    /// `message` as a request of that principal.
-    fn as_default<T>(message: T) -> Request<T> {
-        let mut request = Request::new(message);
-        let caller = Caller(scion_proto::auth::DEFAULT_PRINCIPAL.into());
-        request.extensions_mut().insert(caller);
-        request
-    }
-
-    /// A store whose repo `r` has one changeset, which puts `f` with
-    /// `content`. Also returns the changeset and the blob.
     fn file_store(content: &[u8]) -> (tempfile::TempDir, Store, ChangesetId, BlobId) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
@@ -1091,12 +967,36 @@ mod tests {
         (task, rx, reads)
     }
 
+    /// Polls `run` on one thread.
+    fn block_on<T>(run: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run)
+    }
+
+    /// A service whose one principal may do everything.
+    fn test_service(store: Store) -> ScionService {
+        ScionService::new(Worker::new(store), Arc::new(Access::single("t")))
+    }
+
+    /// `message` as a request of that principal.
+    fn as_default<T>(message: T) -> Request<T> {
+        let mut request = Request::new(message);
+        let caller = Caller(scion_proto::auth::DEFAULT_PRINCIPAL.into());
+        request.extensions_mut().insert(caller);
+        request
+    }
+
     #[test]
-    fn a_refused_call_makes_one_line() {
+    fn a_denied_write_makes_one_line() {
+        init_log();
         let (_dir, store, _, _) = file_store(b"x");
         let service = ScionService::new(Worker::new(store.clone()), Arc::new(read_only_access()));
-        // A valid changeset, which puts `f`: decode succeeds, the rules deny
-        // the write.
+        // A valid changeset, which puts `f`: decode succeeds, the rules
+        // deny the write. The check runs in the job, so this also shows
+        // that the job stays in the call's span.
         let state = FileState::Regular {
             content: store.blobs().put(b"x").unwrap(),
             executable: false,
@@ -1114,45 +1014,75 @@ mod tests {
             changes: [(RepoPath::new("f").unwrap(), Some(state))].into(),
         };
         let mut request = Request::new(CreateChangesetRequest {
-            repo: "open".to_owned(),
+            repo: "log-open".to_owned(),
             changeset: cs.encode(),
         });
         request.extensions_mut().insert(Caller("p".to_owned()));
 
-        let (status, text) =
-            capture(|| block_on(service.create_changeset(request)).expect_err("denied"));
+        let span = call_span("CreateChangeset");
+        let guard = span.enter();
+        let status = block_on(service.create_changeset(request)).expect_err("denied");
+        drop(guard);
         assert_eq!(status.code(), Code::PermissionDenied);
         // One line, with who and what, and no token.
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 1, "{text}");
-        assert!(lines[0].contains("WARN"), "{text}");
-        assert!(lines[0].contains("rpc=\"CreateChangeset\""), "{text}");
-        assert!(lines[0].contains("repo=\"open\""), "{text}");
-        assert!(lines[0].contains("principal=\"p\""), "{text}");
-        assert!(lines[0].contains("code=PermissionDenied"), "{text}");
+        let lines = log_lines("repo=\"log-open\"");
+        assert_eq!(lines.len(), 1, "ALL:\n{}", log_text());
+        assert!(lines[0].contains("WARN"), "{}", lines[0]);
+        assert!(lines[0].contains("may not write the path"), "{}", lines[0]);
+        assert!(lines[0].contains("principal=\"p\""), "{}", lines[0]);
+        assert!(lines[0].contains("path=\"f\""), "{}", lines[0]);
+        assert!(lines[0].contains("rpc=\"CreateChangeset\""), "{}", lines[0]);
     }
 
     #[test]
     fn a_failed_call_makes_one_line() {
+        init_log();
+        // The reply of a failure keeps its detail in the log. Inside the
+        // call's span, that line also says who and which repo.
+        let span = call_span("GetLand");
+        let guard = span.enter();
+        tracing::Span::current().record("principal", "default");
+        tracing::Span::current().record("repo", "log-no-such");
+        let status = Status::from(crate::error::Error::Io(std::io::Error::other(
+            "the disk went away",
+        )));
+        drop(guard);
+        assert_eq!(status.code(), Code::Internal);
+        // One line, with who and what, and no token.
+        let lines = log_lines("repo=\"log-no-such\"");
+        assert_eq!(lines.len(), 1, "ALL:\n{}", log_text());
+        assert!(lines[0].contains("ERROR"), "{}", lines[0]);
+        assert!(lines[0].contains("internal error"), "{}", lines[0]);
+        assert!(lines[0].contains("the disk went away"), "{}", lines[0]);
+        assert!(lines[0].contains("rpc=\"GetLand\""), "{}", lines[0]);
+        assert!(lines[0].contains("principal=\"default\""), "{}", lines[0]);
+    }
+
+    #[test]
+    fn a_hidden_repo_makes_one_warn() {
+        init_log();
         let (_dir, store, _, _) = file_store(b"x");
         let service = test_service(store);
-
-        let (status, text) = capture(|| {
-            block_on(service.get_land(as_default(GetLandRequest {
-                repo: "no-such".to_owned(),
-                land_id: "1".to_owned(),
-            })))
-            .expect_err("no such repo")
+        // `p` has no grant on `log-secret`: the reply says that it does not
+        // exist, and the log says why.
+        let mut request = Request::new(GetLandRequest {
+            repo: "log-secret".to_owned(),
+            land_id: "1".to_owned(),
         });
+        request.extensions_mut().insert(Caller("p".to_owned()));
+
+        let span = call_span("GetLand");
+        let guard = span.enter();
+        let status = block_on(service.get_land(request)).expect_err("hidden");
+        drop(guard);
         assert_eq!(status.code(), Code::NotFound);
         // One line, with who and what.
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 1, "{text}");
-        assert!(lines[0].contains("DEBUG"), "{text}");
-        assert!(lines[0].contains("rpc=\"GetLand\""), "{text}");
-        assert!(lines[0].contains("repo=\"no-such\""), "{text}");
-        assert!(lines[0].contains("principal=\"default\""), "{text}");
-        assert!(lines[0].contains("code=NotFound"), "{text}");
+        let lines = log_lines("repo=\"log-secret\"");
+        assert_eq!(lines.len(), 1, "{}", log_text());
+        assert!(lines[0].contains("WARN"), "{}", lines[0]);
+        assert!(lines[0].contains("may not read the repo"), "{}", lines[0]);
+        assert!(lines[0].contains("principal=\"p\""), "{}", lines[0]);
+        assert!(lines[0].contains("rpc=\"GetLand\""), "{}", lines[0]);
     }
 
     #[tokio::test]

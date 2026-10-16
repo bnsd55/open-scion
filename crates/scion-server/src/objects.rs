@@ -22,10 +22,11 @@ use scion_proto::v1::{
 use scion_proto::{Bytes, CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_PART_MESSAGE_BYTES};
 use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
+use tracing::Instrument as _;
 
 use crate::access::Access;
 use crate::error::{Error, Result};
-use crate::service::{Call, Worker, caller, check_reader, parse_id, resolve_ref};
+use crate::service::{Worker, caller, check_reader, parse_id, resolve_ref};
 use crate::store::{self, Store};
 use crate::{db, read};
 
@@ -230,20 +231,24 @@ async fn start_reply(
         .await
         .ok_or_else(reply::busy)?;
     let (tx, stream) = reply::channel();
-    tokio::spawn(async move {
-        let (worker, in_flight) = (&worker, &in_flight);
-        let produce = |key| {
-            find(
-                worker,
-                in_flight,
-                waits.until.wait(waits.busy),
-                read,
-                zstd,
-                key,
-            )
-        };
-        reply::send_objects(first, rest, tx, waits.stall, stalled, produce).await;
-    });
+    tokio::spawn(
+        async move {
+            let (worker, in_flight) = (&worker, &in_flight);
+            let produce = |key| {
+                find(
+                    worker,
+                    in_flight,
+                    waits.until.wait(waits.busy),
+                    read,
+                    zstd,
+                    key,
+                )
+            };
+            reply::send_objects(first, rest, tx, waits.stall, stalled, produce).await;
+        }
+        // The reply runs outside the call, but stays in its span.
+        .instrument(tracing::Span::current()),
+    );
     Ok(stream)
 }
 
@@ -282,33 +287,26 @@ impl Objects for ObjectsService {
         &self,
         request: Request<ResolveRefRequest>,
     ) -> Result<Response<ResolveRefResponse>, Status> {
-        let call = Call::of("ResolveRef", &request);
-        resolve_ref(&self.worker, &self.access, &call, request)
+        resolve_ref(&self.worker, &self.access, request)
             .await
             .map(Response::new)
-            .map_err(|status| call.failed(status))
     }
 
     async fn get_root_tree(
         &self,
         request: Request<GetRootTreeRequest>,
     ) -> Result<Response<GetRootTreeResponse>, Status> {
-        let call = Call::of("GetRootTree", &request);
-        let replied = async {
-            let caller = caller(&request)?;
-            let GetRootTreeRequest { repo, changeset_id } = request.into_inner();
-            call.about(&caller, Some(&repo));
-            check_reader(&self.access, &caller, &repo)?;
-            let cs = parse_id(&changeset_id, "changeset_id")?;
-            let tree = self
-                .worker
-                .run(move |store| read::root_tree(&store, &repo, cs))
-                .await?;
-            Ok(Response::new(GetRootTreeResponse {
-                tree_id: tree.as_bytes().to_vec(),
-            }))
-        };
-        replied.await.map_err(|status| call.failed(status))
+        let caller = caller(&request)?;
+        let GetRootTreeRequest { repo, changeset_id } = request.into_inner();
+        check_reader(&self.access, &caller, &repo)?;
+        let cs = parse_id(&changeset_id, "changeset_id")?;
+        let tree = self
+            .worker
+            .run(move |store| read::root_tree(&store, &repo, cs))
+            .await?;
+        Ok(Response::new(GetRootTreeResponse {
+            tree_id: tree.as_bytes().to_vec(),
+        }))
     }
 
     type GetObjectsStream = ObjectStream;
@@ -317,39 +315,34 @@ impl Objects for ObjectsService {
         &self,
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<Self::GetObjectsStream>, Status> {
-        let call = Call::of("GetObjects", &request);
-        let replied = async {
-            let caller = caller(&request)?;
-            let waits = Waits {
-                until: Until::of(&request),
-                ..WAITS
-            };
-            // The handle of the caller's connection, before the request is taken
-            // apart: the reply counts what it leaves in HTTP/2 on it.
-            let stalled = scion_proto::listen::Stalled::of(&request);
-            let GetObjectsRequest { repo, refs, accept } = request.into_inner();
-            call.about(&caller, Some(&repo));
-            check_reader(&self.access, &caller, &repo)?;
-            scion_proto::check::object_count(refs.len())?;
-            let keys = refs.iter().map(parse_ref).collect::<Result<Vec<_>, _>>()?;
-            // Encodings that this server does not know are ignored.
-            let zstd = accept.contains(&Encoding::Zstd.into());
-            self.worker
-                .run(move |store| store.read(|c| db::repo_id(c, &repo)))
-                .await?;
-            let in_flight = Arc::clone(&self.in_flight);
-            let stream = start_reply(
-                self.worker.clone(),
-                keys,
-                in_flight,
-                waits,
-                read_object,
-                zstd,
-                stalled,
-            );
-            Ok(Response::new(stream.await?))
+        let caller = caller(&request)?;
+        let waits = Waits {
+            until: Until::of(&request),
+            ..WAITS
         };
-        replied.await.map_err(|status| call.failed(status))
+        // The handle of the caller's connection, before the request is taken
+        // apart: the reply counts what it leaves in HTTP/2 on it.
+        let stalled = scion_proto::listen::Stalled::of(&request);
+        let GetObjectsRequest { repo, refs, accept } = request.into_inner();
+        check_reader(&self.access, &caller, &repo)?;
+        scion_proto::check::object_count(refs.len())?;
+        let keys = refs.iter().map(parse_ref).collect::<Result<Vec<_>, _>>()?;
+        // Encodings that this server does not know are ignored.
+        let zstd = accept.contains(&Encoding::Zstd.into());
+        self.worker
+            .run(move |store| store.read(|c| db::repo_id(c, &repo)))
+            .await?;
+        let in_flight = Arc::clone(&self.in_flight);
+        let stream = start_reply(
+            self.worker.clone(),
+            keys,
+            in_flight,
+            waits,
+            read_object,
+            zstd,
+            stalled,
+        );
+        Ok(Response::new(stream.await?))
     }
 }
 

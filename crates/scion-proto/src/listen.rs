@@ -266,7 +266,26 @@ impl Limits {
         I: Stream<Item = io::Result<IO>> + Send + 'static,
         IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
     {
+        // One span per call: the RPC and the peer at the start, and the
+        // principal and the repo once the call knows them. `error_span`, so
+        // the span is open under any filter, and a `WARN` line under a
+        // `warn` filter still shows its fields.
         let server = Server::builder()
+            .trace_fn(|request| {
+                let peer = request
+                    .extensions()
+                    .get::<tonic::transport::server::TcpConnectInfo>()
+                    .and_then(tonic::transport::server::TcpConnectInfo::remote_addr)
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_default();
+                tracing::error_span!(
+                    "call",
+                    rpc = %request.uri().path(),
+                    peer,
+                    principal = tracing::field::Empty,
+                    repo = tracing::field::Empty,
+                )
+            })
             .max_concurrent_streams(self.streams.get())
             .http2_keepalive_interval(Some(timers.keepalive))
             .http2_keepalive_timeout(Some(timers.keepalive_timeout))
