@@ -588,9 +588,7 @@ impl Scion for ScionService {
             .await?
         } else {
             self.worker
-                .run(move |store| {
-                    read::log_page(&store, &req.repo, id, None, limit, &deadline)
-                })
+                .run(move |store| read::log_page(&store, &req.repo, id, None, limit, &deadline))
                 .await?
         };
         // Always send the first entry; stop before the reply gets too big.
