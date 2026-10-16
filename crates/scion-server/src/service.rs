@@ -23,6 +23,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::service::interceptor::InterceptedService;
+use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth::{Auth, Caller};
@@ -59,9 +60,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const READ_BUDGET_BYTES: usize = 256 << 20;
 /// A `ReadFile` reply ends when its client takes no part for this long, and
 /// frees its share, so a client that stops reading does not hold budget.
-/// Three parts stay outside the budget until the stream ends or the
-/// connection closes: the part in its channel, the part that hyper has read
-/// ahead, and the part in the h2 send buffer (`scion_proto::listen`).
+/// The parts that it leaves in its channel and in HTTP/2 stay outside the
+/// budget (`scion_proto::listen`).
 const READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 // Any one reply fits in the budget, and the budget counts in u32 permits.
@@ -88,12 +88,14 @@ pub async fn serve(
         auth.clone(),
     );
     let objects = InterceptedService::new(ObjectsService::new(worker).into_server(), auth);
+    let router = |server: Server| {
+        server
+            .timeout(REQUEST_TIMEOUT)
+            .add_service(scion)
+            .add_service(objects)
+    };
     limits
-        .server()
-        .timeout(REQUEST_TIMEOUT)
-        .add_service(scion)
-        .add_service(objects)
-        .serve_with_incoming_shutdown(limits.accept(TcpListenerStream::new(listener)), shutdown)
+        .serve(router, TcpListenerStream::new(listener), shutdown)
         .await
 }
 

@@ -58,7 +58,7 @@ use tokio_stream::Stream;
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::server::Connected;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Code, Request, Response, Status, Streaming};
 
 use store::lock;
@@ -459,11 +459,9 @@ impl<S: Store> Tier<S> {
         let objects = ObjectsServer::new(self)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_PART_MESSAGE_BYTES);
-        limits
-            .server()
-            .add_service(InterceptedService::new(objects, Auth::new(token)))
-            .serve_with_incoming_shutdown(limits.accept(incoming), shutdown)
-            .await
+        let objects = InterceptedService::new(objects, Auth::new(token));
+        let router = |mut server: Server| server.add_service(objects);
+        limits.serve(router, incoming, shutdown).await
     }
 
     /// Runs store work on a blocking thread.
@@ -1095,7 +1093,6 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_stream::StreamExt as _;
     use tokio_stream::wrappers::TcpListenerStream;
-    use tonic::transport::Server;
 
     use super::*;
 

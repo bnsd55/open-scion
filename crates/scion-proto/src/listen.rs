@@ -1,4 +1,4 @@
-//! How the server and the cache tiers accept connections. They share this
+//! How the server and the cache tiers serve connections. They share this
 //! code, so every process that answers calls keeps the same bounds.
 //!
 //! A reply whose client stops reading keeps memory in HTTP/2 that no budget
@@ -10,11 +10,13 @@
 //! server side: while the stream waits for flow-control window, hyper does
 //! not poll the reply body, so it never sees a body error.
 //!
-//! So this module bounds how many such streams there are: at most
+//! So [`Limits::serve`] bounds how many such streams there are: at most
 //! [`Limits::connections`] connections at once, each with at most
 //! [`Limits::streams`] open streams. HTTP/2 keepalive closes a connection
 //! whose client does not answer a ping, which frees all that it holds.
 
+use std::error::Error;
+use std::future::Future;
 use std::io;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::pin::Pin;
@@ -26,7 +28,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_stream::{Stream, StreamExt as _};
 use tonic::transport::Server;
-use tonic::transport::server::Connected;
+use tonic::transport::server::{Connected, Router};
 
 /// The default of [`Limits::connections`]. Room for the 50 checkouts at once
 /// of `scripts/bench-checkout.sh`, each on its own connection to one daemon.
@@ -48,11 +50,10 @@ pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 /// How many connections a process serves, and how many streams each may
 /// have open.
 // SHORTCUT: a live client that stops reading keeps what its stalled streams
-// hold until its connection closes. So the ceiling is connections x streams
-// x (under 4 MiB for a streamed reply, up to 64 MiB for a unary one). hyper
-// cannot reset a stalled stream from the server side. Upgrade (issue #113):
-// count what the stalled replies of each connection hold, and close a
-// connection that holds too much.
+// hold until its connection closes, so the ceiling is connections x streams
+// x what one stream keeps (see the module docs). Upgrade (issue #113): count
+// what the stalled replies of each connection hold, and close a connection
+// that holds too much.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     /// Most connections served at once. A connection beyond that is
@@ -74,37 +75,32 @@ impl Default for Limits {
 }
 
 impl Limits {
-    /// A server builder with the stream limit and keepalive.
-    #[must_use]
-    pub fn server(self) -> Server {
-        builder(self.streams, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT)
-    }
-
-    /// The connections from `incoming`, at most [`Limits::connections`] at
-    /// once. Each keeps its place until it is dropped, when it closes. A
-    /// connection that waits for a place logs a warning.
-    pub fn accept<I, IO, E>(self, incoming: I) -> impl Stream<Item = Result<Connection<IO>, E>>
+    /// Serves the services that `router` adds to a server, on `incoming`
+    /// connections, within these limits and with keepalive, until
+    /// `shutdown` resolves. A connection that waits for its place logs a
+    /// warning.
+    ///
+    /// # Errors
+    ///
+    /// Transport errors.
+    pub async fn serve<I, IO, IE>(
+        self,
+        router: impl FnOnce(Server) -> Router,
+        incoming: I,
+        shutdown: impl Future<Output = ()>,
+    ) -> Result<(), tonic::transport::Error>
     where
-        I: Stream<Item = Result<IO, E>>,
+        I: Stream<Item = Result<IO, IE>>,
+        IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
+        IE: Into<Box<dyn Error + Send + Sync>>,
     {
-        let max = self.connections.get();
-        let places = Arc::new(Semaphore::new(max));
-        incoming.then(move |accepted| {
-            let places = Arc::clone(&places);
-            async move {
-                let io = accepted?;
-                let place = if let Ok(place) = Arc::clone(&places).try_acquire_owned() {
-                    Some(place)
-                } else {
-                    tracing::warn!(max, "a connection waits: the most connections are open");
-                    places.acquire_owned().await.ok()
-                };
-                Ok(Connection { io, _place: place })
-            }
-        })
+        router(builder(self.streams, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT))
+            .serve_with_incoming_shutdown(accept(incoming, self.connections), shutdown)
+            .await
     }
 }
 
+/// A server builder with the stream limit and keepalive.
 fn builder(streams: NonZeroU32, keepalive: Duration, timeout: Duration) -> Server {
     Server::builder()
         .max_concurrent_streams(streams.get())
@@ -112,13 +108,36 @@ fn builder(streams: NonZeroU32, keepalive: Duration, timeout: Duration) -> Serve
         .http2_keepalive_timeout(Some(timeout))
 }
 
-/// A connection that keeps one of the places of [`Limits::accept`] until it
-/// is dropped.
-#[derive(Debug)]
-pub struct Connection<IO> {
+/// The connections from `incoming`, at most `max` at once. Each keeps its
+/// place until it is dropped, when it closes.
+fn accept<I, IO, E>(incoming: I, max: NonZeroUsize) -> impl Stream<Item = Result<Connection<IO>, E>>
+where
+    I: Stream<Item = Result<IO, E>>,
+{
+    let max = max.get();
+    let places = Arc::new(Semaphore::new(max));
+    incoming.then(move |accepted| {
+        let places = Arc::clone(&places);
+        async move {
+            let io = accepted?;
+            let place = if let Ok(place) = Arc::clone(&places).try_acquire_owned() {
+                place
+            } else {
+                tracing::warn!(max, "a connection waits: the most connections are open");
+                places
+                    .acquire_owned()
+                    .await
+                    .expect("the semaphore of places is never closed")
+            };
+            Ok(Connection { io, _place: place })
+        }
+    })
+}
+
+/// A connection that keeps its place of [`accept`] until it is dropped.
+struct Connection<IO> {
     io: IO,
-    /// `None` only if the semaphore of places were closed. It never is.
-    _place: Option<OwnedSemaphorePermit>,
+    _place: OwnedSemaphorePermit,
 }
 
 impl<IO: Connected> Connected for Connection<IO> {
@@ -172,12 +191,153 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for Connection<IO> {
 #[cfg(test)]
 mod tests {
     use std::io::{Read as _, Write as _};
+    use std::pin::pin;
 
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::service::Routes;
+    use tonic::transport::{Channel, Endpoint};
+    use tonic::{Code, Request, Response, Status, Streaming};
 
     use super::*;
+    use crate::Bytes;
+    use crate::v1::objects_client::ObjectsClient;
+    use crate::v1::objects_server::{Objects, ObjectsServer};
+    use crate::v1::{
+        GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, ObjectPart, ResolveRefRequest,
+        ResolveRefResponse,
+    };
+
+    /// A wait that ends at once when nothing holds the call back.
+    const HELD: Duration = Duration::from_millis(500);
+
+    /// Replies to `GetObjects` with one part of 128 KiB, more than a client's
+    /// whole connection window of 64 KiB, so a client that does not read
+    /// keeps the stream open. Refuses `ResolveRef` at once, with no data, so
+    /// a full window does not hold that reply.
+    struct Stub;
+
+    #[tonic::async_trait]
+    impl Objects for Stub {
+        async fn resolve_ref(
+            &self,
+            _: Request<ResolveRefRequest>,
+        ) -> Result<Response<ResolveRefResponse>, Status> {
+            Err(Status::not_found("no ref"))
+        }
+
+        async fn get_root_tree(
+            &self,
+            _: Request<GetRootTreeRequest>,
+        ) -> Result<Response<GetRootTreeResponse>, Status> {
+            Err(Status::unimplemented("not in the stub"))
+        }
+
+        type GetObjectsStream = tokio_stream::Iter<std::vec::IntoIter<Result<ObjectPart, Status>>>;
+
+        async fn get_objects(
+            &self,
+            _: Request<GetObjectsRequest>,
+        ) -> Result<Response<Self::GetObjectsStream>, Status> {
+            let part = ObjectPart {
+                data: Bytes::from(vec![0; 128 << 10]),
+                ..ObjectPart::default()
+            };
+            Ok(Response::new(tokio_stream::iter(vec![Ok(part)])))
+        }
+    }
+
+    /// The stub, served within `limits`, and its address.
+    async fn serve(limits: Limits) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = |mut server: Server| server.add_service(ObjectsServer::new(Stub));
+        let incoming = TcpListenerStream::new(listener);
+        tokio::spawn(limits.serve(router, incoming, std::future::pending()));
+        url
+    }
+
+    /// A `GetObjects` reply that the caller never reads.
+    async fn stall(client: &mut ObjectsClient<Channel>) -> Streaming<ObjectPart> {
+        let request = GetObjectsRequest::default();
+        client.get_objects(request).await.unwrap().into_inner()
+    }
+
+    /// The code of a call that the stub answers at once.
+    async fn quick(client: &mut ObjectsClient<Channel>) -> Code {
+        let request = ResolveRefRequest::default();
+        client.resolve_ref(request).await.unwrap_err().code()
+    }
+
+    /// A client that stops reading keeps its streams open. With the streams
+    /// of its connection all open, its next call waits, and goes on once one
+    /// of them ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_connection_opens_at_most_its_streams() {
+        let streams = 4;
+        let limits = Limits {
+            streams: NonZeroU32::new(streams).unwrap(),
+            ..Limits::default()
+        };
+        let url = serve(limits).await;
+        // The smallest windows, so no reply ends while it is unread.
+        let channel = Endpoint::from_shared(url)
+            .unwrap()
+            .initial_stream_window_size(65_535)
+            .initial_connection_window_size(65_535)
+            .connect()
+            .await
+            .unwrap();
+        let mut client = ObjectsClient::new(channel);
+        let mut stalled = Vec::new();
+        for _ in 0..streams {
+            stalled.push(stall(&mut client).await);
+        }
+
+        let mut next = client.clone();
+        let mut next = pin!(quick(&mut next));
+        assert!(
+            tokio::time::timeout(HELD, &mut next).await.is_err(),
+            "a stream beyond the cap was opened"
+        );
+        drop(stalled.pop());
+        let code = tokio::time::timeout(Duration::from_secs(10), next)
+            .await
+            .expect("the call goes on once a stream ends");
+        assert_eq!(code, Code::NotFound);
+    }
+
+    /// With all its connections open, a process leaves a new one unread, and
+    /// serves it once another closes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_process_serves_at_most_its_connections() {
+        let connections = 2;
+        let limits = Limits {
+            connections: NonZeroUsize::new(connections).unwrap(),
+            ..Limits::default()
+        };
+        let endpoint = Endpoint::from_shared(serve(limits).await).unwrap();
+        let mut open = Vec::new();
+        for _ in 0..connections {
+            let mut client = ObjectsClient::new(endpoint.connect().await.unwrap());
+            // Served, so the process holds a place for it.
+            assert_eq!(quick(&mut client).await, Code::NotFound);
+            open.push(client);
+        }
+
+        let mut extra = ObjectsClient::new(endpoint.connect_lazy());
+        let mut call = pin!(quick(&mut extra));
+        assert!(
+            tokio::time::timeout(HELD, &mut call).await.is_err(),
+            "a connection beyond the cap was served"
+        );
+        // Its connection closes once no handle is left.
+        drop(open.pop());
+        let code = tokio::time::timeout(Duration::from_secs(10), call)
+            .await
+            .expect("the connection is served once another closes");
+        assert_eq!(code, Code::NotFound);
+    }
 
     /// A peer that sends the HTTP/2 preface and then never answers is closed
     /// by keepalive: a dead client does not keep its connection, or what its
@@ -187,7 +347,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let ping = Duration::from_millis(100);
-        let incoming = Limits::default().accept(TcpListenerStream::new(listener));
+        let incoming = accept(TcpListenerStream::new(listener), DEFAULT_CONNECTIONS);
         tokio::spawn(
             builder(DEFAULT_STREAMS, ping, ping)
                 .add_routes(Routes::default())
