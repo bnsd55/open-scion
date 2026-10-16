@@ -1161,3 +1161,89 @@ fn queries_check_the_repo_and_the_changesets() {
         assert!(matches!(error, Some(Error::NotFound(_))), "{error:?}");
     }
 }
+
+/// Section 9 of `docs/architecture.md` lists the deliberate shortcuts, and
+/// the code marks each one with a `SHORTCUT` marker. This pins the table to
+/// the code: a row names files, and every file a row names has a marker,
+/// and every file with a marker is named by a row. So a PR that removes a
+/// shortcut, or adds one, must update the table. The markers are counted in
+/// the sources of the crates (`src`), not in their tests.
+#[test]
+fn the_shortcut_table_matches_the_markers() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .to_path_buf();
+    let doc = fs::read_to_string(root.join("docs/architecture.md")).unwrap();
+    let section = doc
+        .split("## 9. Deliberate shortcuts")
+        .nth(1)
+        .expect("section 9 of docs/architecture.md");
+    let section = section.split("## 10.").next().unwrap();
+
+    // The files of each row: the backticked paths that name a file under
+    // `crates/`, as `scion-server/src/land.rs` does. A row holds 4 cells,
+    // so a row merged with the next one by a lost line break fails here.
+    let mut rows: Vec<(String, Vec<String>)> = Vec::new();
+    for line in section.lines().filter(|line| line.starts_with("| `")) {
+        let cells: Vec<&str> = line.split('|').collect();
+        assert_eq!(cells.len(), 6, "a row of the table holds 4 cells: {line}");
+        let named: Vec<String> = cells[1]
+            .split('`')
+            .filter(|token| {
+                token.contains("src/")
+                    && Path::new(token)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+            })
+            .map(str::to_owned)
+            .collect();
+        assert!(!named.is_empty(), "a row names a file: {line}");
+        rows.push((line.to_owned(), named));
+    }
+    assert!(!rows.is_empty(), "the table has rows");
+
+    // Every file under `crates/` that carries a `SHORTCUT:` marker.
+    let mut marked: Vec<String> = Vec::new();
+    let mut stack = vec![root.join("crates")];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && !path.components().any(|part| part.as_os_str() == "tests")
+            {
+                let text = fs::read_to_string(&path).unwrap();
+                if text.lines().any(|line| line.contains("SHORTCUT:")) {
+                    let rel = path
+                        .strip_prefix(root.join("crates"))
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .replace('\\', "/");
+                    marked.push(rel);
+                }
+            }
+        }
+    }
+    assert!(!marked.is_empty(), "the code has markers");
+
+    for (line, named) in &rows {
+        for file in named {
+            let text = fs::read_to_string(root.join("crates").join(file))
+                .unwrap_or_else(|_| panic!("{file} does not exist, but the table lists it"));
+            assert!(
+                text.lines().any(|marker| marker.contains("SHORTCUT:")),
+                "{file} has no `SHORTCUT:` marker, but the table lists it: {line}"
+            );
+        }
+    }
+    for file in &marked {
+        assert!(
+            rows.iter().any(|(_, named)| named.contains(file)),
+            "{file} has a `SHORTCUT:` marker, but no row of the table names it"
+        );
+    }
+}
