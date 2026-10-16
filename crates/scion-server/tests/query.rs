@@ -12,9 +12,7 @@ use std::time::{Duration, Instant};
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_server::deadline::Deadline;
 use scion_server::import::{ImportOptions, import_git};
-use scion_server::read::{
-    self, DiffEntry, MAX_DIFF_ENTRIES, MAX_RENAME_CHUNKS, MAX_RENAME_ENTRIES, Rename,
-};
+use scion_server::read::{self, DiffEntry, MAX_DIFF_ENTRIES, MAX_RENAME_CHUNKS, Rename};
 use scion_server::{Error, Store, db, tree};
 use tempfile::TempDir;
 
@@ -943,26 +941,109 @@ fn renames_are_the_same_on_every_page() {
 }
 
 #[test]
-fn a_diff_past_max_rename_entries_has_no_renames() {
+fn a_diff_of_20_000_entries_still_pairs_exact_renames() {
     let (_data, store) = open_store();
-    // A rename and fillers: MAX_RENAME_ENTRIES entries in all, then one
-    // more. Blobs are never read.
-    for (fillers, found) in [
-        (MAX_RENAME_ENTRIES - 2, true),
-        (MAX_RENAME_ENTRIES - 1, false),
-    ] {
-        let base = BTreeMap::from([(path("a/source"), Some(unstored(usize::MAX)))]);
-        let mut change = BTreeMap::from([
-            (path("a/source"), None),
-            (path("b/source"), Some(unstored(usize::MAX))),
-        ]);
-        change.extend((0..fillers).map(|n| (path(&format!("c/f{n:05}")), Some(unstored(n)))));
-        let ids = chain(&store, vec![base, change]);
-        let entries = diff_pages(&store, ids[0], ids[1], None);
-        assert_eq!(entries.len(), fillers + 2);
-        let renamed = entries.iter().filter(|e| e.rename.is_some()).count();
-        assert_eq!(renamed, if found { 2 } else { 0 }, "{fillers} fillers");
+    // 10,000 deleted and 10,000 added files of different content, and one
+    // exact rename (same content) among them. Blobs are never read: exact
+    // renames compare blob IDs only. The inexact search is skipped past its
+    // pair limit, and the page says so; the exact rename is still whole.
+    let content = unstored(usize::MAX);
+    let mut base: BTreeMap<_, _> = (0..10_000)
+        .map(|n| (path(&format!("del/d{n:05}")), Some(unstored(n))))
+        .collect();
+    base.insert(path("zz/old"), Some(content));
+    let mut change: BTreeMap<_, _> = base.keys().map(|p| (p.clone(), None)).collect();
+    change.extend((0..10_000).map(|n| (path(&format!("add/f{n:05}")), Some(unstored(n + 10_000)))));
+    change.insert(path("aa/new"), Some(content));
+    let ids = chain(&store, vec![base, change]);
+
+    let page = read::diff(&store, REPO, ids[0], ids[1], None, None).unwrap();
+    assert!(page.renames_incomplete, "the inexact search is skipped");
+    let added = page
+        .entries
+        .iter()
+        .find(|e| e.path == path("aa/new"))
+        .unwrap();
+    assert_eq!(added.rename.as_ref().unwrap().path, path("zz/old"));
+    assert_eq!(added.old, None);
+
+    // Every page of the diff agrees: it says the flag too, and the two
+    // halves of the rename, found across pages, name each other, with one
+    // similarity.
+    let mut after = None;
+    let mut all = Vec::new();
+    loop {
+        let page = read::diff(&store, REPO, ids[0], ids[1], None, after.as_ref()).unwrap();
+        assert!(page.renames_incomplete, "every page says the same");
+        all.extend(page.entries);
+        match page.next_after {
+            Some(next) => after = Some(next),
+            None => break,
+        }
     }
+    let renamed: Vec<_> = all.iter().filter(|e| e.rename.is_some()).collect();
+    assert_eq!(renamed.len(), 2, "one rename, two halves");
+    let added = all.iter().find(|e| e.path == path("aa/new")).unwrap();
+    let deleted = all.iter().find(|e| e.path == path("zz/old")).unwrap();
+    assert_eq!(added.old, None);
+    assert_eq!(deleted.new, None);
+    assert_eq!(added.rename.as_ref().unwrap().path, path("zz/old"));
+    assert_eq!(deleted.rename.as_ref().unwrap().path, path("aa/new"));
+    assert_eq!(
+        added.rename.as_ref().unwrap().similarity,
+        deleted.rename.as_ref().unwrap().similarity,
+        "one similarity"
+    );
+}
+
+#[test]
+fn a_diff_over_the_rename_entry_cap_gets_the_flag() {
+    let (_data, store) = open_store();
+    // 6,002 entries and an exact rename among them. Past the entry bound of
+    // the rename pass, which this call takes as 5,000, it finds no renames
+    // and says so; the entries of the page are still whole. Under it, the
+    // exact rename is found. Blobs are never read.
+    let content = unstored(usize::MAX);
+    let mut base: BTreeMap<_, _> = (0..3_000)
+        .map(|n| (path(&format!("old/f{n:05}")), Some(unstored(n))))
+        .collect();
+    base.insert(path("zz/old"), Some(content));
+    let mut change: BTreeMap<_, _> = base.keys().map(|p| (p.clone(), None)).collect();
+    change.extend((0..3_000).map(|n| (path(&format!("new/f{n:05}")), Some(unstored(n)))));
+    change.insert(path("aa/new"), Some(content));
+    let ids = chain(&store, vec![base, change]);
+    let page = read::diff_with(&store, REPO, ids[0], ids[1], None, None, 5_000).unwrap();
+    assert!(page.renames_incomplete, "past the entry bound");
+    assert!(page.entries.iter().all(|e| e.rename.is_none()));
+    // Under the bound, the exact rename is paired, and the page is whole.
+    let page = read::diff_with(&store, REPO, ids[0], ids[1], None, None, 10_000).unwrap();
+    assert!(!page.renames_incomplete);
+    let added = page
+        .entries
+        .iter()
+        .find(|e| e.path == path("aa/new"))
+        .unwrap();
+    assert_eq!(added.rename.as_ref().unwrap().path, path("zz/old"));
+    assert!(page.entries.iter().all(|e| e.rename.is_some()));
+}
+
+#[test]
+fn a_diff_over_the_pair_limit_gets_the_incomplete_flag() {
+    let (_data, store) = open_store();
+    // 2,000 added and 2,000 deleted files with nothing in common: 4M pairs,
+    // over the 1,000 x 1,000 limit, so the inexact search is skipped and
+    // the flag is set. Exact renames would still be found; there are none.
+    let base: BTreeMap<_, _> = (0..2_000)
+        .map(|n| (path(&format!("old/f{n:04}")), Some(unstored(n))))
+        .collect();
+    let change: BTreeMap<_, _> = (0..2_000)
+        .map(|n| (path(&format!("old/f{n:04}")), None))
+        .chain((0..2_000).map(|n| (path(&format!("new/f{n:04}")), Some(unstored(n + 50_000)))))
+        .collect();
+    let ids = chain(&store, vec![base, change]);
+    let page = read::diff(&store, REPO, ids[0], ids[1], None, None).unwrap();
+    assert!(page.renames_incomplete);
+    assert!(page.entries.iter().all(|e| e.rename.is_none()));
 }
 
 #[test]
@@ -990,8 +1071,12 @@ fn the_search_for_similar_files_stops_at_its_budget() {
         let mut change: BTreeMap<_, _> = base.keys().map(|p| (p.clone(), None)).collect();
         change.insert(path("zz/new"), Some(stored(&store, new.as_bytes())));
         let ids = chain(&store, vec![base, change]);
-        let entries = diff_all(&store, ids[0], ids[1], None, None);
-        let renamed = entries.iter().find(|e| e.path == path("zz/new")).unwrap();
+        let page = read::diff(&store, REPO, ids[0], ids[1], None, None).unwrap();
+        let renamed = page
+            .entries
+            .iter()
+            .find(|e| e.path == path("zz/new"))
+            .unwrap();
         let expected = found.then(|| Rename {
             path: path("zz/old"),
             similarity: 99,
@@ -1000,6 +1085,8 @@ fn the_search_for_similar_files_stops_at_its_budget() {
             renamed.rename, expected,
             "{decoys} and {small_decoys} decoys"
         );
+        // A search that stopped at its budget leaves renames missing.
+        assert_eq!(page.renames_incomplete, !found, "{decoys} decoys");
     }
 }
 

@@ -227,6 +227,10 @@ pub struct Outcome {
     /// not look at. Then `pairs` holds the best pairs among the files it
     /// looked at.
     pub stopped: Option<usize>,
+    /// Set when the inexact search (steps 2 and 3) did not run: more than
+    /// `max_pairs` pairs were left, as git skips inexact rename detection
+    /// past its rename limit. `pairs` then holds the exact renames only.
+    pub skipped: bool,
 }
 
 /// Pairs added files with the deleted files they came from, as git does by
@@ -299,12 +303,29 @@ pub fn renames(
     };
     if from == Progress::default() {
         search.same_content();
-        search.same_name()?;
+        // git skips the inexact search (by name and by similarity) when more
+        // than `max_pairs` pairs of files are left; only exact renames stay.
+        let count = search
+            .taken
+            .iter()
+            .filter(|&taken| !taken)
+            .count()
+            .saturating_mul(search.used.iter().filter(|&used| !used).count());
+        if count <= max_pairs {
+            search.same_name()?;
+        } else {
+            return Ok(Outcome {
+                pairs: search.pairs,
+                stopped: None,
+                skipped: true,
+            });
+        }
     }
     let stopped = search.similar(max_pairs, from)?;
     Ok(Outcome {
         pairs: search.pairs,
         stopped,
+        skipped: false,
     })
 }
 
