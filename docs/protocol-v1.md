@@ -657,9 +657,10 @@ merge base for a CI job.
   that exists on neither side gives an empty reply.
 - With `after`, only the entries after that path in tree order. It need not
   be in the diff, nor below `path`.
-- `renames_incomplete` is set when renames may be missing: the inexact
-  search did not run (over the pair limit) or stopped at its budget. See
-  the rename bounds below.
+- `renames_incomplete` is set when renames may be missing: the diff is over
+  the entry bound of the rename pass, or the inexact search did not run
+  (over the pair limit) or stopped at its budget. See the rename bounds
+  below.
 
 **Bound and resume.** A reply holds at most 1,000 entries. When more follow,
 `next_after` is the last path in `entries`, and the reply holds exactly
@@ -707,19 +708,22 @@ newline does not count. Each chunk is hashed as git hashes it. Similarity is
 the bytes of the chunks that both files have, over the size of the larger
 file. A symlink or a gitlink is a rename only with the same content.
 
-**Rename bounds.** As in git, the inexact search (steps 2 and 3) runs only
-when the added files left times the deleted files left are at most
-1,000,000. Steps 2 and 3 share a budget per call: about 4M, where each chunk
-of a file read and each row of a chunk table indexed or compared count one,
-and each file size read counts 64 (64 MiB of text in lines of 64 bytes
-costs 1M). Step 1 has no bound but the size of the diff: it compares IDs
-and reads no files, so a diff of any size finds its exact renames. When
-steps 2 and 3 did not run (over the pair limit) or stopped at the budget,
-`renames_incomplete` is set in the reply: renames may be missing, as git
-prints "inexact rename detection was skipped due to too many files". The
-exact renames in the reply are still whole. The pair limit and the budget
-are the same on every call, so every reply gives the same renames. The
-search never ends a page early.
+**Rename bounds.** The rename pass walks the whole diff below `path`, and
+holds its entries in memory: at most 1,000,000 entries, about 150 MB per
+call. Past it, the call finds no renames. As in git, the inexact search
+(steps 2 and 3) runs only when the added files left times the deleted files
+left are at most 1,000,000. Steps 2 and 3 share a budget per call: about
+4M, where each chunk of a file read and each row of a chunk table indexed
+or compared count one, and each file size read counts 64 (64 MiB of text in
+lines of 64 bytes costs 1M). Step 1 has no bound but that entry cap: it
+compares IDs and reads no files, so a diff up to the entry bound finds its
+exact renames, whatever its size. When the pass was past the entry bound,
+or the inexact search did not run (over the pair limit) or stopped at the
+budget, `renames_incomplete` is set in the reply: renames may be missing,
+as git prints "inexact rename detection was skipped due to too many files".
+The exact renames in the reply are still whole. The pair limit and the
+budget are the same on every call, so every reply gives the same renames.
+The search never ends a page early.
 
 | Error | When |
 |---|---|

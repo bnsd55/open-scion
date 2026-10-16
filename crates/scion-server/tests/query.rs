@@ -997,6 +997,37 @@ fn a_diff_of_20_000_entries_still_pairs_exact_renames() {
 }
 
 #[test]
+fn a_diff_over_the_rename_entry_cap_gets_the_flag() {
+    let (_data, store) = open_store();
+    // 6,002 entries and an exact rename among them. Past the entry bound of
+    // the rename pass, which this call takes as 5,000, it finds no renames
+    // and says so; the entries of the page are still whole. Under it, the
+    // exact rename is found. Blobs are never read.
+    let content = unstored(usize::MAX);
+    let mut base: BTreeMap<_, _> = (0..3_000)
+        .map(|n| (path(&format!("old/f{n:05}")), Some(unstored(n))))
+        .collect();
+    base.insert(path("zz/old"), Some(content));
+    let mut change: BTreeMap<_, _> = base.keys().map(|p| (p.clone(), None)).collect();
+    change.extend((0..3_000).map(|n| (path(&format!("new/f{n:05}")), Some(unstored(n)))));
+    change.insert(path("aa/new"), Some(content));
+    let ids = chain(&store, vec![base, change]);
+    let page = read::diff_with(&store, REPO, ids[0], ids[1], None, None, 5_000).unwrap();
+    assert!(page.renames_incomplete, "past the entry bound");
+    assert!(page.entries.iter().all(|e| e.rename.is_none()));
+    // Under the bound, the exact rename is paired, and the page is whole.
+    let page = read::diff_with(&store, REPO, ids[0], ids[1], None, None, 10_000).unwrap();
+    assert!(!page.renames_incomplete);
+    let added = page
+        .entries
+        .iter()
+        .find(|e| e.path == path("aa/new"))
+        .unwrap();
+    assert_eq!(added.rename.as_ref().unwrap().path, path("zz/old"));
+    assert!(page.entries.iter().all(|e| e.rename.is_some()));
+}
+
+#[test]
 fn a_diff_over_the_pair_limit_gets_the_incomplete_flag() {
     let (_data, store) = open_store();
     // 2,000 added and 2,000 deleted files with nothing in common: 4M pairs,

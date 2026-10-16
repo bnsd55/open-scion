@@ -989,11 +989,17 @@ and their bounds, are this project's choices.
   one the new path (`rename_to`). A client that does not know renames still
   sees a correct delete and add. If the page holds no added or deleted file,
   the call skips this. If the page is the whole diff, it uses the page.
-  Else it walks the whole diff below the path, with no bound on entries:
-  exact renames (same content, by blob ID) cost no file reads, so a diff of
-  any size finds them. Steps 2 and 3 (inexact) run only while the added
-  files left times the deleted files left are at most 1,000,000, git's
-  default limit. Step 3 compares files only under that limit. It reads the
+  Else it walks the whole diff below the path, up to 1,000,000 entries
+  (`MAX_RENAME_ENTRIES`), the entries held in memory at about 150 bytes
+  each: exact renames (same content, by blob ID) cost no file reads, so
+  this is the only bound a diff of that size meets. Past the bound, the
+  call finds no renames and sets `renames_incomplete`. Steps 2 and 3
+  (inexact) run only while the added files left times the deleted files
+  left are at most 1,000,000, git's default limit. Step 3 compares files
+  only under that limit. It reads the
+  added files that some deleted file could be like into one index by chunk
+  hash, then reads each deleted file and looks up its chunks there, so it
+  never compares two files row by row.
   added files that some deleted file could be like into one index by chunk
   hash, then reads each deleted file and looks up its chunks there, so it
   never compares two files row by row. Added files with the same blob share
