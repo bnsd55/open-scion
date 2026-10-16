@@ -474,6 +474,37 @@ fn blame_continues_at_the_old_path_after_a_rename() {
 }
 
 #[test]
+fn blame_goes_on_with_a_rename_search_across_replies() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    // `new` replaces 24 deleted files of 65,536 lines, one chunk each, so
+    // one call's budget reads about 15 of them, and the search goes on in a
+    // second reply. All are 99% like `new`, so the first by path wins.
+    let empty = "\n".repeat((1 << 16) - 1);
+    let put = |text: String| Some(regular(store.blobs().put(text.as_bytes()).unwrap()));
+    let names: Vec<String> = (0..24).map(|k| format!("f/{k:02}")).collect();
+    let root = names
+        .iter()
+        .enumerate()
+        .map(|(k, p)| (p.as_str(), put(format!("{empty}{k}\n"))))
+        .collect();
+    let mut rename: Vec<_> = names.iter().map(|p| (p.as_str(), None)).collect();
+    rename.push(("new", put(format!("x\n{empty}"))));
+    let message = b"change\n".to_vec();
+    let ids = chain(&store, vec![(message.clone(), root), (message, rename)]);
+    let server = Server::start(data, store);
+    let lines = blame_lines(&server, &format!("{}:new", ids[1]));
+    assert_eq!(lines.len(), 1 << 16);
+    assert_eq!(lines[0], (ids[1].to_string(), 1, "new".to_owned()));
+    let root = ids[0].to_string();
+    assert!(
+        lines[1..]
+            .iter()
+            .all(|(id, _, p)| *id == root && p == "f/00")
+    );
+}
+
+#[test]
 fn log_continues_after_a_reply_cut_by_its_byte_budget() {
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();

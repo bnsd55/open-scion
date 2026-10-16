@@ -441,11 +441,28 @@ file has no lines and gets no ranges.
 **Bounds per call.** At most 1,000 changesets checked, 100 versions diffed,
 and about 1M lines diffed (both sides of each diff; a line counts once per
 64 bytes). A rename search counts as a line each chunk of up to 64 bytes
-that it reads, and each row of a chunk table that it compares. It compares
-at most 100 deleted files, and stops after it has read about 100 MiB of
-them. The first step of a call always runs, so every call makes progress.
-The rules of a rename search are those of `Diff` (section 6.13) for one
-added file.
+that it reads and each row of a chunk table that it indexes or compares,
+and as 64 lines each file size that it reads. The first step of a call
+always runs, so every call makes progress. The rules of a rename search are
+those of `Diff` (section 6.13) for one added file, with git's limit of
+1,000,000 pairs only: it looks at every deleted file, over several calls if
+it must.
+
+**A rename search over calls.** A rename search uses the budget that the
+call has left. Where the budget runs out inside it, the call stops:
+`next_changeset_id` is the changeset that adds the file, `next_path` is its
+path, and `next_rename_searched` and `next_rename_best` say where the search
+stopped. `next_rename_searched` counts the deleted files looked at, in path
+order (only paths that held a file count). `next_rename_best` is the most
+similar of those so far, or empty. The client MUST send both back unchanged
+as `rename_searched` and `rename_best` with that `next_changeset_id` and
+`next_path`, and MUST send 0 and empty with any other place. The next call
+reads the best file again and goes on from where the search stopped, so it
+finds the file that one search with no budget finds. A call whose first step
+is a rename search looks at one more deleted file even past the budget, so
+the search always moves. When a search ends but the diff after it does not
+fit, the reply names the end of the search, so the next call does not search
+again. A reply sets both fields only with `next_changeset_id`.
 
 **Rules.** The server walks first parents to each changeset that changed the
 file, and diffs that version with the older version. The older version is
@@ -466,7 +483,7 @@ rename. Its next call then fails with `NOT_FOUND`, or blames another file.
 
 | Error | When |
 |---|---|
-| `INVALID_ARGUMENT` | A bad or empty path; the file is not a regular file, is larger than 16 MiB, or has more than 1,048,576 lines. |
+| `INVALID_ARGUMENT` | A bad or empty path; the file is not a regular file, is larger than 16 MiB, or has more than 1,048,576 lines; `rename_searched` and `rename_best` are not a place where a rename search of that path at that changeset can stop. |
 | `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
 
 ### 6.11 MergeBase
@@ -604,8 +621,9 @@ file. A symlink or a gitlink is a rename only with the same content.
 entries below `path`; a larger diff has none. As in git, step 3 runs only
 when the added files left times the deleted files left are at most
 1,000,000. Steps 2 and 3 share a budget per call: about 4M, where each chunk
-of a file read and each row of a chunk table indexed or compared count one
-(64 MiB of text in lines of 64 bytes costs 1M). Past it, the server reads no
+of a file read and each row of a chunk table indexed or compared count one,
+and each file size read counts 64 (64 MiB of text in lines of 64 bytes
+costs 1M). Past it, the server reads no
 more files, so it misses the renames that step 2 or step 3 would find after
 that point. The budget is the same on every call, so every reply gives the
 same renames. The search never ends a page early.

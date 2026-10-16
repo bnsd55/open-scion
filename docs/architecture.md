@@ -660,9 +660,10 @@ adds the path, the source is one of the files that C deletes. `Blame` and
    among the first 100.
 2. Else, if exactly one deleted file has the same name: that file, if it is
    at least 75% similar.
-3. Else, if C deletes at most 100 files (`MAX_RENAME_SOURCES`): the most
-   similar file, if it is at least 50% similar. On a tie, a file with the
-   same name wins, then the first by path.
+3. Else, if C deletes at most 1,000,000 files (git's limit of pairs): the
+   most similar file, if it is at least 50% similar. On a tie, a file with
+   the same name wins, then the first by path. The search looks at every
+   deleted file, over several calls if it must (below).
 
 Similarity is git's. Each file is cut into chunks that end after a newline or
 after 64 bytes. In text (no NUL byte in the first 8,000 bytes, git's test for
@@ -678,14 +679,8 @@ there. `Log` with a path does not follow renames, as `git log` without
 
 Where rename following differs from `git blame`:
 
-- git compares every deleted file. Here a changeset that deletes more than
-  100 files gets only steps 1 and 2
-  ([#87](https://github.com/bnsd55/open-scion/issues/87)).
-- A deleted file over a limit of step 1 is never similar here, and one
-  search reads files, in path order, only until it has read about 100 MiB
-  (`MAX_RENAME_BYTES`: 100 files of the old 1 MiB limit, so it still reads
-  every file that it read under that limit). git can pick any of them
-  ([#87](https://github.com/bnsd55/open-scion/issues/87)).
+- A deleted file over a limit of step 1 is never similar here
+  ([#90](https://github.com/bnsd55/open-scion/issues/90)).
 - git also treats a file as binary, so a CR counts, when `.gitattributes`
   marks it `binary` or `-diff`. Here only the NUL byte test counts.
 - git keeps the four best similar files while it compares, and on a tie the
@@ -707,30 +702,42 @@ changesets (`MAX_SCAN`), so it holds the database lock no longer than a plain
 `Log` of 1,000 entries. A `Blame` call also diffs at most 100 versions, and
 about 1M lines (`MAX_BLAME_DIFF_LINES`, both sides of each diff). Every byte
 that blame reads counts against this budget, once per 64 bytes: a diffed
-line counts once per 64 bytes, a rename search counts each chunk it reads
-and each row of a chunk table it compares, and a file read and then refused
-for its lines counts its size. A
-version with the same content as the newer one (a mode change, or a rename
-with no edit) is not read and costs nothing. The first step of a call always
-runs, so a call always makes progress.
+line counts once per 64 bytes, a rename search counts each chunk it reads,
+each row of a chunk table it indexes or compares, and 64 for each file size
+it reads (`SIZE_COST`), and a file read and then refused for its lines
+counts its size. A version with the same content as the newer one (a mode
+change, or a rename with no edit) is not read and costs nothing. The first
+step of a call always runs, so a call always makes progress.
 
-So a call reads about 64 MiB in the steps that fit in its budget, plus two
-steps past it: the first, which always runs, and the one that stops the call,
-which is read and then dropped. One step reads one older version of at most
-16 MiB, or one rename search: the size of at most 100 deleted files, and
-their content until it has read about 100 MiB, plus the file that crosses
-that bound. The search keeps only chunk tables, so it reads the source it
-finds once more, to diff it. So one call reads at most about 320 MiB. To
-find the deleted
-files, a search reads each directory on their paths once, about the work of
-applying C to its parent tree.
+A rename search uses the budget that the call has left, and checks it
+before each deleted file. Where the budget runs out, the call stops there.
+The reply names the changeset that adds the file, and where the search
+stopped: how many deleted files it looked at, in path order, and the most
+similar so far (`next_rename_searched`, `next_rename_best`). The next call
+reads that best file again and goes on with the next deleted file. So the
+answer is that of one search with no budget, and every deleted file is
+looked at, as in git. When the search is the first step of a call, it looks
+at one more deleted file even past the budget, so it always moves. The
+server checks the place it is sent: the count is at most the number of
+deleted files, and the best file is a deleted file before that count. The
+client must send the place back unchanged.
+
+So a call reads about 64 MiB in the steps that fit in its budget, plus the
+blamed file, plus a few files past the budget. The first step, which always
+runs, can pass it by one deleted file, and by the source it found, which it
+reads once more to diff it: the search keeps only chunk tables. The step
+that stops the call can read one older version, or one deleted file and
+that source, and then drop them. Each file is at most 16 MiB, so one call
+reads at most about 150 MiB. To find the deleted files, a search reads each
+directory on their paths once, about the work of applying C to its parent
+tree. A resumed search does this again on each call.
 
 The slowest step is a diff of two versions of 1,048,576 short lines in
 random order: a diff of many repeated lines is slow. On one machine, with
 release builds, that diff takes about 1.5 times as long as the worst diff
 under the old 1 MiB limit (a 1 MiB file of about 700,000 such lines). A
-rename search that reads up to its bound takes about a tenth of the old
-worst diff, a 16 MiB file with one line changed about 1/100 of it, and 100
+rename search that reads 100 MiB takes about a tenth of the old worst diff,
+and one call now reads less than that, a 16 MiB file with one line changed about 1/100 of it, and 100
 mode changes of a 16 MiB file less than that. Memory per call is at most two
 versions of 16 MiB (two to diff, or one and a rename source), the chunk
 tables of two files, about 50 bytes per line of the blamed file, and the
@@ -1192,9 +1199,7 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/read.rs` (`MAX_RENAME_ENTRIES`) | Each `Diff` call walks the whole diff below its path to find renames. A diff of more than 10,000 entries has no renames: a rename there is a delete and an add. `git diff` finds renames in a diff of any size. | Renames of a diff as derived data, found in steps over calls and kept. | [#107](https://github.com/bnsd55/open-scion/issues/107) |
 | `scion-server/src/read.rs` (`MAX_RENAME_CHUNKS`) | The search for similar files in one `Diff` call reads and compares about 4M chunks, then reads no more files. A diff with many large files that could be similar can miss renames that `git diff` finds. | The same derived data. | [#107](https://github.com/bnsd55/open-scion/issues/107) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_VERSIONS`) | One call diffs at most 100 versions of a file. A file with more versions costs more calls. | Blame as derived data, kept per file version. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
-| `scion-server/src/blame.rs` (`MAX_BLAME_DIFF_LINES`) | One call diffs about 1M lines, and a long line counts once per 64 bytes. A diff of many repeated lines grows faster than its lines, so one diff of two files of 1,048,576 lines is the worst case of a call. | Blame from derived data, so a call does not diff whole versions. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
-| `scion-server/src/blame.rs` (`MAX_RENAME_SOURCES`) | A changeset that deletes more than 100 files is searched only for a rename source with the same content, or the one deleted file with the same name. `git blame` compares every deleted file. | An index of each changeset's deleted files by chunk, as derived data, so a search compares only files that share chunks with the new file. | [#87](https://github.com/bnsd55/open-scion/issues/87) |
-| `scion-server/src/blame.rs` (`MAX_RENAME_BYTES`) | One rename search reads about 100 MiB of deleted files, in path order, then stops and keeps the best file so far. With large files it can miss the source that `git blame` finds. Every search that the old 1 MiB limit allowed still reads every file. | The same index, so a search reads only files that share chunks with the new file. | [#87](https://github.com/bnsd55/open-scion/issues/87) |
+| `scion-server/src/blame.rs` (`MAX_BLAME_DIFF_LINES`) | One call diffs about 1M lines, and a long line counts once per 64 bytes. A diff of many repeated lines grows faster than its lines, so one diff of two files of 1,048,576 lines is the worst case of a call. A rename search shares the budget and goes on over calls, so a changeset that deletes many large files costs one call per about 64 MiB of them. | Blame from derived data, so a call does not diff whole versions, and an index of each changeset's deleted files by chunk, so a search reads only files that share chunks with the new file. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_BYTES`, `MAX_BLAME_LINES`) | A file over 16 MiB or 1,048,576 lines is refused. An older version like that counts as absent, so its lines go to the changeset that replaced it. `git blame` reads any size. | Blame from derived data, so a call does not read whole versions, and a reply that a client asks for in parts. | [#90](https://github.com/bnsd55/open-scion/issues/90) |
 | `scion-proto/src/auth.rs` (`Auth`) | One static token, one principal. | A token-to-principal map, then per-path write rules. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/main.rs` (`serve`) | No TLS. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |

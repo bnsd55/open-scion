@@ -651,13 +651,14 @@ fn blame_picks_the_rename_source_as_git_blame_does() {
 }
 
 #[test]
-fn a_rename_search_reads_every_file_the_old_limit_read() {
+fn a_rename_search_past_one_call_matches_git() {
     let git_dir = tempfile::tempdir().unwrap();
     let dir = git_dir.path();
     git(dir, &["init", "-q", "-b", "main"]);
     // Nine deleted files of 1 MiB, in 8-byte lines: 1,179,648 chunks, more
-    // than one call's budget. `new` is `big/8`, the last by path, with one
-    // line changed. git compares all nine and follows `big/8`.
+    // than one call's budget, so the search goes on in the next call. `new`
+    // is `big/8`, the last by path, with one line changed. git compares all
+    // nine and follows `big/8`.
     let file = |k: usize| format!("{k}aaaaaa\n").repeat((1 << 20) / 8);
     let sources: Vec<(String, String)> = (0..9).map(|k| (format!("big/{k}"), file(k))).collect();
     let sources: Vec<(&str, &str)> = sources
@@ -899,6 +900,47 @@ fn a_rename_search_goes_on_where_a_call_stopped() {
             "{search:?}: {result:?}"
         );
     }
+}
+
+#[test]
+fn a_rename_search_moves_on_every_call() {
+    let (_data, store) = open_store();
+    // Files of half a call's budget, in lines of 16 bytes: one chunk each.
+    // A call reads `new`, then deleted files. A call that goes on with a
+    // best file reads `new` and that file again, which spends its budget,
+    // and still looks at one more file. `old/1` is 60% like `new`, and `new`
+    // is a rename of `old/2` with one line changed.
+    let n = MAX_BLAME_DIFF_LINES / 2;
+    let line = |byte: char| format!("{}\n", byte.to_string().repeat(15));
+    let put = |text: &str| Some(regular(store.blobs().put(text.as_bytes()).unwrap()));
+    let sixty = line('n').repeat(n * 3 / 5) + &line('b').repeat(n - n * 3 / 5);
+    let root = vec![
+        ("old/0", put(&line('a').repeat(n))),
+        ("old/1", put(&sixty)),
+        ("old/2", put(&line('n').repeat(n))),
+    ];
+    let new = line('c') + &line('n').repeat(n - 1);
+    let rename = vec![
+        ("old/0", None),
+        ("old/1", None),
+        ("old/2", None),
+        ("new", put(&new)),
+    ];
+    let ids = chain(&store, vec![root, rename]);
+    let mut search = RenameSearch::default();
+    for (searched, best) in [(1, None), (2, Some("old/1"))] {
+        let result = blame::blame(&store, REPO, ids[1], &path("new"), &search).unwrap();
+        assert_eq!(result.next, Some((ids[1], path("new"))));
+        search = result.next_search;
+        let expected = RenameSearch {
+            searched,
+            best: best.map(path),
+        };
+        assert_eq!(search, expected);
+    }
+    let last = blame::blame(&store, REPO, ids[1], &path("new"), &search).unwrap();
+    assert_eq!(last.next, None);
+    assert_eq!(last.changesets[1], (ids[0], author(), path("old/2")));
 }
 
 #[test]

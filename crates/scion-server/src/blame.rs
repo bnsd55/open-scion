@@ -51,18 +51,20 @@ pub const MAX_BLAME_VERSIONS: usize = 100;
 /// Most lines one call diffs, counting both sides of each diff. A diff of
 /// many repeated lines can take seconds, so this bounds the time of a call.
 /// A line counts once per 64 bytes ([`diff_cost`]), a rename search counts
-/// the chunks it reads and compares and the file sizes it reads
-/// ([`similar::Budget`]), and a file read and refused counts once per 64
-/// bytes, so every byte read counts. The first step of a call always runs,
-/// so a call always makes progress. A rename search uses only the budget
-/// left; where it stops, the next call goes on with it
-/// ([`Blame::next_search`]). So a call reads about 64 MiB in steps that fit,
-/// plus the step that stops the call: one older version (at most
-/// [`MAX_BLAME_BYTES`]), or one more file of a rename search.
+/// the chunks it reads, the rows it indexes and compares, and the file
+/// sizes it reads ([`similar::Budget`]), and a file read and refused counts
+/// once per 64 bytes, so every byte read counts. The first step of a call
+/// always runs, so a call always makes progress. A rename search uses only
+/// the budget left; where it stops, the next call goes on with it
+/// ([`Blame::next_search`]). So a call reads about 64 MiB in steps that
+/// fit, plus a few files of at most [`MAX_BLAME_BYTES`] past it: the first
+/// step can pass it by one file of a rename search, and the step that stops
+/// the call reads one older version, or one more file of a rename search.
 // SHORTCUT: the cost of a diff grows faster than its lines when lines
 // repeat, so one diff of two files of MAX_BLAME_LINES lines is the worst
-// case of a call. Upgrade: blame from derived data, so a call does not diff
-// whole versions.
+// case of a call. A changeset that deletes many large files costs one call
+// per about 64 MiB of them. Upgrade: blame from derived data, so a call does
+// not diff whole versions, and an index of deleted files by chunk (#61).
 pub const MAX_BLAME_DIFF_LINES: usize = 1 << 20;
 
 /// Consecutive lines with the same source.
