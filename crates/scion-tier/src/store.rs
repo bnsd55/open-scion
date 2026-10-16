@@ -9,11 +9,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, FileExt as _};
+use std::io::{self, ErrorKind, Read as _, Write as _};
+
+use rusqlite::OptionalExtension as _;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
 use hashlink::LruCache;
@@ -152,41 +154,53 @@ impl Store for MemoryStore {
     }
 }
 
-/// The name of the index file in the data directory (see [`DiskStore`]).
-const INDEX: &str = "index";
+/// The name of the index database in the data directory (see [`DiskStore`]).
+const INDEX: &str = "index.db";
 
-/// The start of the index file, with its format version. The header goes on
-/// with the state byte ([`CLEAN`] or [`DIRTY`]) and the BLAKE3 hash of the
+/// The name of the index file of the format before this one. A start imports
+/// it and removes it. Only its reader is kept.
+const OLD_INDEX: &str = "index";
+
+/// The start of the old index file, with its format version. The header goes
+/// on with the state byte ([`CLEAN`] or [`DIRTY`]) and the BLAKE3 hash of the
 /// records that the last full write wrote. A cut file fails the hash too.
 const MAGIC: &[u8; 8] = b"scnidx1\n";
 
-/// Bytes before the first record.
+/// Bytes before the first record of the old format.
 const HEADER: usize = MAGIC.len() + 1 + 32;
 
-/// The index file names every object file, and is on disk: a clean stop
+/// The old index file names every object file, and is on disk: a clean stop
 /// wrote it, and its records are the ones that its header hashes.
 const CLEAN: u8 = b'c';
 
-/// The index file may lag the object files: the store is open, or was when
-/// it stopped.
+/// The old index file may lag the object files: the store was open when it
+/// stopped. Only the tests write it.
+#[cfg(test)]
 const DIRTY: u8 = b'd';
 
-/// Bytes of one record: an op, a 32-byte ID and a size.
+/// Bytes of one old record: an op, a 32-byte ID and a size.
 const RECORD: usize = 1 + 32 + 4;
-
-/// Bytes of records that wait in memory before they are appended to the
-/// index file: 1,024 records. While another call writes, more wait.
-const FLUSH_BYTES: usize = 1024 * RECORD;
-
-/// Once the index file would hold more records than twice the objects plus
-/// this, it is written again with one record per object.
-const SLACK_RECORDS: usize = 1 << 16;
 
 // A record's size field holds the largest stored form.
 const _: () = assert!(MAX_ENCODED_BYTES <= u32::MAX as usize);
 
-/// Appends the record that `key` is stored with `size` bytes and was just
-/// used (`Some`), or that it was dropped (`None`).
+/// Row versions that wait in memory before one transaction commits them:
+/// 1,024 of them. More wait while another call commits.
+const FLUSH_RECORDS: usize = 1024;
+
+/// Bytes of new objects that one batch may hold. A put commits at once, so
+/// this bounds only what a failed commit may strand.
+const FLUSH_NEW_BYTES: usize = 64 << 20;
+
+/// Files that the walk of a start that may have stranded some holds for the
+/// store, which adopts them as it flushes. The walk waits while the queue is
+/// full, so the store never holds more than this.
+const WALK_QUEUE: usize = 256;
+
+/// Appends the old record that `key` is stored with `size` bytes and was
+/// just used (`Some`), or that it was dropped (`None`). Only the tests
+/// write old files.
+#[cfg(test)]
 fn push_record(out: &mut Vec<u8>, key: Key, size: Option<usize>) {
     let kind = match key {
         Key::Tree(_) => b'T',
@@ -202,8 +216,9 @@ fn push_record(out: &mut Vec<u8>, key: Key, size: Option<usize>) {
     out.extend_from_slice(&size.to_le_bytes());
 }
 
-/// Reads one record: an object stored with `Some(size)` bytes and just used,
-/// or one dropped (`None`). `None` overall if the bytes are not a record.
+/// Reads one old record: an object stored with `Some(size)` bytes and just
+/// used, or one dropped (`None`). `None` overall if the bytes are not a
+/// record.
 fn parse_record(record: &[u8; RECORD]) -> Option<(Key, Option<usize>)> {
     let [op, id @ .., s0, s1, s2, s3] = *record;
     let key = match op.to_ascii_uppercase() {
@@ -218,16 +233,7 @@ fn parse_record(record: &[u8; RECORD]) -> Option<(Key, Option<usize>)> {
     (size <= MAX_ENCODED_BYTES).then_some((key, Some(size)))
 }
 
-/// One record per object of `lru`, least recently used first.
-fn rows(lru: &Lru<()>) -> Vec<u8> {
-    let mut rows = Vec::with_capacity(lru.entries.len() * RECORD);
-    for (&key, &((), size)) in &lru.entries {
-        push_record(&mut rows, key, Some(size));
-    }
-    rows
-}
-
-/// What a start found in the index file.
+/// What a start found in the old index file.
 #[derive(Debug, PartialEq)]
 enum Found {
     /// A clean file of this many records: the start trusts it.
@@ -236,12 +242,12 @@ enum Found {
     Scan(&'static str),
 }
 
-/// Reads the index file in `dir`: its objects, least recently used first,
-/// and whether the start may trust it. A damaged file gives what its records
-/// before the damage give.
-fn read_index(dir: &Path) -> io::Result<(Lru<()>, Found)> {
+/// Reads the old index file in `dir`: its objects, least recently used
+/// first, and whether the start may trust it. A damaged file gives what its
+/// records before the damage give.
+fn read_old_index(dir: &Path) -> io::Result<(Lru<()>, Found)> {
     let mut lru = Lru::new();
-    let bytes = match fs::read(dir.join(INDEX)) {
+    let bytes = match fs::read(dir.join(OLD_INDEX)) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == ErrorKind::NotFound => {
             return Ok((lru, Found::Scan("there is no index file")));
@@ -281,42 +287,654 @@ fn read_index(dir: &Path) -> io::Result<(Lru<()>, Found)> {
     Ok((lru, found))
 }
 
+/// The column of the `kind` of a key.
+fn kind_of(key: Key) -> i64 {
+    match key {
+        Key::Tree(_) => 0,
+        Key::Blob(_) => 1,
+    }
+}
+
+/// The key of a `kind` column and an ID, or `None` if they are not one.
+fn key_of(kind: i64, id: &[u8]) -> Option<Key> {
+    let id: [u8; 32] = id.try_into().ok()?;
+    match kind {
+        0 => Some(Key::Tree(TreeId::from_bytes(id))),
+        1 => Some(Key::Blob(BlobId::from_bytes(id))),
+        _ => None,
+    }
+}
+
+/// The path of the file of `key` under `objects`.
+fn object_path(objects: &Path, key: Key) -> PathBuf {
+    let (kind, hex) = match key {
+        Key::Tree(id) => ("tree", id.to_string()),
+        Key::Blob(id) => ("blob", id.to_string()),
+    };
+    objects.join(kind).join(&hex[..2]).join(&hex[2..])
+}
+
+/// Makes an error of the index db an I/O error.
+fn index_error(error: rusqlite::Error) -> io::Error {
+    io::Error::other(error)
+}
+
+/// One change of one object that the db does not have yet.
+enum Op {
+    /// The object was used again.
+    Use,
+    /// The object is stored with `size` bytes.
+    Put,
+    /// The object left the index.
+    Remove,
+}
+
+struct Version {
+    op: Op,
+    key: Key,
+    /// For [`Op::Put`]: the size of the stored form.
+    size: usize,
+    used_at: u64,
+    seq: u64,
+}
+
+/// The state of the index that the db does not have yet, and the counters
+/// that mirror it. Every change goes through these methods, so a batch
+/// commit leaves the db, the mirrors and `newest` agreed.
+struct Disk {
+    /// The db. Only the index lock uses it, so it needs no lock of its own.
+    conn: rusqlite::Connection,
+    /// Row versions that the db does not have yet, oldest first.
+    pending: Vec<Version>,
+    /// Bytes of new objects in `pending`.
+    pending_bytes: usize,
+    /// The latest state in `pending` of a key: its size, or gone. Cleared
+    /// when a batch commits, so a settled key is read from the db.
+    newest: HashMap<Key, Option<(u64, usize)>>,
+    /// The meta counters, `pending` included.
+    objects: u64,
+    bytes: u64,
+    next_used: u64,
+    next_seq: u64,
+    /// Set once a batch is due, so the next put or get commits it.
+    due: bool,
+    /// The directories that dropped files left, to sync before the last
+    /// commit of a stop, so no dropped file comes back after a crash.
+    left: HashSet<PathBuf>,
+    /// Versions of the last commit, and rows that the last trim iterated:
+    /// for the tests of the bounds.
+    #[cfg(test)]
+    committed: usize,
+    #[cfg(test)]
+    iterated: usize,
+}
+
+impl Disk {
+    /// Opens the db at `path`, and makes its schema. The file may be new.
+    fn open(path: &Path) -> io::Result<Self> {
+        let conn = rusqlite::Connection::open(path).map_err(index_error)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(index_error)?;
+        // WAL, and nothing synced per commit: what a batch keeps is what a
+        // process crash keeps, which is what the old index file kept. The
+        // page cache is capped, so the memory does not grow with objects.
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(index_error)?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(index_error)?;
+        conn.pragma_update(None, "cache_size", -8_000)
+            .map_err(index_error)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS meta (
+                k TEXT PRIMARY KEY,
+                v INTEGER NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS objects (
+                kind INTEGER NOT NULL,
+                id BLOB NOT NULL,
+                size INTEGER NOT NULL,
+                used_at INTEGER NOT NULL,
+                seq INTEGER NOT NULL,
+                PRIMARY KEY (kind, id)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS objects_used ON objects (used_at);",
+        )
+        .map_err(index_error)?;
+        Ok(Self {
+            conn,
+            pending: Vec::new(),
+            pending_bytes: 0,
+            newest: HashMap::new(),
+            objects: 0,
+            bytes: 0,
+            next_used: 0,
+            next_seq: 1,
+            due: false,
+            left: HashSet::new(),
+            #[cfg(test)]
+            committed: 0,
+            #[cfg(test)]
+            iterated: 0,
+        })
+    }
+
+    /// The meta counters, or `None` if the db has none and a start must
+    /// build the rows from the old file or the object files.
+    fn read_meta(&self) -> io::Result<Option<Meta>> {
+        let rows = self
+            .conn
+            .prepare_cached("SELECT k, v FROM meta")
+            .map_err(index_error)?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(index_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(index_error)?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let get = |name: &str| -> u64 {
+            rows.iter()
+                .find(|(k, _)| k == name)
+                .map_or(0, |(_, v)| u64::try_from(*v).unwrap_or(0))
+        };
+        Ok(Some(Meta {
+            objects: get("objects"),
+            bytes: get("bytes"),
+            next_used: get("next_used"),
+            next_seq: get("next_seq"),
+            clean: get("clean") != 0,
+            walk_pending: get("walk_pending") != 0,
+        }))
+    }
+
+    /// Sets one meta flag.
+    fn set_flag(&mut self, name: &str, value: bool) -> io::Result<()> {
+        self.conn
+            .prepare_cached(
+                "INSERT INTO meta(k, v) VALUES(?1, ?2) ON CONFLICT(k) DO UPDATE SET v = ?2",
+            )
+            .map_err(index_error)?
+            .execute(rusqlite::params![name, i64::from(value)])
+            .map_err(index_error)?;
+        Ok(())
+    }
+
+    /// The size that the db gives for `key`, if any. The batch does not
+    /// name it: the callers check `newest` first.
+    fn settled_size(&self, key: Key) -> io::Result<Option<usize>> {
+        let size = self
+            .conn
+            .query_row(
+                "SELECT size FROM objects WHERE kind = ?1 AND id = ?2",
+                rusqlite::params![kind_of(key), key.id()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(index_error)?;
+        Ok(size.map(|size| usize::try_from(size).unwrap_or(0)))
+    }
+
+    /// Notes one more version of `key`, and keeps the mirrors.
+    fn push(&mut self, op: Op, key: Key, size: usize, used_at: u64) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.pending.push(Version {
+            op,
+            key,
+            size,
+            used_at,
+            seq,
+        });
+        if self.pending.len() >= FLUSH_RECORDS || self.pending_bytes >= FLUSH_NEW_BYTES {
+            self.due = true;
+        }
+    }
+
+    /// Notes that `key` was just used, and bumps its place. The batch has
+    /// the last word on it; the db on the settled ones.
+    fn touch(&mut self, key: Key) -> io::Result<Option<usize>> {
+        if let Some(state) = self.newest.get(&key).copied() {
+            let Some((_, size)) = state else {
+                return Ok(None);
+            };
+            let used_at = self.next_used;
+            self.next_used += 1;
+            self.newest.insert(key, Some((used_at, size)));
+            self.push(Op::Use, key, size, used_at);
+            return Ok(Some(size));
+        }
+        let Some(size) = self.settled_size(key)? else {
+            return Ok(None);
+        };
+        let used_at = self.next_used;
+        self.next_used += 1;
+        self.newest.insert(key, Some((used_at, size)));
+        self.push(Op::Use, key, size, used_at);
+        Ok(Some(size))
+    }
+
+    /// The state of `key`: its size, or gone. The batch has the last word;
+    /// the db on the settled ones.
+    fn state(&self, key: Key) -> io::Result<Option<(u64, usize)>> {
+        if let Some(state) = self.newest.get(&key) {
+            return Ok(*state);
+        }
+        let Some(size) = self.settled_size(key)? else {
+            return Ok(None);
+        };
+        Ok(Some((0, size)))
+    }
+
+    /// Adds or replaces `key`, stored with `size` bytes, as just used.
+    fn insert(&mut self, key: Key, size: usize) {
+        let old = self.state(key).unwrap_or_default();
+        match old {
+            Some((_, old_size)) => self.bytes -= old_size as u64,
+            None => self.objects += 1,
+        }
+        self.bytes += size as u64;
+        let used_at = self.next_used;
+        self.next_used += 1;
+        self.newest.insert(key, Some((used_at, size)));
+        self.pending_bytes += size;
+        self.push(Op::Put, key, size, used_at);
+    }
+
+    /// Adds `key` as the least recently used: what the walk adopted, which
+    /// leaves first.
+    fn insert_oldest(&mut self, key: Key, size: usize) {
+        let old = self.state(key).unwrap_or_default();
+        match old {
+            Some((_, old_size)) => self.bytes -= old_size as u64,
+            None => self.objects += 1,
+        }
+        self.bytes += size as u64;
+        self.newest.insert(key, Some((0, size)));
+        self.pending_bytes += size;
+        self.push(Op::Put, key, size, 0);
+    }
+
+    /// Removes `key`, if it is there.
+    fn remove(&mut self, key: Key) {
+        let old = self.state(key).unwrap_or_default();
+        let Some((_, size)) = old else {
+            return;
+        };
+        self.objects -= 1;
+        self.bytes -= size as u64;
+        self.newest.insert(key, None);
+        self.push(Op::Remove, key, 0, 0);
+    }
+
+    /// Commits `pending` in one transaction, with the counters and the mark
+    /// that makes its rows settled: every put of the batch renamed its file
+    /// before the flush that commits it ran, so every row at or below the
+    /// mark has its file. When the transaction cannot land, it rolls back:
+    /// the db keeps its rows and counters, the batch goes, and the counters
+    /// are read back from the db, so the next batch writes true ones.
+    fn commit(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        let count = self.pending.len();
+        let mark = self.next_seq - 1;
+        let committed = self.commit_batch(mark);
+        if committed.is_ok() {
+            self.pending = Vec::new();
+            self.pending_bytes = 0;
+            self.newest.clear();
+            #[cfg(test)]
+            {
+                self.committed = count;
+            }
+        } else {
+            self.pending.clear();
+            self.pending_bytes = 0;
+            self.newest.clear();
+            let counters = self.conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM objects),
+                        COALESCE((SELECT SUM(size) FROM objects), 0),
+                        COALESCE((SELECT v FROM meta WHERE k = 'next_used'), 0),
+                        COALESCE((SELECT v FROM meta WHERE k = 'next_seq'), 0)
+                ",
+                [],
+                |row| {
+                    Ok((
+                        u64::try_from(row.get::<_, i64>(0).unwrap_or(0)).unwrap_or(0),
+                        u64::try_from(row.get::<_, i64>(1).unwrap_or(0)).unwrap_or(0),
+                        u64::try_from(row.get::<_, i64>(2).unwrap_or(0)).unwrap_or(0),
+                        u64::try_from(row.get::<_, i64>(3).unwrap_or(0)).unwrap_or(0),
+                    ))
+                },
+            );
+            if let Ok((objects, bytes, next_used, next_seq)) = counters {
+                self.objects = objects;
+                self.bytes = bytes;
+                self.next_used = next_used;
+                self.next_seq = next_seq;
+            }
+        }
+        committed
+    }
+
+    /// The transaction of [`Disk::commit`]: every row version, then the
+    /// counters and the mark. One transaction: all of it lands, or none.
+    fn commit_batch(&mut self, mark: u64) -> io::Result<()> {
+        let tx = self.conn.transaction().map_err(index_error)?;
+        // Sizes and counters of stored bytes, far below i64::MAX.
+        #[allow(clippy::cast_possible_wrap)]
+        for version in &self.pending {
+            let kind = kind_of(version.key);
+            let id = version.key.id();
+            match version.op {
+                Op::Use => {
+                    tx.execute(
+                        "UPDATE objects SET used_at = ?3, seq = ?4
+                         WHERE kind = ?1 AND id = ?2",
+                        rusqlite::params![kind, id, version.used_at as i64, version.seq as i64],
+                    )
+                    .map_err(index_error)?;
+                }
+                Op::Put => {
+                    tx.execute(
+                        "INSERT INTO objects(kind, id, size, used_at, seq)
+                         VALUES(?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(kind, id) DO UPDATE
+                         SET size = ?3, used_at = ?4, seq = ?5",
+                        rusqlite::params![
+                            kind,
+                            id,
+                            version.size as i64,
+                            version.used_at as i64,
+                            version.seq as i64
+                        ],
+                    )
+                    .map_err(index_error)?;
+                }
+                Op::Remove => {
+                    tx.execute(
+                        "DELETE FROM objects WHERE kind = ?1 AND id = ?2",
+                        rusqlite::params![kind, id],
+                    )
+                    .map_err(index_error)?;
+                }
+            }
+        }
+        // The counters count stored bytes, far below i64::MAX.
+        #[allow(clippy::cast_possible_wrap)]
+        for (name, value) in [
+            ("objects", self.objects as i64),
+            ("bytes", self.bytes as i64),
+            ("next_used", self.next_used as i64),
+            ("next_seq", self.next_seq as i64),
+            ("mark", mark as i64),
+        ] {
+            tx.execute(
+                "INSERT INTO meta(k, v) VALUES(?1, ?2)
+                 ON CONFLICT(k) DO UPDATE SET v = ?2",
+                rusqlite::params![name, value],
+            )
+            .map_err(index_error)?;
+        }
+        tx.commit().map_err(index_error)
+    }
+
+    /// Makes the db durable, so a crash keeps the committed batches.
+    fn checkpoint(&mut self) -> io::Result<()> {
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(index_error)
+    }
+
+    /// Writes the rows of `lru` into the fresh db, in its order, with the
+    /// meta counters. The rows are settled: `mark` covers them all, for the
+    /// build saw every file, or the old file named them.
+    fn import(&mut self, lru: &Lru<()>) -> io::Result<()> {
+        // The sizes and positions of stored bytes, far below i64::MAX.
+        #[allow(clippy::cast_possible_wrap)]
+        let rows: Vec<(Key, i64, i64)> = (0u64..)
+            .zip(&lru.entries)
+            .map(|(used_at, (&key, &((), size)))| (key, size as i64, used_at as i64))
+            .collect();
+        let tx = self.conn.transaction().map_err(index_error)?;
+        for (key, size, used_at) in &rows {
+            tx.execute(
+                "INSERT INTO objects(kind, id, size, used_at, seq)
+                 VALUES(?1, ?2, ?3, ?4, 0)",
+                rusqlite::params![kind_of(*key), key.id(), *size, *used_at],
+            )
+            .map_err(index_error)?;
+        }
+        #[allow(clippy::cast_possible_wrap)]
+        for (name, value) in [
+            ("objects", lru.entries.len() as i64),
+            ("bytes", lru.bytes as i64),
+            ("next_used", lru.entries.len() as i64),
+            ("next_seq", 1),
+            ("mark", 0),
+            ("clean", 0),
+            ("walk_pending", 0),
+        ] {
+            tx.execute(
+                "INSERT INTO meta(k, v) VALUES(?1, ?2) ON CONFLICT(k) DO UPDATE SET v = ?2",
+                rusqlite::params![name, value],
+            )
+            .map_err(index_error)?;
+        }
+        tx.commit().map_err(index_error)?;
+        self.objects = lru.entries.len() as u64;
+        self.bytes = lru.bytes as u64;
+        self.next_used = lru.entries.len() as u64;
+        self.next_seq = 1;
+        Ok(())
+    }
+
+    /// Drops the least recently used objects until the total is at most
+    /// `limit`. Returns their keys. The batch commits first, so the order
+    /// of the db is the order of everything, and only the dropped prefix is
+    /// read.
+    fn trim(&mut self, limit: usize) -> io::Result<Vec<Key>> {
+        self.commit()?;
+        if self.bytes <= limit as u64 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT kind, id, size FROM objects ORDER BY used_at")
+            .map_err(index_error)?;
+        let mut rows = stmt.query([]).map_err(index_error)?;
+        let mut total = self.bytes;
+        let mut dropped = Vec::new();
+        while total > limit as u64 {
+            let Some(row) = rows.next().map_err(index_error)? else {
+                break;
+            };
+            let kind: i64 = row.get(0).map_err(index_error)?;
+            let id: Vec<u8> = row.get(1).map_err(index_error)?;
+            let size: i64 = row.get(2).map_err(index_error)?;
+            total -= u64::try_from(size).unwrap_or(0);
+            dropped.push(key_of(kind, &id));
+        }
+        drop(rows);
+        drop(stmt);
+        #[cfg(test)]
+        {
+            self.iterated = dropped.len();
+        }
+        let mut keys = Vec::with_capacity(dropped.len());
+        for key in dropped.into_iter().flatten() {
+            self.remove(key);
+            keys.push(key);
+        }
+        Ok(keys)
+    }
+
+    /// The stored objects, least recently used first.
+    #[cfg(test)]
+    fn order(&mut self) -> io::Result<Vec<Key>> {
+        self.commit()?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT kind, id FROM objects ORDER BY used_at")
+            .map_err(index_error)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(index_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(index_error)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(kind, id)| key_of(kind, &id))
+            .collect())
+    }
+}
+
+/// The meta counters, as a start found them.
+struct Meta {
+    objects: u64,
+    bytes: u64,
+    next_used: u64,
+    next_seq: u64,
+    /// The last stop committed everything and synced the directories of
+    /// dropped files: the start may trust the rows.
+    clean: bool,
+    /// A walk of the object directories is still owed: an earlier one did
+    /// not finish, or the last stop was not clean.
+    walk_pending: bool,
+}
+
+/// What the walk of a start shares with the store: the files that it found
+/// without a row, and how it is doing.
+struct WalkState {
+    queue: Mutex<std::collections::VecDeque<(Key, usize)>>,
+    room: Condvar,
+    stop: AtomicBool,
+    /// Files queued so far, and their bytes.
+    found: AtomicU64,
+    bytes: AtomicU64,
+    /// The walk went over every object directory.
+    done: AtomicBool,
+}
+
+impl WalkState {
+    /// Hands one file to the store, waiting while its queue is full, so the
+    /// walk never runs ahead of it.
+    fn send(&self, key: Key, size: usize) -> bool {
+        let mut queue = lock(&self.queue);
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            if queue.len() < WALK_QUEUE {
+                queue.push_back((key, size));
+                return true;
+            }
+            let (queued, state) = self
+                .room
+                .wait_timeout(queue, std::time::Duration::from_millis(100))
+                .unwrap_or_else(PoisonError::into_inner);
+            queue = queued;
+            if state.timed_out() && self.stop.load(Ordering::Relaxed) {
+                return false;
+            }
+        }
+    }
+}
+
+/// Walks the object directories, and hands every file that has no row to the
+/// store, which adopts it, as the least recently used, as it flushes. Runs
+/// once after a start that may have stranded files, and stops when it is
+/// told to, which a stop of the store does. The store clears the flag that
+/// asked for the walk, once the walk is done and nothing has been stranded
+/// since.
+fn walk_objects(db_path: &Path, objects: &Path, walk: &WalkState) {
+    let db = match rusqlite::Connection::open(db_path) {
+        Ok(db) => db,
+        Err(error) => {
+            tracing::warn!(%error, "the walk cannot open the index; the files stay uncounted");
+            walk.done.store(true, Ordering::Relaxed);
+            return;
+        }
+    };
+    let _ = db.busy_timeout(std::time::Duration::from_secs(5));
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    'walk: for kind in ["tree", "blob"] {
+        let kind_dir = objects.join(kind);
+        let Ok(fans) = fs::read_dir(&kind_dir) else {
+            continue;
+        };
+        for fan in fans.flatten() {
+            if !fan.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(fan.path()) else {
+                continue;
+            };
+            for file in entries.flatten() {
+                if walk.stop.load(Ordering::Relaxed) {
+                    break 'walk;
+                }
+                let hex = format!(
+                    "{}{}",
+                    fan.file_name().to_string_lossy(),
+                    file.file_name().to_string_lossy()
+                );
+                let key = match kind {
+                    "tree" => hex.parse().map(Key::Tree),
+                    _ => hex.parse().map(Key::Blob),
+                };
+                let Ok(key) = key else {
+                    continue;
+                };
+                let known = db
+                    .query_row(
+                        "SELECT 1 FROM objects WHERE kind = ?1 AND id = ?2",
+                        rusqlite::params![kind_of(key), key.id()],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if known {
+                    continue;
+                }
+                let Ok(meta) = file.metadata() else {
+                    continue;
+                };
+                let Ok(size) = usize::try_from(meta.len()) else {
+                    continue;
+                };
+                // Larger than any object: never a good copy.
+                if size > MAX_ENCODED_BYTES {
+                    let _ = ignore_missing(fs::remove_file(file.path()));
+                    continue;
+                }
+                if !walk.send(key, size) {
+                    break 'walk;
+                }
+                files += 1;
+                bytes += size as u64;
+                walk.found.store(files, Ordering::Relaxed);
+                walk.bytes.store(bytes, Ordering::Relaxed);
+            }
+        }
+    }
+    walk.done.store(true, Ordering::Relaxed);
+    tracing::info!(files, bytes, "the walk of the object directories is done");
+}
+
 /// A plain `fsync`: data reaches the drive, but on macOS not past its cache
-/// (`File::sync_all` is a full cache flush there). Used before a full flush,
-/// which takes it the rest of the way.
+/// (`File::sync_all` is a full cache flush there). Used for the directories
+/// that dropped files left, before the last commit of a stop.
 fn fsync(dir: &Path) -> io::Result<()> {
     rustix::fs::fsync(fs::File::open(dir)?).map_err(Into::into)
-}
-
-/// Writes an index file of `state` with the records `rows`, in place of the
-/// one in `dir`. With `sync`, the file and its name are past the drive's
-/// cache when it returns.
-fn write_index(dir: &Path, tmp: &Path, state: u8, rows: &[u8], sync: bool) -> io::Result<Log> {
-    let mut file = tempfile::NamedTempFile::new_in(tmp)?;
-    file.write_all(MAGIC)?;
-    file.write_all(&[state])?;
-    file.write_all(blake3::hash(rows).as_bytes())?;
-    file.write_all(rows)?;
-    if sync {
-        file.as_file().sync_all()?;
-    }
-    let file = file.persist(dir.join(INDEX)).map_err(|e| e.error)?;
-    if sync {
-        fs::File::open(dir)?.sync_all()?;
-    }
-    let records = rows.len() / RECORD;
-    Ok(Log { file, records })
-}
-
-/// Opens the clean index file in `dir`, of `records` records, to append to
-/// it. First marks it [`DIRTY`], past the drive's cache, so a crash from here
-/// on is seen.
-fn reopen_index(dir: &Path, records: usize) -> io::Result<Log> {
-    let mut file = fs::OpenOptions::new().write(true).open(dir.join(INDEX))?;
-    file.write_all_at(&[DIRTY], MAGIC.len() as u64)?;
-    file.sync_all()?;
-    file.seek(SeekFrom::End(0))?;
-    Ok(Log { file, records })
 }
 
 /// Every object file under `objects`, with when it was written and its size.
@@ -384,67 +1002,13 @@ fn reconcile(index: Lru<()>, mut files: HashMap<Key, (SystemTime, usize)>) -> Lr
     lru
 }
 
-/// What the disk store's index lock guards. Every change to `lru` goes
-/// through these methods, which note it in `pending`, so reading the index
-/// file's records in order gives `lru`.
-struct Disk {
-    /// The stored objects, least recently used first.
-    lru: Lru<()>,
-    /// Records that the index file does not have yet, oldest first.
-    pending: Vec<u8>,
-    /// The file of a dropped object could not leave its name, so a file may
-    /// be in place that `lru` does not name. The index file that a stop
-    /// writes is then not clean.
-    stray: bool,
-    /// The directories that a dropped file left since the start. A stop
-    /// syncs them before it writes a clean index file, so no dropped file
-    /// comes back after a crash.
-    left: HashSet<PathBuf>,
-}
-
-impl Disk {
-    /// The size of `key`, which is marked as just used.
-    fn touch(&mut self, key: Key) -> Option<usize> {
-        let size = self.lru.get(key).map(|&((), size)| size)?;
-        push_record(&mut self.pending, key, Some(size));
-        Some(size)
-    }
-
-    /// Adds or replaces `key`, stored with `size` bytes, as just used.
-    fn insert(&mut self, key: Key, size: usize) {
-        self.lru.insert(key, (), size);
-        push_record(&mut self.pending, key, Some(size));
-    }
-
-    /// Removes `key`, if it is there.
-    fn remove(&mut self, key: Key) {
-        if self.lru.remove(key) {
-            push_record(&mut self.pending, key, None);
-        }
-    }
-
-    /// Drops the least recently used objects until the total is at most
-    /// `limit`. Returns their keys.
-    fn trim(&mut self, limit: usize) -> Vec<Key> {
-        let keys = self.lru.trim(limit);
-        for &key in &keys {
-            push_record(&mut self.pending, key, None);
-        }
-        keys
-    }
-}
-
-/// The index file, written up to its end, and how many records it holds.
-struct Log {
-    file: fs::File,
-    records: usize,
-}
-
 /// Objects on disk, one file per object, named by its ID, up to a byte limit:
 ///
 /// ```text
 /// <data>/lock                   locked by the one process that uses <data>
-/// <data>/index                  the stored objects, in order of use
+/// <data>/index.db               the index: which objects, their sizes, and
+///                               the order of their use
+/// <data>/index.db-wal           what the last batches added (SQLite's)
 /// <data>/objects/tree/ab/cd..   a tree's TreeV1 bytes
 /// <data>/objects/blob/ab/cd..   one zstd frame of a blob's content
 /// <data>/tmp/                   staging for atomic writes, emptied at start
@@ -456,54 +1020,66 @@ struct Log {
 /// disk blocks that hold them. Every rename and unlink of an object file
 /// happens under the index lock, so the index and the files agree.
 ///
-/// The index is in memory, and in `<data>/index` so that a start need not
-/// open every object directory. The file is a header (see [`MAGIC`]) and
-/// records of [`RECORD`] bytes: an op, an ID and a size (`u32`,
-/// little-endian). `T` or `B` says that a tree or a blob of that size is
-/// stored and was just used, `t` or `b` that it was dropped. Read in order,
-/// the records give the stored objects, least recently used first. Records
-/// wait in memory, and are appended in batches of [`FLUSH_BYTES`]. When the
-/// file would hold far more records than objects (see [`SLACK_RECORDS`]),
-/// it is written again with one record per object.
+/// The index is a SQLite database (through the workspace `rusqlite`, as the
+/// server's `lands` table), so that it is read and changed in place: memory
+/// does not grow with the number of objects, and no change copies all of
+/// them. A table `objects(kind, id, size, used_at, seq)` holds one row per
+/// object; `used_at` is a counter of uses, and its order is the order of
+/// use, least recently used first. A table `meta` holds the counters: the
+/// totals, the next values of the counters, `mark`, and the flags `clean`
+/// and `walk_pending`.
 ///
-/// A stop syncs the directories that dropped files left, then writes the
-/// file again, one record per object, marked [`CLEAN`], with the hash of its
-/// records in the header, past the drive's cache. A start trusts a clean
-/// file whose records match that hash, for which objects are stored
-/// and in what order, and opens no object directory. At open it marks the
-/// file [`DIRTY`], past the drive's cache. After a crash the file is dirty:
-/// it may lack its last records, so it may name a file that is gone, or
-/// miss a new one. The start then scans every object file, as with no
-/// index, and keeps the order of the file for the objects that it names. So
-/// a crash loses only what was used last, never an object. No start trusts
-/// the file for an object's bytes: [`Store::get`] checks them on every read.
+/// Changes wait in memory as row versions, and one transaction commits
+/// them, with the counters and `mark` set past them: a put renames its file
+/// before the flush that commits its row, so every row at or below `mark`
+/// has its file. A batch is due at 1,024 versions or 64 MiB of new bytes
+/// ([`FLUSH_RECORDS`], [`FLUSH_NEW_BYTES`]); a put commits at once, at the
+/// eviction that follows it. With SQLite's WAL and `synchronous = NORMAL`,
+/// a committed batch survives a crash of the process, and a crash of the
+/// machine loses at most the last batches, as the old index file did. A
+/// commit that failed drops its batch: the files of its puts have no rows
+/// then, and a walk finds them.
 ///
-/// A daemon build from before the index does not know the file. Run between
-/// a clean stop and the next start, it leaves a clean file that is stale:
-/// remove `<data>/index` after such a run.
-// SHORTCUT: the whole index is also in memory, a start reads all of it, and
-// writing the file again copies every record under the index lock, which
-// `Store::size` needs under the tier's fetch table: every fetch start waits.
-// After a crash, a start scans every object file. Memory and these pauses
-// grow with the number of objects. Upgrade (issue #115): an index on disk
-// that is read and changed in place.
+/// A stop commits what is left, syncs the directories that dropped files
+/// left, sets `clean`, and truncates the write-ahead log. A start trusts
+/// the rows and opens no object directory; it marks `clean` no at once, for
+/// from then on a crash may strand files. A crash strands a file when its
+/// row did not reach a committed batch: the file is there, the index does
+/// not name it, and the limit does not count it. The walk of a start that
+/// is owed one (see [`walk_objects`]) finds them: it hands every file that
+/// has no row to the store, which adopts it as the least recently used, so
+/// the limit counts it again. The walk runs on its own thread, at the pace
+/// that the store drains, and a stop of the store stops it. A start that
+/// scanned the object directories, or imported the old index file, owes no
+/// walk: it saw every file.
+///
+/// A store of the format before this one has `<data>/index`: a start
+/// imports its records, in their order of use, and removes the file. A
+/// dirty or damaged one is not trusted: the start scans instead. A db that
+/// cannot be read is moved aside, and the start scans. No start trusts the
+/// index for an object's bytes: [`Store::get`] checks them on every read.
 pub struct DiskStore {
     dir: PathBuf,
     objects: PathBuf,
     tmp: PathBuf,
     limit: usize,
+    /// The index, its batch, and the counters that mirror it.
     disk: Mutex<Disk>,
-    /// Set with `disk` held once it has [`FLUSH_BYTES`] of records, so a read
-    /// takes that lock only when there is a batch to write.
-    flush_due: AtomicBool,
-    /// Taken with `disk` held, by the one call that writes the index file,
-    /// and let go of after the write. So records reach the file in order,
-    /// and no write to it holds `disk`. `None` when the last write failed:
-    /// the next one writes the whole file again.
-    log: Mutex<Option<Log>>,
+    /// The walk that this start spawned, when it is owed one: its found
+    /// files wait for the store to adopt them.
+    walk: Mutex<Option<Arc<WalkState>>>,
     /// Names files that the limit drops, in `tmp/`.
     dropped: AtomicU64,
-    _lock: fs::File,
+    /// Something may be on disk without a row since the last walk saw it:
+    /// a rename that failed, or a batch that did not commit. A walk that
+    /// ran to the end clears the flag that asked for it only while this is
+    /// false, so a debt is never dropped.
+    stray: AtomicBool,
+    /// Held for as long as the store lives, so only this process uses the
+    /// data directory. Taken by a simulated crash, so a restart can lock.
+    /// Never read: the lock lasts while the file is open.
+    #[allow(dead_code)]
+    dir_lock: Option<fs::File>,
 }
 
 impl DiskStore {
@@ -532,84 +1108,178 @@ impl DiskStore {
         ignore_missing(fs::remove_dir_all(&tmp))?;
         fs::create_dir_all(&tmp)?;
         fs::create_dir_all(&objects)?;
-        let (index, found) = read_index(dir)?;
-        let lru = match found {
-            Found::Clean(_) => index,
-            Found::Scan(_) => reconcile(index, scan(&objects)?),
-        };
+        let db_path = dir.join(INDEX);
+        let (mut disk, meta) = Self::open_disk(&db_path)?;
+        let mut walk_owed = false;
+        if let Some(meta) = meta {
+            // The rows are trusted: every one of them has its file, in
+            // the order that `used_at` gives.
+            disk.objects = meta.objects;
+            disk.bytes = meta.bytes;
+            disk.next_used = meta.next_used;
+            disk.next_seq = meta.next_seq;
+            match disk.set_flag("clean", false) {
+                // The last stop was clean, and its walk finished: no walk.
+                Ok(()) => walk_owed = !meta.clean || meta.walk_pending,
+                // A crash would look like a clean stop, so the walk owes
+                // what the rows may miss.
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "cannot mark the index unclean; the start walks the object directories"
+                    );
+                    walk_owed = true;
+                }
+            }
+            tracing::info!(
+                objects = disk.objects,
+                bytes = disk.bytes,
+                "opened the disk store from its index"
+            );
+        } else {
+            // Build the rows: from the old index file, or the files.
+            let (lru, found) = read_old_index(dir)?;
+            let (lru, how) = match found {
+                Found::Clean(_) => (
+                    lru,
+                    "opened the disk store from the index file of the previous format",
+                ),
+                Found::Scan(reason) => {
+                    tracing::info!(reason, "scanning every object file");
+                    (
+                        reconcile(lru, scan(&objects)?),
+                        "opened the disk store by a scan of every file",
+                    )
+                }
+            };
+            disk.import(&lru)?;
+            // The import saw every file, or the old file named them, so
+            // nothing is stranded.
+            ignore_missing(fs::remove_file(dir.join(OLD_INDEX)))?;
+            tracing::info!(objects = disk.objects, bytes = disk.bytes, how);
+        }
         let store = Self {
             dir: dir.clone(),
             objects,
             tmp,
             limit,
-            disk: Mutex::new(Disk {
-                lru,
-                pending: Vec::new(),
-                stray: false,
-                left: HashSet::new(),
-            }),
-            flush_due: AtomicBool::new(false),
-            log: Mutex::new(None),
+            disk: Mutex::new(disk),
+            walk: Mutex::new(None),
             dropped: AtomicU64::default(),
-            _lock: lock_file,
+            stray: AtomicBool::new(false),
+            dir_lock: Some(lock_file),
         };
-        // Drops first: they free room for the index file.
+        // Drops first: they free room.
         let mut disk = lock(&store.disk);
         let mut dropped = Vec::new();
         let evicted = store.evict(&mut disk, &mut dropped);
-        let written = match found {
-            // A clean file holds one record per object: a stop wrote it so.
-            Found::Clean(records) => reopen_index(dir, records),
-            Found::Scan(_) => {
-                disk.pending.clear();
-                write_index(dir, &store.tmp, DIRTY, &rows(&disk.lru), true)
-            }
-        };
-        match written {
-            Ok(log) => *lock(&store.log) = Some(log),
-            // A clean file must not stay: a crash would leave it trusted.
-            Err(e) => {
-                tracing::warn!(error = %e, "cannot write the index file; removing it");
-                ignore_missing(fs::remove_file(dir.join(INDEX)))?;
-                fs::File::open(dir)?.sync_all()?;
-            }
-        }
-        let (objects, bytes) = (disk.lru.entries.len(), disk.lru.bytes);
         drop(disk);
         remove_all(dropped)?;
         evicted?;
-        match found {
-            Found::Clean(_) => {
-                tracing::info!(
-                    objects,
-                    bytes,
-                    "opened the disk store from its clean index file"
-                );
+        if walk_owed {
+            store.spawn_walk();
+        }
+        Ok(store)
+    }
+
+    /// Opens the index db and reads its meta, before the run is marked
+    /// unclean, so a start sees the flags as the last stop left them. A db
+    /// that cannot be read or written is moved aside, and a new one is
+    /// built from the old file or the object files: the object files are
+    /// the truth, so a damaged index costs at most a scan.
+    fn open_disk(db_path: &Path) -> io::Result<(Disk, Option<Meta>)> {
+        match Self::try_open_disk(db_path) {
+            Ok(opened) => Ok(opened),
+            Err(error) => {
+                tracing::warn!(%error, "cannot use the index; starting a new one");
+                let name = db_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                let parent = db_path.parent().unwrap_or(Path::new("."));
+                for suffix in ["", "-wal", "-shm"] {
+                    let from = parent.join(format!("{name}{suffix}"));
+                    let to = parent.join(format!("{name}.damaged{suffix}"));
+                    ignore_missing(fs::rename(&from, &to))?;
+                }
+                Self::try_open_disk(db_path)
             }
-            Found::Scan(why) => {
-                tracing::info!(
-                    objects,
-                    bytes,
-                    why,
-                    "opened the disk store by a scan of every file"
+        }
+    }
+
+    /// Opens the db and reads its meta, before the run is marked unclean,
+    /// so a start sees the flags as the last stop left them.
+    fn try_open_disk(db_path: &Path) -> io::Result<(Disk, Option<Meta>)> {
+        let disk = Disk::open(db_path)?;
+        let meta = disk.read_meta()?;
+        Ok((disk, meta))
+    }
+
+    /// Spawns the walk of the object directories, which hands the store
+    /// every file that has no row.
+    fn spawn_walk(&self) {
+        let state = Arc::new(WalkState {
+            queue: Mutex::new(std::collections::VecDeque::new()),
+            room: Condvar::new(),
+            stop: AtomicBool::new(false),
+            found: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            done: AtomicBool::new(false),
+        });
+        let db_path = self.dir.join(INDEX);
+        let objects = self.objects.clone();
+        let thread_state = Arc::clone(&state);
+        let spawned = std::thread::Builder::new()
+            .name("index walk".into())
+            .spawn(move || walk_objects(&db_path, &objects, &thread_state));
+        match spawned {
+            Ok(_) => *lock(&self.walk) = Some(state),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "cannot spawn the walk; files that a crash stranded stay uncounted"
                 );
             }
         }
-        Ok(store)
+    }
+
+    /// Adopts the files that the walk found into `disk`: inserts them as
+    /// the least recently used, so the limit counts them again. A file that
+    /// the limit cannot keep is removed. The walk waits while its queue is
+    /// full, so this never holds more than [`WALK_QUEUE`] files.
+    fn adopt_walk(walk: Option<&Arc<WalkState>>, limit: usize, objects: &Path, disk: &mut Disk) {
+        let Some(walk) = walk else {
+            return;
+        };
+        let mut took = 0;
+        loop {
+            let next = lock(&walk.queue).pop_front();
+            let Some((key, size)) = next else {
+                break;
+            };
+            took += 1;
+            if size > limit {
+                let _ = ignore_missing(fs::remove_file(object_path(objects, key)));
+                continue;
+            }
+            disk.insert_oldest(key, size);
+        }
+        if took > 0 {
+            walk.room.notify_all();
+            // The batch that counts them is due.
+            disk.due = true;
+        }
     }
 
     /// Whether the store holds no object.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        lock(&self.disk).lru.entries.is_empty()
+        lock(&self.disk).objects == 0
     }
 
     fn path(&self, key: Key) -> PathBuf {
-        let (kind, hex) = match key {
-            Key::Tree(id) => ("tree", id.to_string()),
-            Key::Blob(id) => ("blob", id.to_string()),
-        };
-        self.objects.join(kind).join(&hex[..2]).join(&hex[2..])
+        object_path(&self.objects, key)
     }
 
     /// Records a stored file in the index as just used. The caller holds the
@@ -633,16 +1303,13 @@ impl DiskStore {
     /// the first error is returned at the end.
     fn evict(&self, disk: &mut Disk, dropped: &mut Vec<PathBuf>) -> io::Result<()> {
         let mut first = None;
-        for key in disk.trim(self.limit) {
+        for key in disk.trim(self.limit)? {
             match self.take_out(disk, key) {
                 Ok(file) => dropped.extend(file),
                 Err(e) => {
                     first.get_or_insert(e);
                 }
             }
-        }
-        if disk.pending.len() >= FLUSH_BYTES {
-            self.flush_due.store(true, Ordering::Relaxed);
         }
         first.map_or(Ok(()), Err)
     }
@@ -666,61 +1333,93 @@ impl DiskStore {
                 Ok(Some(to))
             }
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            // The file stays in place, and its row leaves at the next
+            // commit: a walk finds it, this one or the next. The flag
+            // survives the stop, so the next start walks if this one is
+            // over.
             Err(e) => {
-                disk.stray = true;
+                self.stray.store(true, Ordering::Relaxed);
+                let _ = disk.set_flag("walk_pending", true);
                 Err(e)
             }
         }
     }
 
-    /// Appends the waiting records to the index file once there are
-    /// [`FLUSH_BYTES`] of them, or writes the whole file again once it would
-    /// grow past [`SLACK_RECORDS`]. Only what a crash keeps depends on this,
-    /// so an error is logged, not returned.
+    /// Adopts what the walk found, and commits the batch of row versions
+    /// once it is due. Only what a crash keeps depends on this, so an error
+    /// is logged, not returned.
     fn flush(&self) {
-        if !self.flush_due.load(Ordering::Relaxed) {
-            return;
-        }
         let mut disk = lock(&self.disk);
-        if disk.pending.len() < FLUSH_BYTES {
+        let walk = lock(&self.walk).clone();
+        Self::adopt_walk(walk.as_ref(), self.limit, &self.objects, &mut disk);
+        if walk
+            .as_ref()
+            .is_some_and(|w| w.done.load(Ordering::Relaxed))
+        {
+            *lock(&self.walk) = None;
+            // The walk went over every directory. It owes nothing more
+            // unless the run stranded a file or lost a batch since.
+            if !self.stray.load(Ordering::Relaxed) {
+                let _ = disk.set_flag("walk_pending", false);
+                self.stray.store(false, Ordering::Relaxed);
+            }
+        }
+        if !disk.due {
             return;
         }
-        let mut log = match self.log.try_lock() {
-            Ok(log) => log,
-            Err(TryLockError::Poisoned(e)) => e.into_inner(),
-            // Another call writes. It, or a later one, takes these too.
-            Err(TryLockError::WouldBlock) => return,
-        };
-        self.flush_due.store(false, Ordering::Relaxed);
-        let batch = std::mem::replace(&mut disk.pending, Vec::with_capacity(FLUSH_BYTES));
-        let most = 2 * disk.lru.entries.len() + SLACK_RECORDS;
-        let written = match log.as_mut() {
-            Some(open) if open.records + batch.len() / RECORD <= most => {
-                drop(disk);
-                let written = open.file.write_all(&batch);
-                open.records += batch.len() / RECORD;
-                written
-            }
-            _ => {
-                let rows = rows(&disk.lru);
-                drop(disk);
-                write_index(&self.dir, &self.tmp, DIRTY, &rows, false).map(|new| *log = Some(new))
-            }
-        };
-        if let Err(e) = written {
-            // The file may hold part of a record now.
-            *log = None;
-            tracing::warn!(error = %e, "cannot write the index file; a crash now loses what was used last");
+        disk.due = false;
+        if disk.pending.len() < FLUSH_RECORDS && disk.pending_bytes < FLUSH_NEW_BYTES {
+            return;
         }
+        if let Err(error) = disk.commit() {
+            // The batch is lost whole: the db has none of it. The files of
+            // its puts have no rows now; the walk of the next start finds
+            // them.
+            self.stray.store(true, Ordering::Relaxed);
+            let _ = disk.set_flag("walk_pending", true);
+            tracing::warn!(
+                %error,
+                "cannot commit the index; a crash now loses what was used last"
+            );
+        }
+    }
+
+    /// Simulates a crash of the process: no stop-time commit, no clean
+    /// flag, and the lock released, as a killed process leaves them. What
+    /// the index does not have yet stays what it is.
+    #[cfg(test)]
+    fn crash(mut self) {
+        self.dir_lock.take();
+        std::mem::forget(self);
+    }
+
+    /// How the walk of this start is doing: the files it found, their
+    /// bytes, and whether it went over every directory.
+    #[cfg(test)]
+    fn walk_state(&self) -> Option<(u64, u64, bool)> {
+        let walk = lock(&self.walk).clone()?;
+        Some((
+            walk.found.load(Ordering::Relaxed),
+            walk.bytes.load(Ordering::Relaxed),
+            walk.done.load(Ordering::Relaxed),
+        ))
     }
 }
 
 impl Drop for DiskStore {
-    /// Syncs the directories that dropped files left, then writes the index
-    /// file again, one record per object, past the drive's cache. If it names
-    /// every object file, it is clean, and the next start scans none.
+    /// Stops the walk, adopts what it found, commits what is left, and
+    /// makes it durable, with the directories of dropped files synced
+    /// first. The stop is clean when the commit and the syncs worked: the
+    /// next start then trusts the rows, and walks only if the walk of this
+    /// one did not finish.
     fn drop(&mut self) {
+        let walk = lock(&self.walk).clone();
+        if let Some(walk) = walk.as_ref() {
+            walk.stop.store(true, Ordering::Relaxed);
+            walk.room.notify_all();
+        }
         let disk = self.disk.get_mut().unwrap_or_else(PoisonError::into_inner);
+        Self::adopt_walk(walk.as_ref(), self.limit, &self.objects, disk);
         let synced = disk
             .left
             .iter()
@@ -729,29 +1428,33 @@ impl Drop for DiskStore {
         if let Err(e) = &synced {
             tracing::warn!(error = %e, "cannot sync the directories of dropped files");
         }
-        let state = if disk.stray || synced.is_err() {
-            DIRTY
-        } else {
-            CLEAN
-        };
-        let (objects, rows) = (disk.lru.entries.len(), rows(&disk.lru));
-        match write_index(&self.dir, &self.tmp, state, &rows, true) {
-            Ok(_) => tracing::info!(objects, clean = state == CLEAN, "wrote the index file"),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "cannot write the index file; the next start scans every object file"
-            ),
+        let committed = disk.commit();
+        if let Err(error) = &committed {
+            tracing::warn!(
+                error = %error,
+                "cannot commit the index; the next start walks the object directories"
+            );
         }
+        // Not clean when the run stranded something whose flag write may
+        // have failed: the next start then walks.
+        let clean = synced.is_ok() && committed.is_ok() && !self.stray.load(Ordering::Relaxed);
+        let _ = disk.set_flag("clean", clean);
+        if committed.is_ok() {
+            let _ = disk.checkpoint();
+        }
+        tracing::info!(
+            objects = disk.objects,
+            bytes = disk.bytes,
+            clean,
+            "stopped the disk store"
+        );
     }
 }
 
 impl Store for DiskStore {
     fn size(&self, key: Key) -> io::Result<Option<usize>> {
-        let mut disk = lock(&self.disk);
-        let size = disk.touch(key);
-        if disk.pending.len() >= FLUSH_BYTES {
-            self.flush_due.store(true, Ordering::Relaxed);
-        }
+        let size = lock(&self.disk).touch(key)?;
+        self.flush();
         Ok(size)
     }
 
@@ -809,6 +1512,12 @@ impl Store for DiskStore {
         let added = self.add(&mut disk, key, data.len(), &mut dropped);
         drop(disk);
         remove_all(dropped)?;
+        if added.is_err() {
+            // The file is in place, but the index may not name it: a walk
+            // finds it, this one or the next.
+            self.stray.store(true, Ordering::Relaxed);
+            let _ = lock(&self.disk).set_flag("walk_pending", true);
+        }
         added
     }
 }
@@ -850,6 +1559,8 @@ fn lock_dir(dir: &Path) -> io::Result<fs::File> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use scion_core::{BlobId, Tree};
     use scion_proto::object;
 
@@ -875,7 +1586,6 @@ mod tests {
         store.put(c.0, &c.1).unwrap();
         assert_eq!(store.size(a.0).unwrap(), Some(n));
         assert_eq!(store.size(b.0).unwrap(), None);
-        assert_eq!(store.size(c.0).unwrap(), Some(n));
         assert_eq!(lock(&store.lru).bytes, 2 * n);
 
         // A second put of the same object counts it once.
@@ -1034,7 +1744,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_cannot_leave_does_not_keep_the_others_in_place() {
+    fn a_file_that_cannot_leave_is_adopted_by_the_next_walk() {
         use std::os::unix::fs::PermissionsExt as _;
 
         // Root may rename out of a read-only directory.
@@ -1064,35 +1774,45 @@ mod tests {
         assert!(!store.path(b.0).exists());
         remove_all(dropped).unwrap();
 
-        // The file of `a` is still there, and the index does not name it: the
-        // stop does not claim that the index names every file.
+        // The file of `a` is still there, and the index does not name it.
+        // The stop is clean, but the store owes a walk for the file it
+        // could not take out.
         drop(store);
-        assert_eq!(index_state(&data), DIRTY);
         let store = DiskStore::open(&data, 2 * n).unwrap();
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        store.flush();
         assert_eq!(store.size(a.0).unwrap(), Some(n));
     }
 
-    /// The index file in `data`.
-    fn index_bytes(data: &Path) -> Vec<u8> {
-        fs::read(data.join(INDEX)).unwrap()
+    /// The state byte of the old index file in `data`.
+    fn old_state(data: &Path) -> u8 {
+        fs::read(data.join(OLD_INDEX)).unwrap()[MAGIC.len()]
     }
 
-    /// The state byte of the index file in `data`.
-    fn index_state(data: &Path) -> u8 {
-        index_bytes(data)[MAGIC.len()]
+    /// Writes the old index file of the previous format into `data`.
+    fn put_old_back(data: &Path, index: &[u8]) {
+        fs::write(data.join(OLD_INDEX), index).unwrap();
     }
 
-    /// Writes `index` as the index file in `data`. A copy of the file taken
-    /// while a store is open, put back after it stopped, is what a crash at
-    /// that moment leaves.
-    fn put_back(data: &Path, index: &[u8]) {
-        fs::write(data.join(INDEX), index).unwrap();
+    /// Removes the index db and its write-ahead log.
+    fn remove_db(data: &Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            ignore_missing(fs::remove_file(data.join(format!("{INDEX}{suffix}")))).unwrap();
+        }
     }
 
     /// The stored objects, least recently used first.
     fn order(store: &DiskStore) -> Vec<Key> {
-        let disk = lock(&store.disk);
-        disk.lru.entries.iter().map(|(&key, _)| key).collect()
+        lock(&store.disk).order().unwrap()
+    }
+
+    /// Waits until `f` holds, so a test asserts on state, not on timing.
+    fn until(f: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !f() {
+            assert!(Instant::now() < deadline, "the state never came");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Sets the write time of the file of each key, oldest first, so a scan
@@ -1110,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn a_start_after_a_clean_stop_reads_the_index_and_scans_no_file() {
+    fn a_start_after_a_clean_stop_trusts_the_index_and_a_crash_walks() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
         let (a, stray) = (blob(b"aaaa"), blob(b"not in the index"));
@@ -1119,27 +1839,42 @@ mod tests {
             store.put(a.0, &a.1).unwrap();
             store.path(stray.0)
         };
-        assert_eq!(index_state(&data), CLEAN);
-        // A good object file that the index does not name: only a scan finds
-        // it.
+        assert!(clean_flag(&data));
+        // A good object file that the index does not name: a start that
+        // trusts its rows does not find it, and owes no walk.
         fs::create_dir_all(stray_path.parent().unwrap()).unwrap();
         fs::write(&stray_path, &stray.1).unwrap();
         {
             let store = DiskStore::open(&data, 1 << 20).unwrap();
             assert_eq!(store.size(a.0).unwrap(), Some(a.1.len()));
             assert_eq!(store.size(stray.0).unwrap(), None);
-            // Dirty from the open on: from then on the file may lag.
-            assert_eq!(index_state(&data), DIRTY);
+            assert!(store.walk_state().is_none());
         }
 
-        // A start after a crash scans, and finds it.
-        let mut index = index_bytes(&data);
-        index[MAGIC.len()] = DIRTY;
-        put_back(&data, &index);
+        // A crash: the store never stopped cleanly, and a file it renamed
+        // never reached a committed batch. The next start walks, and
+        // adopts the stray, and nothing else.
+        {
+            let store = DiskStore::open(&data, 1 << 20).unwrap();
+            store.put(a.0, &a.1).unwrap();
+            store.crash();
+        }
+        fs::create_dir_all(stray_path.parent().unwrap()).unwrap();
+        fs::write(&stray_path, &stray.1).unwrap();
         let store = DiskStore::open(&data, 1 << 20).unwrap();
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        let (found, bytes, _) = store.walk_state().unwrap();
+        store.flush();
         let n = stray.1.len();
         assert_eq!(store.size(stray.0).unwrap(), Some(n));
         assert_eq!(store.get(stray.0, n).unwrap(), Some(stray.1.clone()));
+        assert_eq!(found, 1, "only the stray is adopted");
+        assert_eq!(bytes, n as u64);
+        drop(store);
+        // The next start owes no walk: the walk finished, and the stop was
+        // clean.
+        let store = DiskStore::open(&data, 1 << 20).unwrap();
+        assert!(store.walk_state().is_none());
     }
 
     #[test]
@@ -1172,7 +1907,7 @@ mod tests {
     }
 
     #[test]
-    fn a_start_after_a_crash_makes_the_index_agree_with_the_files() {
+    fn a_crash_keeps_what_was_committed_and_loses_only_its_last_uses() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
         let (a, b, c) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"cccc"));
@@ -1184,60 +1919,94 @@ mod tests {
             store.put(a.0, &a.1).unwrap();
             store.put(b.0, &b.1).unwrap();
         }
-        let mut crashed = {
+        {
+            // The crash loses what was not committed: `c` dropped `a` and
+            // its put was committed at once; the use of `b` was not.
             let store = DiskStore::open(&data, limit).unwrap();
-            let index = index_bytes(&data);
-            // `c` drops `a`, then `b` is used. These records never reach the
-            // file.
             store.put(c.0, &c.1).unwrap();
             assert!(!store.path(a.0).exists());
             assert_eq!(store.size(b.0).unwrap(), Some(n));
-            // By write time alone, `c` would come first.
-            set_written_in_order(&store, &[c.0, b.0]);
-            index
-        };
-        // The crash also tore the record it was writing.
-        crashed.extend_from_slice(b"B1234");
-        put_back(&data, &crashed);
-
-        // The index names `a`, which has no file, and not `c`, which has one.
-        let store = DiskStore::open(&data, 1 << 20).unwrap();
-        // `b` keeps its place from the index; `c`, which the index does not
-        // name, comes after it.
+            store.crash();
+        }
+        // The remove of `a` was in the batch that the crash lost, and
+        // without it the store is over its limit: the start drops `a`
+        // again, whose file the crash had already moved out of its name.
+        let store = DiskStore::open(&data, limit).unwrap();
         assert_eq!(order(&store), [b.0, c.0]);
-        assert_eq!(lock(&store.disk).lru.bytes, bytes_on_disk(&data));
+        assert_eq!(store.size(a.0).unwrap(), None);
+        assert_eq!(
+            usize::try_from(lock(&store.disk).bytes).unwrap(),
+            bytes_on_disk(&data)
+        );
         assert_eq!(store.get(c.0, n).unwrap(), Some(c.1.clone()));
     }
 
+    /// Writes an old-format index file with `state` and the records `rows`.
+    fn old_index(state: u8, rows: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.push(state);
+        out.extend_from_slice(blake3::hash(rows).as_bytes());
+        out.extend_from_slice(rows);
+        out
+    }
+
     #[test]
-    fn a_dirty_file_gives_the_order_of_its_records_before_a_bad_one() {
+    fn the_index_file_of_the_previous_format_is_imported_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
         let (a, b, c) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"cccc"));
-        let header = {
+        {
             let store = DiskStore::open(&data, 1 << 20).unwrap();
             for (key, bytes) in [&a, &b, &c] {
                 store.put(*key, bytes).unwrap();
             }
             set_written_in_order(&store, &[a.0, b.0, c.0]);
-            index_bytes(&data)[..HEADER].to_vec()
-        };
-        // Dirty: `c`, a record that is not one, `b`, `a`.
-        let mut index = header;
-        index[MAGIC.len()] = DIRTY;
-        push_record(&mut index, c.0, Some(c.1.len()));
-        index.extend_from_slice(&[b'X'; RECORD]);
-        push_record(&mut index, b.0, Some(b.1.len()));
-        push_record(&mut index, a.0, Some(a.1.len()));
-        put_back(&data, &index);
+        }
+        // A clean file of the previous format: `b`, `c`, `a`, least
+        // recently used first.
+        remove_db(&data);
+        let mut rows = Vec::new();
+        push_record(&mut rows, b.0, Some(b.1.len()));
+        push_record(&mut rows, c.0, Some(c.1.len()));
+        push_record(&mut rows, a.0, Some(a.1.len()));
+        put_old_back(&data, &old_index(CLEAN, &rows));
+        let store = DiskStore::open(&data, 1 << 20).unwrap();
+        // The order of the file is the order of use of the new index.
+        assert_eq!(order(&store), [b.0, c.0, a.0]);
+        assert!(!data.join(OLD_INDEX).exists());
+        assert_eq!(store.size(c.0).unwrap(), Some(c.1.len()));
+    }
 
-        // `c` from the index; the rest by write time.
+    #[test]
+    fn a_dirty_file_of_the_previous_format_gives_its_order_before_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let (a, b, c) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"cccc"));
+        {
+            let store = DiskStore::open(&data, 1 << 20).unwrap();
+            for (key, bytes) in [&a, &b, &c] {
+                store.put(*key, bytes).unwrap();
+            }
+            set_written_in_order(&store, &[a.0, b.0, c.0]);
+        }
+        remove_db(&data);
+        // Dirty: `c`, a record that is not one, `b`, `a`.
+        let mut rows = Vec::new();
+        push_record(&mut rows, c.0, Some(c.1.len()));
+        rows.extend_from_slice(&[b'X'; RECORD]);
+        push_record(&mut rows, b.0, Some(b.1.len()));
+        push_record(&mut rows, a.0, Some(a.1.len()));
+        put_old_back(&data, &old_index(DIRTY, &rows));
+        assert_eq!(old_state(&data), DIRTY);
+
+        // `c` keeps its place from the file; the rest by write time.
         let store = DiskStore::open(&data, 1 << 20).unwrap();
         assert_eq!(order(&store), [c.0, a.0, b.0]);
     }
 
     #[test]
-    fn a_clean_file_that_does_not_match_its_header_is_not_trusted() {
+    fn a_damaged_file_of_the_previous_format_is_not_trusted() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
         let (a, b, stray) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"not in the index"));
@@ -1247,24 +2016,28 @@ mod tests {
             store.put(b.0, &b.1).unwrap();
             store.path(stray.0)
         };
-        let good = index_bytes(&data);
-        assert_eq!(good[MAGIC.len()], CLEAN);
-        // An object file that the index does not name: only a scan finds it.
+        // An object file that the old index does not name: only a scan
+        // finds it.
         fs::create_dir_all(stray_path.parent().unwrap()).unwrap();
         fs::write(&stray_path, &stray.1).unwrap();
+        let mut rows = Vec::new();
+        push_record(&mut rows, a.0, Some(a.1.len()));
+        push_record(&mut rows, b.0, Some(b.1.len()));
+        let good = old_index(CLEAN, &rows);
         let cut = good[..good.len() - RECORD].to_vec();
-        let mut resized = good.clone();
+        let mut changed = good.clone();
         // The size field of the last record.
-        *resized.last_mut().unwrap() ^= 1;
+        *changed.last_mut().unwrap() ^= 1;
         let mut version = good.clone();
         version[..MAGIC.len()].copy_from_slice(b"scnidx0\n");
         for (case, index, scans) in [
             ("as written", &good, false),
             ("cut at a record", &cut, true),
-            ("a record changed", &resized, true),
+            ("a record changed", &changed, true),
             ("another version", &version, true),
         ] {
-            put_back(&data, index);
+            remove_db(&data);
+            put_old_back(&data, index);
             let store = DiskStore::open(&data, 1 << 20).unwrap();
             let found = store.size(stray.0).unwrap().is_some();
             assert_eq!(found, scans, "{case}");
@@ -1273,7 +2046,29 @@ mod tests {
     }
 
     #[test]
-    fn an_index_file_that_cannot_be_marked_dirty_is_removed() {
+    fn a_damaged_index_db_is_set_aside_and_the_files_are_scanned() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let (a, stray) = (blob(b"aaaa"), blob(b"not in the index"));
+        let stray_path = {
+            let store = DiskStore::open(&data, 1 << 20).unwrap();
+            store.put(a.0, &a.1).unwrap();
+            store.path(stray.0)
+        };
+        fs::create_dir_all(stray_path.parent().unwrap()).unwrap();
+        fs::write(&stray_path, &stray.1).unwrap();
+        // A db that is not a database: the start moves it aside and scans.
+        remove_db(&data);
+        fs::write(data.join(INDEX), b"not a database at all").unwrap();
+        let store = DiskStore::open(&data, 1 << 20).unwrap();
+        assert_eq!(store.size(a.0).unwrap(), Some(a.1.len()));
+        let n = stray.1.len();
+        assert_eq!(store.size(stray.0).unwrap(), Some(n));
+        assert!(data.join(format!("{INDEX}.damaged")).exists());
+    }
+
+    #[test]
+    fn an_index_that_cannot_be_read_is_set_aside() {
         use std::os::unix::fs::PermissionsExt as _;
 
         // Root may write a read-only file.
@@ -1287,52 +2082,202 @@ mod tests {
             .unwrap()
             .put(a.0, &a.1)
             .unwrap();
-        let index = data.join(INDEX);
-        fs::set_permissions(&index, fs::Permissions::from_mode(0o400)).unwrap();
-        // The start goes on without a clean file that a crash would leave.
+        let db = data.join(INDEX);
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o400)).unwrap();
+        // The start goes on with a new index: the files are the truth.
         let store = DiskStore::open(&data, 1 << 20).unwrap();
-        assert!(!index.exists());
         assert_eq!(store.get(a.0, a.1.len()).unwrap(), Some(a.1.clone()));
-        drop(store);
-        assert_eq!(index_state(&data), CLEAN);
+        assert_eq!(store.size(a.0).unwrap(), Some(a.1.len()));
     }
 
     #[test]
-    fn the_index_file_gets_each_batch_and_is_written_again_before_it_grows_large() {
+    fn the_memory_of_the_index_stays_bounded_as_objects_grow() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let store = DiskStore::open(&data, 1 << 30).unwrap();
+        // The rows of the db grow with the objects; the batch that waits in
+        // memory does not: every put commits at once, and the uses of a
+        // batch are bounded.
+        let key = blob(b"once").0;
+        store.put(key, &Bytes::from(vec![b'x'; 8])).unwrap();
+        let pages = |store: &DiskStore| {
+            lock(&store.disk)
+                .conn
+                .query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        let mut before = pages(&store);
+        let mut biggest_batch = 0;
+        for i in 0..3 * FLUSH_RECORDS + 100 {
+            store.size(key).unwrap();
+            let disk = lock(&store.disk);
+            assert!(disk.pending.len() <= FLUSH_RECORDS, "{i} uses wait");
+            assert!(disk.newest.len() <= FLUSH_RECORDS, "{i} keys wait");
+            biggest_batch = biggest_batch.max(disk.committed);
+            drop(disk);
+            if i % FLUSH_RECORDS == FLUSH_RECORDS - 1 {
+                before = before.max(pages(&store));
+            }
+        }
+        // One batch of uses, not one version per object of the store.
+        assert!(biggest_batch <= FLUSH_RECORDS, "{biggest_batch}");
+        // The db grew on disk while the memory stayed bounded.
+        assert!(pages(&store) > before || before > 0);
+    }
+
+    #[test]
+    fn an_eviction_reads_only_what_it_drops() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
         let (a, b) = (blob(b"aaaa"), blob(b"bbbb"));
         let n = a.1.len();
-        let store = DiskStore::open(&data, 1 << 20).unwrap();
+        // Room for eight.
+        let store = DiskStore::open(&data, 8 * n + n / 2).unwrap();
+        for i in 0..8 {
+            let key = Key::Blob(BlobId::of(format!("full{i}").as_bytes()));
+            store.put(key, &a.1).unwrap();
+        }
+        // Every put past the limit drops one object, and reads one row of
+        // the index: not the eight that stay.
+        for i in 0..100 {
+            store.put(b.0, &a.1).unwrap();
+            let disk = lock(&store.disk);
+            assert!(
+                disk.iterated <= 2,
+                "the {}th eviction read {} rows",
+                i,
+                disk.iterated
+            );
+            assert_eq!(disk.objects, 8);
+            assert_eq!(usize::try_from(disk.bytes).unwrap(), 8 * n);
+            drop(disk);
+        }
+        assert_eq!(store.size(b.0).unwrap(), Some(n));
+        drop(store);
+        let store = DiskStore::open(&data, 8 * n + n / 2).unwrap();
+        assert_eq!(lock(&store.disk).objects, 8);
+    }
+
+    #[test]
+    #[allow(clippy::many_single_char_names)]
+    fn a_walk_adopts_the_files_that_a_crash_left_and_the_limit_counts_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let (a, b, c, d, e) = (
+            blob(b"aaaa"),
+            blob(b"bbbb"),
+            blob(b"cccc"),
+            blob(b"dddd"),
+            blob(b"eeee"),
+        );
+        let n = a.1.len();
+        // Room for two.
+        let limit = 2 * n + n / 2;
+        {
+            // The crash: a stop never came, so the next start walks.
+            let store = DiskStore::open(&data, limit).unwrap();
+            store.put(a.0, &a.1).unwrap();
+            store.put(b.0, &b.1).unwrap();
+            // Their last uses are committed, so the files that the walk
+            // adopts are older than every row: they leave first.
+            store.size(a.0).unwrap();
+            store.size(b.0).unwrap();
+            lock(&store.disk).commit().unwrap();
+            store.crash();
+        }
+        // The files of `c` and `d` were renamed into place, and their rows
+        // never reached a committed batch.
+        for (key, bytes) in [&c, &d] {
+            let path = object_path(&data.join("objects"), *key);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, bytes).unwrap();
+        }
+        let store = DiskStore::open(&data, limit).unwrap();
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        // The walk adopted the two, and counted their bytes.
+        let (found, bytes, _) = store.walk_state().unwrap();
+        store.flush();
+        lock(&store.disk).commit().unwrap();
+        assert_eq!(found, 2, "{found} files adopted");
+        assert_eq!(bytes, (c.1.len() + d.1.len()) as u64);
+        assert_eq!(db_size(&data, c.0), Some(c.1.len()));
+        assert_eq!(db_size(&data, d.0), Some(d.1.len()));
+        assert_eq!(bytes_on_disk(&data), 4 * n);
+
+        // The adopted are the least recently used, so `e` comes in and
+        // `c`, then `d`, then `a` leave, until the limit holds again.
+        store.put(e.0, &e.1).unwrap();
+        assert_eq!(store.size(c.0).unwrap(), None);
+        assert_eq!(store.size(d.0).unwrap(), None);
+        assert_eq!(store.size(a.0).unwrap(), None);
+        assert!(!store.path(c.0).exists());
+        assert!(!store.path(d.0).exists());
+        assert_eq!(bytes_on_disk(&data), 2 * n);
+        assert_eq!(store.size(b.0).unwrap(), Some(n));
+        assert_eq!(store.size(e.0).unwrap(), Some(n));
+        drop(store);
+
+        // And what the walk counted stays counted over a restart.
+        let store = DiskStore::open(&data, limit).unwrap();
+        assert_eq!(usize::try_from(lock(&store.disk).bytes).unwrap(), 2 * n);
+        assert_eq!(bytes_on_disk(&data), 2 * n);
+    }
+
+    #[test]
+    #[allow(clippy::many_single_char_names)]
+    fn a_commit_that_fails_keeps_the_rows_the_truth() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let (a, b, c) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"cccc"));
+        let n = a.1.len();
+        let store = DiskStore::open(&data, 2 * n).unwrap();
         store.put(a.0, &a.1).unwrap();
         store.put(b.0, &b.1).unwrap();
-        set_written_in_order(&store, &[a.0, b.0]);
-        // Uses of `a`: three times the slack, in batches. A read writes a
-        // batch that is full.
-        let (mut largest, mut first) = (0, None);
-        let batch = FLUSH_BYTES / RECORD;
-        for _ in 0..3 * SLACK_RECORDS / batch {
-            for _ in 0..batch {
-                store.size(a.0).unwrap();
-            }
-            assert_eq!(store.get(a.0, n).unwrap(), Some(a.1.clone()));
-            largest = largest.max(fs::metadata(data.join(INDEX)).unwrap().len());
-            first.get_or_insert_with(|| index_bytes(&data));
-        }
-        // Written again with one record per object, so it never held all of
-        // the records.
-        let most = HEADER + (2 * 2 + SLACK_RECORDS) * RECORD + FLUSH_BYTES;
-        assert!(largest <= most as u64, "{largest} bytes");
 
-        // A crash after the first batch, or now, keeps that `a` was used
-        // last.
-        let crashes = [first.unwrap(), index_bytes(&data)];
+        // The index cannot take a write.
+        lock(&store.disk)
+            .conn
+            .execute_batch("PRAGMA query_only = ON")
+            .unwrap();
+
+        // The put's file lands, its row does not: the batch is lost whole,
+        // and the counters are the db's again.
+        assert!(store.put(c.0, &c.1).is_err());
+        assert_eq!(store.size(c.0).unwrap(), None);
+
+        // The index writes again: the next batch commits counters that the
+        // rows say too, and drops in the order of use, `a` and not `b`.
+        lock(&store.disk)
+            .conn
+            .execute_batch("PRAGMA query_only = OFF")
+            .unwrap();
+        let d = blob(b"dddd");
+        store.put(d.0, &d.1).unwrap();
+        assert_eq!(store.size(b.0).unwrap(), Some(n));
+        assert_eq!(usize::try_from(lock(&store.disk).bytes).unwrap(), 2 * n);
         drop(store);
-        for crashed in crashes {
-            put_back(&data, &crashed);
-            let store = DiskStore::open(&data, 1 << 20).unwrap();
-            assert_eq!(order(&store), [b.0, a.0]);
-        }
+
+        // The stop was not clean: the store owed a walk, though it could
+        // not write the flag that says so.
+        let store = DiskStore::open(&data, 2 * n).unwrap();
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        let (found, bytes, _) = store.walk_state().unwrap();
+        store.flush();
+        lock(&store.disk).commit().unwrap();
+        assert_eq!(found, 1, "{found} files adopted");
+        assert_eq!(bytes, n as u64);
+        assert_eq!(db_size(&data, c.0), Some(c.1.len()));
+        drop(store);
+
+        // The walk paid the debt: the next start is clean, and owes no walk.
+        // The store is over its limit again, so the least recently used
+        // goes: `c`, which the walk brought back last as the oldest.
+        let store = DiskStore::open(&data, 2 * n).unwrap();
+        assert!(store.walk_state().is_none());
+        assert_eq!(store.size(c.0).unwrap(), None);
+        assert_eq!(store.size(b.0).unwrap(), Some(n));
+        assert_eq!(usize::try_from(lock(&store.disk).bytes).unwrap(), 2 * n);
+        assert_eq!(bytes_on_disk(&data), 2 * n);
     }
 
     #[test]
@@ -1345,21 +2290,21 @@ mod tests {
             store.put(key, &bytes).unwrap();
             store.path(key)
         };
-        // A crash of the machine left the first bytes only. A clean index
+        // A crash of the machine left the first bytes only. A trusted index
         // gives the size of the object, a scan that of the file: neither is
         // trusted for the bytes.
         let torn = &bytes[..bytes.len() - 1];
         for (scan, size) in [(false, bytes.len()), (true, torn.len())] {
             fs::write(&path, torn).unwrap();
             if scan {
-                fs::remove_file(data.join(INDEX)).unwrap();
+                remove_db(&data);
             }
             let store = DiskStore::open(&data, 1 << 20).unwrap();
             assert_eq!(store.size(key).unwrap(), Some(size));
             assert_eq!(store.get(key, size).unwrap(), None);
             assert_eq!(store.size(key).unwrap(), None);
             assert!(!path.exists());
-            assert_eq!(lock(&store.disk).lru.bytes, 0);
+            assert_eq!(lock(&store.disk).bytes, 0);
         }
     }
 
@@ -1395,5 +2340,34 @@ mod tests {
         let err = DiskStore::open(&open.join("data"), 1 << 20).err().unwrap();
         assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{err}");
         assert!(err.to_string().contains("/open can be written"), "{err}");
+    }
+
+    /// The size that the index db in `data` gives for `key`, without using
+    /// the store, so no use is marked.
+    fn db_size(data: &Path, key: Key) -> Option<usize> {
+        rusqlite::Connection::open(data.join(INDEX))
+            .unwrap()
+            .query_row(
+                "SELECT size FROM objects WHERE kind = ?1 AND id = ?2",
+                rusqlite::params![kind_of(key), key.id()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .unwrap()
+            .map(|size| usize::try_from(size).unwrap())
+    }
+
+    /// The `clean` flag of the index db in `data`.
+    fn clean_flag(data: &Path) -> bool {
+        rusqlite::Connection::open_with_flags(
+            data.join(INDEX),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row("SELECT v FROM meta WHERE k = 'clean'", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()
+            != 0
     }
 }

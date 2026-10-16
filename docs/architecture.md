@@ -1224,42 +1224,53 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
 | Listens on | TCP, `127.0.0.1:7879`. Another address needs `--insecure-listen`. | A Unix socket with mode 0600, by default `<data>/daemon.sock`, in a directory that only its user can reach (checked as for `<data>`). So nobody else can connect, even before the mode is set, or put another socket in its place. A stale socket file is replaced; a live one is an error. |
 | Upstream | `--upstream`, by default the server at `127.0.0.1:7878`. | `--upstream`, by default the cache at `127.0.0.1:7879`. |
 | Store | Memory, at most `--max-bytes` (1 GiB) of stored objects (blobs packed). | Disk, at most `--max-bytes` (10 GiB) of stored object bytes (not disk blocks): one file per object under `<data>/objects/`, a tree's `TreeV1` bytes or a blob's zstd frame, written to a temp file and renamed, unpacked as a stream and checked against its ID when read back. A file that the limit drops leaves its name by a rename under the index lock, and is removed after it, so a put of the same object keeps its new file. `<data>` is made with mode 0700 if missing. It must be a real directory (not a symlink), owned by the daemon's user, and closed to others, or the daemon refuses it. One daemon locks it. |
-| Eviction | Least recently used first. | Least recently used first, from an index in memory that is also kept in `<data>/index` (below), so the order survives a restart. |
-| Start | Empty. | Reads `<data>/index`. After a clean stop (SIGINT or SIGTERM) it opens no object directory. After a crash it scans every object file, as with no index ([#115](https://github.com/bnsd55/open-scion/issues/115)). |
+| Eviction | Least recently used first. | Least recently used first, from the index db's order of use (below), so the order survives a restart. |
+| Start | Empty. | Reads `<data>/index.db`. After a clean stop (SIGINT or SIGTERM) it opens no object directory. After a crash it still opens at once, and a low-priority walk adopts the files that the crash left behind ([#115](https://github.com/bnsd55/open-scion/issues/115)). |
 
-**The daemon's index.** `<data>/index` lists the stored objects in order
-of use, so a start need not open every object directory. It is a header
-(`scnidx1\n`, a state byte, and the BLAKE3 hash of the records that the
-last full write wrote) and records of 37 bytes: an op, an object ID and a
-size. `T` or `B` says that a tree or blob of that size is stored and was
-just used; `t` or `b` that it was dropped. Read in order, the records give
-the objects, least recently used first. Records wait in memory and are
-appended 1,024 at a time (more wait while another call writes). Once the
-file holds more than twice as many records as objects, plus 65,536, it is
-written again with one record per object. A stop first syncs the
-directories that dropped files left since the start, and `<data>/tmp`. Then
-it writes the file again, one record per object, marks it clean (it names
-every object file), and flushes it past the drive's cache (`F_FULLFSYNC` on
-macOS).
+**The daemon's index.** `<data>/index.db` is a SQLite database (through
+`rusqlite`, already in the workspace) that gives every stored object a row:
+its kind, ID and size, and `used_at`, a number that rises with every use, so
+the order of `used_at` is the order of use. The index is not held in memory:
+a `size` is one point lookup, and the store keeps only the last batch of row
+changes, at most 1,024 of them (or 64 MiB of new bytes, whichever comes
+first), plus the database's own page cache of 8 MiB. The batch commits in
+one transaction — at 1,024 changes, or when 64 MiB of new bytes wait, or at
+a stop. A stop then fsyncs the directories that dropped files left since the
+start and `<data>/tmp`, checkpoints the write-ahead log (its file shrinks to
+nothing), marks the index clean, and flushes it past the drive's cache
+(`F_FULLFSYNC` on macOS).
+
+Every change carries a rising sequence number, and the index keeps `mark`,
+the newest sequence committed. A start reads only the changes past `mark`,
+so at most one batch is ever uncommitted: a crash start finds the index at
+most one batch behind what the files say. What a crash can leave is a rename
+whose batch did not commit: a file with no row, whose bytes the limit does
+not know. The index says so with its `clean` and `walk_pending` flags, and
+the start answers it with one low-priority walk of the object directories,
+after serving: the walk adopts each file with no row, as the least recently
+used, and counts its bytes against the limit, so the limit holds again. It
+stops at a clean stop, is not owed after a clean start, and logs how many
+files and bytes it adopted.
 
 | Start after | What the start trusts | Cost |
 |---|---|---|
-| A clean stop | The file, if its records match the hash in its header: which objects are stored, and in what order. At open it marks the file dirty and flushes that past the drive's cache. | One file read and hash; no object directory. |
-| A crash | Nothing. The file is dirty, and may lack its last records: it may name a file that is gone, or miss a new one. The start scans every file and keeps the file's order for the objects that it names, up to a record that is not one; the others come last, oldest write first. | One stat per object file, as with no index. |
-| No file, another version, or a clean file that does not match its hash | Nothing, as after a crash. | As after a crash. |
+| A clean stop | The rows. `mark` covers them all. | The rows of the index; no object directory, no scan. |
+| A crash | The rows, to `mark`. The last batch may be missing; at most one batch of files is not yet counted, and the walk adopts those. | The rows of the index; at most one batch of changes; the walk stats every object file once, after serving. |
+| No index, or one that cannot be opened or written | Nothing. The database is moved aside and built again from a scan of every file (or from the old index file, below). | One stat per object file, as with no index. |
 
 The start logs which of these it found. So a crash loses only what was used
-last, never an object: the records that had not reached the file. No start
-trusts the index for an object's bytes: each read checks them against the
-ID. If the index gives a size that is not the file's, the object is dropped
-at its first read and fetched again. If the start cannot mark the file
-dirty, or write it after a scan (a full disk), it removes the file and goes
-on, after the drops that free room. A daemon build from before the index
-does not know the file: run between a clean stop and the next start, it
-leaves a clean file that is stale, so remove `<data>/index` after such a
-run. The format is this project's choice: an append-only file is all that
-a start needs, and its one new dependency in the tier crate, `blake3`, is
-already in the workspace.
+last, never an object: the rows that had not committed. No start trusts the
+index for an object's bytes: each read checks them against the ID. If the
+index gives a size that is not the file's, the object is dropped at its
+first read and fetched again. If the start cannot write the index (a full
+disk), it moves it aside and goes on, after the drops that free room. A
+store from a build before the index db has `<data>/index` (the append-only
+index of that format): the first start imports its records in file order as
+the order of use, and removes the file. A dirty old file names objects that
+a crash may have dropped, so that start scans every object file once and
+keeps the old order for the objects that it names. An old daemon build run
+between a clean stop and the next start leaves a clean `<data>/index` that
+is stale, so remove it after such a run.
 
 This project's choices, not the article's: the Unix socket and its mode,
 TCP between tiers, the stores and their limits, keeping `GetRootTree`
@@ -1329,10 +1340,8 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/blame.rs` (`MAX_BLAME_DIFF_LINES`) | One call diffs about 1M lines, and a long line counts once per 64 bytes. A diff of many repeated lines grows faster than its lines, so one diff of two files of 1,048,576 lines is the worst case of a call. A rename search shares the budget and goes on over calls, so a changeset that deletes many large files costs one call per about 64 MiB of them. | Blame from derived data, so a call does not diff whole versions, and an index of each changeset's deleted files by chunk, so a search reads only files that share chunks with the new file. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_BYTES`, `MAX_BLAME_LINES`) | A file over 16 MiB or 1,048,576 lines is refused. An older version like that counts as absent, so its lines go to the changeset that replaced it. `git blame` reads any size. | Blame from derived data, so a call does not read whole versions, and a reply that a client asks for in parts. | [#90](https://github.com/bnsd55/open-scion/issues/90) |
 | `scion-proto/src/auth.rs` (`Auth`) | One static token, one principal. | A token-to-principal map, then per-path write rules. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
-| `scion-server/src/main.rs` (`serve`) | No TLS. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
-| `scion-tier/src/lib.rs` (`produce`) | Two blocking hops per hit (size, then read) and no read-ahead, as on the server. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
+| `scion-server/src/main.rs` (`serve`) | No TLS. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) || `scion-tier/src/lib.rs` (`produce`) | Two blocking hops per hit (size, then read) and no read-ahead, as on the server. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
 | `scion-tier/src/lib.rs` (`check_repo`) | A tier does not ask whether a repo exists, and serves a stored object to any caller with the token. Safe with one principal. | Read tickets, checked by every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
-| `scion-tier/src/store.rs` (`DiskStore`) | The daemon's whole recency index is also in memory, and a start reads all of it. Writing `<data>/index` again copies every record under the index lock, which `size` needs while the tier holds its fetch table: every fetch start waits. After a crash, a start scans every object file. Memory and these pauses grow with the object count. | An index on disk that is read and changed in place, and a crash start that needs no scan. | [#115](https://github.com/bnsd55/open-scion/issues/115) |
 | `scion-tier/src/bin/scion-cache.rs` (`main`) | No TLS between tiers. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
 | `scn/src/client.rs` (`lossy`) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | Escape or base64 raw bytes in JSON. | |
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |
