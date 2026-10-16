@@ -153,6 +153,8 @@ pub struct Vfs {
     objects: Objects,
     repo: String,
     /// The changeset this mount holds, for a ticket refresh of its tree.
+    /// Unused until #13 PR-C: then the refresh calls `GetRootTree` of it.
+    #[allow(dead_code)]
     changeset: ChangesetId,
     nodes: tokio::sync::RwLock<Nodes>,
     /// Decoded blobs, least recently used first, with their bytes together.
