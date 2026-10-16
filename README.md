@@ -116,6 +116,7 @@ cargo build --release
 export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
 ./target/release/scion-server --data /tmp/scion import /path/to/a/git/repo
 ./target/release/scion-server --data /tmp/scion serve &
+./target/release/scion-server --data /tmp/scion fsck              # check the data directory; safe while the server runs
 
 ./target/release/scn log -n 5
 ./target/release/scn log --path src -n 5          # changesets that changed src/

@@ -33,7 +33,10 @@ until that section gets its release date.
   verified durability, and one write path for changesets and their root
   trees. Group commit: concurrent blob syncs and database commits share one
   full drive flush, so a successful reply never shows state that a power
-  loss can undo.
+  loss can undo. `scion-server fsck <data>` reports the damage in a data
+  directory: it is read-only, it can run while the server runs, and one
+  line per problem names the kind, the ID and the path; it exits 0 when it
+  saw no damage, 1 when it did, and 2 when it could not run.
 - Server-side commits (`CreateChangeset`) and lands: path-level conflict
   checks through a per-ref index, one transaction per land, retries by
   request key, and a bounded retry when the ref moves. A land stops in its
