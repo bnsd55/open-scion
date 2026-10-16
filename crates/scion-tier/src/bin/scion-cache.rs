@@ -8,7 +8,6 @@ use anyhow::Context as _;
 use clap::Parser;
 use scion_proto::listen::{self, Limits};
 use scion_tier::{CACHE_UPSTREAM_TIMEOUT, MemoryStore, Tier};
-use tokio_stream::wrappers::TcpListenerStream;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -70,14 +69,9 @@ async fn main() -> anyhow::Result<()> {
         connections: cli.max_connections,
         streams: cli.max_streams,
     };
-    tier.serve(
-        &cli.token,
-        TcpListenerStream::new(listener),
-        limits,
-        async {
-            tokio::signal::ctrl_c().await.ok();
-        },
-    )
+    tier.serve(&cli.token, listen::tcp(listener), limits, async {
+        tokio::signal::ctrl_c().await.ok();
+    })
     .await?;
     Ok(())
 }

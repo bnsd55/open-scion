@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use scion_core::{BlobId, ChangesetId, FileState, RepoPath};
-use scion_proto::listen::Limits;
+use scion_proto::listen::{self, Limits};
 use scion_proto::v1::scion_server::{Scion, ScionServer};
 use scion_proto::v1::{
     self, BlameChangeset, BlameRange, BlameRequest, BlameResponse, CreateChangesetRequest,
@@ -21,7 +21,7 @@ use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
@@ -64,6 +64,10 @@ const READ_BUDGET_BYTES: usize = 256 << 20;
 /// budget (`scion_proto::listen`).
 const READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
+// A connection that is asked to close keeps its calls for at least as long
+// as the longest call takes.
+const _: () = assert!(REQUEST_TIMEOUT.as_secs() <= listen::CONNECTION_GRACE.as_secs());
+
 // Any one reply fits in the budget, and the budget counts in u32 permits.
 const _: () = assert!(read_share(MAX_OBJECT_BYTES) <= READ_BUDGET_BYTES);
 const _: () = assert!(READ_BUDGET_BYTES <= u32::MAX as usize);
@@ -94,9 +98,7 @@ pub async fn serve(
             .add_service(scion)
             .add_service(objects)
     };
-    limits
-        .serve(router, TcpListenerStream::new(listener), shutdown)
-        .await
+    limits.serve(router, listen::tcp(listener), shutdown).await
 }
 
 /// Implements the Scion RPCs.
