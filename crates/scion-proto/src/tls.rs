@@ -138,19 +138,19 @@ impl ClientTls {
     /// An https address without a CA to trust, or a configuration that tonic
     /// refuses.
     pub fn apply_to(
-        self,
+        &self,
         address: &str,
         endpoint: tonic::transport::Endpoint,
     ) -> anyhow::Result<tonic::transport::Endpoint> {
         if !address.starts_with("https://") {
             return Ok(endpoint);
         }
-        let Some(ca) = self.ca else {
+        let Some(ca) = self.ca.as_deref() else {
             bail!("the address is https, but no CA is given to trust its certificate");
         };
         let mut tls = tonic::transport::ClientTlsConfig::new()
             .ca_certificate(tonic::transport::Certificate::from_pem(ca));
-        if let Some((cert, key)) = self.identity {
+        if let Some((cert, key)) = &self.identity {
             tls = tls.identity(tonic::transport::Identity::from_pem(cert, key));
         }
         endpoint

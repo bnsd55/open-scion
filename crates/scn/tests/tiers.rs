@@ -58,22 +58,24 @@ impl Tiers {
             listener,
             TOKEN,
             Limits::default(),
+            None,
             pending(),
         ));
 
         let memory = MemoryStore::new(64 << 20);
-        let cache = Tier::new(memory, &server, TOKEN, CACHE_UPSTREAM_TIMEOUT).unwrap();
+        let cache = Tier::new(memory, &server, TOKEN, CACHE_UPSTREAM_TIMEOUT, None).unwrap();
         let (listener, cache_url) = tcp();
         let incoming = TcpListenerStream::new(listener);
         runtime.spawn(
             cache
                 .clone()
-                .serve(TOKEN, incoming, Limits::default(), pending()),
+                .serve(TOKEN, incoming, Limits::default(), None, pending()),
         );
 
         let node = tempfile::tempdir().unwrap();
         let store_dir = DiskStore::open(&node.path().join("data"), 64 << 20).unwrap();
-        let daemon = Tier::new(store_dir, &cache_url, TOKEN, DAEMON_UPSTREAM_TIMEOUT).unwrap();
+        let daemon =
+            Tier::new(store_dir, &cache_url, TOKEN, DAEMON_UPSTREAM_TIMEOUT, None).unwrap();
         // The socket's directory must be private.
         fs::set_permissions(node.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let path = node.path().join("daemon.sock");
@@ -81,7 +83,7 @@ impl Tiers {
         runtime.spawn(
             daemon
                 .clone()
-                .serve(TOKEN, incoming, Limits::default(), pending()),
+                .serve(TOKEN, incoming, Limits::default(), None, pending()),
         );
 
         Self {

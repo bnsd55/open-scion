@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use clap::Parser;
 use scion_proto::listen::{self, Limits};
+use scion_proto::tls::ClientTls;
 use scion_tier::{DAEMON_UPSTREAM_TIMEOUT, DiskStore, Tier, bind_unix};
 use tokio_stream::wrappers::UnixListenerStream;
 use tracing_subscriber::EnvFilter;
@@ -29,6 +30,16 @@ struct Cli {
     /// Where to fetch misses: a scion-cache.
     #[arg(long, default_value = "http://127.0.0.1:7879")]
     upstream: String,
+    /// Trust this CA (PEM) for the https upstream.
+    #[arg(long, value_name = "FILE")]
+    tls_ca: Option<PathBuf>,
+    /// Present this client certificate (PEM) to the upstream, for mTLS,
+    /// together with `--tls-client-key`.
+    #[arg(long, requires = "tls_client_key", value_name = "FILE")]
+    tls_client_cert: Option<PathBuf>,
+    /// The key of `--tls-client-cert` (PEM).
+    #[arg(long, requires = "tls_client_cert", value_name = "FILE")]
+    tls_client_key: Option<PathBuf>,
     /// Bearer token that clients must send.
     #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
     token: String,
@@ -52,11 +63,17 @@ async fn main() -> anyhow::Result<()> {
     anyhow::ensure!(!cli.token.is_empty(), "--token must not be empty");
     let store = DiskStore::open(&cli.data, cli.max_bytes)
         .with_context(|| format!("cannot open data directory {}", cli.data.display()))?;
+    let client_tls = ClientTls::load(
+        cli.tls_ca.as_deref(),
+        cli.tls_client_cert.as_deref(),
+        cli.tls_client_key.as_deref(),
+    )?;
     let tier = Tier::new(
         store,
         &cli.upstream,
         &cli.upstream_token,
         DAEMON_UPSTREAM_TIMEOUT,
+        Some(&client_tls),
     )?;
     let socket = cli.socket.unwrap_or_else(|| cli.data.join("daemon.sock"));
     let listener = bind_unix(&socket)
@@ -75,14 +92,15 @@ async fn main() -> anyhow::Result<()> {
         connections: cli.max_connections,
         streams: cli.max_streams,
     };
-    tier.serve(
+    Box::pin(tier.serve(
         &cli.token,
         UnixListenerStream::new(listener),
         limits,
+        None,
         async {
             tokio::signal::ctrl_c().await.ok();
         },
-    )
+    ))
     .await?;
     std::fs::remove_file(&socket).ok();
     Ok(())
