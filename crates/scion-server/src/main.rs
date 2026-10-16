@@ -10,6 +10,7 @@ use scion_proto::listen::{self, Limits};
 use scion_proto::tls::ServerTls;
 use scion_server::derived::{self, Kind};
 use scion_server::graph::CommitGraph;
+use scion_server::history::PathHistory;
 use scion_server::import::{ImportOptions, import_git};
 use scion_server::quotas::Quotas;
 use scion_server::tree::RootTree;
@@ -126,7 +127,8 @@ enum Command {
         #[arg(long, default_value = "main")]
         repo: String,
         /// Ref whose history is derived: its first-parent history for
-        /// `root_tree`, every ancestor for `commit_graph`.
+        /// `root_tree` and `path_history`, every ancestor for
+        /// `commit_graph`.
         #[arg(long = "ref", default_value = "main")]
         target_ref: String,
     },
@@ -141,6 +143,9 @@ enum KindName {
     /// The commit-graph index of each changeset.
     #[value(name = "commit_graph")]
     CommitGraph,
+    /// The path history of each changeset.
+    #[value(name = "path_history")]
+    PathHistory,
 }
 
 #[tokio::main]
@@ -247,6 +252,10 @@ async fn main() -> anyhow::Result<()> {
                     KindName::CommitGraph => {
                         derived::backfill::<CommitGraph>(&store, repo_id, tip)?;
                         CommitGraph::NAME
+                    }
+                    KindName::PathHistory => {
+                        derived::backfill::<PathHistory>(&store, repo_id, tip)?;
+                        PathHistory::NAME
                     }
                 };
                 Ok::<_, Error>((name, tip))

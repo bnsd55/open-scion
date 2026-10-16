@@ -21,6 +21,7 @@
 //! its client stops reading. Misses are fetched in batches, and concurrent
 //! misses for the same object share one fetch.
 
+pub mod snapshot;
 mod store;
 
 use std::collections::hash_map::Entry;
@@ -454,6 +455,12 @@ impl<S: Store> Tier<S> {
         })
     }
 
+    /// The store that this tier serves from.
+    #[must_use]
+    pub fn store(&self) -> &S {
+        &self.inner.store
+    }
+
     /// How many calls this tier has sent upstream.
     #[must_use]
     pub fn upstream_calls(&self) -> u64 {
@@ -582,6 +589,13 @@ impl<S: Store> Tier<S> {
                             progress.hits.fetch_add(1, Ordering::Relaxed);
                             tracing::debug!(%key, "hit");
                         }
+                        // After the call's checks, in `get_objects`.
+                        // SHORTCUT: the record takes the request's repo
+                        // field, and GetObjects does not check that the
+                        // object belongs to that repo until #13 PR-C, which
+                        // moves this after the ticket walk, under the
+                        // ticket's repo.
+                        self.inner.store.served(&ask.repo, key);
                         return self.outgoing(key, stored, permit, ask).await;
                     }
                     // The stored copy went (dropped, or bad) after its size
@@ -610,6 +624,9 @@ impl<S: Store> Tier<S> {
                 None => reply::try_take(&self.inner.in_flight, data.len()),
             };
             if let Some(permit) = permit {
+                // SHORTCUT: as at the hit above, #13 PR-C moves this after
+                // the ticket walk, under the ticket's repo.
+                self.inner.store.served(&ask.repo, key);
                 return self.outgoing(key, data, permit, ask).await;
             }
             let size = data.len();
@@ -1274,7 +1291,7 @@ mod tests {
                 .add_service(ObjectsServer::new(fake.clone()))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
-        let store = MemoryStore::new(limit);
+        let store = MemoryStore::new(limit).recording(&["r".into()]);
         let tier = Tier::new(store, &url, "token", CACHE_UPSTREAM_TIMEOUT, None).unwrap();
         (blobs, keys, fake, tier)
     }
@@ -1415,6 +1432,34 @@ mod tests {
         assert_eq!(fake.asked.load(Ordering::SeqCst), 300);
         assert_eq!(fake.largest.load(Ordering::SeqCst), MAX_BATCH);
         assert_eq!(tier.upstream_calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn each_object_sent_for_a_repo_is_noted_for_its_snapshot() {
+        let (blobs, keys, fake, tier) = setup(3, 1 << 20).await;
+        // The first is a hit, the second comes from upstream.
+        let frame = Bytes::from(object::pack(&blobs[0]).unwrap());
+        tier.store().put(keys[0], &frame).unwrap();
+        for (repo, keys) in [("r", &keys[..2]), ("q", &keys[2..])] {
+            let request = GetObjectsRequest {
+                repo: repo.into(),
+                refs: keys.iter().map(|key| key.to_ref()).collect(),
+                accept: vec![Encoding::Zstd.into()],
+            };
+            let reply = tier.get_objects(Request::new(request)).await.unwrap();
+            let parts: Vec<_> = reply.into_inner().collect().await;
+            assert_eq!(parts.len(), keys.len(), "{parts:?}");
+        }
+        assert_eq!(fake.asked.load(Ordering::SeqCst), 2);
+        // Only "r" is recorded, and only what went into its replies.
+        let noted: Vec<Key> = tier
+            .store()
+            .snapshot("r", 1 << 20)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(noted, keys[..2]);
+        assert_eq!(tier.store().snapshot("q", 1 << 20), []);
     }
 
     #[test]

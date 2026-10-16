@@ -81,8 +81,8 @@ release.
   forcing it, not on a real NFS mount.
 - Path history and blame on first-parent history: `Log` takes an optional
   path and says where to continue, and a new `Blame` RPC gives each line's
-  last changeset. `scn log --path` and `scn blame`. Each call has a bound,
-  and the client continues where a call stopped. An older server ignores
+  last changeset. `scn log --path` and `scn blame`. Each `Blame` call has a
+  bound, and the client continues where a call stopped. An older server ignores
   the new `path` field, so `scn log --path` against it prints unfiltered
   history.
 - `Blame` follows renames as `git blame` does by default: a deleted file
@@ -133,8 +133,17 @@ release.
   full, the indexes of idle refs go first, least recently used first. Else
   the growing index starts over at the tip. The lands still get the same
   answers.
-- A land walks at most 100,000 changesets below the path index. A base
-  further back is `REJECTED` as too old, and the client must rebase.
+- Path history as derived data (kind `path_history`, schema version 5).
+  `Log` with a path reads only the changesets that change the path, so one
+  call returns up to 1,000 entries however far apart they are. A call stops
+  after about 64 MiB of path history, which a file in a large directory
+  reaches in fewer entries, and it waits in the queue of `MergeBase` and
+  `IsAncestor`. A land on a
+  base more than 10,000 generations below the head checks its paths in the
+  head's path history, so no base is too old to check. Before, such a land
+  walked the history back to its base each time, and a base more than
+  100,000 changesets back was `REJECTED` (#38). `scion-server derive --kind
+  path_history` derives it ahead of the first query.
 - A land stops in its long loops 600 s after its call started, or as soon
   as its call is dropped by a timeout or by the client, because neither
   stops a running job. The land stays pending.
@@ -144,6 +153,11 @@ release.
   tier answers the `Objects` calls, checks every object from upstream
   against its ID before it stores or sends it, forwards `ResolveRef`, keeps
   `GetRootTree` answers, fetches a shared miss once, and needs a token.
+  A `scion-cache --snapshot DIR --snapshot-repo R` writes `DIR/R.scnsnap`
+  every `--snapshot-every` seconds: the most recently used objects of that
+  repo, up to `--snapshot-bytes`. A cold `scion-daemon --seed FILE` imports
+  them before it serves, each checked against its ID; a warm one ignores
+  the file (#59).
 - `scn` reaches a daemon with `--server unix:///PATH`. It first refuses a
   path that is not a socket owned by its user or by root. `scn` and the
   daemon also refuse a socket or data directory under a directory that
@@ -182,15 +196,27 @@ release.
 - The tier timeouts nest: the server and tiers wait 30 s for reply memory,
   a tier 30 s for a fetch slot and 30 s for fetch memory, the cache 60 s per
   step of the server, the daemon 180 s per step of the cache.
-- `scion-daemon` keeps its recency index in `<data>/index` too, appended in
-  batches. After a clean stop (Ctrl-C, or SIGTERM, which it now handles
-  too), a start reads that one file and opens no object directory, and the
-  order of use survives the restart. The stop flushes the file, with a hash
-  of its records, past the drive's cache. After a crash, or for a file that
-  does not match its hash, a start scans every object file as before, and
-  keeps the order of the index for the objects that it names. A crash loses
-  only what was used last, never an object. After running a daemon build
-  from before the index on the same data directory, remove `<data>/index`.
+- `scion-daemon` keeps its recency index in `<data>/index.db`, a SQLite
+  database (through `rusqlite`), read and changed in place. The index is
+  not held in memory: a `size` is one point lookup, and the daemon keeps
+  only the last batch of row changes, at most 1,024 (or 64 MiB of new
+  bytes), committed in one transaction, plus the database's own page cache
+  of 8 MiB. After a clean stop (Ctrl-C, or SIGTERM, which it now handles
+  too), a start reads the rows and opens no object directory, and the order
+  of use survives the restart. The stop commits, checkpoints the
+  write-ahead log, and flushes it past the drive's cache. After a crash, a
+  start still opens at once, at most one batch behind: every change carries
+  a sequence number, and the start reads only the changes past the newest
+  one committed. Files that a crash left before their batch (a rename
+  without a row) are adopted by one low-priority walk of the object
+  directories after the start: each file with no row comes back as the
+  least recently used, and its bytes count against `--max-bytes`, so the
+  limit holds again; the walk stops at a clean stop and logs what it
+  adopted. A crash loses only what was used last, never an object. A store
+  from a build before the index db has `<data>/index` (the append-only
+  index of that format): the first start imports its records in file order
+  and removes it. After running a daemon build from before the index db on
+  the same data directory, remove `<data>/index`.
 - Receivers accept only plain Zstandard frames, with no dictionary and a
   window of at most 8 MiB; the zstd library is built without its legacy
   decoders.

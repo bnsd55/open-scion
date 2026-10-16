@@ -13,6 +13,7 @@ use crate::db::{self, RepoId};
 use crate::derived::{self, Kind};
 use crate::error::{ApplyError, Error, Result};
 use crate::graph::CommitGraph;
+use crate::history::PathHistory;
 use crate::store::Store;
 
 /// Applies `changes` to `base` (`None` is the empty tree), stores the new
@@ -136,7 +137,8 @@ pub fn derive_root_tree(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result
 /// older versions.
 ///
 /// It also stores the changeset's node in the commit graph, if each parent
-/// has one ([`derived::on_write`]).
+/// has one, and its path history, if its first parent has one
+/// ([`derived::on_write`]).
 ///
 /// It adds each blob that the changeset names to the blobs of `repo`, so a
 /// blob that a changeset of `repo` names always belongs to `repo`, also
@@ -165,6 +167,7 @@ pub fn store_changeset(
     derived::put::<RootTree>(c, id, &tree)?;
     derived::remove_old::<RootTree>(c)?;
     derived::on_write::<CommitGraph>(c, id, cs)?;
+    derived::on_write::<PathHistory>(c, id, cs)?;
     Ok((id, tree))
 }
 
@@ -263,6 +266,11 @@ impl Dir {
     }
 
     /// Stores every loaded directory, bottom up, and returns this one's ID.
+    // SHORTCUT: a change rewrites each directory on its paths whole, so a
+    // write in a directory of n entries stores about n x (name + 38) bytes:
+    // 500 KB for 10,000 names of 12 bytes. Upgrade: directories cut into
+    // chunks, a new tree format, so a write stores only the chunks it changes
+    // (https://github.com/bnsd55/open-scion/issues/114).
     fn store(self, c: &Connection) -> Result<TreeId> {
         match self {
             Self::Stored(id) => Ok(id),

@@ -16,6 +16,7 @@ anyhow.workspace = true
 blake3.workspace = true
 clap.workspace = true
 hashlink.workspace = true
+rusqlite.workspace = true
 rustix.workspace = true
 scion-core.workspace = true
 scion-proto.workspace = true
