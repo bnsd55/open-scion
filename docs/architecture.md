@@ -192,6 +192,9 @@ rename (see below).
 - A stored blob still costs a full flush when it is put again or named by a
   changeset: another batch may have written it and not synced yet.
 
+Unit tests check where each flush comes. No test cuts the power: the crash
+suite kills the process, and the kernel keeps what it wrote (section 10).
+
 **Processes that share a data directory.** `scion-server import` can run
 while the server runs. The server opens the directory with `Store::open`, an
 import with `Store::open_shared`. Each holds its `flock`s until the last
@@ -1163,3 +1166,61 @@ limit and its upgrade path. This is the list on `main` today.
 | `scn/src/cmd/commit.rs` (`commit`) | The author time zone is always UTC. | A time zone crate. | |
 | `scn/src/materialize.rs` (`check_name`) | No Windows rules: device names (`CON`, `NUL`) and names that end in a dot or a space pass. | Per-platform rules before checkout runs on Windows. | [#45](https://github.com/bnsd55/open-scion/issues/45) |
 | `scn/src/materialize.rs` (`collision_if_exists`) | On NFS version 3, a `mkdirat` or `symlinkat` in the temp directory, sent again after a lost reply, fails with `EEXIST` and reads as a folding collision. The checkout fails safe, and leaves its temp directory. | An exact name that the checkout has not recorded, holding what the call makes, is the call's own. | [#106](https://github.com/bnsd55/open-scion/issues/106) |
+
+## 10. Testing
+
+`cargo test --workspace` runs every test.
+
+| Layer | What it checks |
+|---|---|
+| Unit tests in each module | One mechanism at a time. Faults are made in the process: a land stopped after each of its steps, a failed full flush, a derivation that fails in a step, temp files that a crash left, damaged blob files. |
+| `scion-core` golden, property and fuzz tests | The frozen v1 format (section 2). |
+| Integration tests (`crates/*/tests`) | The RPCs over gRPC, git import against the `git` CLI, `scn` against a server in the test process, and the tiers against a fake upstream that sends wrong bytes, wrong kinds, short replies and slow replies. |
+| Crash suite (`scion-server/tests/crash.rs`) | The real `scion-server` binary, killed with SIGKILL (below). |
+| Conformance (`scn/tests/conformance.rs`) | The server, a `scion-cache` and a `scion-daemon` give the same `Objects` answers (below). |
+
+**The crash suite.** Four clients upload blobs, create changesets and land
+them on two refs. Some lands start from an older base, and some put a shared
+path, so they conflict. The test kills the server six times: at a random
+moment, or soon after a large upload or a land starts. After each restart
+it checks:
+
+- The server removed the temp files that the kill left.
+- A retry with the same request key returns the reply that the land got,
+  field for field. A land whose reply was lost finishes on retry. Two
+  retries of it at once return the same land.
+- Each ref points at a changeset that exists, and so does each first parent
+  below it. Each one hashes to its ID, and its root tree differs from its
+  parent's by exactly its changes.
+- Each landed changeset is on its ref once, with the changes that the
+  client sent. Nothing else is on a ref, and no land is pending.
+- Every blob that a reply or the metadata names exists and matches its ID.
+  No blob file is torn.
+
+A second test kills the server while it upgrades a database of schema
+version 2. Each kill leaves version 2 or version 3, whole, and the next start
+upgrades it.
+
+What the suite does not prove:
+
+- Durability after a power loss. SIGKILL stops the process, but the kernel
+  keeps its writes in the page cache, synced or not. So the suite tests the
+  order of writes, renames and transactions: what a dead process leaves. A
+  missing `fsync` or full flush (section 3) passes it.
+- A crash of an import process or of a tier. It kills only the server.
+- Every crash point. A kill comes at a moment that the test chooses, so a
+  run can miss a short window. Each run prints its seed, and
+  `SCION_CRASH_SEED` runs the same workload and kill times again (thread
+  timing still differs). `SCION_CRASH_KILLS` sets more kills.
+
+**Conformance.** The same `ResolveRef`, `GetRootTree` and `GetObjects` calls
+go to the daemon, the cache and the server, then to the daemon and the cache
+again, now warm. Each answer, as a client sees it, must be the server's: the
+objects, each checked against its ID, and the error that ends the answer.
+The calls cover RAW and ZSTD clients, objects of many parts, an empty blob,
+missing objects, a missing repo, root trees asked for in a repo without the
+changeset, and the requests that the server refuses. Two more tests damage a
+stored copy. A damaged copy on the daemon is fetched again. A damaged blob
+on the server ends each tier's reply with `DATA_LOSS`, and no tier keeps it.
+One known difference is left out: a tier sends an object that it holds for
+any valid repo name ([#13](https://github.com/bnsd55/open-scion/issues/13)).

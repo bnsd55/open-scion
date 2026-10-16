@@ -16,14 +16,18 @@
 //! - Every blob that a reply named, and every blob that the metadata names,
 //!   exists and matches its ID. No blob file is torn.
 //!
+//! A second test kills the server while it upgrades the schema of a data
+//! directory, and checks that the kill leaves the old schema or the new one.
+//!
 //! What this does not prove: SIGKILL stops the process, but the kernel keeps
 //! the writes that reached its page cache, synced or not. So the suite checks
 //! the order of writes, renames and transactions, not durability after a
 //! power loss. A missing `fsync` or full flush passes it.
 //!
-//! Each run picks a seed and prints it. `SCION_CRASH_SEED=<n>` runs the same
-//! workload and kill times again; thread timing still differs.
-//! `SCION_CRASH_KILLS=<n>` sets the number of kills (default 6).
+//! Each run of the first test picks a seed and prints it.
+//! `SCION_CRASH_SEED=<n>` runs the same workload and kill times again;
+//! thread timing still differs. `SCION_CRASH_KILLS=<n>` sets the number of
+//! kills (default 6).
 #![cfg(unix)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -812,19 +816,28 @@ fn version_2_data(data: &Path) -> ChangesetId {
     id
 }
 
-/// The schema version of the database in `data`.
-fn version(data: &Path) -> u32 {
-    let c = rusqlite::Connection::open(data.join("scion.db")).unwrap();
-    c.query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap()
+/// What a kill can leave of the database in `data`: its schema version, its
+/// tables and indexes (name and SQL), and its filler rows.
+#[derive(Debug, PartialEq, Eq)]
+struct Schema {
+    version: u32,
+    tables: Vec<(String, Option<String>)>,
+    filler: i64,
 }
 
-/// The schema version of the database in `data`, and its filler rows.
-fn schema(data: &Path) -> (u32, i64) {
+fn schema(data: &Path) -> Schema {
     let c = rusqlite::Connection::open(data.join("scion.db")).unwrap();
+    let version = c.query_row("PRAGMA user_version", [], |row| row.get(0));
+    let mut tables = c
+        .prepare("SELECT name, sql FROM sqlite_master ORDER BY name")
+        .unwrap();
+    let tables = tables.query_map([], |row| Ok((row.get(0)?, row.get(1)?)));
     let filler = "SELECT count(*) FROM derived WHERE kind = 'filler'";
-    let filler = c.query_row(filler, [], |row| row.get(0));
-    (version(data), filler.unwrap())
+    Schema {
+        version: version.unwrap(),
+        tables: tables.unwrap().map(Result::unwrap).collect(),
+        filler: c.query_row(filler, [], |row| row.get(0)).unwrap(),
+    }
 }
 
 /// A kill while the server upgrades the schema leaves the old schema or the
@@ -837,11 +850,13 @@ fn a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one() {
     let root = version_2_data(&data);
     let old = dir.path().join("version-2.db");
     fs::copy(data.join("scion.db"), &old).unwrap();
+    let version_2 = schema(&data);
+    assert_eq!((version_2.version, version_2.filler), (2, FILLER_ROWS));
 
     // Kills 0, 10, 20 ms and so on after a start, each from version 2,
     // until one comes after the upgrade committed. The kills after the
     // upgrade began stop it in the middle.
-    let mut kills = 0;
+    let mut left = Vec::new();
     for delay in (0..).map(|i| Duration::from_millis(10 * i)) {
         for log in ["scion.db-wal", "scion.db-shm"] {
             fs::remove_file(data.join(log)).ok();
@@ -850,19 +865,23 @@ fn a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one() {
         let server = Server::spawn(&data, &log);
         std::thread::sleep(delay);
         drop(server);
-        kills += 1;
-        let (version, filler) = schema(&data);
-        assert_eq!(filler, FILLER_ROWS, "version {version} after {delay:?}");
-        match version {
-            2 => assert!(delay < Duration::from_secs(60), "no upgrade"),
-            3 => break,
-            _ => panic!("version {version} after {delay:?}"),
+        let found = schema(&data);
+        let upgraded = found.version != 2;
+        left.push((delay, found));
+        if upgraded {
+            break;
         }
+        assert!(delay < Duration::from_secs(60), "no upgrade");
     }
-    println!("{kills} kills; the last one came after the upgrade");
+    println!("{} kills; the last one came after the upgrade", left.len());
 
     let server = Server::start(&data, &log);
-    assert_eq!(schema(&data), (3, FILLER_ROWS));
+    let version_3 = schema(&data);
+    assert_eq!((version_3.version, version_3.filler), (3, FILLER_ROWS));
+    for (delay, found) in left {
+        let whole = found == version_2 || found == version_3;
+        assert!(whole, "a kill after {delay:?} left {found:?}");
+    }
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let (_, mut objects) = connect(&server.url).await.unwrap();
         let request = ResolveRefRequest {
