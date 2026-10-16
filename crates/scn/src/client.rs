@@ -206,7 +206,7 @@ mod tests {
         // is accepted for every user.
         if owner != 0 {
             let err = check_socket(path, owner + 1).unwrap_err();
-            assert!(err.to_string().contains("another user"), "{err:#}");
+            assert!(err.to_string().contains("owns it"), "{err:#}");
         }
     }
 
@@ -226,5 +226,25 @@ mod tests {
             format!("{err:#}").contains("/open can be written"),
             "{err:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_socket_through_a_symlinked_directory_is_reached_at_its_resolved_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(real.join("daemon.sock")).unwrap();
+        // A link whose name is too long for a socket address (104 bytes on
+        // macOS, 108 on Linux): only the resolved path can connect.
+        let link = tmp.path().join("l".repeat(120));
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let path = link.join("daemon.sock");
+        let owner = fs::symlink_metadata(&path).unwrap().uid();
+        let resolved = fs::canonicalize(&real).unwrap().join("daemon.sock");
+        assert_eq!(check_socket(&path, owner).unwrap(), resolved);
+        let server = format!("unix://{}", path.display());
+        Ctx::connect(&server, "token", "r".into(), false)
+            .await
+            .unwrap();
     }
 }

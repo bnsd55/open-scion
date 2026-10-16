@@ -80,10 +80,20 @@ impl Interceptor for Bearer {
 /// has). Else another user could put their own socket or directory at
 /// `path` after a check of `path` alone.
 ///
-/// Returns `path` with its directory resolved. Use it, not `path`: a symlink
-/// on the way is not followed again, so a symlink in a directory that others
-/// can change is harmless. The last part of `path` is not resolved or
-/// checked: that is the caller's check.
+/// Returns `path` with its directory resolved. Use it, not `path`, so no
+/// symlink on the way is followed again after the check. The last part of
+/// `path` is not resolved or checked: that is the caller's check.
+///
+/// A symlink on the way, in a directory that another user can write, is
+/// still theirs to repoint before the check. They cannot point it at a
+/// directory of their own, as that fails the check. But they can choose
+/// which directory of root or this user is used: for the daemon, which
+/// directory's `tmp` is cleared and whose `objects` are evicted. And what the
+/// caller does through `path` before the check goes where the link pointed
+/// then: `DiskStore::open` makes its directory first.
+///
+/// By choice, as OpenSSH's `StrictModes`, a group-writable directory is
+/// refused, and only the owner and the mode bits are read, not ACLs.
 ///
 /// # Errors
 ///
@@ -108,17 +118,19 @@ pub fn check_ancestors(path: &Path, me: u32) -> io::Result<PathBuf> {
     let parent = fs::canonicalize(parent)?;
     for dir in parent.ancestors() {
         let meta = fs::symlink_metadata(dir)?;
-        let why = if meta.uid() != 0 && meta.uid() != me {
-            format!("is owned by another user (uid {})", meta.uid())
+        let (why, fix) = if meta.uid() != 0 && meta.uid() != me {
+            let why = format!("is owned by another user (uid {})", meta.uid());
+            (why, String::new())
         } else if meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
-            "can be written by group or others, and has no sticky bit".to_owned()
+            let why = "can be written by group or others, and has no sticky bit".to_owned();
+            (why, format!(" (fix: chmod go-w {})", dir.display()))
         } else {
             continue;
         };
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "{} {why}, so another user could swap {}",
+                "{} {why}, so another user could swap {}{fix}",
                 dir.display(),
                 path.display()
             ),
@@ -189,6 +201,8 @@ mod tests {
         let err = check_ancestors(&path, me).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert!(err.to_string().contains("/open can be written"), "{err}");
+        let fix = format!("chmod go-w {}", fs::canonicalize(&open).unwrap().display());
+        assert!(err.to_string().contains(&fix), "{err}");
         // Others cannot rename or remove what they do not own in it.
         fs::set_permissions(&open, fs::Permissions::from_mode(0o1777)).unwrap();
         check_ancestors(&path, me).unwrap();

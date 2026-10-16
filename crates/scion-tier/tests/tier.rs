@@ -331,6 +331,18 @@ async fn each_tier_refuses_a_call_without_the_token() {
     std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
     let refused = bind_unix(&open.join("daemon.sock")).await.unwrap_err();
     assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+    // Through a symlinked directory, the socket is bound where the link
+    // pointed at the check, and its address names that path. The daemon logs
+    // and removes that path, not one through the link.
+    let private = dir.path().join("private");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+    let listener = bind_unix(&link.join("private/other.sock")).await.unwrap();
+    let bound = listener.local_addr().unwrap();
+    let real = std::fs::canonicalize(&private).unwrap().join("other.sock");
+    assert_eq!(bound.as_pathname(), Some(real.as_path()));
 
     let daemon_url = format!("unix://{}", socket.display());
     for url in [&cache_url, &daemon_url] {
