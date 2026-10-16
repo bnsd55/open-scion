@@ -22,9 +22,11 @@
 //! handle stop stray and accidental callers only.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -35,7 +37,8 @@ use nfsserve::nfs::{
     fattr3, fileid3, filename3, ftype3, nfs_fh3, nfspath3, nfsstat3, nfstime3, sattr3, set_mode3,
     set_size3, specdata3,
 };
-use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
+pub use nfsserve::vfs::NFSFileSystem;
+use nfsserve::vfs::{DirEntry, ReadDirResult, VFSCapabilities};
 use scion_core::{BlobId, Entry, FileState, RepoPath, Tree, TreeId};
 use scion_proto::object::{self, Assembler, Header};
 use scion_proto::v1::{Encoding, GetObjectsRequest, ObjectKind, ObjectRef};
@@ -99,7 +102,10 @@ impl Kind {
 /// A change that `scn commit --from-mount` commits for one path.
 pub enum Change {
     /// The file at the overlay path replaces the path, or adds it.
-    Put { exec: bool },
+    Put {
+        /// Whether the file is executable.
+        exec: bool,
+    },
     /// The symlink with this target replaces the path.
     PutLink(Vec<u8>),
     /// The path of the ref is deleted.
@@ -205,7 +211,7 @@ impl Vfs {
     }
 
     /// The path of `path` under the overlay directory.
-    fn overlay_file(&self, path: &RepoPath) -> PathBuf {
+    pub fn overlay_file(&self, path: &RepoPath) -> PathBuf {
         let mut file = self.overlay.clone();
         for part in path.as_bytes().split(|&b| b == b'/') {
             file.push(String::from_utf8_lossy(part).as_ref());
@@ -260,6 +266,11 @@ impl Vfs {
     }
 
     /// One object of `kind`, checked, in its plain form.
+    /// // SHORTCUT: after #13 PR-C, every `GetObjects` of a mount must
+    /// carry an access ticket, and a mount lives longer than a ticket
+    /// (15 minutes). Refresh it by calling `GetRootTree` of the MOUNTED
+    /// changeset — never of the ref, which may have moved — and send the
+    /// new ticket with the next `GetObjects`. Build this when PR-C merges.
     async fn fetch_object(&self, kind: ObjectKind, id: [u8; 32]) -> Result<Vec<u8>> {
         let mut objects = self.objects.clone();
         let refs = vec![ObjectRef {
@@ -312,10 +323,17 @@ impl Vfs {
     }
 
     /// The blob `id`, checked, through the cache of decoded blobs.
+    /// The blob `id`, checked, through the cache of decoded blobs. The
+    /// lock is held only for the look up and the insert, never over the
+    /// network fetch: one slow fetch must not stop the other reads of the
+    /// mount. Two calls that race on one blob both fetch, and both insert
+    /// a correct copy; the last one wins.
     async fn fetch_blob(&self, id: BlobId) -> Result<Arc<Vec<u8>>> {
-        let mut blobs = self.blobs.lock().await;
-        if let Some(data) = blobs.0.get_mut(&id) {
-            return Ok(Arc::clone(data));
+        if let Some(data) = {
+            let mut blobs = self.blobs.lock().await;
+            blobs.0.get_mut(&id).map(|data| Arc::clone(data))
+        } {
+            return Ok(data);
         }
         let raw = self
             .fetch_object(ObjectKind::Blob, *id.as_bytes())
@@ -325,6 +343,7 @@ impl Vfs {
             bail!("the server sent other bytes than what {id} names");
         }
         let data = Arc::new(raw);
+        let mut blobs = self.blobs.lock().await;
         blobs.1 += data.len();
         blobs.0.insert(id, Arc::clone(&data));
         while blobs.1 > BLOB_CACHE_BYTES {
@@ -528,12 +547,43 @@ impl NFSFileSystem for Vfs {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
+        // One read copies at most `count` bytes: a ref file slices the
+        // cached blob, an overlay file is read from its offset. The client
+        // reads in pieces, so a whole-file copy would make a big file
+        // quadratic.
         let nodes = self.nodes.read().await;
-        let data = self.file_bytes(&nodes, id).await?;
-        let from = usize::try_from(offset.min(data.len() as u64)).unwrap_or(usize::MAX);
-        let to = usize::try_from((offset + u64::from(count)).min(data.len() as u64))
-            .unwrap_or(usize::MAX);
-        Ok((data[from..to].to_vec(), to >= data.len()))
+        let node = nodes.by_id.get(&id).ok_or(nfsstat3::NFS3ERR_STALE)?;
+        match &node.kind {
+            Kind::Store { blob, .. } => {
+                let data = self.fetch_blob(*blob).await.map_err(io_err)?;
+                let len = data.len() as u64;
+                let from = usize::try_from(offset.min(len)).unwrap_or(usize::MAX);
+                let to = usize::try_from(offset.saturating_add(u64::from(count)).min(len))
+                    .unwrap_or(usize::MAX);
+                Ok((data[from..to].to_vec(), to as u64 >= len))
+            }
+            Kind::Local { .. } => {
+                use std::io::SeekFrom;
+                use std::io::{Read as _, Seek as _};
+
+                let file = self.overlay_file(node.path.as_ref().expect("a file has a path"));
+                let mut file = std::fs::File::open(&file).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                let len = file.metadata().map_err(|_| nfsstat3::NFS3ERR_IO)?.len();
+                let from = offset.min(len);
+                file.seek(SeekFrom::Start(from))
+                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                let want = usize::try_from(count).unwrap_or(usize::MAX);
+                let mut data = Vec::new();
+                let taken = file
+                    .take(u64::try_from(want).unwrap_or(u64::MAX))
+                    .read_to_end(&mut data)
+                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                let eof = from + taken as u64 >= len;
+                Ok((data, eof))
+            }
+            Kind::Dir { .. } | Kind::LocalDir => Err(nfsstat3::NFS3ERR_ISDIR),
+            Kind::Link { .. } | Kind::StoreLink { .. } => Err(nfsstat3::NFS3ERR_INVAL),
+        }
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
@@ -691,9 +741,20 @@ impl NFSFileSystem for Vfs {
         let from_id = Self::id_of(&nodes, Some(&from_path))
             .filter(|_| !nodes.deleted.contains(&from_path))
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
-        match &nodes.by_id[&from_id].kind {
-            Kind::Dir { .. } | Kind::LocalDir => return Err(nfsstat3::NFS3ERR_NOTSUPP),
-            _ => {}
+        // A directory moves with everything under it: each file and
+        // symlink of the ref is materialized at the new path, and its old
+        // path is a deletion.
+        if nodes.by_id[&from_id].kind.is_dir() {
+            self.move_dir(&mut nodes, from_id, &from_path, &to_path)
+                .await?;
+            drop_listed(&mut nodes, from_dirid, from_filename.as_ref());
+            nodes.drop_node(from_id);
+            // The new directory is of the overlay; its children are its
+            // changes.
+            let new_id = nodes.add(Some(to_path.clone()), Kind::LocalDir, false);
+            self.forget_delete(&mut nodes, &to_path);
+            note_child(&mut nodes, to_dirid, to_filename.as_ref(), new_id);
+            return Ok(());
         }
         // The target, if it is there, goes away.
         if let Some(to_id) =
@@ -1060,6 +1121,113 @@ fn secret_from_urandom() -> [u8; 16] {
     secret
 }
 
+impl Vfs {
+    /// Moves the directory `from_id` (`from_path`) to `to_path`. Boxed:
+    /// the walk recurses.
+    fn move_dir<'a>(
+        &'a self,
+        nodes: &'a mut Nodes,
+        dir_id: u64,
+        from: &'a RepoPath,
+        to: &'a RepoPath,
+    ) -> Pin<Box<dyn Future<Output = Result<(), nfsstat3>> + Send + 'a>> {
+        Box::pin(self.move_dir_inner(nodes, dir_id, from, to))
+    }
+
+    /// Moves the directory `from_id` (`from_path`) to `to_path`: each file
+    /// and symlink under it, of the ref or of the overlay, is written to
+    /// the new overlay path, and its old path is a deletion. A directory
+    /// of the ref whose files were never read is read in full.
+    async fn move_dir_inner(
+        &self,
+        nodes: &mut Nodes,
+        dir_id: u64,
+        from: &RepoPath,
+        to: &RepoPath,
+    ) -> Result<(), nfsstat3> {
+        // Load this level, then take the names: the moves below change the
+        // maps the listing lives in.
+        self.list_dir(nodes, dir_id).await?;
+        let mut children: Vec<(Vec<u8>, u64)> = match nodes.by_id.get(&dir_id) {
+            Some(Node {
+                kind:
+                    Kind::Dir {
+                        listed: Some(listed),
+                        ..
+                    },
+                ..
+            }) => listed
+                .iter()
+                .map(|(name, id)| (name.clone(), *id))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for (path, id) in &nodes.by_path {
+            let Some(path) = path else { continue };
+            if Self::parent(path).as_ref() != Some(from) || nodes.deleted.contains(path) {
+                continue;
+            }
+            let name = path.as_bytes()[from.as_bytes().len() + 1..].to_vec();
+            if !children.iter().any(|(other, _)| *other == name) {
+                children.push((name, *id));
+            }
+        }
+        children.sort();
+        for (name, id) in children {
+            let child_from = Self::child(Some(from), &name)?;
+            let child_to = Self::child(Some(to), &name)?;
+            let kind = nodes.by_id[&id].kind.is_dir();
+            if kind {
+                self.move_dir(nodes, id, &child_from, &child_to).await?;
+                nodes.drop_node(id);
+            } else {
+                let bytes = self.file_bytes(nodes, id).await?;
+                let is_link = matches!(
+                    nodes.by_id[&id].kind,
+                    Kind::Link { .. } | Kind::StoreLink { .. }
+                );
+                if is_link {
+                    symlink_bytes(&bytes, &self.overlay_file(&child_to))
+                        .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                } else {
+                    let exec = match &nodes.by_id[&id].kind {
+                        Kind::Store { exec, .. } | Kind::Local { exec } => *exec,
+                        _ => false,
+                    };
+                    write_file(&self.overlay_file(&child_to), &bytes, exec)
+                        .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                }
+                if nodes.by_id[&id].from_ref {
+                    self.note_delete(nodes, &child_from);
+                } else {
+                    let _ = std::fs::remove_file(self.overlay_file(&child_from));
+                }
+                if matches!(
+                    nodes.by_id[&id].kind,
+                    Kind::Local { .. } | Kind::Link { .. }
+                ) {
+                    let _ = std::fs::remove_file(self.overlay_file(&child_from));
+                }
+                nodes.drop_node(id);
+                let new_kind = if is_link {
+                    Kind::Link { target: bytes }
+                } else {
+                    Kind::Local { exec: false }
+                };
+                let new_id = nodes.add(Some(child_to.clone()), new_kind, false);
+                self.forget_delete(nodes, &child_to);
+                if let Some(new_dir_id) = Self::id_of(nodes, Some(to)) {
+                    note_child(nodes, new_dir_id, &name, new_id);
+                }
+            }
+        }
+        // The old directory's name goes from every listing, but it is not
+        // a deletion: a changeset deletes files, and this was a directory.
+        nodes.deleted.insert(from.clone());
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1215,6 +1383,24 @@ mod tests {
         let (data, _) = test.vfs.read(id, 0, 1000).await.unwrap();
         assert_eq!(data, b"data\n");
         assert_eq!(cached().await, 1, "the second read fetched the blob again");
+    }
+
+    #[tokio::test]
+    async fn a_read_at_a_huge_offset_does_not_panic() {
+        let test = start(&[("a", b"data\n", Some(false))]).await;
+        let root = NFSFileSystem::root_dir(&test.vfs);
+        let id = test
+            .vfs
+            .lookup(root, &filename3::from(b"a".to_vec()))
+            .await
+            .unwrap();
+        // A client offset near the top of the range must not overflow.
+        let (data, eof) = test.vfs.read(id, u64::MAX, 16).await.unwrap();
+        assert_eq!(data, b"");
+        assert!(eof);
+        let (data, eof) = test.vfs.read(id, 3, u32::MAX).await.unwrap();
+        assert_eq!(data, b"a\n");
+        assert!(eof);
     }
 
     #[tokio::test]

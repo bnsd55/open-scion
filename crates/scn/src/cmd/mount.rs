@@ -212,7 +212,7 @@ fn overlay_dir() -> Result<PathBuf> {
 }
 
 /// The path of the session file, under the home directory.
-fn session_file() -> Result<PathBuf> {
+pub fn session_file() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("cannot read $HOME"))?;
@@ -259,7 +259,7 @@ fn parse_sessions(json: &serde_json::Value) -> Vec<MountRecord> {
 }
 
 /// Adds `record` to the session file, replacing the record of its dir.
-fn save_session(record: &MountRecord) -> Result<()> {
+pub fn save_session(record: &MountRecord) -> Result<()> {
     let file = session_file()?;
     let mut sessions = load_sessions();
     sessions.retain(|known| known.dir != record.dir);
@@ -268,7 +268,7 @@ fn save_session(record: &MountRecord) -> Result<()> {
 }
 
 /// Writes `records` as the session file `file`.
-fn write_sessions(file: &Path, sessions: &[MountRecord]) -> Result<()> {
+pub fn write_sessions(file: &Path, sessions: &[MountRecord]) -> Result<()> {
     let records: Vec<serde_json::Value> = sessions
         .iter()
         .map(|record| {
@@ -318,15 +318,17 @@ pub fn session_for_dir(dir: &Path) -> Result<MountRecord> {
 /// and each recorded deletion of the ref.
 pub fn overlay_changes(record: &MountRecord) -> Result<Vec<(RepoPath, Change)>> {
     let mut changes = Vec::new();
-    walk_changes(&record.overlay.join(CHANGES), "", &mut changes)?;
+    let tree = record.overlay.join(CHANGES);
+    walk_changes(&tree, "", &mut changes)?;
     // The recorded deletions, but not of a path that the overlay holds.
-    for name in crate::vfs::read_deletes(&record.overlay) {
+    for name in crate::vfs::read_deletes(&tree) {
         if let Ok(path) = RepoPath::new(name.as_bytes())
             && !changes.iter().any(|(known, _)| known == &path)
         {
             changes.push((path, Change::Delete));
         }
     }
+
     Ok(changes)
 }
 
@@ -351,6 +353,10 @@ fn walk_changes(dir: &Path, prefix: &str, out: &mut Vec<(RepoPath, Change)>) -> 
         };
         let path = RepoPath::new(rel.clone())
             .with_context(|| format!("bad name in the overlay: {rel:?}"))?;
+        // The note of deletions is bookkeeping, not a change.
+        if rel == crate::vfs::DELETES.as_bytes() {
+            continue;
+        }
         let kind = entry
             .file_type()
             .with_context(|| format!("cannot read {}", entry.path().display()))?;
@@ -438,7 +444,7 @@ mod tests {
         std::os::unix::fs::symlink("README", overlay.join(CHANGES).join("link")).unwrap();
         // One deletion, of a path that the overlay does not hold.
         fs::write(
-            overlay.join(crate::vfs::DELETES),
+            overlay.join(CHANGES).join(crate::vfs::DELETES),
             r#"["gone.txt", "src/old.rs"]"#,
         )
         .unwrap();

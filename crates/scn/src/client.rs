@@ -46,9 +46,12 @@ impl Interceptor for Call {
     }
 }
 
-/// The `Objects` client of `url`, for the tests of this crate.
-#[cfg(test)]
-pub(crate) async fn test_objects(url: &str, token: &str) -> Objects {
+/// The `Objects` client of `url`, for the tests, with a 10s timeout.
+///
+/// # Panics
+///
+/// Panics when `url` is not a valid address.
+pub async fn test_objects(url: &str, token: &str) -> Objects {
     let channel = Endpoint::from_shared(url.to_owned())
         .unwrap()
         .connect()
@@ -74,6 +77,11 @@ pub struct Ctx {
 impl Ctx {
     /// Connects to `server`: `http://HOST:PORT`, or `unix:///PATH` for a
     /// daemon on this node.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the address is bad, the server does not answer, or the
+    /// token is refused.
     pub async fn connect(
         server: &str,
         token: &str,
