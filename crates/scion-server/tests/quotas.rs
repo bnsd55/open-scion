@@ -139,9 +139,11 @@ fn client(channel: Channel, token: &str) -> Scion {
 
 /// A request that fails only on the quotas: land 1 does not exist, so a
 /// caller with free slots sees `NOT_FOUND`, and a caller at its request cap
-/// sees `RESOURCE_EXHAUSTED`.
-async fn probe(channel: Channel, token: &str) -> Code {
-    client(channel, token)
+/// sees `RESOURCE_EXHAUSTED`. The caller is reused, so the probes share one
+/// connection instead of opening thousands.
+async fn probe(caller: &Scion) -> Code {
+    caller
+        .clone()
         .get_land(GetLandRequest {
             repo: REPO.to_string(),
             land_id: "1".into(),
@@ -160,7 +162,9 @@ where
     F: Send,
     Fut: Future<Output = bool> + Send,
 {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    // Generous, so a loaded CI machine still reaches the state; the
+    // test asserts the state, never a duration.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while !f().await {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -178,7 +182,7 @@ async fn hold_upload(
     data: &[u8],
 ) -> (
     tokio::sync::mpsc::Sender<PutBlobRequest>,
-    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<Result<tonic::Response<scion_proto::v1::PutBlobResponse>, Status>>,
 ) {
     let (sender, receiver) = tokio::sync::mpsc::channel::<PutBlobRequest>(1);
     sender
@@ -190,9 +194,45 @@ async fn hold_upload(
         .unwrap();
     let mut client = client(channel, token);
     let reply = tokio::spawn(async move {
-        let _ = client.put_blob(ReceiverStream::new(receiver)).await;
+        client.put_blob(ReceiverStream::new(receiver)).await
     });
     (sender, reply)
+}
+
+/// Holds one request slot of `principal` with a half-open upload. A probe
+/// that reaches the server first takes the slot and gets the upload
+/// refused; that round is dropped and the hold is tried again.
+async fn hold_slot(
+    channel: &Channel,
+    principal: &str,
+    data: &[u8],
+) -> (
+    tokio::sync::mpsc::Sender<PutBlobRequest>,
+    tokio::task::JoinHandle<Result<tonic::Response<scion_proto::v1::PutBlobResponse>, Status>>,
+    Scion,
+) {
+    for _ in 0..20 {
+        let (sender, reply) = hold_upload(channel.clone(), principal, data).await;
+        let caller = client(channel.clone(), principal);
+        let held = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                // The upload lost the race and was refused: rearm.
+                if reply.is_finished() {
+                    break false;
+                }
+                if probe(&caller).await == Code::ResourceExhausted {
+                    break true;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if held && !reply.is_finished() {
+            return (sender, reply, caller);
+        }
+        drop(sender);
+    }
+    panic!("the upload never got its request slot");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -203,12 +243,14 @@ async fn a_principal_at_its_cap_is_refused_while_another_goes_on() {
     let (stop, channel) = server(&store, access, Quotas::new(Some(1), None)).await;
 
     // Alice's upload sends its first message and stays open, so the server
-    // holds her only request slot. The probe says when that has happened.
-    let (sender, reply) = hold_upload(channel.clone(), "alice", b"held").await;
-    until(|| async { probe(channel.clone(), "alice").await == Code::ResourceExhausted }).await;
+    // holds her only request slot. A probe that reaches the server before
+    // the upload would take the slot first and get the upload refused, so
+    // such a round is rearmed.
+    let (sender, reply, alice) = hold_slot(&channel, "alice", b"held").await;
 
     // Alice's next request is refused, and the error names her flag.
-    let denied = client(channel.clone(), "alice")
+    let denied = alice
+        .clone()
         .get_land(GetLandRequest {
             repo: REPO.to_string(),
             land_id: "1".into(),
@@ -228,13 +270,13 @@ async fn a_principal_at_its_cap_is_refused_while_another_goes_on() {
         })
         .await
         .unwrap();
-    let _ = probe(channel.clone(), "bob").await;
+    let _ = probe(&client(channel.clone(), "bob")).await;
 
     // Alice ends her upload, so her slot comes back and her next request
     // goes through again.
     drop(sender);
-    reply.await.unwrap();
-    until(|| async { probe(channel.clone(), "alice").await == Code::NotFound }).await;
+    reply.await.unwrap().unwrap();
+    until(|| async { probe(&alice).await == Code::NotFound }).await;
     stop.send(()).ok();
 }
 
@@ -342,6 +384,7 @@ async fn a_stream_holds_its_slot_until_the_stream_ends() {
         })
         .unwrap();
     let mut alice = client(channel.clone(), "alice");
+    let prober = client(channel.clone(), "alice");
     // Alice opens a reply and stops reading it. The producer of the reply
     // stays alive, and with it her only request slot.
     let stream = alice
@@ -353,14 +396,14 @@ async fn a_stream_holds_its_slot_until_the_stream_ends() {
         .await
         .unwrap()
         .into_inner();
-    until(|| async { probe(channel.clone(), "alice").await == Code::ResourceExhausted }).await;
+    until(|| async { probe(&prober).await == Code::ResourceExhausted }).await;
 
     // Bob is under his own cap: his calls complete while alice holds hers.
-    let _ = probe(channel.clone(), "bob").await;
+    let _ = probe(&client(channel.clone(), "bob")).await;
 
     // Alice drops her reply, so the stream ends and her slot comes back.
     drop(stream);
     drop(alice);
-    until(|| async { probe(channel.clone(), "alice").await == Code::NotFound }).await;
+    until(|| async { probe(&prober).await == Code::NotFound }).await;
     stop.send(()).ok();
 }
