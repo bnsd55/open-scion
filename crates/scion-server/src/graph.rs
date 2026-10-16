@@ -1093,4 +1093,31 @@ mod tests {
         other.unwrap().join().unwrap();
         assert_eq!(bases, [side]);
     }
+
+    #[test]
+    fn a_walk_waits_for_one_flush_for_all_its_steps() {
+        let (_dir, store, repo, ids) = store_graph_with_nodes(&ladder(20));
+        let (side, tip) = (ids[1], *ids.last().unwrap());
+        let mut paint = Paint::new(
+            At::get(&store, repo, side).unwrap(),
+            At::get(&store, repo, tip).unwrap(),
+        );
+        let before = store.blobs().full_flushes();
+        let mut commits = 0;
+        let (bases, cost) = in_steps(&store, &later(), SMALL, |index| {
+            // Each step sees a commit that no flush covers yet.
+            if index.reads == 0 {
+                commits += 1;
+                let name = format!("other {commits}");
+                store.commit(|c| db::create_repo(c, &name).map(drop))?;
+            }
+            paint.next(index)
+        })
+        .unwrap();
+        assert_eq!(bases, [side]);
+        assert!(cost.steps > 1, "{cost:?}");
+        // None where the commit's own fsync flushes the drive cache.
+        let flushes = store.blobs().full_flushes() - before;
+        assert_eq!(flushes, u64::from(crate::store::FSYNC_LEAVES_DRIVE_CACHE));
+    }
 }
