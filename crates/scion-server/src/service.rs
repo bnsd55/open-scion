@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use scion_core::{BlobId, ChangesetId, FileState, RepoPath};
+use scion_proto::listen::Limits;
 use scion_proto::v1::scion_server::{Scion, ScionServer};
 use scion_proto::v1::{
     self, BlameChangeset, BlameRange, BlameRequest, BlameResponse, CreateChangesetRequest,
@@ -64,7 +65,8 @@ const READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 const _: () = assert!(read_share(MAX_OBJECT_BYTES) <= READ_BUDGET_BYTES);
 const _: () = assert!(READ_BUDGET_BYTES <= u32::MAX as usize);
 
-/// Serves the API on `listener`, requiring `token`, until `shutdown` resolves.
+/// Serves the API on `listener`, requiring `token`, within `limits`, until
+/// `shutdown` resolves.
 ///
 /// # Errors
 ///
@@ -73,6 +75,7 @@ pub async fn serve(
     store: Store,
     listener: TcpListener,
     token: &str,
+    limits: Limits,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
     let auth = Auth::new(token);
@@ -82,11 +85,12 @@ pub async fn serve(
         auth.clone(),
     );
     let objects = InterceptedService::new(ObjectsService::new(worker).into_server(), auth);
-    tonic::transport::Server::builder()
+    limits
+        .server()
         .timeout(REQUEST_TIMEOUT)
         .add_service(scion)
         .add_service(objects)
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
+        .serve_with_incoming_shutdown(limits.accept(TcpListenerStream::new(listener)), shutdown)
         .await
 }
 

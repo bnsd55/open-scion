@@ -18,6 +18,7 @@ use scion_core::{
     TreeId,
 };
 use scion_proto::CHUNK_BYTES;
+use scion_proto::listen::Limits;
 use scion_proto::object::{self, Header};
 use scion_proto::v1::objects_server::{Objects, ObjectsServer};
 use scion_proto::v1::{
@@ -118,6 +119,7 @@ impl Server {
             store,
             listener,
             TOKEN,
+            Limits::default(),
             std::future::pending(),
         ));
         Self {

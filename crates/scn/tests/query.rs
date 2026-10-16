@@ -9,6 +9,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, GitOid, IdentityTime, RepoPath};
+use scion_proto::listen::Limits;
 use scion_server::import::{ImportOptions, import_git};
 use scion_server::read::MAX_DIFF_ENTRIES;
 use scion_server::{Store, db, service, tree};
@@ -78,6 +79,7 @@ impl Server {
             store,
             listener,
             TOKEN,
+            Limits::default(),
             std::future::pending(),
         ));
         Self {
