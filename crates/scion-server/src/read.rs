@@ -12,7 +12,7 @@ use crate::db::{self, RepoId};
 use crate::deadline::Deadline;
 use crate::error::{Error, Result};
 use crate::graph;
-use crate::similar::{self, Budget, Chunks};
+use crate::similar::{self, Budget, Chunks, MAX_PAIRS, Progress};
 use crate::store::Store;
 use crate::tree;
 
@@ -269,11 +269,11 @@ pub const MAX_DIFF_ENTRIES: usize = 1000;
 pub const MAX_RENAME_ENTRIES: usize = 10_000;
 
 /// Most work one `Diff` call does to find similar files, in steps 2 and 3
-/// of [`similar::renames`]: each chunk of a file read counts once, and each
-/// row of a chunk table that the search indexes or compares counts once
-/// ([`similar::Budget`]). Reading 64 MiB of text in lines of 64 bytes or
-/// more costs 1M. The budget is the same on every call, so every call finds
-/// the same renames.
+/// of [`similar::renames`]: each chunk of a file read counts once, each row
+/// of a chunk table that the search indexes or compares counts once, and
+/// each file size read counts [`similar::SIZE_COST`] ([`similar::Budget`]).
+/// Reading 64 MiB of text in lines of 64 bytes or more costs 1M. The budget
+/// is the same on every call, so every call finds the same renames.
 // SHORTCUT: past it, the search reads no more files, so a diff with many
 // large files that could be similar can miss renames that git finds, also
 // renames to a file of the same name.
@@ -401,8 +401,10 @@ fn renames(store: &Store, entries: &[DiffEntry]) -> Result<HashMap<RepoPath, Ren
     let budget = Budget {
         cost: &mut cost,
         cap: MAX_RENAME_CHUNKS,
+        progress: false,
     };
-    let pairs = similar::renames(store, &added, &deleted, read, similar::MAX_PAIRS, budget)?;
+    let from = Progress::default();
+    let pairs = similar::renames(store, &added, &deleted, read, MAX_PAIRS, from, budget)?.pairs;
     if cost >= MAX_RENAME_CHUNKS {
         tracing::debug!(
             cost,
