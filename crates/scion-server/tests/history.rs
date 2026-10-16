@@ -845,12 +845,15 @@ fn a_rename_search_goes_on_where_a_call_stopped() {
     // call's budget is four of them. `new` is a rename of `old/7` with one
     // line changed. `old/1` is 60% like it, the rest are not like it.
     // A call reads `new`, then deleted files while its budget lasts, and
-    // reads the best file so far again when it goes on.
+    // reads the best file so far again when it goes on. `lib/new`, first by
+    // path, has the name of `new`, so step 2 of the first call reads it. The
+    // calls that go on do not run step 2 again.
     let n = MAX_BLAME_BYTES / 64;
     assert_eq!(4 * n, MAX_BLAME_DIFF_LINES);
     let line = |byte: char| format!("{}\n", byte.to_string().repeat(63));
     let put = |text: &str| Some(regular(store.blobs().put(text.as_bytes()).unwrap()));
-    let names: Vec<String> = (0..=7).map(|k| format!("old/{k}")).collect();
+    let mut names: Vec<String> = (0..=7).map(|k| format!("old/{k}")).collect();
+    names.push("lib/new".into());
     let unlike = put(&line('a').repeat(n));
     let mut root: Vec<_> = names.iter().map(|p| (p.as_str(), unlike)).collect();
     let sixty = line('n').repeat(n * 3 / 5) + &line('b').repeat(n - n * 3 / 5);
@@ -859,7 +862,8 @@ fn a_rename_search_goes_on_where_a_call_stopped() {
     let mut rename: Vec<_> = names.iter().map(|p| (p.as_str(), None)).collect();
     let new = format!("{}{}", line('c'), line('n').repeat(n - 1));
     rename.push(("new", put(&new)));
-    let ids = chain(&store, vec![root, rename]);
+    let edit = vec![("new", put("edited\n"))];
+    let ids = chain(&store, vec![root, rename, edit]);
 
     let mut search = RenameSearch::default();
     for searched in [3, 5, 7] {
@@ -882,12 +886,15 @@ fn a_rename_search_goes_on_where_a_call_stopped() {
     assert_eq!(last.changesets[1], (ids[0], author(), path("old/7")));
     assert_eq!(blame_calls(&store, ids[1], "new").1, 4);
 
-    // A search that cannot have stopped there is refused.
+    // A search that cannot have stopped there is refused: past the deleted
+    // files, a best file not searched yet or not deleted, at a changeset
+    // with no parent, and where the file was there before.
     let bad = [
-        (ids[1], "new", 9, None),
+        (ids[1], "new", 10, None),
         (ids[1], "new", 3, Some("old/3")),
         (ids[1], "new", 3, Some("old")),
         (ids[0], "old/7", 1, None),
+        (ids[2], "new", 1, None),
     ];
     for (cs, p, searched, best) in bad {
         let search = RenameSearch {
@@ -941,6 +948,85 @@ fn a_rename_search_moves_on_every_call() {
     let last = blame::blame(&store, REPO, ids[1], &path("new"), &search).unwrap();
     assert_eq!(last.next, None);
     assert_eq!(last.changesets[1], (ids[0], author(), path("old/2")));
+}
+
+#[test]
+fn a_rename_search_at_a_later_step_uses_the_budget_left() {
+    // `ids[2]` adds a line to `new`, a diff that costs about 300,000. Before
+    // that, `ids[1]` renamed `old` to `new` with one line changed. The
+    // search and its diff do not fit in the budget left, so the call stops
+    // at `ids[1]` and says where the search stopped. With no other deleted
+    // file the search ends, so the next call only reads `old` again. With
+    // five files of the same size before `old`, of one line repeated, so
+    // not like `new`, it stops before `old`.
+    let n: u32 = 150_000;
+    let lines =
+        |from: u32| (from..from + n).fold(String::new(), |text, i| text + &format!("{i:07}\n"));
+    let old = lines(0);
+    let new = old.replacen("0000000\n", "changed\n", 1);
+    let ended = RenameSearch {
+        searched: 1,
+        best: Some(path("old")),
+    };
+    let before_old = RenameSearch {
+        searched: 4,
+        best: None,
+    };
+    for (decoys, stopped) in [(0, ended), (5, before_old)] {
+        let (_data, store) = open_store();
+        let put = |text: &str| Some(regular(store.blobs().put(text.as_bytes()).unwrap()));
+        let names: Vec<String> = (0..decoys).map(|k| format!("a/{k}")).collect();
+        let mut root: Vec<_> = names
+            .iter()
+            .map(|p| (p.as_str(), put(&format!("{p:<7}\n").repeat(150_000))))
+            .collect();
+        root.push(("old", put(&old)));
+        let mut rename: Vec<_> = root.iter().map(|&(p, _)| (p, None)).collect();
+        rename.push(("new", put(&new)));
+        let edit = vec![("new", put(&format!("{new}extra00\n")))];
+        let ids = chain(&store, vec![root, rename, edit]);
+        let first = blame(&store, ids[2], "new");
+        assert_eq!(first.next, Some((ids[1], path("new"))), "{decoys}");
+        assert_eq!(first.next_search, stopped, "{decoys}");
+        let (got, calls) = blame_calls(&store, ids[2], "new");
+        let mut expected = vec![(ids[1], 1, path("new"))];
+        expected.extend((2..=n).map(|i| (ids[0], i, path("old"))));
+        expected.push((ids[2], n + 1, path("new")));
+        assert_eq!((got, calls), (expected, 2), "{decoys}");
+    }
+}
+
+#[test]
+fn a_rename_search_counts_the_file_sizes_it_reads() {
+    let (_data, store) = open_store();
+    // 17,000 deleted files of a few bytes, each its own blob: too small to
+    // be like `new`, so the search reads only their sizes. At 64 each, that
+    // is more than one call's budget, so the search goes on in a second
+    // call. `old`, first by path, is the rename.
+    let names: Vec<String> = (0..17_000).map(|k| format!("t/{k:05}")).collect();
+    let mut batch = store.blobs().batch();
+    let mut root: Vec<_> = names
+        .iter()
+        .map(|p| (p.as_str(), Some(regular(batch.put(p.as_bytes()).unwrap()))))
+        .collect();
+    batch.sync().unwrap();
+    let put = |text: &str| Some(regular(store.blobs().put(text.as_bytes()).unwrap()));
+    let old = numbered(0..2000);
+    root.push(("old", put(&old)));
+    let mut rename: Vec<_> = root.iter().map(|&(p, _)| (p, None)).collect();
+    rename.push(("new", put(&old.replacen("n000000\n", "changed\n", 1))));
+    let ids = chain(&store, vec![root, rename]);
+    let first = blame(&store, ids[1], "new");
+    assert_eq!(first.next, Some((ids[1], path("new"))));
+    assert!(
+        first.next_search.searched < names.len(),
+        "{:?}",
+        first.next_search
+    );
+    assert_eq!(first.next_search.best, Some(path("old")));
+    let (got, calls) = blame_calls(&store, ids[1], "new");
+    assert_eq!(got[1], (ids[0], 2, path("old")));
+    assert_eq!(calls, 2);
 }
 
 #[test]
@@ -1047,9 +1133,10 @@ fn assert_many_deletes_match_git(
 
 #[test]
 fn a_changeset_that_deletes_150_files_is_searched_as_git_blame_does() {
-    // `f/0120` is 80% like `new.txt`. `lib/new.txt` has its name, and no
-    // other deleted file has, but it is 60% like it: under 75%, so it only
-    // competes on similarity. The others are 45% to 68%.
+    // `f/0120` shares 80% of `new.txt`. `lib/new.txt` has its name, and no
+    // other deleted file has, but it shares 60%: under 75%, so it only
+    // competes on similarity. The others share 45% to 68%. Chunks whose
+    // hashes collide add to that, as in git.
     let shared = |k: usize| if k == 120 { 1600 } else { 900 + k * 3 };
     let same_name = [("lib/new.txt", like_numbered(4000, 1200))];
     assert_many_deletes_match_git(150, shared, &same_name);
@@ -1057,12 +1144,14 @@ fn a_changeset_that_deletes_150_files_is_searched_as_git_blame_does() {
 
 #[test]
 fn a_changeset_that_deletes_1000_files_is_searched_over_calls_as_git_blame_does() {
-    // `f/0100` is 70% like `new.txt`, `f/0700` 69.5%, the others at most
-    // 65%. The search reads all 1,000 files, more than one call's budget, so
-    // later calls go on with `f/0100` as the best so far and keep it.
+    // `f/0100` shares 95% of `new.txt`, `f/0700` 92.5%, the others 45% to
+    // 65%. Chunks whose hashes collide add to that, as in git: up to about
+    // 75% here. The search reads all 1,000 files, more than one call's
+    // budget, so later calls go on with `f/0100` as the best so far and keep
+    // it.
     let shared = |k: usize| match k {
-        100 => 1400,
-        700 => 1390,
+        100 => 1900,
+        700 => 1850,
         _ => 900 + k * 37 % 400,
     };
     let calls = assert_many_deletes_match_git(1000, shared, &[]);
