@@ -601,7 +601,14 @@ impl<S: Store> Tier<S> {
                 self.cover(&mut permit, bytes, ask.until).await?;
                 Some(permit)
             }
-            None => reply::take(&self.inner.in_flight, bytes, ask.until.wait(self.inner.busy)).await,
+            None => {
+                reply::take(
+                    &self.inner.in_flight,
+                    bytes,
+                    ask.until.wait(self.inner.busy),
+                )
+                .await
+            }
         }
     }
 
@@ -673,48 +680,70 @@ impl<S: Store> Tier<S> {
         self.blocking(move |store| store.get(key, size)).await
     }
 
-    /// Gets `keys[i]` in its stored form from upstream. Joins the fetch in
-    /// progress for it, or starts one. A fetch that a reply starts also takes
-    /// the later keys, up to [`MAX_BATCH`] in all, that the store lacks. A
-    /// key that an earlier fetch of the same reply covered, but the store did
-    /// not keep, is fetched alone, so such a store costs one fetch per
-    /// object, not one per remaining call. The wait is bounded: each step of
-    /// a fetch has the tier's timeout, and a fetch always settles every
-    /// object it holds. `None` if a fetch that ended after the caller found
-    /// no stored copy has stored the object: the caller reads it from the
-    /// store, with its share, and does not fetch it again.
+    /// Gets `ask.keys[i]` in its stored form from upstream. Joins the fetch
+    /// in progress for it, or starts one. A fetch that a reply starts also
+    /// takes the later keys, up to [`MAX_BATCH`] in all, that the store
+    /// lacks. A key that an earlier fetch of the same reply covered, but the
+    /// store did not keep, is fetched alone, so such a store costs one fetch
+    /// per object, not one per remaining call. A fetch has the deadline of
+    /// the caller that started it.
+    ///
+    /// The wait is bounded: each step of a fetch has the tier's timeout and
+    /// the fetch's deadline, and a fetch always settles every object it
+    /// holds. A caller waits no longer than its own deadline. Then it stops,
+    /// and the fetch goes on for the others. If the fetch failed as a whole
+    /// and its deadline came first, the caller asks again with its own: the
+    /// failure may have come from the shorter deadline.
+    ///
+    /// `None` if a fetch that ended after the caller found no stored copy has
+    /// stored the object: the caller reads it from the store, with its
+    /// share, and does not fetch it again.
     async fn fetch(
         &self,
-        repo: &str,
-        keys: &[Key],
+        ask: &Ask,
         i: usize,
         progress: &Progress,
     ) -> Result<Option<Bytes>, Failed> {
+        let (repo, keys, until) = (&ask.repo, &ask.keys, ask.until);
         let key = keys[i];
-        let joined = lock(&self.inner.flights)
-            .get(&(repo.to_owned(), key))
-            .cloned();
-        let flight = if let Some(flight) = joined {
-            Some(flight)
-        } else if i < progress.fetched_to.load(Ordering::Relaxed) {
-            self.start(repo, key, Vec::new())
-        } else {
-            let end = keys.len().min(i + MAX_BATCH);
-            progress.fetched_to.store(end, Ordering::Relaxed);
-            self.start(repo, key, keys[i + 1..end].to_vec())
-        };
-        let Some(mut flight) = flight else {
-            return Ok(None);
-        };
-        let outcome = flight
-            .wait_for(Option::is_some)
-            .await
-            .ok()
-            .and_then(|outcome| outcome.clone());
-        outcome.map_or_else(
-            || Err(Status::internal("a fetch from upstream ended without a result").into()),
-            |outcome| outcome.map(Some),
-        )
+        loop {
+            let joined = lock(&self.inner.flights).get(&(repo.clone(), key)).cloned();
+            let flight = if let Some(flight) = joined {
+                Some(flight)
+            } else if i < progress.fetched_to.load(Ordering::Relaxed) {
+                self.start(repo, key, Vec::new(), until)
+            } else {
+                let end = keys.len().min(i + MAX_BATCH);
+                progress.fetched_to.store(end, Ordering::Relaxed);
+                self.start(repo, key, keys[i + 1..end].to_vec(), until)
+            };
+            let Some(mut flight) = flight else {
+                return Ok(None);
+            };
+            let settled = flight.wait_for(Option::is_some);
+            let Ok(settled) = tokio::time::timeout(until.wait(Duration::MAX), settled).await else {
+                return Err(Failed {
+                    status: Status::deadline_exceeded(
+                        "the deadline passed while the call waited for a fetch from upstream",
+                    ),
+                    whole_call: true,
+                    until,
+                });
+            };
+            match settled.ok().and_then(|outcome| outcome.clone()) {
+                None => {
+                    return Err(
+                        Status::internal("a fetch from upstream ended without a result").into(),
+                    );
+                }
+                Some(Err(failed))
+                    if failed.whole_call && failed.until.before(until) && !until.passed() =>
+                {
+                    tracing::debug!(%key, status = %failed.status, "a fetch with an earlier deadline failed; asking again");
+                }
+                Some(outcome) => return outcome.map(Some),
+            }
+        }
     }
 
     /// Starts one fetch for `key` and `later`, minus the objects that another
@@ -724,7 +753,13 @@ impl<S: Store> Tier<S> {
     /// The store is asked under the fetch table's lock. A fetch stores each
     /// object before it takes the object out of the table, so an object in
     /// neither has not been fetched yet, and only one fetch starts for it.
-    fn start(&self, repo: &str, key: Key, later: Vec<Key>) -> Option<watch::Receiver<Outcome>> {
+    fn start(
+        &self,
+        repo: &str,
+        key: Key,
+        later: Vec<Key>,
+        until: Until,
+    ) -> Option<watch::Receiver<Outcome>> {
         let stored = |k| matches!(self.inner.store.size(k), Ok(Some(_)));
         let mut flights = lock(&self.inner.flights);
         if let Some(rx) = flights.get(&(repo.to_owned(), key)) {
@@ -749,6 +784,7 @@ impl<S: Store> Tier<S> {
             tier: self.clone(),
             repo: repo.to_owned(),
             waiting,
+            until,
         };
         tokio::spawn(flight.run());
         Some(rx)
@@ -765,6 +801,9 @@ struct Flight<S: Store> {
     /// The objects not fetched yet, in request order, each with the sender
     /// that its waiters listen to.
     waiting: VecDeque<(Key, watch::Sender<Outcome>)>,
+    /// When the fetch ends its waits: the deadline of the caller that
+    /// started it, less the margin.
+    until: Until,
 }
 
 /// The next object of an upstream reply.
@@ -787,6 +826,7 @@ impl<S: Store> Flight<S> {
             let failed = Failed {
                 status,
                 whole_call: true,
+                until: self.until,
             };
             for (_, tx) in &self.waiting {
                 tx.send_replace(Some(Err(failed.clone())));
@@ -819,26 +859,33 @@ impl<S: Store> Flight<S> {
             fetch_slots, busy, ..
         } = &*self.tier.inner;
         let slot = Arc::clone(fetch_slots).acquire_owned();
-        let _slot = match tokio::time::timeout(*busy, slot).await {
+        let wait = self.until.wait(*busy);
+        let _slot = match tokio::time::timeout(wait, slot).await {
             Ok(Ok(slot)) => slot,
             Ok(Err(_)) => return Err(Status::unavailable("the tier is shutting down")),
             Err(_) => {
                 return Err(Status::unavailable(format!(
-                    "no fetch slot within {busy:?}; ask again"
+                    "no fetch slot within {wait:?}; ask again"
                 )));
             }
         };
         while !self.waiting.is_empty() {
+            if self.until.passed() {
+                return Err(Status::deadline_exceeded(
+                    "the deadline passed before the fetch could ask upstream",
+                ));
+            }
             let refs = self.waiting.iter().map(|(key, _)| key.to_ref()).collect();
-            let request = GetObjectsRequest {
+            // Upstream gets what is left of the deadline.
+            let request = self.until.request(GetObjectsRequest {
                 repo: self.repo.clone(),
                 refs,
                 accept: vec![Encoding::Zstd.into()],
-            };
+            });
             let mut upstream = self.tier.inner.upstream.clone();
             let mut stream = self
                 .tier
-                .within(upstream.get_objects(request))
+                .within(self.until, upstream.get_objects(request))
                 .await?
                 .into_inner();
             let before = self.waiting.len();
@@ -886,7 +933,7 @@ impl<S: Store> Flight<S> {
     /// the object at the front of the fetch. Takes its share of the fetch
     /// budget from its header, before the rest of its parts arrive.
     async fn next(&self, stream: &mut Streaming<ObjectPart>) -> Result<Next, Status> {
-        let first = match self.tier.within(stream.message()).await {
+        let first = match self.tier.within(self.until, stream.message()).await {
             Ok(Some(part)) => part,
             Ok(None) => return Ok(Next::End),
             // Upstream ends its reply after an error about one object.
@@ -911,16 +958,17 @@ impl<S: Store> Flight<S> {
         // reply's is. Then the fetch ends, and every object it holds fails
         // with `UNAVAILABLE`: the callers ask again.
         let Inner { fetching, busy, .. } = &*self.tier.inner;
-        let permit = reply::take(fetching, key.check_bytes(&header), *busy)
+        let wait = self.until.wait(*busy);
+        let permit = reply::take(fetching, key.check_bytes(&header), wait)
             .await
             .ok_or_else(|| {
                 Status::unavailable(format!(
-                    "no memory within {busy:?} for an object from upstream; ask again"
+                    "no memory within {wait:?} for an object from upstream; ask again"
                 ))
             })?;
         let mut object = Assembler::new(header, first);
         while !object.is_done() {
-            let part = match self.tier.within(stream.message()).await {
+            let part = match self.tier.within(self.until, stream.message()).await {
                 Ok(Some(part)) => part,
                 Ok(None) => return bad("the reply ended in the middle of the object".into()),
                 Err(status) if about_one_object(&status) => return Ok(Next::Failed(status)),
@@ -968,9 +1016,13 @@ impl<S: Store> Objects for Tier<S> {
         request: Request<ResolveRefRequest>,
     ) -> Result<Response<ResolveRefResponse>, Status> {
         // A ref moves, so its answer is always forwarded and never kept.
+        let until = Until::of(&request);
         let mut upstream = self.inner.upstream.clone();
         let reply = self
-            .within(upstream.resolve_ref(request.into_inner()))
+            .within(
+                until,
+                upstream.resolve_ref(until.request(request.into_inner())),
+            )
             .await?;
         Ok(Response::new(reply.into_inner()))
     }
@@ -979,6 +1031,7 @@ impl<S: Store> Objects for Tier<S> {
         &self,
         request: Request<GetRootTreeRequest>,
     ) -> Result<Response<GetRootTreeResponse>, Status> {
+        let until = Until::of(&request);
         let request = request.into_inner();
         check_repo(&request.repo)?;
         let changeset: ChangesetId = check::id(&request.changeset_id, "changeset_id")?;
@@ -991,7 +1044,7 @@ impl<S: Store> Objects for Tier<S> {
             tracing::debug!(%changeset, "root tree miss");
             let mut upstream = self.inner.upstream.clone();
             let reply = self
-                .within(upstream.get_root_tree(request))
+                .within(until, upstream.get_root_tree(until.request(request)))
                 .await?
                 .into_inner();
             let tree: TreeId = TreeId::try_from(reply.tree_id.as_slice())
@@ -1011,6 +1064,7 @@ impl<S: Store> Objects for Tier<S> {
         &self,
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<ObjectStream>, Status> {
+        let until = Until::of(&request);
         let GetObjectsRequest { repo, refs, accept } = request.into_inner();
         check_repo(&repo)?;
         check::object_count(refs.len())?;
@@ -1019,6 +1073,7 @@ impl<S: Store> Objects for Tier<S> {
             repo,
             keys,
             zstd: accept.contains(&Encoding::Zstd.into()),
+            until,
         };
         // The first object is found before the reply starts, as on the
         // server. So when the whole upstream call fails (for example,
@@ -1197,6 +1252,7 @@ mod tests {
             repo: "r".into(),
             keys: keys.to_vec(),
             zstd: false,
+            until: Until::NONE,
         }
     }
 
@@ -1209,7 +1265,11 @@ mod tests {
         // has ended, so none can join a fetch in progress.
         let progress = Progress::default();
         for (i, blob) in blobs.iter().enumerate() {
-            let stored = tier.fetch("r", &keys, i, &progress).await.unwrap().unwrap();
+            let stored = tier
+                .fetch(&ask(&keys), i, &progress)
+                .await
+                .unwrap()
+                .unwrap();
             // A RAW blob from upstream is kept packed.
             assert_eq!(object::unpack(&stored, blob.len()).unwrap(), *blob);
             while !lock(&tier.inner.flights).is_empty() {
@@ -1231,13 +1291,13 @@ mod tests {
         };
 
         // A fetch of the last two objects ends, and stores them.
-        tier.fetch("r", &keys, 1, &Progress::default())
+        tier.fetch(&ask(&keys), 1, &Progress::default())
             .await
             .unwrap();
         settled().await;
         assert_eq!(asked(), 2);
         // A batch that starts at the first object leaves out the two stored.
-        tier.fetch("r", &keys, 0, &Progress::default())
+        tier.fetch(&ask(&keys), 0, &Progress::default())
             .await
             .unwrap();
         settled().await;
@@ -1246,7 +1306,7 @@ mod tests {
         // asks after the fetch has ended, is sent to the store. This is the
         // window between a reply's store check and its fetch.
         for i in 0..blobs.len() {
-            let fetched = tier.fetch("r", &keys, i, &Progress::default()).await;
+            let fetched = tier.fetch(&ask(&keys), i, &Progress::default()).await;
             assert!(fetched.unwrap().is_none(), "read it from the store");
         }
         assert_eq!(asked(), 3, "nothing was fetched twice");
@@ -1424,8 +1484,8 @@ mod tests {
             .await
             .unwrap();
 
-        let (keys, progress) = ([key], Progress::default());
-        let fetch = tier.fetch("r", &keys, 0, &progress);
+        let (ask, progress) = (ask(&[key]), Progress::default());
+        let fetch = tier.fetch(&ask, 0, &progress);
         let failed = tokio::time::timeout(Duration::from_secs(10), fetch)
             .await
             .expect("the wait for a slot is bounded")
@@ -1497,8 +1557,8 @@ mod tests {
 
         // The upstream reply stays open meanwhile, so the wait is bounded:
         // the fetch fails, and so does every object it holds.
-        let (keys, progress) = ([key], Progress::default());
-        let fetch = tier.fetch("r", &keys, 0, &progress);
+        let (ask, progress) = (ask(&[key]), Progress::default());
+        let fetch = tier.fetch(&ask, 0, &progress);
         let failed = tokio::time::timeout(Duration::from_secs(10), fetch)
             .await
             .expect("the wait for memory is bounded")
@@ -1516,7 +1576,9 @@ mod tests {
         let tier = stalled_upstream(&data).await;
         let fetching = tier.clone();
         let fetch =
-            tokio::spawn(async move { fetching.fetch("r", &[key], 0, &Progress::default()).await });
+            tokio::spawn(
+                async move { fetching.fetch(&ask(&[key]), 0, &Progress::default()).await },
+            );
 
         // The content, the frame packed from it and the codec, no more: a
         // small object takes no room for the largest one.
