@@ -88,7 +88,7 @@ async fn sweeps(worker: Worker, lands: Arc<Lands>, stale_secs: i64, mut stop: wa
             Err(e) => tracing::warn!(error = %e, "the stale-land sweep task failed"),
         }
         tokio::select! {
-            _ = tokio::time::sleep(SWEEP_PERIOD) => {}
+            () = tokio::time::sleep(SWEEP_PERIOD) => {}
             _ = stop.changed() => break,
         }
     }
@@ -112,6 +112,9 @@ const _: () = assert!(READ_BUDGET_BYTES <= u32::MAX as usize);
 /// # Errors
 ///
 /// Transport errors.
+// SHORTCUT: eight knobs in one call. Upgrade: a config struct when a ninth
+// appears, or when callers stop passing every knob in tests.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     store: Store,
     listener: TcpListener,
@@ -142,13 +145,20 @@ pub async fn serve(
             let _ = stopped.changed().await;
         }
     };
-    tokio::spawn(sweeps(worker.clone(), Arc::clone(&lands), land_stale_secs, stop_rx));
+    tokio::spawn(sweeps(
+        worker.clone(),
+        Arc::clone(&lands),
+        land_stale_secs,
+        stop_rx,
+    ));
     let scion = InterceptedService::new(
         ScionService::new(worker.clone(), Arc::clone(&access), lands, quotas.clone()).into_server(),
         auth.clone(),
     );
-    let objects =
-        InterceptedService::new(ObjectsService::new(worker, access, quotas).into_server(), auth);
+    let objects = InterceptedService::new(
+        ObjectsService::new(worker, access, quotas).into_server(),
+        auth,
+    );
     let router = |server: Server| {
         server
             .timeout(REQUEST_TIMEOUT)
@@ -450,7 +460,10 @@ impl Scion for ScionService {
         self.access.check_writer(&caller, &first.repo)?;
         // The first message's bytes, and the budget that the later messages
         // of this upload take from. Held until the reply, on every path.
-        let mut quota = self.quotas.upload(&caller, first.data.len()).map_err(Status::from)?;
+        let mut quota = self
+            .quotas
+            .upload(&caller, first.data.len())
+            .map_err(Status::from)?;
         // Check the repo before reading any more data. Each message goes to
 
         // the spool file before the next one is read, so an upload holds one

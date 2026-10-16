@@ -59,7 +59,7 @@ impl Quotas {
     /// # Errors
     ///
     /// [`Error::ResourceExhausted`] if the principal is over its limit.
-    pub fn enter(&self, caller: &Caller) -> Result<Call> {
+    pub(crate) fn enter(&self, caller: &Caller) -> Result<Call> {
         let Some(limit) = self.requests else {
             return Ok(self.nothing(caller));
         };
@@ -89,7 +89,7 @@ impl Quotas {
     /// # Errors
     ///
     /// [`Error::ResourceExhausted`] if the principal is over its limit.
-    pub fn upload(&self, caller: &Caller, bytes: usize) -> Result<Call> {
+    pub(crate) fn upload(&self, caller: &Caller, bytes: usize) -> Result<Call> {
         let limit = self.upload_bytes;
         let Some(limit) = limit else {
             return Ok(self.nothing(caller));
@@ -240,7 +240,9 @@ mod tests {
     #[test]
     fn no_limits_take_nothing() {
         let quotas = Quotas::off();
-        let held: Vec<_> = (0..1000).map(|_| quotas.enter(&caller("a")).unwrap()).collect();
+        let held: Vec<_> = (0..1000)
+            .map(|_| quotas.enter(&caller("a")).unwrap())
+            .collect();
         let mut upload = quotas.upload(&caller("a"), usize::MAX - 1).unwrap();
         upload.add(usize::MAX - 1).unwrap();
         drop(upload);

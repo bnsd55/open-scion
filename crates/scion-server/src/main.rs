@@ -160,43 +160,21 @@ async fn main() -> anyhow::Result<()> {
             // principal, a per-principal cap is a global one, so the quotas
             // are off unless a flag sets one.
             let (access, single) = load_access(token, access)?;
-            let with_default = |flag: Option<usize>, default: usize| match single {
-                true => flag,
-                false => Some(flag.unwrap_or(default)),
-            };
-            let quotas = Quotas::new(
-                with_default(max_principal_requests, 64),
-                with_default(max_principal_upload_bytes, 512 << 20),
+            let caps = caps(
+                single,
+                max_principal_requests,
+                max_principal_upload_bytes,
+                max_principal_pending_lands,
             );
-            let pending_lands = with_default(max_principal_pending_lands, 64);
-            // SHORTCUT: no TLS. Upgrade: tonic TLS or mTLS before any
-            // deployment beyond one machine.
-            anyhow::ensure!(
-                listen.ip().is_loopback() || insecure_listen,
-                "{listen} is not a loopback address; traffic and the token would \
-                 travel unencrypted. Pass --insecure-listen to allow it."
-            );
-            let listener = tokio::net::TcpListener::bind(listen)
-                .await
-                .with_context(|| format!("cannot listen on {listen}"))?;
-            // The bound address, so port 0 shows the port that the OS chose.
-            let listen = listener.local_addr()?;
-            tracing::info!(%listen, "serving");
-            let limits = Limits {
-                connections: max_connections,
-                streams: max_streams,
-            };
-            service::serve(
+            serve_cli(
                 store,
-                listener,
+                listen,
                 access,
-                limits,
-                quotas,
-                pending_lands,
+                caps,
                 land_stale_secs,
-                async {
-                    tokio::signal::ctrl_c().await.ok();
-                },
+                insecure_listen,
+                max_connections,
+                max_streams,
             )
             .await?;
         }
@@ -245,6 +223,83 @@ async fn main() -> anyhow::Result<()> {
             println!("derived {name} for the history of {tip}; older versions are removed");
         }
     }
+    Ok(())
+}
+
+/// The three per-principal caps, as the flags set them. With one principal
+/// (the `--token` mode) a per-principal cap is a global one, so each cap is
+/// off unless a flag sets it; with an access file the defaults apply.
+struct Caps {
+    quotas: Quotas,
+    pending_lands: Option<usize>,
+}
+
+fn caps(
+    single: bool,
+    requests: Option<usize>,
+    upload_bytes: Option<usize>,
+    pending_lands: Option<usize>,
+) -> Caps {
+    let with_default = |flag: Option<usize>, default: usize| {
+        if single {
+            flag
+        } else {
+            Some(flag.unwrap_or(default))
+        }
+    };
+    Caps {
+        quotas: Quotas::new(
+            with_default(requests, 64),
+            with_default(upload_bytes, 512 << 20),
+        ),
+        pending_lands: with_default(pending_lands, 64),
+    }
+}
+
+/// Serves with the flags of `--serve`. Returns when the server stops.
+// SHORTCUT: eight knobs in one call. Upgrade: a config struct when a ninth
+// appears, or when callers stop passing every knob in tests.
+#[allow(clippy::too_many_arguments)]
+async fn serve_cli(
+    store: Store,
+    listen: SocketAddr,
+    access: scion_server::access::Access,
+    caps: Caps,
+    land_stale_secs: i64,
+    insecure_listen: bool,
+    max_connections: NonZeroUsize,
+    max_streams: NonZeroU32,
+) -> anyhow::Result<()> {
+    // SHORTCUT: no TLS. Upgrade: tonic TLS or mTLS before any
+    // deployment beyond one machine.
+    anyhow::ensure!(
+        listen.ip().is_loopback() || insecure_listen,
+        "{listen} is not a loopback address; traffic and the token would \
+         travel unencrypted. Pass --insecure-listen to allow it."
+    );
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("cannot listen on {listen}"))?;
+    // The bound address, so port 0 shows the port that the OS chose.
+    let listen = listener.local_addr()?;
+    tracing::info!(%listen, "serving");
+    let limits = Limits {
+        connections: max_connections,
+        streams: max_streams,
+    };
+    service::serve(
+        store,
+        listener,
+        access,
+        limits,
+        caps.quotas,
+        caps.pending_lands,
+        land_stale_secs,
+        async {
+            tokio::signal::ctrl_c().await.ok();
+        },
+    )
+    .await?;
     Ok(())
 }
 

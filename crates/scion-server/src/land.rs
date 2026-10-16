@@ -236,7 +236,11 @@ impl Lands {
             )?;
             let rows = stmt
                 .query_map(params![stale_secs], |row| {
-                    Ok((RepoId(row.get(0)?), row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+                    Ok((
+                        RepoId(row.get(0)?),
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
@@ -264,7 +268,7 @@ impl Lands {
                         "UPDATE lands SET state = 'rejected', detail = ?1, finished_at = unixepoch()
                          WHERE land_id = ?2 AND state = 'pending'",
                     )?
-                    .execute(params![detail])?;
+                    .execute(params![detail, land_id])?;
                 Ok(u64::try_from(changed).unwrap_or(0))
             })?;
             drop(index);
@@ -2570,5 +2574,97 @@ mod tests {
         assert_eq!(decode_paths(&encode_paths(&paths)), Some(paths));
         assert_eq!(decode_paths(&[]), Some(vec![]));
         assert_eq!(decode_paths(b"a\0\0b"), None, "an empty path is not a path");
+    }
+
+    #[test]
+    fn a_pending_land_cap_counts_rows_so_a_restart_keeps_the_count() {
+        let f = fixture();
+        let cs = f.commit(f.root, &[put("a/x", "new")]);
+        // `record` is where the quota lives: it counts the pending rows of
+        // the caller in the store, and adds one new row under its limit.
+        let record_of = |key: &str, limit: Option<usize>| {
+            f.store
+                .write(|c| record(c, &caller(), &req(cs, key), limit))
+        };
+        let first = record_of("k1", Some(1)).unwrap();
+        assert_eq!(first.1.state, LandState::Pending);
+        // A different key for the same principal is over the cap. The error
+        // names its flag.
+        let second = record_of("k2", Some(1)).unwrap_err();
+        assert!(matches!(second, Error::ResourceExhausted(_)), "{second:?}");
+        assert!(
+            second
+                .to_string()
+                .contains("--max-principal-pending-lands 1")
+        );
+        // A retry of an existing key adds no row: it may always finish.
+        let again = record_of("k1", Some(1)).unwrap();
+        assert_eq!(again.1.land_id, first.1.land_id);
+        // Another principal counts its own pending lands.
+        let theirs = f
+            .store
+            .write(|c| record(c, &Caller("other".into()), &req(cs, "k3"), Some(1)))
+            .unwrap();
+        assert_eq!(theirs.1.state, LandState::Pending);
+        // The count comes from the store's rows, not from memory of the
+        // `Lands` that recorded them, so it is right after a restart: a
+        // fresh `Lands` with the same cap refuses a new key too, because
+        // the row of `k1` is still pending.
+        let restarted = f
+            .store
+            .write(|c| record(c, &caller(), &req(cs, "k4"), Some(1)));
+        assert!(matches!(restarted, Err(Error::ResourceExhausted(_))));
+    }
+
+    #[test]
+    fn the_sweep_rejects_only_pending_lands_past_the_cutoff() {
+        let f = fixture();
+        let cs = f.commit(f.root, &[put("a/x", "new")]);
+        let lands = Lands::new(Some(8));
+        let recorded = f
+            .store
+            .write(|c| record(c, &caller(), &req(cs, "old"), None))
+            .unwrap();
+        assert_eq!(recorded.1.state, LandState::Pending);
+
+        // A fresh pending land stays, even at a cutoff of now.
+        let rejected = lands.sweep_stale(&f.store, 60).unwrap();
+        assert_eq!(rejected, 0);
+
+        // The row is old now: the sweep rejects it, and the detail says
+        // why, and that a retry needs a new request key.
+        f.store
+            .write(|c| {
+                c.execute(
+                    "UPDATE lands SET created_at = unixepoch() - 100000
+                     WHERE state = 'pending'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let rejected = lands.sweep_stale(&f.store, 60).unwrap();
+        assert_eq!(rejected, 1);
+        let (state, detail): (String, String) = f
+            .store
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT state, detail FROM lands WHERE request_key = 'old'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(state, "rejected");
+        assert!(detail.contains("stale"), "{detail}");
+        assert!(detail.contains("retry with a new request key"), "{detail}");
+
+        // The same request key cannot resume a rejected land, so the
+        // client retries with a new key, which counts as a new land.
+        let resumed = f
+            .store
+            .write(|c| record(c, &caller(), &req(cs, "old"), None))
+            .unwrap();
+        assert_eq!(resumed.1.state, LandState::Rejected);
     }
 }

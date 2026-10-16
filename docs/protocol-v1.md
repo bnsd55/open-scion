@@ -84,6 +84,31 @@ caller cannot tell whether such a repo exists. A change fails with
 `PERMISSION_DENIED` when the caller may read the repo but not make the
 change (sections 6.1 to 6.3).
 
+**Per-principal quotas.** A server MAY cap what one principal holds at once.
+The caps are `--max-principal-requests` (calls in flight, counted from the
+server takes the call until its reply starts), `--max-principal-upload-bytes`
+(bytes of upload messages in flight) and `--max-principal-pending-lands`
+(lands in the `PENDING` state, counted in the store, so the count is right
+after a restart). A call over a cap fails before any work with
+`RESOURCE_EXHAUSTED`, and the message names the flag of the cap it hit. A
+cap applies to one principal, so other principals are not slowed. A
+server started with `--token T` has one principal, so its quotas are off
+unless a flag sets one. An upload whose message would cross the byte cap
+fails with `RESOURCE_EXHAUSTED`, and the bytes it already sent do not count
+once the call ends.
+
+**Stale pending lands.** A land that stays `PENDING` for longer than
+`--land-stale-secs` (a day) was left pending by a server stop: no caller of
+today can still be finishing it, because a call runs at most 600 s. A sweep
+that runs at start and then once per hour rejects such a land: `GetLand`
+then reports the outcome `REJECTED`, and the detail says that the land was
+stale and that a retry needs a new request key. The sweep holds the same
+per-ref lock that the land path holds, so a live retry finishes or keeps
+its land pending first; the sweep rejects only a row with no live call
+left. A retry with the same request key cannot resume a rejected land, so
+a client that wants the change retried MUST send a new request key. The
+sweep never moves a ref.
+
 **Timeouts.** The server ends a call with `CANCELLED` when its reply has not
 started after 600 s, or earlier if the client's `grpc-timeout` is shorter.
 For `PutBlob` this covers the whole upload. For a streamed reply (`ReadFile`,
@@ -940,7 +965,6 @@ A new version is a new package, `scion.v2`. A server MAY serve both.
 - TLS ([#14](https://github.com/bnsd55/open-scion/issues/14)).
 - More than one principal, per-path write rules and read tickets
   ([#13](https://github.com/bnsd55/open-scion/issues/13)).
-- Per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)).
 - Calls that create a repo or a ref, delete a ref, move a ref other than by
   `Land`, or list repos or refs. `scion-server import` creates repos and refs.
 - Client changesets with no parent, several parents or a committer. Only git
