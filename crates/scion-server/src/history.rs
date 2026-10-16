@@ -628,6 +628,8 @@ mod tests {
         let (_dir, store, repo) = open();
         let main = store_chain(&store, repo, None, &[&[("a", true)], &[("b", true)]], true);
         let blob = store.blobs().put(b"draft").unwrap();
+        // PutBlob makes the blob a member of the repo; the test mirrors it.
+        store.write(|c| db::add_repo_blob(c, repo, blob)).unwrap();
         // A changeset that no ref points to gets its path history when it is
         // written, because its parent has one.
         let draft = changeset(Some(main[1]), &[("a", Some(blob))]);
