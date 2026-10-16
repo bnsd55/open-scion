@@ -122,11 +122,13 @@ const FILL_LOG_EVERY: u64 = 10_000;
 /// [`Error::Corrupt`] if a changeset does not decode or match its ID.
 /// Database errors.
 pub(crate) fn fill_repo_blobs(c: &Connection) -> Result<(u64, u64)> {
-    let total: u64 = c.query_row(
-        "SELECT count(*) FROM repo_changesets JOIN changesets ON cs = id",
-        [],
-        |row| row.get::<_, i64>(0),
-    )?.cast_unsigned();
+    let total: u64 = c
+        .query_row(
+            "SELECT count(*) FROM repo_changesets JOIN changesets ON cs = id",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?
+        .cast_unsigned();
     tracing::info!(changesets = total, "schema 4: adding each repo's blobs");
     let mut select =
         c.prepare("SELECT repo_id, id, body FROM repo_changesets JOIN changesets ON cs = id")?;
@@ -609,13 +611,15 @@ mod tests {
             );
             let side = insert(a, &changeset(vec![root_id], &[("s", Some(file("s")))]));
             insert(a, &changeset(vec![child, side], &[]));
-            // Repo b: the same root, a symlink and a submodule.
+            // Repo b: the same root, a symlink and a submodule whose
+            // commit bytes are repo a's "z" blob. A gitlink names no blob,
+            // so repo b gains nothing for it, whatever the 32 bytes are.
             insert(b, &root);
             let link = FileState::Symlink {
                 target: BlobId::of(b"t"),
             };
             let module = FileState::Gitlink {
-                commit: GitOid::Sha1([1; 20]),
+                commit: GitOid::Sha256(*BlobId::of(b"z").as_bytes()),
             };
             insert(
                 b,
