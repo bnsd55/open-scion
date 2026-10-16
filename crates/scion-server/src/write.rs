@@ -280,11 +280,13 @@ mod tests {
         let main = repo(&store, "main");
         let before = store.blobs().full_flushes();
         upload(&store, main, b"new");
-        // Where a plain fsync leaves data in the drive cache, one full flush
-        // covers the file and the row.
+        // The rename shares one full flush: it covers the temp file before
+        // the rename, so a stored blob it replaces is never left with data
+        // that a power loss can lose. Where a plain fsync leaves data in the
+        // drive cache, the row's flush is one more.
         assert_eq!(
             store.blobs().full_flushes() - before,
-            u64::from(FSYNC_LEAVES_DRIVE_CACHE)
+            1 + u64::from(FSYNC_LEAVES_DRIVE_CACHE)
         );
     }
 

@@ -1040,6 +1040,13 @@ impl BlobBatch<'_> {
         let mut tmp = tempfile::NamedTempFile::new_in(&self.blobs.tmp)?;
         zstd::stream::compress_sized_into(raw, &mut tmp, 3, len as u64)?;
         fsync(tmp.as_file())?;
+        // A full flush before the rename. The rename may replace an intact
+        // file that other repos name, and on macOS a plain fsync can leave
+        // the temp file's data in the drive cache: a power loss after the
+        // rename could then corrupt that blob. The flush covers the temp
+        // file, so after the rename its data is durable. It runs every time,
+        // so the time of the write does not show whether a copy exists.
+        self.blobs.full_flush()?;
         fs::create_dir_all(&dir)?;
         tmp.persist(&path).map_err(|e| e.error)?;
         self.dirs.insert(dir);
