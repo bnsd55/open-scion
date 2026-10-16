@@ -21,7 +21,7 @@ use scion_core::{
 };
 
 use crate::db;
-use crate::deadline::Deadline;
+use crate::deadline::{CALL_LIMIT, Deadline};
 use crate::error::{Error, Result};
 use crate::history;
 use crate::memory::{BYTES_PER_LINE, Bytes, Held};
@@ -165,7 +165,10 @@ enum Older {
 /// a few node rows per version, however many changesets lie between two
 /// versions. A binary file is blamed line by line too, as
 /// `git blame` does. `from` goes on with a rename search that an earlier
-/// call stopped ([`Blame::next_search`]); its default starts none.
+/// call stopped ([`Blame::next_search`]); its default starts none. A call
+/// that cannot take the nodes' share before it explains a version is
+/// `ResourceExhausted`, retryable; past the first version it stops with a
+/// cursor.
 ///
 /// Every version read takes its bytes from `memory`, and the lines of the
 /// blamed file take [`BYTES_PER_LINE`] each; the takes wait for the budget
@@ -199,9 +202,7 @@ pub fn blame(
     // The walk reads the path history of `start`: derive it first, in
     // steps, the way `Log` with a path does, so every changeset on its
     // first-parent history has a value.
-    let derive_until = Deadline::new(
-        until.unwrap_or_else(|| Instant::now() + std::time::Duration::from_secs(600)),
-    );
+    let derive_until = Deadline::new(until.unwrap_or_else(|| Instant::now() + CALL_LIMIT));
     crate::derived::get_by::<history::PathHistory>(store, repo, start, &derive_until)?;
     let root = tree::root_tree(store, repo, start)?;
     let mut blob = regular_blob(store, root, &start_path)?;
@@ -256,6 +257,10 @@ pub fn blame(
     let mut nodes = history::Nodes::default();
     let mut node_bytes = 0usize;
     let mut node_holds: Vec<Held> = Vec::new();
+    // The versions this call explained: a call that stops before the
+    // first one has no progress, and a cursor here would send the client
+    // round the same step for ever.
+    let mut explained = 0usize;
     for _ in 0..MAX_BLAME_VERSIONS {
         if lines[resume.after_line..window_end]
             .iter()
@@ -290,6 +295,12 @@ pub fn blame(
             if let Ok(hold) = memory.try_take(nodes.bytes() - node_bytes) {
                 node_holds.push(hold);
                 node_bytes = nodes.bytes();
+            } else if explained == 0 {
+                // Retryable: another time, the pool may hold the share.
+                return Err(Error::ResourceExhausted(format!(
+                    "the walk of {path:?} needs {} bytes of path history nodes before it names a line",
+                    nodes.bytes() - node_bytes
+                )));
             } else {
                 (next, next_search) = (Some(id), next_search);
                 break;
@@ -376,6 +387,7 @@ pub fn blame(
         if give_lines(&mut lines, id, older.as_ref(), &text) {
             changesets.push((id, changeset.author, path.clone()));
         }
+        explained += 1;
         drop(diff_hold);
         if let Some((older_path, older_blob, older_text)) = older {
             (path, blob) = (older_path, older_blob);

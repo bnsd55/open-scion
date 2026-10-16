@@ -1603,6 +1603,24 @@ fn a_cursor_names_only_changesets_of_its_repo() {
 }
 
 #[test]
+fn a_pool_too_small_for_the_first_node_share_is_resource_exhausted() {
+    let (_data, store) = open_store();
+    let f = store.blobs().put(b"x\n").unwrap();
+    // `d` holds 100 names, so its level is chunked: the first lookup of
+    // `d/f` reads a few node rows, about 3 KB, more than the pool holds
+    // past the text and the answer's rows.
+    let mut changes = vec![vec![("d/f", regular(f))]];
+    let names: Vec<String> = (0..100).map(|i| format!("d/g{i}")).collect();
+    changes[0].extend(names.iter().map(|name| (name.as_str(), regular(f))));
+    let ids = chain(&store, changes);
+    let result = blame_bounded(&store, ids[0], "d/f", 2 << 10);
+    assert!(
+        matches!(result, Err(Error::ResourceExhausted(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
 fn a_cursor_of_an_unknown_version_is_refused() {
     let (_data, store) = open_store();
     let put = |data: &[u8]| regular(store.blobs().put(data).unwrap());

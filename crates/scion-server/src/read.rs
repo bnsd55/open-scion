@@ -143,7 +143,7 @@ pub fn log(
 ) -> Result<Vec<(ChangesetId, Changeset)>> {
     let mut entries = Vec::new();
     let mut next = Some(cs);
-    let deadline = Deadline::new(std::time::Instant::now() + std::time::Duration::from_secs(600));
+    let deadline = Deadline::new(std::time::Instant::now() + crate::deadline::CALL_LIMIT);
     while let Some(from) = next.filter(|_| entries.len() < limit) {
         let page = log_page(store, repo, from, None, limit - entries.len(), &deadline)?;
         entries.extend(page.entries);
