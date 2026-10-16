@@ -25,6 +25,10 @@ const TOKEN: &str = "secret";
 /// config. Returns whether it succeeded, and stdout.
 fn git_status(dir: &Path, args: &[&str]) -> (bool, String) {
     let out = Command::new("git")
+        // No auto gc or maintenance: they pack loose objects in the
+        // background and delete the loose files, also while the import of
+        // the same repository still reads them.
+        .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
