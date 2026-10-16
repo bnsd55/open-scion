@@ -3,6 +3,7 @@
 mod client;
 mod cmd;
 mod materialize;
+mod vfs;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -79,6 +80,11 @@ enum Command {
     /// Write the files of a changeset into a new directory:
     /// `scn checkout main --sparse src --into ./work`.
     Checkout(cmd::checkout::CheckoutArgs),
+    /// Serve a ref as a filesystem that reads files on demand:
+    /// `scn mount ./view main`.
+    Mount(cmd::mount::MountArgs),
+    /// Stop a mount of `scn mount`.
+    Unmount(cmd::mount::UnmountArgs),
     /// Create a changeset on the server. Moves no ref; use `scn land` next.
     Commit(cmd::commit::CommitArgs),
     /// Rebase a changeset onto a ref and move the ref.
@@ -148,6 +154,8 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Blame { spec } => cmd::blame::blame(&mut ctx, &spec).await,
         Command::Show { rev } => cmd::read::show(&mut ctx, &rev).await,
         Command::Checkout(args) => cmd::checkout::checkout(&mut ctx, args).await,
+        Command::Mount(args) => cmd::mount::mount(&mut ctx, args).await,
+        Command::Unmount(args) => cmd::mount::unmount(&mut ctx, args).await,
         Command::Commit(args) => cmd::commit::commit(&mut ctx, args).await,
         Command::Land(args) => cmd::land::land(&mut ctx, args).await,
         Command::Bench(args) => cmd::bench::bench(&ctx, args).await,

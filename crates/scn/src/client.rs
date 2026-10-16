@@ -46,6 +46,18 @@ impl Interceptor for Call {
     }
 }
 
+/// The `Objects` client of `url`, for the tests of this crate.
+#[cfg(test)]
+pub(crate) async fn test_objects(url: &str, token: &str) -> Objects {
+    let channel = Endpoint::from_shared(url.to_owned())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let call = Call(Bearer::new(token).unwrap());
+    ObjectsClient::with_interceptor(channel, call)
+}
+
 /// What every command needs.
 #[derive(Clone)]
 pub struct Ctx {

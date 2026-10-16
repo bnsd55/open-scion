@@ -1,0 +1,477 @@
+//! `mount` and `unmount`: the virtual checkout
+//! ([#11](https://github.com/bnsd55/open-scion/issues/11)).
+
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context as _, Result, anyhow};
+use nfsserve::tcp::{NFSTcp, NFSTcpListener};
+use scion_core::RepoPath;
+use scion_proto::v1::GetRootTreeRequest;
+
+use crate::client::{Ctx, id_from};
+use crate::vfs::{CHANGES, Change, Vfs};
+
+/// The export name of every mount.
+const EXPORT: &str = "scion";
+
+/// Serves a ref as a filesystem that reads files on demand.
+///
+/// For single-user machines only: any local user who can read the mount
+/// table can reach the mounted content through the NFS port.
+#[derive(clap::Args)]
+pub struct MountArgs {
+    /// Directory to mount the checkout on.
+    dir: PathBuf,
+    /// Ref name or changeset ID to serve.
+    #[arg(default_value = "main")]
+    rev: String,
+    /// Serve NFS, but do not try to mount: print the command instead.
+    #[arg(long)]
+    no_mount: bool,
+}
+
+/// Arguments of `scn unmount`.
+#[derive(clap::Args)]
+pub struct UnmountArgs {
+    /// A directory that `scn mount` mounted.
+    dir: PathBuf,
+}
+
+/// One live mount, as the session file holds it.
+#[derive(Clone)]
+pub struct MountRecord {
+    /// The mounted directory, absolute.
+    pub dir: PathBuf,
+    /// The overlay directory with the changes.
+    pub overlay: PathBuf,
+    /// The revision that the mount serves.
+    pub rev: String,
+    /// The process that serves the NFS server.
+    pub pid: u32,
+}
+
+/// Serves the ref over the network filesystem on a free loopback port,
+/// mounts it, and
+/// waits for a signal. The changes go to an overlay directory, which
+/// `scn commit --from-mount DIR` commits.
+pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
+    let base = ctx.resolve(&args.rev).await?;
+    let reply = ctx
+        .objects
+        .get_root_tree(GetRootTreeRequest {
+            repo: ctx.repo.clone(),
+            changeset_id: base.as_bytes().to_vec(),
+        })
+        .await
+        .with_context(|| format!("cannot read the tree of {}", args.rev))?
+        .into_inner();
+    let root = id_from(&reply.tree_id)?;
+
+    // The overlay holds the changes; it dies with the mount.
+    let overlay = overlay_dir()?;
+    let objects = ctx.objects.clone();
+    let repo = ctx.repo.clone();
+    let vfs = Vfs::new(objects, repo, root, overlay.join(CHANGES));
+    let secret = vfs.secret_name();
+
+    let listener = NFSTcpListener::bind("127.0.0.1:0", vfs)
+        .await
+        .context("cannot listen for NFS")?;
+    let port = listener.get_listen_port();
+    let server = tokio::spawn(async move {
+        if let Err(e) = listener.handle_forever().await {
+            eprintln!("scn mount: the NFS server stopped: {e}");
+        }
+    });
+
+    let dir = std::path::absolute(&args.dir)?;
+    println!(
+        "single-user machines only: any local user who can read the mount table can reach this mount"
+    );
+    println!("{}", mount_command(port, &secret, &dir));
+    if !args.no_mount {
+        try_mount(port, &secret, &dir);
+    }
+
+    save_session(&MountRecord {
+        dir: dir.clone(),
+        overlay: overlay.clone(),
+        rev: args.rev.clone(),
+        pid: std::process::id(),
+    })?;
+    wait_stopped().await;
+    drop(server);
+    // Unmount before the overlay goes, so no file disappears mid-read.
+    unmount_dir(&dir);
+    let _ = remove_session(&dir);
+    let _ = std::fs::remove_dir_all(&overlay);
+    println!("stopped serving {}", dir.display());
+    Ok(())
+}
+
+/// Stops the mount on `dir`, and tells the serving process to clean up.
+// The signature matches the other commands, which are all async.
+#[allow(clippy::unused_async)]
+pub async fn unmount(_ctx: &mut Ctx, args: UnmountArgs) -> Result<()> {
+    let dir = std::path::absolute(&args.dir)?;
+    let record = remove_session(&dir)
+        .ok_or_else(|| anyhow!("{}: no mount of scn is recorded", dir.display()))?;
+    // The serving process unmounts and removes the overlay on this signal.
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &record.pid.to_string()])
+        .status();
+    // The unmount itself may need root; say so, and let the user run it.
+    if !std::process::Command::new("umount")
+        .arg(&dir)
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        println!("unmount failed; to unmount, run:");
+        println!("sudo umount {}", dir.display());
+    }
+    println!("unmounted {}", dir.display());
+    Ok(())
+}
+
+/// The `sudo` mount command, for the user to run when the plain mount is
+/// refused: only root may use a port under 1024, and root may read any
+/// mounted content ([#11], section 8 of the docs).
+fn mount_command(port: u16, secret: &str, dir: &Path) -> String {
+    let target = format!("127.0.0.1:/{EXPORT}/{secret}");
+    if cfg!(target_os = "macos") {
+        format!(
+            "sudo mount_nfs -o resvport,port={port},mountport={port},vers=3,tcp,soft,nolocks {target} {}",
+            dir.display()
+        )
+    } else {
+        format!(
+            "sudo mount -t nfs -o vers=3,tcp,port={port},mountport={port},nolock,soft {target} {}",
+            dir.display()
+        )
+    }
+}
+
+/// Tries to mount without sudo; on failure, prints the sudo command and
+/// keeps serving ([#11]).
+fn try_mount(port: u16, secret: &str, dir: &Path) {
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = std::process::Command::new("mount_nfs");
+        command.arg(format!(
+            "-oport={port},mountport={port},vers=3,tcp,soft,nolocks"
+        ));
+        command
+    } else {
+        let mut command = std::process::Command::new("mount");
+        command.args(["-t", "nfs"]);
+        command.arg(format!(
+            "-overs=3,tcp,port={port},mountport={port},nolock,soft"
+        ));
+        command
+    };
+    command
+        .arg(format!("127.0.0.1:/{EXPORT}/{secret}"))
+        .arg(dir);
+    let mounted = command.status().is_ok_and(|status| status.success());
+    if !mounted {
+        println!("mount failed; to mount, run:");
+        println!("{}", mount_command(port, secret, dir));
+    }
+}
+
+/// Unmounts `dir`, best effort.
+fn unmount_dir(dir: &Path) {
+    let _ = std::process::Command::new("umount").arg(dir).status();
+    // macOS may need this form.
+    if cfg!(target_os = "macos") {
+        let _ = std::process::Command::new("diskutil")
+            .args(["unmount", "force"])
+            .arg(dir)
+            .status();
+    }
+}
+
+/// A private directory for the changes, under the system's temporary
+/// directory, with a random name.
+fn overlay_dir() -> Result<PathBuf> {
+    use std::io::Read as _;
+    let mut bytes = [0u8; 8];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .context("cannot read /dev/urandom")?;
+    let name: String = bytes.iter().fold(String::new(), |mut all, b| {
+        use std::fmt::Write as _;
+        let _ = write!(all, "{b:02x}");
+        all
+    });
+    let dir = std::env::temp_dir().join(format!("scn-mount-{name}"));
+    std::fs::create_dir(&dir).context("cannot make the overlay directory")?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::create_dir(dir.join(CHANGES))?;
+    Ok(dir)
+}
+
+/// The path of the session file, under the home directory.
+fn session_file() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("cannot read $HOME"))?;
+    let dir = home.join(".scion");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(dir.join("mounts.json"))
+}
+
+/// Reads the session file.
+pub fn load_sessions() -> Vec<MountRecord> {
+    let Ok(file) = session_file() else {
+        return Vec::new();
+    };
+    read_sessions(&file)
+}
+
+/// Reads the sessions of `file`.
+fn read_sessions(file: &Path) -> Vec<MountRecord> {
+    std::fs::read_to_string(file)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .map(|json| parse_sessions(&json))
+        .unwrap_or_default()
+}
+
+/// The records of a session file's JSON.
+fn parse_sessions(json: &serde_json::Value) -> Vec<MountRecord> {
+    json.as_array()
+        .map(|records| {
+            records
+                .iter()
+                .filter_map(|record| {
+                    Some(MountRecord {
+                        dir: PathBuf::from(record.get("dir")?.as_str()?),
+                        overlay: PathBuf::from(record.get("overlay")?.as_str()?),
+                        rev: record.get("rev")?.as_str()?.to_owned(),
+                        pid: u32::try_from(record.get("pid")?.as_u64()?).ok()?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Adds `record` to the session file, replacing the record of its dir.
+fn save_session(record: &MountRecord) -> Result<()> {
+    let file = session_file()?;
+    let mut sessions = load_sessions();
+    sessions.retain(|known| known.dir != record.dir);
+    sessions.push(record.clone());
+    write_sessions(&file, &sessions)
+}
+
+/// Writes `records` as the session file `file`.
+fn write_sessions(file: &Path, sessions: &[MountRecord]) -> Result<()> {
+    let records: Vec<serde_json::Value> = sessions
+        .iter()
+        .map(|record| {
+            serde_json::json!({
+                "dir": record.dir.display().to_string(),
+                "overlay": record.overlay.display().to_string(),
+                "rev": record.rev,
+                "pid": record.pid,
+            })
+        })
+        .collect();
+    std::fs::write(file, serde_json::to_vec(&records)?)?;
+    Ok(())
+}
+
+/// Drops the session of `dir`, and returns its record.
+fn remove_session(dir: &Path) -> Option<MountRecord> {
+    let file = session_file().ok()?;
+    let sessions = load_sessions();
+    let record = sessions.iter().find(|r| r.dir == dir)?.clone();
+    let rest: Vec<MountRecord> = sessions.into_iter().filter(|r| r.dir != dir).collect();
+    write_sessions(&file, &rest).ok()?;
+    Some(record)
+}
+
+/// Waits for a stop signal.
+async fn wait_stopped() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut stop = signal(SignalKind::interrupt()).expect("cannot listen for SIGINT");
+    let mut term = signal(SignalKind::terminate()).expect("cannot listen for SIGTERM");
+    tokio::select! {
+        _ = stop.recv() => {}
+        _ = term.recv() => {}
+    }
+}
+
+/// The recorded mount of `dir`.
+pub fn session_for_dir(dir: &Path) -> Result<MountRecord> {
+    let dir = std::path::absolute(dir).context("cannot resolve the mount directory")?;
+    load_sessions()
+        .into_iter()
+        .find(|record| record.dir == dir)
+        .ok_or_else(|| anyhow!("{}: no mount of scn is recorded", dir.display()))
+}
+
+/// The changes of a mount, from its overlay: each file or symlink under it,
+/// and each recorded deletion of the ref.
+pub fn overlay_changes(record: &MountRecord) -> Result<Vec<(RepoPath, Change)>> {
+    let mut changes = Vec::new();
+    walk_changes(&record.overlay.join(CHANGES), "", &mut changes)?;
+    // The recorded deletions, but not of a path that the overlay holds.
+    for name in crate::vfs::read_deletes(&record.overlay) {
+        if let Ok(path) = RepoPath::new(name.as_bytes())
+            && !changes.iter().any(|(known, _)| known == &path)
+        {
+            changes.push((path, Change::Delete));
+        }
+    }
+    Ok(changes)
+}
+
+/// Walks one directory of the overlay, collecting its changes.
+fn walk_changes(dir: &Path, prefix: &str, out: &mut Vec<(RepoPath, Change)>) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let read = |path: &Path| {
+        std::fs::read_dir(path).with_context(|| format!("cannot read {}", path.display()))
+    };
+    for entry in read(dir)? {
+        let entry = entry.with_context(|| format!("cannot read {}", dir.display()))?;
+        let name = entry.file_name();
+        let rel = if prefix.is_empty() {
+            name.as_bytes().to_vec()
+        } else {
+            let mut rel = prefix.as_bytes().to_vec();
+            rel.push(b'/');
+            rel.extend_from_slice(name.as_bytes());
+            rel
+        };
+        let path = RepoPath::new(rel.clone())
+            .with_context(|| format!("bad name in the overlay: {rel:?}"))?;
+        let kind = entry
+            .file_type()
+            .with_context(|| format!("cannot read {}", entry.path().display()))?;
+        if kind.is_dir() {
+            let next = String::from_utf8_lossy(path.as_bytes()).into_owned();
+            walk_changes(&entry.path(), &next, out)?;
+        } else if kind.is_symlink() {
+            let target = std::fs::read_link(entry.path())?;
+            let target = target.as_os_str().as_bytes().to_vec();
+            out.push((path, Change::PutLink(target)));
+        } else {
+            let exec = std::fs::metadata(entry.path())
+                .with_context(|| format!("cannot read {}", entry.path().display()))?
+                .permissions()
+                .mode()
+                & 0o111
+                != 0;
+            out.push((path, Change::Put { exec }));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn a_session_survives_a_round_trip() {
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("mounts.json");
+        let record = MountRecord {
+            dir: PathBuf::from("/tmp/view"),
+            overlay: PathBuf::from("/tmp/overlay"),
+            rev: "main".to_owned(),
+            pid: 123,
+        };
+        let sessions = vec![record.clone()];
+        write_sessions(&file, &sessions).unwrap();
+        let found = read_sessions(&file);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].dir, record.dir);
+        assert_eq!(found[0].overlay, record.overlay);
+        assert_eq!(found[0].rev, "main");
+        assert_eq!(found[0].pid, 123);
+        // A second mount of the same dir replaces the record.
+        let other = MountRecord {
+            dir: record.dir.clone(),
+            overlay: PathBuf::from("/tmp/overlay-2"),
+            rev: "dev".to_owned(),
+            pid: 5,
+        };
+        let mut sessions = read_sessions(&file);
+        sessions.retain(|known| known.dir != other.dir);
+        sessions.push(other.clone());
+        write_sessions(&file, &sessions).unwrap();
+        let found = read_sessions(&file);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].overlay, other.overlay);
+        // Removing the session returns its record.
+        let gone = sessions.pop().unwrap();
+        assert_eq!(gone.overlay, other.overlay);
+        write_sessions(&file, &[]).unwrap();
+        assert!(read_sessions(&file).is_empty());
+    }
+
+    #[test]
+    fn the_changes_of_a_mount_come_from_the_overlay() {
+        let home = tempfile::tempdir().unwrap();
+        let overlay = home.path().join("overlay");
+        fs::create_dir_all(overlay.join(CHANGES).join("src")).unwrap();
+        fs::write(overlay.join(CHANGES).join("README"), b"changed\n").unwrap();
+        fs::write(
+            overlay.join(CHANGES).join("src").join("new.rs"),
+            b"fn f() {}\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            overlay.join(CHANGES).join("src").join("new.rs"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("README", overlay.join(CHANGES).join("link")).unwrap();
+        // One deletion, of a path that the overlay does not hold.
+        fs::write(
+            overlay.join(crate::vfs::DELETES),
+            r#"["gone.txt", "src/old.rs"]"#,
+        )
+        .unwrap();
+        let record = MountRecord {
+            dir: PathBuf::from("/tmp/view"),
+            overlay: overlay.clone(),
+            rev: "main".to_owned(),
+            pid: 1,
+        };
+        let mut changes = overlay_changes(&record).unwrap();
+        changes.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
+        let names: Vec<String> = changes
+            .iter()
+            .map(|(path, _)| String::from_utf8_lossy(path.as_bytes()).into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            ["README", "gone.txt", "link", "src/new.rs", "src/old.rs"]
+        );
+        let puts: Vec<bool> = changes
+            .iter()
+            .map(|(_, change)| matches!(change, Change::Put { .. }))
+            .collect();
+        assert_eq!(puts, [true, false, false, true, false]);
+        let link = changes
+            .iter()
+            .find(|(path, _)| path.as_bytes() == b"link")
+            .unwrap();
+        assert!(matches!(link.1, Change::PutLink(ref target) if target == b"README"));
+        let exec = match &changes[3].1 {
+            Change::Put { exec } => *exec,
+            _ => false,
+        };
+        assert!(exec);
+    }
+}
