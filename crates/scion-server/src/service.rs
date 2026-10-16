@@ -55,10 +55,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const READ_BUDGET_BYTES: usize = 256 << 20;
 /// A `ReadFile` reply ends when its client takes no part for this long, and
 /// frees its share, so a client that stops reading does not hold budget.
-// SHORTCUT: the reply frees its share, but the part that waits in its
-// channel and the part inside HTTP/2 stay in memory, outside the budget,
-// until the connection closes: up to 2 MiB per stalled reply. Upgrade
-// (issue #42): a response body timeout that resets the stream.
+/// Three parts stay outside the budget until the stream ends or the
+/// connection closes: the part in its channel, the part that hyper has read
+/// ahead, and the part in the h2 send buffer (`scion_proto::listen`).
 const READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 // Any one reply fits in the budget, and the budget counts in u32 permits.

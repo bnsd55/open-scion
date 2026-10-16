@@ -28,7 +28,8 @@ use tokio_stream::{Stream, StreamExt as _};
 use tonic::transport::Server;
 use tonic::transport::server::Connected;
 
-/// The default of [`Limits::connections`].
+/// The default of [`Limits::connections`]. Room for the 50 checkouts at once
+/// of `scripts/bench-checkout.sh`, each on its own connection to one daemon.
 pub const DEFAULT_CONNECTIONS: NonZeroUsize = NonZeroUsize::new(128).unwrap();
 
 /// The default of [`Limits::streams`]. One connection can still fill all

@@ -106,6 +106,14 @@ release.
   unpacks within that size. A tier now fetches up to 64 objects at once
   from upstream instead of 4, within the same 400 MiB. A reply cut off in
   the middle of an object ends with `DEADLINE_EXCEEDED`.
+- The server, `scion-cache` and `scion-daemon` serve at most 128
+  connections at once (`--max-connections`), each with at most 256 open
+  streams (`--max-streams`). Before, both had no bound: tonic replaced
+  hyper's default of 200 streams with none. A client beyond either cap
+  waits, and a connection that waits logs a warning. A client that sends no
+  frame for 60 s gets an HTTP/2 ping, and its connection closes if it does
+  not answer within 20 s. So the number of stalled replies has a bound, and
+  a dead peer frees what its replies hold within 80 s.
 - The tier timeouts nest: the server and tiers wait 30 s for reply memory,
   a tier 30 s for a fetch slot and 30 s for fetch memory, the cache 60 s per
   step of the server, the daemon 180 s per step of the cache.
