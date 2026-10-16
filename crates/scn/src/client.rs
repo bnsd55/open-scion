@@ -3,16 +3,16 @@
 use std::borrow::Cow;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use scion_core::{BlobId, Changeset, ChangesetId, RepoPath};
-use scion_proto::auth::Bearer;
+use scion_proto::auth::{Bearer, check_ancestors};
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ResolveRefRequest};
-use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_OBJECT_MESSAGE_BYTES};
+use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_PART_MESSAGE_BYTES};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Endpoint};
 
@@ -39,21 +39,25 @@ impl Ctx {
     /// Connects to `server`: `http://HOST:PORT`, or `unix:///PATH` for a
     /// daemon on this node.
     pub async fn connect(server: &str, token: &str, repo: String, json: bool) -> Result<Self> {
+        let mut address = server.to_owned();
         if let Some(socket) = server
             .strip_prefix("unix://")
             .or_else(|| server.strip_prefix("unix:"))
         {
-            check_socket(Path::new(socket), rustix::process::geteuid().as_raw())?;
+            let socket = check_socket(Path::new(socket), rustix::process::geteuid().as_raw())?;
+            // The checked path, so no symlink in `server` is followed again.
+            let socket = socket.to_str().context("the socket path is not UTF-8")?;
+            address = format!("unix://{socket}");
         }
         // `Endpoint` reads `unix:` addresses too, unlike `Channel::from_shared`.
-        let channel = Endpoint::from_shared(server.to_owned())
+        let channel = Endpoint::from_shared(address)
             .context("bad server address")?
             .connect()
             .await
             .with_context(|| format!("cannot connect to {server}"))?;
         let bearer = Bearer::new(token).context("token is not valid ASCII")?;
         let objects = ObjectsClient::with_interceptor(channel.clone(), bearer.clone())
-            .max_decoding_message_size(MAX_OBJECT_MESSAGE_BYTES)
+            .max_decoding_message_size(MAX_PART_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
         let client = ScionClient::with_interceptor(channel, bearer)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
@@ -122,14 +126,13 @@ impl Ctx {
 
 /// Refuses a socket that is not a socket file owned by user `me` or by root,
 /// so the token is never sent to another user's socket. A symlink is
-/// refused too.
-// SHORTCUT: checks only the socket file. Another user who can write to a
-// directory above it can swap the socket between the check and the connect.
-// Upgrade (issue #70): check every directory up to `/` too: owned by root or
-// this user, and not writable by others unless sticky.
-fn check_socket(path: &Path, me: u32) -> Result<()> {
-    let meta = fs::symlink_metadata(path)
-        .with_context(|| format!("cannot use socket {}", path.display()))?;
+/// refused too, and so is a socket under a directory that another user can
+/// change ([`check_ancestors`]). Returns the path to connect to, with its
+/// directory resolved.
+fn check_socket(path: &Path, me: u32) -> Result<PathBuf> {
+    let context = || format!("cannot use socket {}", path.display());
+    let resolved = check_ancestors(path, me).with_context(context)?;
+    let meta = fs::symlink_metadata(&resolved).with_context(context)?;
     if !meta.file_type().is_socket() {
         bail!("refusing {}: it is not a socket", path.display());
     }
@@ -140,7 +143,7 @@ fn check_socket(path: &Path, me: u32) -> Result<()> {
             path.display()
         );
     }
-    Ok(())
+    Ok(resolved)
 }
 
 /// Parses 32 raw ID bytes from a reply.
@@ -187,16 +190,61 @@ mod tests {
 
     #[test]
     fn a_socket_that_another_user_owns_is_refused() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("daemon.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let owner = fs::symlink_metadata(&path).unwrap().uid();
-        check_socket(&path, owner).unwrap();
+        // Right in `/tmp`, whose directories root owns, so they pass the
+        // check for every user and only the socket's owner counts.
+        let socket = tempfile::Builder::new()
+            .suffix(".sock")
+            .make_in("/tmp", |path| std::os::unix::net::UnixListener::bind(path))
+            .unwrap();
+        let path = socket.path();
+        let owner = fs::symlink_metadata(path).unwrap().uid();
+        assert_eq!(
+            check_socket(path, owner).unwrap(),
+            fs::canonicalize(path).unwrap()
+        );
         // The same socket, as another user sees it. A socket that root owns
         // is accepted for every user.
         if owner != 0 {
-            let err = check_socket(&path, owner + 1).unwrap_err();
-            assert!(err.to_string().contains("another user"), "{err:#}");
+            let err = check_socket(path, owner + 1).unwrap_err();
+            assert!(err.to_string().contains("owns it"), "{err:#}");
         }
+    }
+
+    #[test]
+    fn a_socket_under_a_directory_that_others_can_write_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let open = tmp.path().join("open");
+        fs::create_dir(&open).unwrap();
+        let path = open.join("daemon.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let owner = fs::symlink_metadata(&path).unwrap().uid();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
+        let err = check_socket(&path, owner).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("/open can be written"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_socket_through_a_symlinked_directory_is_reached_at_its_resolved_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(real.join("daemon.sock")).unwrap();
+        // A link whose name is too long for a socket address (104 bytes on
+        // macOS, 108 on Linux): only the resolved path can connect.
+        let link = tmp.path().join("l".repeat(120));
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let path = link.join("daemon.sock");
+        let owner = fs::symlink_metadata(&path).unwrap().uid();
+        let resolved = fs::canonicalize(&real).unwrap().join("daemon.sock");
+        assert_eq!(check_socket(&path, owner).unwrap(), resolved);
+        let server = format!("unix://{}", path.display());
+        Ctx::connect(&server, "token", "r".into(), false)
+            .await
+            .unwrap();
     }
 }

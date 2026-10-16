@@ -62,7 +62,7 @@ at most 4 `Blame` calls run at once, and at most 4 `MergeBase` and
 `IsAncestor` calls together. A `ReadFile` call waits for its share of a memory
 budget (section 6.7). Time in a queue counts toward the timeout.
 One wait has its own limit: a `GetObjects` call that gets no memory for its
-first object within 120 s fails with `RESOURCE_EXHAUSTED` (section 7.3).
+first object within 30 s fails with `RESOURCE_EXHAUSTED` (section 7.3).
 
 ## 3. Common rules
 
@@ -92,13 +92,14 @@ and blobs are not scoped to a repo in v1 (section 5).
 |---|---|
 | Any request message, both services | 64 MiB |
 | Any `Scion` reply message | 64 MiB |
-| One `Objects` reply message | 100 MiB + 1 KiB: one object of up to 100 MiB, plus its kind and ID |
+| One `Objects` reply message | 1 MiB + 1 KiB: one part of an object, of up to 1 MiB of encoded data, plus its header |
 
 A message over its limit fails the call with `OUT_OF_RANGE`, on whichever
 side finds it. A client MUST accept received messages up to these sizes.
 Many gRPC libraries accept only 4 MiB by default. An object (a blob's
 content or a tree's `TreeV1` bytes) is at most 100 MiB. Streamed file content
-moves in chunks of 1 MiB.
+moves in chunks of 1 MiB, and `GetObjects` sends each object in parts of
+1 MiB (section 7.3).
 
 **Status codes.** The status message is for people and is not part of the
 contract. A client MUST NOT depend on its text.
@@ -111,9 +112,9 @@ contract. A client MUST NOT depend on its text.
 | `ABORTED` | `Land` only: other writers kept moving the ref. The land stays `PENDING`. | Yes, with the same request key |
 | `OUT_OF_RANGE` | A message is larger than its limit. | After the cause is fixed |
 | `CANCELLED` | The server's 600 s limit or the client's `grpc-timeout` ran out. A client library can report its own deadline as `DEADLINE_EXCEEDED`. | Yes. A `Land` retry uses the same request key. |
-| `DEADLINE_EXCEEDED` | `ReadFile`: the client took no message for 120 s. `Land`: the land ran past 600 s from the start of the call. The land stays `PENDING`. `MergeBase`, `IsAncestor`: the walk ran past 600 s from the start of the call. | Yes. A `Land` retry uses the same request key. |
-| `UNAVAILABLE` | The server cannot be reached or is shutting down, or its database stayed busy for 5 s (another process, such as an import, held its write lock). A tier also replies `UNAVAILABLE` when its upstream does not answer in time (section 8). | Yes |
-| `RESOURCE_EXHAUSTED` | `GetObjects` only: no memory for the first object within 120 s (section 7.3). | Yes, after a wait |
+| `DEADLINE_EXCEEDED` | `ReadFile`: the client took no message for 120 s. `GetObjects`: the client took no part for 120 s in the middle of an object (section 7.3). `Land`: the land ran past 600 s from the start of the call. The land stays `PENDING`. `MergeBase`, `IsAncestor`: the walk ran past 600 s from the start of the call. | Yes. A `Land` retry uses the same request key. |
+| `UNAVAILABLE` | The server cannot be reached or is shutting down, or its database stayed busy for 5 s (another process, such as an import, held its write lock). A tier also replies `UNAVAILABLE` when its upstream does not answer in time, or when it finds no room to fetch an object from upstream within 30 s (section 8). | Yes |
+| `RESOURCE_EXHAUSTED` | `GetObjects` only: no memory for the first object within 30 s (section 7.3). | Yes, after a wait |
 | `DATA_LOSS` | From a tier only: its upstream sent bytes that are not the object asked for (section 8). | MAY |
 | `INTERNAL` | A database, I/O or stored-data error, or a server bug. The message is `internal error`; the detail stays in the server log. | MAY |
 | `UNIMPLEMENTED` | The server does not have the call, or the request is compressed. | After the cause is fixed |
@@ -147,11 +148,13 @@ can answer a request for an object. A client checks what it can by hash.
 
 **A client MUST check:**
 
-- every object from `GetObjects`. A tree's `data` MUST decode as strict
-  `TreeV1` and hash to the requested tree ID. A blob's `data` MUST hash to the
-  requested blob ID.
-- that each `Object`'s `kind` and `id` match a ref that the client asked for.
-  An object that the client did not ask for is an error.
+- every object from `GetObjects`, after it unpacks the object's encoded
+  bytes within the limits of section 7.3. A tree's bytes MUST decode as
+  strict `TreeV1` and hash to the requested tree ID. A blob's bytes MUST
+  hash to the requested blob ID.
+- that the `kind` and `id` in the first part of each object match a ref that
+  the client asked for. An object that the client did not ask for is an
+  error.
 
 **A client SHOULD check:**
 
@@ -435,10 +438,12 @@ file has no lines and gets no ranges.
 
 **Bounds per call.** At most 1,000 changesets checked, 100 versions diffed,
 and about 1M lines diffed (both sides of each diff; a line counts once per
-64 bytes). A rename search counts each chunk of up to 64 bytes it compares as
-a line, compares at most 100 deleted files, and stops after it has read about
-100 MiB of them. The first step of a call always runs, so every call makes
-progress.
+64 bytes). A rename search counts as a line each chunk of up to 64 bytes
+that it reads, and each row of a chunk table that it compares. It compares
+at most 100 deleted files, and stops after it has read about 100 MiB of
+them. The first step of a call always runs, so every call makes progress.
+The rules of a rename search are those of `Diff` (section 6.13) for one
+added file.
 
 **Rules.** The server walks first parents to each changeset that changed the
 file, and diffs that version with the older version. The older version is
@@ -529,7 +534,7 @@ merge base for a CI job.
 - A file is anything at a path that is not a directory: a regular file, a
   symlink or a gitlink. A path differs when its `FileState` differs: kind,
   ID or executable flag. Content is compared by ID; there is no line diff.
-  Renames are not detected: a rename is a delete and an add.
+  Renames are found, as below.
 - Each `DiffEntry` has the `path`, the file there in the old changeset
   (`old`) and in the new one (`new`). An unset side means no file is there:
   nothing, or a directory. The two sides always differ.
@@ -552,6 +557,56 @@ merge base for a CI job.
 1,000 entries. To continue, a client sends the same request with `after` set
 to `next_after`, until `next_after` is empty. Snapshots never change, so the
 pages together are the whole diff, each entry once.
+
+**Renames.** The server finds renames as `git diff` does by default, among
+the added and deleted files of the whole diff below `path`. A rename keeps
+its two entries: the deleted file at the old path and the added file at the
+new path.
+
+- The added entry (`old` unset) has `rename_from`, the old path. The deleted
+  entry (`new` unset) has `rename_to`, the new path. Both have
+  `similarity`: how similar the two files are, in percent, as git prints it.
+  100 is the same content.
+- A client that ignores these fields sees a delete and an add, as from a
+  server that does not find renames. Then all three fields are empty.
+- The two entries are in tree order like all others, so they can come in
+  different replies. To print a rename once, as `git diff --name-status`
+  does, a client prints it at the added entry and skips the deleted entry.
+- Each call finds the renames of the whole diff below `path`, not of its
+  page. So an entry has the same rename in every reply, whatever `after` is.
+
+The rules are git's (`diffcore-rename.c`). Path order here is the byte order
+of the whole path, git's order, not tree order. A deleted file is the source
+of at most one rename.
+
+1. Same content: a deleted file of the same kind and ID. A regular file can
+   change its executable bit. Added files take their turn in path order.
+   Each takes, among the first 100 deleted files left with that content, the
+   first with the same name (the last part of the path), else the first.
+2. Same name: a deleted and an added regular file whose name no other file
+   left on its side has, if they are at least 75% similar.
+3. Similar: each added regular file keeps the four deleted regular files
+   most similar to it, of those at least 50% similar. Then those pairs, most
+   similar first, become renames while both files are free. On a tie, a pair
+   with the same name comes first, then by added path, then by deleted path.
+   git breaks some ties among more than four files another way. Which file
+   of such a tie the server pairs is not part of v1.
+
+Similarity is git's: each file is cut into chunks that end after a newline or
+after 64 bytes. In text (no NUL byte in the first 8,000 bytes), a CR before a
+newline does not count. Each chunk is hashed as git hashes it. Similarity is
+the bytes of the chunks that both files have, over the size of the larger
+file. A symlink or a gitlink is a rename only with the same content.
+
+**Rename bounds.** The server finds renames only in a diff of at most 10,000
+entries below `path`; a larger diff has none. As in git, step 3 runs only
+when the added files left times the deleted files left are at most
+1,000,000. Steps 2 and 3 share a budget per call: about 4M, where each chunk
+of a file read and each row of a chunk table indexed or compared count one
+(64 MiB of text in lines of 64 bytes costs 1M). Past it, the server reads no
+more files, so it misses the renames that step 2 or step 3 would find after
+that point. The budget is the same on every call, so every reply gives the
+same renames. The search never ends a page early.
 
 | Error | When |
 |---|---|
@@ -579,52 +634,107 @@ changeset does not exist for that repo. The answer never changes.
 
 ### 7.3 GetObjects
 
-`rpc GetObjects(GetObjectsRequest) returns (stream Object)`. Streams the
-trees and blobs named by `refs`.
+`rpc GetObjects(GetObjectsRequest) returns (stream ObjectPart)`. Streams the
+trees and blobs named by `refs`, each in an encoding that the request
+accepts, in parts.
 
 **Request.** `refs` names 1 to 1,000 objects, each a `kind` (`TREE` or
-`BLOB`) and a 32-byte `id`. A ref can repeat. The server checks the whole
-request before it sends any object.
+`BLOB`) and a 32-byte `id`. A ref can repeat. `accept` lists the encodings
+that the client accepts besides `RAW`, which every client accepts. In v1 the
+only other encoding is `ZSTD`. An empty list means `RAW` only. A server
+ignores a value that it does not know. The server checks the whole request
+before it sends any object.
+
+**Encodings.** An object's bytes are a tree's `TreeV1` bytes or a blob's
+content, and its ID is of those bytes. They travel in one of two encodings:
+
+| Encoding | Encoded bytes |
+|---|---|
+| `RAW` | The bytes as they are. |
+| `ZSTD` | One Zstandard frame ([RFC 8878](https://www.rfc-editor.org/rfc/rfc8878)) of the bytes, and no other bytes before or after it. It starts with the Zstandard magic number `0xFD2FB528`: not a skippable frame, not a legacy format. It has no `Dictionary_ID`, gives the size of the bytes as its `Frame_Content_Size`, and has a `Window_Size` of at most 8 MiB (for a single-segment frame, its size). It is at most `ZSTD_compressBound(size)` bytes, as the zstd library computes it: `size + size / 256`, plus `(128 KiB - size) / 2048` if `size` is below 128 KiB. libzstd makes such frames at every level up to 19. |
+
+The article says caches send objects in the disk format that the daemon will
+consume. Here, the server stores each blob as one zstd file, and sends a blob
+`ZSTD` to a client that accepts it: the stored file as it is, which the
+server does not unpack. It unpacks a blob for a client that accepts only
+`RAW`. It sends a tree `RAW`. A server or tier MUST NOT send `ZSTD` to a
+client that did not accept it. It MAY send any object `RAW`.
+
+**Parts.** An object of E encoded bytes comes in one or more `ObjectPart`
+messages. Each part holds 1 byte to 1 MiB of `data`, and the parts add up to
+E. An object with E = 0 is one part with no data. The server and
+`scion-tier` send parts of 1 MiB, the last one shorter. The first part also
+sets `kind` (1), `id` (2), `encoding` (4), `encoded_size` (5, which is E) and
+`size` (6, the size of the object's bytes, at most 100 MiB). For `RAW`,
+`encoded_size` equals `size`. A later part sets none of fields 1, 2, 4, 5
+and 6. So a receiver knows from the first part how much memory the object
+takes, before the rest arrives.
+
+**A receiver MUST**, before it uses, stores or forwards an object:
+
+- refuse a first part whose `kind` and `id` are not an object that it asked
+  for and has not got yet, whose encoding it did not accept, whose `size` is
+  over 100 MiB, or whose `encoded_size` does not fit `size` as the table
+  above says;
+- refuse a part of more than 1 MiB, an empty part (but the one part of an
+  empty object), parts that add up to more than E, a later part that sets
+  any of fields 1, 2, 4, 5 and 6, and a reply that ends in the middle of an
+  object;
+- for `ZSTD`, refuse a frame that breaks the rules of the table above, or
+  whose size is not `size`, and unpack it into at most `size` bytes with a
+  window of at most 8 MiB, so that a frame never makes it hold more than the
+  first part said;
+- check the bytes against the ID (section 5).
+
+A receiver ignores fields that it does not know, also in a later part. A
+server sends objects in request order; a receiver MAY refuse one out of
+order. `scion-tier` does; `scn` takes each object it asked for in any
+order.
 
 **Reply.**
 
-- Objects come in request order, one per message. So a reply is always a
+- Objects come in request order, part by part. So a reply is always a
   prefix of `refs`.
-- Each `Object` repeats the `kind` and `id` of its ref.
 - The reply sends the next object only while it has sent less than 64 MiB
-  of object data. So a reply holds at least one object, and at most 64 MiB
+  of encoded data. So a reply holds at least one object, and at most 64 MiB
   plus one object of up to 100 MiB.
-- All replies share a budget of 400 MiB of object data. The server finds the
-  first object before it answers the call. If it has no memory for that
-  object within 120 s, the call fails with `RESOURCE_EXHAUSTED` and sends no
+- All replies share a budget of 400 MiB. Before the server reads an object,
+  the object takes its share of the budget: all the memory that the reply
+  holds for it (its bytes, and the decoder while it unpacks a blob for a
+  `RAW` client). It keeps the share until the reply has handed the object's
+  last part on. Each part is a buffer of its own, so a part that waits for
+  the client never keeps the rest of the object. Not counted: the part that
+  waits for the client and the part that HTTP/2 is sending, at most 1 MiB
+  each. The server finds the first object before it answers the call. If it has no memory for that
+  object within 30 s, the call fails with `RESOURCE_EXHAUSTED` and sends no
   object. The client SHOULD wait before it asks again.
-- The reply stops when a later object does not reach the client within
-  120 s (the stall limit): because the client takes no object, or because
-  the server waits that long for memory.
-- A reply that stops early ends with status `OK`, after at least one object.
-  A server or tier MUST NOT end a reply with `OK` and no object. The client
-  MUST ask again for the objects it did not get.
+- The reply stops when the server waits 30 s for memory for a later object,
+  or when the client takes no part for 120 s (the stall limit).
+- A reply that stops between objects ends with status `OK`, after at least
+  one object. A server or tier MUST NOT end a reply with `OK` and no object,
+  or with `OK` in the middle of an object. A reply that stops in the middle
+  of an object, because its client took no part for 120 s, ends with
+  `DEADLINE_EXCEEDED`, as `ReadFile` does. The client MUST ask again for the
+  objects it did not get.
 
 **Errors.** An error status of the call is about the whole call, and no
 object was sent: for example a repo that does not exist, or no memory for
-the first object. An error in the stream is about the next object, and ends
-the reply after the objects before it. A server or tier MUST NOT put an
-error about the whole call in the stream. A missing object ends the reply
-with `NOT_FOUND`. A damaged stored object ends it with `INTERNAL`. The
-client MAY keep the objects it got before the error.
-
-**Object data.**
-
-> Changes with [#53](https://github.com/bnsd55/open-scion/issues/53).
-
-- A tree's `data` is its `TreeV1` bytes.
-- A blob's `data` is the file's raw content, uncompressed, at most 100 MiB.
+the first object. An error in the stream is about the object in progress,
+or the next object if none is in progress. It ends the reply after the
+objects before it. A server or tier MUST NOT put an error about the whole
+call in the stream. A missing object ends the reply with `NOT_FOUND`. A
+damaged stored tree, or a damaged blob that the server unpacks, ends it
+with `INTERNAL`. The server does not check a blob that it sends `ZSTD`: if
+the stored file is damaged, the receiver finds it (section 5). The client
+MAY keep the objects it got before the error.
 
 | Error | When |
 |---|---|
 | `INVALID_ARGUMENT` | A bad repo name; no ref or more than 1,000; a kind that is not `TREE` or `BLOB`; an ID that is not 32 bytes. |
 | `NOT_FOUND` | The repo does not exist (the call's status); a named object does not exist (in the stream, after the objects before it). |
-| `RESOURCE_EXHAUSTED` | No memory for the first object within 120 s. No object was sent. |
+| `RESOURCE_EXHAUSTED` | No memory for the first object within 30 s. No object was sent. |
+| `DEADLINE_EXCEEDED` | In the stream: the client took no part for 120 s in the middle of an object. |
+| `UNAVAILABLE` | From a tier: its upstream did not answer in time, or it found no fetch slot or no memory for an object from upstream within 30 s (section 8). The call's status for the first object, else in the stream. Ask again. |
 
 ## 8. Cache tiers
 
@@ -644,10 +754,15 @@ order is daemon, cache, server. These rules hold for any tier:
 - A tier MAY keep a `GetRootTree` answer forever, keyed by (repo,
   changeset), but only as its upstream gave it. It MUST NOT compute one.
 - A tier MAY keep objects forever. A tier never trusts upstream bytes: it
-  MUST check each object from its upstream against its ID, as a client does
-  (section 5), before it stores, forwards or sends it. An object that fails
-  the check MUST NOT be stored or sent. It ends the reply with `DATA_LOSS`,
+  MUST check each object from its upstream as a client does (sections 5
+  and 7.3), before it stores, forwards or sends it. An object that fails the
+  check MUST NOT be stored or sent. It ends the reply with `DATA_LOSS`,
   after the objects before it.
+- A tier MAY keep an object in any encoding, and MAY send it in any
+  encoding that its client accepts. `scion-tier` asks its upstream for
+  `ZSTD`, keeps a tree `RAW` and a blob as one zstd frame (the frame from
+  upstream, or one that it packs from a `RAW` blob), and sends that frame as
+  it is to a client that accepts `ZSTD`.
 - An error status of an upstream call is about every object in that call.
   If it comes for the first object of a reply, the tier MUST fail its own
   call with that status. If it comes later, the tier ends its reply with
@@ -658,18 +773,30 @@ order is daemon, cache, server. These rules hold for any tier:
   whole call, because a broken connection also ends a stream with an error.
   `scion-tier` does.
 - A tier SHOULD wait longer for its upstream than that upstream may wait for
-  its own, so it does not give up on a slow but healthy path. `scion-cache`
-  waits at most 60 s for each step of the server (an answer, or the next
-  object), and `scion-daemon` 200 s for each step of the cache. On a
-  timeout, the tier fails with `UNAVAILABLE`.
+  its own, so it does not give up on a slow but healthy path. The limits of
+  `scion-tier` nest. The server and each tier wait at most 30 s for memory
+  before an object. A tier waits at most 30 s for one of its 64 fetch slots
+  before it calls upstream, and at most 30 s for memory for an object from
+  upstream, while that upstream reply waits. `scion-cache` waits at most
+  60 s for each step of the server (an answer, or the next part), so a busy
+  server answers first. `scion-daemon` waits 180 s for each step of the
+  cache, which covers one step of the server, the cache's own three waits
+  of 30 s, and 30 s to spare. On a timeout or a wait that ends, the tier
+  fails with `UNAVAILABLE`. A deadline that the client passes down
+  is not in v0.1 ([#98](https://github.com/bnsd55/open-scion/issues/98)).
 - The `Scion` service goes only to the server.
 
 **The daemon's socket.** `scion-daemon` listens on a Unix socket with mode
 0600, in a directory that only its user can reach. A client sends its token
 to the socket, so it SHOULD check first that the socket file is a socket
-(not a symlink) owned by its own user or by root. `scn` does, for every
-`unix://` address. Neither `scn` nor the daemon checks the directories above
-the socket yet ([#70](https://github.com/bnsd55/open-scion/issues/70)).
+(not a symlink) owned by its own user or by root. It SHOULD also check each
+directory above the socket, up to `/`: owned by root or by its own user,
+and not writable by group or others unless it has the sticky bit. Else
+another user could swap the socket after the check. It SHOULD resolve the
+socket's directory before this check and connect to the resolved path, so
+that it follows no symlink after the check. `scn` does all of this, for
+every `unix://` address. The daemon checks the directories above its socket
+and its data directory in the same way.
 
 Tiers are trusted in v0.1. A client cannot check a `ResolveRef` or
 `GetRootTree` answer by hash, so it trusts every tier on its path for them.
@@ -691,6 +818,8 @@ only if an answer that ignores it is still correct for the client.
 | A new call. An older server replies `UNIMPLEMENTED`. | No |
 | A new reply field that an older client can ignore | No |
 | A new request field whose empty value means today's behavior, and that an older server can safely ignore | No |
+| A new `Encoding` value. A server sends it only to a client that lists it in `accept`, and ignores a value that it does not know. | No |
+| A new field in `ObjectPart`, first or later part, that an older receiver can ignore | No |
 | A higher limit on requests that the server accepts | No |
 | Deprecating a call that keeps working | No |
 | A field's number, type or meaning, or the meaning of its empty value | Yes |
@@ -714,10 +843,8 @@ A new version is a new package, `scion.v2`. A server MAY serve both.
 - Client changesets with no parent, several parents or a committer. Only git
   import makes them.
 - Text merge. Conflicts are path-level.
-- `Diff` with rename detection
-  ([#79](https://github.com/bnsd55/open-scion/issues/79)).
+- `Diff` renames in a diff of more than 10,000 entries or past the search
+  budget ([#107](https://github.com/bnsd55/open-scion/issues/107)).
 - `Blame` without per-call bounds
   ([#61](https://github.com/bnsd55/open-scion/issues/61)), and `Log` that
   follows renames.
-- Blobs sent in their stored, compressed form
-  ([#53](https://github.com/bnsd55/open-scion/issues/53)).
