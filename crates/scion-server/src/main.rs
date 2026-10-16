@@ -2,7 +2,7 @@
 //! derived data ahead of reads.
 
 use std::net::SocketAddr;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -75,6 +75,10 @@ enum Command {
         /// public key), whose tickets stay valid during a rotation.
         #[arg(long, value_name = "FILE", requires = "ticket_key")]
         ticket_key_old: Option<PathBuf>,
+        /// Most bytes that the stalled replies of one connection may hold. A
+        /// connection over it is closed with them.
+        #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
+        max_stalled_bytes: NonZeroU64,
     },
     /// Print the BLAKE3 digest of a token, as a `token` line of an access
     /// file wants it. The file holds digests, never tokens.
@@ -183,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
             tls_client_ca,
             max_connections,
             max_streams,
+            max_stalled_bytes,
             ticket_key,
             ticket_key_old,
         } => {
@@ -202,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
                 Limits {
                     connections: max_connections,
                     streams: max_streams,
+                    stalled_bytes: max_stalled_bytes,
                 },
             )
             .await?;
@@ -258,7 +264,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// Serves the gRPC API on `listen`, with the TLS files of the flags, until
 /// the caller stops it.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn serve(
     store: Store,
     listen: SocketAddr,

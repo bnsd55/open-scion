@@ -2872,6 +2872,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "ed25519-dalek",
  "hashlink",
  "rcgen",
  "rustix",
