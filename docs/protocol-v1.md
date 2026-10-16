@@ -266,7 +266,7 @@ the same bytes give the same ID and no second copy.
 
 | Error | When |
 |---|---|
-| `INVALID_ARGUMENT` | Any rule above fails, including a parent that the repo does not have. For a blob that is not the repo's, or is missing or damaged, the message names the first such path in path order. A blob of another repo gets the same answer as content that no repo stored, and the server checks every blob for the repo before it reads any, so the answer does not show whether another repo has it. |
+| `INVALID_ARGUMENT` | Any rule above fails, including a parent that the repo does not have. The message names the first path in path order whose blob is not the repo's; if every put names the repo's blobs, the first path whose blob is missing or damaged. A blob of another repo gets the same answer as content that no repo stored, and the server checks every blob for the repo before it reads any, so the answer does not show whether another repo has it. |
 | `NOT_FOUND` | The repo does not exist. |
 
 ### 6.3 Land
