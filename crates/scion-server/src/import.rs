@@ -45,6 +45,20 @@ const TX_BUDGET: Duration = Duration::from_secs(1);
 /// transaction begins.
 const TX_YIELD: Duration = Duration::from_millis(100);
 
+/// How many times one batch waits out a busy write lock and runs again.
+/// The batch's writes are idempotent, so a retry is safe; past the bound
+/// the import fails and the caller sees the busy error.
+const BUSY_TRIES: u32 = 10;
+
+/// Whether the error is the database staying busy past `busy_timeout`.
+fn is_busy(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::Db(db)
+            if db.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
+    )
+}
+
 // How long the write transaction sleeps per commit of a batch, for the
 // tests of a slow batch. It models a batch whose records are slow.
 #[cfg(test)]
@@ -249,23 +263,43 @@ fn store_batch(
     while !rest.is_empty() {
         let mut taken = 0;
         let started_tx = Instant::now();
-        store.write(|c| {
-            for (commit, cs, git_tree) in rest {
-                #[cfg(test)]
-                if !slow_record.is_zero() {
-                    std::thread::sleep(slow_record);
+        // The write lock of a shared data directory stays busy when the
+        // servers that share it write without a pause, and `busy_timeout`
+        // then expires with the transaction rolled back and nothing
+        // written. A batch is safe to run again whole: every write in it is
+        // content-addressed or `INSERT OR IGNORE`, so it retries a bounded
+        // number of times, and waits between tries so it takes its turn.
+        let mut tries = 0;
+        loop {
+            let result = store.write(|c| {
+                for (commit, cs, git_tree) in rest {
+                    #[cfg(test)]
+                    if !slow_record.is_zero() {
+                        std::thread::sleep(slow_record);
+                    }
+                    let root = record(c, repo_id, *commit, cs)?;
+                    if plan.verify.contains(commit) {
+                        checker.check(c, *commit, *git_tree, root)?;
+                    }
+                    taken += 1;
+                    if shared && started_tx.elapsed() >= TX_BUDGET {
+                        break;
+                    }
                 }
-                let root = record(c, repo_id, *commit, cs)?;
-                if plan.verify.contains(commit) {
-                    checker.check(c, *commit, *git_tree, root)?;
+                Ok(taken)
+            });
+            match result {
+                Ok(_) => break,
+                Err(e) if is_busy(&e) && tries < BUSY_TRIES => {
+                    tries += 1;
+                    taken = 0;
+                    checker.reset_for_retry();
+                    tracing::warn!(tries, "the database stayed busy; the batch retries");
+                    std::thread::sleep(TX_YIELD);
                 }
-                taken += 1;
-                if shared && started_tx.elapsed() >= TX_BUDGET {
-                    break;
-                }
+                Err(e) => return Err(e),
             }
-            Ok(taken)
-        })?;
+        }
         rest = &rest[taken..];
         *done += taken;
         tracing::info!(
@@ -556,6 +590,16 @@ struct Checker<'a> {
     /// Stored blobs recently known to be intact: put in this run, or read
     /// back by an earlier check. A miss costs a read-back of the stored blob.
     intact: LruCache<BlobId, ()>,
+}
+
+impl Checker<'_> {
+    /// Drops the state of checks that a rolled-back transaction recorded,
+    /// so a batch that runs again verifies from scratch. The git-to-blob
+    /// map stays: it hashes content, so it never lies.
+    fn reset_for_retry(&mut self) {
+        self.equal.clear();
+        self.intact.clear();
+    }
 }
 
 impl Checker<'_> {
