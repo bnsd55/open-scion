@@ -63,6 +63,7 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::server::Connected;
 use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Code, Request, Response, Status, Streaming};
+use tonic_health::ServingStatus;
 
 use store::lock;
 pub use store::{DiskStore, MemoryStore, Store};
@@ -491,7 +492,26 @@ impl<S: Store> Tier<S> {
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_PART_MESSAGE_BYTES);
         let objects = InterceptedService::new(objects, Auth::new(token));
-        let router = |mut server: Server| server.add_service(objects);
+        // The health service answers `grpc.health.v1.Check` and `Watch` on
+        // the same port, without a token: a probe carries none. The store
+        // and the upstream channel opened before this call, so the tier
+        // starts serving.
+        let (reporter, health) = tonic_health::server::health_reporter();
+        reporter
+            .set_service_status("", ServingStatus::Serving)
+            .await;
+        reporter
+            .set_service_status("scion.v1.Objects", ServingStatus::Serving)
+            .await;
+        // On shutdown, the status flips before the drain, so a watcher
+        // sees `NOT_SERVING` while the server still answers.
+        let shutdown = async {
+            shutdown.await;
+            reporter
+                .set_service_status("", ServingStatus::NotServing)
+                .await;
+        };
+        let router = |mut server: Server| server.add_service(health).add_service(objects);
         limits
             .serve(router, incoming, tls.map(|tls| tls.config()), shutdown)
             .await

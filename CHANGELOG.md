@@ -150,6 +150,12 @@ until that section gets its release date.
   `default`, which may read and write every repo.
 - Bearer-token auth, loopback-only listening by default, request limits
   and name validation at the RPC boundary.
+- The gRPC health service (`grpc.health.v1`) on the same port as the other
+  services, without a token, so a probe needs none: `scion-server` and
+  `scion-cache` (and `scion-daemon`, which shares the tier's server)
+  answer `Check` and `Watch` with `SERVING` once the store and the
+  upstream channel are open, and with `NOT_SERVING` while a shutdown
+  drains.
 - TLS and mTLS: the server and `scion-cache` serve TLS with `--tls-cert`
   and `--tls-key` (a non-loopback address then needs no
   `--insecure-listen`), and require a client certificate with
