@@ -920,10 +920,12 @@ impl PathIndex {
         Ok(Checked::Paths(conflicts))
     }
 
-    /// Walks from the floor back to `base`, adding each changeset and moving
-    /// the floor down past it. Stops at the first changeset that does not fit
-    /// in [`MAX_INDEX_BYTES`], which is then the floor. The caller has checked
-    /// that `base` is not the floor and not in the index.
+    /// Walks first parents from the floor back to `base`, adding each
+    /// changeset and moving the floor down past it. Stops at the first
+    /// changeset that does not fit in [`MAX_INDEX_BYTES`], which is then the
+    /// floor. The caller has checked that `base` is not the floor and not in
+    /// the index. Fails with [`Error::DeadlineExceeded`] once `deadline` has
+    /// passed.
     fn reach(
         &mut self,
         lands: &Lands,
@@ -933,24 +935,26 @@ impl PathIndex {
         base_gen: i64,
         deadline: &Deadline,
     ) -> Result<Walk> {
-        walk_back(
-            c,
-            repo,
-            self.floor,
-            base,
-            base_gen,
-            deadline,
-            |id, generation, cs| {
-                let cost = self.cost([(generation, &cs.changes)]);
-                if !self.grow(lands, cost, |index| index.add(id, generation, &cs.changes)) {
-                    return false;
-                }
-                if let Some(&parent) = cs.parents.first() {
-                    self.floor = parent;
-                }
-                true
-            },
-        )
+        loop {
+            deadline.check()?;
+            let id = self.floor;
+            let generation = db::generation(c, repo, id)?;
+            if generation <= base_gen {
+                return Ok(Walk::Missed);
+            }
+            let cs = db::get_changeset(c, repo, id)?;
+            let cost = self.cost([(generation, &cs.changes)]);
+            if !self.grow(lands, cost, |index| index.add(id, generation, &cs.changes)) {
+                return Ok(Walk::Stopped);
+            }
+            let Some(&parent) = cs.parents.first() else {
+                return Ok(Walk::Missed);
+            };
+            self.floor = parent;
+            if parent == base {
+                return Ok(Walk::Reached);
+            }
+        }
     }
 
     /// Whether a changeset after `base_gen` touched `path`: the same path, a
@@ -1110,46 +1114,14 @@ enum Checked {
     Derive,
 }
 
-/// How a [`walk_back`] ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How a [`PathIndex::reach`] ended.
 enum Walk {
     /// It reached the base: the base is on the history.
     Reached,
     /// The base is not on the history.
     Missed,
-    /// The visit stopped it before it reached the base.
+    /// The index ran out of room before the walk reached the base.
     Stopped,
-}
-
-/// Walks first parents from `from` back to `base`, and passes each changeset
-/// after `base` to `visit`, newest first, while `visit` returns `true`.
-/// Fails with [`Error::DeadlineExceeded`] once `deadline` has passed.
-fn walk_back(
-    c: &Connection,
-    repo: RepoId,
-    from: ChangesetId,
-    base: ChangesetId,
-    base_gen: i64,
-    deadline: &Deadline,
-    mut visit: impl FnMut(ChangesetId, i64, &Changeset) -> bool,
-) -> Result<Walk> {
-    let mut cur = from;
-    loop {
-        deadline.check()?;
-        let generation = db::generation(c, repo, cur)?;
-        if generation <= base_gen {
-            return Ok(Walk::Missed);
-        }
-        let cs = db::get_changeset(c, repo, cur)?;
-        if !visit(cur, generation, &cs) {
-            return Ok(Walk::Stopped);
-        }
-        match cs.parents.first() {
-            Some(&parent) if parent == base => return Ok(Walk::Reached),
-            Some(&parent) => cur = parent,
-            None => return Ok(Walk::Missed),
-        }
-    }
 }
 
 /// Checks a land in the path history of `tip`, for a base that the
@@ -1728,8 +1700,8 @@ mod tests {
         assert!(f.generation(f.main().target) - f.generation(root) > MAX_DEPTH);
         let last = format!("f{}", history.len() - 2);
         let path = |p: &str| RepoPath::new(p).unwrap();
-        // A's a/x and F2's f2 are below the floor, so only the walk sees
-        // them. The last F's change is still in the index.
+        // A's a/x and F2's f2 are below the floor, so only the path history
+        // sees them. The last F's change is still in the index.
         assert!(f.index(|index| {
             !index.files.contains_key(b"a/x".as_slice())
                 && !index.files.contains_key(b"f2".as_slice())
@@ -2268,7 +2240,7 @@ mod tests {
         assert!(f.held()["other"]);
 
         // Bases below the floor. Each check reaches back while the index has
-        // room, and walks the rest.
+        // room, and checks the rest in the path history.
         let base = history[1];
         assert!(f.generation(base) < f.generation(within_budget(&f)));
         let cases = [

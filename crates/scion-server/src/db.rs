@@ -417,6 +417,8 @@ fn to_id(bytes: &[u8]) -> Result<ChangesetId> {
 /// Commit graphs for tests.
 #[cfg(test)]
 pub(crate) mod testing {
+    use std::collections::BTreeMap;
+
     use proptest::prelude::{Strategy, any};
     use proptest::sample::Index;
     use scion_core::{BlobId, FileState, IdentityTime, RepoPath};
@@ -432,13 +434,31 @@ pub(crate) mod testing {
         repo: RepoId,
         parents: &[Vec<usize>],
     ) -> Result<Vec<ChangesetId>> {
-        let mut ids: Vec<ChangesetId> = Vec::new();
-        for (i, of) in parents.iter().enumerate() {
+        insert_each(c, repo, parents, |i| {
             let path = format!("f{i}");
             let state = FileState::Regular {
                 content: BlobId::of(path.as_bytes()),
                 executable: false,
             };
+            let message = path.clone().into_bytes();
+            (
+                message,
+                [(RepoPath::new(path).unwrap(), Some(state))].into(),
+            )
+        })
+    }
+
+    /// Stores a graph as [`insert_graph`] does, where changeset `i` has the
+    /// message and the changes that `make(i)` returns.
+    fn insert_each(
+        c: &Connection,
+        repo: RepoId,
+        parents: &[Vec<usize>],
+        make: impl Fn(usize) -> (Vec<u8>, BTreeMap<RepoPath, Option<FileState>>),
+    ) -> Result<Vec<ChangesetId>> {
+        let mut ids: Vec<ChangesetId> = Vec::new();
+        for (i, of) in parents.iter().enumerate() {
+            let (message, changes) = make(i);
             let cs = Changeset {
                 parents: of.iter().map(|&p| ids[p]).collect(),
                 author: IdentityTime {
@@ -448,8 +468,8 @@ pub(crate) mod testing {
                     tz_offset_minutes: 0,
                 },
                 committer: None,
-                message: path.clone().into_bytes(),
-                changes: [(RepoPath::new(path).unwrap(), Some(state))].into(),
+                message,
+                changes,
             };
             ids.push(insert_changeset(c, repo, &cs)?);
         }
@@ -486,9 +506,8 @@ pub(crate) mod testing {
         parents: &[Vec<usize>],
         edits: &[Edits],
     ) -> Result<Vec<ChangesetId>> {
-        let mut ids: Vec<ChangesetId> = Vec::new();
-        for (i, (of, edits)) in parents.iter().zip(edits).enumerate() {
-            let changes = edits
+        insert_each(c, repo, parents, |i| {
+            let changes = edits[i]
                 .iter()
                 .map(|&(path, put)| {
                     let state = put.then(|| FileState::Regular {
@@ -498,21 +517,8 @@ pub(crate) mod testing {
                     (RepoPath::new(PATHS[path]).unwrap(), state)
                 })
                 .collect();
-            let cs = Changeset {
-                parents: of.iter().map(|&p| ids[p]).collect(),
-                author: IdentityTime {
-                    name: b"a".to_vec(),
-                    email: b"a@x".to_vec(),
-                    unix_secs: 0,
-                    tz_offset_minutes: 0,
-                },
-                committer: None,
-                message: i.to_string().into_bytes(),
-                changes,
-            };
-            ids.push(insert_changeset(c, repo, &cs)?);
-        }
-        Ok(ids)
+            (i.to_string().into_bytes(), changes)
+        })
     }
 
     /// Graphs of 1 to `max` changesets for [`insert_graph`]. Most have a

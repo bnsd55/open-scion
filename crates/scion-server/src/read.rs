@@ -186,12 +186,13 @@ pub fn log_page(
         while let Some(from) = next.filter(|_| entries.len() < limit) {
             // Each changeset on the first-parent history of `cs` has a path
             // history, so `from` has one.
-            next = None;
-            if let Some(id) = history::newest_change(c, from, path)? {
-                let changeset = db::get_changeset(c, repo, id)?;
-                next = changeset.parents.first().copied();
-                entries.push((id, changeset));
-            }
+            let Some(id) = history::newest_change(c, from, path)? else {
+                next = None;
+                break;
+            };
+            let changeset = db::get_changeset(c, repo, id)?;
+            next = changeset.parents.first().copied();
+            entries.push((id, changeset));
         }
         Ok(LogPage { entries, next })
     })

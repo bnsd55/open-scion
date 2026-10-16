@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, HashMap, btree_map, hash_map};
 use std::fmt;
 
 use rusqlite::{Connection, OptionalExtension, params};
-use scion_core::{Changeset, ChangesetId, PathElem, RepoPath};
+use scion_core::{Changeset, ChangesetId, FileState, PathElem, RepoPath};
 
 use crate::db;
 use crate::deadline::Deadline;
@@ -70,7 +70,7 @@ impl NodeId {
 
 impl fmt::Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
+        f.write_str(&blake3::Hash::from_bytes(self.0).to_hex())
     }
 }
 
@@ -82,11 +82,9 @@ impl fmt::Debug for NodeId {
 
 /// A changeset and its generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Stamp {
-    /// The changeset.
-    pub id: ChangesetId,
-    /// Its generation.
-    pub generation: i64,
+struct Stamp {
+    id: ChangesetId,
+    generation: i64,
 }
 
 /// One entry of a history node.
@@ -122,7 +120,7 @@ impl Kind for PathHistory {
             id,
             generation: db::generation_of(c, id)?,
         };
-        apply(c, parents.first().copied(), by, changeset.changes.keys())
+        apply(c, parents.first().copied(), by, &changeset.changes)
     }
 
     fn encode(root: &NodeId) -> Vec<u8> {
@@ -134,21 +132,20 @@ impl Kind for PathHistory {
     }
 }
 
-/// The tree of `base` (`None` is the empty tree) with the entry of each of
-/// `paths`, and of each directory above them, stamped with `by`. Stores the
-/// new nodes and returns the new root.
-fn apply<'p>(
+/// The tree of `base` (`None` is the empty tree) with the entry of each
+/// changed path, and of each directory above it, stamped with `by`. Stores
+/// the new nodes and returns the new root.
+fn apply(
     c: &Connection,
     base: Option<NodeId>,
     by: Stamp,
-    paths: impl IntoIterator<Item = &'p RepoPath>,
+    changes: &BTreeMap<RepoPath, Option<FileState>>,
 ) -> Result<NodeId> {
-    let mut paths = paths.into_iter().peekable();
-    if let (Some(base), None) = (base, paths.peek()) {
+    if let (Some(base), true) = (base, changes.is_empty()) {
         return Ok(base);
     }
     let mut root = Edit::load(c, base)?;
-    for path in paths {
+    for path in changes.keys() {
         root.stamp(c, &tree::parts(path), by)?;
     }
     root.store(c)
@@ -208,7 +205,7 @@ impl Edit {
 }
 
 /// What a history tree holds for one path.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Default)]
 struct Hit {
     /// The newest changeset that changed the path or a path below it.
     last: Option<Stamp>,
