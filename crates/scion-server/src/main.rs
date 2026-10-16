@@ -1,5 +1,4 @@
-//! `scion-server`: serve the Scion API, import a git repository, or derive
-//! derived data ahead of reads.
+//! The `scion-server` binary: `import`, `serve` and `derive`.
 
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
@@ -13,15 +12,17 @@ use scion_server::derived::{self, Kind};
 use scion_server::graph::CommitGraph;
 use scion_server::history::PathHistory;
 use scion_server::import::{ImportOptions, import_git};
+use scion_server::quotas::Quotas;
 use scion_server::tree::RootTree;
 use scion_server::{Error, Store, db, read, service};
 use tracing_subscriber::EnvFilter;
 
+/// The scion server: import, serve and derive.
 #[derive(Parser)]
-#[command(version, about = "Server for the Scion version control system")]
+#[command(version, about, long_about = None)]
 struct Cli {
-    /// Data directory. Created if missing.
-    #[arg(long, env = "SCION_DATA", default_value = "scion-data", global = true)]
+    /// The data directory. Holds the SQLite database and the objects.
+    #[arg(long, env = "SCION_DATA", default_value = "scion-data")]
     data: PathBuf,
     #[command(subcommand)]
     command: Command,
@@ -36,7 +37,9 @@ enum Command {
         listen: SocketAddr,
         /// Bearer token that clients must send. Its principal, `default`,
         /// may read and write every repo. Give `--token` or `--access`, not
-        /// both.
+        /// both. With this, the per-principal quotas are off unless a flag
+        /// sets one: every client is the same principal, so a cap would be
+        /// a global one.
         #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
         token: Option<String>,
         /// Access file: tokens with principals, and which repos and paths
@@ -44,6 +47,24 @@ enum Command {
         /// not both.
         #[arg(long, value_name = "FILE")]
         access: Option<PathBuf>,
+        /// Most requests one principal may hold at once. With `--access`
+        /// the default is 64; with `--token` the check is off.
+        #[arg(long)]
+        max_principal_requests: Option<usize>,
+        /// Most upload bytes one principal may hold in flight. With
+        /// `--access` the default is 536870912 (512 MiB); with `--token`
+        /// the check is off.
+        #[arg(long, value_name = "BYTES")]
+        max_principal_upload_bytes: Option<usize>,
+        /// Most pending lands one principal may hold at once. With
+        /// `--access` the default is 64; with `--token` the check is off.
+        #[arg(long)]
+        max_principal_pending_lands: Option<usize>,
+        /// A land that has been pending for longer than this many seconds is
+        /// rejected by the sweep, so a restart cannot leave one pending
+        /// forever. The default is 86400 (24 hours).
+        #[arg(long, default_value_t = 24 * 60 * 60)]
+        land_stale_secs: i64,
         /// Allow a non-loopback address. Without TLS, traffic, including the
         /// token, is not encrypted, so use this only on a trusted network.
         /// With `--tls-cert` and `--tls-key`, a non-loopback address is
@@ -127,25 +148,8 @@ enum KindName {
     PathHistory,
 }
 
-/// The TLS of a `serve` command: none, or the certificate, key and client CA
-/// of the flags. Clap requires the certificate and the key together, and the
-/// client CA on a certificate.
-fn server_tls(
-    cert: Option<&Path>,
-    key: Option<&Path>,
-    client_ca: Option<&Path>,
-) -> anyhow::Result<Option<ServerTls>> {
-    match (cert, key) {
-        (None, None) => Ok(None),
-        (Some(cert), Some(key)) => {
-            let tls = ServerTls::load(cert, key, client_ca)?;
-            Ok(Some(tls))
-        }
-        _ => unreachable!("clap requires --tls-cert and --tls-key together"),
-    }
-}
-
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
@@ -167,6 +171,10 @@ async fn main() -> anyhow::Result<()> {
             listen,
             token,
             access,
+            max_principal_requests,
+            max_principal_upload_bytes,
+            max_principal_pending_lands,
+            land_stale_secs,
             insecure_listen,
             tls_cert,
             tls_key,
@@ -175,6 +183,16 @@ async fn main() -> anyhow::Result<()> {
             max_streams,
             max_stalled_bytes,
         } => {
+            // The second reply says whether the mode is one token: with one
+            // principal, a per-principal cap is a global one, so the quotas
+            // are off unless a flag sets one.
+            let (access, single) = load_access(token, access)?;
+            let caps = caps(
+                single,
+                max_principal_requests,
+                max_principal_upload_bytes,
+                max_principal_pending_lands,
+            );
             let server_tls = server_tls(
                 tls_cert.as_deref(),
                 tls_key.as_deref(),
@@ -183,12 +201,17 @@ async fn main() -> anyhow::Result<()> {
             serve(
                 store,
                 listen,
-                load_access(token, access)?,
-                insecure_listen,
-                server_tls,
-                max_connections,
-                max_streams,
-                max_stalled_bytes,
+                access,
+                ServeConfig {
+                    insecure_listen,
+                    quotas: caps.quotas,
+                    pending_lands: caps.pending_lands,
+                    land_stale_secs,
+                    server_tls,
+                    max_connections,
+                    max_streams,
+                    max_stalled_bytes,
+                },
             )
             .await?;
         }
@@ -244,6 +267,67 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The TLS of a `serve` command: none, or the certificate, key and client CA
+/// of the flags. Clap requires the certificate and the key together, and the
+/// client CA on a certificate.
+fn server_tls(
+    cert: Option<&Path>,
+    key: Option<&Path>,
+    client_ca: Option<&Path>,
+) -> anyhow::Result<Option<ServerTls>> {
+    match (cert, key) {
+        (None, None) => Ok(None),
+        (Some(cert), Some(key)) => {
+            let tls = ServerTls::load(cert, key, client_ca)?;
+            Ok(Some(tls))
+        }
+        _ => unreachable!("clap requires --tls-cert and --tls-key together"),
+    }
+}
+
+/// The three per-principal caps, as the flags set them. With one principal
+/// (the `--token` mode) a per-principal cap is a global one, so each cap is
+/// off unless a flag sets it; with an access file the defaults apply.
+struct Caps {
+    quotas: Quotas,
+    pending_lands: Option<usize>,
+}
+
+fn caps(
+    single: bool,
+    requests: Option<usize>,
+    upload_bytes: Option<usize>,
+    pending_lands: Option<usize>,
+) -> Caps {
+    let with_default = |flag: Option<usize>, default: usize| {
+        if single {
+            flag
+        } else {
+            Some(flag.unwrap_or(default))
+        }
+    };
+    Caps {
+        quotas: Quotas::new(
+            with_default(requests, 64),
+            with_default(upload_bytes, 512 << 20),
+        ),
+        pending_lands: with_default(pending_lands, 64),
+    }
+}
+
+/// What a `serve` command serves with, besides the data directory and the
+/// access rules.
+struct ServeConfig {
+    insecure_listen: bool,
+    quotas: Quotas,
+    pending_lands: Option<usize>,
+    land_stale_secs: i64,
+    server_tls: Option<ServerTls>,
+    max_connections: NonZeroUsize,
+    max_streams: NonZeroU32,
+    max_stalled_bytes: NonZeroU64,
+}
+
 /// Serves the gRPC API on `listen`, with the TLS files of the flags, until
 /// the caller stops it.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -251,14 +335,10 @@ async fn serve(
     store: Store,
     listen: SocketAddr,
     access: scion_server::access::Access,
-    insecure_listen: bool,
-    server_tls: Option<ServerTls>,
-    max_connections: NonZeroUsize,
-    max_streams: NonZeroU32,
-    max_stalled_bytes: NonZeroU64,
+    config: ServeConfig,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        listen.ip().is_loopback() || insecure_listen || server_tls.is_some(),
+        listen.ip().is_loopback() || config.insecure_listen || config.server_tls.is_some(),
         "{listen} is not a loopback address; without TLS the traffic and the \
          token would travel unencrypted. Pass --tls-cert and --tls-key, or \
          --insecure-listen to allow it."
@@ -269,17 +349,22 @@ async fn serve(
     // The bound address, so port 0 shows the port that the OS chose.
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "serving");
-    let limits = Limits {
-        connections: max_connections,
-        streams: max_streams,
-        stalled_bytes: max_stalled_bytes,
-    };
+
     Box::pin(service::serve(
         store,
         listener,
         access,
-        limits,
-        server_tls,
+        service::ServeOptions {
+            limits: Limits {
+                connections: config.max_connections,
+                streams: config.max_streams,
+                stalled_bytes: config.max_stalled_bytes,
+            },
+            quotas: config.quotas,
+            pending_lands: config.pending_lands,
+            land_stale_secs: config.land_stale_secs,
+            tls: config.server_tls,
+        },
         async {
             tokio::signal::ctrl_c().await.ok();
         },
@@ -293,18 +378,19 @@ async fn serve(
 fn load_access(
     token: Option<String>,
     file: Option<PathBuf>,
-) -> anyhow::Result<scion_server::access::Access> {
+) -> anyhow::Result<(scion_server::access::Access, bool)> {
     match (token, file) {
         (Some(_), Some(_)) => anyhow::bail!("give --token or --access, not both"),
         (Some(token), None) => {
             anyhow::ensure!(!token.is_empty(), "--token must not be empty");
-            Ok(scion_server::access::Access::single(&token))
+            Ok((scion_server::access::Access::single(&token), true))
         }
         (None, Some(file)) => {
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("cannot read {}", file.display()))?;
-            scion_server::access::Access::parse(&text)
-                .map_err(|why| anyhow::anyhow!("bad access file {}: {why}", file.display()))
+            let access = scion_server::access::Access::parse(&text)
+                .map_err(|why| anyhow::anyhow!("bad access file {}: {why}", file.display()))?;
+            Ok((access, false))
         }
         (None, None) => anyhow::bail!("give --token or --access"),
     }
