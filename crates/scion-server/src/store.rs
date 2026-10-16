@@ -1359,9 +1359,16 @@ mod tests {
     /// the dropped store's lock for the fork-to-exec window. Without
     /// [`spawn_guard`] this test fails within a few hundred cycles; with
     /// it, the spawns wait out every release window.
+    ///
+    /// The reopen allows a short wait: on macOS, a child of the storm
+    /// beside this test can hold the inherited lock for one scheduler
+    /// tick past the drops, because the `exec` that closes it ends
+    /// asynchronously to the spawner's thread. A leak never releases, so
+    /// a bounded wait still fails this test if the guard is removed.
     #[test]
     fn a_dropped_store_lock_is_shared_by_a_forked_child_until_it_execs() {
         use std::process::Command;
+        use std::time::{Duration, Instant};
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let spawner = {
             let stop = stop.clone();
@@ -1385,8 +1392,25 @@ mod tests {
                 drop(first);
                 drop(clone);
                 // The window between the drops and this open is where a
-                // forked child still holds the lock.
-                Store::open(dir.path()).unwrap();
+                // forked child still holds the lock. A child that lingers
+                // one tick past the drops releases it; a leak never does.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    match Store::open(dir.path()) {
+                        Ok(opened) => {
+                            drop(opened);
+                            break;
+                        }
+                        Err(e) if Instant::now() < deadline => {
+                            assert!(
+                                e.to_string().contains("server.lock is locked"),
+                                "the open failed for another reason: {e}"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("the lock was never released: {e}"),
+                    }
+                }
             });
         }
         stop.store(true, Ordering::Relaxed);
