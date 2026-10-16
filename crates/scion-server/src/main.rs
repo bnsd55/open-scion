@@ -131,25 +131,7 @@ async fn main() -> anyhow::Result<()> {
             max_connections,
             max_streams,
         } => {
-            // Exactly one of the two: one token with every right, or a file
-            // of tokens and rules.
-            let access = match (token, access) {
-                (Some(_), Some(_)) => {
-                    anyhow::bail!("give --token or --access, not both")
-                }
-                (Some(token), None) => {
-                    anyhow::ensure!(!token.is_empty(), "--token must not be empty");
-                    scion_server::access::Access::single(&token)
-                }
-                (None, Some(file)) => {
-                    let text = std::fs::read_to_string(&file)
-                        .with_context(|| format!("cannot read {}", file.display()))?;
-                    scion_server::access::Access::parse(&text).map_err(|why| {
-                        anyhow::anyhow!("bad access file {}: {why}", file.display())
-                    })?
-                }
-                (None, None) => anyhow::bail!("give --token or --access"),
-            };
+            let access = load_access(token, access)?;
             // SHORTCUT: no TLS. Upgrade: tonic TLS or mTLS before any
             // deployment beyond one machine.
             anyhow::ensure!(
@@ -216,6 +198,28 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The rules of `serve`: exactly one of `--token` (one principal with every
+/// right) and `--access` (a file of tokens and rules).
+fn load_access(
+    token: Option<String>,
+    file: Option<PathBuf>,
+) -> anyhow::Result<scion_server::access::Access> {
+    match (token, file) {
+        (Some(_), Some(_)) => anyhow::bail!("give --token or --access, not both"),
+        (Some(token), None) => {
+            anyhow::ensure!(!token.is_empty(), "--token must not be empty");
+            Ok(scion_server::access::Access::single(&token))
+        }
+        (None, Some(file)) => {
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("cannot read {}", file.display()))?;
+            scion_server::access::Access::parse(&text)
+                .map_err(|why| anyhow::anyhow!("bad access file {}: {why}", file.display()))
+        }
+        (None, None) => anyhow::bail!("give --token or --access"),
+    }
 }
 
 /// Prints the BLAKE3 digest of the token of `hash-token`.

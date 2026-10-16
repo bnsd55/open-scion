@@ -213,9 +213,20 @@ mod tests {
             (token_digest("a-token"), caller("alice")),
             (token_digest("b-token"), caller("bob")),
         ]);
-        assert_eq!(call(&mut auth, Some("Bearer a-token")).unwrap(), Some(caller("alice")));
-        assert_eq!(call(&mut auth, Some("Bearer b-token")).unwrap(), Some(caller("bob")));
-        for bad in [None, Some("Bearer c-token"), Some("a-token"), Some("Bearer a-token ")] {
+        assert_eq!(
+            call(&mut auth, Some("Bearer a-token")).unwrap(),
+            Some(caller("alice"))
+        );
+        assert_eq!(
+            call(&mut auth, Some("Bearer b-token")).unwrap(),
+            Some(caller("bob"))
+        );
+        for bad in [
+            None,
+            Some("Bearer c-token"),
+            Some("a-token"),
+            Some("Bearer a-token "),
+        ] {
             let status = call(&mut auth, bad).unwrap_err();
             assert_eq!(status.code(), tonic::Code::Unauthenticated, "{bad:?}");
         }

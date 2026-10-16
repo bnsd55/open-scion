@@ -331,7 +331,9 @@ mod tests {
             }
         }
         // A rule with no prefix covers the whole repo.
-        access.check_write(&caller("ci"), "main", [&path("a")]).unwrap();
+        access
+            .check_write(&caller("ci"), "main", [&path("a")])
+            .unwrap();
     }
 
     #[test]
@@ -399,9 +401,18 @@ mod tests {
         let cases = [
             ("token alice abc\n".to_owned(), "line 1: expected"),
             ("token\talice\tabc\n".to_owned(), "64 hex digits"),
-            (format!("{token}token\tbob\t{}\n", hex("a")), "line 2: another principal"),
-            (format!("{token}token\talice\t{}\n", hex("b")), "has a token already"),
-            (format!("{token}read\tbob\tmain\n"), "line 2: principal \"bob\" has no token"),
+            (
+                format!("{token}token\tbob\t{}\n", hex("a")),
+                "line 2: another principal",
+            ),
+            (
+                format!("{token}token\talice\t{}\n", hex("b")),
+                "has a token already",
+            ),
+            (
+                format!("{token}read\tbob\tmain\n"),
+                "line 2: principal \"bob\" has no token",
+            ),
             (format!("{token}write\talice\tmain\t/abs\n"), "bad path"),
             (format!("{token}write\talice\tmain\ta\tb\n"), "expected"),
             (format!("{token}read\talice\t\n"), "repo"),

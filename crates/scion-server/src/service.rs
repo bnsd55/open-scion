@@ -97,8 +97,7 @@ pub async fn serve(
         ScionService::new(worker.clone(), Arc::clone(&access)).into_server(),
         auth.clone(),
     );
-    let objects =
-        InterceptedService::new(ObjectsService::new(worker, access).into_server(), auth);
+    let objects = InterceptedService::new(ObjectsService::new(worker, access).into_server(), auth);
     let router = |server: Server| {
         server
             .timeout(REQUEST_TIMEOUT)

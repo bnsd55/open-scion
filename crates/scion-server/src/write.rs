@@ -37,8 +37,10 @@ pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<Chang
     // The blob check touches only the object folder, so it runs before the
     // write transaction.
     // SHORTCUT: blobs are shared by all repos, so a changeset may name a blob
-    // that another repo uploaded and then read it. Safe with one principal.
-    // Upgrade before multi-tenant auth: a repo_blobs table checked here.
+    // that another repo uploaded and then read it. The access rules check
+    // only the repo of the call, so this is safe only when every principal
+    // may read every repo (issue #13).
+    // Upgrade: a repo_blobs table checked here.
     check_blobs(store, &cs)?;
     // See `tree::store_changeset`. The write's flush covers these steps.
     tree::fill_root_tree(store, repo_id, parent)?;
