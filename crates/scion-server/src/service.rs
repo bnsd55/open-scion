@@ -234,6 +234,7 @@ impl ScionService {
     /// file. Holds the whole bytes, so the share is their size.
     async fn stream_whole<T: Send + 'static>(
         &self,
+        call: Call,
         data: Vec<u8>,
         stalled: Option<scion_proto::listen::Stalled>,
         make: fn(Vec<u8>) -> T,
@@ -251,6 +252,7 @@ impl ScionService {
                 offset: 0,
             },
             share,
+            call,
             tx,
             READ_STALL_TIMEOUT,
             stalled,
@@ -593,6 +595,7 @@ async fn send_file(
     worker: Worker,
     blob: BlobId,
     share: OwnedSemaphorePermit,
+    call: Call,
     tx: mpsc::Sender<Part<ReadFileResponse>>,
     stall: Duration,
     stalled: Option<scion_proto::listen::Stalled>,
@@ -604,6 +607,7 @@ async fn send_file(
             open: None,
         },
         share,
+        call,
         tx,
         stall,
         stalled,
@@ -763,7 +767,7 @@ impl Scion for ScionService {
         request: Request<GetChangesetRequest>,
     ) -> Result<Response<GetChangesetStream>, Status> {
         let caller = caller(&request)?;
-        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
+        let call = self.quotas.enter(&caller).map_err(Status::from)?;
         // The handle of the caller's connection, before the request is taken
         // apart: the reply counts what it leaves in HTTP/2 on it.
         let stalled = scion_proto::listen::Stalled::of(&request);
@@ -774,7 +778,7 @@ impl Scion for ScionService {
             .worker
             .run(move |store| Ok(read::get_changeset(&store, &req.repo, id)?.encode()))
             .await?;
-        self.stream_whole(data, stalled, |data| GetChangesetResponse {
+        self.stream_whole(call, data, stalled, |data| GetChangesetResponse {
             changeset: data,
         })
         .await
@@ -835,7 +839,7 @@ impl Scion for ScionService {
         request: Request<ListDirRequest>,
     ) -> Result<Response<ListDirStream>, Status> {
         let caller = caller(&request)?;
-        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
+        let call = self.quotas.enter(&caller).map_err(Status::from)?;
         // The handle of the caller's connection, before the request is taken
         // apart: the reply counts what it leaves in HTTP/2 on it.
         let stalled = scion_proto::listen::Stalled::of(&request);
@@ -847,7 +851,7 @@ impl Scion for ScionService {
             .worker
             .run(move |store| Ok(read::list_dir(&store, &req.repo, id, path.as_ref())?.encode()))
             .await?;
-        self.stream_whole(data, stalled, |data| ListDirResponse { tree: data })
+        self.stream_whole(call, data, stalled, |data| ListDirResponse { tree: data })
             .await
     }
 
@@ -1270,6 +1274,7 @@ mod tests {
                 offset: 0,
             },
             share,
+            Call::default(),
             tx,
             stall,
             None,

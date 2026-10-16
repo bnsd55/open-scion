@@ -60,8 +60,13 @@ async fn big_repo(names: usize) -> (tempfile::TempDir, Scion, ChangesetId) {
         store,
         listener,
         TOKEN,
-        Limits::default(),
-        None,
+        service::ServeOptions {
+            limits: Limits::default(),
+            quotas: scion_server::quotas::Quotas::off(),
+            pending_lands: None,
+            land_stale_secs: 1 << 40,
+            tls: None,
+        },
         std::future::pending(),
     ));
     let channel = Channel::from_shared(format!("http://{addr}"))
