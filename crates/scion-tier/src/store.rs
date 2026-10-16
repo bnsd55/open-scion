@@ -7,7 +7,7 @@
 //! counts those bytes. A store only holds objects that were checked against
 //! their IDs. The disk store checks each object again when it reads it back.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, FileExt as _};
@@ -155,15 +155,16 @@ impl Store for MemoryStore {
 /// The name of the index file in the data directory (see [`DiskStore`]).
 const INDEX: &str = "index";
 
-/// The start of the index file. The state byte follows: [`CLEAN`] or
-/// [`DIRTY`].
+/// The start of the index file, with its format version. The header goes on
+/// with the state byte ([`CLEAN`] or [`DIRTY`]) and the BLAKE3 hash of the
+/// records that the last full write wrote. A cut file fails the hash too.
 const MAGIC: &[u8; 8] = b"scnidx1\n";
 
-/// Bytes before the first record: [`MAGIC`] and the state byte.
-const HEADER: usize = MAGIC.len() + 1;
+/// Bytes before the first record.
+const HEADER: usize = MAGIC.len() + 1 + 32;
 
 /// The index file names every object file, and is on disk: a clean stop
-/// wrote it.
+/// wrote it, and its records are the ones that its header hashes.
 const CLEAN: u8 = b'c';
 
 /// The index file may lag the object files: the store is open, or was when
@@ -174,8 +175,7 @@ const DIRTY: u8 = b'd';
 const RECORD: usize = 1 + 32 + 4;
 
 /// Bytes of records that wait in memory before they are appended to the
-/// index file: 1,024 records. A crash loses at most these, and they only say
-/// what was used last.
+/// index file: 1,024 records. While another call writes, more wait.
 const FLUSH_BYTES: usize = 1024 * RECORD;
 
 /// Once the index file would hold more records than twice the objects plus
@@ -227,25 +227,45 @@ fn rows(lru: &Lru<()>) -> Vec<u8> {
     rows
 }
 
+/// What a start found in the index file.
+#[derive(Debug, PartialEq)]
+enum Found {
+    /// A clean file of this many records: the start trusts it.
+    Clean(usize),
+    /// Why the start scans every object file.
+    Scan(&'static str),
+}
+
 /// Reads the index file in `dir`: its objects, least recently used first,
-/// and whether it is clean. A missing file names no object. A damaged one
-/// gives what its records before the damage give, and is not clean.
-fn read_index(dir: &Path) -> io::Result<(Lru<()>, bool)> {
+/// and whether the start may trust it. A damaged file gives what its records
+/// before the damage give.
+fn read_index(dir: &Path) -> io::Result<(Lru<()>, Found)> {
     let mut lru = Lru::new();
     let bytes = match fs::read(dir.join(INDEX)) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok((lru, false)),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Ok((lru, Found::Scan("there is no index file")));
+        }
         Err(e) => return Err(e),
     };
-    let Some((header, records)) = bytes.split_at_checked(HEADER) else {
-        return Ok((lru, false));
+    let header = bytes
+        .split_first_chunk::<HEADER>()
+        .and_then(|(header, body)| {
+            let (magic, rest) = header.split_first_chunk::<8>()?;
+            let ([state], hash) = rest.split_first_chunk::<1>()?;
+            (magic == MAGIC).then_some((*state, hash, body))
+        });
+    let Some((state, hash, body)) = header else {
+        return Ok((lru, Found::Scan("the index file has an unknown header")));
     };
-    if !header.starts_with(MAGIC) {
-        return Ok((lru, false));
-    }
-    let (records, torn) = records.as_chunks::<RECORD>();
-    // A clean file is written whole: part of a record is damage.
-    let mut clean = header[MAGIC.len()] == CLEAN && torn.is_empty();
+    let (records, torn) = body.as_chunks::<RECORD>();
+    let mut found = if state != CLEAN {
+        Found::Scan("the index file is dirty: the last run did not stop cleanly")
+    } else if !torn.is_empty() || blake3::hash(body).as_bytes() != hash {
+        Found::Scan("the clean index file does not match its header")
+    } else {
+        Found::Clean(records.len())
+    };
     for record in records {
         match parse_record(record) {
             Some((key, Some(size))) => lru.insert(key, (), size),
@@ -253,55 +273,50 @@ fn read_index(dir: &Path) -> io::Result<(Lru<()>, bool)> {
                 lru.remove(key);
             }
             None => {
-                clean = false;
+                found = Found::Scan("the index file is damaged");
                 break;
             }
         }
     }
-    Ok((lru, clean))
+    Ok((lru, found))
 }
 
-/// A plain `fsync`, as the server's: data reaches the drive, not
-/// necessarily past its cache. (`File::sync_all` is a full cache flush on
-/// macOS, about 20 times slower.)
-fn fsync(file: &fs::File) -> io::Result<()> {
-    rustix::fs::fsync(file).map_err(Into::into)
+/// A plain `fsync`: data reaches the drive, but on macOS not past its cache
+/// (`File::sync_all` is a full cache flush there). Used before a full flush,
+/// which takes it the rest of the way.
+fn fsync(dir: &Path) -> io::Result<()> {
+    rustix::fs::fsync(fs::File::open(dir)?).map_err(Into::into)
 }
 
 /// Writes an index file of `state` with the records `rows`, in place of the
-/// one in `dir`. With `sync`, the file and its name are on disk when it
-/// returns.
+/// one in `dir`. With `sync`, the file and its name are past the drive's
+/// cache when it returns.
 fn write_index(dir: &Path, tmp: &Path, state: u8, rows: &[u8], sync: bool) -> io::Result<Log> {
     let mut file = tempfile::NamedTempFile::new_in(tmp)?;
     file.write_all(MAGIC)?;
     file.write_all(&[state])?;
+    file.write_all(blake3::hash(rows).as_bytes())?;
     file.write_all(rows)?;
     if sync {
-        fsync(file.as_file())?;
+        file.as_file().sync_all()?;
     }
     let file = file.persist(dir.join(INDEX)).map_err(|e| e.error)?;
     if sync {
-        fsync(&fs::File::open(dir)?)?;
+        fs::File::open(dir)?.sync_all()?;
     }
-    Ok(Log {
-        file,
-        records: rows.len() / RECORD,
-        torn: false,
-    })
+    let records = rows.len() / RECORD;
+    Ok(Log { file, records })
 }
 
 /// Opens the clean index file in `dir`, of `records` records, to append to
-/// it. First marks it [`DIRTY`] on disk, so a crash from here on is seen.
+/// it. First marks it [`DIRTY`], past the drive's cache, so a crash from here
+/// on is seen.
 fn reopen_index(dir: &Path, records: usize) -> io::Result<Log> {
     let mut file = fs::OpenOptions::new().write(true).open(dir.join(INDEX))?;
     file.write_all_at(&[DIRTY], MAGIC.len() as u64)?;
-    fsync(&file)?;
+    file.sync_all()?;
     file.seek(SeekFrom::End(0))?;
-    Ok(Log {
-        file,
-        records,
-        torn: false,
-    })
+    Ok(Log { file, records })
 }
 
 /// Every object file under `objects`, with when it was written and its size.
@@ -381,6 +396,10 @@ struct Disk {
     /// be in place that `lru` does not name. The index file that a stop
     /// writes is then not clean.
     stray: bool,
+    /// The directories that a dropped file left since the start. A stop
+    /// syncs them before it writes a clean index file, so no dropped file
+    /// comes back after a crash.
+    left: HashSet<PathBuf>,
 }
 
 impl Disk {
@@ -419,9 +438,6 @@ impl Disk {
 struct Log {
     file: fs::File,
     records: usize,
-    /// A write failed and may have left part of a record. The next write
-    /// writes the whole file again.
-    torn: bool,
 }
 
 /// Objects on disk, one file per object, named by its ID, up to a byte limit:
@@ -441,34 +457,36 @@ struct Log {
 /// happens under the index lock, so the index and the files agree.
 ///
 /// The index is in memory, and in `<data>/index` so that a start need not
-/// open every object directory. The file is [`MAGIC`], a state byte, and
+/// open every object directory. The file is a header (see [`MAGIC`]) and
 /// records of [`RECORD`] bytes: an op, an ID and a size (`u32`,
 /// little-endian). `T` or `B` says that a tree or a blob of that size is
 /// stored and was just used, `t` or `b` that it was dropped. Read in order,
 /// the records give the stored objects, least recently used first. Records
 /// wait in memory, and are appended in batches of [`FLUSH_BYTES`]. When the
 /// file would hold far more records than objects (see [`SLACK_RECORDS`]),
-/// it is written again with one record per object. A stop writes it again
-/// too, syncs it, and marks it [`CLEAN`]: it names every object file.
+/// it is written again with one record per object.
 ///
-/// A start trusts a clean file for which objects are stored and in what
-/// order, and opens no object directory. Before the first put, it marks the
-/// file [`DIRTY`] on disk. After a crash the file is dirty: it may lack its
-/// last records, so it may name a file that is gone, or miss a new one. The
-/// start then scans every object file, as with no index, and keeps the order
-/// of the file for the objects that it names. So a crash loses only what was
-/// used last, never an object. No start trusts the file for an object's
-/// bytes: [`Store::get`] checks them on every read.
+/// A stop syncs the directories that dropped files left, then writes the
+/// file again, one record per object, marked [`CLEAN`], with the hash of its
+/// records in the header, past the drive's cache. A start trusts a clean
+/// file whose records match that hash, for which objects are stored
+/// and in what order, and opens no object directory. At open it marks the
+/// file [`DIRTY`], past the drive's cache. After a crash the file is dirty:
+/// it may lack its last records, so it may name a file that is gone, or
+/// miss a new one. The start then scans every object file, as with no
+/// index, and keeps the order of the file for the objects that it names. So
+/// a crash loses only what was used last, never an object. No start trusts
+/// the file for an object's bytes: [`Store::get`] checks them on every read.
 ///
-/// Object files are not synced, so a machine crash soon after a clean stop
-/// can bring back a file that was just dropped. The index does not name it:
-/// it is never served, and the limit does not count it until a put of that
-/// object replaces it.
+/// A daemon build from before the index does not know the file. Run between
+/// a clean stop and the next start, it leaves a clean file that is stale:
+/// remove `<data>/index` after such a run.
 // SHORTCUT: the whole index is also in memory, a start reads all of it, and
-// writing the file again copies every record under the index lock. After a
-// crash, a start scans every object file. Memory and these pauses grow with
-// the number of objects. Upgrade (issue #115): an index on disk that is read
-// and changed in place.
+// writing the file again copies every record under the index lock, which
+// `Store::size` needs under the tier's fetch table: every fetch start waits.
+// After a crash, a start scans every object file. Memory and these pauses
+// grow with the number of objects. Upgrade (issue #115): an index on disk
+// that is read and changed in place.
 pub struct DiskStore {
     dir: PathBuf,
     objects: PathBuf,
@@ -480,8 +498,9 @@ pub struct DiskStore {
     flush_due: AtomicBool,
     /// Taken with `disk` held, by the one call that writes the index file,
     /// and let go of after the write. So records reach the file in order,
-    /// and no write to it holds `disk`.
-    log: Mutex<Log>,
+    /// and no write to it holds `disk`. `None` when the last write failed:
+    /// the next one writes the whole file again.
+    log: Mutex<Option<Log>>,
     /// Names files that the limit drops, in `tmp/`.
     dropped: AtomicU64,
     _lock: fs::File,
@@ -513,15 +532,10 @@ impl DiskStore {
         ignore_missing(fs::remove_dir_all(&tmp))?;
         fs::create_dir_all(&tmp)?;
         fs::create_dir_all(&objects)?;
-        let (index, clean) = read_index(dir)?;
-        // A clean file holds one record per object: a stop wrote it so.
-        let (lru, log) = if clean {
-            let log = reopen_index(dir, index.entries.len())?;
-            (index, log)
-        } else {
-            let lru = reconcile(index, scan(&objects)?);
-            let log = write_index(dir, &tmp, DIRTY, &rows(&lru), true)?;
-            (lru, log)
+        let (index, found) = read_index(dir)?;
+        let lru = match found {
+            Found::Clean(_) => index,
+            Found::Scan(_) => reconcile(index, scan(&objects)?),
         };
         let store = Self {
             dir: dir.clone(),
@@ -532,21 +546,62 @@ impl DiskStore {
                 lru,
                 pending: Vec::new(),
                 stray: false,
+                left: HashSet::new(),
             }),
             flush_due: AtomicBool::new(false),
-            log: Mutex::new(log),
+            log: Mutex::new(None),
             dropped: AtomicU64::default(),
             _lock: lock_file,
         };
+        // Drops first: they free room for the index file.
         let mut disk = lock(&store.disk);
         let mut dropped = Vec::new();
         let evicted = store.evict(&mut disk, &mut dropped);
+        let written = match found {
+            // A clean file holds one record per object: a stop wrote it so.
+            Found::Clean(records) => reopen_index(dir, records),
+            Found::Scan(_) => {
+                disk.pending.clear();
+                write_index(dir, &store.tmp, DIRTY, &rows(&disk.lru), true)
+            }
+        };
+        match written {
+            Ok(log) => *lock(&store.log) = Some(log),
+            // A clean file must not stay: a crash would leave it trusted.
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot write the index file; removing it");
+                ignore_missing(fs::remove_file(dir.join(INDEX)))?;
+                fs::File::open(dir)?.sync_all()?;
+            }
+        }
         let (objects, bytes) = (disk.lru.entries.len(), disk.lru.bytes);
         drop(disk);
         remove_all(dropped)?;
         evicted?;
-        tracing::info!(objects, bytes, scanned = !clean, "opened the disk store");
+        match found {
+            Found::Clean(_) => {
+                tracing::info!(
+                    objects,
+                    bytes,
+                    "opened the disk store from its clean index file"
+                );
+            }
+            Found::Scan(why) => {
+                tracing::info!(
+                    objects,
+                    bytes,
+                    why,
+                    "opened the disk store by a scan of every file"
+                );
+            }
+        }
         Ok(store)
+    }
+
+    /// Whether the store holds no object.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        lock(&self.disk).lru.entries.is_empty()
     }
 
     fn path(&self, key: Key) -> PathBuf {
@@ -596,13 +651,20 @@ impl DiskStore {
     /// into `tmp/`, under the index lock, so that a later put of the same
     /// object keeps its new file. The caller removes the returned file once
     /// it has let go of the lock: a rename is quick, but removing a large
-    /// file may not be. `None` if there is no file. On an error the file may
-    /// stay in place, and `disk` notes it.
+    /// file may not be. `None` if there is no file. `disk` notes the
+    /// directory that the file left, or, on an error, that the file may stay
+    /// in place.
     fn take_out(&self, disk: &mut Disk, key: Key) -> io::Result<Option<PathBuf>> {
         let n = self.dropped.fetch_add(1, Ordering::Relaxed);
         let to = self.tmp.join(format!("dropped-{n}"));
-        match fs::rename(self.path(key), &to) {
-            Ok(()) => Ok(Some(to)),
+        let from = self.path(key);
+        match fs::rename(&from, &to) {
+            Ok(()) => {
+                if let Some(fan) = from.parent() {
+                    disk.left.insert(fan.to_owned());
+                }
+                Ok(Some(to))
+            }
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
             Err(e) => {
                 disk.stray = true;
@@ -631,30 +693,47 @@ impl DiskStore {
         };
         self.flush_due.store(false, Ordering::Relaxed);
         let batch = std::mem::replace(&mut disk.pending, Vec::with_capacity(FLUSH_BYTES));
-        let records = log.records + batch.len() / RECORD;
-        let again = log.torn || records > 2 * disk.lru.entries.len() + SLACK_RECORDS;
-        let rows = again.then(|| rows(&disk.lru));
-        drop(disk);
-        let written = match rows {
-            Some(rows) => {
-                write_index(&self.dir, &self.tmp, DIRTY, &rows, false).map(|new| *log = new)
+        let most = 2 * disk.lru.entries.len() + SLACK_RECORDS;
+        let written = match log.as_mut() {
+            Some(open) if open.records + batch.len() / RECORD <= most => {
+                drop(disk);
+                let written = open.file.write_all(&batch);
+                open.records += batch.len() / RECORD;
+                written
             }
-            None => log.file.write_all(&batch).map(|()| log.records = records),
+            _ => {
+                let rows = rows(&disk.lru);
+                drop(disk);
+                write_index(&self.dir, &self.tmp, DIRTY, &rows, false).map(|new| *log = Some(new))
+            }
         };
         if let Err(e) = written {
-            log.torn = true;
+            // The file may hold part of a record now.
+            *log = None;
             tracing::warn!(error = %e, "cannot write the index file; a crash now loses what was used last");
         }
     }
 }
 
 impl Drop for DiskStore {
-    /// Writes the index file again, one record per object, and syncs it. If
-    /// it names every object file, it is clean, and the next start scans
-    /// none.
+    /// Syncs the directories that dropped files left, then writes the index
+    /// file again, one record per object, past the drive's cache. If it names
+    /// every object file, it is clean, and the next start scans none.
     fn drop(&mut self) {
         let disk = self.disk.get_mut().unwrap_or_else(PoisonError::into_inner);
-        let state = if disk.stray { DIRTY } else { CLEAN };
+        let synced = disk
+            .left
+            .iter()
+            .chain([&self.tmp])
+            .try_for_each(|dir| fsync(dir));
+        if let Err(e) = &synced {
+            tracing::warn!(error = %e, "cannot sync the directories of dropped files");
+        }
+        let state = if disk.stray || synced.is_err() {
+            DIRTY
+        } else {
+            CLEAN
+        };
         let (objects, rows) = (disk.lru.entries.len(), rows(&disk.lru));
         match write_index(&self.dir, &self.tmp, state, &rows, true) {
             Ok(_) => tracing::info!(objects, clean = state == CLEAN, "wrote the index file"),
@@ -1049,7 +1128,7 @@ mod tests {
             let store = DiskStore::open(&data, 1 << 20).unwrap();
             assert_eq!(store.size(a.0).unwrap(), Some(a.1.len()));
             assert_eq!(store.size(stray.0).unwrap(), None);
-            // Dirty before the first put: from then on the file may lag.
+            // Dirty from the open on: from then on the file may lag.
             assert_eq!(index_state(&data), DIRTY);
         }
 
@@ -1113,6 +1192,8 @@ mod tests {
             store.put(c.0, &c.1).unwrap();
             assert!(!store.path(a.0).exists());
             assert_eq!(store.size(b.0).unwrap(), Some(n));
+            // By write time alone, `c` would come first.
+            set_written_in_order(&store, &[c.0, b.0]);
             index
         };
         // The crash also tore the record it was writing.
@@ -1121,10 +1202,99 @@ mod tests {
 
         // The index names `a`, which has no file, and not `c`, which has one.
         let store = DiskStore::open(&data, 1 << 20).unwrap();
-        // `b` keeps its place; `c` is newer than the index, so it comes last.
+        // `b` keeps its place from the index; `c`, which the index does not
+        // name, comes after it.
         assert_eq!(order(&store), [b.0, c.0]);
         assert_eq!(lock(&store.disk).lru.bytes, bytes_on_disk(&data));
         assert_eq!(store.get(c.0, n).unwrap(), Some(c.1.clone()));
+    }
+
+    #[test]
+    fn a_dirty_file_gives_the_order_of_its_records_before_a_bad_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let (a, b, c) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"cccc"));
+        let header = {
+            let store = DiskStore::open(&data, 1 << 20).unwrap();
+            for (key, bytes) in [&a, &b, &c] {
+                store.put(*key, bytes).unwrap();
+            }
+            set_written_in_order(&store, &[a.0, b.0, c.0]);
+            index_bytes(&data)[..HEADER].to_vec()
+        };
+        // Dirty: `c`, a record that is not one, `b`, `a`.
+        let mut index = header;
+        index[MAGIC.len()] = DIRTY;
+        push_record(&mut index, c.0, Some(c.1.len()));
+        index.extend_from_slice(&[b'X'; RECORD]);
+        push_record(&mut index, b.0, Some(b.1.len()));
+        push_record(&mut index, a.0, Some(a.1.len()));
+        put_back(&data, &index);
+
+        // `c` from the index; the rest by write time.
+        let store = DiskStore::open(&data, 1 << 20).unwrap();
+        assert_eq!(order(&store), [c.0, a.0, b.0]);
+    }
+
+    #[test]
+    fn a_clean_file_that_does_not_match_its_header_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let (a, b, stray) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"not in the index"));
+        let stray_path = {
+            let store = DiskStore::open(&data, 1 << 20).unwrap();
+            store.put(a.0, &a.1).unwrap();
+            store.put(b.0, &b.1).unwrap();
+            store.path(stray.0)
+        };
+        let good = index_bytes(&data);
+        assert_eq!(good[MAGIC.len()], CLEAN);
+        // An object file that the index does not name: only a scan finds it.
+        fs::create_dir_all(stray_path.parent().unwrap()).unwrap();
+        fs::write(&stray_path, &stray.1).unwrap();
+        let cut = good[..good.len() - RECORD].to_vec();
+        let mut resized = good.clone();
+        // The size field of the last record.
+        *resized.last_mut().unwrap() ^= 1;
+        let mut version = good.clone();
+        version[..MAGIC.len()].copy_from_slice(b"scnidx0\n");
+        for (case, index, scans) in [
+            ("as written", &good, false),
+            ("cut at a record", &cut, true),
+            ("a record changed", &resized, true),
+            ("another version", &version, true),
+        ] {
+            put_back(&data, index);
+            let store = DiskStore::open(&data, 1 << 20).unwrap();
+            let found = store.size(stray.0).unwrap().is_some();
+            assert_eq!(found, scans, "{case}");
+            assert_eq!(store.size(b.0).unwrap(), Some(b.1.len()), "{case}");
+        }
+    }
+
+    #[test]
+    fn an_index_file_that_cannot_be_marked_dirty_is_removed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Root may write a read-only file.
+        if rustix::process::geteuid().as_raw() == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let a = blob(b"aaaa");
+        DiskStore::open(&data, 1 << 20)
+            .unwrap()
+            .put(a.0, &a.1)
+            .unwrap();
+        let index = data.join(INDEX);
+        fs::set_permissions(&index, fs::Permissions::from_mode(0o400)).unwrap();
+        // The start goes on without a clean file that a crash would leave.
+        let store = DiskStore::open(&data, 1 << 20).unwrap();
+        assert!(!index.exists());
+        assert_eq!(store.get(a.0, a.1.len()).unwrap(), Some(a.1.clone()));
+        drop(store);
+        assert_eq!(index_state(&data), CLEAN);
     }
 
     #[test]
@@ -1139,7 +1309,7 @@ mod tests {
         set_written_in_order(&store, &[a.0, b.0]);
         // Uses of `a`: three times the slack, in batches. A read writes a
         // batch that is full.
-        let mut largest = 0;
+        let (mut largest, mut first) = (0, None);
         let batch = FLUSH_BYTES / RECORD;
         for _ in 0..3 * SLACK_RECORDS / batch {
             for _ in 0..batch {
@@ -1147,18 +1317,22 @@ mod tests {
             }
             assert_eq!(store.get(a.0, n).unwrap(), Some(a.1.clone()));
             largest = largest.max(fs::metadata(data.join(INDEX)).unwrap().len());
+            first.get_or_insert_with(|| index_bytes(&data));
         }
         // Written again with one record per object, so it never held all of
         // the records.
         let most = HEADER + (2 * 2 + SLACK_RECORDS) * RECORD + FLUSH_BYTES;
         assert!(largest <= most as u64, "{largest} bytes");
 
-        // A crash now keeps that `a` was used last.
-        let crashed = index_bytes(&data);
+        // A crash after the first batch, or now, keeps that `a` was used
+        // last.
+        let crashes = [first.unwrap(), index_bytes(&data)];
         drop(store);
-        put_back(&data, &crashed);
-        let store = DiskStore::open(&data, 1 << 20).unwrap();
-        assert_eq!(order(&store), [b.0, a.0]);
+        for crashed in crashes {
+            put_back(&data, &crashed);
+            let store = DiskStore::open(&data, 1 << 20).unwrap();
+            assert_eq!(order(&store), [b.0, a.0]);
+        }
     }
 
     #[test]

@@ -1149,29 +1149,37 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
 
 **The daemon's index.** `<data>/index` lists the stored objects in order
 of use, so a start need not open every object directory. It is a header
-(`scnidx1\n` and a state byte) and records of 37 bytes: an op, an object ID
-and a size. `T` or `B` says that a tree or blob of that size is stored and
-was just used; `t` or `b` that it was dropped. Read in order, the records
-give the objects, least recently used first. Records wait in memory and are
-appended 1,024 at a time. Once the file holds more than twice as many
-records as objects, plus 65,536, it is written again with one record per
-object. A stop writes it again too, syncs it, and marks it clean: it names
-every object file.
+(`scnidx1\n`, a state byte, and the BLAKE3 hash of the records that the
+last full write wrote) and records of 37 bytes: an op, an object ID and a
+size. `T` or `B` says that a tree or blob of that size is stored and was
+just used; `t` or `b` that it was dropped. Read in order, the records give
+the objects, least recently used first. Records wait in memory and are
+appended 1,024 at a time (more wait while another call writes). Once the
+file holds more than twice as many records as objects, plus 65,536, it is
+written again with one record per object. A stop first syncs the
+directories that dropped files left since the start, and `<data>/tmp`. Then
+it writes the file again, one record per object, marks it clean (it names
+every object file), and flushes it past the drive's cache (`F_FULLFSYNC` on
+macOS).
 
 | Start after | What the start trusts | Cost |
 |---|---|---|
-| A clean stop | The file, for which objects are stored and in what order. Before the first put it marks the file dirty and syncs it. | One file read; no object directory. |
-| A crash | Nothing. The file may lack its last records: it may name a file that is gone, or miss a new one. The start scans every file and keeps the file's order for the objects that it names; the others come last, oldest write first. | One stat per object file, as with no index. |
+| A clean stop | The file, if its records match the hash in its header: which objects are stored, and in what order. At open it marks the file dirty and flushes that past the drive's cache. | One file read and hash; no object directory. |
+| A crash | Nothing. The file is dirty, and may lack its last records: it may name a file that is gone, or miss a new one. The start scans every file and keeps the file's order for the objects that it names, up to a record that is not one; the others come last, oldest write first. | One stat per object file, as with no index. |
+| No file, another version, or a clean file that does not match its hash | Nothing, as after a crash. | As after a crash. |
 
-So a crash loses only what was used last, never an object. No start trusts
-the index for an object's bytes: each read checks them against the ID. If
-the index gives a size that is not the file's, the object is dropped at its
-first read and fetched again. Object files are not synced, so a machine crash soon
-after a clean stop can bring back a file that was just dropped; the index
-does not name it, so it is never served, and the limit does not count it
-until a put of that object replaces it. The format is this project's
-choice: an append-only file needs no new dependency in the tier crate, and
-replaying it in order is all that a start needs.
+The start logs which of these it found. So a crash loses only what was used
+last, never an object: the records that had not reached the file. No start
+trusts the index for an object's bytes: each read checks them against the
+ID. If the index gives a size that is not the file's, the object is dropped
+at its first read and fetched again. If the start cannot mark the file
+dirty, or write it after a scan (a full disk), it removes the file and goes
+on, after the drops that free room. A daemon build from before the index
+does not know the file: run between a clean stop and the next start, it
+leaves a clean file that is stale, so remove `<data>/index` after such a
+run. The format is this project's choice: an append-only file is all that
+a start needs, and its one new dependency in the tier crate, `blake3`, is
+already in the workspace.
 
 This project's choices, not the article's: the Unix socket and its mode,
 TCP between tiers, the stores and their limits, keeping `GetRootTree`
@@ -1250,7 +1258,7 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-tier/src/lib.rs` (`produce`) | Two blocking hops per hit (size, then read) and no read-ahead, as on the server. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
 | `scion-tier/src/lib.rs` (`DAEMON_UPSTREAM_TIMEOUT`) | Fixed limits per step that nest. A fetch joined in the middle of its batch can wait for the objects ahead of it, and a client's own deadline does not reach the tiers. | Pass the remaining deadline down with `grpc-timeout`. | [#98](https://github.com/bnsd55/open-scion/issues/98) |
 | `scion-tier/src/lib.rs` (`check_repo`) | A tier does not ask whether a repo exists, and serves a stored object to any caller with the token. Safe with one principal. | Read tickets, checked by every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
-| `scion-tier/src/store.rs` (`DiskStore`) | The daemon's whole recency index is also in memory, and a start reads all of it. Writing `<data>/index` again copies every record under the index lock. After a crash, a start scans every object file. Memory and these pauses grow with the object count. | An index on disk that is read and changed in place, and a crash start that needs no scan. | [#115](https://github.com/bnsd55/open-scion/issues/115) |
+| `scion-tier/src/store.rs` (`DiskStore`) | The daemon's whole recency index is also in memory, and a start reads all of it. Writing `<data>/index` again copies every record under the index lock, which `size` needs while the tier holds its fetch table: every fetch start waits. After a crash, a start scans every object file. Memory and these pauses grow with the object count. | An index on disk that is read and changed in place, and a crash start that needs no scan. | [#115](https://github.com/bnsd55/open-scion/issues/115) |
 | `scion-tier/src/bin/scion-cache.rs` (`main`) | No TLS between tiers. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
 | `scn/src/client.rs` (`lossy`) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | Escape or base64 raw bytes in JSON. | |
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |
