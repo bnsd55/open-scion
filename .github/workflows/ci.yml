@@ -59,6 +59,28 @@ jobs:
         env:
           PROPTEST_CASES: "2000"
 
+  power-loss:
+    name: power-loss
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SCION_POWER_REQUIRE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@v2
+      - name: device mapper
+        run: |
+          sudo modprobe dm_flakey || true
+          command -v dmsetup >/dev/null 2>&1 || {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq dmsetup
+          }
+      - run: cargo test -p open-scion-server --test power
+
   msrv:
     name: check (MSRV)
     runs-on: ubuntu-latest
