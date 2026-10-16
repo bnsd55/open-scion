@@ -981,25 +981,28 @@ mod tests {
     }
 
     /// A peer that opens a TLS connection and sends nothing holds its place,
-    /// but no accept: a second client is served at once, before the silent
-    /// peer's handshake timeout ends. (The timeouts here are 2 s, so the
-    /// second client must finish within 1.5 s.)
+    /// but no accept: a second client is served at once, while the silent
+    /// peer's handshake timeout is still far away. With the handshake run in
+    /// sequence instead (the mutation), the second client would wait for the
+    /// silent peer's timeout, past 20 s.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_silent_tls_handshake_does_not_block_other_clients() {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, None);
+        // The silent peer's handshake timeout: far beyond the next test
+        // step, so only the blocking of a sequential handshake can end it.
         let addr = serve_tls(
             Limits::default(),
             TIMERS,
             &server_tls,
-            Duration::from_secs(2),
+            Duration::from_secs(60),
         )
         .await;
         // A peer that connects and sends nothing: no ClientHello.
         let mut silent = tokio::net::TcpStream::connect(addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let served = tokio::time::timeout(Duration::from_millis(1500), async {
+        let served = tokio::time::timeout(Duration::from_secs(20), async {
             let mut client = client(addr, &certs.authority.cert(), None).await?;
             Ok::<_, tonic::transport::Error>(quick(&mut client).await)
         })
@@ -1007,8 +1010,8 @@ mod tests {
         .expect("a silent handshake does not block the next client")
         .expect("the client connects");
         assert_eq!(served, Code::NotFound);
-        // The silent peer is still holding its connection, within its
-        // handshake timeout.
+        // The silent peer is still holding its connection: a read would
+        // block, not return.
         let mut buf = [0; 1];
         assert!(
             tokio::time::timeout(Duration::from_millis(50), silent.read(&mut buf))
