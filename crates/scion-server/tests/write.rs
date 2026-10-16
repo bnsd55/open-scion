@@ -350,7 +350,17 @@ fn concurrent_puts_of_one_blob_leave_it_intact() {
     });
     assert!(ids.iter().all(|got| *got == id), "{ids:?}");
     assert_eq!(f.store.blobs().verify(id).unwrap(), BlobStatus::Valid);
-    let staged = fs::read_dir(f.dir.path().join("tmp")).unwrap().count();
+    // Each put stages in its process's folder; nothing of the puts is left
+    // in it (issue #101).
+    let staged: usize = fs::read_dir(f.dir.path().join("tmp"))
+        .unwrap()
+        .map(|entry| {
+            fs::read_dir(entry.unwrap().path())
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().file_name() != ".lock")
+                .count()
+        })
+        .sum();
     assert_eq!(staged, 0, "no temp file is left behind");
 }
 

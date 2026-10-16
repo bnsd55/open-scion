@@ -209,13 +209,9 @@ const WAITS: Waits = Waits {
     until: Until::NONE,
 };
 
-/// Starts the reply to `keys`: finds the first object before the call
-/// answers, then sends the rest on a task of its own, part by part, as the
-/// client takes them (see [`reply::send_objects`]). If the first object gets
-/// no share of `in_flight` within `waits.busy`, or before `waits.until`, the
-/// call fails with [`reply::busy`], so a reply never ends `OK` with no
 /// object. That comes before the caller's deadline, so the caller gets this
-/// status, not a timeout of its own.
+/// status, not a timeout of its own. `stalled` is the handle of the
+/// connection, which counts what a stalled reply leaves in HTTP/2.
 async fn start_reply(
     worker: Worker,
     keys: Vec<Key>,
@@ -223,6 +219,7 @@ async fn start_reply(
     waits: Waits,
     read: Read,
     zstd: bool,
+    stalled: Option<scion_proto::listen::Stalled>,
 ) -> Result<ObjectStream, Status> {
     let mut rest = keys.into_iter();
     let Some(key) = rest.next() else {
@@ -245,7 +242,7 @@ async fn start_reply(
                 key,
             )
         };
-        reply::send_objects(first, rest, tx, waits.stall, produce).await;
+        reply::send_objects(first, rest, tx, waits.stall, stalled, produce).await;
     });
     Ok(stream)
 }
@@ -318,6 +315,9 @@ impl Objects for ObjectsService {
             until: Until::of(&request),
             ..WAITS
         };
+        // The handle of the caller's connection, before the request is taken
+        // apart: the reply counts what it leaves in HTTP/2 on it.
+        let stalled = scion_proto::listen::Stalled::of(&request);
         let GetObjectsRequest { repo, refs, accept } = request.into_inner();
         check_reader(&self.access, &caller, &repo)?;
         scion_proto::check::object_count(refs.len())?;
@@ -335,6 +335,7 @@ impl Objects for ObjectsService {
             waits,
             read_object,
             zstd,
+            stalled,
         );
         Ok(Response::new(stream.await?))
     }
@@ -411,6 +412,7 @@ mod tests {
             waits(stall),
             read_object,
             true,
+            None,
         );
         let mut stream = reply.await.unwrap();
 
@@ -448,6 +450,7 @@ mod tests {
                 wait,
                 counted,
                 true,
+                None,
             );
             tokio::time::timeout(Duration::from_secs(10), reply)
         };
@@ -485,6 +488,7 @@ mod tests {
             waits,
             read_object,
             true,
+            None,
         );
         let status = tokio::time::timeout(Duration::from_secs(5), reply)
             .await
@@ -516,6 +520,7 @@ mod tests {
             WAITS,
             watched,
             false,
+            None,
         );
         let objects = collect(reply.await.unwrap(), false).await;
         assert_eq!(objects[0].1, content);
@@ -578,6 +583,7 @@ mod tests {
                 WAITS,
                 read_object,
                 zstd,
+                None,
             );
             async move { collect(reply.await.unwrap(), zstd).await }
         };

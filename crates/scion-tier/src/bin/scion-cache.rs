@@ -2,14 +2,18 @@
 //! memory and fetches misses from its upstream, the server.
 
 use std::net::SocketAddr;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use clap::Parser;
+use scion_proto::check;
 use scion_proto::listen::{self, Limits};
 use scion_proto::tls::{ClientTls, ServerTls};
-use scion_tier::{CACHE_UPSTREAM_TIMEOUT, MemoryStore, Tier};
+use scion_tier::{CACHE_UPSTREAM_TIMEOUT, MemoryStore, Tier, snapshot};
+use tokio::time::MissedTickBehavior;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -62,6 +66,28 @@ struct Cli {
     /// Most calls (HTTP/2 streams) that one connection may have open at once.
     #[arg(long, default_value_t = listen::DEFAULT_STREAMS)]
     max_streams: NonZeroU32,
+    /// Directory for snapshots, for daemons to start from (`scion-daemon
+    /// --seed`): one file per --snapshot-repo, DIR/REPO.scnsnap (a byte
+    /// that is not a letter, a digit, '-', '_' or '.' as %XX). Created with
+    /// mode 0700 if missing.
+    #[arg(long, value_name = "DIR", requires = "snapshot_repo")]
+    snapshot: Option<PathBuf>,
+    /// A repo to write snapshots of: the objects that went into its
+    /// replies, most recently used first. Repeat for more. Give a node only
+    /// snapshots of repos that all its users may read.
+    #[arg(long, value_name = "REPO", requires = "snapshot")]
+    snapshot_repo: Vec<String>,
+    /// Most object bytes in one snapshot.
+    #[arg(long, default_value_t = 256 << 20)]
+    snapshot_bytes: usize,
+    /// Seconds between snapshots. The first comes one interval after start.
+    #[arg(long, value_name = "SECS", default_value_t = 600,
+          value_parser = clap::value_parser!(u64).range(1..))]
+    snapshot_every: u64,
+    /// Most bytes that the stalled replies of one connection may hold. A
+    /// connection over it is closed with them.
+    #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
+    max_stalled_bytes: NonZeroU64,
 }
 
 #[tokio::main]
@@ -88,13 +114,32 @@ async fn main() -> anyhow::Result<()> {
         cli.tls_client_cert.as_deref(),
         cli.tls_client_key.as_deref(),
     )?;
+    for repo in &cli.snapshot_repo {
+        check::name("--snapshot-repo", repo).map_err(anyhow::Error::msg)?;
+    }
+    let store = MemoryStore::new(cli.max_bytes).recording(&cli.snapshot_repo);
     let tier = Tier::new(
-        MemoryStore::new(cli.max_bytes),
+        store,
         &cli.upstream,
         &cli.upstream_token,
         CACHE_UPSTREAM_TIMEOUT,
         Some(&client_tls),
     )?;
+    if let Some(dir) = cli.snapshot {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("cannot make {}", dir.display()))?;
+        let every = Duration::from_secs(cli.snapshot_every);
+        tokio::spawn(snapshots(
+            tier.clone(),
+            dir,
+            cli.snapshot_repo,
+            cli.snapshot_bytes,
+            every,
+        ));
+    }
     let listener = tokio::net::TcpListener::bind(cli.listen)
         .await
         .with_context(|| format!("cannot listen on {}", cli.listen))?;
@@ -102,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
     let limits = Limits {
         connections: cli.max_connections,
         streams: cli.max_streams,
+        stalled_bytes: cli.max_stalled_bytes,
     };
     Box::pin(tier.serve(
         &cli.token,
@@ -114,4 +160,46 @@ async fn main() -> anyhow::Result<()> {
     ))
     .await?;
     Ok(())
+}
+
+/// Every `every`, writes a snapshot of each of `repos` into `dir`: the
+/// objects that went into its replies, the most recently used up to `bytes`.
+/// A repo with none keeps its last snapshot.
+async fn snapshots(
+    tier: Tier<MemoryStore>,
+    dir: PathBuf,
+    repos: Vec<String>,
+    bytes: usize,
+    every: Duration,
+) {
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        for repo in &repos {
+            let objects = tier.store().snapshot(repo, bytes);
+            if objects.is_empty() {
+                continue;
+            }
+            let path = dir.join(snapshot::file_name(repo));
+            let (count, started) = (objects.len(), Instant::now());
+            let task = {
+                let (path, repo) = (path.clone(), repo.clone());
+                tokio::task::spawn_blocking(move || snapshot::write(&path, &repo, &objects))
+            };
+            match task.await {
+                Ok(Ok(written)) => tracing::info!(
+                    %repo,
+                    objects = count,
+                    bytes = written,
+                    ms = started.elapsed().as_millis(),
+                    "wrote a snapshot"
+                ),
+                Ok(Err(e)) => {
+                    tracing::warn!(%repo, path = %path.display(), error = %e, "cannot write a snapshot");
+                }
+                Err(e) => tracing::warn!(%repo, error = %e, "cannot write a snapshot"),
+            }
+        }
+    }
 }

@@ -446,7 +446,8 @@ fn log_follows_git_first_parents() {
         .lines()
         .map(|commit| changeset_of(&store, commit))
         .collect();
-    let log: Vec<ChangesetId> = read::log_page(&store, "r", report.tip, None, 100)
+    let later = Deadline::new(Instant::now() + Duration::from_secs(600));
+    let log: Vec<ChangesetId> = read::log_page(&store, "r", report.tip, None, 100, &later)
         .unwrap()
         .entries
         .into_iter()

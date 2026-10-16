@@ -52,6 +52,11 @@ pub trait Store: Send + Sync + 'static {
     ///
     /// I/O errors.
     fn put(&self, key: Key, data: &Bytes) -> io::Result<()>;
+
+    /// Notes that `key` went into a reply for `repo`. The tier calls it for
+    /// each object that it sends, after the call's checks. Must be quick, as
+    /// [`Store::size`]. Only a store that makes snapshots per repo keeps it.
+    fn served(&self, _repo: &str, _key: Key) {}
 }
 
 /// Objects by key, least recently used first, each with its size.
@@ -116,7 +121,18 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// without work.
 pub struct MemoryStore {
     limit: usize,
-    lru: Mutex<Lru<Bytes>>,
+    memory: Mutex<Memory>,
+    /// It records some repo: [`Store::served`] takes the lock.
+    records: bool,
+}
+
+/// What the memory store's lock guards.
+struct Memory {
+    lru: Lru<Bytes>,
+    /// For each repo that the store makes snapshots of, the keys that went
+    /// into its replies, least recently first. Only keys that `lru` holds: a
+    /// key leaves when the store drops its object.
+    repos: HashMap<String, LruCache<Key, ()>>,
 }
 
 impl MemoryStore {
@@ -126,29 +142,91 @@ impl MemoryStore {
     pub fn new(limit: usize) -> Self {
         Self {
             limit,
-            lru: Mutex::new(Lru::new()),
+            memory: Mutex::new(Memory {
+                lru: Lru::new(),
+                repos: HashMap::new(),
+            }),
+            records: false,
         }
+    }
+
+    /// This store, which also notes the keys that go into replies for each
+    /// of `repos`, for [`MemoryStore::snapshot`]. A noted key costs about 80
+    /// bytes per repo, besides the object.
+    #[must_use]
+    pub fn recording(mut self, repos: &[String]) -> Self {
+        let memory = self
+            .memory
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        for repo in repos {
+            memory.repos.insert(repo.clone(), LruCache::new_unbounded());
+        }
+        self.records = !memory.repos.is_empty();
+        self
+    }
+
+    /// The objects that went into replies for `repo`: the most recently used
+    /// ones, up to `limit` bytes, least recently used first, as the store
+    /// holds them. Empty for a repo that the store does not record.
+    #[must_use]
+    pub fn snapshot(&self, repo: &str, limit: usize) -> Vec<(Key, Bytes)> {
+        let memory = lock(&self.memory);
+        let mut objects = Vec::new();
+        let mut bytes = 0;
+        for (key, ()) in memory.repos.get(repo).into_iter().flatten().rev() {
+            let Some((data, size)) = memory.lru.entries.peek(key) else {
+                continue;
+            };
+            if bytes + size > limit {
+                break;
+            }
+            bytes += size;
+            objects.push((*key, data.clone()));
+        }
+        objects.reverse();
+        objects
     }
 }
 
 impl Store for MemoryStore {
     fn size(&self, key: Key) -> io::Result<Option<usize>> {
-        Ok(lock(&self.lru).get(key).map(|&(_, size)| size))
+        Ok(lock(&self.memory).lru.get(key).map(|&(_, size)| size))
     }
 
     /// The stored buffer itself, not a copy.
     fn get(&self, key: Key, size: usize) -> io::Result<Option<Bytes>> {
-        let data = lock(&self.lru).get(key).map(|(data, _)| data.clone());
+        let data = lock(&self.memory)
+            .lru
+            .get(key)
+            .map(|(data, _)| data.clone());
         Ok(data.filter(|data| data.len() <= size))
     }
 
     fn put(&self, key: Key, data: &Bytes) -> io::Result<()> {
         if data.len() <= self.limit {
-            let mut lru = lock(&self.lru);
-            lru.insert(key, data.clone(), data.len());
-            lru.trim(self.limit);
+            let mut memory = lock(&self.memory);
+            memory.lru.insert(key, data.clone(), data.len());
+            for key in memory.lru.trim(self.limit) {
+                for keys in memory.repos.values_mut() {
+                    keys.remove(&key);
+                }
+            }
         }
         Ok(())
+    }
+
+    fn served(&self, repo: &str, key: Key) {
+        if !self.records {
+            return;
+        }
+        let mut memory = lock(&self.memory);
+        let Memory { lru, repos } = &mut *memory;
+        if let Some(keys) = repos.get_mut(repo)
+            && lru.entries.contains_key(&key)
+        {
+            keys.insert(key, ());
+        }
     }
 }
 
@@ -172,7 +250,7 @@ const CLEAN: u8 = b'c';
 const DIRTY: u8 = b'd';
 
 /// Bytes of one record: an op, a 32-byte ID and a size.
-const RECORD: usize = 1 + 32 + 4;
+pub(crate) const RECORD: usize = 1 + 32 + 4;
 
 /// Bytes of records that wait in memory before they are appended to the
 /// index file: 1,024 records. While another call writes, more wait.
@@ -187,7 +265,7 @@ const _: () = assert!(MAX_ENCODED_BYTES <= u32::MAX as usize);
 
 /// Appends the record that `key` is stored with `size` bytes and was just
 /// used (`Some`), or that it was dropped (`None`).
-fn push_record(out: &mut Vec<u8>, key: Key, size: Option<usize>) {
+pub(crate) fn push_record(out: &mut Vec<u8>, key: Key, size: Option<usize>) {
     let kind = match key {
         Key::Tree(_) => b'T',
         Key::Blob(_) => b'B',
@@ -204,7 +282,7 @@ fn push_record(out: &mut Vec<u8>, key: Key, size: Option<usize>) {
 
 /// Reads one record: an object stored with `Some(size)` bytes and just used,
 /// or one dropped (`None`). `None` overall if the bytes are not a record.
-fn parse_record(record: &[u8; RECORD]) -> Option<(Key, Option<usize>)> {
+pub(crate) fn parse_record(record: &[u8; RECORD]) -> Option<(Key, Option<usize>)> {
     let [op, id @ .., s0, s1, s2, s3] = *record;
     let key = match op.to_ascii_uppercase() {
         b'T' => Key::Tree(TreeId::from_bytes(id)),
@@ -876,11 +954,11 @@ mod tests {
         assert_eq!(store.size(a.0).unwrap(), Some(n));
         assert_eq!(store.size(b.0).unwrap(), None);
         assert_eq!(store.size(c.0).unwrap(), Some(n));
-        assert_eq!(lock(&store.lru).bytes, 2 * n);
+        assert_eq!(lock(&store.memory).lru.bytes, 2 * n);
 
         // A second put of the same object counts it once.
         store.put(c.0, &c.1).unwrap();
-        assert_eq!(lock(&store.lru).bytes, 2 * n);
+        assert_eq!(lock(&store.memory).lru.bytes, 2 * n);
 
         // An object larger than the whole limit is not kept, and drops nothing.
         let big = (
@@ -890,6 +968,39 @@ mod tests {
         store.put(big.0, &big.1).unwrap();
         assert_eq!(store.size(big.0).unwrap(), None);
         assert_eq!(store.size(a.0).unwrap(), Some(n));
+    }
+
+    #[test]
+    fn the_memory_store_notes_per_repo_only_what_it_holds() {
+        let (a, b, c) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"cccc"));
+        let n = a.1.len();
+        // Room for two.
+        let store = MemoryStore::new(2 * n + n / 2).recording(&["r".into()]);
+        let noted = |limit| -> Vec<Key> {
+            let snapshot = store.snapshot("r", limit);
+            snapshot.into_iter().map(|(key, _)| key).collect()
+        };
+        // Not stored: not noted.
+        store.served("r", a.0);
+        assert_eq!(noted(usize::MAX), []);
+        store.put(a.0, &a.1).unwrap();
+        store.put(b.0, &b.1).unwrap();
+        store.served("r", a.0);
+        // A repo that the store does not record.
+        store.served("q", b.0);
+        store.served("r", b.0);
+        store.served("r", a.0);
+        // Least recently used first. A limit keeps the most recent.
+        assert_eq!(noted(usize::MAX), [b.0, a.0]);
+        assert_eq!(noted(n), [a.0]);
+        assert_eq!(store.snapshot("r", n), std::slice::from_ref(&a));
+        assert_eq!(store.snapshot("q", usize::MAX), []);
+
+        // `c` drops `a`, the least recently used in the store; its key
+        // leaves the record too.
+        store.put(c.0, &c.1).unwrap();
+        assert_eq!(noted(usize::MAX), [b.0]);
+        assert_eq!(lock(&store.memory).repos["r"].len(), 1);
     }
 
     /// Total size of the object files under `dir`.

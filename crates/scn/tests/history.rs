@@ -391,9 +391,9 @@ fn log_path_and_blame_continue_past_the_server_bounds() {
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
     // The root adds `f` with two lines. Then 2 * MAX_SCAN changesets change
-    // only `g`, so at least one `Log` reply has no entries. Then
-    // MAX_BLAME_VERSIONS changesets each add one line at the top of `f`, one
-    // more than one `Blame` call diffs.
+    // only `g`, more than one `Blame` call walks. Then MAX_BLAME_VERSIONS
+    // changesets each add one line at the top of `f`, one more than one
+    // `Blame` call diffs.
     let mut text = String::from("line 1\nend\n");
     let mut changes = vec![vec![
         ("f", regular(store.blobs().put(text.as_bytes()).unwrap())),

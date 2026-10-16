@@ -46,8 +46,11 @@ release.
 - `scion-server import` can run while the server runs on the same data
   directory. It moves the ref by compare-and-swap, as a land does, and its
   commits are durable before the server can see them. A second server, or
-  a process of another build, is refused. A request that waits for the
-  import's write lock for more than 5 s fails with `UNAVAILABLE`.
+  a process of another build, is refused. Its write transactions end after
+  1 s, so a server write waits for at most that plus one commit instead of
+  a whole batch, and a request that waits more than 5 s fails with
+  `UNAVAILABLE`. The temp files of a crashed import are removed by the
+  next open of the directory, while the server keeps running.
 - Server-side commits (`CreateChangeset`) and lands: path-level conflict
   checks through a per-ref index, one transaction per land, retries by
   request key, and bounded retry when the ref moves.
@@ -76,8 +79,8 @@ release.
   forcing it, not on a real NFS mount.
 - Path history and blame on first-parent history: `Log` takes an optional
   path and says where to continue, and a new `Blame` RPC gives each line's
-  last changeset. `scn log --path` and `scn blame`. Each call has a bound,
-  and the client continues where a call stopped. An older server ignores
+  last changeset. `scn log --path` and `scn blame`. Each `Blame` call has a
+  bound, and the client continues where a call stopped. An older server ignores
   the new `path` field, so `scn log --path` against it prints unfiltered
   history.
 - `Blame` follows renames as `git blame` does by default: a deleted file
@@ -128,8 +131,17 @@ release.
   full, the indexes of idle refs go first, least recently used first. Else
   the growing index starts over at the tip. The lands still get the same
   answers.
-- A land walks at most 100,000 changesets below the path index. A base
-  further back is `REJECTED` as too old, and the client must rebase.
+- Path history as derived data (kind `path_history`, schema version 5).
+  `Log` with a path reads only the changesets that change the path, so one
+  call returns up to 1,000 entries however far apart they are. A call stops
+  after about 64 MiB of path history, which a file in a large directory
+  reaches in fewer entries, and it waits in the queue of `MergeBase` and
+  `IsAncestor`. A land on a
+  base more than 10,000 generations below the head checks its paths in the
+  head's path history, so no base is too old to check. Before, such a land
+  walked the history back to its base each time, and a base more than
+  100,000 changesets back was `REJECTED` (#38). `scion-server derive --kind
+  path_history` derives it ahead of the first query.
 - A land stops in its long loops 600 s after its call started, or as soon
   as its call is dropped by a timeout or by the client, because neither
   stops a running job. The land stays pending.
@@ -139,6 +151,11 @@ release.
   tier answers the `Objects` calls, checks every object from upstream
   against its ID before it stores or sends it, forwards `ResolveRef`, keeps
   `GetRootTree` answers, fetches a shared miss once, and needs a token.
+  A `scion-cache --snapshot DIR --snapshot-repo R` writes `DIR/R.scnsnap`
+  every `--snapshot-every` seconds: the most recently used objects of that
+  repo, up to `--snapshot-bytes`. A cold `scion-daemon --seed FILE` imports
+  them before it serves, each checked against its ID; a warm one ignores
+  the file (#59).
 - `scn` reaches a daemon with `--server unix:///PATH`. It first refuses a
   path that is not a socket owned by its user or by root. `scn` and the
   daemon also refuse a socket or data directory under a directory that
@@ -259,3 +276,12 @@ release.
   with its own if the fetch failed on a shorter one. `scn` sends a 600 s
   deadline (the server's own limit) and a 10 s connect timeout on every
   call, so a waiting `scn` never hangs silently (#98).
+- A process now bounds what stalled replies hold: a reply whose client
+  stops reading adds what it leaves in HTTP/2 (under 4 MiB) to a count of
+  its connection, and a connection whose stalled replies hold more than
+  64 MiB together (`--max-stalled-bytes`) is closed with them. Other
+  connections are not touched. hyper cannot reset one stalled stream, so
+  the connection is the unit of accounting; the ceiling drops from
+  connections x streams x 4 MiB to connections x 64 MiB for streamed
+  replies. A unary reply that its client never reads is not counted
+  (hyper gives the server no hook that sees it stall) (#113).

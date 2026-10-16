@@ -10,8 +10,10 @@ use scion_core::{
 
 use crate::db::{self, RepoId};
 use crate::deadline::Deadline;
+use crate::derived;
 use crate::error::{Error, Result};
 use crate::graph;
+use crate::history::{self, PathHistory};
 use crate::similar::{self, Budget, Chunks, MAX_PAIRS, Progress};
 use crate::store::Store;
 use crate::tree;
@@ -104,15 +106,21 @@ pub fn list_dir(
     })
 }
 
-/// Most changesets one call checks on a first-parent walk: a `Log` call, or
-/// the walk of a `Blame` call. So it is also the most entries a `Log` reply
-/// holds. Each check reads one changeset while the call holds one read
-/// connection.
-// SHORTCUT: path history and blame walk first parents on every call, so a
-// path changed long ago costs one call per 1,000 changesets since. Upgrade:
-// per-path history as derived data, so a call reads only the changesets that
-// changed the path.
+/// Most changesets that one `Blame` call checks on its first-parent walk,
+/// and most entries that a `Log` reply holds. Each check, and each entry,
+/// reads one changeset while the call holds one read connection.
+// SHORTCUT: blame walks first parents on every call, so a file changed long
+// ago costs one call per 1,000 changesets since. Upgrade: blame from the
+// path history (`history.rs`), so a call reads only the changesets that
+// changed the file (https://github.com/bnsd55/open-scion/issues/61).
 pub const MAX_SCAN: usize = 1000;
+
+/// Most bytes of path history that one `Log` call with a path reads, about
+/// as much as a `Blame` call reads. A lookup reads a whole directory level
+/// on each part of the path, so a file in a large directory costs a lot per
+/// entry: about 630 KB at 10,000 names. A call stops at this bound, after
+/// its first entry. Tests use a small bound, so that they reach it.
+pub const MAX_LOG_NODE_BYTES: usize = if cfg!(test) { 512 << 10 } else { 64 << 20 };
 
 /// One page of first-parent history.
 #[derive(Debug)]
@@ -139,38 +147,73 @@ pub fn log(
 ) -> Result<Vec<(ChangesetId, Changeset)>> {
     let mut entries = Vec::new();
     let mut next = Some(cs);
+    let deadline = Deadline::new(std::time::Instant::now() + std::time::Duration::from_secs(600));
     while let Some(from) = next.filter(|_| entries.len() < limit) {
-        let page = log_page(store, repo, from, None, limit - entries.len())?;
+        let page = log_page(store, repo, from, None, limit - entries.len(), &deadline)?;
         entries.extend(page.entries);
         next = page.next;
     }
     Ok(entries)
 }
 
-/// Up to `limit` changesets, walking first parents from `cs`, newest first.
-/// With a `path`, only the changesets that change it ([`changes_path`]).
-/// Checks at most [`MAX_SCAN`] changesets.
+/// Up to `limit` changesets, and at most [`MAX_SCAN`], walking first
+/// parents from `cs`, newest first. With a `path`, only the changesets that
+/// change it ([`changes_path`]), found in the path history of `cs`
+/// ([`history`]): each entry reads one changeset and at most one history
+/// node per part of the path, however many changesets lie between two
+/// entries. Such a page stops early, after its first entry, once it has read
+/// [`MAX_LOG_NODE_BYTES`] of nodes. If `cs` has no path history yet, this
+/// derives it first, in steps, until `deadline`.
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or changeset does not exist.
+/// [`Error::DeadlineExceeded`] if `deadline` passed while the path history
+/// was derived; the steps before it stay.
 pub fn log_page(
     store: &Store,
     repo: &str,
     cs: ChangesetId,
     path: Option<&RepoPath>,
     limit: usize,
+    deadline: &Deadline,
 ) -> Result<LogPage> {
+    let limit = limit.min(MAX_SCAN);
+    let Some(path) = path else {
+        return store.read(|c| {
+            let repo = db::repo_id(c, repo)?;
+            let mut entries = Vec::new();
+            let mut next = Some(cs);
+            let mut budget = limit;
+            while let Some(entry) = next_change(c, repo, None, &mut next, &mut budget)? {
+                entries.push(entry);
+            }
+            Ok(LogPage { entries, next })
+        });
+    };
+    let repo = store.read(|c| db::repo_id(c, repo))?;
+    derived::get_by::<PathHistory>(store, repo, cs, deadline)?;
+    // Each statement sees its own snapshot, and none needs another's: a
+    // changeset, a node and a value of this version never change and are
+    // never removed, and a node is stored in the transaction of the value
+    // that names it.
     store.read(|c| {
-        let repo = db::repo_id(c, repo)?;
+        let mut nodes = history::Nodes::default();
         let mut entries = Vec::new();
         let mut next = Some(cs);
-        let mut budget = MAX_SCAN;
-        while entries.len() < limit {
-            match next_change(c, repo, path, &mut next, &mut budget)? {
-                Some(entry) => entries.push(entry),
-                None => break,
+        while let Some(from) = next.filter(|_| entries.len() < limit) {
+            if !entries.is_empty() && nodes.bytes() >= MAX_LOG_NODE_BYTES {
+                break;
             }
+            // Each changeset on the first-parent history of `cs` has a path
+            // history, so `from` has one.
+            let Some(id) = history::newest_change(c, &mut nodes, from, path)? else {
+                next = None;
+                break;
+            };
+            let changeset = db::get_changeset(c, repo, id)?;
+            next = changeset.parents.first().copied();
+            entries.push((id, changeset));
         }
         Ok(LogPage { entries, next })
     })
@@ -179,7 +222,7 @@ pub fn log_page(
 /// Walks first parents from `next` to the newest changeset that changes
 /// `path` ([`changes_path`]), or to the next changeset if `path` is `None`.
 /// Checks at most `budget` changesets, and leaves `next` at the first one it
-/// did not check.
+/// did not check. `Blame` walks with it, and `Log` without a path.
 pub(crate) fn next_change(
     c: &Connection,
     repo: RepoId,
