@@ -180,3 +180,5 @@ release.
   waits for a write, for a long read such as a graph walk, or for a server
   write that waits for an import's write lock. Writes still take turns
   on one connection.
+- `scion-server serve` logs the address that it bound, so `--listen
+  127.0.0.1:0` shows the port that the OS chose.

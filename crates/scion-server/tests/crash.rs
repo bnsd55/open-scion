@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;
@@ -94,7 +94,7 @@ impl Server {
     fn start(data: &Path, log: &Path) -> Self {
         let mut server = Self::spawn(data, log);
         let start = Instant::now();
-        while !server.listens() {
+        while !server.listens(log) {
             if let Some(status) = server.child.try_wait().unwrap() {
                 let log = fs::read_to_string(log).unwrap_or_default();
                 panic!("the server exited with {status}:\n{log}");
@@ -105,21 +105,22 @@ impl Server {
         server
     }
 
-    /// Whether the server listens. It opens the data directory before, so
-    /// it has removed the temp files and upgraded the schema.
-    fn listens(&self) -> bool {
-        TcpStream::connect(self.addr).is_ok()
+    /// Whether the server listens. The address comes from the newest
+    /// `serving` line in the log: the server binds `127.0.0.1:0`, so the OS
+    /// picks a free port and no other process can take it in between. It
+    /// opens the data directory before, so it has removed the temp files and
+    /// upgraded the schema.
+    fn listens(&mut self, log: &Path) -> bool {
+        let Some(addr) = bound_addr(log) else {
+            return false;
+        };
+        self.addr = addr;
+        self.url = format!("http://{addr}");
+        TcpStream::connect(addr).is_ok()
     }
 
     /// Starts a server on `data`, and does not wait for it.
     fn spawn(data: &Path, log: &Path) -> Self {
-        // The OS picks a free port, and the server binds it again.
-        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let log_file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -128,7 +129,9 @@ impl Server {
         let child = Command::new(env!("CARGO_BIN_EXE_scion-server"))
             .arg("--data")
             .arg(data)
-            .args(["serve", "--token", TOKEN, "--listen", &addr.to_string()])
+            .args(["serve", "--token", TOKEN, "--listen", "127.0.0.1:0"])
+            // Plain log lines, so the address parses without escape codes.
+            .env("NO_COLOR", "1")
             .env("RUST_LOG", "info")
             .stdout(log_file.try_clone().unwrap())
             .stderr(log_file)
@@ -136,10 +139,17 @@ impl Server {
             .unwrap();
         Self {
             child,
-            addr,
-            url: format!("http://{addr}"),
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            url: String::new(),
         }
     }
+}
+
+/// The address of the newest `serving` line in the log, if there is one.
+fn bound_addr(log: &Path) -> Option<SocketAddr> {
+    let text = fs::read_to_string(log).unwrap_or_default();
+    let line = text.lines().rev().find(|line| line.contains("serving"))?;
+    line.split("listen=").nth(1)?.parse().ok()
 }
 
 impl Drop for Server {
