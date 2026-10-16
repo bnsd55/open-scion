@@ -923,8 +923,18 @@ Access tickets that a tier checks are not in v1
 
 ## 9. Compatibility
 
-Version 1 is the `scion.v1` package together with object format v1. A server,
-tier or client MUST ignore fields that it does not know, as proto3 does.
+This file describes version 1 of the protocol: the `scion.v1` package of
+[`proto/scion.proto`](../proto/scion.proto) together with object format v1
+([`format-v1.md`](format-v1.md)). A caller states the version it wants by
+which package it calls; there is no handshake and no version header. A
+server answers every call of a package that it serves, and a call of a
+package or a service that it does not serve fails with `UNIMPLEMENTED`, as
+for a call that it does not have. A later version is a new package,
+`scion.v2`. A server MAY serve both, so a client can move to the new
+version call by call, and an older client keeps working.
+
+A server, tier or client MUST ignore fields that it does not know, as
+proto3 does.
 
 Because unknown fields are ignored, an older server drops a new request field
 without an error. For example, a server from before `LogRequest.path` ignores
@@ -948,7 +958,9 @@ only if an answer that ignores it is still correct for the client.
 | What a client must check or may trust (section 5), or what a status code means | Yes |
 | Request-key rules, or a land retention shorter than 7 days | Yes |
 
-A new version is a new package, `scion.v2`. A server MAY serve both.
+A server MAY serve both `scion.v1` and `scion.v2` at once. To retire a
+version, a server stops serving its package; its clients then get
+`UNIMPLEMENTED`, which tells them to move.
 
 ## 10. Not in v1
 
