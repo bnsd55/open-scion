@@ -656,6 +656,15 @@ async fn every_reply_survives_a_kill_of_the_server() {
             .collect();
         let run = 100 + rng.below(500);
         tokio::time::sleep(Duration::from_millis(u64::try_from(run).unwrap())).await;
+        // Every other kill, on average, waits for a blob write in progress: a
+        // file in `tmp/`. Small writes end before the kill, large ones not.
+        if rng.below(2) == 0 {
+            let tmp = data.join("tmp");
+            let give_up = Instant::now() + Duration::from_secs(2);
+            while fs::read_dir(&tmp).unwrap().next().is_none() && Instant::now() < give_up {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
         killed.store(true, Ordering::SeqCst);
         drop(server);
         for client in clients {
