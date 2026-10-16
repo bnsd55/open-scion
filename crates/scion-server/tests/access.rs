@@ -353,8 +353,7 @@ mod req {
             repo: REPO.into(),
             changeset_id: root.to_vec(),
             path: path.to_vec(),
-            rename_searched: 0,
-            rename_best: Vec::new(),
+            cursor: Vec::new(),
         }
     }
 

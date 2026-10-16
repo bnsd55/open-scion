@@ -208,38 +208,32 @@ message LogEntry {
 message BlameRequest {
   string repo = 1;
   bytes changeset_id = 2;
-  // A regular file of at most 16 MiB and 1,048,576 lines.
   bytes path = 3;
-  // Optional. Where a rename search stopped: a reply's
-  // next_rename_searched and next_rename_best, sent back unchanged with
-  // its next_changeset_id and next_path. 0 and empty start no search.
-  uint64 rename_searched = 4;
-  bytes rename_best = 5;
+  // Optional. Where the last call stopped: a reply's next_cursor, sent
+  // back unchanged with the same repo, changeset_id and path. Empty starts
+  // a first blame. The cursor is opaque to clients.
+  bytes cursor = 7;
+  reserved 4, 5;
+  reserved "rename_searched", "rename_best";
 }
 
 message BlameResponse {
-  // Line ranges in file order. Together they cover every line once.
+  // Line ranges in file order. Together they cover the lines of the
+  // window this call answered, from after_line to its end, once each.
   repeated BlameRange ranges = 1;
   // The author of each changeset that a range names, once each.
   repeated BlameChangeset changesets = 2;
-  // Set when a call stopped at its bound before every line had a
-  // changeset. The ranges without a changeset came from this changeset or
-  // an older one. Blame next_path here to continue.
-  bytes next_changeset_id = 3;
-  // The path of the file at next_changeset_id, set with it. It differs from
-  // the requested path when the walk followed a rename. Empty from a server
-  // that does not follow renames: then it is the requested path.
-  bytes next_path = 4;
-  // Set when the call stopped in the search for the file that
-  // next_changeset_id renamed to next_path, or right after it: how many of
-  // the files it deletes the search has looked at, all of them if the
-  // search ended. With next_rename_best, the client MUST send it back
-  // unchanged as rename_searched and rename_best in the next call. 0 and
-  // empty when the call did not stop at a search.
-  uint64 next_rename_searched = 5;
-  // With next_rename_searched: the deleted file that the search picks so
-  // far, if any. Else empty.
-  bytes next_rename_best = 6;
+  // Set when more lines are left to blame: the lines after this call's
+  // window, or the rest of this window when the call stopped at a bound.
+  // The ranges without a changeset came from the changeset in the cursor
+  // or an older one. The client MUST send next_cursor back unchanged, with
+  // the same repo, changeset_id and path, to get the next part. Empty when
+  // the blame is done. Opaque: the server decodes it, and a cursor that
+  // was not made for this repo, changeset and path is refused.
+  bytes next_cursor = 7;
+  reserved 3, 4, 5, 6;
+  reserved "next_changeset_id", "next_path", "next_rename_searched",
+      "next_rename_best";
 }
 
 message BlameRange {

@@ -29,7 +29,6 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::access::Access;
 use crate::auth::Caller;
-use crate::blame::RenameSearch;
 use crate::deadline::Deadline;
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
@@ -48,6 +47,10 @@ const MAX_UPLOADS: usize = 16;
 /// blames never take more than this many of the `MAX_BLOCKING` permits that
 /// writes and lands share.
 const MAX_BLAMES: usize = 4;
+/// The bytes of memory that all `Blame` calls share: a call takes the bytes
+/// of every version it reads, and [`memory::BYTES_PER_LINE`] per line of the
+/// blamed file, so together they hold no more than this.
+const BLAME_MEMORY_BUDGET: usize = 1 << 30;
 /// Most `MergeBase` and `IsAncestor` calls running at once. A call has no
 /// bound on its reads, only its deadline, so these queries never take more
 /// than this many of the `MAX_BLOCKING` permits.
@@ -128,6 +131,8 @@ pub struct ScionService {
     uploads: Arc<Semaphore>,
     /// Bounds blames running at once (`MAX_BLAMES`).
     blames: Arc<Semaphore>,
+    /// The memory that blames share (`BLAME_MEMORY_BUDGET`).
+    blame_memory: crate::memory::Bytes,
     /// Bounds graph queries running at once (`MAX_GRAPH_QUERIES`).
     graph_queries: Arc<Semaphore>,
     /// Bounds diffs running at once (`MAX_DIFFS`).
@@ -145,6 +150,7 @@ impl ScionService {
             lands: Arc::default(),
             uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
             blames: Arc::new(Semaphore::new(MAX_BLAMES)),
+            blame_memory: crate::memory::Bytes::new(BLAME_MEMORY_BUDGET),
             graph_queries: Arc::new(Semaphore::new(MAX_GRAPH_QUERIES)),
             diffs: Arc::new(Semaphore::new(MAX_DIFFS)),
             reads: Arc::new(Semaphore::new(READ_BUDGET_BYTES)),
@@ -618,14 +624,17 @@ impl Scion for ScionService {
         request: Request<BlameRequest>,
     ) -> Result<Response<BlameResponse>, Status> {
         let caller = caller(&request)?;
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
-        let path = parse_path(req.path)?;
-        let search = RenameSearch {
-            searched: usize::try_from(req.rename_searched)
-                .map_err(|_| Status::invalid_argument("rename_searched is too large"))?,
-            best: parse_optional_path(req.rename_best)?,
+        let path = parse_path(req.path.clone())?;
+        // The client sends the cursor back unchanged. A cursor made for
+        // another repo, changeset or path is refused here.
+        let resume = if req.cursor.is_empty() {
+            blame::Resume::default()
+        } else {
+            blame::decode_cursor(&req.cursor, id, &path)?
         };
         // Taken before the worker permit, and held until the job ends, also
         // when the client leaves first.
@@ -633,11 +642,15 @@ impl Scion for ScionService {
             .acquire_owned()
             .await
             .map_err(|_| Status::unavailable("server is shutting down"))?;
+        let memory = self.blame_memory.clone();
+        let until = Some(deadline.at());
+        let walk_path = path.clone();
         let blame = self
             .worker
             .run(move |store| {
                 let _slot = slot;
-                blame::blame(&store, &req.repo, id, &path, &search)
+                let _call = deadline.guard();
+                blame::blame(&store, &req.repo, id, &walk_path, &resume, &memory, until)
             })
             .await?;
         let ranges = blame
@@ -662,15 +675,11 @@ impl Scion for ScionService {
                 path: path.as_bytes().to_vec(),
             })
             .collect();
-        let (next, next_path) = blame.next.unzip();
-        Ok(Response::new(BlameResponse {
-            ranges,
-            changesets,
-            next_changeset_id: id_bytes(next),
-            next_path: path_bytes(next_path),
-            next_rename_searched: blame.next_search.searched as u64,
-            next_rename_best: path_bytes(blame.next_search.best),
-        }))
+        let next_cursor = blame
+            .resume
+            .map(|resume| blame::encode_cursor(&resume, id, &path))
+            .unwrap_or_default();
+        Ok(Response::new(BlameResponse { ranges, changesets, next_cursor }))
     }
 
     async fn merge_base(
