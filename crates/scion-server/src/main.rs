@@ -3,11 +3,12 @@
 
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use scion_proto::listen::{self, Limits};
+use scion_proto::tls::ServerTls;
 use scion_server::derived::{self, Kind};
 use scion_server::graph::CommitGraph;
 use scion_server::import::{ImportOptions, import_git};
@@ -35,10 +36,22 @@ enum Command {
         /// Bearer token that clients must send.
         #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
         token: String,
-        /// Allow a non-loopback address. Traffic, including the token, is not
-        /// encrypted, so use this only on a trusted network.
+        /// Allow a non-loopback address. Without TLS, traffic, including the
+        /// token, is not encrypted, so use this only on a trusted network.
+        /// With `--tls-cert` and `--tls-key`, a non-loopback address is
+        /// allowed without this flag.
         #[arg(long)]
         insecure_listen: bool,
+        /// Serve TLS with this certificate (PEM), together with `--tls-key`.
+        /// Then a non-loopback address needs no `--insecure-listen`.
+        #[arg(long, requires = "tls_key", value_name = "FILE")]
+        tls_cert: Option<PathBuf>,
+        /// The key of `--tls-cert` (PEM).
+        #[arg(long, requires = "tls_cert", value_name = "FILE")]
+        tls_key: Option<PathBuf>,
+        /// Require a client certificate (mTLS) that this CA (PEM) signed.
+        #[arg(long, requires = "tls_cert", value_name = "FILE")]
+        tls_client_ca: Option<PathBuf>,
         /// Most connections served at once. More clients wait until one closes.
         #[arg(long, default_value_t = listen::DEFAULT_CONNECTIONS)]
         max_connections: NonZeroUsize,
@@ -92,6 +105,24 @@ enum KindName {
     CommitGraph,
 }
 
+/// The TLS of a `serve` command: none, or the certificate, key and client CA
+/// of the flags. Clap requires the certificate and the key together, and the
+/// client CA on a certificate.
+fn server_tls(
+    cert: Option<&Path>,
+    key: Option<&Path>,
+    client_ca: Option<&Path>,
+) -> anyhow::Result<Option<ServerTls>> {
+    match (cert, key) {
+        (None, None) => Ok(None),
+        (Some(cert), Some(key)) => {
+            let tls = ServerTls::load(cert, key, client_ca)?;
+            Ok(Some(tls))
+        }
+        _ => unreachable!("clap requires --tls-cert and --tls-key together"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -112,16 +143,20 @@ async fn main() -> anyhow::Result<()> {
             listen,
             token,
             insecure_listen,
+            tls_cert,
+            tls_key,
+            tls_client_ca,
             max_connections,
             max_streams,
         } => {
             anyhow::ensure!(!token.is_empty(), "--token must not be empty");
-            // SHORTCUT: no TLS. Upgrade: tonic TLS or mTLS before any
-            // deployment beyond one machine.
+            let server_tls =
+                server_tls(tls_cert.as_deref(), tls_key.as_deref(), tls_client_ca.as_deref())?;
             anyhow::ensure!(
-                listen.ip().is_loopback() || insecure_listen,
-                "{listen} is not a loopback address; traffic and the token would \
-                 travel unencrypted. Pass --insecure-listen to allow it."
+                listen.ip().is_loopback() || insecure_listen || server_tls.is_some(),
+                "{listen} is not a loopback address; without TLS the traffic and the \
+                 token would travel unencrypted. Pass --tls-cert and --tls-key, or \
+                 --insecure-listen to allow it."
             );
             let listener = tokio::net::TcpListener::bind(listen)
                 .await
@@ -131,9 +166,16 @@ async fn main() -> anyhow::Result<()> {
                 connections: max_connections,
                 streams: max_streams,
             };
-            service::serve(store, listener, &token, limits, async {
-                tokio::signal::ctrl_c().await.ok();
-            })
+            Box::pin(service::serve(
+                store,
+                listener,
+                &token,
+                limits,
+                server_tls.as_ref(),
+                async {
+                    tokio::signal::ctrl_c().await.ok();
+                },
+            ))
             .await?;
         }
         Command::Import {
