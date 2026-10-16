@@ -615,8 +615,16 @@ async fn walk_refs(
 /// sent, and that nothing else is on a ref.
 fn check_lands(ledger: &Ledger, history: &HashMap<ChangesetId, (&str, Changeset)>) {
     let mut lands_on_refs = 0;
+    // A land ID names one request key for ever, so no second reply may
+    // carry it.
+    let mut land_ids = HashSet::new();
     for sent in &ledger.lands {
         let reply = sent.reply.as_ref().expect("every land was retried");
+        assert!(
+            land_ids.insert(reply.land_id.as_str()),
+            "land ID {} went to two keys",
+            reply.land_id
+        );
         let key = &sent.key;
         match reply.state() {
             LandState::Landed => {
@@ -625,14 +633,21 @@ fn check_lands(ledger: &Ledger, history: &HashMap<ChangesetId, (&str, Changeset)
                     .get(&result)
                     .unwrap_or_else(|| panic!("{key} landed as {result}, which is not on a ref"));
                 assert_eq!(*target, sent.target, "{key}");
-                assert_eq!(landed.changes, sent.changeset.changes, "{key}");
-                assert_eq!(landed.message, sent.changeset.message, "{key}");
+                // The server may rebase, so only the parents may differ.
+                let mut want = sent.changeset.clone();
+                want.parents = landed.parents.clone();
+                assert_eq!(landed, &want, "{key}");
                 lands_on_refs += 1;
             }
             LandState::Conflict => {
                 let shared = RepoPath::new(SHARED).unwrap();
                 let changes = &sent.changeset.changes;
                 assert!(changes.contains_key(&shared), "{key}: {reply:?}");
+                assert_eq!(
+                    reply.conflict_paths,
+                    vec![shared.as_bytes().to_vec()],
+                    "{key}"
+                );
             }
             _ => panic!("{key}: {reply:?}"),
         }
