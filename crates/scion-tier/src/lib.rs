@@ -41,7 +41,7 @@ use scion_core::{BlobId, ChangesetId, Tree, TreeId};
 use scion_proto::auth::{Auth, Bearer};
 use scion_proto::check;
 use scion_proto::deadline::Until;
-use scion_proto::listen::Limits;
+use scion_proto::listen::{self, Limits};
 use scion_proto::object::{self, Assembler, Header, MAX_ENCODED_BYTES, UNPACK_BYTES, zstd_bound};
 use scion_proto::reply::{
     self, BUSY_TIMEOUT, Body, IN_FLIGHT_BYTES, ObjectStream, Outgoing, STALL_TIMEOUT,
@@ -63,7 +63,6 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::server::Connected;
 use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Code, Request, Response, Status, Streaming};
-use tonic_health::ServingStatus;
 
 use store::lock;
 pub use store::{DiskStore, MemoryStore, Store};
@@ -496,21 +495,7 @@ impl<S: Store> Tier<S> {
         // the same port, without a token: a probe carries none. The store
         // and the upstream channel opened before this call, so the tier
         // starts serving.
-        let (reporter, health) = tonic_health::server::health_reporter();
-        reporter
-            .set_service_status("", ServingStatus::Serving)
-            .await;
-        reporter
-            .set_service_status("scion.v1.Objects", ServingStatus::Serving)
-            .await;
-        // On shutdown, the status flips before the drain, so a watcher
-        // sees `NOT_SERVING` while the server still answers.
-        let shutdown = async {
-            shutdown.await;
-            reporter
-                .set_service_status("", ServingStatus::NotServing)
-                .await;
-        };
+        let (health, shutdown) = listen::health(&["scion.v1.Objects"], shutdown).await;
         let router = |mut server: Server| server.add_service(health).add_service(objects);
         limits
             .serve(router, incoming, tls.map(|tls| tls.config()), shutdown)

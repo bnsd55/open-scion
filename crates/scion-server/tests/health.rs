@@ -19,6 +19,7 @@ use tonic_health::pb::health_client::HealthClient;
 struct Server {
     child: Child,
     watcher: Option<tonic::Streaming<tonic_health::pb::HealthCheckResponse>>,
+    named: Option<tonic::Streaming<tonic_health::pb::HealthCheckResponse>>,
     _data: TempDir,
     log: PathBuf,
 }
@@ -67,6 +68,7 @@ fn spawn() -> Server {
     Server {
         child,
         watcher: None,
+        named: None,
         _data: data,
         log,
     }
@@ -99,7 +101,28 @@ async fn wait_serving(server: &mut Server, log: &Path) {
         .await
         .expect("the health service answers")
         .into_inner();
+    // A watch of one named service answers `SERVING` too, on its own
+    // connection, so the test does not depend on how one connection
+    // multiplexes two idle streams.
+    let addr2 = bound_addr(log).expect("the address again");
+    let channel2 = Channel::from_shared(format!("http://{addr2}"))
+        .unwrap()
+        .connect()
+        .await
+        .expect("the server listens again");
+    let mut client2 = HealthClient::new(channel2);
+    let named = client2
+        .watch(tonic::Request::new(HealthCheckRequest {
+            service: "scion.v1.Scion".to_owned(),
+        }))
+        .await
+        .expect("the named service answers")
+        .into_inner();
+    let mut named = named;
+    let first = named.message().await.unwrap().expect("a status");
+    assert_eq!(first.status(), ServingStatus::Serving);
     server.watcher = Some(watcher);
+    server.named = Some(named);
 }
 
 /// Sends `SIGINT`, as Ctrl-C does.
@@ -122,12 +145,19 @@ async fn the_server_serves_until_shutdown_starts() {
     assert_eq!(first.status(), ServingStatus::Serving);
 
     // Shutdown starts: the watcher sees `NOT_SERVING` on its open stream,
-    // while the server still answers.
+    // while the server still answers. A named service flips too.
     interrupt(&server.child);
     let update = watcher
         .message()
         .await
         .expect("the watcher stays open through the drain")
+        .expect("a status update");
+    assert_eq!(update.status(), ServingStatus::NotServing);
+    let mut named = server.named.take().unwrap();
+    let update = named
+        .message()
+        .await
+        .expect("the named watch stays open through the drain")
         .expect("a status update");
     assert_eq!(update.status(), ServingStatus::NotServing);
 }

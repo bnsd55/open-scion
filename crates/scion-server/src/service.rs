@@ -26,7 +26,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
-use tonic_health::ServingStatus;
 
 use crate::access::Access;
 use crate::auth::Caller;
@@ -107,24 +106,8 @@ pub async fn serve(
     // The health service answers `grpc.health.v1.Check` and `Watch` on the
     // same port, without a token: a probe carries none. The store opens
     // before this call, so the server starts serving.
-    let (reporter, health) = tonic_health::server::health_reporter();
-    reporter
-        .set_service_status("", ServingStatus::Serving)
-        .await;
-    reporter
-        .set_service_status("scion.v1.Scion", ServingStatus::Serving)
-        .await;
-    reporter
-        .set_service_status("scion.v1.Objects", ServingStatus::Serving)
-        .await;
-    // On shutdown, the status flips before the drain, so a watcher sees
-    // `NOT_SERVING` while the server still answers.
-    let shutdown = async {
-        shutdown.await;
-        reporter
-            .set_service_status("", ServingStatus::NotServing)
-            .await;
-    };
+    let (health, shutdown) =
+        listen::health(&["scion.v1.Scion", "scion.v1.Objects"], shutdown).await;
     let router = |server: Server| {
         server
             .timeout(REQUEST_TIMEOUT)
