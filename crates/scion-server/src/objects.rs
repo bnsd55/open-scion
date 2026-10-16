@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use scion_core::{BlobId, TreeId};
+use scion_proto::auth::Auth;
 use scion_proto::deadline::Until;
 use scion_proto::object::{self, Header, zstd_bound};
 use scion_proto::reply::{
@@ -27,7 +28,7 @@ use tonic::{Request, Response, Status};
 
 use crate::access::Access;
 use crate::error::{Error, Result};
-use crate::service::{Worker, caller, check_reader, parse_id, resolve_ref};
+use crate::service::{Worker, check_reader, parse_id, resolve_ref};
 use crate::store::{self, Store};
 use crate::tickets::Keys;
 use crate::{db, read};
@@ -67,6 +68,9 @@ impl Plan {
 pub struct ObjectsService {
     worker: Worker,
     access: Arc<Access>,
+    /// The tokens of the server: every call of this service but
+    /// `GetObjects` needs one. An object read's permission is its ticket.
+    auth: Auth,
     /// The keys that mint the tickets of `GetRootTree` replies. `None`
     /// keeps every object read closed: a reply then carries no ticket.
     tickets: Option<Arc<Keys>>,
@@ -78,6 +82,7 @@ impl ObjectsService {
     pub(crate) fn new(worker: Worker, access: Arc<Access>, tickets: Option<Arc<Keys>>) -> Self {
         Self {
             worker,
+            auth: access.auth(),
             access,
             tickets,
             in_flight: Arc::new(Semaphore::new(IN_FLIGHT_BYTES)),
@@ -218,7 +223,8 @@ const WAITS: Waits = Waits {
 /// object. That comes before the caller's deadline, so the caller gets this
 /// status, not a timeout of its own. `stalled` is the handle of the
 /// connection, which counts what a stalled reply leaves in HTTP/2.
-/// The waits are the caller's budget and the deadlines of its waits; the
+/// The waits are the caller's budget and the deadlines of its waits, and
+/// `decoded` is the memory the trees of the ticket's walk decoded; the
 /// reply needs every part of it, hence the argument count.
 #[allow(clippy::too_many_arguments)]
 async fn start_reply(
@@ -230,17 +236,31 @@ async fn start_reply(
     read: Read,
     zstd: bool,
     stalled: Option<scion_proto::listen::Stalled>,
+    decoded: usize,
 ) -> Result<ObjectStream, Status> {
     let mut rest = keys.into_iter();
     let Some(key) = rest.next() else {
         return Err(Status::invalid_argument("a call names at least one object"));
     };
     let busy = waits.until.wait(waits.busy);
+    // The share of the walk's trees: held to the end of the call, so the
+    // walks of all calls together cannot outrun the reply budget. No room
+    // within the busy wait: the call ends `RESOURCE_EXHAUSTED`. A walk that
+    // decoded nothing takes no share.
+    let walk_share = if decoded > 0 {
+        Some(reply::take(&in_flight, decoded, busy).await)
+    } else {
+        None
+    };
+    if decoded > 0 && walk_share.is_none() {
+        return Err(reply::busy());
+    }
     let first = find(&worker, &in_flight, busy, read, &allowed, zstd, key)
         .await
         .ok_or_else(reply::busy)?;
     let (tx, stream) = reply::channel();
     tokio::spawn(async move {
+        let _walk_share = walk_share;
         let (worker, in_flight) = (&worker, &in_flight);
         let produce = |key| {
             find(
@@ -295,8 +315,10 @@ async fn find(
 impl Objects for ObjectsService {
     async fn resolve_ref(
         &self,
-        request: Request<ResolveRefRequest>,
+        mut request: Request<ResolveRefRequest>,
     ) -> Result<Response<ResolveRefResponse>, Status> {
+        let caller = self.auth.caller_of(&request)?;
+        request.extensions_mut().insert(caller);
         resolve_ref(&self.worker, &self.access, request)
             .await
             .map(Response::new)
@@ -306,7 +328,7 @@ impl Objects for ObjectsService {
         &self,
         request: Request<GetRootTreeRequest>,
     ) -> Result<Response<GetRootTreeResponse>, Status> {
-        let caller = caller(&request)?;
+        let caller = self.auth.caller_of(&request)?;
         let GetRootTreeRequest { repo, changeset_id } = request.into_inner();
         check_reader(&self.access, &caller, &repo)?;
         let cs = parse_id(&changeset_id, "changeset_id")?;
@@ -362,20 +384,21 @@ impl Objects for ObjectsService {
             .tickets
             .as_ref()
             .map_or(no_keys, |keys| keys.for_verify());
-        let ticket = scion_proto::ticket::parse(&ticket, keys_for_verify, now())
-            .map_err(|why| Status::permission_denied(format!("bad ticket: {why}")))?;
+        let ticket =
+            scion_proto::ticket::parse(&ticket, keys_for_verify, scion_proto::ticket::now())
+                .map_err(|why| Status::permission_denied(format!("bad ticket: {why}")))?;
         let refs = refs
             .into_iter()
             .map(|r| Ok((parse_ref(&r)?, r.path)))
             .collect::<Result<Vec<_>, Status>>()?;
         // Encodings that this server does not know are ignored.
         let zstd = accept.contains(&Encoding::Zstd.into());
-        let (allowed, keys) = self
+        let (allowed, decoded, keys) = self
             .worker
             .run(move |store| {
-                let allowed = prove(&store, ticket.root_tree, &refs)?;
+                let (allowed, decoded) = prove(&store, ticket.root_tree, &refs)?;
                 let keys = refs.into_iter().map(|(key, _)| key).collect();
-                Ok((allowed, keys))
+                Ok((allowed, decoded, keys))
             })
             .await?;
         let in_flight = Arc::clone(&self.in_flight);
@@ -388,23 +411,17 @@ impl Objects for ObjectsService {
             read_object,
             zstd,
             stalled,
+            decoded,
         );
         Ok(Response::new(stream.await?))
     }
-}
-
-/// The moment that ticket checks use.
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs())
 }
 
 /// Marks every ref that the walk from `root` reaches, over the trees of
 /// `store`: the caller keeps the keys, and `plan` serves only the proven
 /// ones. A tree that `store` does not hold, or one whose bytes do not
 /// match its ID, refuses the ref.
-fn prove(store: &Store, root: [u8; 32], refs: &[(Key, Vec<u8>)]) -> Result<HashSet<Key>> {
+fn prove(store: &Store, root: [u8; 32], refs: &[(Key, Vec<u8>)]) -> Result<(HashSet<Key>, usize)> {
     let mut walk = scion_proto::ticket::Walker::new(root);
     let mut allowed = HashSet::new();
     store.read(|c| {
@@ -425,7 +442,9 @@ fn prove(store: &Store, root: [u8; 32], refs: &[(Key, Vec<u8>)]) -> Result<HashS
         }
         Ok(())
     })?;
-    Ok(allowed)
+    // The trees the walks decoded hold memory: they count against the
+    // call's reply budget, as the objects do.
+    Ok((allowed, walk.decoded_bytes()))
 }
 
 /// The kind and the bytes of the ID that a key names.
@@ -509,6 +528,7 @@ mod tests {
             read_object,
             true,
             None,
+            0,
         );
         let mut stream = reply.await.unwrap();
 
@@ -548,6 +568,7 @@ mod tests {
                 counted,
                 true,
                 None,
+                0,
             );
             tokio::time::timeout(Duration::from_secs(10), reply)
         };
@@ -562,6 +583,42 @@ mod tests {
         drop(others);
         reply().await.unwrap().unwrap();
         assert_eq!(READS.load(Ordering::SeqCst), 1);
+    }
+
+    // The trees that a ticket's walk decoded hold their share of the reply
+    // budget to the end of the call: a walk too big for the free budget
+    // fails the call before any object is read.
+    #[tokio::test]
+    async fn a_walk_bigger_than_the_free_budget_ends_resource_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let a = Key::Blob(store.blobs().put(b"a blob").unwrap());
+        let budget = 1000;
+        let in_flight = Arc::new(Semaphore::new(budget));
+        let worker = Worker::new(store);
+        let reply = |decoded| {
+            let reply = start_reply(
+                worker.clone(),
+                vec![a],
+                HashSet::from([a]),
+                Arc::clone(&in_flight),
+                waits(Duration::from_millis(100)),
+                read_object,
+                true,
+                None,
+                decoded,
+            );
+            tokio::time::timeout(Duration::from_secs(10), reply)
+        };
+        // A walk that takes every byte of the budget: nothing is read, and
+        // the call ends `RESOURCE_EXHAUSTED`.
+        let status = reply(budget).await.unwrap().unwrap_err();
+        assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+        // Within the budget, the walk's share is held while the reply goes,
+        // and freed after it: a second call with a walk of the same size
+        // gets room again.
+        reply(budget / 2).await.unwrap().unwrap();
+        reply(budget / 2).await.unwrap().unwrap();
     }
 
     /// A caller's deadline shorter than the busy limit ends the wait for
@@ -587,6 +644,7 @@ mod tests {
             read_object,
             true,
             None,
+            0,
         );
         let status = tokio::time::timeout(Duration::from_secs(5), reply)
             .await
@@ -620,6 +678,7 @@ mod tests {
             watched,
             false,
             None,
+            0,
         );
         let objects = collect(reply.await.unwrap(), false).await;
         assert_eq!(objects[0].1, content);
@@ -684,6 +743,7 @@ mod tests {
                 read_object,
                 zstd,
                 None,
+                0,
             );
             async move { collect(reply.await.unwrap(), zstd).await }
         };

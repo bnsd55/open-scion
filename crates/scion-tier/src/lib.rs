@@ -348,14 +348,19 @@ pub fn key_from_hex(hex: &str) -> Option<[u8; 32]> {
 /// Adds the tier's own token to every upstream call, and counts the calls.
 #[derive(Clone)]
 struct UpstreamAuth {
-    bearer: Bearer,
+    bearer: Option<Bearer>,
     calls: Arc<AtomicU64>,
 }
 
 impl Interceptor for UpstreamAuth {
     fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        self.bearer.call(request)
+        match &mut self.bearer {
+            // An object read's permission is its ticket: a tier sends no
+            // token unless it was given one.
+            Some(bearer) => bearer.call(request),
+            None => Ok(request),
+        }
     }
 }
 
@@ -427,7 +432,9 @@ struct Ask {
 
 impl<S: Store> Tier<S> {
     /// A tier that keeps objects in `store` and sends misses to `upstream`
-    /// (`http://HOST:PORT` or `unix:///PATH`) with `upstream_token`. It waits
+    /// (`http://HOST:PORT` or `unix:///PATH`). A non-empty `upstream_token`
+    /// rides on every call; an empty one sends none, which is enough for
+    /// `GetObjects` of a server: its permission is the ticket. It waits
     /// at most `timeout` for each step of upstream, and connects on the first
     /// call. With `client_tls`, the upstream is trusted with that CA, and a
     /// client certificate is presented for mTLS.
@@ -457,7 +464,11 @@ impl<S: Store> Tier<S> {
             endpoint
         };
         let channel = endpoint.connect_lazy();
-        let bearer = Bearer::new(upstream_token).context("upstream token is not valid ASCII")?;
+        let bearer = if upstream_token.is_empty() {
+            None
+        } else {
+            Some(Bearer::new(upstream_token).context("upstream token is not valid ASCII")?)
+        };
         let upstream_calls = Arc::default();
         let auth = UpstreamAuth {
             bearer,

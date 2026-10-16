@@ -38,6 +38,8 @@ proptest.workspace = true
 rusqlite = { workspace = true, features = ["hooks"] }
 # Tests of the reply timeouts run on a paused clock.
 tokio = { workspace = true, features = ["test-util"] }
+# A test fetches from a real server through a tier with no token.
+scion-tier = { workspace = true }
 
 [lints]
 workspace = true

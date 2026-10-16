@@ -81,9 +81,11 @@ A request with a `grpc-encoding` other than `identity` fails with
 `UNIMPLEMENTED`, so a client MUST NOT compress requests.
 
 **Authentication.** Every call on both services MUST carry the metadata
-`authorization: Bearer <token>`: the exact prefix `Bearer `, then the token.
-A missing or wrong token fails the call with `UNAUTHENTICATED` before the
-request is read. A token names a principal. A server started with `--token T`
+`authorization: Bearer <token>`, with the exact prefix `Bearer `, then the
+token — except `Objects.GetObjects` (section 7.3), whose permission is its
+read ticket, and which MUST carry none. On every call that needs one, a
+missing or wrong token fails with `UNAUTHENTICATED` before the request is
+read. A token names a principal. A server started with `--token T`
 has one principal, `default`, which may read and write every repo. A server
 started with `--access FILE` reads the principal of each token and its rules
 from the file; the file's format is a deployment matter and lives in the
@@ -733,9 +735,10 @@ read the repo.
 ### 7.2 GetRootTree
 
 `rpc GetRootTree(GetRootTreeRequest) returns (GetRootTreeResponse)`. The ID of
-the root tree of a changeset that the repo has. `NOT_FOUND` if the repo does
-not exist, the caller may not read it, or the changeset does not exist for
-that repo. The answer never changes.
+the root tree of a changeset that the repo has, with a signed read ticket for
+it (section 7.3). `NOT_FOUND` if the repo does not exist, the caller may not
+read it, or the changeset does not exist for that repo. The answer never
+changes.
 
 ### 7.3 GetObjects
 
@@ -744,7 +747,11 @@ trees and blobs named by `refs`, each in an encoding that the request
 accepts, in parts.
 
 **Request.** `refs` names 1 to 1,000 objects, each a `kind` (`TREE` or
-`BLOB`) and a 32-byte `id`. A ref can repeat. `accept` lists the encodings
+`BLOB`), a 32-byte `id`, and the `path` from the ticket's root tree that
+reaches it. The `ticket` field carries a read ticket (section 7.2), which is
+the only permission of the call: it names the repo and the root tree, and
+every object must be reachable from that tree over the path that its ref
+names. The call carries no token. A ref can repeat. `accept` lists the encodings
 that the client accepts besides `RAW`, which every client accepts. In v1 the
 only other encoding is `ZSTD`. An empty list means `RAW` only. A server
 ignores a value that it does not know. The server checks the whole request
@@ -855,11 +862,18 @@ order is daemon, cache, server. These rules hold for any tier:
 - A tier MUST serve the `Objects` service with the same calls, fields, limits
   and reply rules as the server. A client MUST NOT need to know whether it
   talks to a tier or to the server.
-- A tier MUST require a bearer token on every call, as the server does.
-- A tier MUST forward every `ResolveRef` call to its upstream, and MUST NOT
-  keep the answer.
-- A tier MAY keep a `GetRootTree` answer forever, keyed by (repo,
-  changeset), but only as its upstream gave it. It MUST NOT compute one.
+- A tier MUST require a bearer token on every call, as the server does,
+  except `GetObjects`, whose permission is its ticket (section 7.3).
+- A tier MUST NOT serve `ResolveRef` or `GetRootTree` at all: both answer
+  `UNIMPLEMENTED`. A client resolves a ref and gets the ticket of its root
+  tree from the server, and brings that ticket to the tier's `GetObjects`. A
+  tier that fetched root trees for its callers would be a way to get a
+  ticket for any repo.
+- A tier that is a daemon checks no ticket at all: it only forwards the
+  ticket it received to its upstream, whose signature check is what keeps
+  unproven reads out. A tier that is a cache MUST check each ticket it
+  receives against the public keys of its upstream server (at most 2, for a
+  rotation), as the server does.
 - A tier MAY keep objects forever. A tier never trusts upstream bytes: it
   MUST check each object from its upstream as a client does (sections 5
   and 7.3), before it stores, forwards or sends it. An object that fails the

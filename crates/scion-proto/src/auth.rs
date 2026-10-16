@@ -46,6 +46,23 @@ impl Auth {
         }
     }
 
+    /// The caller of `request`, from its `authorization` header. Every
+    /// call but `GetObjects` needs one: the permission of an object read
+    /// is its ticket, not a token.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::unauthenticated`] without a `Bearer` token of this set.
+    pub fn caller_of<T>(&self, request: &Request<T>) -> Result<Caller, Status> {
+        request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.as_bytes().strip_prefix(b"Bearer "))
+            .and_then(|token| self.principal(token))
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("missing or wrong token"))
+    }
+
     /// The principal of `token`, if any. Compares its digest with every
     /// known digest, without an early exit, so the time does not depend on
     /// which digest matches or how much of one does.

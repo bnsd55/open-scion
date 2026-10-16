@@ -2855,6 +2855,7 @@ dependencies = [
  "rustix",
  "scion-core",
  "scion-proto",
+ "scion-tier",
  "tempfile",
  "thiserror",
  "tokio",

@@ -13,9 +13,10 @@
 //! most 2, for a rotation; there is no key id). A parser takes exact
 //! lengths and refuses extra bytes.
 //!
-//! The server keeps the signing key. The tiers hold public keys only: the
-//! daemon runs as its own user, so a shared MAC key there would let that
-//! user mint tickets for every repo.
+//! The server keeps the signing key. The tiers hold public keys only: a
+//! daemon serves one system account over one private socket, so a signing
+//! key there would let that account mint tickets for every repo of every
+//! user of the server.
 
 use std::collections::HashMap;
 
@@ -156,9 +157,14 @@ pub fn parse(bytes: &[u8], keys: &[VerifyingKey], now: u64) -> Result<Ticket, Ti
     ticket_of(body, bytes, now)
 }
 
-/// A ticket without checking who signed it, for a hop that only forwards
-/// tickets and never vouches for them. Everything else is checked, so the
-/// walk from its root tree still gates what a forwarder serves.
+/// A ticket without checking who signed it, for a daemon, which only
+/// forwards tickets and never vouches for them. An unverified ticket is
+/// not a protection: its caller picks the root tree it names, and the
+/// daemon would then walk from a tree of the caller's choosing. The real
+/// limits of a daemon are its own: it serves one user over a private
+/// socket, and that user can read everything in the daemon's store
+/// anyway. The walk only finds what to fetch; the upstream checks the
+/// signature of the ticket it receives.
 ///
 /// # Errors
 ///
@@ -192,7 +198,7 @@ fn ticket_of(mut read: &[u8], bytes: &[u8], now: u64) -> Result<Ticket, TicketEr
     if !read.is_empty() {
         return Err(TicketError::Bad("trailing bytes"));
     }
-    if now > expires + TICKET_SKEW_SECS {
+    if now > expires.saturating_add(TICKET_SKEW_SECS) {
         return Err(TicketError::Expired);
     }
     if expires > now.saturating_add(TICKET_LIFETIME_SECS + TICKET_SKEW_SECS) {
@@ -428,6 +434,14 @@ mod tests {
         assert_eq!(
             parse_unverified(&bytes[..20], 1_000),
             Err(TicketError::Bad("too short"))
+        );
+        // An expiry of u64::MAX overflows the window arithmetic of a parse
+        // that is not careful: refused, not a panic.
+        let mut far = bytes.clone();
+        far[1..9].copy_from_slice(&u64::MAX.to_be_bytes());
+        assert_eq!(
+            parse_unverified(&far, 1_000),
+            Err(TicketError::OutsideClockWindow)
         );
         // The ticket lives 900 s; past its expiry plus the skew it is out.
         assert_eq!(

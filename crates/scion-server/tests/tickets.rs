@@ -4,7 +4,7 @@
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_proto::auth::Bearer;
 use scion_proto::listen::Limits;
-use scion_proto::object::Assembler;
+use scion_proto::object::{Assembler, Header};
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::{GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
 use scion_server::tickets::Keys;
@@ -247,4 +247,163 @@ async fn only_a_ticket_of_this_server_serves() {
     .await
     .unwrap();
     assert_eq!(got[0].1, CONTENT);
+}
+
+/// A cache tier with no token of the server fetches over a ticket: the
+/// permission of an object read is the ticket, not a token. A call without
+/// a ticket is refused even so.
+/// A server with one `README`, its keys, and a stop handle to hold.
+async fn server_of_readme() -> (
+    std::net::SocketAddr,
+    Keys,
+    ChangesetId,
+    BlobId,
+    tokio::sync::oneshot::Sender<()>,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let server_store = Store::open(dir.path()).unwrap();
+    let readme = server_store.blobs().put(CONTENT).unwrap();
+    let changeset = Changeset {
+        parents: Vec::new(),
+        author: IdentityTime {
+            name: b"Ada".to_vec(),
+            email: b"ada@example.com".to_vec(),
+            unix_secs: 1_700_000_000,
+            tz_offset_minutes: 0,
+        },
+        committer: None,
+        message: b"add\n".to_vec(),
+        changes: [(
+            RepoPath::new("README").unwrap(),
+            Some(FileState::Regular {
+                content: readme,
+                executable: false,
+            }),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let (_bytes, cs) = changeset.encode_with_id();
+    server_store
+        .write(|c| {
+            let repo = db::create_repo(c, REPO)?;
+            db::insert_changeset(c, repo, &changeset)
+        })
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let keys = Keys::generate();
+    tokio::spawn(service::serve(
+        server_store,
+        listener,
+        TOKEN,
+        Limits::default(),
+        None,
+        Some(keys.clone().into()),
+        async {
+            stopped.await.ok();
+        },
+    ));
+    (server_addr, keys, cs, readme, stop, dir)
+}
+
+#[tokio::test]
+async fn a_cache_without_a_token_fetches_over_a_ticket() {
+    use scion_proto::v1::GetRootTreeRequest as Root;
+    use scion_tier::{MemoryStore, Tier};
+
+    let (_objects, _keys, _cs, _blob, stop, _dir) = server().await;
+
+    // A server with the data, and a cache in front of it with no token.
+    let (server_addr, keys, cs, readme, stop_server, _dir2) = server_of_readme().await;
+
+    // The cache: no token, only the server's public key.
+    let cache = Tier::new(
+        MemoryStore::new(16 << 20),
+        &format!("http://{server_addr}"),
+        "",
+        std::time::Duration::from_secs(5),
+        None,
+        keys.for_verify().to_vec(),
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cache_addr = listener.local_addr().unwrap();
+    let (stop_cache, stopped_cache) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(cache.clone().serve(
+        TOKEN,
+        tokio_stream::wrappers::TcpListenerStream::new(listener),
+        Limits::default(),
+        None,
+        async {
+            stopped_cache.await.ok();
+        },
+    ));
+
+    // The caller holds the CACHE's token (the tier's own door), but has no
+    // token of the SERVER anywhere.
+    let channel = tonic::transport::Channel::from_shared(format!("http://{cache_addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut tier = ObjectsClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap());
+
+    // A tier resolves nothing; the caller asks the server, with a token.
+    let status = tier
+        .get_root_tree(Root {
+            repo: REPO.into(),
+            changeset_id: cs.as_bytes().to_vec(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::Unimplemented, "{status:?}");
+    let channel = tonic::transport::Channel::from_shared(format!("http://{server_addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut server = ObjectsClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap());
+    let (ticket, _tree) = root(&mut server, cs).await;
+
+    // The ticket alone buys the object through the token-less tier.
+    let refs = vec![ObjectRef {
+        kind: ObjectKind::Blob.into(),
+        id: readme.as_bytes().to_vec(),
+        path: b"README".to_vec(),
+    }];
+    let mut stream = tier
+        .get_objects(GetObjectsRequest {
+            refs: refs.clone(),
+            accept: Vec::new(),
+            ticket,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let first = stream.message().await.unwrap().unwrap();
+    let mut object = Assembler::new(Header::of(&first, false).unwrap(), first);
+    while !object.is_done() {
+        object
+            .push(&stream.message().await.unwrap().unwrap())
+            .unwrap();
+    }
+    let (_header, data) = object.finish();
+    assert_eq!(data, CONTENT);
+
+    // Without a ticket, the same call is refused.
+    let status = tier
+        .get_objects(GetObjectsRequest {
+            refs,
+            accept: Vec::new(),
+            ticket: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    stop_server.send(()).ok();
+    stop_cache.send(()).ok();
+    stop.send(()).ok();
 }

@@ -101,12 +101,12 @@ pub async fn serve(
     let worker = Worker::new(store);
     let scion = InterceptedService::new(
         ScionService::new(worker.clone(), Arc::clone(&access)).into_server(),
-        auth.clone(),
-    );
-    let objects = InterceptedService::new(
-        ObjectsService::new(worker, access, tickets).into_server(),
         auth,
     );
+    // No token interceptor: `GetObjects` authenticates by ticket alone, and
+    // the service's other calls check the token themselves. So a tier needs
+    // no token of the server to fetch objects.
+    let objects = ObjectsService::new(worker, access, tickets).into_server();
     let router = |server: Server| {
         server
             .timeout(REQUEST_TIMEOUT)
