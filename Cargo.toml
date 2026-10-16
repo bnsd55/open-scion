@@ -14,10 +14,10 @@ categories = ["development-tools"]
 authors = ["Ben Shaharizad <bnsd55@gmail.com>"]
 
 [workspace.dependencies]
-scion-core = { version = "0.1.0", path = "crates/scion-core" }
-scion-proto = { version = "0.1.0", path = "crates/scion-proto" }
-scion-server = { version = "0.1.0", path = "crates/scion-server" }
-scion-tier = { version = "0.1.0", path = "crates/scion-tier" }
+open-scion-core = { version = "0.1.0", path = "crates/scion-core" }
+open-scion-proto = { version = "0.1.0", path = "crates/scion-proto" }
+open-scion-server = { version = "0.1.0", path = "crates/scion-server" }
+open-scion-tier = { version = "0.1.0", path = "crates/scion-tier" }
 
 anyhow = "1.0"
 blake3 = "1.8"

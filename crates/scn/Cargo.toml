@@ -1,5 +1,5 @@
 [package]
-name = "scn"
+name = "open-scn"
 description = "Command-line client for the Scion version control system"
 version.workspace = true
 edition.workspace = true
@@ -11,13 +11,17 @@ keywords.workspace = true
 categories.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "scn"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 hashlink.workspace = true
 rustix.workspace = true
-scion-core.workspace = true
-scion-proto.workspace = true
+open-scion-core.workspace = true
+open-scion-proto.workspace = true
 serde_json.workspace = true
 signal-hook.workspace = true
 tokio.workspace = true
@@ -26,8 +30,8 @@ tonic.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
-scion-server.workspace = true
-scion-tier.workspace = true
+open-scion-server.workspace = true
+open-scion-tier.workspace = true
 tempfile.workspace = true
 zstd.workspace = true
 
