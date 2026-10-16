@@ -790,6 +790,7 @@ impl Scion for ScionService {
         Ok(Response::new(DiffResponse {
             entries,
             next_after: path_bytes(page.next_after),
+            renames_incomplete: page.renames_incomplete,
         }))
     }
 }
