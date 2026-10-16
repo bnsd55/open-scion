@@ -1890,7 +1890,7 @@ mod tests {
                 s.spawn(|| {
                     while !done.load(Ordering::Relaxed) {
                         store
-                            .read(|c| (0..1000).try_for_each(|_| repos(c).map(drop)))
+                            .read(|c| (0..10_000).try_for_each(|_| repos(c).map(drop)))
                             .unwrap();
                     }
                 });
@@ -1907,7 +1907,7 @@ mod tests {
         });
         // The log file never shrinks, so its size is the most it held.
         let log = fs::metadata(dir.path().join("scion.db-wal")).unwrap().len();
-        assert!(log < 16 << 20, "the log grew to {} MiB", log >> 20);
+        assert!(log < 8 << 20, "the log grew to {} MiB", log >> 20);
     }
 
     #[test]
