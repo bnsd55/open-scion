@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
+use scion_proto::CHUNK_BYTES;
 use scion_proto::auth::Bearer;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::{GetObjectsRequest, ObjectKind, ObjectRef};
@@ -36,7 +37,7 @@ struct Tiers {
     /// `unix://` address of the daemon.
     socket: String,
     runtime: Runtime,
-    _dirs: [TempDir; 2],
+    dirs: [TempDir; 2],
 }
 
 impl Tiers {
@@ -75,7 +76,7 @@ impl Tiers {
             daemon,
             socket: format!("unix://{}", path.display()),
             runtime,
-            _dirs: [data, node],
+            dirs: [data, node],
         }
     }
 
@@ -83,6 +84,32 @@ impl Tiers {
     fn upstream_calls(&self) -> (u64, u64) {
         (self.daemon.upstream_calls(), self.cache.upstream_calls())
     }
+
+    /// The file of blob `id` on the server, and on the daemon's disk.
+    fn blob_files(&self, id: BlobId) -> [Vec<u8>; 2] {
+        let [server, node] = &self.dirs;
+        [server.path().to_path_buf(), node.path().join("data")]
+            .map(|dir| fs::read(blob_path(&dir, id)).unwrap())
+    }
+}
+
+/// Where the server, and the daemon, keep blob `id` under `dir`.
+fn blob_path(dir: &Path, id: BlobId) -> PathBuf {
+    let hex = id.to_string();
+    dir.join("objects/blob").join(&hex[..2]).join(&hex[2..])
+}
+
+/// `len` bytes that zstd cannot make smaller.
+fn noise(len: usize) -> Vec<u8> {
+    let mut state = 1_u64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[3]
+        })
+        .collect()
 }
 
 /// `scn checkout REV --into dest` against the server at `url`.
@@ -104,7 +131,11 @@ fn checkout(url: &str, rev: &str, dest: &Path) {
 #[derive(Debug, PartialEq, Eq)]
 enum Node {
     Dir,
-    File { data: Vec<u8>, mode: u32 },
+    /// A file, by the ID of its content, so a failure prints no content.
+    File {
+        content: BlobId,
+        mode: u32,
+    },
     Symlink(PathBuf),
 }
 
@@ -123,7 +154,7 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Node> {
                 Node::Dir
             } else {
                 Node::File {
-                    data: fs::read(&path).unwrap(),
+                    content: BlobId::of(&fs::read(&path).unwrap()),
                     mode: meta.permissions().mode() & 0o777,
                 }
             };
@@ -174,10 +205,14 @@ fn checkout_through_the_daemon_and_the_cache_matches_a_direct_checkout() {
         executable,
     };
     let readme = regular(b"hello\n", false);
+    // Over three parts of 1 MiB, packed or not: noise, then text.
+    let mut big = noise(3 * CHUNK_BYTES);
+    big.extend((0..100_000).flat_map(|i| format!("line {i}\n").into_bytes()));
     let first = changeset(
         None,
         &[
             ("README.md", readme),
+            ("big.bin", regular(&big, false)),
             ("run.sh", regular(b"#!/bin/sh\necho hi\n", true)),
             ("src/lib.rs", regular(b"pub fn f() {}\n", false)),
             ("src/nested/deep/file.txt", regular(b"deep\n", false)),
@@ -195,6 +230,10 @@ fn checkout_through_the_daemon_and_the_cache_matches_a_direct_checkout() {
     // For a later change. A blob is not part of any tree until a changeset
     // names it.
     let new_readme = regular(b"hello, again\n", false);
+    // The server's file of `big`, packed at another level than a tier would
+    // pack it, so a tier that packs again is seen.
+    let packed = zstd::bulk::compress(&big, 1).unwrap();
+    fs::write(blob_path(data.path(), BlobId::of(&big)), packed).unwrap();
     let tiers = Tiers::start(data, store);
     let tmp = tempfile::tempdir().unwrap();
     let dest = |name: &str| tmp.path().join(name);
@@ -202,8 +241,14 @@ fn checkout_through_the_daemon_and_the_cache_matches_a_direct_checkout() {
     checkout(&tiers.socket, "main", &dest("through-tiers"));
     checkout(&tiers.server, "main", &dest("direct"));
     let direct = snapshot(&dest("direct"));
-    assert_eq!(direct.len(), 9, "{direct:?}");
+    assert_eq!(direct.len(), 10, "{direct:?}");
     assert_eq!(snapshot(&dest("through-tiers")), direct);
+    let written = fs::read(dest("through-tiers").join("big.bin")).unwrap();
+    assert_eq!(BlobId::of(&written), BlobId::of(&big));
+    // The daemon keeps each blob in the server's disk format, byte for byte:
+    // the zstd file went through the cache unchanged.
+    let [on_server, on_node] = tiers.blob_files(BlobId::of(&big));
+    assert!(on_server == on_node, "the daemon packed the blob again");
     // The first checkout missed at each tier: calls went up to the server.
     let before = tiers.upstream_calls();
     assert!(before.0 > 0 && before.1 > 0, "{before:?}");
@@ -240,6 +285,7 @@ fn a_missing_repo_fails_the_call_once_at_each_tier() {
     let request = GetObjectsRequest {
         repo: "no-such-repo".into(),
         refs,
+        accept: Vec::new(),
     };
 
     let reply = tiers.runtime.block_on(async {

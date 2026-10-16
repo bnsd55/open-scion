@@ -89,10 +89,29 @@ release.
   against its ID before it stores or sends it, forwards `ResolveRef`, keeps
   `GetRootTree` answers, fetches a shared miss once, and needs a token.
 - `scn` reaches a daemon with `--server unix:///PATH`. It first refuses a
-  path that is not a socket owned by its user or by root.
+  path that is not a socket owned by its user or by root. `scn` and the
+  daemon also refuse a socket or data directory under a directory that
+  another user can change: each directory up to `/` must be owned by root
+  or by their user, and not writable by group or others unless it has the
+  sticky bit.
 - A `GetObjects` reply never ends `OK` with no object. If the server or a
-  tier has no memory for the first object within 120 s, the call fails
+  tier has no memory for the first object within 30 s, the call fails
   with `RESOURCE_EXHAUSTED`.
+- `GetObjects` sends blobs in their stored form: the server's zstd file, as
+  it is, to a client that lists `ZSTD` in the new `accept` field. The tiers
+  keep and pass on that frame, and `scn checkout` unpacks it, so a blob is
+  packed once and unpacked once. Each object comes in parts of 1 MiB
+  (`ObjectPart`, which replaces `Object`); the first part gives its encoding
+  and sizes, so every receiver reserves memory before the bytes arrive and
+  unpacks within that size. A tier now fetches up to 64 objects at once
+  from upstream instead of 4, within the same 400 MiB. A reply cut off in
+  the middle of an object ends with `DEADLINE_EXCEEDED`.
+- The tier timeouts nest: the server and tiers wait 30 s for reply memory,
+  a tier 30 s for a fetch slot and 30 s for fetch memory, the cache 60 s per
+  step of the server, the daemon 180 s per step of the cache.
+- Receivers accept only plain Zstandard frames, with no dictionary and a
+  window of at most 8 MiB; the zstd library is built without its legacy
+  decoders.
 - `docs/protocol-v1.md`: the contract of the `Scion` and `Objects` services,
   for independent clients, tiers and servers.
 - Query API: `MergeBase` (every best common ancestor, as

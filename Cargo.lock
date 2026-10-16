@@ -2481,11 +2481,13 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "prost",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "zstd",
 ]
 
 [[package]]
@@ -2528,6 +2530,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]
@@ -2548,6 +2551,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "zstd",
 ]
 
 [[package]]
