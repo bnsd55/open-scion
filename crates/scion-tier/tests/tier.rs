@@ -657,6 +657,8 @@ async fn concurrent_misses_for_one_object_share_one_fetch() {
         assert_eq!(client.await.unwrap().unwrap(), vec![object.clone()]);
     }
     // One fetch of the object, shared, plus the root tree of the walk.
+    // Each job mints its own ticket (get() signs a fresh one), so the
+    // flight is joined across tickets, not within one.
     assert_eq!(fake.calls(), 2);
     assert_eq!(cache.upstream_calls(), 2);
 }

@@ -1,7 +1,9 @@
 //! Object reads with tickets, against an in-process server: a ticket from
 //! `GetRootTree` serves the objects that its walk reaches, and nothing else.
 
-use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
+use scion_core::{
+    BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, RepoPath, Tree, TreeId,
+};
 use scion_proto::auth::Bearer;
 use scion_proto::listen::Limits;
 use scion_proto::object::{Assembler, Header};
@@ -92,11 +94,11 @@ async fn server() -> (
     )
 }
 
-/// The ticket and root tree of `changeset`, from the server.
-async fn root(objects: &mut Objects, changeset: ChangesetId) -> (Vec<u8>, Vec<u8>) {
+/// The ticket and root tree of `changeset` of `repo`, from the server.
+async fn root(objects: &mut Objects, repo: &str, changeset: ChangesetId) -> (Vec<u8>, Vec<u8>) {
     let reply = objects
         .get_root_tree(GetRootTreeRequest {
-            repo: REPO.into(),
+            repo: repo.to_owned(),
             changeset_id: changeset.as_bytes().to_vec(),
         })
         .await
@@ -150,7 +152,7 @@ fn blob_ref(id: &[u8], path: &str) -> ObjectRef {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_ticket_serves_what_its_walk_reaches() {
     let (mut objects, keys, cs, blob, _stop, _dir) = server().await;
-    let (ticket, tree) = root(&mut objects, cs).await;
+    let (ticket, tree) = root(&mut objects, REPO, cs).await;
     // The ticket is real, for this principal, this repo, and this tree.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -186,7 +188,7 @@ async fn a_ticket_serves_what_its_walk_reaches() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_ticket_serves_nothing_beyond_its_walk() {
     let (mut objects, _keys, cs, blob, _stop, _dir) = server().await;
-    let (ticket, tree) = root(&mut objects, cs).await;
+    let (ticket, tree) = root(&mut objects, REPO, cs).await;
     // A path that is not in the tree, and an ID that no path names.
     let status = get(
         &mut objects,
@@ -218,7 +220,7 @@ async fn a_ticket_serves_nothing_beyond_its_walk() {
 #[tokio::test(flavor = "multi_thread")]
 async fn only_a_ticket_of_this_server_serves() {
     let (mut objects, _keys, cs, blob, _stop, _dir) = server().await;
-    let (ticket, _tree) = root(&mut objects, cs).await;
+    let (ticket, _tree) = root(&mut objects, REPO, cs).await;
 
     // No ticket, a foreign key's ticket, and a damaged one: all refused.
     let stranger = Keys::generate();
@@ -366,7 +368,7 @@ async fn a_cache_without_a_token_fetches_over_a_ticket() {
         .await
         .unwrap();
     let mut server = ObjectsClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap());
-    let (ticket, _tree) = root(&mut server, cs).await;
+    let (ticket, _tree) = root(&mut server, REPO, cs).await;
 
     // The ticket alone buys the object through the token-less tier.
     let refs = vec![ObjectRef {
@@ -406,4 +408,442 @@ async fn a_cache_without_a_token_fetches_over_a_ticket() {
     stop_server.send(()).ok();
     stop_cache.send(()).ok();
     stop.send(()).ok();
+}
+
+/// The `now` of the ticket clock, in seconds.
+fn now() -> u64 {
+    scion_proto::ticket::now()
+}
+
+/// A server with ticket keys, and a cache in front of it that knows the
+/// server's public key. The store holds two repos that share blobs:
+/// - `main`: one changeset whose tree has `README`, `src/lib.rs`,
+///   `docs/a.md`, `docs/b.md`, and the gitlink `sub`, whose commit is the
+///   ID of a real blob;
+/// - `side`: one changeset whose tree has only `other.txt`.
+struct Tiers {
+    server: Objects,
+    cache: Objects,
+    keys: Keys,
+    main_cs: ChangesetId,
+    side_cs: ChangesetId,
+    readme: BlobId,
+    lib: BlobId,
+    sub: BlobId,
+    other: BlobId,
+}
+
+/// The two changesets of the fixture: `main` over the given blobs, and
+/// `side`, which shares one of them.
+fn changesets(
+    shared: BlobId,
+    readme: BlobId,
+    lib: BlobId,
+    sub: BlobId,
+    other: BlobId,
+) -> (Changeset, Changeset) {
+    let file = |content: BlobId| {
+        Some(FileState::Regular {
+            content,
+            executable: false,
+        })
+    };
+    let main = Changeset {
+        parents: Vec::new(),
+        author: IdentityTime {
+            name: b"Ada".to_vec(),
+            email: b"ada@example.com".to_vec(),
+            unix_secs: 1_700_000_000,
+            tz_offset_minutes: 0,
+        },
+        committer: None,
+        message: b"main\n".to_vec(),
+        changes: [
+            (RepoPath::new("README").unwrap(), file(readme)),
+            (RepoPath::new("src/lib.rs").unwrap(), file(lib)),
+            (RepoPath::new("docs/a.md").unwrap(), file(readme)),
+            (RepoPath::new("docs/b.md").unwrap(), file(shared)),
+            (RepoPath::new("shared.txt").unwrap(), file(shared)),
+            (
+                RepoPath::new("sub").unwrap(),
+                Some(FileState::Gitlink {
+                    commit: scion_core::GitOid::Sha256(*sub.as_bytes()),
+                }),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let side = Changeset {
+        parents: Vec::new(),
+        author: IdentityTime {
+            name: b"Ada".to_vec(),
+            email: b"ada@example.com".to_vec(),
+            unix_secs: 1_700_000_001,
+            tz_offset_minutes: 0,
+        },
+        committer: None,
+        message: b"side\n".to_vec(),
+        changes: [
+            (RepoPath::new("other.txt").unwrap(), file(other)),
+            (RepoPath::new("shared.txt").unwrap(), file(shared)),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    (main, side)
+}
+
+async fn tiers() -> (Tiers, tokio::sync::oneshot::Sender<()>, tempfile::TempDir) {
+    use scion_tier::{MemoryStore, Tier};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    // One blob in both repos, and one in each alone.
+    let shared = store.blobs().put(b"shared\n").unwrap();
+    let readme = store.blobs().put(b"# main\n").unwrap();
+    let lib = store.blobs().put(b"pub fn f() {}\n").unwrap();
+    let other = store.blobs().put(b"other\n").unwrap();
+    // A gitlink that names the ID of a real blob: the walk must end there,
+    // so the bytes behind the ID never go out under this path.
+    let sub = store.blobs().put(b"behind a gitlink\n").unwrap();
+    let (main, side) = changesets(shared, readme, lib, sub, other);
+    let (_bytes, main_cs) = main.encode_with_id();
+    let (_bytes, side_cs) = side.encode_with_id();
+    store
+        .write(|c| {
+            let repo = db::create_repo(c, "main")?;
+            db::insert_changeset(c, repo, &main)?;
+            let repo = db::create_repo(c, "side")?;
+            db::insert_changeset(c, repo, &side)
+        })
+        .unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let keys = Keys::generate();
+    tokio::spawn(service::serve(
+        store,
+        listener,
+        TOKEN,
+        Limits::default(),
+        None,
+        Some(keys.clone().into()),
+        async {
+            stopped.await.ok();
+        },
+    ));
+
+    let cache = Tier::new(
+        MemoryStore::new(16 << 20),
+        &format!("http://{addr}"),
+        TOKEN,
+        std::time::Duration::from_secs(5),
+        None,
+        keys.for_verify().to_vec(),
+    )
+    .unwrap();
+    let cache_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cache_addr = cache_listener.local_addr().unwrap();
+    tokio::spawn(cache.clone().serve(
+        TOKEN,
+        tokio_stream::wrappers::TcpListenerStream::new(cache_listener),
+        Limits::default(),
+        None,
+        std::future::pending(),
+    ));
+
+    let connect = |url: String| async {
+        ObjectsClient::with_interceptor(
+            Channel::from_shared(url).unwrap().connect().await.unwrap(),
+            Bearer::new(TOKEN).unwrap(),
+        )
+    };
+    let server = connect(format!("http://{addr}")).await;
+    let cache = connect(format!("http://{cache_addr}")).await;
+    let tiers = Tiers {
+        server,
+        cache,
+        keys,
+        main_cs,
+        side_cs,
+        readme,
+        lib,
+        sub,
+        other,
+    };
+    (tiers, stop, dir)
+}
+
+/// Signs a ticket with the server's own key, with `expires` set as if the
+/// server had minted it at `minted_at`.
+fn signed_with(keys: &Keys, repo: &str, root_tree: [u8; 32], minted_at: u64) -> Vec<u8> {
+    let seed: [u8; 32] = hex_of(&keys.seed_hex()).try_into().unwrap();
+    let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    scion_proto::ticket::sign(&key, repo, "default", root_tree, minted_at).unwrap()
+}
+
+/// The bytes of a hex string.
+fn hex_of(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// Tickets that are not in time, not in shape, or not from this server's
+/// key are refused by the server and by the cache alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn tickets_out_of_time_or_shape_are_refused() {
+    let (tiers, _stop, _dir) = tiers().await;
+    let mut server = tiers.server;
+    let mut cache = tiers.cache;
+
+    let (ticket, root) = root(&mut server, "main", tiers.main_cs).await;
+    let refs = vec![blob_ref(tiers.readme.as_bytes(), "README")];
+    let good = get(&mut server, &ticket, refs.clone()).await.unwrap();
+    assert_eq!(good[0].1, b"# main\n");
+
+    // An expired ticket, and one so far ahead that no server could have
+    // minted it now.
+    let expired = signed_with(
+        &tiers.keys,
+        "main",
+        root[..].try_into().unwrap(),
+        now() - 900 - 60 - 10,
+    );
+    let ahead = signed_with(
+        &tiers.keys,
+        "main",
+        root[..].try_into().unwrap(),
+        now() + 900 + 120 + 10,
+    );
+    // A ticket of another key, and a ticket with bytes after its signature.
+    let stranger = signed_with(
+        &Keys::generate(),
+        "main",
+        root[..].try_into().unwrap(),
+        now(),
+    );
+    let mut trailing = ticket.clone();
+    trailing.push(0);
+    for bad in [expired, ahead, stranger, trailing] {
+        let status = get(&mut server, &bad, refs.clone()).await.unwrap_err();
+        assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+        let status = get(&mut cache, &bad, refs.clone()).await.unwrap_err();
+        assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    }
+
+    // The good ticket still serves after the refusals.
+    let got = get(&mut server, &ticket, refs).await.unwrap();
+    assert_eq!(got[0].1, b"# main\n");
+}
+
+/// A ticket of another repo is a real ticket: the server minted it. It
+/// still serves nothing of this repo, because its walk starts at another
+/// root tree.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ticket_of_another_repo_serves_nothing_of_this_one() {
+    let (tiers, _stop, _dir) = tiers().await;
+    let mut server = tiers.server;
+    let mut cache = tiers.cache;
+
+    let (side_ticket, _side_root) = root(&mut server, "side", tiers.side_cs).await;
+    for client in [&mut server, &mut cache] {
+        // A path of `main` that `side` does not name, and one that it names
+        // with other bytes: the shared blob is at another root tree, so its
+        // ID at this path is not the walk's.
+        for refs in [
+            vec![blob_ref(tiers.readme.as_bytes(), "README")],
+            vec![blob_ref(tiers.lib.as_bytes(), "src/lib.rs")],
+        ] {
+            let status = get(client, &side_ticket, refs).await.unwrap_err();
+            assert_eq!(status.code(), Code::NotFound, "{status:?}");
+        }
+    }
+}
+
+/// A gitlink ends the walk: the bytes of the blob whose ID the gitlink
+/// holds never go out under the gitlink's path, on the server or on a
+/// cache.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gitlink_ends_the_walk() {
+    let (tiers, _stop, _dir) = tiers().await;
+    let mut server = tiers.server;
+    let mut cache = tiers.cache;
+
+    let (ticket, root) = root(&mut server, "main", tiers.main_cs).await;
+    // The blob behind the gitlink, asked for as a blob and as a tree at the
+    // gitlink's path.
+    for client in [&mut server, &mut cache] {
+        for refs in [
+            vec![blob_ref(tiers.sub.as_bytes(), "sub")],
+            vec![ObjectRef {
+                kind: ObjectKind::Tree.into(),
+                id: tiers.sub.as_bytes().to_vec(),
+                path: b"sub".to_vec(),
+            }],
+        ] {
+            let status = get(client, &ticket, refs).await.unwrap_err();
+            assert_eq!(status.code(), Code::NotFound, "{status:?}");
+        }
+        // The bytes do go out under their own path of another repo, whose
+        // ticket reaches them there... but no repo holds them as a file, so
+        // they never go out at all. The gitlink's bytes are of no repo.
+        let _ = root;
+    }
+}
+
+/// A seeded xorshift, so a failure repeats from the seed it prints.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// Every object that the ticket's walk can reach: the root tree at the
+/// empty path, each tree at its path, each file's blob at its path. The
+/// trees are decoded from the server's own reply, each checked against its
+/// ID. A gitlink ends the walk: nothing under it is reachable.
+async fn reachable(objects: &mut Objects, ticket: &[u8], root: &[u8]) -> Vec<ObjectRef> {
+    let mut found = Vec::new();
+    let mut level = vec![(Vec::new(), TreeId::try_from(root).unwrap())];
+    while let Some((path, id)) = level.pop() {
+        let got = get(
+            objects,
+            ticket,
+            vec![ObjectRef {
+                kind: ObjectKind::Tree.into(),
+                id: id.as_bytes().to_vec(),
+                path: path.clone(),
+            }],
+        )
+        .await
+        .unwrap_or_else(|status| panic!("the walk of the tree at {path:?}: {status:?}"));
+        found.push(ObjectRef {
+            kind: ObjectKind::Tree.into(),
+            id: id.as_bytes().to_vec(),
+            path: path.clone(),
+        });
+        let tree = Tree::decode(&got[0].1).unwrap();
+        for (name, entry) in tree.entries {
+            let mut below = path.clone();
+            if !below.is_empty() {
+                below.push(b'/');
+            }
+            below.extend_from_slice(name.as_bytes());
+            match entry {
+                Entry::Dir(id) => level.push((below, id)),
+                Entry::File(state) => {
+                    if let Some(blob) = state.blob() {
+                        found.push(ObjectRef {
+                            kind: ObjectKind::Blob.into(),
+                            id: blob.as_bytes().to_vec(),
+                            path: below,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// A ref is refused alone, on the server and on the cache.
+async fn refused(client: &mut Objects, ticket: &[u8], decoy: ObjectRef, where_: &str) {
+    let status = get(client, ticket, vec![decoy]).await.unwrap_err();
+    assert_eq!(status.code(), Code::NotFound, "{where_}: {status:?}");
+}
+
+/// Over repos that share blobs and a random pick of repo, changeset and
+/// decoys, a `GetObjects` call serves exactly what the ticket's walk
+/// reaches: every reached object goes out, every other object is refused,
+/// on the server and on the cache alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn whatever_is_served_is_reachable_from_the_ticket() {
+    let (tiers, _stop, _dir) = tiers().await;
+    let seed = 0x5EED_u64.wrapping_mul(1_700_000_009);
+    let mut rng = Rng(seed);
+
+    for round in 0..16 {
+        // A random read rule: whose ticket this round spends, main or side.
+        let (repo, cs) = if rng.below(2) == 0 {
+            ("main", tiers.main_cs)
+        } else {
+            ("side", tiers.side_cs)
+        };
+        let (ticket, root_id) = root(&mut tiers.server.clone(), repo, cs).await;
+        let reaches = reachable(&mut tiers.server.clone(), &ticket, &root_id).await;
+        assert!(!reaches.is_empty(), "seed {seed:#x} round {round}");
+
+        // Every reached object, in one call, is served with its bytes.
+        for client in [&mut tiers.server.clone(), &mut tiers.cache.clone()] {
+            let got = get(client, &ticket, reaches.clone()).await.unwrap();
+            assert_eq!(
+                got.len(),
+                reaches.len(),
+                "seed {seed:#x} round {round} {repo}"
+            );
+        }
+
+        // The gitlink's blob never goes out under the gitlink's path.
+        if repo == "main" {
+            let decoy = blob_ref(tiers.sub.as_bytes(), "sub");
+            refused(
+                &mut tiers.server.clone(),
+                &ticket,
+                decoy.clone(),
+                "gitlink as blob",
+            )
+            .await;
+            refused(&mut tiers.cache.clone(), &ticket, decoy, "gitlink as blob").await;
+        }
+        // A real object of the other repo, at its own path, and at a path
+        // of this repo: the walk reaches neither.
+        let foreign = if repo == "main" {
+            tiers.other
+        } else {
+            tiers.readme
+        };
+        let foreign_path = if repo == "main" {
+            "other.txt"
+        } else {
+            "README"
+        };
+        for decoy in [
+            blob_ref(foreign.as_bytes(), foreign_path),
+            blob_ref(foreign.as_bytes(), own_path(&mut rng)),
+        ] {
+            refused(
+                &mut tiers.server.clone(),
+                &ticket,
+                decoy.clone(),
+                "foreign object",
+            )
+            .await;
+            refused(&mut tiers.cache.clone(), &ticket, decoy, "foreign object").await;
+        }
+    }
+}
+
+/// A path that holds no object of this ticket's repo, picked by `rng`.
+fn own_path(rng: &mut Rng) -> &'static str {
+    let pick = rng.below(3);
+    match pick {
+        0 => "no/such/file",
+        1 => "src",
+        _ => "docs",
+    }
 }
