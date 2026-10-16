@@ -386,7 +386,11 @@ impl Objects for ObjectsService {
             .map_or(no_keys, |keys| keys.for_verify());
         let ticket =
             scion_proto::ticket::parse(&ticket, keys_for_verify, scion_proto::ticket::now())
-                .map_err(|why| Status::permission_denied(format!("bad ticket: {why}")))?;
+                .map_err(|why| {
+                    // The reason only: no ticket bytes, and no signature.
+                    tracing::warn!(reason = %why, "a GetObjects ticket was refused");
+                    Status::permission_denied(format!("bad ticket: {why}"))
+                })?;
         let refs = refs
             .into_iter()
             .map(|r| Ok((parse_ref(&r)?, r.path)))
