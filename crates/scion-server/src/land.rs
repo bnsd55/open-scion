@@ -79,8 +79,8 @@ const MAX_DEPTH: i64 = if cfg!(test) { 16 } else { PRUNE_EVERY };
 /// [`PathIndex`]. A land whose base is further back is rejected, and the
 /// client must rebase it. Tests use a walk longer than their other walks.
 // SHORTCUT: each land on an old base walks the history again, and holds the
-// database lock while it walks, so a client that lands on such bases makes
-// other requests wait. Ceiling: a base more than this far back is rejected.
+// write connection while it walks, so a client that lands on such bases makes
+// other writes wait. Ceiling: a base more than this far back is rejected.
 // Upgrade (issue #38): per-path history in the database, so the check reads
 // only the paths that the land changes.
 const MAX_WALK: usize = if cfg!(test) { 1000 } else { 100_000 };
@@ -179,7 +179,7 @@ pub struct Lands {
     /// `bytes`. At most [`MAX_INDEX_BYTES`].
     used: Arc<AtomicUsize>,
     /// Indexes that [`Lands::evict`] dropped. Their bytes are back in
-    /// `used`. A land frees them after its database lock and ref lock.
+    /// `used`. A land frees them after its write connection and ref lock.
     evicted: Mutex<Vec<PathIndex>>,
 }
 
@@ -768,7 +768,7 @@ impl PathIndex {
     /// to other history), if `head` is more than [`MAX_DEPTH`] changesets
     /// ahead, or if those changesets would not fit in [`MAX_INDEX_BYTES`].
     /// An index at the head is always correct, and a longer walk would hold
-    /// the database lock for little gain.
+    /// the write connection for little gain.
     fn advance_to(
         &mut self,
         lands: &Lands,

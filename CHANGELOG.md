@@ -107,6 +107,23 @@ release.
   unpacks within that size. A tier now fetches up to 64 objects at once
   from upstream instead of 4, within the same 400 MiB. A reply cut off in
   the middle of an object ends with `DEADLINE_EXCEEDED`.
+- The server, `scion-cache` and `scion-daemon` serve at most 128
+  connections at once (`--max-connections`), each with at most 256 open
+  streams (`--max-streams`). Before, both had no bound: tonic replaced
+  hyper's default of 200 streams with none. A client beyond either cap
+  waits, and a connection that waits logs a warning. Every connection
+  closes in time: 20 s after it gets its place if no HTTP/2 preface came;
+  after the preface, 20 s after an unanswered ping, which goes out after
+  60 s without a frame; and 10 min after a `GOAWAY` at 30 min of age, so a
+  daemon's lifelong connection to its cache gives its place up. So the
+  number of stalled replies has a bound, and a connection beyond the cap
+  waits at most 40 min. Size `--max-connections` on a cache for the
+  daemons behind it, and on the server for the caches and direct clients.
+- The server and `scion-cache` turn off Nagle's algorithm on each TCP
+  connection. It was on: tonic ignores its `tcp_nodelay` setting for a
+  listener that it does not open itself. So a small reply, such as a unary
+  answer or a status, could wait for the client's ACK, up to about 40 ms
+  where the client delays its ACKs.
 - The tier timeouts nest: the server and tiers wait 30 s for reply memory,
   a tier 30 s for a fetch slot and 30 s for fetch memory, the cache 60 s per
   step of the server, the daemon 180 s per step of the cache.
@@ -144,8 +161,8 @@ release.
   `DEADLINE_EXCEEDED` at 600 s or once its call is dropped. The merge-base
   walk jumps over runs of first parents that only one part of the walk
   reaches: a few dozen reads for a run, not one for each changeset. A walk
-  holds the database lock for about 1,000 reads at a time, then leaves it
-  free for other requests.
+  holds one read connection (below), so writes and other reads run beside
+  it.
 - `Diff` finds renames as `git diff` does by default: same content, then the
   one file of a name on each side at 75%, then the most similar files at
   50%. A rename keeps its two entries. The added one has `rename_from`, the
@@ -159,3 +176,7 @@ release.
 - `Blame` and `Diff` find renames with one implementation. Chunks now go to
   git's hash buckets, as in git, so a score can change where two different
   chunks share a bucket.
+- Reads use a pool of 8 read-only SQLite connections. A read no longer
+  waits for a write, for a long read such as a graph walk, or for a server
+  write that waits for an import's write lock. Writes still take turns
+  on one connection.

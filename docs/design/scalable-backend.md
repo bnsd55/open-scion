@@ -64,8 +64,8 @@ v0.1 is one `scion-server serve` process on one machine.
 | Part | Today (`main`) | Why it does not scale out |
 |---|---|---|
 | Metadata | One SQLite file, `<data>/scion.db` (`store.rs`). | It lives on one machine's disk. SQLite takes one writer at a time, and its file locks are not reliable on many network file systems. So other machines cannot share it. |
-| Write path | One connection behind a mutex (`Inner::db`). Write transactions use `BEGIN IMMEDIATE`. | Every read and write of every repo waits for one lock ([#17](https://github.com/bnsd55/open-scion/issues/17)). Throughput is that of one connection on one drive. |
-| Durability | Group commit: callers share one full drive flush (`GroupFlush`). A read waits if it saw a commit that no flush covers yet. | The counters that decide when to flush (`committed`, `flushed`) are in process memory. A commit by another process is not counted. |
+| Write path | One write connection behind a mutex (`Inner::db`), and 8 read-only connections. Write transactions use `BEGIN IMMEDIATE`. | Every write of every repo waits for one lock. Throughput is that of one connection on one drive. |
+| Durability | Group commit: callers share one full drive flush (`GroupFlush`). A read waits if it saw a commit that no flush covers yet. | The counters that decide when to flush (`committing`, `committed`, `flushed`) are in process memory. A commit by another process is not counted. |
 | Land lock | One mutex per (repo, ref) in `Lands::refs` (`land.rs`). | A second process does not see it. |
 | Path index | `PathIndex`: per ref, in memory, built on the first land and pruned in cycles of 10,000 generations. | Each process builds its own copy for each ref, and a restart loses it. A base more than `MAX_DEPTH` below the tip walks history on each land ([#38](https://github.com/bnsd55/open-scion/issues/38)). |
 | Blobs | One zstd file per blob in `<data>/objects/blob/` on the local disk. | Other machines cannot read them, and one drive holds the only copy. |
@@ -384,7 +384,8 @@ twice.
 
 **Cheaper than today.**
 
-- `PutBlob`, `CreateChangeset` and every read stop sharing one connection.
+- `PutBlob`, `CreateChangeset` and every read stop sharing the connections
+  of one process.
   They scale with the number of servers.
 - A restart loses nothing. Today the first land per ref after a restart
   rebuilds the path index.
