@@ -235,7 +235,7 @@ pub fn merge_bases(
 /// Whether `base`, of generation `base_gen`, is on the first-parent history
 /// of `tip`, `tip` included. `None` if `tip` has no node yet. Walks down
 /// that history to `base_gen`, so it reads O(log n) nodes. Unlike the
-/// queries above, it runs on the caller's connection, in one go.
+/// queries above, it runs on the caller's transaction, in one go.
 ///
 /// # Errors
 ///

@@ -1,8 +1,9 @@
 //! Snapshots: apply a changeset to a tree, look up paths, and derive the
 //! root tree of any changeset.
 //!
-//! Every function takes a `&Connection`. Callers that write pass a
-//! transaction, so all trees from one apply or derivation commit together.
+//! Every function takes a `&mut dyn MetaTx`. Callers that write pass the
+//! transaction of their write, so all trees from one apply or derivation
+//! commit together.
 
 use std::collections::BTreeMap;
 
