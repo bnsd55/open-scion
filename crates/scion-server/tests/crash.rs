@@ -635,7 +635,7 @@ fn check_lands(ledger: &Ledger, history: &HashMap<ChangesetId, (&str, Changeset)
                 assert_eq!(*target, sent.target, "{key}");
                 // The server may rebase, so only the parents may differ.
                 let mut want = sent.changeset.clone();
-                want.parents = landed.parents.clone();
+                want.parents.clone_from(&landed.parents);
                 assert_eq!(landed, &want, "{key}");
                 lands_on_refs += 1;
             }
