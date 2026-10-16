@@ -132,6 +132,7 @@ async fn server(store: &Store, access: Access, token: &str) -> (Stop, Scion, Obj
         listener,
         access,
         Limits::default(),
+        None,
         async {
             stopped.await.ok();
         },

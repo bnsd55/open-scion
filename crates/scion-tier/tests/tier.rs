@@ -13,6 +13,7 @@ use scion_core::{BlobId, Entry, FileState, PathElem, Tree};
 use scion_proto::CHUNK_BYTES;
 use scion_proto::listen::Limits;
 use scion_proto::object::{self, Assembler, Header};
+use scion_proto::tls::{ClientTls, ServerTls};
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::objects_server::{Objects, ObjectsServer};
 use scion_proto::v1::{
@@ -288,15 +289,17 @@ async fn get_in(
 /// A cache that waits at most `timeout` for `upstream`, and its address.
 async fn serve_cache(upstream: &str, timeout: Duration) -> (Tier<MemoryStore>, String) {
     let store = MemoryStore::new(16 << 20);
-    let cache = Tier::new(store, upstream, TOKEN, timeout).unwrap();
+    let cache = Tier::new(store, upstream, TOKEN, timeout, None).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let incoming = TcpListenerStream::new(listener);
-    tokio::spawn(
-        cache
-            .clone()
-            .serve(TOKEN, incoming, Limits::default(), std::future::pending()),
-    );
+    tokio::spawn(cache.clone().serve(
+        TOKEN,
+        incoming,
+        Limits::default(),
+        None,
+        std::future::pending(),
+    ));
     (cache, url)
 }
 
@@ -510,13 +513,15 @@ async fn each_tier_refuses_a_call_without_the_token() {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("daemon.sock");
     let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
-    let daemon = Tier::new(store, &cache_url, TOKEN, CACHE_UPSTREAM_TIMEOUT).unwrap();
+    let daemon = Tier::new(store, &cache_url, TOKEN, CACHE_UPSTREAM_TIMEOUT, None).unwrap();
     let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
-    tokio::spawn(
-        daemon
-            .clone()
-            .serve(TOKEN, incoming, Limits::default(), std::future::pending()),
-    );
+    tokio::spawn(daemon.clone().serve(
+        TOKEN,
+        incoming,
+        Limits::default(),
+        None,
+        std::future::pending(),
+    ));
 
     // Only this user can connect to the daemon, and only one daemon listens.
     let mode = std::fs::metadata(&socket).unwrap().permissions().mode();
@@ -739,4 +744,254 @@ async fn a_call_level_failure_is_the_status_of_a_call_never_an_error_in_its_stre
     assert_eq!(first.unwrap(), vec![kept]);
     let status = get_in(&mut client, &[&other]).await.unwrap_err();
     assert_eq!(status.code(), Code::NotFound, "{status:?}");
+}
+
+// The certificates here and in scion-proto's listen tests are separate, so
+// each crate's tests stand alone.
+
+/// A leaf certificate and its key, both PEM files in a temp directory.
+struct TestCert {
+    cert: std::path::PathBuf,
+    key: std::path::PathBuf,
+}
+
+/// A certificate authority for one test: it signs the server and client
+/// certificates, and its own certificate is what a peer trusts.
+struct TestAuthority {
+    dir: tempfile::TempDir,
+    ca: TestCert,
+    key: rcgen::KeyPair,
+    params: rcgen::CertificateParams,
+}
+
+impl TestAuthority {
+    /// A CA with no name that a test needs.
+    fn new(name: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let ca = write_pem(
+            &dir,
+            &format!("{name}-ca"),
+            &cert.pem(),
+            &key.serialize_pem(),
+        );
+        Self {
+            dir,
+            ca,
+            key,
+            params,
+        }
+    }
+
+    /// Signs a leaf for `names`, used as `purpose`.
+    fn sign(
+        &self,
+        name: &str,
+        names: &[&str],
+        purpose: rcgen::ExtendedKeyUsagePurpose,
+    ) -> TestCert {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(
+            names
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        params.extended_key_usages = vec![purpose];
+        let issuer = rcgen::Issuer::from_params(&self.params, &self.key);
+        let cert = params.signed_by(&key, &issuer).unwrap();
+        write_pem(&self.dir, name, &cert.pem(), &key.serialize_pem())
+    }
+}
+
+/// Writes a certificate and its key into `dir`, as `name.pem` and
+/// `name.key`.
+fn write_pem(dir: &tempfile::TempDir, name: &str, cert: &str, key: &str) -> TestCert {
+    let cert_path = dir.path().join(format!("{name}.pem"));
+    std::fs::write(&cert_path, cert).unwrap();
+    let key_path = dir.path().join(format!("{name}.key"));
+    std::fs::write(&key_path, key).unwrap();
+    TestCert {
+        cert: cert_path,
+        key: key_path,
+    }
+}
+
+/// The certificates of one test: an authority, its server and client
+/// certificates, and a second authority with a client certificate of its
+/// own, so a test can trust or present the wrong one.
+struct TestCerts {
+    authority: TestAuthority,
+    server: TestCert,
+    client: TestCert,
+    /// Kept for its temp directory, which holds the client certificate's
+    /// files.
+    _stranger: TestAuthority,
+    stranger_client: TestCert,
+}
+
+fn test_certs() -> TestCerts {
+    let authority = TestAuthority::new("main");
+    let server = authority.sign(
+        "server",
+        &["localhost", "127.0.0.1"],
+        rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+    );
+    let client = authority.sign(
+        "client",
+        &["client"],
+        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+    );
+    let stranger = TestAuthority::new("stranger");
+    let stranger_client = stranger.sign(
+        "stranger-client",
+        &["client"],
+        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+    );
+    TestCerts {
+        authority,
+        server,
+        client,
+        _stranger: stranger,
+        stranger_client,
+    }
+}
+
+/// A cache that serves `https://` with the certificate of `certs`, and, with
+/// `client_ca`, requires a client certificate that CA signed. Its https
+/// address.
+async fn serve_tls_cache(
+    upstream: &str,
+    certs: &TestCerts,
+    client_ca: Option<&TestCert>,
+) -> String {
+    let tls = ServerTls::load(
+        &certs.server.cert,
+        &certs.server.key,
+        client_ca.map(|ca| ca.cert.as_path()),
+    )
+    .unwrap();
+    let cache = Tier::new(
+        MemoryStore::new(16 << 20),
+        upstream,
+        TOKEN,
+        CACHE_UPSTREAM_TIMEOUT,
+        None,
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("https://{}", listener.local_addr().unwrap());
+    tokio::spawn(cache.serve(
+        TOKEN,
+        TcpListenerStream::new(listener),
+        Limits::default(),
+        Some(tls),
+        std::future::pending(),
+    ));
+    url
+}
+
+/// A daemon whose upstream is `cache_url`, trusting `ca` and presenting
+/// `client` (a client certificate) for mTLS, on a private Unix socket. Its
+/// `unix://` address, and the directory that keeps the socket alive. `client`
+/// is `None` for a daemon without one.
+async fn serve_daemon(
+    cache_url: &str,
+    ca: Option<&TestCert>,
+    client: Option<&TestCert>,
+) -> (String, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
+    let client_tls = ClientTls::load(
+        ca.map(|ca| ca.cert.as_path()),
+        client.map(|c| c.cert.as_path()),
+        client.map(|c| c.key.as_path()),
+    )
+    .unwrap();
+    let daemon = Tier::new(
+        store,
+        cache_url,
+        TOKEN,
+        CACHE_UPSTREAM_TIMEOUT,
+        Some(&client_tls),
+    )
+    .unwrap();
+    let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
+    tokio::spawn(daemon.serve(
+        TOKEN,
+        incoming,
+        Limits::default(),
+        None,
+        std::future::pending(),
+    ));
+    (format!("unix://{}", socket.display()), dir)
+}
+
+/// A daemon fetches its miss from an mTLS cache over https, with the client
+/// certificate that the cache's CA signed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_fetches_from_an_mtls_cache_over_https() {
+    let object = blob(b"fetched through mutual TLS\n");
+    let fake = Fake::new(&[&object], Duration::ZERO);
+    let upstream = serve_fake(fake.clone()).await;
+    let certs = test_certs();
+    let cache_url = serve_tls_cache(&upstream, &certs, Some(&certs.authority.ca)).await;
+    let (daemon_url, _dir) =
+        serve_daemon(&cache_url, Some(&certs.authority.ca), Some(&certs.client)).await;
+    let mut client = connect(&daemon_url, Some(TOKEN)).await;
+    assert_eq!(get(&mut client, &[&object]).await.unwrap(), vec![object]);
+}
+
+/// A daemon without a client certificate fetches nothing from an mTLS cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_without_a_client_certificate_is_refused() {
+    let object = blob(b"never fetched\n");
+    let fake = Fake::new(&[&object], Duration::ZERO);
+    let upstream = serve_fake(fake.clone()).await;
+    let certs = test_certs();
+    let cache_url = serve_tls_cache(&upstream, &certs, Some(&certs.authority.ca)).await;
+    let (daemon_url, _dir) = serve_daemon(&cache_url, Some(&certs.authority.ca), None).await;
+    let mut client = connect(&daemon_url, Some(TOKEN)).await;
+    assert!(get(&mut client, &[&object]).await.is_err());
+}
+
+/// A daemon whose client certificate another CA signed fetches nothing from
+/// an mTLS cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_with_a_certificate_of_another_ca_is_refused() {
+    let object = blob(b"never fetched either\n");
+    let fake = Fake::new(&[&object], Duration::ZERO);
+    let upstream = serve_fake(fake.clone()).await;
+    let certs = test_certs();
+    let cache_url = serve_tls_cache(&upstream, &certs, Some(&certs.authority.ca)).await;
+    let (daemon_url, _dir) = serve_daemon(
+        &cache_url,
+        Some(&certs.authority.ca),
+        Some(&certs.stranger_client),
+    )
+    .await;
+    let mut client = connect(&daemon_url, Some(TOKEN)).await;
+    assert!(get(&mut client, &[&object]).await.is_err());
+}
+
+/// An https upstream without a CA to trust is refused when the tier is
+/// built, not on its first call.
+#[tokio::test]
+async fn an_https_upstream_needs_a_ca() {
+    let store = MemoryStore::new(1 << 20);
+    let tier = Tier::new(
+        store,
+        "https://127.0.0.1:1",
+        TOKEN,
+        CACHE_UPSTREAM_TIMEOUT,
+        None,
+    );
+    assert!(tier.is_err());
 }

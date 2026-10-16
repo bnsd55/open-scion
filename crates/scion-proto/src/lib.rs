@@ -3,7 +3,8 @@
 //! fields ([`check`]), how a caller's deadline passes down ([`deadline`]), how
 //! one object travels in parts and encodings ([`object`]), how a
 //! `GetObjects` reply streams objects ([`reply`]), and how many connections
-//! and streams a process serves ([`listen`]).
+//! and streams a process serves ([`listen`]), and TLS for those connections
+//! ([`tls`]).
 
 pub mod auth;
 pub mod check;
@@ -12,6 +13,7 @@ pub mod listen;
 pub mod object;
 pub mod reply;
 pub mod ticket;
+pub mod tls;
 
 /// The buffer type of `ObjectPart.data`: parts of one object are slices of one
 /// buffer.

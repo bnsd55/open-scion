@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use scion_core::{BlobId, Changeset, ChangesetId, RepoPath};
 use scion_proto::auth::{Bearer, check_ancestors};
+use scion_proto::tls::ClientTls;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ResolveRefRequest};
@@ -61,7 +62,13 @@ pub struct Ctx {
 impl Ctx {
     /// Connects to `server`: `http://HOST:PORT`, or `unix:///PATH` for a
     /// daemon on this node.
-    pub async fn connect(server: &str, token: &str, repo: String, json: bool) -> Result<Self> {
+    pub async fn connect(
+        server: &str,
+        token: &str,
+        ca: Option<&Path>,
+        repo: String,
+        json: bool,
+    ) -> Result<Self> {
         let mut address = server.to_owned();
         if let Some(socket) = server
             .strip_prefix("unix://")
@@ -73,10 +80,13 @@ impl Ctx {
             address = format!("unix://{socket}");
         }
         // `Endpoint` reads `unix:` addresses too, unlike `Channel::from_shared`.
+        let endpoint = Endpoint::from_shared(address).context("bad server address")?;
+        let endpoint = ClientTls::load(ca, None, None)
+            .and_then(|tls| tls.apply_to(server, endpoint))
+            .with_context(|| format!("cannot trust the certificate of {server}"))?;
         // A server at its connection cap leaves a new connection unread, so
         // a call also has a limit here, until its reply starts.
-        let channel = Endpoint::from_shared(address)
-            .context("bad server address")?
+        let channel = endpoint
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(CALL_TIMEOUT)
             .connect()
@@ -282,7 +292,7 @@ mod tests {
         let resolved = fs::canonicalize(&real).unwrap().join("daemon.sock");
         assert_eq!(check_socket(&path, owner).unwrap(), resolved);
         let server = format!("unix://{}", path.display());
-        Ctx::connect(&server, "token", "r".into(), false)
+        Ctx::connect(&server, "token", None, "r".into(), false)
             .await
             .unwrap();
     }
