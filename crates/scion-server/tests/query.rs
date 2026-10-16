@@ -2,7 +2,7 @@
 //! the test, and their bounds.
 #![cfg(unix)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
@@ -1164,9 +1164,10 @@ fn queries_check_the_repo_and_the_changesets() {
 
 /// Section 9 of `docs/architecture.md` lists the deliberate shortcuts, and
 /// the code marks each one with a `SHORTCUT` marker. This pins the table to
-/// the code: a row names files, and every file a row names has a marker,
-/// and every file with a marker is named by a row. So a PR that removes a
-/// shortcut, or adds one, must update the table. The markers are counted in
+/// the code: a row names files, and for every file the rows that name it
+/// are as many as its markers, one row per marker. A row that names two
+/// files counts once for each. So a PR that removes or adds a shortcut, or
+/// one of its markers, must update the table. The markers are counted in
 /// the sources of the crates (`src`), not in their tests.
 #[test]
 fn the_shortcut_table_matches_the_markers() {
@@ -1204,8 +1205,8 @@ fn the_shortcut_table_matches_the_markers() {
     }
     assert!(!rows.is_empty(), "the table has rows");
 
-    // Every file under `crates/` that carries a `SHORTCUT:` marker.
-    let mut marked: Vec<String> = Vec::new();
+    // Every file under `crates/` with markers, and how many it has.
+    let mut marked: HashMap<String, usize> = HashMap::new();
     let mut stack = vec![root.join("crates")];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).unwrap() {
@@ -1216,34 +1217,45 @@ fn the_shortcut_table_matches_the_markers() {
                 && !path.components().any(|part| part.as_os_str() == "tests")
             {
                 let text = fs::read_to_string(&path).unwrap();
-                if text.lines().any(|line| line.contains("SHORTCUT:")) {
+                let markers = text
+                    .lines()
+                    .filter(|line| line.contains("SHORTCUT:"))
+                    .count();
+                if markers > 0 {
                     let rel = path
                         .strip_prefix(root.join("crates"))
                         .unwrap()
                         .to_str()
                         .unwrap()
-                        .replace('\\', "/");
-                    marked.push(rel);
+                        .to_owned();
+                    marked.insert(rel, markers);
                 }
             }
         }
     }
     assert!(!marked.is_empty(), "the code has markers");
 
-    for (line, named) in &rows {
+    for (_, named) in &rows {
         for file in named {
-            let text = fs::read_to_string(root.join("crates").join(file))
+            fs::read_to_string(root.join("crates").join(file))
                 .unwrap_or_else(|_| panic!("{file} does not exist, but the table lists it"));
-            assert!(
-                text.lines().any(|marker| marker.contains("SHORTCUT:")),
-                "{file} has no `SHORTCUT:` marker, but the table lists it: {line}"
-            );
         }
     }
-    for file in &marked {
-        assert!(
-            rows.iter().any(|(_, named)| named.contains(file)),
-            "{file} has a `SHORTCUT:` marker, but no row of the table names it"
+    // Every file with markers, and every file a row names, once per marker
+    // and once per row that names it.
+    let mut named: HashMap<String, usize> = HashMap::new();
+    for (_, files) in &rows {
+        for file in files {
+            *named.entry(file.clone()).or_insert(0) += 1;
+        }
+    }
+    let files: HashSet<String> = marked.keys().chain(named.keys()).cloned().collect();
+    for file in &files {
+        let markers = marked.get(file).copied().unwrap_or(0);
+        let rows = named.get(file).copied().unwrap_or(0);
+        assert_eq!(
+            markers, rows,
+            "{file}: {markers} `SHORTCUT:` markers, but {rows} rows of the table name it"
         );
     }
 }
