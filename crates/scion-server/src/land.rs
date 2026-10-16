@@ -171,6 +171,9 @@ type RefSlot = Arc<Mutex<Option<PathIndex>>>;
 
 /// Serializes lands per ref and keeps each ref's [`PathIndex`].
 pub struct Lands {
+    /// The most pending lands one principal may hold at once. `None` turns
+    /// the check off.
+    pending_limit: Option<usize>,
     /// The slot of each ref that holds a path index or that a land uses,
     /// the least recently landed on first. [`Lands::evict`] removes the
     /// others.
@@ -185,15 +188,95 @@ pub struct Lands {
 
 impl Default for Lands {
     fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl Lands {
+    /// Limits each principal to `pending_limit` lands pending at once;
+    /// `None` turns the check off.
+    #[must_use]
+    pub fn new(pending_limit: Option<usize>) -> Self {
         Self {
+            pending_limit,
             refs: Mutex::new(LruCache::new_unbounded()),
             used: Arc::default(),
             evicted: Mutex::default(),
         }
     }
-}
 
-impl Lands {
+    /// Rejects every land that has been pending for more than `stale_secs`,
+    /// with a detail that tells the client to retry with a new key.
+    ///
+    /// A retry with the same key can still finish a pending land: the land
+    /// path takes the lock of the ref and runs the plan again. So each check
+    /// here holds the same per-ref lock first, and re-reads the row while it
+    /// holds it: a retry that is finishing the land wins, and the sweep sees
+    /// the row is no longer pending. A row this stale that no call holds is
+    /// beyond any deadline (600 s), so no live call can finish it.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    /// Rejects every pending land that started more than `stale_secs` ago,
+    /// and reports how many. The detail of a rejected land says why.
+    ///
+    /// A pending land can always be finished by a retry with its key: the
+    /// land path takes the lock of the ref and runs the plan again. So this
+    /// takes the same lock first, and only rejects a row that is still
+    /// pending under it. A row rejected here has no live call: the 600 s
+    /// call limit ended long before, and a retry that had the lock would
+    /// have finished the land.
+    pub fn sweep_stale(&self, store: &Store, stale_secs: i64) -> Result<u64> {
+        let stale = store.read(|c| {
+            let mut stmt = c.prepare_cached(
+                "SELECT repo_id, land_id, target_ref FROM lands
+                 WHERE state = 'pending' AND created_at > 0
+                     AND created_at < unixepoch() - ?1",
+            )?;
+            let rows = stmt
+                .query_map(params![stale_secs], |row| {
+                    Ok((RepoId(row.get(0)?), row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        let mut rejected = 0;
+        for (repo, land_id, target_ref) in stale {
+            // The same per-ref lock that the land path holds, so a retry
+            // that is finishing this land wins the race: the sweep then
+            // finds the row no longer pending, and leaves it alone.
+            let slot = self.slot(repo, &target_ref);
+            let index = slot.lock().unwrap_or_else(PoisonError::into_inner);
+            let changed = store.write(|c| {
+                let still_pending = c
+                    .prepare_cached("SELECT 1 FROM lands WHERE land_id = ?1 AND state = 'pending'")?
+                    .exists(params![land_id])?;
+                if !still_pending {
+                    return Ok(0u64);
+                }
+                let detail = format!(
+                    "stale: pending for more than {stale_secs} s, so the server stopped \
+                     before it finished; retry with a new request key"
+                );
+                let changed = c
+                    .prepare_cached(
+                        "UPDATE lands SET state = 'rejected', detail = ?1, finished_at = unixepoch()
+                         WHERE land_id = ?2 AND state = 'pending'",
+                    )?
+                    .execute(params![detail])?;
+                Ok(u64::try_from(changed).unwrap_or(0))
+            })?;
+            drop(index);
+            // The index is unaffected: the sweep moves no ref.
+            rejected += changed;
+            if changed == 1 {
+                tracing::info!(land_id, "rejected a stale pending land");
+            }
+        }
+        Ok(rejected)
+    }
+
     /// Lands a changeset. A conflict or rejection is an outcome, not an error.
     ///
     /// # Errors
@@ -227,7 +310,7 @@ impl Lands {
     ) -> Result<LandOutcome> {
         check_name("target_ref", &req.target_ref)?;
         check_name("request_key", &req.request_key)?;
-        let (repo, recorded) = store.commit(|c| record(c, caller, req))?;
+        let (repo, recorded) = store.commit(|c| record(c, caller, req, self.pending_limit))?;
         if recorded.state != LandState::Pending {
             return Ok(recorded);
         }
@@ -396,7 +479,12 @@ fn check_name(what: &str, value: &str) -> Result<()> {
 /// Inserts a land, or finds the land for the same request key. A land to a
 /// ref that does not exist is recorded as rejected at once, so only real refs
 /// ever get a lock slot in [`Lands`]. A new land also expires old ones.
-fn record(c: &Connection, caller: &Caller, req: &LandRequest) -> Result<(RepoId, LandOutcome)> {
+fn record(
+    c: &Connection,
+    caller: &Caller,
+    req: &LandRequest,
+    pending_limit: Option<usize>,
+) -> Result<(RepoId, LandOutcome)> {
     let repo = db::repo_id(c, &req.repo)?;
     db::generation(c, repo, req.changeset)?;
     let existing = c
@@ -428,11 +516,28 @@ fn record(c: &Connection, caller: &Caller, req: &LandRequest) -> Result<(RepoId,
             let detail = format!("ref {:?} does not exist", req.target_ref);
             (LandState::Rejected, detail)
         };
+        if let Some(limit) = pending_limit {
+            // The pending-lands quota counts new pending rows. A retry of an
+            // existing key resumes its land and adds no row, so a client can
+            // always finish what it started.
+            let pending = c
+                .prepare_cached(
+                    "SELECT count(*) FROM lands WHERE caller = ?1 AND state = 'pending'",
+                )?
+                .query_row([caller.0.as_str()], |row| row.get::<_, i64>(0))?;
+            if pending >= i64::try_from(limit).unwrap_or(i64::MAX) {
+                return Err(Error::ResourceExhausted(format!(
+                    "principal {:?} has its {limit} lands pending \
+                     (--max-principal-pending-lands {limit}); wait for one to finish",
+                    caller.0
+                )));
+            }
+        }
         c.prepare_cached(
             "INSERT INTO lands
-                 (repo_id, caller, request_key, target_ref, input_cs, state, detail, finished_at)
+                 (repo_id, caller, request_key, target_ref, input_cs, state, detail, finished_at, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                 CASE ?6 WHEN 'pending' THEN NULL ELSE unixepoch() END)",
+                 CASE ?6 WHEN 'pending' THEN NULL ELSE unixepoch() END, unixepoch())",
         )?
         .execute(params![
             repo.0,
@@ -1544,7 +1649,7 @@ mod tests {
             let req = req(cs, "k");
 
             // The first attempt runs the steps of `Lands::land` by hand.
-            let (repo, recorded) = f.store.write(|c| record(c, &caller(), &req)).unwrap();
+            let (repo, recorded) = f.store.write(|c| record(c, &caller(), &req, None)).unwrap();
             assert_eq!(recorded.state, LandState::Pending);
             if crash != Crash::AfterRecord {
                 let mut index = None;
@@ -2311,7 +2416,7 @@ mod tests {
         let cs = f.commit(f.root, &[put("b/y", "pending")]);
         let (_, pending) = f
             .store
-            .write(|c| record(c, &caller(), &req(cs, "pending")))
+            .write(|c| record(c, &caller(), &req(cs, "pending"), None))
             .unwrap();
         assert_eq!(pending.state, Pending);
         assert!(f.gone(&landed) && f.gone(&conflict));

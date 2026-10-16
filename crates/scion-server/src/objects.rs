@@ -23,6 +23,7 @@ use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 
 use crate::access::Access;
+use crate::quotas::Quotas;
 use crate::error::{Error, Result};
 use crate::service::{Worker, caller, check_reader, parse_id, resolve_ref};
 use crate::store::{self, Store};
@@ -63,15 +64,18 @@ impl Plan {
 pub struct ObjectsService {
     worker: Worker,
     access: Arc<Access>,
+    /// What one principal may hold at once.
+    quotas: Quotas,
     /// `IN_FLIGHT_BYTES` permits, one per object byte, shared by all replies.
     in_flight: Arc<Semaphore>,
 }
 
 impl ObjectsService {
-    pub(crate) fn new(worker: Worker, access: Arc<Access>) -> Self {
+    pub(crate) fn new(worker: Worker, access: Arc<Access>, quotas: Quotas) -> Self {
         Self {
             worker,
             access,
+            quotas,
             in_flight: Arc::new(Semaphore::new(IN_FLIGHT_BYTES)),
         }
     }
@@ -269,7 +273,7 @@ impl Objects for ObjectsService {
         &self,
         request: Request<ResolveRefRequest>,
     ) -> Result<Response<ResolveRefResponse>, Status> {
-        resolve_ref(&self.worker, &self.access, request)
+        resolve_ref(&self.worker, &self.access, &self.quotas, request)
             .await
             .map(Response::new)
     }
@@ -279,6 +283,7 @@ impl Objects for ObjectsService {
         request: Request<GetRootTreeRequest>,
     ) -> Result<Response<GetRootTreeResponse>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let GetRootTreeRequest { repo, changeset_id } = request.into_inner();
         check_reader(&self.access, &caller, &repo)?;
         let cs = parse_id(&changeset_id, "changeset_id")?;
@@ -298,6 +303,7 @@ impl Objects for ObjectsService {
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<Self::GetObjectsStream>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let GetObjectsRequest { repo, refs, accept } = request.into_inner();
         check_reader(&self.access, &caller, &repo)?;
         scion_proto::check::object_count(refs.len())?;

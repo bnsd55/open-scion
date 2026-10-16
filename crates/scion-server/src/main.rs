@@ -11,6 +11,7 @@ use scion_proto::listen::{self, Limits};
 use scion_server::derived::{self, Kind};
 use scion_server::graph::CommitGraph;
 use scion_server::import::{ImportOptions, import_git};
+use scion_server::quotas::Quotas;
 use scion_server::tree::RootTree;
 use scion_server::{Error, Store, db, read, service};
 use tracing_subscriber::EnvFilter;
@@ -34,7 +35,9 @@ enum Command {
         listen: SocketAddr,
         /// Bearer token that clients must send. Its principal, `default`,
         /// may read and write every repo. Give `--token` or `--access`, not
-        /// both.
+        /// both. With this, the per-principal quotas are off unless a flag
+        /// sets one: every client is the same principal, so a cap would be
+        /// a global one.
         #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
         token: Option<String>,
         /// Access file: tokens with principals, and which repos and paths
@@ -42,6 +45,24 @@ enum Command {
         /// not both.
         #[arg(long, value_name = "FILE")]
         access: Option<PathBuf>,
+        /// Most requests one principal may hold at once. With `--access`
+        /// the default is 64; with `--token` the check is off.
+        #[arg(long)]
+        max_principal_requests: Option<usize>,
+        /// Most upload bytes one principal may hold in flight. With
+        /// `--access` the default is 536870912 (512 MiB); with `--token`
+        /// the check is off.
+        #[arg(long, value_name = "BYTES")]
+        max_principal_upload_bytes: Option<usize>,
+        /// Most pending lands one principal may hold at once. With
+        /// `--access` the default is 64; with `--token` the check is off.
+        #[arg(long)]
+        max_principal_pending_lands: Option<usize>,
+        /// A land that has been pending for longer than this many seconds is
+        /// rejected by the sweep, so a restart cannot leave one pending
+        /// forever. The default is 86400 (24 hours).
+        #[arg(long, default_value_t = 24 * 60 * 60)]
+        land_stale_secs: i64,
         /// Allow a non-loopback address. Traffic, including the token, is not
         /// encrypted, so use this only on a trusted network.
         #[arg(long)]
@@ -130,8 +151,24 @@ async fn main() -> anyhow::Result<()> {
             insecure_listen,
             max_connections,
             max_streams,
+            max_principal_requests,
+            max_principal_upload_bytes,
+            max_principal_pending_lands,
+            land_stale_secs,
         } => {
-            let access = load_access(token, access)?;
+            // The second reply says whether the mode is one token: with one
+            // principal, a per-principal cap is a global one, so the quotas
+            // are off unless a flag sets one.
+            let (access, single) = load_access(token, access)?;
+            let with_default = |flag: Option<usize>, default: usize| match single {
+                true => flag,
+                false => Some(flag.unwrap_or(default)),
+            };
+            let quotas = Quotas::new(
+                with_default(max_principal_requests, 64),
+                with_default(max_principal_upload_bytes, 512 << 20),
+            );
+            let pending_lands = with_default(max_principal_pending_lands, 64);
             // SHORTCUT: no TLS. Upgrade: tonic TLS or mTLS before any
             // deployment beyond one machine.
             anyhow::ensure!(
@@ -149,9 +186,18 @@ async fn main() -> anyhow::Result<()> {
                 connections: max_connections,
                 streams: max_streams,
             };
-            service::serve(store, listener, access, limits, async {
-                tokio::signal::ctrl_c().await.ok();
-            })
+            service::serve(
+                store,
+                listener,
+                access,
+                limits,
+                quotas,
+                pending_lands,
+                land_stale_secs,
+                async {
+                    tokio::signal::ctrl_c().await.ok();
+                },
+            )
             .await?;
         }
         Command::HashToken { .. } => unreachable!("handled before the store opens"),
@@ -207,18 +253,19 @@ async fn main() -> anyhow::Result<()> {
 fn load_access(
     token: Option<String>,
     file: Option<PathBuf>,
-) -> anyhow::Result<scion_server::access::Access> {
+) -> anyhow::Result<(scion_server::access::Access, bool)> {
     match (token, file) {
         (Some(_), Some(_)) => anyhow::bail!("give --token or --access, not both"),
         (Some(token), None) => {
             anyhow::ensure!(!token.is_empty(), "--token must not be empty");
-            Ok(scion_server::access::Access::single(&token))
+            Ok((scion_server::access::Access::single(&token), true))
         }
         (None, Some(file)) => {
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("cannot read {}", file.display()))?;
-            scion_server::access::Access::parse(&text)
-                .map_err(|why| anyhow::anyhow!("bad access file {}: {why}", file.display()))
+            let access = scion_server::access::Access::parse(&text)
+                .map_err(|why| anyhow::anyhow!("bad access file {}: {why}", file.display()))?;
+            Ok((access, false))
         }
         (None, None) => anyhow::bail!("give --token or --access"),
     }

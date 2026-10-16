@@ -132,6 +132,9 @@ async fn server(store: &Store, access: Access, token: &str) -> (Stop, Scion, Obj
         listener,
         access,
         Limits::default(),
+        scion_server::quotas::Quotas::off(),
+        None,
+        i64::MAX,
         async {
             stopped.await.ok();
         },

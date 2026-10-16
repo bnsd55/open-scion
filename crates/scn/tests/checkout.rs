@@ -120,6 +120,9 @@ impl Server {
             listener,
             TOKEN,
             Limits::default(),
+            scion_server::quotas::Quotas::off(),
+            None,
+            1 << 40,
             std::future::pending(),
         ));
         Self {

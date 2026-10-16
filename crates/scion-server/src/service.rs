@@ -19,7 +19,7 @@ use scion_proto::v1::{
 };
 use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES};
 use tokio::net::TcpListener;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
@@ -33,6 +33,7 @@ use crate::deadline::Deadline;
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
 use crate::objects::ObjectsService;
+use crate::quotas::Quotas;
 use crate::store::{MAX_OBJECT_BYTES, READER_BYTES, Store};
 use crate::{blame, db, names, read, write};
 
@@ -69,6 +70,30 @@ const READ_BUDGET_BYTES: usize = 256 << 20;
 /// budget (`scion_proto::listen`).
 const READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How often the stale-land sweep runs after the first one.
+const SWEEP_PERIOD: Duration = Duration::from_secs(60 * 60);
+
+/// Runs the stale-land sweep at once, then once per [`SWEEP_PERIOD`], until
+/// `stop` resolves. The first sweep settles what a restart left pending
+/// before the first client asks.
+async fn sweeps(worker: Worker, lands: Arc<Lands>, stale_secs: i64, mut stop: watch::Receiver<()>) {
+    loop {
+        let (lands, store) = (Arc::clone(&lands), worker.store());
+        let rejected =
+            tokio::task::spawn_blocking(move || lands.sweep_stale(&store, stale_secs)).await;
+        match rejected {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => tracing::info!(rejected = n, "rejected stale pending lands"),
+            Ok(Err(e)) => tracing::warn!(error = %e, "the stale-land sweep failed"),
+            Err(e) => tracing::warn!(error = %e, "the stale-land sweep task failed"),
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(SWEEP_PERIOD) => {}
+            _ = stop.changed() => break,
+        }
+    }
+}
+
 // A connection that is asked to close keeps its calls for at least as long
 // as the longest call takes.
 const _: () = assert!(REQUEST_TIMEOUT.as_secs() <= listen::CONNECTION_GRACE.as_secs());
@@ -79,7 +104,10 @@ const _: () = assert!(READ_BUDGET_BYTES <= u32::MAX as usize);
 
 /// Serves the API on `listener` within `limits`, until `shutdown` resolves,
 /// to the tokens and with the rules of `access`: an [`Access`], or one token
-/// (`&str`) that may do everything.
+/// (`&str`) that may do everything. `quotas` bounds what one principal may
+/// hold at once, and each principal at most `pending_lands` lands pending.
+/// A land that has been pending for longer than `land_stale_secs` is
+/// rejected by the sweep that runs at start and then once per hour.
 ///
 /// # Errors
 ///
@@ -89,16 +117,38 @@ pub async fn serve(
     listener: TcpListener,
     access: impl Into<Access>,
     limits: Limits,
-    shutdown: impl Future<Output = ()>,
+    quotas: Quotas,
+    pending_lands: Option<usize>,
+    land_stale_secs: i64,
+    shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
     let access = Arc::new(access.into());
     let auth = access.auth();
     let worker = Worker::new(store);
+    let lands = Arc::new(Lands::new(pending_lands));
+    // The sweep stops when the server does: the shutdown future resolves,
+    // the watch says so, and the loop breaks.
+    // The sweep stops when the server does: the shutdown future resolves,
+    // the watch says so, and the loop breaks. The same watch ends the
+    // server itself.
+    let (stop_tx, stop_rx) = watch::channel(());
+    tokio::spawn(async move {
+        shutdown.await;
+        let _ = stop_tx.send(());
+    });
+    let shutdown = {
+        let mut stopped = stop_rx.clone();
+        async move {
+            let _ = stopped.changed().await;
+        }
+    };
+    tokio::spawn(sweeps(worker.clone(), Arc::clone(&lands), land_stale_secs, stop_rx));
     let scion = InterceptedService::new(
-        ScionService::new(worker.clone(), Arc::clone(&access)).into_server(),
+        ScionService::new(worker.clone(), Arc::clone(&access), lands, quotas.clone()).into_server(),
         auth.clone(),
     );
-    let objects = InterceptedService::new(ObjectsService::new(worker, access).into_server(), auth);
+    let objects =
+        InterceptedService::new(ObjectsService::new(worker, access, quotas).into_server(), auth);
     let router = |server: Server| {
         server
             .timeout(REQUEST_TIMEOUT)
@@ -113,6 +163,8 @@ pub struct ScionService {
     worker: Worker,
     access: Arc<Access>,
     lands: Arc<Lands>,
+    /// What one principal may hold at once.
+    quotas: Quotas,
     /// Bounds uploads read at once (`MAX_UPLOADS`): their messages in memory
     /// and their spool files in `tmp/`.
     uploads: Arc<Semaphore>,
@@ -128,11 +180,12 @@ pub struct ScionService {
 }
 
 impl ScionService {
-    fn new(worker: Worker, access: Arc<Access>) -> Self {
+    fn new(worker: Worker, access: Arc<Access>, lands: Arc<Lands>, quotas: Quotas) -> Self {
         Self {
             worker,
             access,
-            lands: Arc::default(),
+            lands,
+            quotas,
             uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
             blames: Arc::new(Semaphore::new(MAX_BLAMES)),
             graph_queries: Arc::new(Semaphore::new(MAX_GRAPH_QUERIES)),
@@ -192,6 +245,12 @@ impl Worker {
         }
     }
 
+    /// A handle to the store, for work outside the permit queue, such as the
+    /// stale-land sweep.
+    pub(crate) fn store(&self) -> Store {
+        self.store.clone()
+    }
+
     /// Runs `f` on a blocking thread once a permit is free.
     pub(crate) async fn run<T, F>(&self, f: F) -> Result<T, Status>
     where
@@ -234,10 +293,14 @@ pub(crate) fn check_reader(access: &Access, caller: &Caller, repo: &str) -> Resu
 pub(crate) async fn resolve_ref(
     worker: &Worker,
     access: &Access,
+    quotas: &Quotas,
     request: Request<ResolveRefRequest>,
 ) -> Result<ResolveRefResponse, Status> {
     let caller = caller(&request)?;
+    let _call = quotas.enter(&caller).map_err(Status::from)?;
     let ResolveRefRequest { repo, name } = request.into_inner();
+    check_reader(access, &caller, &repo)?;
+    check_name("ref", &name)?;
     check_reader(access, &caller, &repo)?;
     check_name("ref", &name)?;
     let id = worker
@@ -376,6 +439,7 @@ impl Scion for ScionService {
             .await
             .map_err(|_| Status::unavailable("server is shutting down"))?;
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let mut stream = request.into_inner();
         let first = stream
             .next()
@@ -385,7 +449,11 @@ impl Scion for ScionService {
         // An upload names no path, so a caller that may change some path of
         // the repo may upload.
         self.access.check_writer(&caller, &first.repo)?;
+        // The first message's bytes, and the budget that the later messages
+        // of this upload take from. Held until the reply, on every path.
+        let mut quota = self.quotas.upload(&caller, first.data.len()).map_err(Status::from)?;
         // Check the repo before reading any more data. Each message goes to
+
         // the spool file before the next one is read, so an upload holds one
         // message in memory, not the whole blob.
         let (repo, mut upload) = self
@@ -402,6 +470,7 @@ impl Scion for ScionService {
                     "only the first PutBlob message names the repo",
                 ));
             }
+            quota.add(chunk.data.len()).map_err(Status::from)?;
             upload = self.worker.run(move |_| upload.append(&chunk.data)).await?;
         }
         let id = self
@@ -418,6 +487,7 @@ impl Scion for ScionService {
         request: Request<CreateChangesetRequest>,
     ) -> Result<Response<CreateChangesetResponse>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let CreateChangesetRequest { repo, changeset } = request.into_inner();
         check_reader(&self.access, &caller, &repo)?;
         let access = Arc::clone(&self.access);
@@ -447,6 +517,7 @@ impl Scion for ScionService {
         let deadline = Deadline::new(Instant::now() + REQUEST_TIMEOUT);
         let _call = deadline.guard();
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         check_name("target_ref", &req.target_ref)?;
@@ -478,6 +549,7 @@ impl Scion for ScionService {
         request: Request<GetLandRequest>,
     ) -> Result<Response<LandResponse>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let GetLandRequest { repo, land_id } = request.into_inner();
         check_reader(&self.access, &caller, &repo)?;
         let land_id = land_id
@@ -494,7 +566,7 @@ impl Scion for ScionService {
         &self,
         request: Request<ResolveRefRequest>,
     ) -> Result<Response<ResolveRefResponse>, Status> {
-        resolve_ref(&self.worker, &self.access, request)
+        resolve_ref(&self.worker, &self.access, &self.quotas, request)
             .await
             .map(Response::new)
     }
@@ -504,6 +576,7 @@ impl Scion for ScionService {
         request: Request<GetChangesetRequest>,
     ) -> Result<Response<GetChangesetResponse>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
@@ -523,6 +596,7 @@ impl Scion for ScionService {
         request: Request<ReadFileRequest>,
     ) -> Result<Response<ReadFileStream>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
@@ -556,6 +630,7 @@ impl Scion for ScionService {
         request: Request<ListDirRequest>,
     ) -> Result<Response<ListDirResponse>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
@@ -571,6 +646,7 @@ impl Scion for ScionService {
 
     async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogResponse>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
@@ -609,6 +685,7 @@ impl Scion for ScionService {
         request: Request<BlameRequest>,
     ) -> Result<Response<BlameResponse>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
@@ -669,6 +746,7 @@ impl Scion for ScionService {
         request: Request<MergeBaseRequest>,
     ) -> Result<Response<MergeBaseResponse>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let a = parse_id(&req.a_changeset_id, "a_changeset_id")?;
@@ -686,6 +764,7 @@ impl Scion for ScionService {
         request: Request<IsAncestorRequest>,
     ) -> Result<Response<IsAncestorResponse>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let ancestor = parse_id(&req.ancestor_id, "ancestor_id")?;
@@ -700,6 +779,7 @@ impl Scion for ScionService {
 
     async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<DiffResponse>, Status> {
         let caller = caller(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let old = parse_id(&req.old_changeset_id, "old_changeset_id")?;
@@ -784,7 +864,12 @@ mod tests {
 
     /// A service whose one principal may do everything.
     fn test_service(store: Store) -> ScionService {
-        ScionService::new(Worker::new(store), Arc::new(Access::single("t")))
+        ScionService::new(
+            Worker::new(store),
+            Arc::new(Access::single("t")),
+            Arc::default(),
+            Quotas::off(),
+        )
     }
 
     /// `message` as a request of that principal.
