@@ -8,124 +8,13 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
-use scion_proto::CHUNK_BYTES;
-use scion_proto::auth::Bearer;
-use scion_proto::listen::Limits;
-use scion_proto::v1::objects_client::ObjectsClient;
-use scion_proto::v1::{GetObjectsRequest, ObjectKind, ObjectRef};
-use scion_server::{Store, db, service, tree};
-use scion_tier::{
-    CACHE_UPSTREAM_TIMEOUT, DAEMON_UPSTREAM_TIMEOUT, DiskStore, MemoryStore, Tier, bind_unix,
-};
-use tempfile::TempDir;
-use tokio::net::TcpListener;
-use tokio::runtime::Runtime;
-use tokio_stream::wrappers::{TcpListenerStream, UnixListenerStream};
+use scion_core::{BlobId, FileState};
+use scion_proto::v1::GetObjectsRequest;
+use scion_server::Store;
 use tonic::Code;
-use tonic::transport::Endpoint;
 
-const REPO: &str = "r";
-const TOKEN: &str = "secret";
-
-/// A server, a cache in front of it, and a daemon in front of the cache.
-/// Dropping it stops all three.
-struct Tiers {
-    store: Store,
-    server: String,
-    cache: Tier<MemoryStore>,
-    daemon: Tier<DiskStore>,
-    /// `unix://` address of the daemon.
-    socket: String,
-    runtime: Runtime,
-    dirs: [TempDir; 2],
-}
-
-impl Tiers {
-    fn start(data: TempDir, store: Store) -> Self {
-        let runtime = Runtime::new().unwrap();
-        let _entered = runtime.enter();
-        let tcp = || {
-            let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            (listener, url)
-        };
-        let pending = std::future::pending;
-
-        let (listener, server) = tcp();
-        runtime.spawn(service::serve(
-            store.clone(),
-            listener,
-            TOKEN,
-            Limits::default(),
-            pending(),
-        ));
-
-        let memory = MemoryStore::new(64 << 20);
-        let cache = Tier::new(memory, &server, TOKEN, CACHE_UPSTREAM_TIMEOUT).unwrap();
-        let (listener, cache_url) = tcp();
-        let incoming = TcpListenerStream::new(listener);
-        runtime.spawn(
-            cache
-                .clone()
-                .serve(TOKEN, incoming, Limits::default(), pending()),
-        );
-
-        let node = tempfile::tempdir().unwrap();
-        let store_dir = DiskStore::open(&node.path().join("data"), 64 << 20).unwrap();
-        let daemon = Tier::new(store_dir, &cache_url, TOKEN, DAEMON_UPSTREAM_TIMEOUT).unwrap();
-        // The socket's directory must be private.
-        fs::set_permissions(node.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let path = node.path().join("daemon.sock");
-        let incoming = UnixListenerStream::new(runtime.block_on(bind_unix(&path)).unwrap());
-        runtime.spawn(
-            daemon
-                .clone()
-                .serve(TOKEN, incoming, Limits::default(), pending()),
-        );
-
-        Self {
-            store,
-            server,
-            cache,
-            daemon,
-            socket: format!("unix://{}", path.display()),
-            runtime,
-            dirs: [data, node],
-        }
-    }
-
-    /// Calls past the daemon, and calls that reached the server.
-    fn upstream_calls(&self) -> (u64, u64) {
-        (self.daemon.upstream_calls(), self.cache.upstream_calls())
-    }
-
-    /// The file of blob `id` on the server, and on the daemon's disk.
-    fn blob_files(&self, id: BlobId) -> [Vec<u8>; 2] {
-        let [server, node] = &self.dirs;
-        [server.path().to_path_buf(), node.path().join("data")]
-            .map(|dir| fs::read(blob_path(&dir, id)).unwrap())
-    }
-}
-
-/// Where the server, and the daemon, keep blob `id` under `dir`.
-fn blob_path(dir: &Path, id: BlobId) -> PathBuf {
-    let hex = id.to_string();
-    dir.join("objects/blob").join(&hex[..2]).join(&hex[2..])
-}
-
-/// `len` bytes that zstd cannot make smaller.
-fn noise(len: usize) -> Vec<u8> {
-    let mut state = 1_u64;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state.to_le_bytes()[3]
-        })
-        .collect()
-}
+mod common;
+use common::{REPO, TOKEN, Tiers, blob_path, blob_ref, changeset, connect, land};
 
 /// `scn checkout REV --into dest` against the server at `url`.
 fn checkout(url: &str, rev: &str, dest: &Path) {
@@ -179,72 +68,18 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Node> {
     nodes
 }
 
-/// A changeset on `parent` that puts `files` (raw path and state).
-fn changeset(parent: Option<ChangesetId>, files: &[(&str, FileState)]) -> Changeset {
-    Changeset {
-        parents: parent.into_iter().collect(),
-        author: IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"tiers\n".to_vec(),
-        changes: files
-            .iter()
-            .map(|(path, state)| (RepoPath::new(*path).unwrap(), Some(*state)))
-            .collect(),
-    }
-}
-
-/// Stores `cs` in the repo and points `main` at it.
-fn land(store: &Store, cs: &Changeset) -> ChangesetId {
-    store
-        .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
-            let (id, _) = tree::store_changeset(c, repo, cs)?;
-            let version = db::get_ref(c, repo, "main")?.map(|r| r.version);
-            assert!(db::cas_ref(c, repo, "main", version, id)?);
-            Ok(id)
-        })
-        .unwrap()
-}
-
 #[test]
 fn checkout_through_the_daemon_and_the_cache_matches_a_direct_checkout() {
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
-    let regular = |content: &[u8], executable| FileState::Regular {
-        content: store.blobs().put(content).unwrap(),
-        executable,
-    };
-    let readme = regular(b"hello\n", false);
-    // Over three parts of 1 MiB, packed or not: noise, then text.
-    let mut big = noise(3 * CHUNK_BYTES);
-    big.extend((0..100_000).flat_map(|i| format!("line {i}\n").into_bytes()));
-    let first = changeset(
-        None,
-        &[
-            ("README.md", readme),
-            ("big.bin", regular(&big, false)),
-            ("run.sh", regular(b"#!/bin/sh\necho hi\n", true)),
-            ("src/lib.rs", regular(b"pub fn f() {}\n", false)),
-            ("src/nested/deep/file.txt", regular(b"deep\n", false)),
-            // The same blob as README.md.
-            ("src/nested/copy.txt", readme),
-            (
-                "link",
-                FileState::Symlink {
-                    target: store.blobs().put(b"README.md").unwrap(),
-                },
-            ),
-        ],
-    );
-    let first = land(&store, &first);
+    let (files, big) = common::files(&store);
+    let first = land(&store, &changeset(None, &files));
     // For a later change. A blob is not part of any tree until a changeset
     // names it.
-    let new_readme = regular(b"hello, again\n", false);
+    let new_readme = FileState::Regular {
+        content: store.blobs().put(b"hello, again\n").unwrap(),
+        executable: false,
+    };
     // The server's file of `big`, packed at another level than a tier would
     // pack it, so a tier that packs again is seen.
     let packed = zstd::bulk::compress(&big, 1).unwrap();
@@ -256,7 +91,7 @@ fn checkout_through_the_daemon_and_the_cache_matches_a_direct_checkout() {
     checkout(&tiers.socket, "main", &dest("through-tiers"));
     checkout(&tiers.server, "main", &dest("direct"));
     let direct = snapshot(&dest("direct"));
-    assert_eq!(direct.len(), 10, "{direct:?}");
+    assert_eq!(direct.len(), 11, "{direct:?}");
     assert_eq!(snapshot(&dest("through-tiers")), direct);
     let written = fs::read(dest("through-tiers").join("big.bin")).unwrap();
     assert_eq!(BlobId::of(&written), BlobId::of(&big));
@@ -291,12 +126,7 @@ fn a_missing_repo_fails_the_call_once_at_each_tier() {
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
     let tiers = Tiers::start(data, store);
-    let refs = (0..3u8)
-        .map(|i| ObjectRef {
-            kind: ObjectKind::Blob.into(),
-            id: BlobId::of(&[i]).as_bytes().to_vec(),
-        })
-        .collect();
+    let refs = (0..3u8).map(|i| blob_ref(BlobId::of(&[i]))).collect();
     let request = GetObjectsRequest {
         repo: "no-such-repo".into(),
         refs,
@@ -304,12 +134,7 @@ fn a_missing_repo_fails_the_call_once_at_each_tier() {
     };
 
     let reply = tiers.runtime.block_on(async {
-        let channel = Endpoint::from_shared(tiers.socket.clone())
-            .unwrap()
-            .connect()
-            .await
-            .unwrap();
-        let mut daemon = ObjectsClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap());
+        let mut daemon = connect(&tiers.socket).await;
         daemon.get_objects(request).await
     });
     // The call itself fails, as it does on the server, not one object of it.
