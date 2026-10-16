@@ -10,11 +10,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use scion_core::{BlobId, Entry, FileState, PathElem, Tree};
+use scion_proto::CHUNK_BYTES;
+use scion_proto::object::{self, Assembler, Header};
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::objects_server::{Objects, ObjectsServer};
 use scion_proto::v1::{
-    GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, Object, ObjectKind, ObjectRef,
-    ResolveRefRequest, ResolveRefResponse,
+    Encoding, GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, ObjectKind, ObjectPart,
+    ObjectRef, ResolveRefRequest, ResolveRefResponse,
 };
 use scion_tier::{CACHE_UPSTREAM_TIMEOUT, DiskStore, MemoryStore, Tier, bind_unix};
 use tokio::net::TcpListener;
@@ -26,6 +28,38 @@ use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Code, Request, Response, Status};
 
 const TOKEN: &str = "secret";
+
+/// An object as a client sees it once unpacked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Object {
+    kind: i32,
+    id: Vec<u8>,
+    data: Vec<u8>,
+}
+
+impl Object {
+    fn header(&self, encoding: Encoding, encoded_size: usize) -> Header {
+        Header {
+            kind: ObjectKind::try_from(self.kind).unwrap(),
+            id: self.id.clone().try_into().unwrap(),
+            encoding,
+            encoded_size,
+            size: self.data.len(),
+        }
+    }
+
+    /// The parts that send it RAW.
+    fn raw(&self) -> Vec<ObjectPart> {
+        let header = self.header(Encoding::Raw, self.data.len());
+        header.parts(object::read_chunks(&self.data[..], self.data.len()).unwrap())
+    }
+
+    /// The parts that send `frame` as its zstd form.
+    fn zstd(&self, frame: &[u8]) -> Vec<ObjectPart> {
+        self.header(Encoding::Zstd, frame.len())
+            .parts(object::read_chunks(frame, frame.len()).unwrap())
+    }
+}
 
 /// How the fake upstream's `GetObjects` replies go wrong.
 #[derive(Clone, Copy, Debug, Default)]
@@ -42,14 +76,13 @@ enum Mode {
     Short,
 }
 
-/// An upstream that sends fixed objects, each as given (so possibly with the
-/// wrong bytes); the first `GetObjects` reply only after `delay`, so other
-/// calls can join that fetch. A missing object ends the reply with
-/// `NOT_FOUND`, as on the server. It counts the `GetObjects` and the
-/// `GetRootTree` calls.
+/// An upstream that sends fixed parts for each object (so possibly the wrong
+/// bytes); the first `GetObjects` reply only after `delay`, so other calls
+/// can join that fetch. A missing object ends the reply with `NOT_FOUND`, as
+/// on the server. It counts the `GetObjects` and the `GetRootTree` calls.
 #[derive(Clone, Default)]
 struct Fake {
-    objects: Arc<HashMap<Vec<u8>, Object>>,
+    objects: Arc<HashMap<Vec<u8>, Vec<ObjectPart>>>,
     delay: Duration,
     mode: Mode,
     calls: Arc<AtomicUsize>,
@@ -57,10 +90,19 @@ struct Fake {
 }
 
 impl Fake {
+    /// Sends each object RAW.
     fn new(objects: &[&Object], delay: Duration) -> Self {
-        let objects = objects.iter().map(|o| (o.id.clone(), (*o).clone()));
+        let sent = objects.iter().map(|o| (o.id.clone(), o.raw()));
+        Self::sending(sent, delay)
+    }
+
+    /// Sends the given parts for each ID.
+    fn sending(
+        sent: impl IntoIterator<Item = (Vec<u8>, Vec<ObjectPart>)>,
+        delay: Duration,
+    ) -> Self {
         Self {
-            objects: Arc::new(objects.collect()),
+            objects: Arc::new(sent.into_iter().collect()),
             delay,
             ..Self::default()
         }
@@ -79,7 +121,7 @@ impl Fake {
     }
 }
 
-type Replies = Pin<Box<dyn Stream<Item = Result<Object, Status>> + Send>>;
+type Replies = Pin<Box<dyn Stream<Item = Result<ObjectPart, Status>> + Send>>;
 
 #[tonic::async_trait]
 impl Objects for Fake {
@@ -119,10 +161,11 @@ impl Objects for Fake {
         if request.repo == "gone" {
             return Err(Status::not_found("no such repo"));
         }
-        let mut replies = Vec::new();
+        // The parts of each object, or the error that ends the reply.
+        let mut replies: Vec<Result<Vec<ObjectPart>, Status>> = Vec::new();
         for r in request.refs {
-            if let Some(object) = self.objects.get(&r.id) {
-                replies.push(Ok(object.clone()));
+            if let Some(parts) = self.objects.get(&r.id) {
+                replies.push(Ok(parts.clone()));
             } else {
                 replies.push(Err(Status::not_found("no such object")));
                 break;
@@ -130,15 +173,22 @@ impl Objects for Fake {
         }
         match self.mode {
             Mode::Honest => {}
-            Mode::Extra => replies.push(Ok(blob(b"not asked for\n"))),
+            Mode::Extra => replies.push(Ok(blob(b"not asked for\n").raw())),
             Mode::WrongKind => {
-                for object in replies.iter_mut().flatten() {
-                    object.kind = ObjectKind::Tree.into();
+                for parts in replies.iter_mut().flatten() {
+                    parts[0].kind = ObjectKind::Tree.into();
                 }
             }
             Mode::Reversed => replies.reverse(),
             Mode::Short => replies.truncate(1),
         }
+        let replies: Vec<Result<ObjectPart, Status>> = replies
+            .into_iter()
+            .flat_map(|object| match object {
+                Ok(parts) => parts.into_iter().map(Ok).collect(),
+                Err(status) => vec![Err(status)],
+            })
+            .collect();
         Ok(Response::new(Box::pin(tokio_stream::iter(replies))))
     }
 }
@@ -154,13 +204,16 @@ async fn serve_fake(fake: Fake) -> String {
     url
 }
 
-/// A `GetObjects` call for `objects` in `repo`: the objects it returns, or
-/// the error that ends it. `Err` from the outer result is the call's status.
-async fn get_in(
+/// A `GetObjects` call for `objects` in `repo`, from a client that accepts
+/// `zstd` or not: the objects it returns, unpacked, with the number of parts
+/// and the encoding of each, or the error that ends it. `Err` from the outer
+/// result is the call's status.
+async fn get_parts(
     client: &mut Client,
     repo: &str,
     objects: &[&Object],
-) -> Result<Result<Vec<Object>, Status>, Status> {
+    zstd: bool,
+) -> Result<Result<Vec<(Object, usize, Encoding)>, Status>, Status> {
     let refs = objects
         .iter()
         .map(|o| ObjectRef {
@@ -168,24 +221,58 @@ async fn get_in(
             id: o.id.clone(),
         })
         .collect();
+    let accept = if zstd {
+        vec![Encoding::Zstd.into()]
+    } else {
+        Vec::new()
+    };
     let request = GetObjectsRequest {
         repo: repo.into(),
         refs,
+        accept,
     };
     let mut stream = client.get_objects(request).await?.into_inner();
     let mut got = Vec::new();
     loop {
-        match stream.message().await {
-            Ok(Some(object)) => got.push(object),
+        let first = match stream.message().await {
+            Ok(Some(part)) => part,
             Ok(None) => return Ok(Ok(got)),
             Err(status) => return Ok(Err(status)),
+        };
+        let mut object = Assembler::new(Header::of(&first, zstd).unwrap(), first);
+        let mut parts = 1;
+        while !object.is_done() {
+            match stream.message().await {
+                Ok(Some(part)) => object.push(&part).unwrap(),
+                Ok(None) => panic!("the reply ended in the middle of an object"),
+                Err(status) => return Ok(Err(status)),
+            }
+            parts += 1;
         }
+        let (header, data) = object.finish();
+        let data = object::decode(&header, data).unwrap();
+        let object = Object {
+            kind: header.kind.into(),
+            id: header.id.to_vec(),
+            data,
+        };
+        got.push((object, parts, header.encoding));
     }
+}
+
+/// [`get_parts`] from a client that accepts only RAW, without the parts.
+async fn get_in(
+    client: &mut Client,
+    repo: &str,
+    objects: &[&Object],
+) -> Result<Result<Vec<Object>, Status>, Status> {
+    let got = get_parts(client, repo, objects, false).await?;
+    Ok(got.map(|got| got.into_iter().map(|(object, ..)| object).collect()))
 }
 
 /// A cache that waits at most `timeout` for `upstream`, and its address.
 async fn serve_cache(upstream: &str, timeout: Duration) -> (Tier<MemoryStore>, String) {
-    let store = MemoryStore::new(1 << 20);
+    let store = MemoryStore::new(16 << 20);
     let cache = Tier::new(store, upstream, TOKEN, timeout).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -229,6 +316,19 @@ fn blob(data: &[u8]) -> Object {
         id: BlobId::of(data).as_bytes().to_vec(),
         data: data.to_vec(),
     }
+}
+
+/// `len` bytes that zstd cannot make smaller.
+fn noise(len: usize) -> Vec<u8> {
+    let mut state = 1_u64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[3]
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -277,6 +377,85 @@ async fn a_tier_refuses_an_object_whose_bytes_do_not_match_its_id() {
         // Not kept: each call asked upstream again.
         assert_eq!(fake.calls(), before + 2);
     }
+}
+
+#[tokio::test]
+async fn a_tier_refuses_a_bad_zstd_frame_or_part_sequence() {
+    let content = b"the content of a blob, the content of a blob\n";
+    let target = blob(content);
+    let frame = object::pack(content).unwrap();
+    let mut bad: Vec<(&str, Vec<ObjectPart>)> = Vec::new();
+    // A good frame of other bytes.
+    bad.push((
+        "other bytes",
+        target.zstd(&object::pack(b"evil\n").unwrap()),
+    ));
+    // The object's size says one byte more than the frame header.
+    let mut parts = target.zstd(&frame);
+    parts[0].size += 1;
+    bad.push(("size above the header", parts));
+    // The frame header says one byte more than the frame holds. Byte 5 is the
+    // content size of a small frame.
+    let mut lying = frame.clone();
+    lying[5] += 1;
+    assert_eq!(object::frame_size(&lying), Ok(content.len() + 1));
+    let mut parts = target.zstd(&lying);
+    parts[0].size += 1;
+    bad.push(("a lying frame header", parts));
+    // A frame with no size in its header.
+    let mut streamed = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
+    std::io::Write::write_all(&mut streamed, content).unwrap();
+    bad.push(("no size", target.zstd(&streamed.finish().unwrap())));
+    // Two parts announced, one sent: the reply ends in the middle.
+    let big = blob(&noise(CHUNK_BYTES + 10));
+    let mut parts = big.raw();
+    parts.truncate(1);
+    bad.push(("a truncated part sequence", parts));
+    // A later part past the encoded size, and an empty one.
+    let mut parts = big.raw();
+    parts[1].data = vec![0; 11].into();
+    bad.push(("a part past the end", parts));
+    let mut parts = big.raw();
+    parts[1].data = scion_proto::Bytes::new();
+    bad.push(("an empty part", parts));
+
+    for (what, parts) in bad {
+        let id = parts[0].id.clone();
+        let wanted = Object {
+            id: id.clone(),
+            ..blob(b"")
+        };
+        let fake = Fake::sending([(id, parts)], Duration::ZERO);
+        let (_cache, url) = cache_for(&fake).await;
+        let mut client = connect(&url, Some(TOKEN)).await;
+        for zstd in [false, true] {
+            let status = get_parts(&mut client, "r", &[&wanted], zstd)
+                .await
+                .and_then(|got| got)
+                .unwrap_err();
+            assert_eq!(status.code(), Code::DataLoss, "{what}: {status:?}");
+        }
+        // Not kept: each call asked upstream again.
+        assert_eq!(fake.calls(), 2, "{what}");
+    }
+}
+
+#[tokio::test]
+async fn a_large_blob_arrives_in_parts_is_checked_and_sent_on_as_it_came() {
+    let big = blob(&noise(3 * CHUNK_BYTES + 5));
+    let frame = object::pack(&big.data).unwrap();
+    assert!(frame.len() > 3 * CHUNK_BYTES);
+    let fake = Fake::sending([(big.id.clone(), big.zstd(&frame))], Duration::ZERO);
+    let (_cache, url) = cache_for(&fake).await;
+    let mut client = connect(&url, Some(TOKEN)).await;
+
+    // A client that accepts zstd gets the frame in four parts; another gets
+    // the content in four parts. Both from one fetch.
+    for (zstd, encoding) in [(true, Encoding::Zstd), (false, Encoding::Raw)] {
+        let got = get_parts(&mut client, "r", &[&big], zstd).await.unwrap();
+        assert_eq!(got.unwrap(), vec![(big.clone(), 4, encoding)]);
+    }
+    assert_eq!(fake.calls(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -331,6 +510,18 @@ async fn each_tier_refuses_a_call_without_the_token() {
     std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
     let refused = bind_unix(&open.join("daemon.sock")).await.unwrap_err();
     assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+    // Through a symlinked directory, the socket is bound where the link
+    // pointed at the check, and its address names that path. The daemon logs
+    // and removes that path, not one through the link.
+    let private = dir.path().join("private");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+    let listener = bind_unix(&link.join("private/other.sock")).await.unwrap();
+    let bound = listener.local_addr().unwrap();
+    let real = std::fs::canonicalize(&private).unwrap().join("other.sock");
+    assert_eq!(bound.as_pathname(), Some(real.as_path()));
 
     let daemon_url = format!("unix://{}", socket.display());
     for url in [&cache_url, &daemon_url] {
