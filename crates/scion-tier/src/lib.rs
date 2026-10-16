@@ -614,7 +614,17 @@ impl<S: Store> Tier<S> {
         // path from the ticket's root tree, fetching a tree that the store
         // lacks with the same ticket. Anything the walk does not reach
         // never goes out.
-        if let Err(failed) = self.prove(i, ask).await {
+        //
+        // SHORTCUT: a daemon skips the walk (it checks no ticket, so it has
+        // no root tree to walk from). That is safe only while a daemon
+        // serves the one OS user that owns its private 0600 socket in its
+        // private directory: that user can read the daemon's store files
+        // anyway, so serving unproved objects adds nothing. Trigger to
+        // upgrade: a daemon that serves several OS users must walk (and
+        // then check tickets), like a cache.
+        if !self.inner.ticket_keys.is_empty()
+            && let Err(failed) = self.prove(i, ask).await
+        {
             return Some((Err(failed), self.share(held, 1, ask).await?));
         }
         loop {

@@ -1185,3 +1185,53 @@ async fn an_https_upstream_needs_a_ca() {
     );
     assert!(tier.is_err());
 }
+
+/// A daemon checks no ticket and runs no walk: a miss forwards the ticket
+/// and the path upstream and fetches the object, with no fetch of the
+/// ticket's root tree. One upstream call per miss.
+#[tokio::test]
+async fn a_daemon_miss_fetches_the_object_only() {
+    let object = blob(b"served unproved to its one user\n");
+    let fake = Fake::new(&[&object], Duration::ZERO);
+    let upstream = serve_fake(fake.clone()).await;
+    let (cache, cache_url) = serve_cache(&upstream, CACHE_UPSTREAM_TIMEOUT, &fake.keys()).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
+    // No ticket keys: a daemon, which checks no ticket and runs no walk.
+    let daemon = Tier::new(
+        store,
+        &cache_url,
+        TOKEN,
+        CACHE_UPSTREAM_TIMEOUT,
+        None,
+        Vec::new(),
+    )
+    .unwrap();
+    let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
+    tokio::spawn(daemon.clone().serve(
+        TOKEN,
+        incoming,
+        Limits::default(),
+        None,
+        std::future::pending(),
+    ));
+    let mut client = connect(&format!("unix://{}", socket.display()), Some(TOKEN)).await;
+    assert_eq!(
+        get(&mut client, &fake, &[&object]).await.unwrap(),
+        vec![object]
+    );
+    // The daemon fetched the object through the cache, and no root tree:
+    // its own upstream calls are the object's fetch alone.
+    assert_eq!(daemon.upstream_calls(), 1, "no walk, so no tree fetch");
+    assert_eq!(fake.calls(), 2, "the cache fetched the tree and the object");
+    // A miss with a ticket whose tree reaches nothing is refused by the
+    // cache's walk before anything is fetched: the daemon forwards, the
+    // upstream proves.
+    let stranger = blob(b"not in the ticket's tree\n");
+    let status = get(&mut client, &fake, &[&stranger]).await.unwrap_err();
+    assert_eq!(status.code(), Code::NotFound, "{status:?}");
+    assert_eq!(fake.calls(), 2, "the cache fetched nothing for it");
+    let _ = cache;
+}

@@ -869,9 +869,13 @@ order is daemon, cache, server. These rules hold for any tier:
   tree from the server, and brings that ticket to the tier's `GetObjects`. A
   tier that fetched root trees for its callers would be a way to get a
   ticket for any repo.
-- A tier that is a daemon checks no ticket at all: it only forwards the
-  ticket it received to its upstream, whose signature check is what keeps
-  unproven reads out. A tier that is a cache MUST check each ticket it
+- A tier that is a daemon checks no ticket at all and runs no walk: it
+  only forwards the ticket and the paths it received to its upstream, whose
+  signature check and walk are what keep unproven reads out. There is one
+  daemon per OS user, enforced by its 0600 socket in its private directory:
+  the user it serves can read the daemon's store files anyway, so serving
+  what its store holds adds nothing. A daemon that serves several OS users
+  MUST check tickets and walk, like a cache. A tier that is a cache MUST check each ticket it
   receives against the public keys of its upstream server (at most 2, for a
   rotation), as the server does.
 - A tier MAY keep objects forever. A tier never trusts upstream bytes: it
@@ -916,7 +920,8 @@ order is daemon, cache, server. These rules hold for any tier:
 - The `Scion` service goes only to the server.
 
 **The daemon's socket.** `scion-daemon` listens on a Unix socket with mode
-0600, in a directory that only its user can reach. A client sends its token
+0600, in a directory that only its user can reach. One daemon serves one OS
+user; a user who wants a daemon runs their own. A client sends its token
 to the socket, so it SHOULD check first that the socket file is a socket
 (not a symlink) owned by its own user or by root. It SHOULD also check each
 directory above the socket, up to `/`: owned by root or by its own user,
