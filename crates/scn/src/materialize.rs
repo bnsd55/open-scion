@@ -240,6 +240,10 @@ enum Nfs {
     /// that call fails. Every call that makes or removes a name is a step,
     /// from the start of the checkout to its cleanup.
     ReplyLost,
+    /// As `ReplyLost`, and the exclusive create of a file in the temp
+    /// directory lands without its mode. On NFS version 3 that create sends
+    /// no mode: the client sets it after the reply.
+    ModeLost,
 }
 
 #[cfg(test)]
@@ -370,16 +374,31 @@ impl Checkout {
             let dir = self.held(path.as_bytes());
             let mode = Mode::from_raw_mode(if executable { 0o777 } else { 0o666 });
             let created = self.make_new(dir, path.as_bytes(), New::File, || {
-                rustix::fs::openat(dir, name, NEW_FILE, mode)
+                let file = rustix::fs::openat(dir, name, NEW_FILE, mode);
+                #[cfg(test)]
+                if let (Some(Nfs::ModeLost), Ok(file)) = (NFS.get(), &file) {
+                    rustix::fs::fchmod(file, Mode::empty())?;
+                }
+                file
             })?;
+            // Recorded first, so that the cleanup removes it if a later
+            // call fails.
+            self.made.insert(path.as_bytes().to_vec(), false);
             let file = if let Some(file) = created {
                 file
             } else {
-                // Made before its reply was lost, and still empty.
-                let flags = OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-                rustix::fs::openat(dir, name, flags, Mode::empty())?
+                // Made before its reply was lost, and empty. On NFS version
+                // 3 it can also have no mode yet: an exclusive create sends
+                // none, and the client sets it only after the reply. Setting
+                // it here needs the umask, which cannot be read without
+                // changing it, so the file is made once more. A second
+                // EEXIST fails.
+                let dir = self.held(path.as_bytes());
+                step_done(false, Errno::NOENT, || {
+                    rustix::fs::unlinkat(dir, name, AtFlags::empty())
+                })?;
+                rustix::fs::openat(dir, name, NEW_FILE, mode)?
             };
-            self.made.insert(path.as_bytes().to_vec(), false);
             fs::File::from(file).write_all(data)
         };
         write().with_context(|| format!("cannot write {path:?}"))
@@ -656,8 +675,10 @@ impl Checkout {
     /// the temp directory, and it records every path it makes. So the entry
     /// is the call's own, or a recorded path in `dir` that the filesystem
     /// folded into `path`, by case or by Unicode form. The call's own entry
-    /// is what `new` makes, with nothing written yet, and is this user's. A
-    /// folded one has the inode of a recorded path in `dir`.
+    /// is what `new` makes, with nothing in it yet, and is this user's. A
+    /// folded one has the inode of a recorded path in `dir`. A directory
+    /// that the checkout made already holds an entry, so a folded directory
+    /// fails even where each name shows its own inode.
     fn is_lost_reply(&self, dir: BorrowedFd<'_>, path: &[u8], new: New<'_>) -> bool {
         let name = path.rsplit(|&b| b == b'/').next().unwrap_or_default();
         let Ok(stat) = rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) else {
@@ -665,7 +686,10 @@ impl Checkout {
         };
         let kind = FileType::from_raw_mode(stat.st_mode);
         let made = match new {
-            New::Dir => kind == FileType::Directory,
+            // `open_dir` refuses anything but a directory.
+            New::Dir => open_dir(dir, name)
+                .and_then(|opened| entries(&opened))
+                .is_ok_and(|names| names.is_empty()),
             New::File => kind == FileType::RegularFile && stat.st_size == 0,
             New::Symlink(target) => {
                 kind == FileType::Symlink
@@ -678,15 +702,19 @@ impl Checkout {
         }
         // The recorded paths in `dir` of the same kind, by their names
         // there. Paths below them come too, and are skipped. A stat for each
-        // costs time only after EEXIST.
+        // costs time only after EEXIST. One that fails counts as folded: a
+        // soft NFS mount can fail it with EIO.
         let (parent, is_dir) = (&path[..path.len() - name.len()], new.is_dir());
         let folded = self
             .made
             .range::<[u8], _>((Bound::Included(parent), Bound::Unbounded))
-            .filter(|&(_, &made_dir)| made_dir == is_dir)
-            .map_while(|(made, _)| made.strip_prefix(parent))
-            .filter(|other| !other.contains(&b'/'))
-            .any(|other| has_inode(dir, other, &stat));
+            .map_while(|(made, &made_dir)| Some((made.strip_prefix(parent)?, made_dir)))
+            .filter(|&(other, made_dir)| made_dir == is_dir && !other.contains(&b'/'))
+            .any(|(other, _)| {
+                rustix::fs::statat(dir, other, AtFlags::SYMLINK_NOFOLLOW).map_or(true, |now| {
+                    (now.st_dev, now.st_ino) == (stat.st_dev, stat.st_ino)
+                })
+            });
         !folded
     }
 
@@ -854,7 +882,7 @@ fn step<T>(
     #[cfg(test)]
     match (NFS.get(), again) {
         (Some(Nfs::StepFails), _) if after_claim => return Err(Errno::IO),
-        (Some(Nfs::ReplyLost), Some(again)) => return call().and(Err(again)),
+        (Some(Nfs::ReplyLost | Nfs::ModeLost), Some(again)) => return call().and(Err(again)),
         _ => {}
     }
     call()
@@ -947,7 +975,7 @@ fn is_mine(stat: &Stat) -> bool {
 
 /// Opens directory `name` in `dir`. Fails if `name` is a symlink or anything
 /// else that is not a directory.
-fn open_dir(dir: &OwnedFd, name: &[u8]) -> io::Result<OwnedFd> {
+fn open_dir(dir: impl AsFd, name: &[u8]) -> io::Result<OwnedFd> {
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     rustix::fs::openat(dir, name, flags, Mode::empty()).map_err(|e| match e {
         Errno::LOOP | Errno::NOTDIR => io::Error::other(format!(
@@ -979,7 +1007,7 @@ pub fn is_within(path: &[u8], dir: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 
     use super::*;
 
@@ -1319,8 +1347,8 @@ mod tests {
         let at = checkout
             .temp_path()
             .join(written.split('/').next().unwrap_or_default());
-        fs::remove_dir(&at)
-            .or_else(|_| fs::remove_file(&at))
+        fs::remove_file(&at)
+            .or_else(|_| fs::remove_dir_all(&at))
             .unwrap();
     }
 
@@ -1392,8 +1420,12 @@ mod tests {
             ("a file with data", "f"),
             ("an empty file", "d/x"),
             ("an empty directory", "f"),
+            ("a directory with an entry", "d/x"),
+            ("a symlink to an empty directory", "d/x"),
             ("a symlink to another target", "s"),
         ];
+        let empty = tmp.path().join("empty");
+        fs::create_dir(&empty).unwrap();
         for (there, written) in cases {
             let mut checkout = start(&tmp.path().join("dest"), None, false).unwrap();
             let at = checkout
@@ -1403,6 +1435,10 @@ mod tests {
                 "a file with data" => fs::write(&at, "theirs"),
                 "an empty file" => fs::write(&at, ""),
                 "an empty directory" => fs::create_dir(&at),
+                "a directory with an entry" => {
+                    fs::create_dir(&at).and_then(|()| fs::write(at.join("theirs"), ""))
+                }
+                "a symlink to an empty directory" => std::os::unix::fs::symlink(&empty, &at),
                 "a symlink to another target" => std::os::unix::fs::symlink("theirs", &at),
                 _ => unreachable!("{there}"),
             }
@@ -1411,6 +1447,45 @@ mod tests {
             assert!(format!("{err:#}").contains("collides"), "{there}: {err:#}");
             unrecorded(&checkout, written);
         }
+    }
+
+    #[test]
+    fn a_recorded_path_that_cannot_be_read_counts_as_folded() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The stat of the recorded `d/x` fails, here with ENOENT, and on a
+        // soft NFS mount with EIO. `d/y` looks like the call's own, but a
+        // fold of the two cannot be ruled out.
+        let mut checkout = start(&tmp.path().join("dest"), None, false).unwrap();
+        write(&mut checkout, "d/x", b"").unwrap();
+        let d = checkout.temp_path().join("d");
+        fs::remove_file(d.join("x")).unwrap();
+        fs::write(d.join("y"), "").unwrap();
+        let err = write(&mut checkout, "d/y", b"").unwrap_err();
+        assert!(format!("{err:#}").contains("collides"), "{err:#}");
+        fs::remove_file(d.join("y")).unwrap();
+    }
+
+    #[test]
+    fn a_file_found_after_a_lost_reply_gets_its_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        // Each exclusive create lands with mode 0, and its reply is lost.
+        let mut checkout = start(&dest, Some(Nfs::ModeLost), false).unwrap();
+        checkout.file(&path("f"), false, b"f\n").unwrap();
+        checkout.file(&path("x"), true, b"x\n").unwrap();
+        checkout.finish().unwrap();
+        // The modes that a plain create gives, less the umask.
+        let plain = |name: &str, bits| {
+            let at = tmp.path().join(name);
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true).mode(bits);
+            options.open(&at).unwrap();
+            mode(&at)
+        };
+        assert_eq!(mode(&dest.join("f")), plain("plain-f", 0o666));
+        assert_eq!(mode(&dest.join("x")), plain("plain-x", 0o777));
+        assert_eq!(fs::read(dest.join("f")).unwrap(), b"f\n");
+        assert_eq!(fs::read(dest.join("x")).unwrap(), b"x\n");
     }
 
     #[test]
