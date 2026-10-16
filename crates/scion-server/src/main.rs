@@ -359,21 +359,29 @@ async fn serve(
     // does not excuse a non-loopback address: `--insecure-listen` must allow
     // it.
     let metrics = Arc::new(Metrics::default());
+    // One signal task ends the gRPC listener and the metrics export alike.
+    let (end_tx, end_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(async move {
+        scion_proto::metrics::shutdown_signal().await;
+        let _ = end_tx.send(());
+    });
     if let Some(metrics_listen) = config.metrics_listen {
         let address = metrics_listen.to_string();
-        anyhow::ensure!(
-            metrics_listen.ip().is_loopback() || config.insecure_listen,
-            "{address} is not a loopback address; the metrics travel \
-             unencrypted over plain HTTP. Pass --insecure-listen to allow it."
-        );
+        let checked = metrics::loopback_or_allow(metrics_listen, config.insecure_listen);
+        anyhow::ensure!(checked.is_ok(), "{}", checked.unwrap_err());
         let metrics_listener = tokio::net::TcpListener::bind(metrics_listen)
             .await
             .with_context(|| format!("cannot listen on {address}"))?;
         let metrics_addr = metrics_listener.local_addr()?;
         tracing::info!(listen = %metrics_addr, "serving metrics");
-        tokio::spawn(metrics::serve(metrics_listener, metrics.clone(), async {
-            tokio::signal::ctrl_c().await.ok();
-        }));
+        let mut stopped = end_rx.clone();
+        tokio::spawn(metrics::serve(
+            metrics_listener,
+            metrics.clone(),
+            async move {
+                let _ = stopped.changed().await;
+            },
+        ));
     }
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -398,8 +406,9 @@ async fn serve(
             tls: config.server_tls,
             metrics,
         },
-        async {
-            tokio::signal::ctrl_c().await.ok();
+        async move {
+            let mut end_rx = end_rx;
+            let _ = end_rx.changed().await;
         },
     ))
     .await?;

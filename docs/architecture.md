@@ -1574,10 +1574,13 @@ is refused on a non-loopback address unless `--insecure-listen` is given;
 TLS does not change that, because the endpoint is unauthenticated by
 design.
 
-The registry is a fixed set of atomics. A call counts its metrics on the
-request path without taking a lock or allocating: it increments counters,
-and its latency and byte counts go into fixed buckets. The values are read
-on export only.
+The registry, the counting layer and the HTTP export live in
+`scion-proto`, and the server and a tier share one implementation: the
+tier serves the `Objects` calls through the same layer and adds its cache
+counters to the same registry. The registry is a fixed set of atomics. A
+call counts its metrics on the request path without taking a lock or
+allocating: it increments counters, and its latency and byte counts go
+into fixed buckets. The values are read on export only.
 
 | Metric | Kind | Meaning |
 |---|---|---|
@@ -1585,7 +1588,7 @@ on export only.
 | `scion_request_seconds{rpc}` | histogram | A call's duration from the moment the layer sees the request until the reply ends or is dropped. Buckets at 1, 4, 16, 64, 256 ms and 1, 4, 16, 64 s, then `+Inf`. |
 | `scion_rpc_bytes_total{rpc,direction}` | counter | Reply bytes out; request bytes in, counted from the `content-length` header, which a gRPC client does not send. |
 | `scion_lands_total{outcome}` | counter | Lands by outcome: `landed`, `conflict`, `rejected`, `retry` (a pending land waits for its retry). |
-| `scion_cache_hits_total`, `scion_cache_misses_total` | counter | A tier's object reads served from its store or its snapshot, and read from upstream. |
+| `scion_cache_hits_total`, `scion_cache_misses_total` | counter | A tier's object reads served from its store or its snapshot, and read from upstream. A tier's scrape also shows its `Objects` calls in `scion_requests_total` and `scion_request_seconds`. |
 
 The layer sits inside the axum router, around both gRPC services and
 outside the access checks. A refusal (bad token, unknown repo, a budget
@@ -1596,3 +1599,10 @@ to the end or drops it: a dropped reply counts as `cancelled`. The `ok`
 line of a streamed RPC therefore grows only as replies complete, and the
 cancelled line shows clients that went away mid-stream. An unknown gRPC
 code is counted as `unrecognised`.
+
+The export is hyper's HTTP/1 server, one connection at a time: no keep
+alive, a 5 s header read timeout, so a silent client cannot hold it, and
+a reply only to `GET /metrics`. It ends with the process's shutdown
+signal (Ctrl+C or SIGTERM), the same one that ends the gRPC listener. A
+test reads `proto/scion.proto` and fails when an rpc has no slot in the
+registry's table.

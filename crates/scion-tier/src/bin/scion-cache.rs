@@ -145,19 +145,31 @@ async fn main() -> anyhow::Result<()> {
             every,
         ));
     }
+    // One signal task ends the Objects listener and the metrics export
+    // alike.
+    let (end_tx, end_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(async move {
+        scion_proto::metrics::shutdown_signal().await;
+        let _ = end_tx.send(());
+    });
     if let Some(metrics_listen) = cli.metrics_listen {
         let address = metrics_listen.to_string();
-        anyhow::ensure!(
-            metrics_listen.ip().is_loopback() || cli.insecure_listen,
-            "{address} is not a loopback address; the metrics travel unencrypted over \
-             plain HTTP. Pass --insecure-listen to allow it."
-        );
+        let checked = scion_proto::metrics::loopback_or_allow(metrics_listen, cli.insecure_listen);
+        anyhow::ensure!(checked.is_ok(), "{}", checked.unwrap_err());
         let metrics_listener = tokio::net::TcpListener::bind(metrics_listen)
             .await
             .with_context(|| format!("cannot listen on {address}"))?;
         let metrics_addr = metrics_listener.local_addr()?;
         tracing::info!(listen = %metrics_addr, "serving metrics");
-        tokio::spawn(metrics(tier.clone(), metrics_listener));
+        let metrics = tier.metrics();
+        let mut stopped = end_rx.clone();
+        tokio::spawn(scion_proto::metrics::serve(
+            metrics_listener,
+            metrics,
+            async move {
+                let _ = stopped.changed().await;
+            },
+        ));
     }
     let listener = tokio::net::TcpListener::bind(cli.listen)
         .await
@@ -173,8 +185,9 @@ async fn main() -> anyhow::Result<()> {
         listen::tcp(listener),
         limits,
         server_tls,
-        async {
-            tokio::signal::ctrl_c().await.ok();
+        async move {
+            let mut end_rx = end_rx;
+            let _ = end_rx.changed().await;
         },
     ))
     .await?;
@@ -220,33 +233,5 @@ async fn snapshots(
                 Err(e) => tracing::warn!(%repo, error = %e, "cannot write a snapshot"),
             }
         }
-    }
-}
-
-/// Serves the cache's hits and misses as Prometheus text on `listener`, one
-/// scrape at a time, until the process ends. The metrics are plain HTTP with
-/// no token: bind them to a loopback address unless `--insecure-listen`.
-async fn metrics(tier: Tier<MemoryStore>, listener: tokio::net::TcpListener) {
-    use tokio::io::AsyncWriteExt as _;
-    loop {
-        let Ok((mut socket, _)) = listener.accept().await else {
-            continue;
-        };
-        let (hits, misses) = tier.cache_hits_and_misses();
-        let text = format!(
-            "# HELP scion_cache_hits_total Objects served from the store.\n\
-             # TYPE scion_cache_hits_total counter\n\
-             scion_cache_hits_total {hits}\n\
-             # HELP scion_cache_misses_total Objects fetched from upstream.\n\
-             # TYPE scion_cache_misses_total counter\n\
-             scion_cache_misses_total {misses}\n"
-        );
-        let answer = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: text/plain; version=0.0.4\r\n\
-             content-length: {}\r\nconnection: close\r\n\r\n{text}",
-            text.len()
-        );
-        let _ = socket.write_all(answer.as_bytes()).await;
-        let _ = socket.shutdown().await;
     }
 }

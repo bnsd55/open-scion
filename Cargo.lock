@@ -2287,6 +2287,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "bytes",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "prost",
  "rcgen",
  "tempfile",
@@ -2297,6 +2303,7 @@ dependencies = [
  "tonic-health",
  "tonic-prost",
  "tonic-prost-build",
+ "tower",
  "tracing",
  "zstd",
 ]

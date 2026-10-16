@@ -24,7 +24,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
-use tower::Layer as _;
 
 use crate::metrics::{Metrics, MetricsLayer};
 use tonic::transport::Server;

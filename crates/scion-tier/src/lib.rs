@@ -363,10 +363,9 @@ struct Inner<S> {
     busy: Duration,
     /// Calls sent upstream, of every kind.
     upstream_calls: Arc<AtomicU64>,
-    /// Objects served from the store, and fetches sent upstream, over the
-    /// life of the process, for the metrics of `scion-cache`.
-    cache_hits: Arc<AtomicU64>,
-    cache_misses: Arc<AtomicU64>,
+    /// The registry that counts objects served from the store and fetched
+    /// from upstream, and, when the binary exports, the `Objects` calls.
+    metrics: Arc<scion_proto::metrics::Metrics>,
     /// The reply budget, as on the server: object bytes read or copied for a
     /// reply and not yet taken by its client.
     in_flight: Arc<Semaphore>,
@@ -436,8 +435,6 @@ impl<S: Store> Tier<S> {
         let channel = endpoint.connect_lazy();
         let bearer = Bearer::new(upstream_token).context("upstream token is not valid ASCII")?;
         let upstream_calls = Arc::default();
-        let cache_hits = Arc::default();
-        let cache_misses = Arc::default();
         let auth = UpstreamAuth {
             bearer,
             calls: Arc::clone(&upstream_calls),
@@ -452,8 +449,7 @@ impl<S: Store> Tier<S> {
                 timeout,
                 busy: BUSY_TIMEOUT,
                 upstream_calls,
-                cache_hits,
-                cache_misses,
+                metrics: Arc::new(scion_proto::metrics::Metrics::default()),
                 in_flight: Arc::new(Semaphore::new(IN_FLIGHT_BYTES)),
                 fetch_slots: Arc::new(Semaphore::new(FETCH_SLOTS)),
                 fetching: Arc::new(Semaphore::new(FETCH_BYTES)),
@@ -479,10 +475,13 @@ impl<S: Store> Tier<S> {
     /// it has fetched from upstream, over the life of the process.
     #[must_use]
     pub fn cache_hits_and_misses(&self) -> (u64, u64) {
-        (
-            self.inner.cache_hits.load(Ordering::Relaxed),
-            self.inner.cache_misses.load(Ordering::Relaxed),
-        )
+        self.inner.metrics.cache_counts()
+    }
+
+    /// The registry this tier counts in: `scion-cache` exports it.
+    #[must_use]
+    pub fn metrics(&self) -> Arc<scion_proto::metrics::Metrics> {
+        Arc::clone(&self.inner.metrics)
     }
 
     /// Serves the `Objects` calls on `incoming` connections, to callers that
@@ -505,10 +504,14 @@ impl<S: Store> Tier<S> {
         I: Stream<Item = io::Result<IO>> + Send + 'static,
         IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
     {
-        let objects = ObjectsServer::new(self)
-            .max_decoding_message_size(MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_PART_MESSAGE_BYTES);
-        let objects = InterceptedService::new(objects, Auth::new(token));
+        // Outside the token check, so a refused call counts too.
+        let objects = scion_proto::metrics::MetricsLayer::new(Arc::clone(&self.inner.metrics))
+            .layer(InterceptedService::new(
+                ObjectsServer::new(self)
+                    .max_decoding_message_size(MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_PART_MESSAGE_BYTES),
+                Auth::new(token),
+            ));
         // The health service answers `grpc.health.v1.Check` and `Watch` on
         // the same port, without a token: a probe carries none. The store
         // and the upstream channel opened before this call, so the tier
@@ -614,7 +617,7 @@ impl<S: Store> Tier<S> {
                     Ok(Some(stored)) => {
                         if !missed {
                             progress.hits.fetch_add(1, Ordering::Relaxed);
-                            self.inner.cache_hits.fetch_add(1, Ordering::Relaxed);
+                            self.inner.metrics.cache_hit();
                             tracing::debug!(%key, "hit");
                         }
                         // After the call's checks, in `get_objects`.
@@ -635,7 +638,7 @@ impl<S: Store> Tier<S> {
             if !missed {
                 missed = true;
                 progress.misses.fetch_add(1, Ordering::Relaxed);
-                self.inner.cache_misses.fetch_add(1, Ordering::Relaxed);
+                self.inner.metrics.cache_miss();
                 tracing::debug!(%key, "miss");
             }
             let data = match self.fetch(ask, i, progress).await {
