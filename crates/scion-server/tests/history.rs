@@ -555,7 +555,9 @@ fn scan_versions(store: &Store, cs: ChangesetId, p: &str) -> Vec<ChangesetId> {
     let mut found = Vec::new();
     let mut next = Some(cs);
     while let Some(id) = next {
-        let cs = store.read(|c| scion_server::db::get_changeset(c, repo, id)).unwrap();
+        let cs = store
+            .read(|c| scion_server::db::get_changeset(c, repo, id))
+            .unwrap();
         next = cs.parents.first().copied();
         if cs.changes.keys().any(|changed| {
             let (changed, p) = (changed.as_bytes(), p.as_bytes());
@@ -647,10 +649,13 @@ proptest::proptest! {
                 .iter()
                 .find(|v| lines_of(&text_of(**v)).contains(&line))
                 .unwrap();
-            let at = lines_of(&text_of(*version))
-                .iter()
-                .position(|own| *own == line)
-                .unwrap() as u32
+            let at = u32::try_from(
+                lines_of(&text_of(*version))
+                    .iter()
+                    .position(|own| *own == line)
+                    .unwrap(),
+            )
+            .unwrap()
                 + 1;
             expected.push((*version, at, path("f")));
         }
@@ -1598,18 +1603,28 @@ fn a_cursor_names_only_changesets_of_its_repo() {
 }
 
 #[test]
-#[test]
 fn a_cursor_of_an_unknown_version_is_refused() {
     let (_data, store) = open_store();
     let put = |data: &[u8]| regular(store.blobs().put(data).unwrap());
     let ids = chain(&store, vec![vec![("f", put(b"a\n"))]]);
     let mut made = cursor_bytes(&Resume::default(), ids[0], "f");
     made[0] += 1;
-    let result =
-        blame::decode_cursor(&store, REPO, &made, ids[0], &path("f"), &Bytes::new(1 << 20), None);
-    assert!(matches!(result, Err(Error::InvalidArgument(_))), "{result:?}");
+    let result = blame::decode_cursor(
+        &store,
+        REPO,
+        &made,
+        ids[0],
+        &path("f"),
+        &Bytes::new(1 << 20),
+        None,
+    );
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
 }
 
+#[test]
 fn a_cursor_with_past_bounds_is_refused_before_it_allocates() {
     let (_data, store) = open_store();
     let put = |data: &[u8]| regular(store.blobs().put(data).unwrap());

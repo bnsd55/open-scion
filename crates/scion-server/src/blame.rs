@@ -287,15 +287,12 @@ pub fn blame(
         // goes on at the version this one explained, and reads the nodes
         // again within its own share.
         if nodes.bytes() > node_bytes {
-            match memory.try_take(nodes.bytes() - node_bytes) {
-                Ok(hold) => {
-                    node_holds.push(hold);
-                    node_bytes = nodes.bytes();
-                }
-                Err(_) => {
-                    (next, next_search) = (Some(id), next_search);
-                    break;
-                }
+            if let Ok(hold) = memory.try_take(nodes.bytes() - node_bytes) {
+                node_holds.push(hold);
+                node_bytes = nodes.bytes();
+            } else {
+                (next, next_search) = (Some(id), next_search);
+                break;
             }
         }
         let puts_text = matches!(
