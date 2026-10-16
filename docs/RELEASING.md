@@ -27,23 +27,16 @@ step is run by a person.
    number there and the four `version = "..."` entries of the internal
    dependencies in `[workspace.dependencies]` to the same value.
 3. **Check the packages.** From a clean worktree (no uncommitted
-   changes), package every crate:
+   changes), one command packages all five crates and verifies each by
+   building it, resolving the internal dependencies from the packaged
+   crates:
 
    ```sh
-   cargo package --workspace --no-verify
-   cargo package -p scion-core
+   cargo package --workspace
    ```
 
-   The first command packages all five crates; it must end with
-   `Packaged` five times. `cargo package` builds nothing, so it uploads
-   nothing. The second verifies `scion-core` by building it, which the
-   other four cannot do before they are published: their build resolves
-   the unpublished internal dependencies from crates.io, and
-   `scion-proto`'s build script needs `proto/scion.proto`, which sits
-   outside the crate (the packaged crate cannot build; the generated
-   code is built in place instead). A release that follows this list
-   re-runs the full workspace test suite (step 1), so the verification
-   gap is the resolver's, not the code's.
+   It must end with `Packaged` five times and `Verifying` five times.
+   `cargo package` uploads nothing.
 4. **Tag.** Cut an annotated tag from the commit that the release
    notes describe:
 
@@ -61,11 +54,11 @@ step is run by a person.
 
    ```sh
    cargo login   # once, with a crates.io API token
-   cargo publish -p scion-core
-   cargo publish -p scion-proto
-   cargo publish -p scion-server
-   cargo publish -p scion-tier
-   cargo publish -p scn
+   cargo publish -p open-scion-core
+   cargo publish -p open-scion-proto
+   cargo publish -p open-scion-server
+   cargo publish -p open-scion-tier
+   cargo publish -p open-scion
    ```
 
    The order matters: `open-scion-server` depends on `open-scion-core`
@@ -80,11 +73,11 @@ step is run by a person.
   version, then install the client from crates.io and run it:
 
   ```sh
-  cargo install open-scion --version 0.1.0 --root /tmp/scion-install
-  /tmp/scion-install/bin/scn --version
+  dir=$(mktemp -d)
+  cargo install open-scion --version 0.1.0 --root "$dir"
+  "$dir/bin/scn" --version
+  rm -rf "$dir"
   ```
-
-  Remove `/tmp/scion-install` afterwards.
 - Close the milestone if it is still open.
 
 ## Notes
