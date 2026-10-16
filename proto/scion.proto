@@ -50,12 +50,14 @@ service Scion {
 
   // The best common ancestors of two changesets, over all parents: every
   // common ancestor that is not an ancestor of another common ancestor, as
-  // `git merge-base --all`. Fails with RESOURCE_EXHAUSTED if the walk
-  // passes its bound.
+  // `git merge-base --all`. The walk has no step bound: it stops at the
+  // call's deadline with DEADLINE_EXCEEDED, or with CANCELLED when the
+  // client drops the call.
   rpc MergeBase(MergeBaseRequest) returns (MergeBaseResponse);
   // Whether one changeset is an ancestor of another, over all parents. A
-  // changeset is its own ancestor. Fails with RESOURCE_EXHAUSTED if the
-  // walk passes its bound.
+  // changeset is its own ancestor. The walk has no step bound: it stops at
+  // the call's deadline with DEADLINE_EXCEEDED, or with CANCELLED when the
+  // client drops the call.
   rpc IsAncestor(IsAncestorRequest) returns (IsAncestorResponse);
   // The paths whose file state differs between the snapshots of two
   // changesets. Compares file states, not lines. Finds renames as `git diff`

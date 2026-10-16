@@ -82,9 +82,11 @@ A request with a `grpc-encoding` other than `identity` fails with
 
 **Authentication.** Every call on both services MUST carry the metadata
 `authorization: Bearer <token>`: the exact prefix `Bearer `, then the token.
-A missing or wrong token fails the call with `UNAUTHENTICATED` before the
-request is read. A token names a principal. A server started with `--token T`
-has one principal, `default`, which may read and write every repo. A server
+The token is printable ASCII, as a gRPC metadata value is; a tier refuses an
+upstream token that is not. A missing or wrong token fails the call with
+`UNAUTHENTICATED` before the request is read. A token names a principal. A
+server started with `--token T` has one principal, `default`, which may read
+and write every repo. A server
 started with `--access FILE` reads the principal of each token and its rules
 from the file; the file's format is a deployment matter and lives in the
 README. The principal of a call's token is its caller. Land request keys and
@@ -105,9 +107,10 @@ server (section 6.3).
 
 **Queues.** The server queues work instead of failing it. At most 256 jobs run
 at once across both services, at most 16 `PutBlob` uploads are read at once,
-at most 4 `Blame` calls run at once, and at most 4 `MergeBase`,
-`IsAncestor` and `Log` calls with a path together. A `ReadFile` call waits for its share of a memory
-budget (section 6.7). Time in a queue counts toward the timeout.
+at most 4 `Blame` calls run at once, at most 4 `MergeBase`, `IsAncestor`
+and `Log` calls with a path together, and at most 4 `Diff` calls run at
+once. A `ReadFile` call waits for its share of a memory budget
+(section 6.7). Time in a queue counts toward the timeout.
 One wait has its own limit: a `GetObjects` call that gets no memory for its
 first object within 30 s, or before the caller's `grpc-timeout`, fails with
 `RESOURCE_EXHAUSTED` (section 7.3).
@@ -444,7 +447,7 @@ content of a regular file, or the target of a symlink, at `path` in
 
 | Error | When |
 |---|---|
-| `INVALID_ARGUMENT` | A bad or empty path; the path is a directory or a submodule. |
+| `INVALID_ARGUMENT` | A bad repo name or ID; a bad or empty path; the path is a directory or a submodule. |
 | `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
 | `DEADLINE_EXCEEDED` | After zero or more messages: the client took no message for 120 s. |
 | `INTERNAL` | After zero or more messages: the stored blob is damaged. |
@@ -456,7 +459,7 @@ level as `TreeV1` bytes. An empty path is the repo root.
 
 | Error | When |
 |---|---|
-| `INVALID_ARGUMENT` | A bad path; the path is a file. |
+| `INVALID_ARGUMENT` | A bad repo name or ID; a bad path; the path is a file. |
 | `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
 
 ### 6.9 Log
@@ -491,7 +494,7 @@ stops at 600 s; what it derived stays, so the next call goes on from there.
 
 | Error | When |
 |---|---|
-| `INVALID_ARGUMENT` | A bad path. |
+| `INVALID_ARGUMENT` | A bad repo name or ID; a bad path. |
 | `NOT_FOUND` | The repo or changeset does not exist. |
 | `DEADLINE_EXCEEDED` | With a `path`: the server ran past 600 s from the start of the call. |
 
@@ -570,7 +573,7 @@ rename. Its next call then fails with `NOT_FOUND`, or blames another file.
 
 | Error | When |
 |---|---|
-| `INVALID_ARGUMENT` | A bad or empty path; the file is not a regular file, is larger than 16 MiB, or has more than 1,048,576 lines; `rename_searched` and `rename_best` are not a place where a rename search of that path at that changeset can stop. |
+| `INVALID_ARGUMENT` | A bad repo name or ID; a bad or empty path; the file is not a regular file, is larger than 16 MiB, or has more than 1,048,576 lines; `rename_searched` and `rename_best` are not a place where a rename search of that path at that changeset can stop. |
 | `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
 
 ### 6.11 MergeBase
@@ -937,8 +940,18 @@ Access tickets that a tier checks are not in v1
 
 ## 9. Compatibility
 
-Version 1 is the `scion.v1` package together with object format v1. A server,
-tier or client MUST ignore fields that it does not know, as proto3 does.
+This file describes version 1 of the protocol: the `scion.v1` package of
+[`proto/scion.proto`](../proto/scion.proto) together with object format v1
+([`format-v1.md`](format-v1.md)). A caller states the version it wants by
+which package it calls; there is no handshake and no version header. A
+server answers every call of a package that it serves, and a call of a
+package or a service that it does not serve fails with `UNIMPLEMENTED`, as
+for a call that it does not have. A later version is a new package,
+`scion.v2`. A server MAY serve both, so a client can move to the new
+version call by call, and an older client keeps working.
+
+A server, tier or client MUST ignore fields that it does not know, as
+proto3 does.
 
 Because unknown fields are ignored, an older server drops a new request field
 without an error. For example, a server from before `LogRequest.path` ignores
@@ -962,7 +975,9 @@ only if an answer that ignores it is still correct for the client.
 | What a client must check or may trust (section 5), or what a status code means | Yes |
 | Request-key rules, or a land retention shorter than 7 days | Yes |
 
-A new version is a new package, `scion.v2`. A server MAY serve both.
+A server MAY serve both `scion.v1` and `scion.v2` at once. To retire a
+version, a server stops serving its package; its clients then get
+`UNIMPLEMENTED`, which tells them to move.
 
 ## 10. Not in v1
 

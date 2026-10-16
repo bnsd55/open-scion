@@ -197,15 +197,27 @@ release.
 - The tier timeouts nest: the server and tiers wait 30 s for reply memory,
   a tier 30 s for a fetch slot and 30 s for fetch memory, the cache 60 s per
   step of the server, the daemon 180 s per step of the cache.
-- `scion-daemon` keeps its recency index in `<data>/index` too, appended in
-  batches. After a clean stop (Ctrl-C, or SIGTERM, which it now handles
-  too), a start reads that one file and opens no object directory, and the
-  order of use survives the restart. The stop flushes the file, with a hash
-  of its records, past the drive's cache. After a crash, or for a file that
-  does not match its hash, a start scans every object file as before, and
-  keeps the order of the index for the objects that it names. A crash loses
-  only what was used last, never an object. After running a daemon build
-  from before the index on the same data directory, remove `<data>/index`.
+- `scion-daemon` keeps its recency index in `<data>/index.db`, a SQLite
+  database (through `rusqlite`), read and changed in place. The index is
+  not held in memory: a `size` is one point lookup, and the daemon keeps
+  only the last batch of row changes, at most 1,024 (or 64 MiB of new
+  bytes), committed in one transaction, plus the database's own page cache
+  of 8 MiB. After a clean stop (Ctrl-C, or SIGTERM, which it now handles
+  too), a start reads the rows and opens no object directory, and the order
+  of use survives the restart. The stop commits, checkpoints the
+  write-ahead log, and flushes it past the drive's cache. After a crash, a
+  start still opens at once, at most one batch behind: every change carries
+  a sequence number, and the start reads only the changes past the newest
+  one committed. Files that a crash left before their batch (a rename
+  without a row) are adopted by one low-priority walk of the object
+  directories after the start: each file with no row comes back as the
+  least recently used, and its bytes count against `--max-bytes`, so the
+  limit holds again; the walk stops at a clean stop and logs what it
+  adopted. A crash loses only what was used last, never an object. A store
+  from a build before the index db has `<data>/index` (the append-only
+  index of that format): the first start imports its records in file order
+  and removes it. After running a daemon build from before the index db on
+  the same data directory, remove `<data>/index`.
 - Receivers accept only plain Zstandard frames, with no dictionary and a
   window of at most 8 MiB; the zstd library is built without its legacy
   decoders.

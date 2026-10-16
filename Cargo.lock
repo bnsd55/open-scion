@@ -2767,6 +2767,7 @@ dependencies = [
  "clap",
  "hashlink",
  "rcgen",
+ "rusqlite",
  "rustix",
  "scion-core",
  "scion-proto",
