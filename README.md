@@ -186,7 +186,7 @@ These are this project's choices where the article does not give details.
 | Retries | Each land has a caller-chosen request key, so a retry returns the first result |
 | Git | One-way import. Commit IDs are not kept identical to git commit IDs. |
 | Cache tiers | As in the article, a daemon per machine on a socket and a regional cache in memory. The Unix socket, TCP between tiers, the disk store, the byte limits, and one shared fetch per missed object are this project's choices. |
-| History and blame | Computed on each call from first-parent changes, with a bound per call. Blame follows renames, as `git blame` does; path history does not, as `git log` without `--follow`. The article keeps them as derived data; that is planned ([#61](https://github.com/bnsd55/open-scion/issues/61)). |
+| History and blame | Path history is derived data, as in the article: the form, one history tree per changeset, is this project's choice. Blame is computed on each call from first-parent changes, with a bound per call; the article keeps it as derived data too, which is planned ([#61](https://github.com/bnsd55/open-scion/issues/61)). Blame follows renames, as `git blame` does; path history does not, as `git log` without `--follow`. |
 
 Deliberate simplifications are marked `SHORTCUT:` in the code, each with its
 limit and its upgrade path.

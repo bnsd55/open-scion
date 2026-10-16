@@ -243,12 +243,8 @@ server checks, in order:
 1. The ref exists. If not, the land is `REJECTED` at once.
 2. The changeset has exactly one parent. If not (an imported root or merge),
    `REJECTED`.
-3. The base is on the ref's first-parent history. If not, `REJECTED`. A base
-   more than 100,000 changesets behind the head on that history MAY be
-   `REJECTED` as too old. Then the client makes a new changeset on a newer
-   head and lands that. A base within 100,000 changesets of the head is never
-   too old. Further back, the answer depends on what the server holds in
-   memory at the time, so the same base can pass later under a new key.
+3. The base is on the ref's first-parent history. If not, `REJECTED`. Any
+   base on that history is checked, however far behind the head it is.
 4. Each path P that the changeset changes is checked. P conflicts when a
    changeset on the ref after the base changed P itself, a path below P, or a
    file at a directory above P. If any path conflicts, the land is
@@ -393,13 +389,15 @@ level as `TreeV1` bytes. An empty path is the repo root.
   appears, and a merge appears when its first-parent diff touches the path.
 - `limit` is the most entries the client wants. 0 means 1. A reply holds at
   most `limit` entries and at most 1,000.
-- A call checks at most 1,000 changesets. A reply stops before an entry that
-  would take its changeset bytes over 32 MiB, but always holds the first
-  entry it found.
+- A reply holds `limit` entries, and at most 1,000, unless the history ends
+  first. With a `path`, any number of changesets can lie between two
+  entries. A reply stops before an entry that would take its changeset bytes
+  over 32 MiB, but always holds the first entry it found.
 - `next_changeset_id` is the first changeset that this reply does not cover,
   or empty when the history ends. To continue, a client calls `Log` again
-  with `changeset_id` set to it and the same `path`. A reply can have no
-  entries and still set `next_changeset_id`, so a client MUST continue until
+  with `changeset_id` set to it and the same `path`. This server sends no
+  reply with no entries and a `next_changeset_id`. An earlier server did, for
+  a path changed long ago, and v1 allows it. So a client MUST continue until
   it has enough entries or `next_changeset_id` is empty.
 
 | Error | When |
@@ -718,7 +716,7 @@ A new version is a new package, `scion.v2`. A server MAY serve both.
 - Text merge. Conflicts are path-level.
 - `Diff` with rename detection
   ([#79](https://github.com/bnsd55/open-scion/issues/79)).
-- `Log` and `Blame` without per-call bounds
+- `Blame` without per-call bounds
   ([#61](https://github.com/bnsd55/open-scion/issues/61)), and `Log` that
   follows renames.
 - Blobs sent in their stored, compressed form

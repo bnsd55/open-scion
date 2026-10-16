@@ -239,7 +239,7 @@ fn blame(store: &Store, cs: ChangesetId, p: &str) -> Blame {
 }
 
 #[test]
-fn walks_stop_after_max_scan_changesets_and_resume() {
+fn a_path_log_reads_past_max_scan_changesets_and_blame_resumes() {
     let (_data, store) = open_store();
     let f = store.blobs().put(b"one\ntwo\n").unwrap();
     // `f` changes only in the root, then MAX_SCAN changesets change `g`.
@@ -249,8 +249,8 @@ fn walks_stop_after_max_scan_changesets_and_resume() {
     let ids = chain(&store, changes);
     let (root, tip) = (ids[0], *ids.last().unwrap());
 
-    assert_eq!(path_log(&store, tip, "f"), (vec![], Some(root)));
-    assert_eq!(path_log(&store, root, "f"), (vec![root], None));
+    // A path log reads the path history, so one call finds the root.
+    assert_eq!(path_log(&store, tip, "f"), (vec![root], None));
 
     let first = blame(&store, tip, "f");
     assert_eq!(first.ranges, [range(1, 2, None, 1)]);

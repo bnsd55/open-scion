@@ -10,8 +10,10 @@ use scion_core::{
 
 use crate::db::{self, RepoId};
 use crate::deadline::Deadline;
+use crate::derived;
 use crate::error::{Error, Result};
 use crate::graph;
+use crate::history::{self, PathHistory};
 use crate::store::Store;
 use crate::tree;
 
@@ -103,14 +105,13 @@ pub fn list_dir(
     })
 }
 
-/// Most changesets one call checks on a first-parent walk: a `Log` call, or
-/// the walk of a `Blame` call. So it is also the most entries a `Log` reply
-/// holds. Each check reads one changeset while the call holds the database
-/// lock.
-// SHORTCUT: path history and blame walk first parents on every call, so a
-// path changed long ago costs one call per 1,000 changesets since. Upgrade:
-// per-path history as derived data, so a call reads only the changesets that
-// changed the path.
+/// Most changesets that one `Blame` call checks on its first-parent walk,
+/// and most entries that a `Log` reply holds. Each check, and each entry,
+/// reads one changeset while the call holds the database lock.
+// SHORTCUT: blame walks first parents on every call, so a file changed long
+// ago costs one call per 1,000 changesets since. Upgrade: blame from the
+// path history (`history.rs`), so a call reads only the changesets that
+// changed the file (https://github.com/bnsd55/open-scion/issues/61).
 pub const MAX_SCAN: usize = 1000;
 
 /// One page of first-parent history.
@@ -146,9 +147,12 @@ pub fn log(
     Ok(entries)
 }
 
-/// Up to `limit` changesets, walking first parents from `cs`, newest first.
-/// With a `path`, only the changesets that change it ([`changes_path`]).
-/// Checks at most [`MAX_SCAN`] changesets.
+/// Up to `limit` changesets, and at most [`MAX_SCAN`], walking first
+/// parents from `cs`, newest first. With a `path`, only the changesets that
+/// change it ([`changes_path`]), found in the path history of `cs`
+/// ([`history`]): each entry reads one changeset and one history node per
+/// part of the path, however many changesets lie between two entries. If
+/// `cs` has no path history yet, this derives it first, in steps.
 ///
 /// # Errors
 ///
@@ -160,15 +164,32 @@ pub fn log_page(
     path: Option<&RepoPath>,
     limit: usize,
 ) -> Result<LogPage> {
+    let limit = limit.min(MAX_SCAN);
+    let Some(path) = path else {
+        return store.read(|c| {
+            let repo = db::repo_id(c, repo)?;
+            let mut entries = Vec::new();
+            let mut next = Some(cs);
+            let mut budget = limit;
+            while let Some(entry) = next_change(c, repo, None, &mut next, &mut budget)? {
+                entries.push(entry);
+            }
+            Ok(LogPage { entries, next })
+        });
+    };
+    let repo = store.read(|c| db::repo_id(c, repo))?;
+    derived::get::<PathHistory>(store, repo, cs)?;
     store.read(|c| {
-        let repo = db::repo_id(c, repo)?;
         let mut entries = Vec::new();
         let mut next = Some(cs);
-        let mut budget = MAX_SCAN;
-        while entries.len() < limit {
-            match next_change(c, repo, path, &mut next, &mut budget)? {
-                Some(entry) => entries.push(entry),
-                None => break,
+        while let Some(from) = next.filter(|_| entries.len() < limit) {
+            // Each changeset on the first-parent history of `cs` has a path
+            // history, so `from` has one.
+            next = None;
+            if let Some(id) = history::newest_change(c, from, path)? {
+                let changeset = db::get_changeset(c, repo, id)?;
+                next = changeset.parents.first().copied();
+                entries.push((id, changeset));
             }
         }
         Ok(LogPage { entries, next })
@@ -178,7 +199,7 @@ pub fn log_page(
 /// Walks first parents from `next` to the newest changeset that changes
 /// `path` ([`changes_path`]), or to the next changeset if `path` is `None`.
 /// Checks at most `budget` changesets, and leaves `next` at the first one it
-/// did not check.
+/// did not check. `Blame` walks with it, and `Log` without a path.
 pub(crate) fn next_change(
     c: &Connection,
     repo: RepoId,

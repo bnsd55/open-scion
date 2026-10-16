@@ -25,7 +25,7 @@ use scion_core::{BlobHasher, BlobId};
 use crate::error::{Error, Result};
 
 /// The schema version this build makes and reads.
-pub(crate) const SCHEMA_VERSION: u32 = 3;
+pub(crate) const SCHEMA_VERSION: u32 = 4;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database from
 /// version `n - 1` to version `n`. A released migration never changes.
@@ -33,6 +33,7 @@ const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_land_retention.sql"),
     include_str!("../migrations/0003_derived_values.sql"),
+    include_str!("../migrations/0004_path_history.sql"),
 ];
 
 /// Largest object accepted or read back, uncompressed: 100 MiB, the hard
@@ -305,10 +306,12 @@ impl Store {
 fn build() -> String {
     use crate::derived::Kind;
     use crate::graph::CommitGraph;
+    use crate::history::PathHistory;
     use crate::tree::RootTree;
     let kinds = [
         (RootTree::NAME, RootTree::VERSION),
         (CommitGraph::NAME, CommitGraph::VERSION),
+        (PathHistory::NAME, PathHistory::VERSION),
     ];
     let kinds = kinds.map(|(name, version)| format!("{name} {version}"));
     format!("schema {SCHEMA_VERSION}, {}", kinds.join(", "))
