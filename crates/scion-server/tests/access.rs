@@ -97,10 +97,26 @@ fn store() -> (tempfile::TempDir, Store, ChangesetId, BlobId) {
             let root =
                 db::insert_changeset(c, repo, &changeset(vec![], "README", Some(regular(blob))))?;
             db::cas_ref(c, repo, "main", None, root)?;
+            // As if uploaded to `main` with `PutBlob`.
+            db::add_repo_blob(c, repo, blob)?;
             Ok(root)
         })
         .unwrap();
     (dir, store, root, blob)
+}
+
+/// Stores `content` as a blob of `REPO`, as an upload through `PutBlob`
+/// would.
+fn put(store: &Store, content: &[u8]) -> BlobId {
+    let blob = store.blobs().put(content).unwrap();
+    store
+        .write(|c| {
+            let repo = db::repo_id(c, REPO)?;
+            db::add_repo_blob(c, repo, blob)?;
+            Ok(())
+        })
+        .unwrap();
+    blob
 }
 
 /// A server of `store` with `access`, and a client of each service as
@@ -140,7 +156,7 @@ async fn writes_outside_a_prefix_are_denied_with_the_path() {
     let (_alice_stop, mut alice, _) = server(&store, access.clone(), "alice").await;
 
     // Inside the prefix: accepted.
-    let guide = store.blobs().put(b"guide").unwrap();
+    let guide = put(&store, b"guide");
     let (bytes, _) = changeset(vec![root], "docs/guide", Some(regular(guide))).encode_with_id();
     alice
         .create_changeset(CreateChangesetRequest {
@@ -151,7 +167,7 @@ async fn writes_outside_a_prefix_are_denied_with_the_path() {
         .unwrap();
 
     // Outside it: denied, and the message names the path.
-    let source = store.blobs().put(b"source").unwrap();
+    let source = put(&store, b"source");
     let (bytes, _) = changeset(vec![root], "src/a", Some(regular(source))).encode_with_id();
     let status = alice
         .create_changeset(CreateChangesetRequest {
@@ -164,7 +180,7 @@ async fn writes_outside_a_prefix_are_denied_with_the_path() {
     assert!(status.message().contains("src/a"), "{}", status.message());
 
     // Not by bytes alone: `docsx` is not below `docs`.
-    let source = store.blobs().put(b"sx").unwrap();
+    let source = put(&store, b"sx");
     let (bytes, _) = changeset(vec![root], "docsx/readme", Some(regular(source))).encode_with_id();
     let status = alice
         .create_changeset(CreateChangesetRequest {
@@ -194,7 +210,7 @@ async fn put_upload_create_and_land_need_write_rules() {
     assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
 
     // A create is denied with the path it would change.
-    let x = store.blobs().put(b"x").unwrap();
+    let x = put(&store, b"x");
     let (bytes, _) = changeset(vec![root], "docs/x", Some(regular(x))).encode_with_id();
     let status = bob
         .create_changeset(CreateChangesetRequest {
@@ -226,7 +242,7 @@ async fn the_lander_of_another_principals_changeset_needs_write() {
 
     // alice creates a changeset inside her prefix.
     let (_alice_stop, mut alice, _) = server(&store, access.clone(), "alice").await;
-    let guide = store.blobs().put(b"guide").unwrap();
+    let guide = put(&store, b"guide");
     let (bytes, id) = changeset(vec![root], "docs/guide", Some(regular(guide))).encode_with_id();
     alice
         .create_changeset(CreateChangesetRequest {
