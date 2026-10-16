@@ -13,9 +13,7 @@ use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPa
 use scion_server::deadline::Deadline;
 use scion_server::import::{ImportOptions, import_git};
 use scion_server::meta::MetaTx as _;
-use scion_server::read::{
-    self, DiffEntry, MAX_DIFF_ENTRIES, MAX_RENAME_CHUNKS, Rename,
-};
+use scion_server::read::{self, DiffEntry, MAX_DIFF_ENTRIES, MAX_RENAME_CHUNKS, Rename};
 use scion_server::{Error, Store, tree};
 use tempfile::TempDir;
 
