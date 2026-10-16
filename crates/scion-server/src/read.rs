@@ -12,7 +12,7 @@ use crate::db::{self, RepoId};
 use crate::deadline::Deadline;
 use crate::error::{Error, Result};
 use crate::graph;
-use crate::similar::{self, Budget, Chunks};
+use crate::similar::{self, Budget, Chunks, MAX_PAIRS, Progress};
 use crate::store::Store;
 use crate::tree;
 
@@ -399,8 +399,11 @@ fn renames(store: &Store, entries: &[DiffEntry]) -> Result<HashMap<RepoPath, Ren
     let budget = Budget {
         cost: &mut cost,
         cap: MAX_RENAME_CHUNKS,
+        progress: false,
     };
-    let pairs = similar::renames(store, &added, &deleted, read, similar::MAX_PAIRS, budget)?;
+    let from = Progress::default();
+    let found = similar::renames(store, &added, &deleted, read, MAX_PAIRS, from, budget)?;
+    let pairs = found.pairs;
     if cost >= MAX_RENAME_CHUNKS {
         tracing::debug!(
             cost,

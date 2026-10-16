@@ -25,6 +25,7 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth::{Auth, Caller};
+use crate::blame::RenameSearch;
 use crate::deadline::Deadline;
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
@@ -563,6 +564,11 @@ impl Scion for ScionService {
         check_name("repo", &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_path(req.path)?;
+        let search = RenameSearch {
+            searched: usize::try_from(req.rename_searched)
+                .map_err(|_| Status::invalid_argument("rename_searched is too large"))?,
+            best: parse_optional_path(req.rename_best)?,
+        };
         // Taken before the worker permit, and held until the job ends, also
         // when the client leaves first.
         let slot = Arc::clone(&self.blames)
@@ -573,7 +579,7 @@ impl Scion for ScionService {
             .worker
             .run(move |store| {
                 let _slot = slot;
-                blame::blame(&store, &req.repo, id, &path)
+                blame::blame(&store, &req.repo, id, &path, &search)
             })
             .await?;
         let ranges = blame
@@ -599,13 +605,17 @@ impl Scion for ScionService {
             })
             .collect();
         let (next, next_path) = blame.next.unzip();
+        let path_bytes = |path: Option<RepoPath>| {
+            path.map(|path| path.as_bytes().to_vec())
+                .unwrap_or_default()
+        };
         Ok(Response::new(BlameResponse {
             ranges,
             changesets,
             next_changeset_id: id_bytes(next),
-            next_path: next_path
-                .map(|path| path.as_bytes().to_vec())
-                .unwrap_or_default(),
+            next_path: path_bytes(next_path),
+            next_rename_searched: blame.next_search.searched as u64,
+            next_rename_best: path_bytes(blame.next_search.best),
         }))
     }
 

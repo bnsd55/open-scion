@@ -190,13 +190,42 @@ pub struct Pair {
 /// The work that one [`renames`] call may do.
 pub struct Budget<'a> {
     /// The cost so far, with what the caller counted before. Each chunk of
-    /// a file read counts once, and each row of a chunk table that a
-    /// comparison reads counts once.
+    /// a file read counts once, each row of a chunk table that a comparison
+    /// reads counts once, and each file size read counts [`SIZE_COST`].
     pub cost: &'a mut usize,
-    /// Once `cost` reaches this, the search reads no more files. It checks
-    /// before each read, so a read and its comparisons that start below the
-    /// cap run to the end.
+    /// Once `cost` reaches this, the search starts no more work. It checks
+    /// before each pair of step 2 and each deleted file of step 3, so the
+    /// work on one of them runs to the end.
     pub cap: usize,
+    /// Whether step 3 looks at one more deleted file than it already had,
+    /// even past the cap, so that a search that goes on over calls always
+    /// moves.
+    pub progress: bool,
+}
+
+/// What one file size read costs against a [`Budget`]: about the work of
+/// cutting this many chunks, since it opens the file.
+pub const SIZE_COST: usize = 64;
+
+/// Where step 3 of a search for one added file stands ([`renames`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Progress {
+    /// How many deleted files, in path order, step 3 has looked at.
+    pub searched: usize,
+    /// The deleted file most like the added file among those, if one is at
+    /// least 50% like it.
+    pub best: Option<usize>,
+}
+
+/// What [`renames`] found.
+#[derive(Debug, Default)]
+pub struct Outcome {
+    /// The renames.
+    pub pairs: Vec<Pair>,
+    /// Set when step 3 stopped at the budget: the first deleted file it did
+    /// not look at. Then `pairs` holds the best pairs among the files it
+    /// looked at.
+    pub stopped: Option<usize>,
 }
 
 /// Pairs added files with the deleted files they came from, as git does by
@@ -223,11 +252,18 @@ pub struct Budget<'a> {
 /// file's chunks, given its path, blob and size. When it returns `None`,
 /// the file is like no other.
 ///
-/// Step 3 reads the added files that some deleted file could be like, in
-/// path order, into one index by chunk hash. Then it reads the deleted
-/// files, in path order, one at a time, and looks up each of their chunks
-/// in the index. So it holds the tables of those added files, and of one
-/// deleted file.
+/// Step 3 takes the deleted files in path order, one at a time. For each,
+/// it reads the added files that it could be like into one index by chunk
+/// hash, if not read yet, then reads the deleted file and looks up its
+/// chunks in the index. So it holds the tables of those added files, and of
+/// one deleted file.
+///
+/// A search for one added file can stop at the budget and go on later: pass
+/// the [`Progress`] made of [`Outcome::stopped`] and the deleted file of the
+/// pair found so far. Then steps 1 and 2 do not run again; they found
+/// nothing, or the search would not have reached step 3. Step 3 reads the
+/// best file again, and goes on from where it stopped. The answer is the
+/// same as that of one search with no budget.
 ///
 /// # Errors
 ///
@@ -238,10 +274,12 @@ pub fn renames(
     deleted: &[(&RepoPath, FileState)],
     read: impl FnMut(&RepoPath, BlobId, usize) -> Result<Option<Chunks>>,
     max_pairs: usize,
+    from: Progress,
     budget: Budget<'_>,
-) -> Result<Vec<Pair>> {
+) -> Result<Outcome> {
     debug_assert!(added.is_sorted_by_key(|(path, _)| *path));
     debug_assert!(deleted.is_sorted_by_key(|(path, _)| *path));
+    debug_assert!(from == Progress::default() || added.len() == 1);
     let mut search = Search {
         store,
         read,
@@ -255,10 +293,15 @@ pub fn renames(
         tables: HashMap::new(),
         known: HashMap::new(),
     };
-    search.same_content();
-    search.same_name()?;
-    search.similar(max_pairs)?;
-    Ok(search.pairs)
+    if from == Progress::default() {
+        search.same_content();
+        search.same_name()?;
+    }
+    let stopped = search.similar(max_pairs, from)?;
+    Ok(Outcome {
+        pairs: search.pairs,
+        stopped,
+    })
 }
 
 /// What step 1 of [`renames`] compares: the kind and the ID. The executable
@@ -307,10 +350,6 @@ fn git_score(shared: u64, size: usize, other: usize) -> u32 {
     u32::try_from(shared * u64::from(SAME) / large).unwrap_or(SAME)
 }
 
-/// A regular file that step 3 of [`renames`] compares: its index, blob and
-/// size.
-type File = (usize, BlobId, usize);
-
 /// The state of one [`renames`] call.
 struct Search<'a, R> {
     store: &'a Store,
@@ -325,7 +364,7 @@ struct Search<'a, R> {
     pairs: Vec<Pair>,
     /// The size of each file looked at.
     sizes: HashMap<BlobId, usize>,
-    /// The chunks of each added file read, or `None` if it was not read.
+    /// The chunks of each added file read, or `None` if `read` refused it.
     tables: HashMap<BlobId, Option<Chunks>>,
     /// For each deleted file that step 2 compared and found under 75%: the
     /// added file and the score, so step 3 does not compare them again.
@@ -399,6 +438,9 @@ impl<R: FnMut(&RepoPath, BlobId, usize) -> Result<Option<Chunks>>> Search<'_, R>
             else {
                 continue;
             };
+            if self.spent() {
+                break;
+            }
             let (from_size, to_size) = (self.size(from)?, self.size(to)?);
             if !can_be(from_size, to_size, MIN_NAME_SCORE) || !self.load(self.added[a].0, to)? {
                 continue;
@@ -421,77 +463,74 @@ impl<R: FnMut(&RepoPath, BlobId, usize) -> Result<Option<Chunks>>> Search<'_, R>
         Ok(())
     }
 
-    /// The regular files among `left`, the files of a side at those indexes.
-    fn regular_files(
-        &mut self,
-        files: &[(&RepoPath, FileState)],
-        left: Vec<usize>,
-    ) -> Result<Vec<File>> {
-        let mut regular_files = Vec::new();
-        for at in left {
-            if let Some(blob) = regular(files[at].1) {
-                regular_files.push((at, blob, self.size(blob)?));
-            }
-        }
-        Ok(regular_files)
-    }
-
-    /// Whether step 3 compares the added file `to` and the deleted file
-    /// `from`: they can be 50% similar, and step 2 did not compare them.
-    fn compares(&self, &(a, _, to_size): &File, &(d, _, from_size): &File) -> bool {
-        can_be(from_size, to_size, MIN_SCORE)
-            && self.known.get(&d).is_none_or(|&(known, _)| known != a)
-    }
-
-    /// Step 3 of [`renames`].
-    fn similar(&mut self, max_pairs: usize) -> Result<()> {
+    /// Step 3 of [`renames`], from `from`. Returns the first deleted file
+    /// that it did not look at, if it stopped at the budget.
+    fn similar(&mut self, max_pairs: usize, from: Progress) -> Result<Option<usize>> {
         let (added_left, deleted_left) = (Self::left(&self.taken), Self::left(&self.used));
         let count = added_left.len().saturating_mul(deleted_left.len());
         if count == 0 || count > max_pairs {
-            return Ok(());
+            return Ok(None);
         }
-        let targets = self.regular_files(self.added, added_left)?;
-        let sources = self.regular_files(self.deleted, deleted_left)?;
+        // The added regular files: index, blob and size.
+        let mut targets = Vec::new();
+        for a in added_left {
+            if let Some(to) = regular(self.added[a].1) {
+                targets.push((a, to, self.size(to)?));
+            }
+        }
+        // The best file found before, then the files from where the search
+        // stopped.
+        let seed = from.best.filter(|&d| d < from.searched);
+        let sources = seed
+            .into_iter()
+            .chain(deleted_left.into_iter().filter(|&d| d >= from.searched));
         // For each chunk hash, the targets read with it, and their bytes.
         let mut index: HashMap<u32, Vec<(usize, u32)>> = HashMap::new();
-        // Each target's place in `targets`, by its added file.
-        let mut place = vec![None; self.added.len()];
         let mut loaded = vec![false; targets.len()];
-        for (t, target) in targets.iter().enumerate() {
-            let (a, to, _) = *target;
-            place[a] = Some(t);
-            if !sources.iter().any(|source| self.compares(target, source))
-                || !self.load(self.added[a].0, to)?
-            {
-                continue;
-            }
-            let Some(Some(chunks)) = self.tables.get(&to) else {
-                continue;
-            };
-            for &(hash, bytes) in &chunks.table {
-                index.entry(hash).or_default().push((t, bytes));
-            }
-            loaded[t] = true;
-        }
         // For each target, its best pairs so far: score, same name, and the
         // deleted file.
         let mut best: Vec<Vec<(u32, bool, usize)>> = vec![Vec::new(); targets.len()];
         let mut shared = vec![0; targets.len()];
-        for source in &sources {
-            let (d, from, from_size) = *source;
+        let mut moved = false;
+        let mut stopped = None;
+        for d in sources {
+            // The best file found before is read again, whatever the cost.
+            let is_seed = Some(d) == seed;
+            if !is_seed && self.spent() && (moved || !self.budget.progress) {
+                stopped = Some(d);
+                break;
+            }
+            moved |= !is_seed;
+            let Some(from) = regular(self.deleted[d].1) else {
+                continue;
+            };
+            let from_size = self.size(from)?;
             let mut found = Vec::new();
             if let Some(&(a, value)) = self.known.get(&d)
-                && let Some(t) = place[a]
+                && let Some(t) = targets.iter().position(|&(at, ..)| at == a)
             {
                 found.push((t, value));
             }
-            let wanted: Vec<usize> = if self.spent() {
-                Vec::new()
-            } else {
-                (0..targets.len())
-                    .filter(|&t| loaded[t] && self.compares(&targets[t], source))
-                    .collect()
-            };
+            let known = self.known.get(&d).map(|&(a, _)| a);
+            let wanted: Vec<usize> = (0..targets.len())
+                .filter(|&t| {
+                    let (a, _, to_size) = targets[t];
+                    known != Some(a) && can_be(from_size, to_size, MIN_SCORE)
+                })
+                .collect();
+            for &t in &wanted {
+                let (a, to, _) = targets[t];
+                if loaded[t] || !self.load(self.added[a].0, to)? {
+                    continue;
+                }
+                if let Some(Some(chunks)) = self.tables.get(&to) {
+                    for &(hash, bytes) in &chunks.table {
+                        index.entry(hash).or_default().push((t, bytes));
+                    }
+                }
+                loaded[t] = true;
+            }
+            let wanted: Vec<usize> = wanted.into_iter().filter(|&t| loaded[t]).collect();
             if !wanted.is_empty()
                 && let Some(chunks) = self.read_file(self.deleted[d].0, from)?
             {
@@ -523,9 +562,17 @@ impl<R: FnMut(&RepoPath, BlobId, usize) -> Result<Option<Chunks>>> Search<'_, R>
                 kept.truncate(CANDIDATES);
             }
         }
+        let added = targets.iter().map(|&(a, ..)| a);
+        self.pair_best(added.zip(best));
+        Ok(stopped)
+    }
+
+    /// The end of step 3: for each added file, the best pairs kept (score,
+    /// same name, and the deleted file). Pairs them, most similar first,
+    /// while both files are free.
+    fn pair_best(&mut self, best: impl Iterator<Item = (usize, Vec<(u32, bool, usize)>)>) {
         let mut candidates: Vec<(u32, bool, usize, usize)> = Vec::new();
-        for (t, kept) in best.into_iter().enumerate() {
-            let a = targets[t].0;
+        for (a, kept) in best {
             candidates.extend(
                 kept.into_iter()
                     .map(|(value, same_name, d)| (value, same_name, a, d)),
@@ -537,14 +584,15 @@ impl<R: FnMut(&RepoPath, BlobId, usize) -> Result<Option<Chunks>>> Search<'_, R>
                 self.pair(a, d, value);
             }
         }
-        Ok(())
     }
 
+    /// A file's size. Each one read costs [`SIZE_COST`].
     fn size(&mut self, blob: BlobId) -> Result<usize> {
         if let Some(&size) = self.sizes.get(&blob) {
             return Ok(size);
         }
         let size = self.store.blobs().size(blob)?;
+        *self.budget.cost += SIZE_COST;
         self.sizes.insert(blob, size);
         Ok(size)
     }
@@ -553,12 +601,8 @@ impl<R: FnMut(&RepoPath, BlobId, usize) -> Result<Option<Chunks>>> Search<'_, R>
         *self.budget.cost >= self.budget.cap
     }
 
-    /// Reads the chunks of the file at `path`, unless the budget is spent
-    /// or `read` refuses it.
+    /// Reads the chunks of the file at `path`, unless `read` refuses it.
     fn read_file(&mut self, path: &RepoPath, blob: BlobId) -> Result<Option<Chunks>> {
-        if self.spent() {
-            return Ok(None);
-        }
         let size = self.size(blob)?;
         let chunks = (self.read)(path, blob, size)?;
         *self.budget.cost += chunks.as_ref().map_or(0, |chunks| chunks.count);
