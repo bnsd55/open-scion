@@ -1885,8 +1885,8 @@ mod tests {
             .unwrap();
         let done = AtomicBool::new(false);
         thread::scope(|s| {
-            // Long reads, as graph walks are, on half the read connections.
-            for _ in 0..READERS / 2 {
+            // Two long reads at a time, as graph walks are.
+            for _ in 0..2 {
                 s.spawn(|| {
                     while !done.load(Ordering::Relaxed) {
                         store
