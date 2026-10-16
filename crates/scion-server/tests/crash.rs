@@ -23,7 +23,7 @@
 //!
 //! Each run picks a seed and prints it. `SCION_CRASH_SEED=<n>` runs the same
 //! workload and kill times again; thread timing still differs.
-//! `SCION_CRASH_KILLS=<n>` sets the number of kills (default 4).
+//! `SCION_CRASH_KILLS=<n>` sets the number of kills (default 6).
 #![cfg(unix)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -32,18 +32,20 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use scion_core::{BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, RepoPath, Tree};
 use scion_proto::auth::Bearer;
+use scion_proto::object::{self, Assembler, Header};
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{
-    self, CreateChangesetRequest, DiffRequest, FileKind, GetChangesetRequest, GetObjectsRequest,
-    LandRequest, LandResponse, LandState, ObjectKind, ObjectRef, PutBlobRequest, ResolveRefRequest,
+    self, CreateChangesetRequest, DiffRequest, Encoding, FileKind, GetChangesetRequest,
+    GetObjectsRequest, LandRequest, LandResponse, LandState, ObjectKind, ObjectRef, PutBlobRequest,
+    ResolveRefRequest,
 };
-use scion_proto::{CHUNK_BYTES, MAX_OBJECT_MESSAGE_BYTES, MAX_OBJECT_REFS};
+use scion_proto::{CHUNK_BYTES, MAX_OBJECT_REFS};
 use scion_server::store::BlobStatus;
 use scion_server::{Store, db, tree};
 use tonic::Status;
@@ -154,8 +156,7 @@ async fn connect(url: &str) -> Result<(Scion, Objects), tonic::transport::Error>
         .connect()
         .await?;
     let bearer = Bearer::new(TOKEN).unwrap();
-    let objects = ObjectsClient::with_interceptor(channel.clone(), bearer.clone())
-        .max_decoding_message_size(MAX_OBJECT_MESSAGE_BYTES);
+    let objects = ObjectsClient::with_interceptor(channel.clone(), bearer.clone());
     Ok((ScionClient::with_interceptor(channel, bearer), objects))
 }
 
@@ -247,13 +248,42 @@ async fn put_blob(scion: &mut Scion, data: &[u8]) -> Result<BlobId, Status> {
     Ok(BlobId::try_from(reply.into_inner().blob_id.as_slice()).unwrap())
 }
 
+/// What the clients and the test that kills the server share.
+#[derive(Default)]
+struct Signals {
+    /// Set just before the kill.
+    killed: AtomicBool,
+    /// Calls in progress that a kill can wait for: `PutBlob` of a large
+    /// file, and `Land`.
+    calls: [AtomicUsize; 2],
+}
+
+/// How long after a call of [`Signals::calls`] starts a kill may come, in
+/// milliseconds. A large upload writes its blob near its end, after about
+/// 10 to 30 ms. A land is pending for its first few ms, then waits for its
+/// flush.
+const KILL_WINDOW_MS: [usize; 2] = [30, 4];
+
+impl Signals {
+    /// Counts a call of kind `kind` in progress while `call` runs.
+    async fn track<T>(&self, kind: usize, call: impl Future<Output = T>) -> T {
+        self.calls[kind].fetch_add(1, Ordering::SeqCst);
+        let done = call.await;
+        self.calls[kind].fetch_sub(1, Ordering::SeqCst);
+        done
+    }
+}
+
+/// A file of more than this many bytes counts as large.
+const LARGE: usize = 64 << 10;
+
 /// One client: uploads files, creates a changeset on a ref's head (or on an
 /// older base of it), and lands it, until a call fails. Only the kill may
-/// fail a call, and it sets `killed` first.
-async fn client(url: String, name: String, mut rng: Rng, killed: Arc<AtomicBool>) -> Ledger {
+/// fail a call, and it sets `signals.killed` first.
+async fn client(url: String, name: String, mut rng: Rng, signals: Arc<Signals>) -> Ledger {
     let mut ledger = Ledger::default();
     let cut = |ledger, call: &str, error: &dyn std::fmt::Debug| {
-        let killed = killed.load(Ordering::SeqCst);
+        let killed = signals.killed.load(Ordering::SeqCst);
         assert!(killed, "{name}: {call} failed before the kill: {error:?}");
         ledger
     };
@@ -285,7 +315,7 @@ async fn client(url: String, name: String, mut rng: Rng, killed: Arc<AtomicBool>
         let mut files = Vec::new();
         for i in 0..=rng.below(3) {
             let len = if rng.below(8) == 0 {
-                (64 << 10) + rng.below(1 << 20)
+                LARGE + rng.below(1 << 20)
             } else {
                 1 + rng.below(4096)
             };
@@ -296,7 +326,13 @@ async fn client(url: String, name: String, mut rng: Rng, killed: Arc<AtomicBool>
         }
         let mut changes = BTreeMap::new();
         for (path, data) in files {
-            let id = match put_blob(&mut scion, &data).await {
+            let put = put_blob(&mut scion, &data);
+            let put = if data.len() > LARGE {
+                signals.track(0, put).await
+            } else {
+                put.await
+            };
+            let id = match put {
                 Ok(id) => id,
                 Err(status) => return cut(ledger, "PutBlob", &status),
             };
@@ -337,7 +373,7 @@ async fn client(url: String, name: String, mut rng: Rng, killed: Arc<AtomicBool>
         };
         let request = sent.request();
         ledger.lands.push(sent);
-        match scion.land(request).await {
+        match signals.track(1, scion.land(request)).await {
             Ok(reply) => ledger.lands.last_mut().unwrap().reply = Some(reply.into_inner()),
             Err(status) => return cut(ledger, "Land", &status),
         }
@@ -415,15 +451,25 @@ async fn read_blobs(objects: &mut Objects, blobs: &[BlobId]) {
         let request = GetObjectsRequest {
             repo: REPO.into(),
             refs,
+            accept: vec![Encoding::Zstd.into()],
         };
         let mut reply = objects.get_objects(request).await.unwrap().into_inner();
         let mut got = 0;
-        while let Some(object) = reply
-            .message()
-            .await
-            .unwrap_or_else(|status| panic!("blob {:?}: {status:?}", batch.get(got)))
-        {
-            assert_eq!(BlobId::of(&object.data), batch[got], "blob {}", batch[got]);
+        loop {
+            let fail = |status| panic!("blob {:?}: {status:?}", batch.get(got));
+            let Some(first) = reply.message().await.unwrap_or_else(fail) else {
+                break;
+            };
+            let mut object = Assembler::new(Header::of(&first, true).unwrap(), first);
+            while !object.is_done() {
+                let part = reply.message().await.unwrap_or_else(fail);
+                object.push(&part.expect("an object cut short")).unwrap();
+            }
+            let (header, data) = object.finish();
+            let id = batch[got];
+            assert_eq!(header.id, *id.as_bytes(), "blob {id}");
+            let data = object::decode(&header, data).unwrap();
+            assert_eq!(BlobId::of(&data), id, "blob {id}");
             got += 1;
         }
         assert!(got > 0, "a reply with no object");
@@ -494,8 +540,12 @@ async fn check(url: &str, data: &Path, ledger: &mut Ledger, checked: &mut Checke
     let (mut scion, mut objects) = connect(url).await.unwrap();
 
     // Retry each land sent since the last check, and a few older ones, with
-    // its key. Calls run at once, so they share the server's flushes.
-    let mut retry: Vec<usize> = (checked.lands..ledger.lands.len()).collect();
+    // its key. A land whose reply was lost is retried twice at once: calls
+    // with the same key wait for each other and return the same land. All
+    // calls run at once, so they share the server's flushes.
+    let new = checked.lands..ledger.lands.len();
+    let lost = new.clone().filter(|&i| ledger.lands[i].reply.is_none());
+    let mut retry: Vec<usize> = lost.chain(new).collect();
     if checked.lands > 0 {
         retry.extend((0..OLD_RETRIES).map(|_| rng.below(checked.lands)));
     }
@@ -633,7 +683,7 @@ async fn every_reply_survives_a_kill_of_the_server() {
         "SCION_CRASH_SEED",
         now.as_secs() ^ u64::from(now.subsec_nanos()),
     );
-    let kills = usize::try_from(env("SCION_CRASH_KILLS", 4)).unwrap();
+    let kills = usize::try_from(env("SCION_CRASH_KILLS", 6)).unwrap();
     println!("crash suite: seed {seed}, {kills} kills; replay with SCION_CRASH_SEED={seed}");
     let mut rng = Rng::new(seed);
     let dir = tempfile::tempdir().unwrap();
@@ -646,26 +696,29 @@ async fn every_reply_survives_a_kill_of_the_server() {
     for round in 0..kills {
         let server = Server::start(&data, &log);
         check(&server.url, &data, &mut ledger, &mut checked, &mut rng).await;
-        let killed = Arc::new(AtomicBool::new(false));
+        let signals = Arc::new(Signals::default());
         let clients: Vec<_> = (0..CLIENTS)
             .map(|c| {
                 let name = format!("k{round}c{c}");
                 let rng = Rng::new(rng.next());
-                tokio::spawn(client(server.url.clone(), name, rng, Arc::clone(&killed)))
+                tokio::spawn(client(server.url.clone(), name, rng, Arc::clone(&signals)))
             })
             .collect();
         let run = 100 + rng.below(500);
         tokio::time::sleep(Duration::from_millis(u64::try_from(run).unwrap())).await;
-        // Every other kill, on average, waits for a blob write in progress: a
-        // file in `tmp/`. Small writes end before the kill, large ones not.
-        if rng.below(2) == 0 {
-            let tmp = data.join("tmp");
+        // Two kills in three, on average, come soon after a large upload or a
+        // land starts, so they often stop the server while it writes a blob
+        // or holds a pending land.
+        if let Some(kind) = rng.below(3).checked_sub(1) {
             let give_up = Instant::now() + Duration::from_secs(2);
-            while fs::read_dir(&tmp).unwrap().next().is_none() && Instant::now() < give_up {
+            let running = || signals.calls[kind].load(Ordering::SeqCst);
+            while running() == 0 && Instant::now() < give_up {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
+            let delay = u64::try_from(rng.below(KILL_WINDOW_MS[kind])).unwrap();
+            tokio::time::sleep(Duration::from_millis(delay)).await;
         }
-        killed.store(true, Ordering::SeqCst);
+        signals.killed.store(true, Ordering::SeqCst);
         drop(server);
         for client in clients {
             let mut got = client.await.unwrap();
