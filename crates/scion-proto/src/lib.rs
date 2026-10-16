@@ -11,6 +11,7 @@ pub mod deadline;
 pub mod listen;
 pub mod object;
 pub mod reply;
+pub mod ticket;
 
 /// The buffer type of `ObjectPart.data`: parts of one object are slices of one
 /// buffer.
