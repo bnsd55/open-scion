@@ -686,8 +686,9 @@ impl Blobs {
         Ok(reader)
     }
 
-    /// Opens a blob's file.
-    fn open_file(&self, id: BlobId) -> Result<fs::File> {
+    /// Opens a blob's file: one zstd frame, which nothing here unpacks or
+    /// checks.
+    pub(crate) fn open_file(&self, id: BlobId) -> Result<fs::File> {
         fs::File::open(self.location(id).1).map_err(|e| match e.kind() {
             ErrorKind::NotFound => Error::NotFound(format!("blob {id}")),
             _ => e.into(),

@@ -110,7 +110,7 @@ which this benchmark does not run.
 | wall s | Wall time of the run: from the start of the first job to the end of the last. `/usr/bin/time -p` around the whole batch measures it. |
 | CPU s | User plus system CPU time of every process of the run: the jobs, and the server side. For scion, the server side is `scion-server`, `scion-cache` and `scion-daemon`. For git, it is `git daemon` and the `upload-pack` and `pack-objects` processes that it starts. The server side starts fresh for each run, so this includes its start and stop. |
 | server CPU s | The server alone: `scion-server`, or `git daemon` and its processes. This is the server load. |
-| server MiB | The object bytes that the server sent. For git: the pack files that the clones received. For scion: what the daemon's data directory gained in the run, which is what the server sent while the daemon stores objects in the form in which they arrive (recheck after #53). Not counted: protocol framing, the `ResolveRef` and `GetRootTree` answers, and git's ref negotiation. |
+| server MiB | The object bytes that the server sent. For git: the pack files that the clones received. For scion: what the daemon's data directory gained in the run, which is what the server sent: the daemon stores each object in the form in which it arrives, a blob as the server's zstd file. Not counted: protocol framing, the `ResolveRef` and `GetRootTree` answers, and git's ref negotiation. |
 
 The second table divides each git run by a scion run in the same state. A
 plain clone and a partial clone keep nothing on the machine, so they compare
