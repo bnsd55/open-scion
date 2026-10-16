@@ -165,38 +165,20 @@ async fn main() -> anyhow::Result<()> {
             max_connections,
             max_streams,
         } => {
-            let access = load_access(token, access)?;
             let server_tls = server_tls(
                 tls_cert.as_deref(),
                 tls_key.as_deref(),
                 tls_client_ca.as_deref(),
             )?;
-            anyhow::ensure!(
-                listen.ip().is_loopback() || insecure_listen || server_tls.is_some(),
-                "{listen} is not a loopback address; without TLS the traffic and the \
-                 token would travel unencrypted. Pass --tls-cert and --tls-key, or \
-                 --insecure-listen to allow it."
-            );
-            let listener = tokio::net::TcpListener::bind(listen)
-                .await
-                .with_context(|| format!("cannot listen on {listen}"))?;
-            // The bound address, so port 0 shows the port that the OS chose.
-            let listen = listener.local_addr()?;
-            tracing::info!(%listen, "serving");
-            let limits = Limits {
-                connections: max_connections,
-                streams: max_streams,
-            };
-            Box::pin(service::serve(
+            serve(
                 store,
-                listener,
-                access,
-                limits,
+                listen,
+                load_access(token, access)?,
+                insecure_listen,
                 server_tls,
-                async {
-                    tokio::signal::ctrl_c().await.ok();
-                },
-            ))
+                max_connections,
+                max_streams,
+            )
             .await?;
         }
         Command::HashToken { .. } => unreachable!("handled before the store opens"),
@@ -244,6 +226,48 @@ async fn main() -> anyhow::Result<()> {
             println!("derived {name} for the history of {tip}; older versions are removed");
         }
     }
+    Ok(())
+}
+
+/// Serves the gRPC API on `listen`, with the TLS files of the flags, until
+/// the caller stops it.
+#[allow(clippy::too_many_lines)]
+async fn serve(
+    store: Store,
+    listen: SocketAddr,
+    access: scion_server::access::Access,
+    insecure_listen: bool,
+    server_tls: Option<ServerTls>,
+    max_connections: NonZeroUsize,
+    max_streams: NonZeroU32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        listen.ip().is_loopback() || insecure_listen || server_tls.is_some(),
+        "{listen} is not a loopback address; without TLS the traffic and the \
+         token would travel unencrypted. Pass --tls-cert and --tls-key, or \
+         --insecure-listen to allow it."
+    );
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("cannot listen on {listen}"))?;
+    // The bound address, so port 0 shows the port that the OS chose.
+    let listen = listener.local_addr()?;
+    tracing::info!(%listen, "serving");
+    let limits = Limits {
+        connections: max_connections,
+        streams: max_streams,
+    };
+    Box::pin(service::serve(
+        store,
+        listener,
+        access,
+        limits,
+        server_tls,
+        async {
+            tokio::signal::ctrl_c().await.ok();
+        },
+    ))
+    .await?;
     Ok(())
 }
 
