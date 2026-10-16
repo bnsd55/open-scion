@@ -1206,24 +1206,66 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
   60 s per step for the server, so a busy server answers first; the daemon
   waits 180 s per step for the cache, which covers one step of the server,
   the cache's own three waits (slot, fetch memory, reply memory) and 30 s
-  to spare. A fetch joined in the middle of
-  its batch can still wait for the objects ahead of it, and a client's own
-  deadline does not reach the tiers
-  ([#98](https://github.com/bnsd55/open-scion/issues/98)).
+  to spare. A caller's deadline reaches every tier as `grpc-timeout`. Each
+  tier ends every wait at that deadline, less a margin (a tenth, at most
+  1 s), and sends what is left of it upstream, so the status of the deepest
+  process reaches the caller in time. With no deadline, the fixed limits
+  above apply and nothing goes upstream. A caller whose deadline passes
+  stops waiting: its first object fails with `DEADLINE_EXCEEDED`, a later
+  one just ends the reply, and the fetch goes on for the callers that still
+  wait. A caller with a later deadline whose fetch failed on a shorter one
+  asks again with its own.
 - **Auth.** A tier requires its own bearer token (`--token`, `SCION_TOKEN`),
   checked by the server's code, and sends its own token upstream
   (`--upstream-token`, `SCION_UPSTREAM_TOKEN`). A tier does not ask whether
   a repo exists: it serves a stored object for any valid repo name
   ([#13](https://github.com/bnsd55/open-scion/issues/13)).
 - **Logs.** Each `GetObjects` reply logs its hits and misses at `info`, and
-  each object at `debug`.
+  each object at `debug`. The daemon logs at `info` how many objects its
+  start found and whether it scanned, and whether its stop wrote a clean
+  index.
 
 | | `scion-cache` | `scion-daemon` |
 |---|---|---|
 | Listens on | TCP, `127.0.0.1:7879`. Another address needs `--insecure-listen`. | A Unix socket with mode 0600, by default `<data>/daemon.sock`, in a directory that only its user can reach (checked as for `<data>`). So nobody else can connect, even before the mode is set, or put another socket in its place. A stale socket file is replaced; a live one is an error. |
 | Upstream | `--upstream`, by default the server at `127.0.0.1:7878`. | `--upstream`, by default the cache at `127.0.0.1:7879`. |
 | Store | Memory, at most `--max-bytes` (1 GiB) of stored objects (blobs packed). | Disk, at most `--max-bytes` (10 GiB) of stored object bytes (not disk blocks): one file per object under `<data>/objects/`, a tree's `TreeV1` bytes or a blob's zstd frame, written to a temp file and renamed, unpacked as a stream and checked against its ID when read back. A file that the limit drops leaves its name by a rename under the index lock, and is removed after it, so a put of the same object keeps its new file. `<data>` is made with mode 0700 if missing. It must be a real directory (not a symlink), owned by the daemon's user, and closed to others, or the daemon refuses it. One daemon locks it. |
-| Eviction | Least recently used first. | Least recently used first, from an index in memory that a scan rebuilds at start, oldest write first ([#63](https://github.com/bnsd55/open-scion/issues/63)). |
+| Eviction | Least recently used first. | Least recently used first, from an index in memory that is also kept in `<data>/index` (below), so the order survives a restart. |
+| Start | Empty. | Reads `<data>/index`. After a clean stop (SIGINT or SIGTERM) it opens no object directory. After a crash it scans every object file, as with no index ([#115](https://github.com/bnsd55/open-scion/issues/115)). |
+
+**The daemon's index.** `<data>/index` lists the stored objects in order
+of use, so a start need not open every object directory. It is a header
+(`scnidx1\n`, a state byte, and the BLAKE3 hash of the records that the
+last full write wrote) and records of 37 bytes: an op, an object ID and a
+size. `T` or `B` says that a tree or blob of that size is stored and was
+just used; `t` or `b` that it was dropped. Read in order, the records give
+the objects, least recently used first. Records wait in memory and are
+appended 1,024 at a time (more wait while another call writes). Once the
+file holds more than twice as many records as objects, plus 65,536, it is
+written again with one record per object. A stop first syncs the
+directories that dropped files left since the start, and `<data>/tmp`. Then
+it writes the file again, one record per object, marks it clean (it names
+every object file), and flushes it past the drive's cache (`F_FULLFSYNC` on
+macOS).
+
+| Start after | What the start trusts | Cost |
+|---|---|---|
+| A clean stop | The file, if its records match the hash in its header: which objects are stored, and in what order. At open it marks the file dirty and flushes that past the drive's cache. | One file read and hash; no object directory. |
+| A crash | Nothing. The file is dirty, and may lack its last records: it may name a file that is gone, or miss a new one. The start scans every file and keeps the file's order for the objects that it names, up to a record that is not one; the others come last, oldest write first. | One stat per object file, as with no index. |
+| No file, another version, or a clean file that does not match its hash | Nothing, as after a crash. | As after a crash. |
+
+The start logs which of these it found. So a crash loses only what was used
+last, never an object: the records that had not reached the file. No start
+trusts the index for an object's bytes: each read checks them against the
+ID. If the index gives a size that is not the file's, the object is dropped
+at its first read and fetched again. If the start cannot mark the file
+dirty, or write it after a scan (a full disk), it removes the file and goes
+on, after the drops that free room. A daemon build from before the index
+does not know the file: run between a clean stop and the next start, it
+leaves a clean file that is stale, so remove `<data>/index` after such a
+run. The format is this project's choice: an append-only file is all that
+a start needs, and its one new dependency in the tier crate, `blake3`, is
+already in the workspace.
 
 This project's choices, not the article's: the Unix socket and its mode,
 TCP between tiers, the stores and their limits, keeping `GetRootTree`
@@ -1258,7 +1300,7 @@ an untrusted network.
 | Area | Today | Limit |
 |---|---|---|
 | Authentication | One static bearer token (`--token` or `SCION_TOKEN`). The server and each tier compare BLAKE3 digests of the tokens in constant time. A tier sends its own token upstream. | Every caller is the same principal, `default`. No users or per-folder rules ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
-| Network | The server listens on `127.0.0.1:7878` and `scion-cache` on `127.0.0.1:7879` by default. A non-loopback address is refused unless `--insecure-listen` is given. `scion-daemon` listens only on a Unix socket with mode 0600, in a directory that only its user can reach; it refuses any other. `scn` refuses a socket that another user owns. Both refuse a socket or data directory under a directory that another user can change: one that another user owns, or that group or others can write and has no sticky bit. | No TLS: the token and all data travel unencrypted, also between tiers ([#14](https://github.com/bnsd55/open-scion/issues/14)). By choice, as OpenSSH's `StrictModes`, the directory checks refuse a group-writable directory (`chmod go-w` fixes it; with umask 002, new directories are group-writable), and read only the owner and the mode bits, not ACLs: an ACL that lets other users write a directory gets past them. |
+| Network | The server listens on `127.0.0.1:7878` and `scion-cache` on `127.0.0.1:7879` by default. A non-loopback address is refused unless `--insecure-listen` is given, or the process serves TLS (`--tls-cert` and `--tls-key`; a private CA is trusted by `scn` with `--tls-ca`). With `--tls-client-ca`, a tier must present a client certificate that CA signed. `scion-daemon` listens only on a Unix socket with mode 0600, in a directory that only its user can reach; it refuses any other. `scn` refuses a socket that another user owns. Both refuse a socket or data directory under a directory that another user can change: one that another user owns, or that group or others can write and has no sticky bit. | With TLS, the process trusts the server's certificate only if a CA is given; there are no public roots. Without TLS, the token and all data travel unencrypted: a bearer token over plain TCP to a non-loopback address stays refused. TLS certificates are not checked against hostnames beyond what the CA signs, and there is no revocation ([#14](https://github.com/bnsd55/open-scion/issues/14) tracks TLS; revocation has no issue). By choice, as OpenSSH's `StrictModes`, the directory checks refuse a group-writable directory (`chmod go-w` fixes it; with umask 002, new directories are group-writable), and read only the owner and the mode bits, not ACLs: an ACL that lets other users write a directory gets past them. |
 | Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. A changeset names only blobs of its own repo (`repo_blobs`, section 5), so the path reads (`ReadFile`, `ListDir`, `Log`, `Blame`, `Diff`) reach only the repo's own content. No answer of the write calls shows whether another repo has a blob: `CreateChangeset` gives the error of content that no repo stored, before any file is read, and `PutBlob` of such content takes the same write path as for new content. Two leaks stay: the rename frees the old file, and the page cache makes a shared blob fast. | `GetObjects` reads any tree or blob by ID, for any repo name ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
 | Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 1 MiB plus 1 KiB: one part of an object), blobs up to 100 MiB, 16 uploads at once (each holds one message in memory), 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget and `ReadFile` replies a 256 MiB budget. A reply of either whose client stops reading ends after 120 s. Every receiver of an object unpacks it within the size its first part gives, at most 100 MiB, with a zstd window of at most 8 MiB, and accepts only plain Zstandard frames (no skippable or legacy frames, no dictionary). The zstd library is built without its legacy decoders. Names of 1 to 256 bytes with no control characters. The path indexes of all refs hold at most 128 MiB together, and a land walks at most 100,000 changesets below its ref's index. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 16 MiB and 1,048,576 lines, diffs at most 100 versions and about 1M lines (a line counts once per 64 bytes), compares at most 100 deleted files and about 100 MiB to find a rename, and at most 4 run at once. At most 4 `MergeBase` and `IsAncestor` calls run at once, each until its 600 s deadline; a `Diff` reply holds at most 1,000 paths. The server and each tier serve at most 128 connections at once (`--max-connections`), each with at most 256 open streams (`--max-streams`); a client beyond either waits. A connection closes 20 s after it gets its place if no HTTP/2 preface came; after the preface, 20 s after an unanswered ping, which goes out after 60 s without a frame; and in any case 10 min after it was asked to close at 30 min of age. So a connection beyond the cap waits at most 40 min. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). A reply whose client stops reading keeps memory that no budget counts, until its stream ends or its connection closes: a `GetObjects` or `ReadFile` reply three parts (in its channel, read ahead by hyper, in the h2 send buffer) plus up to 400 KiB more of h2 send buffer, under 4 MiB; a unary reply its whole message, up to 64 MiB. So the ceiling is connections x streams x that: 128 x 256 x 4 MiB = 128 GiB for streamed replies, and 128 x 256 x 64 MiB = 2 TiB for unary ones. What a dead peer holds is freed within 80 s of its last frame (keepalive), or within 20 s if it never sent the preface. A live client that stops reading keeps it until its connection is closed at 40 min of age: hyper cannot reset a stalled stream from the server side ([#113](https://github.com/bnsd55/open-scion/issues/113)). |
@@ -1295,9 +1337,8 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-proto/src/auth.rs` (`Auth`) | One static token, one principal. | A token-to-principal map, then per-path write rules. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/main.rs` (`serve`) | No TLS. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
 | `scion-tier/src/lib.rs` (`produce`) | Two blocking hops per hit (size, then read) and no read-ahead, as on the server. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
-| `scion-tier/src/lib.rs` (`DAEMON_UPSTREAM_TIMEOUT`) | Fixed limits per step that nest. A fetch joined in the middle of its batch can wait for the objects ahead of it, and a client's own deadline does not reach the tiers. | Pass the remaining deadline down with `grpc-timeout`. | [#98](https://github.com/bnsd55/open-scion/issues/98) |
 | `scion-tier/src/lib.rs` (`check_repo`) | A tier does not ask whether a repo exists, and serves a stored object to any caller with the token. Safe with one principal. | Read tickets, checked by every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
-| `scion-tier/src/store.rs` (`DiskStore`) | The daemon's recency index lives in memory and a scan of every file rebuilds it at start. Memory and start time grow with the object count, and a restart forgets which objects were read last. | A persistent index. | [#63](https://github.com/bnsd55/open-scion/issues/63) |
+| `scion-tier/src/store.rs` (`DiskStore`) | The daemon's whole recency index is also in memory, and a start reads all of it. Writing `<data>/index` again copies every record under the index lock, which `size` needs while the tier holds its fetch table: every fetch start waits. After a crash, a start scans every object file. Memory and these pauses grow with the object count. | An index on disk that is read and changed in place, and a crash start that needs no scan. | [#115](https://github.com/bnsd55/open-scion/issues/115) |
 | `scion-tier/src/bin/scion-cache.rs` (`main`) | No TLS between tiers. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
 | `scn/src/client.rs` (`lossy`) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | Escape or base64 raw bytes in JSON. | |
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |

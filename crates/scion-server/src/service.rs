@@ -4,10 +4,11 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use scion_core::{BlobId, ChangesetId, FileState, RepoPath};
 use scion_proto::listen::{self, Limits};
+use scion_proto::tls::ServerTls;
 use scion_proto::v1::scion_server::{Scion, ScionServer};
 use scion_proto::v1::{
     self, BlameChangeset, BlameRange, BlameRequest, BlameResponse, CreateChangesetRequest,
@@ -26,7 +27,8 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::auth::{Auth, Caller};
+use crate::access::Access;
+use crate::auth::Caller;
 use crate::blame::RenameSearch;
 use crate::deadline::Deadline;
 use crate::error::Result;
@@ -76,8 +78,10 @@ const _: () = assert!(REQUEST_TIMEOUT.as_secs() <= listen::CONNECTION_GRACE.as_s
 const _: () = assert!(read_share(MAX_OBJECT_BYTES) <= READ_BUDGET_BYTES);
 const _: () = assert!(READ_BUDGET_BYTES <= u32::MAX as usize);
 
-/// Serves the API on `listener`, requiring `token`, within `limits`, until
-/// `shutdown` resolves.
+/// Serves the API on `listener` within `limits`, until `shutdown` resolves,
+/// to the tokens and with the rules of `access`: an [`Access`], or one token
+/// (`&str`) that may do everything. With `tls`, every connection is a TLS
+/// connection, whose handshake `listen` ends within its timeout.
 ///
 /// # Errors
 ///
@@ -85,29 +89,39 @@ const _: () = assert!(READ_BUDGET_BYTES <= u32::MAX as usize);
 pub async fn serve(
     store: Store,
     listener: TcpListener,
-    token: &str,
+    access: impl Into<Access>,
     limits: Limits,
+    tls: Option<ServerTls>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
-    let auth = Auth::new(token);
+    let access = Arc::new(access.into());
+    let auth = access.auth();
     let worker = Worker::new(store);
     let scion = InterceptedService::new(
-        ScionService::new(worker.clone()).into_server(),
+        ScionService::new(worker.clone(), Arc::clone(&access)).into_server(),
         auth.clone(),
     );
-    let objects = InterceptedService::new(ObjectsService::new(worker).into_server(), auth);
+    let objects = InterceptedService::new(ObjectsService::new(worker, access).into_server(), auth);
     let router = |server: Server| {
         server
             .timeout(REQUEST_TIMEOUT)
             .add_service(scion)
             .add_service(objects)
     };
-    limits.serve(router, listen::tcp(listener), shutdown).await
+    limits
+        .serve(
+            router,
+            listen::tcp(listener),
+            tls.map(|tls| tls.config()),
+            shutdown,
+        )
+        .await
 }
 
 /// Implements the Scion RPCs.
 pub struct ScionService {
     worker: Worker,
+    access: Arc<Access>,
     lands: Arc<Lands>,
     /// Bounds uploads read at once (`MAX_UPLOADS`): their messages in memory
     /// and their spool files in `tmp/`.
@@ -124,9 +138,10 @@ pub struct ScionService {
 }
 
 impl ScionService {
-    fn new(worker: Worker) -> Self {
+    fn new(worker: Worker, access: Arc<Access>) -> Self {
         Self {
             worker,
+            access,
             lands: Arc::default(),
             uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
             blames: Arc::new(Semaphore::new(MAX_BLAMES)),
@@ -143,8 +158,8 @@ impl ScionService {
     }
 
     /// Runs a `MergeBase` or `IsAncestor` query: at most `MAX_GRAPH_QUERIES`
-    /// at once, each until its call ends or `REQUEST_TIMEOUT` passes.
-    async fn graph_query<T, F>(&self, query: F) -> Result<T, Status>
+    /// at once, each until its call ends or its `deadline` passes.
+    async fn graph_query<T, F>(&self, deadline: Deadline, query: F) -> Result<T, Status>
     where
         T: Send + 'static,
         F: FnOnce(&Store, &Deadline) -> Result<T> + Send + 'static,
@@ -152,7 +167,6 @@ impl ScionService {
         // The query checks it at each read: a request timeout, or a client
         // that cancels, drops this call but not a job that is running. The
         // guard ends the deadline when this call ends or is dropped.
-        let deadline = Deadline::new(Instant::now() + REQUEST_TIMEOUT);
         let _call = deadline.guard();
         // Taken before the worker permit, and held until the job ends, also
         // when the client leaves first.
@@ -218,13 +232,22 @@ pub(crate) fn check_name(what: &str, value: &str) -> Result<(), Status> {
     names::check(what, value).map_err(Status::from)
 }
 
+/// Checks the name of `repo`, then that `caller` may read it. A repo that it
+/// may not read gets the answer of a repo that does not exist.
+pub(crate) fn check_reader(access: &Access, caller: &Caller, repo: &str) -> Result<(), Status> {
+    check_name("repo", repo)?;
+    access.check_read(caller, repo).map_err(Status::from)
+}
+
 /// `ResolveRef`, served by both services.
 pub(crate) async fn resolve_ref(
     worker: &Worker,
-    request: ResolveRefRequest,
+    access: &Access,
+    request: Request<ResolveRefRequest>,
 ) -> Result<ResolveRefResponse, Status> {
-    let ResolveRefRequest { repo, name } = request;
-    check_name("repo", &repo)?;
+    let caller = caller(&request)?;
+    let ResolveRefRequest { repo, name } = request.into_inner();
+    check_reader(access, &caller, &repo)?;
     check_name("ref", &name)?;
     let id = worker
         .run(move |store| read::resolve_ref(&store, &repo, &name))
@@ -247,7 +270,7 @@ fn parse_optional_path(bytes: Vec<u8>) -> Result<Option<RepoPath>, Status> {
     }
 }
 
-fn caller<T>(request: &Request<T>) -> Result<Caller, Status> {
+pub(crate) fn caller<T>(request: &Request<T>) -> Result<Caller, Status> {
     request
         .extensions()
         .get::<Caller>()
@@ -361,12 +384,16 @@ impl Scion for ScionService {
             .acquire_owned()
             .await
             .map_err(|_| Status::unavailable("server is shutting down"))?;
+        let caller = caller(&request)?;
         let mut stream = request.into_inner();
         let first = stream
             .next()
             .await
             .ok_or_else(|| Status::invalid_argument("empty upload"))??;
         check_name("repo", &first.repo)?;
+        // An upload names no path, so a caller that may change some path of
+        // the repo may upload.
+        self.access.check_writer(&caller, &first.repo)?;
         // Check the repo before reading any more data. Each message goes to
         // the spool file before the next one is read, so an upload holds one
         // message in memory, not the whole blob.
@@ -399,11 +426,20 @@ impl Scion for ScionService {
         &self,
         request: Request<CreateChangesetRequest>,
     ) -> Result<Response<CreateChangesetResponse>, Status> {
+        let caller = caller(&request)?;
         let CreateChangesetRequest { repo, changeset } = request.into_inner();
-        check_name("repo", &repo)?;
+        check_reader(&self.access, &caller, &repo)?;
+        let access = Arc::clone(&self.access);
         let id = self
             .worker
-            .run(move |store| write::create_changeset(&store, &repo, &changeset))
+            .run(move |store| {
+                // The rules first, so a change that the caller may not make
+                // reads no blob. Decoding twice costs little next to reading
+                // every blob back.
+                let (cs, _) = write::decode(&changeset)?;
+                access.check_write(&caller, &repo, cs.changes.keys())?;
+                write::create_changeset(&store, &repo, &changeset)
+            })
             .await?;
         Ok(Response::new(CreateChangesetResponse {
             changeset_id: id.as_bytes().to_vec(),
@@ -417,11 +453,11 @@ impl Scion for ScionService {
         // The job checks it in its walks: a request timeout, or a client
         // that cancels, drops this call but not a job that is running. The
         // guard ends the deadline when this call ends or is dropped.
-        let deadline = Deadline::new(Instant::now() + REQUEST_TIMEOUT);
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let _call = deadline.guard();
         let caller = caller(&request)?;
         let req = request.into_inner();
-        check_name("repo", &req.repo)?;
+        check_reader(&self.access, &caller, &req.repo)?;
         check_name("target_ref", &req.target_ref)?;
         check_name("request_key", &req.request_key)?;
         let req = land::LandRequest {
@@ -431,10 +467,17 @@ impl Scion for ScionService {
             request_key: req.request_key,
             deadline,
         };
-        let lands = Arc::clone(&self.lands);
+        let (lands, access) = (Arc::clone(&self.lands), Arc::clone(&self.access));
         let outcome = self
             .worker
-            .run(move |store| lands.land(&store, &caller, &req))
+            .run(move |store| {
+                // A rebase keeps the changes, so these are the paths that the
+                // land changes, on any ref of the repo. Checked on every call,
+                // before the land records anything, also on a retry.
+                let cs = read::get_changeset(&store, &req.repo, req.changeset)?;
+                access.check_write(&caller, &req.repo, cs.changes.keys())?;
+                lands.land(&store, &caller, &req)
+            })
             .await?;
         Ok(Response::new(land_response(outcome)))
     }
@@ -445,7 +488,7 @@ impl Scion for ScionService {
     ) -> Result<Response<LandResponse>, Status> {
         let caller = caller(&request)?;
         let GetLandRequest { repo, land_id } = request.into_inner();
-        check_name("repo", &repo)?;
+        check_reader(&self.access, &caller, &repo)?;
         let land_id = land_id
             .parse()
             .map_err(|_| Status::invalid_argument("land_id must be a number"))?;
@@ -460,7 +503,7 @@ impl Scion for ScionService {
         &self,
         request: Request<ResolveRefRequest>,
     ) -> Result<Response<ResolveRefResponse>, Status> {
-        resolve_ref(&self.worker, request.into_inner())
+        resolve_ref(&self.worker, &self.access, request)
             .await
             .map(Response::new)
     }
@@ -469,8 +512,9 @@ impl Scion for ScionService {
         &self,
         request: Request<GetChangesetRequest>,
     ) -> Result<Response<GetChangesetResponse>, Status> {
+        let caller = caller(&request)?;
         let req = request.into_inner();
-        check_name("repo", &req.repo)?;
+        check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let changeset = self
             .worker
@@ -487,8 +531,9 @@ impl Scion for ScionService {
         &self,
         request: Request<ReadFileRequest>,
     ) -> Result<Response<ReadFileStream>, Status> {
+        let caller = caller(&request)?;
         let req = request.into_inner();
-        check_name("repo", &req.repo)?;
+        check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_path(req.path)?;
         let (blob, size) = self
@@ -519,8 +564,9 @@ impl Scion for ScionService {
         &self,
         request: Request<ListDirRequest>,
     ) -> Result<Response<ListDirResponse>, Status> {
+        let caller = caller(&request)?;
         let req = request.into_inner();
-        check_name("repo", &req.repo)?;
+        check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_optional_path(req.path)?;
         let tree = self
@@ -533,8 +579,9 @@ impl Scion for ScionService {
     }
 
     async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogResponse>, Status> {
+        let caller = caller(&request)?;
         let req = request.into_inner();
-        check_name("repo", &req.repo)?;
+        check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         // `read::MAX_SCAN` also bounds the entries.
         let limit = (req.limit as usize).max(1);
@@ -570,8 +617,9 @@ impl Scion for ScionService {
         &self,
         request: Request<BlameRequest>,
     ) -> Result<Response<BlameResponse>, Status> {
+        let caller = caller(&request)?;
         let req = request.into_inner();
-        check_name("repo", &req.repo)?;
+        check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_path(req.path)?;
         let search = RenameSearch {
@@ -629,12 +677,16 @@ impl Scion for ScionService {
         &self,
         request: Request<MergeBaseRequest>,
     ) -> Result<Response<MergeBaseResponse>, Status> {
+        let caller = caller(&request)?;
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
-        check_name("repo", &req.repo)?;
+        check_reader(&self.access, &caller, &req.repo)?;
         let a = parse_id(&req.a_changeset_id, "a_changeset_id")?;
         let b = parse_id(&req.b_changeset_id, "b_changeset_id")?;
         let bases = self
-            .graph_query(move |store, deadline| read::merge_base(store, &req.repo, a, b, deadline))
+            .graph_query(deadline, move |store, deadline| {
+                read::merge_base(store, &req.repo, a, b, deadline)
+            })
             .await?;
         Ok(Response::new(MergeBaseResponse {
             changeset_ids: bases.iter().map(|id| id.as_bytes().to_vec()).collect(),
@@ -645,12 +697,14 @@ impl Scion for ScionService {
         &self,
         request: Request<IsAncestorRequest>,
     ) -> Result<Response<IsAncestorResponse>, Status> {
+        let caller = caller(&request)?;
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
-        check_name("repo", &req.repo)?;
+        check_reader(&self.access, &caller, &req.repo)?;
         let ancestor = parse_id(&req.ancestor_id, "ancestor_id")?;
         let descendant = parse_id(&req.descendant_id, "descendant_id")?;
         let is_ancestor = self
-            .graph_query(move |store, deadline| {
+            .graph_query(deadline, move |store, deadline| {
                 read::is_ancestor(store, &req.repo, ancestor, descendant, deadline)
             })
             .await?;
@@ -658,8 +712,9 @@ impl Scion for ScionService {
     }
 
     async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<DiffResponse>, Status> {
+        let caller = caller(&request)?;
         let req = request.into_inner();
-        check_name("repo", &req.repo)?;
+        check_reader(&self.access, &caller, &req.repo)?;
         let old = parse_id(&req.old_changeset_id, "old_changeset_id")?;
         let new = parse_id(&req.new_changeset_id, "new_changeset_id")?;
         let path = parse_optional_path(req.path)?;
@@ -735,10 +790,25 @@ fn file_state(state: FileState) -> v1::FileState {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use scion_core::{Changeset, FileState, IdentityTime};
     use tonic::Code;
 
     use super::*;
+
+    /// A service whose one principal may do everything.
+    fn test_service(store: Store) -> ScionService {
+        ScionService::new(Worker::new(store), Arc::new(Access::single("t")))
+    }
+
+    /// `message` as a request of that principal.
+    fn as_default<T>(message: T) -> Request<T> {
+        let mut request = Request::new(message);
+        let caller = Caller(scion_proto::auth::DEFAULT_PRINCIPAL.into());
+        request.extensions_mut().insert(caller);
+        request
+    }
 
     /// A store whose repo `r` has one changeset, which puts `f` with
     /// `content`. Also returns the changeset and the blob.
@@ -912,7 +982,7 @@ mod tests {
                 Ok((b, db::insert_changeset(c, repo, &put(vec![root], "c"))?))
             })
             .unwrap();
-        let service = Arc::new(ScionService::new(Worker::new(store.clone())));
+        let service = Arc::new(test_service(store.clone()));
         let idle = || service.worker.permits.available_permits() == MAX_BLOCKING;
 
         // Hold the write connection, so the job waits at its first step.
@@ -929,13 +999,12 @@ mod tests {
             }
         });
         held_rx.recv().unwrap();
-        let mut request = Request::new(scion_proto::v1::LandRequest {
+        let request = as_default(scion_proto::v1::LandRequest {
             repo: "r".into(),
             changeset_id: cs.as_bytes().to_vec(),
             target_ref: "main".into(),
             request_key: "k".into(),
         });
-        request.extensions_mut().insert(Caller("t".into()));
         let call = tokio::spawn({
             let service = Arc::clone(&service);
             async move { service.land(request).await }
@@ -972,10 +1041,10 @@ mod tests {
         // Room for one reply of this file, not two.
         let service = Arc::new(ScionService {
             reads: Arc::new(Semaphore::new(read_share(data.len()))),
-            ..ScionService::new(Worker::new(store))
+            ..test_service(store)
         });
         let request = move || {
-            Request::new(ReadFileRequest {
+            as_default(ReadFileRequest {
                 repo: "r".into(),
                 changeset_id: cs.as_bytes().to_vec(),
                 path: b"f".to_vec(),
@@ -1016,7 +1085,7 @@ mod tests {
             })
             .unwrap();
         let bytes = |i: usize| ids[i].as_bytes().to_vec();
-        let service = Arc::new(ScionService::new(Worker::new(store.clone())));
+        let service = Arc::new(test_service(store.clone()));
         let busy = || MAX_BLOCKING - service.worker.permits.available_permits();
 
         // Hold every read connection, so each job waits at its first read.
@@ -1044,7 +1113,7 @@ mod tests {
                 let (root, a, b) = (bytes(0), bytes(1), bytes(2));
                 tokio::spawn(async move {
                     if i % 2 == 0 {
-                        let request = Request::new(MergeBaseRequest {
+                        let request = as_default(MergeBaseRequest {
                             repo: "r".into(),
                             a_changeset_id: a,
                             b_changeset_id: b,
@@ -1052,7 +1121,7 @@ mod tests {
                         let reply = service.merge_base(request).await.unwrap();
                         reply.into_inner().changeset_ids == [root]
                     } else {
-                        let request = Request::new(IsAncestorRequest {
+                        let request = as_default(IsAncestorRequest {
                             repo: "r".into(),
                             ancestor_id: root,
                             descendant_id: a,

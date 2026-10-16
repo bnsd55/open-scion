@@ -13,41 +13,72 @@ use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::Interceptor;
 use tonic::{Request, Status};
 
-/// Who made a request. Added to request extensions by [`Auth`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Who made a request: the principal of its token. Added to request
+/// extensions by [`Auth`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Caller(pub String);
 
-/// Accepts requests that carry `authorization: Bearer <token>`.
-// SHORTCUT: one static token, one principal ("default"). Upgrade: a token to
-// principal map, then per-path write rules.
+/// The principal of the one token that [`Auth::new`] accepts.
+pub const DEFAULT_PRINCIPAL: &str = "default";
+
+/// Accepts requests that carry `authorization: Bearer <token>` with a known
+/// token, and tags each with the token's principal.
 #[derive(Clone)]
 pub struct Auth {
-    /// Hash of the expected token, so every comparison has the same length.
-    token: Arc<[u8; 32]>,
+    /// The BLAKE3 digest of each token, and its principal. A presented token
+    /// is hashed, so every comparison has the same length.
+    tokens: Arc<[([u8; 32], Caller)]>,
 }
 
 impl Auth {
-    /// Accepts this token.
+    /// Accepts this one token, as principal [`DEFAULT_PRINCIPAL`].
     #[must_use]
     pub fn new(token: &str) -> Self {
+        Self::digests([(token_digest(token), Caller(DEFAULT_PRINCIPAL.into()))])
+    }
+
+    /// Accepts each token whose digest ([`token_digest`]) is given, as its
+    /// principal. The digests must differ, so a token has one principal.
+    #[must_use]
+    pub fn digests(tokens: impl IntoIterator<Item = ([u8; 32], Caller)>) -> Self {
         Self {
-            token: Arc::new(digest(token.as_bytes())),
+            tokens: tokens.into_iter().collect(),
         }
+    }
+
+    /// The principal of `token`, if any. Compares its digest with every
+    /// known digest, without an early exit, so the time does not depend on
+    /// which digest matches or how much of one does.
+    fn principal(&self, token: &[u8]) -> Option<&Caller> {
+        let presented = digest(token);
+        let mut found = None;
+        for (known, caller) in self.tokens.iter() {
+            if constant_time_eq(&presented, known) {
+                found = Some(caller);
+            }
+        }
+        found
     }
 }
 
 impl Interceptor for Auth {
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
-        let presented = request
+        let caller = request
             .metadata()
             .get("authorization")
-            .and_then(|value| value.as_bytes().strip_prefix(b"Bearer "));
-        if !presented.is_some_and(|token| constant_time_eq(&digest(token), &self.token)) {
-            return Err(Status::unauthenticated("missing or wrong token"));
-        }
-        request.extensions_mut().insert(Caller("default".into()));
+            .and_then(|value| value.as_bytes().strip_prefix(b"Bearer "))
+            .and_then(|token| self.principal(token))
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("missing or wrong token"))?;
+        request.extensions_mut().insert(caller);
         Ok(request)
     }
+}
+
+/// The digest of a token that [`Auth::digests`] takes: BLAKE3 of its bytes.
+#[must_use]
+pub fn token_digest(token: &str) -> [u8; 32] {
+    digest(token.as_bytes())
 }
 
 /// Adds `authorization: Bearer <token>` to every request.
@@ -164,6 +195,44 @@ mod tests {
     fn mkdir(path: &Path, mode: u32) {
         fs::create_dir(path).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn each_token_gets_its_own_principal() {
+        let caller = |name: &str| Caller(name.into());
+        let call = |auth: &mut Auth, header: Option<&str>| {
+            let mut request = Request::new(());
+            if let Some(header) = header {
+                let value = header.parse().unwrap();
+                request.metadata_mut().insert("authorization", value);
+            }
+            let request = auth.call(request)?;
+            Ok::<_, Status>(request.extensions().get::<Caller>().cloned())
+        };
+        let mut auth = Auth::digests([
+            (token_digest("a-token"), caller("alice")),
+            (token_digest("b-token"), caller("bob")),
+        ]);
+        assert_eq!(
+            call(&mut auth, Some("Bearer a-token")).unwrap(),
+            Some(caller("alice"))
+        );
+        assert_eq!(
+            call(&mut auth, Some("Bearer b-token")).unwrap(),
+            Some(caller("bob"))
+        );
+        for bad in [
+            None,
+            Some("Bearer c-token"),
+            Some("a-token"),
+            Some("Bearer a-token "),
+        ] {
+            let status = call(&mut auth, bad).unwrap_err();
+            assert_eq!(status.code(), tonic::Code::Unauthenticated, "{bad:?}");
+        }
+        let mut single = Auth::new("t");
+        let default = Some(caller(DEFAULT_PRINCIPAL));
+        assert_eq!(call(&mut single, Some("Bearer t")).unwrap(), default);
     }
 
     #[test]

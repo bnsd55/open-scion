@@ -133,6 +133,40 @@ Every `scn` command takes `--json` for machine-readable output. A `scn`
 error exits 2. A checkout that a signal stops removes what it wrote, and
 then dies by the signal (a shell reports 130 for Ctrl-C).
 
+### Access file
+
+`--token T` gives one principal, `default`, which may read and write every
+repo. For several principals, write an access file and start the server with
+`--access FILE` (give one of the two, not both). The file is UTF-8 text, one
+rule per line, fields separated by one tab. Empty lines and lines that start
+with `#` are skipped:
+
+```text
+# token <principal> <the BLAKE3 digest of the token>
+token	alice	d4289b3345cfbdfb36fb37ee89e85bd74447f837b04c18aee6233c731b1419a7
+token	ci	<64 hex digits>
+# read <principal> <repo>: every RPC on that repo
+read	ci	main
+# write <principal> <repo> [prefix]: changes at or below the prefix, by
+# path parts. No prefix means the whole repo. Write implies read.
+write	alice	main	src
+write	ci	main
+```
+
+The file holds digests, never tokens. Print the digest of a token with
+`scion-server hash-token`:
+
+```sh
+token=$(read -s -p token: t; echo "$t")
+digest=$(./target/release/scion-server hash-token --token "$token")
+```
+
+A principal with no rule for a repo cannot see the repo: every call answers
+`NOT_FOUND`, as for a repo that does not exist. A change to a path outside
+the principal's write prefixes answers `PERMISSION_DENIED` and names the
+path. A land is checked for the principal that lands it, even when another
+principal made the changeset.
+
 Checkouts can go through the cache tiers: a `scion-daemon` per machine, on a
 Unix socket, in front of a regional `scion-cache`, in front of the server.
 Each tier keeps what it fetched, so a second checkout on the machine sends
@@ -144,7 +178,8 @@ must not be writable by group or others unless it has the sticky bit (as
 `/tmp` has). `scn` checks the same for the socket. The error names the
 directory; `chmod go-w DIR` fixes it. With umask 002 (a private group per
 user), new directories are group-writable, so they are refused until you run
-that.
+that. Stop the daemon with Ctrl-C or SIGTERM: it then writes its index, and
+its next start reads that one file instead of every stored object.
 
 ```sh
 export SCION_UPSTREAM_TOKEN=dev                  # what each tier sends upstream
@@ -161,6 +196,28 @@ with none lost or duplicated. Every land is on disk before it replies, and
 concurrent requests share each full disk flush
 ([#3](https://github.com/bnsd55/open-scion/issues/3)). Importing a git
 repository with 23,871 commits took 50 seconds.
+
+### TLS
+
+Over loopback the token travels unencrypted, which is fine on one machine. For
+a non-loopback address, serve TLS: give the server, or a `scion-cache`, a
+certificate and key in PEM files. Then it accepts the address without
+`--insecure-listen`. A certificate from a private CA is what the client trusts:
+`scn` takes it with `--tls-ca`, a tier for its upstream with its own
+`--tls-ca`. For links between tiers, the server and the cache can require a
+client certificate with `--tls-client-ca` (mTLS); the cache and the daemon
+present one with `--tls-client-cert` and `--tls-client-key`. To make the
+certificates of a test setup, a tool such as `minica` or `openssl` makes a CA
+and leaves signed for each host's name or address.
+
+```sh
+./target/release/scion-server --data /tmp/scion serve \
+  --listen 0.0.0.0:7878 --tls-cert server.pem --tls-key server.key &
+./target/release/scn --server https://scion.example.com:7878 \
+  --tls-ca ca.pem log -n 5
+```
+
+A bearer token over plain TCP to a non-loopback address stays refused.
 
 ## Layout
 

@@ -9,6 +9,19 @@ release.
 
 ### Added
 
+- Principals and access rules (`#13`, part 2). `scion-server serve --access
+  FILE` reads an access file that maps the BLAKE3 digest of each token to a
+  principal, and says which repos each principal may read and which paths it
+  may write: a path prefix by path parts (`src` covers `src/a`, not
+  `srcx`), no prefix meaning the whole repo, and write implying read. A
+  principal with no rule for a repo cannot see the repo: every call answers
+  `NOT_FOUND`, as for a repo that does not exist. A change to a path outside
+  the principal's write prefixes answers `PERMISSION_DENIED` and names the
+  first denied path; `PutBlob` needs a write rule, and `Land` is checked for
+  the principal that lands it. `scion-server hash-token` prints the digest
+  that a `token` line wants, so the file never holds a token. `--token T`
+  stays: one principal, `default`, which may read and write every repo.
+
 - `scion-core`: the object model (changesets, trees, blob IDs) and a frozen,
   canonical v1 byte format, with golden tests, property tests and a fuzz
   target.
@@ -79,6 +92,16 @@ release.
   file as the answer at once. `scn blame` does this.
 - Bearer-token auth, loopback-only listening by default, request limits and
   name validation at the RPC boundary.
+- TLS and mTLS: the server and `scion-cache` serve TLS with `--tls-cert` and
+  `--tls-key` (a non-loopback address then needs no `--insecure-listen`), and
+  require a client certificate with `--tls-client-ca`. The cache and
+  `scion-daemon` trust `--tls-ca` for their https upstream and present
+  `--tls-client-cert` and `--tls-client-key` for mTLS. `scn` trusts `--tls-ca`
+  for an https server. The TLS handshake of a connection ends within 20 s, and
+  the HTTP/2 preface is still awaited within 20 s of the place, so a peer that
+  stops before or after the handshake holds no connection place. The
+  cryptography is ring (the `tls-ring` feature of tonic: 8 new crates, fewer
+  than the 12 of `tls-aws-lc`, one of which needs cmake).
 - Blobs belong to repos (schema version 4, table `repo_blobs`). A repo has
   the blobs uploaded to it and the blobs that its changesets name.
   `CreateChangeset` refuses a blob of another repo with the error of content
@@ -146,6 +169,15 @@ release.
 - The tier timeouts nest: the server and tiers wait 30 s for reply memory,
   a tier 30 s for a fetch slot and 30 s for fetch memory, the cache 60 s per
   step of the server, the daemon 180 s per step of the cache.
+- `scion-daemon` keeps its recency index in `<data>/index` too, appended in
+  batches. After a clean stop (Ctrl-C, or SIGTERM, which it now handles
+  too), a start reads that one file and opens no object directory, and the
+  order of use survives the restart. The stop flushes the file, with a hash
+  of its records, past the drive's cache. After a crash, or for a file that
+  does not match its hash, a start scans every object file as before, and
+  keeps the order of the index for the objects that it names. A crash loses
+  only what was used last, never an object. After running a daemon build
+  from before the index on the same data directory, remove `<data>/index`.
 - Receivers accept only plain Zstandard frames, with no dictionary and a
   window of at most 8 MiB; the zstd library is built without its legacy
   decoders.
@@ -201,3 +233,21 @@ release.
   on one connection.
 - `scion-server serve` logs the address that it bound, so `--listen
   127.0.0.1:0` shows the port that the OS chose.
+
+### Changed
+
+- A caller's deadline passes down through the tiers with `grpc-timeout`.
+  Each tier ends every wait at the caller's deadline, less a margin (a
+  tenth, at most 1 s), and sends what is left upstream, so the status of
+  the deepest process reaches the caller for any deadline: a call through
+  a daemon, a cache and a busy server fails with the server's
+  `RESOURCE_EXHAUSTED`, never with a timeout of a tier in the middle. The
+  server also ends its waits before the caller's deadline: a `GetObjects`
+  call with no memory for its first object within 30 s, or before the
+  caller's deadline, fails with `RESOURCE_EXHAUSTED`. With no deadline,
+  the fixed limits per step still apply and nothing goes upstream. A
+  caller whose deadline passes stops waiting; a fetch goes on for the
+  callers that still wait, and a caller with a later deadline asks again
+  with its own if the fetch failed on a shorter one. `scn` sends a 600 s
+  deadline (the server's own limit) and a 10 s connect timeout on every
+  call, so a waiting `scn` never hangs silently (#98).

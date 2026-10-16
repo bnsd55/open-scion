@@ -33,6 +33,10 @@ fn path(p: &str) -> RepoPath {
 /// config, and returns stdout. Fails the test unless git succeeds.
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
+        // No auto gc or maintenance: they pack loose objects in the
+        // background and delete the loose files, also while `import_git` of
+        // the same repository still reads them.
+        .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")

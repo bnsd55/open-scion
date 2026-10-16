@@ -3,11 +3,12 @@
 
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use scion_proto::listen::{self, Limits};
+use scion_proto::tls::ServerTls;
 use scion_server::derived::{self, Kind};
 use scion_server::graph::CommitGraph;
 use scion_server::import::{ImportOptions, import_git};
@@ -32,19 +33,44 @@ enum Command {
         /// Address to listen on.
         #[arg(long, default_value = "127.0.0.1:7878")]
         listen: SocketAddr,
-        /// Bearer token that clients must send.
+        /// Bearer token that clients must send. Its principal, `default`,
+        /// may read and write every repo. Give `--token` or `--access`, not
+        /// both.
         #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
-        token: String,
-        /// Allow a non-loopback address. Traffic, including the token, is not
-        /// encrypted, so use this only on a trusted network.
+        token: Option<String>,
+        /// Access file: tokens with principals, and which repos and paths
+        /// each principal may read and write. Give `--token` or `--access`,
+        /// not both.
+        #[arg(long, value_name = "FILE")]
+        access: Option<PathBuf>,
+        /// Allow a non-loopback address. Without TLS, traffic, including the
+        /// token, is not encrypted, so use this only on a trusted network.
+        /// With `--tls-cert` and `--tls-key`, a non-loopback address is
+        /// allowed without this flag.
         #[arg(long)]
         insecure_listen: bool,
+        /// Serve TLS with this certificate (PEM), together with `--tls-key`.
+        /// Then a non-loopback address needs no `--insecure-listen`.
+        #[arg(long, requires = "tls_key", value_name = "FILE")]
+        tls_cert: Option<PathBuf>,
+        /// The key of `--tls-cert` (PEM).
+        #[arg(long, requires = "tls_cert", value_name = "FILE")]
+        tls_key: Option<PathBuf>,
+        /// Require a client certificate (mTLS) that this CA (PEM) signed.
+        #[arg(long, requires = "tls_cert", value_name = "FILE")]
+        tls_client_ca: Option<PathBuf>,
         /// Most connections served at once. More clients wait until one closes.
         #[arg(long, default_value_t = listen::DEFAULT_CONNECTIONS)]
         max_connections: NonZeroUsize,
         /// Most calls (HTTP/2 streams) that one connection may have open at once.
         #[arg(long, default_value_t = listen::DEFAULT_STREAMS)]
         max_streams: NonZeroU32,
+    },
+    /// Print the BLAKE3 digest of a token, as a `token` line of an access
+    /// file wants it. The file holds digests, never tokens.
+    HashToken {
+        #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
+        token: String,
     },
     /// Import a local git repository, one way. Safe to repeat. It can run
     /// while the server runs.
@@ -92,18 +118,38 @@ enum KindName {
     CommitGraph,
 }
 
+/// The TLS of a `serve` command: none, or the certificate, key and client CA
+/// of the flags. Clap requires the certificate and the key together, and the
+/// client CA on a certificate.
+fn server_tls(
+    cert: Option<&Path>,
+    key: Option<&Path>,
+    client_ca: Option<&Path>,
+) -> anyhow::Result<Option<ServerTls>> {
+    match (cert, key) {
+        (None, None) => Ok(None),
+        (Some(cert), Some(key)) => {
+            let tls = ServerTls::load(cert, key, client_ca)?;
+            Ok(Some(tls))
+        }
+        _ => unreachable!("clap requires --tls-cert and --tls-key together"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let cli = Cli::parse();
-    // An import does not land, so it can run beside the server. `derive`
-    // removes rows of older versions of a kind, which a running server of an
-    // older build may read, so it opens as the server.
+    // `hash-token` needs no data directory. An import does not land, so it
+    // can run beside the server. `derive` removes rows of older versions of a
+    // kind, which a running server of an older build may read, so it opens as
+    // the server.
     let open = match cli.command {
         Command::Import { .. } => Store::open_shared,
         Command::Serve { .. } | Command::Derive { .. } => Store::open,
+        Command::HashToken { .. } => return hash_token(),
     };
     let store = open(&cli.data)
         .with_context(|| format!("cannot open data directory {}", cli.data.display()))?;
@@ -111,33 +157,31 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve {
             listen,
             token,
+            access,
             insecure_listen,
+            tls_cert,
+            tls_key,
+            tls_client_ca,
             max_connections,
             max_streams,
         } => {
-            anyhow::ensure!(!token.is_empty(), "--token must not be empty");
-            // SHORTCUT: no TLS. Upgrade: tonic TLS or mTLS before any
-            // deployment beyond one machine.
-            anyhow::ensure!(
-                listen.ip().is_loopback() || insecure_listen,
-                "{listen} is not a loopback address; traffic and the token would \
-                 travel unencrypted. Pass --insecure-listen to allow it."
-            );
-            let listener = tokio::net::TcpListener::bind(listen)
-                .await
-                .with_context(|| format!("cannot listen on {listen}"))?;
-            // The bound address, so port 0 shows the port that the OS chose.
-            let listen = listener.local_addr()?;
-            tracing::info!(%listen, "serving");
-            let limits = Limits {
-                connections: max_connections,
-                streams: max_streams,
-            };
-            service::serve(store, listener, &token, limits, async {
-                tokio::signal::ctrl_c().await.ok();
-            })
+            let server_tls = server_tls(
+                tls_cert.as_deref(),
+                tls_key.as_deref(),
+                tls_client_ca.as_deref(),
+            )?;
+            serve(
+                store,
+                listen,
+                load_access(token, access)?,
+                insecure_listen,
+                server_tls,
+                max_connections,
+                max_streams,
+            )
             .await?;
         }
+        Command::HashToken { .. } => unreachable!("handled before the store opens"),
         Command::Import {
             repo,
             rev,
@@ -182,5 +226,83 @@ async fn main() -> anyhow::Result<()> {
             println!("derived {name} for the history of {tip}; older versions are removed");
         }
     }
+    Ok(())
+}
+
+/// Serves the gRPC API on `listen`, with the TLS files of the flags, until
+/// the caller stops it.
+#[allow(clippy::too_many_lines)]
+async fn serve(
+    store: Store,
+    listen: SocketAddr,
+    access: scion_server::access::Access,
+    insecure_listen: bool,
+    server_tls: Option<ServerTls>,
+    max_connections: NonZeroUsize,
+    max_streams: NonZeroU32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        listen.ip().is_loopback() || insecure_listen || server_tls.is_some(),
+        "{listen} is not a loopback address; without TLS the traffic and the \
+         token would travel unencrypted. Pass --tls-cert and --tls-key, or \
+         --insecure-listen to allow it."
+    );
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("cannot listen on {listen}"))?;
+    // The bound address, so port 0 shows the port that the OS chose.
+    let listen = listener.local_addr()?;
+    tracing::info!(%listen, "serving");
+    let limits = Limits {
+        connections: max_connections,
+        streams: max_streams,
+    };
+    Box::pin(service::serve(
+        store,
+        listener,
+        access,
+        limits,
+        server_tls,
+        async {
+            tokio::signal::ctrl_c().await.ok();
+        },
+    ))
+    .await?;
+    Ok(())
+}
+
+/// The rules of `serve`: exactly one of `--token` (one principal with every
+/// right) and `--access` (a file of tokens and rules).
+fn load_access(
+    token: Option<String>,
+    file: Option<PathBuf>,
+) -> anyhow::Result<scion_server::access::Access> {
+    match (token, file) {
+        (Some(_), Some(_)) => anyhow::bail!("give --token or --access, not both"),
+        (Some(token), None) => {
+            anyhow::ensure!(!token.is_empty(), "--token must not be empty");
+            Ok(scion_server::access::Access::single(&token))
+        }
+        (None, Some(file)) => {
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("cannot read {}", file.display()))?;
+            scion_server::access::Access::parse(&text)
+                .map_err(|why| anyhow::anyhow!("bad access file {}: {why}", file.display()))
+        }
+        (None, None) => anyhow::bail!("give --token or --access"),
+    }
+}
+
+/// Prints the BLAKE3 digest of the token of `hash-token`.
+fn hash_token() -> anyhow::Result<()> {
+    let Cli { command, .. } = Cli::parse();
+    let Command::HashToken { token } = command else {
+        unreachable!("hash_token handles only the hash-token command")
+    };
+    anyhow::ensure!(!token.is_empty(), "--token must not be empty");
+    println!(
+        "{}",
+        blake3::Hash::from(scion_proto::auth::token_digest(&token)).to_hex()
+    );
     Ok(())
 }
