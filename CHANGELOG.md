@@ -217,3 +217,21 @@ release.
   on one connection.
 - `scion-server serve` logs the address that it bound, so `--listen
   127.0.0.1:0` shows the port that the OS chose.
+
+### Changed
+
+- A caller's deadline passes down through the tiers with `grpc-timeout`.
+  Each tier ends every wait at the caller's deadline, less a margin (a
+  tenth, at most 1 s), and sends what is left upstream, so the status of
+  the deepest process reaches the caller for any deadline: a call through
+  a daemon, a cache and a busy server fails with the server's
+  `RESOURCE_EXHAUSTED`, never with a timeout of a tier in the middle. The
+  server also ends its waits before the caller's deadline: a `GetObjects`
+  call with no memory for its first object within 30 s, or before the
+  caller's deadline, fails with `RESOURCE_EXHAUSTED`. With no deadline,
+  the fixed limits per step still apply and nothing goes upstream. A
+  caller whose deadline passes stops waiting; a fetch goes on for the
+  callers that still wait, and a caller with a later deadline asks again
+  with its own if the fetch failed on a shorter one. `scn` sends a 600 s
+  deadline (the server's own limit) and a 10 s connect timeout on every
+  call, so a waiting `scn` never hangs silently (#98).

@@ -1200,10 +1200,15 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
   60 s per step for the server, so a busy server answers first; the daemon
   waits 180 s per step for the cache, which covers one step of the server,
   the cache's own three waits (slot, fetch memory, reply memory) and 30 s
-  to spare. A fetch joined in the middle of
-  its batch can still wait for the objects ahead of it, and a client's own
-  deadline does not reach the tiers
-  ([#98](https://github.com/bnsd55/open-scion/issues/98)).
+  to spare. A caller's deadline reaches every tier as `grpc-timeout`. Each
+  tier ends every wait at that deadline, less a margin (a tenth, at most
+  1 s), and sends what is left of it upstream, so the status of the deepest
+  process reaches the caller in time. With no deadline, the fixed limits
+  above apply and nothing goes upstream. A caller whose deadline passes
+  stops waiting: its first object fails with `DEADLINE_EXCEEDED`, a later
+  one just ends the reply, and the fetch goes on for the callers that still
+  wait. A caller with a later deadline whose fetch failed on a shorter one
+  asks again with its own.
 - **Auth.** A tier requires its own bearer token (`--token`, `SCION_TOKEN`),
   checked by the server's code, and sends its own token upstream
   (`--upstream-token`, `SCION_UPSTREAM_TOKEN`). A tier does not ask whether
@@ -1327,7 +1332,6 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-proto/src/auth.rs` (`Auth`) | One static token, one principal. | A token-to-principal map, then per-path write rules. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/main.rs` (`serve`) | No TLS. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
 | `scion-tier/src/lib.rs` (`produce`) | Two blocking hops per hit (size, then read) and no read-ahead, as on the server. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
-| `scion-tier/src/lib.rs` (`DAEMON_UPSTREAM_TIMEOUT`) | Fixed limits per step that nest. A fetch joined in the middle of its batch can wait for the objects ahead of it, and a client's own deadline does not reach the tiers. | Pass the remaining deadline down with `grpc-timeout`. | [#98](https://github.com/bnsd55/open-scion/issues/98) |
 | `scion-tier/src/lib.rs` (`check_repo`) | A tier does not ask whether a repo exists, and serves a stored object to any caller with the token. Safe with one principal. | Read tickets, checked by every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-tier/src/store.rs` (`DiskStore`) | The daemon's whole recency index is also in memory, and a start reads all of it. Writing `<data>/index` again copies every record under the index lock, which `size` needs while the tier holds its fetch table: every fetch start waits. After a crash, a start scans every object file. Memory and these pauses grow with the object count. | An index on disk that is read and changed in place, and a crash start that needs no scan. | [#115](https://github.com/bnsd55/open-scion/issues/115) |
 | `scion-tier/src/bin/scion-cache.rs` (`main`) | No TLS between tiers. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
