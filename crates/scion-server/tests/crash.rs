@@ -1,23 +1,8 @@
-//! Crash suite: the real `scion-server` binary, killed with SIGKILL at random
-//! moments while several clients upload, create changesets and land, then
-//! started again on the same data directory.
-//!
-//! After each restart the test checks what a crash must never break:
-//!
-//! - The restarted server removed the temp files that the crash left.
-//! - A retry of each land with its request key returns the reply that the
-//!   land got before, field for field. A land whose reply was lost finishes
-//!   on retry, as landed or conflict.
-//! - Each ref points at a changeset that exists, and so does each first
-//!   parent down to the root. Each changeset hashes to its ID, and its root
-//!   tree differs from its parent's by exactly its changes (`Diff`).
-//! - Each landed changeset is on its ref once, with the changes that the
-//!   client sent. Nothing else is on a ref, and no land is pending.
-//! - Every blob that a reply named, and every blob that the metadata names,
-//!   exists and matches its ID. No blob file is torn.
-//!
-//! A second test kills the server while it upgrades the schema of a data
-//! directory, and checks that the kill leaves the old schema or the new one.
+//! Crash suite: the real `scion-server` binary, killed with SIGKILL while
+//! several clients upload, create changesets and land, then started again on
+//! the same data directory. After each restart, [`check`] checks what a crash
+//! must never break; `docs/architecture.md` (section 10) lists it. A second
+//! test kills the server while it upgrades the schema of a data directory.
 //!
 //! What this does not prove: SIGKILL stops the process, but the kernel keeps
 //! the writes that reached its page cache, synced or not. So the suite checks
@@ -214,9 +199,7 @@ impl Sent {
 struct Ledger {
     /// Blobs that `PutBlob` replied with.
     blobs: Vec<BlobId>,
-    /// Changesets that `CreateChangeset` replied with.
-    created: Vec<ChangesetId>,
-    /// Every land sent, in order.
+    /// Every land sent, in order. `CreateChangeset` replied for each one.
     lands: Vec<Sent>,
 }
 
@@ -269,28 +252,12 @@ async fn put_blob(scion: &mut Scion, data: &[u8]) -> Result<BlobId, Status> {
 struct Signals {
     /// Set just before the kill.
     killed: AtomicBool,
-    /// Calls in progress that a kill can wait for: `PutBlob` of a large
-    /// file, and `Land`.
-    calls: [AtomicUsize; 2],
+    /// `PutBlob` calls of a large file in progress.
+    large_uploads: AtomicUsize,
 }
 
-/// How long after a call of [`Signals::calls`] starts a kill may come, in
-/// milliseconds. A large upload writes its blob near its end, after about
-/// 10 to 30 ms. A land is pending for its first few ms, then waits for its
-/// flush.
-const KILL_WINDOW_MS: [usize; 2] = [30, 4];
-
-impl Signals {
-    /// Counts a call of kind `kind` in progress while `call` runs.
-    async fn track<T>(&self, kind: usize, call: impl Future<Output = T>) -> T {
-        self.calls[kind].fetch_add(1, Ordering::SeqCst);
-        let done = call.await;
-        self.calls[kind].fetch_sub(1, Ordering::SeqCst);
-        done
-    }
-}
-
-/// A file of more than this many bytes counts as large.
+/// A file of more than this many bytes counts as large. Its upload writes
+/// the blob near its end, 10 to 30 ms after it starts.
 const LARGE: usize = 64 << 10;
 
 /// One client: uploads files, creates a changeset on a ref's head (or on an
@@ -342,12 +309,10 @@ async fn client(url: String, name: String, mut rng: Rng, signals: Arc<Signals>) 
         }
         let mut changes = BTreeMap::new();
         for (path, data) in files {
-            let put = put_blob(&mut scion, &data);
-            let put = if data.len() > LARGE {
-                signals.track(0, put).await
-            } else {
-                put.await
-            };
+            let large = usize::from(data.len() > LARGE);
+            signals.large_uploads.fetch_add(large, Ordering::SeqCst);
+            let put = put_blob(&mut scion, &data).await;
+            signals.large_uploads.fetch_sub(large, Ordering::SeqCst);
             let id = match put {
                 Ok(id) => id,
                 Err(status) => return cut(ledger, "PutBlob", &status),
@@ -378,7 +343,6 @@ async fn client(url: String, name: String, mut rng: Rng, signals: Arc<Signals>) 
             Ok(reply) => assert_eq!(changeset_id(&reply.into_inner().changeset_id), id),
             Err(status) => return cut(ledger, "CreateChangeset", &status),
         }
-        ledger.created.push(id);
 
         let sent = Sent {
             key,
@@ -389,7 +353,7 @@ async fn client(url: String, name: String, mut rng: Rng, signals: Arc<Signals>) 
         };
         let request = sent.request();
         ledger.lands.push(sent);
-        match signals.track(1, scion.land(request)).await {
+        match scion.land(request).await {
             Ok(reply) => ledger.lands.last_mut().unwrap().reply = Some(reply.into_inner()),
             Err(status) => return cut(ledger, "Land", &status),
         }
@@ -403,13 +367,13 @@ async fn client(url: String, name: String, mut rng: Rng, signals: Arc<Signals>) 
 struct Checked {
     /// Lands `..lands` were retried after a restart.
     lands: usize,
-    /// Changesets `..created` were read back.
-    created: usize,
+    /// Blobs `..blobs` of the ledger were read back.
+    blobs: usize,
     /// Changesets whose root tree was checked against their changes.
     changesets: HashSet<ChangesetId>,
-    /// Blobs read back through `GetObjects`.
-    replied: HashSet<BlobId>,
-    /// Blob files found intact on disk.
+    /// Changeset and tree rows whose blobs were found.
+    rows: HashSet<Vec<u8>>,
+    /// Blobs found intact on disk.
     files: HashSet<BlobId>,
 }
 
@@ -495,42 +459,46 @@ async fn read_blobs(objects: &mut Objects, blobs: &[BlobId]) {
     }
 }
 
-/// The blobs that every changeset and every tree in the database names, and
-/// the number of pending lands. Read through a second `Store` that shares
-/// the data directory with the server, as an import does.
-fn metadata(data: &Path) -> (Store, BTreeSet<BlobId>, i64) {
-    let store = Store::open_shared(data).unwrap();
-    let (named, pending) = store
+/// Lands that are pending in the database.
+fn pending_lands(c: &rusqlite::Connection) -> i64 {
+    let pending = "SELECT count(*) FROM lands WHERE state = 'pending'";
+    c.query_row(pending, [], |row| row.get(0)).unwrap()
+}
+
+/// The blobs that the changeset and tree rows of the database name, and the
+/// number of pending lands. Rows in `seen` are skipped, and new rows added:
+/// a row never changes.
+fn metadata(store: &Store, seen: &mut HashSet<Vec<u8>>) -> (BTreeSet<BlobId>, i64) {
+    store
         .read(|c| {
             let mut named = BTreeSet::new();
-            let mut changesets = c.prepare("SELECT body FROM changesets")?;
-            for body in changesets.query_map([], |row| row.get::<_, Vec<u8>>(0))? {
-                let changeset = Changeset::decode(&body?).unwrap();
-                named.extend(
-                    changeset
-                        .changes
-                        .values()
-                        .flatten()
-                        .filter_map(FileState::blob),
-                );
+            for table in ["changesets", "trees"] {
+                let mut rows = c.prepare(&format!("SELECT id, body FROM {table}"))?;
+                let rows = rows.query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })?;
+                for row in rows {
+                    let (id, body) = row?;
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    let states: Vec<FileState> = if table == "changesets" {
+                        let changes = Changeset::decode(&body).unwrap().changes;
+                        changes.into_values().flatten().collect()
+                    } else {
+                        let entries = Tree::decode(&body).unwrap().entries.into_values();
+                        let file = |entry| match entry {
+                            Entry::File(state) => Some(state),
+                            Entry::Dir(_) => None,
+                        };
+                        entries.filter_map(file).collect()
+                    };
+                    named.extend(states.iter().filter_map(FileState::blob));
+                }
             }
-            let mut trees = c.prepare("SELECT body FROM trees")?;
-            for body in trees.query_map([], |row| row.get::<_, Vec<u8>>(0))? {
-                let tree = Tree::decode(&body?).unwrap();
-                named.extend(tree.entries.values().filter_map(|entry| match entry {
-                    Entry::File(state) => state.blob(),
-                    Entry::Dir(_) => None,
-                }));
-            }
-            let pending = c.query_row(
-                "SELECT count(*) FROM lands WHERE state = 'pending'",
-                [],
-                |row| row.get(0),
-            )?;
-            Ok((named, pending))
+            Ok((named, pending_lands(c)))
         })
-        .unwrap();
-    (store, named, pending)
+        .unwrap()
 }
 
 /// Every blob file under `<data>/objects/blob`, by its ID.
@@ -650,8 +618,8 @@ fn check_lands(ledger: &Ledger, history: &HashMap<ChangesetId, (&str, Changeset)
     assert_eq!(history.len(), lands_on_refs);
 }
 
-/// Checks the invariants of the module comment against a server that has
-/// just started on `data`.
+/// Checks what a crash must never break (`docs/architecture.md`, section
+/// 10) against a server that has just started on `data`.
 async fn check(url: &str, data: &Path, ledger: &mut Ledger, checked: &mut Checked, rng: &mut Rng) {
     let tmp: Vec<PathBuf> = fs::read_dir(data.join("tmp"))
         .unwrap()
@@ -659,40 +627,46 @@ async fn check(url: &str, data: &Path, ledger: &mut Ledger, checked: &mut Checke
         .collect();
     assert!(tmp.is_empty(), "temp files after the restart: {tmp:?}");
     let (mut scion, mut objects) = connect(url).await.unwrap();
+    let new_lands = checked.lands;
     retry_lands(&scion, ledger, checked, rng).await;
     let history = walk_refs(&mut scion, &mut objects, checked).await;
     check_lands(ledger, &history);
 
-    // Every blob that a reply named reads back, and every changeset that
-    // `CreateChangeset` replied with.
-    let named = ledger.lands.iter().flat_map(|sent| {
-        let states = sent.changeset.changes.values().flatten();
-        states.filter_map(FileState::blob)
-    });
-    let mut blobs: Vec<BlobId> = ledger.blobs.iter().copied().chain(named).collect();
-    blobs.retain(|id| checked.replied.insert(*id));
-    read_blobs(&mut objects, &blobs).await;
-    for &id in &ledger.created[checked.created..] {
+    // Every blob that `PutBlob` replied with reads back. It comes as its
+    // stored file, so the file is intact too. Every changeset that
+    // `CreateChangeset` replied with is there.
+    let blobs = &ledger.blobs[checked.blobs..];
+    read_blobs(&mut objects, blobs).await;
+    checked.files.extend(blobs);
+    checked.blobs = ledger.blobs.len();
+    for sent in &ledger.lands[new_lands..] {
         let request = GetChangesetRequest {
             repo: REPO.into(),
-            changeset_id: id.as_bytes().to_vec(),
+            changeset_id: sent.id.as_bytes().to_vec(),
         };
         let reply = scion.get_changeset(request).await;
-        reply.unwrap_or_else(|s| panic!("created changeset {id}: {s:?}"));
+        reply.unwrap_or_else(|s| panic!("created changeset {}: {s:?}", sent.id));
     }
-    checked.created = ledger.created.len();
 
     // Every blob that the metadata names is intact, and so is every blob
     // file: a file reaches its name only whole.
-    let (store, named, pending) = metadata(data);
+    let store = Store::open_shared(data).unwrap();
+    let (named, pending) = metadata(&store, &mut checked.rows);
     assert_eq!(pending, 0, "every land sent was retried");
     let files = blob_files(data);
     for id in named.into_iter().chain(files) {
-        if !checked.files.contains(&id) {
+        if checked.files.insert(id) {
             let status = store.blobs().verify(id).unwrap();
             assert_eq!(status, BlobStatus::Valid, "blob {id}");
-            checked.files.insert(id);
         }
+    }
+}
+
+/// Waits until `ready` holds, for at most 2 s.
+async fn wait_until(ready: impl Fn() -> bool) {
+    let give_up = Instant::now() + Duration::from_secs(2);
+    while !ready() && Instant::now() < give_up {
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -738,24 +712,26 @@ async fn every_reply_survives_a_kill_of_the_server() {
             .collect();
         let run = 100 + rng.below(500);
         tokio::time::sleep(Duration::from_millis(u64::try_from(run).unwrap())).await;
-        // Two kills in three, on average, come soon after a large upload or a
-        // land starts, so they often stop the server while it writes a blob
-        // or holds a pending land.
-        if let Some(kind) = rng.below(3).checked_sub(1) {
-            let give_up = Instant::now() + Duration::from_secs(2);
-            let running = || signals.calls[kind].load(Ordering::SeqCst);
-            while running() == 0 && Instant::now() < give_up {
-                tokio::time::sleep(Duration::from_millis(1)).await;
+        // Two kills in three, on average, wait for a moment that a crash
+        // must survive: a blob write, soon after a large upload starts, or a
+        // land that is pending in the database.
+        match rng.below(3) {
+            0 => {}
+            1 => {
+                wait_until(|| signals.large_uploads.load(Ordering::SeqCst) > 0).await;
+                let delay = u64::try_from(rng.below(30)).unwrap();
+                tokio::time::sleep(Duration::from_millis(delay)).await;
             }
-            let delay = u64::try_from(rng.below(KILL_WINDOW_MS[kind])).unwrap();
-            tokio::time::sleep(Duration::from_millis(delay)).await;
+            _ => {
+                let db = rusqlite::Connection::open(data.join("scion.db")).unwrap();
+                wait_until(|| pending_lands(&db) > 0).await;
+            }
         }
         signals.killed.store(true, Ordering::SeqCst);
         drop(server);
         for client in clients {
             let mut got = client.await.unwrap();
             ledger.blobs.append(&mut got.blobs);
-            ledger.created.append(&mut got.created);
             cut += got.lands.iter().filter(|sent| sent.reply.is_none()).count();
             ledger.lands.append(&mut got.lands);
         }
@@ -774,7 +750,7 @@ async fn every_reply_survives_a_kill_of_the_server() {
 
 /// Derived rows in the schema-upgrade test, so that the upgrade of version 2
 /// to 3, which copies every derived row, takes a while.
-const FILLER_ROWS: i64 = 50_000;
+const FILLER_ROWS: i64 = 30_000;
 
 /// A data directory at schema version 2, as a build of that version left it:
 /// repo `r` with a root changeset, ref `main` at it, and [`FILLER_ROWS`]
@@ -852,36 +828,43 @@ fn a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one() {
     fs::copy(data.join("scion.db"), &old).unwrap();
     let version_2 = schema(&data);
     assert_eq!((version_2.version, version_2.filler), (2, FILLER_ROWS));
-
-    // Kills 0, 10, 20 ms and so on after a start, each from version 2,
-    // until one comes after the upgrade committed. The kills after the
-    // upgrade began stop it in the middle.
-    let mut left = Vec::new();
-    for delay in (0..).map(|i| Duration::from_millis(10 * i)) {
-        for log in ["scion.db-wal", "scion.db-shm"] {
-            fs::remove_file(data.join(log)).ok();
+    let restore = || {
+        for file in ["scion.db-wal", "scion.db-shm"] {
+            fs::remove_file(data.join(file)).ok();
         }
         fs::copy(&old, data.join("scion.db")).unwrap();
-        let server = Server::spawn(&data, &log);
-        std::thread::sleep(delay);
-        drop(server);
-        let found = schema(&data);
-        let upgraded = found.version != 2;
-        left.push((delay, found));
-        if upgraded {
-            break;
-        }
-        assert!(delay < Duration::from_secs(60), "no upgrade");
-    }
-    println!("{} kills; the last one came after the upgrade", left.len());
+    };
 
-    let server = Server::start(&data, &log);
+    // A whole start with the upgrade. Its time sets the step of the kills,
+    // so their number does not depend on the speed of the machine.
+    let start = Instant::now();
+    drop(Server::start(&data, &log));
+    let step = start.elapsed() / 64;
     let version_3 = schema(&data);
     assert_eq!((version_3.version, version_3.filler), (3, FILLER_ROWS));
-    for (delay, found) in left {
-        let whole = found == version_2 || found == version_3;
-        assert!(whole, "a kill after {delay:?} left {found:?}");
+
+    // Kills 0, 1, 2 steps and so on after a start, each from version 2,
+    // until one comes after the upgrade committed. The kills after the
+    // upgrade began stop it in the middle.
+    let mut kills = 0;
+    loop {
+        restore();
+        let server = Server::spawn(&data, &log);
+        let after = step * kills;
+        std::thread::sleep(after);
+        drop(server);
+        kills += 1;
+        let found = schema(&data);
+        if found == version_3 {
+            break;
+        }
+        assert_eq!(found, version_2, "a kill after {after:?}");
+        assert!(kills < 256, "no upgrade");
     }
+    println!("{kills} kills, {step:?} apart; the last one came after the upgrade");
+
+    let server = Server::start(&data, &log);
+    assert_eq!(schema(&data), version_3);
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let (_, mut objects) = connect(&server.url).await.unwrap();
         let request = ResolveRefRequest {
