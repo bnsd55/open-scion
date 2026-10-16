@@ -870,14 +870,7 @@ mod tests {
         let share = u32::try_from(budget).unwrap();
         let share = Arc::clone(&reads).acquire_many_owned(share).await.unwrap();
         let (tx, rx) = mpsc::channel(2);
-        let task = tokio::spawn(send_file(
-            Worker::new(store),
-            blob,
-            share,
-            tx,
-            stall,
-            None,
-        ));
+        let task = tokio::spawn(send_file(Worker::new(store), blob, share, tx, stall, None));
         (task, rx, reads)
     }
 
