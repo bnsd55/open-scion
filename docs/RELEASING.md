@@ -10,11 +10,6 @@ step is run by a person.
   --all-targets -- -D warnings`, `cargo test --workspace`, the MSRV check
   and the fuzz smoke test.
 - The milestone for the version has no open issues.
-- The crate versions in `Cargo.toml` and the versions of the internal
-  dependencies (`scion-core`, `scion-proto`, `scion-server`, `scion-tier`)
-  are the version that is about to ship. They live in
-  `[workspace.package]` and in `[workspace.dependencies]`: a release bump
-  changes one `version` and four dependency lines.
 - Every crate carries the metadata that crates.io wants: a description,
   the license (`MIT OR Apache-2.0`), the repository and homepage, keywords
   and categories, and the workspace `rust-version`. `cargo package -p
@@ -32,14 +27,23 @@ step is run by a person.
    number there and the four `version = "..."` entries of the internal
    dependencies in `[workspace.dependencies]` to the same value.
 3. **Check the packages.** From a clean worktree (no uncommitted
-   changes), for each crate, in dependency order:
+   changes), package every crate:
 
    ```sh
-   cargo package -p scion-core --no-verify
+   cargo package --workspace --no-verify
+   cargo package -p scion-core
    ```
 
-   It must end with `Packaged`. A crate that fails here cannot publish.
-   `cargo package --no-verify` still uploads nothing.
+   The first command packages all five crates; it must end with
+   `Packaged` five times. `cargo package` builds nothing, so it uploads
+   nothing. The second verifies `scion-core` by building it, which the
+   other four cannot do before they are published: their build resolves
+   the unpublished internal dependencies from crates.io, and
+   `scion-proto`'s build script needs `proto/scion.proto`, which sits
+   outside the crate (the packaged crate cannot build; the generated
+   code is built in place instead). A release that follows this list
+   re-runs the full workspace test suite (step 1), so the verification
+   gap is the resolver's, not the code's.
 4. **Tag.** Cut an annotated tag from the commit that the release
    notes describe:
 
@@ -73,15 +77,21 @@ step is run by a person.
 ## After
 
 - Watch the crates.io pages of the five crates until each shows the
-  version, and build a fresh checkout that depends on `scn` from crates.io.
+  version, then install the client from crates.io and run it:
+
+  ```sh
+  cargo install scn --version 0.1.0 --root /tmp/scion-install
+  /tmp/scion-install/bin/scn --version
+  ```
+
+  Remove `/tmp/scion-install` afterwards.
 - Close the milestone if it is still open.
 
 ## Notes
 
-- License text: the repository carries `LICENSE-MIT` and `LICENSE-APACHE`
-  at its root. A crate manifest can only list license files inside its own
-  directory, so the published crates carry the SPDX `license` field, and
-  the license text ships with the GitHub release and the repository.
+- Each crate ships both license files: `crates/<crate>/LICENSE-MIT` and
+  `LICENSE-APACHE` are links to the files at the repository root, and
+  `cargo package --list` shows them for every crate.
 - Windows is not supported; the release notes say so.
 - Never publish or tag from a fork or a dirty worktree; the tag and the
   crates.io upload both record the commit that built them.
