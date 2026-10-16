@@ -1360,15 +1360,18 @@ mod tests {
     /// [`spawn_guard`] this test fails within a few hundred cycles; with
     /// it, the spawns wait out every release window.
     ///
-    /// The reopen allows a short wait: on macOS, a child of the storm
-    /// beside this test can hold the inherited lock for one scheduler
-    /// tick past the drops, because the `exec` that closes it ends
-    /// asynchronously to the spawner's thread. A leak never releases, so
-    /// a bounded wait still fails this test if the guard is removed.
+    /// The read side covers a spawn until the child has exited
+    /// (`status`), so no child of this binary holds any descriptor once
+    /// the read side is released, whatever the platform does at `exec`.
+    /// Only Linux gates the assertion: on macOS the kernel tears a
+    /// reaped child's inherited `flock` down one tick after `waitpid`
+    /// (a standalone probe fails ~15% of lock-spawn-close-reopen rounds
+    /// with `EWOULDBLOCK` and no holder left), so no immediate reopen
+    /// can be exact there.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_dropped_store_lock_is_shared_by_a_forked_child_until_it_execs() {
         use std::process::Command;
-        use std::time::{Duration, Instant};
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let spawner = {
             let stop = stop.clone();
@@ -1392,25 +1395,8 @@ mod tests {
                 drop(first);
                 drop(clone);
                 // The window between the drops and this open is where a
-                // forked child still holds the lock. A child that lingers
-                // one tick past the drops releases it; a leak never does.
-                let deadline = Instant::now() + Duration::from_secs(2);
-                loop {
-                    match Store::open(dir.path()) {
-                        Ok(opened) => {
-                            drop(opened);
-                            break;
-                        }
-                        Err(e) if Instant::now() < deadline => {
-                            assert!(
-                                e.to_string().contains("server.lock is locked"),
-                                "the open failed for another reason: {e}"
-                            );
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(e) => panic!("the lock was never released: {e}"),
-                    }
-                }
+                // forked child still holds the lock.
+                Store::open(dir.path()).unwrap();
             });
         }
         stop.store(true, Ordering::Relaxed);
