@@ -10,8 +10,10 @@
 //!   A long one stops at its call's [`deadline`].
 //!   [`similar`] finds renames for `Diff` and `Blame`.
 //! - [`import`]: one-way import from a git repository.
-//! - [`service`], [`objects`] and [`auth`]: the gRPC front end.
+//! - [`service`], [`objects`] and [`auth`]: the gRPC front end. [`access`]:
+//!   which principal may read or write what.
 
+pub mod access;
 pub mod auth;
 pub mod blame;
 pub mod db;

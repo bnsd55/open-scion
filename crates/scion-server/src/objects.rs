@@ -22,8 +22,9 @@ use scion_proto::{Bytes, CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_PART_MESSAGE_BYTES}
 use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 
+use crate::access::Access;
 use crate::error::{Error, Result};
-use crate::service::{Worker, check_name, parse_id, resolve_ref};
+use crate::service::{Worker, caller, check_reader, parse_id, resolve_ref};
 use crate::store::{self, Store};
 use crate::{db, read};
 
@@ -61,14 +62,16 @@ impl Plan {
 /// Implements the `Objects` RPCs.
 pub struct ObjectsService {
     worker: Worker,
+    access: Arc<Access>,
     /// `IN_FLIGHT_BYTES` permits, one per object byte, shared by all replies.
     in_flight: Arc<Semaphore>,
 }
 
 impl ObjectsService {
-    pub(crate) fn new(worker: Worker) -> Self {
+    pub(crate) fn new(worker: Worker, access: Arc<Access>) -> Self {
         Self {
             worker,
+            access,
             in_flight: Arc::new(Semaphore::new(IN_FLIGHT_BYTES)),
         }
     }
@@ -264,7 +267,7 @@ impl Objects for ObjectsService {
         &self,
         request: Request<ResolveRefRequest>,
     ) -> Result<Response<ResolveRefResponse>, Status> {
-        resolve_ref(&self.worker, request.into_inner())
+        resolve_ref(&self.worker, &self.access, request)
             .await
             .map(Response::new)
     }
@@ -273,8 +276,9 @@ impl Objects for ObjectsService {
         &self,
         request: Request<GetRootTreeRequest>,
     ) -> Result<Response<GetRootTreeResponse>, Status> {
+        let caller = caller(&request)?;
         let GetRootTreeRequest { repo, changeset_id } = request.into_inner();
-        check_name("repo", &repo)?;
+        check_reader(&self.access, &caller, &repo)?;
         let cs = parse_id(&changeset_id, "changeset_id")?;
         let tree = self
             .worker
@@ -291,8 +295,9 @@ impl Objects for ObjectsService {
         &self,
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<Self::GetObjectsStream>, Status> {
+        let caller = caller(&request)?;
         let GetObjectsRequest { repo, refs, accept } = request.into_inner();
-        check_name("repo", &repo)?;
+        check_reader(&self.access, &caller, &repo)?;
         scion_proto::check::object_count(refs.len())?;
         let keys = refs.iter().map(parse_ref).collect::<Result<Vec<_>, _>>()?;
         // Encodings that this server does not know are ignored.

@@ -29,8 +29,7 @@ pub const MAX_IDENTITY_BYTES: usize = 1 << 10;
 /// stored intact. [`Error::Apply`] if the changes do not apply to the parent's
 /// tree. [`Error::Io`] if a blob cannot be read.
 pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<ChangesetId> {
-    let (cs, id) = Changeset::decode_with_id_max_changes(bytes, MAX_CHANGES)
-        .map_err(|e| Error::InvalidArgument(format!("bad changeset: {e}")))?;
+    let (cs, id) = decode(bytes)?;
     let parent = check_request(&cs)?;
     // A cheap read first, so a request on a missing repo or parent reads no
     // blob. The transaction checks again.
@@ -51,6 +50,17 @@ pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<Chang
         }
         tree::store_changeset(c, repo_id, &cs).map(|(id, _)| id)
     })
+}
+
+/// Decodes a changeset that a client sent, with at most [`MAX_CHANGES`]
+/// changes. A larger change count is refused before any change is read.
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] if the bytes do not decode.
+pub fn decode(bytes: &[u8]) -> Result<(Changeset, ChangesetId)> {
+    Changeset::decode_with_id_max_changes(bytes, MAX_CHANGES)
+        .map_err(|e| Error::InvalidArgument(format!("bad changeset: {e}")))
 }
 
 /// Checks that `repo` exists and has `parent`, and returns the repo.
