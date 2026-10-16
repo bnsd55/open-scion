@@ -8,9 +8,11 @@
 //! Git headers that Scion does not model (`encoding`, `gpgsig`, `mergetag`)
 //! are dropped, so a changeset ID is not a function of the git object name.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gix::ObjectId;
 use gix::actor::SignatureRef;
@@ -28,13 +30,28 @@ use crate::tree;
 
 /// `git_import.git_algo` for SHA-1 object names.
 const SHA1: i64 = 1;
-/// Commits per write transaction.
-// SHORTCUT: a server that shares the data directory waits for each batch
-// transaction, up to `busy_timeout` (5 s), and then its write fails. Its
-// other writes wait behind that write, which holds its write connection.
-// Ceiling: a batch that takes longer. Upgrade (issue #100): shorter
-// transactions while a server shares the directory.
+/// Commits per blob batch: their blobs are prepared and made durable
+/// together, outside any write transaction.
 const BATCH: usize = 1000;
+/// A write transaction of an import ends once it has run this long, so a
+/// server that shares the data directory waits at most this, well under its
+/// `busy_timeout` of 5 s (issue #100). One commit's record and check can run
+// SHORTCUT: one commit of a batch can still run longer than the budget, and
+// a server write then waits for it. Ceiling: the changes and trees of the
+// biggest commit. Upgrade: a separate write connection for the import, or
+// per-statement yields.
+const TX_BUDGET: Duration = Duration::from_secs(1);
+/// How long an import stays off the write lock between two transactions, so
+/// a server write that waited for one can take the lock before the next
+/// transaction begins.
+const TX_YIELD: Duration = Duration::from_millis(100);
+
+// How long the write transaction sleeps per commit of a batch, for the
+// tests of a slow batch. It models a batch whose records are slow.
+#[cfg(test)]
+thread_local! {
+    static SLOW_RECORD: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+}
 /// Cache for decoded git objects. A tree diff re-reads the trees that the
 /// previous commit's diff just read.
 const OBJECT_CACHE_BYTES: usize = 64 << 20;
@@ -167,22 +184,15 @@ fn import_with_cache(
                 tree::fill_root_tree(store, repo_id, parent)?;
             }
         }
-        store.write(|c| {
-            for (commit, cs, git_tree) in &prepared {
-                let root = record(c, repo_id, *commit, cs)?;
-                if plan.verify.contains(commit) {
-                    checker.check(c, *commit, *git_tree, root)?;
-                }
-            }
-            Ok(())
-        })?;
-        done += batch.len();
-        tracing::info!(
-            done,
-            total = plan.todo.len(),
-            commits_per_sec = per_sec(done, started),
-            "importing git commits"
-        );
+        store_batch(
+            store,
+            repo_id,
+            &prepared,
+            &plan,
+            &mut checker,
+            &mut done,
+            started,
+        )?;
     }
 
     // The tip was imported before, or planned and imported above.
@@ -212,6 +222,66 @@ fn import_with_cache(
         "git import done"
     );
     Ok(report)
+}
+
+/// Stores a batch's prepared commits: each in a write transaction, with its
+/// check inside it. A chunk commits whole: a crash loses whole commits,
+/// never half a one, and a commit is stored only with its check.
+///
+/// A `Store` that shares the data directory keeps each transaction short: it
+/// ends after [`TX_BUDGET`] plus one commit, and the import stays off the
+/// write lock [`TX_YIELD`] between two transactions, so a server that writes
+/// waits for that, and not for the whole batch. A `Store` that is alone has
+/// nobody to wait for it, and runs the whole batch in one transaction.
+#[allow(clippy::too_many_arguments)]
+fn store_batch(
+    store: &Store,
+    repo_id: RepoId,
+    prepared: &[(ObjectId, Changeset, ObjectId)],
+    plan: &Plan,
+    checker: &mut Checker<'_>,
+    done: &mut usize,
+    started: Instant,
+) -> Result<()> {
+    #[cfg(test)]
+    let slow_record = SLOW_RECORD.with(Cell::get);
+    let shared = store.is_shared();
+    let mut rest = prepared;
+    while !rest.is_empty() {
+        let mut taken = 0;
+        let started_tx = Instant::now();
+        store.write(|c| {
+            for (commit, cs, git_tree) in rest {
+                #[cfg(test)]
+                if !slow_record.is_zero() {
+                    std::thread::sleep(slow_record);
+                }
+                let root = record(c, repo_id, *commit, cs)?;
+                if plan.verify.contains(commit) {
+                    checker.check(c, *commit, *git_tree, root)?;
+                }
+                taken += 1;
+                if shared && started_tx.elapsed() >= TX_BUDGET {
+                    break;
+                }
+            }
+            Ok(taken)
+        })?;
+        rest = &rest[taken..];
+        *done += taken;
+        tracing::info!(
+            done = *done,
+            total = plan.todo.len(),
+            commits_per_sec = per_sec(*done, started),
+            "importing git commits"
+        );
+        if shared && !rest.is_empty() {
+            // A server write that waited for this transaction takes the lock
+            // here, before the next one begins.
+            std::thread::sleep(TX_YIELD);
+        }
+    }
+    Ok(())
 }
 
 /// What to import, in order.
@@ -904,5 +974,86 @@ mod tests {
         // The repo, the root trees of the four parents in steps, the batch
         // and the ref. The batch derives nothing while it holds the lock.
         assert_eq!(store.commits() - commits, 3 + derived::steps(4));
+    }
+
+    #[test]
+    fn a_server_write_waits_less_than_busy_timeout_during_a_slow_batch() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        // More commits than one budget-sized transaction takes, so the batch
+        // splits.
+        for i in 0..160 {
+            git(
+                dir,
+                &["commit", "-q", "--allow-empty", "-m", &i.to_string()],
+            );
+        }
+        let data = tempfile::tempdir().unwrap();
+        let server = Store::open(data.path()).unwrap();
+        let importer = Store::open_shared(data.path()).unwrap();
+        let opts = ImportOptions {
+            rev: "main".into(),
+            target_ref: "main".into(),
+            verify_sample: 0,
+        };
+        // The sleep runs on the import thread, inside each transaction, so
+        // one transaction of the whole batch holds the write lock for
+        // 160 x 40 ms, past busy_timeout, and the server's writes fail
+        // without the budget. With it, a transaction ends at 1 s plus one
+        // commit.
+        let import = {
+            let dir = dir.to_path_buf();
+            let importer = importer.clone();
+            thread::spawn(move || {
+                SLOW_RECORD.with(|c| c.set(Duration::from_millis(40)));
+                import_git(&importer, "r", &dir, &opts)
+            })
+        };
+        let mut writes = 0;
+        while !import.is_finished() {
+            let name = format!("w{writes}");
+            // Every write succeeds: a wait past the 5 s busy_timeout fails
+            // here, which one transaction of the whole batch would cause.
+            server.write(|c| db::create_repo(c, &name)).unwrap();
+            writes += 1;
+            thread::sleep(Duration::from_millis(10));
+        }
+        let report = import.join().unwrap().unwrap();
+        assert!(writes > 0, "no server write ran during the import");
+        // The budget split the batch into transactions, and the import did
+        // its work.
+        assert!(importer.txes() > 2, "the batch was one transaction");
+        assert_eq!(report.imported, 160);
+    }
+
+    #[test]
+    fn an_import_that_is_alone_runs_its_batch_in_one_transaction() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        // More slow records than one budget-sized transaction takes, so a
+        // shared import would split the batch.
+        for i in 0..30 {
+            git(
+                dir,
+                &["commit", "-q", "--allow-empty", "-m", &i.to_string()],
+            );
+        }
+        let data = tempfile::tempdir().unwrap();
+        let importer = Store::open(data.path()).unwrap();
+        let opts = ImportOptions {
+            rev: "main".into(),
+            target_ref: "main".into(),
+            verify_sample: 0,
+        };
+        // 30 x 40 ms of records is over the 1 s budget: an import that is
+        // alone ignores the budget and runs the batch in one transaction.
+        SLOW_RECORD.with(|c| c.set(Duration::from_millis(40)));
+        let report = import_git(&importer, "r", dir, &opts).unwrap();
+        // One transaction each for the repo, the batch, and the ref: the
+        // batch did not split at the budget.
+        assert_eq!(importer.txes(), 3);
+        assert_eq!(report.imported, 30);
     }
 }

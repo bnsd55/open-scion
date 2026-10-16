@@ -48,8 +48,11 @@ release.
 - `scion-server import` can run while the server runs on the same data
   directory. It moves the ref by compare-and-swap, as a land does, and its
   commits are durable before the server can see them. A second server, or
-  a process of another build, is refused. A request that waits for the
-  import's write lock for more than 5 s fails with `UNAVAILABLE`.
+  a process of another build, is refused. Its write transactions end after
+  1 s, so a server write waits for at most that plus one commit instead of
+  a whole batch, and a request that waits more than 5 s fails with
+  `UNAVAILABLE`. The temp files of a crashed import are removed by the
+  next open of the directory, while the server keeps running.
 - Server-side commits (`CreateChangeset`) and lands: path-level conflict
   checks through a per-ref index, one transaction per land, retries by
   request key, and bounded retry when the ref moves.
@@ -261,3 +264,12 @@ release.
   with its own if the fetch failed on a shorter one. `scn` sends a 600 s
   deadline (the server's own limit) and a 10 s connect timeout on every
   call, so a waiting `scn` never hangs silently (#98).
+- A process now bounds what stalled replies hold: a reply whose client
+  stops reading adds what it leaves in HTTP/2 (under 4 MiB) to a count of
+  its connection, and a connection whose stalled replies hold more than
+  64 MiB together (`--max-stalled-bytes`) is closed with them. Other
+  connections are not touched. hyper cannot reset one stalled stream, so
+  the connection is the unit of accounting; the ceiling drops from
+  connections x streams x 4 MiB to connections x 64 MiB for streamed
+  replies. A unary reply that its client never reads is not counted
+  (hyper gives the server no hook that sees it stall) (#113).

@@ -1,7 +1,7 @@
 //! The `scion-server` binary: `import`, `serve` and `derive`.
 
 use std::net::SocketAddr;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -86,6 +86,10 @@ enum Command {
         /// Most calls (HTTP/2 streams) that one connection may have open at once.
         #[arg(long, default_value_t = listen::DEFAULT_STREAMS)]
         max_streams: NonZeroU32,
+        /// Most bytes that the stalled replies of one connection may hold. A
+        /// connection over it is closed with them.
+        #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
+        max_stalled_bytes: NonZeroU64,
     },
     /// Print the BLAKE3 digest of a token, as a `token` line of an access
     /// file wants it. The file holds digests, never tokens.
@@ -172,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
             tls_client_ca,
             max_connections,
             max_streams,
+            max_stalled_bytes,
         } => {
             // The second reply says whether the mode is one token: with one
             // principal, a per-principal cap is a global one, so the quotas
@@ -200,6 +205,7 @@ async fn main() -> anyhow::Result<()> {
                     server_tls,
                     max_connections,
                     max_streams,
+                    max_stalled_bytes,
                 },
             )
             .await?;
@@ -310,11 +316,12 @@ struct ServeConfig {
     server_tls: Option<ServerTls>,
     max_connections: NonZeroUsize,
     max_streams: NonZeroU32,
+    max_stalled_bytes: NonZeroU64,
 }
 
 /// Serves the gRPC API on `listen`, with the TLS files of the flags, until
 /// the caller stops it.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn serve(
     store: Store,
     listen: SocketAddr,
@@ -333,6 +340,7 @@ async fn serve(
     // The bound address, so port 0 shows the port that the OS chose.
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "serving");
+        
     Box::pin(service::serve(
         store,
         listener,
@@ -341,6 +349,7 @@ async fn serve(
             limits: Limits {
                 connections: config.max_connections,
                 streams: config.max_streams,
+                stalled_bytes: config.max_stalled_bytes,
             },
             quotas: config.quotas,
             pending_lands: config.pending_lands,
