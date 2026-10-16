@@ -45,6 +45,10 @@ impl Git {
     /// raw stdout.
     fn raw(&self, args: &[&str], stdin: &[u8]) -> Vec<u8> {
         let mut child = Command::new("git")
+            // No auto gc or maintenance: they pack loose objects in the
+            // background and delete the loose files, also while the import
+            // of the same repository still reads them.
+            .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
             .args(args)
             .current_dir(self.path())
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
