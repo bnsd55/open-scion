@@ -41,4 +41,48 @@ pub mod spawn_guard {
             let _ = gix::path::env::installation_config();
         });
     }
+
+    /// Waits until the server lock of `dir` is free. Call it on the write
+    /// side (inside [`across_release`]), after dropping the stores and
+    /// before the reopen that must see the lock released.
+    ///
+    /// The poll takes the real condition — the lock is free — instead of
+    /// a timing guess: it opens `<dir>/server.lock` and takes a
+    /// non-blocking exclusive flock every 1 ms, up to 2 s, then fails
+    /// with the holder message, so a real leak still fails. The delay it
+    /// absorbs is the operating system's: macOS tears a reaped child's
+    /// inherited `flock` down one tick after `waitpid`, and about 7% of
+    /// immediate reopens after a Rust spawn and its wait fail with
+    /// `EWOULDBLOCK` there, sub-ms; Linux shows 0 of 2,000 rounds (a
+    /// standalone probe). (The same helper, for the unit tests of the
+    /// server, is `store::spawn_guard::wait_for_lock_release`.)
+    pub fn wait_for_lock_release(dir: &std::path::Path) {
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(dir.join("server.lock"))
+                .unwrap_or_else(|e| panic!("cannot open the lock of {}: {e}", dir.display()));
+            // rustix's flock takes the lock or fails with would-block:
+            // `Ok` is free, `Err` is still held.
+            let free =
+                rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                    .is_ok();
+            drop(file);
+            if free {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the server lock of {} was never released within 2 s",
+                dir.display()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
