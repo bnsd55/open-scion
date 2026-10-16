@@ -32,11 +32,16 @@ MUST keep both.
 
 ## 2. Transport and authentication
 
-**Transport.** gRPC over HTTP/2 without TLS. The server listens on
-`127.0.0.1:7878` by default. It refuses a non-loopback address unless it is
-started with `--insecure-listen`. The token and all data travel unencrypted,
-so a client SHOULD reach a server only over loopback or a trusted network.
-TLS is not in v1 ([#14](https://github.com/bnsd55/open-scion/issues/14)).
+**Transport.** gRPC over HTTP/2. The server listens on `127.0.0.1:7878` by
+default. It refuses a non-loopback address unless it is started with
+`--insecure-listen`, or it serves TLS: `--tls-cert` and `--tls-key` (PEM
+files), with the HTTP/2 protocol negotiated by ALPN. With `--tls-client-ca`,
+every client MUST present a certificate that CA signed (mTLS). A client that
+calls an `https://` address trusts the CA of its certificate: `scn` reads it
+from `--tls-ca`, a tier from its own `--tls-ca`. A bearer token over plain
+tcp to a non-loopback address is refused, so a client SHOULD reach a server
+only over loopback, a trusted network, or TLS. Certificate revocation is not
+in v1 ([#14](https://github.com/bnsd55/open-scion/issues/14)).
 
 **Connections and streams.** The server serves at most 128 connections at
 once (`--max-connections`). It reads nothing from a connection beyond that
@@ -944,7 +949,8 @@ A new version is a new package, `scion.v2`. A server MAY serve both.
 
 ## 10. Not in v1
 
-- TLS ([#14](https://github.com/bnsd55/open-scion/issues/14)).
+- Certificate revocation and a public CA store; trust comes only from a CA
+  file ([#14](https://github.com/bnsd55/open-scion/issues/14)).
 - More than one principal, per-path write rules and read tickets
   ([#13](https://github.com/bnsd55/open-scion/issues/13)).
 - Per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)).

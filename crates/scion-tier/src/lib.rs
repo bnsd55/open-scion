@@ -45,6 +45,7 @@ use scion_proto::object::{self, Assembler, Header, MAX_ENCODED_BYTES, UNPACK_BYT
 use scion_proto::reply::{
     self, BUSY_TIMEOUT, Body, IN_FLIGHT_BYTES, ObjectStream, Outgoing, STALL_TIMEOUT,
 };
+use scion_proto::tls::{ClientTls, ServerTls};
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::objects_server::{Objects, ObjectsServer};
 use scion_proto::v1::{
@@ -398,20 +399,33 @@ impl<S: Store> Tier<S> {
     /// A tier that keeps objects in `store` and sends misses to `upstream`
     /// (`http://HOST:PORT` or `unix:///PATH`) with `upstream_token`. It waits
     /// at most `timeout` for each step of upstream, and connects on the first
-    /// call.
+    /// call. With `client_tls`, the upstream is trusted with that CA, and a
+    /// client certificate is presented for mTLS.
     ///
     /// # Errors
     ///
-    /// A bad upstream address, or a token that is not ASCII.
+    /// A bad upstream address, a token that is not ASCII, or an https
+    /// upstream without a CA to trust.
     pub fn new(
         store: S,
         upstream: &str,
         upstream_token: &str,
         timeout: Duration,
+        client_tls: Option<&ClientTls>,
     ) -> anyhow::Result<Self> {
-        let channel = Endpoint::from_shared(upstream.to_owned())
-            .with_context(|| format!("bad upstream address {upstream:?}"))?
-            .connect_lazy();
+        let endpoint = Endpoint::from_shared(upstream.to_owned())
+            .with_context(|| format!("bad upstream address {upstream:?}"))?;
+        let endpoint = if let Some(client_tls) = client_tls {
+            client_tls.apply_to(upstream, endpoint)?
+        } else {
+            anyhow::ensure!(
+                !upstream.starts_with("https://"),
+                "the upstream {upstream} is https, but no CA is given to trust its \
+                 certificate; pass --tls-ca"
+            );
+            endpoint
+        };
+        let channel = endpoint.connect_lazy();
         let bearer = Bearer::new(upstream_token).context("upstream token is not valid ASCII")?;
         let upstream_calls = Arc::default();
         let auth = UpstreamAuth {
@@ -444,29 +458,33 @@ impl<S: Store> Tier<S> {
     }
 
     /// Serves the `Objects` calls on `incoming` connections, to callers that
-    /// send `token`, within `limits`, until `shutdown` resolves.
+    /// send `token`, within `limits`, until `shutdown` resolves. With `tls`,
+    /// every connection is a TLS connection, whose handshake `listen` ends
+    /// within its timeout.
     ///
     /// # Errors
     ///
     /// Transport errors.
-    pub async fn serve<I, IO, IE>(
+    pub async fn serve<I, IO>(
         self,
         token: &str,
         incoming: I,
         limits: Limits,
+        tls: Option<ServerTls>,
         shutdown: impl Future<Output = ()>,
     ) -> Result<(), tonic::transport::Error>
     where
-        I: Stream<Item = Result<IO, IE>>,
+        I: Stream<Item = io::Result<IO>> + Send + 'static,
         IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
-        IE: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         let objects = ObjectsServer::new(self)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_PART_MESSAGE_BYTES);
         let objects = InterceptedService::new(objects, Auth::new(token));
         let router = |mut server: Server| server.add_service(objects);
-        limits.serve(router, incoming, shutdown).await
+        limits
+            .serve(router, incoming, tls.map(|tls| tls.config()), shutdown)
+            .await
     }
 
     /// Runs store work on a blocking thread.
@@ -1243,7 +1261,7 @@ mod tests {
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
         let store = MemoryStore::new(limit);
-        let tier = Tier::new(store, &url, "token", CACHE_UPSTREAM_TIMEOUT).unwrap();
+        let tier = Tier::new(store, &url, "token", CACHE_UPSTREAM_TIMEOUT, None).unwrap();
         (blobs, keys, fake, tier)
     }
 
@@ -1469,7 +1487,14 @@ mod tests {
                 .add_service(ObjectsServer::new(Stalls(data.to_vec())))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
-        Tier::new(MemoryStore::new(0), &url, "token", CACHE_UPSTREAM_TIMEOUT).unwrap()
+        Tier::new(
+            MemoryStore::new(0),
+            &url,
+            "token",
+            CACHE_UPSTREAM_TIMEOUT,
+            None,
+        )
+        .unwrap()
     }
 
     #[tokio::test]

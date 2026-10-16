@@ -120,6 +120,7 @@ impl Server {
             listener,
             TOKEN,
             Limits::default(),
+            None,
             std::future::pending(),
         ));
         Self {
