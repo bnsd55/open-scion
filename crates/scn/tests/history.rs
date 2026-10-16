@@ -22,24 +22,10 @@ use tokio::runtime::Runtime;
 const REPO: &str = "r";
 const TOKEN: &str = "secret";
 
-/// A temp directory whose name the cleanup of leaked test directories does
-/// not match. Such a cleanup removes `$TMPDIR/.tmp*`, also while another
-/// test still uses its directory.
-fn tempdir() -> TempDir {
-    tempfile::Builder::new()
-        .prefix("scn-e2e-")
-        .tempdir()
-        .unwrap()
-}
-
 /// Runs git in `dir` with fixed identities and dates and no user or system
 /// config, and returns stdout. Fails the test unless git succeeds.
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
-        // No auto gc or maintenance: they pack loose objects in a detached
-        // background process, and delete the loose files while the import
-        // still reads them.
-        .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -298,7 +284,7 @@ fn blame_matches_git_blame_first_parent() {
         "empty.txt",
         "swap",
     ];
-    let git_dir = tempdir();
+    let git_dir = tempfile::tempdir().unwrap();
     let dir = git_dir.path();
     blame_fixture(dir);
     // Then a rename into a new directory, with an edit.
@@ -311,7 +297,7 @@ fn blame_matches_git_blame_first_parent() {
             ("src/lib.rs", Some(&lib.replace("header 2", "header 3"))),
         ],
     );
-    let data = tempdir();
+    let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
     let opts = ImportOptions {
         rev: "HEAD".into(),
@@ -401,7 +387,7 @@ fn log_ids(server: &Server, args: &[&str]) -> Vec<String> {
 
 #[test]
 fn log_path_and_blame_continue_past_the_server_bounds() {
-    let data = tempdir();
+    let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
     // The root adds `f` with two lines. Then 2 * MAX_SCAN changesets change
     // only `g`, so at least one `Log` reply has no entries. Then
@@ -456,7 +442,7 @@ fn log_path_and_blame_continue_past_the_server_bounds() {
 
 #[test]
 fn blame_continues_at_the_old_path_after_a_rename() {
-    let data = tempdir();
+    let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
     // Each changeset adds one line at the top. The one at `before` also
     // renames `a` to `f`. One `Blame` call diffs MAX_BLAME_VERSIONS
@@ -491,7 +477,7 @@ fn blame_continues_at_the_old_path_after_a_rename() {
 
 #[test]
 fn blame_goes_on_with_a_rename_search_across_replies() {
-    let data = tempdir();
+    let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
     // `new` replaces 24 deleted files of 65,536 lines, one chunk each, so
     // one call's budget reads about 15 of them, and the search goes on in a
@@ -522,7 +508,7 @@ fn blame_goes_on_with_a_rename_search_across_replies() {
 
 #[test]
 fn log_continues_after_a_reply_cut_by_its_byte_budget() {
-    let data = tempdir();
+    let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
     // A reply holds about 32 MiB of changesets, so it stops after three of
     // these and must say where to continue.

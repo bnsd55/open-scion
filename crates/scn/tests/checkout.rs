@@ -44,10 +44,6 @@ const ANY_CHANGESET: &str = "000000000000000000000000000000000000000000000000000
 /// config. Fails the test unless git succeeds.
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
-        // No auto gc or maintenance: they pack loose objects in the
-        // background and delete the loose files, also while the test's own
-        // `scn` process reads them.
-        .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -67,22 +63,12 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
-/// A temp directory whose name the cleanup of leaked test directories does
-/// not match. Such a cleanup removes `$TMPDIR/.tmp*`, also while another
-/// test still uses its directory.
-fn tempdir() -> TempDir {
-    tempfile::Builder::new()
-        .prefix("scn-e2e-")
-        .tempdir()
-        .unwrap()
-}
-
 /// A git repository with one commit that has every entry kind: regular and
 /// executable files, an empty file, binary content, nested directories, and
 /// symlinks to a file, to a directory, out of the repo, to an absolute path,
 /// and to nothing; plus a submodule.
 fn fixture() -> TempDir {
-    let repo = tempdir();
+    let repo = tempfile::tempdir().unwrap();
     let root = repo.path();
     let write = |path: &str, content: &[u8]| {
         let path = root.join(path);
@@ -197,7 +183,7 @@ fn temp_dirs(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn open_store() -> (TempDir, Store) {
-    let data = tempdir();
+    let data = tempfile::tempdir().unwrap();
     let store = Store::open(data.path()).unwrap();
     (data, store)
 }
@@ -264,7 +250,7 @@ fn git_checkout(git_dir: &Path, dest: &Path) -> BTreeMap<PathBuf, Node> {
 fn checkout_matches_git_checkout_byte_for_byte() {
     let repo = fixture();
     let server = Server::with_import(repo.path());
-    let tmp = tempdir();
+    let tmp = tempfile::tempdir().unwrap();
     let ours = tmp.path().join("ours");
 
     let out = server.scn(&["checkout", "main", "--into", text(&ours)]);
@@ -325,7 +311,7 @@ fn checkout_matches_git_checkout_byte_for_byte() {
 fn checkout_into_an_existing_empty_directory_keeps_it() {
     let repo = fixture();
     let server = Server::with_import(repo.path());
-    let tmp = tempdir();
+    let tmp = tempfile::tempdir().unwrap();
     let parent = tmp.path().join("parent");
     let ours = parent.join("ours");
     fs::create_dir_all(&ours).unwrap();
@@ -346,7 +332,7 @@ fn checkout_into_an_existing_empty_directory_keeps_it() {
 fn sparse_checkout_writes_only_the_requested_directories() {
     let repo = fixture();
     let server = Server::with_import(repo.path());
-    let tmp = tempdir();
+    let tmp = tempfile::tempdir().unwrap();
     let ours = tmp.path().join("ours");
 
     let out = server.scn(&[
@@ -444,7 +430,7 @@ fn unsafe_names_fail_before_anything_is_written() {
     let files: Vec<_> = cases.iter().map(|(files, _)| *files).collect();
     let ids = store_changesets(&store, &files);
     let server = Server::start(data, store);
-    let tmp = tempdir();
+    let tmp = tempfile::tempdir().unwrap();
 
     for ((_, expected), id) in cases.iter().zip(ids) {
         let dest = tmp.path().join(id.to_string());
@@ -483,7 +469,7 @@ fn names_that_fold_together_fail_cleanly_where_the_filesystem_folds_them() {
             target: store.blobs().put(b"t").unwrap(),
         },
     );
-    let tmp = tempdir();
+    let tmp = tempfile::tempdir().unwrap();
     let case = folds(tmp.path(), "probe", "PROBE");
     // U+00E9 in NFC, and in NFD as `e` and U+0301.
     let unicode = folds(tmp.path(), "caf\u{e9}", "cafe\u{301}");
@@ -557,7 +543,7 @@ fn objects_larger_than_one_reply_span_several_calls() {
     let b = regular(store.blobs().put(&big_b).unwrap());
     let ids = store_changesets(&store, &[&[(b"a.bin", a), (b"b.bin", b)]]);
     let server = Server::start(data, store);
-    let tmp = tempdir();
+    let tmp = tempfile::tempdir().unwrap();
     let dest = tmp.path().join("big");
 
     let out = server.scn(&["checkout", &ids[0].to_string(), "--into", text(&dest)]);
@@ -798,7 +784,7 @@ fn start_liar(depth: usize) -> (Runtime, String) {
 #[test]
 fn blobs_are_asked_for_in_path_order() {
     let (_runtime, url) = start_liar(0);
-    let tmp = tempdir();
+    let tmp = tempfile::tempdir().unwrap();
     let dest = tmp.path().join("dest");
     let out = scn(
         &url,
@@ -816,7 +802,7 @@ fn blobs_are_asked_for_in_path_order() {
 #[test]
 fn a_misbehaving_server_is_caught_and_nothing_is_written() {
     let (_runtime, url) = start_liar(0);
-    let tmp = tempdir();
+    let tmp = tempfile::tempdir().unwrap();
 
     for (misbehavior, expected) in [
         ("extra", "not asked for"),
@@ -848,7 +834,7 @@ fn a_misbehaving_server_is_caught_and_nothing_is_written() {
 #[test]
 fn a_signal_removes_what_the_checkout_wrote_and_then_kills_it() {
     let (_runtime, url) = start_liar(0);
-    let tmp = tempdir();
+    let tmp = tempfile::tempdir().unwrap();
     for (signal, name) in [
         (Signal::INT, "SIGINT"),
         (Signal::TERM, "SIGTERM"),
@@ -890,7 +876,7 @@ fn a_signal_removes_what_the_checkout_wrote_and_then_kills_it() {
 fn a_deep_failed_checkout_is_removed_with_few_open_files() {
     // 255 directories, the most a path can have above a file.
     let (_runtime, url) = start_liar(255);
-    let tmp = tempdir();
+    let tmp = tempfile::tempdir().unwrap();
     let dest = tmp.path().join("dest");
     fs::create_dir(&dest).unwrap();
     // Fewer open files than the tree has levels. The server sends `a`, then
