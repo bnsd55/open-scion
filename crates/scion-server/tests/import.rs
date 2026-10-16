@@ -1,6 +1,8 @@
 //! Git import against fixture repositories built with the `git` CLI.
 #![cfg(unix)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -44,26 +46,31 @@ impl Git {
     /// Runs git with `stdin`, fails the test unless it succeeds, and returns
     /// raw stdout.
     fn raw(&self, args: &[&str], stdin: &[u8]) -> Vec<u8> {
-        let mut child = Command::new("git")
-            // No auto gc or maintenance: they pack loose objects in the
-            // background and delete the loose files, also while the import
-            // of the same repository still reads them.
-            .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
-            .args(args)
-            .current_dir(self.path())
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_AUTHOR_NAME", "Ada")
-            .env("GIT_AUTHOR_EMAIL", "ada@example.com")
-            .env("GIT_AUTHOR_DATE", "1700000000 +0530")
-            .env("GIT_COMMITTER_NAME", "Bob")
-            .env("GIT_COMMITTER_EMAIL", "bob@example.com")
-            .env("GIT_COMMITTER_DATE", "1700000100 -0700")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        // The child shares a flock until it execs (see `common::spawn_guard`):
+        // the read side keeps this spawn out of a lock-release window of
+        // another test.
+        let mut child = common::spawn_guard::across_spawn(|| {
+            Command::new("git")
+                // No auto gc or maintenance: they pack loose objects in the
+                // background and delete the loose files, also while the
+                // import of the same repository still reads them.
+                .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
+                .args(args)
+                .current_dir(self.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "Ada")
+                .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+                .env("GIT_AUTHOR_DATE", "1700000000 +0530")
+                .env("GIT_COMMITTER_NAME", "Bob")
+                .env("GIT_COMMITTER_EMAIL", "bob@example.com")
+                .env("GIT_COMMITTER_DATE", "1700000100 -0700")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        })
+        .unwrap();
         child.stdin.take().unwrap().write_all(stdin).unwrap();
         let out = child.wait_with_output().unwrap();
         assert!(
@@ -831,11 +838,13 @@ fn an_import_process_shares_the_data_directory_with_lands() {
     // Agents land on main while another process imports more commits into
     // another ref.
     let more = git.fast_commits(60, 400);
-    let import = import_process(data, &git, &more, "git/main")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let import = common::spawn_guard::across_spawn(|| {
+        import_process(data, &git, &more, "git/main")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+    })
+    .unwrap();
     let done = AtomicBool::new(false);
     let landed: Vec<ChangesetId> = thread::scope(|scope| {
         let agents: Vec<_> = (0..4)
@@ -888,11 +897,13 @@ fn an_import_process_shares_the_data_directory_with_lands() {
 #[test]
 fn a_second_server_process_is_refused() {
     let (dir, _server) = open_store();
-    let out = server_process(
-        dir.path(),
-        &["serve", "--token", "t", "--listen", "127.0.0.1:0"],
-    )
-    .output()
+    let out = common::spawn_guard::across_spawn(|| {
+        server_process(
+            dir.path(),
+            &["serve", "--token", "t", "--listen", "127.0.0.1:0"],
+        )
+        .output()
+    })
     .unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);

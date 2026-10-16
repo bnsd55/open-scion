@@ -1,6 +1,8 @@
 //! Path history (`Log` with a path) and blame, with their bounds.
 #![cfg(unix)]
 
+mod common;
+
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;

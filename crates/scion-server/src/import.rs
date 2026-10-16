@@ -833,17 +833,22 @@ mod tests {
 
     /// Runs git in `dir` with a fixed identity and no user or system config.
     fn git(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_AUTHOR_NAME", "Ada")
-            .env("GIT_AUTHOR_EMAIL", "ada@example.com")
-            .env("GIT_COMMITTER_NAME", "Ada")
-            .env("GIT_COMMITTER_EMAIL", "ada@example.com")
-            .output()
-            .unwrap();
+        // The child shares a flock until it execs (see `spawn_guard` in
+        // store.rs): the read side keeps this spawn out of a lock-release
+        // window of another test.
+        let out = crate::store::spawn_guard::across_spawn(|| {
+            Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "Ada")
+                .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+                .env("GIT_COMMITTER_NAME", "Ada")
+                .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+                .output()
+        })
+        .unwrap();
         assert!(
             out.status.success(),
             "git {args:?}: {}",

@@ -2,6 +2,8 @@
 //! the test, and their bounds.
 #![cfg(unix)]
 
+mod common;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -36,23 +38,28 @@ fn path(p: &str) -> RepoPath {
 /// Runs git in `dir` with fixed identities and dates and no user or system
 /// config. Returns whether it succeeded, and stdout.
 fn git_status(dir: &Path, args: &[&str]) -> (bool, String) {
-    let out = Command::new("git")
-        // No auto gc or maintenance: they pack loose objects in the
-        // background and delete the loose files, also while `import_git` of
-        // the same repository still reads them.
-        .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_AUTHOR_NAME", "Ada")
-        .env("GIT_AUTHOR_EMAIL", "ada@example.com")
-        .env("GIT_AUTHOR_DATE", "1700000000 +0000")
-        .env("GIT_COMMITTER_NAME", "Ada")
-        .env("GIT_COMMITTER_EMAIL", "ada@example.com")
-        .env("GIT_COMMITTER_DATE", "1700000000 +0000")
-        .output()
-        .unwrap();
+    // The child shares a flock until it execs (see `common::spawn_guard`):
+    // the read side keeps this spawn out of a lock-release window of
+    // another test.
+    let out = common::spawn_guard::across_spawn(|| {
+        Command::new("git")
+            // No auto gc or maintenance: they pack loose objects in the
+            // background and delete the loose files, also while `import_git`
+            // of the same repository still reads them.
+            .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Ada")
+            .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+            .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+            .env("GIT_COMMITTER_NAME", "Ada")
+            .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+            .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+            .output()
+    })
+    .unwrap();
     let stdout = String::from_utf8(out.stdout).unwrap().trim_end().to_owned();
     (out.status.success(), stdout)
 }
