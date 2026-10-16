@@ -25,7 +25,19 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
 
 use common::*;
-use scion_core::{Changeset, ChangesetId, Tree};
+use scion_proto::v1::GetRootTreeRequest;
+
+/// `Objects.GetRootTree` as one call: the ID of the root tree of `changeset`.
+async fn root_tree(objects: &mut Objects, changeset: ChangesetId) -> TreeId {
+    let request = GetRootTreeRequest {
+        repo: REPO.into(),
+        changeset_id: changeset.as_bytes().to_vec(),
+    };
+    let reply = objects.get_root_tree(request).await.unwrap();
+    TreeId::try_from(reply.into_inner().tree_id.as_slice()).unwrap()
+}
+
+use scion_core::{Changeset, ChangesetId, Tree, TreeId};
 
 fn seed() -> u64 {
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH);
@@ -106,7 +118,7 @@ const FILLER_ROWS: i64 = 30_000;
 
 /// A data directory at schema version 2, as a build of that version left it:
 /// repo `r` with a root changeset, ref `main` at it, and [`FILLER_ROWS`]
-
+/// derived rows of a kind that no build has. Returns the root.
 fn version_2_data(data: &Path) -> ChangesetId {
     fs::create_dir_all(data).unwrap();
     let c = rusqlite::Connection::open(data.join("scion.db")).unwrap();

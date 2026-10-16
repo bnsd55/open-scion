@@ -116,8 +116,9 @@ struct Device {
 impl Device {
     /// Creates a fresh ext4 on a loop device, mounts it through a plain
     /// table, and gives the mount to the current user, so the server can
-    /// create its data directory in it. `round` keeps the names apart.
-    fn create(dir: &Path, round: usize) -> Self {
+    /// create its data directory in it. `run_token` keeps the mapper's name
+    /// apart from other runs on the same machine.
+    fn create(dir: &Path, run_token: u64, round: usize) -> Self {
         let sub = dir.join(format!("r{round}"));
         fs::create_dir(&sub).unwrap();
         let image = sub.join("ext4.img");
@@ -128,9 +129,16 @@ impl Device {
             .unwrap();
         let image = image.to_str().unwrap();
         run("mkfs.ext4", &["-q", "-F", image]);
-        let loop_dev = run_out("losetup", &["--find", "--show", image]);
+        // Direct I/O: the loop device keeps no cache of its own, so the
+        // page cache the cut drops is the ext4 one, nothing below it.
+        let loop_dev = run_out("losetup", &["--find", "--show", "--direct-io=on", image]);
         let sectors = run_out("blockdev", &["--getsz", &loop_dev]);
-        let name = format!("scion-power-{round}");
+        let name = format!("scion-power-{run_token:x}-{round}");
+        // A run that died before its cleanup may have left the name.
+        Command::new("dmsetup")
+            .args(["remove", &name])
+            .output()
+            .ok();
         run(
             "dmsetup",
             &[
@@ -140,13 +148,14 @@ impl Device {
                 &format!("0 {sectors} linear {loop_dev} 0"),
             ],
         );
+        let (major, minor) = dm_major_minor(&name);
+        let node = sub.join("dm.b");
+        let node = node.to_str().unwrap();
+        run("mknod", &[node, "b", &major, &minor]);
         let mount = sub.join("mnt");
         fs::create_dir(&mount).unwrap();
         let mount = mount.to_str().unwrap();
-        run(
-            "mount",
-            &["-t", "ext4", &format!("/dev/mapper/{name}"), mount],
-        );
+        run("mount", &["-t", "ext4", node, mount]);
         give_to_user(mount);
         Self {
             image: PathBuf::from(image),
@@ -161,7 +170,7 @@ impl Device {
     /// the server sees success for writes it never synced.
     fn cut(&self) {
         let sectors = run_out("blockdev", &["--getsz", &self.loop_dev]);
-        let table = format!("0 {sectors} flakey {} 0 1 86400 drop_writes", self.loop_dev);
+        let table = format!("0 {sectors} flakey {} 0 1 86400 1 drop_writes", self.loop_dev);
         run("dmsetup", &["suspend", &self.name]);
         run("dmsetup", &["load", &self.name, "--table", &table]);
         run("dmsetup", &["resume", &self.name]);
@@ -184,8 +193,29 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(self.mount.parent().unwrap());
+        let mount = self.mount.to_str().unwrap();
+        let image = self.image.to_str().unwrap();
+        // Best effort: a drop in the middle of a round undoes what the
+        // round set up, and a drop after one undoes the second mount.
+        for args in [
+            vec!["umount", mount],
+            vec!["dmsetup", "remove", &self.name],
+            vec!["losetup", "-d", &self.loop_dev],
+        ] {
+            priv_cmd(args[0]).args(&args[1..]).output().ok();
+        }
+        let _ = fs::remove_dir_all(image.rsplit_once('/').map(|(dir, _)| dir).unwrap());
     }
+}
+
+/// The mapper device's major and minor numbers, from `dmsetup`.
+fn dm_major_minor(name: &str) -> (String, String) {
+    let info = run_out(
+        "dmsetup",
+        &["info", "-c", "--noheadings", "-o", "major,minor", name],
+    );
+    let (major, minor) = info.split_once(':').unwrap();
+    (major.to_owned(), minor.to_owned())
 }
 
 /// Gives a mount point, which `mount` made root's, to the current user.
@@ -226,7 +256,8 @@ async fn every_reply_survives_a_power_cut() {
     if !may_run() {
         return;
     }
-    let mut rng = Rng::new(seed());
+    let seed = seed();
+    let mut rng = Rng::new(seed);
     let rounds = usize::try_from(env("SCION_POWER_ROUNDS", 4)).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("server.log");
@@ -234,7 +265,7 @@ async fn every_reply_survives_a_power_cut() {
     let mut checked = Checked::default();
     let mut cut_lands = 0;
     for round in 0..rounds {
-        let dev = Device::create(dir.path(), round);
+        let dev = Device::create(dir.path(), seed, round);
         let data = dev.mount.join("data");
         create_repo(&data);
         let server = Server::start(&data, &log);
@@ -262,9 +293,13 @@ async fn every_reply_survives_a_power_cut() {
                 wait_until(|| pending_lands(&db) > 0).await;
             }
         }
+        // Kill first, cut second: a server alive under the cut can sit in
+        // an uninterruptible page-fault wait on the device and never finish
+        // exiting. With the server gone, the kernel's writeback still sends
+        // what the page cache had, and the cut drops exactly those.
         signals.killed.store(true, Ordering::SeqCst);
-        dev.cut();
         drop(server);
+        dev.cut();
         for client in clients {
             let mut got = client.await.unwrap();
             ledger.blobs.append(&mut got.blobs);

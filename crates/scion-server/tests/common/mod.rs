@@ -11,17 +11,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use scion_core::{
-    BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, RepoPath, Tree, TreeId,
-};
+use scion_core::{BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, RepoPath, Tree};
 use scion_proto::auth::Bearer;
 use scion_proto::object::{self, Assembler, Header};
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{
     self, CreateChangesetRequest, DiffRequest, Encoding, FileKind, GetChangesetRequest,
-    GetObjectsRequest, GetRootTreeRequest, LandRequest, LandResponse, LandState, ObjectKind,
-    ObjectRef, PutBlobRequest, ResolveRefRequest,
+    GetObjectsRequest, LandRequest, LandResponse, LandState, ObjectKind, ObjectRef, PutBlobRequest,
+    ResolveRefRequest,
 };
 use scion_proto::{CHUNK_BYTES, MAX_OBJECT_REFS};
 use scion_server::store::BlobStatus;
@@ -169,16 +167,6 @@ pub async fn resolve_ref(objects: &mut Objects, name: &str) -> Result<ChangesetI
     };
     let reply = objects.resolve_ref(request).await?;
     Ok(changeset_id(&reply.into_inner().changeset_id))
-}
-
-/// `Objects.GetRootTree` as one call: the ID of the root tree of `changeset`.
-pub async fn root_tree(objects: &mut Objects, changeset: ChangesetId) -> TreeId {
-    let request = GetRootTreeRequest {
-        repo: REPO.into(),
-        changeset_id: changeset.as_bytes().to_vec(),
-    };
-    let reply = objects.get_root_tree(request).await.unwrap();
-    TreeId::try_from(reply.into_inner().tree_id.as_slice()).unwrap()
 }
 
 pub fn author() -> IdentityTime {
