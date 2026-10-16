@@ -55,8 +55,8 @@ enum End {
 /// A `GetObjects` answer as a client sees it.
 #[derive(Debug, PartialEq, Eq)]
 struct Got {
-    /// The objects, as (kind, ID), each checked against its ID.
-    objects: Vec<(i32, Vec<u8>)>,
+    /// The objects, as kind and ID in hex, each checked against its ID.
+    objects: Vec<(i32, String)>,
     end: Option<End>,
 }
 
@@ -128,7 +128,8 @@ async fn get_objects(client: &mut Client, request: &GetObjectsRequest) -> (Got, 
                 Ok(data) if fits && matches(kind, &want.id, &data) => bytes.push(data),
                 _ => break 'calls Some(End::Refused),
             }
-            objects.push((kind, want.id.clone()));
+            let hex = BlobId::try_from(want.id.as_slice()).unwrap().to_string();
+            objects.push((kind, hex));
         }
         // A reply that ends `OK` sends at least one object.
         if objects.len() == before {
