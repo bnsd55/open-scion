@@ -115,7 +115,9 @@ benchmark against git are in [docs/benchmarks.md](docs/benchmarks.md).
 cargo build --release
 export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
 ./target/release/scion-server --data /tmp/scion import /path/to/a/git/repo
-./target/release/scion-server --data /tmp/scion serve &
+./target/release/scion-server --data /tmp/scion ticket-key --out /tmp/scion/ticket.key
+# prints the public key; pass it to the tiers below
+./target/release/scion-server --data /tmp/scion serve --ticket-key /tmp/scion/ticket.key &
 
 ./target/release/scn log -n 5
 ./target/release/scn log --path src -n 5          # changesets that changed src/
@@ -191,13 +193,24 @@ to the node (any copy tool or shared mount) and start the daemon with
 `--seed FILE`: it imports the objects, each checked against its ID, before
 it serves, and only if its store is empty. A warm daemon ignores the file.
 
+A read needs a ticket: `scn checkout` asks the server for one (`--server`,
+where it also resolves the ref), and fetches the objects through a tier
+(`--objects`). A tier that carries the objects verifies each ticket against
+the server's public key; the daemon forwards it. One daemon serves one OS
+user: the user it serves can read its store files anyway.
+
 ```sh
 export SCION_UPSTREAM_TOKEN=dev                  # what each tier sends upstream
-./target/release/scion-cache &                   # memory, 127.0.0.1:7879
+PUB=$(cat /tmp/scion/ticket.pub)                 # from the server's ticket-key
+./target/release/scion-cache --ticket-public-key "$PUB" &   # memory, 127.0.0.1:7879
 ./target/release/scion-daemon --data "$HOME/.scion-daemon" &   # disk, Unix socket
-SCION_SERVER="unix://$HOME/.scion-daemon/daemon.sock" \
+SCION_SERVER=http://127.0.0.1:7878 \
+SCION_OBJECTS="unix://$HOME/.scion-daemon/daemon.sock" \
   ./target/release/scn checkout main --into /tmp/work2
 ```
+
+Without `--ticket-key` on the server, no object is readable: a read needs a
+ticket, and the server mints none. An object ID alone is not a permission.
 
 `scn bench` runs many agents that land changes at the same time, then checks
 that `main` gained each landed change exactly once. With one server process on

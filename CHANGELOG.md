@@ -25,7 +25,34 @@ until that section gets its release date.
   no longer name another repo's blob and then read it. `PutBlob` keeps a
   stored copy only for a blob that its repo has, and else writes the
   content again, so its time does not show that another repo has the
-  content. `GetObjects` still reads any object by ID (#13).
+  content.
+
+#### Read tickets (#13)
+
+- An object ID alone is no longer a permission. `GetRootTree` returns the
+  root tree with a signed read ticket: repo, principal, root tree and
+  expiry (15 minutes, checked against the server's clock with 60 seconds of
+  skew), signed with Ed25519 over a versioned body. `GetObjects` carries
+  the ticket, and each ref names its path from the ticket's root tree; the
+  server and every tier walk the path, and a walk that does not reach the
+  object ends it `NOT_FOUND`. The ticket is the only permission of an
+  object read: it carries no token. Every other call needs a token, as
+  before. A tier refuses `ResolveRef` and `GetRootTree` with
+  `UNIMPLEMENTED`: the ref and the ticket come from the server, so a tier
+  can never mint a permission.
+- The server signs with an Ed25519 key from `--ticket-key FILE` (make one
+  with `scion-server ticket-key --out FILE`; rotation with
+  `--ticket-key-old`). A `scion-cache` verifies with
+  `--ticket-public-key HEX`, at most 2 keys during a rotation. A
+  `scion-daemon` takes no key: it checks no ticket, and serves what its
+  store holds only to the one OS user that owns its private 0600 socket,
+  who can read its store files anyway. It forwards the ticket upstream,
+  whose check and walk keep unproven reads out. One daemon per OS user.
+- `scn` resolves and reads the root tree on `--server`, and sends
+  `GetObjects` to `--objects` (a `scion-cache` or `scion-daemon`) with the
+  checkout's ticket and each ref's path. Without `--objects`, object reads
+  go to `--server`. On `ticket expired`, `scn` mints a fresh ticket for the
+  same changeset, once per call, and goes on.
 
 #### The server
 
