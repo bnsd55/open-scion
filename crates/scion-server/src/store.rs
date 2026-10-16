@@ -1301,7 +1301,11 @@ fn fsync_dir(path: &Path) -> io::Result<()> {
 /// spawners finish before the release window opens.
 #[cfg(test)]
 pub(crate) mod spawn_guard {
+    use super::{flock, lock_file};
+    use rustix::fs::FlockOperation;
+    use std::path::Path;
     use std::sync::RwLock;
+    use std::time::{Duration, Instant};
 
     static SPAWNS: RwLock<()> = RwLock::new(());
 
@@ -1310,6 +1314,39 @@ pub(crate) mod spawn_guard {
     pub fn across_spawn<T>(f: impl FnOnce() -> T) -> T {
         let _held = SPAWNS.read().expect("the spawn guard is not poisoned");
         f()
+    }
+
+    /// Waits until the server lock of `dir` is free. Call it on the
+    /// write side (inside [`Self::across_release`]), after dropping the
+    /// stores and before the reopen that must see the lock released.
+    ///
+    /// The poll takes the real condition — the lock is free — instead of
+    /// a timing guess: it opens `<dir>/server.lock` and takes a
+    /// non-blocking exclusive flock every 1 ms, up to 2 s, then fails
+    /// with the holder message, so a real leak still fails. The delay it
+    /// absorbs is the operating system's: macOS tears a reaped child's
+    /// inherited `flock` down one tick after `waitpid`, and about 7% of
+    /// immediate reopens after a Rust spawn and its wait fail with
+    /// `EWOULDBLOCK` there, sub-ms; Linux shows 0 of 2,000 rounds (a
+    /// standalone probe). The server never spawns a child, so
+    /// `Store::open` itself needs none of this.
+    pub fn wait_for_lock_release(dir: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let file = lock_file(dir, "server.lock")
+                .unwrap_or_else(|e| panic!("cannot open the lock of {dir:?}: {e}"));
+            let free = flock(&file, FlockOperation::NonBlockingLockExclusive).unwrap_or(false);
+            drop(file);
+            if free {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the server lock of {} was never released within 2 s",
+                dir.display()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// Primes gix's one-time `git` installation lookup under the read
@@ -1403,7 +1440,10 @@ mod tests {
                 drop(first);
                 drop(clone);
                 // The window between the drops and this open is where a
-                // forked child still holds the lock.
+                // forked child still holds the lock, one tick past the
+                // reaper on macOS. The poll waits for the real
+                // condition: the lock is free.
+                super::spawn_guard::wait_for_lock_release(dir.path());
                 Store::open(dir.path()).unwrap();
             });
         }
@@ -1428,6 +1468,7 @@ mod tests {
                 "a live clone keeps the lock"
             );
             drop(clone);
+            super::spawn_guard::wait_for_lock_release(dir.path());
             Store::open(dir.path()).unwrap();
             drop(shared);
         });
@@ -1467,6 +1508,7 @@ mod tests {
             assert!(tmp.join("live").exists(), "another process uses it");
             drop(server);
             drop(shared);
+            super::spawn_guard::wait_for_lock_release(dir.path());
             // Now it is what a crash left behind.
             Store::open_shared(dir.path()).unwrap();
             assert!(!tmp.join("live").exists());
@@ -1507,6 +1549,8 @@ mod tests {
             // The importer's folder is held only while it lives. Once it is
             // gone, the next open removes the folder, with the file in it.
             drop(importer);
+            // The server store stays alive, so the directory stays in use:
+            // no release to wait for.
             Store::open_shared(dir.path()).unwrap();
             assert!(!live_file.exists(), "a dead process's folder is removed");
         });
@@ -1534,6 +1578,7 @@ mod tests {
                 }
             }
             drop(live);
+            super::spawn_guard::wait_for_lock_release(dir.path());
             let store = Store::open_shared(dir.path()).unwrap();
             assert_eq!(version(&store), SCHEMA_VERSION);
             // A newer schema is refused, alone or not.
@@ -1541,6 +1586,7 @@ mod tests {
                 .write(|c| Ok(c.pragma_update(None, "user_version", 99)?))
                 .unwrap();
             drop(store);
+            super::spawn_guard::wait_for_lock_release(dir.path());
             for open in [Store::open, Store::open_shared] {
                 assert!(matches!(open(dir.path()), Err(Error::Corrupt(_))));
             }
@@ -1558,12 +1604,14 @@ mod tests {
             assert_in_use(Store::open(dir.path()), dir.path(), by);
             assert_in_use(Store::open_shared(dir.path()), dir.path(), by);
             drop(old);
+            super::spawn_guard::wait_for_lock_release(dir.path());
             // A store of this build holds the directory shared once it is open,
             // so an older build, which takes it alone, is kept out in turn.
             let store = Store::open(dir.path()).unwrap();
             let file = lock_file(dir.path(), "lock").unwrap();
             assert!(!flock(&file, FlockOperation::NonBlockingLockExclusive).unwrap());
             drop(store);
+            super::spawn_guard::wait_for_lock_release(dir.path());
         });
     }
 
@@ -1591,6 +1639,7 @@ mod tests {
             refused(Store::open(dir.path()));
             refused(Store::open_shared(dir.path()));
             drop(import);
+            super::spawn_guard::wait_for_lock_release(dir.path());
             Store::open(dir.path()).unwrap();
         });
     }
