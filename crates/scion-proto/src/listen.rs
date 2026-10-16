@@ -77,8 +77,9 @@ const PREFACE_BYTES: usize = 24;
 /// How many connections a process serves, and how many streams each may
 /// have open.
 // SHORTCUT: a live client that stops reading keeps what its stalled streams
-// hold until its connection closes, so the ceiling is connections x streams
-// x what one stream keeps (see the module docs). Upgrade (issue #113): count
+// hold until its connection closes (at most the age plus the grace), so the
+// ceiling is connections x streams x what one stream keeps (see the module
+// docs). Upgrade (issue #113): count
 // what the stalled replies of each connection hold, and close a connection
 // that holds too much.
 #[derive(Clone, Copy, Debug)]

@@ -44,10 +44,21 @@ until another one closes, so a call on it waits. Each connection may have at
 most 256 open streams (`--max-streams`), which the server sends as
 `SETTINGS_MAX_CONCURRENT_STREAMS`. As HTTP/2 requires, a client MUST NOT
 open more; it waits for a stream to end. A client SHOULD close a connection
-that it no longer uses, because an idle one keeps its place. When the
-server gets no frame on a connection for 60 s, it sends an HTTP/2 `PING`,
-and it closes the connection if no answer comes within 20 s. A client MUST
-answer a `PING`, as HTTP/2 requires. A client that stops reading a reply
+that it no longer uses, because an idle one keeps its place. The server
+closes a connection:
+
+- 20 s after it gets its place, if no HTTP/2 client preface came. A client
+  MUST send the preface as soon as it connects, as HTTP/2 requires.
+- after the preface, when it gets no frame on the connection for 60 s: it
+  sends an HTTP/2 `PING`, and closes the connection if no answer comes
+  within 20 s. A client MUST answer a `PING`, as HTTP/2 requires.
+- after 30 min: it sends `GOAWAY`, so the client opens a new connection for
+  new calls, and closes the connection 10 min later, with any call still in
+  it. A client MUST handle `GOAWAY` as HTTP/2 says. A call cut this way
+  fails, and the client MAY retry it (`GetObjects` and `ReadFile` only
+  re-read; a `Land` retry uses the same request key).
+
+So a connection beyond the cap waits at most 40 min. A client that stops reading a reply
 keeps the server's memory for that reply until the stream ends or the
 connection closes, so a client SHOULD reset a stream that it no longer
 reads (gRPC libraries do when the call is dropped). A cache tier keeps the
@@ -378,7 +389,8 @@ content of a regular file, or the target of a symlink, at `path` in
   so a client never gets all of a damaged file.
 - The reply ends with `DEADLINE_EXCEEDED` when the client takes no message
   for 120 s (the stall limit). A client that keeps reading has no time
-  limit.
+  limit of its own, but a reply that runs for more than 10 min can be cut
+  when its connection is closed for its age (section 2).
 - Before the reply starts, the call waits for its share of a memory budget of
   256 MiB that all `ReadFile` replies share: the file's size for a file of at
   most 1 MiB, 5 MiB for a larger one. A stalled reply frees its share. Up to

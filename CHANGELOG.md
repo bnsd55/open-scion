@@ -111,10 +111,14 @@ release.
   connections at once (`--max-connections`), each with at most 256 open
   streams (`--max-streams`). Before, both had no bound: tonic replaced
   hyper's default of 200 streams with none. A client beyond either cap
-  waits, and a connection that waits logs a warning. A client that sends no
-  frame for 60 s gets an HTTP/2 ping, and its connection closes if it does
-  not answer within 20 s. So the number of stalled replies has a bound, and
-  a dead peer frees what its replies hold within 80 s.
+  waits, and a connection that waits logs a warning. Every connection
+  closes in time: 20 s after it gets its place if no HTTP/2 preface came;
+  after the preface, 20 s after an unanswered ping, which goes out after
+  60 s without a frame; and 10 min after a `GOAWAY` at 30 min of age, so a
+  daemon's lifelong connection to its cache gives its place up. So the
+  number of stalled replies has a bound, and a connection beyond the cap
+  waits at most 40 min. Size `--max-connections` on a cache for the
+  daemons behind it, and on the server for the caches and direct clients.
 - The server and `scion-cache` turn off Nagle's algorithm on each TCP
   connection. It was on: tonic ignores its `tcp_nodelay` setting for a
   listener that it does not open itself. So a small reply, such as a unary
