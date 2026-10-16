@@ -247,6 +247,7 @@ fn open_store() -> (TempDir, Store) {
 }
 
 fn try_import(store: &Store, git: &Git, rev: &str) -> Result<ImportReport, Error> {
+    common::spawn_guard::prime_gix_lookup();
     import_git(store, "r", git.path(), &opts(rev))
 }
 
@@ -658,6 +659,7 @@ fn import_never_moves_a_ref_off_a_land() {
     // The commits are imported, so another ref can take them.
     let mut other = opts(&next);
     other.target_ref = "git/main".to_owned();
+    common::spawn_guard::prime_gix_lookup();
     let report = import_git(&store, "r", git.path(), &other).unwrap();
     assert_eq!(report.imported, 0);
     assert_eq!(

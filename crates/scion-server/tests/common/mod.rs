@@ -30,4 +30,15 @@ pub mod spawn_guard {
         let _held = SPAWNS.write().expect("the spawn guard is not poisoned");
         f()
     }
+
+    /// Primes gix's one-time `git` installation lookup under the read
+    /// side. The first `gix::open` in a process forks `git` outside our
+    /// control (gix-path), and caches the result afterwards. Every test
+    /// that reaches `gix` calls this first, so that fork waits out any
+    /// release window like our own spawns do.
+    pub fn prime_gix_lookup() {
+        across_spawn(|| {
+            let _ = gix::path::env::installation_config();
+        });
+    }
 }

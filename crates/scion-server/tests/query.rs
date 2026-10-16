@@ -89,6 +89,7 @@ fn merge(dir: &Path, what: &[&str]) -> String {
 }
 
 fn import(store: &Store, dir: &Path) {
+    common::spawn_guard::prime_gix_lookup();
     let opts = ImportOptions {
         rev: "HEAD".into(),
         target_ref: "main".into(),

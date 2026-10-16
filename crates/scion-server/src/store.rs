@@ -1312,6 +1312,17 @@ pub(crate) mod spawn_guard {
         f()
     }
 
+    /// Primes gix's one-time `git` installation lookup under the read
+    /// side. The first `gix::open` in a process forks `git` outside our
+    /// control (gix-path), and caches the result afterwards. Every test
+    /// that reaches `gix` calls this first, so that fork waits out any
+    /// release window like our own spawns do.
+    pub fn prime_gix_lookup() {
+        across_spawn(|| {
+            let _ = gix::path::env::installation_config();
+        });
+    }
+
     /// Holds the write side while `f` drops a store and checks its lock is
     /// released: no child is in its fork-to-exec window, and no new spawn
     /// starts, until `f` is done.
@@ -1363,12 +1374,9 @@ mod tests {
     /// The read side covers a spawn until the child has exited
     /// (`status`), so no child of this binary holds any descriptor once
     /// the read side is released, whatever the platform does at `exec`.
-    /// Only Linux gates the assertion: on macOS the kernel tears a
-    /// reaped child's inherited `flock` down one tick after `waitpid`
-    /// (a standalone probe fails ~15% of lock-spawn-close-reopen rounds
-    /// with `EWOULDBLOCK` and no holder left), so no immediate reopen
-    /// can be exact there.
-    #[cfg(target_os = "linux")]
+    /// Spawns outside the guard, like gix's one-time `git` lookup, are
+    /// primed under the read side before any test opens a store (see
+    /// [`spawn_guard::prime_gix_lookup`]).
     #[test]
     fn a_dropped_store_lock_is_shared_by_a_forked_child_until_it_execs() {
         use std::process::Command;
