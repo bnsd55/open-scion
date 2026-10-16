@@ -2,48 +2,53 @@
 //! on disk ([`DiskStore`], `scion-daemon`). Both keep at most a set number of
 //! object bytes, and drop the least recently used objects first.
 //!
-//! A store only holds objects that were checked against their IDs. The disk
-//! store checks each object again when it reads it back.
+//! A store holds each object in the form a tier keeps it (see [`Key`]): a
+//! tree as its `TreeV1` bytes, a blob as one zstd frame. Its byte limit
+//! counts those bytes. A store only holds objects that were checked against
+//! their IDs. The disk store checks each object again when it reads it back.
 
 use std::fs;
 use std::io::{self, ErrorKind, Read as _, Write as _};
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use hashlink::LruCache;
 use rustix::fs::FlockOperation;
-use scion_proto::MAX_OBJECT_BYTES;
+use scion_proto::Bytes;
+use scion_proto::object::MAX_ENCODED_BYTES;
 
 use crate::Key;
 
 /// Object storage for a tier. Calls may block; the tier makes them on a
 /// blocking thread.
 pub trait Store: Send + Sync + 'static {
-    /// The size of a stored object, without reading it. `None` if it is not
-    /// stored.
+    /// The size of a stored object in its stored form, without reading it.
+    /// `None` if it is not stored. Must be quick: a tier calls it while it
+    /// holds its table of fetches.
     ///
     /// # Errors
     ///
     /// I/O errors.
     fn size(&self, key: Key) -> io::Result<Option<usize>>;
 
-    /// The bytes of a stored object whose size [`Store::size`] gave as
+    /// The stored form of an object whose size [`Store::size`] gave as
     /// `size`. Returns at most `size` bytes. `None` if it is not stored, or
     /// if the stored copy is bad (it is then dropped).
     ///
     /// # Errors
     ///
     /// I/O errors.
-    fn get(&self, key: Key, size: usize) -> io::Result<Option<Vec<u8>>>;
+    fn get(&self, key: Key, size: usize) -> io::Result<Option<Bytes>>;
 
-    /// Stores an object. The caller has checked `data` against `key`. An
-    /// object larger than the store's limit is not kept.
+    /// Stores an object in its stored form. The caller has checked `data`
+    /// against `key`. An object larger than the store's limit is not kept.
     ///
     /// # Errors
     ///
     /// I/O errors.
-    fn put(&self, key: Key, data: &Arc<Vec<u8>>) -> io::Result<()>;
+    fn put(&self, key: Key, data: &Bytes) -> io::Result<()>;
 }
 
 /// Objects by key, least recently used first, each with its size.
@@ -96,10 +101,12 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Objects in memory, up to a byte limit.
+/// Objects in memory, up to a byte limit. Blobs stay packed, as on disk, so
+/// the limit holds more of them and a client that accepts zstd gets them
+/// without work.
 pub struct MemoryStore {
     limit: usize,
-    lru: Mutex<Lru<Arc<Vec<u8>>>>,
+    lru: Mutex<Lru<Bytes>>,
 }
 
 impl MemoryStore {
@@ -119,17 +126,15 @@ impl Store for MemoryStore {
         Ok(lock(&self.lru).get(key).map(|&(_, size)| size))
     }
 
-    fn get(&self, key: Key, size: usize) -> io::Result<Option<Vec<u8>>> {
-        let data = lock(&self.lru).get(key).map(|(data, _)| Arc::clone(data));
-        // Copied outside the lock.
-        Ok(data
-            .filter(|data| data.len() <= size)
-            .map(|data| data.to_vec()))
+    /// The stored buffer itself, not a copy.
+    fn get(&self, key: Key, size: usize) -> io::Result<Option<Bytes>> {
+        let data = lock(&self.lru).get(key).map(|(data, _)| data.clone());
+        Ok(data.filter(|data| data.len() <= size))
     }
 
-    fn put(&self, key: Key, data: &Arc<Vec<u8>>) -> io::Result<()> {
+    fn put(&self, key: Key, data: &Bytes) -> io::Result<()> {
         if data.len() <= self.limit {
-            lock(&self.lru).insert(key, Arc::clone(data), data.len(), self.limit);
+            lock(&self.lru).insert(key, data.clone(), data.len(), self.limit);
         }
         Ok(())
     }
@@ -140,7 +145,7 @@ impl Store for MemoryStore {
 /// ```text
 /// <data>/lock                   locked by the one process that uses <data>
 /// <data>/objects/tree/ab/cd..   a tree's TreeV1 bytes
-/// <data>/objects/blob/ab/cd..   a blob's raw content
+/// <data>/objects/blob/ab/cd..   one zstd frame of a blob's content
 /// <data>/tmp/                   staging for atomic writes, emptied at start
 /// ```
 ///
@@ -158,6 +163,8 @@ pub struct DiskStore {
     tmp: PathBuf,
     limit: usize,
     lru: Mutex<Lru<()>>,
+    /// Names files that the limit drops, in `tmp/`.
+    dropped: AtomicU64,
     _lock: fs::File,
 }
 
@@ -178,7 +185,8 @@ impl DiskStore {
             .recursive(true)
             .mode(0o700)
             .create(dir)?;
-        crate::check_private_dir(dir)?;
+        // The checked directory, so no symlink in `dir` is followed again.
+        let dir = &crate::check_private_dir(dir)?;
         let lock_file = lock_dir(dir)?;
         let objects = dir.join("objects");
         let tmp = dir.join("tmp");
@@ -191,15 +199,18 @@ impl DiskStore {
             tmp,
             limit,
             lru: Mutex::new(Lru::new()),
+            dropped: AtomicU64::default(),
             _lock: lock_file,
         };
         let mut found = store.scan()?;
         found.sort_by_key(|&(modified, ..)| modified);
         let mut lru = lock(&store.lru);
+        let mut dropped = Vec::new();
         for (_, key, size) in found {
-            store.add(&mut lru, key, size)?;
+            store.add(&mut lru, key, size, &mut dropped)?;
         }
         drop(lru);
+        remove_all(dropped)?;
         Ok(store)
     }
 
@@ -238,7 +249,7 @@ impl DiskStore {
                     };
                     let meta = file.metadata()?;
                     // Larger than any object: never a good copy.
-                    if meta.len() > MAX_OBJECT_BYTES as u64 {
+                    if meta.len() > MAX_ENCODED_BYTES as u64 {
                         ignore_missing(fs::remove_file(file.path()))?;
                         continue;
                     }
@@ -254,13 +265,43 @@ impl DiskStore {
         Ok(found)
     }
 
-    /// Records a stored file in the index, then removes the files that the
-    /// limit drops. The caller holds the index lock.
-    fn add(&self, lru: &mut Lru<()>, key: Key, size: usize) -> io::Result<()> {
+    /// Records a stored file in the index. The caller holds the index lock.
+    /// The files that the limit drops leave their names now (see
+    /// [`DiskStore::take_out`]) and go into `dropped`, for the caller to
+    /// remove once it has let go of the lock. Every dropped file is tried;
+    /// the first error is returned at the end.
+    fn add(
+        &self,
+        lru: &mut Lru<()>,
+        key: Key,
+        size: usize,
+        dropped: &mut Vec<PathBuf>,
+    ) -> io::Result<()> {
+        let mut first = None;
         for key in lru.insert(key, (), size, self.limit) {
-            ignore_missing(fs::remove_file(self.path(key)))?;
+            match self.take_out(key) {
+                Ok(file) => dropped.extend(file),
+                Err(e) => {
+                    first.get_or_insert(e);
+                }
+            }
         }
-        Ok(())
+        first.map_or(Ok(()), Err)
+    }
+
+    /// Moves the file of `key` out of its name, into `tmp/`, under the index
+    /// lock, so that a later put of the same object keeps its new file. The
+    /// caller removes the returned file once it has let go of the lock: a
+    /// rename is quick, but removing a large file may not be. `None` if there
+    /// is no file.
+    fn take_out(&self, key: Key) -> io::Result<Option<PathBuf>> {
+        let n = self.dropped.fetch_add(1, Ordering::Relaxed);
+        let to = self.tmp.join(format!("dropped-{n}"));
+        match fs::rename(self.path(key), &to) {
+            Ok(()) => Ok(Some(to)),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -269,7 +310,7 @@ impl Store for DiskStore {
         Ok(lock(&self.lru).get(key).map(|&((), size)| size))
     }
 
-    fn get(&self, key: Key, size: usize) -> io::Result<Option<Vec<u8>>> {
+    fn get(&self, key: Key, size: usize) -> io::Result<Option<Bytes>> {
         let path = self.path(key);
         let mut data = Vec::with_capacity(size + 1);
         match fs::File::open(&path) {
@@ -285,17 +326,24 @@ impl Store for DiskStore {
             }
             Err(e) => return Err(e),
         };
-        if data.len() != size || !key.matches(&data) {
-            tracing::warn!(%key, "dropping a stored copy that does not match its ID");
+        let checked = if data.len() == size {
+            key.check_stored(&data)
+        } else {
+            Err(format!("{} bytes, not {size}", data.len()))
+        };
+        if let Err(why) = checked {
+            tracing::warn!(%key, %why, "dropping a stored copy that does not match its ID");
             let mut lru = lock(&self.lru);
             lru.remove(key);
-            ignore_missing(fs::remove_file(&path))?;
+            let file = self.take_out(key);
+            drop(lru);
+            remove_all(file?.into_iter().collect())?;
             return Ok(None);
         }
-        Ok(Some(data))
+        Ok(Some(Bytes::from(data)))
     }
 
-    fn put(&self, key: Key, data: &Arc<Vec<u8>>) -> io::Result<()> {
+    fn put(&self, key: Key, data: &Bytes) -> io::Result<()> {
         if data.len() > self.limit {
             return Ok(());
         }
@@ -310,8 +358,20 @@ impl Store for DiskStore {
         let mut lru = lock(&self.lru);
         // The rename replaces a bad copy, if there is one, in one step.
         tmp.persist(&path).map_err(|e| e.error)?;
-        self.add(&mut lru, key, data.len())
+        let mut dropped = Vec::new();
+        let added = self.add(&mut lru, key, data.len(), &mut dropped);
+        drop(lru);
+        remove_all(dropped)?;
+        added
     }
+}
+
+/// Removes files that the limit dropped.
+fn remove_all(files: Vec<PathBuf>) -> io::Result<()> {
+    for file in files {
+        ignore_missing(fs::remove_file(file))?;
+    }
+    Ok(())
 }
 
 /// `Ok` if `result` failed only because the path is missing.
@@ -344,41 +404,49 @@ fn lock_dir(dir: &Path) -> io::Result<fs::File> {
 #[cfg(test)]
 mod tests {
     use scion_core::{BlobId, Tree};
+    use scion_proto::object;
 
     use super::*;
 
-    fn blob(data: &[u8]) -> (Key, Arc<Vec<u8>>) {
-        (Key::Blob(BlobId::of(data)), Arc::new(data.to_vec()))
+    /// A blob's key and stored form: one zstd frame of `data`.
+    fn blob(data: &[u8]) -> (Key, Bytes) {
+        let frame = object::pack(data).unwrap();
+        (Key::Blob(BlobId::of(data)), Bytes::from(frame))
     }
 
     #[test]
     fn the_memory_store_drops_the_least_recently_used_at_its_limit() {
-        let store = MemoryStore::new(10);
         let (a, b, c) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"cccc"));
+        // Each stored form is `n` bytes. Room for two, not three.
+        let n = a.1.len();
+        let store = MemoryStore::new(2 * n + n / 2);
         store.put(a.0, &a.1).unwrap();
         store.put(b.0, &b.1).unwrap();
         // Reading `a` makes `b` the least recently used.
-        assert_eq!(store.get(a.0, 4).unwrap().as_deref(), Some(&b"aaaa"[..]));
-        // 12 bytes is over the limit of 10: `b` goes.
+        assert_eq!(store.get(a.0, n).unwrap(), Some(a.1.clone()));
+        // Three are over the limit: `b` goes.
         store.put(c.0, &c.1).unwrap();
-        assert_eq!(store.size(a.0).unwrap(), Some(4));
+        assert_eq!(store.size(a.0).unwrap(), Some(n));
         assert_eq!(store.size(b.0).unwrap(), None);
-        assert_eq!(store.size(c.0).unwrap(), Some(4));
-        assert_eq!(lock(&store.lru).bytes, 8);
+        assert_eq!(store.size(c.0).unwrap(), Some(n));
+        assert_eq!(lock(&store.lru).bytes, 2 * n);
 
         // A second put of the same object counts it once.
         store.put(c.0, &c.1).unwrap();
-        assert_eq!(lock(&store.lru).bytes, 8);
+        assert_eq!(lock(&store.lru).bytes, 2 * n);
 
         // An object larger than the whole limit is not kept, and drops nothing.
-        let big = blob(&[b'x'; 11]);
+        let big = (
+            Key::Blob(BlobId::of(b"big")),
+            Bytes::from(vec![b'x'; 3 * n]),
+        );
         store.put(big.0, &big.1).unwrap();
         assert_eq!(store.size(big.0).unwrap(), None);
-        assert_eq!(store.size(a.0).unwrap(), Some(4));
+        assert_eq!(store.size(a.0).unwrap(), Some(n));
     }
 
     /// Total size of the object files under `dir`.
-    fn bytes_on_disk(dir: &Path) -> u64 {
+    fn bytes_on_disk(dir: &Path) -> usize {
         let mut total = 0;
         let mut dirs = vec![dir.join("objects")];
         while let Some(dir) = dirs.pop() {
@@ -388,7 +456,7 @@ mod tests {
                 if meta.is_dir() {
                     dirs.push(entry.path());
                 } else {
-                    total += meta.len();
+                    total += usize::try_from(meta.len()).unwrap();
                 }
             }
         }
@@ -400,34 +468,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
         let (a, b, c) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"cccc"));
+        let n = a.1.len();
+        let limit = 2 * n + n / 2;
         {
-            let store = DiskStore::open(&data, 10).unwrap();
+            let store = DiskStore::open(&data, limit).unwrap();
             // One process per data directory.
-            let err = DiskStore::open(&data, 10).err().unwrap();
+            let err = DiskStore::open(&data, limit).err().unwrap();
             assert_eq!(err.kind(), ErrorKind::WouldBlock);
             store.put(a.0, &a.1).unwrap();
             store.put(b.0, &b.1).unwrap();
             // Reading `a` makes `b` the least recently used.
-            assert_eq!(store.size(a.0).unwrap(), Some(4));
+            assert_eq!(store.size(a.0).unwrap(), Some(n));
             store.put(c.0, &c.1).unwrap();
             assert_eq!(store.size(b.0).unwrap(), None);
             assert!(!store.path(b.0).exists());
-            assert_eq!(bytes_on_disk(&data), 8);
+            assert_eq!(bytes_on_disk(&data), 2 * n);
             // A temp file left by a crash.
             fs::write(store.tmp.join("torn"), b"aa").unwrap();
         }
 
         // A restart finds what is on disk, and empties tmp/.
-        let store = DiskStore::open(&data, 10).unwrap();
-        assert_eq!(store.get(a.0, 4).unwrap(), Some(a.1.to_vec()));
-        assert_eq!(store.get(c.0, 4).unwrap(), Some(c.1.to_vec()));
+        let store = DiskStore::open(&data, limit).unwrap();
+        assert_eq!(store.get(a.0, n).unwrap(), Some(a.1.clone()));
+        assert_eq!(store.get(c.0, n).unwrap(), Some(c.1.clone()));
         assert_eq!(store.size(b.0).unwrap(), None);
         assert_eq!(fs::read_dir(&store.tmp).unwrap().count(), 0);
         drop(store);
 
         // A lower limit drops objects at start.
-        let store = DiskStore::open(&data, 4).unwrap();
-        assert_eq!(bytes_on_disk(&data), 4);
+        let store = DiskStore::open(&data, n).unwrap();
+        assert_eq!(bytes_on_disk(&data), n);
         let kept = [a.0, c.0].map(|key| store.size(key).unwrap());
         assert_eq!(kept.iter().flatten().count(), 1, "{kept:?}");
     }
@@ -443,31 +513,108 @@ mod tests {
             0o700
         );
 
-        let (blob_key, blob_data) = blob(b"hello\n");
+        let (blob_key, frame) = blob(b"hello\n");
+        let n = frame.len();
         let (tree_bytes, tree_id) = Tree::default().encode_with_id();
         let tree_key = Key::Tree(tree_id);
-        store.put(blob_key, &blob_data).unwrap();
-        store.put(tree_key, &Arc::new(tree_bytes.clone())).unwrap();
-        assert_eq!(store.size(blob_key).unwrap(), Some(6));
-        assert_eq!(store.get(blob_key, 6).unwrap(), Some(b"hello\n".to_vec()));
+        store.put(blob_key, &frame).unwrap();
+        store
+            .put(tree_key, &Bytes::from(tree_bytes.clone()))
+            .unwrap();
+        assert_eq!(store.size(blob_key).unwrap(), Some(n));
+        assert_eq!(store.get(blob_key, n).unwrap(), Some(frame.clone()));
         let tree_size = tree_bytes.len();
-        assert_eq!(store.get(tree_key, tree_size).unwrap(), Some(tree_bytes));
+        assert_eq!(
+            store.get(tree_key, tree_size).unwrap(),
+            Some(tree_bytes.into())
+        );
         let (missing, _) = blob(b"never stored");
         assert_eq!(store.size(missing).unwrap(), None);
         assert_eq!(store.get(missing, 12).unwrap(), None);
 
-        // A file that does not match its ID is never returned, and is removed.
-        fs::write(store.path(blob_key), b"hellO\n").unwrap();
-        assert_eq!(store.get(blob_key, 6).unwrap(), None);
-        assert_eq!(store.size(blob_key).unwrap(), None);
-        assert!(!store.path(blob_key).exists());
+        // A file that is not this blob is never returned, and is removed:
+        // the raw content, a frame of other content, or a frame whose header
+        // gives another size.
+        let mut lying = frame.to_vec();
+        // The one-byte content size field of a small single-segment frame.
+        lying[5] += 1;
+        assert_eq!(object::frame_size(&lying), Ok(7));
+        for bad in [
+            b"hello\n".to_vec(),
+            object::pack(b"hellO\n").unwrap(),
+            lying,
+        ] {
+            fs::write(store.path(blob_key), &bad).unwrap();
+            store
+                .add(&mut lock(&store.lru), blob_key, bad.len(), &mut Vec::new())
+                .unwrap();
+            assert_eq!(store.get(blob_key, bad.len()).unwrap(), None);
+            assert_eq!(store.size(blob_key).unwrap(), None);
+            assert!(!store.path(blob_key).exists());
+            // Moved out under the lock, then removed.
+            assert_eq!(fs::read_dir(&store.tmp).unwrap().count(), 0);
+        }
         // A put replaces a bad copy.
         fs::write(store.path(blob_key), b"torn").unwrap();
-        store.put(blob_key, &blob_data).unwrap();
-        assert_eq!(store.get(blob_key, 6).unwrap(), Some(b"hello\n".to_vec()));
+        store.put(blob_key, &frame).unwrap();
+        assert_eq!(store.get(blob_key, n).unwrap(), Some(frame.clone()));
         // A file longer than its recorded size is not read past it.
-        fs::write(store.path(blob_key), b"hello\n and more").unwrap();
-        assert_eq!(store.get(blob_key, 6).unwrap(), None);
+        fs::write(store.path(blob_key), [&frame[..], b" and more"].concat()).unwrap();
+        assert_eq!(store.get(blob_key, n).unwrap(), None);
+    }
+
+    #[test]
+    fn a_put_of_an_object_that_was_just_dropped_keeps_its_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (blob(b"aaaa"), blob(b"bbbb"));
+        let n = a.1.len();
+        // Room for one object.
+        let store = DiskStore::open(&dir.path().join("data"), n).unwrap();
+        store.put(a.0, &a.1).unwrap();
+        // `b` comes in and drops `a`, whose file leaves its name at once.
+        let mut dropped = Vec::new();
+        store
+            .add(&mut lock(&store.lru), b.0, n, &mut dropped)
+            .unwrap();
+        assert_eq!(dropped.len(), 1);
+        assert!(!store.path(a.0).exists());
+        // `a` is put again before the dropped file is removed. Removing it
+        // then does not touch the new file.
+        store.put(a.0, &a.1).unwrap();
+        remove_all(dropped).unwrap();
+        assert_eq!(store.get(a.0, n).unwrap(), Some(a.1.clone()));
+        assert_eq!(fs::read_dir(&store.tmp).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_file_that_cannot_leave_does_not_keep_the_others_in_place() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Root may rename out of a read-only directory.
+        if rustix::process::geteuid().as_raw() == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (blob(b"aaaa"), blob(b"bbbb"));
+        let n = a.1.len();
+        let store = DiskStore::open(&dir.path().join("data"), 2 * n).unwrap();
+        store.put(a.0, &a.1).unwrap();
+        store.put(b.0, &b.1).unwrap();
+        let fan_out = |key: Key| store.path(key).parent().unwrap().to_path_buf();
+        assert_ne!(fan_out(a.0), fan_out(b.0));
+        // The file of `a` cannot leave its directory.
+        let mode = |m| fs::Permissions::from_mode(m);
+        fs::set_permissions(fan_out(a.0), mode(0o500)).unwrap();
+
+        // An object of `2n` bytes drops both: `a` fails, `b` still leaves.
+        let big = Key::Blob(BlobId::of(b"big"));
+        let mut dropped = Vec::new();
+        let added = store.add(&mut lock(&store.lru), big, 2 * n, &mut dropped);
+        fs::set_permissions(fan_out(a.0), mode(0o700)).unwrap();
+        assert!(added.is_err());
+        assert_eq!(dropped.len(), 1);
+        assert!(!store.path(b.0).exists());
+        remove_all(dropped).unwrap();
     }
 
     #[test]
@@ -481,11 +628,12 @@ mod tests {
             store.path(key)
         };
         // A crash left the first bytes only.
-        fs::write(&path, &bytes[..4]).unwrap();
+        fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
 
         let store = DiskStore::open(&data, 1 << 20).unwrap();
-        assert_eq!(store.size(key).unwrap(), Some(4));
-        assert_eq!(store.get(key, 4).unwrap(), None);
+        let torn = bytes.len() - 1;
+        assert_eq!(store.size(key).unwrap(), Some(torn));
+        assert_eq!(store.get(key, torn).unwrap(), None);
         assert_eq!(store.size(key).unwrap(), None);
         assert!(!path.exists());
         assert_eq!(lock(&store.lru).bytes, 0);
@@ -518,5 +666,10 @@ mod tests {
             let err = DiskStore::open(Path::new("/"), 1 << 20).err().unwrap();
             assert!(err.to_string().contains("owned by another user"), "{err}");
         }
+
+        // A private directory under one that others can write.
+        let err = DiskStore::open(&open.join("data"), 1 << 20).err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{err}");
+        assert!(err.to_string().contains("/open can be written"), "{err}");
     }
 }

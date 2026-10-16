@@ -72,16 +72,18 @@ service Objects {
   rpc ResolveRef(ResolveRefRequest) returns (ResolveRefResponse);
   // The root tree of a changeset.
   rpc GetRootTree(GetRootTreeRequest) returns (GetRootTreeResponse);
-  // Streams the requested objects in request order, one per message. A reply
-  // sends the next object only while it has sent less than 64 MiB of object
-  // data. So it holds at least one object, and at most 64 MiB plus one object
-  // of up to 100 MiB. The client asks again for the rest. An error status of
-  // the call itself is about the whole call: for example NOT_FOUND for a
-  // repo that does not exist, or RESOURCE_EXHAUSTED when the server has no
-  // memory for the first object (ask again later). An error in the stream,
-  // after the call started, is about the next object (NOT_FOUND if it does
-  // not exist), and ends the reply.
-  rpc GetObjects(GetObjectsRequest) returns (stream Object);
+  // Streams the requested objects in request order. Each object comes in
+  // parts of at most 1 MiB of encoded data (see ObjectPart), in an encoding
+  // that the request accepts. A reply sends the next object only while it
+  // has sent less than 64 MiB of encoded data. So it holds at least one
+  // object, and at most 64 MiB plus one object. The client asks again for
+  // the rest. An error status of the call itself is about the whole call:
+  // for example NOT_FOUND for a repo that does not exist, or
+  // RESOURCE_EXHAUSTED when the server has no memory for the first object
+  // (ask again later). An error in the stream, after the call started, is
+  // about the object in progress, or the next one if none is (NOT_FOUND if
+  // it does not exist), and ends the reply.
+  rpc GetObjects(GetObjectsRequest) returns (stream ObjectPart);
 }
 
 message PutBlobRequest {
@@ -357,15 +359,43 @@ message ObjectRef {
   bytes id = 2;
 }
 
+// How an object's bytes travel. A tree's bytes are its TreeV1 bytes, and a
+// blob's bytes are the file's content. The ID is always of those bytes.
+enum Encoding {
+  // The bytes as they are.
+  ENCODING_RAW = 0;
+  // One Zstandard frame (RFC 8878) of the bytes: not skippable, not a legacy
+  // format, no dictionary, their size in the frame header, a window of at
+  // most 8 MiB.
+  ENCODING_ZSTD = 1;
+}
+
 message GetObjectsRequest {
   string repo = 1;
   // 1 to 1000 objects.
   repeated ObjectRef refs = 2;
+  // The encodings the client accepts besides RAW, which every client
+  // accepts. The server sends each object RAW or in one of these.
+  repeated Encoding accept = 3;
 }
 
-message Object {
+// One message of a GetObjects reply. An object of E encoded bytes comes in
+// one or more parts of 1 byte to 1 MiB of data that add up to E, or one part
+// with no data if E is 0. The first part names the object and gives its
+// sizes, so a receiver can reserve memory before the rest arrives. A later
+// part sets none of fields 1, 2, 4, 5 and 6.
+message ObjectPart {
+  // First part only.
   ObjectKind kind = 1;
+  // First part only.
   bytes id = 2;
-  // The stored form: TreeV1 bytes for a tree, the raw content for a blob.
+  // The next encoded bytes of the object.
   bytes data = 3;
+  // First part only. RAW, or an encoding that the request accepts.
+  Encoding encoding = 4;
+  // First part only. E: all the encoded bytes of the object, in all its
+  // parts. Equal to size for RAW.
+  uint64 encoded_size = 5;
+  // First part only. The size of the object's bytes, at most 100 MiB.
+  uint64 size = 6;
 }
