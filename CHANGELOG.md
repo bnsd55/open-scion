@@ -76,6 +76,17 @@ release.
   file as the answer at once. `scn blame` does this.
 - Bearer-token auth, loopback-only listening by default, request limits and
   name validation at the RPC boundary.
+- Blobs belong to repos (schema version 4, table `repo_blobs`). A repo has
+  the blobs uploaded to it and the blobs that its changesets name.
+  `CreateChangeset` refuses a blob of another repo with the error of content
+  that no repo stored, before it reads any file, so a changeset can no
+  longer name another repo's blob and then read it. `PutBlob` keeps a stored
+  copy only for a blob that its repo has, and else writes the content again,
+  so its time does not show that another repo has the content. The upgrade
+  adds the blobs of every changeset of each repo, in one transaction, and
+  logs its progress. A blob uploaded before the upgrade and named by no
+  changeset must be uploaded again. `GetObjects` still reads any object by
+  ID (#13).
 - `ReadFile` streams a file in 1 MiB parts from the zstd decoder, under a
   256 MiB budget for all replies. It checks the content against its ID
   before the last part, and ends a stalled reply with `DEADLINE_EXCEEDED`.
@@ -132,6 +143,15 @@ release.
 - The tier timeouts nest: the server and tiers wait 30 s for reply memory,
   a tier 30 s for a fetch slot and 30 s for fetch memory, the cache 60 s per
   step of the server, the daemon 180 s per step of the cache.
+- `scion-daemon` keeps its recency index in `<data>/index` too, appended in
+  batches. After a clean stop (Ctrl-C, or SIGTERM, which it now handles
+  too), a start reads that one file and opens no object directory, and the
+  order of use survives the restart. The stop flushes the file, with a hash
+  of its records, past the drive's cache. After a crash, or for a file that
+  does not match its hash, a start scans every object file as before, and
+  keeps the order of the index for the objects that it names. A crash loses
+  only what was used last, never an object. After running a daemon build
+  from before the index on the same data directory, remove `<data>/index`.
 - Receivers accept only plain Zstandard frames, with no dictionary and a
   window of at most 8 MiB; the zstd library is built without its legacy
   decoders.

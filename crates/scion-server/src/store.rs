@@ -27,7 +27,7 @@ use scion_core::{BlobHasher, BlobId};
 use crate::error::{Error, Result};
 
 /// The schema version this build makes and reads.
-pub(crate) const SCHEMA_VERSION: u32 = 3;
+pub(crate) const SCHEMA_VERSION: u32 = 4;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database from
 /// version `n - 1` to version `n`. A released migration never changes.
@@ -35,6 +35,7 @@ const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_land_retention.sql"),
     include_str!("../migrations/0003_derived_values.sql"),
+    include_str!("../migrations/0004_repo_blobs.sql"),
 ];
 
 /// Largest object accepted or read back, uncompressed: 100 MiB, the hard
@@ -527,8 +528,16 @@ pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
         )));
     }
     // Each migration runs in its own transaction, with the version it sets.
+    // A crash rolls it back, and the next open runs it again from its start.
     for (to, sql) in (1..=target).zip(MIGRATIONS).skip(version as usize) {
-        db.execute_batch(&format!("BEGIN; {sql} PRAGMA user_version = {to}; COMMIT;"))?;
+        let tx = db.unchecked_transaction()?;
+        tx.execute_batch(sql)?;
+        if to == 4 {
+            // SQL cannot read the blob IDs inside changeset bytes.
+            crate::db::fill_repo_blobs(&tx)?;
+        }
+        tx.pragma_update(None, "user_version", to)?;
+        tx.commit()?;
     }
     Ok(())
 }
@@ -628,14 +637,19 @@ impl Blobs {
         })
     }
 
-    /// Stores a finished upload durably, like [`Blobs::put`]. The content
-    /// streams from the spool file through the compressor, so it is never all
-    /// in memory. Safe to repeat.
+    /// Stores a finished upload. The content streams from the spool file
+    /// through the compressor, so it is never all in memory. An intact stored
+    /// copy is kept only if `keep_stored`; else the file is written again.
+    /// Safe to repeat.
+    ///
+    /// The blob is durable after the next [`Store::flush`]: each file and
+    /// directory that changed is flushed with a plain `fsync`, so only the
+    /// full flush of the drive cache is left, which that flush shares.
     ///
     /// # Errors
     ///
     /// Fails if a read or write fails.
-    pub fn put_upload(&self, upload: Upload) -> Result<BlobId> {
+    pub fn put_upload(&self, upload: Upload, keep_stored: bool) -> Result<BlobId> {
         let Upload {
             mut spool,
             hasher,
@@ -644,9 +658,21 @@ impl Blobs {
         let id = hasher.finalize();
         spool.rewind()?;
         let read_bytes = zstd::zstd_safe::CCtx::in_size();
+        let raw = io::BufReader::with_capacity(read_bytes, spool);
         let mut batch = self.batch();
-        batch.write(id, len, io::BufReader::with_capacity(read_bytes, spool))?;
-        batch.sync()?;
+        if keep_stored {
+            batch.write(id, len, raw)?;
+        } else {
+            // The upload may replace an intact stored copy that other repos
+            // name. The full flush runs on every call, so the time of the
+            // reply does not show whether a copy exists.
+            batch.replace_stored(id, len, raw)?;
+        }
+        if batch.flush_dirs()? {
+            // A new fan-out directory is an entry in the root. The full flush
+            // of `sync` would cover it.
+            fsync_dir(&self.root)?;
+        }
         Ok(id)
     }
 
@@ -949,6 +975,12 @@ impl Upload {
         self.len += part.len();
         Ok(self)
     }
+
+    /// The ID of the content so far.
+    #[must_use]
+    pub fn id(&self) -> BlobId {
+        self.hasher.finalize()
+    }
 }
 
 fn too_large() -> Error {
@@ -996,6 +1028,13 @@ impl BlobBatch<'_> {
             BlobStatus::Corrupt => tracing::warn!(blob = %id, "rewriting a corrupt blob file"),
             BlobStatus::Missing => {}
         }
+        self.replace(id, len, raw)
+    }
+
+    /// Writes blob `id`, whose `len` bytes `raw` gives, whether or not the
+    /// stored file is intact. Then the time it takes does not show whether
+    /// the blob was stored.
+    fn replace(&mut self, id: BlobId, len: usize, raw: impl Read) -> Result<()> {
         let (dir, path) = self.blobs.location(id);
         // Write a temp file and flush it before the rename, so the name never
         // points at data that is not on the drive. The frame header holds the
@@ -1008,6 +1047,19 @@ impl BlobBatch<'_> {
         tmp.persist(&path).map_err(|e| e.error)?;
         self.dirs.insert(dir);
         Ok(())
+    }
+
+    /// Writes blob `id`, whose `len` bytes `raw` gives, over whatever is
+    /// stored: a full flush runs on the temp file before the rename, every
+    /// time, so the time it takes does not show whether a copy exists. For a
+    /// put that may replace an intact stored copy that other repos name: the
+    /// temp file is durable first, so a power loss never leaves the stored
+    /// blob with data that the drive lost. A put of a blob that is missing or
+    /// corrupt replaces no intact file, and its batch `sync` covers the
+    /// rename.
+    fn replace_stored(&mut self, id: BlobId, len: usize, raw: impl Read) -> Result<()> {
+        self.blobs.full_flush()?;
+        self.replace(id, len, raw)
     }
 
     /// Checks a stored blob and, if it is intact, keeps it: `sync` makes it
@@ -1037,14 +1089,21 @@ impl BlobBatch<'_> {
     ///
     /// Fails if a flush fails.
     pub fn sync(self) -> Result<()> {
-        if self.dirs.is_empty() {
-            return Ok(());
+        let blobs = self.blobs;
+        if self.flush_dirs()? {
+            blobs.full_flush()?;
         }
+        Ok(())
+    }
+
+    /// Like [`BlobBatch::sync`], but leaves the full flush of the drive cache
+    /// to the next [`Store::flush`]. Returns whether the batch wrote or kept
+    /// any blob.
+    fn flush_dirs(self) -> Result<bool> {
         for dir in &self.dirs {
             fsync_dir(dir)?;
         }
-        self.blobs.full_flush()?;
-        Ok(())
+        Ok(!self.dirs.is_empty())
     }
 }
 
@@ -1076,6 +1135,9 @@ struct FlushState {
     finished: u64,
     /// The latest flush that failed, and its error.
     failed: Option<(u64, Arc<io::Error>)>,
+    /// Callers of [`GroupFlush::run`] in the wait, for tests.
+    #[cfg(test)]
+    waiting: usize,
 }
 
 impl GroupFlush {
@@ -1088,6 +1150,10 @@ impl GroupFlush {
         let mut state = self.lock();
         // A running flush may have started before this caller's writes.
         let target = state.started + 1;
+        #[cfg(test)]
+        {
+            state.waiting += 1;
+        }
         state = self
             .finished
             .wait_while(state, |s| s.started > s.finished && s.finished < target)
@@ -1355,14 +1421,35 @@ mod tests {
             }
         };
         let before = blobs.full_flushes();
+        // Run callers so far, so the arrival count below is relative.
+        let runs_before = blobs
+            .group_flush
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .waiting as u64;
         let running = Barrier::new(2);
         let ids: Vec<BlobId> = thread::scope(|s| {
-            // A slow first flush, as on a busy drive, so the writers arrive
-            // while it runs whatever the speed of the test machine's drive.
+            // A first flush that ends only when every writer waits in the
+            // group, so they all share the next one, whatever the speed of
+            // the machine or its drive.
             let slow = s.spawn(|| {
                 blobs.group_flush.run(|| {
                     running.wait();
-                    thread::sleep(Duration::from_millis(200));
+                    loop {
+                        let state = blobs
+                            .group_flush
+                            .state
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        // The slow caller counts itself, so all have arrived
+                        // at the runs before the test plus one more.
+                        if state.waiting as u64 >= runs_before + 1 + WRITERS {
+                            break;
+                        }
+                        drop(state);
+                        thread::yield_now();
+                    }
                     Ok(())
                 })
             });
@@ -1379,12 +1466,10 @@ mod tests {
                 .map(|w| w.join().unwrap().unwrap())
                 .collect()
         });
-        // Not counting the slow flush.
+        // Not counting the slow flush: each writer waits in the group once,
+        // while it runs, so one flush serves them all.
         let flushes = blobs.full_flushes() - before - 1;
-        assert!(
-            flushes <= WRITERS / 4,
-            "{WRITERS} writers ran {flushes} full flushes"
-        );
+        assert_eq!(flushes, 1, "{WRITERS} writers ran {flushes} full flushes");
         for id in ids {
             assert_eq!(blobs.verify(id).unwrap(), BlobStatus::Valid);
         }
@@ -1540,7 +1625,7 @@ mod tests {
         for parts in cases {
             let content = parts.concat();
             let id = blobs
-                .put_upload(fill(&blobs, parts.iter().copied()).unwrap())
+                .put_upload(fill(&blobs, parts.iter().copied()).unwrap(), true)
                 .unwrap();
             assert_eq!(id, BlobId::of(&content), "{parts:?}");
             assert_eq!(blobs.get(id).unwrap(), content, "{parts:?}");
@@ -1566,7 +1651,7 @@ mod tests {
             sent += part.len();
             assert_eq!(upload.spool.metadata().unwrap().len(), sent as u64);
         }
-        let id = blobs.put_upload(upload).unwrap();
+        let id = blobs.put_upload(upload, true).unwrap();
         assert_eq!(id, BlobId::of(&content));
         assert!(blobs.get(id).unwrap() == content, "content differs");
         assert_eq!(blobs.size(id).unwrap(), content.len());
@@ -1620,9 +1705,10 @@ mod tests {
                 .map(|_| {
                     s.spawn(|| {
                         let upload = fill(&blobs, content.chunks(1 << 20))?;
-                        // All store at once, so their writes overlap.
+                        // All store at once, so their writes overlap. None
+                        // keeps a stored copy, so each writes the file.
                         ready.wait();
-                        blobs.put_upload(upload)
+                        blobs.put_upload(upload, false)
                     })
                 })
                 .collect();

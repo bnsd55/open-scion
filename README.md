@@ -144,7 +144,8 @@ must not be writable by group or others unless it has the sticky bit (as
 `/tmp` has). `scn` checks the same for the socket. The error names the
 directory; `chmod go-w DIR` fixes it. With umask 002 (a private group per
 user), new directories are group-writable, so they are refused until you run
-that.
+that. Stop the daemon with Ctrl-C or SIGTERM: it then writes its index, and
+its next start reads that one file instead of every stored object.
 
 ```sh
 export SCION_UPSTREAM_TOKEN=dev                  # what each tier sends upstream
@@ -186,6 +187,7 @@ These are this project's choices where the article does not give details.
 |---|---|
 | Hash and format | BLAKE3 with a different prefix per object kind, over a written, frozen byte format |
 | Storage | SQLite for metadata and trees, one compressed file per blob. Anthropic uses Spanner and cloud storage; this is the single-machine stand-in. |
+| Blobs per repo | One file per content, shared by all repos. A repo may name only its own blobs: those uploaded to it, and those that its changesets name. No answer of `PutBlob` or `CreateChangeset` shows whether another repo has a blob. `GetObjects` does not check this yet ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Conflicts | Path-level only: the same path, or a directory above or below it. No text merge. |
 | Landing | One land at a time per ref, inside one process. A changeset can be created in parallel without any lock. |
 | Retries | Each land has a caller-chosen request key, so a retry returns the first result |

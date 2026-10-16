@@ -1,14 +1,18 @@
-//! Writes: create changesets. Moves no ref. An upload goes straight to the
-//! blob folder (`Blobs::upload`).
+//! Writes: store uploads and create changesets. Moves no ref. An upload goes
+//! to a spool file in the blob folder (`Blobs::upload`) as it arrives.
+//!
+//! Blob files are shared by all repos, but each repo may name only its own
+//! blobs (`repo_blobs`): those uploaded to it, and those that its changesets
+//! name. So a changeset cannot name another repo's blob and then read it.
 
 use std::collections::BTreeSet;
 
 use rusqlite::Connection;
-use scion_core::{Changeset, ChangesetId};
+use scion_core::{BlobId, Changeset, ChangesetId, RepoPath};
 
 use crate::db::{self, RepoId};
 use crate::error::{Error, Result};
-use crate::store::{BlobStatus, Store};
+use crate::store::{BlobStatus, Store, Upload};
 use crate::tree;
 
 /// Most path changes in one created changeset.
@@ -25,22 +29,25 @@ pub const MAX_IDENTITY_BYTES: usize = 1 << 10;
 ///
 /// [`Error::NotFound`] if the repo does not exist. [`Error::InvalidArgument`]
 /// unless the bytes decode, the changeset has exactly one parent that the repo
-/// has, no committer, fits the request limits, and every blob it names is
-/// stored intact. [`Error::Apply`] if the changes do not apply to the parent's
-/// tree. [`Error::Io`] if a blob cannot be read.
+/// has, no committer, fits the request limits, and every blob it names is in
+/// the repo and stored intact. [`Error::Apply`] if the changes do not apply
+/// to the parent's tree. [`Error::Io`] if a blob cannot be read.
 pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<ChangesetId> {
     let (cs, id) = Changeset::decode_with_id_max_changes(bytes, MAX_CHANGES)
         .map_err(|e| Error::InvalidArgument(format!("bad changeset: {e}")))?;
     let parent = check_request(&cs)?;
-    // A cheap read first, so a request on a missing repo or parent reads no
-    // blob. The transaction checks again.
-    let repo_id = store.read(|c| check_parent(c, repo, parent))?;
+    // A cheap read first, so a request on a missing repo or parent, or one
+    // that names a blob the repo does not have, reads no blob. The
+    // transaction checks the parent again. A repo never loses a blob, so the
+    // member check still holds then.
+    let repo_id = store.read(|c| {
+        let repo_id = check_parent(c, repo, parent)?;
+        check_members(c, repo, repo_id, &cs)?;
+        Ok(repo_id)
+    })?;
     // The blob check touches only the object folder, so it runs before the
     // write transaction.
-    // SHORTCUT: blobs are shared by all repos, so a changeset may name a blob
-    // that another repo uploaded and then read it. Safe with one principal.
-    // Upgrade before multi-tenant auth: a repo_blobs table checked here.
-    check_blobs(store, &cs)?;
+    check_blobs(store, repo, &cs)?;
     // See `tree::store_changeset`. The write's flush covers these steps.
     tree::fill_root_tree(store, repo_id, parent)?;
     store.write(|c| {
@@ -51,6 +58,50 @@ pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<Chang
         }
         tree::store_changeset(c, repo_id, &cs).map(|(id, _)| id)
     })
+}
+
+/// Stores a finished upload and adds the blob to the blobs of `repo`.
+/// Returns once both are durable. Safe to repeat.
+///
+/// An intact stored copy is kept only if `repo` has the blob already. Else
+/// the file is written again, so the time of the reply does not show whether
+/// another repo stored the same content.
+///
+/// # Errors
+///
+/// Database errors, and as [`Blobs::put_upload`](crate::store::Blobs::put_upload).
+pub fn put_blob(store: &Store, repo: RepoId, upload: Upload) -> Result<BlobId> {
+    let id = upload.id();
+    // The flush below covers what this read saw.
+    let member = store.read_unflushed(|c| db::repo_has_blob(c, repo, id))?;
+    store.blobs().put_upload(upload, member)?;
+    if !member {
+        // One flush covers the file and this row. A row whose blob a crash
+        // lost grants nothing: `create_changeset` reads every blob back.
+        store.commit(|c| db::add_repo_blob(c, repo, id))?;
+    }
+    store.flush()?;
+    Ok(id)
+}
+
+/// Why a blob that a changeset puts is refused.
+fn bad_blob(blob: BlobId, path: &RepoPath, problem: &str, repo: &str) -> Error {
+    Error::InvalidArgument(format!(
+        "blob {blob} for {path:?} {problem} in repo {repo:?}; upload it with PutBlob"
+    ))
+}
+
+/// Fails on the first put, in path order, whose blob `repo` may not name.
+/// It gets the answer of a blob that is not stored, and no blob is read, so
+/// neither the answer nor its time shows whether another repo has the blob.
+fn check_members(c: &Connection, repo: &str, repo_id: RepoId, cs: &Changeset) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for (path, blob) in db::puts(cs) {
+        if seen.insert(blob) && !db::repo_has_blob(c, repo_id, blob)? {
+            return Err(bad_blob(blob, path, "is not stored", repo));
+        }
+    }
+    Ok(())
 }
 
 /// Checks that `repo` exists and has `parent`, and returns the repo.
@@ -94,16 +145,14 @@ fn check_request(cs: &Changeset) -> Result<ChangesetId> {
 /// Reads every blob back, once however many paths name it, so a torn or
 /// overwritten file is not accepted. Then syncs them (see
 /// [`BlobBatch::keep`]), so the commit never names a blob that a crash can
-/// lose.
-fn check_blobs(store: &Store, cs: &Changeset) -> Result<()> {
-    let puts = cs
-        .changes
-        .iter()
-        .filter_map(|(path, state)| Some((path, state.as_ref()?.blob()?)));
+/// lose. Call it only after [`check_members`]: every blob here is the repo's.
+///
+/// [`BlobBatch::keep`]: crate::store::BlobBatch::keep
+fn check_blobs(store: &Store, repo: &str, cs: &Changeset) -> Result<()> {
     let mut blobs = store.blobs().batch();
     // A blob seen before was intact, or the loop would have stopped.
     let mut seen = BTreeSet::new();
-    for (path, blob) in puts {
+    for (path, blob) in db::puts(cs) {
         if !seen.insert(blob) {
             continue;
         }
@@ -112,9 +161,7 @@ fn check_blobs(store: &Store, cs: &Changeset) -> Result<()> {
             BlobStatus::Missing => "is not stored",
             BlobStatus::Corrupt => "is corrupt",
         };
-        return Err(Error::InvalidArgument(format!(
-            "blob {blob} for {path:?} {problem}; upload it with PutBlob"
-        )));
+        return Err(bad_blob(blob, path, problem, repo));
     }
     blobs.sync()
 }
@@ -123,7 +170,7 @@ fn check_blobs(store: &Store, cs: &Changeset) -> Result<()> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use scion_core::{BlobId, FileState, IdentityTime, RepoPath};
+    use scion_core::{FileState, GitOid, IdentityTime};
 
     use super::*;
     use crate::store::FSYNC_LEAVES_DRIVE_CACHE;
@@ -169,6 +216,123 @@ mod tests {
         cs.encode()
     }
 
+    /// Repo `name`, made if missing.
+    fn repo(store: &Store, name: &str) -> RepoId {
+        store.write(|c| db::create_repo(c, name)).unwrap()
+    }
+
+    /// Uploads `content` to `repo`, as `PutBlob` does.
+    fn upload(store: &Store, repo: RepoId, content: &[u8]) -> BlobId {
+        let upload = store.blobs().upload().unwrap().append(content).unwrap();
+        put_blob(store, repo, upload).unwrap()
+    }
+
+    /// Adds `blob` to the blobs of `main`, without storing it.
+    fn give_main(store: &Store, blob: BlobId) {
+        store
+            .write(|c| db::add_repo_blob(c, db::repo_id(c, "main")?, blob))
+            .unwrap();
+    }
+
+    /// The `InvalidArgument` text of a `create_changeset` that fails, with
+    /// the blob IDs in it replaced.
+    fn refusal(store: &Store, bytes: &[u8], blobs: &[BlobId]) -> String {
+        match create_changeset(store, "main", bytes) {
+            Err(Error::InvalidArgument(why)) => blobs
+                .iter()
+                .fold(why, |why, blob| why.replace(&blob.to_string(), "<blob>")),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_upload_keeps_a_stored_copy_only_for_a_blob_of_its_repo() {
+        use std::os::unix::fs::MetadataExt as _;
+        let (_dir, store, _root) = store_with_root();
+        let (main, other) = (repo(&store, "main"), repo(&store, "other"));
+        let inode = |id| {
+            let (_, path) = store.blobs().location(id);
+            std::fs::metadata(path).unwrap().ino()
+        };
+        let id = upload(&store, main, b"same");
+        let first = inode(id);
+        upload(&store, main, b"same");
+        assert_eq!(inode(id), first, "main has it, so the stored file stays");
+        // Else the reply would come sooner than for content stored nowhere,
+        // and show that another repo has it.
+        upload(&store, other, b"same");
+        assert_ne!(inode(id), first, "other did not have it: a new file");
+        assert!(store.read(|c| db::repo_has_blob(c, other, id)).unwrap());
+        assert_eq!(store.blobs().get(id).unwrap(), b"same");
+    }
+
+    #[test]
+    fn an_upload_shares_one_full_flush_with_its_row() {
+        let (_dir, store, _root) = store_with_root();
+        let main = repo(&store, "main");
+        let before = store.blobs().full_flushes();
+        upload(&store, main, b"new");
+        // The rename shares one full flush: it covers the temp file before
+        // the rename, so a stored blob it replaces is never left with data
+        // that a power loss can lose. Where a plain fsync leaves data in the
+        // drive cache, the row's flush is one more.
+        assert_eq!(
+            store.blobs().full_flushes() - before,
+            1 + u64::from(FSYNC_LEAVES_DRIVE_CACHE)
+        );
+    }
+
+    #[test]
+    fn a_blob_of_another_repo_is_refused_before_it_is_read() {
+        let (_dir, store, root) = store_with_root();
+        let secret = upload(&store, repo(&store, "other"), b"secret");
+        let never = BlobId::of(b"stored nowhere");
+        let before = store.blobs().verifies();
+        let names = |blob| child(root, &[("f", blob)]);
+        // The same answer as for content that no repo stored, and the file is
+        // not read, so neither the answer nor its time shows that `other`
+        // has it.
+        let answer = refusal(&store, &names(secret), &[secret]);
+        assert_eq!(answer, refusal(&store, &names(never), &[never]));
+        assert!(
+            answer.contains("is not stored in repo \"main\""),
+            "{answer}"
+        );
+        assert_eq!(store.blobs().verifies(), before);
+        // Once uploaded to `main` too, it is accepted.
+        upload(&store, repo(&store, "main"), b"secret");
+        create_changeset(&store, "main", &names(secret)).unwrap();
+    }
+
+    #[test]
+    fn a_blob_of_another_repo_fails_the_changeset_before_any_blob_is_read() {
+        let (_dir, store, root) = store_with_root();
+        let theirs = upload(&store, repo(&store, "other"), b"theirs");
+        let mine = upload(&store, repo(&store, "main"), b"mine");
+        let before = store.blobs().verifies();
+        // `main`'s own blob comes first in path order, and is not read either.
+        let why = refusal(&store, &child(root, &[("a", mine), ("b", theirs)]), &[]);
+        let expected = format!("blob {theirs} for \"b\" is not stored in repo \"main\"");
+        assert!(why.contains(&expected), "{why}");
+        assert_eq!(store.blobs().verifies(), before);
+    }
+
+    #[test]
+    fn a_gitlink_names_no_blob_whatever_its_bytes() {
+        let (_dir, store, root) = store_with_root();
+        let theirs = upload(&store, repo(&store, "other"), b"theirs");
+        let module = FileState::Gitlink {
+            commit: GitOid::Sha256(*theirs.as_bytes()),
+        };
+        let mut cs = changeset(vec![root]);
+        cs.changes.insert(RepoPath::new("m").unwrap(), Some(module));
+        let with_module = create_changeset(&store, "main", &cs.encode()).unwrap();
+        // Storing the gitlink did not make the blob `main`'s.
+        let named = child(with_module, &[("f", theirs)]);
+        let why = refusal(&store, &named, &[theirs]);
+        assert!(why.contains("is not stored"), "{why}");
+    }
+
     #[test]
     fn a_changeset_makes_its_blobs_durable_before_it_commits() {
         let (_dir, store, root) = store_with_root();
@@ -176,6 +340,7 @@ mod tests {
         let mut upload = store.blobs().batch();
         let blob = upload.put(b"new").unwrap();
         drop(upload);
+        give_main(&store, blob);
 
         let before = store.blobs().full_flushes();
         create_changeset(&store, "main", &child(root, &[("f", blob)])).unwrap();
@@ -208,7 +373,7 @@ mod tests {
     #[test]
     fn a_blob_that_many_paths_name_is_read_once() {
         let (_dir, store, root) = store_with_root();
-        let blob = store.blobs().put(b"same").unwrap();
+        let blob = upload(&store, repo(&store, "main"), b"same");
         let paths: Vec<String> = (0..100).map(|i| format!("f{i}")).collect();
         let puts: Vec<(&str, BlobId)> = paths.iter().map(|p| (p.as_str(), blob)).collect();
         let before = store.blobs().verifies();

@@ -145,6 +145,7 @@ One data directory holds everything (`store.rs`):
 | `changesets` | ID, generation and `ChangesetV1` bytes. Global: one row per changeset, whatever repos have it. |
 | `changeset_parents` | Parent `n` of each changeset, also indexed by parent. |
 | `repo_changesets` | Which changesets a repo may read. Every changeset read checks this table. |
+| `repo_blobs` | Which blobs a repo may name: those uploaded to it, and those that its changesets name. `CreateChangeset` checks this table. A row is never removed, and is not a promise that the blob is stored. |
 | `refs` | Ref name to target and `version`. A ref moves only by compare-and-swap on `version`. A foreign key keeps the target in the repo. |
 | `lands` | One row per land request, unique on (repo, caller, request key): state, result, detail, conflict paths, and when it finished. A finished row expires after 7 days (section 5). |
 | `trees` | `TreeV1` bytes by tree ID. Global. |
@@ -157,7 +158,15 @@ trees commits them in one transaction. The schema version is
 `migrations/` that is newer than its version runs, in order, in its own
 transaction. A released migration never changes. A build refuses a database
 with a newer version. Version 3 lets a derived value have any length; the
-upgrade copies every row.
+upgrade copies every row. Version 4 adds `repo_blobs`. SQL cannot read the
+blob IDs inside changeset bytes, so the upgrade runs a step in Rust
+(`db::fill_repo_blobs`) in the same transaction: it reads each changeset of
+each repo once and adds the blobs that its changes put. A changeset lists
+every path that differs from its first parent, so these are every blob that
+the repo's trees name. It logs its progress every 10,000 changesets. It is
+one transaction, not resumable: a crash rolls it back, and the next open runs
+it again from its start. A blob uploaded before the upgrade and named by no
+changeset must be uploaded again.
 
 **Connections.** Each process has one write connection behind a mutex, and
 8 read-only connections (`store::READERS`). Write transactions use
@@ -190,8 +199,11 @@ hasher and to a spool file in `tmp/` before the server reads the next one, so
 an upload holds one message in memory, not the whole blob. The spool file
 holds raw bytes, because the frame header needs the size before the first
 compressed byte. After the last message, the server keeps an intact stored
-copy if there is one. Otherwise it streams the spool file through the
-compressor into the temp file. The spool file has no name, so a dropped
+copy only if the repo of the upload has the blob already (`repo_blobs`).
+Otherwise it streams the spool file through the compressor into the temp
+file, and renames it over any stored copy. So an upload of content that only
+another repo has takes the same write path as one of new content: its time
+does not show that the content exists. Then it adds the blob to the repo. The spool file has no name, so a dropped
 upload or a crash leaves nothing behind. An open that finds no other process
 in the data directory removes any temp file that a crash left before its
 rename (see below).
@@ -234,7 +246,11 @@ rename (see below).
 - No committed metadata may name a blob that a crash could lose. `PutBlob`
   syncs its blob before it replies. `CreateChangeset` reads back, hashes and
   syncs every blob it names before its transaction. Git import syncs one blob
-  batch per 1,000 commits before the transaction that records them.
+  batch per 1,000 commits before the transaction that records them. A
+  `repo_blobs` row is the exception: `PutBlob` commits it after a plain
+  `fsync` of the blob, and one full flush then covers both before the reply.
+  A crash can keep the row and lose the blob, which grants nothing, because
+  `CreateChangeset` still reads every blob back.
 - A stored blob still costs a full flush when it is put again or named by a
   changeset: another batch may have written it and not synced yet.
 
@@ -402,14 +418,31 @@ started.
    refused before any change is read.
 2. Check the request: exactly one parent, no committer, a message of at most
    1 MiB, author name and email of at most 1 KiB each.
-3. Check that the repo exists and has the parent, so a bad request reads no
-   blob.
+3. In one read: check that the repo exists and has the parent, and that the
+   repo has each blob that a regular file or a symlink puts (`repo_blobs`).
+   A gitlink names no blob, whatever its bytes. So a bad request reads no
+   blob. A blob of another repo gets the error of content that no repo
+   stored, before any file is read, so neither the answer nor its time shows
+   that another repo has it. The error names the first such path, in path
+   order. Rows are never removed, so this check still holds at step 5.
 4. Read back each blob it names, before the write transaction. A blob that many
    paths name is read once. The error names the first path, in path order,
    whose blob is missing or corrupt.
 5. In one write transaction: check the repo and the parent again. If the repo
    already has this ID, return it (a retry). Then `tree::store_changeset`.
    Changes that do not apply to the parent's tree are `INVALID_ARGUMENT`.
+
+**Blobs per repo.** The blob files are shared by all repos: one file per
+content. But a repo may name only its own blobs: those uploaded to it, and
+those that its changesets name. `tree::store_changeset`, the one write path
+for changesets (commits, lands and imports), adds each blob that a changeset
+names to its repo. So a blob that a changeset of a repo names always belongs
+to that repo, and a changeset cannot name another repo's blob and then read
+it with `ReadFile`. A rename needs no new upload: the repo has the blob. Two
+repos that share content each have their own row. A blob uploaded to a repo
+but not yet named belongs to that repo, whoever uploaded it. `GetObjects`
+still reads any tree or blob by ID
+([#13](https://github.com/bnsd55/open-scion/issues/13), section 7).
 
 **Land** (`land.rs`):
 
@@ -1008,8 +1041,9 @@ starting at the root tree, and never says what it already has.
   one object of up to 100 MiB. The client asks again for the rest, so one
   call stays short and a transfer can resume.
 - A missing repo fails the call with `NOT_FOUND`. A missing object ends the
-  reply with `NOT_FOUND`, after the objects before it. Trees and blobs are
-  global: any repo name that exists can read any object by ID
+  reply with `NOT_FOUND`, after the objects before it. This call does not
+  check `repo_blobs` or which trees a repo reaches: any repo name that
+  exists can read any tree or blob by ID. Read tickets will close this
   ([#13](https://github.com/bnsd55/open-scion/issues/13)).
 
 **What the client checks, and what it trusts.** Every tree and blob is
@@ -1181,14 +1215,51 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
   a repo exists: it serves a stored object for any valid repo name
   ([#13](https://github.com/bnsd55/open-scion/issues/13)).
 - **Logs.** Each `GetObjects` reply logs its hits and misses at `info`, and
-  each object at `debug`.
+  each object at `debug`. The daemon logs at `info` how many objects its
+  start found and whether it scanned, and whether its stop wrote a clean
+  index.
 
 | | `scion-cache` | `scion-daemon` |
 |---|---|---|
 | Listens on | TCP, `127.0.0.1:7879`. Another address needs `--insecure-listen`. | A Unix socket with mode 0600, by default `<data>/daemon.sock`, in a directory that only its user can reach (checked as for `<data>`). So nobody else can connect, even before the mode is set, or put another socket in its place. A stale socket file is replaced; a live one is an error. |
 | Upstream | `--upstream`, by default the server at `127.0.0.1:7878`. | `--upstream`, by default the cache at `127.0.0.1:7879`. |
 | Store | Memory, at most `--max-bytes` (1 GiB) of stored objects (blobs packed). | Disk, at most `--max-bytes` (10 GiB) of stored object bytes (not disk blocks): one file per object under `<data>/objects/`, a tree's `TreeV1` bytes or a blob's zstd frame, written to a temp file and renamed, unpacked as a stream and checked against its ID when read back. A file that the limit drops leaves its name by a rename under the index lock, and is removed after it, so a put of the same object keeps its new file. `<data>` is made with mode 0700 if missing. It must be a real directory (not a symlink), owned by the daemon's user, and closed to others, or the daemon refuses it. One daemon locks it. |
-| Eviction | Least recently used first. | Least recently used first, from an index in memory that a scan rebuilds at start, oldest write first ([#63](https://github.com/bnsd55/open-scion/issues/63)). |
+| Eviction | Least recently used first. | Least recently used first, from an index in memory that is also kept in `<data>/index` (below), so the order survives a restart. |
+| Start | Empty. | Reads `<data>/index`. After a clean stop (SIGINT or SIGTERM) it opens no object directory. After a crash it scans every object file, as with no index ([#115](https://github.com/bnsd55/open-scion/issues/115)). |
+
+**The daemon's index.** `<data>/index` lists the stored objects in order
+of use, so a start need not open every object directory. It is a header
+(`scnidx1\n`, a state byte, and the BLAKE3 hash of the records that the
+last full write wrote) and records of 37 bytes: an op, an object ID and a
+size. `T` or `B` says that a tree or blob of that size is stored and was
+just used; `t` or `b` that it was dropped. Read in order, the records give
+the objects, least recently used first. Records wait in memory and are
+appended 1,024 at a time (more wait while another call writes). Once the
+file holds more than twice as many records as objects, plus 65,536, it is
+written again with one record per object. A stop first syncs the
+directories that dropped files left since the start, and `<data>/tmp`. Then
+it writes the file again, one record per object, marks it clean (it names
+every object file), and flushes it past the drive's cache (`F_FULLFSYNC` on
+macOS).
+
+| Start after | What the start trusts | Cost |
+|---|---|---|
+| A clean stop | The file, if its records match the hash in its header: which objects are stored, and in what order. At open it marks the file dirty and flushes that past the drive's cache. | One file read and hash; no object directory. |
+| A crash | Nothing. The file is dirty, and may lack its last records: it may name a file that is gone, or miss a new one. The start scans every file and keeps the file's order for the objects that it names, up to a record that is not one; the others come last, oldest write first. | One stat per object file, as with no index. |
+| No file, another version, or a clean file that does not match its hash | Nothing, as after a crash. | As after a crash. |
+
+The start logs which of these it found. So a crash loses only what was used
+last, never an object: the records that had not reached the file. No start
+trusts the index for an object's bytes: each read checks them against the
+ID. If the index gives a size that is not the file's, the object is dropped
+at its first read and fetched again. If the start cannot mark the file
+dirty, or write it after a scan (a full disk), it removes the file and goes
+on, after the drops that free room. A daemon build from before the index
+does not know the file: run between a clean stop and the next start, it
+leaves a clean file that is stale, so remove `<data>/index` after such a
+run. The format is this project's choice: an append-only file is all that
+a start needs, and its one new dependency in the tier crate, `blake3`, is
+already in the workspace.
 
 This project's choices, not the article's: the Unix socket and its mode,
 TCP between tiers, the stores and their limits, keeping `GetRootTree`
@@ -1224,7 +1295,7 @@ an untrusted network.
 |---|---|---|
 | Authentication | One static bearer token (`--token` or `SCION_TOKEN`). The server and each tier compare BLAKE3 digests of the tokens in constant time. A tier sends its own token upstream. | Every caller is the same principal, `default`. No users or per-folder rules ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Network | The server listens on `127.0.0.1:7878` and `scion-cache` on `127.0.0.1:7879` by default. A non-loopback address is refused unless `--insecure-listen` is given. `scion-daemon` listens only on a Unix socket with mode 0600, in a directory that only its user can reach; it refuses any other. `scn` refuses a socket that another user owns. Both refuse a socket or data directory under a directory that another user can change: one that another user owns, or that group or others can write and has no sticky bit. | No TLS: the token and all data travel unencrypted, also between tiers ([#14](https://github.com/bnsd55/open-scion/issues/14)). By choice, as OpenSSH's `StrictModes`, the directory checks refuse a group-writable directory (`chmod go-w` fixes it; with umask 002, new directories are group-writable), and read only the owner and the mode bits, not ACLs: an ACL that lets other users write a directory gets past them. |
-| Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. | Trees and blobs are shared by all repos. `GetObjects` reads any tree or blob by ID, and a changeset can name another repo's blob and then read it ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
+| Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. A changeset names only blobs of its own repo (`repo_blobs`, section 5), so the path reads (`ReadFile`, `ListDir`, `Log`, `Blame`, `Diff`) reach only the repo's own content. No answer of the write calls shows whether another repo has a blob: `CreateChangeset` gives the error of content that no repo stored, before any file is read, and `PutBlob` of such content takes the same write path as for new content. Two leaks stay: the rename frees the old file, and the page cache makes a shared blob fast. | `GetObjects` reads any tree or blob by ID, for any repo name ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
 | Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 1 MiB plus 1 KiB: one part of an object), blobs up to 100 MiB, 16 uploads at once (each holds one message in memory), 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget and `ReadFile` replies a 256 MiB budget. A reply of either whose client stops reading ends after 120 s. Every receiver of an object unpacks it within the size its first part gives, at most 100 MiB, with a zstd window of at most 8 MiB, and accepts only plain Zstandard frames (no skippable or legacy frames, no dictionary). The zstd library is built without its legacy decoders. Names of 1 to 256 bytes with no control characters. The path indexes of all refs hold at most 128 MiB together, and a land walks at most 100,000 changesets below its ref's index. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 16 MiB and 1,048,576 lines, diffs at most 100 versions and about 1M lines (a line counts once per 64 bytes), compares at most 100 deleted files and about 100 MiB to find a rename, and at most 4 run at once. At most 4 `MergeBase` and `IsAncestor` calls run at once, each until its 600 s deadline; a `Diff` reply holds at most 1,000 paths. The server and each tier serve at most 128 connections at once (`--max-connections`), each with at most 256 open streams (`--max-streams`); a client beyond either waits. A connection closes 20 s after it gets its place if no HTTP/2 preface came; after the preface, 20 s after an unanswered ping, which goes out after 60 s without a frame; and in any case 10 min after it was asked to close at 30 min of age. So a connection beyond the cap waits at most 40 min. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). A reply whose client stops reading keeps memory that no budget counts, until its stream ends or its connection closes: a `GetObjects` or `ReadFile` reply three parts (in its channel, read ahead by hyper, in the h2 send buffer) plus up to 400 KiB more of h2 send buffer, under 4 MiB; a unary reply its whole message, up to 64 MiB. So the ceiling is connections x streams x that: 128 x 256 x 4 MiB = 128 GiB for streamed replies, and 128 x 256 x 64 MiB = 2 TiB for unary ones. What a dead peer holds is freed within 80 s of its last frame (keepalive), or within 20 s if it never sent the preface. A live client that stops reading keeps it until its connection is closed at 40 min of age: hyper cannot reset a stalled stream from the server side ([#113](https://github.com/bnsd55/open-scion/issues/113)). |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. Each tier also checks every object from upstream before it stores or sends it, and the daemon checks each object again when it reads it from disk. The server sends a blob's zstd file without unpacking it, so the receiver finds a damaged file. | Tiers are trusted in v0.1: the client trusts the `ResolveRef` and `GetRootTree` answers that a tier passes on, which it cannot check by hash. A tier forwards them, and keeps only what upstream answered. |
@@ -1245,12 +1316,11 @@ limit and its upgrade path. This is the list on `main` today.
 |---|---|---|---|
 | `scion-core/src/codec.rs` (`put_len`) | Encoding panics if a field is longer than `u32::MAX`. Every ingest path caps sizes far below that. | `try_encode` returning `Result`, if a path ever does not. | |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
-| `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/import.rs` (`BATCH`) | A server that shares the data directory waits for each import batch transaction, up to `busy_timeout` (5 s), and then its write fails with `UNAVAILABLE`. Its other writes wait behind that write. | Shorter import transactions while a server shares the directory. | [#100](https://github.com/bnsd55/open-scion/issues/100) |
 | `scion-server/src/store.rs` (`Blobs::sweep_tmp`) | Only an open that finds no other process removes the temp files that a crash left, so those of a crashed import stay while the server runs. | A `tmp/` folder per process, under its own lock. | [#101](https://github.com/bnsd55/open-scion/issues/101) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | Per-ref serialization in a shared database ([design](design/scalable-backend.md)). | [#47](https://github.com/bnsd55/open-scion/issues/47) |
 | `scion-server/src/land.rs` (`MAX_WALK`) | A land on a base more than `MAX_DEPTH` generations below the tip walks the history from the index floor back to the base, each time, and holds the write connection while it walks. A base more than 100,000 changesets below the floor is rejected. | Per-path history in the database, so the check reads only the paths that the land changes. | [#38](https://github.com/bnsd55/open-scion/issues/38) |
-| `scion-server/src/objects.rs` (`read_object`) | An object ID is treated as permission to read it; trees and blobs are shared by all repos. Safe with one principal. | A read ticket bound to a principal, a repo and a root tree, checked by the server and every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
+| `scion-server/src/objects.rs` (`read_object`) | An object ID is treated as permission to read it: `GetObjects` serves any tree or blob for any repo name. Safe with one principal. | A read ticket bound to a principal, a repo and a root tree, checked by the server and every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-proto/src/listen.rs` (`Limits`) | A live client that stops reading keeps what its stalled replies hold in HTTP/2 until its connection closes, at most 40 min after it opened: under 4 MiB per streamed reply, up to 64 MiB per unary one. The caps bound only the number: connections x streams. hyper cannot reset a stalled stream from the server side: while the stream waits for window, hyper does not poll the reply body. | Count what the stalled replies of each connection hold, and close a connection that holds too much, which frees its h2 buffers. | [#113](https://github.com/bnsd55/open-scion/issues/113) |
 | `scion-server/src/objects.rs` (`find`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
 | `scion-server/src/read.rs` (`MAX_SCAN`) | Path history and blame walk first parents on every call, at most 1,000 changesets per call. A path changed long ago costs many calls. | Path history as derived data. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
@@ -1263,7 +1333,7 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/main.rs` (`serve`) | No TLS. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
 | `scion-tier/src/lib.rs` (`produce`) | Two blocking hops per hit (size, then read) and no read-ahead, as on the server. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
 | `scion-tier/src/lib.rs` (`check_repo`) | A tier does not ask whether a repo exists, and serves a stored object to any caller with the token. Safe with one principal. | Read tickets, checked by every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
-| `scion-tier/src/store.rs` (`DiskStore`) | The daemon's recency index lives in memory and a scan of every file rebuilds it at start. Memory and start time grow with the object count, and a restart forgets which objects were read last. | A persistent index. | [#63](https://github.com/bnsd55/open-scion/issues/63) |
+| `scion-tier/src/store.rs` (`DiskStore`) | The daemon's whole recency index is also in memory, and a start reads all of it. Writing `<data>/index` again copies every record under the index lock, which `size` needs while the tier holds its fetch table: every fetch start waits. After a crash, a start scans every object file. Memory and these pauses grow with the object count. | An index on disk that is read and changed in place, and a crash start that needs no scan. | [#115](https://github.com/bnsd55/open-scion/issues/115) |
 | `scion-tier/src/bin/scion-cache.rs` (`main`) | No TLS between tiers. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
 | `scn/src/client.rs` (`lossy`) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | Escape or base64 raw bytes in JSON. | |
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |

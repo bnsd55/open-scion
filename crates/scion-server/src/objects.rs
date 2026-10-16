@@ -137,8 +137,8 @@ fn plan(store: &Store, key: Key, zstd: bool) -> Result<Plan> {
 /// read in chunks and not unpacked: the receiver checks it. A RAW blob is
 /// unpacked in chunks, so it is never in memory twice.
 fn read_object(store: &Store, key: Key, plan: Plan) -> Result<Outgoing> {
-    // SHORTCUT: an object ID is treated as permission to read the object, and
-    // trees and blobs are shared by all repos. Safe with one principal.
+    // SHORTCUT: an object ID is treated as permission to read the object, so
+    // this serves any tree or blob for any repo name. Safe with one principal.
     // Upgrade (issue #13): a read ticket bound to a principal, a repo and a
     // root tree, checked here and by every cache tier.
     let (kind, id, body) = match key {
