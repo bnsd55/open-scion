@@ -1183,12 +1183,8 @@ fn about_one_object(status: &Status) -> bool {
     matches!(status.code(), Code::NotFound | Code::DataLoss)
 }
 
-/// Checks a repo name by the server's rule, so a tier refuses the calls that
-/// the server refuses.
-// SHORTCUT: a tier does not ask whether the repo exists, and serves a stored
-// object to any caller with the token, for any repo name. Safe with one
-// principal; the server also shares trees and blobs across repos. Upgrade
-// (issue #13): read tickets, checked by every tier.
+/// The `Objects` service of a tier: `GetObjects` of a ticket, and nothing
+/// else.
 #[tonic::async_trait]
 impl<S: Store> Objects for Tier<S> {
     /// No refs here either: a caller resolves on the server, then brings
