@@ -1998,9 +1998,34 @@ mod tests {
     #[test]
     fn a_deep_land_reads_its_paths_not_the_history() {
         // The same land on two histories, one ten times longer, reads the
-        // same rows.
+        // same rows: the check reads the paths of the land, not the
+        // history. The chains put the same few paths, so their levels stay
+        // small and the same in both runs.
         let reads = [2, 20].map(|cycles| {
-            let (f, history) = imported(cycles * depth());
+            let f = fixture();
+            let mut history = vec![f.root];
+            f.store
+                .write(|c| {
+                    // `c1` and `d/e/f` before the base, `c2` after it,
+                    // `warm` after that, many times.
+                    for i in 1..=cycles * depth() {
+                        let changes = match i {
+                            1 => vec![put("c1", "x"), put("d/e/f", "x")],
+                            2 => vec![put("c2", "x")],
+                            _ => vec![put("warm", "x")],
+                        };
+                        let cs = changeset(vec![history[i - 1]], &changes);
+                        history.push(db::insert_changeset(c, f.repo, &cs)?);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            f.move_main(history[cycles * depth()]);
+            let out = f.land(
+                f.commit(history[cycles * depth()], &[put("warm", "x")]),
+                "warm",
+            );
+            assert_eq!(out.state, LandState::Landed);
             let out = f.land(f.commit(f.root, &[put("c1", "mine")]), "derives");
             assert_eq!(out.state, LandState::Conflict);
             let changes = [put("c2", "mine"), put("d/e/g", "mine"), put("c1/z", "mine")];
@@ -2678,6 +2703,44 @@ mod tests {
         assert_ne!(tip, empty);
         let tree = |cs| tree::root_tree(&f.store, f.repo, cs).unwrap();
         assert_eq!(tree(tip), tree(before.target));
+    }
+
+    #[test]
+    fn a_retry_within_the_window_returns_the_stored_outcome() {
+        let f = fixture();
+        let cs = f.commit(f.root, &[put("a/x", "1")]);
+        let first = f.land(cs, "key");
+        assert_eq!(first.state, LandState::Landed);
+
+        // The land is 60 s inside the window. Lands after it run expiry, and
+        // it stays: a retry with the same key still returns the stored
+        // outcome, field for field, with the same land ID.
+        f.age(first.land_id, LAND_RETENTION_SECS - 60);
+        f.fill("t", 3);
+        let retry = f.try_land(cs, "key").unwrap();
+        assert_eq!(retry, first);
+        assert_eq!(retry.land_id, first.land_id);
+    }
+
+    #[test]
+    fn a_retry_after_the_window_is_a_new_land() {
+        let f = fixture();
+        let cs = f.commit(f.root, &[put("a/x", "1")]);
+        let first = f.land(cs, "key");
+
+        // The land is past the window, so the next land expires it. The key
+        // is gone: a retry with the same key is a new land with a new ID,
+        // checked like any other. Its own landed copy changed its paths
+        // after its base, so it comes back as a conflict, and main stays.
+        f.age(first.land_id, LAND_RETENTION_SECS + 60);
+        f.fill("t", 1);
+        assert!(f.gone(&first));
+        let main_before = f.main();
+        let retry = f.land(cs, "key");
+        assert!(retry.land_id > first.land_id);
+        assert_eq!(retry.state, LandState::Conflict);
+        assert_eq!(retry.conflict_paths, [RepoPath::new("a/x").unwrap()]);
+        assert_eq!(f.main(), main_before);
     }
 
     #[test]

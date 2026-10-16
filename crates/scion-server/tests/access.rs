@@ -15,6 +15,7 @@ use scion_proto::v1::{
 use scion_server::access::Access;
 use scion_server::{Store, db, service};
 use tokio::net::TcpListener;
+use tokio_stream::StreamExt;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::service::interceptor::{InterceptedService, Interceptor};
 use tonic::transport::Channel;
@@ -358,8 +359,7 @@ mod req {
             repo: REPO.into(),
             changeset_id: root.to_vec(),
             path: path.to_vec(),
-            rename_searched: 0,
-            rename_best: Vec::new(),
+            cursor: Vec::new(),
         }
     }
 
@@ -466,4 +466,60 @@ async fn a_principal_without_a_read_rule_sees_no_repo_on_any_rpc() {
         "GetObjects",
         objects.get_objects(req::get_objects(blob)).await,
     );
+}
+
+/// Four `Blame` calls of one big file run at once: each takes one of the 4
+/// blame slots, and holds it for the seconds its diff takes, while it also
+/// holds one of the 256 permits that writes and lands share. A `ReadFile`
+/// must still run at once: the slots bound how many permits blame can hold.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_file_runs_while_the_blame_slots_are_full() {
+    let (_dir, store, root, _blob) = store();
+    // Five versions of a 1,048,576-line file: one blame call diffs at
+    // least one version pair, which takes seconds, and stops at its diff
+    // budget with a cursor.
+    let line = "x".repeat(15) + "\n";
+    let mut text = String::new();
+    let mut puts = Vec::new();
+    for n in 0..5 {
+        text = format!("version {n}\n") + &line.repeat(1 << 20);
+        puts.push(Some(regular(store.blobs().put(text.as_bytes()).unwrap())));
+    }
+    let tip = store
+        .write(|c| {
+            let repo = db::repo_id(c, REPO)?;
+            let mut id = root;
+            for put in puts {
+                id = db::insert_changeset(c, repo, &changeset(vec![id], "big", put))?;
+            }
+            Ok(id)
+        })
+        .unwrap();
+    // bob may read the repo, and so may blame and read its files.
+    let (_stop, mut scion, _) = server(&store, access(), "bob").await;
+
+    let mut blames = Vec::new();
+    for _ in 0..4 {
+        let mut client = scion.clone();
+        let request = req::blame(tip.as_bytes(), b"big");
+        blames.push(tokio::spawn(async move {
+            client.blame(request).await.unwrap().into_inner()
+        }));
+    }
+    // The blames hold their slots while they diff. A read needs none of
+    // the 4 slots, and still gets a permit of the 256.
+    let mut read = scion
+        .read_file(req::read_file(tip.as_bytes(), b"big"))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut read_back = Vec::new();
+    while let Some(chunk) = read.next().await {
+        read_back.extend(chunk.unwrap().data);
+    }
+    assert_eq!(read_back, text.as_bytes(), "the read answered at once");
+    for blamed in blames {
+        let reply = blamed.await.unwrap();
+        assert!(!reply.ranges.is_empty(), "the blame answered");
+    }
 }

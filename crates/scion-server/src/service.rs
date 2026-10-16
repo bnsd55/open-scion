@@ -29,7 +29,6 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::access::Access;
 use crate::auth::Caller;
-use crate::blame::RenameSearch;
 use crate::deadline::Deadline;
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
@@ -45,10 +44,16 @@ const MAX_BLOCKING: usize = 256;
 /// Most uploads read at once. Each holds one request message in memory, of up
 /// to `MAX_MESSAGE_BYTES`, and a spool file of up to `MAX_OBJECT_BYTES`.
 const MAX_UPLOADS: usize = 16;
-/// Most `Blame` calls running at once. One call can diff for seconds, so
-/// blames never take more than this many of the `MAX_BLOCKING` permits that
-/// writes and lands share.
+/// Most `Blame` calls running at once. One call can diff for seconds, and
+/// a call that waits for its memory budget holds one of the `MAX_BLOCKING`
+/// permits that writes and lands share for the rest of its deadline. Four
+/// of the 256 permits can never starve a land or a read; a blame queue
+/// beyond this waits here, in async code, for a slot to free.
 const MAX_BLAMES: usize = 4;
+/// The bytes of memory that all `Blame` calls share: a call takes the bytes
+/// of every version it reads, and [`memory::BYTES_PER_LINE`] per line of the
+/// blamed file, so together they hold no more than this.
+const BLAME_MEMORY_BUDGET: usize = 1 << 30;
 /// Most `MergeBase`, `IsAncestor` and `Log` calls with a path running at
 /// once. A call has no bound on its reads, only its deadline: a walk, or the
 /// first derivation of path history on a database from before it. So these
@@ -206,6 +211,8 @@ pub struct ScionService {
     uploads: Arc<Semaphore>,
     /// Bounds blames running at once (`MAX_BLAMES`).
     blames: Arc<Semaphore>,
+    /// The memory that blames share (`BLAME_MEMORY_BUDGET`).
+    blame_memory: crate::memory::Bytes,
     /// Bounds graph queries running at once (`MAX_GRAPH_QUERIES`).
     graph_queries: Arc<Semaphore>,
     /// Bounds diffs running at once (`MAX_DIFFS`).
@@ -224,6 +231,7 @@ impl ScionService {
             quotas,
             uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
             blames: Arc::new(Semaphore::new(MAX_BLAMES)),
+            blame_memory: crate::memory::Bytes::new(BLAME_MEMORY_BUDGET),
             graph_queries: Arc::new(Semaphore::new(MAX_GRAPH_QUERIES)),
             diffs: Arc::new(Semaphore::new(MAX_DIFFS)),
             reads: Arc::new(Semaphore::new(READ_BUDGET_BYTES)),
@@ -757,26 +765,47 @@ impl Scion for ScionService {
     ) -> Result<Response<BlameResponse>, Status> {
         let caller = caller(&request)?;
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
-        let path = parse_path(req.path)?;
-        let search = RenameSearch {
-            searched: usize::try_from(req.rename_searched)
-                .map_err(|_| Status::invalid_argument("rename_searched is too large"))?,
-            best: parse_optional_path(req.rename_best)?,
-        };
+        let path = parse_path(req.path.clone())?;
         // Taken before the worker permit, and held until the job ends, also
         // when the client leaves first.
         let slot = Arc::clone(&self.blames)
             .acquire_owned()
             .await
             .map_err(|_| Status::unavailable("server is shutting down"))?;
+        let memory = self.blame_memory.clone();
+        let until = Some(deadline.at());
+        let repo = req.repo.clone();
+        let cursor_bytes = req.cursor.clone();
+        let walk_path = path.clone();
         let blame = self
             .worker
             .run(move |store| {
                 let _slot = slot;
-                blame::blame(&store, &req.repo, id, &path, &search)
+                let _call = deadline.guard();
+                // The client sends the cursor back unchanged. A cursor made
+                // for another repo, changeset or path is refused here, and
+                // its changesets must be the repo's. Its memory takes the
+                // blame budget, and stays taken until the call ends.
+                let (resume, cursor) = if cursor_bytes.is_empty() {
+                    (blame::Resume::default(), None)
+                } else {
+                    let (resume, hold) = blame::decode_cursor(
+                        &store,
+                        &repo,
+                        &cursor_bytes,
+                        id,
+                        &walk_path,
+                        &memory,
+                        until,
+                    )?;
+                    (resume, Some(hold))
+                };
+                let _cursor = cursor;
+                blame::blame(&store, &repo, id, &walk_path, &resume, &memory, until)
             })
             .await?;
         let ranges = blame
@@ -801,14 +830,14 @@ impl Scion for ScionService {
                 path: path.as_bytes().to_vec(),
             })
             .collect();
-        let (next, next_path) = blame.next.unzip();
+        let next_cursor = blame
+            .resume
+            .map(|resume| blame::encode_cursor(&resume, &req.repo, id, &path))
+            .unwrap_or_default();
         Ok(Response::new(BlameResponse {
             ranges,
             changesets,
-            next_changeset_id: id_bytes(next),
-            next_path: path_bytes(next_path),
-            next_rename_searched: blame.next_search.searched as u64,
-            next_rename_best: path_bytes(blame.next_search.best),
+            next_cursor,
         }))
     }
 

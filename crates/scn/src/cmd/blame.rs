@@ -21,12 +21,9 @@ pub async fn blame(ctx: &mut Ctx, spec: &str) -> Result<()> {
     let (rev, path) = split_spec(spec)?;
     let path = path.with_context(|| format!("{spec:?}: expected REV:PATH"))?;
     let changeset_id = ctx.resolve(rev).await?;
-    let mut at = changeset_id;
-    // The path of the file at `at`. A rename changes it.
-    let mut at_path = path.as_bytes().to_vec();
-    // Where a rename search at `at` stopped, sent back as the server sent
-    // it: files searched, and the best so far.
-    let mut search = (0, Vec::new());
+    // The cursor of the next call, opaque: sent back unchanged with the
+    // same changeset and path. Empty starts the first call.
+    let mut cursor = Vec::new();
     let mut sources = Sources::new();
     // For each line of the file: its changeset once known, and until then
     // its line in the file at `at`. Empty before the first reply.
@@ -36,10 +33,9 @@ pub async fn blame(ctx: &mut Ctx, spec: &str) -> Result<()> {
             .client
             .blame(BlameRequest {
                 repo: ctx.repo.clone(),
-                changeset_id: at.as_bytes().to_vec(),
-                path: at_path.clone(),
-                rename_searched: search.0,
-                rename_best: search.1.clone(),
+                changeset_id: changeset_id.as_bytes().to_vec(),
+                path: path.as_bytes().to_vec(),
+                cursor: cursor.clone(),
             })
             .await
             .with_context(|| format!("cannot blame {spec}"))?
@@ -51,16 +47,19 @@ pub async fn blame(ctx: &mut Ctx, spec: &str) -> Result<()> {
                 unix_secs: c.author_unix_secs,
                 tz_offset_minutes: c.author_tz_offset_minutes,
             };
-            let source_path = sent_path(c.path, &at_path);
-            sources.insert(
-                id_from::<ChangesetId>(&c.changeset_id)?,
-                (author, source_path),
-            );
+            sources.insert(id_from::<ChangesetId>(&c.changeset_id)?, (author, c.path));
         }
-        // The source of each line of the file at `at`.
+        // The source of each line of the window the reply covers. The
+        // ranges cover it in order, so the first range names its first
+        // line. An empty file has none, and no cursor to go on with.
+        let at_line = match reply.ranges.first() {
+            Some(r) => r.start_line as usize - 1,
+            None if reply.next_cursor.is_empty() => break,
+            None => bail!("server sent no blame ranges"),
+        };
         let mut here = Vec::new();
         for range in &reply.ranges {
-            if range.start_line as usize != here.len() + 1 {
+            if range.start_line as usize != at_line + here.len() + 1 {
                 bail!("server sent blame ranges out of order");
             }
             let changeset = opt_id(&range.changeset_id)?;
@@ -68,27 +67,36 @@ pub async fn blame(ctx: &mut Ctx, spec: &str) -> Result<()> {
                 (0..range.line_count).map(|n| (changeset, range.origin_line.saturating_add(n))),
             );
         }
-        if lines.is_empty() {
-            lines = here;
+        if at_line == lines.len() {
+            // A window the client has not seen: it follows the last one.
+            lines.extend(here);
         } else {
-            for line in lines.iter_mut().filter(|(source, _)| source.is_none()) {
-                *line = *line
-                    .1
-                    .checked_sub(1)
-                    .and_then(|i| here.get(i as usize))
+            // The same window again, from a call that went deeper into the
+            // history. Its lines map to their sources.
+            if at_line > lines.len() {
+                bail!("server skipped lines of the file");
+            }
+            for (line, source) in lines
+                .iter_mut()
+                .enumerate()
+                .take(at_line + here.len())
+                .skip(at_line)
+            {
+                if source.0.is_some() {
+                    continue;
+                }
+                *source = *here
+                    .get(line - at_line)
                     .context("server sent a blame shorter than the file")?;
             }
         }
-        if lines.iter().all(|(source, _)| source.is_some()) {
+        if reply.next_cursor.is_empty() {
             break;
         }
-        let next = opt_id(&reply.next_changeset_id)?.context("server sent no place to continue")?;
-        let next_path = sent_path(reply.next_path, &at_path);
-        let next_search = (reply.next_rename_searched, reply.next_rename_best);
-        if (next, &next_path, &next_search) == (at, &at_path, &search) {
-            bail!("server sent the same place to continue");
+        if reply.next_cursor == cursor {
+            bail!("server sent the same cursor again");
         }
-        (at, at_path, search) = (next, next_path, next_search);
+        cursor = reply.next_cursor;
     }
     let lines: Vec<(ChangesetId, u32)> = lines
         .into_iter()
@@ -111,16 +119,6 @@ pub async fn blame(ctx: &mut Ctx, spec: &str) -> Result<()> {
     }
     print_text(&lines, &sources, path.as_bytes(), &text);
     Ok(())
-}
-
-/// A path from a reply. An older server sends none, because it does not
-/// follow renames: then it is `at_path`, the path the call asked for.
-fn sent_path(sent: Vec<u8>, at_path: &[u8]) -> Vec<u8> {
-    if sent.is_empty() {
-        at_path.to_vec()
-    } else {
-        sent
-    }
 }
 
 /// Prints each line of `text`, the file at `path`, after its changeset, its
