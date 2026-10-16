@@ -31,13 +31,12 @@
 use std::collections::{BTreeMap, HashMap, btree_map, hash_map};
 use std::fmt;
 
-use rusqlite::{Connection, OptionalExtension, params};
 use scion_core::{Changeset, ChangesetId, FileState, PathElem, RepoPath};
 
-use crate::db;
 use crate::deadline::Deadline;
 use crate::derived::{self, Kind};
 use crate::error::{Error, Result};
+use crate::meta::MetaTx;
 use crate::tree;
 
 /// Hashed before a node's bytes, so a node ID is never the ID of another
@@ -57,10 +56,10 @@ thread_local! {
 
 /// The ID of a history node: the hash of its bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NodeId([u8; 32]);
+pub struct NodeId(pub(crate) [u8; 32]);
 
 impl NodeId {
-    fn of(body: &[u8]) -> Self {
+    pub(crate) fn of(body: &[u8]) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(DOMAIN);
         hasher.update(body);
@@ -111,14 +110,14 @@ impl Kind for PathHistory {
     type Value = NodeId;
 
     fn derive(
-        c: &Connection,
+        c: &mut dyn MetaTx,
         id: ChangesetId,
         changeset: &Changeset,
         parents: Vec<NodeId>,
     ) -> Result<NodeId> {
         let by = Stamp {
             id,
-            generation: db::generation_of(c, id)?,
+            generation: c.generation_of(id)?,
         };
         apply(c, parents.first().copied(), by, &changeset.changes)
     }
@@ -136,7 +135,7 @@ impl Kind for PathHistory {
 /// changed path, and of each directory above it, stamped with `by`. Stores
 /// the new nodes and returns the new root.
 fn apply(
-    c: &Connection,
+    c: &mut dyn MetaTx,
     base: Option<NodeId>,
     by: Stamp,
     changes: &BTreeMap<RepoPath, Option<FileState>>,
@@ -159,7 +158,7 @@ struct Edit {
 }
 
 impl Edit {
-    fn load(c: &Connection, id: Option<NodeId>) -> Result<Self> {
+    fn load(c: &mut dyn MetaTx, id: Option<NodeId>) -> Result<Self> {
         Ok(Self {
             entries: match id {
                 Some(id) => get_node(c, id)?.0,
@@ -170,7 +169,7 @@ impl Edit {
     }
 
     /// Stamps the entry at `parts` with `by`, and each entry above it.
-    fn stamp(&mut self, c: &Connection, parts: &[PathElem], by: Stamp) -> Result<()> {
+    fn stamp(&mut self, c: &mut dyn MetaTx, parts: &[PathElem], by: Stamp) -> Result<()> {
         let (name, rest) = parts.split_first().expect("a path has at least one part");
         let entry = self.entries.entry(name.clone()).or_insert(Entry {
             last: by,
@@ -191,7 +190,7 @@ impl Edit {
     }
 
     /// Stores every edited node, bottom up, and returns this one's ID.
-    fn store(mut self, c: &Connection) -> Result<NodeId> {
+    fn store(mut self, c: &mut dyn MetaTx) -> Result<NodeId> {
         for (name, edit) in self.below {
             let below = edit.store(c)?;
             let entry = self
@@ -228,7 +227,7 @@ impl Nodes {
         self.bytes
     }
 
-    fn get(&mut self, c: &Connection, id: NodeId) -> Result<&Node> {
+    fn get(&mut self, c: &mut dyn MetaTx, id: NodeId) -> Result<&Node> {
         Ok(match self.nodes.entry(id) {
             hash_map::Entry::Occupied(node) => node.into_mut(),
             hash_map::Entry::Vacant(slot) => {
@@ -242,7 +241,7 @@ impl Nodes {
 
 /// What the tree at `root` holds for `path`. Reads at most one node per
 /// part of `path`, and none that `nodes` holds.
-fn lookup(c: &Connection, nodes: &mut Nodes, root: NodeId, path: &RepoPath) -> Result<Hit> {
+fn lookup(c: &mut dyn MetaTx, nodes: &mut Nodes, root: NodeId, path: &RepoPath) -> Result<Hit> {
     let parts = tree::parts(path);
     let (name, dirs) = parts.split_last().expect("a path has at least one part");
     let mut hit = Hit::default();
@@ -271,7 +270,7 @@ fn lookup(c: &Connection, nodes: &mut Nodes, root: NodeId, path: &RepoPath) -> R
 ///
 /// [`Error::Corrupt`] if `from` has no value, or a node is missing.
 pub(crate) fn newest_change(
-    c: &Connection,
+    c: &mut dyn MetaTx,
     nodes: &mut Nodes,
     from: ChangesetId,
     path: &RepoPath,
@@ -292,7 +291,7 @@ pub(crate) fn newest_change(
 /// [`Error::Corrupt`] if a node is missing. [`Error::DeadlineExceeded`]
 /// once `deadline` has passed.
 pub(crate) fn touched_after<'p>(
-    c: &Connection,
+    c: &mut dyn MetaTx,
     root: NodeId,
     paths: impl IntoIterator<Item = &'p RepoPath>,
     base_gen: i64,
@@ -317,32 +316,21 @@ pub(crate) fn touched_after<'p>(
 // it ever had: 630 KB for 10,000 names of 12 bytes. Upgrade: nodes cut into
 // chunks, so a write stores only the chunks it changes, as for trees
 // (https://github.com/bnsd55/open-scion/issues/114).
-fn put_node(c: &Connection, node: &Node) -> Result<NodeId> {
+fn put_node(c: &mut dyn MetaTx, node: &Node) -> Result<NodeId> {
     let body = encode_node(node);
     let id = NodeId::of(&body);
-    c.prepare_cached("INSERT OR IGNORE INTO history_nodes (id, body) VALUES (?1, ?2)")?
-        .execute(params![&id.0[..], body])?;
-    Ok(id)
+    c.put_history_node(id, body)
 }
 
 /// Reads a node and checks it against its ID. Also returns the length of
 /// its stored bytes.
-fn get_node(c: &Connection, id: NodeId) -> Result<(Node, usize)> {
+fn get_node(c: &mut dyn MetaTx, id: NodeId) -> Result<(Node, usize)> {
     #[cfg(test)]
     NODE_READS.set(NODE_READS.get() + 1);
-    let body: Vec<u8> = c
-        .prepare_cached("SELECT body FROM history_nodes WHERE id = ?1")?
-        .query_row([&id.0[..]], |row| row.get(0))
-        .optional()?
-        .ok_or_else(|| Error::Corrupt(format!("history node {id} is missing")))?;
-    if NodeId::of(&body) != id {
-        return Err(Error::Corrupt(format!(
-            "history node {id} does not match its ID"
-        )));
-    }
+    let (body, len) = c.get_history_node(id)?;
     let node = decode_node(&body)
         .ok_or_else(|| Error::Corrupt(format!("history node {id} does not decode")))?;
-    Ok((node, body.len()))
+    Ok((node, len))
 }
 
 /// The bytes of a node: its entries in name order, each
@@ -412,10 +400,12 @@ fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
 
 #[cfg(test)]
 mod tests {
+    use crate::db;
     use scion_core::{BlobId, FileState, IdentityTime};
 
     use super::*;
-    use crate::db::{RepoId, testing};
+    use crate::db::testing;
+    use crate::meta::RepoId;
     use crate::read;
     use crate::store::Store;
     use crate::write;
@@ -457,7 +447,7 @@ mod tests {
     fn open() -> (tempfile::TempDir, Store, RepoId) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let repo = store.write(|c| db::create_repo(c, "r")).unwrap();
+        let repo = store.write(|c| c.create_repo("r")).unwrap();
         (dir, store, repo)
     }
 
@@ -487,7 +477,7 @@ mod tests {
                     ids.push(if stored {
                         tree::store_changeset(c, repo, &cs)?.0
                     } else {
-                        db::insert_changeset(c, repo, &cs)?
+                        c.insert_changeset(repo, &cs)?
                     });
                 }
                 Ok(ids)
@@ -541,7 +531,7 @@ mod tests {
                     let mut walked = Vec::new();
                     let mut next = Some(tip);
                     while let Some(id) = next {
-                        let cs = store.read(|c| db::get_changeset(c, repo, id)).unwrap();
+                        let cs = store.read(|c| c.get_changeset(repo, id)).unwrap();
                         if read::changes_path(&cs, &path(p)) {
                             walked.push(id);
                         }
@@ -629,7 +619,7 @@ mod tests {
         let main = store_chain(&store, repo, None, &[&[("a", true)], &[("b", true)]], true);
         let blob = store.blobs().put(b"draft").unwrap();
         // PutBlob makes the blob a member of the repo; the test mirrors it.
-        store.write(|c| db::add_repo_blob(c, repo, blob)).unwrap();
+        store.write(|c| c.add_repo_blob(repo, blob)).unwrap();
         // A changeset that no ref points to gets its path history when it is
         // written, because its parent has one.
         let draft = changeset(Some(main[1]), &[("a", Some(blob))]);

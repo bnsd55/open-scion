@@ -7,11 +7,11 @@
 
 use std::collections::BTreeSet;
 
-use rusqlite::Connection;
 use scion_core::{BlobId, Changeset, ChangesetId, RepoPath};
 
-use crate::db::{self, RepoId};
+use crate::db;
 use crate::error::{Error, Result};
+use crate::meta::{MetaTx, RepoId};
 use crate::store::{BlobStatus, Store, Upload};
 use crate::tree;
 
@@ -51,7 +51,7 @@ pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<Chang
     tree::fill_root_tree(store, repo_id, parent)?;
     store.write(|c| {
         let repo_id = check_parent(c, repo, parent)?;
-        if db::has_changeset(c, repo_id, id)? {
+        if c.has_changeset(repo_id, id)? {
             // A retry. Its tree was checked and recorded the first time.
             return Ok(id);
         }
@@ -83,12 +83,12 @@ pub fn decode(bytes: &[u8]) -> Result<(Changeset, ChangesetId)> {
 pub fn put_blob(store: &Store, repo: RepoId, upload: Upload) -> Result<BlobId> {
     let id = upload.id();
     // The flush below covers what this read saw.
-    let member = store.read_unflushed(|c| db::repo_has_blob(c, repo, id))?;
+    let member = store.read_unflushed(|c| c.repo_has_blob(repo, id))?;
     store.blobs().put_upload(upload, member)?;
     if !member {
         // One flush covers the file and this row. A row whose blob a crash
         // lost grants nothing: `create_changeset` reads every blob back.
-        store.commit(|c| db::add_repo_blob(c, repo, id))?;
+        store.commit(|c| c.add_repo_blob(repo, id))?;
     }
     store.flush()?;
     Ok(id)
@@ -104,10 +104,10 @@ fn bad_blob(blob: BlobId, path: &RepoPath, problem: &str, repo: &str) -> Error {
 /// Fails on the first put, in path order, whose blob `repo` may not name.
 /// It gets the answer of a blob that is not stored, and no blob is read, so
 /// neither the answer nor its time shows whether another repo has the blob.
-fn check_members(c: &Connection, repo: &str, repo_id: RepoId, cs: &Changeset) -> Result<()> {
+fn check_members(c: &mut dyn MetaTx, repo: &str, repo_id: RepoId, cs: &Changeset) -> Result<()> {
     let mut seen = BTreeSet::new();
     for (path, blob) in db::puts(cs) {
-        if seen.insert(blob) && !db::repo_has_blob(c, repo_id, blob)? {
+        if seen.insert(blob) && !c.repo_has_blob(repo_id, blob)? {
             return Err(bad_blob(blob, path, "is not stored", repo));
         }
     }
@@ -115,9 +115,9 @@ fn check_members(c: &Connection, repo: &str, repo_id: RepoId, cs: &Changeset) ->
 }
 
 /// Checks that `repo` exists and has `parent`, and returns the repo.
-fn check_parent(c: &Connection, repo: &str, parent: ChangesetId) -> Result<RepoId> {
-    let repo_id = db::repo_id(c, repo)?;
-    if !db::has_changeset(c, repo_id, parent)? {
+fn check_parent(c: &mut dyn MetaTx, repo: &str, parent: ChangesetId) -> Result<RepoId> {
+    let repo_id = c.repo_id(repo)?;
+    if !c.has_changeset(repo_id, parent)? {
         return Err(Error::InvalidArgument(format!(
             "parent {parent} is not in repo {repo:?}"
         )));
@@ -206,8 +206,8 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         let root = store
             .write(|c| {
-                let repo = db::create_repo(c, "main")?;
-                db::insert_changeset(c, repo, &changeset(vec![]))
+                let repo = c.create_repo("main")?;
+                c.insert_changeset(repo, &changeset(vec![]))
             })
             .unwrap();
         (dir, store, root)
@@ -228,7 +228,7 @@ mod tests {
 
     /// Repo `name`, made if missing.
     fn repo(store: &Store, name: &str) -> RepoId {
-        store.write(|c| db::create_repo(c, name)).unwrap()
+        store.write(|c| c.create_repo(name)).unwrap()
     }
 
     /// Uploads `content` to `repo`, as `PutBlob` does.
@@ -240,7 +240,10 @@ mod tests {
     /// Adds `blob` to the blobs of `main`, without storing it.
     fn give_main(store: &Store, blob: BlobId) {
         store
-            .write(|c| db::add_repo_blob(c, db::repo_id(c, "main")?, blob))
+            .write(|c| {
+                let repo = c.repo_id("main")?;
+                c.add_repo_blob(repo, blob)
+            })
             .unwrap();
     }
 
@@ -272,7 +275,7 @@ mod tests {
         // and show that another repo has it.
         upload(&store, other, b"same");
         assert_ne!(inode(id), first, "other did not have it: a new file");
-        assert!(store.read(|c| db::repo_has_blob(c, other, id)).unwrap());
+        assert!(store.read(|c| c.repo_has_blob(other, id)).unwrap());
         assert_eq!(store.blobs().get(id).unwrap(), b"same");
     }
 
@@ -368,9 +371,9 @@ mod tests {
         // Changesets without root trees, as after a version bump of the kind.
         let tip = store
             .write(|c| {
-                let repo = db::repo_id(c, "main")?;
+                let repo = c.repo_id("main")?;
                 (0..4).try_fold(root, |tip, _| {
-                    db::insert_changeset(c, repo, &changeset(vec![tip]))
+                    c.insert_changeset(repo, &changeset(vec![tip]))
                 })
             })
             .unwrap();

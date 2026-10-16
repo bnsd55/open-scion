@@ -15,8 +15,9 @@ use scion_server::blame::{
 };
 use scion_server::deadline::Deadline;
 use scion_server::import::{ImportOptions, import_git};
+use scion_server::meta::MetaTx as _;
 use scion_server::read::{self, MAX_SCAN};
-use scion_server::{Error, Store, db, tree};
+use scion_server::{Error, Store, tree};
 use tempfile::TempDir;
 
 const REPO: &str = "r";
@@ -217,7 +218,7 @@ fn regular(content: BlobId) -> FileState {
 fn chain<S: Into<Option<FileState>>>(store: &Store, puts: Vec<Vec<(&str, S)>>) -> Vec<ChangesetId> {
     store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
+            let repo = c.create_repo(REPO)?;
             let mut ids: Vec<ChangesetId> = Vec::new();
             for puts in puts {
                 let cs = Changeset {

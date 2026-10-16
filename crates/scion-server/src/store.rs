@@ -26,6 +26,7 @@ use rustix::fs::FlockOperation;
 use rustix::io::Errno;
 use scion_core::{BlobHasher, BlobId};
 
+use crate::db::SqliteTx;
 use crate::error::{Error, Result};
 
 /// The schema version this build makes and reads.
@@ -196,7 +197,7 @@ impl Store {
             if server { "OFF" } else { "ON" }
         ))?;
         // Only a `Store` that is alone changes the schema.
-        let version = user_version(&db)?;
+        let version = user_version(&mut SqliteTx(&db))?;
         if !alone && version < SCHEMA_VERSION {
             return Err(Error::FailedPrecondition(format!(
                 "database schema version {version} is older than this build \
@@ -251,7 +252,7 @@ impl Store {
     /// # Errors
     ///
     /// Returns what `f` returns, or an error from [`Store::flush`].
-    pub fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub fn read<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
         let (result, seen) = self.read_counted(f);
         // An error is an answer too.
         self.wait_durable(seen)?;
@@ -264,10 +265,10 @@ impl Store {
     /// replies.
     pub(crate) fn read_counted<T>(
         &self,
-        f: impl FnOnce(&Connection) -> Result<T>,
+        f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>,
     ) -> (Result<T>, u64) {
         let reader = self.inner.readers.take();
-        let result = f(&reader);
+        let result = f(&mut SqliteTx(&reader));
         (result, self.inner.committing.load(Ordering::Acquire))
     }
 
@@ -307,8 +308,9 @@ impl Store {
     /// # Errors
     ///
     /// Returns what `f` returns.
-    pub fn read_unflushed<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        f(&self.lock())
+    pub fn read_unflushed<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
+        let db = self.lock();
+        f(&mut SqliteTx(&db))
     }
 
     /// Whether another process may use the directory at the same time. A
@@ -331,7 +333,7 @@ impl Store {
     /// # Errors
     ///
     /// As [`Store::commit`] and [`Store::flush`].
-    pub fn write<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub fn write<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
         let value = self.commit(f)?;
         self.flush()?;
         Ok(value)
@@ -343,10 +345,10 @@ impl Store {
     /// # Errors
     ///
     /// Returns what `f` returns, or a database error from begin or commit.
-    pub fn commit<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub fn commit<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
         let mut db = self.lock();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let value = f(&tx)?;
+        let value = f(&mut SqliteTx(&tx))?;
         // Counted before a read can see it, and again once it ended (see
         // `read` and `flush`).
         self.inner.committing.fetch_add(1, Ordering::Release);
@@ -545,14 +547,14 @@ fn in_use(dir: &Path, name: &str, by: &str) -> Error {
     .into()
 }
 
-fn user_version(db: &Connection) -> Result<u32> {
+fn user_version(db: &mut SqliteTx<'_>) -> Result<u32> {
     Ok(db.pragma_query_value(None, "user_version", |row| row.get(0))?)
 }
 
 /// Runs the migrations from the database's version up to `target`. Only
 /// tests stop below [`SCHEMA_VERSION`], to make an older database.
 pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
-    let version = user_version(db)?;
+    let version = user_version(&mut SqliteTx(db))?;
     if version > SCHEMA_VERSION {
         return Err(Error::Corrupt(format!(
             "database schema version {version} is newer than this build ({SCHEMA_VERSION})"
@@ -1283,6 +1285,8 @@ fn fsync_dir(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::db::SqliteTx;
+    use crate::meta::MetaTx as _;
     use std::cell::{Cell, RefCell};
     use std::panic;
     use std::rc::Rc;
@@ -1918,8 +1922,8 @@ mod tests {
         store.blobs().full_flushes() - before
     }
 
-    fn create_repo(c: &Connection) -> Result<()> {
-        crate::db::create_repo(c, "main").map(drop)
+    fn create_repo(c: &mut SqliteTx<'_>) -> Result<()> {
+        c.create_repo("main").map(drop)
     }
 
     #[test]
@@ -1948,12 +1952,12 @@ mod tests {
         assert_eq!(flushes_in_read(&store), 0);
     }
 
-    fn repos(c: &Connection) -> Result<i64> {
+    fn repos(c: &mut SqliteTx<'_>) -> Result<i64> {
         Ok(c.query_row("SELECT count(*) FROM repos", [], |row| row.get(0))?)
     }
 
-    fn add_repo(name: &str) -> impl Fn(&Connection) -> Result<()> {
-        move |c| crate::db::create_repo(c, name).map(drop)
+    fn add_repo(name: &'static str) -> impl Fn(&mut SqliteTx<'_>) -> Result<()> {
+        move |c| c.create_repo(name).map(drop)
     }
 
     #[test]

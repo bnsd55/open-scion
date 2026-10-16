@@ -13,14 +13,13 @@ use std::collections::hash_map::Entry as Slot;
 
 use gix::diff::blob::sources::byte_lines;
 use gix::diff::blob::{Algorithm, Diff, InternedInput};
-use rusqlite::Connection;
 use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, PathElem, RepoPath, Tree,
     TreeId,
 };
 
-use crate::db;
 use crate::error::{Error, Result};
+use crate::meta::MetaTx;
 use crate::read::{self, MAX_SCAN};
 use crate::similar::{self, Budget, Chunks, MAX_PAIRS, Progress};
 use crate::store::Store;
@@ -154,7 +153,7 @@ pub fn blame(
     path: &RepoPath,
     from: &RenameSearch,
 ) -> Result<Blame> {
-    let repo = store.read(|c| db::repo_id(c, repo))?;
+    let repo = store.read(|c| c.repo_id(repo))?;
     let root = tree::root_tree(store, repo, cs)?;
     let mut blob = regular_blob(store, root, path)?;
     let mut text = read_text(store, blob, path, &mut 0)??;
@@ -528,7 +527,7 @@ fn deleted_files<'c>(
 
 /// [`tree::lookup`] that loads each tree at most once across calls.
 fn lookup_cached(
-    c: &Connection,
+    c: &mut dyn MetaTx,
     trees: &mut HashMap<TreeId, Tree>,
     root: TreeId,
     path: &RepoPath,
@@ -540,7 +539,7 @@ fn lookup_cached(
         };
         let tree = match trees.entry(id) {
             Slot::Occupied(slot) => slot.into_mut(),
-            Slot::Vacant(slot) => slot.insert(db::get_tree(c, id)?),
+            Slot::Vacant(slot) => slot.insert(c.get_tree(id)?),
         };
         let name = PathElem::new(name).expect("a RepoPath part is a valid name");
         match tree.entries.get(&name) {

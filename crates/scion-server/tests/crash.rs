@@ -37,8 +37,9 @@ use scion_proto::v1::{
     ObjectRef, PutBlobRequest, ResolveRefRequest,
 };
 use scion_proto::{CHUNK_BYTES, MAX_OBJECT_REFS};
+use scion_server::meta::MetaTx as _;
 use scion_server::store::BlobStatus;
-use scion_server::{Store, db, tree};
+use scion_server::{Store, tree};
 use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -258,10 +259,10 @@ fn create_repo(data: &Path) {
     };
     store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
+            let repo = c.create_repo(REPO)?;
             let (id, _) = tree::store_changeset(c, repo, &root)?;
             for name in REFS {
-                assert!(db::cas_ref(c, repo, name, None, id)?);
+                assert!(c.cas_ref(repo, name, None, id)?);
             }
             Ok(())
         })

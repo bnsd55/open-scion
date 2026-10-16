@@ -17,19 +17,18 @@ use std::time::{Duration, Instant};
 use gix::ObjectId;
 use gix::actor::SignatureRef;
 use hashlink::LruCache;
-use rusqlite::{Connection, params};
 use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileState, GitOid, IdentityTime, PathElem, RepoPath,
     TreeId,
 };
 
-use crate::db::{self, RepoId};
 use crate::error::{Error, Result};
+use crate::meta::{MetaTx, RepoId};
 use crate::store::{BlobBatch, BlobStatus, MAX_OBJECT_BYTES, Store};
 use crate::tree;
 
 /// `git_import.git_algo` for SHA-1 object names.
-const SHA1: i64 = 1;
+pub(crate) const SHA1: i64 = 1;
 /// Commits per blob batch: their blobs are prepared and made durable
 /// together, outside any write transaction.
 const BATCH: usize = 1000;
@@ -133,8 +132,8 @@ fn import_with_cache(
         .map_err(|e| Error::Git(format!("cannot resolve {:?} to a commit: {e}", opts.rev)))?
         .id;
 
-    let repo_id = store.write(|c| db::create_repo(c, repo))?;
-    let mut known = store.read(|c| imported_commits(c, repo_id))?;
+    let repo_id = store.write(|c| c.create_repo(repo))?;
+    let mut known = store.read(|c| c.imported_commits(repo_id))?;
     let plan = plan(&git, tip, &known, opts.verify_sample)?;
     tracing::info!(
         reachable = plan.reachable,
@@ -367,39 +366,17 @@ fn plan(
     })
 }
 
-/// Stores one changeset, its git mapping and its root tree. Returns the root
-/// tree.
-fn record(c: &Connection, repo: RepoId, commit: ObjectId, cs: &Changeset) -> Result<TreeId> {
+/// Records that a git commit became the changeset `cs` whose changes build
+/// the tree `root`. Safe to repeat.
+fn record(c: &mut dyn MetaTx, repo: RepoId, commit: ObjectId, cs: &Changeset) -> Result<TreeId> {
     let (id, root) = tree::store_changeset(c, repo, cs).map_err(|e| match e {
         Error::Apply(e) => Error::Corrupt(format!(
             "commit {commit}: changes do not apply to the first parent: {e}"
         )),
         other => other,
     })?;
-    c.prepare_cached(
-        "INSERT OR IGNORE INTO git_import (repo_id, git_algo, git_oid, cs)
-         VALUES (?1, ?2, ?3, ?4)",
-    )?
-    .execute(params![repo.0, SHA1, commit.as_slice(), id.as_bytes()])?;
+    c.put_git_import(repo, commit, id)?;
     Ok(root)
-}
-
-/// Every git commit already imported into `repo`.
-fn imported_commits(c: &Connection, repo: RepoId) -> Result<HashMap<ObjectId, ChangesetId>> {
-    let mut stmt =
-        c.prepare("SELECT git_oid, cs FROM git_import WHERE repo_id = ?1 AND git_algo = ?2")?;
-    let rows = stmt.query_map(params![repo.0, SHA1], |row| {
-        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })?;
-    let mut out = HashMap::new();
-    for row in rows {
-        let (oid, cs) = row?;
-        let corrupt = || Error::Corrupt("git_import row".to_owned());
-        let oid = ObjectId::try_from(oid.as_slice()).map_err(|_| corrupt())?;
-        let cs = ChangesetId::try_from(cs.as_slice()).map_err(|_| corrupt())?;
-        out.insert(oid, cs);
-    }
-    Ok(out)
 }
 
 /// Points `name` at `tip`, creating it if missing. Leaves it alone if it is
@@ -416,9 +393,9 @@ fn point_ref(store: &Store, repo: RepoId, name: &str, tip: ChangesetId) -> Resul
     // The walks run in reads, outside any write transaction, so a server
     // that shares the data directory does not wait for them. They have no
     // bound. The swap fails if the ref moved after the read.
-    let contains = |head, cs| store.read(|c| db::is_ancestor(c, repo, cs, head, usize::MAX));
+    let contains = |head, cs| store.read(|c| c.is_ancestor(repo, cs, head, usize::MAX));
     loop {
-        let current = store.read(|c| db::get_ref(c, repo, name))?;
+        let current = store.read(|c| c.get_ref(repo, name))?;
         if let Some(current) = current {
             // Already there, or the ref already contains the tip (changes
             // were landed on top of an earlier import): nothing to do.
@@ -434,7 +411,7 @@ fn point_ref(store: &Store, repo: RepoId, name: &str, tip: ChangesetId) -> Resul
             }
         }
         let expected = current.map(|r| r.version);
-        if store.write(|c| db::cas_ref(c, repo, name, expected, tip))? {
+        if store.write(|c| c.cas_ref(repo, name, expected, tip))? {
             return Ok(());
         }
         tracing::info!(name, "the ref moved during the import; checking it again");
@@ -586,7 +563,7 @@ impl Checker<'_> {
     /// flags and content of the git tree `git_tree`.
     fn check(
         &mut self,
-        c: &Connection,
+        c: &mut dyn MetaTx,
         commit: ObjectId,
         git_tree: ObjectId,
         scion: TreeId,
@@ -597,7 +574,8 @@ impl Checker<'_> {
                 continue;
             }
             let want = read_tree(self.git, commit, Some(git_id))?;
-            let have: BTreeMap<Vec<u8>, Entry> = db::get_tree(c, scion_id)?
+            let have: BTreeMap<Vec<u8>, Entry> = c
+                .get_tree(scion_id)?
                 .entries
                 .into_iter()
                 .map(|(name, entry)| (name.as_bytes().to_vec(), entry))
@@ -908,11 +886,11 @@ mod tests {
         };
         let (repo, tip, x) = server
             .write(|c| {
-                let repo = db::create_repo(c, "r")?;
-                let root = db::insert_changeset(c, repo, &changeset(vec![], "root"))?;
-                let tip = db::insert_changeset(c, repo, &changeset(vec![root], "tip"))?;
-                let x = db::insert_changeset(c, repo, &changeset(vec![root], "x"))?;
-                assert!(db::cas_ref(c, repo, "main", None, root)?);
+                let repo = c.create_repo("r")?;
+                let root = c.insert_changeset(repo, &changeset(vec![], "root"))?;
+                let tip = c.insert_changeset(repo, &changeset(vec![root], "tip"))?;
+                let x = c.insert_changeset(repo, &changeset(vec![root], "x"))?;
+                assert!(c.cas_ref(repo, "main", None, root)?);
                 Ok((repo, tip, x))
             })
             .unwrap();
@@ -924,7 +902,7 @@ mod tests {
             let (server, started) = (server.clone(), Arc::clone(&started));
             thread::spawn(move || {
                 server.write(|c| {
-                    let moved = db::cas_ref(c, repo, "main", Some(1), x)?;
+                    let moved = c.cas_ref(repo, "main", Some(1), x)?;
                     started.wait();
                     thread::sleep(Duration::from_millis(300));
                     Ok(moved)
@@ -939,7 +917,7 @@ mod tests {
             matches!(moved, Err(Error::FailedPrecondition(_))),
             "{moved:?}"
         );
-        let main = server.read(|c| db::get_ref(c, repo, "main")).unwrap();
+        let main = server.read(|c| c.get_ref(repo, "main")).unwrap();
         assert_eq!(main.unwrap().target, x);
     }
 
@@ -1015,7 +993,7 @@ mod tests {
             let name = format!("w{writes}");
             // Every write succeeds: a wait past the 5 s busy_timeout fails
             // here, which one transaction of the whole batch would cause.
-            server.write(|c| db::create_repo(c, &name)).unwrap();
+            server.write(|c| c.create_repo(&name)).unwrap();
             writes += 1;
             thread::sleep(Duration::from_millis(10));
         }

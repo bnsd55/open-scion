@@ -6,14 +6,14 @@
 
 use std::collections::BTreeMap;
 
-use rusqlite::Connection;
 use scion_core::{Changeset, ChangesetId, Entry, FileState, PathElem, RepoPath, Tree, TreeId};
 
-use crate::db::{self, RepoId};
+use crate::db;
 use crate::derived::{self, Kind};
 use crate::error::{ApplyError, Error, Result};
 use crate::graph::CommitGraph;
 use crate::history::PathHistory;
+use crate::meta::{MetaTx, RepoId};
 use crate::store::Store;
 
 /// Applies `changes` to `base` (`None` is the empty tree), stores the new
@@ -27,7 +27,7 @@ use crate::store::Store;
 /// [`Error::Apply`] if a change does not fit the tree. Database errors
 /// otherwise.
 pub fn apply(
-    c: &Connection,
+    c: &mut dyn MetaTx,
     base: Option<TreeId>,
     changes: &BTreeMap<RepoPath, Option<FileState>>,
 ) -> Result<TreeId> {
@@ -48,13 +48,13 @@ pub fn apply(
 /// # Errors
 ///
 /// Database errors.
-pub fn lookup(c: &Connection, root: TreeId, path: &RepoPath) -> Result<Option<Entry>> {
+pub fn lookup(c: &mut dyn MetaTx, root: TreeId, path: &RepoPath) -> Result<Option<Entry>> {
     let mut entry = Entry::Dir(root);
     for name in parts(path) {
         let Entry::Dir(id) = entry else {
             return Ok(None);
         };
-        match db::get_tree(c, id)?.entries.remove(&name) {
+        match c.get_tree(id)?.entries.remove(&name) {
             Some(next) => entry = next,
             None => return Ok(None),
         }
@@ -72,7 +72,7 @@ impl Kind for RootTree {
     type Value = TreeId;
 
     fn derive(
-        c: &Connection,
+        c: &mut dyn MetaTx,
         id: ChangesetId,
         changeset: &Changeset,
         parents: Vec<TreeId>,
@@ -119,7 +119,7 @@ pub fn fill_root_tree(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<Tr
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. [`Error::Corrupt`] if a
 /// stored changeset does not apply to its parent tree.
-pub fn derive_root_tree(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
+pub fn derive_root_tree(c: &mut dyn MetaTx, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
     derived::derive::<RootTree>(c, repo, cs)
 }
 
@@ -150,7 +150,7 @@ pub fn derive_root_tree(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result
 /// callers decide whether that is the client's fault or corruption.
 /// [`Error::NotFound`] if a parent is not in `repo`.
 pub fn store_changeset(
-    c: &Connection,
+    c: &mut dyn MetaTx,
     repo: RepoId,
     cs: &Changeset,
 ) -> Result<(ChangesetId, TreeId)> {
@@ -160,9 +160,9 @@ pub fn store_changeset(
         .map(|&parent| derive_root_tree(c, repo, parent))
         .transpose()?;
     let tree = apply(c, base, &cs.changes)?;
-    let id = db::insert_changeset(c, repo, cs)?;
+    let id = c.insert_changeset(repo, cs)?;
     for (_, blob) in db::puts(cs) {
-        db::add_repo_blob(c, repo, blob)?;
+        c.add_repo_blob(repo, blob)?;
     }
     derived::put::<RootTree>(c, id, &tree)?;
     derived::remove_old::<RootTree>(c)?;
@@ -196,9 +196,10 @@ enum Node {
 }
 
 impl Dir {
-    fn entries(&mut self, c: &Connection) -> Result<&mut BTreeMap<PathElem, Node>> {
+    fn entries(&mut self, c: &mut dyn MetaTx) -> Result<&mut BTreeMap<PathElem, Node>> {
         if let Self::Stored(id) = *self {
-            let entries = db::get_tree(c, id)?
+            let entries = c
+                .get_tree(id)?
                 .entries
                 .into_iter()
                 .map(|(name, entry)| {
@@ -218,7 +219,7 @@ impl Dir {
     }
 
     /// Deletes the file at `parts`. Returns whether this directory is now empty.
-    fn delete(&mut self, c: &Connection, path: &RepoPath, parts: &[PathElem]) -> Result<bool> {
+    fn delete(&mut self, c: &mut dyn MetaTx, path: &RepoPath, parts: &[PathElem]) -> Result<bool> {
         let entries = self.entries(c)?;
         let (name, rest) = parts.split_first().expect("a path has at least one part");
         let remove = match (entries.get_mut(name), rest.is_empty()) {
@@ -237,7 +238,7 @@ impl Dir {
 
     fn put(
         &mut self,
-        c: &Connection,
+        c: &mut dyn MetaTx,
         path: &RepoPath,
         parts: &[PathElem],
         depth: usize,
@@ -271,7 +272,7 @@ impl Dir {
     // 500 KB for 10,000 names of 12 bytes. Upgrade: directories cut into
     // chunks, a new tree format, so a write stores only the chunks it changes
     // (https://github.com/bnsd55/open-scion/issues/114).
-    fn store(self, c: &Connection) -> Result<TreeId> {
+    fn store(self, c: &mut dyn MetaTx) -> Result<TreeId> {
         match self {
             Self::Stored(id) => Ok(id),
             Self::Loaded(entries) => {
@@ -283,7 +284,7 @@ impl Dir {
                     };
                     tree.entries.insert(name, entry);
                 }
-                db::put_tree(c, &tree)
+                c.put_tree(&tree)
             }
         }
     }
@@ -292,6 +293,7 @@ impl Dir {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::SqliteTx;
     use scion_core::{BlobId, Changeset, IdentityTime};
 
     /// `(path, Some(content))` puts a regular file; `(path, None)` deletes.
@@ -316,16 +318,16 @@ mod tests {
     }
 
     /// Runs `f` in one write transaction on a fresh store.
-    fn with_db<T>(f: impl FnOnce(&Connection) -> Result<T>) -> T {
+    fn with_db<T>(f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> T {
         let dir = tempfile::tempdir().unwrap();
         Store::open(dir.path()).unwrap().write(f).unwrap()
     }
 
-    fn files(c: &Connection, root: TreeId) -> Vec<String> {
+    fn files(c: &mut dyn MetaTx, root: TreeId) -> Vec<String> {
         let mut out = Vec::new();
         let mut stack = vec![(String::new(), root)];
         while let Some((prefix, id)) = stack.pop() {
-            for (name, entry) in db::get_tree(c, id).unwrap().entries {
+            for (name, entry) in c.get_tree(id).unwrap().entries {
                 let path = format!("{prefix}{}", String::from_utf8_lossy(name.as_bytes()));
                 match entry {
                     Entry::File(_) => out.push(path),
@@ -444,7 +446,7 @@ mod tests {
         Some(files)
     }
 
-    fn snapshot(c: &Connection, root: TreeId) -> BTreeMap<String, u8> {
+    fn snapshot(c: &mut dyn MetaTx, root: TreeId) -> BTreeMap<String, u8> {
         files(c, root)
             .into_iter()
             .map(|path| {
@@ -527,14 +529,14 @@ mod tests {
             let store = Store::open(dir.path()).unwrap();
             let (repo, ids) = store
                 .write(|c| {
-                    let repo = db::create_repo(c, "r")?;
+                    let repo = c.create_repo("r")?;
                     let mut ids: Vec<ChangesetId> = Vec::new();
                     for edits in history {
                         let cs = changeset(ids.last().copied(), edits);
                         ids.push(if stored {
                             store_changeset(c, repo, &cs)?.0
                         } else {
-                            db::insert_changeset(c, repo, &cs)?
+                            c.insert_changeset(repo, &cs)?
                         });
                     }
                     Ok((repo, ids))
@@ -573,8 +575,8 @@ mod tests {
         // A changeset with no root tree row yet.
         let cs = store
             .write(|c| {
-                let repo = db::create_repo(c, "r")?;
-                db::insert_changeset(c, repo, &changeset(None, &[("a/b", Some("1"))]))
+                let repo = c.create_repo("r")?;
+                c.insert_changeset(repo, &changeset(None, &[("a/b", Some("1"))]))
             })
             .unwrap();
         let get_root_tree = || {
@@ -601,7 +603,7 @@ mod tests {
         };
         let (repo, tip) = store
             .write(|c| {
-                let repo = db::create_repo(c, "r")?;
+                let repo = c.create_repo("r")?;
                 let mut parent: Option<ChangesetId> = None;
                 for i in 0..2000 {
                     let cs = Changeset {
@@ -611,7 +613,7 @@ mod tests {
                         message: vec![],
                         changes: changes(&[(&format!("f{}", i % 7), Some(&i.to_string()))]),
                     };
-                    parent = Some(db::insert_changeset(c, repo, &cs)?);
+                    parent = Some(c.insert_changeset(repo, &cs)?);
                 }
                 Ok((repo, parent.unwrap()))
             })

@@ -26,7 +26,8 @@ use scion_proto::v1::{
     ResolveRefRequest, ResolveRefResponse,
 };
 use scion_server::import::{ImportOptions, import_git};
-use scion_server::{Store, db, service, tree};
+use scion_server::meta::MetaTx as _;
+use scion_server::{Store, service, tree};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -399,7 +400,7 @@ fn root_changeset(files: Files) -> Changeset {
 fn store_changesets(store: &Store, cases: &[Files]) -> Vec<ChangesetId> {
     store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
+            let repo = c.create_repo(REPO)?;
             cases
                 .iter()
                 .map(|files| Ok(tree::store_changeset(c, repo, &root_changeset(files))?.0))

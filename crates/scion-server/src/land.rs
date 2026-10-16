@@ -30,16 +30,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
 use hashlink::LruCache;
-use rusqlite::{Connection, OptionalExtension, params};
 use scion_core::{Changeset, ChangesetId, FileState, RepoPath};
 
 use crate::auth::Caller;
-use crate::db::{self, RepoId};
 use crate::deadline::Deadline;
 use crate::derived;
 use crate::error::{Error, Result};
 use crate::graph::{self, CommitGraph};
 use crate::history::{self, PathHistory};
+use crate::meta::{MetaTx, RefState, RepoId};
 use crate::store::Store;
 use crate::tree;
 
@@ -60,12 +59,12 @@ const MAX_ATTEMPTS: u32 = 3;
 /// with the same request key returns the stored outcome. A client retries
 /// within minutes, and a week also covers a client that is down over a long
 /// weekend. Pending lands are kept until they finish.
-const LAND_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+pub(crate) const LAND_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// Most expired lands that one new land deletes. A land adds one row, so
 /// expiry keeps up, and no land does much work after a long pause. Tests use
 /// a small batch, so that they reach the limit.
-const EXPIRE_PER_LAND: i64 = if cfg!(test) { 2 } else { 100 };
+pub(crate) const EXPIRE_PER_LAND: i64 = if cfg!(test) { 2 } else { 100 };
 
 /// How far, in generations, the ref moves in one prune cycle of a
 /// [`PathIndex`]. Tests use a short cycle, so that they prune.
@@ -103,7 +102,7 @@ pub enum LandState {
 }
 
 impl LandState {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Landed => "landed",
@@ -112,7 +111,7 @@ impl LandState {
         }
     }
 
-    fn parse(s: &str) -> Result<Self> {
+    pub(crate) fn parse(s: &str) -> Result<Self> {
         match s {
             "pending" => Ok(Self::Pending),
             "landed" => Ok(Self::Landed),
@@ -215,7 +214,7 @@ impl Lands {
     ) -> Result<LandOutcome> {
         check_name("target_ref", &req.target_ref)?;
         check_name("request_key", &req.request_key)?;
-        let (repo, recorded) = store.commit(|c| record(c, caller, req))?;
+        let (repo, recorded) = store.commit(|c| c.record_land(caller, req))?;
         if recorded.state != LandState::Pending {
             return Ok(recorded);
         }
@@ -231,7 +230,7 @@ impl Lands {
             let mut index = slot.lock().unwrap_or_else(PoisonError::into_inner);
             // A call with the same key may have finished the land while this
             // one waited for the lock.
-            let row = store.read_unflushed(|c| load(c, repo, caller, land_id))?;
+            let row = store.read_unflushed(|c| c.land_outcome(repo, caller, land_id))?;
             if row.state != LandState::Pending {
                 return Ok(row);
             }
@@ -378,8 +377,8 @@ impl Lands {
 /// started it.
 pub fn get_land(store: &Store, caller: &Caller, repo: &str, land_id: i64) -> Result<LandOutcome> {
     store.read(|c| {
-        let repo = db::repo_id(c, repo)?;
-        load(c, repo, caller, land_id)
+        let repo = c.repo_id(repo)?;
+        c.land_outcome(repo, caller, land_id)
     })
 }
 
@@ -392,164 +391,13 @@ fn check_name(what: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Inserts a land, or finds the land for the same request key. A land to a
-/// ref that does not exist is recorded as rejected at once, so only real refs
-/// ever get a lock slot in [`Lands`]. A new land also expires old ones.
-fn record(c: &Connection, caller: &Caller, req: &LandRequest) -> Result<(RepoId, LandOutcome)> {
-    let repo = db::repo_id(c, &req.repo)?;
-    db::generation(c, repo, req.changeset)?;
-    let existing = c
-        .query_row(
-            "SELECT land_id, input_cs, target_ref FROM lands
-             WHERE repo_id = ?1 AND caller = ?2 AND request_key = ?3",
-            params![repo.0, caller.0, req.request_key],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .optional()?;
-    let land_id = if let Some((land_id, input, target)) = existing {
-        if input != req.changeset.as_bytes() || target != req.target_ref {
-            return Err(Error::InvalidArgument(format!(
-                "request key {:?} was already used for a different land",
-                req.request_key
-            )));
-        }
-        land_id
-    } else {
-        let (state, detail) = if db::get_ref(c, repo, &req.target_ref)?.is_some() {
-            (LandState::Pending, String::new())
-        } else {
-            let detail = format!("ref {:?} does not exist", req.target_ref);
-            (LandState::Rejected, detail)
-        };
-        c.prepare_cached(
-            "INSERT INTO lands
-                 (repo_id, caller, request_key, target_ref, input_cs, state, detail, finished_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                 CASE ?6 WHEN 'pending' THEN NULL ELSE unixepoch() END)",
-        )?
-        .execute(params![
-            repo.0,
-            caller.0,
-            req.request_key,
-            req.target_ref,
-            req.changeset.as_bytes(),
-            state.as_str(),
-            detail
-        ])?;
-        let land_id = c.last_insert_rowid();
-        expire(c)?;
-        land_id
-    };
-    Ok((repo, load(c, repo, caller, land_id)?))
-}
-
-/// Deletes up to [`EXPIRE_PER_LAND`] lands that finished more than
-/// [`LAND_RETENTION_SECS`] ago, oldest first. A pending land has no
-/// `finished_at`, so it never expires. It runs in the transaction that
-/// records a new land, so the flush before that land's reply covers it.
-///
-/// The newest land always stays. `land_id` has no AUTOINCREMENT: a new row
-/// gets the highest ID plus one. So keeping the newest row means a land ID
-/// is never given out twice.
-fn expire(c: &Connection) -> Result<()> {
-    let deleted = c
-        .prepare_cached(
-            "DELETE FROM lands WHERE land_id IN (
-                 SELECT land_id FROM lands
-                 WHERE finished_at < unixepoch() - ?1
-                     AND land_id < (SELECT max(land_id) FROM lands)
-                 ORDER BY finished_at LIMIT ?2)",
-        )?
-        .execute(params![LAND_RETENTION_SECS, EXPIRE_PER_LAND])?;
-    if deleted > 0 {
-        tracing::debug!(deleted, "expired finished lands");
-    }
-    Ok(())
-}
-
-/// A land that `caller` started in `repo`.
-fn load(c: &Connection, repo: RepoId, caller: &Caller, land_id: i64) -> Result<LandOutcome> {
-    let (state, result, detail, paths) = c
-        .query_row(
-            "SELECT state, result_cs, detail, conflict_paths FROM lands
-             WHERE repo_id = ?1 AND land_id = ?2 AND caller = ?3",
-            params![repo.0, land_id, caller.0],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<Vec<u8>>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                ))
-            },
-        )
-        .optional()?
-        .ok_or_else(|| Error::NotFound(format!("land {land_id}")))?;
-    let result = result
-        .map(|bytes| ChangesetId::try_from(bytes.as_slice()))
-        .transpose()
-        .map_err(|e| Error::Corrupt(format!("land {land_id} result: {e}")))?;
-    Ok(LandOutcome {
-        land_id,
-        state: LandState::parse(&state)?,
-        result,
-        detail,
-        conflict_paths: decode_paths(&paths)
-            .ok_or_else(|| Error::Corrupt(format!("land {land_id} conflict paths")))?,
-    })
-}
-
-/// Moves a pending land to its final state and returns the outcome.
-fn set_state(
-    c: &Connection,
-    repo: RepoId,
-    land_id: i64,
-    state: LandState,
-    result: Option<ChangesetId>,
-    detail: String,
-    conflict_paths: Vec<RepoPath>,
-) -> Result<LandOutcome> {
-    let updated = c
-        .prepare_cached(
-            "UPDATE lands SET state = ?3, result_cs = ?4, detail = ?5, conflict_paths = ?6,
-                 finished_at = unixepoch()
-             WHERE repo_id = ?1 AND land_id = ?2 AND state = 'pending'",
-        )?
-        .execute(params![
-            repo.0,
-            land_id,
-            state.as_str(),
-            result.as_ref().map(ChangesetId::as_bytes),
-            detail,
-            encode_paths(&conflict_paths)
-        ])?;
-    if updated != 1 {
-        return Err(Error::Corrupt(format!(
-            "land {land_id} is no longer pending"
-        )));
-    }
-    Ok(LandOutcome {
-        land_id,
-        state,
-        result,
-        detail,
-        conflict_paths,
-    })
-}
-
 /// What step 4 decided.
 enum Plan {
     Reject(String),
     Conflict(String, Vec<RepoPath>),
     Land {
         rebased: Changeset,
-        head: db::RefState,
+        head: RefState,
     },
     /// The check needs the history of this head, which is not derived yet
     /// ([`check_history`]).
@@ -622,19 +470,19 @@ fn finish(
 /// Step 4: decides the land against the ref's current head.
 fn plan(
     lands: &Lands,
-    c: &Connection,
+    c: &mut dyn MetaTx,
     repo: RepoId,
     req: &LandRequest,
     index: &mut Option<PathIndex>,
 ) -> Result<Plan> {
     let target = &req.target_ref;
-    let cs = db::get_changeset(c, repo, req.changeset)?;
+    let cs = c.get_changeset(repo, req.changeset)?;
     let [base] = cs.parents[..] else {
         return Ok(Plan::Reject(
             "a land needs a changeset with exactly one parent".into(),
         ));
     };
-    let Some(head) = db::get_ref(c, repo, target)? else {
+    let Some(head) = c.get_ref(repo, target)? else {
         return Ok(Plan::Reject(format!("ref {target:?} does not exist")));
     };
     let index = match index {
@@ -680,12 +528,16 @@ fn settle(
         Plan::Derive(head) => return Ok(Finished::Derive(head)),
         Plan::Reject(detail) => {
             return store
-                .commit(|c| set_state(c, repo, land_id, LandState::Rejected, None, detail, vec![]))
+                .commit(|c| {
+                    c.set_land_state(repo, land_id, LandState::Rejected, None, detail, vec![])
+                })
                 .map(Finished::Outcome);
         }
         Plan::Conflict(detail, paths) => {
             return store
-                .commit(|c| set_state(c, repo, land_id, LandState::Conflict, None, detail, paths))
+                .commit(|c| {
+                    c.set_land_state(repo, land_id, LandState::Conflict, None, detail, paths)
+                })
                 .map(Finished::Outcome);
         }
         Plan::Land { rebased, head } => (rebased, head),
@@ -695,15 +547,14 @@ fn settle(
     tree::fill_root_tree(store, repo, head.target)?;
     let landed = store.commit(|c| {
         let (id, _) = tree::store_changeset(c, repo, &rebased)?;
-        if !db::cas_ref(c, repo, target, Some(head.version), id)? {
+        if !c.cas_ref(repo, target, Some(head.version), id)? {
             // The error rolls back the transaction, rebased changeset included.
             return Err(Error::Aborted(format!(
                 "ref {target:?} moved during the land; retry with the same request key"
             )));
         }
-        let generation = db::generation(c, repo, id)?;
-        let outcome = set_state(
-            c,
+        let generation = c.generation(repo, id)?;
+        let outcome = c.set_land_state(
             repo,
             land_id,
             LandState::Landed,
@@ -727,7 +578,9 @@ fn settle(
         Err(Error::Apply(e)) => {
             let detail = format!("does not apply to {target:?}: {e}");
             store
-                .commit(|c| set_state(c, repo, land_id, LandState::Conflict, None, detail, vec![]))
+                .commit(|c| {
+                    c.set_land_state(repo, land_id, LandState::Conflict, None, detail, vec![])
+                })
                 .map(Finished::Outcome)
         }
         Err(e) => Err(e),
@@ -777,12 +630,12 @@ impl PathIndex {
     /// An empty index at `head`, counted in `used`. Its first prune cycle
     /// starts there.
     fn new(
-        c: &Connection,
+        c: &mut dyn MetaTx,
         repo: RepoId,
         head: ChangesetId,
         used: &Arc<AtomicUsize>,
     ) -> Result<Self> {
-        Ok(Self::at(head, db::generation(c, repo, head)?, used))
+        Ok(Self::at(head, c.generation(repo, head)?, used))
     }
 
     /// An empty index at `head`, of generation `head_gen`.
@@ -809,7 +662,7 @@ impl PathIndex {
     fn advance_to(
         &mut self,
         lands: &Lands,
-        c: &Connection,
+        c: &mut dyn MetaTx,
         repo: RepoId,
         head: ChangesetId,
         deadline: &Deadline,
@@ -817,7 +670,7 @@ impl PathIndex {
         if head == self.tip {
             return Ok(());
         }
-        let tip_gen = db::generation(c, repo, self.tip)?;
+        let tip_gen = c.generation(repo, self.tip)?;
         let mut walked: Vec<(ChangesetId, i64, BTreeMap<RepoPath, Option<FileState>>)> = Vec::new();
         // The most that the walked changesets can add, to stop the walk early.
         let mut most = 0;
@@ -847,11 +700,11 @@ impl PathIndex {
                 );
                 break;
             }
-            let generation = db::generation(c, repo, id)?;
+            let generation = c.generation(repo, id)?;
             if generation <= tip_gen {
                 break;
             }
-            let cs = db::get_changeset(c, repo, id)?;
+            let cs = c.get_changeset(repo, id)?;
             most += added_bytes(&cs.changes);
             if self.bytes + most > MAX_INDEX_BYTES {
                 tracing::info!(
@@ -878,16 +731,16 @@ impl PathIndex {
     fn check(
         &mut self,
         lands: &Lands,
-        c: &Connection,
+        c: &mut dyn MetaTx,
         repo: RepoId,
         base: ChangesetId,
         changes: &BTreeMap<RepoPath, Option<FileState>>,
         deadline: &Deadline,
     ) -> Result<Checked> {
-        let base_gen = db::generation(c, repo, base)?;
+        let base_gen = c.generation(repo, base)?;
         let tip_gen = match self.chain.last_key_value() {
             Some((&generation, _)) => generation,
-            None => db::generation(c, repo, self.tip)?,
+            None => c.generation(repo, self.tip)?,
         };
         let deep = tip_gen - base_gen > MAX_DEPTH;
         let mut reached = base == self.floor || self.chain.get(&base_gen) == Some(&base);
@@ -928,7 +781,7 @@ impl PathIndex {
     fn reach(
         &mut self,
         lands: &Lands,
-        c: &Connection,
+        c: &mut dyn MetaTx,
         repo: RepoId,
         base: ChangesetId,
         base_gen: i64,
@@ -937,11 +790,11 @@ impl PathIndex {
         loop {
             deadline.check()?;
             let id = self.floor;
-            let generation = db::generation(c, repo, id)?;
+            let generation = c.generation(repo, id)?;
             if generation <= base_gen {
                 return Ok(Walk::Missed);
             }
-            let cs = db::get_changeset(c, repo, id)?;
+            let cs = c.get_changeset(repo, id)?;
             let cost = self.cost([(generation, &cs.changes)]);
             if !self.grow(lands, cost, |index| index.add(id, generation, &cs.changes)) {
                 return Ok(Walk::Stopped);
@@ -1131,7 +984,7 @@ enum Walk {
 /// path, however old the base is. [`Checked::Derive`] if `tip` has no node
 /// or no path history yet.
 fn check_history(
-    c: &Connection,
+    c: &mut dyn MetaTx,
     tip: ChangesetId,
     base: ChangesetId,
     base_gen: i64,
@@ -1179,7 +1032,7 @@ fn ancestors(path: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 /// Paths joined by NUL, which a `RepoPath` cannot contain.
-fn encode_paths(paths: &[RepoPath]) -> Vec<u8> {
+pub(crate) fn encode_paths(paths: &[RepoPath]) -> Vec<u8> {
     paths
         .iter()
         .map(RepoPath::as_bytes)
@@ -1187,7 +1040,7 @@ fn encode_paths(paths: &[RepoPath]) -> Vec<u8> {
         .join(&0)
 }
 
-fn decode_paths(bytes: &[u8]) -> Option<Vec<RepoPath>> {
+pub(crate) fn decode_paths(bytes: &[u8]) -> Option<Vec<RepoPath>> {
     if bytes.is_empty() {
         return Some(Vec::new());
     }
@@ -1199,6 +1052,8 @@ fn decode_paths(bytes: &[u8]) -> Option<Vec<RepoPath>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::db::{self, SqliteTx};
+    use rusqlite::{Connection, params};
     use std::time::Instant;
 
     use super::*;
@@ -1244,7 +1099,7 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         let (repo, root) = store
             .write(|c| {
-                let repo = db::create_repo(c, "r")?;
+                let repo = c.create_repo("r")?;
                 let root = Changeset {
                     parents: vec![],
                     author: author(),
@@ -1252,8 +1107,8 @@ mod tests {
                     message: b"root".to_vec(),
                     changes: BTreeMap::from([put("a/x", "1"), put("b/y", "2"), put("c", "3")]),
                 };
-                let id = db::insert_changeset(c, repo, &root)?;
-                assert!(db::cas_ref(c, repo, "main", None, id)?);
+                let id = c.insert_changeset(repo, &root)?;
+                assert!(c.cas_ref(repo, "main", None, id)?);
                 Ok((repo, id))
             })
             .unwrap();
@@ -1297,7 +1152,7 @@ mod tests {
 
         fn insert(&self, cs: &Changeset) -> ChangesetId {
             self.store
-                .write(|c| db::insert_changeset(c, self.repo, cs))
+                .write(|c| c.insert_changeset(self.repo, cs))
                 .unwrap()
         }
 
@@ -1306,7 +1161,7 @@ mod tests {
             let head = self.main();
             let moved = self
                 .store
-                .write(|c| db::cas_ref(c, self.repo, "main", Some(head.version), to))
+                .write(|c| c.cas_ref(self.repo, "main", Some(head.version), to))
                 .unwrap();
             assert!(moved);
         }
@@ -1347,9 +1202,9 @@ mod tests {
             assert_eq!(aged, 1);
         }
 
-        fn main(&self) -> db::RefState {
+        fn main(&self) -> RefState {
             self.store
-                .read(|c| db::get_ref(c, self.repo, "main"))
+                .read(|c| c.get_ref(self.repo, "main"))
                 .unwrap()
                 .unwrap()
         }
@@ -1362,9 +1217,7 @@ mod tests {
         }
 
         fn generation(&self, cs: ChangesetId) -> i64 {
-            self.store
-                .read(|c| db::generation(c, self.repo, cs))
-                .unwrap()
+            self.store.read(|c| c.generation(self.repo, cs)).unwrap()
         }
 
         /// Lands `n` changesets in a row, each on the head. The i-th one,
@@ -1478,7 +1331,7 @@ mod tests {
         assert_eq!(f.main().target, tip);
         assert!(f.file(tip, "a/x").is_some() && f.file(tip, "b/new").is_some());
         assert!(f.file(tip, "c").is_none());
-        let rebased = f.store.read(|c| db::get_changeset(c, f.repo, tip)).unwrap();
+        let rebased = f.store.read(|c| c.get_changeset(f.repo, tip)).unwrap();
         assert_eq!(rebased.parents, vec![one]);
     }
 
@@ -1539,7 +1392,7 @@ mod tests {
             let req = req(cs, "k");
 
             // The first attempt runs the steps of `Lands::land` by hand.
-            let (repo, recorded) = f.store.write(|c| record(c, &caller(), &req)).unwrap();
+            let (repo, recorded) = f.store.write(|c| c.record_land(&caller(), &req)).unwrap();
             assert_eq!(recorded.state, LandState::Pending);
             if crash != Crash::AfterRecord {
                 let mut index = None;
@@ -1555,7 +1408,7 @@ mod tests {
                     let err = settle(&f.lands, &f.store, repo, land_id, "main", plan, &mut index)
                         .unwrap_err();
                     assert!(matches!(err, Error::Aborted(_)), "{crash:?}: {err}");
-                    let kept = f.store.read(|c| db::has_changeset(c, repo, rebased));
+                    let kept = f.store.read(|c| c.has_changeset(repo, rebased));
                     assert!(!kept.unwrap(), "the transaction rolled back");
                 }
             }
@@ -1571,7 +1424,7 @@ mod tests {
             let after = f.main();
             assert_eq!(after.version, before.version + 1, "{crash:?}: moved once");
             assert_eq!(Some(after.target), out.result);
-            let landed = f.store.read(|c| db::get_changeset(c, repo, after.target));
+            let landed = f.store.read(|c| c.get_changeset(repo, after.target));
             assert_eq!(landed.unwrap().parents, vec![before.target], "{crash:?}");
             assert_eq!(fresh.land(&f.store, &caller(), &req).unwrap(), out);
             assert_eq!(f.landed_count(), 1, "{crash:?}");
@@ -1822,7 +1675,7 @@ mod tests {
                         changes.push(put("d/e/f", "x"));
                     }
                     let cs = changeset(vec![history[i - 1]], &changes);
-                    history.push(db::insert_changeset(c, f.repo, &cs)?);
+                    history.push(c.insert_changeset(f.repo, &cs)?);
                 }
                 Ok(())
             })
@@ -1958,7 +1811,7 @@ mod tests {
             let store = Store::open(dir.path()).unwrap();
             let (repo, ids) = store
                 .write(|c| {
-                    let repo = db::create_repo(c, "r")?;
+                    let repo = c.create_repo("r")?;
                     Ok((repo, testing::insert_history(c, repo, &parents, &edits)?))
                 })
                 .unwrap();
@@ -1987,14 +1840,14 @@ mod tests {
                 .unwrap();
             for &tip in &ids {
                 store.read(|c| {
-                    let tip_gen = db::generation(c, repo, tip)?;
+                    let tip_gen = c.generation(repo, tip)?;
                     // The first-parent history of the tip, newest first.
                     let mut chain: Vec<(ChangesetId, i64, Changeset)> = Vec::new();
                     let mut next = Some(tip);
                     while let Some(id) = next {
-                        let cs = db::get_changeset(c, repo, id)?;
+                        let cs = c.get_changeset(repo, id)?;
                         next = cs.parents.first().copied();
-                        chain.push((id, db::generation(c, repo, id)?, cs));
+                        chain.push((id, c.generation(repo, id)?, cs));
                     }
                     // One index for all bases, as a ref's index serves its lands.
                     let mut index = PathIndex::new(c, repo, tip, &tight.used)?;
@@ -2020,7 +1873,7 @@ mod tests {
                     }
                     let off = ids.iter().filter(|&&id| chain.iter().all(|(on, ..)| *on != id));
                     for &base in off {
-                        let base_gen = db::generation(c, repo, base)?;
+                        let base_gen = c.generation(repo, base)?;
                         let in_history = check_history(c, tip, base, base_gen, &land, &deadline)?;
                         assert_eq!(in_history, Checked::NotOnHistory);
                         let checked = index.check(&tight, c, repo, base, &land, &deadline)?;
@@ -2073,9 +1926,7 @@ mod tests {
         assert!(8 * one < MAX_INDEX_BYTES && 10 * one > MAX_INDEX_BYTES);
         let names: Vec<String> = (0..12).map(|i| format!("r{i}")).collect();
         for name in &names {
-            let moved = f
-                .store
-                .write(|c| db::cas_ref(c, f.repo, name, None, f.root));
+            let moved = f.store.write(|c| c.cas_ref(f.repo, name, None, f.root));
             assert!(moved.unwrap());
         }
         let land_wide = |name: &str| {
@@ -2104,7 +1955,7 @@ mod tests {
 
         // A land that rewrites every path of the last ref's index adds only
         // a chain entry. It takes only that, so it drops nothing.
-        let tip = f.store.read(|c| db::get_ref(c, f.repo, last)).unwrap();
+        let tip = f.store.read(|c| c.get_ref(f.repo, last)).unwrap();
         let rewrite: Vec<Change> = (0..WIDE)
             .map(|i| put(&format!("{last}/f{i}"), "y"))
             .collect();
@@ -2147,7 +1998,7 @@ mod tests {
         let f = fixture();
         assert!(
             f.store
-                .write(|c| db::cas_ref(c, f.repo, "big", None, f.root))
+                .write(|c| c.cas_ref(f.repo, "big", None, f.root))
                 .unwrap()
         );
         // main's index has its tip at L.
@@ -2185,7 +2036,7 @@ mod tests {
         for name in &refs {
             assert!(
                 f.store
-                    .write(|c| db::cas_ref(c, f.repo, name, None, f.root))
+                    .write(|c| c.cas_ref(f.repo, name, None, f.root))
                     .unwrap()
             );
         }
@@ -2196,7 +2047,7 @@ mod tests {
                 let f = Arc::clone(&f);
                 std::thread::spawn(move || {
                     for i in 0..30 {
-                        let head = f.store.read(|c| db::get_ref(c, f.repo, &name));
+                        let head = f.store.read(|c| c.get_ref(f.repo, &name));
                         let head = head.unwrap().unwrap().target;
                         let dir = format!("{name}/w{i}");
                         let cs = f.commit(head, &wide(&dir, 15 + (i % 4) * 10));
@@ -2229,7 +2080,7 @@ mod tests {
         // its room, so it stays.
         assert!(
             f.store
-                .write(|c| db::cas_ref(c, f.repo, "other", None, f.root))
+                .write(|c| c.cas_ref(f.repo, "other", None, f.root))
                 .unwrap()
         );
         f.land_on("other", f.commit(f.root, &[put("o", "x")]), "other");
@@ -2355,7 +2206,7 @@ mod tests {
                     } else {
                         put("side/f", &n.to_string())
                     };
-                    parent = db::insert_changeset(c, f.repo, &changeset(vec![parent], &[change]))?;
+                    parent = c.insert_changeset(f.repo, &changeset(vec![parent], &[change]))?;
                     chain.push(parent);
                 }
                 Ok(chain)
@@ -2393,7 +2244,7 @@ mod tests {
                 if state == LandState::Landed {
                     let tip = out.result.unwrap();
                     assert_eq!(m.f.main().target, tip, "{case}");
-                    let rebased = m.f.store.read(|c| db::get_changeset(c, m.f.repo, tip));
+                    let rebased = m.f.store.read(|c| c.get_changeset(m.f.repo, tip));
                     assert_eq!(rebased.unwrap().parents, vec![m.head], "{case}");
                     assert_eq!(m.f.file(tip, path), change.1.map(Entry::File), "{case}");
                 }
@@ -2496,7 +2347,7 @@ mod tests {
         let cs = f.commit(f.root, &[put("b/y", "pending")]);
         let (_, pending) = f
             .store
-            .write(|c| record(c, &caller(), &req(cs, "pending")))
+            .write(|c| c.record_land(&caller(), &req(cs, "pending")))
             .unwrap();
         assert_eq!(pending.state, Pending);
         assert!(f.gone(&landed) && f.gone(&conflict));
@@ -2518,7 +2369,7 @@ mod tests {
         let first = f.land(f.commit(f.root, &[put("f1", "x")]), "1");
         f.age(first.land_id, LAND_RETENTION_SECS + 1);
         // The only land expired, but it is the newest, so it stays.
-        f.store.write(expire).unwrap();
+        f.store.write(|c| c.expire_lands()).unwrap();
         assert_eq!(f.get(first.land_id).unwrap(), first);
         // The next land gets a higher ID, and then the first one expires.
         let second = f.land(f.commit(f.root, &[put("f2", "x")]), "2");
@@ -2579,12 +2430,14 @@ mod tests {
             let v1 = include_str!("../migrations/0001_init.sql");
             c.execute_batch(&format!("BEGIN; {v1} PRAGMA user_version = 1; COMMIT;"))
                 .unwrap();
-            let repo = db::create_repo(&c, "r").unwrap();
-            let insert = |cs: &Changeset| db::insert_changeset(&c, repo, cs).unwrap();
-            let root = insert(&changeset(vec![], &[put("a/x", "1")]));
-            let child = insert(&changeset(vec![root], &[put("a/x", "2")]));
-            let pending_cs = insert(&changeset(vec![root], &[put("b", "3")]));
-            assert!(db::cas_ref(&c, repo, "main", None, child).unwrap());
+            let mut tx = SqliteTx(&c);
+            let repo = tx.create_repo("r").unwrap();
+            let insert =
+                |tx: &mut SqliteTx<'_>, cs: &Changeset| tx.insert_changeset(repo, cs).unwrap();
+            let root = insert(&mut tx, &changeset(vec![], &[put("a/x", "1")]));
+            let child = insert(&mut tx, &changeset(vec![root], &[put("a/x", "2")]));
+            let pending_cs = insert(&mut tx, &changeset(vec![root], &[put("b", "3")]));
+            assert!(tx.cas_ref(repo, "main", None, child).unwrap());
             c.execute(
                 "INSERT INTO lands
                      (repo_id, caller, request_key, target_ref, input_cs, state, result_cs,

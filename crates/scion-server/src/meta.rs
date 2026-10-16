@@ -3,25 +3,42 @@
 //!
 //! [`Store`] is the SQLite implementation: one data directory, one write
 //! connection, readers around it, and the group flush that makes a reply
-//! wait for durability. Its queries live in `db.rs`, and [`SqliteTx`] hands
-//! them out as [`MetaTx`] methods. A backend that many servers share
-//! implements the same two traits with its own transaction type, and the
-//! callers do not change.
+//! wait for durability. Its queries are [`MetaTx`] methods, split by table
+//! owner: the shared tables in `db.rs`, the tables of lands in `land.rs`,
+//! and so on. A backend that many servers share implements the same traits
+//! with its own transaction type, and the callers do not change.
 //!
-//! The five methods of [`Meta`] keep today's semantics, because the
-//! durability rules of protocol section 4 must hold in every backend. On a
-//! backend whose commits are durable on return, `write` is `commit` plus
-//! nothing, `flush` does nothing, and `read` never waits.
+//! The seven methods of [`Meta`] keep today's semantics, because the
+//! durability rules of protocol section 4 must hold in every backend:
+//!
+//! - `read` is a strong read: it returns only after what it saw is durable.
+//! - `read_unflushed` reads on the connection that writes, so it sees the
+//!   caller's own writes before they are durable.
+//! - `commit` runs one write transaction and returns before it is durable;
+//!   the caller calls `flush` before it replies with anything the commit
+//!   wrote.
+//! - `write` is `commit` plus `flush`.
+//! - `flush` returns once every earlier commit is durable.
+//! - `read_counted` and `wait_durable` are the counted form of `read`, for
+//!   a caller that reads first and waits before it replies.
+//!
+//! On a backend whose commit is durable on return, `write` is `commit`,
+//! `flush` does nothing, and a read need not wait.
 
-use rusqlite::Connection;
+use scion_core::RepoPath;
 use scion_core::{BlobId, Changeset, ChangesetId, Tree, TreeId};
 
-use crate::db::{self, RefState, RepoId};
+use gix::ObjectId;
+
+use crate::auth::Caller;
+use crate::db::SqliteTx;
 use crate::error::Result;
+use crate::history::NodeId;
+use crate::land::{LandOutcome, LandRequest, LandState};
 use crate::store::Store;
 
-/// The metadata storage of a server. One implementation per backend;
-/// callers hold a `Store` today and any `M: Meta` later.
+/// The metadata storage of a server. One implementation per backend; a
+/// caller holds a concrete one and calls these methods.
 pub trait Meta: Send + Sync + 'static {
     /// One set of queries, alive for one read or one transaction.
     type Tx<'a>: MetaTx
@@ -29,32 +46,47 @@ pub trait Meta: Send + Sync + 'static {
         Self: 'a;
 
     /// A strong read: `f` sees every commit that finished before it
-    /// started, and the call returns only after what `f` saw is durable.
+    /// started, and the call returns only after what it saw is durable.
     ///
     /// # Errors
     ///
-    /// What `f` returns, or an error from [`Meta::flush`].
+    /// What `f` returns, or a flush error.
     fn read<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T>;
 
-    /// A read on the connection that writes, so it sees this flow's own
+    /// Like [`Meta::read`], but returns before what `f` saw is durable,
+    /// with a count that covers every commit `f` could see. The caller
+    /// passes that count to [`Meta::wait_durable`] before it replies.
+    ///
+    /// # Errors
+    ///
+    /// What `f` returns.
+    fn read_counted<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> (Result<T>, u64);
+
+    /// Returns once every commit that a read with count `seen` could see is
+    /// durable.
+    ///
+    /// # Errors
+    ///
+    /// A flush error.
+    fn wait_durable(&self, seen: u64) -> Result<()>;
+
+    /// A read on the connection that writes, so it sees the caller's own
     /// commits before they are durable. The caller flushes before it
     /// replies with anything those reads saw.
     ///
     /// # Errors
     ///
-    /// What `f` returns.
+    /// What `f` returns, or a database error from taking the connection.
     fn read_unflushed<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T>;
 
-    /// Runs `f` in one write transaction. It commits when `f` returns `Ok`,
-    /// and rolls back otherwise. Returns before the commit is durable: the
-    /// caller calls [`Meta::flush`] before it replies with anything the
-    /// commit wrote. A backend with retryable errors may run `f` again
-    /// after a lost race; `f` must not change anything outside the
-    /// transaction.
+    /// Runs `f` in one write transaction. It commits when `f` returns `Ok`
+    /// and rolls back otherwise, and returns before the commit is durable.
+    /// A backend with retryable errors may run `f` again; it must not
+    /// change anything outside the transaction.
     ///
     /// # Errors
     ///
-    /// What `f` returns, or a backend error from begin or commit.
+    /// What `f` returns, or a database error from begin or commit.
     fn commit<T>(&self, f: impl FnMut(&mut Self::Tx<'_>) -> Result<T>) -> Result<T>;
 
     /// [`Meta::commit`], and then [`Meta::flush`]: durable on return.
@@ -69,17 +101,14 @@ pub trait Meta: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// An error from the backend. The commits stay; a retry sees them.
+    /// A flush error.
     fn flush(&self) -> Result<()>;
 }
 
-/// The queries on the shared tables: repos, changesets, the blobs of each
-/// repo, refs, trees, and derived data. The tables of one module (lands,
-/// git import) keep their queries on the same trait, next to these.
-///
-/// Every query fails with a database error, or with the `NotFound` or
-/// `Corrupt` error that its db.rs twin says; the docs do not repeat that
-/// per method.
+/// The queries on the metadata tables. Every query fails with a database
+/// error, or with the `NotFound` or `Corrupt` error that its doc says; the
+/// docs do not repeat that per method. A query may be called in a read or
+/// in a write transaction; the ones that write are called in transactions.
 #[allow(clippy::missing_errors_doc)]
 pub trait MetaTx {
     /// Creates a repository, or returns the existing one with that name.
@@ -100,8 +129,7 @@ pub trait MetaTx {
     /// The generation of a changeset that `repo` may see.
     fn generation(&mut self, repo: RepoId, id: ChangesetId) -> Result<i64>;
 
-    /// The generation of a changeset, in any repo. For derived data: the
-    /// caller reaches `id` from a changeset whose repo it checked.
+    /// The generation of a changeset, in any repo. For derived data.
     fn generation_of(&mut self, id: ChangesetId) -> Result<i64>;
 
     /// The first parent of a changeset, if it has one.
@@ -110,7 +138,8 @@ pub trait MetaTx {
     /// Every parent of `id`, in order, with its generation.
     fn parents(&mut self, id: ChangesetId, id_gen: i64) -> Result<Vec<(ChangesetId, i64)>>;
 
-    /// Whether `ancestor` is `descendant` or reachable from it.
+    /// Whether `ancestor` is `descendant` or reachable from it, within a
+    /// bounded walk.
     fn is_ancestor(
         &mut self,
         repo: RepoId,
@@ -162,8 +191,60 @@ pub trait MetaTx {
     /// Adds a blob to the blobs that `repo` may name. `Ok(true)` if new.
     fn add_repo_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool>;
 
+    /// Inserts a land, or finds the land for the same request key. Returns
+    /// the repo and the land's outcome, pending or final.
+    fn record_land(&mut self, caller: &Caller, req: &LandRequest) -> Result<(RepoId, LandOutcome)>;
+
+    /// Deletes up to a bound of lands that finished before the retention
+    /// window, oldest first, keeping the newest.
+    fn expire_lands(&mut self) -> Result<()>;
+
+    /// Reads a land that `caller` started in `repo`.
+    fn land_outcome(&mut self, repo: RepoId, caller: &Caller, land_id: i64) -> Result<LandOutcome>;
+
+    /// Moves a pending land to its final state, and returns the outcome.
+    fn set_land_state(
+        &mut self,
+        repo: RepoId,
+        land_id: i64,
+        state: LandState,
+        result: Option<ChangesetId>,
+        detail: String,
+        conflict_paths: Vec<RepoPath>,
+    ) -> Result<LandOutcome>;
+
+    /// Records that a git commit became the changeset. Safe to repeat.
+    fn put_git_import(&mut self, repo: RepoId, oid: ObjectId, cs: ChangesetId) -> Result<()>;
+
+    /// Every git commit already imported into `repo`.
+    fn imported_commits(
+        &mut self,
+        repo: RepoId,
+    ) -> Result<std::collections::HashMap<ObjectId, ChangesetId>>;
+
+    /// Stores a node of a path history under its content address. Safe to
+    /// repeat.
+    fn put_history_node(&mut self, id: NodeId, body: Vec<u8>) -> Result<NodeId>;
+
+    /// Reads a history node's stored bytes, and returns them with the
+    /// length of their stored form.
+    fn get_history_node(&mut self, id: NodeId) -> Result<(Vec<u8>, usize)>;
+
     /// Whether `repo` may name `blob`.
     fn repo_has_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool>;
+}
+
+/// The row ID of a repository, private to the backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RepoId(pub i64);
+
+/// Where a ref points, and the version to compare-and-swap against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RefState {
+    /// The changeset the ref points to.
+    pub target: ChangesetId,
+    /// Bumped on every move.
+    pub version: i64,
 }
 
 impl Meta for Store {
@@ -174,6 +255,14 @@ impl Meta for Store {
 
     fn read<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
         Store::read(self, |c| f(&mut SqliteTx(c)))
+    }
+
+    fn read_counted<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> (Result<T>, u64) {
+        Store::read_counted(self, |c| f(&mut SqliteTx(c)))
+    }
+
+    fn wait_durable(&self, seen: u64) -> Result<()> {
+        Store::wait_durable(self, seen)
     }
 
     fn read_unflushed<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
@@ -190,118 +279,5 @@ impl Meta for Store {
 
     fn flush(&self) -> Result<()> {
         Store::flush(self)
-    }
-}
-
-/// The transaction handle of the SQLite [`Store`]: a reader's connection,
-/// or the write connection inside one transaction.
-pub struct SqliteTx<'a>(&'a Connection);
-
-impl MetaTx for SqliteTx<'_> {
-    fn create_repo(&mut self, name: &str) -> Result<RepoId> {
-        db::create_repo(self.0, name)
-    }
-
-    fn repo_id(&mut self, name: &str) -> Result<RepoId> {
-        db::repo_id(self.0, name)
-    }
-
-    fn insert_changeset(&mut self, repo: RepoId, cs: &Changeset) -> Result<ChangesetId> {
-        db::insert_changeset(self.0, repo, cs)
-    }
-
-    fn get_changeset(&mut self, repo: RepoId, id: ChangesetId) -> Result<Changeset> {
-        db::get_changeset(self.0, repo, id)
-    }
-
-    fn has_changeset(&mut self, repo: RepoId, id: ChangesetId) -> Result<bool> {
-        db::has_changeset(self.0, repo, id)
-    }
-
-    fn generation(&mut self, repo: RepoId, id: ChangesetId) -> Result<i64> {
-        db::generation(self.0, repo, id)
-    }
-
-    fn generation_of(&mut self, id: ChangesetId) -> Result<i64> {
-        db::generation_of(self.0, id)
-    }
-
-    fn first_parent(&mut self, id: ChangesetId) -> Result<Option<ChangesetId>> {
-        db::first_parent(self.0, id)
-    }
-
-    fn parents(&mut self, id: ChangesetId, id_gen: i64) -> Result<Vec<(ChangesetId, i64)>> {
-        db::parents(self.0, id, id_gen)
-    }
-
-    fn is_ancestor(
-        &mut self,
-        repo: RepoId,
-        ancestor: ChangesetId,
-        descendant: ChangesetId,
-        max_visits: usize,
-    ) -> Result<bool> {
-        db::is_ancestor(self.0, repo, ancestor, descendant, max_visits)
-    }
-
-    fn get_ref(&mut self, repo: RepoId, name: &str) -> Result<Option<RefState>> {
-        db::get_ref(self.0, repo, name)
-    }
-
-    fn cas_ref(
-        &mut self,
-        repo: RepoId,
-        name: &str,
-        expected: Option<i64>,
-        target: ChangesetId,
-    ) -> Result<bool> {
-        db::cas_ref(self.0, repo, name, expected, target)
-    }
-
-    fn get_derived(
-        &mut self,
-        kind: &str,
-        version: u32,
-        cs: ChangesetId,
-    ) -> Result<Option<Vec<u8>>> {
-        db::get_derived(self.0, kind, version, cs)
-    }
-
-    fn put_derived(
-        &mut self,
-        kind: &str,
-        version: u32,
-        cs: ChangesetId,
-        value: &[u8],
-    ) -> Result<()> {
-        db::put_derived(self.0, kind, version, cs, value)
-    }
-
-    fn delete_derived_below(&mut self, kind: &str, version: u32, limit: usize) -> Result<usize> {
-        db::delete_derived_below(self.0, kind, version, limit)
-    }
-
-    fn put_tree(&mut self, tree: &Tree) -> Result<TreeId> {
-        db::put_tree(self.0, tree)
-    }
-
-    fn get_tree(&mut self, id: TreeId) -> Result<Tree> {
-        db::get_tree(self.0, id)
-    }
-
-    fn get_tree_body(&mut self, id: TreeId) -> Result<Vec<u8>> {
-        db::get_tree_body(self.0, id)
-    }
-
-    fn tree_size(&mut self, id: TreeId) -> Result<usize> {
-        db::tree_size(self.0, id)
-    }
-
-    fn add_repo_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool> {
-        db::add_repo_blob(self.0, repo, blob)
-    }
-
-    fn repo_has_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool> {
-        db::repo_has_blob(self.0, repo, blob)
     }
 }

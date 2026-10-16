@@ -13,7 +13,8 @@ use scion_proto::v1::{
     ResolveRefRequest,
 };
 use scion_server::access::Access;
-use scion_server::{Store, db, service};
+use scion_server::meta::MetaTx as _;
+use scion_server::{Store, service};
 use tokio::net::TcpListener;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::service::interceptor::{InterceptedService, Interceptor};
@@ -93,12 +94,12 @@ fn store() -> (tempfile::TempDir, Store, ChangesetId, BlobId) {
     let blob = store.blobs().put(b"# hello\n").unwrap();
     let root = store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
+            let repo = c.create_repo(REPO)?;
             let root =
-                db::insert_changeset(c, repo, &changeset(vec![], "README", Some(regular(blob))))?;
-            db::cas_ref(c, repo, "main", None, root)?;
+                c.insert_changeset(repo, &changeset(vec![], "README", Some(regular(blob))))?;
+            c.cas_ref(repo, "main", None, root)?;
             // As if uploaded to `main` with `PutBlob`.
-            db::add_repo_blob(c, repo, blob)?;
+            c.add_repo_blob(repo, blob)?;
             Ok(root)
         })
         .unwrap();
@@ -111,8 +112,8 @@ fn put(store: &Store, content: &[u8]) -> BlobId {
     let blob = store.blobs().put(content).unwrap();
     store
         .write(|c| {
-            let repo = db::repo_id(c, REPO)?;
-            db::add_repo_blob(c, repo, blob)?;
+            let repo = c.repo_id(REPO)?;
+            c.add_repo_blob(repo, blob)?;
             Ok(())
         })
         .unwrap();

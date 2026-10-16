@@ -25,9 +25,10 @@ use tonic::{Request, Response, Status};
 
 use crate::access::Access;
 use crate::error::{Error, Result};
+use crate::meta::MetaTx as _;
+use crate::read;
 use crate::service::{Worker, caller, check_reader, parse_id, resolve_ref};
 use crate::store::{self, Store};
-use crate::{db, read};
 
 // The store keeps exactly the objects that the API promises to send.
 const _: () = assert!(store::MAX_OBJECT_BYTES == scion_proto::MAX_OBJECT_BYTES);
@@ -109,7 +110,7 @@ fn plan(store: &Store, key: Key, zstd: bool) -> Result<Plan> {
     };
     let id = match key {
         Key::Tree(id) => {
-            let size = store.read(|c| db::tree_size(c, id))?;
+            let size = store.read(|c| c.tree_size(id))?;
             if size > store::MAX_OBJECT_BYTES {
                 return corrupt("larger than the object limit");
             }
@@ -148,7 +149,7 @@ fn read_object(store: &Store, key: Key, plan: Plan) -> Result<Outgoing> {
     // checked here and by every cache tier.
     let (kind, id, body) = match key {
         Key::Tree(id) => {
-            let data = store.read(|c| db::get_tree_body(c, id))?;
+            let data = store.read(|c| c.get_tree_body(id))?;
             (
                 ObjectKind::Tree,
                 *id.as_bytes(),
@@ -325,7 +326,7 @@ impl Objects for ObjectsService {
         // Encodings that this server does not know are ignored.
         let zstd = accept.contains(&Encoding::Zstd.into());
         self.worker
-            .run(move |store| store.read(|c| db::repo_id(c, &repo)))
+            .run(move |store| store.read(|c| c.repo_id(&repo)))
             .await?;
         let in_flight = Arc::clone(&self.in_flight);
         let stream = start_reply(

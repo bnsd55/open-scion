@@ -32,13 +32,12 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use rusqlite::Connection;
 use scion_core::{Changeset, ChangesetId};
 
-use crate::db::{self, RepoId};
 use crate::deadline::Deadline;
 use crate::derived::{self, Kind};
 use crate::error::{Error, Result};
+use crate::meta::{MetaTx, RepoId};
 use crate::store::Store;
 
 /// A changeset that a [`Node`] points to, with what a query needs to decide
@@ -85,7 +84,7 @@ impl Kind for CommitGraph {
     type Value = Node;
 
     fn derive(
-        c: &Connection,
+        c: &mut dyn MetaTx,
         id: ChangesetId,
         changeset: &Changeset,
         parents: Vec<Node>,
@@ -202,7 +201,7 @@ pub fn is_ancestor(
     deadline: &Deadline,
 ) -> Result<bool> {
     let from = At::get(store, repo, descendant)?;
-    let floor = store.read(|c| db::generation(c, repo, ancestor))?;
+    let floor = store.read(|c| c.generation(repo, ancestor))?;
     let mut search = Search::new(from, ancestor, floor);
     Ok(in_steps(store, deadline, STEPS, |index| search.next(index))?.0)
 }
@@ -242,7 +241,7 @@ pub fn merge_bases(
 ///
 /// [`Error::DeadlineExceeded`] once `deadline` has passed.
 pub(crate) fn on_first_parents(
-    c: &Connection,
+    c: &mut dyn MetaTx,
     tip: ChangesetId,
     base: ChangesetId,
     base_gen: i64,
@@ -539,13 +538,13 @@ impl At {
 
 /// Reads nodes and parents for one step of a query, until its deadline.
 struct Index<'a> {
-    c: &'a Connection,
+    c: &'a mut dyn MetaTx,
     deadline: &'a Deadline,
     reads: usize,
 }
 
 impl<'a> Index<'a> {
-    fn new(c: &'a Connection, deadline: &'a Deadline) -> Self {
+    fn new(c: &'a mut dyn MetaTx, deadline: &'a Deadline) -> Self {
         Self {
             c,
             deadline,
@@ -571,7 +570,7 @@ impl<'a> Index<'a> {
     /// Every parent of a merge, in order, with its generation.
     fn parents(&mut self, merge: Link) -> Result<Vec<(ChangesetId, i64)>> {
         self.count()?;
-        db::parents(self.c, merge.id, merge.generation)
+        self.c.parents(merge.id, merge.generation)
     }
 
     /// Walks down the first-parent history of `from` to the oldest changeset
@@ -622,7 +621,7 @@ impl<'a> Index<'a> {
 
 /// The stored node of a changeset that a node reaches. It has one: each
 /// ancestor of a changeset with a node has one.
-fn node(c: &Connection, id: ChangesetId) -> Result<Node> {
+fn node(c: &mut dyn MetaTx, id: ChangesetId) -> Result<Node> {
     derived::load::<CommitGraph>(c, id)?
         .ok_or_else(|| Error::Corrupt(format!("commit graph: no node for {id}")))
 }
@@ -655,7 +654,7 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         let (repo, ids) = store
             .write(|c| {
-                let repo = db::create_repo(c, "r")?;
+                let repo = c.create_repo("r")?;
                 Ok((repo, testing::insert_graph(c, repo, parents)?))
             })
             .unwrap();
@@ -670,7 +669,8 @@ mod tests {
         store
             .write(|c| {
                 for &id in &ids {
-                    derived::on_write::<CommitGraph>(c, id, &db::get_changeset(c, repo, id)?)?;
+                    let cs = c.get_changeset(repo, id)?;
+                    derived::on_write::<CommitGraph>(c, id, &cs)?;
                 }
                 Ok(())
             })
@@ -758,7 +758,7 @@ mod tests {
             let index_of = |id: ChangesetId| ids.iter().position(|&i| i == id).unwrap();
             for (i, node) in nodes.iter().enumerate() {
                 let history = &histories[i];
-                let generation = store.read(|c| db::generation(c, repo, ids[i])).unwrap();
+                let generation = store.read(|c| c.generation(repo, ids[i])).unwrap();
                 proptest::prop_assert_eq!(node.generation, generation);
                 proptest::prop_assert_eq!(usize::try_from(node.depth).unwrap(), history.len() - 1);
                 proptest::prop_assert_eq!(index_of(node.parent.id), history[1.min(history.len() - 1)]);
@@ -774,18 +774,22 @@ mod tests {
             let searched = store
                 .read(|c| {
                     let deadline = later();
-                    let mut index = Index::new(c, &deadline);
+                    let mut walked = Vec::new();
+                    for (x, y) in (0..ids.len()).flat_map(|x| (0..ids.len()).map(move |y| (x, y))) {
+                        let (a, b) = (ids[x], ids[y]);
+                        walked.push(c.is_ancestor(repo, a, b, usize::MAX)?);
+                    }
+                    let mut index = Index::new(&mut *c, &deadline);
                     let mut out = Vec::new();
                     for (x, y) in (0..ids.len()).flat_map(|x| (0..ids.len()).map(move |y| (x, y))) {
                         let (a, b) = (ids[x], ids[y]);
-                        let walked = db::is_ancestor(c, repo, a, b, usize::MAX)?;
                         let mut search = Search::new(At { id: b, node: nodes[y] }, a, nodes[x].generation);
                         let found = loop {
                             if let Some(found) = search.next(&mut index)? {
                                 break found;
                             }
                         };
-                        out.push((x, y, walked, found));
+                        out.push((x, y, walked[x * ids.len() + y], found));
                     }
                     Ok(out)
                 })
@@ -855,8 +859,8 @@ mod tests {
     fn deep_chain(store: &Store, n: usize) -> (RepoId, Vec<ChangesetId>, ChangesetId) {
         store
             .write(|c| {
-                let repo = db::create_repo(c, "r")?;
-                let add = |parent: Option<ChangesetId>, message: String| {
+                let repo = c.create_repo("r")?;
+                let mut add = |parent: Option<ChangesetId>, message: String| {
                     let cs = Changeset {
                         parents: parent.into_iter().collect(),
                         author: IdentityTime {
@@ -876,7 +880,7 @@ mod tests {
                         )]
                         .into(),
                     };
-                    let id = db::insert_changeset(c, repo, &cs)?;
+                    let id = c.insert_changeset(repo, &cs)?;
                     derived::on_write::<CommitGraph>(c, id, &cs)?;
                     Ok::<_, Error>(id)
                 };
@@ -907,7 +911,7 @@ mod tests {
 
         // Each query counts its reads of nodes and parents.
         let ancestry = |ancestor: ChangesetId, descendant: ChangesetId| {
-            let floor = store.read(|c| db::generation(c, repo, ancestor)).unwrap();
+            let floor = store.read(|c| c.generation(repo, ancestor)).unwrap();
             let mut search =
                 Search::new(At::get(&store, repo, descendant).unwrap(), ancestor, floor);
             let (found, cost) =
@@ -922,7 +926,7 @@ mod tests {
             store
                 .read(|c| {
                     let deadline = later();
-                    let mut index = Index::new(c, &deadline);
+                    let mut index = Index::new(&mut *c, &deadline);
                     Ok((meeting(&mut index, a, b)?, index.reads))
                 })
                 .unwrap()
@@ -970,7 +974,7 @@ mod tests {
         // A write stores the node of a changeset whose parents have one.
         let cs = Changeset {
             parents: vec![ids[4], ids[1]],
-            ..store.read(|c| db::get_changeset(c, repo, ids[4])).unwrap()
+            ..store.read(|c| c.get_changeset(repo, ids[4])).unwrap()
         };
         let (merge, _) = store
             .write(|c| crate::tree::store_changeset(c, repo, &cs))
@@ -1067,7 +1071,7 @@ mod tests {
         assert!(matches!(late, Err(Error::DeadlineExceeded(_))), "{late:?}");
 
         // A call that goes in the middle of a walk stops it at its next read.
-        let floor = store.read(|c| db::generation(c, repo, side)).unwrap();
+        let floor = store.read(|c| c.generation(repo, side)).unwrap();
         let search = || Search::new(At::get(&store, repo, tip).unwrap(), side, floor);
         let mut whole = search();
         let (found, all) = walk_until(&store, usize::MAX, |index| whole.next(index));
@@ -1108,9 +1112,7 @@ mod tests {
                 let (done, finished) = mpsc::channel();
                 let store = store.clone();
                 other = Some(std::thread::spawn(move || {
-                    store
-                        .write(|c| db::create_repo(c, "other").map(drop))
-                        .unwrap();
+                    store.write(|c| c.create_repo("other").map(drop)).unwrap();
                     store.read(|_| Ok(())).unwrap();
                     done.send(()).unwrap();
                 }));
@@ -1140,7 +1142,7 @@ mod tests {
             if index.reads == 0 {
                 commits += 1;
                 let name = format!("other {commits}");
-                store.commit(|c| db::create_repo(c, &name).map(drop))?;
+                store.commit(|c| c.create_repo(&name).map(drop))?;
             }
             paint.next(index)
         })

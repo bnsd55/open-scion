@@ -13,8 +13,9 @@ use scion_server::derived::{self, Kind};
 use scion_server::graph::CommitGraph;
 use scion_server::history::PathHistory;
 use scion_server::import::{ImportOptions, import_git};
+use scion_server::meta::MetaTx as _;
 use scion_server::tree::RootTree;
-use scion_server::{Error, Store, db, read, service};
+use scion_server::{Error, Store, read, service};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -220,7 +221,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let (name, tip) = tokio::task::spawn_blocking(move || {
                 let tip = read::resolve_ref(&store, &repo, &target_ref)?;
-                let repo_id = store.read(|c| db::repo_id(c, &repo))?;
+                let repo_id = store.read(|c| c.repo_id(&repo))?;
                 let name = match kind {
                     KindName::RootTree => {
                         derived::backfill::<RootTree>(&store, repo_id, tip)?;

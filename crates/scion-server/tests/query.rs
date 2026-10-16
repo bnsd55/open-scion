@@ -12,10 +12,11 @@ use std::time::{Duration, Instant};
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_server::deadline::Deadline;
 use scion_server::import::{ImportOptions, import_git};
+use scion_server::meta::MetaTx as _;
 use scion_server::read::{
     self, DiffEntry, MAX_DIFF_ENTRIES, MAX_RENAME_CHUNKS, MAX_RENAME_ENTRIES, Rename,
 };
-use scion_server::{Error, Store, db, tree};
+use scion_server::{Error, Store, tree};
 use tempfile::TempDir;
 
 const REPO: &str = "r";
@@ -109,7 +110,10 @@ fn changeset_of(store: &Store, commit: &str) -> ChangesetId {
 
 fn generation(store: &Store, id: ChangesetId) -> i64 {
     store
-        .read(|c| db::generation(c, db::repo_id(c, REPO)?, id))
+        .read(|c| {
+            let repo = c.repo_id(REPO)?;
+            c.generation(repo, id)
+        })
         .unwrap()
 }
 
@@ -226,7 +230,7 @@ fn author() -> IdentityTime {
 fn chain(store: &Store, changes: Vec<BTreeMap<RepoPath, Option<FileState>>>) -> Vec<ChangesetId> {
     store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
+            let repo = c.create_repo(REPO)?;
             let mut ids: Vec<ChangesetId> = Vec::new();
             for changes in changes {
                 let cs = Changeset {
@@ -275,8 +279,8 @@ fn graph_queries_across_many_merges_answer() {
     let (_data, store) = open_store();
     let (main, sides, late, early) = store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
-            let store = |parents: Vec<ChangesetId>, message: String| {
+            let repo = c.create_repo(REPO)?;
+            let mut put = |parents: Vec<ChangesetId>, message: String| {
                 let cs = Changeset {
                     parents,
                     author: author(),
@@ -286,17 +290,17 @@ fn graph_queries_across_many_merges_answer() {
                 };
                 Ok::<_, Error>(tree::store_changeset(c, repo, &cs)?.0)
             };
-            let mut main = vec![store(vec![], "root".into())?];
+            let mut main = vec![put(vec![], "root".into())?];
             let mut sides = Vec::new();
             for i in 0..merges {
                 let last = *main.last().unwrap();
-                let side = store(vec![last], format!("side {i}"))?;
-                main.push(store(vec![last, side], format!("merge {i}"))?);
+                let side = put(vec![last], format!("side {i}"))?;
+                main.push(put(vec![last, side], format!("merge {i}"))?);
                 sides.push(side);
             }
             // Not merged: one from the oldest side changeset, one from root.
-            let late = store(vec![sides[0]], "late".into())?;
-            let early = store(vec![main[0]], "early".into())?;
+            let late = put(vec![sides[0]], "late".into())?;
+            let early = put(vec![main[0]], "early".into())?;
             Ok((main, sides, late, early))
         })
         .unwrap();

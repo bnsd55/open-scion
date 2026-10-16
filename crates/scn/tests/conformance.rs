@@ -19,7 +19,8 @@ use scion_proto::object::{self, Assembler, Header};
 use scion_proto::v1::{
     Encoding, GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef, ResolveRefRequest,
 };
-use scion_server::{Store, db, tree};
+use scion_server::meta::MetaTx as _;
+use scion_server::{Store, tree};
 use tonic::Code;
 
 mod common;
@@ -247,7 +248,7 @@ fn fixture() -> (Tiers, ChangesetId) {
     let other = changeset(None, &[("other.txt", other)]);
     store
         .write(|c| {
-            let repo = db::create_repo(c, "other")?;
+            let repo = c.create_repo("other")?;
             tree::store_changeset(c, repo, &other)
         })
         .unwrap();
