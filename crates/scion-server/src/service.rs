@@ -49,6 +49,9 @@ const MAX_BLAMES: usize = 4;
 /// bound on its reads, only its deadline, so these queries never take more
 /// than this many of the `MAX_BLOCKING` permits.
 const MAX_GRAPH_QUERIES: usize = 4;
+// A graph query holds one read connection at a time, through a walk with no
+// bound on its reads. So the walks never take every one.
+const _: () = assert!(MAX_GRAPH_QUERIES < crate::store::READERS);
 /// Most `Diff` calls running at once. One call can read and compare files
 /// for about a second to find renames (`read::MAX_RENAME_CHUNKS`), so diffs
 /// never take more than this many of the `MAX_BLOCKING` permits either.
@@ -903,13 +906,13 @@ mod tests {
         let service = Arc::new(ScionService::new(Worker::new(store.clone())));
         let idle = || service.worker.permits.available_permits() == MAX_BLOCKING;
 
-        // Hold the database, so the job waits at its first step.
+        // Hold the write connection, so the job waits at its first step.
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
         let blocker = std::thread::spawn({
             let store = store.clone();
             move || {
-                store.read(|_| {
+                store.read_unflushed(|_| {
                     held_tx.send(()).unwrap();
                     go_rx.recv().unwrap();
                     Ok(())
@@ -1007,20 +1010,24 @@ mod tests {
         let service = Arc::new(ScionService::new(Worker::new(store.clone())));
         let busy = || MAX_BLOCKING - service.worker.permits.available_permits();
 
-        // Hold the database, so each job waits at its first read.
+        // Hold every read connection, so each job waits at its first read.
         let (held_tx, held_rx) = std::sync::mpsc::channel();
-        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-        let blocker = std::thread::spawn({
-            let store = store.clone();
-            move || {
-                store.read(|_| {
-                    held_tx.send(()).unwrap();
-                    go_rx.recv().unwrap();
-                    Ok(())
+        let go = Arc::new(std::sync::Barrier::new(crate::store::READERS + 1));
+        let blockers: Vec<_> = (0..crate::store::READERS)
+            .map(|_| {
+                let (store, held_tx, go) = (store.clone(), held_tx.clone(), Arc::clone(&go));
+                std::thread::spawn(move || {
+                    store.read(|_| {
+                        held_tx.send(()).unwrap();
+                        go.wait();
+                        Ok(())
+                    })
                 })
-            }
-        });
-        held_rx.recv().unwrap();
+            })
+            .collect();
+        for _ in &blockers {
+            held_rx.recv().unwrap();
+        }
         // One call more than the limit, of both kinds.
         let calls: Vec<_> = (0..=MAX_GRAPH_QUERIES)
             .map(|i| {
@@ -1055,8 +1062,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(busy(), MAX_GRAPH_QUERIES, "the last call waits for a slot");
 
-        go_tx.send(()).unwrap();
-        blocker.join().unwrap().unwrap();
+        go.wait();
+        for blocker in blockers {
+            blocker.join().unwrap().unwrap();
+        }
         for call in calls {
             let answer = tokio::time::timeout(Duration::from_secs(10), call)
                 .await

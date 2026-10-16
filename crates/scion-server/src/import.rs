@@ -31,7 +31,7 @@ const SHA1: i64 = 1;
 /// Commits per write transaction.
 // SHORTCUT: a server that shares the data directory waits for each batch
 // transaction, up to `busy_timeout` (5 s), and then its write fails. Its
-// reads wait behind that write, which holds its one connection.
+// other writes wait behind that write, which holds its write connection.
 // Ceiling: a batch that takes longer. Upgrade (issue #100): shorter
 // transactions while a server shares the directory.
 const BATCH: usize = 1000;
