@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use scion_core::{BlobId, ChangesetId, FileState, RepoPath};
 use scion_proto::listen::{self, Limits};
+use scion_proto::tls::ServerTls;
 use scion_proto::v1::scion_server::{Scion, ScionServer};
 use scion_proto::v1::{
     self, BlameChangeset, BlameRange, BlameRequest, BlameResponse, CreateChangesetRequest,
@@ -79,7 +80,8 @@ const _: () = assert!(READ_BUDGET_BYTES <= u32::MAX as usize);
 
 /// Serves the API on `listener` within `limits`, until `shutdown` resolves,
 /// to the tokens and with the rules of `access`: an [`Access`], or one token
-/// (`&str`) that may do everything.
+/// (`&str`) that may do everything. With `tls`, every connection is a TLS
+/// connection, whose handshake `listen` ends within its timeout.
 ///
 /// # Errors
 ///
@@ -89,6 +91,7 @@ pub async fn serve(
     listener: TcpListener,
     access: impl Into<Access>,
     limits: Limits,
+    tls: Option<ServerTls>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
     let access = Arc::new(access.into());
@@ -105,7 +108,14 @@ pub async fn serve(
             .add_service(scion)
             .add_service(objects)
     };
-    limits.serve(router, listen::tcp(listener), shutdown).await
+    limits
+        .serve(
+            router,
+            listen::tcp(listener),
+            tls.map(|tls| tls.config()),
+            shutdown,
+        )
+        .await
 }
 
 /// Implements the Scion RPCs.

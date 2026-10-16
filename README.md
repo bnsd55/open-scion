@@ -197,6 +197,28 @@ concurrent requests share each full disk flush
 ([#3](https://github.com/bnsd55/open-scion/issues/3)). Importing a git
 repository with 23,871 commits took 50 seconds.
 
+### TLS
+
+Over loopback the token travels unencrypted, which is fine on one machine. For
+a non-loopback address, serve TLS: give the server, or a `scion-cache`, a
+certificate and key in PEM files. Then it accepts the address without
+`--insecure-listen`. A certificate from a private CA is what the client trusts:
+`scn` takes it with `--tls-ca`, a tier for its upstream with its own
+`--tls-ca`. For links between tiers, the server and the cache can require a
+client certificate with `--tls-client-ca` (mTLS); the cache and the daemon
+present one with `--tls-client-cert` and `--tls-client-key`. To make the
+certificates of a test setup, a tool such as `minica` or `openssl` makes a CA
+and leaves signed for each host's name or address.
+
+```sh
+./target/release/scion-server --data /tmp/scion serve \
+  --listen 0.0.0.0:7878 --tls-cert server.pem --tls-key server.key &
+./target/release/scn --server https://scion.example.com:7878 \
+  --tls-ca ca.pem log -n 5
+```
+
+A bearer token over plain TCP to a non-loopback address stays refused.
+
 ## Layout
 
 | Path | Contents |
