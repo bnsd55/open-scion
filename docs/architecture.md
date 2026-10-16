@@ -368,8 +368,11 @@ A changeset's tree is its first parent's tree, with the entries of its
 changed paths, and of the directories above them, set to the changeset. So
 a changeset stores one node per directory on its changed paths, as for its
 root tree, and shares the other nodes with its first parent. A node is one
-directory level, stored in `history_nodes` by the hash of its bytes. The
-value is stored when a changeset is written, if its first parent has one.
+directory level, stored in `history_nodes` by the hash of its bytes. As
+with trees, no node is ever deleted: not after a version bump, not for a
+draft that never lands, and not for a changeset that a land stored again
+on a new head. The value is stored when a changeset is written, if its
+first parent has one.
 In a database from before path history, the first query that needs it
 derives it in steps. A golden test pins the root nodes of a fixed history.
 
@@ -609,9 +612,10 @@ base, and a walk back to the base give the same paths for every base.
 If the head has no path history yet, in a database from before it, the land
 releases the ref lock. It derives the head's node in the commit graph and its
 path history in steps, takes the lock again and plans again. Other writes,
-and lands on the ref, run between the steps. The land checks its deadline
-before each of the two derivations, and then stays pending. If the head
-still has no path history after that, the land fails with `INTERNAL`.
+and lands on the ref, run between the steps. The derivation stops between
+steps at the land's deadline, and the land stays pending; the steps before
+it stay. If the head still has no path history after that, the land fails
+with `INTERNAL`.
 
 **Not planned now:** a lander that rebases a batch of pending lands and moves
 the ref once ([#18](https://github.com/bnsd55/open-scion/issues/18), closed: one
@@ -695,7 +699,16 @@ directory. It reads the path history (section 4). The path's entry in the
 given changeset's history tree names the newest such changeset, and its
 entry in the tree of that changeset's first parent names the one before it.
 So each entry reads one changeset and one node per path part, however many
-changesets lie between two entries. A commit on a merged branch never
+changesets lie between two entries. A node is a whole directory level, so a
+file in a large directory costs a lot per entry: about 630 KB at 10,000
+names ([#114](https://github.com/bnsd55/open-scion/issues/114)). So a call
+stops once it has read 64 MiB of nodes (`read::MAX_LOG_NODE_BYTES`), after
+its first entry, and `next_changeset_id` says where to continue. A call
+keeps the nodes it read, so it reads each node once. A `Log` with a path
+runs as a graph query (below): at most 4 at once, each until its 600 s
+deadline. On a database from before path history, its first call derives
+the path history in steps, and stops between steps at the deadline. A
+commit on a merged branch never
 appears; the merge appears when its diff against its first parent changes
 the path. The article stores changes against the first parent because people
 care about history and blame only for commits on the main line.
@@ -772,9 +785,9 @@ histories where they agree: edits, merges, a file that becomes a directory
 and a file again, and renames for each rule above.
 
 **Bounds and resume.** A `Blame` call checks at most 1,000 changesets
-(`MAX_SCAN`) on its walk, so it holds a read connection no longer than a
-`Log` of 1,000 entries. A `Blame` call also diffs at most 100 versions, and
-about 1M lines (`MAX_BLAME_DIFF_LINES`, both sides of each diff). Every byte
+(`MAX_SCAN`) on its walk, and reads one changeset per check. It also
+diffs at most 100 versions, and about 1M lines (`MAX_BLAME_DIFF_LINES`,
+both sides of each diff). Every byte
 that blame reads counts against this budget, once per 64 bytes: a diffed
 line counts once per 64 bytes, a rename search counts each chunk it reads
 and each row of a chunk table it compares, and a file read and then refused
@@ -807,8 +820,8 @@ tables of one diff.
 
 At most 4 `Blame` calls run at once, so they never take more than 4 of the
 permits that writes and lands share. When a call stops at a bound,
-`next_changeset_id` names where to continue. In a `Blame` reply, the ranges left have no changeset, and
-`origin_line` gives their line in the file at `next_changeset_id` and
+`next_changeset_id` names where to continue. In a `Blame` reply, the ranges
+left have no changeset, and `origin_line` gives their line in the file at `next_changeset_id` and
 `next_path`. The path differs from the blamed path when the walk followed a
 rename. A blame of `next_path` there continues the work exactly. `scn blame`
 asks again until it is done. Blame from the path history will remove these
@@ -1220,9 +1233,9 @@ an untrusted network.
 |---|---|---|
 | Authentication | One static bearer token (`--token` or `SCION_TOKEN`). The server and each tier compare BLAKE3 digests of the tokens in constant time. A tier sends its own token upstream. | Every caller is the same principal, `default`. No users or per-folder rules ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Network | The server listens on `127.0.0.1:7878` and `scion-cache` on `127.0.0.1:7879` by default. A non-loopback address is refused unless `--insecure-listen` is given. `scion-daemon` listens only on a Unix socket with mode 0600, in a directory that only its user can reach; it refuses any other. `scn` refuses a socket that another user owns. Both refuse a socket or data directory under a directory that another user can change: one that another user owns, or that group or others can write and has no sticky bit. | No TLS: the token and all data travel unencrypted, also between tiers ([#14](https://github.com/bnsd55/open-scion/issues/14)). By choice, as OpenSSH's `StrictModes`, the directory checks refuse a group-writable directory (`chmod go-w` fixes it; with umask 002, new directories are group-writable), and read only the owner and the mode bits, not ACLs: an ACL that lets other users write a directory gets past them. |
-| Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. | Trees and blobs are shared by all repos. `GetObjects` reads any tree or blob by ID, and a changeset can name another repo's blob and then read it ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
+| Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. Path history nodes are reached only through the derived value of a changeset that the repo has, and name only changesets on its first-parent history. | Trees and blobs are shared by all repos. `GetObjects` reads any tree or blob by ID, and a changeset can name another repo's blob and then read it ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
-| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 1 MiB plus 1 KiB: one part of an object), blobs up to 100 MiB, 16 uploads at once (each holds one message in memory), 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget and `ReadFile` replies a 256 MiB budget. A reply of either whose client stops reading ends after 120 s. Every receiver of an object unpacks it within the size its first part gives, at most 100 MiB, with a zstd window of at most 8 MiB, and accepts only plain Zstandard frames (no skippable or legacy frames, no dictionary). The zstd library is built without its legacy decoders. Names of 1 to 256 bytes with no control characters. The path indexes of all refs hold at most 128 MiB together. A `Log` reply holds at most 1,000 entries, and a `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 16 MiB and 1,048,576 lines, diffs at most 100 versions and about 1M lines (a line counts once per 64 bytes), compares at most 100 deleted files and about 100 MiB to find a rename, and at most 4 run at once. At most 4 `MergeBase` and `IsAncestor` calls run at once, each until its 600 s deadline; a `Diff` reply holds at most 1,000 paths. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps two parts of an object (at most 1 MiB each), or up to 2 MiB of a file, in memory until its connection closes, and the number of stalled replies has no bound ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
+| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 1 MiB plus 1 KiB: one part of an object), blobs up to 100 MiB, 16 uploads at once (each holds one message in memory), 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget and `ReadFile` replies a 256 MiB budget. A reply of either whose client stops reading ends after 120 s. Every receiver of an object unpacks it within the size its first part gives, at most 100 MiB, with a zstd window of at most 8 MiB, and accepts only plain Zstandard frames (no skippable or legacy frames, no dictionary). The zstd library is built without its legacy decoders. Names of 1 to 256 bytes with no control characters. The path indexes of all refs hold at most 128 MiB together. A `Log` reply holds at most 1,000 entries, and with a path it reads about 64 MiB of path history at most; a `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 16 MiB and 1,048,576 lines, diffs at most 100 versions and about 1M lines (a line counts once per 64 bytes), compares at most 100 deleted files and about 100 MiB to find a rename, and at most 4 run at once. At most 4 `MergeBase`, `IsAncestor` and `Log` calls with a path run at once, each until its 600 s deadline; a `Diff` reply holds at most 1,000 paths. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps two parts of an object (at most 1 MiB each), or up to 2 MiB of a file, in memory until its connection closes, and the number of stalled replies has no bound ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. Each tier also checks every object from upstream before it stores or sends it, and the daemon checks each object again when it reads it from disk. The server sends a blob's zstd file without unpacking it, so the receiver finds a damaged file. | Tiers are trusted in v0.1: the client trusts the `ResolveRef` and `GetRootTree` answers that a tier passes on, which it cannot check by hash. A tier forwards them, and keeps only what upstream answered. |
 | Checkout | `scn checkout` writes into a private temp directory with a random name. It renames it onto a new destination, or moves its entries up into an existing empty directory that the user owns, never over an entry already there. It never follows a symlink while writing or removing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure, or on SIGINT, SIGTERM or SIGHUP, the destination stays as it was. | The directory that gets the checkout (an existing destination, or a new one's parent) must not be writable by all users, unless it has the sticky bit: they could swap parts of the checkout. An existing destination that breaks this is refused. Members of a group that can write it are trusted. Where the filesystem has no rename that never replaces (NFS), any empty mode 0700 directory of the user at a top-level directory name counts as the checkout's claim after `mkdirat` fails with `EEXIST`, and is replaced. Where it has no hard links either (some FUSE filesystems), any symlink of the user with the same target at a top-level symlink name counts as made after `symlinkat` fails with `EEXIST`, and is kept. This is for a lost NFS version 3 reply, but a trusted user (the owner, a group member, root) can also put such an entry there: it is taken, and no data is lost. A filesystem that shows one owner for every entry (a FUSE or SMB mount with `-o uid=`) passes every ownership check. In the temp directory, an entry found after `EEXIST` that is what the call makes counts as made, unless a recorded path in the same directory has its inode. A filesystem that folds names but shows another inode number under each name (CIFS with `noserverino`, FUSE without `use_ino`) would let such a fold through only for two empty files or two symlinks with one target: the two paths then share one entry, with the same content. A folded directory always fails: each directory that the checkout made already holds an entry. The check reads only the mode bits, not ACLs: an ACL that lets other users add or delete entries gets past it. No Windows rules: device names and names that end in a dot or a space pass. |
 | Cache tiers | A tier refuses calls without its token, and serves only objects that match their IDs. | A tier serves a stored object for any valid repo name and does not ask whether the repo exists. Safe with one principal ([#13](https://github.com/bnsd55/open-scion/issues/13)). |

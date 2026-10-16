@@ -161,10 +161,10 @@ struct Edit {
 impl Edit {
     fn load(c: &Connection, id: Option<NodeId>) -> Result<Self> {
         Ok(Self {
-            entries: id
-                .map(|id| get_node(c, id))
-                .transpose()?
-                .unwrap_or_default(),
+            entries: match id {
+                Some(id) => get_node(c, id)?.0,
+                None => Node::new(),
+            },
             below: BTreeMap::new(),
         })
     }
@@ -214,16 +214,28 @@ struct Hit {
     above: i64,
 }
 
-/// The nodes that one query has read, so that paths in one directory read
-/// it once.
+/// The nodes that one call has read, so that it reads each one once, and
+/// how many bytes they hold.
 #[derive(Default)]
-struct Nodes(HashMap<NodeId, Node>);
+pub(crate) struct Nodes {
+    nodes: HashMap<NodeId, Node>,
+    bytes: usize,
+}
 
 impl Nodes {
+    /// The stored bytes of the nodes read so far.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     fn get(&mut self, c: &Connection, id: NodeId) -> Result<&Node> {
-        Ok(match self.0.entry(id) {
+        Ok(match self.nodes.entry(id) {
             hash_map::Entry::Occupied(node) => node.into_mut(),
-            hash_map::Entry::Vacant(node) => node.insert(get_node(c, id)?),
+            hash_map::Entry::Vacant(slot) => {
+                let (node, bytes) = get_node(c, id)?;
+                self.bytes += bytes;
+                slot.insert(node)
+            }
         })
     }
 }
@@ -252,19 +264,21 @@ fn lookup(c: &Connection, nodes: &mut Nodes, root: NodeId, path: &RepoPath) -> R
 /// The newest changeset at or below `from`, on its first-parent history,
 /// that changes `path`: the file, or anything below it if it is a
 /// directory. This is the rule of [`crate::read::changes_path`]. `from` has
-/// a value of [`PathHistory`]. Reads one node per part of `path`.
+/// a value of [`PathHistory`]. Reads at most one node per part of `path`,
+/// and none that `nodes` holds.
 ///
 /// # Errors
 ///
 /// [`Error::Corrupt`] if `from` has no value, or a node is missing.
 pub(crate) fn newest_change(
     c: &Connection,
+    nodes: &mut Nodes,
     from: ChangesetId,
     path: &RepoPath,
 ) -> Result<Option<ChangesetId>> {
     let root = derived::load::<PathHistory>(c, from)?
         .ok_or_else(|| Error::Corrupt(format!("path history: no value for {from}")))?;
-    let hit = lookup(c, &mut Nodes::default(), root, path)?;
+    let hit = lookup(c, nodes, root, path)?;
     Ok(hit.last.map(|last| last.id))
 }
 
@@ -311,8 +325,9 @@ fn put_node(c: &Connection, node: &Node) -> Result<NodeId> {
     Ok(id)
 }
 
-/// Reads a node and checks it against its ID.
-fn get_node(c: &Connection, id: NodeId) -> Result<Node> {
+/// Reads a node and checks it against its ID. Also returns the length of
+/// its stored bytes.
+fn get_node(c: &Connection, id: NodeId) -> Result<(Node, usize)> {
     #[cfg(test)]
     NODE_READS.set(NODE_READS.get() + 1);
     let body: Vec<u8> = c
@@ -325,7 +340,9 @@ fn get_node(c: &Connection, id: NodeId) -> Result<Node> {
             "history node {id} does not match its ID"
         )));
     }
-    decode_node(&body).ok_or_else(|| Error::Corrupt(format!("history node {id} does not decode")))
+    let node = decode_node(&body)
+        .ok_or_else(|| Error::Corrupt(format!("history node {id} does not decode")))?;
+    Ok((node, body.len()))
 }
 
 /// The bytes of a node: its entries in name order, each
@@ -407,6 +424,10 @@ mod tests {
         RepoPath::new(p).unwrap()
     }
 
+    fn later() -> Deadline {
+        Deadline::new(std::time::Instant::now() + std::time::Duration::from_secs(600))
+    }
+
     /// A changeset that puts a file with `blob`, or deletes it, at each path.
     fn changeset(parent: Option<ChangesetId>, edits: &[(&str, Option<BlobId>)]) -> Changeset {
         Changeset {
@@ -479,7 +500,8 @@ mod tests {
         let mut ids = Vec::new();
         let mut next = Some(from);
         while let Some(from) = next {
-            let page = read::log_page(store, "r", from, Some(&path(p)), limit).unwrap();
+            let page = read::log_page(store, "r", from, Some(&path(p)), limit, &later()).unwrap();
+            // Small directories never reach the bound of node bytes.
             assert!(
                 page.entries.len() == limit.min(read::MAX_SCAN) || page.next.is_none(),
                 "a page is full unless the history ends"
@@ -551,7 +573,8 @@ mod tests {
 
         db::CHANGESET_READS.set(0);
         NODE_READS.set(0);
-        let page = read::log_page(&store, "r", tip, Some(&path("d/f")), usize::MAX).unwrap();
+        let page = read::log_page(&store, "r", tip, Some(&path("d/f")), usize::MAX, &later());
+        let page = page.unwrap();
         // One call returns a full page, past 3,000 changesets.
         let found: Vec<ChangesetId> = page.entries.iter().map(|(id, _)| *id).collect();
         assert_eq!(found, changed[..read::MAX_SCAN]);
@@ -560,10 +583,44 @@ mod tests {
         assert_eq!(db::CHANGESET_READS.get(), read::MAX_SCAN);
         assert_eq!(NODE_READS.get(), 2 * read::MAX_SCAN);
 
-        let rest = read::log_page(&store, "r", ids[2], Some(&path("d/f")), usize::MAX).unwrap();
+        let rest = read::log_page(
+            &store,
+            "r",
+            ids[2],
+            Some(&path("d/f")),
+            usize::MAX,
+            &later(),
+        );
+        let rest = rest.unwrap();
         let found: Vec<ChangesetId> = rest.entries.iter().map(|(id, _)| *id).collect();
         assert_eq!(found, [ids[0]]);
         assert_eq!(rest.next, None);
+    }
+
+    #[test]
+    fn a_path_log_stops_at_its_node_bytes_after_one_entry() {
+        let (_dir, store, repo) = open();
+        // `d` holds 10,000 files, so its node is larger than the bound. Then
+        // three changesets change `d/f0`.
+        let wide: Vec<String> = (0..10_000).map(|i| format!("d/f{i}")).collect();
+        let first: Vec<(&str, bool)> = wide.iter().map(|p| (p.as_str(), true)).collect();
+        let mut history: Vec<Edits<'_>> = vec![&first];
+        history.extend([&[("d/f0", true)][..]; 3]);
+        let ids = store_chain(&store, repo, None, &history, true);
+        let page_of = |from| {
+            let page = read::log_page(&store, "r", from, Some(&path("d/f0")), 10, &later());
+            let page = page.unwrap();
+            let found: Vec<ChangesetId> = page.entries.iter().map(|(id, _)| *id).collect();
+            (found, page.next)
+        };
+        // Each page holds one entry, and says where to go on.
+        assert_eq!(page_of(ids[3]), (vec![ids[3]], Some(ids[2])));
+        assert_eq!(page_of(ids[2]), (vec![ids[2]], Some(ids[1])));
+        assert_eq!(page_of(ids[0]), (vec![ids[0]], None));
+        // A file in a small directory fills its page.
+        let small = store_chain(&store, repo, Some(ids[3]), &[&[("e", true)][..]; 3], true);
+        let page = read::log_page(&store, "r", small[2], Some(&path("e")), 10, &later());
+        assert_eq!(page.unwrap().entries.len(), 3);
     }
 
     #[test]
@@ -648,7 +705,7 @@ mod tests {
             .read(|c| derived::load::<PathHistory>(c, ids[1]))
             .unwrap()
             .unwrap();
-        let node = store.read(|c| get_node(c, root)).unwrap();
+        let (node, _) = store.read(|c| get_node(c, root)).unwrap();
         let bytes = encode_node(&node);
         assert_eq!(decode_node(&bytes), Some(node.clone()));
         let a = node[&PathElem::new("a").unwrap()];

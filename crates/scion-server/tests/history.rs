@@ -6,12 +6,14 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_server::blame::{
     self, Blame, BlameRange, MAX_BLAME_BYTES, MAX_BLAME_DIFF_LINES, MAX_BLAME_LINES,
     MAX_BLAME_VERSIONS, MAX_RENAME_BYTES, MAX_RENAME_SOURCES,
 };
+use scion_server::deadline::Deadline;
 use scion_server::import::{ImportOptions, import_git};
 use scion_server::read::{self, MAX_SCAN};
 use scion_server::{Error, Store, db, tree};
@@ -27,6 +29,10 @@ fn open_store() -> (TempDir, Store) {
 
 fn path(p: &str) -> RepoPath {
     RepoPath::new(p).unwrap()
+}
+
+fn later() -> Deadline {
+    Deadline::new(Instant::now() + Duration::from_secs(600))
 }
 
 /// Runs git in `dir` with fixed identities and dates and no user or system
@@ -97,7 +103,7 @@ fn changeset_of(store: &Store, commit: &str) -> ChangesetId {
 }
 
 fn path_log(store: &Store, from: ChangesetId, p: &str) -> (Vec<ChangesetId>, Option<ChangesetId>) {
-    let page = read::log_page(store, REPO, from, Some(&path(p)), 1000).unwrap();
+    let page = read::log_page(store, REPO, from, Some(&path(p)), 1000, &later()).unwrap();
     (
         page.entries.into_iter().map(|(id, _)| id).collect(),
         page.next,
@@ -178,7 +184,7 @@ fn path_log_follows_files_directories_deletes_and_first_parents() {
         assert_eq!(path_log(&store, tip, p), (ids(expected), None), "{p}");
     }
     // A limit stops the walk after the last entry it returns.
-    let page = read::log_page(&store, REPO, tip, Some(&path("a.txt")), 2).unwrap();
+    let page = read::log_page(&store, REPO, tip, Some(&path("a.txt")), 2, &later()).unwrap();
     let delete = changeset_of(&store, &delete_a);
     let parent = read::get_changeset(&store, REPO, delete).unwrap().parents[0];
     assert_eq!(page.entries.len(), 2);

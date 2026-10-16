@@ -80,7 +80,10 @@ release.
   answers.
 - Path history as derived data (kind `path_history`, schema version 4).
   `Log` with a path reads only the changesets that change the path, so one
-  call returns up to 1,000 entries however far apart they are. A land on a
+  call returns up to 1,000 entries however far apart they are. A call stops
+  after about 64 MiB of path history, which a file in a large directory
+  reaches in fewer entries, and it waits in the queue of `MergeBase` and
+  `IsAncestor`. A land on a
   base more than 10,000 generations below the head checks its paths in the
   head's path history, so no base is too old to check. Before, such a land
   walked the history back to its base each time, and a base more than

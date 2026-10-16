@@ -115,6 +115,13 @@ pub fn list_dir(
 // changed the file (https://github.com/bnsd55/open-scion/issues/61).
 pub const MAX_SCAN: usize = 1000;
 
+/// Most bytes of path history that one `Log` call with a path reads, about
+/// as much as a `Blame` call reads. A lookup reads a whole directory level
+/// on each part of the path, so a file in a large directory costs a lot per
+/// entry: about 630 KB at 10,000 names. A call stops at this bound, after
+/// its first entry. Tests use a small bound, so that they reach it.
+pub const MAX_LOG_NODE_BYTES: usize = if cfg!(test) { 512 << 10 } else { 64 << 20 };
+
 /// One page of first-parent history.
 #[derive(Debug)]
 pub struct LogPage {
@@ -140,8 +147,9 @@ pub fn log(
 ) -> Result<Vec<(ChangesetId, Changeset)>> {
     let mut entries = Vec::new();
     let mut next = Some(cs);
+    let deadline = Deadline::new(std::time::Instant::now() + std::time::Duration::from_secs(600));
     while let Some(from) = next.filter(|_| entries.len() < limit) {
-        let page = log_page(store, repo, from, None, limit - entries.len())?;
+        let page = log_page(store, repo, from, None, limit - entries.len(), &deadline)?;
         entries.extend(page.entries);
         next = page.next;
     }
@@ -151,19 +159,24 @@ pub fn log(
 /// Up to `limit` changesets, and at most [`MAX_SCAN`], walking first
 /// parents from `cs`, newest first. With a `path`, only the changesets that
 /// change it ([`changes_path`]), found in the path history of `cs`
-/// ([`history`]): each entry reads one changeset and one history node per
-/// part of the path, however many changesets lie between two entries. If
-/// `cs` has no path history yet, this derives it first, in steps.
+/// ([`history`]): each entry reads one changeset and at most one history
+/// node per part of the path, however many changesets lie between two
+/// entries. Such a page stops early, after its first entry, once it has read
+/// [`MAX_LOG_NODE_BYTES`] of nodes. If `cs` has no path history yet, this
+/// derives it first, in steps, until `deadline`.
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or changeset does not exist.
+/// [`Error::DeadlineExceeded`] if `deadline` passed while the path history
+/// was derived; the steps before it stay.
 pub fn log_page(
     store: &Store,
     repo: &str,
     cs: ChangesetId,
     path: Option<&RepoPath>,
     limit: usize,
+    deadline: &Deadline,
 ) -> Result<LogPage> {
     let limit = limit.min(MAX_SCAN);
     let Some(path) = path else {
@@ -179,18 +192,22 @@ pub fn log_page(
         });
     };
     let repo = store.read(|c| db::repo_id(c, repo))?;
-    derived::get::<PathHistory>(store, repo, cs)?;
+    derived::get_by::<PathHistory>(store, repo, cs, deadline)?;
     // Each statement sees its own snapshot, and none needs another's: a
     // changeset, a node and a value of this version never change and are
     // never removed, and a node is stored in the transaction of the value
     // that names it.
     store.read(|c| {
+        let mut nodes = history::Nodes::default();
         let mut entries = Vec::new();
         let mut next = Some(cs);
         while let Some(from) = next.filter(|_| entries.len() < limit) {
+            if !entries.is_empty() && nodes.bytes() >= MAX_LOG_NODE_BYTES {
+                break;
+            }
             // Each changeset on the first-parent history of `cs` has a path
             // history, so `from` has one.
-            let Some(id) = history::newest_change(c, from, path)? else {
+            let Some(id) = history::newest_change(c, &mut nodes, from, path)? else {
                 next = None;
                 break;
             };

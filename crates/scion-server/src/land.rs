@@ -575,10 +575,11 @@ fn stays_pending(e: Error) -> Error {
 }
 
 /// Derives what [`check_history`] reads for `head`, in steps
-/// ([`derived::fill`]): its node in the commit graph and its path history.
-/// The caller holds no lock, so other requests run between the steps. A
-/// database from before path history needs this once: each later changeset
-/// gets its own when it is written.
+/// ([`derived::fill_by`]): its node in the commit graph and its path
+/// history. The caller holds no lock, so other requests run between the
+/// steps, and the derivation stops between steps at `deadline`. A database
+/// from before path history needs this once: each later changeset gets its
+/// own when it is written.
 fn derive_history(
     store: &Store,
     repo: RepoId,
@@ -586,10 +587,8 @@ fn derive_history(
     deadline: &Deadline,
 ) -> Result<()> {
     tracing::info!(%head, "deriving the history of the head for a land on an old base");
-    deadline.check()?;
-    derived::fill::<CommitGraph>(store, repo, head)?;
-    deadline.check()?;
-    derived::fill::<PathHistory>(store, repo, head)?;
+    derived::fill_by::<CommitGraph>(store, repo, head, deadline)?;
+    derived::fill_by::<PathHistory>(store, repo, head, deadline)?;
     Ok(())
 }
 
@@ -1952,7 +1951,8 @@ mod tests {
         /// path history.
         #[test]
         fn a_check_in_the_path_history_matches_the_index_and_a_walk(
-            (parents, edits) in testing::histories(48),
+            (parents, edits) in testing::histories(40),
+            room in proptest::option::of(0..4000_usize),
         ) {
             let dir = tempfile::tempdir().unwrap();
             let store = Store::open(dir.path()).unwrap();
@@ -1963,6 +1963,12 @@ mod tests {
                 })
                 .unwrap();
             let lands = Lands::default();
+            // With little room, the budget stops `reach`, and the path history
+            // checks the rest.
+            let tight = Lands::default();
+            if let Some(room) = room {
+                tight.used.store(MAX_INDEX_BYTES - room, Ordering::Release);
+            }
             let deadline = Deadline::new(Instant::now() + std::time::Duration::from_secs(600));
             // One land changes every path. Each path is checked on its own.
             let land: BTreeMap<RepoPath, Option<FileState>> = (testing::PATHS.into_iter())
@@ -1991,7 +1997,7 @@ mod tests {
                         chain.push((id, db::generation(c, repo, id)?, cs));
                     }
                     // One index for all bases, as a ref's index serves its lands.
-                    let mut index = PathIndex::new(c, repo, tip, &lands.used)?;
+                    let mut index = PathIndex::new(c, repo, tip, &tight.used)?;
                     // Bases on the history, newest first. The model holds the
                     // changesets after each.
                     let mut model = PathIndex::at(tip, tip_gen, &lands.used);
@@ -2009,7 +2015,7 @@ mod tests {
                         assert_eq!(indexed, walked);
                         let in_history = check_history(c, tip, base, base_gen, &land, &deadline)?;
                         assert_eq!(in_history, Checked::Paths(walked.clone()));
-                        let checked = index.check(&lands, c, repo, base, &land, &deadline)?;
+                        let checked = index.check(&tight, c, repo, base, &land, &deadline)?;
                         assert_eq!(checked, Checked::Paths(walked));
                     }
                     let off = ids.iter().filter(|&&id| chain.iter().all(|(on, ..)| *on != id));
@@ -2017,7 +2023,7 @@ mod tests {
                         let base_gen = db::generation(c, repo, base)?;
                         let in_history = check_history(c, tip, base, base_gen, &land, &deadline)?;
                         assert_eq!(in_history, Checked::NotOnHistory);
-                        let checked = index.check(&lands, c, repo, base, &land, &deadline)?;
+                        let checked = index.check(&tight, c, repo, base, &land, &deadline)?;
                         assert_eq!(checked, Checked::NotOnHistory);
                     }
                     Ok(())

@@ -58,8 +58,8 @@ server (section 6.3).
 
 **Queues.** The server queues work instead of failing it. At most 256 jobs run
 at once across both services, at most 16 `PutBlob` uploads are read at once,
-at most 4 `Blame` calls run at once, and at most 4 `MergeBase` and
-`IsAncestor` calls together. A `ReadFile` call waits for its share of a memory
+at most 4 `Blame` calls run at once, and at most 4 `MergeBase`,
+`IsAncestor` and `Log` calls with a path together. A `ReadFile` call waits for its share of a memory
 budget (section 6.7). Time in a queue counts toward the timeout.
 One wait has its own limit: a `GetObjects` call that gets no memory for its
 first object within 30 s fails with `RESOURCE_EXHAUSTED` (section 7.3).
@@ -112,7 +112,7 @@ contract. A client MUST NOT depend on its text.
 | `ABORTED` | `Land` only: other writers kept moving the ref. The land stays `PENDING`. | Yes, with the same request key |
 | `OUT_OF_RANGE` | A message is larger than its limit. | After the cause is fixed |
 | `CANCELLED` | The server's 600 s limit or the client's `grpc-timeout` ran out. A client library can report its own deadline as `DEADLINE_EXCEEDED`. | Yes. A `Land` retry uses the same request key. |
-| `DEADLINE_EXCEEDED` | `ReadFile`: the client took no message for 120 s. `GetObjects`: the client took no part for 120 s in the middle of an object (section 7.3). `Land`: the land ran past 600 s from the start of the call. The land stays `PENDING`. `MergeBase`, `IsAncestor`: the walk ran past 600 s from the start of the call. | Yes. A `Land` retry uses the same request key. |
+| `DEADLINE_EXCEEDED` | `ReadFile`: the client took no message for 120 s. `GetObjects`: the client took no part for 120 s in the middle of an object (section 7.3). `Land`: the land ran past 600 s from the start of the call. The land stays `PENDING`. `MergeBase`, `IsAncestor`, `Log` with a path: the call ran past 600 s from its start. | Yes. A `Land` retry uses the same request key. |
 | `UNAVAILABLE` | The server cannot be reached or is shutting down, or its database stayed busy for 5 s (another process, such as an import, held its write lock). A tier also replies `UNAVAILABLE` when its upstream does not answer in time, or when it finds no room to fetch an object from upstream within 30 s (section 8). | Yes |
 | `RESOURCE_EXHAUSTED` | `GetObjects` only: no memory for the first object within 30 s (section 7.3). | Yes, after a wait |
 | `DATA_LOSS` | From a tier only: its upstream sent bytes that are not the object asked for (section 8). | MAY |
@@ -391,11 +391,14 @@ level as `TreeV1` bytes. An empty path is the repo root.
   changes against its first parent, so a changeset on a merged branch never
   appears, and a merge appears when its first-parent diff touches the path.
 - `limit` is the most entries the client wants. 0 means 1. A reply holds at
-  most `limit` entries and at most 1,000.
-- A reply holds `limit` entries, and at most 1,000, unless the history ends
-  first. With a `path`, any number of changesets can lie between two
-  entries. A reply stops before an entry that would take its changeset bytes
-  over 32 MiB, but always holds the first entry it found.
+  most `limit` entries and at most 1,000. Without a `path`, it holds that
+  many unless the history ends first.
+- With a `path`, any number of changesets can lie between two entries. A
+  reply can hold fewer entries than `limit`: it stops once the server has
+  read about 64 MiB of its path history, which takes fewer entries for a
+  file in a large directory.
+- A reply stops before an entry that would take its changeset bytes over
+  32 MiB. Every reply holds the first entry it found.
 - `next_changeset_id` is the first changeset that this reply does not cover,
   or empty when the history ends. To continue, a client calls `Log` again
   with `changeset_id` set to it and the same `path`. This server sends no
@@ -403,10 +406,16 @@ level as `TreeV1` bytes. An empty path is the repo root.
   a path changed long ago, and v1 allows it. So a client MUST continue until
   it has enough entries or `next_changeset_id` is empty.
 
+**Cost.** A `Log` with a path waits in the queue of `MergeBase` and
+`IsAncestor` (section 2). On a server whose database is older than its path
+history, the first call on a long history can derive that history first. It
+stops at 600 s; what it derived stays, so the next call goes on from there.
+
 | Error | When |
 |---|---|
 | `INVALID_ARGUMENT` | A bad path. |
 | `NOT_FOUND` | The repo or changeset does not exist. |
+| `DEADLINE_EXCEEDED` | With a `path`: the server ran past 600 s from the start of the call. |
 
 ### 6.10 Blame
 
