@@ -2597,6 +2597,44 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_within_the_window_returns_the_stored_outcome() {
+        let f = fixture();
+        let cs = f.commit(f.root, &[put("a/x", "1")]);
+        let first = f.land(cs, "key");
+        assert_eq!(first.state, LandState::Landed);
+
+        // The land is 60 s inside the window. Lands after it run expiry, and
+        // it stays: a retry with the same key still returns the stored
+        // outcome, field for field, with the same land ID.
+        f.age(first.land_id, LAND_RETENTION_SECS - 60);
+        f.fill("t", 3);
+        let retry = f.try_land(cs, "key").unwrap();
+        assert_eq!(retry, first);
+        assert_eq!(retry.land_id, first.land_id);
+    }
+
+    #[test]
+    fn a_retry_after_the_window_is_a_new_land() {
+        let f = fixture();
+        let cs = f.commit(f.root, &[put("a/x", "1")]);
+        let first = f.land(cs, "key");
+
+        // The land is past the window, so the next land expires it. The key
+        // is gone: a retry with the same key is a new land with a new ID,
+        // checked like any other. Its own landed copy changed its paths
+        // after its base, so it comes back as a conflict, and main stays.
+        f.age(first.land_id, LAND_RETENTION_SECS + 60);
+        f.fill("t", 1);
+        assert!(f.gone(&first));
+        let main_before = f.main();
+        let retry = f.land(cs, "key");
+        assert!(retry.land_id > first.land_id);
+        assert_eq!(retry.state, LandState::Conflict);
+        assert_eq!(retry.conflict_paths, [RepoPath::new("a/x").unwrap()]);
+        assert_eq!(f.main(), main_before);
+    }
+
+    #[test]
     fn a_version_1_database_upgrades_and_keeps_its_lands() {
         let dir = tempfile::tempdir().unwrap();
         let (child, pending_cs) = {
