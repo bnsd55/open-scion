@@ -589,11 +589,8 @@ async fn walk_refs(
                 repo: REPO.into(),
                 changeset_id: at.as_bytes().to_vec(),
             };
-            let reply = scion.get_changeset(request).await;
-            let bytes = reply
-                .unwrap_or_else(|s| panic!("{target}: {at}: {s:?}"))
-                .into_inner();
-            let (changeset, id) = Changeset::decode_with_id(&bytes.changeset).unwrap();
+            let bytes = collect_changeset(scion, request, target, at).await;
+            let (changeset, id) = Changeset::decode_with_id(&bytes).unwrap();
             assert_eq!(id, at, "{target}: changeset {at} does not match its ID");
             let Some(&parent) = changeset.parents.first() else {
                 break;
@@ -692,8 +689,14 @@ async fn check(url: &str, data: &Path, ledger: &mut Ledger, checked: &mut Checke
             repo: REPO.into(),
             changeset_id: sent.id.as_bytes().to_vec(),
         };
-        let reply = scion.get_changeset(request).await;
-        reply.unwrap_or_else(|s| panic!("created changeset {}: {s:?}", sent.id));
+        let mut stream = scion
+            .get_changeset(request)
+            .await
+            .unwrap_or_else(|s| panic!("created changeset {}: {s:?}", sent.id))
+            .into_inner();
+        while let Some(part) = stream.message().await.unwrap() {
+            drop(part);
+        }
     }
 
     // Every blob that the metadata names is intact, and so is every blob
@@ -708,6 +711,29 @@ async fn check(url: &str, data: &Path, ledger: &mut Ledger, checked: &mut Checke
             assert_eq!(status, BlobStatus::Valid, "blob {id}");
         }
     }
+}
+
+/// Collects the parts of one `GetChangeset` reply.
+async fn collect_changeset(
+    scion: &mut Scion,
+    request: GetChangesetRequest,
+    target: &str,
+    at: ChangesetId,
+) -> Vec<u8> {
+    let mut stream = scion
+        .get_changeset(request)
+        .await
+        .unwrap_or_else(|s| panic!("{target}: {at}: {s:?}"))
+        .into_inner();
+    let mut bytes = Vec::new();
+    while let Some(part) = stream
+        .message()
+        .await
+        .unwrap_or_else(|s| panic!("{target}: {at}: {s:?}"))
+    {
+        bytes.extend_from_slice(&part.changeset);
+    }
+    bytes
 }
 
 /// Waits until `ready` holds, for at most 2 s.

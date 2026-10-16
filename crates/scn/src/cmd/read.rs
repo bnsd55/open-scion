@@ -55,7 +55,7 @@ pub(crate) async fn read_stream(
 pub async fn ls(ctx: &mut Ctx, spec: &str) -> Result<()> {
     let (rev, path) = split_spec(spec)?;
     let changeset_id = ctx.resolve(rev).await?;
-    let reply = ctx
+    let mut reply = ctx
         .client
         .list_dir(ListDirRequest {
             repo: ctx.repo.clone(),
@@ -65,7 +65,15 @@ pub async fn ls(ctx: &mut Ctx, spec: &str) -> Result<()> {
         .await
         .with_context(|| format!("cannot list {spec}"))?
         .into_inner();
-    let tree = Tree::decode(&reply.tree).context("server sent a bad tree")?;
+    let mut tree_bytes = Vec::new();
+    while let Some(part) = reply
+        .message()
+        .await
+        .with_context(|| format!("cannot list {spec}"))?
+    {
+        tree_bytes.extend_from_slice(&part.tree);
+    }
+    let tree = Tree::decode(&tree_bytes).context("server sent a bad tree")?;
     if ctx.json {
         let entries: Vec<Value> = tree
             .entries
@@ -140,7 +148,7 @@ pub async fn log(ctx: &mut Ctx, rev: &str, path: Option<&RepoPath>, limit: u32) 
 /// changed paths.
 pub async fn show(ctx: &mut Ctx, rev: &str) -> Result<()> {
     let id = ctx.resolve(rev).await?;
-    let reply = ctx
+    let mut reply = ctx
         .client
         .get_changeset(GetChangesetRequest {
             repo: ctx.repo.clone(),
@@ -149,7 +157,15 @@ pub async fn show(ctx: &mut Ctx, rev: &str) -> Result<()> {
         .await
         .with_context(|| format!("cannot read changeset {rev}"))?
         .into_inner();
-    let cs = decode_changeset(id, &reply.changeset)?;
+    let mut cs_bytes = Vec::new();
+    while let Some(part) = reply
+        .message()
+        .await
+        .with_context(|| format!("cannot read changeset {rev}"))?
+    {
+        cs_bytes.extend_from_slice(&part.changeset);
+    }
+    let cs = decode_changeset(id, &cs_bytes)?;
     if ctx.json {
         let mut value = changeset_json(id, &cs);
         value["changes"] = cs

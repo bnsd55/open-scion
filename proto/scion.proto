@@ -33,11 +33,13 @@ service Scion {
   // Deprecated: use Objects.ResolveRef, which a cache tier forwards. Kept so
   // existing clients still work; both share one implementation.
   rpc ResolveRef(ResolveRefRequest) returns (ResolveRefResponse);
-  rpc GetChangeset(GetChangesetRequest) returns (GetChangesetResponse);
+  // Streams the ChangesetV1 bytes in parts, as ReadFile streams a file.
+  rpc GetChangeset(GetChangesetRequest) returns (stream GetChangesetResponse);
   // Streams the content of a regular file or the target of a symlink.
   rpc ReadFile(ReadFileRequest) returns (stream ReadFileResponse);
-  // Returns one directory level as a TreeV1 object.
-  rpc ListDir(ListDirRequest) returns (ListDirResponse);
+  // Streams one directory level as its TreeV1 bytes, in parts, as ReadFile
+  // streams a file.
+  rpc ListDir(ListDirRequest) returns (stream ListDirResponse);
   // Walks first parents, newest first. With a path, returns only the
   // changesets that change it.
   rpc Log(LogRequest) returns (LogResponse);
@@ -158,7 +160,7 @@ message GetChangesetRequest {
 }
 
 message GetChangesetResponse {
-  // ChangesetV1 bytes.
+  // A part of the ChangesetV1 bytes.
   bytes changeset = 1;
 }
 
@@ -180,7 +182,7 @@ message ListDirRequest {
 }
 
 message ListDirResponse {
-  // TreeV1 bytes.
+  // A part of the TreeV1 bytes.
   bytes tree = 1;
 }
 
