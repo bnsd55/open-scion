@@ -56,9 +56,9 @@ pub struct Store {
     inner: Arc<Inner>,
 }
 
-/// Read-only connections of one [`Store`]: so many reads run at once. Each
-/// has its own page cache, so they are few. More than the long reads that
-/// can run at once, so those never take every one.
+/// Read-only connections of one [`Store`], so at most this many reads run at
+/// once. Each has its own page cache, so they are few. They are more than
+/// the graph queries that can run at once, so those never take every one.
 pub(crate) const READERS: usize = 8;
 
 struct Inner {
