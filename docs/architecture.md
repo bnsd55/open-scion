@@ -77,6 +77,14 @@ How one request flows through the server:
    sees `CANCELLED` or `DEADLINE_EXCEEDED`.
 4. `error.rs` maps errors to gRPC codes. Database, I/O, git and corruption
    errors reply `INTERNAL`. The detail goes only to the server log.
+5. Every RPC ends with one line about its refusal or its failure: the RPC,
+   the repo and the principal once the request names them, the peer
+   address, the code, and the reason. A line never carries the token, not
+   even its digest. The level follows the cause: a wrong token or a denied
+   right is `WARN`, a malformed request or a missing object is `DEBUG`, a
+   server fault is `ERROR`. A failure inside a streamed reply logs at the
+   layer that owns it, with the repo when that layer knows one: the store
+   and its index sit below the repos, so their lines name no repo.
 
 ## 2. Object model
 

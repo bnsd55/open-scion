@@ -865,6 +865,8 @@ impl Blobs {
             Err(e) => return Err(e),
         };
         let corrupt = |why: String| {
+            // No repo on this line: a blob may be shared by repos. The call
+            // whose read failed logs the repo and the caller.
             tracing::warn!(blob = %id, %why, "stored blob is corrupt");
             Ok(BlobStatus::Corrupt)
         };
@@ -1109,7 +1111,8 @@ impl BlobBatch<'_> {
     fn write(&mut self, id: BlobId, len: usize, raw: impl Read) -> Result<()> {
         match self.keep(id)? {
             BlobStatus::Valid => return Ok(()),
-            // The rename below replaces it in one step.
+            // The rename below replaces it in one step. No repo on this
+            // line: a blob may be shared by repos.
             BlobStatus::Corrupt => tracing::warn!(blob = %id, "rewriting a corrupt blob file"),
             BlobStatus::Missing => {}
         }
