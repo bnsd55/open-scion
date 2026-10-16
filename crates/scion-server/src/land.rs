@@ -899,10 +899,6 @@ impl PathIndex {
                 Walk::Stopped => {}
             }
         }
-        eprintln!(
-            "CHECK[{:?}] reached={reached} deep={deep} tip_gen={tip_gen} base_gen={base_gen}",
-            std::thread::current().id()
-        );
         let conflicts = if reached {
             // The index holds every changeset after the base.
             changes
