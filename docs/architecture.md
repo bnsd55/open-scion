@@ -1290,8 +1290,9 @@ pending in the database. After each restart it checks:
   No blob file is torn.
 
 A second test kills the server while it upgrades a database of schema
-version 2. Each kill leaves version 2 or version 3, whole, and the next start
-upgrades it.
+version 2. Each kill leaves the database at one whole migration step (the
+first version, the last, or one between them), and the next start upgrades
+it.
 
 What the suite does not prove:
 

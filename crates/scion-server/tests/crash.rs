@@ -816,9 +816,9 @@ fn schema(data: &Path) -> Schema {
     }
 }
 
-/// A kill while the server upgrades the schema leaves the old schema or the
-/// new one, never a mix: each migration commits in one transaction. The
-/// next start upgrades it and serves.
+/// A kill while the server upgrades the schema leaves the database at one
+/// whole migration step, never a mix: each migration commits in one
+/// transaction. The next start upgrades it and serves.
 #[test]
 fn a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -836,12 +836,14 @@ fn a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one() {
     };
 
     // A whole start with the upgrade. Its time sets the step of the kills,
-    // so their number does not depend on the speed of the machine.
+    // so their number does not depend on the speed of the machine. Its
+    // schema is the final one, whatever migrations a build ships.
     let start = Instant::now();
     drop(Server::start(&data, &log));
     let step = start.elapsed() / 64;
-    let version_3 = schema(&data);
-    assert_eq!((version_3.version, version_3.filler), (3, FILLER_ROWS));
+    let upgraded = schema(&data);
+    assert!(upgraded.version > version_2.version, "no migration ran");
+    assert_eq!(upgraded.filler, FILLER_ROWS);
 
     // Kills 0, 1, 2 steps and so on after a start, each from version 2,
     // until one comes after the upgrade committed. The kills after the
@@ -855,16 +857,24 @@ fn a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one() {
         drop(server);
         kills += 1;
         let found = schema(&data);
-        if found == version_3 {
+        if found == upgraded {
             break;
         }
-        assert_eq!(found, version_2, "a kill after {after:?}");
+        // Each migration commits in one transaction, so a kill leaves the
+        // database at one whole step: the version it started at (its exact
+        // tables and rows), the final one, or one between them, which also
+        // keeps every filler row.
+        let whole = found == version_2
+            || (found.version > version_2.version
+                && found.version < upgraded.version
+                && found.filler == FILLER_ROWS);
+        assert!(whole, "a kill after {after:?}: {found:?}");
         assert!(kills < 256, "no upgrade");
     }
     println!("{kills} kills, {step:?} apart; the last one came after the upgrade");
 
     let server = Server::start(&data, &log);
-    assert_eq!(schema(&data), version_3);
+    assert_eq!(schema(&data), upgraded);
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let (_, mut objects) = connect(&server.url).await.unwrap();
         let request = ResolveRefRequest {
