@@ -1,6 +1,8 @@
 //! Path history (`Log` with a path) and blame, with their bounds.
 #![cfg(unix)]
 
+mod common;
+
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
@@ -10,11 +12,11 @@ use std::time::{Duration, Instant};
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_server::blame::{
-    self, Blame, BlameRange, MAX_BLAME_BYTES, MAX_BLAME_DIFF_LINES, MAX_BLAME_LINES,
-    MAX_BLAME_VERSIONS, RenameSearch,
+    self, Blame, BlameRange, Line, MAX_BLAME_DIFF_LINES, MAX_BLAME_VERSIONS, RenameSearch, Resume,
 };
 use scion_server::deadline::Deadline;
 use scion_server::import::{ImportOptions, import_git};
+use scion_server::memory::Bytes;
 use scion_server::read::{self, MAX_SCAN};
 use scion_server::{Error, Store, db, tree};
 use tempfile::TempDir;
@@ -83,6 +85,7 @@ fn commit(dir: &Path, message: &str, files: &[(&str, Option<&str>)]) -> String {
 }
 
 fn import(store: &Store, dir: &Path) -> ChangesetId {
+    common::spawn_guard::prime_gix_lookup();
     let opts = ImportOptions {
         rev: "HEAD".into(),
         target_ref: "main".into(),
@@ -245,7 +248,40 @@ fn range(start: usize, count: usize, id: Option<ChangesetId>, origin: u32) -> Bl
 }
 
 fn blame(store: &Store, cs: ChangesetId, p: &str) -> Blame {
-    blame::blame(store, REPO, cs, &path(p), &RenameSearch::default()).unwrap()
+    blame::blame(
+        store,
+        REPO,
+        cs,
+        &path(p),
+        &Resume::default(),
+        &Bytes::new(1 << 30),
+        None,
+    )
+    .unwrap()
+}
+
+/// A resume that goes on with `next` and the search, at line 0.
+/// Whether a reply's resume goes on at `cs` and `p`.
+fn goes_on(resume: Option<&Resume>, cs: ChangesetId, p: &str) -> bool {
+    resume.and_then(|r| r.next.as_ref()) == Some(&(cs, path(p)))
+}
+
+/// Blames with a pool of `cap` bytes.
+fn blame_bounded(
+    store: &Store,
+    cs: ChangesetId,
+    p: &str,
+    cap: usize,
+) -> std::result::Result<Blame, scion_server::error::Error> {
+    blame::blame(
+        store,
+        REPO,
+        cs,
+        &path(p),
+        &Resume::default(),
+        &Bytes::new(cap),
+        None,
+    )
 }
 
 #[test]
@@ -264,10 +300,10 @@ fn a_path_log_reads_past_max_scan_changesets_and_blame_resumes() {
 
     let first = blame(&store, tip, "f");
     assert_eq!(first.ranges, [range(1, 2, None, 1)]);
-    assert_eq!(first.next, Some((root, path("f"))));
+    assert!(goes_on(first.resume.as_ref(), root, "f"));
     let rest = blame(&store, root, "f");
     assert_eq!(rest.ranges, [range(1, 2, Some(root), 1)]);
-    assert_eq!(rest.next, None);
+    assert_eq!(rest.resume, None);
     assert_eq!(rest.changesets, [(root, author(), path("f"))]);
 }
 
@@ -294,37 +330,39 @@ fn blame_stops_after_max_versions_and_resumes() {
         .collect();
     expected.push(range(len, 1, None, 1));
     assert_eq!(first.ranges, expected);
-    assert_eq!(first.next, Some((ids[0], path("f"))));
+    assert!(goes_on(first.resume.as_ref(), ids[0], "f"));
     assert_eq!(first.changesets.len(), MAX_BLAME_VERSIONS);
 
     let rest = blame(&store, ids[0], "f");
     assert_eq!(rest.ranges, [range(1, 1, Some(ids[0]), 1)]);
-    assert_eq!(rest.next, None);
+    assert_eq!(rest.resume, None);
 }
 
 #[test]
 fn blame_gives_every_line_to_the_change_after_a_version_it_cannot_diff() {
     let (_data, store) = open_store();
-    let too_long = format!("a\nb\n{}", "\n".repeat(MAX_BLAME_LINES));
-    let over_limit = store.blobs().put(too_long.as_bytes()).unwrap();
+    // One million empty lines: the version's text is small, but a diff of
+    // it holds about 128 bytes per line, far past a pool of 2 MiB.
+    let big = store.blobs().put("\n".repeat(1 << 20).as_bytes()).unwrap();
     let text = store.blobs().put(b"a\nb\n").unwrap();
     let edit = store.blobs().put(b"a\nb\nc\n").unwrap();
     let ids = chain(
         &store,
         vec![
-            vec![("f", regular(over_limit))],
+            vec![("f", regular(big))],
             vec![("f", regular(text))],
             vec![("f", regular(edit))],
         ],
     );
-    // A line diff would keep "a" and "b" from the first version. It has
-    // more lines than blame reads, so they belong to the change after it.
-    let result = blame(&store, ids[2], "f");
+    // A line diff would keep "a" and "b" from the first version. Its diff
+    // does not fit the budget, so the version counts as absent, and its
+    // lines belong to the change after it.
+    let result = blame_bounded(&store, ids[2], "f", 2 << 20).unwrap();
     assert_eq!(
         result.ranges,
         [range(1, 2, Some(ids[1]), 1), range(3, 1, Some(ids[2]), 3)]
     );
-    assert_eq!(result.next, None, "every line has a changeset");
+    assert_eq!(result.resume, None, "every line has a changeset");
 }
 
 #[test]
@@ -347,14 +385,13 @@ fn a_change_that_only_deletes_lines_is_not_named() {
 fn blame_refuses_what_it_cannot_diff() {
     let (_data, store) = open_store();
     let put = |data: &[u8]| regular(store.blobs().put(data).unwrap());
-    let lines = |n: usize| "\n".repeat(n).into_bytes();
+    // Files of the old limits: 16 MiB in one line, and a million lines.
+    // There are no size or line limits any more: both blame as one range.
     let ids = chain(
         &store,
         vec![vec![
-            ("bytes-at-limit", put(&vec![b'x'; MAX_BLAME_BYTES])),
-            ("bytes-over-limit", put(&vec![b'x'; MAX_BLAME_BYTES + 1])),
-            ("lines-at-limit", put(&lines(MAX_BLAME_LINES))),
-            ("lines-over-limit", put(&lines(MAX_BLAME_LINES + 1))),
+            ("16mib", put(&vec![b'x'; 16 << 20])),
+            ("million-lines", put(&vec![b'\n'; 1 << 20])),
             ("dir/file", put(b"x\n")),
             (
                 "link",
@@ -366,22 +403,52 @@ fn blame_refuses_what_it_cannot_diff() {
     );
     let cs = ids[0];
     assert_eq!(
-        blame(&store, cs, "bytes-at-limit").ranges,
+        blame(&store, cs, "16mib").ranges,
         [range(1, 1, Some(cs), 1)]
     );
     assert_eq!(
-        blame(&store, cs, "lines-at-limit").ranges,
-        [range(1, MAX_BLAME_LINES, Some(cs), 1)]
+        blame(&store, cs, "million-lines").ranges,
+        [range(1, 1 << 20, Some(cs), 1)]
     );
-    for p in ["bytes-over-limit", "lines-over-limit", "dir", "link"] {
-        let result = blame::blame(&store, REPO, cs, &path(p), &RenameSearch::default());
+    for p in ["dir", "link"] {
+        let result = blame::blame(
+            &store,
+            REPO,
+            cs,
+            &path(p),
+            &Resume::default(),
+            &Bytes::new(1 << 30),
+            None,
+        );
         assert!(
             matches!(result, Err(Error::InvalidArgument(_))),
             "{p}: {result:?}"
         );
     }
-    let missing = blame::blame(&store, REPO, cs, &path("missing"), &RenameSearch::default());
+    let missing = blame::blame(
+        &store,
+        REPO,
+        cs,
+        &path("missing"),
+        &Resume::default(),
+        &Bytes::new(1 << 30),
+        None,
+    );
     assert!(matches!(missing, Err(Error::NotFound(_))), "{missing:?}");
+}
+
+#[test]
+fn blame_refuses_a_file_whose_share_is_past_the_whole_budget() {
+    let (_data, store) = open_store();
+    let f = store.blobs().put(&[b'x'; 100]).unwrap();
+    let ids = chain(&store, vec![vec![("f", regular(f))]]);
+    // The text alone is 100 bytes; with its rows and a diff's state it is
+    // about 12,800. A pool of 64 bytes cannot hold it.
+    let result = blame_bounded(&store, ids[0], "f", 64);
+    assert!(
+        matches!(result, Err(Error::ResourceExhausted(_))),
+        "{result:?}"
+    );
 }
 
 /// Blames `p` at `cs` to the end, and continues where a call stops, as a
@@ -397,30 +464,78 @@ fn blame_calls(
     cs: ChangesetId,
     p: &str,
 ) -> (Vec<(ChangesetId, u32, RepoPath)>, usize) {
-    let mut at = (cs, path(p));
-    let mut search = RenameSearch::default();
+    let mut resume = Resume::default();
     let mut paths = HashMap::new();
-    // Each line's changeset once known, and until then its line at `at`.
+    // Each line's changeset and line at it, once known, and until then its
+    // line in the file at the walk's position.
     let mut lines: Vec<(Option<ChangesetId>, u32)> = Vec::new();
     let mut calls = 0;
     loop {
         calls += 1;
-        let result = blame::blame(store, REPO, at.0, &at.1, &search).unwrap();
+        let result = blame::blame(
+            store,
+            REPO,
+            cs,
+            &path(p),
+            &resume,
+            &Bytes::new(1 << 30),
+            None,
+        )
+        .unwrap();
         paths.extend(result.changesets.into_iter().map(|(id, _, p)| (id, p)));
-        let here: Vec<_> = result
+        // Each reply covers a window of the file: its first range names
+        // the window's first line.
+        let at_line = result
+            .ranges
+            .first()
+            .map(|r| r.start_line as usize - 1)
+            .expect("a reply has ranges");
+        let here: Vec<(Option<ChangesetId>, u32)> = result
             .ranges
             .iter()
             .flat_map(|r| (0..r.line_count).map(move |n| (r.changeset, r.origin_line + n)))
             .collect();
-        if lines.is_empty() {
-            lines = here;
+        if at_line == lines.len() {
+            lines.extend(here);
         } else {
-            for line in lines.iter_mut().filter(|(id, _)| id.is_none()) {
-                *line = here[line.1 as usize - 1];
+            // The same window again, from a call that went deeper into the
+            // history: its reply maps the lines still without a changeset.
+            assert!(at_line < lines.len(), "the server skipped lines");
+            for (line, source) in lines.iter_mut().enumerate().skip(at_line) {
+                if source.0.is_some() {
+                    continue;
+                }
+                *source = here[line - at_line];
             }
         }
-        match result.next {
-            Some(next) => (at, search) = (next, result.next_search),
+        match result.resume {
+            Some(next) => {
+                // The next call gets the cursor the reply carried, and the
+                // server reads it back the way a resumed call does.
+                eprintln!(
+                    "DEBUG resume: after_line={} counted={} window={} next_path={:?} searched={} best={:?} first_lines={:?}",
+                    next.after_line,
+                    next.counted,
+                    next.window.len(),
+                    next.next.as_ref().map(|(_, p)| p.as_bytes()),
+                    next.search.searched,
+                    next.search.best,
+                    &next.window[..next.window.len().min(6)]
+                );
+                let bytes = blame::encode_cursor(&next, REPO, cs, &path(p));
+                let (decoded, hold) = blame::decode_cursor(
+                    store,
+                    REPO,
+                    &bytes,
+                    cs,
+                    &path(p),
+                    &Bytes::new(1 << 30),
+                    None,
+                )
+                .unwrap();
+                drop(hold);
+                resume = decoded;
+            }
             None => break,
         }
     }
@@ -776,8 +891,12 @@ fn blame_continues_at_the_old_path_after_a_rename() {
     let ids = chain(&store, changes);
     let tip = *ids.last().unwrap();
 
-    let (next, next_path) = blame(&store, tip, "f").next.unwrap();
+    let resume = blame(&store, tip, "f").resume.expect("the call stopped");
+    let Some((next, next_path)) = resume.next else {
+        panic!("the walk stopped");
+    };
     assert!(ids[..before].contains(&next), "{next}");
+    // The walk follows the rename to the old path.
     assert_eq!(next_path, path("a"));
     // Line k came from changeset `len - k`, where it was line 1.
     let len = ids.len();
@@ -814,7 +933,9 @@ fn a_rename_search_counts_against_the_diff_budget() {
         first.ranges,
         [range(1, 1, Some(ids[2]), 1), range(2, n + 1, None, 1)]
     );
-    assert_eq!(first.next, Some((ids[1], path("f"))));
+    // The walk stopped at `ids[1]`, where the search for the rename source
+    // ran to its end.
+    assert_eq!(first.resume.unwrap().next, Some((ids[1], path("f"))));
     let rest = blame(&store, ids[1], "f");
     assert_eq!(
         rest.ranges,
@@ -845,20 +966,28 @@ fn a_long_line_costs_once_per_64_bytes() {
         )]);
     }
     let ids = chain(&store, changes);
-    assert_eq!(blame(&store, ids[3], "f").next, Some((ids[1], path("f"))));
+    // The walk stopped at `ids[1]` after one diff; the reply carries the
+    // lines it named and where the rest sit.
+    let resume = blame(&store, ids[3], "f").resume.expect("the call stopped");
+    assert!(goes_on(Some(&resume), ids[1], "f"));
+    assert_eq!(resume.counted, 2_003);
+    assert_eq!(resume.window.len(), 2_003);
+    assert_eq!(resume.window[0], Line::Named(ids[3]));
+    assert_eq!(resume.window[1], Line::Named(ids[2]));
+    assert_eq!(resume.window[2], Line::Unnamed(0));
 }
 
 #[test]
 fn a_rename_search_goes_on_where_a_call_stopped() {
     let (_data, store) = open_store();
-    // Files of MAX_BLAME_BYTES, in lines of 64 bytes: n chunks each, so a
-    // call's budget is four of them. `new` is a rename of `old/7` with one
+    // Files of 16 MiB, in lines of 64 bytes: n chunks each, so a call's
+    // budget is four of them. `new` is a rename of `old/7` with one
     // line changed. `old/1` is 60% like it, the rest are not like it.
     // A call reads `new`, then deleted files while its budget lasts, and
     // reads the best file so far again when it goes on. `lib/new`, first by
     // path, has the name of `new`, so step 2 of the first call reads it. The
     // calls that go on do not run step 2 again.
-    let n = MAX_BLAME_BYTES / 64;
+    let n = MAX_BLAME_DIFF_LINES / 4;
     assert_eq!(4 * n, MAX_BLAME_DIFF_LINES);
     let line = |byte: char| format!("{}\n", byte.to_string().repeat(63));
     let put = |text: &str| Some(regular(store.blobs().put(text.as_bytes()).unwrap()));
@@ -875,22 +1004,39 @@ fn a_rename_search_goes_on_where_a_call_stopped() {
     let edit = vec![("new", put("edited\n"))];
     let ids = chain(&store, vec![root, rename, edit]);
 
-    let mut search = RenameSearch::default();
+    let mut resume = Resume::default();
     for searched in [3, 5, 7] {
-        let result = blame::blame(&store, REPO, ids[1], &path("new"), &search).unwrap();
+        let result = blame::blame(
+            &store,
+            REPO,
+            ids[1],
+            &path("new"),
+            &resume,
+            &Bytes::new(1 << 30),
+            None,
+        )
+        .unwrap();
         assert_eq!(result.ranges, [range(1, n, None, 1)]);
-        assert_eq!(result.next, Some((ids[1], path("new"))));
-        search = RenameSearch {
+        let next = result.resume.expect("the search stopped");
+        assert!(goes_on(Some(&next), ids[1], "new"));
+        let expected = RenameSearch {
             searched,
             best: Some(path("old/1")),
         };
-        assert_eq!(result.next_search, search);
+        assert_eq!(next.search, expected);
+        resume = next;
     }
-    let last = blame::blame(&store, REPO, ids[1], &path("new"), &search).unwrap();
-    assert_eq!(
-        (last.next, last.next_search),
-        (None, RenameSearch::default())
-    );
+    let last = blame::blame(
+        &store,
+        REPO,
+        ids[1],
+        &path("new"),
+        &resume,
+        &Bytes::new(1 << 30),
+        None,
+    )
+    .unwrap();
+    assert_eq!(last.resume, None);
     assert_eq!(last.ranges[0], range(1, 1, Some(ids[1]), 1));
     assert!(last.ranges[1..].iter().all(|r| r.changeset == Some(ids[0])));
     assert_eq!(last.changesets[1], (ids[0], author(), path("old/7")));
@@ -906,15 +1052,38 @@ fn a_rename_search_goes_on_where_a_call_stopped() {
         (ids[0], "old/7", 1, None),
         (ids[2], "new", 1, None),
     ];
+    // A real reply's resume, with its search replaced by a bad one.
+    let stopped = blame::blame(
+        &store,
+        REPO,
+        ids[1],
+        &path("new"),
+        &Resume::default(),
+        &Bytes::new(1 << 30),
+        None,
+    )
+    .unwrap()
+    .resume
+    .expect("the search stopped");
     for (cs, p, searched, best) in bad {
-        let search = RenameSearch {
+        let mut resume = stopped.clone();
+        resume.next = Some((cs, path(p)));
+        resume.search = RenameSearch {
             searched,
             best: best.map(path),
         };
-        let result = blame::blame(&store, REPO, cs, &path(p), &search);
+        let result = blame::blame(
+            &store,
+            REPO,
+            ids[1],
+            &path("new"),
+            &resume,
+            &Bytes::new(1 << 30),
+            None,
+        );
         assert!(
             matches!(result, Err(Error::InvalidArgument(_))),
-            "{search:?}: {result:?}"
+            "{p} at {searched}: {result:?}"
         );
     }
 }
@@ -944,19 +1113,38 @@ fn a_rename_search_moves_on_every_call() {
         ("new", put(&new)),
     ];
     let ids = chain(&store, vec![root, rename]);
-    let mut search = RenameSearch::default();
+    let mut resume = Resume::default();
     for (searched, best) in [(1, None), (2, Some("old/1"))] {
-        let result = blame::blame(&store, REPO, ids[1], &path("new"), &search).unwrap();
-        assert_eq!(result.next, Some((ids[1], path("new"))));
-        search = result.next_search;
-        let expected = RenameSearch {
+        let result = blame::blame(
+            &store,
+            REPO,
+            ids[1],
+            &path("new"),
+            &resume,
+            &Bytes::new(1 << 30),
+            None,
+        )
+        .unwrap();
+        let search = RenameSearch {
             searched,
             best: best.map(path),
         };
-        assert_eq!(search, expected);
+        let next = result.resume.expect("the search stopped");
+        assert!(goes_on(Some(&next), ids[1], "new"));
+        assert_eq!(next.search, search);
+        resume = next;
     }
-    let last = blame::blame(&store, REPO, ids[1], &path("new"), &search).unwrap();
-    assert_eq!(last.next, None);
+    let last = blame::blame(
+        &store,
+        REPO,
+        ids[1],
+        &path("new"),
+        &resume,
+        &Bytes::new(1 << 30),
+        None,
+    )
+    .unwrap();
+    assert_eq!(last.resume, None);
     assert_eq!(last.changesets[1], (ids[0], author(), path("old/2")));
 }
 
@@ -996,8 +1184,9 @@ fn a_rename_search_at_a_later_step_uses_the_budget_left() {
         let edit = vec![("new", put(&format!("{new}extra00\n")))];
         let ids = chain(&store, vec![root, rename, edit]);
         let first = blame(&store, ids[2], "new");
-        assert_eq!(first.next, Some((ids[1], path("new"))), "{decoys}");
-        assert_eq!(first.next_search, stopped, "{decoys}");
+        let next = first.resume.expect("the search stopped");
+        assert!(goes_on(Some(&next), ids[1], "new"), "{decoys}");
+        assert_eq!(next.search, stopped, "{decoys}");
         let (got, calls) = blame_calls(&store, ids[2], "new");
         let mut expected = vec![(ids[1], 1, path("new"))];
         expected.extend((2..=n).map(|i| (ids[0], i, path("old"))));
@@ -1027,13 +1216,11 @@ fn a_rename_search_counts_the_file_sizes_it_reads() {
     rename.push(("new", put(&old.replacen("n000000\n", "changed\n", 1))));
     let ids = chain(&store, vec![root, rename]);
     let first = blame(&store, ids[1], "new");
-    assert_eq!(first.next, Some((ids[1], path("new"))));
-    assert!(
-        first.next_search.searched < names.len(),
-        "{:?}",
-        first.next_search
-    );
-    assert_eq!(first.next_search.best, Some(path("old")));
+    let Some(Resume { search, .. }) = first.resume else {
+        panic!("the search stopped");
+    };
+    assert!(search.searched < names.len(), "{search:?}");
+    assert_eq!(search.best, Some(path("old")));
     let (got, calls) = blame_calls(&store, ids[1], "new");
     assert_eq!(got[1], (ids[0], 2, path("old")));
     assert_eq!(calls, 2);
@@ -1068,29 +1255,7 @@ fn a_mode_change_or_a_rename_with_no_edit_costs_nothing() {
         result.ranges,
         [range(1, 1, Some(ids[3]), 1), range(2, n, Some(ids[0]), 1)]
     );
-    assert_eq!(result.next, None);
-}
-
-#[test]
-fn a_file_read_and_refused_costs_its_size() {
-    let (_data, store) = open_store();
-    // `ids[0]` has more lines than blame reads. It is read, then refused,
-    // and that costs about 16,000. With the diff of `ids[2]` before it, the
-    // call passes its budget and stops at `ids[1]`.
-    let n = 520_000;
-    let refused = MAX_BLAME_LINES.div_ceil(64);
-    assert!(2 * n < MAX_BLAME_DIFF_LINES && 2 * n + 1 + refused > MAX_BLAME_DIFF_LINES);
-    let put = |text: &str| Some(regular(store.blobs().put(text.as_bytes()).unwrap()));
-    let empty = "\n".repeat(n);
-    let ids = chain(
-        &store,
-        vec![
-            vec![("f", put(&"\n".repeat(MAX_BLAME_LINES + 1)))],
-            vec![("f", put(&empty))],
-            vec![("f", put(&format!("x\n{empty}")))],
-        ],
-    );
-    assert_eq!(blame(&store, ids[2], "f").next, Some((ids[1], path("f"))));
+    assert_eq!(result.resume, None);
 }
 
 /// Lines `n<number>` for each number of `range`, 8 bytes each with their
@@ -1175,7 +1340,7 @@ fn blame_of_an_empty_file_has_no_ranges() {
     let ids = chain(&store, vec![vec![("f", regular(empty))]]);
     let result = blame(&store, ids[0], "f");
     assert_eq!(result.ranges, Vec::<BlameRange>::new());
-    assert_eq!(result.next, None);
+    assert_eq!(result.resume, None);
 }
 
 #[test]
@@ -1208,13 +1373,13 @@ fn blame_stops_when_its_diff_budget_runs_out() {
         first.ranges,
         [range(1, 1, Some(ids[2]), 1), range(2, n + 1, None, 1)]
     );
-    assert_eq!(first.next, Some((ids[1], path("f"))));
+    assert!(goes_on(first.resume.as_ref(), ids[1], "f"));
     let rest = blame(&store, ids[1], "f");
     assert_eq!(
         rest.ranges,
         [range(1, 1, Some(ids[1]), 1), range(2, n, Some(ids[0]), 1)]
     );
-    assert_eq!(rest.next, None);
+    assert_eq!(rest.resume, None);
 
     // The first diff of a call runs even when it alone is over the budget,
     // so every call makes progress.
@@ -1234,5 +1399,212 @@ fn blame_stops_when_its_diff_budget_runs_out() {
         result.ranges,
         [range(1, 1, Some(ids[1]), 1), range(2, big, Some(ids[0]), 1)]
     );
-    assert_eq!(result.next, None);
+    assert_eq!(result.resume, None);
+}
+
+/// A chain of changesets in the repo `name`, as [`chain`] does in `r`.
+fn chain_in<S: Into<Option<FileState>>>(
+    store: &Store,
+    name: &str,
+    puts: Vec<Vec<(&str, S)>>,
+) -> Vec<ChangesetId> {
+    assert_ne!(name, REPO);
+    store
+        .write(|c| {
+            let repo = db::create_repo(c, name)?;
+            let mut ids: Vec<ChangesetId> = Vec::new();
+            for puts in puts {
+                let cs = Changeset {
+                    parents: ids.last().copied().into_iter().collect(),
+                    author: author(),
+                    committer: None,
+                    message: format!("{name} change {}", ids.len()).into_bytes(),
+                    changes: puts.into_iter().map(|(p, s)| (path(p), s.into())).collect(),
+                };
+                ids.push(tree::store_changeset(c, repo, &cs)?.0);
+            }
+            Ok(ids)
+        })
+        .unwrap()
+}
+
+/// Cursor bytes for `resume`, made for a blame of `p` at `cs` in `r`.
+fn cursor_bytes(resume: &Resume, cs: ChangesetId, p: &str) -> Vec<u8> {
+    blame::encode_cursor(resume, REPO, cs, &path(p))
+}
+
+#[test]
+fn a_cursor_names_only_changesets_of_its_repo() {
+    let (_data, store) = open_store();
+    let put = |data: &[u8]| regular(store.blobs().put(data).unwrap());
+    let ids = chain(
+        &store,
+        vec![vec![("f", put(b"a\n"))], vec![("f", put(b"b\n"))]],
+    );
+    // Another repo, with a changeset `r` does not have.
+    let other = chain_in(&store, "other", vec![vec![("f", put(b"a\n"))]]);
+
+    // A cursor whose walk goes on at the other repo's changeset: its
+    // digest is right, its changeset is not.
+    let walk = Resume {
+        next: Some((other[0], path("f"))),
+        search: RenameSearch::default(),
+        after_line: 0,
+        counted: 2,
+        window: vec![Line::Unnamed(0), Line::Unnamed(1)],
+    };
+    let bytes = cursor_bytes(&walk, ids[1], "f");
+    let err = blame::decode_cursor(
+        &store,
+        REPO,
+        &bytes,
+        ids[1],
+        &path("f"),
+        &Bytes::new(1 << 30),
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+
+    // The same for a line the cursor says was named by it.
+    let named = Resume {
+        next: Some((ids[1], path("f"))),
+        search: RenameSearch::default(),
+        after_line: 0,
+        counted: 2,
+        window: vec![Line::Named(other[0]), Line::Unnamed(0)],
+    };
+    let bytes = cursor_bytes(&named, ids[1], "f");
+    let err = blame::decode_cursor(
+        &store,
+        REPO,
+        &bytes,
+        ids[1],
+        &path("f"),
+        &Bytes::new(1 << 30),
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+}
+
+#[test]
+fn a_cursor_with_past_bounds_is_refused_before_it_allocates() {
+    let (_data, store) = open_store();
+    let put = |data: &[u8]| regular(store.blobs().put(data).unwrap());
+    let ids = chain(
+        &store,
+        vec![vec![("f", put(b"a\n"))], vec![("f", put(b"b\n"))]],
+    );
+    // A cursor with an empty window: its header ends at the table count.
+    let resume = Resume {
+        next: Some((ids[1], path("f"))),
+        search: RenameSearch::default(),
+        after_line: 0,
+        counted: 2,
+        window: vec![Line::Unnamed(0), Line::Unnamed(1)],
+    };
+    let good = cursor_bytes(&resume, ids[1], "f");
+    // version, digest, walk flag, walk changeset, walk path, searched, best
+    // flag, after_line, counted, table count: the run count follows.
+    let head = good.len() - 4 - 2; // past the run count and the two runs
+    assert_eq!(good[good.len() - 6], 0, "no table");
+
+    // A run count of u32::MAX: refused, and it does not allocate for it.
+    let mut made = good[..head].to_vec();
+    made.truncate(good.len() - 6);
+    made.extend_from_slice(&u32::MAX.to_be_bytes());
+    let err = blame::decode_cursor(
+        &store,
+        REPO,
+        &made,
+        ids[1],
+        &path("f"),
+        &Bytes::new(1 << 30),
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+
+    // A cursor that does not fit the budget is refused too.
+    let err = blame::decode_cursor(
+        &store,
+        REPO,
+        &good,
+        ids[1],
+        &path("f"),
+        &Bytes::new(10),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::ResourceExhausted(_)),
+        "a cursor past the budget: {err:?}"
+    );
+}
+
+#[test]
+fn the_worst_cursor_stays_small() {
+    // The most runs a window can hold: its lines alternate between the
+    // changesets one call can walk, and every other line is still open.
+    // The table holds each changeset once; a run costs a few bytes.
+    let versions = MAX_BLAME_VERSIONS;
+    let window: Vec<Line> = (0..blame::MAX_BLAME_WINDOW_LINES)
+        .map(|i| {
+            if i % 2 == 0 {
+                let mut id = [0u8; 32];
+                id[0] = u8::try_from(i % versions).unwrap_or(u8::MAX);
+                id[1] = 0x42;
+                Line::Named(ChangesetId::from_bytes(id))
+            } else {
+                Line::Unnamed(i)
+            }
+        })
+        .collect();
+    let resume = Resume {
+        next: None,
+        search: RenameSearch::default(),
+        after_line: 0,
+        counted: blame::MAX_BLAME_WINDOW_LINES,
+        window,
+    };
+    let bytes = cursor_bytes(&resume, ChangesetId::from_bytes([7; 32]), "f");
+    println!(
+        "worst cursor: {} bytes for {} lines, {} runs",
+        bytes.len(),
+        blame::MAX_BLAME_WINDOW_LINES,
+        blame::MAX_BLAME_WINDOW_LINES
+    );
+    assert!(bytes.len() < 8 << 20, "{} bytes", bytes.len());
+}
+
+#[test]
+fn a_call_that_holds_budget_never_waits_for_more() {
+    let (_data, store) = open_store();
+    // The older version is long, the blamed one short: the call takes the
+    // short text and the file's line share first, and the long older text
+    // does not fit what is left. The call must fail at once with
+    // `RESOURCE_EXHAUSTED`, not wait for bytes that only it can free: with
+    // a waiting take and no deadline, this test would hang forever.
+    let long = store.blobs().put("line\n".repeat(100).as_bytes()).unwrap();
+    let put_long = Some(regular(long));
+    let put_short = Some(regular(store.blobs().put(b"a\nb\n").unwrap()));
+    let ids = chain(&store, vec![vec![("f", put_long)], vec![("f", put_short)]]);
+    // 6 bytes of text + 2 lines x 128 bytes of state leave 338 of 600,
+    // and the 500 bytes of the older version do not fit them. The cap is
+    // above 500, so the version is not absent: the take is what misses.
+    let err = blame::blame(
+        &store,
+        REPO,
+        ids[1],
+        &path("f"),
+        &Resume::default(),
+        &Bytes::new(600),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::ResourceExhausted(_)),
+        "a held budget never waits: {err:?}"
+    );
 }

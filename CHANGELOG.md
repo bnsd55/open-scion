@@ -16,6 +16,19 @@ until that section gets its release date.
 
 #### Objects and byte format
 
+- Per-principal quotas (`#15`). With `--access`, `--max-principal-requests`
+  (64), `--max-principal-upload-bytes` (512 MiB) and
+  `--max-principal-pending-lands` (64) bound what one principal holds at
+  once; a call over a cap fails before any work with `RESOURCE_EXHAUSTED`,
+  naming the flag of the cap it hit. With `--token T`, one client is one
+  principal, so the caps are off unless a flag sets one. The pending-lands
+  count comes from the store, so it is right after a restart. A land that
+  stays `PENDING` for longer than `--land-stale-secs` (a day) is rejected by
+  a sweep at start and then once per hour: no caller can still be finishing
+  it, because a call runs at most 600 s, and the sweep holds the same
+  per-ref lock as the land path, so a live retry wins. A retry of a
+  rejected land needs a new request key.
+
 - `scion-core`: the object model (changesets, trees, blob IDs) and a frozen,
   canonical v1 byte format, with golden tests, property tests and a fuzz
   target. Blobs belong to repos (schema version 4, table `repo_blobs`): a
@@ -87,29 +100,39 @@ until that section gets its release date.
   `Log` with a path reads only the changesets that change the path, so one
   call returns up to 1,000 entries however far apart they are. A call
   stops after about 64 MiB of path history, which a file in a large
-  directory reaches in fewer entries. `scn log --path` and `scn blame`.
+  directory reaches in fewer entries. A level of path history above 64 KiB
+  is cut into chunks at content-defined boundaries (a name cuts with
+  chance 1 in 128), so a change in a directory of 100,000 names stores
+  about 47 KiB of new rows, not the 6.3 MB node of every name the
+  directory ever had. `scn log --path` and `scn blame`.
   An older server ignores the new `path` field, so `scn log --path`
   against it prints unfiltered history.
 - `Blame`, a new RPC: which changeset last changed each line of a file, on
   first-parent history. It follows renames as `git blame` does by
   default: a deleted file with the same content, else a similar one (50%
   or more). Each changeset in a reply names the path of the file there
-  (`BlameChangeset.path`), and a reply that stopped says where to continue
-  (`next_path`). `scn blame` shows each line's path when some line came
-  from another path, as git does, and `--json` adds `path` to each range.
-  A client that ignores `next_path` continues at the wrong path after a
-  rename.
-- `Blame` reads files of up to 16 MiB and 1,048,576 lines, and blames a
-  binary file line by line, as `git blame` does. Every byte read counts
-  against the per-call budget, once per 64 bytes.
-- A `Blame` rename search looks at every file that the changeset deletes,
-  as `git blame` does. It uses the budget that the call has left. Where
-  the budget runs out, the reply says where the search stopped
-  (`next_rename_searched`, `next_rename_best`), and the next call goes on
-  from there with `rename_searched` and `rename_best`, which the client
-  must send back unchanged. When the search has looked at every deleted
-  file, the reply says that too, and the next call takes the best file as
-  the answer at once. `scn blame` does this.
+  (`BlameChangeset.path`). `scn blame` shows each line's path when some
+  line came from another path, as git does, and `--json` adds `path` to
+  each range.
+- `Blame` blames a binary file line by line, as `git blame` does, and
+  files of any size the shared memory budget holds: all `Blame` calls of a
+  server share 1 GiB, and a call takes the bytes of every version it reads
+  and 128 bytes per line of the file it blames. A call's first take may
+  wait for bytes; every later take fails at once if they are not free, so
+  two calls can never wait for each other. An older version that does not
+  fit counts as absent, so its lines go to the changeset that replaced it.
+  A call answers at most 1,048,576 lines of the file; a bigger one is
+  blamed over several calls.
+- A `Blame` reply that stopped at a bound carries an opaque cursor
+  (`next_cursor`): where the walk goes on, where its rename search
+  stopped, and which lines of the file the reply answered. The client MUST
+  send it back unchanged, with the same repo, changeset and path; the
+  server binds it to all three, checks every changeset it names, and
+  refuses anything else with `INVALID_ARGUMENT`. Each new window re-walks
+  the history from the requested changeset and diffs only the versions of
+  its own window. When the search has looked at every deleted file, the
+  reply says that too, and the next call takes the best file as the answer
+  at once. `scn blame` does all of this.
 - The query API: `MergeBase` (every best common ancestor, as
   `git merge-base --all`), `IsAncestor` (exit 0 or 1), and `Diff` (the
   paths whose file differs between two changesets, optionally below a
@@ -150,6 +173,12 @@ until that section gets its release date.
   `default`, which may read and write every repo.
 - Bearer-token auth, loopback-only listening by default, request limits
   and name validation at the RPC boundary.
+- The gRPC health service (`grpc.health.v1`) on the same port as the other
+  services, without a token, so a probe needs none: `scion-server` and
+  `scion-cache` (and `scion-daemon`, which shares the tier's server)
+  answer `Check` and `Watch` with `SERVING` once the store and the
+  upstream channel are open, and with `NOT_SERVING` while a shutdown
+  drains.
 - TLS and mTLS: the server and `scion-cache` serve TLS with `--tls-cert`
   and `--tls-key` (a non-loopback address then needs no
   `--insecure-listen`), and require a client certificate with

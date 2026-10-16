@@ -39,6 +39,7 @@ tokio = { version = "1.53", features = ["macros", "net", "rt-multi-thread", "sig
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14"
+tonic-health = "0.14"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 tracing = "0.1"

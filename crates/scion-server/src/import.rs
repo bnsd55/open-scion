@@ -833,17 +833,22 @@ mod tests {
 
     /// Runs git in `dir` with a fixed identity and no user or system config.
     fn git(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_AUTHOR_NAME", "Ada")
-            .env("GIT_AUTHOR_EMAIL", "ada@example.com")
-            .env("GIT_COMMITTER_NAME", "Ada")
-            .env("GIT_COMMITTER_EMAIL", "ada@example.com")
-            .output()
-            .unwrap();
+        // The child shares a flock until it execs (see `spawn_guard` in
+        // store.rs): the read side keeps this spawn out of a lock-release
+        // window of another test.
+        let out = crate::store::spawn_guard::across_spawn(|| {
+            Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "Ada")
+                .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+                .env("GIT_COMMITTER_NAME", "Ada")
+                .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+                .output()
+        })
+        .unwrap();
         assert!(
             out.status.success(),
             "git {args:?}: {}",
@@ -853,6 +858,7 @@ mod tests {
 
     #[test]
     fn a_tiny_blob_cache_imports_the_same_changesets() {
+        crate::store::spawn_guard::prime_gix_lookup();
         let repo = tempfile::tempdir().unwrap();
         let dir = repo.path();
         git(dir, &["init", "-q", "-b", "main"]);
@@ -890,6 +896,7 @@ mod tests {
 
     #[test]
     fn a_land_while_the_import_checks_the_ref_is_never_overwritten() {
+        crate::store::spawn_guard::prime_gix_lookup();
         let data = tempfile::tempdir().unwrap();
         let server = Store::open(data.path()).unwrap();
         let importer = Store::open_shared(data.path()).unwrap();
@@ -945,6 +952,7 @@ mod tests {
 
     #[test]
     fn an_import_derives_missing_parent_root_trees_in_steps_first() {
+        crate::store::spawn_guard::prime_gix_lookup();
         let repo = tempfile::tempdir().unwrap();
         let dir = repo.path();
         git(dir, &["init", "-q", "-b", "main"]);
@@ -978,6 +986,7 @@ mod tests {
 
     #[test]
     fn a_server_write_waits_less_than_busy_timeout_during_a_slow_batch() {
+        crate::store::spawn_guard::prime_gix_lookup();
         let repo = tempfile::tempdir().unwrap();
         let dir = repo.path();
         git(dir, &["init", "-q", "-b", "main"]);
@@ -1029,6 +1038,7 @@ mod tests {
 
     #[test]
     fn an_import_that_is_alone_runs_its_batch_in_one_transaction() {
+        crate::store::spawn_guard::prime_gix_lookup();
         let repo = tempfile::tempdir().unwrap();
         let dir = repo.path();
         git(dir, &["init", "-q", "-b", "main"]);
