@@ -364,7 +364,6 @@ fn read_index(dir: &Path) -> io::Result<(Lru<()>, Found)> {
 /// which takes it the rest of the way.
 fn fsync(dir: &Path) -> io::Result<()> {
     rustix::fs::fsync(fs::File::open(dir)?).map_err(Into::into)
-
 }
 
 /// Writes an index file of `state` with the records `rows`, in place of the

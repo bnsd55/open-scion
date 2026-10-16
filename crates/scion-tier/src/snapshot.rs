@@ -292,7 +292,14 @@ mod tests {
         let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
         seed(&store, &path).unwrap().unwrap();
         // Nothing listens on the discard port.
-        let tier = Tier::new(store, "http://127.0.0.1:9", "t", DAEMON_UPSTREAM_TIMEOUT).unwrap();
+        let tier = Tier::new(
+            store,
+            "http://127.0.0.1:9",
+            "t",
+            DAEMON_UPSTREAM_TIMEOUT,
+            None,
+        )
+        .unwrap();
         let request = GetObjectsRequest {
             repo: "r".into(),
             refs: objects.iter().map(|(key, _)| key.to_ref()).collect(),
