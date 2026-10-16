@@ -224,12 +224,15 @@ fn import_with_cache(
     Ok(report)
 }
 
-/// Stores a batch's prepared commits: each in a write transaction that ends
-/// after [`TX_BUDGET`] plus one commit, with its check inside it, so a server
-/// that shares the data directory waits for that, and not for the whole
-/// batch. A chunk commits whole: a crash loses whole commits, never half a
-/// one, and a commit is stored only with its check. The import stays off the
-/// write lock [`TX_YIELD`] between two transactions.
+/// Stores a batch's prepared commits: each in a write transaction, with its
+/// check inside it. A chunk commits whole: a crash loses whole commits,
+/// never half a one, and a commit is stored only with its check.
+///
+/// A `Store` that shares the data directory keeps each transaction short: it
+/// ends after [`TX_BUDGET`] plus one commit, and the import stays off the
+/// write lock [`TX_YIELD`] between two transactions, so a server that writes
+/// waits for that, and not for the whole batch. A `Store` that is alone has
+/// nobody to wait for it, and runs the whole batch in one transaction.
 #[allow(clippy::too_many_arguments)]
 fn store_batch(
     store: &Store,
@@ -242,6 +245,7 @@ fn store_batch(
 ) -> Result<()> {
     #[cfg(test)]
     let slow_record = SLOW_RECORD.with(Cell::get);
+    let shared = store.is_shared();
     let mut rest = prepared;
     while !rest.is_empty() {
         let mut taken = 0;
@@ -257,7 +261,7 @@ fn store_batch(
                     checker.check(c, *commit, *git_tree, root)?;
                 }
                 taken += 1;
-                if started_tx.elapsed() >= TX_BUDGET {
+                if shared && started_tx.elapsed() >= TX_BUDGET {
                     break;
                 }
             }
@@ -271,7 +275,7 @@ fn store_batch(
             commits_per_sec = per_sec(*done, started),
             "importing git commits"
         );
-        if !rest.is_empty() {
+        if shared && !rest.is_empty() {
             // A server write that waited for this transaction takes the lock
             // here, before the next one begins.
             std::thread::sleep(TX_YIELD);
@@ -1007,28 +1011,49 @@ mod tests {
             })
         };
         let mut writes = 0;
-        let mut slowest = Duration::ZERO;
         while !import.is_finished() {
-            let started = Instant::now();
             let name = format!("w{writes}");
+            // Every write succeeds: a wait past the 5 s busy_timeout fails
+            // here, which one transaction of the whole batch would cause.
             server.write(|c| db::create_repo(c, &name)).unwrap();
-            slowest = slowest.max(started.elapsed());
             writes += 1;
             thread::sleep(Duration::from_millis(10));
         }
         let report = import.join().unwrap().unwrap();
-        assert_eq!(report.imported, 160);
         assert!(writes > 0, "no server write ran during the import");
-        // The write that waited for a transaction never waited for the
-        // importer's whole batch, or the 5 s busy_timeout would fire.
-        assert!(
-            slowest < Duration::from_secs(5),
-            "a server write waited {slowest:?}, past busy_timeout"
-        );
-        // The budget is what bounds the wait, not luck: each transaction is
-        // far shorter than busy_timeout.
-        assert!(slowest < Duration::from_secs(3), "{slowest:?}");
-        // And the import did its work.
+        // The budget split the batch into transactions, and the import did
+        // its work.
+        assert!(importer.txes() > 2, "the batch was one transaction");
         assert_eq!(report.imported, 160);
+    }
+
+    #[test]
+    fn an_import_that_is_alone_runs_its_batch_in_one_transaction() {
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        // More slow records than one budget-sized transaction takes, so a
+        // shared import would split the batch.
+        for i in 0..30 {
+            git(
+                dir,
+                &["commit", "-q", "--allow-empty", "-m", &i.to_string()],
+            );
+        }
+        let data = tempfile::tempdir().unwrap();
+        let importer = Store::open(data.path()).unwrap();
+        let opts = ImportOptions {
+            rev: "main".into(),
+            target_ref: "main".into(),
+            verify_sample: 0,
+        };
+        // 30 x 40 ms of records is over the 1 s budget: an import that is
+        // alone ignores the budget and runs the batch in one transaction.
+        SLOW_RECORD.with(|c| c.set(Duration::from_millis(40)));
+        let report = import_git(&importer, "r", dir, &opts).unwrap();
+        // One transaction each for the repo, the batch, and the ref: the
+        // batch did not split at the budget.
+        assert_eq!(importer.txes(), 3);
+        assert_eq!(report.imported, 30);
     }
 }

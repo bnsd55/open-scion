@@ -80,10 +80,17 @@ struct Inner {
     /// How many of the ended commits a finished full flush covers.
     flushed: AtomicU64,
     blobs: Blobs,
+    /// This `Store` holds the directory alone: no other process may use it,
+    /// so a write cannot make one wait.
+    alone: bool,
     /// `<data>/lock`, shared, until the last clone is dropped.
     _lock: fs::File,
     /// `<data>/server.lock`, for a server `Store`.
     _server_lock: Option<fs::File>,
+    /// Write transactions run so far, for tests of how imports share the
+    /// write lock.
+    #[cfg(test)]
+    txes: AtomicU64,
 }
 
 impl Store {
@@ -209,8 +216,11 @@ impl Store {
                 committed: AtomicU64::new(0),
                 flushed: AtomicU64::new(0),
                 blobs,
+                alone,
                 _lock: lock,
                 _server_lock: server_lock,
+                #[cfg(test)]
+                txes: AtomicU64::new(0),
             }),
         })
     }
@@ -300,6 +310,19 @@ impl Store {
         f(&self.lock())
     }
 
+    /// Whether another process may use the directory at the same time. A
+    /// [`Store::open_shared`] shares even if it found nobody; only one that
+    /// took the directory alone is not shared.
+    pub(crate) fn is_shared(&self) -> bool {
+        !self.inner.alone
+    }
+
+    /// Write transactions run so far.
+    #[cfg(test)]
+    pub(crate) fn txes(&self) -> u64 {
+        self.inner.txes.load(Ordering::Relaxed)
+    }
+
     /// Runs `f` in one write transaction. Commits if `f` returns `Ok`, rolls
     /// back otherwise. Returns once the commit is durable: [`Store::commit`],
     /// then [`Store::flush`].
@@ -328,6 +351,8 @@ impl Store {
         self.inner.committing.fetch_add(1, Ordering::Release);
         let committed = tx.commit();
         self.inner.committed.fetch_add(1, Ordering::Release);
+        #[cfg(test)]
+        self.inner.txes.fetch_add(1, Ordering::Relaxed);
         committed?;
         Ok(value)
     }
