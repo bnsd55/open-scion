@@ -2,7 +2,7 @@
 //! node, serves them over a Unix socket, and fetches misses from its upstream,
 //! a `scion-cache`.
 
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -59,6 +59,10 @@ struct Cli {
     /// and stored before the daemon serves. Repeat for more.
     #[arg(long, value_name = "FILE")]
     seed: Vec<PathBuf>,
+    /// Most bytes that the stalled replies of one connection may hold. A
+    /// connection over it is closed with them.
+    #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
+    max_stalled_bytes: NonZeroU64,
 }
 
 #[tokio::main]
@@ -104,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
     let limits = Limits {
         connections: cli.max_connections,
         streams: cli.max_streams,
+        stalled_bytes: cli.max_stalled_bytes,
     };
     Box::pin(tier.serve(
         &cli.token,

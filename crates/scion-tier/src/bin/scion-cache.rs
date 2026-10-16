@@ -2,7 +2,7 @@
 //! memory and fetches misses from its upstream, the server.
 
 use std::net::SocketAddr;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -84,6 +84,10 @@ struct Cli {
     #[arg(long, value_name = "SECS", default_value_t = 600,
           value_parser = clap::value_parser!(u64).range(1..))]
     snapshot_every: u64,
+    /// Most bytes that the stalled replies of one connection may hold. A
+    /// connection over it is closed with them.
+    #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
+    max_stalled_bytes: NonZeroU64,
 }
 
 #[tokio::main]
@@ -143,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
     let limits = Limits {
         connections: cli.max_connections,
         streams: cli.max_streams,
+        stalled_bytes: cli.max_stalled_bytes,
     };
     Box::pin(tier.serve(
         &cli.token,

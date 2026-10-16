@@ -328,6 +328,7 @@ async fn send_file(
     _share: OwnedSemaphorePermit,
     tx: mpsc::Sender<Part>,
     stall: Duration,
+    stalled: Option<scion_proto::listen::Stalled>,
 ) {
     let fail = |status: Status| {
         // Fails only if the client has gone.
@@ -361,6 +362,11 @@ async fn send_file(
                 }
                 Ok(Err(_)) => return,
                 Err(_) => {
+                    // The parts of the file stay in HTTP/2 until the
+                    // connection ends; the connection counts them.
+                    if let Some(stalled) = &stalled {
+                        stalled.add(scion_proto::reply::STALLED_REPLY_BYTES);
+                    }
                     let detail = format!("the client took no data for {stall:?}");
                     return fail(Status::deadline_exceeded(detail));
                 }
@@ -368,7 +374,16 @@ async fn send_file(
         }
         if open.is_none() {
             // Keeps the share until the client has taken the last part.
-            let _ = tokio::time::timeout(stall, tx.reserve_many(2)).await;
+            match tokio::time::timeout(stall, tx.reserve_many(2)).await {
+                // Sent, or the client has gone with it.
+                Ok(_) => {}
+                // It stopped reading: what was sent stays in HTTP/2.
+                Err(_) => {
+                    if let Some(stalled) = &stalled {
+                        stalled.add(scion_proto::reply::STALLED_REPLY_BYTES);
+                    }
+                }
+            }
             return;
         }
     }
@@ -532,6 +547,9 @@ impl Scion for ScionService {
         request: Request<ReadFileRequest>,
     ) -> Result<Response<ReadFileStream>, Status> {
         let caller = caller(&request)?;
+        // The handle of the caller's connection, before the request is taken
+        // apart: the reply counts what it leaves in HTTP/2 on it.
+        let stalled = scion_proto::listen::Stalled::of(&request);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
@@ -549,6 +567,8 @@ impl Scion for ScionService {
             .acquire_many_owned(share)
             .await
             .map_err(|_| Status::unavailable("server is shutting down"))?;
+        // The handle of the caller's connection, before the request is taken
+        // apart: the reply counts what it leaves in HTTP/2 on it.
         let (tx, rx) = mpsc::channel(2);
         tokio::spawn(send_file(
             self.worker.clone(),
@@ -556,6 +576,7 @@ impl Scion for ScionService {
             share,
             tx,
             READ_STALL_TIMEOUT,
+            stalled,
         ));
         Ok(Response::new(ReceiverStream::new(rx)))
     }
@@ -859,7 +880,7 @@ mod tests {
         let share = u32::try_from(budget).unwrap();
         let share = Arc::clone(&reads).acquire_many_owned(share).await.unwrap();
         let (tx, rx) = mpsc::channel(2);
-        let task = tokio::spawn(send_file(Worker::new(store), blob, share, tx, stall));
+        let task = tokio::spawn(send_file(Worker::new(store), blob, share, tx, stall, None));
         (task, rx, reads)
     }
 

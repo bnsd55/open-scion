@@ -394,6 +394,9 @@ struct Ask {
     zstd: bool,
     /// When the reply ends its waits: the caller's deadline less a margin.
     until: Until,
+    /// The handle of the caller's connection, which counts what a stalled
+    /// reply leaves in HTTP/2.
+    stalled: Option<scion_proto::listen::Stalled>,
 }
 
 impl<S: Store> Tier<S> {
@@ -539,8 +542,17 @@ impl<S: Store> Tier<S> {
         tx: mpsc::Sender<reply::Sent>,
     ) {
         let (tier, ask, progress) = (&self, &ask, &progress);
+        let stalled = ask.stalled.clone();
         let produce = |i| async move { split(tier.produce(ask, i, progress).await?).ok() };
-        reply::send_objects(first, 1..ask.keys.len(), tx, STALL_TIMEOUT, produce).await;
+        reply::send_objects(
+            first,
+            1..ask.keys.len(),
+            tx,
+            STALL_TIMEOUT,
+            stalled,
+            produce,
+        )
+        .await;
         tracing::info!(
             objects = ask.keys.len(),
             hits = progress.hits.load(Ordering::Relaxed),
@@ -1094,6 +1106,7 @@ impl<S: Store> Objects for Tier<S> {
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<ObjectStream>, Status> {
         let until = Until::of(&request);
+        let stalled = scion_proto::listen::Stalled::of(&request);
         let GetObjectsRequest { repo, refs, accept } = request.into_inner();
         check_repo(&repo)?;
         check::object_count(refs.len())?;
@@ -1103,6 +1116,7 @@ impl<S: Store> Objects for Tier<S> {
             keys,
             zstd: accept.contains(&Encoding::Zstd.into()),
             until,
+            stalled,
         };
         // The first object is found before the reply starts, as on the
         // server. So when the whole upstream call fails (for example,
@@ -1282,6 +1296,7 @@ mod tests {
             keys: keys.to_vec(),
             zstd: false,
             until: Until::NONE,
+            stalled: None,
         }
     }
 

@@ -253,3 +253,12 @@ release.
   with its own if the fetch failed on a shorter one. `scn` sends a 600 s
   deadline (the server's own limit) and a 10 s connect timeout on every
   call, so a waiting `scn` never hangs silently (#98).
+- A process now bounds what stalled replies hold: a reply whose client
+  stops reading adds what it leaves in HTTP/2 (under 4 MiB) to a count of
+  its connection, and a connection whose stalled replies hold more than
+  64 MiB together (`--max-stalled-bytes`) is closed with them. Other
+  connections are not touched. hyper cannot reset one stalled stream, so
+  the connection is the unit of accounting; the ceiling drops from
+  connections x streams x 4 MiB to connections x 64 MiB for streamed
+  replies. A unary reply that its client never reads is not counted
+  (hyper gives the server no hook that sees it stall) (#113).
