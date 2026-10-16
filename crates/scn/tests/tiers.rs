@@ -11,6 +11,7 @@ use std::process::Command;
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_proto::CHUNK_BYTES;
 use scion_proto::auth::Bearer;
+use scion_proto::listen::Limits;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::{GetObjectsRequest, ObjectKind, ObjectRef};
 use scion_server::{Store, db, service, tree};
@@ -52,13 +53,23 @@ impl Tiers {
         let pending = std::future::pending;
 
         let (listener, server) = tcp();
-        runtime.spawn(service::serve(store.clone(), listener, TOKEN, pending()));
+        runtime.spawn(service::serve(
+            store.clone(),
+            listener,
+            TOKEN,
+            Limits::default(),
+            pending(),
+        ));
 
         let memory = MemoryStore::new(64 << 20);
         let cache = Tier::new(memory, &server, TOKEN, CACHE_UPSTREAM_TIMEOUT).unwrap();
         let (listener, cache_url) = tcp();
         let incoming = TcpListenerStream::new(listener);
-        runtime.spawn(cache.clone().serve(TOKEN, incoming, pending()));
+        runtime.spawn(
+            cache
+                .clone()
+                .serve(TOKEN, incoming, Limits::default(), pending()),
+        );
 
         let node = tempfile::tempdir().unwrap();
         let store_dir = DiskStore::open(&node.path().join("data"), 64 << 20).unwrap();
@@ -67,7 +78,11 @@ impl Tiers {
         fs::set_permissions(node.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let path = node.path().join("daemon.sock");
         let incoming = UnixListenerStream::new(runtime.block_on(bind_unix(&path)).unwrap());
-        runtime.spawn(daemon.clone().serve(TOKEN, incoming, pending()));
+        runtime.spawn(
+            daemon
+                .clone()
+                .serve(TOKEN, incoming, Limits::default(), pending()),
+        );
 
         Self {
             store,

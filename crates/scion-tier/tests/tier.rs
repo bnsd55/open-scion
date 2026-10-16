@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use scion_core::{BlobId, Entry, FileState, PathElem, Tree};
 use scion_proto::CHUNK_BYTES;
+use scion_proto::listen::Limits;
 use scion_proto::object::{self, Assembler, Header};
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::objects_server::{Objects, ObjectsServer};
@@ -277,7 +278,11 @@ async fn serve_cache(upstream: &str, timeout: Duration) -> (Tier<MemoryStore>, S
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let incoming = TcpListenerStream::new(listener);
-    tokio::spawn(cache.clone().serve(TOKEN, incoming, std::future::pending()));
+    tokio::spawn(
+        cache
+            .clone()
+            .serve(TOKEN, incoming, Limits::default(), std::future::pending()),
+    );
     (cache, url)
 }
 
@@ -496,7 +501,7 @@ async fn each_tier_refuses_a_call_without_the_token() {
     tokio::spawn(
         daemon
             .clone()
-            .serve(TOKEN, incoming, std::future::pending()),
+            .serve(TOKEN, incoming, Limits::default(), std::future::pending()),
     );
 
     // Only this user can connect to the daemon, and only one daemon listens.

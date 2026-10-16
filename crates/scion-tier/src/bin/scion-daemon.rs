@@ -2,10 +2,12 @@
 //! node, serves them over a Unix socket, and fetches misses from its upstream,
 //! a `scion-cache`.
 
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 
 use anyhow::Context as _;
 use clap::Parser;
+use scion_proto::listen::{self, Limits};
 use scion_tier::{DAEMON_UPSTREAM_TIMEOUT, DiskStore, Tier, bind_unix};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_stream::wrappers::UnixListenerStream;
@@ -34,6 +36,12 @@ struct Cli {
     /// Bearer token to send upstream.
     #[arg(long, env = "SCION_UPSTREAM_TOKEN", hide_env_values = true)]
     upstream_token: String,
+    /// Most connections served at once. More clients wait until one closes.
+    #[arg(long, default_value_t = listen::DEFAULT_CONNECTIONS)]
+    max_connections: NonZeroUsize,
+    /// Most calls (HTTP/2 streams) that one connection may have open at once.
+    #[arg(long, default_value_t = listen::DEFAULT_STREAMS)]
+    max_streams: NonZeroU32,
 }
 
 #[tokio::main]
@@ -67,13 +75,22 @@ async fn main() -> anyhow::Result<()> {
     // store's index, so the next start reads it instead of every file.
     let mut terminate = signal(SignalKind::terminate()).context("cannot listen for SIGTERM")?;
     tracing::info!(socket = %socket.display(), upstream = %cli.upstream, "serving");
-    tier.serve(&cli.token, UnixListenerStream::new(listener), async move {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
-        }
-        tracing::info!("stopping");
-    })
+    let limits = Limits {
+        connections: cli.max_connections,
+        streams: cli.max_streams,
+    };
+    tier.serve(
+        &cli.token,
+        UnixListenerStream::new(listener),
+        limits,
+        async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+            tracing::info!("stopping");
+        },
+    )
     .await?;
     std::fs::remove_file(&socket).ok();
     // The store writes its index when the last task that holds the tier ends,
