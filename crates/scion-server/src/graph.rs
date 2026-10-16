@@ -233,6 +233,33 @@ pub fn merge_bases(
     Ok(in_steps(store, deadline, STEPS, |index| paint.next(index))?.0)
 }
 
+/// Whether `base`, of generation `base_gen`, is on the first-parent history
+/// of `tip`, `tip` included. `None` if `tip` has no node yet. Walks down
+/// that history to `base_gen`, so it reads O(log n) nodes. Unlike the
+/// queries above, it runs on the caller's connection, in one go.
+///
+/// # Errors
+///
+/// [`Error::DeadlineExceeded`] once `deadline` has passed.
+pub(crate) fn on_first_parents(
+    c: &Connection,
+    tip: ChangesetId,
+    base: ChangesetId,
+    base_gen: i64,
+    deadline: &Deadline,
+) -> Result<Option<bool>> {
+    let Some(node) = derived::load::<CommitGraph>(c, tip)? else {
+        return Ok(None);
+    };
+    let mut index = Index::new(c, deadline);
+    let from = At { id: tip, node };
+    // Generations strictly increase along first parents, so the oldest
+    // changeset at or above `base_gen` is the base exactly when the base is
+    // on the history.
+    let at = index.descend(from, base_gen, |link| link.generation)?;
+    Ok(Some(at.id == base))
+}
+
 /// What a query read: nodes and parents, in steps.
 #[derive(Clone, Copy, Debug, Default)]
 struct Cost {

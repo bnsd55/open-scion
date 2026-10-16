@@ -2,7 +2,7 @@
 //! derived data ahead of reads.
 
 use std::net::SocketAddr;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -11,6 +11,7 @@ use scion_proto::listen::{self, Limits};
 use scion_proto::tls::ServerTls;
 use scion_server::derived::{self, Kind};
 use scion_server::graph::CommitGraph;
+use scion_server::history::PathHistory;
 use scion_server::import::{ImportOptions, import_git};
 use scion_server::tree::RootTree;
 use scion_server::{Error, Store, db, read, service};
@@ -65,6 +66,10 @@ enum Command {
         /// Most calls (HTTP/2 streams) that one connection may have open at once.
         #[arg(long, default_value_t = listen::DEFAULT_STREAMS)]
         max_streams: NonZeroU32,
+        /// Most bytes that the stalled replies of one connection may hold. A
+        /// connection over it is closed with them.
+        #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
+        max_stalled_bytes: NonZeroU64,
     },
     /// Print the BLAKE3 digest of a token, as a `token` line of an access
     /// file wants it. The file holds digests, never tokens.
@@ -101,7 +106,8 @@ enum Command {
         #[arg(long, default_value = "main")]
         repo: String,
         /// Ref whose history is derived: its first-parent history for
-        /// `root_tree`, every ancestor for `commit_graph`.
+        /// `root_tree` and `path_history`, every ancestor for
+        /// `commit_graph`.
         #[arg(long = "ref", default_value = "main")]
         target_ref: String,
     },
@@ -116,6 +122,9 @@ enum KindName {
     /// The commit-graph index of each changeset.
     #[value(name = "commit_graph")]
     CommitGraph,
+    /// The path history of each changeset.
+    #[value(name = "path_history")]
+    PathHistory,
 }
 
 /// The TLS of a `serve` command: none, or the certificate, key and client CA
@@ -164,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
             tls_client_ca,
             max_connections,
             max_streams,
+            max_stalled_bytes,
         } => {
             let server_tls = server_tls(
                 tls_cert.as_deref(),
@@ -178,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
                 server_tls,
                 max_connections,
                 max_streams,
+                max_stalled_bytes,
             )
             .await?;
         }
@@ -219,6 +230,10 @@ async fn main() -> anyhow::Result<()> {
                         derived::backfill::<CommitGraph>(&store, repo_id, tip)?;
                         CommitGraph::NAME
                     }
+                    KindName::PathHistory => {
+                        derived::backfill::<PathHistory>(&store, repo_id, tip)?;
+                        PathHistory::NAME
+                    }
                 };
                 Ok::<_, Error>((name, tip))
             })
@@ -231,7 +246,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// Serves the gRPC API on `listen`, with the TLS files of the flags, until
 /// the caller stops it.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn serve(
     store: Store,
     listen: SocketAddr,
@@ -240,6 +255,7 @@ async fn serve(
     server_tls: Option<ServerTls>,
     max_connections: NonZeroUsize,
     max_streams: NonZeroU32,
+    max_stalled_bytes: NonZeroU64,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         listen.ip().is_loopback() || insecure_listen || server_tls.is_some(),
@@ -256,6 +272,7 @@ async fn serve(
     let limits = Limits {
         connections: max_connections,
         streams: max_streams,
+        stalled_bytes: max_stalled_bytes,
     };
     Box::pin(service::serve(
         store,

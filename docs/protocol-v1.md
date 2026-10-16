@@ -62,10 +62,17 @@ closes a connection:
   it. A client MUST handle `GOAWAY` as HTTP/2 says. A call cut this way
   fails, and the client MAY retry it (`GetObjects` and `ReadFile` only
   re-read; a `Land` retry uses the same request key).
+- when the replies of the connection that stopped reading hold more than
+  64 MiB together (`--max-stalled-bytes`). A reply that stalls adds what it
+  leaves in HTTP/2, under 4 MiB, to a count of its connection; a connection
+  over the limit is closed, which frees what every stalled reply of it
+  holds. Other connections are not touched. A unary reply that its client
+  never reads is not counted: hyper gives the server no hook that sees it
+  stall.
 
 So a connection beyond the cap waits at most 40 min. A client that stops reading a reply
-keeps the server's memory for that reply until the stream ends or the
-connection closes, so a client SHOULD reset a stream that it no longer
+keeps the memory that no budget counts for that reply until the stream ends
+or the connection closes, so a client SHOULD reset a stream that it no longer
 reads (gRPC libraries do when the call is dropped). A cache tier keeps the
 same limits (section 8).
 
@@ -75,9 +82,11 @@ A request with a `grpc-encoding` other than `identity` fails with
 
 **Authentication.** Every call on both services MUST carry the metadata
 `authorization: Bearer <token>`: the exact prefix `Bearer `, then the token.
-A missing or wrong token fails the call with `UNAUTHENTICATED` before the
-request is read. A token names a principal. A server started with `--token T`
-has one principal, `default`, which may read and write every repo. A server
+The token is printable ASCII, as a gRPC metadata value is; a tier refuses an
+upstream token that is not. A missing or wrong token fails the call with
+`UNAUTHENTICATED` before the request is read. A token names a principal. A
+server started with `--token T` has one principal, `default`, which may read
+and write every repo. A server
 started with `--access FILE` reads the principal of each token and its rules
 from the file; the file's format is a deployment matter and lives in the
 README. The principal of a call's token is its caller. Land request keys and
@@ -98,9 +107,10 @@ server (section 6.3).
 
 **Queues.** The server queues work instead of failing it. At most 256 jobs run
 at once across both services, at most 16 `PutBlob` uploads are read at once,
-at most 4 `Blame` calls run at once, and at most 4 `MergeBase` and
-`IsAncestor` calls together. A `ReadFile` call waits for its share of a memory
-budget (section 6.7). Time in a queue counts toward the timeout.
+at most 4 `Blame` calls run at once, at most 4 `MergeBase`, `IsAncestor`
+and `Log` calls with a path together, and at most 4 `Diff` calls run at
+once. A `ReadFile` call waits for its share of a memory budget
+(section 6.7). Time in a queue counts toward the timeout.
 One wait has its own limit: a `GetObjects` call that gets no memory for its
 first object within 30 s, or before the caller's `grpc-timeout`, fails with
 `RESOURCE_EXHAUSTED` (section 7.3).
@@ -158,7 +168,7 @@ contract. A client MUST NOT depend on its text.
 | `ABORTED` | `Land` only: other writers kept moving the ref. The land stays `PENDING`. | Yes, with the same request key |
 | `OUT_OF_RANGE` | A message is larger than its limit. | After the cause is fixed |
 | `CANCELLED` | The server's 600 s limit or the client's `grpc-timeout` ran out. A client library can report its own deadline as `DEADLINE_EXCEEDED`. | Yes. A `Land` retry uses the same request key. |
-| `DEADLINE_EXCEEDED` | `ReadFile`: the client took no message for 120 s. `GetObjects`: the client took no part for 120 s in the middle of an object (section 7.3). `Land`: the land ran past 600 s from the start of the call. The land stays `PENDING`. `MergeBase`, `IsAncestor`: the walk ran past 600 s from the start of the call. From a tier: the caller's deadline ran out while the tier waited for its first object (section 8). | Yes. A `Land` retry uses the same request key. |
+| `DEADLINE_EXCEEDED` | `ReadFile`: the client took no message for 120 s. `GetObjects`: the client took no part for 120 s in the middle of an object (section 7.3). `Land`: the land ran past 600 s from the start of the call. The land stays `PENDING`. `MergeBase`, `IsAncestor`, `Log` with a path: the call ran past its deadline, 600 s from its start or the caller's `grpc-timeout`. From a tier: the caller's deadline ran out while the tier waited for its first object (section 8). | Yes. A `Land` retry uses the same request key. |
 | `UNAVAILABLE` | The server cannot be reached or is shutting down, or its database stayed busy for 5 s (another process, such as an import, held its write lock). A tier also replies `UNAVAILABLE` when its upstream does not answer in time, or when it finds no room to fetch an object from upstream within 30 s (section 8). | Yes |
 | `RESOURCE_EXHAUSTED` | `GetObjects` only: no memory for the first object within 30 s, or before the caller's deadline (section 7.3). | Yes, after a wait |
 | `DATA_LOSS` | From a tier only: its upstream sent bytes that are not the object asked for (section 8). | MAY |
@@ -313,12 +323,8 @@ server checks, in order:
 1. The ref exists. If not, the land is `REJECTED` at once.
 2. The changeset has exactly one parent. If not (an imported root or merge),
    `REJECTED`.
-3. The base is on the ref's first-parent history. If not, `REJECTED`. A base
-   more than 100,000 changesets behind the head on that history MAY be
-   `REJECTED` as too old. Then the client makes a new changeset on a newer
-   head and lands that. A base within 100,000 changesets of the head is never
-   too old. Further back, the answer depends on what the server holds in
-   memory at the time, so the same base can pass later under a new key.
+3. The base is on the ref's first-parent history. If not, `REJECTED`. Any
+   base on that history is checked, however far behind the head it is.
 4. Each path P that the changeset changes is checked. P conflicts when a
    changeset on the ref after the base changed P itself, a path below P, or a
    file at a directory above P. If any path conflicts, the land is
@@ -441,7 +447,7 @@ content of a regular file, or the target of a symlink, at `path` in
 
 | Error | When |
 |---|---|
-| `INVALID_ARGUMENT` | A bad or empty path; the path is a directory or a submodule. |
+| `INVALID_ARGUMENT` | A bad repo name or ID; a bad or empty path; the path is a directory or a submodule. |
 | `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
 | `DEADLINE_EXCEEDED` | After zero or more messages: the client took no message for 120 s. |
 | `INTERNAL` | After zero or more messages: the stored blob is damaged. |
@@ -453,7 +459,7 @@ level as `TreeV1` bytes. An empty path is the repo root.
 
 | Error | When |
 |---|---|
-| `INVALID_ARGUMENT` | A bad path; the path is a file. |
+| `INVALID_ARGUMENT` | A bad repo name or ID; a bad path; the path is a file. |
 | `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
 
 ### 6.9 Log
@@ -466,20 +472,31 @@ level as `TreeV1` bytes. An empty path is the repo root.
   changes against its first parent, so a changeset on a merged branch never
   appears, and a merge appears when its first-parent diff touches the path.
 - `limit` is the most entries the client wants. 0 means 1. A reply holds at
-  most `limit` entries and at most 1,000.
-- A call checks at most 1,000 changesets. A reply stops before an entry that
-  would take its changeset bytes over 32 MiB, but always holds the first
-  entry it found.
+  most `limit` entries and at most 1,000. Without a `path`, it holds that
+  many unless the history ends first.
+- With a `path`, any number of changesets can lie between two entries. A
+  reply can hold fewer entries than `limit`: it stops once the server has
+  read about 64 MiB of its path history, which takes fewer entries for a
+  file in a large directory.
+- A reply stops before an entry that would take its changeset bytes over
+  32 MiB. Every reply holds the first entry it found.
 - `next_changeset_id` is the first changeset that this reply does not cover,
   or empty when the history ends. To continue, a client calls `Log` again
-  with `changeset_id` set to it and the same `path`. A reply can have no
-  entries and still set `next_changeset_id`, so a client MUST continue until
+  with `changeset_id` set to it and the same `path`. This server sends no
+  reply with no entries and a `next_changeset_id`. An earlier server did, for
+  a path changed long ago, and v1 allows it. So a client MUST continue until
   it has enough entries or `next_changeset_id` is empty.
+
+**Cost.** A `Log` with a path waits in the queue of `MergeBase` and
+`IsAncestor` (section 2). On a server whose database is older than its path
+history, the first call on a long history can derive that history first. It
+stops at 600 s; what it derived stays, so the next call goes on from there.
 
 | Error | When |
 |---|---|
-| `INVALID_ARGUMENT` | A bad path. |
+| `INVALID_ARGUMENT` | A bad repo name or ID; a bad path. |
 | `NOT_FOUND` | The repo or changeset does not exist. |
+| `DEADLINE_EXCEEDED` | With a `path`: the server ran past 600 s from the start of the call. |
 
 ### 6.10 Blame
 
@@ -556,7 +573,7 @@ rename. Its next call then fails with `NOT_FOUND`, or blames another file.
 
 | Error | When |
 |---|---|
-| `INVALID_ARGUMENT` | A bad or empty path; the file is not a regular file, is larger than 16 MiB, or has more than 1,048,576 lines; `rename_searched` and `rename_best` are not a place where a rename search of that path at that changeset can stop. |
+| `INVALID_ARGUMENT` | A bad repo name or ID; a bad or empty path; the file is not a regular file, is larger than 16 MiB, or has more than 1,048,576 lines; `rename_searched` and `rename_best` are not a place where a rename search of that path at that changeset can stop. |
 | `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
 
 ### 6.11 MergeBase
@@ -643,6 +660,10 @@ merge base for a CI job.
   that exists on neither side gives an empty reply.
 - With `after`, only the entries after that path in tree order. It need not
   be in the diff, nor below `path`.
+- `renames_incomplete` is set when renames may be missing: the diff is over
+  the entry bound of the rename pass, or the inexact search did not run
+  (over the pair limit) or stopped at its budget. See the rename bounds
+  below.
 
 **Bound and resume.** A reply holds at most 1,000 entries. When more follow,
 `next_after` is the last path in `entries`, and the reply holds exactly
@@ -690,16 +711,22 @@ newline does not count. Each chunk is hashed as git hashes it. Similarity is
 the bytes of the chunks that both files have, over the size of the larger
 file. A symlink or a gitlink is a rename only with the same content.
 
-**Rename bounds.** The server finds renames only in a diff of at most 10,000
-entries below `path`; a larger diff has none. As in git, step 3 runs only
-when the added files left times the deleted files left are at most
-1,000,000. Steps 2 and 3 share a budget per call: about 4M, where each chunk
-of a file read and each row of a chunk table indexed or compared count one,
-and each file size read counts 64 (64 MiB of text in lines of 64 bytes
-costs 1M). Past it, the server reads no
-more files, so it misses the renames that step 2 or step 3 would find after
-that point. The budget is the same on every call, so every reply gives the
-same renames. The search never ends a page early.
+**Rename bounds.** The rename pass walks the whole diff below `path`, and
+holds its entries in memory: at most 1,000,000 entries, about 150 MB per
+call. Past it, the call finds no renames. As in git, the inexact search
+(steps 2 and 3) runs only when the added files left times the deleted files
+left are at most 1,000,000. Steps 2 and 3 share a budget per call: about
+4M, where each chunk of a file read and each row of a chunk table indexed
+or compared count one, and each file size read counts 64 (64 MiB of text in
+lines of 64 bytes costs 1M). Step 1 has no bound but that entry cap: it
+compares IDs and reads no files, so a diff up to the entry bound finds its
+exact renames, whatever its size. When the pass was past the entry bound,
+or the inexact search did not run (over the pair limit) or stopped at the
+budget, `renames_incomplete` is set in the reply: renames may be missing,
+as git prints "inexact rename detection was skipped due to too many files".
+The exact renames in the reply are still whole. The pair limit and the
+budget are the same on every call, so every reply gives the same renames.
+The search never ends a page early.
 
 | Error | When |
 |---|---|
@@ -913,8 +940,18 @@ Access tickets that a tier checks are not in v1
 
 ## 9. Compatibility
 
-Version 1 is the `scion.v1` package together with object format v1. A server,
-tier or client MUST ignore fields that it does not know, as proto3 does.
+This file describes version 1 of the protocol: the `scion.v1` package of
+[`proto/scion.proto`](../proto/scion.proto) together with object format v1
+([`format-v1.md`](format-v1.md)). A caller states the version it wants by
+which package it calls; there is no handshake and no version header. A
+server answers every call of a package that it serves, and a call of a
+package or a service that it does not serve fails with `UNIMPLEMENTED`, as
+for a call that it does not have. A later version is a new package,
+`scion.v2`. A server MAY serve both, so a client can move to the new
+version call by call, and an older client keeps working.
+
+A server, tier or client MUST ignore fields that it does not know, as
+proto3 does.
 
 Because unknown fields are ignored, an older server drops a new request field
 without an error. For example, a server from before `LogRequest.path` ignores
@@ -938,7 +975,9 @@ only if an answer that ignores it is still correct for the client.
 | What a client must check or may trust (section 5), or what a status code means | Yes |
 | Request-key rules, or a land retention shorter than 7 days | Yes |
 
-A new version is a new package, `scion.v2`. A server MAY serve both.
+A server MAY serve both `scion.v1` and `scion.v2` at once. To retire a
+version, a server stops serving its package; its clients then get
+`UNIMPLEMENTED`, which tells them to move.
 
 ## 10. Not in v1
 
@@ -954,6 +993,6 @@ A new version is a new package, `scion.v2`. A server MAY serve both.
 - Text merge. Conflicts are path-level.
 - `Diff` renames in a diff of more than 10,000 entries or past the search
   budget ([#107](https://github.com/bnsd55/open-scion/issues/107)).
-- `Log` and `Blame` without per-call bounds
+- `Blame` without per-call bounds
   ([#61](https://github.com/bnsd55/open-scion/issues/61)), and `Log` that
   follows renames.

@@ -51,9 +51,10 @@ const MAX_BLAMES: usize = 4;
 /// of every version it reads, and [`memory::BYTES_PER_LINE`] per line of the
 /// blamed file, so together they hold no more than this.
 const BLAME_MEMORY_BUDGET: usize = 1 << 30;
-/// Most `MergeBase` and `IsAncestor` calls running at once. A call has no
-/// bound on its reads, only its deadline, so these queries never take more
-/// than this many of the `MAX_BLOCKING` permits.
+/// Most `MergeBase`, `IsAncestor` and `Log` calls with a path running at
+/// once. A call has no bound on its reads, only its deadline: a walk, or the
+/// first derivation of path history on a database from before it. So these
+/// queries never take more than this many of the `MAX_BLOCKING` permits.
 const MAX_GRAPH_QUERIES: usize = 4;
 // A graph query holds one read connection at a time, through a walk with no
 // bound on its reads. So the walks never take every one.
@@ -163,8 +164,9 @@ impl ScionService {
             .max_encoding_message_size(MAX_MESSAGE_BYTES)
     }
 
-    /// Runs a `MergeBase` or `IsAncestor` query: at most `MAX_GRAPH_QUERIES`
-    /// at once, each until its call ends or its `deadline` passes.
+    /// Runs a `MergeBase`, `IsAncestor` or `Log` with a path: at most
+    /// `MAX_GRAPH_QUERIES` at once, each until its call ends or its
+    /// `deadline` passes.
     async fn graph_query<T, F>(&self, deadline: Deadline, query: F) -> Result<T, Status>
     where
         T: Send + 'static,
@@ -334,6 +336,7 @@ async fn send_file(
     _share: OwnedSemaphorePermit,
     tx: mpsc::Sender<Part>,
     stall: Duration,
+    stalled: Option<scion_proto::listen::Stalled>,
 ) {
     let fail = |status: Status| {
         // Fails only if the client has gone.
@@ -367,6 +370,11 @@ async fn send_file(
                 }
                 Ok(Err(_)) => return,
                 Err(_) => {
+                    // The parts of the file stay in HTTP/2 until the
+                    // connection ends; the connection counts them.
+                    if let Some(stalled) = &stalled {
+                        stalled.add(scion_proto::reply::STALLED_REPLY_BYTES);
+                    }
                     let detail = format!("the client took no data for {stall:?}");
                     return fail(Status::deadline_exceeded(detail));
                 }
@@ -374,7 +382,16 @@ async fn send_file(
         }
         if open.is_none() {
             // Keeps the share until the client has taken the last part.
-            let _ = tokio::time::timeout(stall, tx.reserve_many(2)).await;
+            match tokio::time::timeout(stall, tx.reserve_many(2)).await {
+                // Sent, or the client has gone with it.
+                Ok(_) => {}
+                // It stopped reading: what was sent stays in HTTP/2.
+                Err(_) => {
+                    if let Some(stalled) = &stalled {
+                        stalled.add(scion_proto::reply::STALLED_REPLY_BYTES);
+                    }
+                }
+            }
             return;
         }
     }
@@ -538,6 +555,9 @@ impl Scion for ScionService {
         request: Request<ReadFileRequest>,
     ) -> Result<Response<ReadFileStream>, Status> {
         let caller = caller(&request)?;
+        // The handle of the caller's connection, before the request is taken
+        // apart: the reply counts what it leaves in HTTP/2 on it.
+        let stalled = scion_proto::listen::Stalled::of(&request);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
@@ -555,6 +575,8 @@ impl Scion for ScionService {
             .acquire_many_owned(share)
             .await
             .map_err(|_| Status::unavailable("server is shutting down"))?;
+        // The handle of the caller's connection, before the request is taken
+        // apart: the reply counts what it leaves in HTTP/2 on it.
         let (tx, rx) = mpsc::channel(2);
         tokio::spawn(send_file(
             self.worker.clone(),
@@ -562,6 +584,7 @@ impl Scion for ScionService {
             share,
             tx,
             READ_STALL_TIMEOUT,
+            stalled,
         ));
         Ok(Response::new(ReceiverStream::new(rx)))
     }
@@ -586,16 +609,25 @@ impl Scion for ScionService {
 
     async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogResponse>, Status> {
         let caller = caller(&request)?;
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         // `read::MAX_SCAN` also bounds the entries.
         let limit = (req.limit as usize).max(1);
         let path = parse_optional_path(req.path)?;
-        let page = self
-            .worker
-            .run(move |store| read::log_page(&store, &req.repo, id, path.as_ref(), limit))
-            .await?;
+        let page = if let Some(path) = path {
+            // It may derive the path history of a long history first, so it
+            // runs as a graph query, with its slot and its deadline.
+            self.graph_query(deadline, move |store, deadline| {
+                read::log_page(store, &req.repo, id, Some(&path), limit, deadline)
+            })
+            .await?
+        } else {
+            self.worker
+                .run(move |store| read::log_page(&store, &req.repo, id, None, limit, &deadline))
+                .await?
+        };
         // Always send the first entry; stop before the reply gets too big.
         let mut next = page.next;
         let mut budget = LOG_BUDGET_BYTES;
@@ -780,6 +812,7 @@ impl Scion for ScionService {
         Ok(Response::new(DiffResponse {
             entries,
             next_after: path_bytes(page.next_after),
+            renames_incomplete: page.renames_incomplete,
         }))
     }
 }
@@ -882,7 +915,7 @@ mod tests {
         let share = u32::try_from(budget).unwrap();
         let share = Arc::clone(&reads).acquire_many_owned(share).await.unwrap();
         let (tx, rx) = mpsc::channel(2);
-        let task = tokio::spawn(send_file(Worker::new(store), blob, share, tx, stall));
+        let task = tokio::spawn(send_file(Worker::new(store), blob, share, tx, stall, None));
         (task, rx, reads)
     }
 
@@ -1129,13 +1162,25 @@ mod tests {
         for _ in &blockers {
             held_rx.recv().unwrap();
         }
-        // One call more than the limit, of both kinds.
+        // One call more than the limit, of each kind.
         let calls: Vec<_> = (0..=MAX_GRAPH_QUERIES)
             .map(|i| {
                 let service = Arc::clone(&service);
                 let (root, a, b) = (bytes(0), bytes(1), bytes(2));
                 tokio::spawn(async move {
-                    if i % 2 == 0 {
+                    if i % 3 == 2 {
+                        // `a` puts `f1`.
+                        let request = as_default(LogRequest {
+                            repo: "r".into(),
+                            changeset_id: a.clone(),
+                            limit: 10,
+                            path: "f1".into(),
+                        });
+                        let reply = service.log(request).await.unwrap().into_inner();
+                        let ids: Vec<Vec<u8>> =
+                            reply.entries.into_iter().map(|e| e.changeset_id).collect();
+                        ids == [a]
+                    } else if i % 3 == 0 {
                         let request = as_default(MergeBaseRequest {
                             repo: "r".into(),
                             a_changeset_id: a,

@@ -7,7 +7,8 @@
 //! <data>/server.lock               held by the one process that may land
 //! <data>/scion.db                  metadata and trees (see migrations/)
 //! <data>/objects/blob/ab/cd..      one zstd file per blob, named by ID
-//! <data>/tmp/                      staging for atomic blob writes and uploads
+//! <data>/tmp/                      staging for atomic blob writes and uploads,
+//!                                  one folder per process, held with a lock
 //! ```
 
 use std::collections::BTreeSet;
@@ -15,6 +16,7 @@ use std::fs;
 use std::io::{self, ErrorKind, Read, Seek, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -27,7 +29,7 @@ use scion_core::{BlobHasher, BlobId};
 use crate::error::{Error, Result};
 
 /// The schema version this build makes and reads.
-pub(crate) const SCHEMA_VERSION: u32 = 4;
+pub(crate) const SCHEMA_VERSION: u32 = 5;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database from
 /// version `n - 1` to version `n`. A released migration never changes.
@@ -36,6 +38,7 @@ const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [
     include_str!("../migrations/0002_land_retention.sql"),
     include_str!("../migrations/0003_derived_values.sql"),
     include_str!("../migrations/0004_repo_blobs.sql"),
+    include_str!("../migrations/0005_path_history.sql"),
 ];
 
 /// Largest object accepted or read back, uncompressed: 100 MiB, the hard
@@ -78,10 +81,17 @@ struct Inner {
     /// How many of the ended commits a finished full flush covers.
     flushed: AtomicU64,
     blobs: Blobs,
+    /// This `Store` holds the directory alone: no other process may use it,
+    /// so a write cannot make one wait.
+    alone: bool,
     /// `<data>/lock`, shared, until the last clone is dropped.
     _lock: fs::File,
     /// `<data>/server.lock`, for a server `Store`.
     _server_lock: Option<fs::File>,
+    /// Write transactions run so far, for tests of how imports share the
+    /// write lock.
+    #[cfg(test)]
+    txes: AtomicU64,
 }
 
 impl Store {
@@ -163,9 +173,10 @@ impl Store {
             }
         }
         let blobs = Blobs::open(dir)?;
-        if alone {
-            blobs.sweep_tmp()?;
-        }
+        // Every open removes the folders of dead processes; only an open
+        // that is alone also removes files, which a build older than the
+        // folders may have left.
+        blobs.sweep_tmp(alone)?;
         let path = dir.join("scion.db");
         let db = connect(&path, OpenFlags::default())?;
         // `fullfsync = OFF` for a server: a commit ends with a plain fsync,
@@ -206,8 +217,11 @@ impl Store {
                 committed: AtomicU64::new(0),
                 flushed: AtomicU64::new(0),
                 blobs,
+                alone,
                 _lock: lock,
                 _server_lock: server_lock,
+                #[cfg(test)]
+                txes: AtomicU64::new(0),
             }),
         })
     }
@@ -297,6 +311,19 @@ impl Store {
         f(&self.lock())
     }
 
+    /// Whether another process may use the directory at the same time. A
+    /// [`Store::open_shared`] shares even if it found nobody; only one that
+    /// took the directory alone is not shared.
+    pub(crate) fn is_shared(&self) -> bool {
+        !self.inner.alone
+    }
+
+    /// Write transactions run so far.
+    #[cfg(test)]
+    pub(crate) fn txes(&self) -> u64 {
+        self.inner.txes.load(Ordering::Relaxed)
+    }
+
     /// Runs `f` in one write transaction. Commits if `f` returns `Ok`, rolls
     /// back otherwise. Returns once the commit is durable: [`Store::commit`],
     /// then [`Store::flush`].
@@ -325,6 +352,8 @@ impl Store {
         self.inner.committing.fetch_add(1, Ordering::Release);
         let committed = tx.commit();
         self.inner.committed.fetch_add(1, Ordering::Release);
+        #[cfg(test)]
+        self.inner.txes.fetch_add(1, Ordering::Relaxed);
         committed?;
         Ok(value)
     }
@@ -471,10 +500,12 @@ impl Drop for Reader<'_> {
 fn build() -> String {
     use crate::derived::Kind;
     use crate::graph::CommitGraph;
+    use crate::history::PathHistory;
     use crate::tree::RootTree;
     let kinds = [
         (RootTree::NAME, RootTree::VERSION),
         (CommitGraph::NAME, CommitGraph::VERSION),
+        (PathHistory::NAME, PathHistory::VERSION),
     ];
     let kinds = kinds.map(|(name, version)| format!("{name} {version}"));
     format!("schema {SCHEMA_VERSION}, {}", kinds.join(", "))
@@ -554,9 +585,17 @@ pub enum BlobStatus {
 }
 
 /// Immutable file contents, one zstd-compressed file per [`BlobId`].
+/// Immutable file contents, one zstd-compressed file per [`BlobId`].
 pub struct Blobs {
     root: PathBuf,
+    /// The staging folder for temp files of every process.
     tmp: PathBuf,
+    /// This process's folder in `tmp/`, held with a lock, so an open of
+    /// another process can tell that this one lives.
+    mine: PathBuf,
+    /// The lock file of `mine`, held for as long as this `Blobs` lives.
+    /// Never read: its life is the point.
+    _mine_lock: fs::File,
     group_flush: GroupFlush,
     /// Calls to [`Blobs::verify`] so far.
     #[cfg(test)]
@@ -565,11 +604,41 @@ pub struct Blobs {
 
 impl Blobs {
     fn open(dir: &Path) -> Result<Self> {
+        // Folders of `tmp/` made in this process, so each `Blobs` gets its own.
+        static FOLDERS: AtomicU64 = AtomicU64::new(0);
         let objects = dir.join("objects");
         let root = objects.join("blob");
         let tmp = dir.join("tmp");
         fs::create_dir_all(&root)?;
         fs::create_dir_all(&tmp)?;
+        // This process stages its temp files in its own folder of `tmp/`, and
+        // holds the folder's lock file for as long as it lives. An open that
+        // finds no holder for a folder removes it, so a crashed import leaves
+        // nothing once any process opens the directory again (issue #101).
+        // Opens hold `open.lock` exclusively, so no other process creates a
+        // folder or sweeps while this one does.
+        let (mine, mine_lock) = loop {
+            let name = format!(
+                "{:x}-{:x}",
+                process::id(),
+                FOLDERS.fetch_add(1, Ordering::Relaxed)
+            );
+            let mine = tmp.join(name);
+            if let Err(e) = fs::create_dir(&mine) {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(e.into());
+            }
+            let lock = fs::File::create(mine.join(".lock"))?;
+            if !flock(&lock, FlockOperation::NonBlockingLockExclusive)? {
+                // Another process holds a folder of the same name. The
+                // process id and the counter of this one are new, so that
+                // cannot be this process's own folder.
+                continue;
+            }
+            break (mine, lock);
+        };
         // A blob file is only as durable as the directories above it. A batch
         // flushes the fan-out directories it writes to; these are made once.
         for path in [&root, &objects, &tmp, dir] {
@@ -578,28 +647,44 @@ impl Blobs {
         Ok(Self {
             root,
             tmp,
+            mine,
+            _mine_lock: mine_lock,
             group_flush: GroupFlush::default(),
             #[cfg(test)]
             verifies: std::sync::atomic::AtomicU64::default(),
         })
     }
 
-    /// Removes the temp files that a crash left: blob writes that were never
-    /// renamed. No blob name points at them. Only for a `Store` that opened
-    /// the data directory alone: the temp files of a live process are there
-    /// too.
-    // SHORTCUT: so the temp files of a crashed import stay while the server
-    // runs. Ceiling: the writes in flight at each crash, each at most one
-    // blob. Upgrade (issue #101): a `tmp/` folder per process, under its own
-    // lock, so that any open removes those of dead processes.
-    fn sweep_tmp(&self) -> io::Result<()> {
+    /// Removes what crashes left in `tmp/`: the folders of processes that no
+    /// longer hold them, with the blob writes that were never renamed, and,
+    /// when this open is alone, files of a build older than the folders. No
+    /// blob name points at any of them. The folders of live processes are
+    /// held, and this process's own folder is held too.
+    fn sweep_tmp(&self, alone: bool) -> io::Result<()> {
         let mut removed = 0;
         for entry in fs::read_dir(&self.tmp)? {
-            fs::remove_file(entry?.path())?;
-            removed += 1;
+            let path = entry?.path();
+            if path.is_dir() {
+                if path == self.mine {
+                    continue;
+                }
+                // A lock file that cannot be opened was never flocked: its
+                // process died before it made one.
+                let held = match fs::File::open(path.join(".lock")) {
+                    Ok(lock) => !flock(&lock, FlockOperation::NonBlockingLockExclusive)?,
+                    Err(_) => false,
+                };
+                if !held {
+                    fs::remove_dir_all(&path)?;
+                    removed += 1;
+                }
+            } else if alone {
+                fs::remove_file(&path)?;
+                removed += 1;
+            }
         }
         if removed > 0 {
-            tracing::info!(removed, "removed temp files that a crash left behind");
+            tracing::info!(removed, "removed temp folders that a crash left behind");
         }
         Ok(())
     }
@@ -631,7 +716,7 @@ impl Blobs {
     /// Fails if the spool file cannot be made.
     pub fn upload(&self) -> Result<Upload> {
         Ok(Upload {
-            spool: tempfile::tempfile_in(&self.tmp)?,
+            spool: tempfile::tempfile_in(&self.mine)?,
             hasher: BlobHasher::default(),
             len: 0,
         })
@@ -1040,7 +1125,7 @@ impl BlobBatch<'_> {
         // points at data that is not on the drive. The frame header holds the
         // size, for `Blobs::size`. Compression fails if `raw` does not give
         // exactly `len` bytes.
-        let mut tmp = tempfile::NamedTempFile::new_in(&self.blobs.tmp)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(&self.blobs.mine)?;
         zstd::stream::compress_sized_into(raw, &mut tmp, 3, len as u64)?;
         fsync(tmp.as_file())?;
         fs::create_dir_all(&dir)?;
@@ -1284,6 +1369,41 @@ mod tests {
     }
 
     #[test]
+    fn an_open_removes_the_temp_files_of_a_dead_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("tmp");
+        let server = Store::open(dir.path()).unwrap();
+        // A live importer: its folder is held with its lock, and a blob
+        // write of it that was never renamed sits in the folder.
+        let importer = Store::open_shared(dir.path()).unwrap();
+        let live_dir = importer.blobs().mine.clone();
+        let live_file = live_dir.join("stage");
+        fs::write(&live_file, b"x").unwrap();
+        // What a crashed import left: a folder whose holder is gone.
+        let dead = tmp.join("dead-1");
+        fs::create_dir(&dead).unwrap();
+        fs::write(dead.join(".lock"), b"").unwrap();
+        fs::write(dead.join("stage"), b"x").unwrap();
+        // Another open, while the server and the importer use the directory:
+        // it removes what the dead process left, and nothing else.
+        Store::open_shared(dir.path()).unwrap();
+        assert!(!dead.exists(), "a dead process's folder is removed");
+        assert!(live_dir.exists(), "a live folder is not swept");
+        assert!(
+            live_file.exists(),
+            "a live process's temp file is not swept"
+        );
+        // The server's own staging folder is held, and still works.
+        let id = server.blobs().put(b"x").unwrap();
+        assert_eq!(server.blobs().verify(id).unwrap(), BlobStatus::Valid);
+        // The importer's folder is held only while it lives. Once it is
+        // gone, the next open removes the folder, with the file in it.
+        drop(importer);
+        Store::open_shared(dir.path()).unwrap();
+        assert!(!live_file.exists(), "a dead process's folder is removed");
+    }
+
+    #[test]
     fn only_an_open_that_is_alone_upgrades_the_schema() {
         let dir = tempfile::tempdir().unwrap();
         {
@@ -1356,26 +1476,30 @@ mod tests {
 
     #[test]
     fn an_open_removes_temp_files_before_another_open_ends() {
-        // What crashes left, enough that removing it takes a while.
+        // What a crashed import left: its staging folder with many temp
+        // files, so removing it takes a while.
         const LEFT: usize = 5_000;
         let dir = tempfile::tempdir().unwrap();
         let tmp = dir.path().join("tmp");
-        fs::create_dir_all(&tmp).unwrap();
+        let dead = tmp.join("dead");
+        fs::create_dir_all(&dead).unwrap();
+        fs::write(dead.join(".lock"), b"").unwrap();
         for i in 0..LEFT {
-            fs::write(tmp.join(format!("left{i}")), b"").unwrap();
+            fs::write(dead.join(format!("left{i}")), b"").unwrap();
         }
-        let count = || fs::read_dir(&tmp).unwrap().count();
-        // The sweep removes the files in the order that the folder lists them.
-        let listed_first = fs::read_dir(&tmp).unwrap().next().unwrap().unwrap().path();
+        // The sweep removes the dead folder's files in the order that the
+        // folder lists them.
+        let listed_first = fs::read_dir(&dead).unwrap().next().unwrap().unwrap().path();
         let path = dir.path().to_owned();
         let first = thread::spawn(move || Store::open(&path));
         while listed_first.exists() && !first.is_finished() {
             thread::yield_now();
         }
-        // The first open is removing them. A second open waits for it, so
-        // the temp files that it writes next are safe from that sweep.
+        // The first open is removing the dead folder. A second open waits
+        // for it, so the folder that it writes next is safe from that sweep:
+        // the dead folder is gone, and the two live ones stay.
         let second = Store::open_shared(dir.path()).unwrap();
-        assert_eq!(count(), 0);
+        assert_eq!(fs::read_dir(&tmp).unwrap().count(), 2);
         drop((first.join().unwrap().unwrap(), second));
     }
 
@@ -1601,7 +1725,10 @@ mod tests {
 
     /// Entries in the temp directory.
     fn staged(blobs: &Blobs) -> usize {
-        fs::read_dir(&blobs.tmp).unwrap().count()
+        fs::read_dir(&blobs.mine)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name() != ".lock")
+            .count()
     }
 
     /// Blob files in the blob folder.
@@ -1680,8 +1807,9 @@ mod tests {
         let id = BlobId::of(content);
         // A crash during an upload: no destructor runs.
         std::mem::forget(store.blobs().upload().unwrap().append(content).unwrap());
-        // A crash after the compressed file is written, before its rename.
-        let mut torn = tempfile::NamedTempFile::new_in(&store.blobs().tmp).unwrap();
+        // A crash after the compressed file is written, before its rename,
+        // in the staging folder of the process that crashed.
+        let mut torn = tempfile::NamedTempFile::new_in(&store.blobs().mine).unwrap();
         torn.write_all(&zstd::bulk::compress(content, 3).unwrap())
             .unwrap();
         torn.keep().unwrap();
@@ -1690,6 +1818,7 @@ mod tests {
 
         let store = Store::open(dir.path()).unwrap();
         assert_eq!(store.blobs().verify(id).unwrap(), BlobStatus::Missing);
+        // The folder of the dead process is gone, and this one is empty.
         assert_eq!(staged(store.blobs()), 0, "open removes what a crash left");
     }
 

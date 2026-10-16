@@ -25,6 +25,7 @@ use rusqlite::Connection;
 use scion_core::{Changeset, ChangesetId};
 
 use crate::db::{self, RepoId};
+use crate::deadline::Deadline;
 use crate::error::{Error, Result};
 use crate::store::Store;
 
@@ -93,6 +94,30 @@ pub trait Kind {
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`], or of [`Store::flush`].
 pub fn get<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
+    get_until::<K>(store, repo, cs, None)
+}
+
+/// [`get`], but if it derives, it stops between steps once `deadline` has
+/// passed. The steps before it stay, so the next call goes on from there.
+///
+/// # Errors
+///
+/// As [`get`], and [`Error::DeadlineExceeded`].
+pub fn get_by<K: Kind>(
+    store: &Store,
+    repo: RepoId,
+    cs: ChangesetId,
+    deadline: &Deadline,
+) -> Result<K::Value> {
+    get_until::<K>(store, repo, cs, Some(deadline))
+}
+
+fn get_until<K: Kind>(
+    store: &Store,
+    repo: RepoId,
+    cs: ChangesetId,
+    deadline: Option<&Deadline>,
+) -> Result<K::Value> {
     let known = store.read(|c| {
         require(c, repo, cs)?;
         load::<K>(c, cs)
@@ -104,7 +129,7 @@ pub fn get<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::V
     // the caller can send it to a client. So it waits for one full flush,
     // shared with concurrent commits. An error is an answer too, so it
     // waits as well: the steps before the error committed.
-    let value = fill::<K>(store, repo, cs);
+    let value = fill_until::<K>(store, repo, cs, deadline);
     store.flush()?;
     value
 }
@@ -131,11 +156,36 @@ pub fn get<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::V
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`].
 pub fn fill<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
-    let pending = match walk_all::<K>(store, repo, cs)? {
+    fill_until::<K>(store, repo, cs, None)
+}
+
+/// [`fill`], but it stops between steps once `deadline` has passed. The
+/// steps before it stay, so the next call goes on from there.
+///
+/// # Errors
+///
+/// As [`fill`], and [`Error::DeadlineExceeded`].
+pub fn fill_by<K: Kind>(
+    store: &Store,
+    repo: RepoId,
+    cs: ChangesetId,
+    deadline: &Deadline,
+) -> Result<K::Value> {
+    fill_until::<K>(store, repo, cs, Some(deadline))
+}
+
+fn fill_until<K: Kind>(
+    store: &Store,
+    repo: RepoId,
+    cs: ChangesetId,
+    deadline: Option<&Deadline>,
+) -> Result<K::Value> {
+    let check = || deadline.map_or(Ok(()), Deadline::check);
+    let pending = match walk_all::<K>(store, repo, cs, check)? {
         ControlFlow::Break(value) => return Ok(value),
         ControlFlow::Continue(pending) => pending,
     };
-    derive_steps::<K>(store, repo, &pending)?
+    derive_steps::<K>(store, repo, &pending, check)?
         .ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
 }
 
@@ -203,11 +253,12 @@ pub fn on_write<K: Kind>(c: &Connection, id: ChangesetId, changeset: &Changeset)
 }
 
 /// The walk of [`fill`]: the stored value for `cs`, or else the changesets
-/// to derive, parents first.
+/// to derive, parents first. Runs `check` before each step after the first.
 fn walk_all<K: Kind>(
     store: &Store,
     repo: RepoId,
     cs: ChangesetId,
+    check: impl Fn() -> Result<()>,
 ) -> Result<ControlFlow<K::Value, Vec<ChangesetId>>> {
     let first = store.read_unflushed(|c| {
         Ok(match Walk::start::<K>(c, repo, cs)? {
@@ -223,6 +274,7 @@ fn walk_all<K: Kind>(
         ControlFlow::Continue(walk) => walk,
     };
     while !walk.next.is_empty() {
+        check()?;
         store.read_unflushed(|c| walk.step::<K>(c, STEP))?;
     }
     Ok(ControlFlow::Continue(walk.into_pending()))
@@ -297,13 +349,16 @@ impl Walk {
 
 /// The derivation of [`fill`]: derives `pending`, parents first, at most
 /// [`STEP`] changesets per transaction. Returns the value for the last one.
+/// Runs `check` before each step.
 fn derive_steps<K: Kind>(
     store: &Store,
     repo: RepoId,
     pending: &[ChangesetId],
+    check: impl Fn() -> Result<()>,
 ) -> Result<Option<K::Value>> {
     let mut value = None;
     for step in pending.chunks(STEP) {
+        check()?;
         value = store.commit(|c| {
             let value = derive_chain::<K>(c, repo, step)?;
             remove_old::<K>(c)?;
@@ -782,8 +837,8 @@ mod tests {
         let tip = ids[4];
         // One fill walks. Another fill derives the history before the first
         // one's steps run.
-        let ControlFlow::Continue(pending) = walk_all::<ChangedPathsV1>(&store, repo, tip).unwrap()
-        else {
+        let walked = walk_all::<ChangedPathsV1>(&store, repo, tip, || Ok(()));
+        let ControlFlow::Continue(pending) = walked.unwrap() else {
             panic!("no value is stored yet");
         };
         assert_eq!(pending, ids);
@@ -791,9 +846,34 @@ mod tests {
         assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), 5);
         assert_eq!(DERIVES.get(), 5);
 
-        let late = derive_steps::<ChangedPathsV1>(&store, repo, &pending).unwrap();
+        let late = derive_steps::<ChangedPathsV1>(&store, repo, &pending, || Ok(())).unwrap();
         assert_eq!(late, Some(5));
         assert_eq!(DERIVES.get(), 5, "the late steps derive nothing again");
+    }
+
+    #[test]
+    fn a_fill_with_a_deadline_stops_between_steps() {
+        let past = Deadline::new(std::time::Instant::now());
+        // A history of one step is walked in one go, and the deadline stops
+        // the first derivation step. A longer one stops in its walk.
+        for n in [STEP, 7] {
+            let (_dir, store, repo, ids) = store_with(&chain(n));
+            let tip = ids[n - 1];
+            DERIVES.set(0);
+            let late = get_by::<ChangedPathsV1>(&store, repo, tip, &past);
+            assert!(
+                matches!(late, Err(Error::DeadlineExceeded(_))),
+                "{n}: {late:?}"
+            );
+            let late = fill_by::<ChangedPathsV1>(&store, repo, tip, &past);
+            assert!(
+                matches!(late, Err(Error::DeadlineExceeded(_))),
+                "{n}: {late:?}"
+            );
+            assert_eq!(DERIVES.get(), 0, "{n}");
+            assert!(kind_rows(&store, 1).is_empty(), "{n}");
+            assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), n as u64);
+        }
     }
 
     #[test]

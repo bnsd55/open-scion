@@ -12,6 +12,13 @@ use scion_core::{BlobId, Changeset, ChangesetId, RepoPath, Tree, TreeId};
 
 use crate::error::{Error, Result};
 
+#[cfg(test)]
+thread_local! {
+    /// Changesets that [`get_changeset`] read on this thread. Tests use it
+    /// to bound the reads of a query.
+    pub(crate) static CHANGESET_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Row ID of a repository.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RepoId(pub i64);
@@ -179,6 +186,8 @@ pub(crate) fn fill_repo_blobs(c: &Connection) -> Result<(u64, u64)> {
 /// [`Error::NotFound`] if `repo` does not have it, [`Error::Corrupt`] if it
 /// does not decode or match.
 pub fn get_changeset(c: &Connection, repo: RepoId, id: ChangesetId) -> Result<Changeset> {
+    #[cfg(test)]
+    CHANGESET_READS.set(CHANGESET_READS.get() + 1);
     let body: Vec<u8> = c
         .query_row(
             "SELECT body FROM changesets JOIN repo_changesets ON cs = id
@@ -224,6 +233,19 @@ pub fn generation(c: &Connection, repo: RepoId, id: ChangesetId) -> Result<i64> 
     .query_row(params![repo.0, id.as_bytes()], |row| row.get(0))
     .optional()?
     .ok_or_else(|| Error::NotFound(format!("changeset {id}")))
+}
+
+/// The generation of a changeset, in any repo. For derived data: the caller
+/// reaches `id` from a changeset whose repo it checked.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if no changeset has this ID.
+pub(crate) fn generation_of(c: &Connection, id: ChangesetId) -> Result<i64> {
+    c.prepare_cached("SELECT gen FROM changesets WHERE id = ?1")?
+        .query_row([id.as_bytes()], |row| row.get(0))
+        .optional()?
+        .ok_or_else(|| Error::NotFound(format!("changeset {id}")))
 }
 
 /// The first parent of a changeset, or `None` for a root.
@@ -495,6 +517,8 @@ fn to_id(bytes: &[u8]) -> Result<ChangesetId> {
 /// Commit graphs for tests.
 #[cfg(test)]
 pub(crate) mod testing {
+    use std::collections::BTreeMap;
+
     use proptest::prelude::{Strategy, any};
     use proptest::sample::Index;
     use scion_core::{BlobId, FileState, IdentityTime, RepoPath};
@@ -510,13 +534,31 @@ pub(crate) mod testing {
         repo: RepoId,
         parents: &[Vec<usize>],
     ) -> Result<Vec<ChangesetId>> {
-        let mut ids: Vec<ChangesetId> = Vec::new();
-        for (i, of) in parents.iter().enumerate() {
+        insert_each(c, repo, parents, |i| {
             let path = format!("f{i}");
             let state = FileState::Regular {
                 content: BlobId::of(path.as_bytes()),
                 executable: false,
             };
+            let message = path.clone().into_bytes();
+            (
+                message,
+                [(RepoPath::new(path).unwrap(), Some(state))].into(),
+            )
+        })
+    }
+
+    /// Stores a graph as [`insert_graph`] does, where changeset `i` has the
+    /// message and the changes that `make(i)` returns.
+    fn insert_each(
+        c: &Connection,
+        repo: RepoId,
+        parents: &[Vec<usize>],
+        make: impl Fn(usize) -> (Vec<u8>, BTreeMap<RepoPath, Option<FileState>>),
+    ) -> Result<Vec<ChangesetId>> {
+        let mut ids: Vec<ChangesetId> = Vec::new();
+        for (i, of) in parents.iter().enumerate() {
+            let (message, changes) = make(i);
             let cs = Changeset {
                 parents: of.iter().map(|&p| ids[p]).collect(),
                 author: IdentityTime {
@@ -526,12 +568,57 @@ pub(crate) mod testing {
                     tz_offset_minutes: 0,
                 },
                 committer: None,
-                message: path.clone().into_bytes(),
-                changes: [(RepoPath::new(path).unwrap(), Some(state))].into(),
+                message,
+                changes,
             };
             ids.push(insert_changeset(c, repo, &cs)?);
         }
         Ok(ids)
+    }
+
+    /// Paths that [`histories`] change. Some are files and directories of
+    /// others, so a path is a file at one time and a directory at another,
+    /// or both in one changeset.
+    pub(crate) const PATHS: [&str; 8] = ["a", "b", "a/b", "a/c", "b/a", "a/b/c", "a/b/d", "c/a/b"];
+
+    /// The changes of one changeset of [`histories`]: an index in
+    /// [`PATHS`], and whether it puts the file there or deletes it.
+    pub(crate) type Edits = Vec<(usize, bool)>;
+
+    /// Graphs as [`graphs`] makes them, with random puts and deletes of
+    /// [`PATHS`] in each changeset, or none. A change need not apply to a
+    /// tree, for example a delete of a missing file, so only kinds that read
+    /// the changes and not the trees can derive these histories.
+    pub(crate) fn histories(max: usize) -> impl Strategy<Value = (Vec<Vec<usize>>, Vec<Edits>)> {
+        graphs(max).prop_flat_map(|parents| {
+            let edit = (0..PATHS.len(), any::<bool>());
+            let edits =
+                proptest::collection::vec(proptest::collection::vec(edit, 0..4), parents.len());
+            (proptest::strategy::Just(parents), edits)
+        })
+    }
+
+    /// Stores a history of [`histories`] as [`insert_graph`] does, where
+    /// changeset `i` makes the changes `edits[i]`. Returns the IDs.
+    pub(crate) fn insert_history(
+        c: &Connection,
+        repo: RepoId,
+        parents: &[Vec<usize>],
+        edits: &[Edits],
+    ) -> Result<Vec<ChangesetId>> {
+        insert_each(c, repo, parents, |i| {
+            let changes = edits[i]
+                .iter()
+                .map(|&(path, put)| {
+                    let state = put.then(|| FileState::Regular {
+                        content: BlobId::of(i.to_string().as_bytes()),
+                        executable: false,
+                    });
+                    (RepoPath::new(PATHS[path]).unwrap(), state)
+                })
+                .collect();
+            (i.to_string().into_bytes(), changes)
+        })
     }
 
     /// Graphs of 1 to `max` changesets for [`insert_graph`]. Most have a

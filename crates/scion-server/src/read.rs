@@ -10,8 +10,10 @@ use scion_core::{
 
 use crate::db::{self, RepoId};
 use crate::deadline::Deadline;
+use crate::derived;
 use crate::error::{Error, Result};
 use crate::graph;
+use crate::history::{self, PathHistory};
 use crate::similar::{self, Budget, Chunks, MAX_PAIRS, Progress};
 use crate::store::Store;
 use crate::tree;
@@ -104,15 +106,21 @@ pub fn list_dir(
     })
 }
 
-/// Most changesets one call checks on a first-parent walk: a `Log` call, or
-/// the walk of a `Blame` call. So it is also the most entries a `Log` reply
-/// holds. Each check reads one changeset while the call holds one read
-/// connection.
-// SHORTCUT: path history and blame walk first parents on every call, so a
-// path changed long ago costs one call per 1,000 changesets since. Upgrade:
-// per-path history as derived data, so a call reads only the changesets that
-// changed the path.
+/// Most changesets that one `Blame` call checks on its first-parent walk,
+/// and most entries that a `Log` reply holds. Each check, and each entry,
+/// reads one changeset while the call holds one read connection.
+// SHORTCUT: blame walks first parents on every call, so a file changed long
+// ago costs one call per 1,000 changesets since. Upgrade: blame from the
+// path history (`history.rs`), so a call reads only the changesets that
+// changed the file (https://github.com/bnsd55/open-scion/issues/61).
 pub const MAX_SCAN: usize = 1000;
+
+/// Most bytes of path history that one `Log` call with a path reads, about
+/// as much as a `Blame` call reads. A lookup reads a whole directory level
+/// on each part of the path, so a file in a large directory costs a lot per
+/// entry: about 630 KB at 10,000 names. A call stops at this bound, after
+/// its first entry. Tests use a small bound, so that they reach it.
+pub const MAX_LOG_NODE_BYTES: usize = if cfg!(test) { 512 << 10 } else { 64 << 20 };
 
 /// One page of first-parent history.
 #[derive(Debug)]
@@ -139,38 +147,73 @@ pub fn log(
 ) -> Result<Vec<(ChangesetId, Changeset)>> {
     let mut entries = Vec::new();
     let mut next = Some(cs);
+    let deadline = Deadline::new(std::time::Instant::now() + std::time::Duration::from_secs(600));
     while let Some(from) = next.filter(|_| entries.len() < limit) {
-        let page = log_page(store, repo, from, None, limit - entries.len())?;
+        let page = log_page(store, repo, from, None, limit - entries.len(), &deadline)?;
         entries.extend(page.entries);
         next = page.next;
     }
     Ok(entries)
 }
 
-/// Up to `limit` changesets, walking first parents from `cs`, newest first.
-/// With a `path`, only the changesets that change it ([`changes_path`]).
-/// Checks at most [`MAX_SCAN`] changesets.
+/// Up to `limit` changesets, and at most [`MAX_SCAN`], walking first
+/// parents from `cs`, newest first. With a `path`, only the changesets that
+/// change it ([`changes_path`]), found in the path history of `cs`
+/// ([`history`]): each entry reads one changeset and at most one history
+/// node per part of the path, however many changesets lie between two
+/// entries. Such a page stops early, after its first entry, once it has read
+/// [`MAX_LOG_NODE_BYTES`] of nodes. If `cs` has no path history yet, this
+/// derives it first, in steps, until `deadline`.
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or changeset does not exist.
+/// [`Error::DeadlineExceeded`] if `deadline` passed while the path history
+/// was derived; the steps before it stay.
 pub fn log_page(
     store: &Store,
     repo: &str,
     cs: ChangesetId,
     path: Option<&RepoPath>,
     limit: usize,
+    deadline: &Deadline,
 ) -> Result<LogPage> {
+    let limit = limit.min(MAX_SCAN);
+    let Some(path) = path else {
+        return store.read(|c| {
+            let repo = db::repo_id(c, repo)?;
+            let mut entries = Vec::new();
+            let mut next = Some(cs);
+            let mut budget = limit;
+            while let Some(entry) = next_change(c, repo, None, &mut next, &mut budget)? {
+                entries.push(entry);
+            }
+            Ok(LogPage { entries, next })
+        });
+    };
+    let repo = store.read(|c| db::repo_id(c, repo))?;
+    derived::get_by::<PathHistory>(store, repo, cs, deadline)?;
+    // Each statement sees its own snapshot, and none needs another's: a
+    // changeset, a node and a value of this version never change and are
+    // never removed, and a node is stored in the transaction of the value
+    // that names it.
     store.read(|c| {
-        let repo = db::repo_id(c, repo)?;
+        let mut nodes = history::Nodes::default();
         let mut entries = Vec::new();
         let mut next = Some(cs);
-        let mut budget = MAX_SCAN;
-        while entries.len() < limit {
-            match next_change(c, repo, path, &mut next, &mut budget)? {
-                Some(entry) => entries.push(entry),
-                None => break,
+        while let Some(from) = next.filter(|_| entries.len() < limit) {
+            if !entries.is_empty() && nodes.bytes() >= MAX_LOG_NODE_BYTES {
+                break;
             }
+            // Each changeset on the first-parent history of `cs` has a path
+            // history, so `from` has one.
+            let Some(id) = history::newest_change(c, &mut nodes, from, path)? else {
+                next = None;
+                break;
+            };
+            let changeset = db::get_changeset(c, repo, id)?;
+            next = changeset.parents.first().copied();
+            entries.push((id, changeset));
         }
         Ok(LogPage { entries, next })
     })
@@ -179,7 +222,7 @@ pub fn log_page(
 /// Walks first parents from `next` to the newest changeset that changes
 /// `path` ([`changes_path`]), or to the next changeset if `path` is `None`.
 /// Checks at most `budget` changesets, and leaves `next` at the first one it
-/// did not check.
+/// did not check. `Blame` walks with it, and `Log` without a path.
 pub(crate) fn next_change(
     c: &Connection,
     repo: RepoId,
@@ -259,27 +302,25 @@ pub fn merge_base(
 /// per part on each side.
 pub const MAX_DIFF_ENTRIES: usize = 1000;
 
-/// Most entries a diff can have for `Diff` to find renames in it. To find
-/// them, a call walks the whole diff below its path, up to one entry more
-/// than this. Each tree read takes a read connection on its own.
-// SHORTCUT: a larger diff has no renames: a rename there is a delete and an
-// add. git finds renames in a diff of any size. Upgrade: renames of a diff
-// as derived data, found in steps over calls and kept
-// (https://github.com/bnsd55/open-scion/issues/107).
-pub const MAX_RENAME_ENTRIES: usize = 10_000;
-
 /// Most work one `Diff` call does to find similar files, in steps 2 and 3
 /// of [`similar::renames`]: each chunk of a file read counts once, each row
 /// of a chunk table that the search indexes or compares counts once, and
 /// each file size read counts [`similar::SIZE_COST`] ([`similar::Budget`]).
 /// Reading 64 MiB of text in lines of 64 bytes or more costs 1M. The budget
-/// is the same on every call, so every call finds the same renames.
-// SHORTCUT: past it, the search reads no more files, so a diff with many
-// large files that could be similar can miss renames that git finds, also
-// renames to a file of the same name.
-// Upgrade: renames of a diff as derived data, found in steps over calls and
-// kept (https://github.com/bnsd55/open-scion/issues/107).
+/// is the same on every call, so every call finds the same renames. Past
+/// it, the search reads no more files, and the reply says so
+/// ([`DiffPage::renames_incomplete`]). Exact renames (step 1) cost no file
+/// reads, so they run for any diff of up to [`MAX_RENAME_ENTRIES`] entries.
 pub const MAX_RENAME_CHUNKS: usize = 4 << 20;
+
+/// Most entries the rename pass of one `Diff` call walks below its path.
+/// It holds them in memory, at about 150 bytes each (`DiffEntry` is 128 on
+/// the stack, plus the bytes of the path), so a diff of
+/// [`MAX_RENAME_ENTRIES`] entries costs the call about 150 MB. Past it, the
+/// call finds no renames and the reply says so
+/// ([`DiffPage::renames_incomplete`]), as git warns when it skips inexact
+/// rename detection.
+pub const MAX_RENAME_ENTRIES: usize = 1_000_000;
 
 /// A path whose file differs between two snapshots.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -314,6 +355,11 @@ pub struct DiffPage {
     /// Set when the call stopped at [`MAX_DIFF_ENTRIES`]: the last path in
     /// `entries`. Diff again with `after` set to it to continue.
     pub next_after: Option<RepoPath>,
+    /// Set when renames may be missing: the inexact search did not run
+    /// (more than [`similar::MAX_PAIRS`] pairs were left), or stopped at
+    /// [`MAX_RENAME_CHUNKS`]. The exact renames that `entries` hold are
+    /// still whole.
+    pub renames_incomplete: bool,
 }
 
 /// The paths whose file differs between the snapshots of `old` and `new`, in
@@ -333,9 +379,13 @@ pub struct DiffPage {
 /// rename, whichever page holds it and wherever `after` is. Both halves of a
 /// rename stay in the diff, so a client that does not know renames sees a
 /// delete and an add. If the page has an added or deleted file, the call
-/// walks the whole diff below `path`, unless the page is all of it. A diff
-/// of more than [`MAX_RENAME_ENTRIES`] entries has no renames, and the
-/// search for similar files stops at [`MAX_RENAME_CHUNKS`].
+/// walks the whole diff below `path`, unless the page is all of it. Exact
+/// renames (same content, by blob ID) cost no file reads, so a diff of up
+/// to [`MAX_RENAME_ENTRIES`] entries gets them, whatever its size. The
+/// inexact search runs only under git's pair limit ([`similar::MAX_PAIRS`])
+/// and stops at [`MAX_RENAME_CHUNKS`]. When the walk was past its entry
+/// bound, or the inexact search did not run or did not end, the page says
+/// so ([`DiffPage::renames_incomplete`]).
 ///
 /// # Errors
 ///
@@ -348,6 +398,24 @@ pub fn diff(
     path: Option<&RepoPath>,
     after: Option<&RepoPath>,
 ) -> Result<DiffPage> {
+    diff_with(store, repo, old, new, path, after, MAX_RENAME_ENTRIES)
+}
+
+/// [`diff`], with the entries that the rename pass may walk bounded by
+/// `rename_entries`. Tests use a small bound to reach it cheaply.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if the repo or a changeset does not exist.
+pub fn diff_with(
+    store: &Store,
+    repo: &str,
+    old: ChangesetId,
+    new: ChangesetId,
+    path: Option<&RepoPath>,
+    after: Option<&RepoPath>,
+    rename_entries: usize,
+) -> Result<DiffPage> {
     let roots = (root_tree(store, repo, old)?, root_tree(store, repo, new)?);
     let mut entries = diff_walk(store, roots, path, after, MAX_DIFF_ENTRIES)?;
     // The walk finds one entry more than a page, to know whether more follow.
@@ -357,34 +425,43 @@ pub fn diff(
     } else {
         None
     };
+    let mut renames_incomplete = false;
     if entries.iter().any(|e| e.old.is_none() || e.new.is_none()) {
-        let renames = if after.is_none() && next_after.is_none() {
-            renames(store, &entries)?
+        // The renames are among the adds and deletes of the whole diff, not
+        // of one page, so a page gives each entry the same rename. Exact
+        // renames cost no file reads, so the walk has no bound but the
+        // memory of holding the entries: up to [`MAX_RENAME_ENTRIES`] of
+        // them, the bound of one call.
+        let all = if after.is_none() && next_after.is_none() {
+            entries.clone()
         } else {
-            let all = diff_walk(store, roots, path, None, MAX_RENAME_ENTRIES)?;
-            if all.len() > MAX_RENAME_ENTRIES {
-                tracing::debug!(
-                    entries = all.len(),
-                    "a diff with too many entries to find renames"
-                );
-                HashMap::new()
-            } else {
-                renames(store, &all)?
-            }
+            diff_walk(store, roots, path, None, rename_entries)?
         };
-        for entry in &mut entries {
-            entry.rename = renames.get(&entry.path).cloned();
+        if all.len() > rename_entries {
+            tracing::debug!(
+                entries = all.len(),
+                "a diff with too many entries to find renames"
+            );
+            renames_incomplete = true;
+        } else {
+            let (renames, incomplete) = renames(store, &all)?;
+            renames_incomplete = incomplete;
+            for entry in &mut entries {
+                entry.rename = renames.get(&entry.path).cloned();
+            }
         }
     }
     Ok(DiffPage {
         entries,
         next_after,
+        renames_incomplete,
     })
 }
 
 /// The renames among `entries`, a whole diff: each path of a rename, with
-/// the other path.
-fn renames(store: &Store, entries: &[DiffEntry]) -> Result<HashMap<RepoPath, Rename>> {
+/// the other path, and whether renames may be missing (the inexact search
+/// did not run, or stopped at its budget).
+fn renames(store: &Store, entries: &[DiffEntry]) -> Result<(HashMap<RepoPath, Rename>, bool)> {
     let (mut added, mut deleted) = (Vec::new(), Vec::new());
     for entry in entries {
         match (entry.old, entry.new) {
@@ -404,7 +481,14 @@ fn renames(store: &Store, entries: &[DiffEntry]) -> Result<HashMap<RepoPath, Ren
         progress: false,
     };
     let from = Progress::default();
-    let pairs = similar::renames(store, &added, &deleted, read, MAX_PAIRS, from, budget)?.pairs;
+    let outcome = similar::renames(store, &added, &deleted, read, MAX_PAIRS, from, budget)?;
+    if outcome.skipped {
+        tracing::debug!(
+            added = added.len(),
+            deleted = deleted.len(),
+            "a diff with too many file pairs for inexact rename detection"
+        );
+    }
     if cost >= MAX_RENAME_CHUNKS {
         tracing::debug!(
             cost,
@@ -412,7 +496,7 @@ fn renames(store: &Store, entries: &[DiffEntry]) -> Result<HashMap<RepoPath, Ren
         );
     }
     let mut renames = HashMap::new();
-    for pair in pairs {
+    for pair in outcome.pairs {
         let (to, from) = (added[pair.added].0, deleted[pair.deleted].0);
         let similarity = pair.score * 100 / similar::SAME;
         for (path, other) in [(to, from), (from, to)] {
@@ -426,7 +510,7 @@ fn renames(store: &Store, entries: &[DiffEntry]) -> Result<HashMap<RepoPath, Ren
             );
         }
     }
-    Ok(renames)
+    Ok((renames, outcome.skipped || outcome.stopped.is_some()))
 }
 
 /// The entries of the diff of two root trees, as [`diff`] returns them, up
