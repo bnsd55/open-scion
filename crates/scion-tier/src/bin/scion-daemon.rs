@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use anyhow::Context as _;
 use clap::Parser;
 use scion_tier::{DAEMON_UPSTREAM_TIMEOUT, DiskStore, Tier, bind_unix};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio_stream::wrappers::UnixListenerStream;
 use tracing_subscriber::EnvFilter;
 
@@ -62,11 +63,20 @@ async fn main() -> anyhow::Result<()> {
         .as_pathname()
         .context("the socket has no path")?
         .to_owned();
+    // SIGTERM too, as service managers send it: a clean stop writes the
+    // store's index, so the next start reads it instead of every file.
+    let mut terminate = signal(SignalKind::terminate()).context("cannot listen for SIGTERM")?;
     tracing::info!(socket = %socket.display(), upstream = %cli.upstream, "serving");
-    tier.serve(&cli.token, UnixListenerStream::new(listener), async {
-        tokio::signal::ctrl_c().await.ok();
+    tier.serve(&cli.token, UnixListenerStream::new(listener), async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+        tracing::info!("stopping");
     })
     .await?;
     std::fs::remove_file(&socket).ok();
+    // The store writes its index when the last task that holds the tier ends,
+    // as the runtime stops after this.
     Ok(())
 }

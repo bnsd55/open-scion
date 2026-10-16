@@ -109,6 +109,12 @@ release.
 - The tier timeouts nest: the server and tiers wait 30 s for reply memory,
   a tier 30 s for a fetch slot and 30 s for fetch memory, the cache 60 s per
   step of the server, the daemon 180 s per step of the cache.
+- `scion-daemon` keeps its recency index in `<data>/index` too, appended in
+  batches. After a clean stop (Ctrl-C, or SIGTERM, which it now handles
+  too), a start reads that one file and opens no object directory, and the
+  order of use survives the restart. After a crash, a start scans every
+  object file as before, and keeps the order of the index for the objects
+  that it names. A crash loses only what was used last, never an object.
 - Receivers accept only plain Zstandard frames, with no dictionary and a
   window of at most 8 MiB; the zstd library is built without its legacy
   decoders.

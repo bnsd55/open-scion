@@ -1073,14 +1073,43 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
   a repo exists: it serves a stored object for any valid repo name
   ([#13](https://github.com/bnsd55/open-scion/issues/13)).
 - **Logs.** Each `GetObjects` reply logs its hits and misses at `info`, and
-  each object at `debug`.
+  each object at `debug`. The daemon logs at `info` how many objects its
+  start found and whether it scanned, and whether its stop wrote a clean
+  index.
 
 | | `scion-cache` | `scion-daemon` |
 |---|---|---|
 | Listens on | TCP, `127.0.0.1:7879`. Another address needs `--insecure-listen`. | A Unix socket with mode 0600, by default `<data>/daemon.sock`, in a directory that only its user can reach (checked as for `<data>`). So nobody else can connect, even before the mode is set, or put another socket in its place. A stale socket file is replaced; a live one is an error. |
 | Upstream | `--upstream`, by default the server at `127.0.0.1:7878`. | `--upstream`, by default the cache at `127.0.0.1:7879`. |
 | Store | Memory, at most `--max-bytes` (1 GiB) of stored objects (blobs packed). | Disk, at most `--max-bytes` (10 GiB) of stored object bytes (not disk blocks): one file per object under `<data>/objects/`, a tree's `TreeV1` bytes or a blob's zstd frame, written to a temp file and renamed, unpacked as a stream and checked against its ID when read back. A file that the limit drops leaves its name by a rename under the index lock, and is removed after it, so a put of the same object keeps its new file. `<data>` is made with mode 0700 if missing. It must be a real directory (not a symlink), owned by the daemon's user, and closed to others, or the daemon refuses it. One daemon locks it. |
-| Eviction | Least recently used first. | Least recently used first, from an index in memory that a scan rebuilds at start, oldest write first ([#63](https://github.com/bnsd55/open-scion/issues/63)). |
+| Eviction | Least recently used first. | Least recently used first, from an index in memory that is also kept in `<data>/index` (below), so the order survives a restart. |
+| Start | Empty. | Reads `<data>/index`. After a clean stop (SIGINT or SIGTERM) it opens no object directory. After a crash it scans every object file, as with no index ([#115](https://github.com/bnsd55/open-scion/issues/115)). |
+
+**The daemon's index.** `<data>/index` lists the stored objects in order
+of use, so a start need not open every object directory. It is a header
+(`scnidx1\n` and a state byte) and records of 37 bytes: an op, an object ID
+and a size. `T` or `B` says that a tree or blob of that size is stored and
+was just used; `t` or `b` that it was dropped. Read in order, the records
+give the objects, least recently used first. Records wait in memory and are
+appended 1,024 at a time. Once the file holds more than twice as many
+records as objects, plus 65,536, it is written again with one record per
+object. A stop writes it again too, syncs it, and marks it clean: it names
+every object file.
+
+| Start after | What the start trusts | Cost |
+|---|---|---|
+| A clean stop | The file, for which objects are stored and in what order. Before the first put it marks the file dirty and syncs it. | One file read; no object directory. |
+| A crash | Nothing. The file may lack its last records: it may name a file that is gone, or miss a new one. The start scans every file and keeps the file's order for the objects that it names; the others come last, oldest write first. | One stat per object file, as with no index. |
+
+So a crash loses only what was used last, never an object. No start trusts
+the index for an object's bytes: each read checks them against the ID. If
+the index gives a size that is not the file's, the object is dropped at its
+first read and fetched again. Object files are not synced, so a machine crash soon
+after a clean stop can bring back a file that was just dropped; the index
+does not name it, so it is never served, and the limit does not count it
+until a put of that object replaces it. The format is this project's
+choice: an append-only file needs no new dependency in the tier crate, and
+replaying it in order is all that a start needs.
 
 This project's choices, not the article's: the Unix socket and its mode,
 TCP between tiers, the stores and their limits, keeping `GetRootTree`
@@ -1160,7 +1189,7 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-tier/src/lib.rs` (`produce`) | Two blocking hops per hit (size, then read) and no read-ahead, as on the server. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
 | `scion-tier/src/lib.rs` (`DAEMON_UPSTREAM_TIMEOUT`) | Fixed limits per step that nest. A fetch joined in the middle of its batch can wait for the objects ahead of it, and a client's own deadline does not reach the tiers. | Pass the remaining deadline down with `grpc-timeout`. | [#98](https://github.com/bnsd55/open-scion/issues/98) |
 | `scion-tier/src/lib.rs` (`check_repo`) | A tier does not ask whether a repo exists, and serves a stored object to any caller with the token. Safe with one principal. | Read tickets, checked by every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
-| `scion-tier/src/store.rs` (`DiskStore`) | The daemon's recency index lives in memory and a scan of every file rebuilds it at start. Memory and start time grow with the object count, and a restart forgets which objects were read last. | A persistent index. | [#63](https://github.com/bnsd55/open-scion/issues/63) |
+| `scion-tier/src/store.rs` (`DiskStore`) | The daemon's whole recency index is also in memory, and a start reads all of it. Writing `<data>/index` again copies every record under the index lock. After a crash, a start scans every object file. Memory and these pauses grow with the object count. | An index on disk that is read and changed in place, and a crash start that needs no scan. | [#115](https://github.com/bnsd55/open-scion/issues/115) |
 | `scion-tier/src/bin/scion-cache.rs` (`main`) | No TLS between tiers. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
 | `scn/src/client.rs` (`lossy`) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | Escape or base64 raw bytes in JSON. | |
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |
