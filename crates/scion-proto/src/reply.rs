@@ -19,8 +19,8 @@
 //! that ends in the middle of an object ends with `DEADLINE_EXCEEDED`, as
 //! `ReadFile` does, never `OK`.
 //!
-//! Not counted in the budget: the part in a reply's channel and the part that
-//! HTTP/2 is sending, at most 1 MiB each.
+//! Not counted in the budget: the parts that a reply leaves in its channel
+//! and in HTTP/2 when its client stops reading ([`crate::listen`]).
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -49,10 +49,6 @@ pub const IN_FLIGHT_BYTES: usize = 4 * MAX_OBJECT_BYTES;
 /// A reply ends when its client takes no part for this long, so a client
 /// that stops reading does not hold the budget. (A request timeout covers
 /// only the start of a streamed reply.)
-// SHORTCUT: a stalled reply ends, but its channel and HTTP/2 keep the part
-// each holds (at most 1 MiB each) until the connection closes, and the
-// number of stalled replies has no bound. Upgrade (issue #42): a response
-// body timeout that resets the stream.
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long a reply waits for room in the budget for its next object. For

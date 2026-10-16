@@ -36,9 +36,32 @@ flowchart LR
 
 How one request flows through the server:
 
-1. The bearer-token check (`scion-proto/src/auth.rs`) tags the request with
+1. The server serves at most 128 connections at once (`--max-connections`).
+   A client beyond that waits, unread, until a connection closes, and the
+   process logs a warning. One connection has at most 256 calls open at
+   once (`--max-streams`, HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS`). Every
+   connection closes in time, so a waiting one gets a place:
+   - A client that sends no HTTP/2 preface within 20 s of getting its
+     place is closed. hyper has no timeout there, and its keepalive starts
+     only after the preface.
+   - After the preface: after 60 s without a frame from a client, the
+     server sends an HTTP/2 ping, and closes the connection if no answer
+     comes within 20 s.
+   - After 30 min, the server asks a connection to close (`GOAWAY`). The
+     client connects again for new calls. The calls in it get 10 min more
+     (at least the 600 s of the longest call), and then the connection is
+     closed. So a connection beyond the cap waits at most 40 min for
+     another to close.
+
+   Each TCP connection has Nagle's algorithm off, so a small reply does not
+   wait for the client's ACK. The tiers share this code
+   (`scion-proto/src/listen.rs`) and its defaults. Size `--max-connections`
+   for the clients that keep a connection: on a cache, at least the daemons
+   behind it plus room for others; on the server, at least the caches plus
+   the direct clients.
+2. The bearer-token check (`scion-proto/src/auth.rs`) tags the request with
    a `Caller`.
-2. `service.rs` (the `Scion` service) or `objects.rs` (the `Objects` service)
+3. `service.rs` (the `Scion` service) or `objects.rs` (the `Objects` service)
    checks names, IDs and paths, then runs `write.rs`, `land.rs`, `read.rs`
    or `blame.rs` on a blocking thread (SQLite and the blob folder are
    synchronous). Both services share one bound: at most 256 run at once,
@@ -52,7 +75,7 @@ How one request flows through the server:
    base): 600 s after the call started, or as soon as a guard that the call
    holds has dropped. Then the land stops and stays pending, and the client
    sees `CANCELLED` or `DEADLINE_EXCEEDED`.
-3. `error.rs` maps errors to gRPC codes. Database, I/O, git and corruption
+4. `error.rs` maps errors to gRPC codes. Database, I/O, git and corruption
    errors reply `INTERNAL`. The detail goes only to the server log.
 
 ## 2. Object model
@@ -134,8 +157,23 @@ trees commits them in one transaction. The schema version is
 `migrations/` that is newer than its version runs, in order, in its own
 transaction. A released migration never changes. A build refuses a database
 with a newer version. Version 3 lets a derived value have any length; the
-upgrade copies every row. All database access of a process goes through one
-connection behind a mutex. Write transactions use `BEGIN IMMEDIATE`.
+upgrade copies every row.
+
+**Connections.** Each process has one write connection behind a mutex, and
+8 read-only connections (`store::READERS`). Write transactions use
+`BEGIN IMMEDIATE`. The migrations run on the write connection before the
+read connections open. In WAL mode a read connection reads beside a write, so a
+read never waits for a write, and a long read never makes a write wait.
+`Store::read` takes an idle read connection, or waits for one. It runs
+outside any explicit transaction, so each statement sees its own snapshot:
+every commit that it can see when it starts. A caller that needs one
+consistent view reads it in one statement. (A snapshot held across the
+statements of back-to-back reads would keep the auto-checkpoint from ever
+copying the whole log, so the log would never restart and its file would
+grow.) `Store::read_unflushed` runs
+on the write connection. Writes use it to read what they are about to
+change, under the same lock. The read connections close first, so the write
+connection closes last and moves the log into `scion.db`.
 
 **Blob folder.** One zstd file per blob, at most 100 MiB uncompressed. A write
 goes to a temp file in `tmp/`, is flushed, and is renamed into place. The zstd
@@ -174,11 +212,19 @@ rename (see below).
   Elsewhere the commit's `fsync` already flushes the cache. A land waits for
   the flush after it releases the ref's lock, so queued lands share it.
 - A read waits too. If `Store::read` saw a commit that no full flush covers
-  yet, it waits for one after it releases the database lock. So no reply
+  yet, it waits for one after it gives back its connection. So no reply
   shows a commit that a power loss can undo, such as a ref target from
   `ResolveRef` or a land state from `GetLand`. Where `fsync` already flushes
   the drive cache, no read waits. A land reads with `Store::read_unflushed`,
   because it flushes before it replies.
+- A read can see a commit before `commit` returns. So each commit is
+  counted twice, under the write lock: in `committing` before its COMMIT
+  runs, and in `committed` after it ends. A read loads `committing` after it
+  ends, so the count covers every commit it saw. A flush covers only
+  `committed`: a commit still in its COMMIT may not have written its log.
+  With `synchronous = FULL`, a commit's log reaches the drive before the
+  commit is visible, so a flush that starts after a read covers what the
+  read saw. The proof is in `Store::wait_durable`.
 - A read that derives a value, such as the root tree for `GetRootTree`,
   waits for a full flush of that derivation before it replies (section 4).
   So a client never gets a tree ID that a power loss can undo.
@@ -220,8 +266,10 @@ import with `Store::open_shared`. Each holds its `flock`s until the last
   process, up to `busy_timeout` (5 s), and then fails with `UNAVAILABLE`, so
   the client retries. An import holds the
   write lock for one batch of 1,000 commits, verification included. While a
-  server write waits, it holds the server's one connection, so the server's
-  reads wait too ([#100](https://github.com/bnsd55/open-scion/issues/100)).
+  server write waits, it holds the server's write connection, so the
+  server's other writes wait too
+  ([#100](https://github.com/bnsd55/open-scion/issues/100)). Its reads do
+  not: they use the read connections.
 - **Refs.** Both processes move a ref by compare-and-swap on its `version`,
   each in a write transaction. The server sees a move that the import made at
   its next land on the ref: each plan reads the head from the database and
@@ -260,7 +308,7 @@ computed eagerly or on demand. The rest is this project's choice.
 | A kind | `derived::Kind`: a name, a version, and `derive`, a function from a changeset and its parents' values, in parent order, to a value. Each kind encodes its value as bytes. |
 | Inputs | By default the first parent's value only, and only first-parent history is derived: a changeset stores only its changes against its first parent (section 2), so a kind over snapshots needs no more. A kind with `ALL_PARENTS`, such as `commit_graph` (below), gets the value of every parent, and every ancestor is derived. `derive` may also read the stored value of an older changeset that it reaches through those parents. |
 | On demand | `derived::get` reads the stored value. If there is none, `derived::fill` derives it in steps (below). |
-| Steps | `fill` walks from the changeset through the parents that the kind reads, and stops at each changeset with a stored value. It visits at most `derived::STEP` (100) changesets per hold of the database lock. It keeps the changesets without a value, 40 bytes each with the generation, so it visits each one once. A walk over every parent also keeps the set of changesets it visited. Then it derives them in generation order, oldest first, at most `STEP` changesets per transaction, and commits each one. A parent's generation is below its child's, so each changeset comes after its parents. Other requests run between steps. A step reads a value that is already stored, for example by a concurrent `fill`, and does not derive it again. So a changeset has a value only if each parent that its kind reads has one, back to the roots. |
+| Steps | `fill` walks from the changeset through the parents that the kind reads, and stops at each changeset with a stored value. It visits at most `derived::STEP` (100) changesets per hold of the write connection. It keeps the changesets without a value, 40 bytes each with the generation, so it visits each one once. A walk over every parent also keeps the set of changesets it visited. Then it derives them in generation order, oldest first, at most `STEP` changesets per transaction, and commits each one. A parent's generation is below its child's, so each changeset comes after its parents. Other writes run between steps. A step reads a value that is already stored, for example by a concurrent `fill`, and does not derive it again. So a changeset has a value only if each parent that its kind reads has one, back to the roots. |
 | Eager | A kind can also store its value when the changeset is written. `root_tree` does (below). `commit_graph` does if each parent has a value (`derived::on_write`), so a write never derives a long history. |
 | Storage | One `derived` row per (kind, version, changeset), written in the transaction that derives it. A large structure belongs in its own table, and the value is its ID, as `root_tree` keeps trees in `trees`. |
 | A version bump | A new version reads and writes only its own rows. So the old rows become unused, and nothing rewrites them. The new version derives its values again, in steps. Each step, and each write of a root tree, also deletes up to `STEP` rows of older versions of its kind, as each new land deletes a few expired lands. Rows of a newer version stay: a newer build that ran on this data may run again, and it reads them. Rows of a kind that the build no longer has also stay. |
@@ -353,7 +401,7 @@ started.
    1 MiB, author name and email of at most 1 KiB each.
 3. Check that the repo exists and has the parent, so a bad request reads no
    blob.
-4. Read back each blob it names, outside the database lock. A blob that many
+4. Read back each blob it names, before the write transaction. A blob that many
    paths name is read once. The error names the first path, in path order,
    whose blob is missing or corrupt.
 5. In one write transaction: check the repo and the parent again. If the repo
@@ -511,7 +559,7 @@ not hold yet, each once (`PathIndex::cost`).
 - If the addition still does not fit, an advance or a land moves the floor
   up to the tip: the index starts over, empty, at the head. So does an
   advance of more than `MAX_DEPTH` changesets, so it never holds the
-  database lock for a long walk.
+  write connection for a long walk.
 - A `reach` back to an older base stops at the first changeset that does not
   fit. That changeset is the floor, and the walk below checks the rest.
 
@@ -542,7 +590,7 @@ A dropped index, or one that started over, is an index whose floor is the
 head, so a land on an older base is the second or third case. So the choice
 of the new floor, of `MAX_DEPTH` and of the budget changes only the speed,
 never the answer. One limit does change it: the walk takes at most 100,000
-changesets (`MAX_WALK`). It holds the database lock, so a base further back
+changesets (`MAX_WALK`). It holds the write connection, so a base further back
 is `REJECTED` as too old, and the client must rebase onto a newer head.
 Per-path history in the database will remove the walk
 ([#38](https://github.com/bnsd55/open-scion/issues/38)).
@@ -698,7 +746,7 @@ histories where they agree: edits, merges, a file that becomes a directory
 and a file again, and renames for each rule above.
 
 **Bounds and resume.** A `Log` or `Blame` call checks at most 1,000
-changesets (`MAX_SCAN`), so it holds the database lock no longer than a plain
+changesets (`MAX_SCAN`), so it holds a read connection no longer than a plain
 `Log` of 1,000 entries. A `Blame` call also diffs at most 100 versions, and
 about 1M lines (`MAX_BLAME_DIFF_LINES`, both sides of each diff). Every byte
 that blame reads counts against this budget, once per 64 bytes: a diffed
@@ -812,14 +860,11 @@ and their bounds, are this project's choices.
   queue with marks. It keeps marks only for its queue, so its memory follows
   the width of the history, not its depth.
 - A walk runs in steps of about 1,000 reads (`graph::STEPS`). A step
-  holds the database lock. A changeset's parents and node never change, so
-  the next step goes on from where the last one stopped. The lock is not
-  fair: a thread that frees it and takes it again at once keeps it. So the
-  walk leaves it free for 100 µs between steps, and a request that waits
-  takes it then. The reply waits for one flush that covers every step, as
-  any read does. **Planned:** a pool of read-only connections, so a walk
-  holds no lock that writes wait for
-  ([#17](https://github.com/bnsd55/open-scion/issues/17)).
+  holds one read connection, so writes and other reads run beside it. A
+  changeset's parents and node never change, so the next step goes on from
+  where the last one stopped. The reply waits for one flush that covers
+  every step, as any read does. At most 4 queries run at once, fewer than
+  the 8 read connections, so the walks never take every one.
 - The first query on a changeset without a node derives the commit graph
   of its whole history, in steps (section 4), before it answers. Its
   deadline does not stop that: each step it stored stays for the next
@@ -900,12 +945,14 @@ that each changeset it receives hashes to its ID.
   empty. So the second slot is always free for the error that ends a reply
   early. A reply ends with `DEADLINE_EXCEEDED` when its client takes no part
   for 120 s, so a client never takes a short file for a whole one. A slow
-  client that keeps reading has no time limit.
+  client that keeps reading has no time limit of its own, but the
+  connection's age can cut a reply that runs for more than 10 min (section
+  1). The client then reads the file again.
 - A reply keeps its share until the client has taken its last part, or
-  until it stalls. After a stall, the part in the channel and the part
-  inside HTTP/2 stay in memory, outside the budget, until the connection
-  closes: up to 2 MiB per stalled reply
-  ([#42](https://github.com/bnsd55/open-scion/issues/42)).
+  until it stalls. After a stall, three parts stay in memory, outside the
+  budget, until the stream ends or the connection closes: the part in the
+  channel, the part that hyper has read ahead, and the part in the h2 send
+  buffer. Section 8 gives the ceiling.
 
 **Object reads (`Objects` service, `objects.rs`).** The calls that every
 cache tier answers too. The client asks only for the objects it wants,
@@ -947,10 +994,10 @@ starting at the root tree, and never says what it already has.
   asks again. A reply whose client takes no part for 120 s ends and frees
   its share; in the middle of an object it ends with `DEADLINE_EXCEEDED`,
   as `ReadFile` does, never `OK`. A blob read back with another size than its header said is corrupt
-  and is never sent. Not counted: per reply, the part in its channel and the
-  part inside HTTP/2, at most 1 MiB each, which stay until the client reads
-  them or the connection closes
-  ([#42](https://github.com/bnsd55/open-scion/issues/42)). Also not counted:
+  and is never sent. Not counted: per reply, the part in its channel, the
+  part that hyper has read ahead, and the part in the h2 send buffer, at
+  most 1 MiB each. They stay until the client reads them, the stream ends
+  or the connection closes (section 8 gives the ceiling). Also not counted:
   the work of the reads in progress, at most 256 at once (a tree's decoded
   entries, the file buffers).
 - A reply sends the next object only while it has sent less than 64 MiB of
@@ -1059,7 +1106,11 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
   400 MiB budget before its bytes are read or copied, and each part frees
   its piece when taken. A reply ends when its client takes no part for
   120 s, or when the budget has no room for 30 s. If that happens at the
-  first object, the call fails with `RESOURCE_EXHAUSTED`.
+  first object, the call fails with `RESOURCE_EXHAUSTED`. A tier serves at
+  most 128 connections, each with at most 256 open calls, and closes
+  connections in time, as the server does (section 1), with the same flags.
+  A daemon keeps one connection to its cache for life; at 30 min of age the
+  cache asks it to close, and the daemon connects again.
 - **Fetches.** On a miss, the tier starts one fetch for that object and the
   later objects of the call that its store lacks, at most 128 in all (a
   reply sends at most 64 MiB, so more would only fill the store). A later
@@ -1167,7 +1218,7 @@ an untrusted network.
 | Network | The server listens on `127.0.0.1:7878` and `scion-cache` on `127.0.0.1:7879` by default. A non-loopback address is refused unless `--insecure-listen` is given. `scion-daemon` listens only on a Unix socket with mode 0600, in a directory that only its user can reach; it refuses any other. `scn` refuses a socket that another user owns. Both refuse a socket or data directory under a directory that another user can change: one that another user owns, or that group or others can write and has no sticky bit. | No TLS: the token and all data travel unencrypted, also between tiers ([#14](https://github.com/bnsd55/open-scion/issues/14)). By choice, as OpenSSH's `StrictModes`, the directory checks refuse a group-writable directory (`chmod go-w` fixes it; with umask 002, new directories are group-writable), and read only the owner and the mode bits, not ACLs: an ACL that lets other users write a directory gets past them. |
 | Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. | Trees and blobs are shared by all repos. `GetObjects` reads any tree or blob by ID, and a changeset can name another repo's blob and then read it ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
-| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 1 MiB plus 1 KiB: one part of an object), blobs up to 100 MiB, 16 uploads at once (each holds one message in memory), 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget and `ReadFile` replies a 256 MiB budget. A reply of either whose client stops reading ends after 120 s. Every receiver of an object unpacks it within the size its first part gives, at most 100 MiB, with a zstd window of at most 8 MiB, and accepts only plain Zstandard frames (no skippable or legacy frames, no dictionary). The zstd library is built without its legacy decoders. Names of 1 to 256 bytes with no control characters. The path indexes of all refs hold at most 128 MiB together, and a land walks at most 100,000 changesets below its ref's index. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 16 MiB and 1,048,576 lines, diffs at most 100 versions and about 1M lines (a line counts once per 64 bytes), compares at most 100 deleted files and about 100 MiB to find a rename, and at most 4 run at once. At most 4 `MergeBase` and `IsAncestor` calls run at once, each until its 600 s deadline; a `Diff` reply holds at most 1,000 paths. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps two parts of an object (at most 1 MiB each), or up to 2 MiB of a file, in memory until its connection closes, and the number of stalled replies has no bound ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
+| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 1 MiB plus 1 KiB: one part of an object), blobs up to 100 MiB, 16 uploads at once (each holds one message in memory), 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget and `ReadFile` replies a 256 MiB budget. A reply of either whose client stops reading ends after 120 s. Every receiver of an object unpacks it within the size its first part gives, at most 100 MiB, with a zstd window of at most 8 MiB, and accepts only plain Zstandard frames (no skippable or legacy frames, no dictionary). The zstd library is built without its legacy decoders. Names of 1 to 256 bytes with no control characters. The path indexes of all refs hold at most 128 MiB together, and a land walks at most 100,000 changesets below its ref's index. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 16 MiB and 1,048,576 lines, diffs at most 100 versions and about 1M lines (a line counts once per 64 bytes), compares at most 100 deleted files and about 100 MiB to find a rename, and at most 4 run at once. At most 4 `MergeBase` and `IsAncestor` calls run at once, each until its 600 s deadline; a `Diff` reply holds at most 1,000 paths. The server and each tier serve at most 128 connections at once (`--max-connections`), each with at most 256 open streams (`--max-streams`); a client beyond either waits. A connection closes 20 s after it gets its place if no HTTP/2 preface came; after the preface, 20 s after an unanswered ping, which goes out after 60 s without a frame; and in any case 10 min after it was asked to close at 30 min of age. So a connection beyond the cap waits at most 40 min. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). A reply whose client stops reading keeps memory that no budget counts, until its stream ends or its connection closes: a `GetObjects` or `ReadFile` reply three parts (in its channel, read ahead by hyper, in the h2 send buffer) plus up to 400 KiB more of h2 send buffer, under 4 MiB; a unary reply its whole message, up to 64 MiB. So the ceiling is connections x streams x that: 128 x 256 x 4 MiB = 128 GiB for streamed replies, and 128 x 256 x 64 MiB = 2 TiB for unary ones. What a dead peer holds is freed within 80 s of its last frame (keepalive), or within 20 s if it never sent the preface. A live client that stops reading keeps it until its connection is closed at 40 min of age: hyper cannot reset a stalled stream from the server side ([#113](https://github.com/bnsd55/open-scion/issues/113)). |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. Each tier also checks every object from upstream before it stores or sends it, and the daemon checks each object again when it reads it from disk. The server sends a blob's zstd file without unpacking it, so the receiver finds a damaged file. | Tiers are trusted in v0.1: the client trusts the `ResolveRef` and `GetRootTree` answers that a tier passes on, which it cannot check by hash. A tier forwards them, and keeps only what upstream answered. |
 | Checkout | `scn checkout` writes into a private temp directory with a random name. It renames it onto a new destination, or moves its entries up into an existing empty directory that the user owns, never over an entry already there. It never follows a symlink while writing or removing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure, or on SIGINT, SIGTERM or SIGHUP, the destination stays as it was. | The directory that gets the checkout (an existing destination, or a new one's parent) must not be writable by all users, unless it has the sticky bit: they could swap parts of the checkout. An existing destination that breaks this is refused. Members of a group that can write it are trusted. Where the filesystem has no rename that never replaces (NFS), any empty mode 0700 directory of the user at a top-level directory name counts as the checkout's claim after `mkdirat` fails with `EEXIST`, and is replaced. Where it has no hard links either (some FUSE filesystems), any symlink of the user with the same target at a top-level symlink name counts as made after `symlinkat` fails with `EEXIST`, and is kept. This is for a lost NFS version 3 reply, but a trusted user (the owner, a group member, root) can also put such an entry there: it is taken, and no data is lost. A filesystem that shows one owner for every entry (a FUSE or SMB mount with `-o uid=`) passes every ownership check. In the temp directory, an entry found after `EEXIST` that is what the call makes counts as made, unless a recorded path in the same directory has its inode. A filesystem that folds names but shows another inode number under each name (CIFS with `noserverino`, FUSE without `use_ino`) would let such a fold through only for two empty files or two symlinks with one target: the two paths then share one entry, with the same content. A folded directory always fails: each directory that the checkout made already holds an entry. The check reads only the mode bits, not ACLs: an ACL that lets other users add or delete entries gets past it. No Windows rules: device names and names that end in a dot or a space pass. |
 | Cache tiers | A tier refuses calls without its token, and serves only objects that match their IDs. | A tier serves a stored object for any valid repo name and does not ask whether the repo exists. Safe with one principal ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
@@ -1185,18 +1236,15 @@ limit and its upgrade path. This is the list on `main` today.
 | File | Shortcut | Upgrade | Issue |
 |---|---|---|---|
 | `scion-core/src/codec.rs` (`put_len`) | Encoding panics if a field is longer than `u32::MAX`. Every ingest path caps sizes far below that. | `try_encode` returning `Result`, if a path ever does not. | |
-| `scion-server/src/graph.rs` (`STEPS`) | A graph walk leaves the database lock free for 100 µs between steps, because the lock is not fair. A request that wakes later than that waits one more step. | A pool of read-only connections, so a walk holds no lock that others wait for. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
-| `scion-server/src/store.rs` (`Inner::db`) | One SQLite connection behind a mutex, so reads wait for writes. | A pool of read-only connections. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
-| `scion-server/src/import.rs` (`BATCH`) | A server that shares the data directory waits for each import batch transaction, up to `busy_timeout` (5 s), and then its write fails with `UNAVAILABLE`. Its reads wait behind that write. | Shorter import transactions while a server shares the directory. | [#100](https://github.com/bnsd55/open-scion/issues/100) |
+| `scion-server/src/import.rs` (`BATCH`) | A server that shares the data directory waits for each import batch transaction, up to `busy_timeout` (5 s), and then its write fails with `UNAVAILABLE`. Its other writes wait behind that write. | Shorter import transactions while a server shares the directory. | [#100](https://github.com/bnsd55/open-scion/issues/100) |
 | `scion-server/src/store.rs` (`Blobs::sweep_tmp`) | Only an open that finds no other process removes the temp files that a crash left, so those of a crashed import stay while the server runs. | A `tmp/` folder per process, under its own lock. | [#101](https://github.com/bnsd55/open-scion/issues/101) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | Per-ref serialization in a shared database ([design](design/scalable-backend.md)). | [#47](https://github.com/bnsd55/open-scion/issues/47) |
-| `scion-server/src/land.rs` (`MAX_WALK`) | A land on a base more than `MAX_DEPTH` generations below the tip walks the history from the index floor back to the base, each time, and holds the database lock while it walks. A base more than 100,000 changesets below the floor is rejected. | Per-path history in the database, so the check reads only the paths that the land changes. | [#38](https://github.com/bnsd55/open-scion/issues/38) |
+| `scion-server/src/land.rs` (`MAX_WALK`) | A land on a base more than `MAX_DEPTH` generations below the tip walks the history from the index floor back to the base, each time, and holds the write connection while it walks. A base more than 100,000 changesets below the floor is rejected. | Per-path history in the database, so the check reads only the paths that the land changes. | [#38](https://github.com/bnsd55/open-scion/issues/38) |
 | `scion-server/src/objects.rs` (`read_object`) | An object ID is treated as permission to read it; trees and blobs are shared by all repos. Safe with one principal. | A read ticket bound to a principal, a repo and a root tree, checked by the server and every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
-| `scion-proto/src/reply.rs` (`STALL_TIMEOUT`) | A stalled `GetObjects` reply ends, but its channel and HTTP/2 keep the part each holds (at most 1 MiB each) until the connection closes, and the number of stalled replies has no bound. | A response body timeout that resets the stream. | [#42](https://github.com/bnsd55/open-scion/issues/42) |
+| `scion-proto/src/listen.rs` (`Limits`) | A live client that stops reading keeps what its stalled replies hold in HTTP/2 until its connection closes, at most 40 min after it opened: under 4 MiB per streamed reply, up to 64 MiB per unary one. The caps bound only the number: connections x streams. hyper cannot reset a stalled stream from the server side: while the stream waits for window, hyper does not poll the reply body. | Count what the stalled replies of each connection hold, and close a connection that holds too much, which frees its h2 buffers. | [#113](https://github.com/bnsd55/open-scion/issues/113) |
 | `scion-server/src/objects.rs` (`find`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
-| `scion-server/src/service.rs` (`READ_STALL_TIMEOUT`) | A stalled `ReadFile` reply frees its share, but the part in its channel and the part inside HTTP/2 stay in memory until the connection closes, up to 2 MiB per reply. | A response body timeout that resets the stream. | [#42](https://github.com/bnsd55/open-scion/issues/42) |
 | `scion-server/src/read.rs` (`MAX_SCAN`) | Path history and blame walk first parents on every call, at most 1,000 changesets per call. A path changed long ago costs many calls. | Path history as derived data. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
 | `scion-server/src/read.rs` (`MAX_RENAME_ENTRIES`) | Each `Diff` call walks the whole diff below its path to find renames. A diff of more than 10,000 entries has no renames: a rename there is a delete and an add. `git diff` finds renames in a diff of any size. | Renames of a diff as derived data, found in steps over calls and kept. | [#107](https://github.com/bnsd55/open-scion/issues/107) |
 | `scion-server/src/read.rs` (`MAX_RENAME_CHUNKS`) | The search for similar files in one `Diff` call reads and compares about 4M chunks, then reads no more files. A diff with many large files that could be similar can miss renames that `git diff` finds. | The same derived data. | [#107](https://github.com/bnsd55/open-scion/issues/107) |

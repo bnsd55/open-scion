@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use scion_core::{BlobId, ChangesetId, FileState, RepoPath};
+use scion_proto::listen::{self, Limits};
 use scion_proto::v1::scion_server::{Scion, ScionServer};
 use scion_proto::v1::{
     self, BlameChangeset, BlameRange, BlameRequest, BlameResponse, CreateChangesetRequest,
@@ -20,8 +21,9 @@ use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
+use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth::{Auth, Caller};
@@ -48,6 +50,9 @@ const MAX_BLAMES: usize = 4;
 /// bound on its reads, only its deadline, so these queries never take more
 /// than this many of the `MAX_BLOCKING` permits.
 const MAX_GRAPH_QUERIES: usize = 4;
+// A graph query holds one read connection at a time, through a walk with no
+// bound on its reads. So the walks never take every one.
+const _: () = assert!(MAX_GRAPH_QUERIES < crate::store::READERS);
 /// Most `Diff` calls running at once. One call can read and compare files
 /// for about a second to find renames (`read::MAX_RENAME_CHUNKS`), so diffs
 /// never take more than this many of the `MAX_BLOCKING` permits either.
@@ -59,17 +64,20 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const READ_BUDGET_BYTES: usize = 256 << 20;
 /// A `ReadFile` reply ends when its client takes no part for this long, and
 /// frees its share, so a client that stops reading does not hold budget.
-// SHORTCUT: the reply frees its share, but the part that waits in its
-// channel and the part inside HTTP/2 stay in memory, outside the budget,
-// until the connection closes: up to 2 MiB per stalled reply. Upgrade
-// (issue #42): a response body timeout that resets the stream.
+/// The parts that it leaves in its channel and in HTTP/2 stay outside the
+/// budget (`scion_proto::listen`).
 const READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+// A connection that is asked to close keeps its calls for at least as long
+// as the longest call takes.
+const _: () = assert!(REQUEST_TIMEOUT.as_secs() <= listen::CONNECTION_GRACE.as_secs());
 
 // Any one reply fits in the budget, and the budget counts in u32 permits.
 const _: () = assert!(read_share(MAX_OBJECT_BYTES) <= READ_BUDGET_BYTES);
 const _: () = assert!(READ_BUDGET_BYTES <= u32::MAX as usize);
 
-/// Serves the API on `listener`, requiring `token`, until `shutdown` resolves.
+/// Serves the API on `listener`, requiring `token`, within `limits`, until
+/// `shutdown` resolves.
 ///
 /// # Errors
 ///
@@ -78,6 +86,7 @@ pub async fn serve(
     store: Store,
     listener: TcpListener,
     token: &str,
+    limits: Limits,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
     let auth = Auth::new(token);
@@ -87,12 +96,13 @@ pub async fn serve(
         auth.clone(),
     );
     let objects = InterceptedService::new(ObjectsService::new(worker).into_server(), auth);
-    tonic::transport::Server::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .add_service(scion)
-        .add_service(objects)
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
-        .await
+    let router = |server: Server| {
+        server
+            .timeout(REQUEST_TIMEOUT)
+            .add_service(scion)
+            .add_service(objects)
+    };
+    limits.serve(router, listen::tcp(listener), shutdown).await
 }
 
 /// Implements the Scion RPCs.
@@ -905,13 +915,13 @@ mod tests {
         let service = Arc::new(ScionService::new(Worker::new(store.clone())));
         let idle = || service.worker.permits.available_permits() == MAX_BLOCKING;
 
-        // Hold the database, so the job waits at its first step.
+        // Hold the write connection, so the job waits at its first step.
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
         let blocker = std::thread::spawn({
             let store = store.clone();
             move || {
-                store.read(|_| {
+                store.read_unflushed(|_| {
                     held_tx.send(()).unwrap();
                     go_rx.recv().unwrap();
                     Ok(())
@@ -1009,20 +1019,24 @@ mod tests {
         let service = Arc::new(ScionService::new(Worker::new(store.clone())));
         let busy = || MAX_BLOCKING - service.worker.permits.available_permits();
 
-        // Hold the database, so each job waits at its first read.
+        // Hold every read connection, so each job waits at its first read.
         let (held_tx, held_rx) = std::sync::mpsc::channel();
-        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-        let blocker = std::thread::spawn({
-            let store = store.clone();
-            move || {
-                store.read(|_| {
-                    held_tx.send(()).unwrap();
-                    go_rx.recv().unwrap();
-                    Ok(())
+        let go = Arc::new(std::sync::Barrier::new(crate::store::READERS + 1));
+        let blockers: Vec<_> = (0..crate::store::READERS)
+            .map(|_| {
+                let (store, held_tx, go) = (store.clone(), held_tx.clone(), Arc::clone(&go));
+                std::thread::spawn(move || {
+                    store.read(|_| {
+                        held_tx.send(()).unwrap();
+                        go.wait();
+                        Ok(())
+                    })
                 })
-            }
-        });
-        held_rx.recv().unwrap();
+            })
+            .collect();
+        for _ in &blockers {
+            held_rx.recv().unwrap();
+        }
         // One call more than the limit, of both kinds.
         let calls: Vec<_> = (0..=MAX_GRAPH_QUERIES)
             .map(|i| {
@@ -1057,8 +1071,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(busy(), MAX_GRAPH_QUERIES, "the last call waits for a slot");
 
-        go_tx.send(()).unwrap();
-        blocker.join().unwrap().unwrap();
+        go.wait();
+        for blocker in blockers {
+            blocker.join().unwrap().unwrap();
+        }
         for call in calls {
             let answer = tokio::time::timeout(Duration::from_secs(10), call)
                 .await

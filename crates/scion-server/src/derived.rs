@@ -29,8 +29,8 @@ use crate::error::{Error, Result};
 use crate::store::Store;
 
 /// Most changesets that one step walks or derives, and most rows of older
-/// versions that one step removes. A step holds the database lock, so this
-/// bounds how long other requests wait. Tests use a small step, so that a
+/// versions that one step removes. A step holds the write connection, so
+/// this bounds how long other writes wait. Tests use a small step, so that a
 /// short history takes several steps.
 pub const STEP: usize = if cfg!(test) { 2 } else { 100 };
 
@@ -115,7 +115,7 @@ pub fn get<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::V
 ///
 /// First it walks from `cs` through the parents that `K` reads, and stops at
 /// each changeset with a stored value. It visits at most [`STEP`] changesets
-/// per hold of the database lock. Then it derives the changesets without a
+/// per hold of the write connection. Then it derives the changesets without a
 /// value in generation order, oldest first, at most [`STEP`] per
 /// transaction. A parent's generation is below its child's, so each
 /// changeset comes after its parents. Each of these transactions also
