@@ -1,5 +1,5 @@
 [package]
-name = "open-scn"
+name = "open-scion"
 description = "Command-line client for the Scion version control system"
 version.workspace = true
 edition.workspace = true
