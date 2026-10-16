@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 
 use rusqlite::{Connection, OptionalExtension, params};
-use scion_core::{BlobId, Changeset, ChangesetId, Tree, TreeId};
+use scion_core::{BlobId, Changeset, ChangesetId, RepoPath, Tree, TreeId};
 
 use crate::error::{Error, Result};
 
@@ -74,11 +74,12 @@ pub fn insert_changeset(c: &Connection, repo: RepoId, cs: &Changeset) -> Result<
     Ok(id)
 }
 
-/// The blobs that a changeset's changes put, in path order, with repeats.
-pub(crate) fn puts(cs: &Changeset) -> impl Iterator<Item = BlobId> + '_ {
+/// The puts of a changeset's changes: each path and its blob, in path
+/// order, with repeats. A gitlink names no blob, whatever its bytes.
+pub(crate) fn puts(cs: &Changeset) -> impl Iterator<Item = (&RepoPath, BlobId)> + '_ {
     cs.changes
-        .values()
-        .filter_map(|state| state.as_ref()?.blob())
+        .iter()
+        .filter_map(|(path, state)| Some((path, state.as_ref()?.blob()?)))
 }
 
 /// Adds `blob` to the blobs that `repo` may name. Returns whether it is new.
@@ -125,7 +126,7 @@ pub(crate) fn fill_repo_blobs(c: &Connection) -> Result<(u64, u64)> {
         "SELECT count(*) FROM repo_changesets JOIN changesets ON cs = id",
         [],
         |row| row.get::<_, i64>(0),
-    )? as u64;
+    )?.cast_unsigned();
     tracing::info!(changesets = total, "schema 4: adding each repo's blobs");
     let mut select =
         c.prepare("SELECT repo_id, id, body FROM repo_changesets JOIN changesets ON cs = id")?;
@@ -142,7 +143,7 @@ pub(crate) fn fill_repo_blobs(c: &Connection) -> Result<(u64, u64)> {
                 "changeset {id} does not match its ID"
             )));
         }
-        for blob in puts(&cs) {
+        for (_, blob) in puts(&cs) {
             added += u64::from(add_repo_blob(c, repo, blob)?);
         }
         read += 1;

@@ -84,14 +84,6 @@ pub fn put_blob(store: &Store, repo: RepoId, upload: Upload) -> Result<BlobId> {
     Ok(id)
 }
 
-/// Each put of a changeset: its path and its blob, in path order. A gitlink
-/// names no blob, whatever its bytes.
-fn puts(cs: &Changeset) -> impl Iterator<Item = (&RepoPath, BlobId)> {
-    cs.changes
-        .iter()
-        .filter_map(|(path, state)| Some((path, state.as_ref()?.blob()?)))
-}
-
 /// Why a blob that a changeset puts is refused.
 fn bad_blob(blob: BlobId, path: &RepoPath, problem: &str, repo: &str) -> Error {
     Error::InvalidArgument(format!(
@@ -104,7 +96,7 @@ fn bad_blob(blob: BlobId, path: &RepoPath, problem: &str, repo: &str) -> Error {
 /// neither the answer nor its time shows whether another repo has the blob.
 fn check_members(c: &Connection, repo: &str, repo_id: RepoId, cs: &Changeset) -> Result<()> {
     let mut seen = BTreeSet::new();
-    for (path, blob) in puts(cs) {
+    for (path, blob) in db::puts(cs) {
         if seen.insert(blob) && !db::repo_has_blob(c, repo_id, blob)? {
             return Err(bad_blob(blob, path, "is not stored", repo));
         }
@@ -160,7 +152,7 @@ fn check_blobs(store: &Store, repo: &str, cs: &Changeset) -> Result<()> {
     let mut blobs = store.blobs().batch();
     // A blob seen before was intact, or the loop would have stopped.
     let mut seen = BTreeSet::new();
-    for (path, blob) in puts(cs) {
+    for (path, blob) in db::puts(cs) {
         if !seen.insert(blob) {
             continue;
         }

@@ -159,7 +159,7 @@ pub fn store_changeset(
         .transpose()?;
     let tree = apply(c, base, &cs.changes)?;
     let id = db::insert_changeset(c, repo, cs)?;
-    for blob in db::puts(cs) {
+    for (_, blob) in db::puts(cs) {
         db::add_repo_blob(c, repo, blob)?;
     }
     derived::put::<RootTree>(c, id, &tree)?;
