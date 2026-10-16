@@ -257,10 +257,10 @@ pub fn blame(
     let mut nodes = history::Nodes::default();
     let mut node_bytes = 0usize;
     let mut node_holds: Vec<Held> = Vec::new();
-    // The versions this call explained: a call that stops before the
-    // first one has no progress, and a cursor here would send the client
-    // round the same step for ever.
-    let mut explained = 0usize;
+    // Whether this call explained a version: a call that stops before
+    // the first one has no progress, and a cursor here would send the
+    // client round the same step for ever.
+    let mut progressed = false;
     for _ in 0..MAX_BLAME_VERSIONS {
         if lines[resume.after_line..window_end]
             .iter()
@@ -295,7 +295,7 @@ pub fn blame(
             if let Ok(hold) = memory.try_take(nodes.bytes() - node_bytes) {
                 node_holds.push(hold);
                 node_bytes = nodes.bytes();
-            } else if explained == 0 {
+            } else if !progressed {
                 // Retryable: another time, the pool may hold the share.
                 return Err(Error::ResourceExhausted(format!(
                     "the walk of {path:?} needs {} bytes of path history nodes before it names a line",
@@ -387,7 +387,7 @@ pub fn blame(
         if give_lines(&mut lines, id, older.as_ref(), &text) {
             changesets.push((id, changeset.author, path.clone()));
         }
-        explained += 1;
+        progressed = true;
         drop(diff_hold);
         if let Some((older_path, older_blob, older_text)) = older {
             (path, blob) = (older_path, older_blob);
