@@ -786,7 +786,9 @@ impl<S: Store> Tier<S> {
         }
         let mut waiting = VecDeque::new();
         for k in iter::once(key).chain(later) {
-            if let Entry::Vacant(slot) = flights.entry(k) && (k == key || !stored(k)) {
+            if let Entry::Vacant(slot) = flights.entry(k)
+                && (k == key || !stored(k))
+            {
                 let (tx, rx) = watch::channel(None);
                 slot.insert(rx);
                 waiting.push_back((k, tx));

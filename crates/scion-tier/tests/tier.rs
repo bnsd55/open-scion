@@ -729,8 +729,7 @@ async fn a_slow_upstream_fails_the_call_with_unavailable() {
 #[tokio::test]
 async fn a_call_level_failure_is_the_status_of_a_call_never_an_error_in_its_stream() {
     let (kept, other) = (blob(b"kept\n"), blob(b"not kept\n"));
-    let fake = Fake::new(&[&kept, &other], Duration::ZERO)
-        .with_call_fail([other.id.clone()]);
+    let fake = Fake::new(&[&kept, &other], Duration::ZERO).with_call_fail([other.id.clone()]);
     let (_cache, url) = cache_for(&fake).await;
     let mut client = connect(&url, Some(TOKEN)).await;
     get(&mut client, &[&kept]).await.unwrap();

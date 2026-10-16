@@ -3,13 +3,13 @@
 #![cfg(unix)]
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Output, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 

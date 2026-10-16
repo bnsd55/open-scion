@@ -447,6 +447,8 @@ async fn diff(
 
 /// Reads `blobs` with `GetObjects`, asking again for the rest after a
 /// reply that stops early, and checks each against its ID.
+// SHORTCUT: dead until C5 verifies tickets and the read-back returns.
+#[allow(dead_code)]
 async fn read_blobs(objects: &mut Objects, blobs: &[BlobId]) {
     let mut rest = blobs;
     while !rest.is_empty() {
