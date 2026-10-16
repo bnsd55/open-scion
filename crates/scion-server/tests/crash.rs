@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -42,8 +42,8 @@ use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{
     self, CreateChangesetRequest, DiffRequest, Encoding, FileKind, GetChangesetRequest,
-    GetObjectsRequest, LandRequest, LandResponse, LandState, ObjectKind, ObjectRef, PutBlobRequest,
-    ResolveRefRequest,
+    GetObjectsRequest, GetRootTreeRequest, LandRequest, LandResponse, LandState, ObjectKind,
+    ObjectRef, PutBlobRequest, ResolveRefRequest,
 };
 use scion_proto::{CHUNK_BYTES, MAX_OBJECT_REFS};
 use scion_server::store::BlobStatus;
@@ -93,6 +93,7 @@ impl Rng {
 /// SIGKILL.
 struct Server {
     child: Child,
+    addr: SocketAddr,
     url: String,
 }
 
@@ -100,6 +101,27 @@ impl Server {
     /// Starts a server on `data` and waits until it listens. It appends its
     /// log to `log`.
     fn start(data: &Path, log: &Path) -> Self {
+        let mut server = Self::spawn(data, log);
+        let start = Instant::now();
+        while !server.listens() {
+            if let Some(status) = server.child.try_wait().unwrap() {
+                let log = fs::read_to_string(log).unwrap_or_default();
+                panic!("the server exited with {status}:\n{log}");
+            }
+            assert!(start.elapsed() < Duration::from_secs(60), "no listen");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        server
+    }
+
+    /// Whether the server listens. It opens the data directory before, so
+    /// it has removed the temp files and upgraded the schema.
+    fn listens(&self) -> bool {
+        TcpStream::connect(self.addr).is_ok()
+    }
+
+    /// Starts a server on `data`, and does not wait for it.
+    fn spawn(data: &Path, log: &Path) -> Self {
         // The OS picks a free port, and the server binds it again.
         let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .unwrap()
@@ -112,28 +134,18 @@ impl Server {
             .append(true)
             .open(log)
             .unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_scion-server"))
+        let child = Command::new(env!("CARGO_BIN_EXE_scion-server"))
             .arg("--data")
             .arg(data)
             .args(["serve", "--token", TOKEN, "--listen", &addr.to_string()])
             .env("RUST_LOG", "info")
-            .stdout(Stdio::null())
+            .stdout(log_file.try_clone().unwrap())
             .stderr(log_file)
             .spawn()
             .unwrap();
-        // The server opens the data directory, and so removes the temp
-        // files, before it listens.
-        let start = Instant::now();
-        while TcpStream::connect(addr).is_err() {
-            if let Some(status) = child.try_wait().unwrap() {
-                let log = fs::read_to_string(log).unwrap_or_default();
-                panic!("the server exited with {status}:\n{log}");
-            }
-            assert!(start.elapsed() < Duration::from_secs(60), "no listen");
-            std::thread::sleep(Duration::from_millis(10));
-        }
         Self {
             child,
+            addr,
             url: format!("http://{addr}"),
         }
     }
@@ -387,6 +399,8 @@ async fn client(url: String, name: String, mut rng: Rng, signals: Arc<Signals>) 
 struct Checked {
     /// Lands `..lands` were retried after a restart.
     lands: usize,
+    /// Changesets `..created` were read back.
+    created: usize,
     /// Changesets whose root tree was checked against their changes.
     changesets: HashSet<ChangesetId>,
     /// Blobs read back through `GetObjects`.
@@ -529,20 +543,11 @@ fn blob_files(data: &Path) -> Vec<BlobId> {
     ids
 }
 
-/// Checks the invariants of the module comment against a server that has
-/// just started on `data`.
-async fn check(url: &str, data: &Path, ledger: &mut Ledger, checked: &mut Checked, rng: &mut Rng) {
-    let tmp: Vec<PathBuf> = fs::read_dir(data.join("tmp"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .collect();
-    assert!(tmp.is_empty(), "temp files after the restart: {tmp:?}");
-    let (mut scion, mut objects) = connect(url).await.unwrap();
-
-    // Retry each land sent since the last check, and a few older ones, with
-    // its key. A land whose reply was lost is retried twice at once: calls
-    // with the same key wait for each other and return the same land. All
-    // calls run at once, so they share the server's flushes.
+/// Retries each land sent since the last check, and a few older ones, with
+/// its key. A land whose reply was lost is retried twice at once: calls with
+/// the same key wait for each other and return the same land. All calls run
+/// at once, so they share the server's flushes.
+async fn retry_lands(scion: &Scion, ledger: &mut Ledger, checked: &mut Checked, rng: &mut Rng) {
     let new = checked.lands..ledger.lands.len();
     let lost = new.clone().filter(|&i| ledger.lands[i].reply.is_none());
     let mut retry: Vec<usize> = lost.chain(new).collect();
@@ -566,22 +571,24 @@ async fn check(url: &str, data: &Path, ledger: &mut Ledger, checked: &mut Checke
             None => sent.reply = Some(reply),
         }
     }
+}
 
-    // Walk each ref's first parents down to the root.
-    let mut history: HashMap<ChangesetId, (&str, Changeset)> = HashMap::new();
+/// The changesets on each ref's first-parent history, but the root, with
+/// the ref. Checks that each one hashes to its ID, and that its root tree
+/// differs from its parent's by exactly its changes.
+async fn walk_refs(
+    scion: &mut Scion,
+    objects: &mut Objects,
+    checked: &mut Checked,
+) -> HashMap<ChangesetId, (&'static str, Changeset)> {
+    let mut history = HashMap::new();
     for target in REFS {
         let request = ResolveRefRequest {
             repo: REPO.into(),
             name: target.into(),
         };
-        let mut at = changeset_id(
-            &objects
-                .resolve_ref(request)
-                .await
-                .unwrap()
-                .into_inner()
-                .changeset_id,
-        );
+        let head = objects.resolve_ref(request).await.unwrap().into_inner();
+        let mut at = changeset_id(&head.changeset_id);
         loop {
             let request = GetChangesetRequest {
                 repo: REPO.into(),
@@ -597,19 +604,21 @@ async fn check(url: &str, data: &Path, ledger: &mut Ledger, checked: &mut Checke
                 break;
             };
             if checked.changesets.insert(at) {
-                let diff = diff(&mut scion, parent, at).await;
+                let diff = diff(scion, parent, at).await;
                 assert_eq!(diff, changeset.changes, "{target}: root tree of {at}");
             }
             let previous = history.insert(at, (target, changeset));
-            assert!(
-                previous.is_none(),
-                "{at} is on two refs, or twice on {target}"
-            );
+            let twice = "is on two refs, or twice on one";
+            assert!(previous.is_none(), "{at} {twice}");
             at = parent;
         }
     }
+    history
+}
 
-    // Each landed changeset is on its ref once, with the changes sent.
+/// Checks that each landed changeset is on its ref once, with the changes
+/// sent, and that nothing else is on a ref.
+fn check_lands(ledger: &Ledger, history: &HashMap<ChangesetId, (&str, Changeset)>) {
     let mut lands_on_refs = 0;
     for sent in &ledger.lands {
         let reply = sent.reply.as_ref().expect("every land was retried");
@@ -627,16 +636,28 @@ async fn check(url: &str, data: &Path, ledger: &mut Ledger, checked: &mut Checke
             }
             LandState::Conflict => {
                 let shared = RepoPath::new(SHARED).unwrap();
-                assert!(
-                    sent.changeset.changes.contains_key(&shared),
-                    "{key}: {reply:?}"
-                );
+                let changes = &sent.changeset.changes;
+                assert!(changes.contains_key(&shared), "{key}: {reply:?}");
             }
             _ => panic!("{key}: {reply:?}"),
         }
     }
-    // So nothing else is on a ref: no land twice, no change without a land.
+    // So no land is on a ref twice, and no change without a land.
     assert_eq!(history.len(), lands_on_refs);
+}
+
+/// Checks the invariants of the module comment against a server that has
+/// just started on `data`.
+async fn check(url: &str, data: &Path, ledger: &mut Ledger, checked: &mut Checked, rng: &mut Rng) {
+    let tmp: Vec<PathBuf> = fs::read_dir(data.join("tmp"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert!(tmp.is_empty(), "temp files after the restart: {tmp:?}");
+    let (mut scion, mut objects) = connect(url).await.unwrap();
+    retry_lands(&scion, ledger, checked, rng).await;
+    let history = walk_refs(&mut scion, &mut objects, checked).await;
+    check_lands(ledger, &history);
 
     // Every blob that a reply named reads back, and every changeset that
     // `CreateChangeset` replied with.
@@ -647,7 +668,7 @@ async fn check(url: &str, data: &Path, ledger: &mut Ledger, checked: &mut Checke
     let mut blobs: Vec<BlobId> = ledger.blobs.iter().copied().chain(named).collect();
     blobs.retain(|id| checked.replied.insert(*id));
     read_blobs(&mut objects, &blobs).await;
-    for &id in &ledger.created {
+    for &id in &ledger.created[checked.created..] {
         let request = GetChangesetRequest {
             repo: REPO.into(),
             changeset_id: id.as_bytes().to_vec(),
@@ -655,6 +676,7 @@ async fn check(url: &str, data: &Path, ledger: &mut Ledger, checked: &mut Checke
         let reply = scion.get_changeset(request).await;
         reply.unwrap_or_else(|s| panic!("created changeset {id}: {s:?}"));
     }
+    checked.created = ledger.created.len();
 
     // Every blob that the metadata names is intact, and so is every blob
     // file: a file reaches its name only whole.
@@ -663,29 +685,35 @@ async fn check(url: &str, data: &Path, ledger: &mut Ledger, checked: &mut Checke
     let files = blob_files(data);
     for id in named.into_iter().chain(files) {
         if !checked.files.contains(&id) {
-            assert_eq!(
-                store.blobs().verify(id).unwrap(),
-                BlobStatus::Valid,
-                "blob {id}"
-            );
+            let status = store.blobs().verify(id).unwrap();
+            assert_eq!(status, BlobStatus::Valid, "blob {id}");
             checked.files.insert(id);
         }
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn every_reply_survives_a_kill_of_the_server() {
-    let env = |name, default| std::env::var(name).map_or(default, |v| v.parse().unwrap());
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap();
+/// The environment variable `name` as a number, or `default`.
+fn env(name: &str, default: u64) -> u64 {
+    std::env::var(name).map_or(default, |v| v.parse().unwrap())
+}
+
+/// `SCION_CRASH_SEED`, or a new seed. Printed, so a failed run can be run
+/// again with it.
+fn seed() -> u64 {
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH);
+    let now = now.unwrap();
     let seed = env(
         "SCION_CRASH_SEED",
         now.as_secs() ^ u64::from(now.subsec_nanos()),
     );
+    println!("seed {seed}; replay with SCION_CRASH_SEED={seed}");
+    seed
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_reply_survives_a_kill_of_the_server() {
+    let mut rng = Rng::new(seed());
     let kills = usize::try_from(env("SCION_CRASH_KILLS", 6)).unwrap();
-    println!("crash suite: seed {seed}, {kills} kills; replay with SCION_CRASH_SEED={seed}");
-    let mut rng = Rng::new(seed);
     let dir = tempfile::tempdir().unwrap();
     let (data, log) = (dir.path().join("data"), dir.path().join("server.log"));
     create_repo(&data);
@@ -738,4 +766,116 @@ async fn every_reply_survives_a_kill_of_the_server() {
         checked.files.len(),
     );
     assert!(ledger.lands.len() > kills, "the clients did little work");
+}
+
+/// Derived rows in the schema-upgrade test, so that the upgrade of version 2
+/// to 3, which copies every derived row, takes a while.
+const FILLER_ROWS: i64 = 50_000;
+
+/// A data directory at schema version 2, as a build of that version left it:
+/// repo `r` with a root changeset, ref `main` at it, and [`FILLER_ROWS`]
+/// derived rows of a kind that no build has. Returns the root.
+fn version_2_data(data: &Path) -> ChangesetId {
+    fs::create_dir_all(data).unwrap();
+    let c = rusqlite::Connection::open(data.join("scion.db")).unwrap();
+    // As the server leaves it. So a reader never blocks the server's open.
+    c.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+    c.execute_batch(include_str!("../migrations/0001_init.sql"))
+        .unwrap();
+    c.execute_batch(include_str!("../migrations/0002_land_retention.sql"))
+        .unwrap();
+    let root = Changeset {
+        parents: vec![],
+        author: author(),
+        committer: None,
+        message: b"root\n".to_vec(),
+        changes: BTreeMap::new(),
+    };
+    let (body, id) = root.encode_with_id();
+    let id_bytes = id.as_bytes().as_slice();
+    c.execute("INSERT INTO repos (repo_id, name) VALUES (1, ?1)", [REPO])
+        .unwrap();
+    let row = "INSERT INTO changesets (id, gen, body) VALUES (?1, 1, ?2)";
+    c.execute(row, rusqlite::params![id_bytes, body]).unwrap();
+    let row = "INSERT INTO repo_changesets (repo_id, cs) VALUES (1, ?1)";
+    c.execute(row, [id_bytes]).unwrap();
+    let row = "INSERT INTO refs (repo_id, name, target, version) VALUES (1, 'main', ?1, 1)";
+    c.execute(row, [id_bytes]).unwrap();
+    c.execute_batch(&format!(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {FILLER_ROWS})
+             INSERT INTO changesets (id, gen, body) SELECT randomblob(32), 1, x'' FROM n;
+         INSERT INTO derived (kind, version, cs, value)
+             SELECT 'filler', 1, id, randomblob(32) FROM changesets WHERE body = x'';
+         PRAGMA user_version = 2;"
+    ))
+    .unwrap();
+    id
+}
+
+/// The schema version of the database in `data`.
+fn version(data: &Path) -> u32 {
+    let c = rusqlite::Connection::open(data.join("scion.db")).unwrap();
+    c.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap()
+}
+
+/// The schema version of the database in `data`, and its filler rows.
+fn schema(data: &Path) -> (u32, i64) {
+    let c = rusqlite::Connection::open(data.join("scion.db")).unwrap();
+    let filler = "SELECT count(*) FROM derived WHERE kind = 'filler'";
+    let filler = c.query_row(filler, [], |row| row.get(0));
+    (version(data), filler.unwrap())
+}
+
+/// A kill while the server upgrades the schema leaves the old schema or the
+/// new one, never a mix: each migration commits in one transaction. The
+/// next start upgrades it and serves.
+#[test]
+fn a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, log) = (dir.path().join("data"), dir.path().join("server.log"));
+    let root = version_2_data(&data);
+    let old = dir.path().join("version-2.db");
+    fs::copy(data.join("scion.db"), &old).unwrap();
+
+    // Kills 0, 10, 20 ms and so on after a start, each from version 2,
+    // until one comes after the upgrade committed. The kills after the
+    // upgrade began stop it in the middle.
+    let mut kills = 0;
+    for delay in (0..).map(|i| Duration::from_millis(10 * i)) {
+        for log in ["scion.db-wal", "scion.db-shm"] {
+            fs::remove_file(data.join(log)).ok();
+        }
+        fs::copy(&old, data.join("scion.db")).unwrap();
+        let server = Server::spawn(&data, &log);
+        std::thread::sleep(delay);
+        drop(server);
+        kills += 1;
+        let (version, filler) = schema(&data);
+        assert_eq!(filler, FILLER_ROWS, "version {version} after {delay:?}");
+        match version {
+            2 => assert!(delay < Duration::from_secs(60), "no upgrade"),
+            3 => break,
+            _ => panic!("version {version} after {delay:?}"),
+        }
+    }
+    println!("{kills} kills; the last one came after the upgrade");
+
+    let server = Server::start(&data, &log);
+    assert_eq!(schema(&data), (3, FILLER_ROWS));
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let (_, mut objects) = connect(&server.url).await.unwrap();
+        let request = ResolveRefRequest {
+            repo: REPO.into(),
+            name: "main".into(),
+        };
+        let main = objects.resolve_ref(request).await.unwrap().into_inner();
+        assert_eq!(changeset_id(&main.changeset_id), root);
+        let request = GetRootTreeRequest {
+            repo: REPO.into(),
+            changeset_id: root.as_bytes().to_vec(),
+        };
+        let tree = objects.get_root_tree(request).await.unwrap().into_inner();
+        assert_eq!(tree.tree_id, Tree::default().id().as_bytes());
+    });
 }
