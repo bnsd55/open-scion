@@ -13,11 +13,13 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, ErrorKind, Read, Seek, Write};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use rustix::fs::FlockOperation;
 use rustix::io::Errno;
 use scion_core::{BlobHasher, BlobId};
@@ -55,14 +57,25 @@ pub struct Store {
     inner: Arc<Inner>,
 }
 
+/// Read-only connections of one [`Store`], so at most this many reads run at
+/// once. Each has its own page cache, so they are few. They are more than
+/// the graph queries that can run at once, so those never take every one.
+pub(crate) const READERS: usize = 8;
+
 struct Inner {
-    // SHORTCUT: one connection behind a mutex, so reads wait for writes.
-    // Upgrade: a pool of read-only connections (WAL allows parallel readers).
+    /// Read-only connections for [`Store::read`]. They come before `db`, so
+    /// they close first: the last connection to close checkpoints the log,
+    /// and a read-only one cannot.
+    readers: Readers,
+    /// The write connection, for every commit and [`Store::read_unflushed`].
     db: Mutex<Connection>,
-    /// Commits made so far. It grows under the `db` lock, right after each
-    /// commit.
+    /// Commits that a read may see. It grows under the `db` lock, right
+    /// before each COMMIT runs.
+    committing: AtomicU64,
+    /// Commits that ended. It grows under the `db` lock, right after each
+    /// COMMIT returns, also if it failed.
     committed: AtomicU64,
-    /// How many of those commits a finished full flush covers.
+    /// How many of the ended commits a finished full flush covers.
     flushed: AtomicU64,
     blobs: Blobs,
     /// `<data>/lock`, shared, until the last clone is dropped.
@@ -153,27 +166,24 @@ impl Store {
         if alone {
             blobs.sweep_tmp()?;
         }
-        let db = Connection::open(dir.join("scion.db"))?;
+        let path = dir.join("scion.db");
+        let db = connect(&path, OpenFlags::default())?;
         // `fullfsync = OFF` for a server: a commit ends with a plain fsync,
         // and `write` then waits for a full flush of the drive cache that it
         // shares with concurrent commits and blob syncs. With `ON`, each
-        // commit runs its own full flush under the database mutex, which a
+        // commit runs its own full flush under the write connection's lock,
+        // which a
         // shared `Store` needs (see `open_shared`). Its commits are few and
         // large. `checkpoint_fullfsync`: a checkpoint, which is rare, fully
-        // flushes the pages it copies before the log can be reused. Writes of
-        // the processes take turns: one waits up to `busy_timeout` for the
-        // other's transaction.
+        // flushes the pages it copies before the log can be reused.
         db.execute_batch(&format!(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;
              PRAGMA fullfsync = {};
              PRAGMA checkpoint_fullfsync = ON;
-             PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;",
+             PRAGMA foreign_keys = ON;",
             if server { "OFF" } else { "ON" }
         ))?;
-        // Enough for every hot statement, so none is prepared twice.
-        db.set_prepared_statement_cache_capacity(64);
         // Only a `Store` that is alone changes the schema.
         let version = user_version(&db)?;
         if !alone && version < SCHEMA_VERSION {
@@ -186,9 +196,13 @@ impl Store {
         }
         migrate(&db, SCHEMA_VERSION)?;
         drop(opening);
+        // After the migrations, so no read sees an older schema.
+        let readers = Readers::open(&path)?;
         Ok(Self {
             inner: Arc::new(Inner {
+                readers,
                 db: Mutex::new(db),
+                committing: AtomicU64::new(0),
                 committed: AtomicU64::new(0),
                 flushed: AtomicU64::new(0),
                 blobs,
@@ -210,29 +224,71 @@ impl Store {
         self.inner.committed.load(Ordering::Acquire)
     }
 
-    /// Runs `f` on the database, outside any explicit transaction. Returns
-    /// once every commit that `f` could see is durable, so a reply never
-    /// shows a commit that a power loss can undo.
+    /// Runs `f` on a read-only connection, outside any explicit transaction.
+    /// Each statement sees its own snapshot: every commit that it can see
+    /// when it starts. So a caller that needs one consistent view must read
+    /// it in one statement. (A snapshot held across the statements of
+    /// back-to-back reads would keep the log from ever restarting.) Reads run
+    /// beside each other and beside a write. If every read connection is in
+    /// use, this waits for one. Returns once every commit that `f` could see
+    /// is durable, so a reply never shows a commit that a power loss can
+    /// undo.
     ///
     /// # Errors
     ///
     /// Returns what `f` returns, or an error from [`Store::flush`].
     pub fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let (result, seen) = {
-            let db = self.lock();
-            // Commits are counted under this lock, so `seen` counts every
-            // commit that `f` could see.
-            (f(&db), self.inner.committed.load(Ordering::Acquire))
-        };
-        // An error is an answer too. The flush runs outside the lock.
-        if seen > self.inner.flushed.load(Ordering::Acquire) {
-            self.flush()?;
-        }
+        let (result, seen) = self.read_counted(f);
+        // An error is an answer too.
+        self.wait_durable(seen)?;
         result
     }
 
-    /// Like [`Store::read`], but returns before what `f` saw is durable. Use
-    /// it only inside a write that calls [`Store::flush`] before it replies.
+    /// Like [`Store::read`], but returns before what `f` saw is durable. Also
+    /// returns a count that covers every commit `f` could see. Pass the
+    /// largest count of a reply's reads to [`Store::wait_durable`] before it
+    /// replies.
+    pub(crate) fn read_counted<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T>,
+    ) -> (Result<T>, u64) {
+        let reader = self.inner.readers.take();
+        let result = f(&reader);
+        (result, self.inner.committing.load(Ordering::Acquire))
+    }
+
+    /// Returns once every commit that a read with count `seen` could see is
+    /// durable ([`Store::read_counted`]). Call it after that read.
+    ///
+    /// # Errors
+    ///
+    /// An error from [`Store::flush`].
+    pub(crate) fn wait_durable(&self, seen: u64) -> Result<()> {
+        // Why no reply shows a commit that is not durable. Say the read saw
+        // commit k: the k-th commit of this `Store` (they take turns under
+        // the `db` lock).
+        // 1. `commit` counts k in `committing` before its COMMIT runs, and
+        //    the read sees it only after that COMMIT made it visible. So
+        //    `seen`, loaded after the read, is at least k. (SQLite makes a
+        //    commit visible through its log index, under locks and memory
+        //    barriers, so the count is visible to the read too.)
+        // 2. If `flushed >= seen`, a flush loaded `committed >= k`, after
+        //    commit k ended, and then finished a full flush that covers it.
+        // 3. Else this call flushes. That flush starts after the read, and
+        //    with `synchronous = FULL` a commit's log reaches the drive
+        //    before the commit is visible. So the flush covers commit k.
+        // Counted after its COMMIT instead, a commit could be seen before it
+        // is counted, and the read would skip the flush.
+        if seen > self.inner.flushed.load(Ordering::Acquire) {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Runs `f` on the write connection, outside any explicit transaction.
+    /// It waits for a write in progress, and writes wait for it. Unlike
+    /// [`Store::read`], it returns before what `f` saw is durable. Use it
+    /// only inside a write that calls [`Store::flush`] before it replies.
     ///
     /// # Errors
     ///
@@ -264,8 +320,12 @@ impl Store {
         let mut db = self.lock();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = f(&tx)?;
-        tx.commit()?;
+        // Counted before a read can see it, and again once it ended (see
+        // `read` and `flush`).
+        self.inner.committing.fetch_add(1, Ordering::Release);
+        let committed = tx.commit();
         self.inner.committed.fetch_add(1, Ordering::Release);
+        committed?;
         Ok(value)
     }
 
@@ -282,9 +342,12 @@ impl Store {
     /// Fails if the flush fails. The commits stay, but may not be durable; a
     /// retry sees them.
     pub fn flush(&self) -> Result<()> {
-        // The full flush starts after this load, so it covers these commits.
+        // The full flush starts after this load, so it covers these commits:
+        // each ended, so its log reached the drive. Not `committing`: a
+        // commit counted there may not have written its log yet.
         let covers = self.inner.committed.load(Ordering::Acquire);
-        // Concurrent calls share one flush, made outside the database lock.
+        // Concurrent calls share one flush, made outside the write
+        // connection's lock.
         if FSYNC_LEAVES_DRIVE_CACHE {
             self.inner.blobs.full_flush()?;
         }
@@ -296,6 +359,108 @@ impl Store {
         // A panic mid-call drops its transaction, which rolls back, so the
         // connection is still usable.
         self.inner.db.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Opens a connection to `path` with the settings that every connection
+/// needs.
+fn connect(path: &Path, flags: OpenFlags) -> Result<Connection> {
+    let db = Connection::open_with_flags(path, flags)?;
+    // Writes of the processes take turns: one waits up to 5 s for the
+    // other's transaction. A read waits as long while another connection
+    // recovers the log.
+    db.busy_timeout(Duration::from_secs(5))?;
+    // Enough for every hot statement, so none is prepared twice.
+    db.set_prepared_statement_cache_capacity(64);
+    Ok(db)
+}
+
+/// The [`READERS`] read-only connections of a [`Store`]. In WAL mode they
+/// read beside the write connection.
+struct Readers {
+    path: PathBuf,
+    idle: Mutex<Vec<Connection>>,
+    returned: Condvar,
+}
+
+impl Readers {
+    fn open(path: &Path) -> Result<Self> {
+        let idle = (0..READERS)
+            .map(|_| Self::connect(path))
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            path: path.to_owned(),
+            idle: Mutex::new(idle),
+            returned: Condvar::new(),
+        })
+    }
+
+    fn connect(path: &Path) -> Result<Connection> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        connect(path, flags)
+    }
+
+    /// Takes an idle connection, or waits until one is returned.
+    fn take(&self) -> Reader<'_> {
+        let mut idle = self.idle();
+        loop {
+            if let Some(conn) = idle.pop() {
+                return Reader {
+                    readers: self,
+                    conn: Some(conn),
+                };
+            }
+            idle = self
+                .returned
+                .wait(idle)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn idle(&self) -> MutexGuard<'_, Vec<Connection>> {
+        // Nothing panics while the lock is held.
+        self.idle.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// A connection taken from [`Readers`]. It goes back when dropped, also when
+/// a read panics.
+struct Reader<'a> {
+    readers: &'a Readers,
+    /// `None` only while it goes back.
+    conn: Option<Connection>,
+}
+
+impl Deref for Reader<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().expect("a reader holds its connection")
+    }
+}
+
+impl Drop for Reader<'_> {
+    fn drop(&mut self) {
+        let Some(conn) = self.conn.take() else {
+            return;
+        };
+        // A connection left in a transaction would keep its snapshot for the
+        // next reads, and keep the log from restarting. So it is replaced.
+        let conn = if conn.is_autocommit() {
+            conn
+        } else {
+            drop(conn);
+            tracing::error!("a read left a transaction open; its connection is replaced");
+            match Readers::connect(&self.readers.path) {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::error!(%e, "cannot open a read connection; the pool has one fewer");
+                    return;
+                }
+            }
+        };
+        self.readers.idle().push(conn);
+        self.readers.returned.notify_one();
     }
 }
 
@@ -970,10 +1135,12 @@ fn fsync_dir(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Barrier;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::cell::{Cell, RefCell};
+    use std::panic;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Barrier, mpsc};
     use std::thread;
-    use std::time::Duration;
 
     use super::*;
 
@@ -1166,9 +1333,10 @@ mod tests {
     #[test]
     fn a_shared_store_commits_with_full_flushes() {
         let dir = tempfile::tempdir().unwrap();
+        // Of the write connection, which commits.
         let fullfsync = |store: &Store| -> bool {
             store
-                .read(|c| Ok(c.pragma_query_value(None, "fullfsync", |row| row.get(0))?))
+                .read_unflushed(|c| Ok(c.pragma_query_value(None, "fullfsync", |row| row.get(0))?))
                 .unwrap()
         };
         assert!(!fullfsync(&Store::open(dir.path()).unwrap()));
@@ -1566,5 +1734,202 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         store.write(create_repo).unwrap();
         assert_eq!(flushes_in_read(&store), 0);
+    }
+
+    fn repos(c: &Connection) -> Result<i64> {
+        Ok(c.query_row("SELECT count(*) FROM repos", [], |row| row.get(0))?)
+    }
+
+    fn add_repo(name: &str) -> impl Fn(&Connection) -> Result<()> {
+        move |c| crate::db::create_repo(c, name).map(drop)
+    }
+
+    #[test]
+    fn a_long_read_blocks_no_write_and_no_other_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.write(add_repo("a")).unwrap();
+        let (held, holding) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        thread::scope(|s| {
+            let store = &store;
+            let long = s.spawn(move || {
+                store.read(|c| {
+                    assert_eq!(repos(c)?, 1);
+                    held.send(()).unwrap();
+                    finished
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("a write or a read waited for this read");
+                    // Each statement has its own snapshot, so this one sees
+                    // the write.
+                    assert_eq!(repos(c)?, 2);
+                    Ok(())
+                })
+            });
+            holding.recv().unwrap();
+            store.write(add_repo("b")).unwrap();
+            assert_eq!(store.read(repos).unwrap(), 2);
+            done.send(()).unwrap();
+            long.join().unwrap().unwrap();
+        });
+        // A read cannot write, so no commit skips the counts of `commit`.
+        let write = store.read(|c| Ok(c.execute("DELETE FROM repos", [])?));
+        assert!(write.is_err());
+    }
+
+    #[test]
+    fn a_write_in_progress_blocks_no_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.write(add_repo("a")).unwrap();
+        let (held, holding) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        thread::scope(|s| {
+            // As a server write that waits for the write lock of an import,
+            // this one holds the write connection.
+            let store = &store;
+            let write = s.spawn(move || {
+                store.write(|c| {
+                    add_repo("b")(c)?;
+                    held.send(()).unwrap();
+                    finished
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("a read waited for this write");
+                    Ok(())
+                })
+            });
+            holding.recv().unwrap();
+            // Not committed yet, so not seen.
+            assert_eq!(store.read(repos).unwrap(), 1);
+            done.send(()).unwrap();
+            write.join().unwrap().unwrap();
+        });
+        assert_eq!(store.read(repos).unwrap(), 2);
+    }
+
+    thread_local! {
+        /// What the WAL hook of a test runs.
+        static ON_COMMIT: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    #[test]
+    fn a_read_that_sees_a_commit_waits_until_it_is_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        // None where the commit's own fsync flushes the drive cache.
+        let flush = u64::from(FSYNC_LEAVES_DRIVE_CACHE);
+
+        // A commit that ends after the read began, before its first
+        // statement.
+        let before = store.blobs().full_flushes();
+        let seen = store.read(|c| {
+            store.commit(add_repo("a"))?;
+            repos(c)
+        });
+        assert_eq!(seen.unwrap(), 1);
+        assert_eq!(store.blobs().full_flushes() - before, flush);
+
+        // A commit that is visible while its COMMIT still runs. SQLite runs
+        // a WAL hook on the thread that commits, once the commit is visible
+        // to other connections, before COMMIT returns.
+        store
+            .read_unflushed(|c| {
+                c.wal_hook(Some(|_, _| {
+                    ON_COMMIT.with_borrow_mut(|f| f.as_mut().map(|f| f()));
+                    Ok(())
+                }));
+                Ok(())
+            })
+            .unwrap();
+        let seen = Rc::new(Cell::new(None));
+        ON_COMMIT.set(Some(Box::new({
+            let (store, seen) = (store.clone(), Rc::clone(&seen));
+            move || {
+                let before = store.blobs().full_flushes();
+                let repos = store.read(repos).unwrap();
+                seen.set(Some((repos, store.blobs().full_flushes() - before)));
+            }
+        })));
+        store.commit(add_repo("b")).unwrap();
+        ON_COMMIT.set(None);
+        assert_eq!(seen.get(), Some((2, flush)));
+    }
+
+    #[test]
+    fn a_read_that_panics_returns_its_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let readers = store.inner.readers.idle().len();
+        let read = panic::catch_unwind(|| store.read(|_| -> Result<()> { panic!("a bug") }));
+        assert!(read.is_err());
+        assert_eq!(store.inner.readers.idle().len(), readers);
+        // Its transaction ended, so the connection reads again.
+        assert_eq!(store.read(repos).unwrap(), 0);
+    }
+
+    #[test]
+    fn the_last_store_to_close_moves_the_log_into_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.write(add_repo("a")).unwrap();
+        assert_eq!(store.read(repos).unwrap(), 1);
+        drop(store);
+        // So a copy of `scion.db` alone holds every commit.
+        assert!(!dir.path().join("scion.db-wal").exists());
+    }
+
+    #[test]
+    fn the_log_restarts_while_reads_run_back_to_back() {
+        const COMMITS: usize = 600;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store
+            .write(|c| Ok(c.execute_batch("CREATE TABLE t (x BLOB)")?))
+            .unwrap();
+        let done = AtomicBool::new(false);
+        thread::scope(|s| {
+            // Two long reads at a time, as graph walks are.
+            for _ in 0..2 {
+                s.spawn(|| {
+                    while !done.load(Ordering::Relaxed) {
+                        store
+                            .read(|c| (0..10_000).try_for_each(|_| repos(c).map(drop)))
+                            .unwrap();
+                    }
+                });
+            }
+            // 600 commits of 64 KiB: 37.5 MiB, more than 9 times the 4 MiB
+            // after which each commit checkpoints the log.
+            for _ in 0..COMMITS {
+                let insert = "INSERT INTO t VALUES (zeroblob(65536))";
+                store
+                    .commit(|c| Ok(c.execute(insert, []).map(drop)?))
+                    .unwrap();
+            }
+            done.store(true, Ordering::Relaxed);
+        });
+        // The log file never shrinks, so its size is the most it held: about
+        // 4 MiB. With a snapshot held for each whole read, the log never
+        // restarts and holds every commit.
+        let log = fs::metadata(dir.path().join("scion.db-wal")).unwrap().len();
+        assert!(log < 16 << 20, "the log grew to {} MiB", log >> 20);
+    }
+
+    #[test]
+    fn a_connection_left_in_a_transaction_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.write(add_repo("a")).unwrap();
+        store
+            .read(|c| {
+                c.execute_batch("BEGIN")?;
+                repos(c).map(drop)
+            })
+            .unwrap();
+        store.write(add_repo("b")).unwrap();
+        // The pool gives the connection returned last to the next read. Kept,
+        // its snapshot would show one repo.
+        assert_eq!(store.read(repos).unwrap(), 2);
+        assert_eq!(store.inner.readers.idle().len(), READERS);
     }
 }

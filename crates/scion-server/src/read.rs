@@ -108,7 +108,7 @@ pub fn list_dir(
 
 /// Most changesets that one `Blame` call checks on its first-parent walk,
 /// and most entries that a `Log` reply holds. Each check, and each entry,
-/// reads one changeset while the call holds the database lock.
+/// reads one changeset while the call holds one read connection.
 // SHORTCUT: blame walks first parents on every call, so a file changed long
 // ago costs one call per 1,000 changesets since. Upgrade: blame from the
 // path history (`history.rs`), so a call reads only the changesets that
@@ -180,6 +180,10 @@ pub fn log_page(
     };
     let repo = store.read(|c| db::repo_id(c, repo))?;
     derived::get::<PathHistory>(store, repo, cs)?;
+    // Each statement sees its own snapshot, and none needs another's: a
+    // changeset, a node and a value of this version never change and are
+    // never removed, and a node is stored in the transaction of the value
+    // that names it.
     store.read(|c| {
         let mut entries = Vec::new();
         let mut next = Some(cs);
@@ -283,7 +287,7 @@ pub const MAX_DIFF_ENTRIES: usize = 1000;
 
 /// Most entries a diff can have for `Diff` to find renames in it. To find
 /// them, a call walks the whole diff below its path, up to one entry more
-/// than this. Each tree read takes the database lock on its own.
+/// than this. Each tree read takes a read connection on its own.
 // SHORTCUT: a larger diff has no renames: a rename there is a delete and an
 // add. git finds renames in a diff of any size. Upgrade: renames of a diff
 // as derived data, found in steps over calls and kept
@@ -563,7 +567,7 @@ impl DiffWalk<'_> {
     }
 
     /// The entries of a directory. Empty for anything else. Each read takes
-    /// the database lock on its own, so a long walk does not hold it.
+    /// a read connection on its own, so a long walk does not hold one.
     fn children(&self, entry: Option<Entry>) -> Result<BTreeMap<PathElem, Entry>> {
         match entry {
             Some(Entry::Dir(id)) => Ok(self.store.read(|c| db::get_tree(c, id))?.entries),

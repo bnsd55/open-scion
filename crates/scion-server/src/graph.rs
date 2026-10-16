@@ -26,11 +26,11 @@
 //!
 //! Neither query has a bound on its reads. Each fails once its [`Deadline`]
 //! has passed, and runs in steps of about 1,000 reads (`STEPS`). A step holds
-//! the database lock, and other requests run between steps.
+//! one read connection ([`Store::read`]), so writes and other reads run
+//! beside it.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::time::Duration;
 
 use rusqlite::Connection;
 use scion_core::{Changeset, ChangesetId};
@@ -236,7 +236,7 @@ pub fn merge_bases(
 /// Whether `base`, of generation `base_gen`, is on the first-parent history
 /// of `tip`, `tip` included. `None` if `tip` has no node yet. Walks down
 /// that history to `base_gen`, so it reads O(log n) nodes. Unlike the
-/// queries above, it runs in the caller's hold of the database lock.
+/// queries above, it runs on the caller's connection, in one go.
 ///
 /// # Errors
 ///
@@ -267,33 +267,22 @@ struct Cost {
     steps: usize,
 }
 
-/// How a walk shares the database lock: it holds it for moves of up to
-/// `reads` reads, then leaves it free for `pause`.
+/// How long a walk holds one read connection: for moves of up to `reads`
+/// reads.
 #[derive(Clone, Copy, Debug)]
 struct Steps {
     reads: usize,
-    pause: Duration,
 }
 
 /// The steps of the queries. A step ends after the move that reaches 1,000
 /// reads, and a move reads at most a few dozen rows: O(log n) nodes, or the
-/// parents of a merge. The lock is not fair: a thread that frees it and
-/// takes it again at once keeps it, before a request that waits for it
-/// wakes up. The pause lets that request in, for a few percent of the time
-/// of a step.
-// SHORTCUT: a pause, not a handoff, so a request that wakes later than the
-// pause waits for one more step. Upgrade: a pool of read-only connections,
-// so a walk holds no lock that others wait for
-// (https://github.com/bnsd55/open-scion/issues/17).
-const STEPS: Steps = Steps {
-    reads: 1000,
-    pause: Duration::from_micros(100),
-};
+/// parents of a merge.
+const STEPS: Steps = Steps { reads: 1000 };
 
 /// Makes the moves of a walk with `next` until it gives the answer, in
-/// `steps`. Other requests take the database lock between steps. A
-/// changeset's parents and node never change, so a walk goes on in the next
-/// step from where it stopped.
+/// `steps`. Each step holds one read connection, and the walk gives it back
+/// between steps. A changeset's parents and node never change, so a walk
+/// goes on in the next step from where it stopped.
 fn in_steps<T>(
     store: &Store,
     deadline: &Deadline,
@@ -301,10 +290,10 @@ fn in_steps<T>(
     mut next: impl FnMut(&mut Index) -> Result<Option<T>>,
 ) -> Result<(T, Cost)> {
     let mut cost = Cost::default();
+    let mut seen = 0;
     let result = loop {
         cost.steps += 1;
-        // The read at the end waits for the flush, once for all steps.
-        let step = store.read_unflushed(|c| {
+        let (step, step_seen) = store.read_counted(|c| {
             let mut index = Index::new(c, deadline);
             let answer = loop {
                 match next(&mut index) {
@@ -315,14 +304,14 @@ fn in_steps<T>(
             cost.reads += index.reads;
             answer
         });
+        seen = seen.max(step_seen);
         if let Some(result) = step.transpose() {
             break result;
         }
-        std::thread::sleep(steps.pause);
     };
     // As `Store::read`: the reply waits until each commit that a step could
-    // see is durable.
-    store.read(|_| Ok(()))?;
+    // see is durable, with one flush for all steps.
+    store.wait_durable(seen)?;
     let Cost { reads, steps } = cost;
     if let Err(Error::DeadlineExceeded(why)) = &result {
         tracing::info!(reads, steps, %why, "a graph query stopped");
@@ -640,9 +629,8 @@ fn node(c: &Connection, id: ChangesetId) -> Result<Node> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Instant;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     use proptest::prelude::{Strategy, any};
     use proptest::sample::Index as Sample;
@@ -653,10 +641,7 @@ mod tests {
     use crate::derived::steps;
 
     /// Steps of a few reads, so that walks go on across steps.
-    const SMALL: Steps = Steps {
-        reads: 4,
-        pause: Duration::ZERO,
-    };
+    const SMALL: Steps = Steps { reads: 4 };
 
     /// A deadline that a test does not reach.
     fn later() -> Deadline {
@@ -1104,47 +1089,62 @@ mod tests {
     }
 
     #[test]
-    fn a_request_that_waits_gets_the_lock_between_steps() {
-        // Steps of a few reads with the pause of the queries.
-        let steps = Steps {
-            reads: SMALL.reads,
-            pause: STEPS.pause,
-        };
-        let (_dir, store, repo, ids) = store_graph_with_nodes(&ladder(200));
+    fn a_walk_blocks_no_write_and_no_read() {
+        let (_dir, store, repo, ids) = store_graph_with_nodes(&ladder(20));
         let (side, tip) = (ids[1], *ids.last().unwrap());
         let mut paint = Paint::new(
             At::get(&store, repo, side).unwrap(),
             At::get(&store, repo, tip).unwrap(),
         );
-        let done = Arc::new(AtomicBool::new(false));
         let mut other = None;
-        let mut let_in = false;
-        // The shortest time from the last move of a step to the first move
-        // of the next: the lock is free for at least that long.
-        let (mut moved, mut free) = (None::<Instant>, Duration::MAX);
-        let (bases, cost) = in_steps(&store, &later(), steps, |index| {
-            // In the first step, a read starts and waits for the lock.
-            other.get_or_insert_with(|| {
-                let (store, done) = (store.clone(), Arc::clone(&done));
-                std::thread::spawn(move || {
+        let (bases, _) = in_steps(&store, &later(), STEPS, |index| {
+            // In the first move, a write and a read run to the end while the
+            // walk holds its read connection.
+            if other.is_none() {
+                let (done, finished) = mpsc::channel();
+                let store = store.clone();
+                other = Some(std::thread::spawn(move || {
+                    store
+                        .write(|c| db::create_repo(c, "other").map(drop))
+                        .unwrap();
                     store.read(|_| Ok(())).unwrap();
-                    done.store(true, Ordering::Relaxed);
-                })
-            });
-            let_in |= done.load(Ordering::Relaxed);
-            // Each move of this walk reads, so a step starts at no reads.
-            if let Some(moved) = moved.filter(|_| index.reads == 0) {
-                free = free.min(moved.elapsed());
+                    done.send(()).unwrap();
+                }));
+                finished
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("a write or a read waited for the walk");
             }
-            let answer = paint.next(index);
-            moved = Some(Instant::now());
-            answer
+            paint.next(index)
         })
         .unwrap();
         other.unwrap().join().unwrap();
         assert_eq!(bases, [side]);
-        assert!(cost.steps > 100, "{cost:?}");
-        assert!(free >= steps.pause, "the lock was free for only {free:?}");
-        assert!(let_in, "the read waited for all {} steps", cost.steps);
+    }
+
+    #[test]
+    fn a_walk_waits_for_one_flush_for_all_its_steps() {
+        let (_dir, store, repo, ids) = store_graph_with_nodes(&ladder(20));
+        let (side, tip) = (ids[1], *ids.last().unwrap());
+        let mut paint = Paint::new(
+            At::get(&store, repo, side).unwrap(),
+            At::get(&store, repo, tip).unwrap(),
+        );
+        let before = store.blobs().full_flushes();
+        let mut commits = 0;
+        let (bases, cost) = in_steps(&store, &later(), SMALL, |index| {
+            // Each step sees a commit that no flush covers yet.
+            if index.reads == 0 {
+                commits += 1;
+                let name = format!("other {commits}");
+                store.commit(|c| db::create_repo(c, &name).map(drop))?;
+            }
+            paint.next(index)
+        })
+        .unwrap();
+        assert_eq!(bases, [side]);
+        assert!(cost.steps > 1, "{cost:?}");
+        // None where the commit's own fsync flushes the drive cache.
+        let flushes = store.blobs().full_flushes() - before;
+        assert_eq!(flushes, u64::from(crate::store::FSYNC_LEAVES_DRIVE_CACHE));
     }
 }

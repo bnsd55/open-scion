@@ -167,7 +167,7 @@ pub struct Lands {
     /// `bytes`. At most [`MAX_INDEX_BYTES`].
     used: Arc<AtomicUsize>,
     /// Indexes that [`Lands::evict`] dropped. Their bytes are back in
-    /// `used`. A land frees them after its database lock and ref lock.
+    /// `used`. A land frees them after its write connection and ref lock.
     evicted: Mutex<Vec<PathIndex>>,
 }
 
@@ -806,7 +806,7 @@ impl PathIndex {
     /// to other history), if `head` is more than [`MAX_DEPTH`] changesets
     /// ahead, or if those changesets would not fit in [`MAX_INDEX_BYTES`].
     /// An index at the head is always correct, and a longer walk would hold
-    /// the database lock for little gain.
+    /// the write connection for little gain.
     fn advance_to(
         &mut self,
         lands: &Lands,

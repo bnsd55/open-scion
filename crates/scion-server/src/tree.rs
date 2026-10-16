@@ -129,7 +129,7 @@ pub fn derive_root_tree(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result
 ///
 /// If the first parent has no root tree, for example after a version bump,
 /// this derives it in the caller's transaction, with no bound, and holds
-/// the database lock while it runs. So a request calls [`fill_root_tree`]
+/// the write connection while it runs. So a request calls [`fill_root_tree`]
 /// on the first parent before its transaction, and so does git import, for
 /// each first parent from before its batch.
 ///
