@@ -357,15 +357,22 @@ mod tests {
         usize::try_from(len).unwrap()
     }
 
-    #[tokio::test]
+    // A paused clock moves only when every task waits, and not while a store
+    // operation runs (`spawn_blocking`). So the stall cannot end before the
+    // test sees the second object hold its share, however busy the machine.
+    #[tokio::test(start_paused = true)]
     async fn a_client_that_stops_reading_is_cut_off_and_frees_its_budget() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let keys: Vec<Key> = [b"one".as_slice(), b"two", b"three"]
+        let keys: Vec<Key> = [b"one".as_slice(), b"second", b"three"]
             .iter()
             .map(|data| Key::Blob(store.blobs().put(data).unwrap()))
             .collect();
         let second = packed_len(&store, keys[1]);
+        // Files of two sizes, so the free budget shows which object holds a
+        // share. With one size, the first object, before it is sent, looks
+        // like the second.
+        assert_ne!(packed_len(&store, keys[0]), second);
         let budget = 1000;
         let in_flight = Arc::new(Semaphore::new(budget));
         let stall = Duration::from_millis(50);

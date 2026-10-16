@@ -4,6 +4,7 @@
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_proto::CHUNK_BYTES;
 use scion_proto::auth::Bearer;
+use scion_proto::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ReadFileRequest};
 use scion_server::{Store, db, service};
@@ -82,9 +83,15 @@ async fn uploaded_file_reads_back_through_a_created_changeset() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(service::serve(store, listener, TOKEN, async {
-        stopped.await.ok();
-    }));
+    let server = tokio::spawn(service::serve(
+        store,
+        listener,
+        TOKEN,
+        Limits::default(),
+        async {
+            stopped.await.ok();
+        },
+    ));
     let channel = Channel::from_shared(format!("http://{addr}"))
         .unwrap()
         .connect()

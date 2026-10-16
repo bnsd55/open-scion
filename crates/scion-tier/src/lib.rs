@@ -39,6 +39,7 @@ use hashlink::LruCache;
 use scion_core::{BlobId, ChangesetId, Tree, TreeId};
 use scion_proto::auth::{Auth, Bearer};
 use scion_proto::check;
+use scion_proto::listen::Limits;
 use scion_proto::object::{self, Assembler, Header, MAX_ENCODED_BYTES, UNPACK_BYTES, zstd_bound};
 use scion_proto::reply::{
     self, BUSY_TIMEOUT, Body, IN_FLIGHT_BYTES, ObjectStream, Outgoing, STALL_TIMEOUT,
@@ -438,7 +439,7 @@ impl<S: Store> Tier<S> {
     }
 
     /// Serves the `Objects` calls on `incoming` connections, to callers that
-    /// send `token`, until `shutdown` resolves.
+    /// send `token`, within `limits`, until `shutdown` resolves.
     ///
     /// # Errors
     ///
@@ -447,6 +448,7 @@ impl<S: Store> Tier<S> {
         self,
         token: &str,
         incoming: I,
+        limits: Limits,
         shutdown: impl Future<Output = ()>,
     ) -> Result<(), tonic::transport::Error>
     where
@@ -457,10 +459,9 @@ impl<S: Store> Tier<S> {
         let objects = ObjectsServer::new(self)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_PART_MESSAGE_BYTES);
-        Server::builder()
-            .add_service(InterceptedService::new(objects, Auth::new(token)))
-            .serve_with_incoming_shutdown(incoming, shutdown)
-            .await
+        let objects = InterceptedService::new(objects, Auth::new(token));
+        let router = |mut server: Server| server.add_service(objects);
+        limits.serve(router, incoming, shutdown).await
     }
 
     /// Runs store work on a blocking thread.
