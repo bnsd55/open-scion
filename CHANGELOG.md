@@ -71,6 +71,16 @@ release.
   1 MiB limit allowed still reads every file.
 - Bearer-token auth, loopback-only listening by default, request limits and
   name validation at the RPC boundary.
+- TLS and mTLS: the server and `scion-cache` serve TLS with `--tls-cert` and
+  `--tls-key` (a non-loopback address then needs no `--insecure-listen`), and
+  require a client certificate with `--tls-client-ca`. The cache and
+  `scion-daemon` trust `--tls-ca` for their https upstream and present
+  `--tls-client-cert` and `--tls-client-key` for mTLS. `scn` trusts `--tls-ca`
+  for an https server. The TLS handshake of a connection ends within 20 s, and
+  the HTTP/2 preface is still awaited within 20 s of the place, so a peer that
+  stops before or after the handshake holds no connection place. The
+  cryptography is ring (the `tls-ring` feature of tonic: 8 new crates, fewer
+  than the 12 of `tls-aws-lc`, one of which needs cmake).
 - `ReadFile` streams a file in 1 MiB parts from the zstd decoder, under a
   256 MiB budget for all replies. It checks the content against its ID
   before the last part, and ends a stalled reply with `DEADLINE_EXCEEDED`.
