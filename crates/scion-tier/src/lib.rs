@@ -41,7 +41,7 @@ use scion_core::{BlobId, ChangesetId, Tree, TreeId};
 use scion_proto::auth::{Auth, Bearer};
 use scion_proto::check;
 use scion_proto::deadline::Until;
-use scion_proto::listen::Limits;
+use scion_proto::listen::{self, Limits};
 use scion_proto::object::{self, Assembler, Header, MAX_ENCODED_BYTES, UNPACK_BYTES, zstd_bound};
 use scion_proto::reply::{
     self, BUSY_TIMEOUT, Body, IN_FLIGHT_BYTES, ObjectStream, Outgoing, STALL_TIMEOUT,
@@ -491,24 +491,32 @@ impl<S: Store> Tier<S> {
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_PART_MESSAGE_BYTES);
         let objects = InterceptedService::new(objects, Auth::new(token));
-        let router = |mut server: Server| server.add_service(objects);
+        // The health service answers `grpc.health.v1.Check` and `Watch` on
+        // the same port, without a token: a probe carries none. The store
+        // and the upstream channel opened before this call, so the tier
+        // starts serving.
+        let (health, shutdown) = listen::health(&["scion.v1.Objects"], shutdown).await;
+        let router = |mut server: Server| server.add_service(health).add_service(objects);
         limits
             .serve(router, incoming, tls.map(|tls| tls.config()), shutdown)
             .await
     }
 
-    /// Runs store work on a blocking thread.
+    /// Runs store work on a blocking thread. `repo` names the call's repo
+    /// in the one line that a failure of this work makes.
     async fn blocking<T: Send + 'static>(
         &self,
+        repo: &str,
         f: impl FnOnce(&S) -> io::Result<T> + Send + 'static,
     ) -> Result<T, Status> {
+        let repo = repo.to_owned();
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || f(&inner.store))
             .await
             .unwrap_or_else(|e| Err(io::Error::other(e)))
             .map_err(|e| {
                 // The detail stays in the log, as on the server.
-                tracing::error!(error = %e, "store failed");
+                tracing::error!(repo = %repo, error = %e, "store failed");
                 Status::internal("internal error")
             })
     }
@@ -554,6 +562,7 @@ impl<S: Store> Tier<S> {
         )
         .await;
         tracing::info!(
+            repo = %ask.repo,
             objects = ask.keys.len(),
             hits = progress.hits.load(Ordering::Relaxed),
             misses = progress.misses.load(Ordering::Relaxed),
@@ -573,7 +582,7 @@ impl<S: Store> Tier<S> {
         let mut held = None;
         let mut missed = false;
         loop {
-            let size = match self.blocking(move |store| store.size(key)).await {
+            let size = match self.blocking(&ask.repo, move |store| store.size(key)).await {
                 Ok(size) => size,
                 Err(status) => return Some((Err(status.into()), self.share(held, 1, ask).await?)),
             };
@@ -581,7 +590,7 @@ impl<S: Store> Tier<S> {
                 let mut permit = self
                     .share(held.take(), size + key.read_bytes(size), ask)
                     .await?;
-                let stored = self.stored(key, size).await;
+                let stored = self.stored(&ask.repo, key, size).await;
                 reply::trim(&mut permit, size);
                 match stored {
                     Ok(Some(stored)) => {
@@ -689,7 +698,9 @@ impl<S: Store> Tier<S> {
         self.cover(&mut permit, stored.len() + size + UNPACK_BYTES, ask.until)
             .await?;
         let chunks = self
-            .blocking(move |_| object::read_chunks(object::unpacker(&stored)?, size))
+            .blocking(&ask.repo, move |_| {
+                object::read_chunks(object::unpacker(&stored)?, size)
+            })
             .await;
         reply::trim(&mut permit, size);
         let header = Header {
@@ -724,8 +735,8 @@ impl<S: Store> Tier<S> {
 
     /// Reads `key` in its stored form from the store, at most `size` bytes.
     /// `None` if it is not there.
-    async fn stored(&self, key: Key, size: usize) -> Result<Option<Bytes>, Status> {
-        self.blocking(move |store| store.get(key, size)).await
+    async fn stored(&self, repo: &str, key: Key, size: usize) -> Result<Option<Bytes>, Status> {
+        self.blocking(repo, move |store| store.get(key, size)).await
     }
 
     /// Gets `ask.keys[i]` in its stored form from upstream. Joins the fetch
@@ -870,7 +881,12 @@ impl<S: Store> Flight<S> {
     async fn run(mut self) {
         tracing::debug!(objects = self.waiting.len(), "fetching from upstream");
         if let Err(status) = self.fetch_all().await {
-            tracing::warn!(%status, objects = self.waiting.len(), "fetch from upstream failed");
+            tracing::warn!(
+                repo = %self.repo,
+                %status,
+                objects = self.waiting.len(),
+                "fetch from upstream failed"
+            );
             let failed = Failed {
                 status,
                 whole_call: true,
@@ -887,7 +903,7 @@ impl<S: Store> Flight<S> {
     fn settle_front(&mut self, outcome: Result<Bytes, Status>) {
         if let Some((key, tx)) = self.waiting.pop_front() {
             if let Err(status) = &outcome {
-                tracing::warn!(%key, %status, "upstream could not give an object");
+                tracing::warn!(repo = %self.repo, %key, %status, "upstream could not give an object");
             }
             tx.send_replace(Some(outcome.map_err(Failed::from)));
             lock(&self.tier.inner.flights).remove(&(self.repo.clone(), key));
@@ -948,9 +964,10 @@ impl<S: Store> Flight<S> {
                 };
                 // Unpacking and hashing up to 100 MiB takes a while: check
                 // and store on a blocking thread.
+                let repo = self.repo.clone();
                 let checked = self
                     .tier
-                    .blocking(move |store| {
+                    .blocking(&self.repo, move |store| {
                         let stored = match key.to_stored(&header, data) {
                             Ok(stored) => Bytes::from(stored),
                             Err(why) => return Ok(Err(why)),
@@ -958,7 +975,7 @@ impl<S: Store> Flight<S> {
                         // A failed put is logged; the object still goes to
                         // its waiters.
                         if let Err(e) = store.put(key, &stored) {
-                            tracing::warn!(%key, error = %e, "cannot store an object");
+                            tracing::warn!(%repo, %key, error = %e, "cannot store an object");
                         }
                         Ok(Ok(stored))
                     })

@@ -15,6 +15,8 @@
 //! kills (default 6).
 #![cfg(unix)]
 
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
@@ -127,17 +129,23 @@ impl Server {
             .append(true)
             .open(log)
             .unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_scion-server"))
-            .arg("--data")
-            .arg(data)
-            .args(["serve", "--token", TOKEN, "--listen", "127.0.0.1:0"])
-            // Plain log lines, so the address parses without escape codes.
-            .env("NO_COLOR", "1")
-            .env("RUST_LOG", "info")
-            .stdout(log_file.try_clone().unwrap())
-            .stderr(log_file)
-            .spawn()
-            .unwrap();
+        // The child shares a flock until it execs (see `common::spawn_guard`):
+        // the read side keeps this spawn out of a lock-release window of
+        // another test.
+        let child = common::spawn_guard::across_spawn(|| {
+            Command::new(env!("CARGO_BIN_EXE_scion-server"))
+                .arg("--data")
+                .arg(data)
+                .args(["serve", "--token", TOKEN, "--listen", "127.0.0.1:0"])
+                // Plain log lines, so the address parses without escape
+                // codes.
+                .env("NO_COLOR", "1")
+                .env("RUST_LOG", "info")
+                .stdout(log_file.try_clone().unwrap())
+                .stderr(log_file)
+                .spawn()
+        })
+        .unwrap();
         Self {
             child,
             addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),

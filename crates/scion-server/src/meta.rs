@@ -192,8 +192,23 @@ pub trait MetaTx {
     fn add_repo_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool>;
 
     /// Inserts a land, or finds the land for the same request key. Returns
-    /// the repo and the land's outcome, pending or final.
-    fn record_land(&mut self, caller: &Caller, req: &LandRequest) -> Result<(RepoId, LandOutcome)>;
+    /// the repo and the land's outcome, pending or final. `pending_limit`
+    /// bounds the lands one principal has pending; `None` turns it off.
+    fn record_land(
+        &mut self,
+        caller: &Caller,
+        req: &LandRequest,
+        pending_limit: Option<usize>,
+    ) -> Result<(RepoId, LandOutcome)>;
+
+    /// Lists the pending lands that started more than `stale_secs` ago, as
+    /// (repo, land ID, target ref).
+    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<(RepoId, i64, String)>>;
+
+    /// Rejects a land that is still pending, and returns whether it changed
+    /// (1) or was no longer pending (0). The caller holds the ref's lock
+    /// slot, so a retry that is finishing the land wins.
+    fn reject_stale_land(&mut self, land_id: i64, detail: String) -> Result<u64>;
 
     /// Deletes up to a bound of lands that finished before the retention
     /// window, oldest first, keeping the newest.
@@ -223,8 +238,9 @@ pub trait MetaTx {
     ) -> Result<std::collections::HashMap<ObjectId, ChangesetId>>;
 
     /// Stores a node of a path history under its content address. Safe to
-    /// repeat.
-    fn put_history_node(&mut self, id: NodeId, body: Vec<u8>) -> Result<NodeId>;
+    /// repeat. Returns whether the row was new, so a caller can charge only
+    /// bytes that actually landed.
+    fn put_history_node(&mut self, id: NodeId, body: Vec<u8>) -> Result<(NodeId, bool)>;
 
     /// Reads a history node's stored bytes, and returns them with the
     /// length of their stored form.

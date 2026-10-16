@@ -30,6 +30,7 @@
 
 use std::collections::{BTreeMap, HashMap, btree_map, hash_map};
 use std::fmt;
+use std::ops::Bound::{self, Unbounded};
 
 use scion_core::{Changeset, ChangesetId, FileState, PathElem, RepoPath};
 
@@ -41,17 +42,51 @@ use crate::tree;
 
 /// Hashed before a node's bytes, so a node ID is never the ID of another
 /// kind of data.
-const DOMAIN: &[u8] = b"scion\0history\0v1\0";
+const DOMAIN: &[u8] = b"scion\0history\0v2\0";
+/// First byte of a stored node: its entries.
+const LEAF: u8 = 0;
+/// First byte of a stored node: an index of chunks of one level, each
+/// `first name` to the chunk that holds it.
+const INDEX: u8 = 1;
 /// Entry flag: `own` follows.
 const OWN: u8 = 1;
 /// Entry flag: `below` follows.
 const BELOW: u8 = 2;
+
+/// How wide one stored node row may be, and how often a name cuts. A
+/// level above `max_bytes` is cut into chunks: a name ends its chunk when
+/// a hash of that name alone hits 1 in `1 << bits`, so the mean chunk
+/// holds `1 << bits` entries, about 8 KiB of rows at a typical entry of
+/// ~90 bytes, and a chunk that reaches `max_bytes` is cut anyway. A cut
+/// hangs on one name, so the same names cut the same way whatever the
+/// edit order.
+#[derive(Clone, Copy)]
+struct Cut {
+    max_bytes: usize,
+    bits: u32,
+}
+
+/// The limits of production.
+const PROD_CUT: Cut = Cut {
+    max_bytes: 64 << 10,
+    bits: 7,
+};
+
+/// The bounds in use. Tests build their own `Cut` to reach deep stacks
+/// and rare cuts with small trees.
+const CUT: Cut = Cut {
+    max_bytes: if cfg!(test) { 1024 } else { PROD_CUT.max_bytes },
+    bits: PROD_CUT.bits,
+};
 
 #[cfg(test)]
 thread_local! {
     /// Nodes read on this thread. Tests use it to bound the reads of a
     /// query.
     pub(crate) static NODE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Bytes stored in `history_nodes` on this thread. Tests use it to
+    /// bound the cost of a change.
+    pub(crate) static NODE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The ID of a history node: the hash of its bytes.
@@ -106,7 +141,7 @@ pub struct PathHistory;
 
 impl Kind for PathHistory {
     const NAME: &'static str = "path_history";
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
     type Value = NodeId;
 
     fn derive(
@@ -147,31 +182,91 @@ fn apply(
     for path in changes.keys() {
         root.stamp(c, &tree::parts(path), by)?;
     }
-    root.store(c)
+    root.store(c, &CUT)
 }
 
-/// A node being edited: its entries, and the nodes below them that are
-/// being edited too. Only the nodes on changed paths are loaded.
+/// A node being edited. A small level is one `leaf`; a large one is an
+/// `index` of chunks, of which only the ones on changed paths are loaded
+/// into `chunks`. `below` holds the edited levels below it.
 struct Edit {
-    entries: Node,
+    leaf: Option<Node>,
+    index: Option<BTreeMap<PathElem, NodeId>>,
+    chunks: BTreeMap<PathElem, Node>,
     below: BTreeMap<PathElem, Edit>,
 }
 
 impl Edit {
     fn load(c: &mut dyn MetaTx, id: Option<NodeId>) -> Result<Self> {
-        Ok(Self {
-            entries: match id {
-                Some(id) => get_node(c, id)?.0,
-                None => Node::new(),
+        Ok(match id {
+            None => Self {
+                leaf: Some(Node::new()),
+                index: None,
+                chunks: BTreeMap::new(),
+                below: BTreeMap::new(),
             },
-            below: BTreeMap::new(),
+            Some(id) => Self::stored(c, id)?,
         })
+    }
+
+    /// Loads the level at `id`: a leaf, or its whole chunk index,
+    /// flattened to the leaf chunks it names.
+    // SHORTCUT: the edit holds the whole index of a chunked level, so a
+    // write in a directory of 10M names re-encodes an index of about
+    // 2.7 MB. Upgrade: keep the index stacked in the edit, and edit one
+    // index chunk per level of the stack.
+    fn stored(c: &mut dyn MetaTx, id: NodeId) -> Result<Self> {
+        match get_row(c, id)?.0 {
+            Row::Leaf(node) => Ok(Self {
+                leaf: Some(node),
+                index: None,
+                chunks: BTreeMap::new(),
+                below: BTreeMap::new(),
+            }),
+            Row::Chunks(index) => Ok(Self::chunked(flatten(c, index)?)),
+        }
+    }
+
+    /// A chunked level whose index rows are flattened to the leaf chunks
+    /// they name.
+    fn chunked(index: BTreeMap<PathElem, NodeId>) -> Self {
+        Self {
+            leaf: None,
+            index: Some(index),
+            chunks: BTreeMap::new(),
+            below: BTreeMap::new(),
+        }
+    }
+
+    /// The entries that hold `name`: the whole level, or the chunk of a
+    fn entries(&mut self, c: &mut dyn MetaTx, name: &PathElem) -> Result<&mut Node> {
+        let Some(index) = &self.index else {
+            return Ok(self.leaf.as_mut().expect("a level is leaf or chunked"));
+        };
+        if index.is_empty() {
+            // An empty level: everything below it is new.
+            self.leaf = Some(Node::new());
+            self.index = None;
+            return Ok(self.leaf.as_mut().expect("just set"));
+        }
+        // The chunk whose range holds the name, or the first one.
+        let first = index
+            .range((Unbounded, Bound::Included(name.to_owned())))
+            .next_back()
+            .or_else(|| index.iter().next())
+            .map(|(first, _)| first.clone())
+            .expect("an index is not empty");
+        if !self.chunks.contains_key(&first) {
+            let node = leaf_of(c, index[&first])?;
+            self.chunks.insert(first.clone(), node);
+        }
+        Ok(self.chunks.get_mut(&first).expect("loaded above"))
     }
 
     /// Stamps the entry at `parts` with `by`, and each entry above it.
     fn stamp(&mut self, c: &mut dyn MetaTx, parts: &[PathElem], by: Stamp) -> Result<()> {
         let (name, rest) = parts.split_first().expect("a path has at least one part");
-        let entry = self.entries.entry(name.clone()).or_insert(Entry {
+        let entries = self.entries(c, name)?;
+        let entry = entries.entry(name.clone()).or_insert(Entry {
             last: by,
             own: None,
             below: None,
@@ -189,17 +284,77 @@ impl Edit {
         edit.stamp(c, rest, by)
     }
 
-    /// Stores every edited node, bottom up, and returns this one's ID.
-    fn store(mut self, c: &mut dyn MetaTx) -> Result<NodeId> {
-        for (name, edit) in self.below {
-            let below = edit.store(c)?;
-            let entry = self
-                .entries
-                .get_mut(&name)
-                .expect("an edited node has an entry");
+    /// Stores every edited level, bottom up, and returns this one's ID. A
+    /// chunked level stores each chunk it edited and rebuilds its index;
+    /// rows whose bytes did not change keep their IDs.
+    fn store(mut self, c: &mut dyn MetaTx, cut: &Cut) -> Result<NodeId> {
+        for (name, edit) in std::mem::take(&mut self.below) {
+            let below = edit.store(c, cut)?;
+            let entries = self.entries_now(&name)?;
+            let entry = entries.get_mut(&name).expect("an edited node has an entry");
             entry.below = Some(below);
         }
-        put_node(c, &self.entries)
+        if let Some(mut index) = self.index.take() {
+            for (first, node) in std::mem::take(&mut self.chunks) {
+                index.remove(&first);
+                index.extend(put_level(c, &node, cut)?);
+            }
+            return level_root(c, index, cut);
+        }
+        let leaf = self.leaf.expect("a level is leaf or chunked");
+        let index = put_level(c, &leaf, cut)?;
+        level_root(c, index, cut)
+    }
+
+    /// The entries that `store` edits, without reading: they are already
+    /// loaded.
+    fn entries_now(&mut self, name: &PathElem) -> Result<&mut Node> {
+        if let Some(index) = &self.index {
+            let first = index
+                .range((Unbounded, Bound::Included(name.to_owned())))
+                .next_back()
+                .or_else(|| index.iter().next())
+                .map(|(first, _)| first.clone())
+                .ok_or_else(|| Error::Corrupt("history: no edited chunk".into()))?;
+            return match self.chunks.get_mut(&first) {
+                Some(entries) => Ok(entries),
+                None => Err(Error::Corrupt("history: no edited chunk".into())),
+            };
+        }
+        self.leaf
+            .as_mut()
+            .ok_or_else(|| Error::Corrupt("history: no level".into()))
+    }
+}
+
+/// The pairs of the leaf chunks that the index rows at `top` name, down
+/// the stack of index levels.
+fn flatten(
+    c: &mut dyn MetaTx,
+    top: BTreeMap<PathElem, NodeId>,
+) -> Result<BTreeMap<PathElem, NodeId>> {
+    let mut flat = BTreeMap::new();
+    let mut work: Vec<(PathElem, NodeId)> = top.into_iter().collect();
+    while let Some((first, id)) = work.pop() {
+        match get_row(c, id)?.0 {
+            Row::Leaf(_) => {
+                flat.insert(first, id);
+            }
+            Row::Chunks(sub) => work.extend(sub),
+        }
+    }
+    Ok(flat)
+}
+
+/// Reads the leaf chunk that the edit's index names. The edit holds
+/// flattened IDs, which are always leaves, so a row that is an index is
+/// corrupt data.
+fn leaf_of(c: &mut dyn MetaTx, id: NodeId) -> Result<Node> {
+    match get_row(c, id)?.0 {
+        Row::Leaf(node) => Ok(node),
+        Row::Chunks(_) => Err(Error::Corrupt(format!(
+            "history chunk {id} is an index where a leaf is expected"
+        ))),
     }
 }
 
@@ -213,29 +368,54 @@ struct Hit {
     above: i64,
 }
 
-/// The nodes that one call has read, so that it reads each one once, and
+/// The rows that one call has read, so that it reads each one once, and
 /// how many bytes they hold.
 #[derive(Default)]
 pub(crate) struct Nodes {
-    nodes: HashMap<NodeId, Node>,
+    rows: HashMap<NodeId, Row>,
     bytes: usize,
 }
 
 impl Nodes {
-    /// The stored bytes of the nodes read so far.
+    /// The stored bytes of the rows read so far.
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
 
-    fn get(&mut self, c: &mut dyn MetaTx, id: NodeId) -> Result<&Node> {
-        Ok(match self.nodes.entry(id) {
-            hash_map::Entry::Occupied(node) => node.into_mut(),
+    fn row(&mut self, c: &mut dyn MetaTx, id: NodeId) -> Result<&Row> {
+        Ok(match self.rows.entry(id) {
+            hash_map::Entry::Occupied(row) => row.into_mut(),
             hash_map::Entry::Vacant(slot) => {
-                let (node, bytes) = get_node(c, id)?;
+                let (row, bytes) = get_row(c, id)?;
                 self.bytes += bytes;
-                slot.insert(node)
+                slot.insert(row)
             }
         })
+    }
+
+    /// The entry that the level at `id` holds for `name`: down its stacked
+    /// indexes, in the chunk whose range holds the name. Reads each row
+    /// once.
+    fn entry(&mut self, c: &mut dyn MetaTx, id: NodeId, name: &PathElem) -> Result<Option<Entry>> {
+        let mut id = id;
+        loop {
+            let next = match self.row(c, id)? {
+                Row::Leaf(node) => return Ok(node.get(name).copied()),
+                Row::Chunks(index) => {
+                    // The chunk whose range holds the name, or the first
+                    // one.
+                    index
+                        .range((Unbounded, Bound::Included(name.to_owned())))
+                        .next_back()
+                        .or_else(|| index.iter().next())
+                        .map(|(_, id)| *id)
+                }
+            };
+            let Some(next) = next else {
+                return Ok(None);
+            };
+            id = next;
+        }
     }
 }
 
@@ -247,7 +427,7 @@ fn lookup(c: &mut dyn MetaTx, nodes: &mut Nodes, root: NodeId, path: &RepoPath) 
     let mut hit = Hit::default();
     let mut node = root;
     for dir in dirs {
-        let Some(entry) = nodes.get(c, node)?.get(dir).copied() else {
+        let Some(entry) = nodes.entry(c, node, dir)? else {
             return Ok(hit);
         };
         hit.above = hit.above.max(entry.own.unwrap_or(0));
@@ -256,7 +436,7 @@ fn lookup(c: &mut dyn MetaTx, nodes: &mut Nodes, root: NodeId, path: &RepoPath) 
         };
         node = below;
     }
-    hit.last = nodes.get(c, node)?.get(name).map(|entry| entry.last);
+    hit.last = nodes.entry(c, node, name)?.map(|entry| entry.last);
     Ok(hit)
 }
 
@@ -309,31 +489,95 @@ pub(crate) fn touched_after<'p>(
     Ok(touched)
 }
 
-/// Stores a node. Safe to repeat.
-// SHORTCUT: a node holds every name that its directory ever had on the
-// first-parent history, and a change rewrites each node on its paths whole.
-// Ceiling: a write in a directory stores name + 51 to 83 bytes for each name
-// it ever had: 630 KB for 10,000 names of 12 bytes. Upgrade: nodes cut into
-// chunks, so a write stores only the chunks it changes, as for trees
-// (https://github.com/bnsd55/open-scion/issues/114).
-fn put_node(c: &mut dyn MetaTx, node: &Node) -> Result<NodeId> {
+/// Stores the entries of one level, cut into chunks when they pass
+/// `cut.max_bytes`, and returns the index of its chunks: the first name
+/// of each chunk and the chunk's ID. A small level is one leaf, so one
+/// pair.
+fn put_level(c: &mut dyn MetaTx, node: &Node, cut: &Cut) -> Result<BTreeMap<PathElem, NodeId>> {
     let body = encode_node(node);
-    let id = NodeId::of(&body);
-    c.put_history_node(id, body)
+    if node.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    if body.len() <= cut.max_bytes {
+        let id = put_row(c, LEAF, &body)?;
+        let first = node.first_key_value().expect("a level is not empty").0;
+        return Ok(BTreeMap::from([(first.clone(), id)]));
+    }
+    let mut index = BTreeMap::new();
+    for chunk in split(node.iter(), cut) {
+        let node: Node = chunk.into_iter().collect();
+        let id = put_row(c, LEAF, &encode_node(&node))?;
+        let first = node.first_key_value().expect("a chunk is not empty").0;
+        index.insert(first.clone(), id);
+    }
+    Ok(index)
 }
 
-/// Reads a node and checks it against its ID. Also returns the length of
-/// its stored bytes.
-fn get_node(c: &mut dyn MetaTx, id: NodeId) -> Result<(Node, usize)> {
+/// Builds the index of a level's chunks, itself cut into chunks when it
+/// passes `cut.max_bytes`, and returns the ID of its top node.
+fn index_node(c: &mut dyn MetaTx, index: &BTreeMap<PathElem, NodeId>, cut: &Cut) -> Result<NodeId> {
+    let body = encode_index(index);
+    if body.len() <= cut.max_bytes {
+        return put_row(c, INDEX, &body);
+    }
+    let mut upper = BTreeMap::new();
+    for chunk in split(index.iter(), cut) {
+        let node: BTreeMap<PathElem, NodeId> = chunk.into_iter().collect();
+        let id = put_row(c, INDEX, &encode_index(&node))?;
+        let first = node.first_key_value().expect("a chunk is not empty").0;
+        upper.insert(first.clone(), id);
+    }
+    level_root(c, upper, cut)
+}
+
+/// The ID of a level whose chunks `index` names: the one leaf, or the top
+/// index row.
+fn level_root(c: &mut dyn MetaTx, index: BTreeMap<PathElem, NodeId>, cut: &Cut) -> Result<NodeId> {
+    if index.len() == 1 {
+        return Ok(index.into_values().next().expect("one pair"));
+    }
+    index_node(c, &index, cut)
+}
+
+/// Stores one row of kind `kind`. Safe to repeat. Counts the bytes that
+/// actually landed in the table, so that a test can bound the cost of a
+/// change: a row whose bytes are already there is stored again for free.
+fn put_row(c: &mut dyn MetaTx, kind: u8, payload: &[u8]) -> Result<NodeId> {
+    let mut body = Vec::with_capacity(payload.len() + 1);
+    body.push(kind);
+    body.extend(payload);
+    let id = NodeId::of(&body);
+    #[cfg(test)]
+    let len = body.len();
+    #[cfg_attr(not(test), allow(unused_variables))]
+    let (_, stored) = c.put_history_node(id, body)?;
+    #[cfg(test)]
+    if stored {
+        NODE_BYTES.with(|n| n.set(n.get() + len));
+    }
+    Ok(id)
+}
+
+/// Reads a row and checks it against its ID. Also returns the length of its
+/// stored bytes.
+fn get_row(c: &mut dyn MetaTx, id: NodeId) -> Result<(Row, usize)> {
     #[cfg(test)]
     NODE_READS.set(NODE_READS.get() + 1);
     let (body, len) = c.get_history_node(id)?;
-    let node = decode_node(&body)
+    let row = decode_row(&body)
         .ok_or_else(|| Error::Corrupt(format!("history node {id} does not decode")))?;
-    Ok((node, len))
+    Ok((row, len))
 }
 
-/// The bytes of a node: its entries in name order, each
+/// One stored row of a level: a leaf of entries, or an index of the level's
+/// chunks.
+#[derive(Clone, Debug)]
+enum Row {
+    Leaf(Node),
+    Chunks(BTreeMap<PathElem, NodeId>),
+}
+
+/// The bytes of a leaf row: its entries in name order, each
 /// `u16le(len(name)) || name || u8(flags) || last ID || i64le(last
 /// generation) || [i64le(own)] || [below]`. Flag 1 says that `own` follows,
 /// flag 2 that `below` follows.
@@ -389,6 +633,89 @@ fn decode_node(mut bytes: &[u8]) -> Option<Node> {
         node.insert(name, Entry { last, own, below });
     }
     Some(node)
+}
+
+/// The bytes of an index row: its chunk entries in name order, each
+/// `u16le(len(name)) || name || chunk ID`.
+fn encode_index(index: &BTreeMap<PathElem, NodeId>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, id) in index {
+        let name = name.as_bytes();
+        let len = u16::try_from(name.len()).expect("a name is at most 4,096 bytes");
+        out.extend(len.to_le_bytes());
+        out.extend(name);
+        out.extend(id.0);
+    }
+    out
+}
+
+/// The index in `bytes`, or `None` if they are not the bytes of one.
+fn decode_index(mut bytes: &[u8]) -> Option<BTreeMap<PathElem, NodeId>> {
+    let mut index = BTreeMap::new();
+    while !bytes.is_empty() {
+        let len = u16::from_le_bytes(take(&mut bytes, 2)?.try_into().ok()?);
+        let name = PathElem::new(take(&mut bytes, usize::from(len))?).ok()?;
+        let id = NodeId(take(&mut bytes, 32)?.try_into().ok()?);
+        if index
+            .last_key_value()
+            .is_some_and(|(prev, _)| *prev >= name)
+        {
+            return None;
+        }
+        index.insert(name, id);
+    }
+    Some(index)
+}
+
+/// The row in `body`, whose first byte is its kind.
+fn decode_row(body: &[u8]) -> Option<Row> {
+    match body.first() {
+        Some(&LEAF) => decode_node(&body[1..]).map(Row::Leaf),
+        Some(&INDEX) => decode_index(&body[1..]).map(Row::Chunks),
+        _ => None,
+    }
+}
+
+/// The gear hash: one value per byte, from a fixed pseudorandom sequence,
+/// so cuts are the same on every machine.
+fn gear(byte: u8) -> u64 {
+    let mut x = (u64::from(byte)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x
+}
+
+/// Splits a sorted list into chunks. A name ends its chunk when a hash of
+/// that name alone hits 1 in `1 << cut.bits`, so a cut hangs on one name:
+/// neighbours never move it, and the same names cut the same way whatever
+/// the edit order. A chunk that reaches `cut.max_bytes` is cut anyway,
+/// the rare backstop for names far larger than the mean. Names are
+/// unique, so chunks stay sorted and never empty.
+fn split<'a, T: Clone + 'a>(
+    items: impl Iterator<Item = (&'a PathElem, &'a T)>,
+    cut: &Cut,
+) -> Vec<Vec<(PathElem, T)>> {
+    let mask = (1u64 << cut.bits) - 1;
+    let mut chunks: Vec<Vec<(PathElem, T)>> = Vec::new();
+    let mut chunk: Vec<(PathElem, T)> = Vec::new();
+    let mut bytes = 0usize;
+    for (name, item) in items {
+        chunk.push((name.clone(), item.clone()));
+        bytes += name.as_bytes().len() + 2 + 83;
+        let mut hash = 0u64;
+        for byte in name.as_bytes() {
+            hash = hash.rotate_left(1).wrapping_add(gear(*byte));
+        }
+        if (bytes >= cut.max_bytes || hash & mask == 0) && !chunk.is_empty() {
+            chunks.push(std::mem::take(&mut chunk));
+            bytes = 0;
+        }
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
 }
 
 /// The first `n` bytes of `bytes`, which then start after them.
@@ -541,6 +868,52 @@ mod tests {
                 }
             }
         }
+
+        /// One level built from the same names through two edit orders
+        /// gets the same top node: a cut hangs on one name, so the order
+        /// of the edits cannot move a boundary. The limits keep the byte
+        /// cap out of reach, so only name hashes cut.
+        #[test]
+        fn the_same_names_cut_the_same_way_in_any_edit_order(
+            names in proptest::collection::vec("[a-z]{1,6}", 200..300),
+            seed in proptest::num::u64::ANY,
+        ) {
+            let (_dir, store, _repo) = open();
+            let mut names: Vec<String> = names;
+            names.sort();
+            names.dedup();
+            let mut shuffled = names.clone();
+            let mut state = seed;
+            for i in (1..shuffled.len()).rev() {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let j = (state >> 33) as usize % (i + 1);
+                shuffled.swap(i, j);
+            }
+            // The byte cap stays out of reach of any chunk of a few
+            // names, so a cut is a name hash or nothing, while the level
+            // of 200 names is over the cap and really is chunked.
+            let cut = Cut { max_bytes: 8192, bits: 2 };
+            let level = |order: &[String], c: &mut dyn MetaTx| -> Result<NodeId> {
+                let mut edit = Edit::load(c, None)?;
+                let by = Stamp {
+                    id: ChangesetId::from_bytes([7; 32]),
+                    generation: 1,
+                };
+                for name in order {
+                    edit.stamp(c, &tree::parts(&path(name)), by)?;
+                }
+                edit.store(c, &cut)
+            };
+            let (root, again) = store
+                .write(|c| Ok((level(&names, c)?, level(&shuffled, c)?)))
+                .unwrap();
+            proptest::prop_assert_eq!(root, again);
+            // The level really is chunked, so the test means something.
+            let row = store.read(|c| Ok(get_row(c, root).unwrap().0)).unwrap();
+            assert!(matches!(row, Row::Chunks(_)), "the level is chunked");
+        }
     }
 
     #[test]
@@ -590,8 +963,9 @@ mod tests {
     #[test]
     fn a_path_log_stops_at_its_node_bytes_after_one_entry() {
         let (_dir, store, repo) = open();
-        // `d` holds 10,000 files, so its node is larger than the bound. Then
-        // three changesets change `d/f0`.
+        // `d` holds 10,000 files, so its level is cut into chunks and its
+        // lookup reads an index and a chunk. Then three changesets change
+        // `d/f0`, and the first changeset made the directory.
         let wide: Vec<String> = (0..10_000).map(|i| format!("d/f{i}")).collect();
         let first: Vec<(&str, bool)> = wide.iter().map(|p| (p.as_str(), true)).collect();
         let mut history: Vec<Edits<'_>> = vec![&first];
@@ -603,14 +977,206 @@ mod tests {
             let found: Vec<ChangesetId> = page.entries.iter().map(|(id, _)| *id).collect();
             (found, page.next)
         };
-        // Each page holds one entry, and says where to go on.
-        assert_eq!(page_of(ids[3]), (vec![ids[3]], Some(ids[2])));
-        assert_eq!(page_of(ids[2]), (vec![ids[2]], Some(ids[1])));
-        assert_eq!(page_of(ids[0]), (vec![ids[0]], None));
+        // The lookups of the three changesets share most of their rows, so
+        // one page of 10 holds all four entries however wide the directory
+        // is. One entry of the old whole-node format cost the whole level
+        // of 10,000 names, about 630 KB, over the bound.
+        let (found, next) = page_of(ids[3]);
+        assert_eq!(found, [ids[3], ids[2], ids[1], ids[0]]);
+        assert_eq!(next, None);
         // A file in a small directory fills its page.
         let small = store_chain(&store, repo, Some(ids[3]), &[&[("e", true)][..]; 3], true);
         let page = read::log_page(&store, "r", small[2], Some(&path("e")), 10, &later());
         assert_eq!(page.unwrap().entries.len(), 3);
+    }
+
+    #[test]
+    fn a_change_in_a_wide_directory_stores_chunks_not_the_level() {
+        let (_dir, store, repo) = open();
+        // `d` holds 100,000 files. Then one changeset changes `d/f50000`.
+        // The nodes it stores are the chunks the change touches, not the
+        // 6.3 MB level of every name (https://github.com/bnsd55/open-scion/
+        // issues/114).
+        let wide: Vec<String> = (0..100_000).map(|i| format!("d/f{i}")).collect();
+        let first: Vec<(&str, bool)> = wide.iter().map(|p| (p.as_str(), true)).collect();
+        let ids = store_chain(
+            &store,
+            repo,
+            None,
+            &[&first[..], &[("d/f50000", true)]],
+            true,
+        );
+        NODE_BYTES.with(|n| n.set(0));
+        let _one = store_chain(
+            &store,
+            repo,
+            Some(ids[1]),
+            &[&[("d/f50001", true)][..]],
+            true,
+        );
+        let written = NODE_BYTES.get();
+        // Two chunks and one index node at most, each under the cap.
+        assert!(written <= 3 * CUT.max_bytes, "{written}");
+        // The lookup still answers.
+        assert_eq!(
+            read::log_page(&store, "r", ids[1], Some(&path("d/f50000")), 10, &later())
+                .unwrap()
+                .entries
+                .len(),
+            2
+        );
+    }
+
+    /// A name far wider than the mean chunk still splits: the byte cap
+    /// cuts when no name hash hits, and every chunk stays within it.
+    #[test]
+    fn a_name_wider_than_the_mean_chunk_still_cuts() {
+        let (_dir, store, _repo) = open();
+        // Twelve names of about 300 bytes, about 385 bytes of entries
+        // each. No name hash hits 1 in a million, so every cut is the
+        // cap.
+        let cut = Cut {
+            max_bytes: 1024,
+            bits: 20,
+        };
+        let node: Node = (0..12)
+            .map(|i| {
+                let name = format!("n{i:02}{}", "x".repeat(300));
+                (
+                    PathElem::new(name).unwrap(),
+                    Entry {
+                        last: Stamp {
+                            id: ChangesetId::from_bytes([7; 32]),
+                            generation: 1,
+                        },
+                        own: Some(1),
+                        below: None,
+                    },
+                )
+            })
+            .collect();
+        let chunks = split(node.iter(), &cut);
+        assert!(chunks.len() >= 4, "{}", chunks.len());
+        let mut names: Vec<&[u8]> = Vec::new();
+        for chunk in &chunks {
+            assert_ne!(chunk.len(), 0);
+            let bytes: usize = chunk
+                .iter()
+                .map(|(name, _)| name.as_bytes().len() + 2 + 83)
+                .sum();
+            // The cap cuts after the entry that crosses it, so a chunk
+            // holds at most one entry over the cap.
+            assert!(bytes < cut.max_bytes + 385, "{bytes}");
+            names.extend(chunk.iter().map(|(name, _)| name.as_bytes()));
+        }
+        // The chunks cover every name once, in order.
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(names.len(), node.len());
+        // A stored level round-trips through its index and its chunks.
+        store
+            .write(|c| {
+                let index = put_level(c, &node, &cut)?;
+                assert!(index.len() >= 4, "{}", index.len());
+                for (first, id) in &index {
+                    let node = leaf_of(c, *id)?;
+                    assert!(node.contains_key(first));
+                    assert!(!decode_node(&encode_node(&node)).unwrap().is_empty());
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// Inserting a name into a wide level re-stores only the chunk that
+    /// holds it: a cut hangs on one name, so the boundaries of the later
+    /// chunks hold. A cut at a byte count would move the boundary after
+    /// the insert, and every later chunk would change.
+    #[test]
+    fn an_inserted_name_moves_no_later_boundary() {
+        let (_dir, store, _repo) = open();
+        store
+            .write(|c| {
+                let cut = Cut {
+                    max_bytes: 8192,
+                    bits: 2,
+                };
+                let level = |names: &[String], c: &mut dyn MetaTx| -> Result<NodeId> {
+                    let mut edit = Edit::load(c, None)?;
+                    let by = Stamp {
+                        id: ChangesetId::from_bytes([7; 32]),
+                        generation: 1,
+                    };
+                    for name in names {
+                        edit.stamp(c, &tree::parts(&path(name)), by)?;
+                    }
+                    edit.store(c, &cut)
+                };
+                let mut names: Vec<String> = (0..200).map(|i| format!("n{i:03}")).collect();
+                let before = level(&names, c)?;
+                names.insert(100, "n0995".into());
+                let after = level(&names, c)?;
+                // The chunks that the two levels name differ only around
+                // the insert.
+                let index =
+                    |root: NodeId, c: &mut dyn MetaTx| -> Result<BTreeMap<PathElem, NodeId>> {
+                        match get_row(c, root)?.0 {
+                            Row::Chunks(index) => flatten(c, index),
+                            Row::Leaf(_) => Err(Error::Corrupt("the level is chunked".into())),
+                        }
+                    };
+                let before = index(before, c)?;
+                let after = index(after, c)?;
+                let changed = before
+                    .iter()
+                    .filter(|(first, id)| after.get(*first).is_some_and(|next| next != *id))
+                    .count()
+                    // A chunk whose first name moved counts as one gone
+                    // and one new.
+                    + before.iter().filter(|(first, _)| !after.contains_key(*first)).count()
+                    + after.iter().filter(|(first, _)| !before.contains_key(*first)).count();
+
+                assert!(changed <= 2, "{changed} chunks changed");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// One name change in a directory of 100,000 names, at the production
+    /// limits, stores the changed chunk and the index rows, not the
+    /// 6.3 MB level of every name. Measured with the production `Cut`,
+    /// the change stores 47,672 bytes: the changed chunk, about 8 KiB,
+    /// and the index of the level's 781 chunks, about 33 KiB. The
+    /// index is the whole cost of a change and the ceiling of the
+    /// `stored` shortcut; keeping it stacked in the edit is the upgrade
+    /// of issue 114.
+    #[test]
+    fn a_change_measured_with_production_limits_stores_its_chunk_and_index() {
+        let (_dir, store, _repo) = open();
+        store
+            .write(|c| {
+                let mut edit = Edit::load(c, None)?;
+                let by = Stamp {
+                    id: ChangesetId::from_bytes([7; 32]),
+                    generation: 1,
+                };
+                for i in 0..100_000 {
+                    edit.stamp(c, &tree::parts(&path(&format!("d/f{i}"))), by)?;
+                }
+                let root = edit.store(c, &PROD_CUT)?;
+                NODE_BYTES.with(|n| n.set(0));
+                let mut edit = Edit::load(c, Some(root))?;
+                let by = Stamp {
+                    id: ChangesetId::from_bytes([9; 32]),
+                    generation: 2,
+                };
+                edit.stamp(c, &tree::parts(&path("d/f50001")), by)?;
+                edit.store(c, &PROD_CUT)?;
+                let written = NODE_BYTES.get();
+                // The changed chunk and the index, each under the cap.
+                assert!(written <= 2 * PROD_CUT.max_bytes, "{written}");
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
@@ -665,10 +1231,10 @@ mod tests {
         ];
         // The empty changeset keeps its parent's tree.
         let golden = [
-            "275f0ac4048df304db51095dc775de19d520a5c4ed585bd6550e8724904c0b62",
-            "d6cf99672ed34457a9c8f2954e970f85458389f07ad3e886c00940096308cc08",
-            "d6cf99672ed34457a9c8f2954e970f85458389f07ad3e886c00940096308cc08",
-            "791e35308cf1c2618cd46241bbbecc9f0e99fedfacd088b9fd62e6c5cb01b5e6",
+            "5208e7e609f94b249aca6f04fdbcfa6319ccd98e1d732e7639e52b95f3fb7a7d",
+            "9fd2ee8a02e3ce4c75fcf0a634c971065117508885573ae6da6fa523e0438843",
+            "9fd2ee8a02e3ce4c75fcf0a634c971065117508885573ae6da6fa523e0438843",
+            "01a64c51815c59ccaae7f819ec25cb4939b06d4e8f30bbe1a69f2a628e669b14",
         ];
         for stored in [true, false] {
             let (_dir, store, repo) = open();
@@ -697,7 +1263,10 @@ mod tests {
             .read(|c| derived::load::<PathHistory>(c, ids[1]))
             .unwrap()
             .unwrap();
-        let (node, _) = store.read(|c| get_node(c, root)).unwrap();
+        let root_row = store.read(|c| get_row(c, root)).unwrap().0;
+        let Row::Leaf(node) = root_row else {
+            panic!("a small level is one leaf");
+        };
         let bytes = encode_node(&node);
         assert_eq!(decode_node(&bytes), Some(node.clone()));
         let a = node[&PathElem::new("a").unwrap()];

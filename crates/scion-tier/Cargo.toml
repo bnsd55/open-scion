@@ -1,5 +1,5 @@
 [package]
-name = "scion-tier"
+name = "open-scion-tier"
 description = "Cache tiers for the Scion version control system: scion-cache and scion-daemon"
 version.workspace = true
 edition.workspace = true
@@ -11,6 +11,9 @@ keywords.workspace = true
 categories.workspace = true
 authors.workspace = true
 
+[lib]
+name = "scion_tier"
+
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
@@ -18,12 +21,13 @@ clap.workspace = true
 hashlink.workspace = true
 rusqlite.workspace = true
 rustix.workspace = true
-scion-core.workspace = true
-scion-proto.workspace = true
+open-scion-core.workspace = true
+open-scion-proto.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
+tonic-health.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zstd.workspace = true
@@ -33,3 +37,5 @@ workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
+tempfile.workspace = true
+tonic-health.workspace = true

@@ -41,6 +41,12 @@ impl Deadline {
         CallGuard(Arc::clone(&self.gone))
     }
 
+    /// The instant the deadline passes.
+    #[must_use]
+    pub fn at(&self) -> Instant {
+        self.at
+    }
+
     /// Fails with [`Error::DeadlineExceeded`] once the deadline has passed.
     pub(crate) fn check(&self) -> Result<()> {
         let why = if self.gone.load(Ordering::Relaxed) {

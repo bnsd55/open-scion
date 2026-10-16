@@ -543,7 +543,12 @@ impl MetaTx for SqliteTx<'_> {
     /// ref that does not exist is recorded as rejected at once, so only real
     /// refs ever get a lock slot in [`Lands`]. A new land also expires old
     /// ones.
-    fn record_land(&mut self, caller: &Caller, req: &LandRequest) -> Result<(RepoId, LandOutcome)> {
+    fn record_land(
+        &mut self,
+        caller: &Caller,
+        req: &LandRequest,
+        pending_limit: Option<usize>,
+    ) -> Result<(RepoId, LandOutcome)> {
         let repo = self.repo_id(&req.repo)?;
         self.generation(repo, req.changeset)?;
         let existing = self
@@ -576,12 +581,30 @@ impl MetaTx for SqliteTx<'_> {
                 let detail = format!("ref {:?} does not exist", req.target_ref);
                 (LandState::Rejected, detail)
             };
+            if let Some(limit) = pending_limit {
+                // The pending-lands quota counts new pending rows. A retry
+                // of an existing key resumes its land and adds no row, so a
+                // client can always finish what it started.
+                let pending = self
+                    .0
+                    .prepare_cached(
+                        "SELECT count(*) FROM lands WHERE caller = ?1 AND state = 'pending'",
+                    )?
+                    .query_row([caller.0.as_str()], |row| row.get::<_, i64>(0))?;
+                if pending >= i64::try_from(limit).unwrap_or(i64::MAX) {
+                    return Err(Error::ResourceExhausted(format!(
+                        "principal {:?} has its {limit} lands pending \
+                         (--max-principal-pending-lands {limit}); wait for one to finish",
+                        caller.0
+                    )));
+                }
+            }
             self.0
                 .prepare_cached(
                     "INSERT INTO lands
-                 (repo_id, caller, request_key, target_ref, input_cs, state, detail, finished_at)
+                 (repo_id, caller, request_key, target_ref, input_cs, state, detail, finished_at, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                 CASE ?6 WHEN 'pending' THEN NULL ELSE unixepoch() END)",
+                 CASE ?6 WHEN 'pending' THEN NULL ELSE unixepoch() END, unixepoch())",
                 )?
                 .execute(params![
                     repo.0,
@@ -597,6 +620,37 @@ impl MetaTx for SqliteTx<'_> {
             land_id
         };
         Ok((repo, self.land_outcome(repo, caller, land_id)?))
+    }
+
+    /// The pending lands that started more than `stale_secs` ago.
+    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<(RepoId, i64, String)>> {
+        let mut stmt = self.0.prepare_cached(
+            "SELECT repo_id, land_id, target_ref FROM lands
+             WHERE state = 'pending' AND created_at > 0
+                 AND created_at < unixepoch() - ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![stale_secs], |row| {
+                Ok((
+                    RepoId(row.get(0)?),
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Rejects a land that is still pending; 1 if it changed, else 0.
+    fn reject_stale_land(&mut self, land_id: i64, detail: String) -> Result<u64> {
+        let changed = self
+            .0
+            .prepare_cached(
+                "UPDATE lands SET state = 'rejected', detail = ?1, finished_at = unixepoch()
+                 WHERE land_id = ?2 AND state = 'pending'",
+            )?
+            .execute(params![detail, land_id])?;
+        Ok(u64::try_from(changed).unwrap_or(0))
     }
 
     /// Deletes up to [`EXPIRE_PER_LAND`] lands that finished more than
@@ -727,11 +781,13 @@ impl MetaTx for SqliteTx<'_> {
     }
 
     /// Stores a history node under its content address. Safe to repeat.
-    fn put_history_node(&mut self, id: NodeId, body: Vec<u8>) -> Result<NodeId> {
-        self.0
+    /// Returns whether the row was new.
+    fn put_history_node(&mut self, id: NodeId, body: Vec<u8>) -> Result<(NodeId, bool)> {
+        let stored = self
+            .0
             .prepare_cached("INSERT OR IGNORE INTO history_nodes (id, body) VALUES (?1, ?2)")?
             .execute(params![&id.0[..], body])?;
-        Ok(id)
+        Ok((id, stored > 0))
     }
 
     /// Reads a history node and checks it against its ID. Also returns the
