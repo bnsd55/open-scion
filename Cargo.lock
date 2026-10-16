@@ -2252,6 +2252,101 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "open-scion"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hashlink",
+ "open-scion-core",
+ "open-scion-proto",
+ "open-scion-server",
+ "open-scion-tier",
+ "rcgen",
+ "rustix",
+ "serde_json",
+ "signal-hook",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "zstd",
+]
+
+[[package]]
+name = "open-scion-core"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "proptest",
+]
+
+[[package]]
+name = "open-scion-proto"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "prost",
+ "rcgen",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
+name = "open-scion-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "gix",
+ "hashlink",
+ "open-scion-core",
+ "open-scion-proto",
+ "proptest",
+ "rusqlite",
+ "rustix",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "zstd",
+]
+
+[[package]]
+name = "open-scion-tier"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "hashlink",
+ "open-scion-core",
+ "open-scion-proto",
+ "rcgen",
+ "rusqlite",
+ "rustix",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "zstd",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2705,101 +2800,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "scion-core"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "proptest",
-]
-
-[[package]]
-name = "scion-proto"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "prost",
- "rcgen",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "tracing",
- "zstd",
-]
-
-[[package]]
-name = "scion-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "gix",
- "hashlink",
- "proptest",
- "rusqlite",
- "rustix",
- "scion-core",
- "scion-proto",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "zstd",
-]
-
-[[package]]
-name = "scion-tier"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "hashlink",
- "rcgen",
- "rusqlite",
- "rustix",
- "scion-core",
- "scion-proto",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "zstd",
-]
-
-[[package]]
-name = "scn"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "hashlink",
- "rcgen",
- "rustix",
- "scion-core",
- "scion-proto",
- "scion-server",
- "scion-tier",
- "serde_json",
- "signal-hook",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tonic",
- "zstd",
 ]
 
 [[package]]
