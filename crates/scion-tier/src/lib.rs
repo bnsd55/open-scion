@@ -39,6 +39,7 @@ use hashlink::LruCache;
 use scion_core::{BlobId, ChangesetId, Tree, TreeId};
 use scion_proto::auth::{Auth, Bearer};
 use scion_proto::check;
+use scion_proto::deadline::Until;
 use scion_proto::object::{self, Assembler, Header, MAX_ENCODED_BYTES, UNPACK_BYTES, zstd_bound};
 use scion_proto::reply::{
     self, BUSY_TIMEOUT, Body, IN_FLIGHT_BYTES, ObjectStream, Outgoing, STALL_TIMEOUT,
@@ -96,11 +97,9 @@ pub const DAEMON_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(180);
 
 // The limits nest: a busy server answers the cache before the cache gives
 // up, and a cache that waits on the server answers the daemon before the
-// daemon gives up.
-// SHORTCUT: fixed limits per step. A fetch joined in the middle of its batch
-// can wait for the objects ahead of it, and a client's own deadline does not
-// reach the tiers. Upgrade (issue #98): pass the remaining deadline down with
-// grpc-timeout.
+// daemon gives up. A caller's deadline also ends each wait, and each tier
+// passes what is left of it upstream, less its margin (`Until`), so the
+// deadlines nest as well.
 const _: () = {
     // Seconds for the work around the waits: reading, checking and moving one
     // object.
@@ -294,6 +293,9 @@ struct Failed {
     /// The whole upstream call failed (its own status, a transport error, a
     /// timeout), not this object alone.
     whole_call: bool,
+    /// The deadline of the fetch that failed. A caller with a later one asks
+    /// again: the failure may have come from that deadline.
+    until: Until,
 }
 
 impl From<Status> for Failed {
@@ -301,6 +303,7 @@ impl From<Status> for Failed {
         Self {
             status,
             whole_call: false,
+            until: Until::NONE,
         }
     }
 }
@@ -386,6 +389,8 @@ struct Ask {
     keys: Vec<Key>,
     /// The client accepts zstd.
     zstd: bool,
+    /// When the reply ends its waits: the caller's deadline less a margin.
+    until: Until,
 }
 
 impl<S: Store> Tier<S> {
@@ -479,16 +484,19 @@ impl<S: Store> Tier<S> {
             })
     }
 
-    /// Waits at most the tier's timeout for an upstream call.
-    async fn within<T>(&self, call: impl Future<Output = Result<T, Status>>) -> Result<T, Status> {
-        tokio::time::timeout(self.inner.timeout, call)
-            .await
-            .unwrap_or_else(|_| {
-                Err(Status::unavailable(format!(
-                    "upstream did not answer within {:?}",
-                    self.inner.timeout
-                )))
-            })
+    /// Waits for an upstream call at most the tier's timeout, and not past
+    /// `until`.
+    async fn within<T>(
+        &self,
+        until: Until,
+        call: impl Future<Output = Result<T, Status>>,
+    ) -> Result<T, Status> {
+        let wait = until.wait(self.inner.timeout);
+        tokio::time::timeout(wait, call).await.unwrap_or_else(|_| {
+            Err(Status::unavailable(format!(
+                "upstream did not answer within {wait:?}"
+            )))
+        })
     }
 
     /// Streams the objects of `ask` into `tx`, starting with `first`, which
@@ -529,10 +537,12 @@ impl<S: Store> Tier<S> {
         loop {
             let size = match self.blocking(move |store| store.size(key)).await {
                 Ok(size) => size,
-                Err(status) => return Some((Err(status.into()), self.share(held, 1).await?)),
+                Err(status) => return Some((Err(status.into()), self.share(held, 1, ask).await?)),
             };
             if let Some(size) = size {
-                let mut permit = self.share(held.take(), size + key.read_bytes(size)).await?;
+                let mut permit = self
+                    .share(held.take(), size + key.read_bytes(size), ask)
+                    .await?;
                 let stored = self.stored(key, size).await;
                 reply::trim(&mut permit, size);
                 match stored {
@@ -541,7 +551,7 @@ impl<S: Store> Tier<S> {
                             progress.hits.fetch_add(1, Ordering::Relaxed);
                             tracing::debug!(%key, "hit");
                         }
-                        return self.outgoing(key, stored, permit, ask.zstd).await;
+                        return self.outgoing(key, stored, permit, ask).await;
                     }
                     // The stored copy went (dropped, or bad) after its size
                     // was read: fetch it.
@@ -554,43 +564,44 @@ impl<S: Store> Tier<S> {
                 progress.misses.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(%key, "miss");
             }
-            let data = match self.fetch(&ask.repo, &ask.keys, i, progress).await {
+            let data = match self.fetch(ask, i, progress).await {
                 Ok(Some(data)) => data,
                 // A fetch stored it a moment ago: read it from the store,
                 // with its share, as a hit is.
                 Ok(None) => continue,
-                Err(failed) => return Some((Err(failed), self.share(held, 1).await?)),
+                Err(failed) => return Some((Err(failed), self.share(held, 1, ask).await?)),
             };
             // The bytes were counted in the fetch budget until stored. Take
             // them into the reply now if the reply budget has room. Else let
             // them go, wait for room, and read them again.
             let permit = match held.take() {
-                Some(permit) => self.share(Some(permit), data.len()).await,
+                Some(permit) => self.share(Some(permit), data.len(), ask).await,
                 None => reply::try_take(&self.inner.in_flight, data.len()),
             };
             if let Some(permit) = permit {
-                return self.outgoing(key, data, permit, ask.zstd).await;
+                return self.outgoing(key, data, permit, ask).await;
             }
             let size = data.len();
             drop(data);
-            held = Some(self.share(None, size + key.read_bytes(size)).await?);
+            held = Some(self.share(None, size + key.read_bytes(size), ask).await?);
         }
     }
 
     /// `held` grown to `bytes` of the reply budget, or a new share of
-    /// `bytes`. Waits at most [`BUSY_TIMEOUT`]; `None` if the room does not
-    /// come.
+    /// `bytes`. Waits at most [`BUSY_TIMEOUT`], and not past `ask.until`;
+    /// `None` if the room does not come.
     async fn share(
         &self,
         held: Option<OwnedSemaphorePermit>,
         bytes: usize,
+        ask: &Ask,
     ) -> Option<OwnedSemaphorePermit> {
         match held {
             Some(mut permit) => {
-                self.cover(&mut permit, bytes).await?;
+                self.cover(&mut permit, bytes, ask.until).await?;
                 Some(permit)
             }
-            None => reply::take(&self.inner.in_flight, bytes, self.inner.busy).await,
+            None => reply::take(&self.inner.in_flight, bytes, ask.until.wait(self.inner.busy)).await,
         }
     }
 
@@ -604,7 +615,7 @@ impl<S: Store> Tier<S> {
         key: Key,
         stored: Bytes,
         mut permit: OwnedSemaphorePermit,
-        zstd: bool,
+        ask: &Ask,
     ) -> Option<Found> {
         let header = match key.stored_header(&stored) {
             Ok(header) => header,
@@ -613,14 +624,14 @@ impl<S: Store> Tier<S> {
                 return Some((Err(Status::internal("internal error").into()), permit));
             }
         };
-        if header.encoding == Encoding::Raw || zstd {
-            self.cover(&mut permit, stored.len()).await?;
+        if header.encoding == Encoding::Raw || ask.zstd {
+            self.cover(&mut permit, stored.len(), ask.until).await?;
             reply::trim(&mut permit, stored.len());
             let body = Body::Whole(stored);
             return Some((Ok(Outgoing { header, body }), permit));
         }
         let size = header.size;
-        self.cover(&mut permit, stored.len() + size + UNPACK_BYTES)
+        self.cover(&mut permit, stored.len() + size + UNPACK_BYTES, ask.until)
             .await?;
         let chunks = self
             .blocking(move |_| object::read_chunks(object::unpacker(&stored)?, size))
@@ -639,11 +650,18 @@ impl<S: Store> Tier<S> {
     }
 
     /// Grows `permit` to `bytes` of the reply budget, if it holds less.
-    /// Waits at most [`BUSY_TIMEOUT`]; `None` if the room does not come.
-    async fn cover(&self, permit: &mut OwnedSemaphorePermit, bytes: usize) -> Option<()> {
+    /// Waits at most [`BUSY_TIMEOUT`], and not past `until`; `None` if the
+    /// room does not come.
+    async fn cover(
+        &self,
+        permit: &mut OwnedSemaphorePermit,
+        bytes: usize,
+        until: Until,
+    ) -> Option<()> {
         let held = permit.num_permits();
         if bytes > held {
-            let more = reply::take(&self.inner.in_flight, bytes - held, self.inner.busy).await?;
+            let wait = until.wait(self.inner.busy);
+            let more = reply::take(&self.inner.in_flight, bytes - held, wait).await?;
             permit.merge(more);
         }
         Some(())
