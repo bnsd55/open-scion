@@ -7,12 +7,14 @@
 //! - [`tree`]: apply changesets to trees and derive each changeset's root tree.
 //! - [`graph`]: the commit-graph index, and the graph queries that read it.
 //! - [`read`], [`blame`], [`write`], [`land`]: the operations behind the RPCs.
+//!   A long one stops at its call's [`deadline`].
 //! - [`import`]: one-way import from a git repository.
 //! - [`service`], [`objects`] and [`auth`]: the gRPC front end.
 
 pub mod auth;
 pub mod blame;
 pub mod db;
+pub mod deadline;
 pub mod derived;
 pub mod error;
 pub mod graph;

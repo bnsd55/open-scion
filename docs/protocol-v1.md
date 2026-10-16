@@ -58,8 +58,9 @@ server (section 6.3).
 
 **Queues.** The server queues work instead of failing it. At most 256 jobs run
 at once across both services, at most 16 `PutBlob` uploads are read at once,
-and at most 4 `Blame` calls run at once. A `ReadFile` call waits for its share
-of a memory budget (section 6.7). Time in a queue counts toward the timeout.
+at most 4 `Blame` calls run at once, and at most 4 `MergeBase` and
+`IsAncestor` calls together. A `ReadFile` call waits for its share of a memory
+budget (section 6.7). Time in a queue counts toward the timeout.
 One wait has its own limit: a `GetObjects` call that gets no memory for its
 first object within 120 s fails with `RESOURCE_EXHAUSTED` (section 7.3).
 
@@ -109,9 +110,8 @@ contract. A client MUST NOT depend on its text.
 | `UNAUTHENTICATED` | The token is missing or wrong. | After the cause is fixed |
 | `ABORTED` | `Land` only: other writers kept moving the ref. The land stays `PENDING`. | Yes, with the same request key |
 | `OUT_OF_RANGE` | A message is larger than its limit. | After the cause is fixed |
-| `RESOURCE_EXHAUSTED` | `MergeBase` or `IsAncestor` only: the answer needs more work than one call may do. | No: the same request fails again |
 | `CANCELLED` | The server's 600 s limit or the client's `grpc-timeout` ran out. A client library can report its own deadline as `DEADLINE_EXCEEDED`. | Yes. A `Land` retry uses the same request key. |
-| `DEADLINE_EXCEEDED` | `ReadFile`: the client took no message for 120 s. `Land`: the land ran past 600 s from the start of the call. The land stays `PENDING`. | Yes. A `Land` retry uses the same request key. |
+| `DEADLINE_EXCEEDED` | `ReadFile`: the client took no message for 120 s. `Land`: the land ran past 600 s from the start of the call. The land stays `PENDING`. `MergeBase`, `IsAncestor`: the walk ran past 600 s from the start of the call. | Yes. A `Land` retry uses the same request key. |
 | `UNAVAILABLE` | The server cannot be reached or is shutting down, or its database stayed busy for 5 s (another process, such as an import, held its write lock). A tier also replies `UNAVAILABLE` when its upstream does not answer in time (section 8). | Yes |
 | `RESOURCE_EXHAUSTED` | `GetObjects` only: no memory for the first object within 120 s (section 7.3). | Yes, after a wait |
 | `DATA_LOSS` | From a tier only: its upstream sent bytes that are not the object asked for (section 8). | MAY |
@@ -485,19 +485,22 @@ repository.
 - If one changeset is an ancestor of the other, the answer is that one.
   `changeset_ids` is empty when the two histories share no changeset.
 
-**Bound.** A call takes at most 10,000 steps. A step reads one changeset's
+**Cost.** A call has no bound on its steps. A step reads one changeset's
 parents, or one entry of the server's commit-graph index. When neither
 first-parent history has a merge newer than where the two meet, the answer
 takes a few dozen steps, at any depth. Otherwise the server walks from both
-changesets, highest generation first, and stops early once no other best
-common ancestor can follow. If the answer needs more, the call fails with
-`RESOURCE_EXHAUSTED`. There is no resume.
+changesets, highest generation first, and stops once no other best common
+ancestor can follow. It reads each merge on the way, and the changesets
+where two parts of the walk are at the same generations. It jumps over the
+other runs of first parents, a few dozen steps for each run. A call stops at
+the 600 s limit (section 2), or when its client cancels it. There is no
+resume.
 
 | Error | When |
 |---|---|
 | `INVALID_ARGUMENT` | A bad repo name or ID. |
 | `NOT_FOUND` | The repo or a changeset does not exist. |
-| `RESOURCE_EXHAUSTED` | The walk passed its bound. |
+| `CANCELLED`, `DEADLINE_EXCEEDED` | The call ran past 600 s, or the client cancelled it. |
 
 ### 6.12 IsAncestor
 
@@ -505,18 +508,18 @@ common ancestor can follow. If the answer needs more, the call fails with
 `is_ancestor` is true when `ancestor_id` is `descendant_id`, or is reached
 from it through parents. Ancestry follows every parent, as in `MergeBase`.
 
-**Bound.** A call takes at most 10,000 steps, as in `MergeBase`, and never
+**Cost.** A call has no bound on its steps, as in `MergeBase`, and never
 goes below the generation of `ancestor_id`. So when the two differ and
 `ancestor_id`'s generation is not lower, the answer is false. Without a
 merge between the two, the answer takes a few dozen steps, at any depth.
 Each merge newer than `ancestor_id` that the search reaches costs three
-steps. If the answer needs more, the call fails with `RESOURCE_EXHAUSTED`.
+steps. A call stops at the 600 s limit, or when its client cancels it.
 
 | Error | When |
 |---|---|
 | `INVALID_ARGUMENT` | A bad repo name or ID. |
 | `NOT_FOUND` | The repo or a changeset does not exist. |
-| `RESOURCE_EXHAUSTED` | The walk passed its bound. |
+| `CANCELLED`, `DEADLINE_EXCEEDED` | The call ran past 600 s, or the client cancelled it. |
 
 ### 6.13 Diff
 
@@ -718,9 +721,8 @@ A new version is a new package, `scion.v2`. A server MAY serve both.
 - Client changesets with no parent, several parents or a committer. Only git
   import makes them.
 - Text merge. Conflicts are path-level.
-- `MergeBase` and `IsAncestor` without a bound across many merges
-  ([#72](https://github.com/bnsd55/open-scion/issues/72)), and `Diff` with
-  rename detection ([#79](https://github.com/bnsd55/open-scion/issues/79)).
+- `Diff` with rename detection
+  ([#79](https://github.com/bnsd55/open-scion/issues/79)).
 - `Log` and `Blame` without per-call bounds
   ([#61](https://github.com/bnsd55/open-scion/issues/61)), and `Log` that
   follows renames.

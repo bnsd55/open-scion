@@ -17,8 +17,9 @@ use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileState, GitOid, IdentityTime, PathElem, RepoPath,
 };
 use scion_server::auth::Caller;
+use scion_server::deadline::Deadline;
 use scion_server::import::{ImportOptions, ImportReport, import_git};
-use scion_server::land::{Deadline, LandRequest, LandState, Lands};
+use scion_server::land::{LandRequest, LandState, Lands};
 use scion_server::{Error, Store, db, read, tree, write};
 use tempfile::TempDir;
 
@@ -860,11 +861,16 @@ fn an_import_process_shares_the_data_directory_with_lands() {
         read::resolve_ref(&store, "r", "git/main").unwrap(),
         changeset_of(&store, &more)
     );
-    // Main's first-parent history above `mine` is the lands, each once.
-    let head = main_ref(&store).target;
-    let log = read::log_page(&store, "r", head, None, landed.len() + 1).unwrap();
-    let mut history: Vec<ChangesetId> = log.entries.into_iter().map(|(id, _)| id).collect();
-    assert_eq!(history.pop(), Some(mine));
+    // Main's first-parent history above `mine` is the lands, each once. A
+    // fast machine lands more than one log page (`read::MAX_SCAN`), so walk
+    // the parents.
+    let mut history = Vec::new();
+    let mut at = main_ref(&store).target;
+    while at != mine {
+        assert!(history.len() < landed.len(), "main does not reach {mine}");
+        history.push(at);
+        at = read::get_changeset(&store, "r", at).unwrap().parents[0];
+    }
     let mut want = landed;
     want.sort();
     history.sort();
