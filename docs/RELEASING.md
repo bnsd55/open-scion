@@ -1,7 +1,7 @@
 # Releasing
 
-How to cut a release of open-scion. The steps below made v0.1.0; follow
-them for every release. Nothing here publishes or tags by itself: each
+How to cut a release of open-scion. The steps are the same for every
+release. Nothing here publishes or tags by itself: each
 step is run by a person.
 
 ## Before a release
@@ -31,10 +31,11 @@ step is run by a person.
    `[workspace.package]` in the root `Cargo.toml`. A release bumps one
    number there and the four `version = "..."` entries of the internal
    dependencies in `[workspace.dependencies]` to the same value.
-3. **Check the packages.** For each crate, in dependency order:
+3. **Check the packages.** From a clean worktree (no uncommitted
+   changes), for each crate, in dependency order:
 
    ```sh
-   cargo package -p scion-core --allow-dirty --no-verify
+   cargo package -p scion-core --no-verify
    ```
 
    It must end with `Packaged`. A crate that fails here cannot publish.
@@ -49,8 +50,8 @@ step is run by a person.
 
 5. **GitHub release.** Open a release for the tag with the notes taken
    from the `CHANGELOG.md` section of the version, and the measured
-   numbers from `docs/benchmarks.md` (method and machine class, not
-   absolute claims).
+   numbers from `docs/benchmarks.md`. The numbers are ratios measured on
+   one machine; a release note never names the machine.
 6. **Publish to crates.io**, one crate at a time, innermost first, and
    wait until each one is indexed before the next:
 
