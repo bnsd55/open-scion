@@ -277,7 +277,9 @@ async fn write_files(
 /// or if `got` fails.
 async fn fetch(
     objects: &mut Objects,
-    repo: &str,
+    // SHORTCUT: unused until C8 asks the server for the root tree and its
+    // ticket first.
+    _repo: &str,
     kind: ObjectKind,
     ids: impl IntoIterator<Item = [u8; 32]>,
     mut got: impl FnMut([u8; 32], Vec<u8>) -> Result<()>,
@@ -290,15 +292,20 @@ async fn fetch(
             .map(|id| ObjectRef {
                 kind: kind.into(),
                 id: id.to_vec(),
+                // SHORTCUT: empty until C8 walks the ticket's root tree
+                // for the path of each object.
+                path: Vec::new(),
             })
             .collect();
         // Blobs come as the zstd files that the server and the daemon store,
         // and are unpacked here, once.
         let mut stream = objects
             .get_objects(GetObjectsRequest {
-                repo: repo.to_owned(),
                 refs,
                 accept: vec![Encoding::Zstd.into()],
+                // SHORTCUT: empty until C8 sends the ticket that the
+                // server minted for this checkout.
+                ticket: Vec::new(),
             })
             .await
             .context("cannot fetch objects")?

@@ -63,10 +63,13 @@ service Scion {
   rpc Diff(DiffRequest) returns (DiffResponse);
 }
 
-// Object reads that any cache tier can answer. Every call but ResolveRef names
-// an immutable object, so a tier may cache its answer forever. A client asks
-// only for the objects it wants, starting at the root tree, and checks each
-// object against its ID on arrival.
+// Object reads. `ResolveRef` and `GetRootTree` go to the server: they need
+// the token, and the server answers `GetRootTree` with a read ticket.
+// `GetObjects` takes that ticket and no token, so a cache tier can answer
+// it. Each name names an immutable object, so a tier may cache its answer,
+// but only after a walk from the ticket's root tree reaches it. A client
+// asks only for the objects it wants, starting at the root tree, and checks
+// each object against its ID on arrival.
 service Objects {
   // Where a ref points. Mutable: a tier forwards it and never caches it.
   rpc ResolveRef(ResolveRefRequest) returns (ResolveRefResponse);
@@ -361,6 +364,10 @@ message GetRootTreeRequest {
 
 message GetRootTreeResponse {
   bytes tree_id = 1;
+  // A read ticket for this tree: bound to the repo, the caller's principal
+  // and this root tree, good for a short time. GetObjects takes it, and no
+  // token.
+  bytes ticket = 2;
 }
 
 enum ObjectKind {
@@ -372,6 +379,11 @@ enum ObjectKind {
 message ObjectRef {
   ObjectKind kind = 1;
   bytes id = 2;
+  // The path of the object, from the root tree of the ticket. Empty names
+  // the root tree itself. A tree must be a directory entry at the path, a
+  // blob the blob of a regular file or of a symlink entry there; a walk
+  // never goes through a symlink, and a gitlink ends it.
+  bytes path = 3;
 }
 
 // How an object's bytes travel. A tree's bytes are its TreeV1 bytes, and a
@@ -386,8 +398,12 @@ enum Encoding {
 }
 
 message GetObjectsRequest {
-  string repo = 1;
-  // 1 to 1000 objects.
+  reserved 1;
+  // A read ticket: permission to read the objects of one root tree of one
+  // repo, for one principal, for a short time. The server gives it with
+  // every GetRootTree reply.
+  bytes ticket = 4;
+  // 1 to 1000 objects, each with its path from that root tree.
   repeated ObjectRef refs = 2;
   // The encodings the client accepts besides RAW, which every client
   // accepts. The server sends each object RAW or in one of these.

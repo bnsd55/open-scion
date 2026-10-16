@@ -392,12 +392,13 @@ mod req {
 
     pub fn get_objects(blob: &[u8]) -> GetObjectsRequest {
         GetObjectsRequest {
-            repo: REPO.into(),
             refs: vec![ObjectRef {
                 kind: ObjectKind::Blob as i32,
                 id: blob.to_vec(),
+                path: Vec::new(),
             }],
             accept: Vec::new(),
+            ticket: Vec::new(),
         }
     }
 }
@@ -456,8 +457,10 @@ async fn a_principal_without_a_read_rule_sees_no_repo_on_any_rpc() {
         "GetRootTree",
         objects.get_root_tree(req::get_root_tree(root)).await,
     );
-    denied(
-        "GetObjects",
-        objects.get_objects(req::get_objects(blob)).await,
-    );
+    // SHORTCUT: GetObjects fails closed until C5 verifies tickets; then it
+    // hides like the rest and this goes back to `denied`.
+    let Err(status) = objects.get_objects(req::get_objects(blob)).await else {
+        panic!("GetObjects: accepted")
+    };
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
 }

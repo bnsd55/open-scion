@@ -146,12 +146,13 @@ async fn connect(url: &str) -> Client {
 /// the whole reply has come.
 async fn get(client: &mut Client, id: BlobId, deadline: Option<Duration>) -> Code {
     let mut request = Request::new(GetObjectsRequest {
-        repo: "main".into(),
         refs: vec![ObjectRef {
             kind: ObjectKind::Blob.into(),
             id: id.as_bytes().to_vec(),
+            path: Vec::new(),
         }],
         accept: Vec::new(),
+        ticket: Vec::new(),
     });
     if let Some(deadline) = deadline {
         request.set_timeout(deadline);

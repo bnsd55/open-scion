@@ -128,9 +128,9 @@ fn a_missing_repo_fails_the_call_once_at_each_tier() {
     let tiers = Tiers::start(data, store);
     let refs = (0..3u8).map(|i| blob_ref(BlobId::of(&[i]))).collect();
     let request = GetObjectsRequest {
-        repo: "no-such-repo".into(),
         refs,
         accept: Vec::new(),
+        ticket: Vec::new(),
     };
 
     let reply = tiers.runtime.block_on(async {

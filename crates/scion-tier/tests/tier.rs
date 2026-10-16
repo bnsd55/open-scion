@@ -2,7 +2,7 @@
 //! shared miss once, keeps one object's failure to that object, and refuses
 //! callers without the token.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt as _;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -84,6 +84,9 @@ enum Mode {
 #[derive(Clone, Default)]
 struct Fake {
     objects: Arc<HashMap<Vec<u8>, Vec<ObjectPart>>>,
+    /// The IDs whose `GetObjects` call fails whole, as a repo that
+    /// upstream does not have did.
+    poison: Arc<HashSet<Vec<u8>>>,
     delay: Duration,
     mode: Mode,
     calls: Arc<AtomicUsize>,
@@ -106,6 +109,14 @@ impl Fake {
             objects: Arc::new(sent.into_iter().collect()),
             delay,
             ..Self::default()
+        }
+    }
+
+    /// Fails the whole call when one of `ids` is asked for.
+    fn with_call_fail(self, ids: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        Self {
+            poison: Arc::new(ids.into_iter().collect()),
+            ..self
         }
     }
 
@@ -145,7 +156,10 @@ impl Objects for Fake {
             Some(1) => vec![7; 31],
             _ => vec![7; 32],
         };
-        Ok(Response::new(GetRootTreeResponse { tree_id }))
+        Ok(Response::new(GetRootTreeResponse {
+            tree_id,
+            ticket: Vec::new(),
+        }))
     }
 
     type GetObjectsStream = Replies;
@@ -158,9 +172,10 @@ impl Objects for Fake {
             tokio::time::sleep(self.delay).await;
         }
         let request = request.into_inner();
-        // A repo that upstream does not have fails the call, as on the server.
-        if request.repo == "gone" {
-            return Err(Status::not_found("no such repo"));
+        // A call for a poisoned ID fails before its reply starts, so the
+        // tier sends the status of the call, not an error in its stream.
+        if request.refs.iter().any(|r| self.poison.contains(&r.id)) {
+            return Err(Status::not_found("no such object"));
         }
         // The parts of each object, or the error that ends the reply.
         let mut replies: Vec<Result<Vec<ObjectPart>, Status>> = Vec::new();
@@ -211,7 +226,6 @@ async fn serve_fake(fake: Fake) -> String {
 /// result is the call's status.
 async fn get_parts(
     client: &mut Client,
-    repo: &str,
     objects: &[&Object],
     zstd: bool,
 ) -> Result<Result<Vec<(Object, usize, Encoding)>, Status>, Status> {
@@ -220,6 +234,7 @@ async fn get_parts(
         .map(|o| ObjectRef {
             kind: o.kind,
             id: o.id.clone(),
+            path: Vec::new(),
         })
         .collect();
     let accept = if zstd {
@@ -228,9 +243,9 @@ async fn get_parts(
         Vec::new()
     };
     let request = GetObjectsRequest {
-        repo: repo.into(),
         refs,
         accept,
+        ticket: Vec::new(),
     };
     let mut stream = client.get_objects(request).await?.into_inner();
     let mut got = Vec::new();
@@ -264,10 +279,9 @@ async fn get_parts(
 /// [`get_parts`] from a client that accepts only RAW, without the parts.
 async fn get_in(
     client: &mut Client,
-    repo: &str,
     objects: &[&Object],
 ) -> Result<Result<Vec<Object>, Status>, Status> {
-    let got = get_parts(client, repo, objects, false).await?;
+    let got = get_parts(client, objects, false).await?;
     Ok(got.map(|got| got.into_iter().map(|(object, ..)| object).collect()))
 }
 
@@ -312,7 +326,7 @@ async fn connect(url: &str, token: Option<&str>) -> Client {
 /// The objects a `GetObjects` call in repo `r` returns, or the error it
 /// ends with.
 async fn get(client: &mut Client, objects: &[&Object]) -> Result<Vec<Object>, Status> {
-    get_in(client, "r", objects).await?
+    get_in(client, objects).await?
 }
 
 fn blob(data: &[u8]) -> Object {
@@ -434,7 +448,7 @@ async fn a_tier_refuses_a_bad_zstd_frame_or_part_sequence() {
         let (_cache, url) = cache_for(&fake).await;
         let mut client = connect(&url, Some(TOKEN)).await;
         for zstd in [false, true] {
-            let status = get_parts(&mut client, "r", &[&wanted], zstd)
+            let status = get_parts(&mut client, &[&wanted], zstd)
                 .await
                 .and_then(|got| got)
                 .unwrap_err();
@@ -457,7 +471,7 @@ async fn a_large_blob_arrives_in_parts_is_checked_and_sent_on_as_it_came() {
     // A client that accepts zstd gets the frame in four parts; another gets
     // the content in four parts. Both from one fetch.
     for (zstd, encoding) in [(true, Encoding::Zstd), (false, Encoding::Raw)] {
-        let got = get_parts(&mut client, "r", &[&big], zstd).await.unwrap();
+        let got = get_parts(&mut client, &[&big], zstd).await.unwrap();
         assert_eq!(got.unwrap(), vec![(big.clone(), 4, encoding)]);
     }
     assert_eq!(fake.calls(), 1);
@@ -710,18 +724,19 @@ async fn a_slow_upstream_fails_the_call_with_unavailable() {
 #[tokio::test]
 async fn a_call_level_failure_is_the_status_of_a_call_never_an_error_in_its_stream() {
     let (kept, other) = (blob(b"kept\n"), blob(b"not kept\n"));
-    let fake = Fake::new(&[&kept, &other], Duration::ZERO);
+    let fake = Fake::new(&[&kept, &other], Duration::ZERO)
+        .with_call_fail([other.id.clone()]);
     let (_cache, url) = cache_for(&fake).await;
     let mut client = connect(&url, Some(TOKEN)).await;
     get(&mut client, &[&kept]).await.unwrap();
 
     // The first object is a miss: the call's status is upstream's.
-    let status = get_in(&mut client, "gone", &[&other]).await.unwrap_err();
+    let status = get_in(&mut client, &[&other]).await.unwrap_err();
     assert_eq!(status.code(), Code::NotFound, "{status:?}");
     // A hit first, then a miss: the reply sends the hit and ends without an
     // error. Asking again for the rest gets the call's status.
-    let first = get_in(&mut client, "gone", &[&kept, &other]).await.unwrap();
+    let first = get_in(&mut client, &[&kept, &other]).await.unwrap();
     assert_eq!(first.unwrap(), vec![kept]);
-    let status = get_in(&mut client, "gone", &[&other]).await.unwrap_err();
+    let status = get_in(&mut client, &[&other]).await.unwrap_err();
     assert_eq!(status.code(), Code::NotFound, "{status:?}");
 }

@@ -33,6 +33,9 @@ use crate::{db, read};
 const _: () = assert!(store::MAX_OBJECT_BYTES == scion_proto::MAX_OBJECT_BYTES);
 
 /// One object to read.
+// SHORTCUT: dead until C5 wires the ticket check that uses this reply
+// pipeline; every item marked below revives then.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 enum Key {
     Tree(TreeId),
@@ -40,6 +43,7 @@ enum Key {
 }
 
 /// How an object goes out, known before its bytes are read.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Plan {
     encoding: Encoding,
@@ -52,6 +56,7 @@ struct Plan {
 impl Plan {
     /// The most memory that reading the object holds: its bytes, and the
     /// decoder of a blob that goes out unpacked.
+    #[allow(dead_code)]
     fn read_bytes(&self, key: Key) -> usize {
         match (key, self.encoding) {
             (Key::Blob(_), Encoding::Raw) => self.encoded + store::READER_BYTES,
@@ -65,6 +70,7 @@ pub struct ObjectsService {
     worker: Worker,
     access: Arc<Access>,
     /// `IN_FLIGHT_BYTES` permits, one per object byte, shared by all replies.
+    #[allow(dead_code)]
     in_flight: Arc<Semaphore>,
 }
 
@@ -96,10 +102,12 @@ fn parse_ref(object: &ObjectRef) -> Result<Key, Status> {
 
 /// Reads an object, as planned. [`read_object`], except in tests that count
 /// reads.
+#[allow(dead_code)]
 type Read = fn(&Store, Key, Plan) -> Result<Outgoing>;
 
 /// How `key` goes out, without reading its bytes. A blob goes out as its
 /// stored zstd file if the client accepts `zstd`.
+#[allow(dead_code)]
 fn plan(store: &Store, key: Key, zstd: bool) -> Result<Plan> {
     let corrupt = |why: &str| Err(Error::Corrupt(format!("{key:?}: {why}")));
     let raw = |size| Plan {
@@ -139,6 +147,7 @@ fn plan(store: &Store, key: Key, zstd: bool) -> Result<Plan> {
 /// their IDs on the way out of the store. A ZSTD blob is its stored file,
 /// read in chunks and not unpacked: the receiver checks it. A RAW blob is
 /// unpacked in chunks, so it is never in memory twice.
+#[allow(dead_code)]
 fn read_object(store: &Store, key: Key, plan: Plan) -> Result<Outgoing> {
     // SHORTCUT: an object ID is treated as permission to read the object, so
     // this serves any tree or blob by ID for a repo the caller may read.
@@ -196,6 +205,7 @@ fn read_object(store: &Store, key: Key, plan: Plan) -> Result<Outgoing> {
 
 /// How long a reply waits: for room in the budget, and for its client. A
 /// wait for room also ends at the caller's deadline.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct Waits {
     busy: Duration,
@@ -203,6 +213,7 @@ struct Waits {
     until: Until,
 }
 
+#[allow(dead_code)]
 const WAITS: Waits = Waits {
     busy: BUSY_TIMEOUT,
     stall: STALL_TIMEOUT,
@@ -216,6 +227,7 @@ const WAITS: Waits = Waits {
 /// call fails with [`reply::busy`], so a reply never ends `OK` with no
 /// object. That comes before the caller's deadline, so the caller gets this
 /// status, not a timeout of its own.
+#[allow(dead_code)]
 async fn start_reply(
     worker: Worker,
     keys: Vec<Key>,
@@ -257,6 +269,7 @@ async fn start_reply(
 // SHORTCUT: two blocking hops per object and no read-ahead, so many small
 // objects are read one after another. Upgrade: read a batch capped by bytes
 // per hop, or keep a few reads in flight (issue #6).
+#[allow(dead_code)]
 async fn find(
     worker: &Worker,
     in_flight: &Arc<Semaphore>,
@@ -304,6 +317,8 @@ impl Objects for ObjectsService {
             .await?;
         Ok(Response::new(GetRootTreeResponse {
             tree_id: tree.as_bytes().to_vec(),
+            // SHORTCUT: empty until C3 mints a ticket for this reply.
+            ticket: Vec::new(),
         }))
     }
 
@@ -313,30 +328,20 @@ impl Objects for ObjectsService {
         &self,
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<Self::GetObjectsStream>, Status> {
-        let caller = caller(&request)?;
-        let waits = Waits {
-            until: Until::of(&request),
-            ..WAITS
-        };
-        let GetObjectsRequest { repo, refs, accept } = request.into_inner();
-        check_reader(&self.access, &caller, &repo)?;
+        // The caller is still checked by the token interceptor; C5 adds
+        // the ticket, which names the repo and the root tree of the read.
+        let _caller = caller(&request)?;
+        let GetObjectsRequest {
+            refs,
+            accept: _accept,
+            ticket: _ticket,
+        } = request.into_inner();
         scion_proto::check::object_count(refs.len())?;
-        let keys = refs.iter().map(parse_ref).collect::<Result<Vec<_>, _>>()?;
-        // Encodings that this server does not know are ignored.
-        let zstd = accept.contains(&Encoding::Zstd.into());
-        self.worker
-            .run(move |store| store.read(|c| db::repo_id(c, &repo)))
-            .await?;
-        let in_flight = Arc::clone(&self.in_flight);
-        let stream = start_reply(
-            self.worker.clone(),
-            keys,
-            in_flight,
-            waits,
-            read_object,
-            zstd,
-        );
-        Ok(Response::new(stream.await?))
+        let _keys = refs.iter().map(parse_ref).collect::<Result<Vec<_>, _>>()?;
+        // SHORTCUT: C5 verifies the ticket and takes the repo from it; the
+        // walk of the ticket's root tree then gates every object. Until
+        // then the request fails closed: an object ID is not a permission.
+        Err(Status::permission_denied("object reads need a ticket"))
     }
 }
 

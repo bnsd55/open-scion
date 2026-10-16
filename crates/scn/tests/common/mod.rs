@@ -44,6 +44,7 @@ pub fn tree_ref(id: TreeId) -> ObjectRef {
     ObjectRef {
         kind: ObjectKind::Tree.into(),
         id: id.as_bytes().to_vec(),
+        path: Vec::new(),
     }
 }
 
@@ -51,6 +52,7 @@ pub fn blob_ref(id: BlobId) -> ObjectRef {
     ObjectRef {
         kind: ObjectKind::Blob.into(),
         id: id.as_bytes().to_vec(),
+        path: Vec::new(),
     }
 }
 

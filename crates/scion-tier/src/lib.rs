@@ -154,6 +154,9 @@ impl Key {
         ObjectRef {
             kind: self.kind().into(),
             id: self.id().to_vec(),
+            // SHORTCUT: empty until C6 names the path of each object it
+            // asks for.
+            path: Vec::new(),
         }
     }
 
@@ -322,8 +325,9 @@ fn split(found: Found) -> Result<reply::Found, Status> {
     }
 }
 
-/// The fetches in progress, by repo and object.
-type Flights = HashMap<(String, Key), watch::Receiver<Outcome>>;
+/// The fetches in progress, by object. Objects are content-addressed, so
+/// one ID is one object, whatever repo it came from.
+type Flights = HashMap<Key, watch::Receiver<Outcome>>;
 
 /// Adds the tier's own token to every upstream call, and counts the calls.
 #[derive(Clone)]
@@ -386,7 +390,6 @@ struct Progress {
 
 /// What one reply asks for.
 struct Ask {
-    repo: String,
     keys: Vec<Key>,
     /// The client accepts zstd.
     zstd: bool,
@@ -705,18 +708,18 @@ impl<S: Store> Tier<S> {
         i: usize,
         progress: &Progress,
     ) -> Result<Option<Bytes>, Failed> {
-        let (repo, keys, until) = (&ask.repo, &ask.keys, ask.until);
+        let (keys, until) = (&ask.keys, ask.until);
         let key = keys[i];
         loop {
-            let joined = lock(&self.inner.flights).get(&(repo.clone(), key)).cloned();
+            let joined = lock(&self.inner.flights).get(&key).cloned();
             let flight = if let Some(flight) = joined {
                 Some(flight)
             } else if i < progress.fetched_to.load(Ordering::Relaxed) {
-                self.start(repo, key, Vec::new(), until)
+                self.start(key, Vec::new(), until)
             } else {
                 let end = keys.len().min(i + MAX_BATCH);
                 progress.fetched_to.store(end, Ordering::Relaxed);
-                self.start(repo, key, keys[i + 1..end].to_vec(), until)
+                self.start(key, keys[i + 1..end].to_vec(), until)
             };
             let Some(mut flight) = flight else {
                 return Ok(None);
@@ -754,16 +757,10 @@ impl<S: Store> Tier<S> {
     /// The store is asked under the fetch table's lock. A fetch stores each
     /// object before it takes the object out of the table, so an object in
     /// neither has not been fetched yet, and only one fetch starts for it.
-    fn start(
-        &self,
-        repo: &str,
-        key: Key,
-        later: Vec<Key>,
-        until: Until,
-    ) -> Option<watch::Receiver<Outcome>> {
+    fn start(&self, key: Key, later: Vec<Key>, until: Until) -> Option<watch::Receiver<Outcome>> {
         let stored = |k| matches!(self.inner.store.size(k), Ok(Some(_)));
         let mut flights = lock(&self.inner.flights);
-        if let Some(rx) = flights.get(&(repo.to_owned(), key)) {
+        if let Some(rx) = flights.get(&key) {
             return Some(rx.clone());
         }
         if stored(key) {
@@ -771,19 +768,16 @@ impl<S: Store> Tier<S> {
         }
         let mut waiting = VecDeque::new();
         for k in iter::once(key).chain(later) {
-            if let Entry::Vacant(slot) = flights.entry((repo.to_owned(), k))
-                && (k == key || !stored(k))
-            {
+            if let Entry::Vacant(slot) = flights.entry(k) && (k == key || !stored(k)) {
                 let (tx, rx) = watch::channel(None);
                 slot.insert(rx);
                 waiting.push_back((k, tx));
             }
         }
-        let rx = flights[&(repo.to_owned(), key)].clone();
+        let rx = flights[&key].clone();
         drop(flights);
         let flight = Flight {
             tier: self.clone(),
-            repo: repo.to_owned(),
             waiting,
             until,
         };
@@ -792,13 +786,12 @@ impl<S: Store> Tier<S> {
     }
 }
 
-/// One fetch from upstream: a few objects of one repo, which other replies
-/// can wait for. It runs on its own task, so it never waits for a reply, and
-/// it ends when every object is fetched or failed. Objects still waiting when
-/// it ends leave the fetch table, so a later call starts anew.
+/// One fetch from upstream: a few objects, which other replies can wait
+/// for. It runs on its own task, so it never waits for a reply, and it ends
+/// when every object is fetched or failed. Objects still waiting when it
+/// ends leave the fetch table, so a later call starts anew.
 struct Flight<S: Store> {
     tier: Tier<S>,
-    repo: String,
     /// The objects not fetched yet, in request order, each with the sender
     /// that its waiters listen to.
     waiting: VecDeque<(Key, watch::Sender<Outcome>)>,
@@ -843,7 +836,7 @@ impl<S: Store> Flight<S> {
                 tracing::warn!(%key, %status, "upstream could not give an object");
             }
             tx.send_replace(Some(outcome.map_err(Failed::from)));
-            lock(&self.tier.inner.flights).remove(&(self.repo.clone(), key));
+            lock(&self.tier.inner.flights).remove(&key);
         }
     }
 
@@ -879,9 +872,11 @@ impl<S: Store> Flight<S> {
             let refs = self.waiting.iter().map(|(key, _)| key.to_ref()).collect();
             // Upstream gets what is left of the deadline.
             let request = self.until.request(GetObjectsRequest {
-                repo: self.repo.clone(),
                 refs,
                 accept: vec![Encoding::Zstd.into()],
+                // SHORTCUT: empty until C6 sends the ticket that names
+                // this fetch.
+                ticket: Vec::new(),
             });
             let mut upstream = self.tier.inner.upstream.clone();
             let mut stream = self
@@ -988,7 +983,7 @@ impl<S: Store> Drop for Flight<S> {
     fn drop(&mut self) {
         let mut flights = lock(&self.tier.inner.flights);
         for (key, _) in &self.waiting {
-            flights.remove(&(self.repo.clone(), *key));
+            flights.remove(key);
         }
     }
 }
@@ -1056,6 +1051,9 @@ impl<S: Store> Objects for Tier<S> {
         };
         Ok(Response::new(GetRootTreeResponse {
             tree_id: tree.as_bytes().to_vec(),
+            // SHORTCUT: empty until C6 relays the ticket that the server
+            // minted for this root tree.
+            ticket: Vec::new(),
         }))
     }
 
@@ -1066,12 +1064,18 @@ impl<S: Store> Objects for Tier<S> {
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<ObjectStream>, Status> {
         let until = Until::of(&request);
-        let GetObjectsRequest { repo, refs, accept } = request.into_inner();
-        check_repo(&repo)?;
+        let GetObjectsRequest {
+            refs,
+            accept,
+            ticket,
+        } = request.into_inner();
         check::object_count(refs.len())?;
         let keys = refs.iter().map(Key::parse).collect::<Result<Vec<_>, _>>()?;
+        // SHORTCUT: the ticket is not checked until C6 caches tickets per
+        // root tree; the tier serves its local daemon, which holds a
+        // ticket of its own.
+        let _ = ticket;
         let ask = Ask {
-            repo,
             keys,
             zstd: accept.contains(&Encoding::Zstd.into()),
             until,
@@ -1250,7 +1254,6 @@ mod tests {
     /// What one reply asks for, RAW only.
     fn ask(keys: &[Key]) -> Ask {
         Ask {
-            repo: "r".into(),
             keys: keys.to_vec(),
             zstd: false,
             until: Until::NONE,
@@ -1365,9 +1368,9 @@ mod tests {
     async fn a_cold_call_fetches_in_batches_of_at_most_max_batch() {
         let (_, keys, fake, tier) = setup(300, 1 << 20).await;
         let request = GetObjectsRequest {
-            repo: "r".into(),
             refs: keys.iter().map(|key| key.to_ref()).collect(),
             accept: vec![Encoding::Zstd.into()],
+            ticket: Vec::new(),
         };
         let reply = tier.get_objects(Request::new(request)).await.unwrap();
         let mut stream = reply.into_inner();
