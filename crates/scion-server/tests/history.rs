@@ -1,6 +1,8 @@
 //! Path history (`Log` with a path) and blame, with their bounds.
 #![cfg(unix)]
 
+mod common;
+
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
@@ -83,6 +85,7 @@ fn commit(dir: &Path, message: &str, files: &[(&str, Option<&str>)]) -> String {
 }
 
 fn import(store: &Store, dir: &Path) -> ChangesetId {
+    common::spawn_guard::prime_gix_lookup();
     let opts = ImportOptions {
         rev: "HEAD".into(),
         target_ref: "main".into(),

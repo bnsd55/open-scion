@@ -135,9 +135,14 @@ async fn server(store: &Store, access: Access, token: &str) -> (Stop, Scion, Obj
         store.clone(),
         listener,
         access,
-        Limits::default(),
-        None,
-        Arc::new(Metrics::default()),
+        service::ServeOptions {
+            limits: Limits::default(),
+            quotas: scion_server::quotas::Quotas::off(),
+            pending_lands: None,
+            land_stale_secs: 1 << 40,
+            tls: None,
+            metrics: Arc::new(Metrics::default()),
+        },
         async {
             stopped.await.ok();
         },

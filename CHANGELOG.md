@@ -16,6 +16,19 @@ until that section gets its release date.
 
 #### Objects and byte format
 
+- Per-principal quotas (`#15`). With `--access`, `--max-principal-requests`
+  (64), `--max-principal-upload-bytes` (512 MiB) and
+  `--max-principal-pending-lands` (64) bound what one principal holds at
+  once; a call over a cap fails before any work with `RESOURCE_EXHAUSTED`,
+  naming the flag of the cap it hit. With `--token T`, one client is one
+  principal, so the caps are off unless a flag sets one. The pending-lands
+  count comes from the store, so it is right after a restart. A land that
+  stays `PENDING` for longer than `--land-stale-secs` (a day) is rejected by
+  a sweep at start and then once per hour: no caller can still be finishing
+  it, because a call runs at most 600 s, and the sweep holds the same
+  per-ref lock as the land path, so a live retry wins. A retry of a
+  rejected land needs a new request key.
+
 - `scion-core`: the object model (changesets, trees, blob IDs) and a frozen,
   canonical v1 byte format, with golden tests, property tests and a fuzz
   target. Blobs belong to repos (schema version 4, table `repo_blobs`): a
@@ -167,6 +180,12 @@ until that section gets its release date.
   `default`, which may read and write every repo.
 - Bearer-token auth, loopback-only listening by default, request limits
   and name validation at the RPC boundary.
+- The gRPC health service (`grpc.health.v1`) on the same port as the other
+  services, without a token, so a probe needs none: `scion-server` and
+  `scion-cache` (and `scion-daemon`, which shares the tier's server)
+  answer `Check` and `Watch` with `SERVING` once the store and the
+  upstream channel are open, and with `NOT_SERVING` while a shutdown
+  drains.
 - TLS and mTLS: the server and `scion-cache` serve TLS with `--tls-cert`
   and `--tls-key` (a non-loopback address then needs no
   `--insecure-listen`), and require a client certificate with

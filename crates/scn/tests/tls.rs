@@ -7,6 +7,7 @@ use std::process::Command;
 use scion_core::{Changeset, IdentityTime};
 use scion_proto::listen::Limits;
 use scion_server::{Store, db, service, tree};
+use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
@@ -125,8 +126,14 @@ async fn serve_tls(certs: &TestCerts) -> String {
         store,
         listener,
         TOKEN,
-        Limits::default(),
-        Some(tls),
+        service::ServeOptions {
+            limits: Limits::default(),
+            quotas: scion_server::quotas::Quotas::off(),
+            pending_lands: None,
+            land_stale_secs: 1 << 40,
+            tls: Some(tls),
+            metrics: Arc::default(),
+        },
         std::future::pending(),
     ));
     format!("https://{addr}")

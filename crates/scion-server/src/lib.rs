@@ -30,6 +30,7 @@ pub mod memory;
 pub mod metrics;
 pub mod names;
 pub mod objects;
+pub mod quotas;
 pub mod read;
 pub mod service;
 pub mod similar;

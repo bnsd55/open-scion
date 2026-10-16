@@ -541,6 +541,8 @@ impl Disk {
     /// what the next start walks, so its loss must be visible.
     fn set_flag_logged(&mut self, name: &str, value: bool) {
         if let Err(error) = self.set_flag(name, value) {
+            // No repo on this line: the store sits below the repos, and the
+            // call whose work failed logs the repo and the caller.
             tracing::warn!(
                 flag = name,
                 value,
@@ -945,6 +947,8 @@ fn walk_objects(db_path: &Path, objects: &Path, walk: &WalkState) {
     let db = match rusqlite::Connection::open(db_path) {
         Ok(db) => db,
         Err(error) => {
+            // No repo on this line: the store sits below the repos, and the
+            // call whose work failed logs the repo and the caller.
             tracing::warn!(%error, "the walk cannot open the index; the files stay uncounted");
             walk.done.store(true, Ordering::Relaxed);
             return;
@@ -1213,6 +1217,8 @@ impl DiskStore {
                 // A crash would look like a clean stop, so the walk owes
                 // what the rows may miss.
                 Err(error) => {
+                    // No repo on this line: the store sits below the repos, and the
+                    // call whose work failed logs the repo and the caller.
                     tracing::warn!(
                         %error,
                         "cannot mark the index unclean; the start walks the object directories"
@@ -1280,6 +1286,8 @@ impl DiskStore {
         match Self::try_open_disk(db_path) {
             Ok(opened) => Ok(opened),
             Err(error) => {
+                // No repo on this line: the store sits below the repos, and the
+                // call whose work failed logs the repo and the caller.
                 tracing::warn!(%error, "cannot use the index; starting a new one");
                 let name = db_path
                     .file_name()
@@ -1325,6 +1333,8 @@ impl DiskStore {
         match spawned {
             Ok(_) => *lock(&self.walk) = Some(state),
             Err(error) => {
+                // No repo on this line: the store sits below the repos, and the
+                // call whose work failed logs the repo and the caller.
                 tracing::warn!(
                     %error,
                     "cannot spawn the walk; files that a crash stranded stay uncounted"
@@ -1466,6 +1476,8 @@ impl DiskStore {
             // them.
             self.stray.store(true, Ordering::Relaxed);
             disk.set_flag_logged("walk_pending", true);
+            // No repo on this line: the store sits below the repos, and the
+            // call whose work failed logs the repo and the caller.
             tracing::warn!(
                 %error,
                 "cannot commit the index; a crash now loses what was used last"
@@ -1515,6 +1527,8 @@ impl Drop for DiskStore {
             .chain([&self.tmp])
             .try_for_each(|dir| fsync(dir));
         if let Err(e) = &synced {
+            // No repo on this line: the store sits below the repos, and the
+            // call whose work failed logs the repo and the caller.
             tracing::warn!(error = %e, "cannot sync the directories of dropped files");
         }
         let committed = disk.commit();

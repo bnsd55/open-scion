@@ -71,6 +71,7 @@ fn regular(content: BlobId) -> FileState {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn uploaded_file_reads_back_through_a_created_changeset() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
@@ -90,9 +91,14 @@ async fn uploaded_file_reads_back_through_a_created_changeset() {
         store,
         listener,
         TOKEN,
-        Limits::default(),
-        None,
-        Arc::new(Metrics::default()),
+        service::ServeOptions {
+            limits: Limits::default(),
+            quotas: scion_server::quotas::Quotas::off(),
+            pending_lands: None,
+            land_stale_secs: 1 << 40,
+            tls: None,
+            metrics: Arc::new(Metrics::default()),
+        },
         async {
             stopped.await.ok();
         },

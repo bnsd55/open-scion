@@ -90,6 +90,8 @@ impl From<Error> for Status {
             Error::Db(ref db)
                 if db.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) =>
             {
+                // No repo on this line: the database is shared by repos. The
+                // call whose work failed logs the repo and the caller.
                 tracing::warn!(error = %e, "the database stayed busy");
                 Status::unavailable("the database is busy; retry")
             }
