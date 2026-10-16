@@ -350,7 +350,14 @@ pub fn blame(
     let named: Vec<ChangesetId> = window_ranges.iter().filter_map(|r| r.changeset).collect();
     changesets.retain(|(id, _, _)| named.contains(id));
     let resume = next_resume(
-        resume, &lines, counted, window_end, next, &path, next_search, start,
+        resume,
+        &lines,
+        counted,
+        window_end,
+        next,
+        &path,
+        next_search,
+        start,
     )?;
     Ok(Blame {
         ranges: window_ranges,
@@ -1061,7 +1068,9 @@ pub fn decode_cursor(
             let at = RepoPath::new(r.bytes_field()?).map_err(|_| bad("bad path"))?;
             let known = store.read(|c| db::has_changeset(c, repo_id, id))?;
             if !known {
-                return Err(bad(&format!("it goes on at {id} which {repo} does not have")));
+                return Err(bad(&format!(
+                    "it goes on at {id} which {repo} does not have"
+                )));
             }
             Some((id, at))
         }
