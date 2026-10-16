@@ -22,7 +22,7 @@ use scion_core::{
 
 use crate::db;
 use crate::error::{Error, Result};
-use crate::memory::{Bytes, Held, BYTES_PER_LINE};
+use crate::memory::{BYTES_PER_LINE, Bytes, Held};
 use crate::read::{self, MAX_SCAN};
 use crate::similar::{self, Budget, Chunks, MAX_PAIRS, Progress};
 use crate::store::Store;
@@ -175,6 +175,7 @@ enum Older {
 /// if `from` is not where a rename search of `path` at `cs` can stop.
 /// [`Error::ResourceExhausted`] if the share of the file is more than the
 /// whole budget, or a take waited past `until`.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn blame(
     store: &Store,
     repo: &str,
@@ -189,10 +190,7 @@ pub fn blame(
     // cursor names, and the lines it still has open sit where the cursor
     // says. The lines outside the window are done: they hold a placeholder
     // changeset that no reply reports.
-    let (start, start_path) = resume
-        .next
-        .clone()
-        .unwrap_or((cs, path.clone()));
+    let (start, start_path) = resume.next.clone().unwrap_or((cs, path.clone()));
     let repo = store.read(|c| db::repo_id(c, repo))?;
     let root = tree::root_tree(store, repo, start)?;
     let mut blob = regular_blob(store, root, &start_path)?;
@@ -202,6 +200,7 @@ pub fn blame(
     let mut text_hold = memory.take(store.blobs().size(blob)?, until)?;
     let mut text = store.blobs().get(blob)?;
     let mut path = start_path;
+    let share = Share { memory, until };
     // The lines of the file that the request names. A walk that goes on
     // reads the version at `next`, which can be an older text of another
     // path, so its line count comes from the cursor.
@@ -219,65 +218,28 @@ pub fn blame(
             resume.after_line
         )));
     }
-    // The window this call answers: the lines from `after_line`, up to the
-    // window cap or the end of the file.
+    // The window this call answers, and where each of its lines stands: a
+    // fresh walk opens every line at its own place, a walk that goes on
+    // takes them from the cursor.
     let window_end = (resume.after_line + MAX_BLAME_WINDOW_LINES).min(counted);
-    let open = window_end - resume.after_line;
-    let here_lines = byte_lines(&text).count();
-    let mut lines: Vec<(Option<ChangesetId>, usize)> = Vec::with_capacity(counted);
-    match &resume.next {
-        // A fresh walk: every line of the window is open, at its own place.
-        None => {
-            if !resume.window.is_empty() {
-                return Err(Error::InvalidArgument(
-                    "the cursor holds lines for a walk that starts at the changeset".into(),
-                ));
-            }
-            lines.extend(std::iter::repeat_n((Some(OUTSIDE), 0), resume.after_line));
-            lines.extend((resume.after_line..window_end).map(|at| (None, at)));
-        }
-        // A walk that goes on: the window's lines are where the cursor
-        // says, in the version at `next`.
-        Some(_) => {
-            if resume.window.len() != open {
-                return Err(Error::InvalidArgument(format!(
-                    "the cursor holds {} lines of a window of {open}",
-                    resume.window.len()
-                )));
-            }
-            for line in &resume.window {
-                match line {
-                    Line::Named(id) => lines.push((Some(*id), 0)),
-                    Line::Unnamed(origin) => {
-                        if *origin >= here_lines {
-                            return Err(Error::InvalidArgument(format!(
-                                "the cursor's line {} is past the {here_lines} lines of the version at {start}",
-                                origin + 1
-                            )));
-                        }
-                        lines.push((None, *origin));
-                    }
-                }
-            }
-        }
-    }
-    lines.extend(std::iter::repeat_n(
-        (Some(OUTSIDE), 0),
-        counted - window_end,
-    ));
+    let mut lines = open_lines(
+        resume,
+        counted,
+        window_end,
+        byte_lines(&text).count(),
+        start,
+    )?;
     let mut changesets = Vec::new();
     let mut next = Some(start);
     let mut next_search = RenameSearch::default();
     let mut budget = MAX_SCAN;
     let mut diffed = 0;
     let mut from = resume.search.clone();
-    let done = |lines: &[(Option<ChangesetId>, usize)]| {
-        lines[resume.after_line..window_end]
+    for _ in 0..MAX_BLAME_VERSIONS {
+        if lines[resume.after_line..window_end]
             .iter()
             .all(|(source, _)| source.is_some())
-    };
-    for _ in 0..MAX_BLAME_VERSIONS {
-        if done(&lines) {
+        {
             break;
         }
         let Some((id, changeset)) =
@@ -320,7 +282,7 @@ pub fn blame(
                     cap: left,
                     progress: always,
                 };
-                older_version(store, root, &changeset, newer, budget, &search, memory, until)?
+                older_version(store, root, &changeset, newer, budget, &search, &share)?
             }
             None => Older::Found(None, RenameSearch::default()),
         };
@@ -342,11 +304,11 @@ pub fn blame(
             Some((older_path, older_blob, Some(older_text))) => {
                 let both = byte_lines(&older_text).count().max(counted);
                 let need = both.saturating_sub(counted) * BYTES_PER_LINE;
-                if need > memory.cap() {
+                if need > share.memory.cap() {
                     absent_read = older_text.len().div_ceil(64);
                     None
                 } else {
-                    diff_hold = Some(memory.take(need, until)?);
+                    diff_hold = Some(share.memory.take(need, share.until)?);
                     Some((older_path, older_blob, Some(older_text)))
                 }
             }
@@ -369,7 +331,11 @@ pub fn blame(
         drop(diff_hold);
         if let Some((older_path, older_blob, older_text)) = older {
             (path, blob) = (older_path, older_blob);
-            if let Some(HeldText { text: new_text, hold: mut new_hold }) = older_text {
+            if let Some(HeldText {
+                text: new_text,
+                hold: mut new_hold,
+            }) = older_text
+            {
                 // The older text is the text being explained now: its bytes
                 // replace the ones the last version held.
                 new_hold.keep(new_text.len());
@@ -383,11 +349,40 @@ pub fn blame(
     let window_ranges = ranges(&lines[resume.after_line..window_end], resume.after_line);
     let named: Vec<ChangesetId> = window_ranges.iter().filter_map(|r| r.changeset).collect();
     changesets.retain(|(id, _, _)| named.contains(id));
-    // More to blame: the rest of this window when the walk stopped at a
-    // bound, or the next window from a fresh walk when this one is done.
-    // The next call takes the window's lines from the cursor, so it does
-    // not diff what this call already did.
-    let resume = if done(&lines) {
+    let resume = next_resume(
+        resume, &lines, counted, window_end, next, &path, next_search, start,
+    )?;
+    Ok(Blame {
+        ranges: window_ranges,
+        changesets,
+        resume,
+    })
+}
+
+/// The walk's state for the next call: the rest of this window when the
+/// walk stopped at a bound, or the next window from a fresh walk when this
+/// one is done. The next call takes the window's lines from the cursor, so
+/// it does not diff what this call already did.
+///
+/// # Errors
+///
+/// [`Error::Corrupt`] if the walk ran out of history before it named every
+/// line of the file.
+#[allow(clippy::too_many_arguments)]
+fn next_resume(
+    resume: &Resume,
+    lines: &[(Option<ChangesetId>, usize)],
+    counted: usize,
+    window_end: usize,
+    next: Option<ChangesetId>,
+    path: &RepoPath,
+    next_search: RenameSearch,
+    start: ChangesetId,
+) -> Result<Option<Resume>> {
+    let window_is_done = lines[resume.after_line..window_end]
+        .iter()
+        .all(|(source, _)| source.is_some());
+    Ok(if window_is_done {
         (window_end < counted).then(|| Resume {
             next: None,
             search: RenameSearch::default(),
@@ -413,11 +408,6 @@ pub fn blame(
                 })
                 .collect(),
         })
-    };
-    Ok(Blame {
-        ranges: window_ranges,
-        changesets,
-        resume,
     })
 }
 
@@ -527,8 +517,7 @@ fn older_version(
     newer: Newer<'_>,
     budget: Budget<'_>,
     search: &RenameSearch,
-    memory: &Bytes,
-    until: Option<Instant>,
+    share: &Share<'_>,
 ) -> Result<Older> {
     let entry = store.read(|c| tree::lookup(c, root, newer.path))?;
     if *search != RenameSearch::default() && matches!(entry, Some(Entry::File(_))) {
@@ -543,13 +532,13 @@ fn older_version(
             Some((newer.path.clone(), content, None))
         }
         Some(Entry::File(FileState::Regular { content, .. })) => {
-            let text = read_version(store, content, memory, until)?;
+            let text = read_version(store, content, share.memory, share.until)?;
             text.map(|text| (newer.path.clone(), content, Some(text)))
         }
         // As in git, only a path with no file before can be a rename. A
         // symlink or submodule that becomes a regular file is not one.
         None | Some(Entry::Dir(_)) => {
-            return renamed_from(store, root, changeset, newer, budget, search, memory, until);
+            return renamed_from(store, root, changeset, newer, budget, search, share);
         }
         Some(Entry::File(_)) => None,
     };
@@ -584,8 +573,7 @@ fn renamed_from(
     newer: Newer<'_>,
     budget: Budget<'_>,
     search: &RenameSearch,
-    memory: &Bytes,
-    until: Option<Instant>,
+    share: &Share<'_>,
 ) -> Result<Older> {
     let Budget {
         cost,
@@ -623,13 +611,13 @@ fn renamed_from(
             if other_blob == newer.blob {
                 return Ok(Some(Chunks::of(newer.text)));
             }
-            if size > memory.cap() {
+            if size > share.memory.cap() {
                 return Ok(None);
             }
             // The bytes are taken only while the text is read: the chunks
             // hold the lines, and their cost counts against the diff-line
             // budget above.
-            let hold = memory.take(size, until)?;
+            let hold = share.memory.take(size, share.until)?;
             let text = store.blobs().get(other_blob)?;
             let chunks = Chunks::of(&text);
             drop(text);
@@ -677,7 +665,7 @@ fn renamed_from(
     }
     // The search kept only its chunks, so read it again to diff it. Its
     // bytes stay taken for the step that diffs it.
-    let text = read_version(store, other_blob, memory, until)?;
+    let text = read_version(store, other_blob, share.memory, share.until)?;
     Ok(Older::Found(
         text.map(|text| (other.clone(), other_blob, Some(text))),
         at,
@@ -790,6 +778,70 @@ fn line_u32(line: usize) -> u32 {
 
 // ---- the cursor ----
 //
+/// The memory a call may spend, and when it stops waiting for it.
+struct Share<'a> {
+    memory: &'a Bytes,
+    until: Option<Instant>,
+}
+
+/// The lines the walk starts with: a fresh walk opens every line of the
+/// window at its own place, a walk that goes on takes the window's lines
+/// from the cursor, with each open line's place in the version at `next`.
+/// Lines outside the window hold the placeholder: they are done.
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] if the cursor's lines do not fit the window,
+/// or name a place past the version at `next`.
+fn open_lines(
+    resume: &Resume,
+    counted: usize,
+    window_end: usize,
+    here_lines: usize,
+    start: ChangesetId,
+) -> Result<Vec<(Option<ChangesetId>, usize)>> {
+    let open = window_end - resume.after_line;
+    let mut lines: Vec<(Option<ChangesetId>, usize)> = Vec::with_capacity(counted);
+    if resume.next.is_none() {
+        // A fresh walk: every line of the window is open, at its own place.
+        if !resume.window.is_empty() {
+            return Err(Error::InvalidArgument(
+                "the cursor holds lines for a walk that starts at the changeset".into(),
+            ));
+        }
+        lines.extend(std::iter::repeat_n((Some(OUTSIDE), 0), resume.after_line));
+        lines.extend((resume.after_line..window_end).map(|at| (None, at)));
+    } else {
+        // A walk that goes on: the window's lines are where the cursor
+        // says, in the version at `next`.
+        if resume.window.len() != open {
+            return Err(Error::InvalidArgument(format!(
+                "the cursor holds {} lines of a window of {open}",
+                resume.window.len()
+            )));
+        }
+        for line in &resume.window {
+            match line {
+                Line::Named(id) => lines.push((Some(*id), 0)),
+                Line::Unnamed(origin) => {
+                    if *origin >= here_lines {
+                        return Err(Error::InvalidArgument(format!(
+                            "the cursor's line {} is past the {here_lines} lines of the version at {start}",
+                            origin + 1
+                        )));
+                    }
+                    lines.push((None, *origin));
+                }
+            }
+        }
+    }
+    lines.extend(std::iter::repeat_n(
+        (Some(OUTSIDE), 0),
+        counted - window_end,
+    ));
+    Ok(lines)
+}
+
 // The reply's cursor holds every field a resumed call needs: where the walk
 // goes on, where its rename search stopped, and the window's first line. It
 // is opaque to the client, which sends it back unchanged with the same
@@ -885,6 +937,11 @@ fn put_bytes(w: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// Encodes `resume` for a blame of the file at `path` in `cs` of `repo`.
+///
+/// # Panics
+///
+/// If the window names more than `u32::MAX` changesets or runs, which a
+/// window of [`MAX_BLAME_WINDOW_LINES`] lines cannot.
 #[must_use]
 pub fn encode_cursor(resume: &Resume, repo: &str, cs: ChangesetId, path: &RepoPath) -> Vec<u8> {
     let mut w = Vec::new();
@@ -898,9 +955,11 @@ pub fn encode_cursor(resume: &Resume, repo: &str, cs: ChangesetId, path: &RepoPa
             put_bytes(&mut w, at.as_bytes());
         }
     }
-    w.extend_from_slice(&u64::try_from(resume.search.searched)
-        .unwrap_or(u64::MAX)
-        .to_be_bytes());
+    w.extend_from_slice(
+        &u64::try_from(resume.search.searched)
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
     match &resume.search.best {
         None => w.push(0),
         Some(best) => {
@@ -909,7 +968,9 @@ pub fn encode_cursor(resume: &Resume, repo: &str, cs: ChangesetId, path: &RepoPa
         }
     }
     w.extend_from_slice(
-        &u64::try_from(resume.after_line).unwrap_or(u64::MAX).to_be_bytes(),
+        &u64::try_from(resume.after_line)
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
     );
     w.extend_from_slice(
         &u64::try_from(resume.counted)
@@ -943,10 +1004,7 @@ pub fn encode_cursor(resume: &Resume, repo: &str, cs: ChangesetId, path: &RepoPa
             Line::Unnamed(first) => {
                 body.push(0);
                 for at in *first..first + run.len as usize {
-                    put_varint(
-                        &mut body,
-                        u64::try_from(at).unwrap_or(u64::MAX),
-                    );
+                    put_varint(&mut body, u64::try_from(at).unwrap_or(u64::MAX));
                 }
             }
         }
@@ -1003,10 +1061,7 @@ pub fn decode_cursor(
             let at = RepoPath::new(r.bytes_field()?).map_err(|_| bad("bad path"))?;
             let known = store.read(|c| db::has_changeset(c, repo_id, id))?;
             if !known {
-                return Err(bad(&format!(
-                    "it goes on at {} which {repo} does not have",
-                    id
-                )));
+                return Err(bad(&format!("it goes on at {id} which {repo} does not have")));
             }
             Some((id, at))
         }
@@ -1046,10 +1101,7 @@ pub fn decode_cursor(
         let id = ChangesetId::from_bytes(r.array::<32>()?);
         let known = store.read(|c| db::has_changeset(c, repo_id, id))?;
         if !known {
-            return Err(bad(&format!(
-                "it names {} which {repo} does not have",
-                id
-            )));
+            return Err(bad(&format!("it names {id} which {repo} does not have")));
         }
         table.push(id);
     }
@@ -1061,25 +1113,25 @@ pub fn decode_cursor(
         if kind > 1 {
             return Err(bad("bad line kind"));
         }
-        total += len as usize;
+        let len = usize::try_from(len).map_err(|_| bad("a run is too long"))?;
+        total += len;
         if total > open {
             return Err(bad("the cursor's lines fill more than its window"));
         }
-        match kind {
-            0 => {
-                for _ in 0..len {
-                    let at = r.varint()? as usize;
-                    window.push(Line::Unnamed(at));
-                }
+        if kind == 0 {
+            for _ in 0..len {
+                let at = r.varint()?;
+                let at = usize::try_from(at).map_err(|_| bad("a line is too far"))?;
+                window.push(Line::Unnamed(at));
             }
-            _ => {
-                let at = r.varint()? as usize;
-                let Some(id) = table.get(at) else {
-                    return Err(bad("a run names a changeset past the table"));
-                };
-                let id = *id;
-                window.extend(std::iter::repeat_n(Line::Named(id), len as usize));
-            }
+        } else {
+            let at = r.varint()?;
+            let at = usize::try_from(at).map_err(|_| bad("a line is too far"))?;
+            let Some(id) = table.get(at) else {
+                return Err(bad("a run names a changeset past the table"));
+            };
+            let id = *id;
+            window.extend(std::iter::repeat_n(Line::Named(id), len));
         }
     }
     if total != open {

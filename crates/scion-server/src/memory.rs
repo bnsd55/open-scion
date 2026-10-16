@@ -26,6 +26,7 @@ pub const BYTES_PER_LINE: usize = 128;
 #[derive(Clone)]
 pub struct Bytes(Arc<Pool>);
 
+#[derive(Debug)]
 struct Pool {
     cap: usize,
     free: Mutex<usize>,
@@ -34,7 +35,10 @@ struct Pool {
 
 impl std::fmt::Debug for Bytes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Bytes").field("cap", &self.0.cap).finish()
+        f.debug_struct("Bytes")
+            .field("cap", &self.0.cap)
+            .field("free", &self.0.free)
+            .finish()
     }
 }
 
@@ -63,6 +67,10 @@ impl Bytes {
     ///
     /// [`Error::ResourceExhausted`] if `n` is more than the whole pool, or
     /// if `until` passes first; the error names the budget.
+    ///
+    /// # Panics
+    ///
+    /// If the budget lock is poisoned, which only a panic inside it causes.
     pub fn take(&self, n: usize, until: Option<Instant>) -> Result<Held> {
         if n > self.0.cap {
             return Err(Error::ResourceExhausted(format!(
@@ -126,10 +134,18 @@ impl Held {
 
     /// Keeps at most `n` of the held bytes and gives the rest back at once,
     /// without waiting.
+    ///
+    /// # Panics
+    ///
+    /// If the budget lock is poisoned, which only a panic inside it causes.
     pub fn keep(&mut self, n: usize) {
         if n < self.n {
             let rest = self.n - n;
-            let mut free = self.pool.free.lock().expect("the budget lock is not poisoned");
+            let mut free = self
+                .pool
+                .free
+                .lock()
+                .expect("the budget lock is not poisoned");
             *free += rest;
             self.pool.woke.notify_all();
             self.n = n;
@@ -139,13 +155,20 @@ impl Held {
 
 impl std::fmt::Debug for Held {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Held").field("n", &self.n).finish()
+        f.debug_struct("Held")
+            .field("n", &self.n)
+            .field("pool", &self.pool)
+            .finish()
     }
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
-        let mut free = self.pool.free.lock().expect("the budget lock is not poisoned");
+        let mut free = self
+            .pool
+            .free
+            .lock()
+            .expect("the budget lock is not poisoned");
         *free += self.n;
         self.pool.woke.notify_all();
     }

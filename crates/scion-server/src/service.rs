@@ -725,7 +725,11 @@ impl Scion for ScionService {
             .resume
             .map(|resume| blame::encode_cursor(&resume, &req.repo, id, &path))
             .unwrap_or_default();
-        Ok(Response::new(BlameResponse { ranges, changesets, next_cursor }))
+        Ok(Response::new(BlameResponse {
+            ranges,
+            changesets,
+            next_cursor,
+        }))
     }
 
     async fn merge_base(

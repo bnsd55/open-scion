@@ -94,22 +94,26 @@ until that section gets its release date.
   first-parent history. It follows renames as `git blame` does by
   default: a deleted file with the same content, else a similar one (50%
   or more). Each changeset in a reply names the path of the file there
-  (`BlameChangeset.path`), and a reply that stopped says where to continue
-  (`next_path`). `scn blame` shows each line's path when some line came
-  from another path, as git does, and `--json` adds `path` to each range.
-  A client that ignores `next_path` continues at the wrong path after a
-  rename.
-- `Blame` reads files of up to 16 MiB and 1,048,576 lines, and blames a
-  binary file line by line, as `git blame` does. Every byte read counts
-  against the per-call budget, once per 64 bytes.
-- A `Blame` rename search looks at every file that the changeset deletes,
-  as `git blame` does. It uses the budget that the call has left. Where
-  the budget runs out, the reply says where the search stopped
-  (`next_rename_searched`, `next_rename_best`), and the next call goes on
-  from there with `rename_searched` and `rename_best`, which the client
-  must send back unchanged. When the search has looked at every deleted
-  file, the reply says that too, and the next call takes the best file as
-  the answer at once. `scn blame` does this.
+  (`BlameChangeset.path`). `scn blame` shows each line's path when some
+  line came from another path, as git does, and `--json` adds `path` to
+  each range.
+- `Blame` blames a binary file line by line, as `git blame` does, and
+  files of any size the shared memory budget holds: all `Blame` calls of a
+  server share 1 GiB, and a call takes the bytes of every version it reads
+  and 128 bytes per line of the file it blames. An older version that does
+  not fit counts as absent, so its lines go to the changeset that replaced
+  it. A call answers at most 1,048,576 lines of the file; a bigger one is
+  blamed over several calls.
+- A `Blame` reply that stopped at a bound carries an opaque cursor
+  (`next_cursor`): where the walk goes on, where its rename search
+  stopped, and which lines of the file the reply answered. The client MUST
+  send it back unchanged, with the same repo, changeset and path; the
+  server binds it to all three, checks every changeset it names, and
+  refuses anything else with `INVALID_ARGUMENT`. Each new window re-walks
+  the history from the requested changeset and diffs only the versions of
+  its own window. When the search has looked at every deleted file, the
+  reply says that too, and the next call takes the best file as the answer
+  at once. `scn blame` does all of this.
 - The query API: `MergeBase` (every best common ancestor, as
   `git merge-base --all`), `IsAncestor` (exit 0 or 1), and `Diff` (the
   paths whose file differs between two changesets, optionally below a

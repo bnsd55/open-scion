@@ -516,15 +516,13 @@ file has no lines and gets no ranges.
   author, and `path`, the path of the file at that changeset, where
   `origin_line` counts. The path differs from the requested path when the
   walk followed a rename.
-- `next_changeset_id` is set when the call stopped at a bound before every
-  line had a changeset. `next_path` is then the path of the file there. The
-  ranges with an empty `changeset_id` came from that changeset or an older
-  one, and their `origin_line` is their line in the file at
-  `next_changeset_id` and `next_path`. To continue, a client blames
-  `next_path` at `next_changeset_id` and maps those lines through
-  `origin_line`.
-- An empty `path` or `next_path` comes from a server that does not follow
-  renames: it means the requested path.
+- `next_cursor` is set when the call stopped at a bound before every line
+  had a changeset. It is opaque: the client sends it back unchanged, as
+  `cursor`, with the same repo, changeset and path, and the reply continues
+  the blame. The ranges of a reply cover the window that call answered,
+  once each. An empty `next_cursor` ends the blame. The server refuses,
+  with `INVALID_ARGUMENT`, a cursor that was not made for the repo,
+  changeset and path of the request.
 
 **Bounds per call.** At most 1,000 changesets checked, 100 versions diffed,
 and about 1M lines diffed (both sides of each diff; a line counts once per
@@ -537,22 +535,16 @@ those of `Diff` (section 6.13) for one added file, with git's limit of
 it must.
 
 **A rename search over calls.** A rename search uses the budget that the
-call has left. Where the budget runs out inside it, the call stops:
-`next_changeset_id` is the changeset that adds the file, `next_path` is its
-path, and `next_rename_searched` and `next_rename_best` say where the search
-stopped. `next_rename_searched` counts the deleted files looked at, in path
-order (only paths that held a file count). `next_rename_best` is the most
-similar of those so far, or empty. The client MUST send both back unchanged
-as `rename_searched` and `rename_best` with that `next_changeset_id` and
-`next_path`, and MUST send 0 and empty with any other place. The next call
-reads the best file again and goes on from where the search stopped, so it
-finds the file that one search with no budget finds. A call whose first step
-is a rename search looks at one more deleted file even past the budget, so
-the search always moves. When a search ends but the diff after it does not
-fit, the reply names the end of the search: `next_rename_searched` is the
-number of deleted files, and `next_rename_best` the file found, if any. The
-next call then uses that file and does not search again. A reply sets both
-fields only with `next_changeset_id`.
+call has left. Where the budget runs out inside it, the call stops: the
+cursor says where the walk goes on, and where the search stopped (how many
+deleted files it looked at, and the most similar so far). The client MUST
+send the cursor back unchanged. The next call reads the best file again and
+goes on from where the search stopped, so it finds the file that one search
+with no budget finds. A call whose first step is a rename search looks at
+one more deleted file even past the budget, so the search always moves.
+When a search ends but the diff after it does not fit, the cursor carries
+the end of the search, and the next call uses that file and does not search
+again.
 
 **Rules.** The server walks first parents to each changeset that changed the
 file, and diffs that version with the older version. The older version is
@@ -564,17 +556,26 @@ it. The other lines are traced further back, at the older path. The diff is
 Myers with an indent heuristic. Where several minimal diffs exist, which one
 the server picks is not part of v1, and neither is which deleted file it
 picks as the source. A binary file is diffed line by line, as `git blame`
-does. An older version that is absent, not a regular file, larger than
-16 MiB or longer than 1,048,576 lines counts as absent: the changeset that
+does. An older version that is absent, not a regular file, or whose bytes
+do not fit the shared memory budget counts as absent: the changeset that
 replaced it gets its lines.
 
-A client that ignores `next_path` continues at the requested path after a
-rename. Its next call then fails with `NOT_FOUND`, or blames another file.
+**Memory.** All `Blame` calls of a server share a budget of 1 GiB. A call
+takes from it the bytes of every version it reads and 128 bytes per line of
+the file it blames, from its first step to its last, and a cursor's bytes
+and state while the call runs. A take that would pass the budget waits for
+another call to free bytes, until the call's deadline, then fails with
+`RESOURCE_EXHAUSTED`. A window holds at most 1,048,576 lines: a file with
+more is blamed over several calls, one window each, and each new window
+re-walks the history from the requested changeset (the cursor carries the
+lines' state, so a call diffs only the versions of its own window). A file
+whose share is more than the whole budget is refused at once.
 
 | Error | When |
 |---|---|
-| `INVALID_ARGUMENT` | A bad repo name or ID; a bad or empty path; the file is not a regular file, is larger than 16 MiB, or has more than 1,048,576 lines; `rename_searched` and `rename_best` are not a place where a rename search of that path at that changeset can stop. |
+| `INVALID_ARGUMENT` | A bad repo name or ID; a bad or empty path; the file is not a regular file; a cursor that was not made for the repo, changeset and path of the request, is damaged, or names a changeset the repo does not have, or lines that do not fit its window. |
 | `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
+| `RESOURCE_EXHAUSTED` | The call's share does not fit the memory budget, or a wait for bytes ran past the deadline. |
 
 ### 6.11 MergeBase
 

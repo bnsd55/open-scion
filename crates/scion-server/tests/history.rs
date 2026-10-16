@@ -9,12 +9,12 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
-use scion_server::memory::Bytes;
 use scion_server::blame::{
     self, Blame, BlameRange, Line, MAX_BLAME_DIFF_LINES, MAX_BLAME_VERSIONS, RenameSearch, Resume,
 };
 use scion_server::deadline::Deadline;
 use scion_server::import::{ImportOptions, import_git};
+use scion_server::memory::Bytes;
 use scion_server::read::{self, MAX_SCAN};
 use scion_server::{Error, Store, db, tree};
 use tempfile::TempDir;
@@ -259,8 +259,8 @@ fn blame(store: &Store, cs: ChangesetId, p: &str) -> Blame {
 
 /// A resume that goes on with `next` and the search, at line 0.
 /// Whether a reply's resume goes on at `cs` and `p`.
-fn goes_on(resume: &Option<Resume>, cs: ChangesetId, p: &str) -> bool {
-    resume.as_ref().and_then(|r| r.next.as_ref()) == Some(&(cs, path(p)))
+fn goes_on(resume: Option<&Resume>, cs: ChangesetId, p: &str) -> bool {
+    resume.and_then(|r| r.next.as_ref()) == Some(&(cs, path(p)))
 }
 
 /// Blames with a pool of `cap` bytes.
@@ -297,7 +297,7 @@ fn a_path_log_reads_past_max_scan_changesets_and_blame_resumes() {
 
     let first = blame(&store, tip, "f");
     assert_eq!(first.ranges, [range(1, 2, None, 1)]);
-    assert!(goes_on(&first.resume, root, "f"));
+    assert!(goes_on(first.resume.as_ref(), root, "f"));
     let rest = blame(&store, root, "f");
     assert_eq!(rest.ranges, [range(1, 2, Some(root), 1)]);
     assert_eq!(rest.resume, None);
@@ -327,7 +327,7 @@ fn blame_stops_after_max_versions_and_resumes() {
         .collect();
     expected.push(range(len, 1, None, 1));
     assert_eq!(first.ranges, expected);
-    assert!(goes_on(&first.resume, ids[0], "f"));
+    assert!(goes_on(first.resume.as_ref(), ids[0], "f"));
     assert_eq!(first.changesets.len(), MAX_BLAME_VERSIONS);
 
     let rest = blame(&store, ids[0], "f");
@@ -437,12 +437,15 @@ fn blame_refuses_what_it_cannot_diff() {
 #[test]
 fn blame_refuses_a_file_whose_share_is_past_the_whole_budget() {
     let (_data, store) = open_store();
-    let f = store.blobs().put(&vec![b'x'; 100]).unwrap();
+    let f = store.blobs().put(&[b'x'; 100]).unwrap();
     let ids = chain(&store, vec![vec![("f", regular(f))]]);
     // The text alone is 100 bytes; with its rows and a diff's state it is
     // about 12,800. A pool of 64 bytes cannot hold it.
     let result = blame_bounded(&store, ids[0], "f", 64);
-    assert!(matches!(result, Err(Error::ResourceExhausted(_))), "{result:?}");
+    assert!(
+        matches!(result, Err(Error::ResourceExhausted(_))),
+        "{result:?}"
+    );
 }
 
 /// Blames `p` at `cs` to the end, and continues where a call stops, as a
@@ -466,8 +469,16 @@ fn blame_calls(
     let mut calls = 0;
     loop {
         calls += 1;
-        let result =
-            blame::blame(store, REPO, cs, &path(p), &resume, &Bytes::new(1 << 30), None).unwrap();
+        let result = blame::blame(
+            store,
+            REPO,
+            cs,
+            &path(p),
+            &resume,
+            &Bytes::new(1 << 30),
+            None,
+        )
+        .unwrap();
         paths.extend(result.changesets.into_iter().map(|(id, _, p)| (id, p)));
         // Each reply covers a window of the file: its first range names
         // the window's first line.
@@ -500,9 +511,12 @@ fn blame_calls(
                 // server reads it back the way a resumed call does.
                 eprintln!(
                     "DEBUG resume: after_line={} counted={} window={} next_path={:?} searched={} best={:?} first_lines={:?}",
-                    next.after_line, next.counted, next.window.len(),
+                    next.after_line,
+                    next.counted,
+                    next.window.len(),
                     next.next.as_ref().map(|(_, p)| p.as_bytes()),
-                    next.search.searched, next.search.best,
+                    next.search.searched,
+                    next.search.best,
                     &next.window[..next.window.len().min(6)]
                 );
                 let bytes = blame::encode_cursor(&next, REPO, cs, &path(p));
@@ -952,7 +966,7 @@ fn a_long_line_costs_once_per_64_bytes() {
     // The walk stopped at `ids[1]` after one diff; the reply carries the
     // lines it named and where the rest sit.
     let resume = blame(&store, ids[3], "f").resume.expect("the call stopped");
-    assert!(goes_on(&Some(resume.clone()), ids[1], "f"));
+    assert!(goes_on(Some(&resume), ids[1], "f"));
     assert_eq!(resume.counted, 2_003);
     assert_eq!(resume.window.len(), 2_003);
     assert_eq!(resume.window[0], Line::Named(ids[3]));
@@ -1001,7 +1015,7 @@ fn a_rename_search_goes_on_where_a_call_stopped() {
         .unwrap();
         assert_eq!(result.ranges, [range(1, n, None, 1)]);
         let next = result.resume.expect("the search stopped");
-        assert!(goes_on(&Some(next.clone()), ids[1], "new"));
+        assert!(goes_on(Some(&next), ids[1], "new"));
         let expected = RenameSearch {
             searched,
             best: Some(path("old/1")),
@@ -1097,7 +1111,6 @@ fn a_rename_search_moves_on_every_call() {
     ];
     let ids = chain(&store, vec![root, rename]);
     let mut resume = Resume::default();
-    let mut search = RenameSearch::default();
     for (searched, best) in [(1, None), (2, Some("old/1"))] {
         let result = blame::blame(
             &store,
@@ -1109,12 +1122,12 @@ fn a_rename_search_moves_on_every_call() {
             None,
         )
         .unwrap();
-        search = RenameSearch {
+        let search = RenameSearch {
             searched,
             best: best.map(path),
         };
         let next = result.resume.expect("the search stopped");
-        assert!(goes_on(&Some(next.clone()), ids[1], "new"));
+        assert!(goes_on(Some(&next), ids[1], "new"));
         assert_eq!(next.search, search);
         resume = next;
     }
@@ -1169,7 +1182,7 @@ fn a_rename_search_at_a_later_step_uses_the_budget_left() {
         let ids = chain(&store, vec![root, rename, edit]);
         let first = blame(&store, ids[2], "new");
         let next = first.resume.expect("the search stopped");
-        assert!(goes_on(&Some(next.clone()), ids[1], "new"), "{decoys}");
+        assert!(goes_on(Some(&next), ids[1], "new"), "{decoys}");
         assert_eq!(next.search, stopped, "{decoys}");
         let (got, calls) = blame_calls(&store, ids[2], "new");
         let mut expected = vec![(ids[1], 1, path("new"))];
@@ -1357,7 +1370,7 @@ fn blame_stops_when_its_diff_budget_runs_out() {
         first.ranges,
         [range(1, 1, Some(ids[2]), 1), range(2, n + 1, None, 1)]
     );
-    assert!(goes_on(&first.resume, ids[1], "f"));
+    assert!(goes_on(first.resume.as_ref(), ids[1], "f"));
     let rest = blame(&store, ids[1], "f");
     assert_eq!(
         rest.ranges,
@@ -1495,7 +1508,7 @@ fn a_cursor_with_past_bounds_is_refused_before_it_allocates() {
     assert_eq!(good[good.len() - 6], 0, "no table");
 
     // A run count of u32::MAX: refused, and it does not allocate for it.
-    let mut made = good[..head - 0].to_vec();
+    let mut made = good[..head].to_vec();
     made.truncate(good.len() - 6);
     made.extend_from_slice(&u32::MAX.to_be_bytes());
     let err = blame::decode_cursor(
@@ -1537,7 +1550,7 @@ fn the_worst_cursor_stays_small() {
         .map(|i| {
             if i % 2 == 0 {
                 let mut id = [0u8; 32];
-                id[0] = (i % versions) as u8;
+                id[0] = u8::try_from(i % versions).unwrap_or(u8::MAX);
                 id[1] = 0x42;
                 Line::Named(ChangesetId::from_bytes(id))
             } else {

@@ -47,10 +47,7 @@ pub async fn blame(ctx: &mut Ctx, spec: &str) -> Result<()> {
                 unix_secs: c.author_unix_secs,
                 tz_offset_minutes: c.author_tz_offset_minutes,
             };
-            sources.insert(
-                id_from::<ChangesetId>(&c.changeset_id)?,
-                (author, c.path),
-            );
+            sources.insert(id_from::<ChangesetId>(&c.changeset_id)?, (author, c.path));
         }
         // The source of each line of the window the reply covers. The
         // ranges cover it in order, so the first range names its first

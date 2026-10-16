@@ -243,10 +243,10 @@ message BlameRange {
   uint32 start_line = 1;
   uint32 line_count = 2;
   // The changeset that last changed these lines. Empty when the call
-  // stopped first: see BlameResponse.next_changeset_id.
+  // stopped before it named them: the cursor says where it went on.
   bytes changeset_id = 3;
   // The first line, counting from 1, in the file at changeset_id (at its
-  // BlameChangeset.path), or at next_changeset_id (at next_path) when
+  // BlameChangeset.path), or in the version the walk stopped at when
   // changeset_id is empty.
   uint32 origin_line = 4;
 }
