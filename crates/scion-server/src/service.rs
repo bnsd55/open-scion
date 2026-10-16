@@ -88,7 +88,7 @@ pub async fn serve(
     listener: TcpListener,
     token: &str,
     limits: Limits,
-    tls: Option<&ServerTls>,
+    tls: Option<ServerTls>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
     let auth = Auth::new(token);
@@ -109,7 +109,11 @@ pub async fn serve(
             limits
                 .serve(
                     router,
-                    listen::tls(listen::tcp(listener), tls.config(), listen::TLS_HANDSHAKE_TIMEOUT),
+                    listen::tls(
+                        listen::tcp(listener),
+                        tls.config(),
+                        listen::TLS_HANDSHAKE_TIMEOUT,
+                    ),
                     shutdown,
                 )
                 .await

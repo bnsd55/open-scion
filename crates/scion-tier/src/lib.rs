@@ -465,7 +465,7 @@ impl<S: Store> Tier<S> {
         token: &str,
         incoming: I,
         limits: Limits,
-        tls: Option<&ServerTls>,
+        tls: Option<ServerTls>,
         shutdown: impl Future<Output = ()>,
     ) -> Result<(), tonic::transport::Error>
     where

@@ -4,6 +4,7 @@ mod client;
 mod cmd;
 mod materialize;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -26,6 +27,9 @@ struct Cli {
     /// Bearer token for the server.
     #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
     token: String,
+    /// Trust this CA (PEM) for an https server.
+    #[arg(long, env = "SCION_TLS_CA", global = true, value_name = "FILE")]
+    tls_ca: Option<PathBuf>,
     /// Repository name.
     #[arg(long, env = "SCION_REPO", default_value = "main", global = true)]
     repo: String,
@@ -127,7 +131,14 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
-    let mut ctx = Ctx::connect(&cli.server, &cli.token, cli.repo, cli.json).await?;
+    let mut ctx = Ctx::connect(
+        &cli.server,
+        &cli.token,
+        cli.tls_ca.as_deref(),
+        cli.repo,
+        cli.json,
+    )
+    .await?;
     let done = match cli.command {
         Command::Cat { spec } => cmd::read::cat(&mut ctx, &spec).await,
         Command::Ls { spec } => cmd::read::ls(&mut ctx, &spec).await,

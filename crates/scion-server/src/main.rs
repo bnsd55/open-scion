@@ -150,8 +150,11 @@ async fn main() -> anyhow::Result<()> {
             max_streams,
         } => {
             anyhow::ensure!(!token.is_empty(), "--token must not be empty");
-            let server_tls =
-                server_tls(tls_cert.as_deref(), tls_key.as_deref(), tls_client_ca.as_deref())?;
+            let server_tls = server_tls(
+                tls_cert.as_deref(),
+                tls_key.as_deref(),
+                tls_client_ca.as_deref(),
+            )?;
             anyhow::ensure!(
                 listen.ip().is_loopback() || insecure_listen || server_tls.is_some(),
                 "{listen} is not a loopback address; without TLS the traffic and the \
@@ -171,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
                 listener,
                 &token,
                 limits,
-                server_tls.as_ref(),
+                server_tls,
                 async {
                     tokio::signal::ctrl_c().await.ok();
                 },

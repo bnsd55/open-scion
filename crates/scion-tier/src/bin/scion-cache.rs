@@ -107,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
         &cli.token,
         listen::tcp(listener),
         limits,
-        server_tls.as_ref(),
+        server_tls,
         async {
             tokio::signal::ctrl_c().await.ok();
         },
