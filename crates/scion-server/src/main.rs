@@ -340,7 +340,7 @@ async fn serve(
     // The bound address, so port 0 shows the port that the OS chose.
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "serving");
-        
+
     Box::pin(service::serve(
         store,
         listener,

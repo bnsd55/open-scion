@@ -216,6 +216,9 @@ const WAITS: Waits = Waits {
 /// object. That comes before the caller's deadline, so the caller gets this
 /// status, not a timeout of its own. `stalled` is the handle of the
 /// connection, which counts what a stalled reply leaves in HTTP/2.
+// SHORTCUT: eight knobs in one call. Upgrade: a reply-options struct if a
+// ninth appears.
+#[allow(clippy::too_many_arguments)]
 async fn start_reply(
     worker: Worker,
     keys: Vec<Key>,
