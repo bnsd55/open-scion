@@ -35,8 +35,11 @@ release.
 - `scion-server import` can run while the server runs on the same data
   directory. It moves the ref by compare-and-swap, as a land does, and its
   commits are durable before the server can see them. A second server, or
-  a process of another build, is refused. A request that waits for the
-  import's write lock for more than 5 s fails with `UNAVAILABLE`.
+  a process of another build, is refused. Its write transactions end after
+  1 s, so a server write waits for at most that plus one commit instead of
+  a whole batch, and a request that waits more than 5 s fails with
+  `UNAVAILABLE`. The temp files of a crashed import are removed by the
+  next open of the directory, while the server keeps running.
 - Server-side commits (`CreateChangeset`) and lands: path-level conflict
   checks through a per-ref index, one transaction per land, retries by
   request key, and bounded retry when the ref moves.
@@ -128,6 +131,11 @@ release.
   tier answers the `Objects` calls, checks every object from upstream
   against its ID before it stores or sends it, forwards `ResolveRef`, keeps
   `GetRootTree` answers, fetches a shared miss once, and needs a token.
+  A `scion-cache --snapshot DIR --snapshot-repo R` writes `DIR/R.scnsnap`
+  every `--snapshot-every` seconds: the most recently used objects of that
+  repo, up to `--snapshot-bytes`. A cold `scion-daemon --seed FILE` imports
+  them before it serves, each checked against its ID; a warm one ignores
+  the file (#59).
 - `scn` reaches a daemon with `--server unix:///PATH`. It first refuses a
   path that is not a socket owned by its user or by root. `scn` and the
   daemon also refuse a socket or data directory under a directory that
