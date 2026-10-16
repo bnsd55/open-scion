@@ -600,11 +600,12 @@ file. A symlink or a gitlink is a rename only with the same content.
 **Rename bounds.** The server finds renames only in a diff of at most 10,000
 entries below `path`; a larger diff has none. As in git, step 3 runs only
 when the added files left times the deleted files left are at most
-1,000,000. Step 3 also has a budget per call: about 4M, where each chunk of
-a file read and each row of a chunk table compared count one (64 MiB of text
-in lines of 64 bytes costs 1M). Past it, the server reads no more files. The
-budget is the same on every call, so every reply gives the same renames. The
-search never ends a page early.
+1,000,000. Steps 2 and 3 share a budget per call: about 4M, where each chunk
+of a file read and each row of a chunk table indexed or compared count one
+(64 MiB of text in lines of 64 bytes costs 1M). Past it, the server reads no
+more files, so it misses the renames that step 2 or step 3 would find after
+that point. The budget is the same on every call, so every reply gives the
+same renames. The search never ends a page early.
 
 | Error | When |
 |---|---|

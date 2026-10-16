@@ -844,10 +844,13 @@ and their bounds, are this project's choices.
   most 1,000,000, git's default limit. It reads the added files that some
   deleted file could be like into one index by chunk hash, then reads each
   deleted file and looks up its chunks there, so it never compares two
-  files row by row. It reads each file in parts of 1 MiB, so it holds the
-  chunk tables but never a whole file. Its budget, about 4M chunks read and table rows
-  compared (`MAX_RENAME_CHUNKS`), is the same on every call, so every call
-  finds the same renames; past it, the search reads no more files
+  files row by row. Added files with the same blob share one place in the
+  index, so a blob added at many paths is read and indexed once. It reads
+  each file in parts of 1 MiB, so it holds the chunk tables but never a
+  whole file. Steps 2 and 3 share one budget, about 4M chunks read and
+  table rows indexed or compared (`MAX_RENAME_CHUNKS`). It is the same on
+  every call, so every call finds the same renames; past it, the search
+  reads no more files, and misses renames, of the same name too
   ([#107](https://github.com/bnsd55/open-scion/issues/107)). So one call
   reads at most about 256 MiB of text in lines of 64 bytes or more, plus
   one file past the budget. Reading a file costs far more than looking up
