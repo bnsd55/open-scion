@@ -82,6 +82,7 @@ pub async fn diff(ctx: &mut Ctx, old: &str, new: &str, path: Option<&RepoPath>) 
     let mut deletes = HashMap::new();
     let mut adds = Vec::new();
     let mut after = Vec::new();
+    let mut renames_incomplete = false;
     loop {
         let reply = ctx
             .client
@@ -130,6 +131,7 @@ pub async fn diff(ctx: &mut Ctx, old: &str, new: &str, path: Option<&RepoPath>) 
         }
         out.flush()?;
         drop(out);
+        renames_incomplete |= reply.renames_incomplete;
         if reply.next_after.is_empty() {
             break;
         }
@@ -137,6 +139,10 @@ pub async fn diff(ctx: &mut Ctx, old: &str, new: &str, path: Option<&RepoPath>) 
             bail!("server sent the same place to continue");
         }
         after = reply.next_after;
+    }
+    if renames_incomplete {
+        // As git warns when it skips or stops its inexact rename search.
+        eprintln!("warning: inexact rename detection was skipped or stopped by its bound");
     }
     let mut olds = match_renames(deletes, adds)?;
     if ctx.json {
