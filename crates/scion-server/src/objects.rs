@@ -22,6 +22,7 @@ use scion_proto::v1::{
 use scion_proto::{Bytes, CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_PART_MESSAGE_BYTES};
 use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
+use tracing::Instrument as _;
 
 use crate::access::Access;
 use crate::error::{Error, Result};
@@ -238,22 +239,26 @@ async fn start_reply(
         .await
         .ok_or_else(reply::busy)?;
     let (tx, stream) = reply::channel();
-    tokio::spawn(async move {
-        // Held to the end of this task, so past the end of the stream.
-        let (worker, in_flight) = (&worker, &in_flight);
-        let _keep = call;
-        let produce = |key| {
-            find(
-                worker,
-                in_flight,
-                waits.until.wait(waits.busy),
-                read,
-                zstd,
-                key,
-            )
-        };
-        reply::send_objects(first, rest, tx, waits.stall, stalled, produce).await;
-    });
+    tokio::spawn(
+        async move {
+            // Held to the end of this task, so past the end of the stream.
+            let (worker, in_flight) = (&worker, &in_flight);
+            let _keep = call;
+            let produce = |key| {
+                find(
+                    worker,
+                    in_flight,
+                    waits.until.wait(waits.busy),
+                    read,
+                    zstd,
+                    key,
+                )
+            };
+            reply::send_objects(first, rest, tx, waits.stall, stalled, produce).await;
+        }
+        // The reply runs outside the call, but stays in its span.
+        .instrument(tracing::Span::current()),
+    );
     Ok(stream)
 }
 

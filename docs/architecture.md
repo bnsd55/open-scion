@@ -77,6 +77,18 @@ How one request flows through the server:
    sees `CANCELLED` or `DEADLINE_EXCEEDED`.
 4. `error.rs` maps errors to gRPC codes. Database, I/O, git and corruption
    errors reply `INTERNAL`. The detail goes only to the server log.
+5. Each call runs in one tracing span that the server opens: the RPC and
+   the peer at the start, and the principal and the repo once the call
+   knows them (`caller()` records the principal, the access checks record
+   the repo). The refusals log one `WARN` line at the decision: a wrong
+   token, a repo that the caller may not read (the reply still says that
+   it does not exist), or a path or repo that it may not change. A
+   malformed request or a missing object logs nothing at `WARN`. A failure
+   keeps its detail in the log, inside the span, so that line carries the
+   RPC, the principal and the repo too. A reply that runs past its call
+   takes the span with it. A line never carries the token, not even its
+   digest. The store and its index sit below the repos, so their lines
+   name no repo.
 
 ## 2. Object model
 
