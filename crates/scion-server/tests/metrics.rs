@@ -296,9 +296,10 @@ async fn lands_count_their_outcomes() {
 async fn a_read_file_counts_its_bytes_and_a_stopped_call_counts_as_cancelled() {
     let (_dir, _stop, store, metrics, mut client, root, _addr) = setup().await;
 
-    // A file of several parts: the reply streams, so a client that stops
-    // after the first part drops the reply before its trailers.
-    let data: Vec<u8> = (0..251_u8).cycle().take(CHUNK_BYTES * 5 / 2).collect();
+    // A file far larger than the HTTP/2 flow-control windows and the
+    // buffers between the server's reply and the client: the server cannot
+    // finish it before the client stops, whatever the transport buffers.
+    let data: Vec<u8> = (0..251_u8).cycle().take(CHUNK_BYTES * 64).collect();
     let big = on_top(&store, root, "big.bin", &data);
 
     // Read it, and take only its first part.
