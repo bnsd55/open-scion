@@ -88,6 +88,11 @@ struct Cli {
     /// connection over it is closed with them.
     #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
     max_stalled_bytes: NonZeroU64,
+    /// Serve Prometheus metrics over plain HTTP on this address. Off by
+    /// default. Follows the listen rule: a non-loopback address needs
+    /// `--insecure-listen`, because the metrics travel unencrypted.
+    #[arg(long, value_name = "ADDR")]
+    metrics_listen: Option<SocketAddr>,
 }
 
 #[tokio::main]
@@ -139,6 +144,20 @@ async fn main() -> anyhow::Result<()> {
             cli.snapshot_bytes,
             every,
         ));
+    }
+    if let Some(metrics_listen) = cli.metrics_listen {
+        let address = metrics_listen.to_string();
+        anyhow::ensure!(
+            metrics_listen.ip().is_loopback() || cli.insecure_listen,
+            "{address} is not a loopback address; the metrics travel unencrypted over \
+             plain HTTP. Pass --insecure-listen to allow it."
+        );
+        let metrics_listener = tokio::net::TcpListener::bind(metrics_listen)
+            .await
+            .with_context(|| format!("cannot listen on {address}"))?;
+        let metrics_addr = metrics_listener.local_addr()?;
+        tracing::info!(listen = %metrics_addr, "serving metrics");
+        tokio::spawn(metrics(tier.clone(), metrics_listener));
     }
     let listener = tokio::net::TcpListener::bind(cli.listen)
         .await
@@ -201,5 +220,33 @@ async fn snapshots(
                 Err(e) => tracing::warn!(%repo, error = %e, "cannot write a snapshot"),
             }
         }
+    }
+}
+
+/// Serves the cache's hits and misses as Prometheus text on `listener`, one
+/// scrape at a time, until the process ends. The metrics are plain HTTP with
+/// no token: bind them to a loopback address unless `--insecure-listen`.
+async fn metrics(tier: Tier<MemoryStore>, listener: tokio::net::TcpListener) {
+    use tokio::io::AsyncWriteExt as _;
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            continue;
+        };
+        let (hits, misses) = tier.cache_hits_and_misses();
+        let text = format!(
+            "# HELP scion_cache_hits_total Objects served from the store.\n\
+             # TYPE scion_cache_hits_total counter\n\
+             scion_cache_hits_total {hits}\n\
+             # HELP scion_cache_misses_total Objects fetched from upstream.\n\
+             # TYPE scion_cache_misses_total counter\n\
+             scion_cache_misses_total {misses}\n"
+        );
+        let answer = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/plain; version=0.0.4\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{text}",
+            text.len()
+        );
+        let _ = socket.write_all(answer.as_bytes()).await;
+        let _ = socket.shutdown().await;
     }
 }

@@ -363,6 +363,10 @@ struct Inner<S> {
     busy: Duration,
     /// Calls sent upstream, of every kind.
     upstream_calls: Arc<AtomicU64>,
+    /// Objects served from the store, and fetches sent upstream, over the
+    /// life of the process, for the metrics of `scion-cache`.
+    cache_hits: Arc<AtomicU64>,
+    cache_misses: Arc<AtomicU64>,
     /// The reply budget, as on the server: object bytes read or copied for a
     /// reply and not yet taken by its client.
     in_flight: Arc<Semaphore>,
@@ -432,6 +436,8 @@ impl<S: Store> Tier<S> {
         let channel = endpoint.connect_lazy();
         let bearer = Bearer::new(upstream_token).context("upstream token is not valid ASCII")?;
         let upstream_calls = Arc::default();
+        let cache_hits = Arc::default();
+        let cache_misses = Arc::default();
         let auth = UpstreamAuth {
             bearer,
             calls: Arc::clone(&upstream_calls),
@@ -446,6 +452,8 @@ impl<S: Store> Tier<S> {
                 timeout,
                 busy: BUSY_TIMEOUT,
                 upstream_calls,
+                cache_hits,
+                cache_misses,
                 in_flight: Arc::new(Semaphore::new(IN_FLIGHT_BYTES)),
                 fetch_slots: Arc::new(Semaphore::new(FETCH_SLOTS)),
                 fetching: Arc::new(Semaphore::new(FETCH_BYTES)),
@@ -465,6 +473,16 @@ impl<S: Store> Tier<S> {
     #[must_use]
     pub fn upstream_calls(&self) -> u64 {
         self.inner.upstream_calls.load(Ordering::Relaxed)
+    }
+
+    /// How many objects this tier has served from its store, and how many
+    /// it has fetched from upstream, over the life of the process.
+    #[must_use]
+    pub fn cache_hits_and_misses(&self) -> (u64, u64) {
+        (
+            self.inner.cache_hits.load(Ordering::Relaxed),
+            self.inner.cache_misses.load(Ordering::Relaxed),
+        )
     }
 
     /// Serves the `Objects` calls on `incoming` connections, to callers that
@@ -587,6 +605,7 @@ impl<S: Store> Tier<S> {
                     Ok(Some(stored)) => {
                         if !missed {
                             progress.hits.fetch_add(1, Ordering::Relaxed);
+                            self.inner.cache_hits.fetch_add(1, Ordering::Relaxed);
                             tracing::debug!(%key, "hit");
                         }
                         // After the call's checks, in `get_objects`.
@@ -607,6 +626,7 @@ impl<S: Store> Tier<S> {
             if !missed {
                 missed = true;
                 progress.misses.fetch_add(1, Ordering::Relaxed);
+                self.inner.cache_misses.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(%key, "miss");
             }
             let data = match self.fetch(ask, i, progress).await {
@@ -1305,6 +1325,35 @@ mod tests {
             until: Until::NONE,
             stalled: None,
         }
+    }
+
+    #[tokio::test]
+    async fn the_cache_counts_its_hits_and_misses() {
+        let (_blobs, keys, _fake, tier) = setup(2, 1 << 20).await;
+        assert_eq!(tier.cache_hits_and_misses(), (0, 0));
+        // A miss: the object is not in the store yet.
+        let (object, _permit) = tier
+            .produce(&ask(&keys), 0, &Progress::default())
+            .await
+            .unwrap();
+        let Body::Chunks(chunks) = object.unwrap().body else {
+            panic!("unpacked into chunks")
+        };
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(tier.cache_hits_and_misses(), (0, 1));
+        // The same object again: a hit, once its fetch has settled.
+        while !lock(&tier.inner.flights).is_empty() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let (object, _permit) = tier
+            .produce(&ask(&keys), 0, &Progress::default())
+            .await
+            .unwrap();
+        let Body::Chunks(chunks) = object.unwrap().body else {
+            panic!("unpacked into chunks")
+        };
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(tier.cache_hits_and_misses(), (1, 1));
     }
 
     #[tokio::test]

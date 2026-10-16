@@ -24,6 +24,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
+use tower::Layer as _;
+
+use crate::metrics::{Metrics, MetricsLayer};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -98,16 +101,25 @@ pub async fn serve(
     access: impl Into<Access>,
     limits: Limits,
     tls: Option<ServerTls>,
+    metrics: Arc<Metrics>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
     let access = Arc::new(access.into());
     let auth = access.auth();
     let worker = Worker::new(store);
-    let scion = InterceptedService::new(
-        ScionService::new(worker.clone(), Arc::clone(&access)).into_server(),
+    // Outside the access rules, so a refused call counts too. The layer
+    // only wraps replies in a counting body; the handlers stay as they are.
+    // The registry always exists; only its HTTP export is optional.
+    let layer = MetricsLayer::new(metrics.clone());
+    let objects_layer = MetricsLayer::new(metrics.clone());
+    let scion = layer.layer(InterceptedService::new(
+        ScionService::new(worker.clone(), Arc::clone(&access), metrics.clone()).into_server(),
         auth.clone(),
-    );
-    let objects = InterceptedService::new(ObjectsService::new(worker, access).into_server(), auth);
+    ));
+    let objects = objects_layer.layer(InterceptedService::new(
+        ObjectsService::new(worker, access).into_server(),
+        auth,
+    ));
     let router = |server: Server| {
         server
             .timeout(REQUEST_TIMEOUT)
@@ -146,11 +158,11 @@ pub struct ScionService {
 }
 
 impl ScionService {
-    fn new(worker: Worker, access: Arc<Access>) -> Self {
+    fn new(worker: Worker, access: Arc<Access>, metrics: Arc<Metrics>) -> Self {
         Self {
             worker,
             access,
-            lands: Arc::default(),
+            lands: Arc::new(Lands::new(Some(metrics))),
             uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
             blames: Arc::new(Semaphore::new(MAX_BLAMES)),
             blame_memory: crate::memory::Bytes::new(BLAME_MEMORY_BUDGET),
@@ -861,7 +873,11 @@ mod tests {
 
     /// A service whose one principal may do everything.
     fn test_service(store: Store) -> ScionService {
-        ScionService::new(Worker::new(store), Arc::new(Access::single("t")))
+        ScionService::new(
+            Worker::new(store),
+            Arc::new(Access::single("t")),
+            Arc::new(Metrics::default()),
+        )
     }
 
     /// `message` as a request of that principal.

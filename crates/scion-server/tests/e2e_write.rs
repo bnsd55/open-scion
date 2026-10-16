@@ -7,6 +7,9 @@ use scion_proto::auth::Bearer;
 use scion_proto::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ReadFileRequest};
+use std::sync::Arc;
+
+use scion_server::metrics::Metrics;
 use scion_server::{Store, db, service};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
@@ -89,6 +92,7 @@ async fn uploaded_file_reads_back_through_a_created_changeset() {
         TOKEN,
         Limits::default(),
         None,
+        Arc::new(Metrics::default()),
         async {
             stopped.await.ok();
         },

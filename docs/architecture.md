@@ -1548,3 +1548,37 @@ stored copy. A damaged copy on the daemon is fetched again. A damaged blob
 on the server ends each tier's reply with `DATA_LOSS`, and no tier keeps it.
 One known difference is left out: a tier sends an object that it holds for
 any valid repo name ([#13](https://github.com/bnsd55/open-scion/issues/13)).
+
+## 11. Metrics
+
+`scion-server --metrics-listen 127.0.0.1:9090` and
+`scion-cache --metrics-listen 127.0.0.1:9091` serve a Prometheus text
+registry (format 0.0.4) at `GET /metrics`, one reply per connection. The
+flag is off by default; a server without it answers exactly as before. The
+listener is plain HTTP without any token, so like every other listener it
+is refused on a non-loopback address unless `--insecure-listen` is given;
+TLS does not change that, because the endpoint is unauthenticated by
+design.
+
+The registry is a fixed set of atomics. A call counts its metrics on the
+request path without taking a lock or allocating: it increments counters,
+and its latency and byte counts go into fixed buckets. The values are read
+on export only.
+
+| Metric | Kind | Meaning |
+|---|---|---|
+| `scion_requests_total{rpc,code}` | counter | Every counted RPC by path (`Scion/Blame`, `Objects/GetObjects`, ...) and gRPC status. |
+| `scion_request_seconds{rpc}` | histogram | A call's duration from the moment the layer sees the request until the reply ends or is dropped. Buckets at 1, 4, 16, 64, 256 ms and 1, 4, 16, 64 s, then `+Inf`. |
+| `scion_rpc_bytes_total{rpc,direction}` | counter | Reply bytes out; request bytes in, counted from the `content-length` header, which a gRPC client does not send. |
+| `scion_lands_total{outcome}` | counter | Lands by outcome: `landed`, `conflict`, `rejected`, `retry` (a pending land waits for its retry). |
+| `scion_cache_hits_total`, `scion_cache_misses_total` | counter | A tier's object reads served from its store or its snapshot, and read from upstream. |
+
+The layer sits inside the axum router, around both gRPC services and
+outside the access checks. A refusal (bad token, unknown repo, a budget
+exhausted) is a trailers-only reply whose code is in the reply's headers,
+not in a body trailer, so the layer reads the code from the headers and
+counts the call at once. A streamed reply counts when the client reads it
+to the end or drops it: a dropped reply counts as `cancelled`. The `ok`
+line of a streamed RPC therefore grows only as replies complete, and the
+cancelled line shows clients that went away mid-stream. An unknown gRPC
+code is counted as `unrecognised`.

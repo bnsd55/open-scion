@@ -169,6 +169,9 @@ pub struct Lands {
     /// Indexes that [`Lands::evict`] dropped. Their bytes are back in
     /// `used`. A land frees them after its write connection and ref lock.
     evicted: Mutex<Vec<PathIndex>>,
+    /// The metrics that count lands by outcome, when the process exports
+    /// any.
+    metrics: Option<Arc<crate::metrics::Metrics>>,
 }
 
 impl Default for Lands {
@@ -177,11 +180,21 @@ impl Default for Lands {
             refs: Mutex::new(LruCache::new_unbounded()),
             used: Arc::default(),
             evicted: Mutex::default(),
+            metrics: None,
         }
     }
 }
 
 impl Lands {
+    /// Lands whose outcomes `metrics` counts, when the process exports any.
+    #[must_use]
+    pub fn new(metrics: Option<Arc<crate::metrics::Metrics>>) -> Self {
+        Self {
+            metrics,
+            ..Self::default()
+        }
+    }
+
     /// Lands a changeset. A conflict or rejection is an outcome, not an error.
     ///
     /// # Errors
@@ -199,6 +212,15 @@ impl Lands {
         let evicted = mem::take(&mut *self.evicted.lock().unwrap_or_else(PoisonError::into_inner));
         drop(evicted);
         let outcome = outcome?;
+        if let Some(metrics) = &self.metrics {
+            metrics.land(match outcome.state {
+                LandState::Landed => 0,
+                LandState::Conflict => 1,
+                LandState::Rejected => 2,
+                // A pending land waits for a retry with its key.
+                LandState::Pending => 3,
+            });
+        }
         // Lands on one ref commit one at a time. Waiting for the flush after
         // the ref lock is released lets them share it.
         store.flush()?;

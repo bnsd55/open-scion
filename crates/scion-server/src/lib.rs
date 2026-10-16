@@ -27,6 +27,7 @@ pub mod history;
 pub mod import;
 pub mod land;
 pub mod memory;
+pub mod metrics;
 pub mod names;
 pub mod objects;
 pub mod read;
