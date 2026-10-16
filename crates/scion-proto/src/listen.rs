@@ -14,6 +14,10 @@
 //! [`Limits::connections`] connections at once, each with at most
 //! [`Limits::streams`] open streams. HTTP/2 keepalive closes a connection
 //! whose client does not answer a ping, which frees all that it holds.
+//!
+//! It also turns off Nagle's algorithm on each TCP connection. tonic ignores
+//! its own `tcp_nodelay` setting for connections that it does not accept
+//! itself, so before, a small reply could wait for the client's ACK.
 
 use std::error::Error;
 use std::future::Future;
@@ -25,6 +29,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_stream::{Stream, StreamExt as _};
 use tonic::transport::Server;
@@ -91,7 +96,7 @@ impl Limits {
     ) -> Result<(), tonic::transport::Error>
     where
         I: Stream<Item = Result<IO, IE>>,
-        IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
+        IO: AsyncRead + AsyncWrite + Connected + NoDelay + Unpin + Send + 'static,
         IE: Into<Box<dyn Error + Send + Sync>>,
     {
         router(builder(self.streams, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT))
@@ -113,6 +118,7 @@ fn builder(streams: NonZeroU32, keepalive: Duration, timeout: Duration) -> Serve
 fn accept<I, IO, E>(incoming: I, max: NonZeroUsize) -> impl Stream<Item = Result<Connection<IO>, E>>
 where
     I: Stream<Item = Result<IO, E>>,
+    IO: NoDelay,
 {
     let max = max.get();
     let places = Arc::new(Semaphore::new(max));
@@ -120,6 +126,9 @@ where
         let places = Arc::clone(&places);
         async move {
             let io = accepted?;
+            if let Err(e) = io.no_delay() {
+                tracing::warn!(error = %e, "cannot turn off Nagle's algorithm");
+            }
             let place = if let Ok(place) = Arc::clone(&places).try_acquire_owned() {
                 place
             } else {
@@ -132,6 +141,29 @@ where
             Ok(Connection { io, _place: place })
         }
     })
+}
+
+/// A connection whose small writes can go out at once.
+pub trait NoDelay {
+    /// Turns off Nagle's algorithm, where the connection has it.
+    ///
+    /// # Errors
+    ///
+    /// The error of the socket option.
+    fn no_delay(&self) -> io::Result<()>;
+}
+
+impl NoDelay for TcpStream {
+    fn no_delay(&self) -> io::Result<()> {
+        self.set_nodelay(true)
+    }
+}
+
+/// A Unix socket has no Nagle's algorithm.
+impl NoDelay for UnixStream {
+    fn no_delay(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A connection that keeps its place of [`accept`] until it is dropped.
@@ -337,6 +369,18 @@ mod tests {
             .await
             .expect("the connection is served once another closes");
         assert_eq!(code, Code::NotFound);
+    }
+
+    /// An accepted TCP connection has Nagle's algorithm off, so a small reply
+    /// does not wait for the client's ACK.
+    #[tokio::test]
+    async fn an_accepted_connection_has_no_delay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = accept(TcpListenerStream::new(listener), DEFAULT_CONNECTIONS);
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let accepted = pin!(incoming).next().await.unwrap().unwrap();
+        assert!(accepted.io.nodelay().unwrap());
     }
 
     /// A peer that sends the HTTP/2 preface and then never answers is closed

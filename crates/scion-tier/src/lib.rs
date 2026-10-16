@@ -39,7 +39,7 @@ use hashlink::LruCache;
 use scion_core::{BlobId, ChangesetId, Tree, TreeId};
 use scion_proto::auth::{Auth, Bearer};
 use scion_proto::check;
-use scion_proto::listen::Limits;
+use scion_proto::listen::{Limits, NoDelay};
 use scion_proto::object::{self, Assembler, Header, MAX_ENCODED_BYTES, UNPACK_BYTES, zstd_bound};
 use scion_proto::reply::{
     self, BUSY_TIMEOUT, Body, IN_FLIGHT_BYTES, ObjectStream, Outgoing, STALL_TIMEOUT,
@@ -453,7 +453,7 @@ impl<S: Store> Tier<S> {
     ) -> Result<(), tonic::transport::Error>
     where
         I: Stream<Item = Result<IO, IE>>,
-        IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
+        IO: AsyncRead + AsyncWrite + Connected + NoDelay + Unpin + Send + 'static,
         IE: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         let objects = ObjectsServer::new(self)
