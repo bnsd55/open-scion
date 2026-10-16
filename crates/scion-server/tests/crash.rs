@@ -659,11 +659,21 @@ fn check_lands(ledger: &Ledger, history: &HashMap<ChangesetId, (&str, Changeset)
 /// Checks what a crash must never break (`docs/architecture.md`, section
 /// 10) against a server that has just started on `data`.
 async fn check(url: &str, data: &Path, ledger: &mut Ledger, checked: &mut Checked, rng: &mut Rng) {
-    let tmp: Vec<PathBuf> = fs::read_dir(data.join("tmp"))
+    // A restart removes the staging folders of the processes that died, and
+    // its own folder is the only one in `tmp/` (issue #101).
+    let folders: Vec<PathBuf> = fs::read_dir(data.join("tmp"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect();
-    assert!(tmp.is_empty(), "temp files after the restart: {tmp:?}");
+    assert_eq!(
+        folders.len(),
+        1,
+        "temp folders after the restart: {folders:?}"
+    );
+    assert!(
+        folders.iter().all(|path| path.is_dir()),
+        "temp files after the restart: {folders:?}"
+    );
     let (mut scion, mut objects) = connect(url).await.unwrap();
     let new_lands = checked.lands;
     retry_lands(&scion, ledger, checked, rng).await;
@@ -773,6 +783,8 @@ async fn every_reply_survives_a_kill_of_the_server() {
             cut += got.lands.iter().filter(|sent| sent.reply.is_none()).count();
             ledger.lands.append(&mut got.lands);
         }
+        // The staging folders of the killed processes are swept by the
+        // restart inside `check`; what a kill left is a folder per process.
         left += fs::read_dir(data.join("tmp")).unwrap().count();
     }
     let server = Server::start(&data, &log);
