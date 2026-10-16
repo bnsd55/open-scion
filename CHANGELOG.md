@@ -65,10 +65,15 @@ release.
   continues at the wrong path after a rename.
 - `Blame` reads files of up to 16 MiB and 1,048,576 lines (was 1 MiB), and
   blames a binary file line by line, as `git blame` does. Every byte read
-  counts against the per-call budget, once per 64 bytes. A rename search now
-  stops after it has read about 100 MiB of deleted files, so with large files
-  it can miss a source and the answer can change. Every search that the old
-  1 MiB limit allowed still reads every file.
+  counts against the per-call budget, once per 64 bytes.
+- A `Blame` rename search looks at every file that the changeset deletes, as
+  `git blame` does (was 100 files and about 100 MiB). It uses the budget
+  that the call has left. Where the budget runs out, the reply says where
+  the search stopped (`next_rename_searched`, `next_rename_best`), and the
+  next call goes on from there with `rename_searched` and `rename_best`. A
+  client must send both back unchanged. When the search has looked at every
+  deleted file, the reply says that too, and the next call takes the best
+  file as the answer at once. `scn blame` does this.
 - Bearer-token auth, loopback-only listening by default, request limits and
   name validation at the RPC boundary.
 - TLS and mTLS: the server and `scion-cache` serve TLS with `--tls-cert` and
@@ -190,3 +195,5 @@ release.
   waits for a write, for a long read such as a graph walk, or for a server
   write that waits for an import's write lock. Writes still take turns
   on one connection.
+- `scion-server serve` logs the address that it bound, so `--listen
+  127.0.0.1:0` shows the port that the OS chose.

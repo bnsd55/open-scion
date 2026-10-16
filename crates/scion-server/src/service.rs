@@ -28,6 +28,7 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth::{Auth, Caller};
+use crate::blame::RenameSearch;
 use crate::deadline::Deadline;
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
@@ -591,6 +592,11 @@ impl Scion for ScionService {
         check_name("repo", &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_path(req.path)?;
+        let search = RenameSearch {
+            searched: usize::try_from(req.rename_searched)
+                .map_err(|_| Status::invalid_argument("rename_searched is too large"))?,
+            best: parse_optional_path(req.rename_best)?,
+        };
         // Taken before the worker permit, and held until the job ends, also
         // when the client leaves first.
         let slot = Arc::clone(&self.blames)
@@ -601,7 +607,7 @@ impl Scion for ScionService {
             .worker
             .run(move |store| {
                 let _slot = slot;
-                blame::blame(&store, &req.repo, id, &path)
+                blame::blame(&store, &req.repo, id, &path, &search)
             })
             .await?;
         let ranges = blame
@@ -631,9 +637,9 @@ impl Scion for ScionService {
             ranges,
             changesets,
             next_changeset_id: id_bytes(next),
-            next_path: next_path
-                .map(|path| path.as_bytes().to_vec())
-                .unwrap_or_default(),
+            next_path: path_bytes(next_path),
+            next_rename_searched: blame.next_search.searched as u64,
+            next_rename_best: path_bytes(blame.next_search.best),
         }))
     }
 
@@ -713,10 +719,7 @@ impl Scion for ScionService {
             .collect();
         Ok(Response::new(DiffResponse {
             entries,
-            next_after: page
-                .next_after
-                .map(|path| path.as_bytes().to_vec())
-                .unwrap_or_default(),
+            next_after: path_bytes(page.next_after),
         }))
     }
 }
@@ -724,6 +727,12 @@ impl Scion for ScionService {
 /// An optional changeset ID on the wire: empty for `None`.
 fn id_bytes(id: Option<ChangesetId>) -> Vec<u8> {
     id.map(|id| id.as_bytes().to_vec()).unwrap_or_default()
+}
+
+/// An optional path on the wire: empty for `None`.
+fn path_bytes(path: Option<RepoPath>) -> Vec<u8> {
+    path.map(|path| path.as_bytes().to_vec())
+        .unwrap_or_default()
 }
 
 fn file_state(state: FileState) -> v1::FileState {

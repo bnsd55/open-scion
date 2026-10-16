@@ -24,6 +24,9 @@ pub async fn blame(ctx: &mut Ctx, spec: &str) -> Result<()> {
     let mut at = changeset_id;
     // The path of the file at `at`. A rename changes it.
     let mut at_path = path.as_bytes().to_vec();
+    // Where a rename search at `at` stopped, sent back as the server sent
+    // it: files searched, and the best so far.
+    let mut search = (0, Vec::new());
     let mut sources = Sources::new();
     // For each line of the file: its changeset once known, and until then
     // its line in the file at `at`. Empty before the first reply.
@@ -35,6 +38,8 @@ pub async fn blame(ctx: &mut Ctx, spec: &str) -> Result<()> {
                 repo: ctx.repo.clone(),
                 changeset_id: at.as_bytes().to_vec(),
                 path: at_path.clone(),
+                rename_searched: search.0,
+                rename_best: search.1.clone(),
             })
             .await
             .with_context(|| format!("cannot blame {spec}"))?
@@ -79,10 +84,11 @@ pub async fn blame(ctx: &mut Ctx, spec: &str) -> Result<()> {
         }
         let next = opt_id(&reply.next_changeset_id)?.context("server sent no place to continue")?;
         let next_path = sent_path(reply.next_path, &at_path);
-        if (next, &next_path) == (at, &at_path) {
+        let next_search = (reply.next_rename_searched, reply.next_rename_best);
+        if (next, &next_path, &next_search) == (at, &at_path, &search) {
             bail!("server sent the same place to continue");
         }
-        (at, at_path) = (next, next_path);
+        (at, at_path, search) = (next, next_path, next_search);
     }
     let lines: Vec<(ChangesetId, u32)> = lines
         .into_iter()
