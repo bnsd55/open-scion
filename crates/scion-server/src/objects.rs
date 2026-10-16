@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use scion_core::{BlobId, TreeId};
+use scion_proto::deadline::Until;
 use scion_proto::object::{self, Header, zstd_bound};
 use scion_proto::reply::{
     self, BUSY_TIMEOUT, Body, Found, IN_FLIGHT_BYTES, ObjectStream, Outgoing, STALL_TIMEOUT,
@@ -193,23 +194,28 @@ fn read_object(store: &Store, key: Key, plan: Plan) -> Result<Outgoing> {
     Ok(Outgoing { header, body })
 }
 
-/// How long a reply waits: for room in the budget, and for its client.
+/// How long a reply waits: for room in the budget, and for its client. A
+/// wait for room also ends at the caller's deadline.
 #[derive(Clone, Copy)]
 struct Waits {
     busy: Duration,
     stall: Duration,
+    until: Until,
 }
 
 const WAITS: Waits = Waits {
     busy: BUSY_TIMEOUT,
     stall: STALL_TIMEOUT,
+    until: Until::NONE,
 };
 
 /// Starts the reply to `keys`: finds the first object before the call
 /// answers, then sends the rest on a task of its own, part by part, as the
 /// client takes them (see [`reply::send_objects`]). If the first object gets
-/// no share of `in_flight` within `waits.busy`, the call fails with
-/// [`reply::busy`], so a reply never ends `OK` with no object.
+/// no share of `in_flight` within `waits.busy`, or before `waits.until`, the
+/// call fails with [`reply::busy`], so a reply never ends `OK` with no
+/// object. That comes before the caller's deadline, so the caller gets this
+/// status, not a timeout of its own.
 async fn start_reply(
     worker: Worker,
     keys: Vec<Key>,
@@ -222,13 +228,23 @@ async fn start_reply(
     let Some(key) = rest.next() else {
         return Err(Status::invalid_argument("a call names at least one object"));
     };
-    let first = find(&worker, &in_flight, waits.busy, read, zstd, key)
+    let busy = waits.until.wait(waits.busy);
+    let first = find(&worker, &in_flight, busy, read, zstd, key)
         .await
         .ok_or_else(reply::busy)?;
     let (tx, stream) = reply::channel();
     tokio::spawn(async move {
         let (worker, in_flight) = (&worker, &in_flight);
-        let produce = |key| find(worker, in_flight, waits.busy, read, zstd, key);
+        let produce = |key| {
+            find(
+                worker,
+                in_flight,
+                waits.until.wait(waits.busy),
+                read,
+                zstd,
+                key,
+            )
+        };
         reply::send_objects(first, rest, tx, waits.stall, produce).await;
     });
     Ok(stream)
@@ -298,6 +314,10 @@ impl Objects for ObjectsService {
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<Self::GetObjectsStream>, Status> {
         let caller = caller(&request)?;
+        let waits = Waits {
+            until: Until::of(&request),
+            ..WAITS
+        };
         let GetObjectsRequest { repo, refs, accept } = request.into_inner();
         check_reader(&self.access, &caller, &repo)?;
         scion_proto::check::object_count(refs.len())?;
@@ -312,7 +332,7 @@ impl Objects for ObjectsService {
             self.worker.clone(),
             keys,
             in_flight,
-            WAITS,
+            waits,
             read_object,
             zstd,
         );
@@ -346,6 +366,7 @@ mod tests {
         Waits {
             busy: wait,
             stall: wait,
+            until: Until::NONE,
         }
     }
 
@@ -441,6 +462,35 @@ mod tests {
         drop(others);
         reply().await.unwrap().unwrap();
         assert_eq!(READS.load(Ordering::SeqCst), 1);
+    }
+
+    /// A caller's deadline shorter than the busy limit ends the wait for
+    /// room, so the call fails `RESOURCE_EXHAUSTED` before the caller's
+    /// deadline, not after the 30 s limit.
+    #[tokio::test]
+    async fn a_wait_for_room_ends_before_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let a = Key::Blob(store.blobs().put(b"a blob").unwrap());
+        let in_flight = Arc::new(Semaphore::new(1000));
+        let _others = reply::try_take(&in_flight, 1000).unwrap();
+        let waits = Waits {
+            until: Until::after(Duration::from_millis(300)),
+            ..WAITS
+        };
+        let reply = start_reply(
+            Worker::new(store),
+            vec![a],
+            in_flight,
+            waits,
+            read_object,
+            true,
+        );
+        let status = tokio::time::timeout(Duration::from_secs(5), reply)
+            .await
+            .expect("the wait ends at the deadline")
+            .unwrap_err();
+        assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
     }
 
     #[tokio::test]
