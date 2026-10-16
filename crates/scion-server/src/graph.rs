@@ -253,10 +253,9 @@ struct Steps {
 const STEPS: Steps = Steps { reads: 1000 };
 
 /// Makes the moves of a walk with `next` until it gives the answer, in
-/// `steps`. Each step is one [`Store::read`], so it sees one snapshot, and
-/// the walk gives its read connection back between steps. A changeset's
-/// parents and node never change, so a walk goes on in the next step from
-/// where it stopped.
+/// `steps`. Each step holds one read connection, and the walk gives it back
+/// between steps. A changeset's parents and node never change, so a walk
+/// goes on in the next step from where it stopped.
 fn in_steps<T>(
     store: &Store,
     deadline: &Deadline,
@@ -264,9 +263,10 @@ fn in_steps<T>(
     mut next: impl FnMut(&mut Index) -> Result<Option<T>>,
 ) -> Result<(T, Cost)> {
     let mut cost = Cost::default();
+    let mut seen = 0;
     let result = loop {
         cost.steps += 1;
-        let step = store.read(|c| {
+        let (step, step_seen) = store.read_counted(|c| {
             let mut index = Index::new(c, deadline);
             let answer = loop {
                 match next(&mut index) {
@@ -277,10 +277,14 @@ fn in_steps<T>(
             cost.reads += index.reads;
             answer
         });
+        seen = seen.max(step_seen);
         if let Some(result) = step.transpose() {
             break result;
         }
     };
+    // As `Store::read`: the reply waits until each commit that a step could
+    // see is durable, with one flush for all steps.
+    store.wait_durable(seen)?;
     let Cost { reads, steps } = cost;
     if let Err(Error::DeadlineExceeded(why)) = &result {
         tracing::info!(reads, steps, %why, "a graph query stopped");
