@@ -8,6 +8,7 @@
 //! - [`graph`]: the commit-graph index, and the graph queries that read it.
 //! - [`read`], [`blame`], [`write`], [`land`]: the operations behind the RPCs.
 //!   A long one stops at its call's [`deadline`].
+//!   [`similar`] finds renames for `Diff` and `Blame`.
 //! - [`import`]: one-way import from a git repository.
 //! - [`service`], [`objects`] and [`auth`]: the gRPC front end.
 
@@ -24,6 +25,7 @@ pub mod names;
 pub mod objects;
 pub mod read;
 pub mod service;
+pub mod similar;
 pub mod store;
 pub mod tree;
 pub mod write;
