@@ -10,10 +10,14 @@
 //! server side: while the stream waits for flow-control window, hyper does
 //! not poll the reply body, so it never sees a body error.
 //!
-//! So [`Limits::serve`] bounds how many such streams there are: at most
+//! So [`Limits::serve`] bounds what stalled replies hold: at most
 //! [`Limits::connections`] connections at once, each with at most
-//! [`Limits::streams`] open streams. And it closes every connection in
-//! time, so a connection that waits for a place gets one:
+//! [`Limits::streams`] open streams, and each with at most
+//! [`Limits::stalled_bytes`] bytes held by its stalled replies — when a
+//! reply stalls, it adds what it leaves in HTTP/2 to its connection's
+//! count, and a connection over the limit is closed, which frees its
+//! stalled streams' buffers at once ([`Stalled`]). And it closes every
+//! connection in time, so a connection that waits for a place gets one:
 //!
 //! - a client that does not send the HTTP/2 preface within
 //!   [`HANDSHAKE_TIMEOUT`] is closed. hyper has no timeout of its own
@@ -27,10 +31,11 @@
 use std::error::Error;
 use std::future::Future;
 use std::io;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -74,14 +79,13 @@ pub const CONNECTION_GRACE: Duration = Duration::from_secs(600);
 /// The bytes of the HTTP/2 client preface.
 const PREFACE_BYTES: usize = 24;
 
+/// A connection whose stalled replies hold more than this is closed, with
+/// all that they hold. 16 stalled replies of under 4 MiB each. The flag is
+/// `--max-stalled-bytes`.
+pub const DEFAULT_STALLED_BYTES: NonZeroU64 = NonZeroU64::new(64 << 20).unwrap();
+
 /// How many connections a process serves, and how many streams each may
 /// have open.
-// SHORTCUT: a live client that stops reading keeps what its stalled streams
-// hold until its connection closes (at most the age plus the grace), so the
-// ceiling is connections x streams x what one stream keeps (see the module
-// docs). Upgrade (issue #113): count
-// what the stalled replies of each connection hold, and close a connection
-// that holds too much.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     /// Most connections served at once. A connection beyond that is
@@ -92,6 +96,9 @@ pub struct Limits {
     /// HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS`. A client that has this many
     /// waits for one to end before it opens another.
     pub streams: NonZeroU32,
+    /// Most bytes that the stalled replies of one connection may hold. A
+    /// connection over it is closed, and what its stalled replies hold goes.
+    pub stalled_bytes: NonZeroU64,
 }
 
 impl Default for Limits {
@@ -99,7 +106,92 @@ impl Default for Limits {
         Self {
             connections: DEFAULT_CONNECTIONS,
             streams: DEFAULT_STREAMS,
+            stalled_bytes: DEFAULT_STALLED_BYTES,
         }
+    }
+}
+
+/// What the stalled replies of one connection hold, counted when a reply
+/// stalls. The count lives as long as the connection: a call gets the
+/// handle in its extensions (as the connection's connect info), and passes
+/// it to its reply. When the count passes the limit, the connection's read
+/// side fails, so hyper closes the connection and frees what every stalled
+/// stream of it holds — even though the client sends nothing, because the
+/// count wakes the stored read waker.
+#[derive(Clone)]
+pub struct Stalled(Arc<Counted>);
+
+struct Counted {
+    /// Most bytes that the stalled replies of this connection may hold.
+    limit: u64,
+    /// Bytes that stalled replies are estimated to hold now.
+    bytes: AtomicU64,
+    /// The waker of the connection's last read poll, woken once the count
+    /// passes the limit, so the close is seen without a frame from the
+    /// client.
+    waker: Mutex<Option<Waker>>,
+    /// Whether the crossing has been logged.
+    logged: AtomicBool,
+}
+
+impl Stalled {
+    fn new(limit: u64) -> Self {
+        Self(Arc::new(Counted {
+            limit,
+            bytes: AtomicU64::new(0),
+            waker: Mutex::new(None),
+            logged: AtomicBool::new(false),
+        }))
+    }
+
+    /// The handle of `request`'s connection, if it is one of ours. A reply
+    /// counts its stalled bytes on it.
+    #[must_use]
+    pub fn of<T>(request: &tonic::Request<T>) -> Option<Self> {
+        request.extensions().get::<Self>().cloned()
+    }
+
+    /// `bytes` more that stalled replies leave in HTTP/2. Past the limit,
+    /// logs once, and wakes the read side, which then fails the connection.
+    ///
+    /// # Panics
+    ///
+    /// Only if a lock is poisoned, which cannot happen: no holder panics.
+    pub fn add(&self, bytes: u64) {
+        let held = self.0.bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        if held >= self.0.limit && !self.0.logged.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                held,
+                limit = self.0.limit,
+                "closing a connection: its stalled replies hold too much"
+            );
+            if let Some(waker) = self.0.waker.lock().unwrap().take() {
+                waker.wake();
+            }
+        }
+    }
+
+    /// Whether the connection must close now.
+    fn over(&self) -> bool {
+        self.0.bytes.load(Ordering::Relaxed) >= self.0.limit
+    }
+
+    /// Registers the read waker, so a crossing of the limit is seen at once.
+    fn register(&self, read: &Waker) {
+        let mut waker = self.0.waker.lock().unwrap();
+        *waker = Some(read.clone());
+    }
+
+    /// The I/O error that closes a connection over the limit.
+    fn error(&self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            format!(
+                "its stalled replies hold {} bytes, over the {} limit",
+                self.0.bytes.load(Ordering::Relaxed),
+                self.0.limit
+            ),
+        )
     }
 }
 
@@ -163,7 +255,12 @@ impl Limits {
             .http2_keepalive_timeout(Some(timers.keepalive_timeout))
             .max_connection_age(timers.age)
             .max_connection_age_grace(timers.grace);
-        let incoming = accept(incoming, self.connections, timers.handshake);
+        let incoming = accept(
+            incoming,
+            self.connections,
+            timers.handshake,
+            self.stalled_bytes,
+        );
         router(server)
             .serve_with_incoming_shutdown(incoming, shutdown)
             .await
@@ -185,11 +282,13 @@ fn accept<I, IO, E>(
     incoming: I,
     max: NonZeroUsize,
     handshake: Duration,
+    stalled_bytes: NonZeroU64,
 ) -> impl Stream<Item = Result<Connection<IO>, E>>
 where
     I: Stream<Item = Result<IO, E>>,
 {
     let max = max.get();
+    let stalled_bytes = stalled_bytes.get();
     let places = Arc::new(Semaphore::new(max));
     incoming.then(move |accepted| {
         let places = Arc::clone(&places);
@@ -208,6 +307,7 @@ where
                 io,
                 _place: place,
                 preface: Some((PREFACE_BYTES, Box::pin(tokio::time::sleep(handshake)))),
+                stalled: Stalled::new(stalled_bytes),
             })
         }
     })
@@ -220,13 +320,15 @@ struct Connection<IO> {
     /// Until the preface has come: its bytes still to come, and the end of
     /// the wait for them.
     preface: Option<(usize, Pin<Box<Sleep>>)>,
+    /// What the stalled replies of this connection hold, and their limit.
+    stalled: Stalled,
 }
 
-impl<IO: Connected> Connected for Connection<IO> {
-    type ConnectInfo = IO::ConnectInfo;
+impl<IO> Connected for Connection<IO> {
+    type ConnectInfo = Stalled;
 
     fn connect_info(&self) -> Self::ConnectInfo {
-        self.io.connect_info()
+        self.stalled.clone()
     }
 }
 
@@ -237,6 +339,14 @@ impl<IO: AsyncRead + Unpin> AsyncRead for Connection<IO> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = &mut *self;
+        // Over the limit, the connection is closed, so hyper frees what its
+        // stalled streams hold.
+        if this.stalled.over() {
+            return Poll::Ready(Err(this.stalled.error()));
+        }
+        // The waker, so a crossing of the limit is seen without a frame from
+        // the client.
+        this.stalled.register(cx.waker());
         let before = buf.filled().len();
         let polled = Pin::new(&mut this.io).poll_read(cx, buf);
         if let Some((left, wait)) = &mut this.preface {
@@ -268,6 +378,9 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for Connection<IO> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if self.stalled.over() {
+            return Poll::Ready(Err(self.stalled.error()));
+        }
         Pin::new(&mut self.io).poll_write(cx, buf)
     }
 
@@ -303,11 +416,13 @@ mod tests {
 
     use super::*;
     use crate::Bytes;
+    use crate::object::Header;
+    use crate::reply::{self, Body, IN_FLIGHT_BYTES, Outgoing};
     use crate::v1::objects_client::ObjectsClient;
     use crate::v1::objects_server::{Objects, ObjectsServer};
     use crate::v1::{
-        GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, ObjectPart, ResolveRefRequest,
-        ResolveRefResponse,
+        Encoding, GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, ObjectKind,
+        ObjectPart, ResolveRefRequest, ResolveRefResponse,
     };
 
     /// A wait that ends at once when nothing holds the call back.
@@ -326,14 +441,16 @@ mod tests {
         }
     }
 
-    /// Replies to `GetObjects` with one part of 128 KiB, more than a client's
-    /// whole connection window of 64 KiB, so a client that does not read
-    /// keeps the stream open. Refuses `ResolveRef` at once, with no data, so
-    /// a full window does not hold that reply.
-    struct Stub;
+    /// Replies to `GetObjects` with one object in three parts of 128 KiB, so
+    /// a client that does not read stalls the reply after its first part.
+    /// The reply runs through the real [`reply::send_objects`], so it counts
+    /// what it leaves on its connection. Refuses `ResolveRef` at once, with
+    /// no data, so a full window does not hold that reply.
+    #[derive(Clone)]
+    struct Stalls;
 
     #[tonic::async_trait]
-    impl Objects for Stub {
+    impl Objects for Stalls {
         async fn resolve_ref(
             &self,
             _: Request<ResolveRefRequest>,
@@ -348,17 +465,45 @@ mod tests {
             Err(Status::unimplemented("not in the stub"))
         }
 
-        type GetObjectsStream = tokio_stream::Iter<std::vec::IntoIter<Result<ObjectPart, Status>>>;
+        type GetObjectsStream = reply::ObjectStream;
 
         async fn get_objects(
             &self,
-            _: Request<GetObjectsRequest>,
+            request: Request<GetObjectsRequest>,
         ) -> Result<Response<Self::GetObjectsStream>, Status> {
-            let part = ObjectPart {
-                data: Bytes::from(vec![0; 128 << 10]),
-                ..ObjectPart::default()
+            // More parts than a client's 64 KiB window and hyper's read
+            // ahead take, so a client that does not read stalls the reply
+            // after its first parts.
+            let chunk = Bytes::from(vec![0; 128 << 10]);
+            let parts = 10;
+            let header = Header {
+                kind: ObjectKind::Blob,
+                id: [2; 32],
+                encoding: Encoding::Raw,
+                encoded_size: parts * chunk.len(),
+                size: parts * chunk.len(),
             };
-            Ok(Response::new(tokio_stream::iter(vec![Ok(part)])))
+            let object = Outgoing {
+                header,
+                body: Body::Chunks(vec![chunk; parts]),
+            };
+            // The budget of this stub: one object at a time, as a reply
+            // holds.
+            let budget = Arc::new(Semaphore::new(IN_FLIGHT_BYTES));
+            let permit = reply::try_take(&budget, 1).unwrap();
+            let (tx, stream) = reply::channel();
+            // The stall is short, so the test does not wait for the real
+            // one; the counting is what the test watches.
+            let stall = Duration::from_millis(100);
+            tokio::spawn(reply::send_objects(
+                (Ok(object), permit),
+                [(); 0],
+                tx,
+                stall,
+                Stalled::of(&request),
+                |()| async { None },
+            ));
+            Ok(Response::new(stream))
         }
     }
 
@@ -367,7 +512,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let router = |mut server: Server| server.add_service(ObjectsServer::new(Stub));
+            let router = |mut server: Server| server.add_service(ObjectsServer::new(Stalls));
             let pending = std::future::pending();
             limits
                 .serve_with(&timers, router, tcp(listener), pending)
@@ -519,6 +664,52 @@ mod tests {
         // server is ever answered, so its ping is not either.
         let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0";
         assert!(closes_a_peer_that_sends(addr, preface).await);
+    }
+
+    /// One stalled reply is already over the limit, so a client that stops
+    /// reading on one stream gets its connection closed, though it sends
+    /// nothing more: the count wakes the read side. Another connection is
+    /// served once the stalled one is closed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_connection_whose_stalled_replies_hold_too_much_is_closed() {
+        let limits = Limits {
+            connections: NonZeroUsize::MIN,
+            stalled_bytes: NonZeroU64::new(reply::STALLED_REPLY_BYTES).unwrap(),
+            ..Limits::default()
+        };
+        // Long keepalive and age, so only the count can close the first
+        // connection.
+        let long = Duration::from_secs(3600);
+        let timers = Timers {
+            handshake: Duration::from_millis(100),
+            keepalive: long,
+            keepalive_timeout: long,
+            age: long,
+            grace: long,
+        };
+        let addr = serve(limits, timers).await;
+        let mut stalling = ObjectsClient::new(
+            endpoint(addr)
+                .initial_stream_window_size(65_535)
+                .initial_connection_window_size(65_535)
+                .connect()
+                .await
+                .unwrap(),
+        );
+        let mut stalled_stream = stall(&mut stalling).await;
+
+        // The other connection waits for a place, and is served once the
+        // process closes the stalled one.
+        let mut other = ObjectsClient::new(endpoint(addr).connect_lazy());
+        let mut next = pin!(quick(&mut other));
+        let code = tokio::time::timeout(Duration::from_secs(10), &mut next)
+            .await
+            .expect(
+                "the connection whose stalled replies hold too much is closed; the other is served",
+            );
+        assert_eq!(code, Code::NotFound);
+        // The stalled stream of the closed connection holds nothing more.
+        assert!(matches!(stalled_stream.message().await, Err(_) | Ok(None)));
     }
 
     /// TCP connections have Nagle's algorithm off, so a small reply does not

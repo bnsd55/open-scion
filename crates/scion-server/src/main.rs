@@ -2,7 +2,7 @@
 //! derived data ahead of reads.
 
 use std::net::SocketAddr;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -45,6 +45,10 @@ enum Command {
         /// Most calls (HTTP/2 streams) that one connection may have open at once.
         #[arg(long, default_value_t = listen::DEFAULT_STREAMS)]
         max_streams: NonZeroU32,
+        /// Most bytes that the stalled replies of one connection may hold. A
+        /// connection over it is closed with them.
+        #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
+        max_stalled_bytes: NonZeroU64,
     },
     /// Import a local git repository, one way. Safe to repeat. It can run
     /// while the server runs.
@@ -114,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
             insecure_listen,
             max_connections,
             max_streams,
+            max_stalled_bytes,
         } => {
             anyhow::ensure!(!token.is_empty(), "--token must not be empty");
             // SHORTCUT: no TLS. Upgrade: tonic TLS or mTLS before any
@@ -132,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
             let limits = Limits {
                 connections: max_connections,
                 streams: max_streams,
+                stalled_bytes: max_stalled_bytes,
             };
             service::serve(store, listener, &token, limits, async {
                 tokio::signal::ctrl_c().await.ok();
