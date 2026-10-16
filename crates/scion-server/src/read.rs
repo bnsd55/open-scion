@@ -1,6 +1,6 @@
 //! Reads. Each takes a changeset ID, so each answer is immutable.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 
 use rusqlite::Connection;
@@ -12,6 +12,7 @@ use crate::db::{self, RepoId};
 use crate::deadline::Deadline;
 use crate::error::{Error, Result};
 use crate::graph;
+use crate::similar::{self, Budget, Chunks};
 use crate::store::Store;
 use crate::tree;
 
@@ -255,8 +256,30 @@ pub fn merge_base(
 }
 
 /// Most paths one `Diff` call returns. Each path costs at most one tree read
-/// per part on each side, while the call holds one read connection.
+/// per part on each side.
 pub const MAX_DIFF_ENTRIES: usize = 1000;
+
+/// Most entries a diff can have for `Diff` to find renames in it. To find
+/// them, a call walks the whole diff below its path, up to one entry more
+/// than this. Each tree read takes a read connection on its own.
+// SHORTCUT: a larger diff has no renames: a rename there is a delete and an
+// add. git finds renames in a diff of any size. Upgrade: renames of a diff
+// as derived data, found in steps over calls and kept
+// (https://github.com/bnsd55/open-scion/issues/107).
+pub const MAX_RENAME_ENTRIES: usize = 10_000;
+
+/// Most work one `Diff` call does to find similar files, in steps 2 and 3
+/// of [`similar::renames`]: each chunk of a file read counts once, and each
+/// row of a chunk table that the search indexes or compares counts once
+/// ([`similar::Budget`]). Reading 64 MiB of text in lines of 64 bytes or
+/// more costs 1M. The budget is the same on every call, so every call finds
+/// the same renames.
+// SHORTCUT: past it, the search reads no more files, so a diff with many
+// large files that could be similar can miss renames that git finds, also
+// renames to a file of the same name.
+// Upgrade: renames of a diff as derived data, found in steps over calls and
+// kept (https://github.com/bnsd55/open-scion/issues/107).
+pub const MAX_RENAME_CHUNKS: usize = 4 << 20;
 
 /// A path whose file differs between two snapshots.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -268,6 +291,19 @@ pub struct DiffEntry {
     pub old: Option<FileState>,
     /// The file at `path` in the new snapshot. `None` as for `old`.
     pub new: Option<FileState>,
+    /// Set when the file is half of a rename ([`diff`]).
+    pub rename: Option<Rename>,
+}
+
+/// The other half of a rename.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rename {
+    /// On an added file (`old` is `None`), the deleted path it came from. On
+    /// a deleted file (`new` is `None`), the added path it went to.
+    pub path: RepoPath,
+    /// How similar the two files are, in percent, as git prints it: 100 for
+    /// the same content.
+    pub similarity: u32,
 }
 
 /// One page of a diff.
@@ -291,13 +327,19 @@ pub struct DiffPage {
 /// sides. So it reads only the trees on the paths it returns, and on the
 /// way down to `path` and `after`.
 ///
+/// Renames are found as `git diff` finds them by default
+/// ([`similar::renames`]), among the added and deleted files of the whole
+/// diff below `path`, not of one page. So a page gives each entry the same
+/// rename, whichever page holds it and wherever `after` is. Both halves of a
+/// rename stay in the diff, so a client that does not know renames sees a
+/// delete and an add. If the page has an added or deleted file, the call
+/// walks the whole diff below `path`, unless the page is all of it. A diff
+/// of more than [`MAX_RENAME_ENTRIES`] entries has no renames, and the
+/// search for similar files stops at [`MAX_RENAME_CHUNKS`].
+///
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or a changeset does not exist.
-// SHORTCUT: renames are not detected, so a rename is a delete and an add;
-// `git diff` detects them by default. Upgrade: pair deletes and adds with
-// the same blob first, then by similarity, with a bound per call
-// (https://github.com/bnsd55/open-scion/issues/79).
 pub fn diff(
     store: &Store,
     repo: &str,
@@ -306,37 +348,8 @@ pub fn diff(
     path: Option<&RepoPath>,
     after: Option<&RepoPath>,
 ) -> Result<DiffPage> {
-    let old_root = root_tree(store, repo, old)?;
-    let new_root = root_tree(store, repo, new)?;
-    let under = path.map(tree::parts).unwrap_or_default();
-    let after = after.map(tree::parts);
-    // The parts of the resume path below `path`, or `None` when every path
-    // below `path` comes after it. Paths compare part by part.
-    let after = match &after {
-        Some(after) if after.starts_with(&under) => Some(&after[under.len()..]),
-        Some(after) if after.as_slice() > under.as_slice() => {
-            return Ok(DiffPage {
-                entries: Vec::new(),
-                next_after: None,
-            });
-        }
-        _ => None,
-    };
-    let mut walk = DiffWalk {
-        path: path.map(|p| p.as_bytes().to_vec()).unwrap_or_default(),
-        entries: Vec::new(),
-    };
-    store.read(|c| {
-        let (old, new) = match path {
-            Some(path) => (
-                tree::lookup(c, old_root, path)?,
-                tree::lookup(c, new_root, path)?,
-            ),
-            None => (Some(Entry::Dir(old_root)), Some(Entry::Dir(new_root))),
-        };
-        walk.walk(c, old, new, after)
-    })?;
-    let mut entries = walk.entries;
+    let roots = (root_tree(store, repo, old)?, root_tree(store, repo, new)?);
+    let mut entries = diff_walk(store, roots, path, after, MAX_DIFF_ENTRIES)?;
     // The walk finds one entry more than a page, to know whether more follow.
     let next_after = if entries.len() > MAX_DIFF_ENTRIES {
         entries.truncate(MAX_DIFF_ENTRIES);
@@ -344,23 +357,126 @@ pub fn diff(
     } else {
         None
     };
+    if entries.iter().any(|e| e.old.is_none() || e.new.is_none()) {
+        let renames = if after.is_none() && next_after.is_none() {
+            renames(store, &entries)?
+        } else {
+            let all = diff_walk(store, roots, path, None, MAX_RENAME_ENTRIES)?;
+            if all.len() > MAX_RENAME_ENTRIES {
+                tracing::debug!(
+                    entries = all.len(),
+                    "a diff with too many entries to find renames"
+                );
+                HashMap::new()
+            } else {
+                renames(store, &all)?
+            }
+        };
+        for entry in &mut entries {
+            entry.rename = renames.get(&entry.path).cloned();
+        }
+    }
     Ok(DiffPage {
         entries,
         next_after,
     })
 }
 
-/// The state of one [`diff`] walk.
-struct DiffWalk {
-    /// The path of the entries being compared, as raw bytes.
-    path: Vec<u8>,
-    /// What the walk found, up to one more than [`MAX_DIFF_ENTRIES`].
-    entries: Vec<DiffEntry>,
+/// The renames among `entries`, a whole diff: each path of a rename, with
+/// the other path.
+fn renames(store: &Store, entries: &[DiffEntry]) -> Result<HashMap<RepoPath, Rename>> {
+    let (mut added, mut deleted) = (Vec::new(), Vec::new());
+    for entry in entries {
+        match (entry.old, entry.new) {
+            (None, Some(state)) => added.push((&entry.path, state)),
+            (Some(state), None) => deleted.push((&entry.path, state)),
+            _ => {}
+        }
+    }
+    // git's order: whole paths by raw bytes, not tree order.
+    added.sort_unstable_by_key(|&(path, _)| path);
+    deleted.sort_unstable_by_key(|&(path, _)| path);
+    let mut cost = 0;
+    let read = |_: &RepoPath, blob, _| Ok(Some(Chunks::read(store, blob)?));
+    let budget = Budget {
+        cost: &mut cost,
+        cap: MAX_RENAME_CHUNKS,
+    };
+    let pairs = similar::renames(store, &added, &deleted, read, similar::MAX_PAIRS, budget)?;
+    if cost >= MAX_RENAME_CHUNKS {
+        tracing::debug!(
+            cost,
+            "the search for similar files in a diff stopped at its budget"
+        );
+    }
+    let mut renames = HashMap::new();
+    for pair in pairs {
+        let (to, from) = (added[pair.added].0, deleted[pair.deleted].0);
+        let similarity = pair.score * 100 / similar::SAME;
+        for (path, other) in [(to, from), (from, to)] {
+            let other = other.clone();
+            renames.insert(
+                path.clone(),
+                Rename {
+                    path: other,
+                    similarity,
+                },
+            );
+        }
+    }
+    Ok(renames)
 }
 
-impl DiffWalk {
+/// The entries of the diff of two root trees, as [`diff`] returns them, up
+/// to one more than `limit`.
+fn diff_walk(
+    store: &Store,
+    (old_root, new_root): (TreeId, TreeId),
+    path: Option<&RepoPath>,
+    after: Option<&RepoPath>,
+    limit: usize,
+) -> Result<Vec<DiffEntry>> {
+    let under = path.map(tree::parts).unwrap_or_default();
+    let after = after.map(tree::parts);
+    // The parts of the resume path below `path`, or `None` when every path
+    // below `path` comes after it. Paths compare part by part.
+    let after = match &after {
+        Some(after) if after.starts_with(&under) => Some(&after[under.len()..]),
+        Some(after) if after.as_slice() > under.as_slice() => return Ok(Vec::new()),
+        _ => None,
+    };
+    let (old, new) = match path {
+        Some(path) => store.read(|c| {
+            Ok((
+                tree::lookup(c, old_root, path)?,
+                tree::lookup(c, new_root, path)?,
+            ))
+        })?,
+        None => (Some(Entry::Dir(old_root)), Some(Entry::Dir(new_root))),
+    };
+    let mut walk = DiffWalk {
+        store,
+        path: path.map(|p| p.as_bytes().to_vec()).unwrap_or_default(),
+        entries: Vec::new(),
+        limit,
+    };
+    walk.walk(old, new, after)?;
+    Ok(walk.entries)
+}
+
+/// The state of one [`diff`] walk.
+struct DiffWalk<'a> {
+    store: &'a Store,
+    /// The path of the entries being compared, as raw bytes.
+    path: Vec<u8>,
+    /// What the walk found, up to one more than `limit`.
+    entries: Vec<DiffEntry>,
+    limit: usize,
+}
+
+impl DiffWalk<'_> {
     fn full(&self) -> bool {
-        self.entries.len() > MAX_DIFF_ENTRIES
+        self.entries.len() > self.limit
     }
 
     /// Compares `old` and `new`, the entries at `self.path`. `after` holds
@@ -371,7 +487,6 @@ impl DiffWalk {
     /// path rules.
     fn walk(
         &mut self,
-        c: &Connection,
         old: Option<Entry>,
         new: Option<Entry>,
         after: Option<&[PathElem]>,
@@ -389,9 +504,10 @@ impl DiffWalk {
                 path,
                 old: old_file,
                 new: new_file,
+                rename: None,
             });
         }
-        let (old_dir, new_dir) = (children(c, old)?, children(c, new)?);
+        let (old_dir, new_dir) = (self.children(old)?, self.children(new)?);
         // Names before the resume path do not matter.
         let start = match after {
             Some([first, ..]) => Bound::Included(first),
@@ -415,13 +531,22 @@ impl DiffWalk {
             }
             self.path.extend_from_slice(name.as_bytes());
             let (old_entry, new_entry) = (old_dir.get(name).copied(), new_dir.get(name).copied());
-            self.walk(c, old_entry, new_entry, name_after)?;
+            self.walk(old_entry, new_entry, name_after)?;
             self.path.truncate(len);
             if self.full() {
                 break;
             }
         }
         Ok(())
+    }
+
+    /// The entries of a directory. Empty for anything else. Each read takes
+    /// a read connection on its own, so a long walk does not hold one.
+    fn children(&self, entry: Option<Entry>) -> Result<BTreeMap<PathElem, Entry>> {
+        match entry {
+            Some(Entry::Dir(id)) => Ok(self.store.read(|c| db::get_tree(c, id))?.entries),
+            _ => Ok(BTreeMap::new()),
+        }
     }
 }
 
@@ -430,13 +555,5 @@ fn file(entry: Option<Entry>) -> Option<FileState> {
     match entry {
         Some(Entry::File(state)) => Some(state),
         _ => None,
-    }
-}
-
-/// The entries of a directory. Empty for anything else.
-fn children(c: &Connection, entry: Option<Entry>) -> Result<BTreeMap<PathElem, Entry>> {
-    match entry {
-        Some(Entry::Dir(id)) => Ok(db::get_tree(c, id)?.entries),
-        _ => Ok(BTreeMap::new()),
     }
 }

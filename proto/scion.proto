@@ -58,7 +58,8 @@ service Scion {
   // walk passes its bound.
   rpc IsAncestor(IsAncestorRequest) returns (IsAncestorResponse);
   // The paths whose file state differs between the snapshots of two
-  // changesets. Compares file states, not lines.
+  // changesets. Compares file states, not lines. Finds renames as `git diff`
+  // does by default.
   rpc Diff(DiffRequest) returns (DiffResponse);
 }
 
@@ -308,6 +309,17 @@ message DiffEntry {
   FileState old = 2;
   // The file at `path` in the new changeset. Unset as for `old`.
   FileState new = 3;
+  // Set on an added file (`old` unset) that is a rename: the deleted path it
+  // came from. The entry at that path has `rename_to` set to this path.
+  // Empty when the file is not a rename, and from a server that does not
+  // find renames.
+  bytes rename_from = 4;
+  // Set on a deleted file (`new` unset) that is a rename: the added path it
+  // went to. The entry at that path has `rename_from` set to this path.
+  bytes rename_to = 5;
+  // With `rename_from` or `rename_to`: how similar the two files are, in
+  // percent, as git prints it. 100 for the same content.
+  uint32 similarity = 6;
 }
 
 enum FileKind {
