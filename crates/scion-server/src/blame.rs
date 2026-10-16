@@ -21,9 +21,10 @@ use scion_core::{
 };
 
 use crate::db;
+use crate::deadline::Deadline;
 use crate::error::{Error, Result};
+use crate::history;
 use crate::memory::{BYTES_PER_LINE, Bytes, Held};
-use crate::read::{self, MAX_SCAN};
 use crate::similar::{self, Budget, Chunks, MAX_PAIRS, Progress};
 use crate::store::Store;
 use crate::tree;
@@ -158,8 +159,11 @@ enum Older {
 }
 
 /// Blames the file at `path` in `cs`. Diffs at most [`MAX_BLAME_VERSIONS`]
-/// versions and about [`MAX_BLAME_DIFF_LINES`] lines, and checks at most
-/// [`MAX_SCAN`] changesets. A binary file is blamed line by line too, as
+/// versions and about [`MAX_BLAME_DIFF_LINES`] lines, and reads at most
+/// the call's share of path history nodes: the versions come from the path
+/// history ([`history::newest_change`]), so a call reads one changeset and
+/// a few node rows per version, however many changesets lie between two
+/// versions. A binary file is blamed line by line too, as
 /// `git blame` does. `from` goes on with a rename search that an earlier
 /// call stopped ([`Blame::next_search`]); its default starts none.
 ///
@@ -192,6 +196,13 @@ pub fn blame(
     // changeset that no reply reports.
     let (start, start_path) = resume.next.clone().unwrap_or((cs, path.clone()));
     let repo = store.read(|c| db::repo_id(c, repo))?;
+    // The walk reads the path history of `start`: derive it first, in
+    // steps, the way `Log` with a path does, so every changeset on its
+    // first-parent history has a value.
+    let derive_until = Deadline::new(
+        until.unwrap_or_else(|| Instant::now() + std::time::Duration::from_secs(600)),
+    );
+    crate::derived::get_by::<history::PathHistory>(store, repo, start, &derive_until)?;
     let root = tree::root_tree(store, repo, start)?;
     let mut blob = regular_blob(store, root, &start_path)?;
     // The text of the version the walk starts at. Its bytes stay taken for
@@ -238,9 +249,13 @@ pub fn blame(
     let mut changesets = Vec::new();
     let mut next = Some(start);
     let mut next_search = RenameSearch::default();
-    let mut budget = MAX_SCAN;
     let mut diffed = 0;
     let mut from = resume.search.clone();
+    // The path history nodes the walk has read, cached across the call's
+    // steps, and the bytes of them that the call holds of its share.
+    let mut nodes = history::Nodes::default();
+    let mut node_bytes = 0usize;
+    let mut node_holds: Vec<Held> = Vec::new();
     for _ in 0..MAX_BLAME_VERSIONS {
         if lines[resume.after_line..window_end]
             .iter()
@@ -248,11 +263,41 @@ pub fn blame(
         {
             break;
         }
-        let Some((id, changeset)) =
-            store.read(|c| read::next_change(c, repo, Some(&path), &mut next, &mut budget))?
-        else {
+        // The next version to explain: the newest changeset at or below
+        // `next`, on its first-parent history, that changes the path.
+        let Some(at) = next else { break };
+        let step = store.read(|c| {
+            let Some(id) = history::newest_change(c, &mut nodes, at, &path)? else {
+                return Ok(None);
+            };
+            let changeset = db::get_changeset(c, repo, id)?;
+            Ok(Some((id, changeset)))
+        })?;
+        let Some((id, changeset)) = step else {
+            // No version below: the walk reached the change that made the
+            // file.
+            next = None;
             break;
         };
+        // The next version, if the walk goes on, is the newest one at or
+        // below this version's parent.
+        next = changeset.parents.first().copied();
+        // The nodes the lookups read hold share bytes until the call
+        // ends. A take that does not fit stops the walk: the next call
+        // goes on at the version this one explained, and reads the nodes
+        // again within its own share.
+        if nodes.bytes() > node_bytes {
+            match memory.try_take(nodes.bytes() - node_bytes) {
+                Ok(hold) => {
+                    node_holds.push(hold);
+                    node_bytes = nodes.bytes();
+                }
+                Err(_) => {
+                    (next, next_search) = (Some(id), next_search);
+                    break;
+                }
+            }
+        }
         let puts_text = matches!(
             changeset.changes.get(&path),
             Some(Some(FileState::Regular { content, .. })) if *content == blob

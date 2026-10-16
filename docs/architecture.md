@@ -845,8 +845,11 @@ Tests compare the result with `git blame --first-parent`, line by line, on
 histories where they agree: edits, merges, a file that becomes a directory
 and a file again, and renames for each rule above.
 
-**Bounds and resume.** A `Blame` call checks at most 1,000 changesets
-(`MAX_SCAN`) on its walk, and reads one changeset per check. It also diffs
+**Bounds and resume.** A `Blame` call walks versions through the path
+history: the versions come from `history::newest_change`, so a call reads
+one changeset and a few node rows per version, however many changesets lie
+between two versions, and holds those node bytes of its memory share. It
+also diffs
 at most 100 versions, and about 1M lines (`MAX_BLAME_DIFF_LINES`, both
 sides of each diff, a line counts once per 64 bytes; a rename search counts
 each chunk it reads, each row of a chunk table it indexes or compares, and
@@ -926,12 +929,10 @@ the repo, that the runs fill the window, and that every open line's place
 is inside the version at the walk's position, and takes the cursor's bytes
 and state from the blame memory budget before it reads them. Each new
 window re-walks from the changeset of the request: the walk from the tip
-to where the cursor stopped costs one `MAX_SCAN` check per changeset, a
-few reads per changeset, and re-reads the versions' trees but not their
-file texts (the cursor carries the line state, so the call diffs only the
-versions of its window). `scn blame` asks again until the cursor is empty.
-Blame from the path history will remove these
-bounds ([#61](https://github.com/bnsd55/open-scion/issues/61)).
+to where the cursor stopped reads the path history again, a few node rows
+per version, and re-reads the versions' trees but not their file texts
+(the cursor carries the line state, so the call diffs only the versions of
+its window). `scn blame` asks again until the cursor is empty.
 
 **Graph and diff queries** (`read::merge_base`, `read::is_ancestor`,
 `read::diff`). The article lists computing diffs and finding merge bases
@@ -1477,7 +1478,6 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | Per-ref serialization in a shared database ([design](design/scalable-backend.md)). | [#47](https://github.com/bnsd55/open-scion/issues/47) |
 | `scion-server/src/objects.rs` (`read_object`) | An object ID is treated as permission to read it: `GetObjects` serves any tree or blob by ID for a repo the caller may read. The access rules check the repo of the call, not the object. | A read ticket bound to a principal, a repo and a root tree, checked by the server and every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/objects.rs` (`find`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
-| `scion-server/src/read.rs` (`MAX_SCAN`) | Blame walks first parents on every call, at most 1,000 changesets per call. A file changed long ago costs many calls. | Blame from the path history. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
 | `scion-server/src/tree.rs` (`Dir::store`) | A change rewrites each directory on its paths whole: a tree of every live name. With names of 12 bytes, a write in a directory of 10,000 names stores 500 KB of tree. | Trees cut into chunks, so a write stores only the chunks it changes. Trees need a new format for it. | [#114](https://github.com/bnsd55/open-scion/issues/114) |
 | `scion-server/src/history.rs` (`Edit::stored`) | An edit of a chunked level holds and re-encodes the whole chunk index of the level, so a write re-stores the index row that changed: about 32 KB at 100,000 names, about 2.7 MB at 10M. | Keep the index stacked in the edit, and edit one index chunk per level of the stack. | [#114](https://github.com/bnsd55/open-scion/issues/114) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_VERSIONS`) | One call diffs at most 100 versions of a file. A file with more versions costs more calls. | Blame as derived data, kept per file version. | [#61](https://github.com/bnsd55/open-scion/issues/61) |

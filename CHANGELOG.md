@@ -95,7 +95,10 @@ until that section gets its release date.
   An older server ignores the new `path` field, so `scn log --path`
   against it prints unfiltered history.
 - `Blame`, a new RPC: which changeset last changed each line of a file, on
-  first-parent history. It follows renames as `git blame` does by
+  first-parent history. It walks versions through the path history, so it
+  reads one changeset and a few node rows per version, however many
+  changesets lie between two versions, and holds those node bytes of the
+  blame memory share. It follows renames as `git blame` does by
   default: a deleted file with the same content, else a similar one (50%
   or more). Each changeset in a reply names the path of the file there
   (`BlameChangeset.path`). `scn blame` shows each line's path when some

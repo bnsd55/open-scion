@@ -106,20 +106,16 @@ pub fn list_dir(
     })
 }
 
-/// Most changesets that one `Blame` call checks on its first-parent walk,
-/// and most entries that a `Log` reply holds. Each check, and each entry,
-/// reads one changeset while the call holds one read connection.
-// SHORTCUT: blame walks first parents on every call, so a file changed long
-// ago costs one call per 1,000 changesets since. Upgrade: blame from the
-// path history (`history.rs`), so a call reads only the changesets that
-// changed the file (https://github.com/bnsd55/open-scion/issues/61).
+/// Most entries that a `Log` reply holds. Each entry reads one changeset
+/// while the call holds one read connection.
 pub const MAX_SCAN: usize = 1000;
 
-/// Most bytes of path history that one `Log` call with a path reads, about
-/// as much as a `Blame` call reads. A lookup reads a whole directory level
-/// on each part of the path, so a file in a large directory costs a lot per
-/// entry: about 630 KB at 10,000 names. A call stops at this bound, after
-/// its first entry. Tests use a small bound, so that they reach it.
+/// Most bytes of path history that one `Log` call with a path reads. A
+/// lookup reads a whole directory level on each part of the path, so a
+/// file in a large directory costs a lot per entry: a change in a
+/// directory of 100,000 names reads its chunk, about 8 KiB, plus the
+/// index. A call stops at this bound, after its first entry. Tests use a
+/// small bound, so that they reach it.
 pub const MAX_LOG_NODE_BYTES: usize = if cfg!(test) { 512 << 10 } else { 64 << 20 };
 
 /// One page of first-parent history.
@@ -185,7 +181,7 @@ pub fn log_page(
             let mut entries = Vec::new();
             let mut next = Some(cs);
             let mut budget = limit;
-            while let Some(entry) = next_change(c, repo, None, &mut next, &mut budget)? {
+            while let Some(entry) = next_change(c, repo, &mut next, &mut budget)? {
                 entries.push(entry);
             }
             Ok(LogPage { entries, next })
@@ -219,26 +215,22 @@ pub fn log_page(
     })
 }
 
-/// Walks first parents from `next` to the newest changeset that changes
-/// `path` ([`changes_path`]), or to the next changeset if `path` is `None`.
-/// Checks at most `budget` changesets, and leaves `next` at the first one it
-/// did not check. `Blame` walks with it, and `Log` without a path.
+/// Walks first parents from `next`, newest first: the entries of a `Log`
+/// reply without a path. Checks at most `budget` changesets, and leaves
+/// `next` at the first one it did not check.
 pub(crate) fn next_change(
     c: &Connection,
     repo: RepoId,
-    path: Option<&RepoPath>,
     next: &mut Option<ChangesetId>,
     budget: &mut usize,
 ) -> Result<Option<(ChangesetId, Changeset)>> {
-    while let Some(id) = next.filter(|_| *budget > 0) {
-        *budget -= 1;
-        let changeset = db::get_changeset(c, repo, id)?;
-        *next = changeset.parents.first().copied();
-        if path.is_none_or(|path| changes_path(&changeset, path)) {
-            return Ok(Some((id, changeset)));
-        }
-    }
-    Ok(None)
+    let Some(id) = next.filter(|_| *budget > 0) else {
+        return Ok(None);
+    };
+    *budget -= 1;
+    let changeset = db::get_changeset(c, repo, id)?;
+    *next = changeset.parents.first().copied();
+    Ok(Some((id, changeset)))
 }
 
 /// Whether a changeset changes `path`: the file itself, or anything below it
