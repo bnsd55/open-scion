@@ -204,9 +204,9 @@ Otherwise it streams the spool file through the compressor into the temp
 file, and renames it over any stored copy. So an upload of content that only
 another repo has takes the same write path as one of new content: its time
 does not show that the content exists. Then it adds the blob to the repo. The spool file has no name, so a dropped
-upload or a crash leaves nothing behind. An open that finds no other process
-in the data directory removes any temp file that a crash left before its
-rename (see below).
+upload or a crash leaves nothing behind. Each process stages its temp files
+in its own folder of `tmp/`, held with a lock, and an open removes the
+folders of processes that no longer hold theirs (see below).
 
 **Durability rules.**
 
@@ -268,11 +268,13 @@ import with `Store::open_shared`. Each holds its `flock`s until the last
 | `<data>/lock` | Every process, shared, for its whole life. An open first tries to take it exclusive, to learn whether another process uses the directory. An older build holds it exclusive for its whole life, so it and this build keep each other out. The file holds the build of the processes that use the directory (below). |
 | `<data>/open.lock` | A process while it opens the directory, so opens take turns. |
 
-- **Alone at open.** Only a process that opens the directory alone removes
-  the files in `tmp/` and runs schema migrations. While another process runs,
-  its temp files are live, and its statements need the schema it knows. So
-  the temp files that a crashed import leaves stay until an open finds the
-  directory unused ([#101](https://github.com/bnsd55/open-scion/issues/101)).
+- **Alone at open.** A process that opens the directory alone also removes
+  files in `tmp/` of a build older than the folders, and runs schema
+  migrations. Every open, alone or not, removes the folders of `tmp/` that
+  no process holds: each process stages its temp files in its own folder,
+  which it holds with a `flock` for as long as it lives, so the temp files
+  of a crashed import are removed by the next open, of any process
+  ([#101](https://github.com/bnsd55/open-scion/issues/101)).
   A shared open of an older schema fails: stop the other processes to
   upgrade it.
 - **One build.** Each process removes the derived rows of older versions of
@@ -283,12 +285,12 @@ import with `Store::open_shared`. Each holds its `flock`s until the last
 - **Writes take turns.** SQLite in WAL mode lets one process read while the
   other writes. A write waits for the write transaction of the other
   process, up to `busy_timeout` (5 s), and then fails with `UNAVAILABLE`, so
-  the client retries. An import holds the
-  write lock for one batch of 1,000 commits, verification included. While a
-  server write waits, it holds the server's write connection, so the
-  server's other writes wait too
-  ([#100](https://github.com/bnsd55/open-scion/issues/100)). Its reads do
-  not: they use the read connections.
+  the client retries. An import ends a write transaction after 1 s, so a
+  server write waits for at most that plus one commit, and the import stays
+  off the lock 100 ms between two transactions
+  ([#100](https://github.com/bnsd55/open-scion/issues/100)). While a server
+  write waits, it holds the server's write connection, so the server's
+  other writes wait too. Its reads do not: they use the read connections.
 - **Refs.** Both processes move a ref by compare-and-swap on its `version`,
   each in a write transaction. The server sees a move that the import made at
   its next land on the ref: each plan reads the head from the database and
@@ -661,11 +663,15 @@ runs (section 3). Only SHA-1 repositories are supported.
 2. For each batch of 1,000 commits, build the changesets, write new blobs into
    one blob batch, and sync it.
 3. Derive the missing root tree of each first parent from before the batch,
-   in steps, as after a version bump. Then, in one transaction, store each
-   changeset with `tree::store_changeset`
+   in steps, as after a version bump. Then store each changeset with
+   `tree::store_changeset`
    (with its root tree, and its commit-graph node if each parent has one),
-   record its `git_import` row, and verify the sampled commits. A failed check
-   rolls back the batch. Earlier batches stay, so a rerun continues.
+   record its `git_import` row, and verify the sampled commits. The stores
+   of a batch run in transactions that end after 1 s, so a server that
+   shares the directory waits for that plus one commit, and not for the
+   batch; the import stays off the write lock 100 ms between two
+   transactions. A failed check rolls back the chunk of its transaction.
+   Earlier commits stay, so a rerun continues.
 4. Point the ref at the tip. The checks in the table below run in reads,
    and the move is a compare-and-swap on the ref's `version`. If a land moved
    the ref in between, the import checks it again.
@@ -1274,8 +1280,7 @@ limit and its upgrade path. This is the list on `main` today.
 |---|---|---|---|
 | `scion-core/src/codec.rs` (`put_len`) | Encoding panics if a field is longer than `u32::MAX`. Every ingest path caps sizes far below that. | `try_encode` returning `Result`, if a path ever does not. | |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
-| `scion-server/src/import.rs` (`BATCH`) | A server that shares the data directory waits for each import batch transaction, up to `busy_timeout` (5 s), and then its write fails with `UNAVAILABLE`. Its other writes wait behind that write. | Shorter import transactions while a server shares the directory. | [#100](https://github.com/bnsd55/open-scion/issues/100) |
-| `scion-server/src/store.rs` (`Blobs::sweep_tmp`) | Only an open that finds no other process removes the temp files that a crash left, so those of a crashed import stay while the server runs. | A `tmp/` folder per process, under its own lock. | [#101](https://github.com/bnsd55/open-scion/issues/101) |
+| `scion-server/src/import.rs` (`TX_BUDGET`) | A transaction of an import ends at 1 s, but one commit's record and check can run longer, and a server write then waits for it. Ceiling: the changes and trees of the biggest commit. | A separate write connection for the import, or per-statement yields. | [#100](https://github.com/bnsd55/open-scion/issues/100) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | Per-ref serialization in a shared database ([design](design/scalable-backend.md)). | [#47](https://github.com/bnsd55/open-scion/issues/47) |
 | `scion-server/src/land.rs` (`MAX_WALK`) | A land on a base more than `MAX_DEPTH` generations below the tip walks the history from the index floor back to the base, each time, and holds the write connection while it walks. A base more than 100,000 changesets below the floor is rejected. | Per-path history in the database, so the check reads only the paths that the land changes. | [#38](https://github.com/bnsd55/open-scion/issues/38) |
 | `scion-server/src/objects.rs` (`read_object`) | An object ID is treated as permission to read it: `GetObjects` serves any tree or blob for any repo name. Safe with one principal. | A read ticket bound to a principal, a repo and a root tree, checked by the server and every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |

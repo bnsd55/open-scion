@@ -557,6 +557,7 @@ pub enum BlobStatus {
 }
 
 /// Immutable file contents, one zstd-compressed file per [`BlobId`].
+/// Immutable file contents, one zstd-compressed file per [`BlobId`].
 pub struct Blobs {
     root: PathBuf,
     /// The staging folder for temp files of every process.
@@ -565,7 +566,8 @@ pub struct Blobs {
     /// another process can tell that this one lives.
     mine: PathBuf,
     /// The lock file of `mine`, held for as long as this `Blobs` lives.
-    mine_lock: fs::File,
+    /// Never read: its life is the point.
+    _mine_lock: fs::File,
     group_flush: GroupFlush,
     /// Calls to [`Blobs::verify`] so far.
     #[cfg(test)]
@@ -574,6 +576,8 @@ pub struct Blobs {
 
 impl Blobs {
     fn open(dir: &Path) -> Result<Self> {
+        // Folders of `tmp/` made in this process, so each `Blobs` gets its own.
+        static FOLDERS: AtomicU64 = AtomicU64::new(0);
         let objects = dir.join("objects");
         let root = objects.join("blob");
         let tmp = dir.join("tmp");
@@ -585,9 +589,7 @@ impl Blobs {
         // nothing once any process opens the directory again (issue #101).
         // Opens hold `open.lock` exclusively, so no other process creates a
         // folder or sweeps while this one does.
-        static FOLDERS: AtomicU64 = AtomicU64::new(0);
-        let mut mine_lock = None;
-        let mine = loop {
+        let (mine, mine_lock) = loop {
             let name = format!(
                 "{:x}-{:x}",
                 process::id(),
@@ -607,10 +609,8 @@ impl Blobs {
                 // cannot be this process's own folder.
                 continue;
             }
-            mine_lock = Some(lock);
-            break mine;
+            break (mine, lock);
         };
-        let mine_lock = mine_lock.unwrap();
         // A blob file is only as durable as the directories above it. A batch
         // flushes the fan-out directories it writes to; these are made once.
         for path in [&root, &objects, &tmp, dir] {
@@ -620,7 +620,7 @@ impl Blobs {
             root,
             tmp,
             mine,
-            mine_lock,
+            _mine_lock: mine_lock,
             group_flush: GroupFlush::default(),
             #[cfg(test)]
             verifies: std::sync::atomic::AtomicU64::default(),
@@ -1448,26 +1448,30 @@ mod tests {
 
     #[test]
     fn an_open_removes_temp_files_before_another_open_ends() {
-        // What crashes left, enough that removing it takes a while.
+        // What a crashed import left: its staging folder with many temp
+        // files, so removing it takes a while.
         const LEFT: usize = 5_000;
         let dir = tempfile::tempdir().unwrap();
         let tmp = dir.path().join("tmp");
-        fs::create_dir_all(&tmp).unwrap();
+        let dead = tmp.join("dead");
+        fs::create_dir_all(&dead).unwrap();
+        fs::write(dead.join(".lock"), b"").unwrap();
         for i in 0..LEFT {
-            fs::write(tmp.join(format!("left{i}")), b"").unwrap();
+            fs::write(dead.join(format!("left{i}")), b"").unwrap();
         }
-        let count = || fs::read_dir(&tmp).unwrap().count();
-        // The sweep removes the files in the order that the folder lists them.
-        let listed_first = fs::read_dir(&tmp).unwrap().next().unwrap().unwrap().path();
+        // The sweep removes the dead folder's files in the order that the
+        // folder lists them.
+        let listed_first = fs::read_dir(&dead).unwrap().next().unwrap().unwrap().path();
         let path = dir.path().to_owned();
         let first = thread::spawn(move || Store::open(&path));
         while listed_first.exists() && !first.is_finished() {
             thread::yield_now();
         }
-        // The first open is removing them. A second open waits for it, so
-        // the temp files that it writes next are safe from that sweep.
+        // The first open is removing the dead folder. A second open waits
+        // for it, so the folder that it writes next is safe from that sweep:
+        // the dead folder is gone, and the two live ones stay.
         let second = Store::open_shared(dir.path()).unwrap();
-        assert_eq!(count(), 0);
+        assert_eq!(fs::read_dir(&tmp).unwrap().count(), 2);
         drop((first.join().unwrap().unwrap(), second));
     }
 
@@ -1693,7 +1697,10 @@ mod tests {
 
     /// Entries in the temp directory.
     fn staged(blobs: &Blobs) -> usize {
-        fs::read_dir(&blobs.tmp).unwrap().count()
+        fs::read_dir(&blobs.mine)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name() != ".lock")
+            .count()
     }
 
     /// Blob files in the blob folder.
@@ -1772,8 +1779,9 @@ mod tests {
         let id = BlobId::of(content);
         // A crash during an upload: no destructor runs.
         std::mem::forget(store.blobs().upload().unwrap().append(content).unwrap());
-        // A crash after the compressed file is written, before its rename.
-        let mut torn = tempfile::NamedTempFile::new_in(&store.blobs().tmp).unwrap();
+        // A crash after the compressed file is written, before its rename,
+        // in the staging folder of the process that crashed.
+        let mut torn = tempfile::NamedTempFile::new_in(&store.blobs().mine).unwrap();
         torn.write_all(&zstd::bulk::compress(content, 3).unwrap())
             .unwrap();
         torn.keep().unwrap();
@@ -1782,6 +1790,7 @@ mod tests {
 
         let store = Store::open(dir.path()).unwrap();
         assert_eq!(store.blobs().verify(id).unwrap(), BlobStatus::Missing);
+        // The folder of the dead process is gone, and this one is empty.
         assert_eq!(staged(store.blobs()), 0, "open removes what a crash left");
     }
 

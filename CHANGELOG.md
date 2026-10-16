@@ -22,8 +22,11 @@ release.
 - `scion-server import` can run while the server runs on the same data
   directory. It moves the ref by compare-and-swap, as a land does, and its
   commits are durable before the server can see them. A second server, or
-  a process of another build, is refused. A request that waits for the
-  import's write lock for more than 5 s fails with `UNAVAILABLE`.
+  a process of another build, is refused. Its write transactions end after
+  1 s, so a server write waits for at most that plus one commit instead of
+  a whole batch, and a request that waits more than 5 s fails with
+  `UNAVAILABLE`. The temp files of a crashed import are removed by the
+  next open of the directory, while the server keeps running.
 - Server-side commits (`CreateChangeset`) and lands: path-level conflict
   checks through a per-ref index, one transaction per land, retries by
   request key, and bounded retry when the ref moves.
