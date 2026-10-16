@@ -97,7 +97,8 @@ at most 4 `Blame` calls run at once, and at most 4 `MergeBase` and
 `IsAncestor` calls together. A `ReadFile` call waits for its share of a memory
 budget (section 6.7). Time in a queue counts toward the timeout.
 One wait has its own limit: a `GetObjects` call that gets no memory for its
-first object within 30 s fails with `RESOURCE_EXHAUSTED` (section 7.3).
+first object within 30 s, or before the caller's `grpc-timeout`, fails with
+`RESOURCE_EXHAUSTED` (section 7.3).
 
 ## 3. Common rules
 
@@ -152,9 +153,9 @@ contract. A client MUST NOT depend on its text.
 | `ABORTED` | `Land` only: other writers kept moving the ref. The land stays `PENDING`. | Yes, with the same request key |
 | `OUT_OF_RANGE` | A message is larger than its limit. | After the cause is fixed |
 | `CANCELLED` | The server's 600 s limit or the client's `grpc-timeout` ran out. A client library can report its own deadline as `DEADLINE_EXCEEDED`. | Yes. A `Land` retry uses the same request key. |
-| `DEADLINE_EXCEEDED` | `ReadFile`: the client took no message for 120 s. `GetObjects`: the client took no part for 120 s in the middle of an object (section 7.3). `Land`: the land ran past 600 s from the start of the call. The land stays `PENDING`. `MergeBase`, `IsAncestor`: the walk ran past 600 s from the start of the call. | Yes. A `Land` retry uses the same request key. |
+| `DEADLINE_EXCEEDED` | `ReadFile`: the client took no message for 120 s. `GetObjects`: the client took no part for 120 s in the middle of an object (section 7.3). `Land`: the land ran past 600 s from the start of the call. The land stays `PENDING`. `MergeBase`, `IsAncestor`: the walk ran past 600 s from the start of the call. From a tier: the caller's deadline ran out while the tier waited for its first object (section 8). | Yes. A `Land` retry uses the same request key. |
 | `UNAVAILABLE` | The server cannot be reached or is shutting down, or its database stayed busy for 5 s (another process, such as an import, held its write lock). A tier also replies `UNAVAILABLE` when its upstream does not answer in time, or when it finds no room to fetch an object from upstream within 30 s (section 8). | Yes |
-| `RESOURCE_EXHAUSTED` | `GetObjects` only: no memory for the first object within 30 s (section 7.3). | Yes, after a wait |
+| `RESOURCE_EXHAUSTED` | `GetObjects` only: no memory for the first object within 30 s, or before the caller's deadline (section 7.3). | Yes, after a wait |
 | `DATA_LOSS` | From a tier only: its upstream sent bytes that are not the object asked for (section 8). | MAY |
 | `INTERNAL` | A database, I/O or stored-data error, or a server bug. The message is `internal error`; the detail stays in the server log. | MAY |
 | `UNIMPLEMENTED` | The server does not have the call, or the request is compressed. | After the cause is fixed |
@@ -799,7 +800,8 @@ order.
   parts that wait for the client in the server and in HTTP/2, at most 1 MiB
   each, until the stream ends or the connection closes (section 2). The
   server finds the first object before it answers the call. If it has no memory for that
-  object within 30 s, the call fails with `RESOURCE_EXHAUSTED` and sends no
+  object within 30 s, or before the caller's deadline, the call fails with
+  `RESOURCE_EXHAUSTED` and sends no
   object. The client SHOULD wait before it asks again.
 - The reply stops when the server waits 30 s for memory for a later object,
   or when the client takes no part for 120 s (the stall limit).
@@ -825,8 +827,8 @@ MAY keep the objects it got before the error.
 |---|---|
 | `INVALID_ARGUMENT` | A bad repo name; no ref or more than 1,000; a kind that is not `TREE` or `BLOB`; an ID that is not 32 bytes. |
 | `NOT_FOUND` | The repo does not exist (the call's status); a named object does not exist (in the stream, after the objects before it). |
-| `RESOURCE_EXHAUSTED` | No memory for the first object within 30 s. No object was sent. |
-| `DEADLINE_EXCEEDED` | In the stream: the client took no part for 120 s in the middle of an object. |
+| `RESOURCE_EXHAUSTED` | No memory for the first object within 30 s, or before the caller's deadline. No object was sent. |
+| `DEADLINE_EXCEEDED` | From a tier: the caller's deadline ran out while it waited for the first object (section 8). In the stream: the client took no part for 120 s in the middle of an object. |
 | `UNAVAILABLE` | From a tier: its upstream did not answer in time, or it found no fetch slot or no memory for an object from upstream within 30 s (section 8). The call's status for the first object, else in the stream. Ask again. |
 
 ## 8. Cache tiers
@@ -875,8 +877,16 @@ order is daemon, cache, server. These rules hold for any tier:
   server answers first. `scion-daemon` waits 180 s for each step of the
   cache, which covers one step of the server, the cache's own three waits
   of 30 s, and 30 s to spare. On a timeout or a wait that ends, the tier
-  fails with `UNAVAILABLE`. A deadline that the client passes down
-  is not in v0.1 ([#98](https://github.com/bnsd55/open-scion/issues/98)).
+  fails with `UNAVAILABLE`. A caller's deadline passes down. A tier reads
+  the caller's `grpc-timeout`, ends every wait at it less a margin (a tenth
+  of it, at most 1 s), and sends what is left of it upstream as
+  `grpc-timeout`. So the status of the deepest process reaches the caller
+  in time, for any deadline. A caller whose deadline passes stops waiting,
+  and the fetch that another caller with a later deadline waits for goes
+  on; that caller asks again with its own if the fetch failed on a shorter
+  one. With no `grpc-timeout`, the fixed limits above apply and the tier
+  sends none upstream. `scn` sends a deadline on every call: 600 s, the
+  server's own limit, so a waiting `scn` never hangs silently.
 - The `Scion` service goes only to the server.
 
 **The daemon's socket.** `scion-daemon` listens on a Unix socket with mode
