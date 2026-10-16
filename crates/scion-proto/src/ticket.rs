@@ -72,6 +72,9 @@ pub struct Ticket {
     pub repo: String,
     /// The principal that may use it.
     pub principal: String,
+    /// The wire bytes that were parsed, so a tier relays the ticket as it
+    /// came.
+    pub bytes: Vec<u8>,
 }
 
 /// Signs a ticket for the objects of a root tree: `repo` and `principal`,
@@ -110,6 +113,14 @@ pub fn sign(
     Ok(body)
 }
 
+/// Seconds since the Unix epoch: the clock that tickets live by.
+#[must_use]
+pub fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
 /// The bytes that a signature covers: [`PREFIX`] and then the ticket bytes
 /// before its signature.
 fn signed_bytes(body: &[u8]) -> Vec<u8> {
@@ -134,12 +145,7 @@ fn signed_bytes(body: &[u8]) -> Vec<u8> {
 /// Never: the length check before the split makes the last slice exactly
 /// [`SIGNATURE_BYTES`] long.
 pub fn parse(bytes: &[u8], keys: &[VerifyingKey], now: u64) -> Result<Ticket, TicketError> {
-    // Version, expiry, root tree, two lengths with their names, signature.
-    const MIN_BYTES: usize = 1 + 8 + ROOT_TREE_BYTES + 2 + 2 + SIGNATURE_BYTES;
-    if bytes.len() < MIN_BYTES {
-        return Err(TicketError::Bad("too short"));
-    }
-    let (body, signature_bytes) = bytes.split_at(bytes.len() - SIGNATURE_BYTES);
+    let (body, signature_bytes) = split(bytes)?;
     let signature = Signature::from_bytes(signature_bytes.try_into().unwrap());
     if !keys
         .iter()
@@ -147,7 +153,35 @@ pub fn parse(bytes: &[u8], keys: &[VerifyingKey], now: u64) -> Result<Ticket, Ti
     {
         return Err(TicketError::Bad("unknown key or bad signature"));
     }
-    let mut read = body;
+    ticket_of(body, bytes, now)
+}
+
+/// A ticket without checking who signed it, for a hop that only forwards
+/// tickets and never vouches for them. Everything else is checked, so the
+/// walk from its root tree still gates what a forwarder serves.
+///
+/// # Errors
+///
+/// [`TicketError::Bad`] for a ticket that is too short, of another
+/// version, or with trailing bytes; [`TicketError::Expired`] or
+/// [`TicketError::OutsideClockWindow`] when its clock window is off.
+pub fn parse_unverified(bytes: &[u8], now: u64) -> Result<Ticket, TicketError> {
+    let (body, _) = split(bytes)?;
+    ticket_of(body, bytes, now)
+}
+
+/// Splits the signature off, or refuses a ticket too short to have one.
+fn split(bytes: &[u8]) -> Result<(&[u8], &[u8]), TicketError> {
+    // Version, expiry, root tree, two lengths with their names, signature.
+    const MIN_BYTES: usize = 1 + 8 + ROOT_TREE_BYTES + 2 + 2 + SIGNATURE_BYTES;
+    if bytes.len() < MIN_BYTES {
+        return Err(TicketError::Bad("too short"));
+    }
+    Ok(bytes.split_at(bytes.len() - SIGNATURE_BYTES))
+}
+
+/// Reads the fields of the body of a ticket and checks its clock window.
+fn ticket_of(mut read: &[u8], bytes: &[u8], now: u64) -> Result<Ticket, TicketError> {
     if take(&mut read, 1)?[0] != VERSION {
         return Err(TicketError::Bad("version"));
     }
@@ -169,6 +203,7 @@ pub fn parse(bytes: &[u8], keys: &[VerifyingKey], now: u64) -> Result<Ticket, Ti
         root_tree,
         repo: repo.to_owned(),
         principal: principal.to_owned(),
+        bytes: bytes.to_owned(),
     })
 }
 
@@ -380,6 +415,31 @@ mod tests {
         // Past the expiry and the skew.
         let late = 1_000 + TICKET_LIFETIME_SECS + TICKET_SKEW_SECS + 1;
         assert_eq!(parse(&bytes, &keys, late), Err(TicketError::Expired));
+    }
+
+    #[test]
+    fn an_unverified_ticket_still_keeps_its_shape_and_its_clock() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let bytes = sign(&key, "r", "alice", [1; 32], 1_000).unwrap();
+        // The bytes are read the same way, signature or not.
+        let ticket = parse_unverified(&bytes, 1_000).unwrap();
+        assert_eq!((ticket.repo.as_str(), ticket.root_tree), ("r", [1; 32]));
+        // Too short, expired, of another version: refused all the same.
+        assert_eq!(
+            parse_unverified(&bytes[..20], 1_000),
+            Err(TicketError::Bad("too short"))
+        );
+        // The ticket lives 900 s; past its expiry plus the skew it is out.
+        assert_eq!(
+            parse_unverified(&bytes, 1_000 + TICKET_LIFETIME_SECS + TICKET_SKEW_SECS + 1),
+            Err(TicketError::Expired)
+        );
+        let mut other = bytes.clone();
+        other[0] = 99;
+        assert_eq!(
+            parse_unverified(&other, 1_000),
+            Err(TicketError::Bad("version"))
+        );
     }
 
     #[test]

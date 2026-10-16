@@ -2,8 +2,6 @@
 //! `GetRootTree` replies carry, and it verifies the ticket of every
 //! `GetObjects` call against each key that it trusts.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 /// The signing key of the tickets that this server mints, and the public
@@ -83,16 +81,14 @@ impl Keys {
         principal: &str,
         root_tree: [u8; 32],
     ) -> Result<Vec<u8>, String> {
-        scion_proto::ticket::sign(&self.signing, repo, principal, root_tree, now())
+        scion_proto::ticket::sign(
+            &self.signing,
+            repo,
+            principal,
+            root_tree,
+            scion_proto::ticket::now(),
+        )
     }
-}
-
-/// Seconds since the Unix epoch.
-pub(crate) fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_secs())
-        .unwrap_or_default()
 }
 
 fn from_hex(hex: &str, name: &str) -> Result<[u8; 32], String> {
@@ -133,7 +129,7 @@ mod tests {
         // Another key does not verify this key's tickets.
         let other = Keys::generate();
         let ticket = keys.sign("r", "alice", [1; 32]).unwrap();
-        let now = now();
+        let now = scion_proto::ticket::now();
         assert!(scion_proto::ticket::parse(&ticket, &[keys.signing.verifying_key()], now,).is_ok());
         assert!(
             scion_proto::ticket::parse(&ticket, &[other.signing.verifying_key()], now,).is_err()

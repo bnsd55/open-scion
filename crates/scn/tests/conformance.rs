@@ -263,58 +263,39 @@ fn shape(answer: &Answer) -> (usize, Option<End>) {
 }
 
 #[test]
-fn every_tier_resolves_as_the_server_does() {
+fn every_tier_refuses_to_resolve() {
     let (tiers, first) = fixture();
     let first_id = first.as_bytes().to_vec();
     tiers.runtime.block_on(async {
-        // A ref is the only answer that changes, so a tier never keeps it.
-        assert_eq!(id_of(&same(&tiers, &resolve(REPO, "main")).await), first_id);
-        for (repo, name, code) in [
-            (REPO, "no-such-ref", Code::NotFound),
-            ("gone", "main", Code::NotFound),
-            ("", "main", Code::InvalidArgument),
-            ("bad\u{1}", "main", Code::InvalidArgument),
-            (REPO, "", Code::InvalidArgument),
-        ] {
-            let answer = same(&tiers, &resolve(repo, name)).await;
-            assert_eq!(answer, Answer::Id(Err(code)), "{repo:?} {name:?}");
-        }
-        let new = FileState::Regular {
-            content: tiers.store.blobs().put(b"hello, again\n").unwrap(),
-            executable: false,
-        };
-        let second = changeset(Some(first), &[("README.md", new)]);
-        let second = land(&tiers.store, &second);
-        let answer = same(&tiers, &resolve(REPO, "main")).await;
-        let moved = id_of(&answer) == second.as_bytes();
-        assert!(moved, "every tier follows the ref");
-
-        // A root tree is kept by repo and changeset: `other` never sees
-        // `first`, before or after `r` asked for it.
-        let not_found = Answer::Id(Err(Code::NotFound));
+        // The server is the only resolver: scn gets a ref and the ticket of
+        // its root tree there, and brings the ticket to a tier. A tier that
+        // answered ResolveRef or GetRootTree would be a way to get a ticket
+        // for any repo.
         assert_eq!(
-            same(&tiers, &root_tree("other", &first_id)).await,
-            not_found
+            ask(&tiers.server, &resolve(REPO, "main")).await,
+            Answer::Id(Ok(first_id.clone()))
         );
-        id_of(&same(&tiers, &root_tree(REPO, &first_id)).await);
-        assert_eq!(
-            same(&tiers, &root_tree("other", &first_id)).await,
-            not_found
-        );
-        for (repo, id, code) in [
-            (REPO, vec![0; 32], Code::NotFound),
-            ("gone", first_id.clone(), Code::NotFound),
-            (REPO, vec![0; 31], Code::InvalidArgument),
-            ("", first_id.clone(), Code::InvalidArgument),
+        for call in [
+            resolve(REPO, "main"),
+            resolve(REPO, "no-such-ref"),
+            root_tree(REPO, &first_id),
+            root_tree(REPO, &[0; 32]),
         ] {
-            let answer = same(&tiers, &root_tree(repo, &id)).await;
-            assert_eq!(answer, Answer::Id(Err(code)), "{repo:?} {id:?}");
+            for (name, url) in [("daemon", &tiers.socket), ("cache", &tiers.cache_url)] {
+                let answer = ask(url, &call).await;
+                assert_eq!(
+                    answer,
+                    Answer::Id(Err(Code::Unimplemented)),
+                    "{name}: {call:?}"
+                );
+            }
         }
     });
 }
 
 #[test]
 #[ignore = "the server fails ticketless GetObjects closed until C5; scn sends tickets in C8"]
+#[allow(dead_code)] // ignored tests still run under `--ignored`
 fn every_tier_sends_the_objects_of_the_server() {
     let (tiers, first) = fixture();
     let missing = blob_ref(BlobId::of(b"in no repo\n"));

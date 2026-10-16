@@ -83,6 +83,10 @@ impl Tiers {
         };
         let pending = std::future::pending;
 
+        // The server mints the tickets; the cache verifies them; the daemon
+        // only forwards them.
+        let tickets = scion_server::tickets::Keys::generate();
+        let verify_keys = tickets.for_verify().to_vec();
         let (listener, server) = tcp();
         runtime.spawn(service::serve(
             store.clone(),
@@ -90,12 +94,20 @@ impl Tiers {
             TOKEN,
             Limits::default(),
             None,
-            None,
+            Some(std::sync::Arc::new(tickets)),
             pending(),
         ));
 
         let memory = MemoryStore::new(64 << 20);
-        let cache = Tier::new(memory, &server, TOKEN, CACHE_UPSTREAM_TIMEOUT, None).unwrap();
+        let cache = Tier::new(
+            memory,
+            &server,
+            TOKEN,
+            CACHE_UPSTREAM_TIMEOUT,
+            None,
+            verify_keys,
+        )
+        .unwrap();
         let (listener, cache_url) = tcp();
         let incoming = TcpListenerStream::new(listener);
         runtime.spawn(
@@ -106,8 +118,15 @@ impl Tiers {
 
         let node = tempfile::tempdir().unwrap();
         let store_dir = DiskStore::open(&node.path().join("data"), 64 << 20).unwrap();
-        let daemon =
-            Tier::new(store_dir, &cache_url, TOKEN, DAEMON_UPSTREAM_TIMEOUT, None).unwrap();
+        let daemon = Tier::new(
+            store_dir,
+            &cache_url,
+            TOKEN,
+            DAEMON_UPSTREAM_TIMEOUT,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         // The socket's directory must be private.
         fs::set_permissions(node.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let path = node.path().join("daemon.sock");
