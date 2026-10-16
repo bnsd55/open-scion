@@ -138,6 +138,10 @@ pub fn derive_root_tree(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result
 /// It also stores the changeset's node in the commit graph, if each parent
 /// has one ([`derived::on_write`]).
 ///
+/// It adds each blob that the changeset names to the blobs of `repo`, so a
+/// blob that a changeset of `repo` names always belongs to `repo`, also
+/// after an import, which uploads nothing.
+///
 /// # Errors
 ///
 /// [`Error::Apply`] if the changes do not apply to the first parent's tree;
@@ -155,6 +159,9 @@ pub fn store_changeset(
         .transpose()?;
     let tree = apply(c, base, &cs.changes)?;
     let id = db::insert_changeset(c, repo, cs)?;
+    for blob in db::puts(cs) {
+        db::add_repo_blob(c, repo, blob)?;
+    }
     derived::put::<RootTree>(c, id, &tree)?;
     derived::remove_old::<RootTree>(c)?;
     derived::on_write::<CommitGraph>(c, id, cs)?;

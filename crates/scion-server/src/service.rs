@@ -359,11 +359,11 @@ impl Scion for ScionService {
         // Check the repo before reading any more data. Each message goes to
         // the spool file before the next one is read, so an upload holds one
         // message in memory, not the whole blob.
-        let mut upload = self
+        let (repo, mut upload) = self
             .worker
             .run(move |store| {
-                store.read(|c| db::repo_id(c, &first.repo))?;
-                store.blobs().upload()?.append(&first.data)
+                let repo = store.read(|c| db::repo_id(c, &first.repo))?;
+                Ok((repo, store.blobs().upload()?.append(&first.data)?))
             })
             .await?;
         while let Some(chunk) = stream.next().await {
@@ -377,7 +377,7 @@ impl Scion for ScionService {
         }
         let id = self
             .worker
-            .run(move |store| store.blobs().put_upload(upload))
+            .run(move |store| write::put_blob(&store, repo, upload))
             .await?;
         Ok(Response::new(PutBlobResponse {
             blob_id: id.as_bytes().to_vec(),
