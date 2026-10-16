@@ -13,7 +13,6 @@ use scion_proto::check;
 use scion_proto::listen::{self, Limits};
 use scion_tier::{CACHE_UPSTREAM_TIMEOUT, MemoryStore, Tier, snapshot};
 use tokio::time::MissedTickBehavior;
-use tokio_stream::wrappers::TcpListenerStream;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]

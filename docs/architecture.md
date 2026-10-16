@@ -1216,8 +1216,9 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
   ([#13](https://github.com/bnsd55/open-scion/issues/13)).
 - **Logs.** Each `GetObjects` reply logs its hits and misses at `info`, and
   each object at `debug`. The daemon logs at `info` how many objects its
-  start found and whether it scanned, and whether its stop wrote a clean
-  index.
+  start found and whether it scanned, whether its stop wrote a clean index,
+  and what each `--seed` file gave it (stored, skipped, bytes, ms). The
+  cache logs each snapshot write (repo, objects, bytes, ms).
 
 | | `scion-cache` | `scion-daemon` |
 |---|---|---|
@@ -1225,7 +1226,8 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
 | Upstream | `--upstream`, by default the server at `127.0.0.1:7878`. | `--upstream`, by default the cache at `127.0.0.1:7879`. |
 | Store | Memory, at most `--max-bytes` (1 GiB) of stored objects (blobs packed). | Disk, at most `--max-bytes` (10 GiB) of stored object bytes (not disk blocks): one file per object under `<data>/objects/`, a tree's `TreeV1` bytes or a blob's zstd frame, written to a temp file and renamed, unpacked as a stream and checked against its ID when read back. A file that the limit drops leaves its name by a rename under the index lock, and is removed after it, so a put of the same object keeps its new file. `<data>` is made with mode 0700 if missing. It must be a real directory (not a symlink), owned by the daemon's user, and closed to others, or the daemon refuses it. One daemon locks it. |
 | Eviction | Least recently used first. | Least recently used first, from an index in memory that is also kept in `<data>/index` (below), so the order survives a restart. |
-| Start | Empty. | Reads `<data>/index`. After a clean stop (SIGINT or SIGTERM) it opens no object directory. After a crash it scans every object file, as with no index ([#115](https://github.com/bnsd55/open-scion/issues/115)). |
+| Start | Empty. | Reads `<data>/index`. After a clean stop (SIGINT or SIGTERM) it opens no object directory. After a crash it scans every object file, as with no index ([#115](https://github.com/bnsd55/open-scion/issues/115)). Then, if it holds no object, it imports each `--seed` file (below). |
+| Snapshots | With `--snapshot DIR` and `--snapshot-repo R`, writes `DIR/<repo>.scnsnap` every `--snapshot-every` seconds (600): the objects that went into that repo's replies, the most recently used up to `--snapshot-bytes` (256 MiB), least recently used first. | With `--seed FILE`, repeatable: before it serves, a cold store only (one that names no object) takes the file's objects (below). |
 
 **The daemon's index.** `<data>/index` lists the stored objects in order
 of use, so a start need not open every object directory. It is a header
@@ -1260,6 +1262,48 @@ leaves a clean file that is stale, so remove `<data>/index` after such a
 run. The format is this project's choice: an append-only file is all that
 a start needs, and its one new dependency in the tier crate, `blake3`, is
 already in the workspace.
+
+a start needs, and its one new dependency in the tier crate, `blake3`, is
+already in the workspace.
+
+**Snapshots.** What the article says: a daemon starts from a periodically
+refreshed snapshot. A cold daemon fetches its whole working set from upstream
+while it fills, so many jobs on a new node all wait for the same objects. So
+a `scion-cache` can write, and a `scion-daemon` read, one snapshot file per
+repo. The rest is this project's choice.
+
+The cache records, for each repo named by `--snapshot-repo`, the keys that
+went into its replies for that repo, most recently used first: a key is
+noted when a request for that repo is served from or stored into the cache,
+and leaves the record when the store drops the object. The note costs about
+80 bytes per repo per key. Every `--snapshot-every` seconds (600 by default;
+the first comes one interval after start) it writes `DIR/<repo>.scnsnap`
+with the most recently used objects of that repo, up to `--snapshot-bytes`
+(256 MiB) of stored bytes: it takes handles to the stored bytes under the
+store's lock (no copy) and writes outside it, to a temp file next to the
+target (mode 0600), then syncs the file and renames it over the target, so
+a reader never sees half a file. A repo with nothing new keeps its last
+snapshot. The file is not synced to its directory entry: a machine crash
+can leave the previous snapshot, which the next write fixes.
+
+A snapshot is one file: `scnsnap1\n`, the repo name (its length as a `u16`
+little-endian, then its bytes), then one entry per object, least recently
+used first. An entry is the record of the daemon's index (an op `T` or `B`,
+the ID, the size as a `u32`), then that many bytes of the object in its
+stored form. The name `DIR/<repo>.scnsnap` writes each byte that is not an
+ASCII letter, a digit, `-`, `_` or a `.` after the first byte as `%XX`, so
+any repo name gives one plain file name.
+
+The daemon takes `--seed FILE`, repeatable. Before it serves, and only if
+its store holds no object, it reads each file: it checks every object
+against its ID, as a fetch from upstream does, and stores it through the
+normal put, so `--max-bytes` holds. A bad object is skipped and counted,
+never stored; an unknown op, a size over the largest object, or a torn tail
+ends the read, and the objects before it stay. One object is in memory at a
+time. A warm store ignores the file. A file that cannot be read is logged,
+and the daemon starts cold. No RPC carries the file: a node gets it by any
+copy tool or a shared mount, and the cache logs each write (repo, objects,
+bytes, ms) while the daemon logs each import (stored, skipped, bytes, ms).
 
 This project's choices, not the article's: the Unix socket and its mode,
 TCP between tiers, the stores and their limits, keeping `GetRootTree`
@@ -1300,7 +1344,7 @@ an untrusted network.
 | Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 1 MiB plus 1 KiB: one part of an object), blobs up to 100 MiB, 16 uploads at once (each holds one message in memory), 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget and `ReadFile` replies a 256 MiB budget. A reply of either whose client stops reading ends after 120 s. Every receiver of an object unpacks it within the size its first part gives, at most 100 MiB, with a zstd window of at most 8 MiB, and accepts only plain Zstandard frames (no skippable or legacy frames, no dictionary). The zstd library is built without its legacy decoders. Names of 1 to 256 bytes with no control characters. The path indexes of all refs hold at most 128 MiB together, and a land walks at most 100,000 changesets below its ref's index. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 16 MiB and 1,048,576 lines, diffs at most 100 versions and about 1M lines (a line counts once per 64 bytes), compares at most 100 deleted files and about 100 MiB to find a rename, and at most 4 run at once. At most 4 `MergeBase` and `IsAncestor` calls run at once, each until its 600 s deadline; a `Diff` reply holds at most 1,000 paths. The server and each tier serve at most 128 connections at once (`--max-connections`), each with at most 256 open streams (`--max-streams`); a client beyond either waits. A connection closes 20 s after it gets its place if no HTTP/2 preface came; after the preface, 20 s after an unanswered ping, which goes out after 60 s without a frame; and in any case 10 min after it was asked to close at 30 min of age. So a connection beyond the cap waits at most 40 min. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). A reply whose client stops reading keeps memory that no budget counts, until its stream ends or its connection closes: a `GetObjects` or `ReadFile` reply three parts (in its channel, read ahead by hyper, in the h2 send buffer) plus up to 400 KiB more of h2 send buffer, under 4 MiB; a unary reply its whole message, up to 64 MiB. So the ceiling is connections x streams x that: 128 x 256 x 4 MiB = 128 GiB for streamed replies, and 128 x 256 x 64 MiB = 2 TiB for unary ones. What a dead peer holds is freed within 80 s of its last frame (keepalive), or within 20 s if it never sent the preface. A live client that stops reading keeps it until its connection is closed at 40 min of age: hyper cannot reset a stalled stream from the server side ([#113](https://github.com/bnsd55/open-scion/issues/113)). |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. Each tier also checks every object from upstream before it stores or sends it, and the daemon checks each object again when it reads it from disk. The server sends a blob's zstd file without unpacking it, so the receiver finds a damaged file. | Tiers are trusted in v0.1: the client trusts the `ResolveRef` and `GetRootTree` answers that a tier passes on, which it cannot check by hash. A tier forwards them, and keeps only what upstream answered. |
 | Checkout | `scn checkout` writes into a private temp directory with a random name. It renames it onto a new destination, or moves its entries up into an existing empty directory that the user owns, never over an entry already there. It never follows a symlink while writing or removing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure, or on SIGINT, SIGTERM or SIGHUP, the destination stays as it was. | The directory that gets the checkout (an existing destination, or a new one's parent) must not be writable by all users, unless it has the sticky bit: they could swap parts of the checkout. An existing destination that breaks this is refused. Members of a group that can write it are trusted. Where the filesystem has no rename that never replaces (NFS), any empty mode 0700 directory of the user at a top-level directory name counts as the checkout's claim after `mkdirat` fails with `EEXIST`, and is replaced. Where it has no hard links either (some FUSE filesystems), any symlink of the user with the same target at a top-level symlink name counts as made after `symlinkat` fails with `EEXIST`, and is kept. This is for a lost NFS version 3 reply, but a trusted user (the owner, a group member, root) can also put such an entry there: it is taken, and no data is lost. A filesystem that shows one owner for every entry (a FUSE or SMB mount with `-o uid=`) passes every ownership check. In the temp directory, an entry found after `EEXIST` that is what the call makes counts as made, unless a recorded path in the same directory has its inode. A filesystem that folds names but shows another inode number under each name (CIFS with `noserverino`, FUSE without `use_ino`) would let such a fold through only for two empty files or two symlinks with one target: the two paths then share one entry, with the same content. A folded directory always fails: each directory that the checkout made already holds an entry. The check reads only the mode bits, not ACLs: an ACL that lets other users add or delete entries gets past it. No Windows rules: device names and names that end in a dot or a space pass. |
-| Cache tiers | A tier refuses calls without its token, and serves only objects that match their IDs. | A tier serves a stored object for any valid repo name and does not ask whether the repo exists. Safe with one principal ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
+| Cache tiers | A tier refuses calls without its token, and serves only objects that match their IDs. A snapshot file (`--snapshot`) holds whole objects of the repos named, and whoever can read the file can read them. | A tier serves a stored object for any valid repo name and does not ask whether the repo exists. Safe with one principal ([#13](https://github.com/bnsd55/open-scion/issues/13)). The file is mode 0600 in a directory made with mode 0700, but a node gets it by any copy tool or a shared mount: give a node only snapshots of repos that all its users may read. |
 | Errors | Internal errors reply `internal error`. The detail stays in the server or tier log. | |
 
 The cache tiers will need access tickets, because an object ID is not a

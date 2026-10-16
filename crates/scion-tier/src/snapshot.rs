@@ -121,10 +121,11 @@ pub fn seed(store: &DiskStore, path: &Path) -> io::Result<Option<Seeded>> {
     if !fill(&mut file, &mut header)? || !header.starts_with(MAGIC) {
         return Err(not_snapshot("it does not start as one"));
     }
-    let mut name = vec![0; usize::from(u16::from_le_bytes([
+    let len = usize::from(u16::from_le_bytes([
         header[MAGIC.len()],
         header[MAGIC.len() + 1],
-    ]))];
+    ]));
+    let mut name = vec![0; len];
     if !fill(&mut file, &mut name)? {
         return Err(not_snapshot("it ends in its repo name"));
     }

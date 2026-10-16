@@ -118,6 +118,11 @@ release.
   tier answers the `Objects` calls, checks every object from upstream
   against its ID before it stores or sends it, forwards `ResolveRef`, keeps
   `GetRootTree` answers, fetches a shared miss once, and needs a token.
+  A `scion-cache --snapshot DIR --snapshot-repo R` writes `DIR/R.scnsnap`
+  every `--snapshot-every` seconds: the most recently used objects of that
+  repo, up to `--snapshot-bytes`. A cold `scion-daemon --seed FILE` imports
+  them before it serves, each checked against its ID; a warm one ignores
+  the file (#59).
 - `scn` reaches a daemon with `--server unix:///PATH`. It first refuses a
   path that is not a socket owned by its user or by root. `scn` and the
   daemon also refuse a socket or data directory under a directory that

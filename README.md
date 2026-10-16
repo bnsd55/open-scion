@@ -181,6 +181,14 @@ user), new directories are group-writable, so they are refused until you run
 that. Stop the daemon with Ctrl-C or SIGTERM: it then writes its index, and
 its next start reads that one file instead of every stored object.
 
+A regional cache can also write snapshots, so that a new node's daemon does
+not start empty: give `scion-cache --snapshot DIR --snapshot-repo R` and it
+writes `DIR/R.scnsnap` every `--snapshot-every` seconds, with the most
+recently used objects of that repo, up to `--snapshot-bytes`. Copy the file
+to the node (any copy tool or shared mount) and start the daemon with
+`--seed FILE`: it imports the objects, each checked against its ID, before
+it serves, and only if its store is empty. A warm daemon ignores the file.
+
 ```sh
 export SCION_UPSTREAM_TOKEN=dev                  # what each tier sends upstream
 ./target/release/scion-cache &                   # memory, 127.0.0.1:7879
