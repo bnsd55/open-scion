@@ -9,11 +9,9 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 /// The signing key of the tickets that this server mints, and the public
 /// keys whose tickets this server verifies: its own, and the previous one
 /// while a rotation replaces it. At most two, so a ticket names no key.
+#[derive(Clone)]
 pub struct Keys {
     signing: SigningKey,
-    // SHORTCUT: C5 verifies GetObjects tickets against these; nothing
-    // reads them until then.
-    #[allow(dead_code)]
     verify: Vec<VerifyingKey>,
 }
 
@@ -46,9 +44,10 @@ impl Keys {
     pub fn generate() -> Self {
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret).expect("system randomness");
+        let signing = SigningKey::from_bytes(&secret);
         Self {
-            signing: SigningKey::from_bytes(&secret),
-            verify: Vec::new(),
+            verify: vec![signing.verifying_key()],
+            signing,
         }
     }
 
@@ -57,6 +56,12 @@ impl Keys {
     #[must_use]
     pub fn public_hex(&self) -> String {
         to_hex(&self.signing.verifying_key().to_bytes())
+    }
+
+    /// The keys that a ticket must verify against: one of them is enough.
+    #[must_use]
+    pub fn for_verify(&self) -> &[VerifyingKey] {
+        &self.verify
     }
 
     /// The secret seed, as 64 hex characters: what `--ticket-key` reads.

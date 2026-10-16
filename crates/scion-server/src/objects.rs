@@ -5,6 +5,7 @@
 //! goes out as its stored zstd file, as is, if the client accepts zstd, or
 //! else unpacked and checked. The client checks each object against its ID.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use scion_proto::object::{self, Header, zstd_bound};
 use scion_proto::reply::{
     self, BUSY_TIMEOUT, Body, Found, IN_FLIGHT_BYTES, ObjectStream, Outgoing, STALL_TIMEOUT,
 };
+use scion_proto::ticket::Walk;
 use scion_proto::v1::objects_server::{Objects, ObjectsServer};
 use scion_proto::v1::{
     Encoding, GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, ObjectKind, ObjectRef,
@@ -34,17 +36,13 @@ use crate::{db, read};
 const _: () = assert!(store::MAX_OBJECT_BYTES == scion_proto::MAX_OBJECT_BYTES);
 
 /// One object to read.
-// SHORTCUT: dead until C5 wires the ticket check that uses this reply
-// pipeline; every item marked below revives then.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Key {
     Tree(TreeId),
     Blob(BlobId),
 }
 
 /// How an object goes out, known before its bytes are read.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Plan {
     encoding: Encoding,
@@ -57,7 +55,6 @@ struct Plan {
 impl Plan {
     /// The most memory that reading the object holds: its bytes, and the
     /// decoder of a blob that goes out unpacked.
-    #[allow(dead_code)]
     fn read_bytes(&self, key: Key) -> usize {
         match (key, self.encoding) {
             (Key::Blob(_), Encoding::Raw) => self.encoded + store::READER_BYTES,
@@ -74,7 +71,6 @@ pub struct ObjectsService {
     /// keeps every object read closed: a reply then carries no ticket.
     tickets: Option<Arc<Keys>>,
     /// `IN_FLIGHT_BYTES` permits, one per object byte, shared by all replies.
-    #[allow(dead_code)]
     in_flight: Arc<Semaphore>,
 }
 
@@ -107,13 +103,16 @@ fn parse_ref(object: &ObjectRef) -> Result<Key, Status> {
 
 /// Reads an object, as planned. [`read_object`], except in tests that count
 /// reads.
-#[allow(dead_code)]
 type Read = fn(&Store, Key, Plan) -> Result<Outgoing>;
 
 /// How `key` goes out, without reading its bytes. A blob goes out as its
-/// stored zstd file if the client accepts `zstd`.
-#[allow(dead_code)]
-fn plan(store: &Store, key: Key, zstd: bool) -> Result<Plan> {
+/// stored zstd file if the client accepts `zstd`. Only an object that the
+/// ticket's walk proved goes out: everything else is not found.
+fn plan(store: &Store, key: Key, allowed: &HashSet<Key>, zstd: bool) -> Result<Plan> {
+    if !allowed.contains(&key) {
+        // The walk did not reach this object from the ticket's root tree.
+        return Err(Error::NotFound(format!("{key:?} is not in the ticket")));
+    }
     let corrupt = |why: &str| Err(Error::Corrupt(format!("{key:?}: {why}")));
     let raw = |size| Plan {
         encoding: Encoding::Raw,
@@ -152,14 +151,7 @@ fn plan(store: &Store, key: Key, zstd: bool) -> Result<Plan> {
 /// their IDs on the way out of the store. A ZSTD blob is its stored file,
 /// read in chunks and not unpacked: the receiver checks it. A RAW blob is
 /// unpacked in chunks, so it is never in memory twice.
-#[allow(dead_code)]
 fn read_object(store: &Store, key: Key, plan: Plan) -> Result<Outgoing> {
-    // SHORTCUT: an object ID is treated as permission to read the object, so
-    // this serves any tree or blob by ID for a repo the caller may read.
-    // The access rules check only the repo of the call, not the object
-    // (issue #13).
-    // Upgrade: a read ticket bound to a principal, a repo and a root tree,
-    // checked here and by every cache tier.
     let (kind, id, body) = match key {
         Key::Tree(id) => {
             let data = store.read(|c| db::get_tree_body(c, id))?;
@@ -210,7 +202,6 @@ fn read_object(store: &Store, key: Key, plan: Plan) -> Result<Outgoing> {
 
 /// How long a reply waits: for room in the budget, and for its client. A
 /// wait for room also ends at the caller's deadline.
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct Waits {
     busy: Duration,
@@ -218,7 +209,6 @@ struct Waits {
     until: Until,
 }
 
-#[allow(dead_code)]
 const WAITS: Waits = Waits {
     busy: BUSY_TIMEOUT,
     stall: STALL_TIMEOUT,
@@ -232,10 +222,10 @@ const WAITS: Waits = Waits {
 /// call fails with [`reply::busy`], so a reply never ends `OK` with no
 /// object. That comes before the caller's deadline, so the caller gets this
 /// status, not a timeout of its own.
-#[allow(dead_code)]
 async fn start_reply(
     worker: Worker,
     keys: Vec<Key>,
+    allowed: HashSet<Key>,
     in_flight: Arc<Semaphore>,
     waits: Waits,
     read: Read,
@@ -246,7 +236,7 @@ async fn start_reply(
         return Err(Status::invalid_argument("a call names at least one object"));
     };
     let busy = waits.until.wait(waits.busy);
-    let first = find(&worker, &in_flight, busy, read, zstd, key)
+    let first = find(&worker, &in_flight, busy, read, &allowed, zstd, key)
         .await
         .ok_or_else(reply::busy)?;
     let (tx, stream) = reply::channel();
@@ -258,6 +248,7 @@ async fn start_reply(
                 in_flight,
                 waits.until.wait(waits.busy),
                 read,
+                &allowed,
                 zstd,
                 key,
             )
@@ -274,16 +265,19 @@ async fn start_reply(
 // SHORTCUT: two blocking hops per object and no read-ahead, so many small
 // objects are read one after another. Upgrade: read a batch capped by bytes
 // per hop, or keep a few reads in flight (issue #6).
-#[allow(dead_code)]
 async fn find(
     worker: &Worker,
     in_flight: &Arc<Semaphore>,
     busy: Duration,
     read: Read,
+    allowed: &HashSet<Key>,
     zstd: bool,
     key: Key,
 ) -> Option<Found> {
-    let plan = worker.run(move |store| plan(&store, key, zstd)).await;
+    let allowed = allowed.clone();
+    let plan = worker
+        .run(move |store| plan(&store, key, &allowed, zstd))
+        .await;
     let bytes = plan.as_ref().map_or(1, |plan| plan.read_bytes(key));
     let mut permit = reply::take(in_flight, bytes, busy).await?;
     let object = match plan {
@@ -343,20 +337,98 @@ impl Objects for ObjectsService {
         &self,
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<Self::GetObjectsStream>, Status> {
-        // The caller is still checked by the token interceptor; C5 adds
-        // the ticket, which names the repo and the root tree of the read.
-        let _caller = caller(&request)?;
+        // No caller here: the ticket is the only permission of an object
+        // read, and the token interceptor has already authenticated the
+        // connection.
+        let waits = Waits {
+            until: Until::of(&request),
+            ..WAITS
+        };
         let GetObjectsRequest {
             refs,
-            accept: _accept,
-            ticket: _ticket,
+            accept,
+            ticket,
         } = request.into_inner();
         scion_proto::check::object_count(refs.len())?;
-        let _keys = refs.iter().map(parse_ref).collect::<Result<Vec<_>, _>>()?;
-        // SHORTCUT: C5 verifies the ticket and takes the repo from it; the
-        // walk of the ticket's root tree then gates every object. Until
-        // then the request fails closed: an object ID is not a permission.
-        Err(Status::permission_denied("object reads need a ticket"))
+        // The ticket is the only permission an object read has: it names
+        // the repo and the root tree, and every object must be reachable
+        // from that tree over the path that its ref names. An object ID
+        // alone is not a permission.
+        let no_keys: &[ed25519_dalek::VerifyingKey] = &[];
+        let keys_for_verify = self
+            .tickets
+            .as_ref()
+            .map_or(no_keys, |keys| keys.for_verify());
+        let ticket = scion_proto::ticket::parse(&ticket, keys_for_verify, now())
+            .map_err(|why| Status::permission_denied(format!("bad ticket: {why}")))?;
+        let refs = refs
+            .into_iter()
+            .map(|r| Ok((parse_ref(&r)?, r.path)))
+            .collect::<Result<Vec<_>, Status>>()?;
+        // Encodings that this server does not know are ignored.
+        let zstd = accept.contains(&Encoding::Zstd.into());
+        let (allowed, keys) = self
+            .worker
+            .run(move |store| {
+                let allowed = prove(&store, ticket.root_tree, &refs)?;
+                let keys = refs.into_iter().map(|(key, _)| key).collect();
+                Ok((allowed, keys))
+            })
+            .await?;
+        let in_flight = Arc::clone(&self.in_flight);
+        let stream = start_reply(
+            self.worker.clone(),
+            keys,
+            allowed,
+            in_flight,
+            waits,
+            read_object,
+            zstd,
+        );
+        Ok(Response::new(stream.await?))
+    }
+}
+
+/// The moment that ticket checks use.
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// Marks every ref that the walk from `root` reaches, over the trees of
+/// `store`: the caller keeps the keys, and `plan` serves only the proven
+/// ones. A tree that `store` does not hold, or one whose bytes do not
+/// match its ID, refuses the ref.
+fn prove(store: &Store, root: [u8; 32], refs: &[(Key, Vec<u8>)]) -> Result<HashSet<Key>> {
+    let mut walk = scion_proto::ticket::Walker::new(root);
+    let mut allowed = HashSet::new();
+    store.read(|c| {
+        let mut reader = |id: [u8; 32]| {
+            // The walk only hands back the 32 bytes it got from a tree.
+            let id = TreeId::try_from(id.as_slice()).expect("a walk names a tree id");
+            match db::get_tree_body(c, id) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(Error::NotFound(_)) => Ok(None),
+                Err(why) => Err(why),
+            }
+        };
+        for (key, path) in refs {
+            let (kind, id) = of(key);
+            if let Walk::Reached = walk.reach(&mut reader, kind, &id, path)? {
+                allowed.insert(*key);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(allowed)
+}
+
+/// The kind and the bytes of the ID that a key names.
+fn of(key: &Key) -> (ObjectKind, [u8; 32]) {
+    match key {
+        Key::Tree(id) => (ObjectKind::Tree, *id.as_bytes()),
+        Key::Blob(id) => (ObjectKind::Blob, *id.as_bytes()),
     }
 }
 
@@ -426,7 +498,8 @@ mod tests {
         let stall = Duration::from_millis(50);
         let reply = start_reply(
             Worker::new(store),
-            keys,
+            keys.clone(),
+            keys.iter().copied().collect(),
             Arc::clone(&in_flight),
             waits(stall),
             read_object,
@@ -464,6 +537,7 @@ mod tests {
             let reply = start_reply(
                 worker.clone(),
                 vec![a],
+                HashSet::from([a]),
                 Arc::clone(&in_flight),
                 wait,
                 counted,
@@ -501,6 +575,7 @@ mod tests {
         let reply = start_reply(
             Worker::new(store),
             vec![a],
+            HashSet::from([a]),
             in_flight,
             waits,
             read_object,
@@ -532,6 +607,7 @@ mod tests {
         let reply = start_reply(
             Worker::new(store),
             vec![key],
+            HashSet::from([key]),
             Arc::clone(&in_flight),
             WAITS,
             watched,
@@ -594,6 +670,7 @@ mod tests {
             let reply = start_reply(
                 worker.clone(),
                 keys,
+                HashSet::from([Key::Blob(id)]),
                 Arc::clone(&in_flight),
                 WAITS,
                 read_object,
