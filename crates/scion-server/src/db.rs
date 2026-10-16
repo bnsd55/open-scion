@@ -121,6 +121,12 @@ const FILL_LOG_EVERY: u64 = 10_000;
 /// [`Error::Corrupt`] if a changeset does not decode or match its ID.
 /// Database errors.
 pub(crate) fn fill_repo_blobs(c: &Connection) -> Result<(u64, u64)> {
+    let total: u64 = c.query_row(
+        "SELECT count(*) FROM repo_changesets JOIN changesets ON cs = id",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? as u64;
+    tracing::info!(changesets = total, "schema 4: adding each repo's blobs");
     let mut select =
         c.prepare("SELECT repo_id, id, body FROM repo_changesets JOIN changesets ON cs = id")?;
     let mut rows = select.query([])?;
@@ -143,6 +149,7 @@ pub(crate) fn fill_repo_blobs(c: &Connection) -> Result<(u64, u64)> {
         if read % FILL_LOG_EVERY == 0 {
             tracing::info!(
                 changesets = read,
+                of = total,
                 rows = added,
                 "schema 4: adding each repo's blobs"
             );
