@@ -663,7 +663,10 @@ impl Blobs {
         if keep_stored {
             batch.write(id, len, raw)?;
         } else {
-            batch.replace(id, len, raw)?;
+            // The upload may replace an intact stored copy that other repos
+            // name. The full flush runs on every call, so the time of the
+            // reply does not show whether a copy exists.
+            batch.replace_stored(id, len, raw)?;
         }
         if batch.flush_dirs()? {
             // A new fan-out directory is an entry in the root. The full flush
@@ -1040,17 +1043,23 @@ impl BlobBatch<'_> {
         let mut tmp = tempfile::NamedTempFile::new_in(&self.blobs.tmp)?;
         zstd::stream::compress_sized_into(raw, &mut tmp, 3, len as u64)?;
         fsync(tmp.as_file())?;
-        // A full flush before the rename. The rename may replace an intact
-        // file that other repos name, and on macOS a plain fsync can leave
-        // the temp file's data in the drive cache: a power loss after the
-        // rename could then corrupt that blob. The flush covers the temp
-        // file, so after the rename its data is durable. It runs every time,
-        // so the time of the write does not show whether a copy exists.
-        self.blobs.full_flush()?;
         fs::create_dir_all(&dir)?;
         tmp.persist(&path).map_err(|e| e.error)?;
         self.dirs.insert(dir);
         Ok(())
+    }
+
+    /// Writes blob `id`, whose `len` bytes `raw` gives, over whatever is
+    /// stored: a full flush runs on the temp file before the rename, every
+    /// time, so the time it takes does not show whether a copy exists. For a
+    /// put that may replace an intact stored copy that other repos name: the
+    /// temp file is durable first, so a power loss never leaves the stored
+    /// blob with data that the drive lost. A put of a blob that is missing or
+    /// corrupt replaces no intact file, and its batch `sync` covers the
+    /// rename.
+    fn replace_stored(&mut self, id: BlobId, len: usize, raw: impl Read) -> Result<()> {
+        self.blobs.full_flush()?;
+        self.replace(id, len, raw)
     }
 
     /// Checks a stored blob and, if it is intact, keeps it: `sync` makes it
@@ -1126,6 +1135,9 @@ struct FlushState {
     finished: u64,
     /// The latest flush that failed, and its error.
     failed: Option<(u64, Arc<io::Error>)>,
+    /// Callers of [`GroupFlush::run`] in the wait, for tests.
+    #[cfg(test)]
+    waiting: usize,
 }
 
 impl GroupFlush {
@@ -1138,6 +1150,10 @@ impl GroupFlush {
         let mut state = self.lock();
         // A running flush may have started before this caller's writes.
         let target = state.started + 1;
+        #[cfg(test)]
+        {
+            state.waiting += 1;
+        }
         state = self
             .finished
             .wait_while(state, |s| s.started > s.finished && s.finished < target)
@@ -1405,14 +1421,35 @@ mod tests {
             }
         };
         let before = blobs.full_flushes();
+        // Run callers so far, so the arrival count below is relative.
+        let runs_before = blobs
+            .group_flush
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .waiting as u64;
         let running = Barrier::new(2);
         let ids: Vec<BlobId> = thread::scope(|s| {
-            // A slow first flush, as on a busy drive, so the writers arrive
-            // while it runs whatever the speed of the test machine's drive.
+            // A first flush that ends only when every writer waits in the
+            // group, so they all share the next one, whatever the speed of
+            // the machine or its drive.
             let slow = s.spawn(|| {
                 blobs.group_flush.run(|| {
                     running.wait();
-                    thread::sleep(Duration::from_millis(200));
+                    loop {
+                        let state = blobs
+                            .group_flush
+                            .state
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        // The slow caller counts itself, so all have arrived
+                        // at the runs before the test plus one more.
+                        if state.waiting as u64 >= runs_before + 1 + WRITERS {
+                            break;
+                        }
+                        drop(state);
+                        thread::yield_now();
+                    }
                     Ok(())
                 })
             });
@@ -1429,12 +1466,10 @@ mod tests {
                 .map(|w| w.join().unwrap().unwrap())
                 .collect()
         });
-        // Not counting the slow flush.
+        // Not counting the slow flush: each writer waits in the group once,
+        // while it runs, so one flush serves them all.
         let flushes = blobs.full_flushes() - before - 1;
-        assert!(
-            flushes <= WRITERS / 4,
-            "{WRITERS} writers ran {flushes} full flushes"
-        );
+        assert_eq!(flushes, 1, "{WRITERS} writers ran {flushes} full flushes");
         for id in ids {
             assert_eq!(blobs.verify(id).unwrap(), BlobStatus::Valid);
         }
