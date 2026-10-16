@@ -41,8 +41,9 @@ How one request flows through the server:
    connection has at most 256 calls open at once (`--max-streams`, HTTP/2
    `SETTINGS_MAX_CONCURRENT_STREAMS`). After 60 s without a frame from a
    client, the server sends an HTTP/2 ping, and closes the connection if no
-   answer comes within 20 s. The tiers share this code
-   (`scion-proto/src/listen.rs`) and its defaults.
+   answer comes within 20 s. Each TCP connection has Nagle's algorithm off,
+   so a small reply does not wait for the client's ACK. The tiers share
+   this code (`scion-proto/src/listen.rs`) and its defaults.
 2. The bearer-token check (`scion-proto/src/auth.rs`) tags the request with
    a `Caller`.
 3. `service.rs` (the `Scion` service) or `objects.rs` (the `Objects` service)

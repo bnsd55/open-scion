@@ -115,6 +115,11 @@ release.
   frame for 60 s gets an HTTP/2 ping, and its connection closes if it does
   not answer within 20 s. So the number of stalled replies has a bound, and
   a dead peer frees what its replies hold within 80 s.
+- The server and `scion-cache` turn off Nagle's algorithm on each TCP
+  connection. It was on: tonic ignores its `tcp_nodelay` setting for a
+  listener that it does not open itself. So a small reply, such as a unary
+  answer or a status, could wait for the client's ACK, up to about 40 ms
+  where the client delays its ACKs.
 - The tier timeouts nest: the server and tiers wait 30 s for reply memory,
   a tier 30 s for a fetch slot and 30 s for fetch memory, the cache 60 s per
   step of the server, the daemon 180 s per step of the cache.
