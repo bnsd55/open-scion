@@ -32,6 +32,8 @@ This project rebuilds the ideas from that public article.
   to [GoogleCloudPlatform/scion](https://github.com/GoogleCloudPlatform/scion),
   or to the `scion` crate on crates.io.
 
+**Platforms.** Linux and macOS. Windows is not supported.
+
 **Scope of v0.1.** v0.1 is one server process on one machine. The article
 describes a horizontally scalable system: a small fleet of servers that need
 little coordination, with metadata in Spanner and file contents in blob
@@ -257,7 +259,7 @@ These are this project's choices where the article does not give details.
 | Retries | Each land has a caller-chosen request key, so a retry returns the first result |
 | Git | One-way import. Commit IDs are not kept identical to git commit IDs. |
 | Cache tiers | As in the article, a daemon per machine on a socket and a regional cache in memory, and objects sent in the disk format that the daemon keeps. The Unix socket, TCP between tiers, the disk store, zstd as that format, the byte limits, and one shared fetch per missed object are this project's choices. |
-| History and blame | Computed on each call from first-parent changes, with a bound per call. Blame follows renames, as `git blame` does; path history does not, as `git log` without `--follow`. The article keeps them as derived data; that is planned ([#61](https://github.com/bnsd55/open-scion/issues/61)). |
+| History and blame | Path history is derived data, as in the article: the form, one history tree per changeset, is this project's choice. Blame is computed on each call from first-parent changes, with a bound per call; the article keeps it as derived data too, which is planned ([#61](https://github.com/bnsd55/open-scion/issues/61)). Blame follows renames, as `git blame` does; path history does not, as `git log` without `--follow`. |
 | Diff | Compares file states, not lines, in pages of 1,000 paths. Finds renames as `git diff` does, over the whole diff below a path, with a bound per call. |
 
 Deliberate simplifications are marked `SHORTCUT:` in the code, each with its

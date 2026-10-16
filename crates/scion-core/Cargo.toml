@@ -1,5 +1,5 @@
 [package]
-name = "scion-core"
+name = "open-scion-core"
 description = "Object model and canonical byte format for the Scion version control system"
 version.workspace = true
 edition.workspace = true
@@ -10,6 +10,9 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 authors.workspace = true
+
+[lib]
+name = "scion_core"
 
 [dependencies]
 blake3.workspace = true

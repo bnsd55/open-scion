@@ -1,5 +1,5 @@
 [package]
-name = "scion-proto"
+name = "open-scion-proto"
 description = "gRPC API definitions for the Scion version control system"
 version.workspace = true
 edition.workspace = true
@@ -10,6 +10,9 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 authors.workspace = true
+
+[lib]
+name = "scion_proto"
 
 [dependencies]
 anyhow.workspace = true

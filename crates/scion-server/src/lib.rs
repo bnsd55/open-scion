@@ -6,6 +6,8 @@
 //! - [`derived`]: one mechanism for every kind of derived data.
 //! - [`tree`]: apply changesets to trees and derive each changeset's root tree.
 //! - [`graph`]: the commit-graph index, and the graph queries that read it.
+//! - [`history`]: the path history of each changeset, for `Log` with a path
+//!   and for lands on old bases.
 //! - [`read`], [`blame`], [`write`], [`land`]: the operations behind the RPCs.
 //!   A long one stops at its call's [`deadline`].
 //!   [`similar`] finds renames for `Diff` and `Blame`.
@@ -21,6 +23,7 @@ pub mod deadline;
 pub mod derived;
 pub mod error;
 pub mod graph;
+pub mod history;
 pub mod import;
 pub mod land;
 pub mod names;

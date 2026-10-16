@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-scion-core = { path = ".." }
+open-scion-core = { path = ".." }
 
 [[bin]]
 name = "decode"
