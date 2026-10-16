@@ -32,6 +32,8 @@ This project rebuilds the ideas from that public article.
   to [GoogleCloudPlatform/scion](https://github.com/GoogleCloudPlatform/scion),
   or to the `scion` crate on crates.io.
 
+**Platforms.** Linux and macOS. Windows is not supported.
+
 **Scope of v0.1.** v0.1 is one server process on one machine. The article
 describes a horizontally scalable system: a small fleet of servers that need
 little coordination, with metadata in Spanner and file contents in blob
