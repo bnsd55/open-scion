@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use scion_core::{BlobId, ChangesetId, FileState, RepoPath};
+use scion_proto::listen::{self, Limits};
 use scion_proto::v1::scion_server::{Scion, ScionServer};
 use scion_proto::v1::{
     self, BlameChangeset, BlameRange, BlameRequest, BlameResponse, CreateChangesetRequest,
@@ -20,8 +21,9 @@ use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
+use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth::{Auth, Caller};
@@ -61,17 +63,20 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const READ_BUDGET_BYTES: usize = 256 << 20;
 /// A `ReadFile` reply ends when its client takes no part for this long, and
 /// frees its share, so a client that stops reading does not hold budget.
-// SHORTCUT: the reply frees its share, but the part that waits in its
-// channel and the part inside HTTP/2 stay in memory, outside the budget,
-// until the connection closes: up to 2 MiB per stalled reply. Upgrade
-// (issue #42): a response body timeout that resets the stream.
+/// The parts that it leaves in its channel and in HTTP/2 stay outside the
+/// budget (`scion_proto::listen`).
 const READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+// A connection that is asked to close keeps its calls for at least as long
+// as the longest call takes.
+const _: () = assert!(REQUEST_TIMEOUT.as_secs() <= listen::CONNECTION_GRACE.as_secs());
 
 // Any one reply fits in the budget, and the budget counts in u32 permits.
 const _: () = assert!(read_share(MAX_OBJECT_BYTES) <= READ_BUDGET_BYTES);
 const _: () = assert!(READ_BUDGET_BYTES <= u32::MAX as usize);
 
-/// Serves the API on `listener`, requiring `token`, until `shutdown` resolves.
+/// Serves the API on `listener`, requiring `token`, within `limits`, until
+/// `shutdown` resolves.
 ///
 /// # Errors
 ///
@@ -80,6 +85,7 @@ pub async fn serve(
     store: Store,
     listener: TcpListener,
     token: &str,
+    limits: Limits,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
     let auth = Auth::new(token);
@@ -89,12 +95,13 @@ pub async fn serve(
         auth.clone(),
     );
     let objects = InterceptedService::new(ObjectsService::new(worker).into_server(), auth);
-    tonic::transport::Server::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .add_service(scion)
-        .add_service(objects)
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
-        .await
+    let router = |server: Server| {
+        server
+            .timeout(REQUEST_TIMEOUT)
+            .add_service(scion)
+            .add_service(objects)
+    };
+    limits.serve(router, listen::tcp(listener), shutdown).await
 }
 
 /// Implements the Scion RPCs.

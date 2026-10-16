@@ -10,6 +10,7 @@ use std::time::Duration;
 use scion_core::BlobId;
 use scion_proto::auth::Bearer;
 use scion_proto::deadline::Until;
+use scion_proto::listen::Limits;
 use scion_proto::object::{self, Header};
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::objects_server::{Objects, ObjectsServer};
@@ -125,7 +126,7 @@ async fn serve_tier(upstream: &str, timeout: Duration) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let incoming = TcpListenerStream::new(listener);
-    tokio::spawn(tier.serve(TOKEN, incoming, std::future::pending()));
+    tokio::spawn(tier.serve(TOKEN, incoming, Limits::default(), std::future::pending()));
     url
 }
 
