@@ -14,6 +14,8 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
 clap.workspace = true
 gix.workspace = true
 hashlink.workspace = true

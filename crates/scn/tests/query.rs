@@ -85,6 +85,7 @@ impl Server {
             TOKEN,
             Limits::default(),
             None,
+            None,
             std::future::pending(),
         ));
         Self {

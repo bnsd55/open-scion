@@ -4,6 +4,7 @@
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -65,12 +66,29 @@ enum Command {
         /// Most calls (HTTP/2 streams) that one connection may have open at once.
         #[arg(long, default_value_t = listen::DEFAULT_STREAMS)]
         max_streams: NonZeroU32,
+        /// File with the Ed25519 seed (64 hex characters) that signs the
+        /// tickets of `GetRootTree` replies, from `ticket-key`. Without it,
+        /// no object is readable: a read needs a ticket.
+        #[arg(long, value_name = "FILE")]
+        ticket_key: Option<PathBuf>,
+        /// File with the previous ticket key (64 hex characters of its
+        /// public key), whose tickets stay valid during a rotation.
+        #[arg(long, value_name = "FILE", requires = "ticket_key")]
+        ticket_key_old: Option<PathBuf>,
     },
     /// Print the BLAKE3 digest of a token, as a `token` line of an access
     /// file wants it. The file holds digests, never tokens.
     HashToken {
         #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
         token: String,
+    },
+    /// Generate an Ed25519 key for the tickets of object reads: writes the
+    /// secret seed to `--out`, and prints the public key as 64 hex
+    /// characters, for `--ticket-key-old` and the tiers to verify with.
+    TicketKey {
+        /// File to write the secret seed to, as 64 hex characters.
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
     },
     /// Import a local git repository, one way. Safe to repeat. It can run
     /// while the server runs.
@@ -150,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Import { .. } => Store::open_shared,
         Command::Serve { .. } | Command::Derive { .. } => Store::open,
         Command::HashToken { .. } => return hash_token(),
+        Command::TicketKey { .. } => return write_ticket_key(),
     };
     let store = open(&cli.data)
         .with_context(|| format!("cannot open data directory {}", cli.data.display()))?;
@@ -164,24 +183,32 @@ async fn main() -> anyhow::Result<()> {
             tls_client_ca,
             max_connections,
             max_streams,
+            ticket_key,
+            ticket_key_old,
         } => {
             let server_tls = server_tls(
                 tls_cert.as_deref(),
                 tls_key.as_deref(),
                 tls_client_ca.as_deref(),
             )?;
+            let tickets = load_tickets(ticket_key.as_deref(), ticket_key_old.as_deref())?;
             serve(
                 store,
                 listen,
                 load_access(token, access)?,
                 insecure_listen,
                 server_tls,
-                max_connections,
-                max_streams,
+                tickets,
+                Limits {
+                    connections: max_connections,
+                    streams: max_streams,
+                },
             )
             .await?;
         }
-        Command::HashToken { .. } => unreachable!("handled before the store opens"),
+        Command::HashToken { .. } | Command::TicketKey { .. } => {
+            unreachable!("handled before the store opens")
+        }
         Command::Import {
             repo,
             rev,
@@ -238,8 +265,8 @@ async fn serve(
     access: scion_server::access::Access,
     insecure_listen: bool,
     server_tls: Option<ServerTls>,
-    max_connections: NonZeroUsize,
-    max_streams: NonZeroU32,
+    tickets: Option<Arc<scion_server::tickets::Keys>>,
+    limits: Limits,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         listen.ip().is_loopback() || insecure_listen || server_tls.is_some(),
@@ -253,16 +280,13 @@ async fn serve(
     // The bound address, so port 0 shows the port that the OS chose.
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "serving");
-    let limits = Limits {
-        connections: max_connections,
-        streams: max_streams,
-    };
     Box::pin(service::serve(
         store,
         listener,
         access,
         limits,
         server_tls,
+        tickets,
         async {
             tokio::signal::ctrl_c().await.ok();
         },
@@ -291,6 +315,47 @@ fn load_access(
         }
         (None, None) => anyhow::bail!("give --token or --access"),
     }
+}
+
+/// The ticket keys of `serve`: a signing key, and the public key that a
+/// rotation keeps alive. Both files hold 64 hex characters.
+fn load_tickets(
+    seed: Option<&Path>,
+    old: Option<&Path>,
+) -> anyhow::Result<Option<Arc<scion_server::tickets::Keys>>> {
+    let Some(seed) = seed else {
+        anyhow::ensure!(old.is_none(), "--ticket-key-old needs --ticket-key");
+        return Ok(None);
+    };
+    let keys = scion_server::tickets::Keys::load(
+        &read_hex(seed)?,
+        &match old {
+            Some(file) => vec![read_hex(file)?],
+            None => Vec::new(),
+        },
+    )
+    .map_err(|why| anyhow::anyhow!("{why}"))?;
+    Ok(Some(Arc::new(keys)))
+}
+
+/// The file's trimmed text, as a key wants it.
+fn read_hex(file: &Path) -> anyhow::Result<String> {
+    let text =
+        std::fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))?;
+    Ok(text.trim().to_owned())
+}
+
+/// Writes a fresh ticket key to `--out` and prints its public key.
+fn write_ticket_key() -> anyhow::Result<()> {
+    let Cli { command, .. } = Cli::parse();
+    let Command::TicketKey { out } = command else {
+        unreachable!("write_ticket_key handles only the ticket-key command")
+    };
+    let keys = scion_server::tickets::Keys::generate();
+    std::fs::write(&out, format!("{}\n", keys.seed_hex()))
+        .with_context(|| format!("cannot write {}", out.display()))?;
+    println!("{}", keys.public_hex());
+    Ok(())
 }
 
 /// Prints the BLAKE3 digest of the token of `hash-token`.

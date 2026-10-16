@@ -27,6 +27,7 @@ use crate::access::Access;
 use crate::error::{Error, Result};
 use crate::service::{Worker, caller, check_reader, parse_id, resolve_ref};
 use crate::store::{self, Store};
+use crate::tickets::Keys;
 use crate::{db, read};
 
 // The store keeps exactly the objects that the API promises to send.
@@ -69,16 +70,20 @@ impl Plan {
 pub struct ObjectsService {
     worker: Worker,
     access: Arc<Access>,
+    /// The keys that mint the tickets of `GetRootTree` replies. `None`
+    /// keeps every object read closed: a reply then carries no ticket.
+    tickets: Option<Arc<Keys>>,
     /// `IN_FLIGHT_BYTES` permits, one per object byte, shared by all replies.
     #[allow(dead_code)]
     in_flight: Arc<Semaphore>,
 }
 
 impl ObjectsService {
-    pub(crate) fn new(worker: Worker, access: Arc<Access>) -> Self {
+    pub(crate) fn new(worker: Worker, access: Arc<Access>, tickets: Option<Arc<Keys>>) -> Self {
         Self {
             worker,
             access,
+            tickets,
             in_flight: Arc::new(Semaphore::new(IN_FLIGHT_BYTES)),
         }
     }
@@ -311,14 +316,24 @@ impl Objects for ObjectsService {
         let GetRootTreeRequest { repo, changeset_id } = request.into_inner();
         check_reader(&self.access, &caller, &repo)?;
         let cs = parse_id(&changeset_id, "changeset_id")?;
-        let tree = self
+        let (tree, repo) = self
             .worker
-            .run(move |store| read::root_tree(&store, &repo, cs))
+            .run(move |store| {
+                let tree = read::root_tree(&store, &repo, cs)?;
+                Ok((tree, repo))
+            })
             .await?;
+        let ticket = match &self.tickets {
+            Some(keys) => keys
+                .sign(&repo, &caller.0, *tree.as_bytes())
+                .map_err(Status::internal)?,
+            // A server without ticket keys serves no objects; the empty
+            // ticket fails every read that carries it.
+            None => Vec::new(),
+        };
         Ok(Response::new(GetRootTreeResponse {
             tree_id: tree.as_bytes().to_vec(),
-            // SHORTCUT: empty until C3 mints a ticket for this reply.
-            ticket: Vec::new(),
+            ticket,
         }))
     }
 

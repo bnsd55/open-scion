@@ -127,6 +127,7 @@ async fn serve_tls(certs: &TestCerts) -> String {
         TOKEN,
         Limits::default(),
         Some(tls),
+        None,
         std::future::pending(),
     ));
     format!("https://{addr}")

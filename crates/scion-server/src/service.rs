@@ -35,6 +35,7 @@ use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
 use crate::objects::ObjectsService;
 use crate::store::{MAX_OBJECT_BYTES, READER_BYTES, Store};
+use crate::tickets::Keys;
 use crate::{blame, db, names, read, write};
 
 /// Most changeset bytes in one `Log` reply; the client pages for more.
@@ -92,6 +93,7 @@ pub async fn serve(
     access: impl Into<Access>,
     limits: Limits,
     tls: Option<ServerTls>,
+    tickets: Option<Arc<Keys>>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
     let access = Arc::new(access.into());
@@ -101,7 +103,10 @@ pub async fn serve(
         ScionService::new(worker.clone(), Arc::clone(&access)).into_server(),
         auth.clone(),
     );
-    let objects = InterceptedService::new(ObjectsService::new(worker, access).into_server(), auth);
+    let objects = InterceptedService::new(
+        ObjectsService::new(worker, access, tickets).into_server(),
+        auth,
+    );
     let router = |server: Server| {
         server
             .timeout(REQUEST_TIMEOUT)
