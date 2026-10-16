@@ -2,10 +2,12 @@
 //! derived data ahead of reads.
 
 use std::net::SocketAddr;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
+use scion_proto::listen::{self, Limits};
 use scion_server::derived::{self, Kind};
 use scion_server::graph::CommitGraph;
 use scion_server::import::{ImportOptions, import_git};
@@ -44,6 +46,12 @@ enum Command {
         /// encrypted, so use this only on a trusted network.
         #[arg(long)]
         insecure_listen: bool,
+        /// Most connections served at once. More clients wait until one closes.
+        #[arg(long, default_value_t = listen::DEFAULT_CONNECTIONS)]
+        max_connections: NonZeroUsize,
+        /// Most calls (HTTP/2 streams) that one connection may have open at once.
+        #[arg(long, default_value_t = listen::DEFAULT_STREAMS)]
+        max_streams: NonZeroU32,
     },
     /// Print the BLAKE3 digest of a token, as a `token` line of an access
     /// file wants it. The file holds digests, never tokens.
@@ -120,6 +128,8 @@ async fn main() -> anyhow::Result<()> {
             token,
             access,
             insecure_listen,
+            max_connections,
+            max_streams,
         } => {
             // Exactly one of the two: one token with every right, or a file
             // of tokens and rules.
@@ -151,7 +161,11 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .with_context(|| format!("cannot listen on {listen}"))?;
             tracing::info!(%listen, "serving");
-            service::serve(store, listener, access, async {
+            let limits = Limits {
+                connections: max_connections,
+                streams: max_streams,
+            };
+            service::serve(store, listener, access, limits, async {
                 tokio::signal::ctrl_c().await.ok();
             })
             .await?;

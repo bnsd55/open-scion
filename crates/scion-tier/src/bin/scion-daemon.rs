@@ -2,10 +2,12 @@
 //! node, serves them over a Unix socket, and fetches misses from its upstream,
 //! a `scion-cache`.
 
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 
 use anyhow::Context as _;
 use clap::Parser;
+use scion_proto::listen::{self, Limits};
 use scion_tier::{DAEMON_UPSTREAM_TIMEOUT, DiskStore, Tier, bind_unix};
 use tokio_stream::wrappers::UnixListenerStream;
 use tracing_subscriber::EnvFilter;
@@ -33,6 +35,12 @@ struct Cli {
     /// Bearer token to send upstream.
     #[arg(long, env = "SCION_UPSTREAM_TOKEN", hide_env_values = true)]
     upstream_token: String,
+    /// Most connections served at once. More clients wait until one closes.
+    #[arg(long, default_value_t = listen::DEFAULT_CONNECTIONS)]
+    max_connections: NonZeroUsize,
+    /// Most calls (HTTP/2 streams) that one connection may have open at once.
+    #[arg(long, default_value_t = listen::DEFAULT_STREAMS)]
+    max_streams: NonZeroU32,
 }
 
 #[tokio::main]
@@ -63,9 +71,18 @@ async fn main() -> anyhow::Result<()> {
         .context("the socket has no path")?
         .to_owned();
     tracing::info!(socket = %socket.display(), upstream = %cli.upstream, "serving");
-    tier.serve(&cli.token, UnixListenerStream::new(listener), async {
-        tokio::signal::ctrl_c().await.ok();
-    })
+    let limits = Limits {
+        connections: cli.max_connections,
+        streams: cli.max_streams,
+    };
+    tier.serve(
+        &cli.token,
+        UnixListenerStream::new(listener),
+        limits,
+        async {
+            tokio::signal::ctrl_c().await.ok();
+        },
+    )
     .await?;
     std::fs::remove_file(&socket).ok();
     Ok(())
