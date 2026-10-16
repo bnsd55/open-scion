@@ -7,7 +7,8 @@ release.
 
 ## [Unreleased]
 
-(Nothing yet.)
+New entries go at the top of the `[v0.1.0] - unreleased` section below,
+until that section gets its release date.
 
 ## [v0.1.0] - unreleased
 
@@ -217,13 +218,25 @@ release.
   repo, up to `--snapshot-bytes`. A cold `scion-daemon --seed FILE`
   imports them before it serves, each checked against its ID; a warm one
   ignores the file (#59).
-- `scion-daemon` keeps its recency index in `<data>/index`, appended in
-  batches. After a clean stop (Ctrl-C, or SIGTERM, which it handles too),
-  a start reads that one file and opens no object directory, and the order
-  of use survives the restart. After a crash, or for a file that does not
-  match its hash, a start scans every object file as before. A crash loses
-  only what was used last, never an object. After running a daemon build
-  from before the index on the same data directory, remove `<data>/index`.
+- `scion-daemon` keeps its recency index in `<data>/index.db`, a SQLite
+  database read and changed in place. The index is not held in memory: a
+  `size` is one point lookup, and the daemon keeps only the last batch of
+  row changes, at most 1,024 (or 64 MiB of new bytes), committed in one
+  transaction, plus the database's own page cache of 8 MiB. After a clean
+  stop (Ctrl-C, or SIGTERM, which it handles too), a start reads the rows
+  and opens no object directory, and the order of use survives the
+  restart; the stop commits, checkpoints the write-ahead log, and flushes
+  it past the drive's cache. After a crash, a start still opens at once,
+  at most one batch behind: every change carries a sequence number, and
+  the start reads only the changes past the newest one committed. Files
+  that a crash left before their batch are adopted by one low-priority
+  walk of the object directories after the start: each file with no row
+  comes back as the least recently used, and its bytes count against
+  `--max-bytes`, so the limit holds again; the walk stops at a clean stop
+  and logs what it adopted. A crash loses only what was used last, never
+  an object. A store from a build before the index db has `<data>/index`
+  (the append-only index of that format): the first start imports its
+  records in file order and removes it.
 
 #### scn
 
@@ -264,7 +277,6 @@ release.
 #### Docs and scripts
 
 - `docs/protocol-v1.md`: the contract of the `Scion` and `Objects`
-  services, for independent clients, tiers and servers.
-- `scripts/demo.sh`, a demo that anyone can rerun on a fixed public
+  services, for independent clients, tiers and servers.- `scripts/demo.sh`, a demo that anyone can rerun on a fixed public
   repository, and `scripts/bench-checkout.sh`, a checkout benchmark
   against git. `docs/benchmarks.md` gives the method.

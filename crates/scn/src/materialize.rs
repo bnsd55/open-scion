@@ -96,10 +96,9 @@ fn set_removing(temp: Option<PathBuf>) {
 /// a name read as another), or is `.git` or `.scion` in any ASCII case. Bytes
 /// that are not UTF-8 are checked one by one: 0x80 to 0x9F are C1 controls on
 /// an 8-bit terminal.
-// SHORTCUT: no Windows rules: device names (`CON`, `NUL`) and names that end
-// in a dot or a space pass. Case and Unicode folding is caught at write time,
-// on the filesystem in use. Upgrade: per-platform rules before checkout runs
-// on Windows.
+// Windows is unsupported: no Windows rules here. Device names (`CON`, `NUL`)
+// and names that end in a dot or a space pass. Case and Unicode folding is
+// caught at write time, on the filesystem in use.
 pub fn check_name(name: &[u8]) -> Result<(), &'static str> {
     for chunk in name.utf8_chunks() {
         let text = chunk.valid();
