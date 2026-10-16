@@ -155,8 +155,8 @@ release.
   `DEADLINE_EXCEEDED` at 600 s or once its call is dropped. The merge-base
   walk jumps over runs of first parents that only one part of the walk
   reaches: a few dozen reads for a run, not one for each changeset. A walk
-  holds the database lock for about 1,000 reads at a time, then leaves it
-  free for other requests.
+  holds one read connection (below), so writes and other reads run beside
+  it.
 - `Diff` finds renames as `git diff` does by default: same content, then the
   one file of a name on each side at 75%, then the most similar files at
   50%. A rename keeps its two entries. The added one has `rename_from`, the
@@ -170,3 +170,7 @@ release.
 - `Blame` and `Diff` find renames with one implementation. Chunks now go to
   git's hash buckets, as in git, so a score can change where two different
   chunks share a bucket.
+- Reads use a pool of 8 read-only SQLite connections. A read no longer
+  waits for a write, for a long read such as a graph walk, or for a server
+  write that waits for an import's write lock. Writes still take turns
+  on one connection.
