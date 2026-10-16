@@ -47,6 +47,10 @@ fn fixture() -> Fixture {
                 ),
             )?;
             assert!(db::cas_ref(c, repo, "main", None, root)?);
+            // As if uploaded to `main`.
+            for content in ["a", "b", "c", "new"] {
+                db::add_repo_blob(c, repo, BlobId::of(content.as_bytes()))?;
+            }
             let other = db::create_repo(c, "other")?;
             let other_root =
                 db::insert_changeset(c, other, &changeset(vec![], &[("x", Some(regular("a")))]))?;
@@ -261,6 +265,34 @@ fn created_changesets_have_the_expected_root_tree() {
         file(regular("a")),
         "the parent is unchanged"
     );
+}
+
+#[test]
+fn a_blob_that_a_changeset_of_the_repo_names_needs_no_upload() {
+    let f = fixture();
+    // As an import stores it: no upload, but a changeset of the repo names it.
+    let blob = f.store.blobs().put(b"imported").unwrap();
+    let file = FileState::Regular {
+        content: blob,
+        executable: false,
+    };
+    let root = f
+        .store
+        .write(|c| {
+            let repo = db::create_repo(c, "imported")?;
+            let root = changeset(vec![], &[("f", Some(file))]);
+            Ok(tree::store_changeset(c, repo, &root)?.0)
+        })
+        .unwrap();
+    // A rename names it again.
+    let rename = changeset(vec![root], &[("f", None), ("g", Some(file))]).encode();
+    create_changeset(&f.store, "imported", &rename).unwrap();
+    // Another repo still may not name it.
+    let theirs = changeset(vec![f.root], &[("g", Some(file))]).encode();
+    match create_changeset(&f.store, REPO, &theirs) {
+        Err(Error::InvalidArgument(why)) => assert!(why.contains("is not stored"), "{why}"),
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
 }
 
 /// Overwrites the stored file of blob `new` with `bytes`, as a crash, a bad

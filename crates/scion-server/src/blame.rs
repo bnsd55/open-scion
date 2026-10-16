@@ -22,7 +22,7 @@ use scion_core::{
 use crate::db;
 use crate::error::{Error, Result};
 use crate::read::{self, MAX_SCAN};
-use crate::similar::{self, Budget, Chunks};
+use crate::similar::{self, Budget, Chunks, MAX_PAIRS, Progress};
 use crate::store::Store;
 use crate::tree;
 
@@ -51,41 +51,21 @@ pub const MAX_BLAME_VERSIONS: usize = 100;
 /// Most lines one call diffs, counting both sides of each diff. A diff of
 /// many repeated lines can take seconds, so this bounds the time of a call.
 /// A line counts once per 64 bytes ([`diff_cost`]), a rename search counts
-/// each chunk it reads and compares ([`similar::Budget`]), and a file read
-/// and refused counts
+/// the chunks it reads, the rows it indexes and compares, and the file
+/// sizes it reads ([`similar::Budget`]), and a file read and refused counts
 /// once per 64 bytes, so every byte read counts. The first step of a call
-/// always runs, so a call always makes progress. So a call reads about
-/// 64 MiB in steps that fit, plus two steps past the budget: the first, and
-/// the one that stops the call. One step reads one older version (at most
-/// [`MAX_BLAME_BYTES`]) or one rename search (about [`MAX_RENAME_BYTES`]
-/// and one more file).
+/// always runs, so a call always makes progress. A rename search uses only
+/// the budget left; where it stops, the next call goes on with it
+/// ([`Blame::next_search`]). So a call reads about 64 MiB in steps that
+/// fit, plus a few files of at most [`MAX_BLAME_BYTES`] past it: the first
+/// step can pass it by one file of a rename search, and the step that stops
+/// the call reads one older version, or one more file of a rename search.
 // SHORTCUT: the cost of a diff grows faster than its lines when lines
 // repeat, so one diff of two files of MAX_BLAME_LINES lines is the worst
-// case of a call. Upgrade: blame from derived data, so a call does not diff
-// whole versions.
+// case of a call. A changeset that deletes many large files costs one call
+// per about 64 MiB of them. Upgrade: blame from derived data, so a call does
+// not diff whole versions, and an index of deleted files by chunk (#61).
 pub const MAX_BLAME_DIFF_LINES: usize = 1 << 20;
-
-/// Most files a changeset can delete for blame to compare each of them with
-/// a file the changeset adds, to find a rename with edits.
-// SHORTCUT: when a changeset deletes more files, only a file with the same
-// content, or the one deleted file with the same name, can be the source.
-// git compares them all. This bounds the files whose size one search
-// checks. Upgrade: an index of each changeset's deleted files by chunk, as
-// derived data, so a search compares only files that share chunks with the
-// new file (#87).
-pub const MAX_RENAME_SOURCES: usize = 100;
-
-/// Most bytes one rename search reads, about: [`MAX_RENAME_SOURCES`] files of
-/// 1 MiB, the old file limit, so a search still reads every file it read
-/// under that limit. Past it, the search stops and keeps the best file so
-/// far. It is the same for every search, so the source does not depend on
-/// where a call stops.
-// SHORTCUT: with larger files a search can stop before it reaches the
-// source, and pick another file or none. git reads them all.
-// Upgrade: an index of each changeset's deleted files by chunk, as derived
-// data, so a search reads only files that share chunks with the new file
-// (#87).
-pub const MAX_RENAME_BYTES: usize = MAX_RENAME_SOURCES << 20;
 
 /// Consecutive lines with the same source.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,6 +95,22 @@ pub struct Blame {
     /// changeset. Blame this path at this changeset to continue. The path
     /// differs from the blamed path after a rename.
     pub next: Option<(ChangesetId, RepoPath)>,
+    /// With `next`: where the rename search stopped, when the call stopped
+    /// inside the search for the file that the changeset at `next` renamed
+    /// to its path. Pass it to the next call. Empty otherwise.
+    pub next_search: RenameSearch,
+}
+
+/// Where a rename search stopped, so that the next call goes on with it
+/// ([`blame`]). The default is a search not started.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenameSearch {
+    /// How many of the files that the changeset deletes, in path order,
+    /// the search has looked at. Only paths that held a file count. When
+    /// it is all of them, the search has ended, and `best` is its answer.
+    pub searched: usize,
+    /// The deleted file that the search picks among those, if any.
+    pub best: Option<RepoPath>,
 }
 
 /// An older version of the blamed file: its path, blob and text. The text
@@ -122,28 +118,45 @@ pub struct Blame {
 /// not read again.
 type Version = (RepoPath, BlobId, Option<Vec<u8>>);
 
+/// The version of the blamed file being explained: its path, blob and text.
+#[derive(Clone, Copy)]
+struct Newer<'a> {
+    path: &'a RepoPath,
+    blob: BlobId,
+    text: &'a [u8],
+}
+
+/// What [`older_version`] found.
+enum Older {
+    /// The older version, if any. After a rename search, also the search
+    /// that ended, so that a call that goes on there does not search again.
+    Found(Option<Version>, RenameSearch),
+    /// The rename search stopped at the budget, here.
+    Stopped(RenameSearch),
+}
+
 /// Blames the file at `path` in `cs`. Diffs at most [`MAX_BLAME_VERSIONS`]
 /// versions and about [`MAX_BLAME_DIFF_LINES`] lines, and checks at most
 /// [`MAX_SCAN`] changesets. A binary file is blamed line by line too, as
-/// `git blame` does.
+/// `git blame` does. `from` goes on with a rename search that an earlier
+/// call stopped ([`Blame::next_search`]); its default starts none.
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo, the changeset or the file does not
 /// exist. [`Error::InvalidArgument`] if the path is not a regular file, or
-/// has more than [`MAX_BLAME_BYTES`] bytes or [`MAX_BLAME_LINES`] lines.
-pub fn blame(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Result<Blame> {
+/// has more than [`MAX_BLAME_BYTES`] bytes or [`MAX_BLAME_LINES`] lines, or
+/// if `from` is not where a rename search of `path` at `cs` can stop.
+pub fn blame(
+    store: &Store,
+    repo: &str,
+    cs: ChangesetId,
+    path: &RepoPath,
+    from: &RenameSearch,
+) -> Result<Blame> {
     let repo = store.read(|c| db::repo_id(c, repo))?;
     let root = tree::root_tree(store, repo, cs)?;
-    let mut blob = match store.read(|c| tree::lookup(c, root, path))? {
-        Some(Entry::File(FileState::Regular { content, .. })) => content,
-        Some(_) => {
-            return Err(Error::InvalidArgument(format!(
-                "{path:?} is not a regular file"
-            )));
-        }
-        None => return Err(Error::NotFound(format!("path {path:?}"))),
-    };
+    let mut blob = regular_blob(store, root, path)?;
     let mut text = read_text(store, blob, path, &mut 0)??;
     let mut path = path.clone();
     // For each line of the blamed file: its changeset once known, and until
@@ -153,8 +166,10 @@ pub fn blame(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Res
         .collect();
     let mut changesets = Vec::new();
     let mut next = Some(cs);
+    let mut next_search = RenameSearch::default();
     let mut budget = MAX_SCAN;
     let mut diffed = 0;
+    let mut from = from.clone();
     for _ in 0..MAX_BLAME_VERSIONS {
         if lines.iter().all(|(source, _)| source.is_some()) {
             break;
@@ -173,46 +188,56 @@ pub fn blame(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Res
                 "changeset {id} does not put the blamed version of {path:?}"
             )));
         }
+        // A search to go on with is the first step's, at `cs`.
+        let search = std::mem::take(&mut from);
+        if search != RenameSearch::default() && (id != cs || next.is_none()) {
+            return Err(Error::InvalidArgument(format!(
+                "{cs} does not add {path:?}, so it has no rename search"
+            )));
+        }
         // The version before `id`. If nothing is there, or no text blame can
-        // diff, `id` added every line.
+        // diff, `id` added every line. A step runs if it fits in the budget
+        // left. The first always runs.
+        let always = diffed == 0;
+        let left = MAX_BLAME_DIFF_LINES.saturating_sub(diffed);
+        let newer = Newer {
+            path: &path,
+            blob,
+            text: &text,
+        };
         let mut cost = 0;
-        let older = match next {
+        let found = match next {
             Some(parent) => {
                 let root = tree::root_tree(store, repo, parent)?;
-                older_version(store, root, &changeset, &path, blob, &text, &mut cost)?
+                let budget = Budget {
+                    cost: &mut cost,
+                    cap: left,
+                    progress: always,
+                };
+                older_version(store, root, &changeset, newer, budget, &search)?
             }
-            None => None,
+            None => Older::Found(None, RenameSearch::default()),
+        };
+        let (older, done) = match found {
+            Older::Found(older, done) => (older, done),
+            Older::Stopped(stopped) => {
+                // Not diffed: the next call goes on with the search at `id`.
+                (next, next_search) = (Some(id), stopped);
+                break;
+            }
         };
         if let Some((_, _, Some(older_text))) = &older {
             cost += diff_cost(older_text) + diff_cost(&text);
         }
-        // A step runs if it fits in the budget left. The first always runs.
-        if diffed > 0 && cost > MAX_BLAME_DIFF_LINES.saturating_sub(diffed) {
-            // Not diffed, so the next call starts at `id`.
-            next = Some(id);
+        if !always && cost > left {
+            // Not diffed, so the next call starts at `id`, and finds the
+            // file that this search found at once.
+            (next, next_search) = (Some(id), done);
             break;
         }
         diffed += cost;
-        let kept = match &older {
-            // The same content, as after a mode change or a rename with no
-            // edit: every line stays where it is.
-            Some((_, _, None)) => None,
-            Some((_, _, Some(older_text))) => Some(kept_lines(older_text, &text)),
-            None => Some(vec![None; byte_lines(&text).count()]),
-        };
-        if let Some(kept) = kept {
-            let mut named = false;
-            for (source, at) in lines.iter_mut().filter(|(source, _)| source.is_none()) {
-                if let Some(older_at) = kept[*at] {
-                    *at = older_at;
-                } else {
-                    *source = Some(id);
-                    named = true;
-                }
-            }
-            if named {
-                changesets.push((id, changeset.author, path.clone()));
-            }
+        if give_lines(&mut lines, id, older.as_ref(), &text) {
+            changesets.push((id, changeset.author, path.clone()));
         }
         if let Some((older_path, older_blob, older_text)) = older {
             (path, blob) = (older_path, older_blob);
@@ -232,7 +257,52 @@ pub fn blame(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Res
         ranges: ranges(&lines),
         changesets,
         next: next.map(|id| (id, path)),
+        next_search,
     })
+}
+
+/// The blob of the regular file at `path` in `root`.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if no file is there. [`Error::InvalidArgument`] if
+/// it is not a regular file.
+fn regular_blob(store: &Store, root: TreeId, path: &RepoPath) -> Result<BlobId> {
+    match store.read(|c| tree::lookup(c, root, path))? {
+        Some(Entry::File(FileState::Regular { content, .. })) => Ok(content),
+        Some(_) => Err(Error::InvalidArgument(format!(
+            "{path:?} is not a regular file"
+        ))),
+        None => Err(Error::NotFound(format!("path {path:?}"))),
+    }
+}
+
+/// Moves each line that has no changeset yet to its line in `older`, the
+/// version of `text` before `id`, or gives it `id` if `older` does not keep
+/// it. Returns whether any line got `id`.
+fn give_lines(
+    lines: &mut [(Option<ChangesetId>, usize)],
+    id: ChangesetId,
+    older: Option<&Version>,
+    text: &[u8],
+) -> bool {
+    let kept = match older {
+        // The same content, as after a mode change or a rename with no
+        // edit: every line stays where it is.
+        Some((_, _, None)) => return false,
+        Some((_, _, Some(older_text))) => kept_lines(older_text, text),
+        None => vec![None; byte_lines(text).count()],
+    };
+    let mut named = false;
+    for (source, at) in lines.iter_mut().filter(|(source, _)| source.is_none()) {
+        if let Some(older_at) = kept[*at] {
+            *at = older_at;
+        } else {
+            *source = Some(id);
+            named = true;
+        }
+    }
+    named
 }
 
 /// The text of `blob`, the file at `path`, if blame can read it. The inner
@@ -240,8 +310,8 @@ pub fn blame(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Res
 /// [`MAX_BLAME_LINES`] lines.
 ///
 /// Every read costs one per 64 bytes. The caller adds the cost of a text it
-/// uses, when it diffs or compares it ([`diff_cost`], [`chunks`]). A text
-/// read and then refused for its lines adds it to `cost` here.
+/// uses, when it diffs or compares it ([`diff_cost`], [`similar::Budget`]).
+/// A text read and then refused for its lines adds it to `cost` here.
 ///
 /// # Errors
 ///
@@ -273,59 +343,174 @@ fn diff_cost(text: &[u8]) -> usize {
     byte_lines(text).map(|line| line.len().div_ceil(64)).sum()
 }
 
-/// The version of the file before `changeset`, which puts `blob` and `text`
-/// at `path`: the file at `path` in `root`, the tree of its first parent, or
-/// else the file that `changeset` renamed to `path` ([`renamed_from`]).
-/// `None` if there is none, or blame cannot read it. Adds the cost of what
-/// it reads and does not return, and of a rename search, to `cost`.
+/// The version of the file before `changeset`, which puts `newer`: the file
+/// at its path in `root`, the tree of its first parent, or else the file
+/// that `changeset` renamed to that path ([`renamed_from`]). `None` if there
+/// is none, or blame cannot read it. Adds the cost of what it reads and does
+/// not return, and of a rename search, to the budget. `search` goes on with
+/// a rename search; it must be the default unless there is one.
 fn older_version(
     store: &Store,
     root: TreeId,
     changeset: &Changeset,
-    path: &RepoPath,
-    blob: BlobId,
-    text: &[u8],
-    cost: &mut usize,
-) -> Result<Option<Version>> {
-    match store.read(|c| tree::lookup(c, root, path))? {
+    newer: Newer<'_>,
+    budget: Budget<'_>,
+    search: &RenameSearch,
+) -> Result<Older> {
+    let entry = store.read(|c| tree::lookup(c, root, newer.path))?;
+    if *search != RenameSearch::default() && matches!(entry, Some(Entry::File(_))) {
+        return Err(Error::InvalidArgument(format!(
+            "{:?} was there before, so it has no rename search",
+            newer.path
+        )));
+    }
+    let older = match entry {
         // Only the mode changed: nothing to read.
-        Some(Entry::File(FileState::Regular { content, .. })) if content == blob => {
-            Ok(Some((path.clone(), content, None)))
+        Some(Entry::File(FileState::Regular { content, .. })) if content == newer.blob => {
+            Some((newer.path.clone(), content, None))
         }
         Some(Entry::File(FileState::Regular { content, .. })) => {
-            let text = read_text(store, content, path, cost)?.ok();
-            Ok(text.map(|text| (path.clone(), content, Some(text))))
+            let text = read_text(store, content, newer.path, budget.cost)?.ok();
+            text.map(|text| (newer.path.clone(), content, Some(text)))
         }
         // As in git, only a path with no file before can be a rename. A
         // symlink or submodule that becomes a regular file is not one.
-        None | Some(Entry::Dir(_)) => renamed_from(store, root, changeset, path, blob, text, cost),
-        Some(Entry::File(_)) => Ok(None),
-    }
+        None | Some(Entry::Dir(_)) => {
+            return renamed_from(store, root, changeset, newer, budget, search);
+        }
+        Some(Entry::File(_)) => None,
+    };
+    Ok(Older::Found(older, RenameSearch::default()))
 }
 
-/// The file that `changeset` renamed to `path`, where it puts `blob` and
-/// `text`. `root` is the tree of its first parent. As `git blame` does by
-/// default (renames, no copies), it picks among the files that `changeset`
-/// deletes, with [`similar::renames`]: a file with the same content, else
-/// one with the same name if at least 75% similar, else the most similar,
-/// if at least 50% similar. A similar file is looked for only if the
-/// changeset deletes at most [`MAX_RENAME_SOURCES`] files, and only until
-/// the search has read [`MAX_RENAME_BYTES`].
+/// The file that `changeset` renamed to the path where it puts `newer`.
+/// `root` is the tree of its first parent. As `git blame` does by default
+/// (renames, no copies), it picks among the files that `changeset` deletes,
+/// with [`similar::renames`]: a file with the same content, else one with
+/// the same name if at least 75% similar, else the most similar, if at
+/// least 50% similar. As in git, a similar file is looked for among at most
+/// [`similar::MAX_PAIRS`] deleted files.
+///
+/// The search stops at the cap of `budget`, and then says where
+/// ([`Older::Stopped`]). `search` goes on from there: the result is the
+/// same as that of one search with no cap. A `search` that has looked at
+/// every deleted file has ended, and its best file is the answer.
 ///
 /// Only a regular file can be the source, and only one that blame can read
-/// can be similar. Adds the chunks compared, and the files read and
-/// refused, to `cost`.
+/// can be similar. Adds the cost of the search, and of the files read and
+/// refused, to the budget.
+///
+/// # Errors
+///
+/// [`Error::InvalidArgument`] if `search` is not where this search can
+/// stop.
 fn renamed_from(
     store: &Store,
     root: TreeId,
     changeset: &Changeset,
-    path: &RepoPath,
-    blob: BlobId,
-    text: &[u8],
-    cost: &mut usize,
-) -> Result<Option<Version>> {
-    // Each deleted file, in path order.
-    let deleted: Vec<(&RepoPath, FileState)> = store.read(|c| {
+    newer: Newer<'_>,
+    budget: Budget<'_>,
+    search: &RenameSearch,
+) -> Result<Older> {
+    let Budget {
+        cost,
+        cap,
+        progress,
+    } = budget;
+    let deleted = deleted_files(store, root, changeset)?;
+    let bad = |why: &str| Error::InvalidArgument(format!("bad rename search: {why}"));
+    if search.searched > deleted.len() {
+        return Err(bad("past the deleted files"));
+    }
+    // A regular file pairs only with a regular file.
+    let best = match &search.best {
+        Some(best) => match deleted.binary_search_by(|&(other, _)| other.cmp(best)) {
+            Ok(d) if d < search.searched && matches!(deleted[d].1, FileState::Regular { .. }) => {
+                Some(d)
+            }
+            _ => return Err(bad("the best file is not a regular file searched")),
+        },
+        None => None,
+    };
+    // The deleted file it came from, and the files looked at so far.
+    let (source, searched) = if search.searched == deleted.len() {
+        (best, search.searched)
+    } else {
+        let added = [(
+            newer.path,
+            FileState::Regular {
+                content: newer.blob,
+                executable: false,
+            },
+        )];
+        // The cost of files read and refused for their lines.
+        let mut refused = 0;
+        let read = |other: &RepoPath, other_blob: BlobId, size: usize| {
+            if other_blob == newer.blob {
+                return Ok(Some(Chunks::of(newer.text)));
+            }
+            if size > MAX_BLAME_BYTES {
+                return Ok(None);
+            }
+            let text = read_text(store, other_blob, other, &mut refused)?.ok();
+            Ok(text.map(|text| Chunks::of(&text)))
+        };
+        let from = Progress {
+            searched: search.searched,
+            best,
+        };
+        let budget = Budget {
+            cost: &mut *cost,
+            cap,
+            progress,
+        };
+        let outcome = similar::renames(store, &added, &deleted, read, MAX_PAIRS, from, budget)?;
+        *cost += refused;
+        let source = outcome.pairs.first().map(|pair| pair.deleted);
+        (source, outcome.stopped.unwrap_or(deleted.len()))
+    };
+    let at = RenameSearch {
+        searched,
+        best: source.map(|d| deleted[d].0.clone()),
+    };
+    if searched < deleted.len() {
+        return Ok(Older::Stopped(at));
+    }
+    let Some(d) = source else {
+        return Ok(Older::Found(None, at));
+    };
+    let (other, state) = deleted[d];
+    let FileState::Regular {
+        content: other_blob,
+        ..
+    } = state
+    else {
+        return Err(Error::Corrupt(format!(
+            "rename source {other:?} is not a regular file"
+        )));
+    };
+    if other_blob == newer.blob {
+        return Ok(Older::Found(
+            Some((other.clone(), other_blob, None)),
+            RenameSearch::default(),
+        ));
+    }
+    // The search kept only its chunks, so read it again to diff it.
+    let text = read_text(store, other_blob, other, cost)?.ok();
+    Ok(Older::Found(
+        text.map(|text| (other.clone(), other_blob, Some(text))),
+        at,
+    ))
+}
+
+/// Each file that `changeset` deletes, in path order, as it was in `root`,
+/// the tree of its first parent.
+fn deleted_files<'c>(
+    store: &Store,
+    root: TreeId,
+    changeset: &'c Changeset,
+) -> Result<Vec<(&'c RepoPath, FileState)>> {
+    store.read(|c| {
         let mut trees = HashMap::new();
         let mut deleted = Vec::new();
         for (other, _) in changeset
@@ -338,50 +523,7 @@ fn renamed_from(
             }
         }
         Ok(deleted)
-    })?;
-    let added = [(
-        path,
-        FileState::Regular {
-            content: blob,
-            executable: false,
-        },
-    )];
-    // The bytes of deleted files read, and the cost of files read and
-    // refused for their lines.
-    let (mut bytes, mut refused) = (0, 0);
-    let read = |other: &RepoPath, other_blob: BlobId, size: usize| {
-        if other_blob == blob {
-            return Ok(Some(Chunks::of(text)));
-        }
-        if bytes > MAX_RENAME_BYTES || size > MAX_BLAME_BYTES {
-            return Ok(None);
-        }
-        bytes += size;
-        let text = read_text(store, other_blob, other, &mut refused)?.ok();
-        Ok(text.map(|text| Chunks::of(&text)))
-    };
-    let budget = Budget {
-        cost: &mut *cost,
-        cap: usize::MAX,
-    };
-    // With one added file, at most this many pairs means at most this many
-    // deleted files.
-    let found = similar::renames(store, &added, &deleted, read, MAX_RENAME_SOURCES, budget)?;
-    *cost += refused;
-    let Some(pair) = found.first() else {
-        return Ok(None);
-    };
-    // A regular file pairs only with a regular file.
-    let (other, state) = deleted[pair.deleted];
-    let other_blob = state
-        .blob()
-        .ok_or_else(|| Error::Corrupt(format!("rename source {other:?} has no blob")))?;
-    if other_blob == blob {
-        return Ok(Some((other.clone(), blob, None)));
-    }
-    // The search read it, and kept only its chunks.
-    let text = read_text(store, other_blob, other, cost)?.ok();
-    Ok(text.map(|text| (other.clone(), other_blob, Some(text))))
+    })
 }
 
 /// [`tree::lookup`] that loads each tree at most once across calls.

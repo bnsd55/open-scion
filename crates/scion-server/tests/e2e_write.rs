@@ -3,17 +3,47 @@
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_proto::CHUNK_BYTES;
+use scion_proto::auth::Bearer;
+use scion_proto::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ReadFileRequest};
 use scion_server::{Store, db, service};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
-use tonic::metadata::AsciiMetadataValue;
+use tonic::Code;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
-use tonic::{Code, Request, Status};
 
 const REPO: &str = "main";
 const TOKEN: &str = "secret";
+
+type Client = ScionClient<InterceptedService<Channel, Bearer>>;
+
+/// A blob uploaded to another repo cannot be named in `main`, until it is
+/// uploaded to `main` too. `root` is in `main`, and repo `other` exists.
+async fn blobs_are_per_repo(mut client: Client, root: ChangesetId) {
+    let content = b"other's file";
+    let uploader = client.clone();
+    let put = |repo: &str| {
+        let upload = PutBlobRequest {
+            repo: repo.into(),
+            data: content.to_vec(),
+        };
+        let mut client = uploader.clone();
+        async move { client.put_blob(tokio_stream::once(upload)).await.unwrap() }
+    };
+    put("other").await;
+    let theirs = changeset(vec![root], "theirs", Some(regular(BlobId::of(content))));
+    let create = CreateChangesetRequest {
+        repo: REPO.into(),
+        changeset: theirs.encode(),
+    };
+    let status = client.create_changeset(create.clone()).await.unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+    assert!(status.message().contains("is not stored"), "{status:?}");
+    put(REPO).await;
+    client.create_changeset(create).await.unwrap();
+}
 
 fn changeset(parents: Vec<ChangesetId>, path: &str, state: Option<FileState>) -> Changeset {
     Changeset {
@@ -44,6 +74,7 @@ async fn uploaded_file_reads_back_through_a_created_changeset() {
     let readme = store.blobs().put(b"# hello\n").unwrap();
     let root = store
         .write(|c| {
+            db::create_repo(c, "other")?;
             let repo = db::create_repo(c, REPO)?;
             db::insert_changeset(c, repo, &changeset(vec![], "README", Some(regular(readme))))
         })
@@ -52,19 +83,21 @@ async fn uploaded_file_reads_back_through_a_created_changeset() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(service::serve(store, listener, TOKEN, async {
-        stopped.await.ok();
-    }));
+    let server = tokio::spawn(service::serve(
+        store,
+        listener,
+        TOKEN,
+        Limits::default(),
+        async {
+            stopped.await.ok();
+        },
+    ));
     let channel = Channel::from_shared(format!("http://{addr}"))
         .unwrap()
         .connect()
         .await
         .unwrap();
-    let bearer: AsciiMetadataValue = format!("Bearer {TOKEN}").parse().unwrap();
-    let mut client = ScionClient::with_interceptor(channel.clone(), move |mut req: Request<()>| {
-        req.metadata_mut().insert("authorization", bearer.clone());
-        Ok::<_, Status>(req)
-    });
+    let mut client = ScionClient::with_interceptor(channel.clone(), Bearer::new(TOKEN).unwrap());
 
     // More than one chunk, not a multiple of the chunk size, and a period
     // (251) that does not divide it, so reordered chunks change the bytes.
@@ -118,6 +151,8 @@ async fn uploaded_file_reads_back_through_a_created_changeset() {
         read.len(),
         data.len()
     );
+
+    blobs_are_per_repo(client.clone(), root).await;
 
     // A change that does not apply is the client's fault.
     let status = client

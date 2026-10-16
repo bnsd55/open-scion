@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use scion_core::{BlobId, ChangesetId, FileState, RepoPath};
+use scion_proto::listen::{self, Limits};
 use scion_proto::v1::scion_server::{Scion, ScionServer};
 use scion_proto::v1::{
     self, BlameChangeset, BlameRange, BlameRequest, BlameResponse, CreateChangesetRequest,
@@ -20,11 +21,13 @@ use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
+use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth::{Auth, Caller};
+use crate::blame::RenameSearch;
 use crate::deadline::Deadline;
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
@@ -62,17 +65,20 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const READ_BUDGET_BYTES: usize = 256 << 20;
 /// A `ReadFile` reply ends when its client takes no part for this long, and
 /// frees its share, so a client that stops reading does not hold budget.
-// SHORTCUT: the reply frees its share, but the part that waits in its
-// channel and the part inside HTTP/2 stay in memory, outside the budget,
-// until the connection closes: up to 2 MiB per stalled reply. Upgrade
-// (issue #42): a response body timeout that resets the stream.
+/// The parts that it leaves in its channel and in HTTP/2 stay outside the
+/// budget (`scion_proto::listen`).
 const READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+// A connection that is asked to close keeps its calls for at least as long
+// as the longest call takes.
+const _: () = assert!(REQUEST_TIMEOUT.as_secs() <= listen::CONNECTION_GRACE.as_secs());
 
 // Any one reply fits in the budget, and the budget counts in u32 permits.
 const _: () = assert!(read_share(MAX_OBJECT_BYTES) <= READ_BUDGET_BYTES);
 const _: () = assert!(READ_BUDGET_BYTES <= u32::MAX as usize);
 
-/// Serves the API on `listener`, requiring `token`, until `shutdown` resolves.
+/// Serves the API on `listener`, requiring `token`, within `limits`, until
+/// `shutdown` resolves.
 ///
 /// # Errors
 ///
@@ -81,6 +87,7 @@ pub async fn serve(
     store: Store,
     listener: TcpListener,
     token: &str,
+    limits: Limits,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
     let auth = Auth::new(token);
@@ -90,12 +97,13 @@ pub async fn serve(
         auth.clone(),
     );
     let objects = InterceptedService::new(ObjectsService::new(worker).into_server(), auth);
-    tonic::transport::Server::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .add_service(scion)
-        .add_service(objects)
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
-        .await
+    let router = |server: Server| {
+        server
+            .timeout(REQUEST_TIMEOUT)
+            .add_service(scion)
+            .add_service(objects)
+    };
+    limits.serve(router, listen::tcp(listener), shutdown).await
 }
 
 /// Implements the Scion RPCs.
@@ -364,11 +372,11 @@ impl Scion for ScionService {
         // Check the repo before reading any more data. Each message goes to
         // the spool file before the next one is read, so an upload holds one
         // message in memory, not the whole blob.
-        let mut upload = self
+        let (repo, mut upload) = self
             .worker
             .run(move |store| {
-                store.read(|c| db::repo_id(c, &first.repo))?;
-                store.blobs().upload()?.append(&first.data)
+                let repo = store.read(|c| db::repo_id(c, &first.repo))?;
+                Ok((repo, store.blobs().upload()?.append(&first.data)?))
             })
             .await?;
         while let Some(chunk) = stream.next().await {
@@ -382,7 +390,7 @@ impl Scion for ScionService {
         }
         let id = self
             .worker
-            .run(move |store| store.blobs().put_upload(upload))
+            .run(move |store| write::put_blob(&store, repo, upload))
             .await?;
         Ok(Response::new(PutBlobResponse {
             blob_id: id.as_bytes().to_vec(),
@@ -577,6 +585,11 @@ impl Scion for ScionService {
         check_name("repo", &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_path(req.path)?;
+        let search = RenameSearch {
+            searched: usize::try_from(req.rename_searched)
+                .map_err(|_| Status::invalid_argument("rename_searched is too large"))?,
+            best: parse_optional_path(req.rename_best)?,
+        };
         // Taken before the worker permit, and held until the job ends, also
         // when the client leaves first.
         let slot = Arc::clone(&self.blames)
@@ -587,7 +600,7 @@ impl Scion for ScionService {
             .worker
             .run(move |store| {
                 let _slot = slot;
-                blame::blame(&store, &req.repo, id, &path)
+                blame::blame(&store, &req.repo, id, &path, &search)
             })
             .await?;
         let ranges = blame
@@ -617,9 +630,9 @@ impl Scion for ScionService {
             ranges,
             changesets,
             next_changeset_id: id_bytes(next),
-            next_path: next_path
-                .map(|path| path.as_bytes().to_vec())
-                .unwrap_or_default(),
+            next_path: path_bytes(next_path),
+            next_rename_searched: blame.next_search.searched as u64,
+            next_rename_best: path_bytes(blame.next_search.best),
         }))
     }
 
@@ -699,10 +712,7 @@ impl Scion for ScionService {
             .collect();
         Ok(Response::new(DiffResponse {
             entries,
-            next_after: page
-                .next_after
-                .map(|path| path.as_bytes().to_vec())
-                .unwrap_or_default(),
+            next_after: path_bytes(page.next_after),
         }))
     }
 }
@@ -710,6 +720,12 @@ impl Scion for ScionService {
 /// An optional changeset ID on the wire: empty for `None`.
 fn id_bytes(id: Option<ChangesetId>) -> Vec<u8> {
     id.map(|id| id.as_bytes().to_vec()).unwrap_or_default()
+}
+
+/// An optional path on the wire: empty for `None`.
+fn path_bytes(path: Option<RepoPath>) -> Vec<u8> {
+    path.map(|path| path.as_bytes().to_vec())
+        .unwrap_or_default()
 }
 
 fn file_state(state: FileState) -> v1::FileState {

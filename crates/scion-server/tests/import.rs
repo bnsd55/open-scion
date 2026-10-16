@@ -747,8 +747,11 @@ fn identity() -> IdentityTime {
 
 /// Creates a changeset on `base` that puts `path`, through the write path.
 fn create(store: &Store, base: ChangesetId, path: &str) -> ChangesetId {
+    let repo = store.read(|c| db::repo_id(c, "r")).unwrap();
+    let upload = store.blobs().upload().unwrap();
+    let upload = upload.append(path.as_bytes()).unwrap();
     let file = FileState::Regular {
-        content: store.blobs().put(path.as_bytes()).unwrap(),
+        content: write::put_blob(store, repo, upload).unwrap(),
         executable: false,
     };
     let cs = Changeset {

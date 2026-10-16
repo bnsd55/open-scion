@@ -2,10 +2,12 @@
 //! derived data ahead of reads.
 
 use std::net::SocketAddr;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
+use scion_proto::listen::{self, Limits};
 use scion_server::derived::{self, Kind};
 use scion_server::graph::CommitGraph;
 use scion_server::history::PathHistory;
@@ -38,6 +40,12 @@ enum Command {
         /// encrypted, so use this only on a trusted network.
         #[arg(long)]
         insecure_listen: bool,
+        /// Most connections served at once. More clients wait until one closes.
+        #[arg(long, default_value_t = listen::DEFAULT_CONNECTIONS)]
+        max_connections: NonZeroUsize,
+        /// Most calls (HTTP/2 streams) that one connection may have open at once.
+        #[arg(long, default_value_t = listen::DEFAULT_STREAMS)]
+        max_streams: NonZeroU32,
     },
     /// Import a local git repository, one way. Safe to repeat. It can run
     /// while the server runs.
@@ -109,6 +117,8 @@ async fn main() -> anyhow::Result<()> {
             listen,
             token,
             insecure_listen,
+            max_connections,
+            max_streams,
         } => {
             anyhow::ensure!(!token.is_empty(), "--token must not be empty");
             // SHORTCUT: no TLS. Upgrade: tonic TLS or mTLS before any
@@ -121,8 +131,14 @@ async fn main() -> anyhow::Result<()> {
             let listener = tokio::net::TcpListener::bind(listen)
                 .await
                 .with_context(|| format!("cannot listen on {listen}"))?;
+            // The bound address, so port 0 shows the port that the OS chose.
+            let listen = listener.local_addr()?;
             tracing::info!(%listen, "serving");
-            service::serve(store, listener, &token, async {
+            let limits = Limits {
+                connections: max_connections,
+                streams: max_streams,
+            };
+            service::serve(store, listener, &token, limits, async {
                 tokio::signal::ctrl_c().await.ok();
             })
             .await?;

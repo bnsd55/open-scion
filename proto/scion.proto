@@ -210,6 +210,11 @@ message BlameRequest {
   bytes changeset_id = 2;
   // A regular file of at most 16 MiB and 1,048,576 lines.
   bytes path = 3;
+  // Optional. Where a rename search stopped: a reply's
+  // next_rename_searched and next_rename_best, sent back unchanged with
+  // its next_changeset_id and next_path. 0 and empty start no search.
+  uint64 rename_searched = 4;
+  bytes rename_best = 5;
 }
 
 message BlameResponse {
@@ -225,6 +230,16 @@ message BlameResponse {
   // the requested path when the walk followed a rename. Empty from a server
   // that does not follow renames: then it is the requested path.
   bytes next_path = 4;
+  // Set when the call stopped in the search for the file that
+  // next_changeset_id renamed to next_path, or right after it: how many of
+  // the files it deletes the search has looked at, all of them if the
+  // search ended. With next_rename_best, the client MUST send it back
+  // unchanged as rename_searched and rename_best in the next call. 0 and
+  // empty when the call did not stop at a search.
+  uint64 next_rename_searched = 5;
+  // With next_rename_searched: the deleted file that the search picks so
+  // far, if any. Else empty.
+  bytes next_rename_best = 6;
 }
 
 message BlameRange {

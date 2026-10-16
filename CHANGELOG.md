@@ -65,12 +65,28 @@ release.
   continues at the wrong path after a rename.
 - `Blame` reads files of up to 16 MiB and 1,048,576 lines (was 1 MiB), and
   blames a binary file line by line, as `git blame` does. Every byte read
-  counts against the per-call budget, once per 64 bytes. A rename search now
-  stops after it has read about 100 MiB of deleted files, so with large files
-  it can miss a source and the answer can change. Every search that the old
-  1 MiB limit allowed still reads every file.
+  counts against the per-call budget, once per 64 bytes.
+- A `Blame` rename search looks at every file that the changeset deletes, as
+  `git blame` does (was 100 files and about 100 MiB). It uses the budget
+  that the call has left. Where the budget runs out, the reply says where
+  the search stopped (`next_rename_searched`, `next_rename_best`), and the
+  next call goes on from there with `rename_searched` and `rename_best`. A
+  client must send both back unchanged. When the search has looked at every
+  deleted file, the reply says that too, and the next call takes the best
+  file as the answer at once. `scn blame` does this.
 - Bearer-token auth, loopback-only listening by default, request limits and
   name validation at the RPC boundary.
+- Blobs belong to repos (schema version 4, table `repo_blobs`). A repo has
+  the blobs uploaded to it and the blobs that its changesets name.
+  `CreateChangeset` refuses a blob of another repo with the error of content
+  that no repo stored, before it reads any file, so a changeset can no
+  longer name another repo's blob and then read it. `PutBlob` keeps a stored
+  copy only for a blob that its repo has, and else writes the content again,
+  so its time does not show that another repo has the content. The upgrade
+  adds the blobs of every changeset of each repo, in one transaction, and
+  logs its progress. A blob uploaded before the upgrade and named by no
+  changeset must be uploaded again. `GetObjects` still reads any object by
+  ID (#13).
 - `ReadFile` streams a file in 1 MiB parts from the zstd decoder, under a
   256 MiB budget for all replies. It checks the content against its ID
   before the last part, and ends a stalled reply with `DEADLINE_EXCEEDED`.
@@ -78,7 +94,7 @@ release.
   full, the indexes of idle refs go first, least recently used first. Else
   the growing index starts over at the tip. The lands still get the same
   answers.
-- Path history as derived data (kind `path_history`, schema version 4).
+- Path history as derived data (kind `path_history`, schema version 5).
   `Log` with a path reads only the changesets that change the path, so one
   call returns up to 1,000 entries however far apart they are. A call stops
   after about 64 MiB of path history, which a file in a large directory
@@ -116,6 +132,23 @@ release.
   unpacks within that size. A tier now fetches up to 64 objects at once
   from upstream instead of 4, within the same 400 MiB. A reply cut off in
   the middle of an object ends with `DEADLINE_EXCEEDED`.
+- The server, `scion-cache` and `scion-daemon` serve at most 128
+  connections at once (`--max-connections`), each with at most 256 open
+  streams (`--max-streams`). Before, both had no bound: tonic replaced
+  hyper's default of 200 streams with none. A client beyond either cap
+  waits, and a connection that waits logs a warning. Every connection
+  closes in time: 20 s after it gets its place if no HTTP/2 preface came;
+  after the preface, 20 s after an unanswered ping, which goes out after
+  60 s without a frame; and 10 min after a `GOAWAY` at 30 min of age, so a
+  daemon's lifelong connection to its cache gives its place up. So the
+  number of stalled replies has a bound, and a connection beyond the cap
+  waits at most 40 min. Size `--max-connections` on a cache for the
+  daemons behind it, and on the server for the caches and direct clients.
+- The server and `scion-cache` turn off Nagle's algorithm on each TCP
+  connection. It was on: tonic ignores its `tcp_nodelay` setting for a
+  listener that it does not open itself. So a small reply, such as a unary
+  answer or a status, could wait for the client's ACK, up to about 40 ms
+  where the client delays its ACKs.
 - The tier timeouts nest: the server and tiers wait 30 s for reply memory,
   a tier 30 s for a fetch slot and 30 s for fetch memory, the cache 60 s per
   step of the server, the daemon 180 s per step of the cache.
@@ -172,3 +205,5 @@ release.
   waits for a write, for a long read such as a graph walk, or for a server
   write that waits for an import's write lock. Writes still take turns
   on one connection.
+- `scion-server serve` logs the address that it bound, so `--listen
+  127.0.0.1:0` shows the port that the OS chose.

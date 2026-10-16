@@ -38,6 +38,32 @@ started with `--insecure-listen`. The token and all data travel unencrypted,
 so a client SHOULD reach a server only over loopback or a trusted network.
 TLS is not in v1 ([#14](https://github.com/bnsd55/open-scion/issues/14)).
 
+**Connections and streams.** The server serves at most 128 connections at
+once (`--max-connections`). It reads nothing from a connection beyond that
+until another one closes, so a call on it waits. Each connection may have at
+most 256 open streams (`--max-streams`), which the server sends as
+`SETTINGS_MAX_CONCURRENT_STREAMS`. As HTTP/2 requires, a client MUST NOT
+open more; it waits for a stream to end. A client SHOULD close a connection
+that it no longer uses, because an idle one keeps its place. The server
+closes a connection:
+
+- 20 s after it gets its place, if no HTTP/2 client preface came. A client
+  MUST send the preface as soon as it connects, as HTTP/2 requires.
+- after the preface, when it gets no frame on the connection for 60 s: it
+  sends an HTTP/2 `PING`, and closes the connection if no answer comes
+  within 20 s. A client MUST answer a `PING`, as HTTP/2 requires.
+- after 30 min: it sends `GOAWAY`, so the client opens a new connection for
+  new calls, and closes the connection 10 min later, with any call still in
+  it. A client MUST handle `GOAWAY` as HTTP/2 says. A call cut this way
+  fails, and the client MAY retry it (`GetObjects` and `ReadFile` only
+  re-read; a `Land` retry uses the same request key).
+
+So a connection beyond the cap waits at most 40 min. A client that stops reading a reply
+keeps the server's memory for that reply until the stream ends or the
+connection closes, so a client SHOULD reset a stream that it no longer
+reads (gRPC libraries do when the call is dropped). A cache tier keeps the
+same limits (section 8).
+
 **No message compression.** The server enables no gRPC message compression.
 A request with a `grpc-encoding` other than `identity` fails with
 `UNIMPLEMENTED`, so a client MUST NOT compress requests.
@@ -83,8 +109,11 @@ request is `INVALID_ARGUMENT`. In a reply, an empty ID field means "none".
 "none".
 
 **Visibility.** A repo sees only its own changesets. A changeset that the
-repo does not have is `NOT_FOUND`, the same as one that does not exist. Trees
-and blobs are not scoped to a repo in v1 (section 5).
+repo does not have is `NOT_FOUND`, the same as one that does not exist. A
+repo has the blobs uploaded to it and the blobs that its changesets name. A
+changeset names only blobs of its repo (section 6.2), so `ReadFile`,
+`ListDir`, `Log`, `Blame` and `Diff` reach only the repo's own content.
+`GetObjects` is not scoped to a repo in v1 (section 5).
 
 **Message size limits.**
 
@@ -176,10 +205,11 @@ can answer a request for an object. A client checks what it can by hash.
 In v0.1 a client also trusts every tier on its path for the `ResolveRef` and
 `GetRootTree` answers that the tier passes on (section 8).
 
-**An object ID is not a permission.** In v1 the server sends any stored tree
-or blob to any caller with the token that names an existing repo, and a
-changeset can name a blob that another repo uploaded. Read tickets and
-per-repo blobs are not in v1
+**An object ID is not a permission.** A changeset cannot name a blob of
+another repo (section 6.2), and no answer of `PutBlob` or `CreateChangeset`
+shows whether another repo has a blob. But in v1 `GetObjects` sends any
+stored tree or blob to any caller with the token that names an existing
+repo. Read tickets are not in v1
 ([#13](https://github.com/bnsd55/open-scion/issues/13)).
 
 ## 6. The `Scion` service
@@ -198,8 +228,13 @@ file's content.
   the rest.
 - The reply's `blob_id` is the `BlobId` of all the bytes together
   ([`format-v1.md`](format-v1.md)).
-- Safe to repeat. The same bytes always give the same ID. Blobs are not
-  scoped to a repo in v1.
+- The blob then belongs to the repo: a changeset of the repo may name it
+  (section 6.2).
+- Safe to repeat. The same bytes always give the same ID.
+- The reply holds only the ID, which the client can compute itself. The
+  server keeps a stored copy only if the repo has the blob already. Else it
+  writes the content as for new content. So neither the reply nor its time
+  shows whether another repo has the same content.
 
 | Error | When |
 |---|---|
@@ -219,8 +254,10 @@ if all of these hold:
 - it has no committer (only git import sets one);
 - its message is at most 1 MiB, and the author's name and email are at most
   1 KiB each;
-- every regular-file or symlink put names a blob that the server has stored
-  intact (upload it first with `PutBlob`);
+- every regular-file or symlink put names a blob of the repo, which the
+  server has stored intact. A blob of the repo is one uploaded to it with
+  `PutBlob`, or one that a changeset of the repo names, so a rename needs no
+  new upload. A gitlink names no blob, whatever its bytes;
 - its changes apply to the parent's tree. For example, a delete of a missing
   path or of a directory does not apply.
 
@@ -229,7 +266,7 @@ the same bytes give the same ID and no second copy.
 
 | Error | When |
 |---|---|
-| `INVALID_ARGUMENT` | Any rule above fails, including a parent that the repo does not have. For a missing or damaged blob, the message names the first such path in path order. |
+| `INVALID_ARGUMENT` | Any rule above fails, including a parent that the repo does not have. The message names the first path in path order whose blob is not the repo's; if every put names the repo's blobs, the first path whose blob is missing or damaged. A blob of another repo gets the same answer as content that no repo stored, and the server checks every blob for the repo before it reads any, so the answer does not show whether another repo has it. |
 | `NOT_FOUND` | The repo does not exist. |
 
 ### 6.3 Land
@@ -359,10 +396,13 @@ content of a regular file, or the target of a symlink, at `path` in
   so a client never gets all of a damaged file.
 - The reply ends with `DEADLINE_EXCEEDED` when the client takes no message
   for 120 s (the stall limit). A client that keeps reading has no time
-  limit.
+  limit of its own, but a reply that runs for more than 10 min can be cut
+  when its connection is closed for its age (section 2).
 - Before the reply starts, the call waits for its share of a memory budget of
   256 MiB that all `ReadFile` replies share: the file's size for a file of at
-  most 1 MiB, 5 MiB for a larger one.
+  most 1 MiB, 5 MiB for a larger one. A stalled reply frees its share. Up to
+  three messages stay in the server and in HTTP/2 until the stream ends or
+  the connection closes (section 2).
 
 | Error | When |
 |---|---|
@@ -448,11 +488,30 @@ file has no lines and gets no ranges.
 **Bounds per call.** At most 1,000 changesets checked, 100 versions diffed,
 and about 1M lines diffed (both sides of each diff; a line counts once per
 64 bytes). A rename search counts as a line each chunk of up to 64 bytes
-that it reads, and each row of a chunk table that it compares. It compares
-at most 100 deleted files, and stops after it has read about 100 MiB of
-them. The first step of a call always runs, so every call makes progress.
-The rules of a rename search are those of `Diff` (section 6.13) for one
-added file.
+that it reads and each row of a chunk table that it indexes or compares,
+and as 64 lines each file size that it reads. The first step of a call
+always runs, so every call makes progress. The rules of a rename search are
+those of `Diff` (section 6.13) for one added file, with git's limit of
+1,000,000 pairs only: it looks at every deleted file, over several calls if
+it must.
+
+**A rename search over calls.** A rename search uses the budget that the
+call has left. Where the budget runs out inside it, the call stops:
+`next_changeset_id` is the changeset that adds the file, `next_path` is its
+path, and `next_rename_searched` and `next_rename_best` say where the search
+stopped. `next_rename_searched` counts the deleted files looked at, in path
+order (only paths that held a file count). `next_rename_best` is the most
+similar of those so far, or empty. The client MUST send both back unchanged
+as `rename_searched` and `rename_best` with that `next_changeset_id` and
+`next_path`, and MUST send 0 and empty with any other place. The next call
+reads the best file again and goes on from where the search stopped, so it
+finds the file that one search with no budget finds. A call whose first step
+is a rename search looks at one more deleted file even past the budget, so
+the search always moves. When a search ends but the diff after it does not
+fit, the reply names the end of the search: `next_rename_searched` is the
+number of deleted files, and `next_rename_best` the file found, if any. The
+next call then uses that file and does not search again. A reply sets both
+fields only with `next_changeset_id`.
 
 **Rules.** The server walks first parents to each changeset that changed the
 file, and diffs that version with the older version. The older version is
@@ -473,7 +532,7 @@ rename. Its next call then fails with `NOT_FOUND`, or blames another file.
 
 | Error | When |
 |---|---|
-| `INVALID_ARGUMENT` | A bad or empty path; the file is not a regular file, is larger than 16 MiB, or has more than 1,048,576 lines. |
+| `INVALID_ARGUMENT` | A bad or empty path; the file is not a regular file, is larger than 16 MiB, or has more than 1,048,576 lines; `rename_searched` and `rename_best` are not a place where a rename search of that path at that changeset can stop. |
 | `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
 
 ### 6.11 MergeBase
@@ -611,8 +670,9 @@ file. A symlink or a gitlink is a rename only with the same content.
 entries below `path`; a larger diff has none. As in git, step 3 runs only
 when the added files left times the deleted files left are at most
 1,000,000. Steps 2 and 3 share a budget per call: about 4M, where each chunk
-of a file read and each row of a chunk table indexed or compared count one
-(64 MiB of text in lines of 64 bytes costs 1M). Past it, the server reads no
+of a file read and each row of a chunk table indexed or compared count one,
+and each file size read counts 64 (64 MiB of text in lines of 64 bytes
+costs 1M). Past it, the server reads no
 more files, so it misses the renames that step 2 or step 3 would find after
 that point. The budget is the same on every call, so every reply gives the
 same renames. The search never ends a page early.
@@ -712,9 +772,10 @@ order.
   holds for it (its bytes, and the decoder while it unpacks a blob for a
   `RAW` client). It keeps the share until the reply has handed the object's
   last part on. Each part is a buffer of its own, so a part that waits for
-  the client never keeps the rest of the object. Not counted: the part that
-  waits for the client and the part that HTTP/2 is sending, at most 1 MiB
-  each. The server finds the first object before it answers the call. If it has no memory for that
+  the client never keeps the rest of the object. Not counted: up to three
+  parts that wait for the client in the server and in HTTP/2, at most 1 MiB
+  each, until the stream ends or the connection closes (section 2). The
+  server finds the first object before it answers the call. If it has no memory for that
   object within 30 s, the call fails with `RESOURCE_EXHAUSTED` and sends no
   object. The client SHOULD wait before it asks again.
 - The reply stops when the server waits 30 s for memory for a later object,
@@ -844,8 +905,8 @@ A new version is a new package, `scion.v2`. A server MAY serve both.
 ## 10. Not in v1
 
 - TLS ([#14](https://github.com/bnsd55/open-scion/issues/14)).
-- More than one principal, per-path write rules, read tickets and per-repo
-  blobs ([#13](https://github.com/bnsd55/open-scion/issues/13)).
+- More than one principal, per-path write rules and read tickets
+  ([#13](https://github.com/bnsd55/open-scion/issues/13)).
 - Per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)).
 - Calls that create a repo or a ref, delete a ref, move a ref other than by
   `Land`, or list repos or refs. `scion-server import` creates repos and refs.
