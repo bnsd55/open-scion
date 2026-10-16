@@ -1889,9 +1889,34 @@ mod tests {
     #[test]
     fn a_deep_land_reads_its_paths_not_the_history() {
         // The same land on two histories, one ten times longer, reads the
-        // same rows.
+        // same rows: the check reads the paths of the land, not the
+        // history. The chains put the same few paths, so their levels stay
+        // small and the same in both runs.
         let reads = [2, 20].map(|cycles| {
-            let (f, history) = imported(cycles * depth());
+            let f = fixture();
+            let mut history = vec![f.root];
+            f.store
+                .write(|c| {
+                    // `c1` and `d/e/f` before the base, `c2` after it,
+                    // `warm` after that, many times.
+                    for i in 1..=cycles * depth() {
+                        let changes = match i {
+                            1 => vec![put("c1", "x"), put("d/e/f", "x")],
+                            2 => vec![put("c2", "x")],
+                            _ => vec![put("warm", "x")],
+                        };
+                        let cs = changeset(vec![history[i - 1]], &changes);
+                        history.push(db::insert_changeset(c, f.repo, &cs)?);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            f.move_main(history[cycles * depth()]);
+            let out = f.land(
+                f.commit(history[cycles * depth()], &[put("warm", "x")]),
+                "warm",
+            );
+            assert_eq!(out.state, LandState::Landed);
             let out = f.land(f.commit(f.root, &[put("c1", "mine")]), "derives");
             assert_eq!(out.state, LandState::Conflict);
             let changes = [put("c2", "mine"), put("d/e/g", "mine"), put("c1/z", "mine")];

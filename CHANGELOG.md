@@ -90,7 +90,11 @@ until that section gets its release date.
   `Log` with a path reads only the changesets that change the path, so one
   call returns up to 1,000 entries however far apart they are. A call
   stops after about 64 MiB of path history, which a file in a large
-  directory reaches in fewer entries. `scn log --path` and `scn blame`.
+  directory reaches in fewer entries. A level of path history above 64 KiB
+  is cut into chunks at content-defined boundaries (a name cuts with
+  chance 1 in 128), so a change in a directory of 100,000 names stores
+  about 47 KiB of new rows, not the 6.3 MB node of every name the
+  directory ever had. `scn log --path` and `scn blame`.
   An older server ignores the new `path` field, so `scn log --path`
   against it prints unfiltered history.
 - `Blame`, a new RPC: which changeset last changed each line of a file, on
