@@ -185,7 +185,8 @@ impl DiskStore {
             .recursive(true)
             .mode(0o700)
             .create(dir)?;
-        crate::check_private_dir(dir)?;
+        // The checked directory, so no symlink in `dir` is followed again.
+        let dir = &crate::check_private_dir(dir)?;
         let lock_file = lock_dir(dir)?;
         let objects = dir.join("objects");
         let tmp = dir.join("tmp");
@@ -665,5 +666,10 @@ mod tests {
             let err = DiskStore::open(Path::new("/"), 1 << 20).err().unwrap();
             assert!(err.to_string().contains("owned by another user"), "{err}");
         }
+
+        // A private directory under one that others can write.
+        let err = DiskStore::open(&open.join("data"), 1 << 20).err().unwrap();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{err}");
+        assert!(err.to_string().contains("/open can be written"), "{err}");
     }
 }

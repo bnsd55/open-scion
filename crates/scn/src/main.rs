@@ -97,7 +97,8 @@ enum Command {
         descendant: String,
     },
     /// Print the paths whose file differs between two revisions, as
-    /// `git diff --name-status`.
+    /// `git diff --name-status`. A rename prints as `R`, a tab, and
+    /// `old -> new`.
     Diff {
         /// The old revision: a ref name or a changeset ID.
         old: String,

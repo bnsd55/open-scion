@@ -54,6 +54,14 @@ async fn main() -> anyhow::Result<()> {
     let listener = bind_unix(&socket)
         .await
         .with_context(|| format!("cannot listen on {}", socket.display()))?;
+    // Where the socket is, with its directory resolved. `--socket` may go
+    // through a symlink that another user can repoint before the removal
+    // below, which then must not follow it.
+    let socket = listener
+        .local_addr()?
+        .as_pathname()
+        .context("the socket has no path")?
+        .to_owned();
     tracing::info!(socket = %socket.display(), upstream = %cli.upstream, "serving");
     tier.serve(&cli.token, UnixListenerStream::new(listener), async {
         tokio::signal::ctrl_c().await.ok();

@@ -623,7 +623,7 @@ takes a revision, and resolves refs through `Objects`.
 | `Blame` | For each range of lines in a file, the changeset that last changed it on first-parent history, across renames, and that changeset's author, time and path of the file. |
 | `MergeBase` | The best common ancestors of two changesets, over all parents. |
 | `IsAncestor` | Whether one changeset is an ancestor of another, over all parents. |
-| `Diff` | The paths whose file differs between two changesets' snapshots, with the old and new file state. At most 1,000 paths per reply. `next_after` says where to continue. |
+| `Diff` | The paths whose file differs between two changesets' snapshots, with the old and new file state, and renames as `git diff` finds them. At most 1,000 paths per reply. `next_after` says where to continue. |
 
 **Path history** (`Log` with a path, `read::log_page`). The walk follows
 first parents from the given changeset, newest first. It returns each
@@ -654,10 +654,13 @@ choices. For a file at a changeset:
    to C. So a file deleted and added again starts over, as in git.
 
 **Renames.** Blame follows a rename, as `git blame` does by default. Where C
-adds the path, the source is one of the files that C deletes:
+adds the path, the source is one of the files that C deletes. `Blame` and
+`Diff` find renames with one implementation (`similar.rs`), git's rules from
+`diffcore-rename.c`. Blame gives it one added file:
 
 1. A file with the same blob ID. This reads no file. On a tie, a file with
-   the same name (the last part of the path) wins, then the first by path.
+   the same name (the last part of the path) wins, then the first by path,
+   among the first 100.
 2. Else, if exactly one deleted file has the same name: that file, if it is
    at least 75% similar.
 3. Else, if C deletes at most 100 files (`MAX_RENAME_SOURCES`): the most
@@ -666,20 +669,21 @@ adds the path, the source is one of the files that C deletes:
 
 Similarity is git's. Each file is cut into chunks that end after a newline or
 after 64 bytes. In text (no NUL byte in the first 8,000 bytes, git's test for
-binary), a CR before a newline does not count. Similarity is the
-bytes of the chunks that both files have, over the size of the larger file.
-A file less than half the size of the other is not read. A symlink or a
-submodule that becomes a regular file is a type change, not a rename, as in
-git. Each changeset that a range names comes with the path of the file there.
-`Log` with a path does not follow renames, as `git log` without `--follow`.
+binary), a CR before a newline does not count. Each chunk goes to one of
+107,927 buckets with git's hash, so two different chunks can count as the
+same, as in git, and a file's table has at most that many rows. Similarity
+is the bytes of the chunks that both files have, over the size of the larger
+file. A file less than half the size of the other is not read. A symlink or
+a submodule that becomes a regular file is a type change, not a rename, as
+in git. Each changeset that a range names comes with the path of the file
+there. `Log` with a path does not follow renames, as `git log` without
+`--follow`.
 
 Where rename following differs from `git blame`:
 
 - git compares every deleted file. Here a changeset that deletes more than
   100 files gets only steps 1 and 2
   ([#87](https://github.com/bnsd55/open-scion/issues/87)).
-- git puts each chunk in one of about 100,000 hash buckets, so two different
-  chunks can count as the same. Here chunks compare byte for byte.
 - A deleted file over a limit of step 1 is never similar here, and one
   search reads files, in path order, only until it has read about 100 MiB
   (`MAX_RENAME_BYTES`: 100 files of the old 1 MiB limit, so it still reads
@@ -687,8 +691,8 @@ Where rename following differs from `git blame`:
   ([#87](https://github.com/bnsd55/open-scion/issues/87)).
 - git also treats a file as binary, so a CR counts, when `.gitattributes`
   marks it `binary` or `-diff`. Here only the NUL byte test counts.
-- git checks only a few of many files with the same content, and keeps only
-  the four best similar files while it compares. So on a tie among many
+- git keeps the four best similar files while it compares, and on a tie the
+  one it keeps first can be a later file. So on a tie among more than four
   files it can pick another one.
 - Neither finds copies or moved lines by default (`git blame -C`, `-M`).
   Here there is no option for them.
@@ -706,8 +710,9 @@ changesets (`MAX_SCAN`), so it holds the database lock no longer than a plain
 `Log` of 1,000 entries. A `Blame` call also diffs at most 100 versions, and
 about 1M lines (`MAX_BLAME_DIFF_LINES`, both sides of each diff). Every byte
 that blame reads counts against this budget, once per 64 bytes: a diffed
-line counts once per 64 bytes, a rename search counts each chunk it
-compares, and a file read and then refused for its lines counts its size. A
+line counts once per 64 bytes, a rename search counts each chunk it reads
+and each row of a chunk table it compares, and a file read and then refused
+for its lines counts its size. A
 version with the same content as the newer one (a mode change, or a rename
 with no edit) is not read and costs nothing. The first step of a call always
 runs, so a call always makes progress.
@@ -717,7 +722,9 @@ steps past it: the first, which always runs, and the one that stops the call,
 which is read and then dropped. One step reads one older version of at most
 16 MiB, or one rename search: the size of at most 100 deleted files, and
 their content until it has read about 100 MiB, plus the file that crosses
-that bound. So one call reads at most about 300 MiB. To find the deleted
+that bound. The search keeps only chunk tables, so it reads the source it
+finds once more, to diff it. So one call reads at most about 320 MiB. To
+find the deleted
 files, a search reads each directory on their paths once, about the work of
 applying C to its parent tree.
 
@@ -727,10 +734,10 @@ release builds, that diff takes about 1.5 times as long as the worst diff
 under the old 1 MiB limit (a 1 MiB file of about 700,000 such lines). A
 rename search that reads up to its bound takes about a tenth of the old
 worst diff, a 16 MiB file with one line changed about 1/100 of it, and 100
-mode changes of a 16 MiB file less than that. Memory per call is at most four
-versions (two to diff, two rename sources) of 16 MiB, the chunk tables of two
-of them, about 50 bytes per line of the blamed file, and the tables of one
-diff.
+mode changes of a 16 MiB file less than that. Memory per call is at most two
+versions of 16 MiB (two to diff, or one and a rename source), the chunk
+tables of two files, about 50 bytes per line of the blamed file, and the
+tables of one diff.
 
 At most 4 `Blame` calls run at once, so they never take more than 4 of the
 permits that writes and lands share. When a call stops at a bound,
@@ -820,13 +827,46 @@ and their bounds, are this project's choices.
   as `git diff --name-status`. A reply holds at most 1,000 paths
   (`MAX_DIFF_ENTRIES`). The walk finds one more to know whether more follow,
   and then `next_after` is the last path sent. The next call walks down to
-  that path again and continues after it. Renames are not detected, so a
-  rename is a delete and an add
-  ([#79](https://github.com/bnsd55/open-scion/issues/79)).
+  that path again and continues after it. Each tree read takes the database
+  lock on its own, so a long walk does not hold it.
+- `Diff` finds renames as `git diff` does by default, with the code that
+  blame uses (`similar.rs`, above): same content, then the one file of a
+  name on each side at 75%, then the most similar pairs at 50%. With many
+  added files, the pairs go most similar first, so two added files never
+  take one deleted file. The rule for pages is this project's choice: a call
+  finds the renames of the whole diff below its path, not of its page. So
+  an entry gets the same rename in every reply, whatever `after` is, and a
+  rename can join two entries in different replies. A rename keeps both
+  entries; the added one names the old path (`rename_from`), and the deleted
+  one the new path (`rename_to`). A client that does not know renames still
+  sees a correct delete and add. If the page holds no added or deleted file,
+  the call skips this. If the page is the whole diff, it uses the page.
+  Else it walks the whole diff below the path, up to 10,000 entries
+  (`MAX_RENAME_ENTRIES`); a larger diff has no renames. Step 3 compares
+  files only while the added files left times the deleted files left are at
+  most 1,000,000, git's default limit. It reads the added files that some
+  deleted file could be like into one index by chunk hash, then reads each
+  deleted file and looks up its chunks there, so it never compares two
+  files row by row. Added files with the same blob share one place in the
+  index, so a blob added at many paths is read and indexed once. It reads
+  each file in parts of 1 MiB, so it holds the chunk tables but never a
+  whole file. Steps 2 and 3 share one budget, about 4M chunks read and
+  table rows indexed or compared (`MAX_RENAME_CHUNKS`). It is the same on
+  every call, so every call finds the same renames; past it, the search
+  reads no more files, and misses renames, of the same name too
+  ([#107](https://github.com/bnsd55/open-scion/issues/107)). So one call
+  reads at most about 256 MiB of text in lines of 64 bytes or more, plus
+  one file past the budget. Reading a file costs far more than looking up
+  its chunks, so the budget goes mostly to reading. At most 4 `Diff` calls
+  run at once (`MAX_DIFFS`), as for `Blame`.
 
 Tests compare all three with git (`merge-base --all`,
 `merge-base --is-ancestor`, `diff --name-status --no-renames`) on a history
 with branches, a criss-cross, an octopus merge and an unrelated history.
+Rename tests compare `Diff` with `git diff -M --name-status`, both ways and
+below paths: pure renames, edits, a mode change, symlinks, empty files, CR
+line ends, many candidates, ties, two added files that want one deleted
+file, and git's limit of 1,000,000 pairs.
 `scn merge-base`, `scn is-ancestor` and `scn diff` call them. `scn diff`
 asks again until `next_after` is empty. `scn is-ancestor` exits 0 for yes
 and 1 for no. Every `scn` error exits 2. A checkout that a signal stops
@@ -956,12 +996,12 @@ accepts names that are not safe to write, so the checkout adds its own rules:
 
 | Rule | Why |
 |---|---|
-| The checkout is written into a temp directory, `.scn-checkout-<16 random hex digits>`, made with mode 0700 by `mkdirat` through a directory handle. | Other users cannot guess the temp name, or enter or write the directory. On SIGINT, SIGTERM or SIGHUP the checkout stops and removes it. A second signal during the removal stops it at once, and names the temp directory that it leaves. A `scn` killed in another way, for example by SIGKILL, can leave it behind. Inside an existing destination, a later checkout into it names the leftover in its error. Next to a new one, it does not block a later checkout. Where top-level files are copied into an existing destination (no hard links), such a kill, or a crash, during a copy can also leave a truncated file at its final name. A move by rename or by hard link cannot. |
+| The checkout is written into a temp directory, `.scn-checkout-<16 random hex digits>`, made with mode 0700 by `mkdirat` through a directory handle. | Other users cannot guess the temp name, or enter or write the directory. On SIGINT, SIGTERM or SIGHUP the checkout stops and removes it. A second signal during the removal stops it at once, and names the temp directory that it leaves. A `scn` killed in another way, for example by SIGKILL, can leave it behind. Inside an existing destination, a later checkout into it names the leftover in its error. Next to a new one, it does not block a later checkout. Where top-level files are copied into an existing destination (no hard links), such a kill, or a crash, during a copy can also leave a truncated file at its final name. A move by rename or by hard link cannot. On NFS version 3, a `mkdirat` sent again after a lost reply fails with `EEXIST`. No other call makes the random name, so the temp directory then counts as made. The same holds for the directory that reads the mode of a plain `mkdir` inside it, and for its removal (`ENOENT`). |
 | A new destination: the temp directory is made in its parent. Just before the rename, it gets the mode of a plain `mkdir` (0777 less the umask). One `renameat` then moves it onto the destination name. | The rename is the check: it fails if the destination has appeared meanwhile as a non-empty directory, a file or a symlink. An early check gives a clear error first, but correctness comes from the rename. A user who can write the destination's parent can still rename the temp directory and put another directory in its place, so that parent must not be writable by all users, unless it has the sticky bit. Members of a group that can write it are trusted. On NFS version 3, a rename sent again after a lost reply fails with `ENOENT`: the checkout then counts as moved if the destination name has the temp directory's inode. |
 | An existing destination: it is opened with `O_NOFOLLOW`. It must be owned by the user who runs `scn`, be empty, and not be writable by all users unless it has the sticky bit, all checked through the handle. The temp directory is made inside it, and must be that user's once opened. Each top-level entry then moves up by a `renameat` that never replaces (`RENAME_NOREPLACE`, or `RENAME_EXCL` on macOS), and the destination must then hold only the checkout. Once that rename fails with `EINVAL`, `ENOTSUP` or `ENOSYS`, it is not tried again: a file or symlink moves up by `linkat`, and then loses its temp name. Where `linkat` fails with `EPERM`, `ENOTSUP`, `EXDEV` or `ENOSYS` (no hard links), a file is copied instead: `openat` in the destination with `O_CREAT \| O_EXCL \| O_NOFOLLOW`, the bytes from a handle on the temp file, `fsync`, and then the temp name goes. A symlink is made again by `symlinkat`. A directory first claims its name with `mkdirat` (mode 0700), and a plain `renameat` then replaces that new empty directory. The type comes from `fstatat` in the temp directory, which also gives the inode. After an error, the entry counts as moved if its name in the destination has that inode. | A symlink as the destination is refused. A directory of another user, for example one made in `/tmp` ahead of time, is refused: its owner could change the checkout. The moves go from the temp directory's handle, so a swapped temp name changes nothing. An entry that appears during the checkout is never replaced, and the final check catches one at any other name: the checkout fails and removes what it moved. Any user who can write the destination could rename a file of their own over one that has moved up, and the final check compares only names, so such a destination is refused. Members of a group that can write it are trusted, as in a new destination's parent: a refusal would break the default umask 002 of some systems. On Linux, NFS has no rename that never replaces (`renameat2` fails with `EINVAL`). There `linkat` and `mkdirat` fail if the name exists, and `linkat` never follows a symlink. Before the plain rename, only a user who can remove the checkout's entries from the destination can swap the claimed directory, and that user is trusted, as above. A rename replaces only an empty directory, so even then no data is lost: a file or symlink in its place fails the rename, and the checkout fails as "no longer empty". On NFS version 3, a lost reply makes the client send a call again, and a call that worked then fails (`linkat` with `EEXIST`, `renameat` or `unlinkat` with `ENOENT`), so the inode check decides. A `mkdirat` or `symlinkat` sent again fails with `EEXIST`, and makes no inode to compare. So after `EEXIST`, an empty directory with mode 0700 (the setgid bit aside) that the user owns, checked through a handle, counts as the claim, and a symlink that the user owns with the same target counts as made. Only that user or root can make either, and only a user who can write the destination can move one in: all are trusted, as above. So such an entry that one of them put there is taken too, and no data is lost. A filesystem that shows one owner for every entry (a FUSE or SMB mount with `-o uid=`) passes every ownership check. After the final check, the temp directory's `rmdir` counts as done on `ENOENT`, so a lost reply there does not make the cleanup remove the finished checkout. An exclusive create is safe to send again on NFS version 3: the server keeps a verifier for it. This costs three calls per top-level entry, where moving each file would cost at least two per file. Without hard links (some FUSE filesystems), `O_EXCL` and `symlinkat` never replace, and a copy that fails removes the name it made. A copied file costs its size again in reads and writes. The tests force these paths, and lost replies. They are untested on a real NFS mount or FUSE filesystem. |
-| On a failure or a signal, every path that the checkout made is removed, deepest first, through the same bounded handles as the writes, by `unlinkat` with the kind recorded when the path was made. Then the temp directory is removed. | The removal never follows a symlink, and needs no path that could be swapped. It keeps at most 64 directories open, so a tree 255 levels deep is removed within the 256 open files that macOS allows by default. It removes only what the checkout made: an entry that another user put in a moved directory stays, with a warning. |
+| On a failure or a signal, every path that the checkout made is removed, deepest first, through the same bounded handles as the writes, by `unlinkat` with the kind recorded when the path was made. Then the temp directory is removed. | The removal never follows a symlink, and needs no path that could be swapped. It keeps at most 64 directories open, so a tree 255 levels deep is removed within the 256 open files that macOS allows by default. It removes only what the checkout made: an entry that another user put in a moved directory stays, with a warning. A path that is gone already (`ENOENT`, for example after a lost NFS reply) counts as removed. |
 | Inside the temp directory, each parent is opened with `O_NOFOLLOW`, one part at a time. Files use `O_CREAT \| O_EXCL`. The handles on the parents of the last path stay open, at most 64. | A symlink in the way, from this checkout or from anything else, fails the write instead of redirecting it. Only directories that this checkout made inside its private temp directory stay open. With files in path order, each directory is opened once. 64 handles stay well below the 256 open files that macOS allows by default; a deeper path keeps its innermost ones. |
-| The temp directory starts empty, and the checkout records every path it makes. A path that already exists without being recorded is a collision. | The filesystem folded two names into one, by case or by Unicode form (for example `A` and `a`, or `X/f` and `x/g`, on macOS). The error names the path, and the temp directory is removed. Where nothing folds, every name is written, as git does. |
+| The temp directory starts empty, only the checkout writes it, and the checkout records every path it makes. When a call that makes a path there fails with `EEXIST` (`mkdirat`, `openat` with `O_EXCL`, or `symlinkat`), the entry counts as made only if it is what the call makes (an empty directory, an empty regular file, or a symlink with the same target), is the user's, and has no inode of a recorded path in the same directory. A stat of a recorded path that fails counts as that inode. Anything else is a collision. | On NFS version 3, a `mkdirat` or `symlinkat` sent again after a lost reply fails with `EEXIST`, and the entry is the call's own. An exclusive create does so only if the server has lost the verifier that makes it safe to send again. The checkout goes on. A file found so is removed and made once more: on NFS version 3 it can lack its mode, because an exclusive create sends none and the client sets it only after the reply. Setting the mode needs the umask, which a process cannot read without changing it. A second `EEXIST` fails. Else the filesystem folded two names into one, by case or by Unicode form (for example `A` and `a`, `X/f` and `x/g`, or `é` in NFC and in NFD, on macOS). The entry then has the inode of the recorded name, even where both hold an empty file or a symlink to one target. The error names the path, and the temp directory is removed. Where nothing folds, every name is written, as git does. The inode check takes one `fstatat` for each recorded name of the same kind in the directory, but only after `EEXIST`. |
 | Symlinks are written as symlinks with their raw target bytes, never resolved. | A target such as `../../etc` is data, not a path to follow. |
 | Executable files get mode 0777, others 0666, less the umask. | The same modes as `git checkout`. |
 | No control character (C0, DEL, C1, or a byte 0x80 to 0x9F that is not UTF-8), no bidirectional text control (U+202A to U+202E, U+2066 to U+2069), and no `.git` or `.scion` part, in any ASCII case. The walk checks every name before anything is written, and the writer checks every part again. | Names are printed, escaped, in errors and notes, and must not rewrite a terminal or read as another name. Tools trust metadata directories. |
@@ -1092,11 +1132,16 @@ format and the 1 MiB parts, and how the strict
 order is kept: each tier's `--upstream` sets it, and nothing checks it.
 `scn` reaches a daemon with `--server unix:///PATH`. Before it connects, it
 refuses a path that is not a socket file owned by its user or by root, so
-the token never goes to another user's socket. Neither `scn` nor the
-daemon checks the directories above the socket or `<data>` yet
-([#70](https://github.com/bnsd55/open-scion/issues/70)). A tier serves only
-`Objects`, so of the `scn` commands only `checkout` works through it; the
-others need the server.
+the token never goes to another user's socket. `scn` and the daemon also
+check every directory above the socket and above `<data>`, up to `/`. Each
+must be owned by root or by their user, and must not be writable by group
+or others unless it has the sticky bit (as `/tmp` has). Else another user
+could swap the path after the check. The directory that holds the path is
+resolved first, and its resolved directories are checked
+(`scion-proto/src/auth.rs`, `check_ancestors`). Then `scn` connects to,
+and the daemon uses, the resolved path, so a symlink on the way is not
+followed again. A tier serves only `Objects`, so of the `scn` commands only
+`checkout` works through it; the others need the server.
 
 `scripts/bench-checkout.sh` runs 50 sparse checkouts at once through one
 daemon, cold and warm, against `git clone` doing the same checkout
@@ -1113,12 +1158,12 @@ an untrusted network.
 | Area | Today | Limit |
 |---|---|---|
 | Authentication | One static bearer token (`--token` or `SCION_TOKEN`). The server and each tier compare BLAKE3 digests of the tokens in constant time. A tier sends its own token upstream. | Every caller is the same principal, `default`. No users or per-folder rules ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
-| Network | The server listens on `127.0.0.1:7878` and `scion-cache` on `127.0.0.1:7879` by default. A non-loopback address is refused unless `--insecure-listen` is given. `scion-daemon` listens only on a Unix socket with mode 0600, in a directory that only its user can reach; it refuses any other. `scn` refuses a socket that another user owns. | No TLS: the token and all data travel unencrypted, also between tiers ([#14](https://github.com/bnsd55/open-scion/issues/14)). |
+| Network | The server listens on `127.0.0.1:7878` and `scion-cache` on `127.0.0.1:7879` by default. A non-loopback address is refused unless `--insecure-listen` is given. `scion-daemon` listens only on a Unix socket with mode 0600, in a directory that only its user can reach; it refuses any other. `scn` refuses a socket that another user owns. Both refuse a socket or data directory under a directory that another user can change: one that another user owns, or that group or others can write and has no sticky bit. | No TLS: the token and all data travel unencrypted, also between tiers ([#14](https://github.com/bnsd55/open-scion/issues/14)). By choice, as OpenSSH's `StrictModes`, the directory checks refuse a group-writable directory (`chmod go-w` fixes it; with umask 002, new directories are group-writable), and read only the owner and the mode bits, not ACLs: an ACL that lets other users write a directory gets past them. |
 | Repo isolation | Changesets and derived root trees are reached only through `repo_changesets`. | Trees and blobs are shared by all repos. `GetObjects` reads any tree or blob by ID, and a changeset can name another repo's blob and then read it ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Lands | `GetLand` and request keys are scoped by caller. | With one principal, all callers share one scope. |
 | Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 1 MiB plus 1 KiB: one part of an object), blobs up to 100 MiB, 16 uploads at once (each holds one message in memory), 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget and `ReadFile` replies a 256 MiB budget. A reply of either whose client stops reading ends after 120 s. Every receiver of an object unpacks it within the size its first part gives, at most 100 MiB, with a zstd window of at most 8 MiB, and accepts only plain Zstandard frames (no skippable or legacy frames, no dictionary). The zstd library is built without its legacy decoders. Names of 1 to 256 bytes with no control characters. The path indexes of all refs hold at most 128 MiB together, and a land walks at most 100,000 changesets below its ref's index. A `Log` or `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 16 MiB and 1,048,576 lines, diffs at most 100 versions and about 1M lines (a line counts once per 64 bytes), compares at most 100 deleted files and about 100 MiB to find a rename, and at most 4 run at once. At most 4 `MergeBase` and `IsAncestor` calls run at once, each until its 600 s deadline; a `Diff` reply holds at most 1,000 paths. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). Each stalled reply keeps two parts of an object (at most 1 MiB each), or up to 2 MiB of a file, in memory until its connection closes, and the number of stalled replies has no bound ([#42](https://github.com/bnsd55/open-scion/issues/42)). |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. Each tier also checks every object from upstream before it stores or sends it, and the daemon checks each object again when it reads it from disk. The server sends a blob's zstd file without unpacking it, so the receiver finds a damaged file. | Tiers are trusted in v0.1: the client trusts the `ResolveRef` and `GetRootTree` answers that a tier passes on, which it cannot check by hash. A tier forwards them, and keeps only what upstream answered. |
-| Checkout | `scn checkout` writes into a private temp directory with a random name. It renames it onto a new destination, or moves its entries up into an existing empty directory that the user owns, never over an entry already there. It never follows a symlink while writing or removing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure, or on SIGINT, SIGTERM or SIGHUP, the destination stays as it was. | The directory that gets the checkout (an existing destination, or a new one's parent) must not be writable by all users, unless it has the sticky bit: they could swap parts of the checkout. An existing destination that breaks this is refused. Members of a group that can write it are trusted. Where the filesystem has no rename that never replaces (NFS), any empty mode 0700 directory of the user at a top-level directory name counts as the checkout's claim after `mkdirat` fails with `EEXIST`, and is replaced. Where it has no hard links either (some FUSE filesystems), any symlink of the user with the same target at a top-level symlink name counts as made after `symlinkat` fails with `EEXIST`, and is kept. This is for a lost NFS version 3 reply, but a trusted user (the owner, a group member, root) can also put such an entry there: it is taken, and no data is lost. A filesystem that shows one owner for every entry (a FUSE or SMB mount with `-o uid=`) passes every ownership check. A lost reply while the temp directory is written still fails the checkout, safely ([#106](https://github.com/bnsd55/open-scion/issues/106)). The check reads only the mode bits, not ACLs: an ACL that lets other users add or delete entries gets past it. No Windows rules: device names and names that end in a dot or a space pass. |
+| Checkout | `scn checkout` writes into a private temp directory with a random name. It renames it onto a new destination, or moves its entries up into an existing empty directory that the user owns, never over an entry already there. It never follows a symlink while writing or removing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure, or on SIGINT, SIGTERM or SIGHUP, the destination stays as it was. | The directory that gets the checkout (an existing destination, or a new one's parent) must not be writable by all users, unless it has the sticky bit: they could swap parts of the checkout. An existing destination that breaks this is refused. Members of a group that can write it are trusted. Where the filesystem has no rename that never replaces (NFS), any empty mode 0700 directory of the user at a top-level directory name counts as the checkout's claim after `mkdirat` fails with `EEXIST`, and is replaced. Where it has no hard links either (some FUSE filesystems), any symlink of the user with the same target at a top-level symlink name counts as made after `symlinkat` fails with `EEXIST`, and is kept. This is for a lost NFS version 3 reply, but a trusted user (the owner, a group member, root) can also put such an entry there: it is taken, and no data is lost. A filesystem that shows one owner for every entry (a FUSE or SMB mount with `-o uid=`) passes every ownership check. In the temp directory, an entry found after `EEXIST` that is what the call makes counts as made, unless a recorded path in the same directory has its inode. A filesystem that folds names but shows another inode number under each name (CIFS with `noserverino`, FUSE without `use_ino`) would let such a fold through only for two empty files or two symlinks with one target: the two paths then share one entry, with the same content. A folded directory always fails: each directory that the checkout made already holds an entry. The check reads only the mode bits, not ACLs: an ACL that lets other users add or delete entries gets past it. No Windows rules: device names and names that end in a dot or a space pass. |
 | Cache tiers | A tier refuses calls without its token, and serves only objects that match their IDs. | A tier serves a stored object for any valid repo name and does not ask whether the repo exists. Safe with one principal ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
 | Errors | Internal errors reply `internal error`. The detail stays in the server or tier log. | |
 
@@ -1147,7 +1192,8 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/objects.rs` (`find`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
 | `scion-server/src/service.rs` (`READ_STALL_TIMEOUT`) | A stalled `ReadFile` reply frees its share, but the part in its channel and the part inside HTTP/2 stay in memory until the connection closes, up to 2 MiB per reply. | A response body timeout that resets the stream. | [#42](https://github.com/bnsd55/open-scion/issues/42) |
 | `scion-server/src/read.rs` (`MAX_SCAN`) | Path history and blame walk first parents on every call, at most 1,000 changesets per call. A path changed long ago costs many calls. | Path history as derived data. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
-| `scion-server/src/read.rs` (`diff`) | Renames are not detected: a rename is a delete and an add. `git diff` detects them by default. | Pair deletes and adds with the same blob, then by similarity, with a bound per call. | [#79](https://github.com/bnsd55/open-scion/issues/79) |
+| `scion-server/src/read.rs` (`MAX_RENAME_ENTRIES`) | Each `Diff` call walks the whole diff below its path to find renames. A diff of more than 10,000 entries has no renames: a rename there is a delete and an add. `git diff` finds renames in a diff of any size. | Renames of a diff as derived data, found in steps over calls and kept. | [#107](https://github.com/bnsd55/open-scion/issues/107) |
+| `scion-server/src/read.rs` (`MAX_RENAME_CHUNKS`) | The search for similar files in one `Diff` call reads and compares about 4M chunks, then reads no more files. A diff with many large files that could be similar can miss renames that `git diff` finds. | The same derived data. | [#107](https://github.com/bnsd55/open-scion/issues/107) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_VERSIONS`) | One call diffs at most 100 versions of a file. A file with more versions costs more calls. | Blame as derived data, kept per file version. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_DIFF_LINES`) | One call diffs about 1M lines, and a long line counts once per 64 bytes. A diff of many repeated lines grows faster than its lines, so one diff of two files of 1,048,576 lines is the worst case of a call. | Blame from derived data, so a call does not diff whole versions. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
 | `scion-server/src/blame.rs` (`MAX_RENAME_SOURCES`) | A changeset that deletes more than 100 files is searched only for a rename source with the same content, or the one deleted file with the same name. `git blame` compares every deleted file. | An index of each changeset's deleted files by chunk, as derived data, so a search compares only files that share chunks with the new file. | [#87](https://github.com/bnsd55/open-scion/issues/87) |
@@ -1159,13 +1205,11 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-tier/src/lib.rs` (`DAEMON_UPSTREAM_TIMEOUT`) | Fixed limits per step that nest. A fetch joined in the middle of its batch can wait for the objects ahead of it, and a client's own deadline does not reach the tiers. | Pass the remaining deadline down with `grpc-timeout`. | [#98](https://github.com/bnsd55/open-scion/issues/98) |
 | `scion-tier/src/lib.rs` (`check_repo`) | A tier does not ask whether a repo exists, and serves a stored object to any caller with the token. Safe with one principal. | Read tickets, checked by every tier. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-tier/src/store.rs` (`DiskStore`) | The daemon's recency index lives in memory and a scan of every file rebuilds it at start. Memory and start time grow with the object count, and a restart forgets which objects were read last. | A persistent index. | [#63](https://github.com/bnsd55/open-scion/issues/63) |
-| `scn/src/client.rs` (`check_socket`), `scion-tier/src/lib.rs` (`check_private_dir`) | `scn` checks only the socket file of a `unix://` address, and the daemon only its own data and socket directories, not the directories above them, which another user might be able to change. | Check each directory up to `/`: owned by root or this user, not writable by others unless sticky. | [#70](https://github.com/bnsd55/open-scion/issues/70) |
 | `scion-tier/src/bin/scion-cache.rs` (`main`) | No TLS between tiers. | Tonic TLS or mTLS before any deployment beyond one machine. | [#14](https://github.com/bnsd55/open-scion/issues/14) |
 | `scn/src/client.rs` (`lossy`) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | Escape or base64 raw bytes in JSON. | |
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |
 | `scn/src/cmd/commit.rs` (`commit`) | The author time zone is always UTC. | A time zone crate. | |
 | `scn/src/materialize.rs` (`check_name`) | No Windows rules: device names (`CON`, `NUL`) and names that end in a dot or a space pass. | Per-platform rules before checkout runs on Windows. | [#45](https://github.com/bnsd55/open-scion/issues/45) |
-| `scn/src/materialize.rs` (`collision_if_exists`) | On NFS version 3, a `mkdirat` or `symlinkat` in the temp directory, sent again after a lost reply, fails with `EEXIST` and reads as a folding collision. The checkout fails safe, and leaves its temp directory. | An exact name that the checkout has not recorded, holding what the call makes, is the call's own. | [#106](https://github.com/bnsd55/open-scion/issues/106) |
 
 ## 10. Testing
 
