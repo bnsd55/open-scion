@@ -114,7 +114,7 @@ fn mount(tiers: &common::Tiers, base: &ChangesetId) -> Mount {
     let view = home.path().join("view");
     std::fs::create_dir_all(&view).unwrap();
     let overlay = home.path().join("overlay");
-    let vfs = Vfs::new(objects, REPO.to_owned(), root, overlay.join("tree"));
+    let vfs = Vfs::new(objects, REPO.to_owned(), *base, root, overlay.join("tree"));
     // The session file the commit reads, under the home of the `scn` runs.
     std::fs::create_dir_all(home.path().join(".scion")).unwrap();
     write_sessions(

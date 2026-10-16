@@ -72,7 +72,7 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
     let overlay = overlay_dir()?;
     let objects = ctx.objects.clone();
     let repo = ctx.repo.clone();
-    let vfs = Vfs::new(objects, repo, root, overlay.join(CHANGES));
+    let vfs = Vfs::new(objects, repo, base, root, overlay.join(CHANGES));
     let secret = vfs.secret_name();
 
     let listener = NFSTcpListener::bind("127.0.0.1:0", vfs)

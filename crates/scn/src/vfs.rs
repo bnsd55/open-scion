@@ -38,7 +38,7 @@ use nfsserve::nfs::{
 };
 pub use nfsserve::vfs::NFSFileSystem;
 use nfsserve::vfs::{DirEntry, ReadDirResult, VFSCapabilities};
-use scion_core::{BlobId, Entry, FileState, RepoPath, Tree, TreeId};
+use scion_core::{BlobId, ChangesetId, Entry, FileState, RepoPath, Tree, TreeId};
 use scion_proto::object::{self, Assembler, Header};
 use scion_proto::v1::{Encoding, GetObjectsRequest, ObjectKind, ObjectRef};
 
@@ -152,6 +152,8 @@ impl Nodes {
 pub struct Vfs {
     objects: Objects,
     repo: String,
+    /// The changeset this mount holds, for a ticket refresh of its tree.
+    changeset: ChangesetId,
     nodes: tokio::sync::RwLock<Nodes>,
     /// Decoded blobs, least recently used first, with their bytes together.
     /// The daemon holds the stored form on disk; this saves the unpacking
@@ -168,13 +170,20 @@ pub struct Vfs {
 }
 
 impl Vfs {
-    /// A virtual checkout of the changeset whose root tree is `root`, of
+    /// A virtual checkout of `changeset`, whose root tree is `root`, of
     /// `repo`. The objects come from `objects`, which may be a daemon.
     /// Changes go to `overlay`.
-    pub fn new(objects: Objects, repo: String, root: TreeId, overlay: PathBuf) -> Self {
+    pub fn new(
+        objects: Objects,
+        repo: String,
+        changeset: ChangesetId,
+        root: TreeId,
+        overlay: PathBuf,
+    ) -> Self {
         Self {
             objects,
             repo,
+            changeset,
             nodes: tokio::sync::RwLock::new(Nodes {
                 next: 2,
                 by_id: BTreeMap::from([(
@@ -1315,7 +1324,13 @@ mod tests {
             .unwrap()
             .into_inner();
         let root = id_from(&reply.tree_id).unwrap();
-        let vfs = Vfs::new(client, REPO.to_owned(), root, overlay.path().to_path_buf());
+        let vfs = Vfs::new(
+            client,
+            REPO.to_owned(),
+            base,
+            root,
+            overlay.path().to_path_buf(),
+        );
         Test {
             vfs,
             dirs: [data, overlay],
