@@ -18,6 +18,7 @@ tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
+zstd.workspace = true
 
 [build-dependencies]
 tonic-prost-build.workspace = true
