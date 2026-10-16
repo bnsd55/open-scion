@@ -23,8 +23,9 @@ use scion_proto::{Bytes, CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_PART_MESSAGE_BYTES}
 use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 
+use crate::access::Access;
 use crate::error::{Error, Result};
-use crate::service::{Worker, check_name, parse_id, resolve_ref};
+use crate::service::{Worker, caller, check_reader, parse_id, resolve_ref};
 use crate::store::{self, Store};
 use crate::{db, read};
 
@@ -62,14 +63,16 @@ impl Plan {
 /// Implements the `Objects` RPCs.
 pub struct ObjectsService {
     worker: Worker,
+    access: Arc<Access>,
     /// `IN_FLIGHT_BYTES` permits, one per object byte, shared by all replies.
     in_flight: Arc<Semaphore>,
 }
 
 impl ObjectsService {
-    pub(crate) fn new(worker: Worker) -> Self {
+    pub(crate) fn new(worker: Worker, access: Arc<Access>) -> Self {
         Self {
             worker,
+            access,
             in_flight: Arc::new(Semaphore::new(IN_FLIGHT_BYTES)),
         }
     }
@@ -138,9 +141,11 @@ fn plan(store: &Store, key: Key, zstd: bool) -> Result<Plan> {
 /// unpacked in chunks, so it is never in memory twice.
 fn read_object(store: &Store, key: Key, plan: Plan) -> Result<Outgoing> {
     // SHORTCUT: an object ID is treated as permission to read the object, so
-    // this serves any tree or blob for any repo name. Safe with one principal.
-    // Upgrade (issue #13): a read ticket bound to a principal, a repo and a
-    // root tree, checked here and by every cache tier.
+    // this serves any tree or blob by ID for a repo the caller may read.
+    // The access rules check only the repo of the call, not the object
+    // (issue #13).
+    // Upgrade: a read ticket bound to a principal, a repo and a root tree,
+    // checked here and by every cache tier.
     let (kind, id, body) = match key {
         Key::Tree(id) => {
             let data = store.read(|c| db::get_tree_body(c, id))?;
@@ -277,7 +282,7 @@ impl Objects for ObjectsService {
         &self,
         request: Request<ResolveRefRequest>,
     ) -> Result<Response<ResolveRefResponse>, Status> {
-        resolve_ref(&self.worker, request.into_inner())
+        resolve_ref(&self.worker, &self.access, request)
             .await
             .map(Response::new)
     }
@@ -286,8 +291,9 @@ impl Objects for ObjectsService {
         &self,
         request: Request<GetRootTreeRequest>,
     ) -> Result<Response<GetRootTreeResponse>, Status> {
+        let caller = caller(&request)?;
         let GetRootTreeRequest { repo, changeset_id } = request.into_inner();
-        check_name("repo", &repo)?;
+        check_reader(&self.access, &caller, &repo)?;
         let cs = parse_id(&changeset_id, "changeset_id")?;
         let tree = self
             .worker
@@ -304,6 +310,7 @@ impl Objects for ObjectsService {
         &self,
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<Self::GetObjectsStream>, Status> {
+        let caller = caller(&request)?;
         let waits = Waits {
             until: Until::of(&request),
             ..WAITS
@@ -312,7 +319,7 @@ impl Objects for ObjectsService {
         // apart: the reply counts what it leaves in HTTP/2 on it.
         let stalled = scion_proto::listen::Stalled::of(&request);
         let GetObjectsRequest { repo, refs, accept } = request.into_inner();
-        check_name("repo", &repo)?;
+        check_reader(&self.access, &caller, &repo)?;
         scion_proto::check::object_count(refs.len())?;
         let keys = refs.iter().map(parse_ref).collect::<Result<Vec<_>, _>>()?;
         // Encodings that this server does not know are ignored.

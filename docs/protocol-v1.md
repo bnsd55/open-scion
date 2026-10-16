@@ -78,9 +78,18 @@ A request with a `grpc-encoding` other than `identity` fails with
 **Authentication.** Every call on both services MUST carry the metadata
 `authorization: Bearer <token>`: the exact prefix `Bearer `, then the token.
 A missing or wrong token fails the call with `UNAUTHENTICATED` before the
-request is read. A server has one token and one principal. Land request keys
-and land IDs are scoped by (repo, principal), so in v1 every client of a repo
-shares one scope.
+request is read. A token names a principal. A server started with `--token T`
+has one principal, `default`, which may read and write every repo. A server
+started with `--access FILE` reads the principal of each token and its rules
+from the file; the file's format is a deployment matter and lives in the
+README. The principal of a call's token is its caller. Land request keys and
+land IDs are scoped by (repo, principal).
+
+**Access rules.** A call on a repo that the caller may not read fails with
+`NOT_FOUND`, the same as for a repo that does not exist, on every RPC. So a
+caller cannot tell whether such a repo exists. A change fails with
+`PERMISSION_DENIED` when the caller may read the repo but not make the
+change (sections 6.1 to 6.3).
 
 **Timeouts.** The server ends a call with `CANCELLED` when its reply has not
 started after 600 s, or earlier if the client's `grpc-timeout` is shorter.
@@ -103,8 +112,9 @@ first object within 30 s, or before the caller's `grpc-timeout`, fails with
 **Names.** `repo`, `ResolveRefRequest.name`, `LandRequest.target_ref` and
 `LandRequest.request_key` are strings of 1 to 256 bytes with no control
 character (Unicode category Cc: U+0000 to U+001F and U+007F to U+009F).
-Another value is `INVALID_ARGUMENT`. A repo that does not exist is
-`NOT_FOUND`. No v1 call creates a repo or a ref.
+Another value is `INVALID_ARGUMENT`. A repo that does not exist, or that the
+caller may not read, is `NOT_FOUND` (section 2). No v1 call creates a repo
+or a ref.
 
 **IDs.** Every ID field is 32 raw bytes: a `ChangesetId`, a `TreeId` or a
 `BlobId` ([`format-v1.md`](format-v1.md)). An ID of another length in a
@@ -146,6 +156,7 @@ contract. A client MUST NOT depend on its text.
 | `INVALID_ARGUMENT` | The request is malformed, or the state does not accept it. Each call lists its cases. | After the cause is fixed |
 | `NOT_FOUND` | A repo, ref, changeset, path, object or land does not exist, or the caller may not see it. | After the cause is fixed |
 | `UNAUTHENTICATED` | The token is missing or wrong. | After the cause is fixed |
+| `PERMISSION_DENIED` | The caller may read the repo, but not make this change: a changed path outside its write prefixes (`CreateChangeset`, `Land`), or no write right at all (`PutBlob`). `CreateChangeset` and `Land` name the first denied path, in the order of the changeset's changes. | After the cause is fixed |
 | `ABORTED` | `Land` only: other writers kept moving the ref. The land stays `PENDING`. | Yes, with the same request key |
 | `OUT_OF_RANGE` | A message is larger than its limit. | After the cause is fixed |
 | `CANCELLED` | The server's 600 s limit or the client's `grpc-timeout` ran out. A client library can report its own deadline as `DEADLINE_EXCEEDED`. | Yes. A `Land` retry uses the same request key. |
@@ -216,8 +227,8 @@ In v0.1 a client also trusts every tier on its path for the `ResolveRef` and
 **An object ID is not a permission.** A changeset cannot name a blob of
 another repo (section 6.2), and no answer of `PutBlob` or `CreateChangeset`
 shows whether another repo has a blob. But in v1 `GetObjects` sends any
-stored tree or blob to any caller with the token that names an existing
-repo. Read tickets are not in v1
+stored tree or blob to any caller that may read the repo it names, whatever
+repo stored the object. Read tickets are not in v1
 ([#13](https://github.com/bnsd55/open-scion/issues/13)).
 
 ## 6. The `Scion` service
@@ -233,7 +244,8 @@ file's content.
   can hold any size within the message limit. A client SHOULD send chunks of
   1 MiB. An empty file is one message with empty `data`.
 - The server checks the repo when the first message arrives, before it reads
-  the rest.
+  the rest. The caller needs a write rule for the repo: an upload names no
+  path, so any write rule covers it.
 - The reply's `blob_id` is the `BlobId` of all the bytes together
   ([`format-v1.md`](format-v1.md)).
 - The blob then belongs to the repo: a changeset of the repo may name it
@@ -247,7 +259,8 @@ file's content.
 | Error | When |
 |---|---|
 | `INVALID_ARGUMENT` | No message; a bad repo name; a later message names a repo; more than 100 MiB in total. |
-| `NOT_FOUND` | The repo does not exist. |
+| `NOT_FOUND` | The repo does not exist, or the caller may not read it. |
+| `PERMISSION_DENIED` | The caller may read the repo, but has no write rule for it. |
 
 ### 6.2 CreateChangeset
 
@@ -259,6 +272,10 @@ if all of these hold:
 
 - it decodes strictly, with at most 100,000 changes;
 - it has exactly one parent, and the repo has that parent;
+- the caller may write every path it changes: each changed path is at or
+  below one of the caller's write prefixes for the repo, by path parts
+  (`src` covers `src/a`, not `srcx`). The server checks this before it reads
+  any blob, so a denied create reads no blob;
 - it has no committer (only git import sets one);
 - its message is at most 1 MiB, and the author's name and email are at most
   1 KiB each;
@@ -275,7 +292,8 @@ the same bytes give the same ID and no second copy.
 | Error | When |
 |---|---|
 | `INVALID_ARGUMENT` | Any rule above fails, including a parent that the repo does not have. The message names the first path in path order whose blob is not the repo's; if every put names the repo's blobs, the first path whose blob is missing or damaged. A blob of another repo gets the same answer as content that no repo stored, and the server checks every blob for the repo before it reads any, so the answer does not show whether another repo has it. |
-| `NOT_FOUND` | The repo does not exist. |
+| `NOT_FOUND` | The repo does not exist, or the caller may not read it. |
+| `PERMISSION_DENIED` | A changed path is outside the caller's write prefixes. The message names the first denied path, in the order of the changeset's changes. |
 
 ### 6.3 Land
 
@@ -285,7 +303,13 @@ ref and moves the ref.
 **Request.** `repo`; `changeset_id`, a changeset that the repo has;
 `target_ref`; and `request_key`, chosen by the client.
 
-**What the server does.** The changeset's first parent is its *base*. The
+**What the server does.** First it checks the write rules of the caller of
+the land against every path that the changeset changes, by the rules of
+`CreateChangeset`. A land of a changeset that another principal made needs
+the write rights too: whoever lands it moves the ref. A denied land fails
+with `PERMISSION_DENIED` and records nothing.
+
+The changeset's first parent is its *base*. The
 server checks, in order:
 
 1. The ref exists. If not, the land is `REJECTED` at once.
@@ -364,7 +388,8 @@ server stops the land at its next check, and the land stays `PENDING`.
 | Error | When |
 |---|---|
 | `INVALID_ARGUMENT` | A bad name or ID; a request key already used for a different changeset or ref. |
-| `NOT_FOUND` | The repo does not exist, or the repo does not have the changeset. |
+| `NOT_FOUND` | The repo does not exist, or the caller may not read it, or the repo does not have the changeset. |
+| `PERMISSION_DENIED` | A changed path is outside the caller's write prefixes. The message names the first denied path. |
 | `ABORTED` | The ref kept moving. The land stays `PENDING`. Retry with the same key. |
 | `CANCELLED`, `DEADLINE_EXCEEDED` | The call ran past 600 s, or the client cancelled it. The land stays `PENDING`. Retry with the same key. |
 
@@ -690,17 +715,22 @@ asks only for the trees and blobs it wants. A client resolves a ref, gets the
 root tree, then asks for trees and blobs by ID, and checks each against its
 ID (section 5).
 
+Every call here needs a read rule for the repo. A caller without one gets
+`NOT_FOUND`, as on every RPC (section 2).
+
 ### 7.1 ResolveRef
 
 `rpc ResolveRef(ResolveRefRequest) returns (ResolveRefResponse)`. The
 changeset that a ref points at now. The only mutable answer in the protocol.
-`NOT_FOUND` if the repo or the ref does not exist.
+`NOT_FOUND` if the repo or the ref does not exist, or the caller may not
+read the repo.
 
 ### 7.2 GetRootTree
 
 `rpc GetRootTree(GetRootTreeRequest) returns (GetRootTreeResponse)`. The ID of
-the root tree of a changeset that the repo has. `NOT_FOUND` if the repo or the
-changeset does not exist for that repo. The answer never changes.
+the root tree of a changeset that the repo has. `NOT_FOUND` if the repo does
+not exist, the caller may not read it, or the changeset does not exist for
+that repo. The answer never changes.
 
 ### 7.3 GetObjects
 

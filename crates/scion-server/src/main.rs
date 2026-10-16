@@ -32,9 +32,16 @@ enum Command {
         /// Address to listen on.
         #[arg(long, default_value = "127.0.0.1:7878")]
         listen: SocketAddr,
-        /// Bearer token that clients must send.
+        /// Bearer token that clients must send. Its principal, `default`,
+        /// may read and write every repo. Give `--token` or `--access`, not
+        /// both.
         #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
-        token: String,
+        token: Option<String>,
+        /// Access file: tokens with principals, and which repos and paths
+        /// each principal may read and write. Give `--token` or `--access`,
+        /// not both.
+        #[arg(long, value_name = "FILE")]
+        access: Option<PathBuf>,
         /// Allow a non-loopback address. Traffic, including the token, is not
         /// encrypted, so use this only on a trusted network.
         #[arg(long)]
@@ -49,6 +56,12 @@ enum Command {
         /// connection over it is closed with them.
         #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
         max_stalled_bytes: NonZeroU64,
+    },
+    /// Print the BLAKE3 digest of a token, as a `token` line of an access
+    /// file wants it. The file holds digests, never tokens.
+    HashToken {
+        #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
+        token: String,
     },
     /// Import a local git repository, one way. Safe to repeat. It can run
     /// while the server runs.
@@ -102,12 +115,14 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let cli = Cli::parse();
-    // An import does not land, so it can run beside the server. `derive`
-    // removes rows of older versions of a kind, which a running server of an
-    // older build may read, so it opens as the server.
+    // `hash-token` needs no data directory. An import does not land, so it
+    // can run beside the server. `derive` removes rows of older versions of a
+    // kind, which a running server of an older build may read, so it opens as
+    // the server.
     let open = match cli.command {
         Command::Import { .. } => Store::open_shared,
         Command::Serve { .. } | Command::Derive { .. } => Store::open,
+        Command::HashToken { .. } => return hash_token(),
     };
     let store = open(&cli.data)
         .with_context(|| format!("cannot open data directory {}", cli.data.display()))?;
@@ -115,12 +130,13 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve {
             listen,
             token,
+            access,
             insecure_listen,
             max_connections,
             max_streams,
             max_stalled_bytes,
         } => {
-            anyhow::ensure!(!token.is_empty(), "--token must not be empty");
+            let access = load_access(token, access)?;
             // SHORTCUT: no TLS. Upgrade: tonic TLS or mTLS before any
             // deployment beyond one machine.
             anyhow::ensure!(
@@ -139,11 +155,12 @@ async fn main() -> anyhow::Result<()> {
                 streams: max_streams,
                 stalled_bytes: max_stalled_bytes,
             };
-            service::serve(store, listener, &token, limits, async {
+            service::serve(store, listener, access, limits, async {
                 tokio::signal::ctrl_c().await.ok();
             })
             .await?;
         }
+        Command::HashToken { .. } => unreachable!("handled before the store opens"),
         Command::Import {
             repo,
             rev,
@@ -188,5 +205,41 @@ async fn main() -> anyhow::Result<()> {
             println!("derived {name} for the history of {tip}; older versions are removed");
         }
     }
+    Ok(())
+}
+
+/// The rules of `serve`: exactly one of `--token` (one principal with every
+/// right) and `--access` (a file of tokens and rules).
+fn load_access(
+    token: Option<String>,
+    file: Option<PathBuf>,
+) -> anyhow::Result<scion_server::access::Access> {
+    match (token, file) {
+        (Some(_), Some(_)) => anyhow::bail!("give --token or --access, not both"),
+        (Some(token), None) => {
+            anyhow::ensure!(!token.is_empty(), "--token must not be empty");
+            Ok(scion_server::access::Access::single(&token))
+        }
+        (None, Some(file)) => {
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("cannot read {}", file.display()))?;
+            scion_server::access::Access::parse(&text)
+                .map_err(|why| anyhow::anyhow!("bad access file {}: {why}", file.display()))
+        }
+        (None, None) => anyhow::bail!("give --token or --access"),
+    }
+}
+
+/// Prints the BLAKE3 digest of the token of `hash-token`.
+fn hash_token() -> anyhow::Result<()> {
+    let Cli { command, .. } = Cli::parse();
+    let Command::HashToken { token } = command else {
+        unreachable!("hash_token handles only the hash-token command")
+    };
+    anyhow::ensure!(!token.is_empty(), "--token must not be empty");
+    println!(
+        "{}",
+        blake3::Hash::from(scion_proto::auth::token_digest(&token)).to_hex()
+    );
     Ok(())
 }
