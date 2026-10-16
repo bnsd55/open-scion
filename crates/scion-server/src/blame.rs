@@ -802,15 +802,31 @@ const OUTSIDE: ChangesetId = ChangesetId::from_bytes([0; 32]);
 /// The version of the cursor format.
 const CURSOR_VERSION: u8 = 1;
 
-/// Binds a cursor to one blame of one file: a hash of the changeset and
-/// path of the request that made it.
-fn cursor_digest(cs: ChangesetId, path: &RepoPath) -> [u8; 16] {
+/// Binds a cursor to one blame of one file of one repo: a hash of the
+/// repo, the changeset and the path of the request that made it. The same
+/// changeset can be in two repos, so the repo is in the digest too.
+fn cursor_digest(repo: &str, cs: ChangesetId, path: &RepoPath) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
+    hasher.update(repo.as_bytes());
+    hasher.update(&[0]);
     hasher.update(cs.as_bytes());
     hasher.update(path.as_bytes());
     hasher.finalize().as_bytes()[..16]
         .try_into()
         .expect("16 bytes of a 32-byte hash")
+}
+
+/// Puts `n` as a LEB128 varint.
+fn put_varint(w: &mut Vec<u8>, mut n: u64) {
+    loop {
+        let byte = (n & 0x7f) as u8;
+        n >>= 7;
+        if n == 0 {
+            w.push(byte);
+            return;
+        }
+        w.push(byte | 0x80);
+    }
 }
 
 /// A stretch of a window's lines that the walk named together, or that are
@@ -868,12 +884,12 @@ fn put_bytes(w: &mut Vec<u8>, bytes: &[u8]) {
     w.extend_from_slice(bytes);
 }
 
-/// Encodes `resume` for a blame of the file at `path` in `cs`.
+/// Encodes `resume` for a blame of the file at `path` in `cs` of `repo`.
 #[must_use]
-pub fn encode_cursor(resume: &Resume, cs: ChangesetId, path: &RepoPath) -> Vec<u8> {
+pub fn encode_cursor(resume: &Resume, repo: &str, cs: ChangesetId, path: &RepoPath) -> Vec<u8> {
     let mut w = Vec::new();
     w.push(CURSOR_VERSION);
-    w.extend_from_slice(&cursor_digest(cs, path));
+    w.extend_from_slice(&cursor_digest(repo, cs, path));
     match &resume.next {
         None => w.push(0),
         Some((id, at)) => {
@@ -893,57 +909,105 @@ pub fn encode_cursor(resume: &Resume, cs: ChangesetId, path: &RepoPath) -> Vec<u
         }
     }
     w.extend_from_slice(
+        &u64::try_from(resume.after_line).unwrap_or(u64::MAX).to_be_bytes(),
+    );
+    w.extend_from_slice(
         &u64::try_from(resume.counted)
             .unwrap_or(u64::MAX)
             .to_be_bytes(),
     );
     // The window's lines as runs: a stretch of lines that the walk named,
     // or one that is still open, with each open line's place in the
-    // version at `next`.
+    // version at `next`. The changesets sit once in a table; a run names
+    // its index, so a window of lines from many changesets costs a few
+    // bytes a run, not 32 bytes a line.
     let runs = Run::runs(&resume.window);
-    let count = u32::try_from(runs.len()).expect("a window holds fewer than 2^32 runs");
-    w.extend_from_slice(&count.to_be_bytes());
+    let mut table: Vec<ChangesetId> = Vec::new();
+    let mut index = |id: &ChangesetId| -> u64 {
+        if let Some(at) = table.iter().position(|known| known == id) {
+            return at as u64;
+        }
+        table.push(*id);
+        (table.len() - 1) as u64
+    };
+    // The table goes before the runs, so measure it first.
+    let mut body = Vec::new();
     for run in &runs {
-        w.extend_from_slice(&run.len.to_be_bytes());
+        put_varint(&mut body, u64::from(run.len));
         match &run.state {
             Line::Named(id) => {
-                w.push(1);
-                w.extend_from_slice(id.as_bytes());
+                body.push(1);
+                let at = index(id);
+                put_varint(&mut body, at);
             }
             Line::Unnamed(first) => {
-                w.push(0);
+                body.push(0);
                 for at in *first..first + run.len as usize {
-                    w.extend_from_slice(
-                        &u32::try_from(at).unwrap_or(u32::MAX).to_be_bytes(),
+                    put_varint(
+                        &mut body,
+                        u64::try_from(at).unwrap_or(u64::MAX),
                     );
                 }
             }
         }
     }
+    let count = u32::try_from(table.len()).expect("a window names fewer than 2^32 changesets");
+    let run_count = u32::try_from(runs.len()).expect("a window holds fewer than 2^32 runs");
+    // Both counts first, so a reader can check them before it allocates.
+    w.extend_from_slice(&count.to_be_bytes());
+    w.extend_from_slice(&run_count.to_be_bytes());
+    for id in &table {
+        w.extend_from_slice(id.as_bytes());
+    }
+    w.extend_from_slice(&body);
     w
 }
 
 /// Decodes a cursor that a reply made for a blame of the file at `path` in
-/// `cs`. The client sends it back unchanged; anything else is refused.
+/// `cs` of `repo`. The client sends it back unchanged; anything else is
+/// refused. The bytes and the decoded state count against `memory`, so a
+/// cursor past the budget is refused instead of read. The cursor is small:
+/// a worst-case window of 1,048,576 lines that alternate between the 100
+/// changesets one call can walk and open lines measures 4,187,699 bytes,
+/// because the changesets sit once in a table and a run costs a few bytes.
 ///
 /// # Errors
 ///
 /// [`Error::InvalidArgument`] for an unknown version, a wrong length, a
-/// cursor made for another changeset or path, or a field out of range.
-pub fn decode_cursor(bytes: &[u8], cs: ChangesetId, path: &RepoPath) -> Result<Resume> {
+/// cursor made for another repo, changeset or path, a changeset it names
+/// that the repo does not have, or a field out of range.
+/// [`Error::ResourceExhausted`] if the cursor does not fit the budget, or a
+/// take waited past `until`.
+pub fn decode_cursor(
+    store: &Store,
+    repo: &str,
+    bytes: &[u8],
+    cs: ChangesetId,
+    path: &RepoPath,
+    memory: &Bytes,
+    until: Option<Instant>,
+) -> Result<(Resume, Held)> {
     let bad = |why: &str| Error::InvalidArgument(format!("bad blame cursor: {why}"));
+    let repo_id = store.read(|c| db::repo_id(c, repo))?;
     let mut r = CursorReader(bytes);
     if r.u8()? != CURSOR_VERSION {
         return Err(bad("unknown version"));
     }
-    if r.array::<16>()? != cursor_digest(cs, path) {
-        return Err(bad("it is for another changeset or path"));
+    if r.array::<16>()? != cursor_digest(repo, cs, path) {
+        return Err(bad("it is for another repo, changeset or path"));
     }
     let next = match r.u8()? {
         0 => None,
         1 => {
             let id = ChangesetId::from_bytes(r.array::<32>()?);
             let at = RepoPath::new(r.bytes_field()?).map_err(|_| bad("bad path"))?;
+            let known = store.read(|c| db::has_changeset(c, repo_id, id))?;
+            if !known {
+                return Err(bad(&format!(
+                    "it goes on at {} which {repo} does not have",
+                    id
+                )));
+            }
             Some((id, at))
         }
         _ => return Err(bad("bad walk flag")),
@@ -960,29 +1024,61 @@ pub fn decode_cursor(bytes: &[u8], cs: ChangesetId, path: &RepoPath) -> Result<R
         return Err(bad("the window starts past the file"));
     }
     let open = (after_line + MAX_BLAME_WINDOW_LINES).min(counted) - after_line;
+    // Each run covers at least one line, and each changeset in the table
+    // names at least one run, so both counts are past these bounds only in
+    // a cursor that was never made. Check them before any allocation.
+    let table_count = r.u32()?;
     let run_count = r.u32()?;
-    let mut window = Vec::new();
+    if run_count as usize > open {
+        return Err(bad("more runs than lines in the window"));
+    }
+    if table_count as usize > run_count as usize {
+        return Err(bad("more changesets than runs"));
+    }
+    // The bytes themselves, and what decoding them holds, take the budget
+    // before the allocations happen.
+    let hold = memory.take(
+        bytes.len() + open * std::mem::size_of::<Line>() + table_count as usize * 32,
+        until,
+    )?;
+    let mut table = Vec::with_capacity(table_count as usize);
+    for _ in 0..table_count {
+        let id = ChangesetId::from_bytes(r.array::<32>()?);
+        let known = store.read(|c| db::has_changeset(c, repo_id, id))?;
+        if !known {
+            return Err(bad(&format!(
+                "it names {} which {repo} does not have",
+                id
+            )));
+        }
+        table.push(id);
+    }
+    let mut window = Vec::with_capacity(open);
     let mut total = 0usize;
     for _ in 0..run_count {
-        let len = r.u32()?;
+        let len = r.varint()?;
         let kind = r.u8()?;
         if kind > 1 {
             return Err(bad("bad line kind"));
         }
-        let run_len = len as usize;
-        total += run_len;
+        total += len as usize;
         if total > open {
             return Err(bad("the cursor's lines fill more than its window"));
         }
         match kind {
             0 => {
-                for _ in 0..run_len {
-                    window.push(Line::Unnamed(r.u32()? as usize));
+                for _ in 0..len {
+                    let at = r.varint()? as usize;
+                    window.push(Line::Unnamed(at));
                 }
             }
             _ => {
-                let id = ChangesetId::from_bytes(r.array::<32>()?);
-                window.extend(std::iter::repeat_n(Line::Named(id), run_len));
+                let at = r.varint()? as usize;
+                let Some(id) = table.get(at) else {
+                    return Err(bad("a run names a changeset past the table"));
+                };
+                let id = *id;
+                window.extend(std::iter::repeat_n(Line::Named(id), len as usize));
             }
         }
     }
@@ -990,13 +1086,14 @@ pub fn decode_cursor(bytes: &[u8], cs: ChangesetId, path: &RepoPath) -> Result<R
         return Err(bad("the cursor's lines do not fill its window"));
     }
     r.finish()?;
-    Ok(Resume {
+    let resume = Resume {
         next,
         search: RenameSearch { searched, best },
         after_line,
         counted,
         window,
-    })
+    };
+    Ok((resume, hold))
 }
 
 /// Reads a cursor from the front of its bytes.
@@ -1009,6 +1106,21 @@ impl CursorReader<'_> {
 
     fn u32(&mut self) -> Result<u32, Error> {
         Ok(u32::from_be_bytes(self.array()?))
+    }
+
+    /// Reads a LEB128 varint. More than 10 bytes is not one.
+    fn varint(&mut self) -> Result<u64, Error> {
+        let mut n = 0u64;
+        for byte in 0..10 {
+            let b = self.u8()?;
+            n |= u64::from(b & 0x7f) << (byte * 7);
+            if b & 0x80 == 0 {
+                return Ok(n);
+            }
+        }
+        Err(Error::InvalidArgument(
+            "bad blame cursor: a varint is longer than 10 bytes".into(),
+        ))
     }
 
     fn u64(&mut self) -> Result<u64, Error> {

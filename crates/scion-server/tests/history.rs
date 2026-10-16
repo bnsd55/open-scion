@@ -489,7 +489,30 @@ fn blame_calls(
             }
         }
         match result.resume {
-            Some(next) => resume = next,
+            Some(next) => {
+                // The next call gets the cursor the reply carried, and the
+                // server reads it back the way a resumed call does.
+                eprintln!(
+                    "DEBUG resume: after_line={} counted={} window={} next_path={:?} searched={} best={:?} first_lines={:?}",
+                    next.after_line, next.counted, next.window.len(),
+                    next.next.as_ref().map(|(_, p)| p.as_bytes()),
+                    next.search.searched, next.search.best,
+                    &next.window[..next.window.len().min(6)]
+                );
+                let bytes = blame::encode_cursor(&next, REPO, cs, &path(p));
+                let (decoded, hold) = blame::decode_cursor(
+                    store,
+                    REPO,
+                    &bytes,
+                    cs,
+                    &path(p),
+                    &Bytes::new(1 << 30),
+                    None,
+                )
+                .unwrap();
+                drop(hold);
+                resume = decoded;
+            }
             None => break,
         }
     }
@@ -1355,4 +1378,180 @@ fn blame_stops_when_its_diff_budget_runs_out() {
         [range(1, 1, Some(ids[1]), 1), range(2, big, Some(ids[0]), 1)]
     );
     assert_eq!(result.resume, None);
+}
+
+/// A chain of changesets in the repo `name`, as [`chain`] does in `r`.
+fn chain_in<S: Into<Option<FileState>>>(
+    store: &Store,
+    name: &str,
+    puts: Vec<Vec<(&str, S)>>,
+) -> Vec<ChangesetId> {
+    assert_ne!(name, REPO);
+    store
+        .write(|c| {
+            let repo = db::create_repo(c, name)?;
+            let mut ids: Vec<ChangesetId> = Vec::new();
+            for puts in puts {
+                let cs = Changeset {
+                    parents: ids.last().copied().into_iter().collect(),
+                    author: author(),
+                    committer: None,
+                    message: format!("{name} change {}", ids.len()).into_bytes(),
+                    changes: puts.into_iter().map(|(p, s)| (path(p), s.into())).collect(),
+                };
+                ids.push(tree::store_changeset(c, repo, &cs)?.0);
+            }
+            Ok(ids)
+        })
+        .unwrap()
+}
+
+/// Cursor bytes for `resume`, made for a blame of `p` at `cs` in `r`.
+fn cursor_bytes(resume: &Resume, cs: ChangesetId, p: &str) -> Vec<u8> {
+    blame::encode_cursor(resume, REPO, cs, &path(p))
+}
+
+#[test]
+fn a_cursor_names_only_changesets_of_its_repo() {
+    let (_data, store) = open_store();
+    let put = |data: &[u8]| regular(store.blobs().put(data).unwrap());
+    let ids = chain(
+        &store,
+        vec![vec![("f", put(b"a\n"))], vec![("f", put(b"b\n"))]],
+    );
+    // Another repo, with a changeset `r` does not have.
+    let other = chain_in(&store, "other", vec![vec![("f", put(b"a\n"))]]);
+
+    // A cursor whose walk goes on at the other repo's changeset: its
+    // digest is right, its changeset is not.
+    let walk = Resume {
+        next: Some((other[0], path("f"))),
+        search: RenameSearch::default(),
+        after_line: 0,
+        counted: 2,
+        window: vec![Line::Unnamed(0), Line::Unnamed(1)],
+    };
+    let bytes = cursor_bytes(&walk, ids[1], "f");
+    let err = blame::decode_cursor(
+        &store,
+        REPO,
+        &bytes,
+        ids[1],
+        &path("f"),
+        &Bytes::new(1 << 30),
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+
+    // The same for a line the cursor says was named by it.
+    let named = Resume {
+        next: Some((ids[1], path("f"))),
+        search: RenameSearch::default(),
+        after_line: 0,
+        counted: 2,
+        window: vec![Line::Named(other[0]), Line::Unnamed(0)],
+    };
+    let bytes = cursor_bytes(&named, ids[1], "f");
+    let err = blame::decode_cursor(
+        &store,
+        REPO,
+        &bytes,
+        ids[1],
+        &path("f"),
+        &Bytes::new(1 << 30),
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+}
+
+#[test]
+fn a_cursor_with_past_bounds_is_refused_before_it_allocates() {
+    let (_data, store) = open_store();
+    let put = |data: &[u8]| regular(store.blobs().put(data).unwrap());
+    let ids = chain(
+        &store,
+        vec![vec![("f", put(b"a\n"))], vec![("f", put(b"b\n"))]],
+    );
+    // A cursor with an empty window: its header ends at the table count.
+    let resume = Resume {
+        next: Some((ids[1], path("f"))),
+        search: RenameSearch::default(),
+        after_line: 0,
+        counted: 2,
+        window: vec![Line::Unnamed(0), Line::Unnamed(1)],
+    };
+    let good = cursor_bytes(&resume, ids[1], "f");
+    // version, digest, walk flag, walk changeset, walk path, searched, best
+    // flag, after_line, counted, table count: the run count follows.
+    let head = good.len() - 4 - 2; // past the run count and the two runs
+    assert_eq!(good[good.len() - 6], 0, "no table");
+
+    // A run count of u32::MAX: refused, and it does not allocate for it.
+    let mut made = good[..head - 0].to_vec();
+    made.truncate(good.len() - 6);
+    made.extend_from_slice(&u32::MAX.to_be_bytes());
+    let err = blame::decode_cursor(
+        &store,
+        REPO,
+        &made,
+        ids[1],
+        &path("f"),
+        &Bytes::new(1 << 30),
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+
+    // A cursor that does not fit the budget is refused too.
+    let err = blame::decode_cursor(
+        &store,
+        REPO,
+        &good,
+        ids[1],
+        &path("f"),
+        &Bytes::new(10),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::ResourceExhausted(_)),
+        "a cursor past the budget: {err:?}"
+    );
+}
+
+#[test]
+fn the_worst_cursor_stays_small() {
+    // The most runs a window can hold: its lines alternate between the
+    // changesets one call can walk, and every other line is still open.
+    // The table holds each changeset once; a run costs a few bytes.
+    let versions = MAX_BLAME_VERSIONS;
+    let window: Vec<Line> = (0..blame::MAX_BLAME_WINDOW_LINES)
+        .map(|i| {
+            if i % 2 == 0 {
+                let mut id = [0u8; 32];
+                id[0] = (i % versions) as u8;
+                id[1] = 0x42;
+                Line::Named(ChangesetId::from_bytes(id))
+            } else {
+                Line::Unnamed(i)
+            }
+        })
+        .collect();
+    let resume = Resume {
+        next: None,
+        search: RenameSearch::default(),
+        after_line: 0,
+        counted: blame::MAX_BLAME_WINDOW_LINES,
+        window,
+    };
+    let bytes = cursor_bytes(&resume, ChangesetId::from_bytes([7; 32]), "f");
+    println!(
+        "worst cursor: {} bytes for {} lines, {} runs",
+        bytes.len(),
+        blame::MAX_BLAME_WINDOW_LINES,
+        blame::MAX_BLAME_WINDOW_LINES
+    );
+    assert!(bytes.len() < 8 << 20, "{} bytes", bytes.len());
 }

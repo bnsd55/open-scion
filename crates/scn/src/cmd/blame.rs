@@ -54,12 +54,12 @@ pub async fn blame(ctx: &mut Ctx, spec: &str) -> Result<()> {
         }
         // The source of each line of the window the reply covers. The
         // ranges cover it in order, so the first range names its first
-        // line.
-        let at_line = reply
-            .ranges
-            .first()
-            .map(|r| r.start_line as usize - 1)
-            .context("server sent no blame ranges")?;
+        // line. An empty file has none, and no cursor to go on with.
+        let at_line = match reply.ranges.first() {
+            Some(r) => r.start_line as usize - 1,
+            None if reply.next_cursor.is_empty() => break,
+            None => bail!("server sent no blame ranges"),
+        };
         let mut here = Vec::new();
         for range in &reply.ranges {
             if range.start_line as usize != at_line + here.len() + 1 {

@@ -629,13 +629,6 @@ impl Scion for ScionService {
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_path(req.path.clone())?;
-        // The client sends the cursor back unchanged. A cursor made for
-        // another repo, changeset or path is refused here.
-        let resume = if req.cursor.is_empty() {
-            blame::Resume::default()
-        } else {
-            blame::decode_cursor(&req.cursor, id, &path)?
-        };
         // Taken before the worker permit, and held until the job ends, also
         // when the client leaves first.
         let slot = Arc::clone(&self.blames)
@@ -644,13 +637,34 @@ impl Scion for ScionService {
             .map_err(|_| Status::unavailable("server is shutting down"))?;
         let memory = self.blame_memory.clone();
         let until = Some(deadline.at());
+        let repo = req.repo.clone();
+        let cursor_bytes = req.cursor.clone();
         let walk_path = path.clone();
         let blame = self
             .worker
             .run(move |store| {
                 let _slot = slot;
                 let _call = deadline.guard();
-                blame::blame(&store, &req.repo, id, &walk_path, &resume, &memory, until)
+                // The client sends the cursor back unchanged. A cursor made
+                // for another repo, changeset or path is refused here, and
+                // its changesets must be the repo's. Its memory takes the
+                // blame budget, and stays taken until the call ends.
+                let (resume, cursor) = if cursor_bytes.is_empty() {
+                    (blame::Resume::default(), None)
+                } else {
+                    let (resume, hold) = blame::decode_cursor(
+                        &store,
+                        &repo,
+                        &cursor_bytes,
+                        id,
+                        &walk_path,
+                        &memory,
+                        until,
+                    )?;
+                    (resume, Some(hold))
+                };
+                let _cursor = cursor;
+                blame::blame(&store, &repo, id, &walk_path, &resume, &memory, until)
             })
             .await?;
         let ranges = blame
@@ -677,7 +691,7 @@ impl Scion for ScionService {
             .collect();
         let next_cursor = blame
             .resume
-            .map(|resume| blame::encode_cursor(&resume, id, &path))
+            .map(|resume| blame::encode_cursor(&resume, &req.repo, id, &path))
             .unwrap_or_default();
         Ok(Response::new(BlameResponse { ranges, changesets, next_cursor }))
     }
