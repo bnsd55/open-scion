@@ -590,6 +590,11 @@ impl<S: Store> Tier<S> {
                             tracing::debug!(%key, "hit");
                         }
                         // After the call's checks, in `get_objects`.
+                        // SHORTCUT: the record takes the request's repo
+                        // field, and GetObjects does not check that the
+                        // object belongs to that repo until #13 PR-C, which
+                        // moves this after the ticket walk, under the
+                        // ticket's repo.
                         self.inner.store.served(&ask.repo, key);
                         return self.outgoing(key, stored, permit, ask).await;
                     }
@@ -619,6 +624,8 @@ impl<S: Store> Tier<S> {
                 None => reply::try_take(&self.inner.in_flight, data.len()),
             };
             if let Some(permit) = permit {
+                // SHORTCUT: as at the hit above, #13 PR-C moves this after
+                // the ticket walk, under the ticket's repo.
                 self.inner.store.served(&ask.repo, key);
                 return self.outgoing(key, data, permit, ask).await;
             }
