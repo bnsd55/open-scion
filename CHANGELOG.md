@@ -147,5 +147,5 @@ release.
   it.
 - Reads use a pool of 8 read-only SQLite connections. A read no longer
   waits for a write, for a long read such as a graph walk, or for a server
-  write that waits for an import's write lock. Each read sees one
-  snapshot. Writes still take turns on one connection.
+  write that waits for an import's write lock. Writes still take turns
+  on one connection.

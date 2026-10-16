@@ -141,9 +141,13 @@ upgrade copies every row.
 `BEGIN IMMEDIATE`. The migrations run on the write connection before the
 read connections open. In WAL mode a read connection reads beside a write, so a
 read never waits for a write, and a long read never makes a write wait.
-`Store::read` takes an idle read connection, or waits for one. It runs in
-one read transaction (`BEGIN DEFERRED`), so it sees one snapshot: every
-commit that ended before its first statement. `Store::read_unflushed` runs
+`Store::read` takes an idle read connection, or waits for one. It runs
+outside any explicit transaction, so each statement sees its own snapshot:
+every commit that it can see when it starts. A caller that needs one
+consistent view reads it in one statement. (A snapshot held across the
+statements of back-to-back reads would keep the auto-checkpoint from ever
+copying the whole log, so the log would never restart and its file would
+grow.) `Store::read_unflushed` runs
 on the write connection. Writes use it to read what they are about to
 change, under the same lock. The read connections close first, so the write
 connection closes last and moves the log into `scion.db`.
@@ -197,7 +201,7 @@ rename (see below).
   `committed`: a commit still in its COMMIT may not have written its log.
   With `synchronous = FULL`, a commit's log reaches the drive before the
   commit is visible, so a flush that starts after a read covers what the
-  read saw. The proof is in `Store::read`.
+  read saw. The proof is in `Store::wait_durable`.
 - A read that derives a value, such as the root tree for `GetRootTree`,
   waits for a full flush of that derivation before it replies (section 4).
   So a client never gets a tree ID that a power loss can undo.
@@ -816,13 +820,12 @@ and their bounds, are this project's choices.
   (above). There is no resume: the state of a merge-base walk is its whole
   queue with marks. It keeps marks only for its queue, so its memory follows
   the width of the history, not its depth.
-- A walk runs in steps of about 1,000 reads (`graph::STEPS`). A step is
-  one `Store::read`: it holds one read connection and sees one snapshot, so
-  writes and other reads run beside it. A changeset's parents and node
-  never change, so the next step goes on from where the last one stopped.
-  Each step waits, as any read does, for a flush that covers the commits
-  it saw. At most 4 queries run at once, fewer than the 8 read
-  connections, so the walks never take every one.
+- A walk runs in steps of about 1,000 reads (`graph::STEPS`). A step
+  holds one read connection, so writes and other reads run beside it. A
+  changeset's parents and node never change, so the next step goes on from
+  where the last one stopped. The reply waits for one flush that covers
+  every step, as any read does. At most 4 queries run at once, fewer than
+  the 8 read connections, so the walks never take every one.
 - The first query on a changeset without a node derives the commit graph
   of its whole history, in steps (section 4), before it answers. Its
   deadline does not stop that: each step it stored stays for the next
