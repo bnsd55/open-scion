@@ -188,13 +188,21 @@ with `#` are skipped:
 # token <principal> <the BLAKE3 digest of the token>
 token	alice	d4289b3345cfbdfb36fb37ee89e85bd74447f837b04c18aee6233c731b1419a7
 token	ci	<64 hex digits>
-# read <principal> <repo>: every RPC on that repo
+# read <principal> <repo> [prefix]: reads at or below the prefix, by
+# path parts. No prefix means the whole repo.
 read	ci	main
 # write <principal> <repo> [prefix]: changes at or below the prefix, by
-# path parts. No prefix means the whole repo. Write implies read.
+# path parts. No prefix means the whole repo. Write implies read of what
+# it writes; a whole-repo write rule needs a whole-repo read rule.
 write	alice	main	src
 write	ci	main
 ```
+
+A principal whose read rules are all prefixes is a *partial reader*: it
+reads only what they cover, through the view of the repo that the server
+derives for it (in work). Until then its content reads answer
+`UNIMPLEMENTED`, uniform for every such principal. The file holds at most
+32 distinct read rule sets per repo, and a set at most 256 prefixes.
 
 The file holds digests, never tokens. Print the digest of a token with
 `scion-server hash-token`:

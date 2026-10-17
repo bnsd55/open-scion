@@ -41,6 +41,7 @@ pub mod similar;
 pub mod store;
 pub mod tickets;
 pub mod tree;
+pub mod views;
 pub mod write;
 
 pub use error::{Error, Result};

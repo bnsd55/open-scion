@@ -87,7 +87,7 @@ per-repo read and write rules:
 
 ```sh
 TOK=$(./scion-server hash-token --token <SECRET>)
-printf 'token\tops\t%s\nwrite\tops\tr\n' "$TOK" > /srv/scion/access.txt
+printf 'token\tops\t%s\nread\tops\tr\nwrite\tops\tr\n' "$TOK" > /srv/scion/access.txt
 chmod 600 /srv/scion/access.txt
 ./scion-server --data /srv/scion serve --access /srv/scion/access.txt \
   --ticket-key /srv/scion-keys/ticket.key

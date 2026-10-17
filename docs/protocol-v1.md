@@ -100,6 +100,17 @@ caller cannot tell whether such a repo exists. A change fails with
 `PERMISSION_DENIED` when the caller may read the repo but not make the
 change (sections 6.1 to 6.3).
 
+**Folder read rules.** A read or write rule MAY name a path prefix, and the
+caller reads the paths at or below its prefixes. A caller whose read rules
+name prefixes is a *partial reader*: it reads no content until the server
+derives its view of the repo ([#121]), and then only what the rules cover.
+Every content RPC of such a caller fails with `UNIMPLEMENTED`, the same
+text on every call, until the views exist; a write rule for a whole repo
+MUST be matched by a whole-repo read rule, so a caller cannot write what it
+cannot read. The access file holds at most 32 distinct canonical read rule
+sets per repo, and a set at most 256 prefixes; a file over either cap is
+refused at load.
+
 **Per-principal quotas.** A server MAY cap what one principal holds at once.
 The caps are `--max-principal-requests` (calls in flight, counted from the
 server takes the call until its reply starts), `--max-principal-upload-bytes`
@@ -201,7 +212,7 @@ contract. A client MUST NOT depend on its text.
 | `RESOURCE_EXHAUSTED` | `GetObjects` only: no memory for the first object within 30 s, or before the caller's deadline (section 7.3). | Yes, after a wait |
 | `DATA_LOSS` | From a tier only: its upstream sent bytes that are not the object asked for (section 8). | MAY |
 | `INTERNAL` | A database, I/O or stored-data error, or a server bug. The message is `internal error`; the detail stays in the server log. | MAY |
-| `UNIMPLEMENTED` | The server does not have the call, or the request is compressed. | After the cause is fixed |
+| `UNIMPLEMENTED` | The server does not have the call, the request is compressed, or the caller is a partial reader of folder read rules and the call reads or writes content (section 2). | After the cause is fixed |
 
 A land that conflicts or is rejected is not an error. It is a state in a
 successful `Land` reply (section 6.3).

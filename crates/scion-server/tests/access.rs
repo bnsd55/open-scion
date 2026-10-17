@@ -1,7 +1,7 @@
 //! Access rules over gRPC: which principal may read, create, land and
 //! upload, and what a caller that may not read a repo sees.
 
-use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
+use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath, Tree, TreeId};
 use scion_proto::auth::token_digest;
 use scion_proto::listen::Limits;
 use scion_proto::v1::objects_client::ObjectsClient;
@@ -51,7 +51,8 @@ fn access() -> Access {
          token\tci\t{}\n\
          write\talice\t{REPO}\tdocs\n\
          read\tbob\t{REPO}\n\
-         write\tci\t{REPO}\n",
+         write\tci\t{REPO}\n\
+         read\tci\t{REPO}\n",
         hex("alice"),
         hex("bob"),
         hex("ci"),
@@ -144,7 +145,7 @@ async fn server(store: &Store, access: Access, token: &str) -> (Stop, Scion, Obj
             tls: None,
             metrics: Arc::new(Metrics::default()),
         },
-        None,
+        Some(Arc::new(scion_server::tickets::Keys::generate())),
         async {
             stopped.await.ok();
         },
@@ -162,48 +163,41 @@ async fn server(store: &Store, access: Access, token: &str) -> (Stop, Scion, Obj
     )
 }
 
+/// The write rules still decide, for a whole-repo writer, which path a
+/// change may name. A partial reader writes nothing in v0.1 of the folder
+/// rules, so its one answer is the uniform `UNIMPLEMENTED`.
 #[tokio::test(flavor = "multi_thread")]
 async fn writes_outside_a_prefix_are_denied_with_the_path() {
     let (_dir, store, root, _blob) = store();
     let access = access();
-    let (_alice_stop, mut alice, _) = server(&store, access.clone(), "alice").await;
 
-    // Inside the prefix: accepted.
+    // ci may write every path: a change outside `docs` is fine.
+    let (_ci_stop, mut ci, _) = server(&store, access.clone(), "ci").await;
     let guide = put(&store, b"guide");
-    let (bytes, _) = changeset(vec![root], "docs/guide", Some(regular(guide))).encode_with_id();
-    alice
-        .create_changeset(CreateChangesetRequest {
-            repo: REPO.into(),
-            changeset: bytes,
-        })
-        .await
-        .unwrap();
+    let (bytes, _) = changeset(vec![root], "src/guide", Some(regular(guide))).encode_with_id();
+    ci.create_changeset(CreateChangesetRequest {
+        repo: REPO.into(),
+        changeset: bytes,
+    })
+    .await
+    .unwrap();
 
-    // Outside it: denied, and the message names the path.
-    let source = put(&store, b"source");
-    let (bytes, _) = changeset(vec![root], "src/a", Some(regular(source))).encode_with_id();
-    let status = alice
-        .create_changeset(CreateChangesetRequest {
-            repo: REPO.into(),
-            changeset: bytes,
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
-    assert!(status.message().contains("src/a"), "{}", status.message());
-
-    // Not by bytes alone: `docsx` is not below `docs`.
-    let source = put(&store, b"sx");
-    let (bytes, _) = changeset(vec![root], "docsx/readme", Some(regular(source))).encode_with_id();
-    let status = alice
-        .create_changeset(CreateChangesetRequest {
-            repo: REPO.into(),
-            changeset: bytes,
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
-    assert!(status.message().contains("docsx"), "{}", status.message());
+    // alice may read only `docs` (her write prefix): she writes nothing,
+    // inside or outside her prefix, and both answers are the same.
+    let (_alice_stop, mut alice, _) = server(&store, access, "alice").await;
+    for at in ["docs/guide", "src/a", "docsx/readme"] {
+        let source = put(&store, b"source");
+        let (bytes, _) = changeset(vec![root], at, Some(regular(source))).encode_with_id();
+        unimplemented(
+            at,
+            alice
+                .create_changeset(CreateChangesetRequest {
+                    repo: REPO.into(),
+                    changeset: bytes,
+                })
+                .await,
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -253,17 +247,16 @@ async fn the_lander_of_another_principals_changeset_needs_write() {
     let (_dir, store, root, _blob) = store();
     let access = access();
 
-    // alice creates a changeset inside her prefix.
-    let (_alice_stop, mut alice, _) = server(&store, access.clone(), "alice").await;
+    // ci, who may write every path, creates a changeset.
+    let (_ci_stop, mut ci, _) = server(&store, access.clone(), "ci").await;
     let guide = put(&store, b"guide");
     let (bytes, id) = changeset(vec![root], "docs/guide", Some(regular(guide))).encode_with_id();
-    alice
-        .create_changeset(CreateChangesetRequest {
-            repo: REPO.into(),
-            changeset: bytes,
-        })
-        .await
-        .unwrap();
+    ci.create_changeset(CreateChangesetRequest {
+        repo: REPO.into(),
+        changeset: bytes,
+    })
+    .await
+    .unwrap();
 
     // bob, read-only, cannot land it.
     let (_bob_stop, mut bob, _) = server(&store, access, "bob").await;
@@ -475,6 +468,239 @@ async fn a_principal_without_a_read_rule_sees_no_repo_on_any_rpc() {
         panic!("GetObjects: accepted")
     };
     assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+}
+
+/// Fails the test unless `reply` is the uniform `UNIMPLEMENTED` answer that
+/// a partial reader gets for the calls that the v0.1 of the folder rules
+/// does not serve.
+fn unimplemented<T>(name: &str, reply: Result<T, Status>) {
+    let Err(status) = reply else {
+        panic!("{name}: accepted")
+    };
+    assert_eq!(status.code(), Code::Unimplemented, "{name}: {status:?}");
+    assert!(
+        status.message().contains("folder read rules"),
+        "{name}: {}",
+        status.message()
+    );
+}
+
+/// pat may read only `docs` of `main`: a partial reader, by folder rules.
+fn partial_access() -> Access {
+    let text = format!(
+        "token\tpat\t{}\n\
+         read\tpat\t{REPO}\tdocs\n",
+        hex("pat"),
+    );
+    Access::parse(&text).unwrap()
+}
+
+/// The repo of the other tests: a root changeset with `README`, and a child
+/// with `docs/a` and `secret/b`. The tip's ID, and the two blobs'.
+fn repo_with_docs_and_secret() -> (tempfile::TempDir, Store, ChangesetId, BlobId, BlobId) {
+    let (dir, store, root, _blob) = store();
+    let (docs_blob, secret_blob) = (put(&store, b"a\n"), put(&store, b"b\n"));
+    let tip = store
+        .write(|c| {
+            let repo = c.repo_id(REPO)?;
+            let mut cs = changeset(vec![root], "docs/a", Some(regular(docs_blob)));
+            cs.changes.insert(
+                RepoPath::new("secret/b").unwrap(),
+                Some(regular(secret_blob)),
+            );
+            c.insert_changeset(repo, &cs)
+        })
+        .unwrap();
+    (dir, store, tip, docs_blob, secret_blob)
+}
+
+/// A partial reader resolves its ref and gets its view root: `docs` is
+/// there, `secret` is not, a visible file reads back, and a hidden path
+/// answers exactly like a missing one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_reader_reads_only_its_view() {
+    let (_dir, store, tip, _docs, _secret) = repo_with_docs_and_secret();
+    let (_stop, mut scion, mut objects) = server(&store, partial_access(), "pat").await;
+
+    // ResolveRef answers as today: the ref's real changeset.
+    let seen = scion.resolve_ref(req::resolve_ref()).await.unwrap();
+    assert!(
+        !seen.into_inner().changeset_id.is_empty(),
+        "the ref resolved"
+    );
+
+    // GetRootTree answers the view root, with a ticket bound to it.
+    let view = objects
+        .get_root_tree(req::get_root_tree(tip.as_bytes()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!view.ticket.is_empty(), "the ticket was minted");
+    let view_root = TreeId::try_from(view.tree_id.as_slice()).unwrap();
+
+    // ListDir from the view root: docs is there, secret is not.
+    let elem = |raw: &[u8]| scion_core::PathElem::new(raw.to_vec()).unwrap();
+    let mut listing = scion
+        .list_dir(req::list_dir(tip.as_bytes()))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut tree_bytes = Vec::new();
+    while let Some(part) = listing.message().await.unwrap() {
+        tree_bytes.extend_from_slice(&part.tree);
+    }
+    let (listed, listed_id) = Tree::decode_with_id(&tree_bytes).unwrap();
+    assert_eq!(listed_id, view_root, "the list is of the view root");
+    assert!(listed.entries.contains_key(&elem(b"docs")), "{listed:?}");
+    assert!(!listed.entries.contains_key(&elem(b"secret")), "{listed:?}");
+
+    // ReadFile serves a visible path and hides a hidden one, the same as a
+    // missing one.
+    let mut reply = scion
+        .read_file(req::read_file(tip.as_bytes(), b"docs/a"))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut bytes = Vec::new();
+    while let Some(part) = reply.message().await.unwrap() {
+        bytes.extend_from_slice(&part.data);
+    }
+    assert_eq!(bytes, b"a\n");
+    let hidden = scion
+        .read_file(req::read_file(tip.as_bytes(), b"secret/b"))
+        .await
+        .unwrap_err();
+    let missing = scion
+        .read_file(req::read_file(tip.as_bytes(), b"no/such"))
+        .await
+        .unwrap_err();
+    assert_eq!(hidden.code(), Code::NotFound, "{hidden:?}");
+    assert_eq!(missing.code(), Code::NotFound, "{missing:?}");
+    // The same shape of answer, with no hint that the path is hidden.
+    assert!(
+        hidden.message().starts_with("path "),
+        "{}",
+        hidden.message()
+    );
+}
+
+/// The history calls that the v0.1 of the folder rules does not serve, each
+/// with the same uniform refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_reader_gets_no_history() {
+    let (_dir, store, tip, _docs, _secret) = repo_with_docs_and_secret();
+    let (_stop, mut scion, _) = server(&store, partial_access(), "pat").await;
+    unimplemented(
+        "GetChangeset",
+        scion
+            .get_changeset(req::get_changeset(tip.as_bytes()))
+            .await,
+    );
+    unimplemented("Log", scion.log(req::log(tip.as_bytes())).await);
+    unimplemented(
+        "Blame",
+        scion.blame(req::blame(tip.as_bytes(), b"docs/a")).await,
+    );
+    unimplemented(
+        "MergeBase",
+        scion.merge_base(req::merge_base(tip.as_bytes())).await,
+    );
+    unimplemented(
+        "IsAncestor",
+        scion.is_ancestor(req::is_ancestor(tip.as_bytes())).await,
+    );
+    unimplemented("Diff", scion.diff(req::diff(tip.as_bytes())).await);
+}
+
+/// A partial reader's ticket reaches only its view: the visible blob by its
+/// path, a hidden blob refused however it is named, and a second reader
+/// with the same prefixes deriving the same view.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_readers_ticket_reaches_only_its_view() {
+    let (_dir, store, tip, docs, secret) = repo_with_docs_and_secret();
+    let (_stop, _scion, mut objects) = server(&store, partial_access(), "pat").await;
+    let view = objects
+        .get_root_tree(req::get_root_tree(tip.as_bytes()))
+        .await
+        .unwrap()
+        .into_inner();
+    let view_root = TreeId::try_from(view.tree_id.as_slice()).unwrap();
+
+    // The visible blob by its path in the view.
+    let mut objects_reply = objects
+        .get_objects(GetObjectsRequest {
+            refs: vec![ObjectRef {
+                kind: ObjectKind::Blob as i32,
+                id: docs.as_bytes().to_vec(),
+                path: b"docs/a".to_vec(),
+            }],
+            accept: Vec::new(),
+            ticket: view.ticket.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut got = Vec::new();
+    while let Some(part) = objects_reply.message().await.unwrap() {
+        got.extend_from_slice(&part.data);
+    }
+    assert_eq!(got, b"a\n");
+
+    // The hidden blob: the walk from the view root has no `secret`, so the
+    // ID is refused however it is named.
+    let mut refused = objects
+        .get_objects(GetObjectsRequest {
+            refs: vec![ObjectRef {
+                kind: ObjectKind::Blob as i32,
+                id: secret.as_bytes().to_vec(),
+                path: b"docs/a".to_vec(),
+            }],
+            accept: Vec::new(),
+            ticket: view.ticket,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let status = match refused.message().await {
+        Err(status) => status,
+        Ok(Some(part)) => panic!("the hidden blob came back: {part:?}"),
+        Ok(None) => panic!("the hidden blob request answered nothing"),
+    };
+    assert_eq!(status.code(), Code::NotFound, "{status:?}");
+
+    // A second reader with the same prefixes derives the same view: a
+    // shared view root.
+    let text = format!("token\tpat2\t{}\nread\tpat2\t{REPO}\tdocs\n", hex("pat2"));
+    let shared = Access::parse(&text).unwrap();
+    let (_stop2, _scion2, mut objects2) = server(&store, shared, "pat2").await;
+    let again = objects2
+        .get_root_tree(req::get_root_tree(tip.as_bytes()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        again.tree_id,
+        view_root.as_bytes().to_vec(),
+        "same prefixes, one view"
+    );
+}
+
+/// A partial reader writes nothing: the write calls all answer the same
+/// uniform `UNIMPLEMENTED`, with no per-object difference.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_reader_writes_nothing() {
+    let (_dir, store, root, _blob) = store();
+    let (_stop, mut scion, _) = server(&store, partial_access(), "pat").await;
+    unimplemented(
+        "PutBlob",
+        scion.put_blob(tokio_stream::once(req::put_blob())).await,
+    );
+    unimplemented(
+        "CreateChangeset",
+        scion.create_changeset(req::create_changeset()).await,
+    );
+    unimplemented("Land", scion.land(req::land(root.as_bytes())).await);
+    unimplemented("GetLand", scion.get_land(req::get_land()).await);
 }
 
 /// Four `Blame` calls of one big file run at once: each takes one of the 4

@@ -35,6 +35,7 @@ use crate::read;
 use crate::service::{Worker, check_reader, parse_id, resolve_ref};
 use crate::store::{self, Store};
 use crate::tickets::Keys;
+use crate::views;
 
 // The store keeps exactly the objects that the API promises to send.
 const _: () = assert!(store::MAX_OBJECT_BYTES == scion_proto::MAX_OBJECT_BYTES);
@@ -367,10 +368,27 @@ impl Objects for ObjectsService {
         let GetRootTreeRequest { repo, changeset_id } = request.into_inner();
         check_reader(&self.access, &caller, &repo)?;
         let cs = parse_id(&changeset_id, "changeset_id")?;
+        // A partial reader gets the root of its view: the real trees with
+        // everything its read rules do not cover removed ([#121]). The view
+        // is derived on the first read of its rule set, then cached.
+        let rule_set = self.access.read_digest(&caller, &repo).map(|digest| {
+            (
+                digest,
+                self.access
+                    .read_rule_set(&caller, &repo)
+                    .unwrap_or_default(),
+            )
+        });
         let (tree, repo) = self
             .worker
             .run(move |store| {
-                let tree = read::root_tree(&store, &repo, cs)?;
+                let tree = match &rule_set {
+                    Some((digest, prefixes)) => {
+                        let repo_id = store.read(|c| c.repo_id(&repo))?;
+                        views::view_root(&store, repo_id, digest, cs, prefixes)?
+                    }
+                    None => read::root_tree(&store, &repo, cs)?,
+                };
                 Ok((tree, repo))
             })
             .await?;
