@@ -86,7 +86,7 @@ pub fn file_blob_at(store: &Store, root: TreeId, path: &RepoPath) -> Result<Blob
             None => Err(Error::InvalidArgument(format!("{path:?} is a submodule"))),
         },
         Some(Entry::Dir(_)) => Err(Error::InvalidArgument(format!("{path:?} is a directory"))),
-        None => Err(Error::NotFound(NO_SUCH_PATH.to_owned())),
+        None => Err(Error::NotFound(format!("path {path:?}"))),
     }
 }
 
@@ -120,16 +120,10 @@ pub fn list_dir_at(store: &Store, root: TreeId, path: Option<&RepoPath>) -> Resu
         match tree::lookup(c, root, path)? {
             Some(Entry::Dir(id)) => c.get_tree(id),
             Some(Entry::File(_)) => Err(Error::InvalidArgument(format!("{path:?} is a file"))),
-            None => Err(Error::NotFound(NO_SUCH_PATH.to_owned())),
+            None => Err(Error::NotFound(format!("path {path:?}"))),
         }
     })
 }
-
-/// What a path that is not there answers: the same text for a path the
-/// caller may not read (folder rules, #121) and one that does not exist,
-/// with no hint of which. The caller named the path; the reply need not
-/// echo it.
-pub(crate) const NO_SUCH_PATH: &str = "no such path";
 
 /// Most entries that a `Log` reply holds. Each entry reads one changeset
 /// while the call holds one read connection.

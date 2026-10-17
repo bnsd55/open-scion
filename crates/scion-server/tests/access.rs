@@ -17,6 +17,10 @@ use scion_proto::v1::{
 use std::sync::Arc;
 
 use scion_server::access::Access;
+
+/// The second repo of the two-world comparisons: its tree holds `docs`
+/// only, so the same path is genuinely missing there.
+const OTHER: &str = "other";
 use scion_server::meta::MetaTx as _;
 use scion_server::metrics::Metrics;
 use scion_server::{Store, service};
@@ -401,8 +405,12 @@ mod req {
     }
 
     pub fn read_file(root: &[u8], path: &[u8]) -> ReadFileRequest {
+        read_file_at(REPO, root, path)
+    }
+
+    pub fn read_file_at(repo: &str, root: &[u8], path: &[u8]) -> ReadFileRequest {
         ReadFileRequest {
-            repo: REPO.into(),
+            repo: repo.into(),
             changeset_id: root.to_vec(),
             path: path.to_vec(),
         }
@@ -416,9 +424,9 @@ mod req {
         }
     }
 
-    pub fn list_dir_at(root: &[u8], path: &[u8]) -> ListDirRequest {
+    pub fn list_dir_at(repo: &str, root: &[u8], path: &[u8]) -> ListDirRequest {
         ListDirRequest {
-            repo: REPO.into(),
+            repo: repo.into(),
             changeset_id: root.to_vec(),
             path: path.to_vec(),
         }
@@ -618,6 +626,18 @@ fn root_tree_id(store: &Store, tip: ChangesetId) -> TreeId {
 async fn a_partial_reader_reads_only_its_view() {
     let (_dir, store, tip, _docs, _secret) = repo_with_docs_and_secret();
     let (_stop, mut scion, mut objects) = server(&store, partial_access(), "pat").await;
+    // The missing world: a second repo whose tree has `docs` only, served
+    // to a whole reader, for the same-path comparison below.
+    let docs_only = put(&store, b"a\n");
+    let other_tip = store
+        .write(|c| {
+            let repo = c.create_repo(OTHER)?;
+            c.insert_changeset(repo, &changeset(vec![], "docs/a", Some(regular(docs_only))))
+        })
+        .unwrap();
+    let whole_text = format!("token\tbob\t{}\nread\tbob\t{OTHER}\n", hex("bob"));
+    let (_whole_stop, mut whole_scion, _whole_objects) =
+        server(&store, Access::parse(&whole_text).unwrap(), "bob").await;
 
     // ResolveRef answers as today: the ref's real changeset.
     let seen = scion.resolve_ref(req::resolve_ref()).await.unwrap();
@@ -664,23 +684,25 @@ async fn a_partial_reader_reads_only_its_view() {
     }
     assert_eq!(bytes, b"a\n");
     // A hidden path answers exactly like a missing one: the same code and
-    // the same message bytes, on ReadFile and on ListDir.
+    // the same message bytes for the SAME path, in the world where the
+    // rules hide it (pat's view) and in one where it does not exist (a
+    // second repo whose tree has only docs).
     let hidden = scion
         .read_file(req::read_file(tip.as_bytes(), b"secret/b"))
         .await
         .unwrap_err();
-    let missing = scion
-        .read_file(req::read_file(tip.as_bytes(), b"no/such"))
+    let missing = whole_scion
+        .read_file(req::read_file_at(OTHER, other_tip.as_bytes(), b"secret/b"))
         .await
         .unwrap_err();
     assert_eq!(hidden.code(), missing.code(), "{hidden:?} vs {missing:?}");
     assert_eq!(hidden.message(), missing.message());
     let hidden = scion
-        .list_dir(req::list_dir_at(tip.as_bytes(), b"secret"))
+        .list_dir(req::list_dir_at(REPO, tip.as_bytes(), b"secret"))
         .await
         .unwrap_err();
-    let missing = scion
-        .list_dir(req::list_dir_at(tip.as_bytes(), b"no/such"))
+    let missing = whole_scion
+        .list_dir(req::list_dir_at(OTHER, other_tip.as_bytes(), b"secret"))
         .await
         .unwrap_err();
     assert_eq!(hidden.code(), missing.code(), "{hidden:?} vs {missing:?}");
