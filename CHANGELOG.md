@@ -54,13 +54,12 @@ until that section gets its release date.
   `UNIMPLEMENTED`: the ref and the ticket come from the server, so a tier
   can never mint a permission.
 - The server signs with an Ed25519 key from `--ticket-key FILE` (make one
-  with `scion-server ticket-key --out FILE`; rotation with
-  `--ticket-key-old`). Only the seed is a secret: the server refuses a
-  seed file that anyone but its owner can read, and a public-key file
-  (`ticket-key.pub`, for the tiers) that group or others can write
-  (`#168`). A
-  `scion-cache` verifies with `--ticket-public-key HEX`, at most 2 keys
-  during a rotation. A
+  with `scion-server ticket-key --out FILE`, which prints the public key,
+  for the tiers, to stdout; rotation with `--ticket-key-old`). Only the
+  seed is a secret: the server refuses a seed file that anyone but its
+  owner can read, and a public-key file (the `--ticket-key-old` argument)
+  that group or others can write (`#168`). A `scion-cache` verifies with
+  `--ticket-public-key HEX`, at most 2 keys during a rotation. A
   `scion-daemon` takes no key: it checks no ticket, and serves what its
   store holds only to the one OS user that owns its private 0600 socket,
   who can read its store files anyway. It forwards the ticket upstream,
@@ -132,8 +131,7 @@ until that section gets its release date.
   one write connection.
 - `scion-server serve` logs the address that it bound, so `--listen
   127.0.0.1:0` shows the port that the OS chose. A refused call or a
-  failed one logs who made it and on which repo
-  (`#148`), with no token
+  failed one logs who made it and on which repo (`#148`), with no token
   or path content in the line.
 
 #### Lands
@@ -341,10 +339,9 @@ until that section gets its release date.
   DIR [REV]` serves one ref as an NFSv3 filesystem from `scn` itself, on a
   free port of 127.0.0.1, so a directory's tree loads when it is first
   listed or looked up in, and a file's blob when it is first read or
-  sized. Until `#172`
-  adds `GetSizes`, a file's size comes from its blob, so a first stat of
-  an unread file fetches the blob. Writes land in
-  a private overlay directory (mode 0700 under the system's temporary
+  sized. Until `#172` adds `GetSizes`, a file's size comes from its
+  blob, so a first stat of an unread file fetches the blob. Writes land
+  in a private overlay directory (mode 0700 under the system's temporary
   directory), and `scn commit --from-mount DIR` commits exactly what the
   overlay holds, with no scan of the tree. `scn unmount DIR` stops the
   mount and removes the overlay. For single-user machines only: the NFS
@@ -389,16 +386,13 @@ until that section gets its release date.
 - `scripts/demo.sh`, a demo that anyone can rerun on a fixed public
   repository, and `scripts/bench-checkout.sh`, a checkout benchmark
   against git. `docs/benchmarks.md` gives the method.
-- `scripts/grpc-conformance.sh`
-  (`#163`): a conformance
-  check that speaks the API with grpcurl, so a client that is not the
-  Rust one is covered by CI.
-- An operations guide, `docs/operations.md`
-  (`#169`): deploy, keys,
+- `scripts/grpc-conformance.sh` (`#163`): a conformance check that
+  speaks the API with grpcurl, so a client that is not the Rust one is
+  covered by CI.
+- An operations guide, `docs/operations.md` (`#169`): deploy, keys,
   backup, upgrade, routines, and what to watch.
-- A container image and a compose example
-  (`#164`): a server and a
-  cache with TLS, and a checkout through the cache.
+- A container image and a compose example (`#164`): a server and a cache
+  with TLS, and a checkout through the cache.
 
 ### Changed
 
