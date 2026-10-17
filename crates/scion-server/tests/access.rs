@@ -1347,8 +1347,15 @@ use proptest::prelude::*;
 /// The file paths of a random tree: unique, nested, names from a small
 /// alphabet. A path with a descendant in the set loses its file role.
 fn file_paths() -> impl proptest::strategy::Strategy<Value = Vec<String>> {
-    proptest::collection::vec(proptest::collection::vec("[ab]{1,3}", 1..3), 2..12).prop_map(
-        |parts| {
+    // Depth 1..4, so nested partial folders are reached; "-" and "." sort
+    // before "/", so names that stress the prefix boundary are tried.
+    proptest::collection::vec(proptest::collection::vec("[ab.-]{1,3}", 1..4), 2..12)
+        .prop_filter("no dot-only part", |parts| {
+            !parts
+                .iter()
+                .any(|names| names.iter().any(|n| n == "." || n == ".."))
+        })
+        .prop_map(|parts| {
             let mut paths: Vec<String> = Vec::new();
             for names in parts {
                 let candidate = names.join("/");
@@ -1364,8 +1371,7 @@ fn file_paths() -> impl proptest::strategy::Strategy<Value = Vec<String>> {
                 .collect();
             keep.sort();
             keep
-        },
-    )
+        })
 }
 
 /// The content of a file: unique per path.
@@ -1435,6 +1441,10 @@ fn shown_children(dir: &str, paths: &[String], rules: &[String]) -> Vec<Vec<u8>>
             }
         }
     }
+    // The tree lists its entries by name bytes; the first-seen order of
+    // the paths is not that order once a name sorts before "/" ("-" vs
+    // "---").
+    direct.sort();
     let mut shown = Vec::new();
     for name in direct {
         let child = if dir.is_empty() {
@@ -1450,14 +1460,7 @@ fn shown_children(dir: &str, paths: &[String], rules: &[String]) -> Vec<Vec<u8>>
             paths.iter().any(|p| {
                 p.strip_prefix(prefix.as_str())
                     .is_some_and(|rest| rest.starts_with(&format!("{name}/")))
-                    && kept(
-                        &if dir.is_empty() {
-                            p.clone()
-                        } else {
-                            format!("{prefix}{p}")
-                        },
-                        rules,
-                    )
+                    && kept(p, rules)
             })
         } else {
             kept(&child, rules)
@@ -1470,218 +1473,232 @@ fn shown_children(dir: &str, paths: &[String], rules: &[String]) -> Vec<Vec<u8>>
     shown
 }
 
-proptest! {
-    #![proptest_config(proptest::test_runner::Config::with_cases(12))]
+/// One random case of the model check: two worlds, one server each. The
+/// two request families read every path and list every directory against
+/// the model and the twin world; splitting them would not shorten it.
+#[allow(clippy::too_many_lines)]
+fn a_partial_reader_case(paths: &[String], rule_seeds: &[u16]) -> Result<(), TestCaseError> {
+    use std::fmt::Write as _;
+    let rule_set = rules(paths, rule_seeds);
+    if paths.is_empty() || rule_set.is_empty() {
+        return Ok(());
+    }
+    let fail = |what: String| Err(TestCaseError::Fail(what.into()));
 
-    /// Through the server: for random trees and rules, a partial
-    /// reader's ReadFile of every file path answers the covered content,
-    /// and a hidden path answers byte for byte the same as the same path
-    /// in a second world with the same rules where it does not exist;
-    /// ListDir of every directory answers exactly the model's names, and
-    /// a hidden directory answers byte for byte the same as an absent
-    /// one.
-    #[test]
-    fn a_partial_reader_answers_like_the_model(
-        paths in file_paths(),
-        rule_seeds in proptest::collection::vec(proptest::num::u16::ANY, 1..5),
-    ) {
-        use std::fmt::Write as _;
-        prop_assume!(!paths.is_empty());
-        let rule_set = rules(&paths, &rule_seeds);
-        prop_assume!(!rule_set.is_empty());
+    // The store: a chain of changesets whose tip tree holds every path,
+    // and each file's blob, as an upload would leave them.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let tip = store
+        .write(|c| {
+            let repo = c.create_repo(REPO)?;
+            let mut head: Option<ChangesetId> = None;
+            for p in paths {
+                let blob = store.blobs().put(&content_of(p)).unwrap();
+                let parents = head.map(|id| vec![id]).unwrap_or_default();
+                head = Some(c.insert_changeset(repo, &changeset(parents, p, Some(regular(blob))))?);
+                c.add_repo_blob(repo, blob)?;
+            }
+            let tip = head.expect("a case holds at least one path");
+            c.cas_ref(repo, "main", None, tip)?;
+            Ok(tip)
+        })
+        .unwrap();
 
-        // The store: one root changeset whose tree holds every path,
-        // and each file's blob, as an upload would leave them.
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        let mut changes = std::collections::BTreeMap::new();
-        for p in &paths {
-            let blob = store.blobs().put(&content_of(p)).unwrap();
-            changes.insert(
-                RepoPath::new(p.clone()).unwrap(),
-                Some(FileState::Regular {
-                    content: blob,
-                    executable: false,
-                }),
-            );
-        }
-        let cs = Changeset {
-            parents: vec![],
-            author: IdentityTime {
-                name: b"Ada".to_vec(),
-                email: b"ada@example.com".to_vec(),
-                unix_secs: 1_700_000_000,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: b"change\n".to_vec(),
-            changes,
+    // The access file: pat reads through the prefixes.
+    let mut text = format!("token\tpat\t{}\n", hex("pat"));
+    for r in &rule_set {
+        let _ = writeln!(text, "read\tpat\t{REPO}\t{r}");
+    }
+    let access = Access::parse(&text).unwrap();
+
+    // The second world: the same rules, but a tree where every hidden
+    // path does not exist. A hidden path of the first world must answer
+    // like its absent twin here, with the same code and message.
+    let kept_paths: Vec<String> = paths
+        .iter()
+        .filter(|p| kept(p, &rule_set))
+        .cloned()
+        .collect();
+    let dir_b = tempfile::tempdir().unwrap();
+    let store_b = Store::open(dir_b.path()).unwrap();
+    let tip_b = store_b
+        .write(|c| {
+            let repo = c.create_repo(REPO)?;
+            let mut head: Option<ChangesetId> = None;
+            for p in &kept_paths {
+                let blob = store_b.blobs().put(&content_of(p)).unwrap();
+                let parents = head.map(|id| vec![id]).unwrap_or_default();
+                head = Some(c.insert_changeset(repo, &changeset(parents, p, Some(regular(blob))))?);
+                c.add_repo_blob(repo, blob)?;
+            }
+            let tip = head.expect("a case keeps at least one path");
+            c.cas_ref(repo, "main", None, tip)?;
+            Ok(tip)
+        })
+        .unwrap();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (_stop, mut scion, _objects) = server(&store, access.clone(), "pat").await;
+        let (_stop_b, mut scion_b, _objects_b) = server(&store_b, access, "pat").await;
+        // What two answers must share to be the same: the code and the
+        // message, not the bytes of the transport.
+        let same = |a: &tonic::Status, b: &tonic::Status| {
+            a.code() == b.code() && a.message() == b.message()
         };
-        let tip = store
-            .write(|c| {
-                let repo = c.create_repo(REPO)?;
-                let tip = c.insert_changeset(repo, &cs)?;
-                c.cas_ref(repo, "main", None, tip)?;
-                for p in &paths {
-                    let blob = store.blobs().put(&content_of(p)).unwrap();
-                    c.add_repo_blob(repo, blob)?;
-                }
-                Ok(tip)
-            })
-            .unwrap();
-
-        // The access file: pat reads through the prefixes.
-        let mut text = format!("token\tpat\t{}\n", hex("pat"));
-        for r in &rule_set {
-            let _ = writeln!(text, "read\tpat\t{REPO}\t{r}");
-        }
-        let access = Access::parse(&text).unwrap();
-
-        // The second world: the same rules, but a tree where every hidden
-        // path does not exist. A hidden path of the first world must
-        // answer exactly like its absent twin here, byte for byte.
-        let kept_paths: Vec<String> = paths
-            .iter()
-            .filter(|p| kept(p, &rule_set))
-            .cloned()
-            .collect();
-        let dir_b = tempfile::tempdir().unwrap();
-        let store_b = Store::open(dir_b.path()).unwrap();
-        let mut kept_changes = std::collections::BTreeMap::new();
-        for p in &kept_paths {
-            let blob = store_b.blobs().put(&content_of(p)).unwrap();
-            kept_changes.insert(
-                RepoPath::new(p.clone()).unwrap(),
-                Some(FileState::Regular {
-                    content: blob,
-                    executable: false,
-                }),
-            );
-        }
-        let cs_b = Changeset {
-            parents: vec![],
-            author: IdentityTime {
-                name: b"Ada".to_vec(),
-                email: b"ada@example.com".to_vec(),
-                unix_secs: 1_700_000_000,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: b"change\n".to_vec(),
-            changes: kept_changes,
+        let read_all = |reply: tonic::Response<
+            tonic::Streaming<scion_proto::v1::ReadFileResponse>,
+        >| async move {
+            let mut bytes = Vec::new();
+            let mut stream = reply.into_inner();
+            while let Some(part) = stream.message().await.unwrap() {
+                bytes.extend_from_slice(&part.data);
+            }
+            bytes
         };
-        let tip_b = store_b
-            .write(|c| {
-                let repo = c.create_repo(REPO)?;
-                let tip = c.insert_changeset(repo, &cs_b)?;
-                c.cas_ref(repo, "main", None, tip)?;
-                for p in &kept_paths {
-                    let blob = store_b.blobs().put(&content_of(p)).unwrap();
-                    c.add_repo_blob(repo, blob)?;
-                }
-                Ok(tip)
-            })
-            .unwrap();
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let (_stop, mut scion, _objects) = server(&store, access.clone(), "pat").await;
-            let (_stop_b, mut scion_b, _objects_b) = server(&store_b, access, "pat").await;
-            let same = |a: &tonic::Status, b: &tonic::Status| {
-                a.code() == b.code() && a.message() == b.message()
-            };
-
-            // ReadFile of every file path: covered content, or byte for
-            // byte the answer of the same path in the world without it.
-            for p in &paths {
-                let at = p.as_bytes();
-                if kept(p, &rule_set) {
-                    let reply = scion
-                        .read_file(req::read_file(tip.as_bytes(), at))
-                        .await
-                        .unwrap()
-                        .into_inner();
-                    let mut bytes = Vec::new();
-                    let mut reply = reply;
-                    while let Some(part) = reply.message().await.unwrap() {
-                        bytes.extend_from_slice(&part.data);
+        // ReadFile of every file path. The two worlds answer together:
+        // a covered path shows its content in both, a hidden path answers
+        // like its absent twin, never with content of its own.
+        for p in paths {
+            let at = p.as_bytes();
+            let (a, b) = (
+                scion.read_file(req::read_file(tip.as_bytes(), at)).await,
+                scion_b
+                    .read_file(req::read_file(tip_b.as_bytes(), at))
+                    .await,
+            );
+            match (a, b) {
+                (Ok(a), Ok(b)) => {
+                    let (bytes, bytes_b) = (read_all(a).await, read_all(b).await);
+                    if bytes != bytes_b {
+                        return fail(format!("the worlds differ for {p}"));
                     }
-                    prop_assert_eq!(bytes, content_of(p), "the content differs from the model");
-                } else {
-                    let hidden = scion
-                        .read_file(req::read_file(tip.as_bytes(), at))
-                        .await
-                        .unwrap_err();
-                    let absent = scion_b
-                        .read_file(req::read_file(tip_b.as_bytes(), at))
-                        .await
-                        .unwrap_err();
-                    prop_assert!(
-                        same(&hidden, &absent),
-                        "the hidden file {p} answers {hidden:?}, the absent one {absent:?}"
-                    );
+                    if !kept(p, &rule_set) {
+                        return fail(format!("the hidden file {p} answered content"));
+                    }
+                    if bytes != content_of(p) {
+                        return fail(format!("the content of {p} differs from the model"));
+                    }
+                }
+                (Err(a), Err(b)) => {
+                    if !same(&a, &b) {
+                        return fail(format!(
+                            "the hidden file {p} answers {a:?}, the absent one {b:?}"
+                        ));
+                    }
+                    if kept(p, &rule_set) {
+                        return fail(format!("the covered file {p} answers {a:?}"));
+                    }
+                }
+                (a, b) => {
+                    return fail(format!("the answers for {p} differ: {a:?} against {b:?}"));
                 }
             }
+        }
 
-            // ListDir of the root and of every directory, kept or not.
-            let mut dirs: Vec<String> = vec![String::new()];
-            for p in &paths {
-                let parts: Vec<&str> = p.split('/').collect();
-                for i in 1..parts.len() {
-                    dirs.push(parts[..i].join("/"));
-                }
+        // ListDir of the root and of every directory, kept or not, again
+        // against the twin world.
+        let mut dirs: Vec<String> = vec![String::new()];
+        for p in paths {
+            let parts: Vec<&str> = p.split('/').collect();
+            for i in 1..parts.len() {
+                dirs.push(parts[..i].join("/"));
             }
-            dirs.sort();
-            dirs.dedup();
-            for d in &dirs {
-                let listing = scion
+        }
+        dirs.sort();
+        dirs.dedup();
+        for d in &dirs {
+            let (a, b) = (
+                scion
                     .list_dir(ListDirRequest {
                         repo: REPO.into(),
                         changeset_id: tip.as_bytes().to_vec(),
                         path: d.as_bytes().to_vec(),
                     })
-                    .await;
-                let expected = shown_children(d, &paths, &rule_set);
-                match listing {
-                    Ok(reply) => {
+                    .await,
+                scion_b
+                    .list_dir(ListDirRequest {
+                        repo: REPO.into(),
+                        changeset_id: tip_b.as_bytes().to_vec(),
+                        path: d.as_bytes().to_vec(),
+                    })
+                    .await,
+            );
+            let expected = shown_children(d, paths, &rule_set);
+            match (a, b) {
+                (Ok(a), Ok(b)) => {
+                    let names = |reply: tonic::Response<
+                        tonic::Streaming<scion_proto::v1::ListDirResponse>,
+                    >| async move {
                         let mut bytes = Vec::new();
                         let mut stream = reply.into_inner();
                         while let Some(part) = stream.message().await.unwrap() {
                             bytes.extend_from_slice(&part.tree);
                         }
                         let (listed, _id) = Tree::decode_with_id(&bytes).unwrap();
-                        let names: Vec<Vec<u8>> = listed
+                        listed
                             .entries
                             .keys()
                             .map(|k| k.as_bytes().to_vec())
-                            .collect();
-                        prop_assert_eq!(names, expected, "the listing differs from the model");
+                            .collect::<Vec<_>>()
+                    };
+                    let (shown_a, shown_b) = (names(a).await, names(b).await);
+                    if shown_a != shown_b {
+                        return fail(format!(
+                            "the worlds list {d:?} differently: {shown_a:?} against {shown_b:?}"
+                        ));
                     }
-                    Err(status) => {
-                        prop_assert!(
-                            expected.is_empty(),
-                            "the directory {d:?} lists nothing but was expected to"
-                        );
-                        let absent = scion_b
-                            .list_dir(ListDirRequest {
-                                repo: REPO.into(),
-                                changeset_id: tip_b.as_bytes().to_vec(),
-                                path: d.as_bytes().to_vec(),
-                            })
-                            .await
-                            .unwrap_err();
-                        prop_assert!(
-                            same(&status, &absent),
-                            "the hidden directory {d} answers {status:?}, the absent one {absent:?}"
-                        );
+                    if kept(d, &rule_set) && shown_a != expected {
+                        return fail(format!(
+                            "the listing of {d:?} differs from the model: {shown_a:?}"
+                        ));
                     }
                 }
+                (Err(a), Err(b)) => {
+                    if !expected.is_empty() {
+                        return fail(format!("the kept directory {d:?} answers {a:?}"));
+                    }
+                    if !same(&a, &b) {
+                        return fail(format!(
+                            "the hidden directory {d} answers {a:?}, the absent one {b:?}"
+                        ));
+                    }
+                }
+                (a, b) => {
+                    return fail(format!("the listings of {d:?} differ: {a:?} against {b:?}"));
+                }
             }
-            Ok::<(), TestCaseError>(())
+        }
+        Ok(())
+    })
+}
+
+/// Through the server: for random trees and rules, a partial reader's
+/// `ReadFile` of every file path answers the covered content, and a
+/// hidden path answers with the same code and message as the same path
+/// in a second world with the same rules where it does not exist;
+/// `ListDir` of every directory answers exactly the model's names, and a
+/// hidden directory answers the same as an absent one. The runner is
+/// built by hand with a fixed case count, so CI's `PROPTEST_CASES` does
+/// not multiply these server-backed cases.
+#[test]
+fn a_partial_reader_answers_like_the_model() {
+    let strategy = (
+        file_paths(),
+        proptest::collection::vec(proptest::num::u16::ANY, 1..5),
+    );
+    let mut runner = proptest::test_runner::TestRunner::new(proptest::test_runner::Config {
+        cases: 12,
+        ..proptest::test_runner::Config::default()
+    });
+    runner
+        .run(&strategy, |(paths, rule_seeds)| {
+            a_partial_reader_case(&paths, &rule_seeds)
         })
         .unwrap();
-    }
 }

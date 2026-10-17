@@ -467,35 +467,42 @@ mod tests {
     /// content. A path that is also a prefix of another path loses its
     /// file role: a real tree holds one entry per name, file or dir.
     fn file_paths() -> impl proptest::strategy::Strategy<Value = Vec<String>> {
-        proptest::collection::vec("[ab]{1,4}", 2..24).prop_map(|parts| {
-            let mut paths: Vec<String> = Vec::new();
-            for (i, name) in parts.iter().enumerate() {
-                let parent = if i == 0 {
-                    String::new()
-                } else {
-                    paths[(name.len() + i) % paths.len()].clone()
-                };
-                let candidate = if parent.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{parent}/{name}")
-                };
-                if !paths.contains(&candidate) {
-                    paths.push(candidate);
+        // "-" and "." sort before "/": a rule "a" must not cover "a-b",
+        // and the boundary bugs that confuse them show here.
+        proptest::collection::vec("[ab.-]{1,4}", 2..24)
+            .prop_filter("no dot-only part", |parts| {
+                !parts.iter().any(|n| n == "." || n == "..")
+            })
+            .prop_map(|parts| {
+                let mut paths: Vec<String> = Vec::new();
+                for (i, name) in parts.iter().enumerate() {
+                    let parent = if i == 0 {
+                        String::new()
+                    } else {
+                        paths[(name.len() + i) % paths.len()].clone()
+                    };
+                    let candidate = if parent.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{parent}/{name}")
+                    };
+                    if !paths.contains(&candidate) {
+                        paths.push(candidate);
+                    }
                 }
-            }
-            // A path with a descendant in the set is a directory, not a
-            // file: drop its file role.
-            let has_descendant = |p: &String| paths.iter().any(|q| q.starts_with(&format!("{p}/")));
-            let keep: Vec<String> = paths
-                .iter()
-                .filter(|p| !has_descendant(p))
-                .cloned()
-                .collect();
-            paths = keep;
-            paths.sort();
-            paths
-        })
+                // A path with a descendant in the set is a directory, not a
+                // file: drop its file role.
+                let has_descendant =
+                    |p: &String| paths.iter().any(|q| q.starts_with(&format!("{p}/")));
+                let keep: Vec<String> = paths
+                    .iter()
+                    .filter(|p| !has_descendant(p))
+                    .cloned()
+                    .collect();
+                paths = keep;
+                paths.sort();
+                paths
+            })
     }
 
     /// The content of a file: unique per path, so every blob ID differs.
@@ -656,6 +663,10 @@ mod tests {
                 }
             }
         }
+        // The tree lists its entries by name bytes; the first-seen order of
+        // the paths is not that order once a name sorts before "/" ("-" vs
+        // "---").
+        direct.sort();
         let mut shown = Vec::new();
         for name in direct {
             let child = if dir.is_empty() {
@@ -806,6 +817,11 @@ mod tests {
             Some(id) => w.store.write(|c| c.get_tree(id)).unwrap(),
             None => Tree::default(),
         };
+        // The names the view shows, straight from the projected tree: the
+        // leak check below compares these against the model's visibility.
+        for name in shown.entries.keys() {
+            w.names.insert(name.as_bytes().to_vec());
+        }
         let model = model_view(dir, paths, rules);
         let shown_names: Vec<Vec<u8>> = shown
             .entries
@@ -828,7 +844,6 @@ mod tests {
                         let Entry::File(f) = entry else {
                             panic!("{child_path} is a file in the view");
                         };
-                        w.names.insert(name.clone().into_bytes());
                         if let FileState::Regular { content: blob, .. } = f.state() {
                             w.blobs.insert(blob.as_bytes().to_vec());
                         }
@@ -843,7 +858,6 @@ mod tests {
                             tree_id_of(&w.dirs[&child_path]),
                             "a fully covered directory shows the real tree"
                         );
-                        w.names.insert(name.clone().into_bytes());
                         w.tree_ids.push(*id);
                     }
                 }
@@ -853,7 +867,6 @@ mod tests {
                     let Entry::Dir(id) = entry else {
                         panic!("{child_path} is a directory in the view");
                     };
-                    w.names.insert(name.clone().into_bytes());
                     w.tree_ids.push(*id);
                     walk(w, Some(*id), &child_path)?;
                 }
