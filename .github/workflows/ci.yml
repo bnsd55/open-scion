@@ -19,6 +19,7 @@ jobs:
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -34,6 +35,7 @@ jobs:
   supply-chain:
     name: cargo-deny
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: taiki-e/install-action@v2
@@ -44,6 +46,7 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -58,6 +61,7 @@ jobs:
   test-macos:
     name: test (macOS)
     runs-on: macos-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -148,6 +152,7 @@ jobs:
   msrv:
     name: check (MSRV)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.88
@@ -160,6 +165,7 @@ jobs:
   grpc-conformance:
     name: conformance (grpcurl)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -177,6 +183,7 @@ jobs:
   docker:
     name: docker demo
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       # The layer cache holds the release build: the first run takes about
@@ -196,6 +203,7 @@ jobs:
   fuzz:
     name: fuzz smoke (60 s)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
