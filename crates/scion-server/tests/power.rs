@@ -358,7 +358,7 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
     let lazyfs = lazyfs_dir().unwrap();
     let seed = seed();
     let mut rng = Rng::new(seed);
-    let rounds = usize::try_from(env("SCION_RACE_ROUNDS", 2)).unwrap();
+    let rounds = usize::try_from(env("SCION_RACE_ROUNDS", 8)).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("race.log");
     let mut total = 0;
@@ -451,7 +451,7 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
     let lazyfs = lazyfs_dir().unwrap();
     let seed = seed();
     let mut rng = Rng::new(seed);
-    let rounds = usize::try_from(env("SCION_CHECKER_ROUNDS", 2)).unwrap();
+    let rounds = usize::try_from(env("SCION_CHECKER_ROUNDS", 4)).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("checker.log");
     for round in 200..200 + rounds {
