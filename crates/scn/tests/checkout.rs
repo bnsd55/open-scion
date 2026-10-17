@@ -1153,10 +1153,10 @@ fn a_schema_6_data_dir_upgrades_and_checks_out() {
             c.execute("UPDATE trees SET body = ?1 WHERE id = ?2", [body, id])
                 .unwrap();
         }
-        // The view roots of #121 did not exist in schema 6: drop the table
-        // that this build's first open made, so the upgrade replays 8 too.
+        // The view memo of #121 did not exist in schema 6: drop the table
+        // that this build's first open made, so the upgrade replays 8 and 9.
         c.execute_batch(
-            "DELETE FROM derived; DROP TABLE IF EXISTS view_roots; PRAGMA user_version = 6;",
+            "DELETE FROM derived; DROP TABLE IF EXISTS view_trees; PRAGMA user_version = 6;",
         )
         .unwrap();
     }
@@ -1166,7 +1166,7 @@ fn a_schema_6_data_dir_upgrades_and_checks_out() {
     let version: u32 = store
         .read(|c| Ok(c.pragma_query_value(None, "user_version", |row| row.get(0))?))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     let trees: i64 = store
         .read(|c| Ok(c.query_row("SELECT count() FROM trees", [], |row| row.get(0))?))
         .unwrap();

@@ -1581,8 +1581,6 @@ limit and its upgrade path. This is the list on `main` today.
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each symlink target whole, so memory caps the target length. | Stream chunks from the file. | |
 | `scn/src/cmd/commit.rs` (`parse_author`) | The author time zone is always UTC, since `std` cannot read the local time zone. | A time zone crate. | |
 | `scn/src/vfs.rs` (`io_err`) | Takes the error by value so `.map_err(io_err)` reads clean. | Take it by reference if the lint allows it one day. | |
-| `scion-server/src/views.rs` | The store caches the view root only, not each derived tree: a cache miss re-walks the whole tree. Ceiling: file-granular rules over a large flat tree pay the walk once per changeset. | One row per (key, tree, context) in `view_roots`, looked up as the walk descends. | [#121](https://github.com/bnsd55/open-scion/issues/121) |
-| `scion-server/src/views.rs` | Rows of old view keys (a changed rule set, a bumped projection version) are never removed. | A sweep like the derived table's, or a delete of a repo's rows when its rule sets change. | [#183](https://github.com/bnsd55/open-scion/issues/183) |
 
 ## 10. Testing
 

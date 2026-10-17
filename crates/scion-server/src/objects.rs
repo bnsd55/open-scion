@@ -381,15 +381,16 @@ impl Objects for ObjectsService {
                 self.access
                     .read_rule_set(&caller, &repo)
                     .unwrap_or_default(),
+                self.access.view_digests(&repo),
             )
         });
         let (tree, repo) = self
             .worker
             .run(move |store| {
                 let tree = match &rule_set {
-                    Some((digest, prefixes)) => {
+                    Some((digest, prefixes, live)) => {
                         let repo_id = store.read(|c| c.repo_id(&repo))?;
-                        views::view_root(&store, repo_id, digest, cs, prefixes, &deadline)?
+                        views::view_root(&store, repo_id, digest, cs, prefixes, live, &deadline)?
                     }
                     None => read::root_tree(&store, &repo, cs)?,
                 };
