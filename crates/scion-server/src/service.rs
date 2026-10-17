@@ -6,7 +6,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use scion_core::{BlobId, ChangesetId, FileState, RepoPath};
+use scion_core::{BlobId, Changeset, ChangesetId, FileState, RepoPath};
 use scion_proto::listen::{self, Limits};
 use scion_proto::tls::ServerTls;
 use scion_proto::v1::scion_server::{Scion, ScionServer};
@@ -44,7 +44,6 @@ use crate::tickets::Keys;
 use crate::{blame, names, read, write};
 
 /// Most changeset bytes in one `Log` reply; the client pages for more.
-const LOG_BUDGET_BYTES: usize = MAX_MESSAGE_BYTES / 2;
 /// Most store operations running at once.
 const MAX_BLOCKING: usize = 256;
 /// Most uploads read at once. Each holds one request message in memory, of up
@@ -292,9 +291,7 @@ impl ScionService {
     }
 
     fn into_server(self) -> ScionServer<Self> {
-        ScionServer::new(self)
-            .max_decoding_message_size(MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_MESSAGE_BYTES)
+        into_server(self)
     }
 
     /// Runs a `MergeBase`, `IsAncestor` or `Log` with a path: at most
@@ -305,23 +302,23 @@ impl ScionService {
         T: Send + 'static,
         F: FnOnce(&Backend, &Deadline) -> Result<T> + Send + 'static,
     {
-        // The query checks it at each read: a request timeout, or a client
-        // that cancels, drops this call but not a job that is running. The
-        // guard ends the deadline when this call ends or is dropped.
-        let _call = deadline.guard();
-        // Taken before the worker permit, and held until the job ends, also
-        // when the client leaves first.
-        let slot = Arc::clone(&self.graph_queries)
-            .acquire_owned()
-            .await
-            .map_err(|_| Status::unavailable("server is shutting down"))?;
-        self.worker
-            .run(move |store| {
-                let _slot = slot;
-                query(&store, &deadline)
-            })
-            .await
+        run_graph_query(&self.worker, &self.graph_queries, deadline, query).await
     }
+}
+
+/// Wraps a service into the gRPC server, with the message limits of the
+/// protocol: a message over them fails the call on whichever side finds it
+/// first (section 2 of protocol-v1).
+///
+/// SHORTCUT: a unary reply's bytes stay in HTTP/2 uncounted until the
+/// client reads them or the connection closes; the encode limit bounds the
+/// encoded bytes of one at the message limit. Upgrade: stream Blame
+/// ([#175](https://github.com/bnsd55/open-scion/issues/175)), the one unary
+/// reply that legitimately grows toward it.
+pub fn into_server<S: Scion + Send + 'static>(service: S) -> ScionServer<S> {
+    ScionServer::new(service)
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES)
 }
 
 /// Runs synchronous store work off the async runtime. Clones share one bound
@@ -468,6 +465,8 @@ type GetChangesetStream = ReceiverStream<Part<GetChangesetResponse>>;
 
 type ListDirStream = ReceiverStream<Part<ListDirResponse>>;
 
+type LogStream = ReceiverStream<Part<LogResponse>>;
+
 /// The share of `READ_BUDGET_BYTES` that a `ReadFile` reply of a `size`-byte
 /// file holds. A file of one part is read in one job, so the reply holds only
 /// that part. A longer file keeps its reader between parts, and reads the
@@ -562,6 +561,199 @@ impl Parts {
 /// the channel only when the channel is empty, so its second slot is always
 /// free for the error that ends a reply early: a store error, or the stall.
 /// A client never takes a short reply for a whole one.
+/// Runs a graph query on `permits`, the way [`ScionService::graph_query`]
+/// does, for a page of a streamed `Log` reply. The query checks the
+/// deadline at each read: a request timeout, or a client that cancels,
+/// drops this call but not a job that is running. The guard ends the
+/// deadline when this call ends or is dropped. The slot is taken before
+/// the worker permit, and held until the job ends, also when the client
+/// leaves first.
+async fn run_graph_query<T, F>(
+    worker: &Worker,
+    permits: &Arc<Semaphore>,
+    deadline: Deadline,
+    query: F,
+) -> Result<T, Status>
+where
+    T: Send + 'static,
+    F: FnOnce(&Store, &Deadline) -> Result<T> + Send + 'static,
+{
+    // The query checks it at each read: a request timeout, or a client
+    // that cancels, drops this call but not a job that is running. The
+    // guard ends the deadline when this call ends or is dropped.
+    let _call = deadline.guard();
+    let slot = Arc::clone(permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| Status::unavailable("server is shutting down"))?;
+    worker
+        .run(move |store| {
+            let _slot = slot;
+            query(&store, &deadline)
+        })
+        .await
+}
+
+/// What a streamed `Log` reply still has to walk: where the last page
+/// stopped, how many entries the call still owes, and the bounds of the
+/// next page.
+struct LogWalk {
+    worker: Worker,
+    repo: String,
+    graph_queries: Arc<Semaphore>,
+    /// The request slot, held until the reply ends.
+    _call: Call,
+    next: Option<ChangesetId>,
+    left: usize,
+    path: Option<RepoPath>,
+    deadline: Deadline,
+    stalled: Option<scion_proto::listen::Stalled>,
+}
+
+/// Splits a fetched page into parts: groups of entries whose encoded bytes
+/// stay within [`CHUNK_BYTES`], one part each. The last part carries where
+/// the walk continues; the walk stops, with the rest of the page unsent, at
+/// the `limit` of the call.
+fn log_page_parts(entries: Vec<(ChangesetId, Changeset)>, walk: &mut LogWalk) -> Vec<LogResponse> {
+    let mut parts = Vec::new();
+    let mut group: Vec<LogEntry> = Vec::new();
+    let mut bytes = 0usize;
+    for (id, changeset) in entries {
+        if walk.left == 0 {
+            // The call owes no more entries: this one starts the next call.
+            walk.next = Some(id);
+            break;
+        }
+        let body = changeset.encode();
+        if !group.is_empty() && bytes + body.len() > CHUNK_BYTES {
+            bytes = 0;
+            parts.push(LogResponse {
+                entries: std::mem::take(&mut group),
+                next_changeset_id: Vec::new(),
+            });
+        }
+        bytes += body.len();
+        walk.left -= 1;
+        group.push(LogEntry {
+            changeset_id: id.as_bytes().to_vec(),
+            changeset: body,
+        });
+    }
+    parts.push(LogResponse {
+        entries: group,
+        next_changeset_id: id_bytes(walk.next),
+    });
+    parts
+}
+
+/// What waiting for the client got the reply's producer.
+enum Taken<'a, T> {
+    /// Two free slots of the reply's channel: the client has taken the
+    /// parts before, so one slot stays free for the error that ends the
+    /// reply early.
+    Slots(tokio::sync::mpsc::PermitIterator<'a, Part<T>>),
+    /// The client has gone with the connection.
+    Gone,
+    /// The client took nothing for `stall`: the parts of the reply stay in
+    /// HTTP/2 until the stream ends or the connection closes, and the
+    /// connection counts them.
+    Stalled,
+}
+
+/// Waits `stall` for two free slots of the reply's channel, as
+/// [`send_parts`] and [`log_parts`] do.
+async fn reserve<'a, T>(
+    tx: &'a mpsc::Sender<Part<T>>,
+    stall: Duration,
+    stalled: Option<&'a scion_proto::listen::Stalled>,
+) -> Taken<'a, T> {
+    match tokio::time::timeout(stall, tx.reserve_many(2)).await {
+        Ok(Ok(slots)) => Taken::Slots(slots),
+        // The client has gone with the connection.
+        Ok(Err(_)) => Taken::Gone,
+        Err(_) => {
+            if let Some(stalled) = stalled {
+                stalled.add(scion_proto::reply::STALLED_REPLY_BYTES);
+            }
+            Taken::Stalled
+        }
+    }
+}
+
+/// Fetches one page of the log: a graph query when `path` is set, because
+/// it may derive the path history of a long history first, a plain read
+/// otherwise.
+async fn log_page(
+    worker: &Worker,
+    graph_queries: &Arc<Semaphore>,
+    repo: String,
+    path: Option<RepoPath>,
+    deadline: Deadline,
+    from: ChangesetId,
+    limit: usize,
+) -> Result<read::LogPage, Status> {
+    if let Some(path) = path {
+        run_graph_query(worker, graph_queries, deadline, move |store, deadline| {
+            read::log_page(store, &repo, from, Some(&path), limit, deadline)
+        })
+        .await
+    } else {
+        worker
+            .run(move |store| read::log_page(&store, &repo, from, None, limit, &deadline))
+            .await
+    }
+}
+
+/// Streams a `Log` reply: sends the parts of the first page, then fetches
+/// the page after it and sends that, until the history ends, the call has
+/// served `limit` entries, or the client stops taking parts. A stall counts
+/// [`STALLED_REPLY_BYTES`] on the connection, as any streamed reply does.
+async fn log_parts(mut walk: LogWalk, page: read::LogPage, tx: mpsc::Sender<Part<LogResponse>>) {
+    let fail = |status: Status| {
+        // Fails only if the client has gone.
+        let _ = tx.try_send(Err(status));
+    };
+    let mut page = page;
+    loop {
+        for part in log_page_parts(std::mem::take(&mut page.entries), &mut walk) {
+            match reserve(&tx, READ_STALL_TIMEOUT, walk.stalled.as_ref()).await {
+                Taken::Slots(mut slots) => {
+                    if let Some(slot) = slots.next() {
+                        slot.send(Ok(part));
+                    }
+                }
+                Taken::Gone => return,
+                Taken::Stalled => {
+                    let detail = format!("the client took no data for {READ_STALL_TIMEOUT:?}");
+                    return fail(Status::deadline_exceeded(detail));
+                }
+            }
+        }
+        if walk.left == 0 || walk.next.is_none() {
+            // Keeps the request slot until the client has taken the last
+            // part; a client that never does is counted.
+            reserve(&tx, READ_STALL_TIMEOUT, walk.stalled.as_ref()).await;
+            return;
+        }
+        let from = walk.next.unwrap();
+        let limit = walk.left.min(read::MAX_SCAN);
+        page = match log_page(
+            &walk.worker,
+            &walk.graph_queries,
+            walk.repo.clone(),
+            walk.path.clone(),
+            walk.deadline.clone(),
+            from,
+            limit,
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(status) => return fail(status),
+        };
+    }
+}
+
 async fn send_parts<T: Send + 'static>(
     mut parts: Parts,
     _share: OwnedSemaphorePermit,
@@ -582,35 +774,23 @@ async fn send_parts<T: Send + 'static>(
         };
         if let Some(data) = part {
             // Both slots free: the client has taken the part before.
-            match tokio::time::timeout(stall, tx.reserve_many(2)).await {
-                Ok(Ok(mut slots)) => {
+            match reserve(&tx, stall, stalled.as_ref()).await {
+                Taken::Slots(mut slots) => {
                     if let Some(slot) = slots.next() {
                         slot.send(Ok(make(data)));
                     }
                 }
-                Ok(Err(_)) => return,
-                Err(_) => {
-                    // The parts of the reply stay in HTTP/2 until the
-                    // connection ends; the connection counts them.
-                    if let Some(stalled) = &stalled {
-                        stalled.add(scion_proto::reply::STALLED_REPLY_BYTES);
-                    }
+                Taken::Gone => return,
+                Taken::Stalled => {
+                    // The client took no part: it is owed the error, so it
+                    // never takes the file for a whole one.
                     let detail = format!("the client took no data for {stall:?}");
                     return fail(Status::deadline_exceeded(detail));
                 }
             }
         } else {
             // Keeps the share until the client has taken the last part.
-            match tokio::time::timeout(stall, tx.reserve_many(2)).await {
-                // Sent, or the client has gone with it.
-                Ok(_) => {}
-                // It stopped reading: what was sent stays in HTTP/2.
-                Err(_) => {
-                    if let Some(stalled) = &stalled {
-                        stalled.add(scion_proto::reply::STALLED_REPLY_BYTES);
-                    }
-                }
-            }
+            reserve(&tx, stall, stalled.as_ref()).await;
             return;
         }
     }
@@ -818,6 +998,8 @@ impl Scion for ScionService {
 
     type ListDirStream = ListDirStream;
 
+    type LogStream = LogStream;
+
     async fn read_file(
         &self,
         request: Request<ReadFileRequest>,
@@ -883,9 +1065,12 @@ impl Scion for ScionService {
             .await
     }
 
-    async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogResponse>, Status> {
+    async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogStream>, Status> {
         let caller = caller(&request)?;
-        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
+        let call = self.quotas.enter(&caller).map_err(Status::from)?;
+        // The handle of the caller's connection, before the request is taken
+        // apart: the reply counts what it leaves in HTTP/2 on it.
+        let stalled = scion_proto::listen::Stalled::of(&request);
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
@@ -893,39 +1078,34 @@ impl Scion for ScionService {
         // `read::MAX_SCAN` also bounds the entries.
         let limit = (req.limit as usize).max(1);
         let path = parse_optional_path(req.path)?;
-        let page = if let Some(path) = path {
-            // It may derive the path history of a long history first, so it
-            // runs as a graph query, with its slot and its deadline.
-            self.graph_query(deadline, move |store, deadline| {
-                read::log_page(store, &req.repo, id, Some(&path), limit, deadline)
-            })
-            .await?
-        } else {
-            self.worker
-                .run(move |store| read::log_page(&store, &req.repo, id, None, limit, &deadline))
-                .await?
+        let page = log_page(
+            &self.worker,
+            &self.graph_queries,
+            req.repo.clone(),
+            path.clone(),
+            deadline.clone(),
+            id,
+            limit,
+        )
+        .await?;
+        // The first page goes out as the first parts; the rest follow,
+        // page by page, until the history or `limit` ends the walk. The
+        // reply's work goes on in the producer, so the request slot lives
+        // until the reply ends.
+        let walk = LogWalk {
+            worker: self.worker.clone(),
+            repo: req.repo.clone(),
+            graph_queries: Arc::clone(&self.graph_queries),
+            _call: call,
+            next: page.next,
+            left: limit,
+            path,
+            deadline,
+            stalled,
         };
-        // Always send the first entry; stop before the reply gets too big.
-        let mut next = page.next;
-        let mut budget = LOG_BUDGET_BYTES;
-        let mut entries = Vec::new();
-        for (id, changeset) in page.entries {
-            let body = changeset.encode();
-            if !entries.is_empty() && body.len() > budget {
-                // Not sent, so the next call starts here.
-                next = Some(id);
-                break;
-            }
-            budget = budget.saturating_sub(body.len());
-            entries.push(LogEntry {
-                changeset_id: id.as_bytes().to_vec(),
-                changeset: body,
-            });
-        }
-        Ok(Response::new(LogResponse {
-            entries,
-            next_changeset_id: id_bytes(next),
-        }))
+        let (tx, rx) = mpsc::channel(2);
+        tokio::spawn(log_parts(walk, page, tx).instrument(tracing::Span::current()));
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn blame(
@@ -1764,7 +1944,17 @@ mod tests {
                         });
                         let reply = service.log(request).await.unwrap().into_inner();
                         let ids: Vec<Vec<u8>> =
-                            reply.entries.into_iter().map(|e| e.changeset_id).collect();
+                            tokio_stream::StreamExt::collect::<Vec<_>>(reply.map(|page| {
+                                page.unwrap()
+                                    .entries
+                                    .into_iter()
+                                    .map(|e| e.changeset_id)
+                                    .collect::<Vec<_>>()
+                            }))
+                            .await
+                            .into_iter()
+                            .flatten()
+                            .collect();
                         ids == [a]
                     } else if i % 3 == 0 {
                         let request = as_default(MergeBaseRequest {

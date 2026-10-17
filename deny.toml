@@ -1,0 +1,37 @@
+# The supply-chain check: advisories (RustSec), licenses, bans, sources.
+
+[advisories]
+version = 2
+# Yanked releases anywhere in the tree are noted, not fatal. An
+# unmaintained direct dependency fails, so it gets acted on; an
+# unmaintained transitive one is only noted, so an upstream flag cannot
+# turn every PR red with no code change to make.
+yanked = "warn"
+unmaintained = "workspace"
+
+[licenses]
+version = 2
+# The license of this project is `MIT OR Apache-2.0` (workspace Cargo.toml).
+# The list below is the license set of the dependency tree as of the first
+# check; a new dependency under a different license is a change to review.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -157,7 +157,7 @@ pub struct LandOutcome {
 /// Per-ref state, guarded by the ref's lock.
 type RefSlot = Arc<Mutex<Option<PathIndex>>>;
 
-/// Serializes lands per ref and keeps each ref's [`PathIndex`].
+/// Serializes lands per ref and keeps each ref's `PathIndex`.
 pub struct Lands {
     /// The most pending lands one principal may hold at once. `None` turns
     /// the check off.

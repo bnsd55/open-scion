@@ -497,8 +497,13 @@ the tree ID when it knows it.
 
 ### 6.9 Log
 
-`rpc Log(LogRequest) returns (LogResponse)`. Walks first parents from
-`changeset_id`, newest first, starting with `changeset_id` itself.
+`rpc Log(LogRequest) returns (stream LogResponse)`. Walks first parents from
+`changeset_id`, newest first, starting with `changeset_id` itself. The reply
+streams its entries in parts: the entries of the reply go out in groups,
+each part's entries within 1 MiB of encoded bytes, in history order. A
+client joins the parts' entries in order into one page; the caps below hold
+over the whole stream, not per part. Only the last part carries
+`next_changeset_id`; the parts before it carry it empty.
 
 - With a `path`, the reply holds only the changesets whose changes include
   the path or a path below it. The test uses each changeset's own list of
@@ -516,9 +521,12 @@ the tree ID when it knows it.
 - `next_changeset_id` is the first changeset that this reply does not cover,
   or empty when the history ends. To continue, a client calls `Log` again
   with `changeset_id` set to it and the same `path`. This server sends no
-  reply with no entries and a `next_changeset_id`. An earlier server did, for
-  a path changed long ago, and v1 allows it. So a client MUST continue until
-  it has enough entries or `next_changeset_id` is empty.
+  last part with no entries and a `next_changeset_id`. An earlier server
+  did, for a path changed long ago, and v1 allows it. So a client MUST
+  continue until it has enough entries or `next_changeset_id` is empty.
+- The reply ends with `DEADLINE_EXCEEDED` when the client takes no part for
+  120 s (the stall limit), as `ReadFile` (section 6.7) does; the entries it
+  holds stay in HTTP/2 until the stream ends or the connection closes.
 
 **Cost.** A `Log` with a path waits in the queue of `MergeBase` and
 `IsAncestor` (section 2). On a server whose database is older than its path
@@ -529,7 +537,7 @@ stops at 600 s; what it derived stays, so the next call goes on from there.
 |---|---|
 | `INVALID_ARGUMENT` | A bad repo name or ID; a bad path. |
 | `NOT_FOUND` | The repo or changeset does not exist. |
-| `DEADLINE_EXCEEDED` | With a `path`: the server ran past 600 s from the start of the call. |
+| `DEADLINE_EXCEEDED` | With a `path`: the server ran past 600 s from the start of the call. After zero or more parts: the client took no part for 120 s. |
 
 ### 6.10 Blame
 
