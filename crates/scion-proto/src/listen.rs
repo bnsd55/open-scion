@@ -28,14 +28,14 @@
 //!   [`MAX_CONNECTION_AGE`], and is closed [`CONNECTION_GRACE`] later, with
 //!   any call still in it. A client then connects again.
 //!
-//! With TLS, the accept of [`tls`] runs the TLS handshake, under
+//! With TLS, the accept of [`tls`](crate::tls) runs the TLS handshake, under
 //! [`HANDSHAKE_TIMEOUT`], before a connection gets its place: a peer that
 //! never starts or never ends the handshake frees no place, because it
 //! A connection takes its place first, and its TLS handshake then runs on
 //! its own, under [`TLS_HANDSHAKE_TIMEOUT`], while it holds that place. So
 //! at most `--max-connections` silent handshakers can exist at once, and
 //! each gives its place up within the timeout, the same bound as a silent
-//! plain peer. [`accept_tls`] then reads the HTTP/2 preface from the
+//! plain peer. `accept_tls` then reads the HTTP/2 preface from the
 //! decrypted connection, so the preface timer covers a peer that stops
 //! right after the handshake too.
 

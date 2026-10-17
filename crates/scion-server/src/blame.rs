@@ -35,13 +35,13 @@ pub const MAX_BLAME_VERSIONS: usize = 100;
 
 /// Most lines one call diffs, counting both sides of each diff. A diff of
 /// many repeated lines can take seconds, so this bounds the time of a call.
-/// A line counts once per 64 bytes ([`diff_cost`]), a rename search counts
+/// A line counts once per 64 bytes (`diff_cost`), a rename search counts
 /// the chunks it reads, the rows it indexes and compares, and the file
 /// sizes it reads ([`similar::Budget`]), and a file read and refused counts
 /// once per 64 bytes, so every byte read counts. The first step of a call
 /// always runs, so a call always makes progress. A rename search uses only
 /// the budget left; where it stops, the next call goes on with it
-/// ([`Blame::next_search`]). So a call reads about 64 MiB in steps that
+/// (`Blame::next_search`). So a call reads about 64 MiB in steps that
 /// fit, plus a few files of at most [`crate::memory::Bytes::cap`] past it:
 /// the first
 /// step can pass it by one file of a rename search, and the step that stops
@@ -61,10 +61,10 @@ pub struct BlameRange {
     /// How many lines.
     pub line_count: u32,
     /// The changeset that last changed these lines. `None` when the call
-    /// stopped first: see [`Blame::next`].
+    /// stopped first: see `Blame::next`.
     pub changeset: Option<ChangesetId>,
     /// The first line, counting from 1, in the file at `changeset`, or at
-    /// [`Blame::next`] when `changeset` is `None`.
+    /// `Blame::next` when `changeset` is `None`.
     pub origin_line: u32,
 }
 
@@ -160,11 +160,11 @@ enum Older {
 /// Blames the file at `path` in `cs`. Diffs at most [`MAX_BLAME_VERSIONS`]
 /// versions and about [`MAX_BLAME_DIFF_LINES`] lines, and reads at most
 /// the call's share of path history nodes: the versions come from the path
-/// history ([`history::newest_change`]), so a call reads one changeset and
+/// history (`history::newest_change`), so a call reads one changeset and
 /// a few node rows per version, however many changesets lie between two
 /// versions. A binary file is blamed line by line too, as
 /// `git blame` does. `from` goes on with a rename search that an earlier
-/// call stopped ([`Blame::next_search`]); its default starts none. A call
+/// call stopped (`Blame::next_search`); its default starts none. A call
 /// that cannot take the nodes' share before it explains a version is
 /// `ResourceExhausted`, retryable; past the first version it stops with a
 /// cursor.
@@ -172,7 +172,7 @@ enum Older {
 /// Every version read takes its bytes from `memory`, and the lines of the
 /// blamed file take [`BYTES_PER_LINE`] each; the takes wait for the budget
 /// to free up, until `until`. A file whose share is more than the whole
-/// budget is refused: see [`memory`].
+/// budget is refused: see [`memory`](crate::memory).
 ///
 /// # Errors
 ///
