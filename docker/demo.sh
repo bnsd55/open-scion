@@ -80,7 +80,17 @@ wait_for server
 wait_for cache
 
 # --- a repo with one commit, then a checkout through the cache ---------
+# A repo's first changeset comes from a git import: the protocol asks for
+# exactly one parent per client-made changeset, and only the import writes
+# a root. The git repo lives in the host's work dir and rides in read-only.
 echo "seeding the demo repo"
+mkdir -p work/seed
+printf "hello from git\n" > work/seed/README.md
+git -C work/seed init -q
+git -C work/seed add -A
+git -C work/seed -c user.name=demo -c user.email=demo@localhost commit -qm "the seed commit"
+docker compose run --rm --entrypoint scion-server server import --repo demo /host-work/seed
+
 docker compose run --rm scn '
     set -eu
     mkdir -p /work/src

@@ -35,6 +35,7 @@ services:
     volumes:
       - server-data:/data
       - demo-certs:/certs:ro
+      - ./work:/host-work:ro
 
   cache:
     image: open-scion-demo
