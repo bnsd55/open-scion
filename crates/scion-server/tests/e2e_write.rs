@@ -96,6 +96,7 @@ async fn uploaded_file_reads_back_through_a_created_changeset() {
             land_stale_secs: 1 << 40,
             tls: None,
         },
+        None,
         async {
             stopped.await.ok();
         },

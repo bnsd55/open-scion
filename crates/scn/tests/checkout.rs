@@ -9,6 +9,8 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Output, Stdio};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -116,6 +118,8 @@ impl Server {
         let runtime = Runtime::new().unwrap();
         let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
+        // The server mints the checkout's ticket, which scn then spends.
+        let tickets = Some(std::sync::Arc::new(scion_server::tickets::Keys::generate()));
         runtime.spawn(service::serve(
             store,
             listener,
@@ -127,6 +131,7 @@ impl Server {
                 land_stale_secs: 1 << 40,
                 tls: None,
             },
+            tickets,
             std::future::pending(),
         ));
         Self {
@@ -568,6 +573,9 @@ struct Liar {
     objects: HashMap<Vec<u8>, Object>,
     /// The blob IDs, in the order of their paths.
     in_path_order: Vec<Vec<u8>>,
+    /// The repo of the last `GetRootTree`, which carries the mode of the
+    /// misbehaviors that the replies fake.
+    repo: Mutex<String>,
 }
 
 impl Liar {
@@ -625,6 +633,7 @@ impl Liar {
             root,
             objects,
             in_path_order,
+            repo: Mutex::new(String::new()),
         }
     }
 }
@@ -681,10 +690,12 @@ impl Objects for Liar {
 
     async fn get_root_tree(
         &self,
-        _: Request<GetRootTreeRequest>,
+        request: Request<GetRootTreeRequest>,
     ) -> Result<Response<GetRootTreeResponse>, Status> {
+        *self.repo.lock().unwrap() = request.into_inner().repo;
         Ok(Response::new(GetRootTreeResponse {
             tree_id: self.root.as_bytes().to_vec(),
+            ticket: Vec::new(),
         }))
     }
 
@@ -694,12 +705,12 @@ impl Objects for Liar {
         &self,
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<Replies>, Status> {
-        let GetObjectsRequest { repo, refs, .. } = request.into_inner();
+        let GetObjectsRequest { refs, .. } = request.into_inner();
         let mut honest: Vec<Object> = refs.iter().map(|r| self.objects[&r.id].clone()).collect();
         let replies: Vec<Result<Object, Status>> = if refs[0].kind == i32::from(ObjectKind::Tree) {
             honest.into_iter().map(Ok).collect()
         } else {
-            match repo.as_str() {
+            match self.repo.lock().unwrap().as_str() {
                 "in-order" => {
                     let asked: Vec<_> = refs.iter().map(|r| r.id.clone()).collect();
                     if asked != self.in_path_order {
@@ -906,4 +917,121 @@ fn a_deep_failed_checkout_is_removed_with_few_open_files() {
     assert!(err.contains("lost the disk"), "{err}");
     assert!(!err.contains("warning"), "{err}");
     assert_untouched(&dest);
+}
+
+/// An `Objects` server whose first ticket has expired: a `GetObjects` that
+/// carries it ends permission-denied, and every ticket minted after works.
+/// It counts its mints, so the test can see the refresh.
+struct Expiring {
+    root: TreeId,
+    objects: HashMap<Vec<u8>, Object>,
+    /// Shared with the test, which reads it while the server runs.
+    mints: std::sync::Arc<AtomicUsize>,
+}
+
+impl Expiring {
+    /// One file `a` of one byte, under the root tree.
+    fn new() -> Self {
+        let blob = Object {
+            kind: ObjectKind::Blob.into(),
+            id: BlobId::of(b"x\n").as_bytes().to_vec(),
+            data: b"x\n".to_vec(),
+        };
+        let tree = Tree {
+            entries: [(
+                PathElem::new("a").unwrap(),
+                Entry::File(FileState::Regular {
+                    content: BlobId::try_from(blob.id.as_slice()).unwrap(),
+                    executable: false,
+                }),
+            )]
+            .into(),
+        };
+        let (data, root) = tree.encode_with_id();
+        let tree = Object {
+            kind: ObjectKind::Tree.into(),
+            id: root.as_bytes().to_vec(),
+            data,
+        };
+        Self {
+            root,
+            objects: [(blob.id.clone(), blob), (tree.id.clone(), tree)]
+                .into_iter()
+                .collect(),
+            mints: std::sync::Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl Objects for Expiring {
+    async fn resolve_ref(
+        &self,
+        _: Request<ResolveRefRequest>,
+    ) -> Result<Response<ResolveRefResponse>, Status> {
+        Err(Status::unimplemented("checkout by ID"))
+    }
+
+    async fn get_root_tree(
+        &self,
+        _: Request<GetRootTreeRequest>,
+    ) -> Result<Response<GetRootTreeResponse>, Status> {
+        let mint = self.mints.fetch_add(1, Ordering::SeqCst) + 1;
+        let ticket = if mint == 1 {
+            b"expired".to_vec()
+        } else {
+            b"fresh".to_vec()
+        };
+        Ok(Response::new(GetRootTreeResponse {
+            tree_id: self.root.as_bytes().to_vec(),
+            ticket,
+        }))
+    }
+
+    type GetObjectsStream = Replies;
+
+    async fn get_objects(
+        &self,
+        request: Request<GetObjectsRequest>,
+    ) -> Result<Response<Replies>, Status> {
+        let GetObjectsRequest { refs, ticket, .. } = request.into_inner();
+        if ticket == b"expired" {
+            return Err(Status::permission_denied("bad ticket: ticket expired"));
+        }
+        assert_eq!(ticket, b"fresh", "the ticket scn was minted last");
+        let replies = refs
+            .iter()
+            .map(|r| Ok(self.objects[&r.id].clone()))
+            .collect();
+        Ok(Response::new(Box::pin(tokio_stream::iter(raw_parts(
+            replies,
+        )))))
+    }
+}
+
+/// A checkout that outlives its first ticket mints a new one, once, and
+/// goes on: the walk fetches again with the fresh ticket.
+#[test]
+fn an_expired_ticket_is_minted_again_once() {
+    let runtime = Runtime::new().unwrap();
+    let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let fake = Expiring::new();
+    let mints = fake.mints.clone();
+    runtime.spawn(
+        tonic::transport::Server::builder()
+            .add_service(ObjectsServer::new(fake))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("dest");
+    let out = scn(
+        &url,
+        "r",
+        &["checkout", ANY_CHANGESET, "--into", text(&dest)],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(fs::read(dest.join("a")).unwrap(), b"x\n");
+    // One mint for the checkout, one for the refresh: no more.
+    assert_eq!(mints.load(Ordering::SeqCst), 2);
 }

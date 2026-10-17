@@ -174,16 +174,32 @@ fn root_tree(repo: &str, changeset_id: &[u8]) -> Call {
     })
 }
 
-fn objects(repo: &str, refs: &[ObjectRef], zstd: bool) -> Call {
+fn objects(refs: &[ObjectRef], zstd: bool, ticket: &[u8]) -> Call {
     Call::GetObjects(GetObjectsRequest {
-        repo: repo.into(),
         refs: refs.to_vec(),
         accept: if zstd {
             vec![Encoding::Zstd.into()]
         } else {
             vec![]
         },
+        ticket: ticket.to_vec(),
     })
+}
+
+/// Mints a ticket for the root tree of `changeset` of [`REPO`] on the
+/// server: the read permission that the `GetObjects` calls below spend.
+async fn mint(tiers: &Tiers, changeset: ChangesetId) -> Vec<u8> {
+    let mut client = connect(&tiers.server).await;
+    let reply = client
+        .get_root_tree(GetRootTreeRequest {
+            repo: REPO.into(),
+            changeset_id: changeset.as_bytes().to_vec(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!reply.ticket.is_empty(), "the server minted no ticket");
+    reply.ticket
 }
 
 /// The ID of a successful `ResolveRef` or `GetRootTree` answer.
@@ -198,24 +214,42 @@ fn id_of(answer: &Answer) -> Vec<u8> {
 /// All of it comes from the server: the tier answers for `ResolveRef` and
 /// `GetRootTree` are compared in one place,
 /// `every_tier_resolves_as_the_server_does`.
-async fn snapshot(tiers: &Tiers, changeset: ChangesetId) -> (Vec<TreeId>, Vec<BlobId>) {
+/// The trees and blobs of the snapshot of `changeset`, its root tree
+/// first, each with its path from the root. All of it comes from the
+/// server: the tier answers for `ResolveRef` and `GetRootTree` are
+/// compared in one place, `every_tier_resolves_as_the_server_does`.
+async fn snapshot(
+    tiers: &Tiers,
+    changeset: ChangesetId,
+) -> (Vec<(TreeId, Vec<u8>)>, Vec<(BlobId, Vec<u8>)>) {
+    let ticket = mint(tiers, changeset).await;
     let root = ask(&tiers.server, &root_tree(REPO, changeset.as_bytes())).await;
     let root = TreeId::try_from(id_of(&root).as_slice()).unwrap();
     let mut client = connect(&tiers.server).await;
-    let (mut trees, mut blobs) = (vec![root], Vec::new());
+    let (mut trees, mut blobs) = (vec![(root, Vec::new())], Vec::new());
     let mut next = 0;
     while next < trees.len() {
+        let (id, path) = trees[next].clone();
         let request = GetObjectsRequest {
-            repo: REPO.into(),
-            refs: vec![tree_ref(trees[next])],
+            refs: vec![tree_ref(id, &path)],
             accept: vec![],
+            ticket: ticket.clone(),
         };
         let (got, data) = get_objects(&mut client, &request).await;
         assert_eq!(got.end, None);
-        for entry in Tree::decode(&data[0]).unwrap().entries.into_values() {
+        for (name, entry) in Tree::decode(&data[0]).unwrap().entries {
+            let mut below = path.clone();
+            if !below.is_empty() {
+                below.push(b'/');
+            }
+            below.extend_from_slice(name.as_bytes());
             match entry {
-                Entry::Dir(id) => trees.push(id),
-                Entry::File(state) => blobs.extend(state.blob()),
+                Entry::Dir(id) => trees.push((id, below)),
+                Entry::File(state) => {
+                    if let Some(blob) = state.blob() {
+                        blobs.push((blob, below));
+                    }
+                }
             }
         }
         next += 1;
@@ -264,52 +298,32 @@ fn shape(answer: &Answer) -> (usize, Option<End>) {
 }
 
 #[test]
-fn every_tier_resolves_as_the_server_does() {
+fn every_tier_refuses_to_resolve() {
     let (tiers, first) = fixture();
     let first_id = first.as_bytes().to_vec();
     tiers.runtime.block_on(async {
-        // A ref is the only answer that changes, so a tier never keeps it.
-        assert_eq!(id_of(&same(&tiers, &resolve(REPO, "main")).await), first_id);
-        for (repo, name, code) in [
-            (REPO, "no-such-ref", Code::NotFound),
-            ("gone", "main", Code::NotFound),
-            ("", "main", Code::InvalidArgument),
-            ("bad\u{1}", "main", Code::InvalidArgument),
-            (REPO, "", Code::InvalidArgument),
-        ] {
-            let answer = same(&tiers, &resolve(repo, name)).await;
-            assert_eq!(answer, Answer::Id(Err(code)), "{repo:?} {name:?}");
-        }
-        let new = FileState::Regular {
-            content: tiers.store.blobs().put(b"hello, again\n").unwrap(),
-            executable: false,
-        };
-        let second = changeset(Some(first), &[("README.md", new)]);
-        let second = land(&tiers.store, &second);
-        let answer = same(&tiers, &resolve(REPO, "main")).await;
-        let moved = id_of(&answer) == second.as_bytes();
-        assert!(moved, "every tier follows the ref");
-
-        // A root tree is kept by repo and changeset: `other` never sees
-        // `first`, before or after `r` asked for it.
-        let not_found = Answer::Id(Err(Code::NotFound));
+        // The server is the only resolver: scn gets a ref and the ticket of
+        // its root tree there, and brings the ticket to a tier. A tier that
+        // answered ResolveRef or GetRootTree would be a way to get a ticket
+        // for any repo.
         assert_eq!(
-            same(&tiers, &root_tree("other", &first_id)).await,
-            not_found
+            ask(&tiers.server, &resolve(REPO, "main")).await,
+            Answer::Id(Ok(first_id.clone()))
         );
-        id_of(&same(&tiers, &root_tree(REPO, &first_id)).await);
-        assert_eq!(
-            same(&tiers, &root_tree("other", &first_id)).await,
-            not_found
-        );
-        for (repo, id, code) in [
-            (REPO, vec![0; 32], Code::NotFound),
-            ("gone", first_id.clone(), Code::NotFound),
-            (REPO, vec![0; 31], Code::InvalidArgument),
-            ("", first_id.clone(), Code::InvalidArgument),
+        for call in [
+            resolve(REPO, "main"),
+            resolve(REPO, "no-such-ref"),
+            root_tree(REPO, &first_id),
+            root_tree(REPO, &[0; 32]),
         ] {
-            let answer = same(&tiers, &root_tree(repo, &id)).await;
-            assert_eq!(answer, Answer::Id(Err(code)), "{repo:?} {id:?}");
+            for (name, url) in [("daemon", &tiers.socket), ("cache", &tiers.cache_url)] {
+                let answer = ask(url, &call).await;
+                assert_eq!(
+                    answer,
+                    Answer::Id(Err(Code::Unimplemented)),
+                    "{name}: {call:?}"
+                );
+            }
         }
     });
 }
@@ -317,27 +331,32 @@ fn every_tier_resolves_as_the_server_does() {
 #[test]
 fn every_tier_sends_the_objects_of_the_server() {
     let (tiers, first) = fixture();
-    let missing = blob_ref(BlobId::of(b"in no repo\n"));
     tiers.runtime.block_on(async {
         // Every object of the snapshot, a tree level at a time as a checkout
-        // asks, then every blob in one call, with a ref that repeats.
+        // asks, then every blob in one call, with a ref that repeats. All of
+        // it rides one ticket, as a checkout's calls do.
         let (trees, blobs) = snapshot(&tiers, first).await;
         assert_eq!((trees.len(), blobs.len()), (4, 8));
+        let ticket = mint(&tiers, first).await;
         for zstd in [false, true] {
-            for &tree in &trees {
-                let answer = same(&tiers, &objects(REPO, &[tree_ref(tree)], zstd)).await;
+            for (tree, path) in &trees {
+                let answer = same(&tiers, &objects(&[tree_ref(*tree, path)], zstd, &ticket)).await;
                 assert_eq!(shape(&answer), (1, None));
             }
-            let mut refs: Vec<ObjectRef> = blobs.iter().copied().map(blob_ref).collect();
+            let mut refs: Vec<ObjectRef> =
+                blobs.iter().map(|(id, path)| blob_ref(*id, path)).collect();
             refs.push(refs[0].clone());
-            let answer = same(&tiers, &objects(REPO, &refs, zstd)).await;
+            let answer = same(&tiers, &objects(&refs, zstd, &ticket)).await;
             assert_eq!(shape(&answer), (refs.len(), None));
         }
 
         // A missing object ends the stream after the objects before it. A
-        // tree asked for as a blob is missing too.
-        let [a, b] = [blobs[0], blobs[1]].map(blob_ref);
-        let tree_as_blob = blob_ref(BlobId::from_bytes(*trees[0].as_bytes()));
+        // tree asked for as a blob is missing too: the walk reaches the path
+        // and finds a directory, not a file.
+        let at = |(id, path): &(BlobId, Vec<u8>)| blob_ref(*id, path);
+        let [a, b] = [at(&blobs[0]), at(&blobs[1])];
+        let missing = blob_ref(BlobId::of(b"in no repo\n"), b"README.md");
+        let tree_as_blob = blob_ref(BlobId::from_bytes(*trees[0].0.as_bytes()), &trees[0].1);
         let not_found = Some(End::Stream(Code::NotFound));
         for (refs, sent) in [
             (vec![a.clone(), missing.clone(), b.clone()], 1),
@@ -345,36 +364,54 @@ fn every_tier_sends_the_objects_of_the_server() {
             (vec![a.clone(), tree_as_blob], 1),
         ] {
             for zstd in [false, true] {
-                let answer = same(&tiers, &objects(REPO, &refs, zstd)).await;
+                let answer = same(&tiers, &objects(&refs, zstd, &ticket)).await;
                 assert_eq!(shape(&answer), (sent, not_found), "{refs:?}");
             }
         }
 
         // Every tier refuses what the server refuses, before it sends
-        // anything.
+        // anything. The repo of a read is the ticket's, so no call names
+        // one; a call whose shape is bad is refused all the same.
         let short = ObjectRef {
             id: vec![1; 31],
             ..a.clone()
         };
         let kind = |kind: i32| ObjectRef { kind, ..a.clone() };
-        for (repo, refs) in [
-            (REPO, vec![]),
-            (REPO, vec![a.clone(); MAX_OBJECT_REFS + 1]),
-            (REPO, vec![a.clone(), short]),
-            (REPO, vec![a.clone(), kind(ObjectKind::Unspecified.into())]),
-            (REPO, vec![a.clone(), kind(7)]),
-            ("", vec![a.clone()]),
-            ("bad\u{1}", vec![a.clone()]),
+        for refs in [
+            vec![],
+            vec![a.clone(); MAX_OBJECT_REFS + 1],
+            vec![a.clone(), short],
+            vec![a.clone(), kind(ObjectKind::Unspecified.into())],
+            vec![a.clone(), kind(7)],
         ] {
-            let answer = same(&tiers, &objects(repo, &refs, true)).await;
+            let answer = same(&tiers, &objects(&refs, true, &ticket)).await;
             let refused = Some(End::Call(Code::InvalidArgument));
-            assert_eq!(shape(&answer), (0, refused), "{repo:?} {refs:?}");
+            assert_eq!(shape(&answer), (0, refused), "{refs:?}");
         }
-        // A repo that nobody has, and an object that no tier holds: the call
-        // fails at each tier. (A tier sends an object that it holds for any
-        // valid repo name, #13.)
-        let answer = same(&tiers, &objects("gone", &[missing], true)).await;
-        assert_eq!(shape(&answer), (0, Some(End::Call(Code::NotFound))));
+        // A ticket that the tiers cannot read ends the call before the
+        // first object. A ref outside the ticket's tree ends the stream
+        // before the first object, with the same not-found as a missing
+        // object.
+        for (refs, ticket, end) in [
+            (
+                vec![a.clone()],
+                Vec::new(),
+                End::Call(Code::PermissionDenied),
+            ),
+            (
+                vec![a.clone()],
+                vec![9; 10],
+                End::Call(Code::PermissionDenied),
+            ),
+            (
+                vec![blob_ref(BlobId::of(b"in no repo\n"), b"nowhere")],
+                ticket.clone(),
+                End::Stream(Code::NotFound),
+            ),
+        ] {
+            let answer = same(&tiers, &objects(&refs, true, &ticket)).await;
+            assert_eq!(shape(&answer), (0, Some(end)), "{refs:?}");
+        }
     });
 }
 
@@ -383,24 +420,30 @@ fn a_damaged_copy_on_the_daemon_is_fetched_again() {
     let (tiers, first) = fixture();
     tiers.runtime.block_on(async {
         let (trees, blobs) = snapshot(&tiers, first).await;
+        let ticket = mint(&tiers, first).await;
         let refs: Vec<ObjectRef> = trees
             .iter()
-            .copied()
-            .map(tree_ref)
-            .chain(blobs.iter().copied().map(blob_ref))
+            .map(|(id, path)| tree_ref(*id, path))
+            .chain(blobs.iter().map(|(id, path)| blob_ref(*id, path)))
             .collect();
-        let all = ask(&tiers.server, &objects(REPO, &refs, true)).await;
+        let all = ask(&tiers.server, &objects(&refs, true, &ticket)).await;
         // Now the daemon holds every object.
-        assert_eq!(ask(&tiers.socket, &objects(REPO, &refs, true)).await, all);
+        assert_eq!(
+            ask(&tiers.socket, &objects(&refs, true, &ticket)).await,
+            all
+        );
         let calls = tiers.upstream_calls();
 
         // One byte of the daemon's copy of the root tree and of the large
         // blob changes.
-        let [on_server, on_node] = tiers.blob_paths(blobs[1]);
+        let [on_server, on_node] = tiers.blob_paths(blobs[1].0);
         damage(&on_node);
-        damage(&tiers.daemon_tree_path(trees[0]));
+        damage(&tiers.daemon_tree_path(trees[0].0));
         for zstd in [true, false] {
-            assert_eq!(ask(&tiers.socket, &objects(REPO, &refs, zstd)).await, all);
+            assert_eq!(
+                ask(&tiers.socket, &objects(&refs, zstd, &ticket)).await,
+                all
+            );
         }
         // The daemon fetched both again, and keeps the server's file again.
         assert!(tiers.upstream_calls().0 > calls.0);
@@ -414,16 +457,20 @@ fn a_damaged_blob_on_the_server_never_passes_a_tier() {
     let (tiers, first) = fixture();
     tiers.runtime.block_on(async {
         let (_, blobs) = snapshot(&tiers, first).await;
+        let ticket = mint(&tiers, first).await;
         // README.md, big.bin and the target of link, by name.
-        let refs = [blobs[0], blobs[1], blobs[3]].map(blob_ref);
-        let big = blobs[1];
+        let refs: Vec<ObjectRef> = [blobs[0].clone(), blobs[1].clone(), blobs[3].clone()]
+            .iter()
+            .map(|(id, path)| blob_ref(*id, path))
+            .collect();
+        let big = blobs[1].0;
 
         // One byte of the large blob's zstd file changes. Its frame header
         // still reads, so the server sends it, in its stored form.
         let path = &tiers.blob_paths(big)[0];
         let good = damage(path);
         for zstd in [false, true] {
-            let call = objects(REPO, &refs, zstd);
+            let call = objects(&refs, zstd, &ticket);
             // The server unpacks the blob for a RAW client and finds the
             // damage. It does not check what it sends ZSTD: the client does.
             let server = if zstd {
@@ -445,7 +492,7 @@ fn a_damaged_blob_on_the_server_never_passes_a_tier() {
         // every tier asks for it again and sends it.
         assert!(!tiers.blob_paths(big)[1].exists());
         fs::write(path, &good).unwrap();
-        let answer = same(&tiers, &objects(REPO, &refs, true)).await;
+        let answer = same(&tiers, &objects(&refs, true, &ticket)).await;
         assert_eq!(shape(&answer), (3, None));
     });
 }

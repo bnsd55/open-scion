@@ -133,6 +133,7 @@ async fn serve_tls(certs: &TestCerts) -> String {
             land_stale_secs: 1 << 40,
             tls: Some(tls),
         },
+        None,
         std::future::pending(),
     ));
     format!("https://{addr}")

@@ -37,6 +37,7 @@ use crate::meta::MetaTx as _;
 use crate::objects::ObjectsService;
 use crate::quotas::{Call, Quotas};
 use crate::store::{MAX_OBJECT_BYTES, READER_BYTES, Store};
+use crate::tickets::Keys;
 use crate::{blame, names, read, write};
 
 /// Most changeset bytes in one `Log` reply; the client pages for more.
@@ -144,6 +145,7 @@ pub async fn serve(
     listener: TcpListener,
     access: impl Into<Access>,
     options: ServeOptions,
+    tickets: Option<Arc<Keys>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
     let ServeOptions {
@@ -179,12 +181,12 @@ pub async fn serve(
     ));
     let scion = InterceptedService::new(
         ScionService::new(worker.clone(), Arc::clone(&access), lands, quotas.clone()).into_server(),
-        auth.clone(),
-    );
-    let objects = InterceptedService::new(
-        ObjectsService::new(worker, access, quotas).into_server(),
         auth,
     );
+    // No token interceptor on `objects`: `GetObjects` authenticates by
+    // ticket alone, and the service's other calls check the token
+    // themselves. So a tier needs no token of the server to fetch objects.
+    let objects = ObjectsService::new(worker, access, quotas, tickets).into_server();
     // The health service answers `grpc.health.v1.Check` and `Watch` on the
     // same port, without a token: a probe carries none. The store opens
     // before this call, so the server starts serving.

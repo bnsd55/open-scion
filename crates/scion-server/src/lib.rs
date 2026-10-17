@@ -38,6 +38,7 @@ pub mod read;
 pub mod service;
 pub mod similar;
 pub mod store;
+pub mod tickets;
 pub mod tree;
 pub mod write;
 
