@@ -76,6 +76,7 @@ pub trait Kind {
         id: ChangesetId,
         changeset: &Changeset,
         parents: Vec<Self::Value>,
+        lens: crate::tree::BlobLens<'_>,
     ) -> Result<Self::Value>;
 
     /// The stored bytes of a value.
@@ -211,13 +212,18 @@ pub fn backfill<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Resu
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`].
-pub fn derive<K: Kind>(c: &mut dyn MetaTx, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
+pub fn derive<K: Kind>(
+    c: &mut dyn MetaTx,
+    repo: RepoId,
+    cs: ChangesetId,
+    lens: crate::tree::BlobLens<'_>,
+) -> Result<K::Value> {
     let mut walk = match Walk::start::<K>(c, repo, cs)? {
         ControlFlow::Break(value) => return Ok(value),
         ControlFlow::Continue(walk) => walk,
     };
     walk.step::<K>(c, usize::MAX)?;
-    derive_chain::<K>(c, repo, &walk.into_pending())?
+    derive_chain::<K>(c, repo, &walk.into_pending(), lens)?
         .ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
 }
 
@@ -241,11 +247,16 @@ pub fn put<K: Kind>(c: &mut dyn MetaTx, cs: ChangesetId, value: &K::Value) -> Re
 /// # Errors
 ///
 /// Errors of [`Kind::derive`].
-pub fn on_write<K: Kind>(c: &mut dyn MetaTx, id: ChangesetId, changeset: &Changeset) -> Result<()> {
+pub fn on_write<K: Kind>(
+    c: &mut dyn MetaTx,
+    id: ChangesetId,
+    changeset: &Changeset,
+    lens: crate::tree::BlobLens<'_>,
+) -> Result<()> {
     if load::<K>(c, id)?.is_none()
         && let Some(parents) = parent_values::<K>(c, changeset)?
     {
-        let value = K::derive(c, id, changeset, parents)?;
+        let value = K::derive(c, id, changeset, parents, lens)?;
         put::<K>(c, id, &value)?;
     }
     remove_old::<K>(c)?;
@@ -360,7 +371,7 @@ fn derive_steps<K: Kind>(
     for step in pending.chunks(STEP) {
         check()?;
         value = store.commit(|c| {
-            let value = derive_chain::<K>(c, repo, step)?;
+            let value = derive_chain::<K>(c, repo, step, &mut crate::tree::lens_of(store))?;
             remove_old::<K>(c)?;
             Ok(value)
         })?;
@@ -377,6 +388,7 @@ fn derive_chain<K: Kind>(
     c: &mut dyn MetaTx,
     repo: RepoId,
     ids: &[ChangesetId],
+    lens: crate::tree::BlobLens<'_>,
 ) -> Result<Option<K::Value>> {
     let mut value = None;
     for &id in ids {
@@ -392,7 +404,7 @@ fn derive_chain<K: Kind>(
                 K::VERSION
             ))
         })?;
-        let next = K::derive(c, id, &changeset, parents)?;
+        let next = K::derive(c, id, &changeset, parents, lens)?;
         put::<K>(c, id, &next)?;
         value = Some(next);
     }
@@ -500,6 +512,7 @@ mod tests {
             id: ChangesetId,
             cs: &Changeset,
             parents: Vec<u64>,
+            _lens: crate::tree::BlobLens<'_>,
         ) -> Result<u64> {
             if FAIL_AT.get() == Some(id) {
                 return Err(Error::Corrupt(format!("injected failure at {id}")));
@@ -541,6 +554,7 @@ mod tests {
             id: ChangesetId,
             cs: &Changeset,
             parents: Vec<Vec<ChangesetId>>,
+            _lens: crate::tree::BlobLens<'_>,
         ) -> Result<Vec<ChangesetId>> {
             DERIVES.set(DERIVES.get() + 1);
             assert_eq!(parents.len(), cs.parents.len(), "a value for each parent");
@@ -601,8 +615,10 @@ mod tests {
     /// stores root trees and the commit graph, and nothing else. Returns the
     /// IDs, oldest first.
     fn store_chain(c: &mut dyn MetaTx, history: &[Edits]) -> Result<(RepoId, Vec<ChangesetId>)> {
+        // The tests store no blob files, so a test lens answers 0 for
+        // everything: the trees it builds are only compared to themselves.
         chain_with(c, history, |c, repo, cs| {
-            Ok(tree::store_changeset(c, repo, cs)?.0)
+            Ok(tree::store_changeset(c, repo, cs, &mut tree::lens_none())?.0)
         })
     }
 
@@ -702,7 +718,7 @@ mod tests {
             Err(Error::NotFound(_))
         ));
         assert!(matches!(
-            store.commit(|c| derive::<ChangedPathsV1>(c, other, tip)),
+            store.commit(|c| derive::<ChangedPathsV1>(c, other, tip, &mut tree::lens_none())),
             Err(Error::NotFound(_))
         ));
     }
@@ -724,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn a_version_2_database_upgrades_and_keeps_its_derived_rows() {
+    fn a_version_2_database_upgrades_and_rederives_its_root_trees() {
         let dir = tempfile::tempdir().unwrap();
         let (repo, ids, before) = {
             let c = Connection::open(dir.path().join("scion.db")).unwrap();
@@ -733,15 +749,13 @@ mod tests {
             let mut tx = SqliteTx(&c);
             let (repo, ids) = chain_with(&mut tx, &HISTORY, |c, repo, cs| {
                 let id = c.insert_changeset(repo, cs)?;
-                tree::derive_root_tree(c, repo, id)?;
+                tree::derive_root_tree(c, repo, id, &mut tree::lens_none())?;
                 Ok(id)
             })
             .unwrap();
             (repo, ids, rows(&c))
         };
         // The rows that version 2 holds: a root tree for each changeset.
-        // Their kind and version must stay, or every root tree is derived
-        // again.
         assert_eq!(before.len(), 3);
         assert!(
             before
@@ -758,23 +772,30 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+        // Migration 7 drops the old root trees: they predate the entry
+        // lengths, so they are re-derived from the blob store.
         assert_eq!(
             store.read(|c| Ok(rows(c.sqlite().unwrap()))).unwrap(),
-            before
+            vec![]
         );
-        // Each root tree is read from its copied row.
+        // The blobs the chain names, by the chain's own convention.
+        for path in ["a", "b", "c", "d"] {
+            store.blobs().put(path.as_bytes()).unwrap();
+        }
+        let mut after = Vec::new();
         for &cs in &ids {
             let tree = tree::root_tree(&store, repo, cs).unwrap();
-            let row = (
+            after.push((
                 RootTree::NAME.to_owned(),
                 RootTree::VERSION,
                 cs.as_bytes().to_vec(),
                 tree.as_bytes().to_vec(),
-            );
-            assert!(before.contains(&row), "{cs}");
+            ));
         }
-        // The table now holds a value that is not 32 bytes.
-        assert_eq!(get::<ChangedPathsV1>(&store, repo, ids[2]).unwrap(), 5);
+        let mut got = store.read(|c| Ok(rows(c.sqlite().unwrap()))).unwrap();
+        got.sort();
+        after.sort();
+        assert_eq!(got, after);
     }
 
     /// How many root tree rows the store holds.
@@ -953,12 +974,14 @@ mod tests {
             .unwrap();
         assert_eq!(added, 7);
 
+        // The chain puts "a"; its blob file makes the real lens work.
+        store.blobs().put(b"a").unwrap();
         let cs = Changeset {
             parents: vec![ids[6]],
             ..store.read(|c| c.get_changeset(repo, ids[0])).unwrap()
         };
         store
-            .write(|c| tree::store_changeset(c, repo, &cs))
+            .write(|c| tree::store_changeset(c, repo, &cs, &mut tree::lens_of(&store)))
             .unwrap();
         // The new row of version 1, and seven rows of version 0 less one
         // step.
@@ -1059,7 +1082,7 @@ mod tests {
             store
                 .write(|c| {
                     let cs_row = c.get_changeset(repo, cs)?;
-                    on_write::<Ancestry>(c, cs, &cs_row)
+                    on_write::<Ancestry>(c, cs, &cs_row, &mut crate::tree::lens_of(&store))
                 })
                 .unwrap();
         };

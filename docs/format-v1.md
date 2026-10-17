@@ -50,11 +50,17 @@ parents is a root.
 ```
 TreeV1 = u8(1) || u32be(n_entries) || EntryV1*                strictly increasing name bytes
 EntryV1 = bytes(name) || u8(tag) || payload
-  tag 1 regular   BlobId || u8(executable 0 | 1)
-  tag 2 symlink   BlobId
+  tag 1 regular   BlobId || u8(executable 0 | 1) || u64be(len)
+  tag 2 symlink   BlobId || u64be(len)
   tag 3 gitlink   GitOid
   tag 4 dir       TreeId
 ```
+
+`len` is the byte length of the blob the entry names: the file's size for a
+regular entry, the link target's length for a symlink. A gitlink names no
+blob and carries no length; a directory's size is filesystem convention, so
+its entry carries none. The tree ID covers `len`, so `len` cannot change
+without changing the ID.
 
 `TreeV1` is the public tree format that clients fetch. Which tree belongs to
 which changeset is private derived data.
@@ -87,3 +93,9 @@ The format checks syntax only. Whether a changeset applies to its parent tree
 is checked when the change is applied. For example: a put at `a` and a put at
 `a/b` in one changeset, a delete of a path that does not exist, or a delete in
 a root.
+
+A tree's `len` is checked where the blob is at hand. The builders of trees
+(`CreateChangeset`, `land`, the git import) take it from the blob they just
+stored, so a stored tree cannot disagree with its blobs. A reader that
+fetches a blob checks the streamed length against the `len` its tree claimed
+and rejects a mismatch.

@@ -246,8 +246,8 @@ async fn snapshot(
             below.extend_from_slice(name.as_bytes());
             match entry {
                 Entry::Dir(id) => trees.push((id, below)),
-                Entry::File(state) => {
-                    if let Some(blob) = state.blob() {
+                Entry::File(file) => {
+                    if let Some(blob) = file.state().blob() {
                         blobs.push((blob, below));
                     }
                 }
@@ -284,7 +284,7 @@ fn fixture() -> (Tiers, ChangesetId) {
     store
         .write(|c| {
             let repo = c.create_repo("other")?;
-            tree::store_changeset(c, repo, &other)
+            tree::store_changeset(c, repo, &other, &mut tree::lens_of(&store))
         })
         .unwrap();
     (Tiers::start(data, store), first)

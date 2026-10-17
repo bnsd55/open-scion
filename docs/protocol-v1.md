@@ -440,9 +440,14 @@ implementation.
 
 ### 6.6 GetChangeset
 
-`rpc GetChangeset(GetChangesetRequest) returns (GetChangesetResponse)`.
-Returns the `ChangesetV1` bytes of a changeset that the repo has.
-`NOT_FOUND` if the repo or the changeset does not exist for that repo.
+`rpc GetChangeset(GetChangesetRequest) returns (stream GetChangesetResponse)`.
+Streams the `ChangesetV1` bytes of a changeset that the repo has, in parts
+that follow the rules of `ReadFile` (section 6.7), with two differences: the
+parts together are the changeset's bytes, not a file's content, and there is
+no per-message check against a stored blob. A client MUST take the changeset
+as whole only when the reply ends with `OK`, and it checks the bytes against
+the changeset ID it asked for. `NOT_FOUND` if the repo or the changeset does
+not exist for that repo.
 
 ### 6.7 ReadFile
 
@@ -478,8 +483,12 @@ content of a regular file, or the target of a symlink, at `path` in
 
 ### 6.8 ListDir
 
-`rpc ListDir(ListDirRequest) returns (ListDirResponse)`. Returns one directory
-level as `TreeV1` bytes. An empty path is the repo root.
+`rpc ListDir(ListDirRequest) returns (stream ListDirResponse)`. Streams one
+directory level as its `TreeV1` bytes, in parts that follow the rules of
+`ReadFile` (section 6.7), with the same two differences as `GetChangeset`
+(section 6.6). An empty path is the repo root. A client MUST take the tree
+as whole only when the reply ends with `OK`, and it checks the bytes against
+the tree ID when it knows it.
 
 | Error | When |
 |---|---|

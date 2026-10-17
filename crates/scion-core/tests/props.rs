@@ -5,8 +5,8 @@ use proptest::collection::{btree_map, vec};
 use proptest::option;
 use proptest::prelude::*;
 use scion_core::{
-    BlobId, Changeset, ChangesetId, Entry, FileState, GitOid, IdentityTime, PathElem, RepoPath,
-    Tree, TreeId,
+    BlobId, Changeset, ChangesetId, Entry, FileEntry, FileState, GitOid, IdentityTime, PathElem,
+    RepoPath, Tree, TreeId,
 };
 
 fn part() -> impl Strategy<Value = Vec<u8>> {
@@ -71,7 +71,8 @@ fn changeset() -> impl Strategy<Value = Changeset> {
 
 fn tree() -> impl Strategy<Value = Tree> {
     let entry = prop_oneof![
-        file_state().prop_map(Entry::File),
+        (file_state(), any::<u64>())
+            .prop_map(|(state, len)| Entry::File(FileEntry::new(state, len))),
         any::<[u8; 32]>().prop_map(|b| Entry::Dir(TreeId::from_bytes(b))),
     ];
     btree_map(part().prop_map(|p| PathElem::new(p).unwrap()), entry, 0..6)

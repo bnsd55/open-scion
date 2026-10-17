@@ -2505,6 +2505,7 @@ dependencies = [
  "open-scion-server",
  "open-scion-tier",
  "rcgen",
+ "rusqlite",
  "rustix",
  "serde_json",
  "signal-hook",

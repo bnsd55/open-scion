@@ -27,7 +27,7 @@ use scion_proto::v1::{
 use scion_proto::{CHUNK_BYTES, MAX_OBJECT_REFS};
 use scion_server::meta::MetaTx as _;
 use scion_server::store::BlobStatus;
-use scion_server::{Store, tree};
+use scion_server::{Backend, Store, tree};
 use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -242,7 +242,12 @@ pub fn create_repo(data: &Path) {
     store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
-            let (id, _) = tree::store_changeset(c, repo, &root)?;
+            let (id, _) = tree::store_changeset(
+                c,
+                repo,
+                &root,
+                &mut tree::lens_of(&Backend::Sqlite(store.clone())),
+            )?;
             for name in REFS {
                 assert!(c.cas_ref(repo, name, None, id)?);
             }
@@ -481,37 +486,42 @@ pub fn pending_lands(c: &rusqlite::Connection) -> i64 {
 /// The blobs that the changeset and tree rows of the database name, and the
 /// number of pending lands. Rows in `seen` are skipped, and new rows added:
 /// a row never changes.
-pub fn metadata(store: &Store, seen: &mut HashSet<Vec<u8>>) -> (BTreeSet<BlobId>, i64) {
-    store
-        .read(|c| {
-            let mut named = BTreeSet::new();
-            for table in ["changesets", "trees"] {
-                let mut rows = c.prepare(&format!("SELECT id, body FROM {table}"))?;
-                let rows = rows.query_map([], |row| {
-                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-                })?;
-                for row in rows {
-                    let (id, body) = row?;
-                    if !seen.insert(id) {
-                        continue;
-                    }
-                    let states: Vec<FileState> = if table == "changesets" {
-                        let changes = Changeset::decode(&body).unwrap().changes;
-                        changes.into_values().flatten().collect()
-                    } else {
-                        let entries = Tree::decode(&body).unwrap().entries.into_values();
-                        let file = |entry| match entry {
-                            Entry::File(state) => Some(state),
-                            Entry::Dir(_) => None,
-                        };
-                        entries.filter_map(file).collect()
-                    };
-                    named.extend(states.iter().filter_map(FileState::blob));
+pub fn metadata(store: &Backend, seen: &mut HashSet<Vec<u8>>) -> (BTreeSet<BlobId>, i64) {
+    // The rows of the data directory's own database: this helper asserts the
+    // storage's internals, which only the SQLite backend holds.
+    let raw = match store {
+        Backend::Sqlite(raw) => raw,
+        Backend::Postgres(_) => unreachable!(),
+    };
+    raw.read(|c| {
+        let mut named = BTreeSet::new();
+        for table in ["changesets", "trees"] {
+            let mut rows = c.prepare(&format!("SELECT id, body FROM {table}"))?;
+            let rows = rows.query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            for row in rows {
+                let (id, body) = row?;
+                if !seen.insert(id) {
+                    continue;
                 }
+                let states: Vec<FileState> = if table == "changesets" {
+                    let changes = Changeset::decode(&body).unwrap().changes;
+                    changes.into_values().flatten().collect()
+                } else {
+                    let entries = Tree::decode(&body).unwrap().entries.into_values();
+                    let file = |entry| match entry {
+                        Entry::File(file) => Some(file.state()),
+                        Entry::Dir(_) => None,
+                    };
+                    entries.filter_map(file).collect()
+                };
+                named.extend(states.iter().filter_map(FileState::blob));
             }
-            Ok((named, pending_lands(c)))
-        })
-        .unwrap()
+        }
+        Ok((named, pending_lands(c)))
+    })
+    .unwrap()
 }
 
 /// Every blob file under `<data>/objects/blob`, by its ID.
@@ -557,6 +567,20 @@ pub async fn retry_lands(scion: &Scion, ledger: &mut Ledger, checked: &mut Check
     }
 }
 
+/// Collects the parts of one `GetChangeset` reply into its bytes.
+async fn changeset_bytes(scion: &mut Scion, request: GetChangesetRequest, what: &str) -> Vec<u8> {
+    let mut stream = scion
+        .get_changeset(request)
+        .await
+        .unwrap_or_else(|s| panic!("{what}: {s:?}"))
+        .into_inner();
+    let mut bytes = Vec::new();
+    while let Some(part) = stream.message().await.unwrap() {
+        bytes.extend_from_slice(&part.changeset);
+    }
+    bytes
+}
+
 /// The changesets on each ref's first-parent history, but the root, with
 /// the ref. Checks that each one hashes to its ID, and that its root tree
 /// differs from its parent's by exactly its changes.
@@ -573,11 +597,8 @@ pub async fn walk_refs(
                 repo: REPO.into(),
                 changeset_id: at.as_bytes().to_vec(),
             };
-            let reply = scion.get_changeset(request).await;
-            let bytes = reply
-                .unwrap_or_else(|s| panic!("{target}: {at}: {s:?}"))
-                .into_inner();
-            let (changeset, id) = Changeset::decode_with_id(&bytes.changeset).unwrap();
+            let bytes = changeset_bytes(scion, request, &format!("{target}: {at}")).await;
+            let (changeset, id) = Changeset::decode_with_id(&bytes).unwrap();
             assert_eq!(id, at, "{target}: changeset {at} does not match its ID");
             let Some(&parent) = changeset.parents.first() else {
                 break;
@@ -679,14 +700,18 @@ pub async fn check(
             repo: REPO.into(),
             changeset_id: sent.id.as_bytes().to_vec(),
         };
-        let reply = scion.get_changeset(request).await;
-        reply.unwrap_or_else(|s| panic!("created changeset {}: {s:?}", sent.id));
+        changeset_bytes(
+            &mut scion,
+            request,
+            &format!("created changeset {}", sent.id),
+        )
+        .await;
     }
 
     // Every blob that the metadata names is intact, and so is every blob
     // file: a file reaches its name only whole.
     let store = Store::open_shared(data).unwrap();
-    let (named, pending) = metadata(&store, &mut checked.rows);
+    let (named, pending) = metadata(&Backend::Sqlite(store.clone()), &mut checked.rows);
     assert_eq!(pending, 0, "every land sent was retried");
     let files = blob_files(data);
     for id in named.into_iter().chain(files) {

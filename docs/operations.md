@@ -193,7 +193,12 @@ schema 4 walks every repo's changesets). Two rules:
 
 So an upgrade is: stop the server (and any tiers that share the directory —
 none do by default), copy the directory as a backup (section 3), start the
-new binary, watch the log for the migration, run `fsck`. New binaries can
+new binary, watch the log for the migration, run `fsck`. Schema 7 (tree
+entry sizes, `#172`) drops every stored tree and its derived rows, so the
+first queries after it re-derive trees from the stored changesets; the
+blobs and changesets stay. A tier's store may keep tree bytes of the old
+format under their old IDs: nothing asks for those IDs again, and the
+format's hash check guards what it does serve. New binaries can
 also add derived data kinds; a server fills what a query needs, and
 `scion-server derive --kind root_tree|commit_graph|path_history --ref R`
 backfills a whole history in steps when you want it done before the first

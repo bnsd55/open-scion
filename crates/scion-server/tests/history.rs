@@ -238,7 +238,7 @@ fn chain<S: Into<Option<FileState>>>(
                     message: format!("change {}", ids.len()).into_bytes(),
                     changes: puts.into_iter().map(|(p, s)| (path(p), s.into())).collect(),
                 };
-                ids.push(tree::store_changeset(c, repo, &cs)?.0);
+                ids.push(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0);
             }
             Ok(ids)
         })
@@ -1544,7 +1544,7 @@ fn chain_in<S: Into<Option<FileState>>>(
                     message: format!("{name} change {}", ids.len()).into_bytes(),
                     changes: puts.into_iter().map(|(p, s)| (path(p), s.into())).collect(),
                 };
-                ids.push(tree::store_changeset(c, repo, &cs)?.0);
+                ids.push(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0);
             }
             Ok(ids)
         })

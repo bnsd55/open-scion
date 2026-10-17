@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{BufWriter, Write as _};
 
 use anyhow::{Context, Result, bail};
-use scion_core::{ChangesetId, Entry, FileState, GitOid, RepoPath};
+use scion_core::{ChangesetId, Entry, FileEntry, FileState, GitOid, RepoPath};
 use scion_proto::v1::{self, DiffRequest, FileKind, IsAncestorRequest, MergeBaseRequest};
 use serde_json::{Value, json};
 
@@ -99,7 +99,9 @@ pub async fn diff(ctx: &mut Ctx, old: &str, new: &str, path: Option<&RepoPath>) 
         let mut out = BufWriter::new(std::io::stdout().lock());
         for entry in reply.entries {
             let (old, new) = (file_state(entry.old)?, file_state(entry.new)?);
-            let side = |state: Option<FileState>| state.map(|s| entry_json(&Entry::File(s)));
+            let side = |state: Option<FileState>| {
+                state.map(|s| entry_json(&Entry::File(FileEntry::new(s, 0))))
+            };
             // The deleted half of a rename prints with the added half.
             if !entry.rename_to.is_empty() {
                 deletes.insert(entry.path, (entry.rename_to, side(old)));

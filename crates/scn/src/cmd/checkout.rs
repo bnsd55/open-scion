@@ -15,7 +15,7 @@ use std::task::Poll;
 
 use anyhow::{Context, Result, anyhow, bail};
 use hashlink::LinkedHashMap;
-use scion_core::{BlobId, Entry, FileState, PathElem, RepoPath, Tree, TreeId};
+use scion_core::{BlobId, Entry, FileEntry, FileState, PathElem, RepoPath, Tree, TreeId};
 use scion_proto::MAX_OBJECT_REFS;
 use scion_proto::object::{self, Assembler, Header};
 use scion_proto::v1::{Encoding, GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
@@ -48,7 +48,7 @@ fn parse_dir(dir: &str) -> Result<RepoPath> {
 }
 
 /// Files to write, in path order. Never holds a gitlink.
-type Files = BTreeMap<RepoPath, FileState>;
+type Files = BTreeMap<RepoPath, FileEntry>;
 
 /// Writes the files of a changeset into a new or empty directory, and prints
 /// how many it wrote. On failure, or on a signal in [`STOP_SIGNALS`], the
@@ -202,11 +202,19 @@ async fn walk(
         let ids = level
             .iter()
             .map(|(_, id, path)| (*id.as_bytes(), path.clone()));
-        fetch(objects, roots, ObjectKind::Tree, ids, grant, |id, data| {
-            let id = TreeId::from_bytes(id);
-            trees.insert(id, decode_tree(id, &data)?);
-            Ok(())
-        })
+        fetch(
+            objects,
+            roots,
+            ObjectKind::Tree,
+            ids,
+            grant,
+            |id, data| {
+                let id = TreeId::from_bytes(id);
+                trees.insert(id, decode_tree(id, &data)?);
+                Ok(())
+            },
+            |_| None,
+        )
         .await?;
         let mut next = Vec::new();
         for (dir, id, tree_path) in level {
@@ -235,7 +243,9 @@ async fn walk(
                 if sparse.contains(&path) {
                     found.insert(path.clone());
                 }
-                if let Entry::File(FileState::Gitlink { commit }) = entry {
+                if let Entry::File(file) = entry
+                    && let FileState::Gitlink { commit } = file.state()
+                {
                     eprintln!("note: skipping submodule {path:?} at {commit}");
                     continue;
                 }
@@ -244,8 +254,8 @@ async fn walk(
                 }
                 match entry {
                     Entry::Dir(id) => next.push((Some(path), *id, ref_path)),
-                    Entry::File(state) => {
-                        files.insert(path, *state);
+                    Entry::File(file) => {
+                        files.insert(path, *file);
                     }
                 }
             }
@@ -274,32 +284,55 @@ async fn write_files(
     files: &Files,
 ) -> Result<()> {
     // A blob may back several files.
-    let mut by_blob: HashMap<BlobId, Vec<(&RepoPath, &FileState)>> = HashMap::new();
-    for (path, state) in files {
-        if let Some(blob) = state.blob() {
-            by_blob.entry(blob).or_default().push((path, state));
+    let mut by_blob: HashMap<BlobId, Vec<(&RepoPath, &FileEntry)>> = HashMap::new();
+    for (path, file) in files {
+        if let Some(blob) = file.state().blob() {
+            by_blob.entry(blob).or_default().push((path, file));
         }
     }
-    let ids = files.iter().filter_map(|(path, state)| {
+    let ids = files.iter().filter_map(|(path, file)| {
         // The path of a file that the blob backs is the address that the
         // ticket's walk reaches.
-        state
+        file.state()
             .blob()
             .map(|blob| (*blob.as_bytes(), path.as_bytes().to_vec()))
     });
-    fetch(objects, roots, ObjectKind::Blob, ids, grant, |id, data| {
-        let id = BlobId::from_bytes(id);
-        check_blob(id, &data)?;
-        for &(path, state) in by_blob.get(&id).into_iter().flatten() {
-            match *state {
-                FileState::Regular { executable, .. } => dest.file(path, executable, &data)?,
-                FileState::Symlink { .. } => dest.symlink(path, &data)?,
-                // A gitlink has no blob, so it never gets here.
-                FileState::Gitlink { .. } => {}
+    let size_of = |id: [u8; 32]| {
+        by_blob
+            .get(&BlobId::from_bytes(id))
+            .and_then(|files| files.first())
+            .map(|(_, file)| file.size())
+    };
+    fetch(
+        objects,
+        roots,
+        ObjectKind::Blob,
+        ids,
+        grant,
+        |id, data| {
+            let id = BlobId::from_bytes(id);
+            check_blob(id, &data)?;
+            for &(path, file) in by_blob.get(&id).into_iter().flatten() {
+                // The tree claimed a size for this blob; the bytes that arrived
+                // must have it, or the checkout would write a lie.
+                if file.size() != data.len() as u64 {
+                    bail!(
+                        "{path:?}: {} bytes arrived, the tree says {}",
+                        data.len(),
+                        file.size()
+                    );
+                }
+                match file.state() {
+                    FileState::Regular { executable, .. } => dest.file(path, executable, &data)?,
+                    FileState::Symlink { .. } => dest.symlink(path, &data)?,
+                    // A gitlink has no blob, so it never gets here.
+                    FileState::Gitlink { .. } => {}
+                }
             }
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+        size_of,
+    )
     .await
 }
 
@@ -322,6 +355,7 @@ async fn fetch(
     ids: impl IntoIterator<Item = ([u8; 32], Vec<u8>)>,
     grant: &mut Grant<'_>,
     mut got: impl FnMut([u8; 32], Vec<u8>) -> Result<()>,
+    size_of: impl Fn([u8; 32]) -> Option<u64>,
 ) -> Result<()> {
     // The path of each id, in the order of the first ask.
     let mut want: LinkedHashMap<[u8; 32], Vec<u8>> = ids.into_iter().collect();
@@ -368,7 +402,18 @@ async fn fetch(
                 _ => format!("blob {}", BlobId::from_bytes(id)),
             };
             let bad = |why| anyhow!("server sent a bad object for {name}: {why}");
-            let mut object = Assembler::new(Header::of(&first, true).map_err(bad)?, first);
+            let header = Header::of(&first, true).map_err(bad)?;
+            // The tree said how big this blob is. A first part whose size
+            // disagrees ends the fetch before any part of the body reads.
+            if let Some(want) = size_of(id)
+                && header.size as u64 != want
+            {
+                bail!(
+                    "server sent {name}: {} bytes, the tree says {want}",
+                    header.size
+                );
+            }
+            let mut object = Assembler::new(header, first);
             while !object.is_done() {
                 let part = stream.message().await.context("cannot fetch objects")?;
                 let part = part.context("the reply ended in the middle of an object")?;
@@ -452,10 +497,13 @@ mod tests {
         let tree = Tree {
             entries: [(
                 PathElem::new("hello.txt").unwrap(),
-                Entry::File(FileState::Regular {
-                    content: blob,
-                    executable: false,
-                }),
+                Entry::File(FileEntry::new(
+                    FileState::Regular {
+                        content: blob,
+                        executable: false,
+                    },
+                    b"hello\n".len() as u64,
+                )),
             )]
             .into(),
         };

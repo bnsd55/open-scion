@@ -395,7 +395,12 @@ mod tests {
             .write(|c| {
                 let mut tx = SqliteTx(c);
                 let repo = tx.create_repo(REPO)?;
-                let (id, _) = crate::tree::store_changeset(&mut tx, repo, cs)?;
+                let (id, _) = crate::tree::store_changeset(
+                    &mut tx,
+                    repo,
+                    cs,
+                    &mut crate::tree::lens_of(&Backend::Sqlite(store.clone())),
+                )?;
                 let version = tx.get_ref(repo, "main")?.map(|r| r.version);
                 assert!(tx.cas_ref(repo, "main", version, id)?);
                 Ok(id)

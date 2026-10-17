@@ -620,8 +620,11 @@ fn settle(
 
     // See `tree::store_changeset`. The land's flush covers these steps.
     tree::fill_root_tree(store, repo, head.target)?;
+    // The blob lengths the tree build needs, read before the write
+    // transaction, so the write connection does no file I/O.
+    let lens = tree::lens_of_puts(store, crate::db::puts(&rebased).map(|(_, blob)| blob))?;
     let landed = store.commit(|c| {
-        let (id, _) = tree::store_changeset(c, repo, &rebased)?;
+        let (id, _) = tree::store_changeset(c, repo, &rebased, &mut tree::lens_from(&lens))?;
         if !c.cas_ref(repo, target, Some(head.version), id)? {
             // The error rolls back the transaction, rebased changeset included.
             return Err(Error::Aborted(format!(
@@ -1136,7 +1139,7 @@ mod tests {
     use super::*;
     use crate::db::testing;
     use crate::store::FSYNC_LEAVES_DRIVE_CACHE;
-    use scion_core::{BlobId, Entry, IdentityTime};
+    use scion_core::{BlobId, Entry, FileEntry, IdentityTime};
 
     type Change = (RepoPath, Option<FileState>);
     type Edits<'a> = &'a [Change];
@@ -1149,6 +1152,17 @@ mod tests {
         lands: Lands,
     }
 
+    /// Stores every blob file the tests have named so far: the land's tree
+    /// builds read their lengths from the files. Repeat calls put nothing
+    /// new: a stored copy is kept.
+    fn store_blobs(store: &Backend) {
+        CONTENTS.with(|c| {
+            for bytes in c.borrow().values() {
+                store.blobs().put(bytes).unwrap();
+            }
+        });
+    }
+
     fn author() -> IdentityTime {
         IdentityTime {
             name: b"t".to_vec(),
@@ -1158,9 +1172,19 @@ mod tests {
         }
     }
 
+    thread_local! {
+        /// What each blob of the test changesets holds, so the fixture can
+        /// store the files the real lens reads. Tests use one thread each.
+        static CONTENTS: std::cell::RefCell<std::collections::HashMap<BlobId, Vec<u8>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+
     fn put(path: &str, content: &str) -> Change {
+        let bytes = content.as_bytes().to_vec();
+        let content = BlobId::of(&bytes);
+        CONTENTS.with(|c| c.borrow_mut().insert(content, bytes));
         let state = FileState::Regular {
-            content: BlobId::of(content.as_bytes()),
+            content,
             executable: false,
         };
         (RepoPath::new(path).unwrap(), Some(state))
@@ -1189,6 +1213,7 @@ mod tests {
                 Ok((repo, id))
             })
             .unwrap();
+        store_blobs(&store);
         Fixture {
             _dir: dir,
             store,
@@ -1228,6 +1253,7 @@ mod tests {
         }
 
         fn insert(&self, cs: &Changeset) -> ChangesetId {
+            store_blobs(&self.store);
             self.store
                 .write(|c| c.insert_changeset(self.repo, cs))
                 .unwrap()
@@ -1941,8 +1967,8 @@ mod tests {
             store
                 .write(|c| {
                     for &tip in &ids {
-                        derived::derive::<CommitGraph>(c, repo, tip)?;
-                        derived::derive::<PathHistory>(c, repo, tip)?;
+                        derived::derive::<CommitGraph>(c, repo, tip, &mut crate::tree::lens_none())?;
+                        derived::derive::<PathHistory>(c, repo, tip, &mut crate::tree::lens_none())?;
                     }
                     Ok(())
                 })
@@ -2355,7 +2381,13 @@ mod tests {
                     assert_eq!(m.f.main().target, tip, "{case}");
                     let rebased = m.f.store.read(|c| c.get_changeset(m.f.repo, tip));
                     assert_eq!(rebased.unwrap().parents, vec![m.head], "{case}");
-                    assert_eq!(m.f.file(tip, path), change.1.map(Entry::File), "{case}");
+                    assert_eq!(
+                        m.f.file(tip, path),
+                        change
+                            .1
+                            .map(|state| Entry::File(FileEntry::new(state, "mine".len() as u64))),
+                        "{case}"
+                    );
                 }
             }
         }
@@ -2604,6 +2636,9 @@ mod tests {
         };
 
         let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        // The fixture wrote no blob files; the pending land's tree build
+        // reads their lengths, so store them now.
+        store_blobs(&store);
         let version: u32 = store
             .read(|c| {
                 Ok(c.sqlite()

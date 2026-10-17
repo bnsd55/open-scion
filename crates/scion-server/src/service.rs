@@ -18,7 +18,7 @@ use scion_proto::v1::{
     MergeBaseResponse, PutBlobRequest, PutBlobResponse, ReadFileRequest, ReadFileResponse,
     ResolveRefRequest, ResolveRefResponse,
 };
-use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES};
+use scion_proto::{Bytes, CHUNK_BYTES, MAX_MESSAGE_BYTES};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio_stream::StreamExt;
@@ -245,6 +245,37 @@ pub struct ScionService {
 }
 
 impl ScionService {
+    /// Sends `data` in parts of up to `CHUNK_BYTES`, as `ReadFile` sends a
+    /// file. Holds the whole bytes, so the share is their size.
+    async fn stream_whole<T: Send + 'static>(
+        &self,
+        call: Call,
+        data: Vec<u8>,
+        stalled: Option<scion_proto::listen::Stalled>,
+        make: fn(Vec<u8>) -> T,
+    ) -> Result<Response<ReceiverStream<Part<T>>>, Status> {
+        // Taken after the bytes are read, so a call that waits holds a
+        // budget share for memory that another reply may need sooner.
+        let share = Arc::clone(&self.reads)
+            .acquire_many_owned(whole_share(data.len()))
+            .await
+            .map_err(|_| Status::unavailable("server is shutting down"))?;
+        let (tx, rx) = mpsc::channel(2);
+        tokio::spawn(send_parts(
+            Parts::Whole {
+                data: data.into(),
+                offset: 0,
+            },
+            share,
+            call,
+            tx,
+            READ_STALL_TIMEOUT,
+            stalled,
+            make,
+        ));
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
     fn new(worker: Worker, access: Arc<Access>, lands: Arc<Lands>, quotas: Quotas) -> Self {
         Self {
             worker,
@@ -428,10 +459,14 @@ fn land_response(outcome: LandOutcome) -> LandResponse {
     }
 }
 
-/// A part of a `ReadFile` reply, or the error that ends it early.
-type Part = Result<ReadFileResponse, Status>;
+/// A part of a streamed reply, or the error that ends it early.
+type Part<T> = Result<T, Status>;
 
-type ReadFileStream = ReceiverStream<Part>;
+type ReadFileStream = ReceiverStream<Part<ReadFileResponse>>;
+
+type GetChangesetStream = ReceiverStream<Part<GetChangesetResponse>>;
+
+type ListDirStream = ReceiverStream<Part<ListDirResponse>>;
 
 /// The share of `READ_BUDGET_BYTES` that a `ReadFile` reply of a `size`-byte
 /// file holds. A file of one part is read in one job, so the reply holds only
@@ -445,54 +480,117 @@ const fn read_share(size: usize) -> usize {
     }
 }
 
-/// Sends a blob to `tx` in parts of up to `CHUNK_BYTES`, as the client takes
-/// them. Holds `share` until the client has taken the last part, or until no
-/// part is taken within `stall`. A part goes into the channel only when the
-/// channel is empty, so its second slot is always free for the error that
-/// ends a reply early: a store error, or the stall. A client never takes a
-/// short file for a whole one.
-async fn send_file(
-    worker: Worker,
-    blob: BlobId,
+/// The share of `READ_BUDGET_BYTES` that a reply holds for `size` bytes that
+/// are all in memory at once, as a `ListDir` or `GetChangeset` reply's object
+/// is. `ReadFile` reads its blob part by part, but these replies have the
+/// whole object in one buffer, so the share is its whole size.
+// SHORTCUT: a reply holds its object even when its share is capped at the
+// budget, so a directory whose bytes are over the budget holds what the
+// budget cannot pay for. The budget bounds how many such replies run at
+// once, not their size. Cap the encoded size if that ever matters.
+fn whole_share(size: usize) -> u32 {
+    u32::try_from(size.clamp(1, READ_BUDGET_BYTES)).unwrap_or(u32::MAX)
+}
+
+/// Where a reply's parts come from.
+enum Parts {
+    /// Parts read from a blob, one job each, so a long file is never all in
+    /// memory. The reader lives between parts.
+    Blob {
+        worker: Worker,
+        blob: BlobId,
+        open: Option<Box<crate::store::BlobReader>>,
+        /// The reader has ended: no part is left, and the next call ends the
+        /// reply without opening the blob again.
+        ended: bool,
+    },
+    /// Parts copied out of one in-memory buffer, as a `ListDir` or
+    /// `GetChangeset` reply has. Each part is its own buffer, so a part that
+    /// waits for a client that stopped reading never keeps the rest.
+    Whole { data: Bytes, offset: usize },
+}
+
+impl Parts {
+    /// Reads the next part of up to `CHUNK_BYTES`, or `None` after the last.
+    async fn next_part(&mut self) -> Result<Option<Vec<u8>>, Status> {
+        match self {
+            Parts::Blob {
+                worker,
+                blob,
+                open,
+                ended,
+            } => {
+                if *ended {
+                    return Ok(None);
+                }
+                let blob = *blob;
+                let read = {
+                    let open = open.take();
+                    worker
+                        .run(move |store| {
+                            let mut reader = match open {
+                                Some(reader) => *reader,
+                                None => store.blobs().reader(blob)?,
+                            };
+                            let part = reader.read_part(CHUNK_BYTES)?;
+                            // A reader that has ended has freed its decoder.
+                            Ok((part, (!reader.ended()).then_some(reader)))
+                        })
+                        .await?
+                };
+                *ended = read.1.is_none();
+                *open = read.1.map(Box::new);
+                Ok(read.0)
+            }
+            Parts::Whole { data, offset } => {
+                let end = (*offset + CHUNK_BYTES).min(data.len());
+                let part = if *offset >= data.len() {
+                    None
+                } else {
+                    Some(data[*offset..end].to_vec())
+                };
+                *offset = end;
+                Ok(part)
+            }
+        }
+    }
+}
+
+/// Sends `parts` to `tx` in parts of up to `CHUNK_BYTES`, as the client takes
+/// them, and wraps each in `make`. Holds `share` until the client has taken
+/// the last part, or until no part is taken within `stall`. A part goes into
+/// the channel only when the channel is empty, so its second slot is always
+/// free for the error that ends a reply early: a store error, or the stall.
+/// A client never takes a short reply for a whole one.
+async fn send_parts<T: Send + 'static>(
+    mut parts: Parts,
     _share: OwnedSemaphorePermit,
     _call: Call,
-    tx: mpsc::Sender<Part>,
+    tx: mpsc::Sender<Part<T>>,
     stall: Duration,
     stalled: Option<scion_proto::listen::Stalled>,
+    make: fn(Vec<u8>) -> T,
 ) {
     let fail = |status: Status| {
         // Fails only if the client has gone.
         let _ = tx.try_send(Err(status));
     };
-    let mut open = None;
     loop {
-        let read = worker
-            .run(move |store| {
-                let mut reader = match open {
-                    Some(reader) => reader,
-                    None => store.blobs().reader(blob)?,
-                };
-                let part = reader.read_part(CHUNK_BYTES)?;
-                // A reader that has ended has freed its decoder.
-                Ok((part, (!reader.ended()).then_some(reader)))
-            })
-            .await;
-        let (part, reader) = match read {
+        let part = match parts.next_part().await {
             Ok(part) => part,
             Err(status) => return fail(status),
         };
-        open = reader;
         if let Some(data) = part {
             // Both slots free: the client has taken the part before.
             match tokio::time::timeout(stall, tx.reserve_many(2)).await {
                 Ok(Ok(mut slots)) => {
                     if let Some(slot) = slots.next() {
-                        slot.send(Ok(ReadFileResponse { data }));
+                        slot.send(Ok(make(data)));
                     }
                 }
                 Ok(Err(_)) => return,
                 Err(_) => {
-                    // The parts of the file stay in HTTP/2 until the
+                    // The parts of the reply stay in HTTP/2 until the
                     // connection ends; the connection counts them.
                     if let Some(stalled) = &stalled {
                         stalled.add(scion_proto::reply::STALLED_REPLY_BYTES);
@@ -501,8 +599,7 @@ async fn send_file(
                     return fail(Status::deadline_exceeded(detail));
                 }
             }
-        }
-        if open.is_none() {
+        } else {
             // Keeps the share until the client has taken the last part.
             match tokio::time::timeout(stall, tx.reserve_many(2)).await {
                 // Sent, or the client has gone with it.
@@ -517,6 +614,34 @@ async fn send_file(
             return;
         }
     }
+}
+
+/// Sends a blob to `tx` in parts of up to `CHUNK_BYTES`, as the client takes
+/// them.
+async fn send_file(
+    worker: Worker,
+    blob: BlobId,
+    share: OwnedSemaphorePermit,
+    call: Call,
+    tx: mpsc::Sender<Part<ReadFileResponse>>,
+    stall: Duration,
+    stalled: Option<scion_proto::listen::Stalled>,
+) {
+    send_parts(
+        Parts::Blob {
+            worker,
+            blob,
+            open: None,
+            ended: false,
+        },
+        share,
+        call,
+        tx,
+        stall,
+        stalled,
+        |data| ReadFileResponse { data },
+    )
+    .await;
 }
 
 #[tonic::async_trait]
@@ -668,22 +793,30 @@ impl Scion for ScionService {
     async fn get_changeset(
         &self,
         request: Request<GetChangesetRequest>,
-    ) -> Result<Response<GetChangesetResponse>, Status> {
+    ) -> Result<Response<GetChangesetStream>, Status> {
         let caller = caller(&request)?;
-        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
+        let call = self.quotas.enter(&caller).map_err(Status::from)?;
+        // The handle of the caller's connection, before the request is taken
+        // apart: the reply counts what it leaves in HTTP/2 on it.
+        let stalled = scion_proto::listen::Stalled::of(&request);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
-        let changeset = self
+        let data = self
             .worker
-            .run(move |store| read::get_changeset(&store, &req.repo, id))
+            .run(move |store| Ok(read::get_changeset(&store, &req.repo, id)?.encode()))
             .await?;
-        Ok(Response::new(GetChangesetResponse {
-            changeset: changeset.encode(),
-        }))
+        self.stream_whole(call, data, stalled, |data| GetChangesetResponse {
+            changeset: data,
+        })
+        .await
     }
 
     type ReadFileStream = ReadFileStream;
+
+    type GetChangesetStream = GetChangesetStream;
+
+    type ListDirStream = ListDirStream;
 
     async fn read_file(
         &self,
@@ -732,20 +865,22 @@ impl Scion for ScionService {
     async fn list_dir(
         &self,
         request: Request<ListDirRequest>,
-    ) -> Result<Response<ListDirResponse>, Status> {
+    ) -> Result<Response<ListDirStream>, Status> {
         let caller = caller(&request)?;
-        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
+        let call = self.quotas.enter(&caller).map_err(Status::from)?;
+        // The handle of the caller's connection, before the request is taken
+        // apart: the reply counts what it leaves in HTTP/2 on it.
+        let stalled = scion_proto::listen::Stalled::of(&request);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_optional_path(req.path)?;
-        let tree = self
+        let data = self
             .worker
-            .run(move |store| read::list_dir(&store, &req.repo, id, path.as_ref()))
+            .run(move |store| Ok(read::list_dir(&store, &req.repo, id, path.as_ref())?.encode()))
             .await?;
-        Ok(Response::new(ListDirResponse {
-            tree: tree.encode(),
-        }))
+        self.stream_whole(call, data, stalled, |data| ListDirResponse { tree: data })
+            .await
     }
 
     async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogResponse>, Status> {
@@ -1132,7 +1267,7 @@ mod tests {
         stall: Duration,
     ) -> (
         tokio::task::JoinHandle<()>,
-        mpsc::Receiver<Part>,
+        mpsc::Receiver<Part<ReadFileResponse>>,
         Arc<Semaphore>,
     ) {
         let reads = Arc::new(Semaphore::new(budget));
@@ -1149,6 +1284,77 @@ mod tests {
             None,
         ));
         (task, rx, reads)
+    }
+
+    /// Starts a [`send_parts`] reply whose parts come from one in-memory
+    /// buffer, with all of a budget of `budget`. Returns the task, the reply
+    /// and the budget.
+    async fn whole_reply(
+        data: Vec<u8>,
+        budget: usize,
+        stall: Duration,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        mpsc::Receiver<Part<ListDirResponse>>,
+        Arc<Semaphore>,
+    ) {
+        let reads = Arc::new(Semaphore::new(budget));
+        let share = u32::try_from(budget).unwrap();
+        let share = Arc::clone(&reads).acquire_many_owned(share).await.unwrap();
+        let (tx, rx) = mpsc::channel(2);
+        let task = tokio::spawn(send_parts(
+            Parts::Whole {
+                data: data.into(),
+                offset: 0,
+            },
+            share,
+            Call::default(),
+            tx,
+            stall,
+            None,
+            |data| ListDirResponse { tree: data },
+        ));
+        (task, rx, reads)
+    }
+
+    #[tokio::test]
+    async fn a_whole_reply_splits_at_chunk_bytes_and_stays_whole() {
+        let data = content(3);
+        let budget = whole_share(data.len()) as usize;
+        let (task, mut rx, reads) =
+            whole_reply(data.clone(), budget, Duration::from_secs(60)).await;
+        let mut sent = Vec::new();
+        while let Some(part) = rx.recv().await {
+            let part = part.unwrap();
+            assert!(part.tree.len() <= CHUNK_BYTES, "a part over the cap");
+            sent.extend(part.tree);
+        }
+        assert_eq!(sent, data, "the parts are the bytes, in order");
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the reply ends")
+            .unwrap();
+        assert_eq!(reads.available_permits(), budget, "the share is free");
+    }
+
+    #[tokio::test]
+    async fn a_whole_reply_whose_client_stops_mid_reply_frees_its_share() {
+        let data = content(3);
+        let budget = whole_share(data.len()) as usize;
+        let (task, mut rx, reads) =
+            whole_reply(data.clone(), budget, Duration::from_secs(60)).await;
+
+        // The client takes one part and stops reading.
+        let first = rx.recv().await.unwrap().unwrap();
+        assert!(first.tree == data[..CHUNK_BYTES], "the first part");
+        drop(rx);
+
+        // The reply ends without the stall, and its share comes back.
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the reply ends when the client goes")
+            .unwrap();
+        assert_eq!(reads.available_permits(), budget, "the share is free");
     }
 
     /// Polls `run` on one thread.
@@ -1267,6 +1473,33 @@ mod tests {
         assert!(lines[0].contains("may not read the repo"), "{}", lines[0]);
         assert!(lines[0].contains("principal=\"p\""), "{}", lines[0]);
         assert!(lines[0].contains("rpc=\"GetLand\""), "{}", lines[0]);
+    }
+
+    #[tokio::test]
+    async fn a_read_file_reply_of_many_parts_stays_exactly_the_file() {
+        let data = content(3);
+        let (_dir, store, _, blob) = file_store(&data);
+        let budget = read_share(data.len());
+        let (task, mut rx, reads) = reply(store, blob, budget, Duration::from_secs(60)).await;
+        let mut parts = 0;
+        let mut read = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(part) = rx.recv().await {
+                let part = part.unwrap();
+                assert!(part.data.len() <= CHUNK_BYTES, "a part over the cap");
+                read.extend(part.data);
+                parts += 1;
+            }
+        })
+        .await
+        .expect("the reply ends; it never repeats a part");
+        assert_eq!(parts, 3, "one part per chunk, no replay");
+        assert_eq!(read, data, "the parts are the file, in order");
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the reply ends")
+            .unwrap();
+        assert_eq!(reads.available_permits(), budget, "the share is free");
     }
 
     #[tokio::test]

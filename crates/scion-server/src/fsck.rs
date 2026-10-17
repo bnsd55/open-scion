@@ -317,11 +317,30 @@ fn check_trees(
                         ));
                         continue;
                     }
-                    for entry in tree.entries.values() {
-                        if let scion_core::Entry::File(state) = entry
-                            && let Some(blob) = state.blob()
-                        {
-                            named_blob_exists(store, blob, report, &format!("named by tree {id}"));
+                    for file in tree.entries.values() {
+                        let scion_core::Entry::File(file) = file else {
+                            continue;
+                        };
+                        let Some(blob) = file.state().blob() else {
+                            continue;
+                        };
+                        named_blob_exists(store, blob, report, &format!("named by tree {id}"));
+                        // The entry's length must be the blob's own: a tree
+                        // whose size lies makes every stat of the file lie.
+                        match store.blobs().size(blob) {
+                            Ok(size) if size as u64 == file.size() => {}
+                            Ok(size) => report.problem(Problem::new(
+                                "tree-size",
+                                id.to_string(),
+                                None,
+                                format!("entry says {} bytes, the blob holds {size}", file.size()),
+                            )),
+                            Err(e) => report.problem(Problem::new(
+                                "tree-size",
+                                id.to_string(),
+                                None,
+                                format!("cannot size the blob: {e}"),
+                            )),
                         }
                     }
                 }
@@ -544,6 +563,7 @@ fn id_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::Backend;
     use crate::db::SqliteTx;
     use crate::meta::MetaTx as _;
     use scion_core::{FileState, IdentityTime, RepoPath};
@@ -578,7 +598,12 @@ mod tests {
             .write(|c| {
                 let mut tx = SqliteTx(c);
                 let repo = tx.create_repo(REPO)?;
-                let (id, _) = crate::tree::store_changeset(&mut tx, repo, cs)?;
+                let (id, _) = crate::tree::store_changeset(
+                    &mut tx,
+                    repo,
+                    cs,
+                    &mut crate::tree::lens_of(&Backend::Sqlite(store.clone())),
+                )?;
                 let version = tx.get_ref(repo, "main")?.map(|r| r.version);
                 assert!(tx.cas_ref(repo, "main", version, id)?);
                 Ok(id)
@@ -671,7 +696,7 @@ mod tests {
             "{:?}",
             kinds(&report)
         );
-        assert_eq!(report.problems.len(), 3, "{:?}", kinds(&report));
+        assert_eq!(report.problems.len(), 4, "{:?}", kinds(&report));
     }
 
     #[test]

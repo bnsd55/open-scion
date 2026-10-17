@@ -485,7 +485,12 @@ fn next_resume(
 /// it is not a regular file.
 fn regular_blob(store: &Backend, root: TreeId, path: &RepoPath) -> Result<BlobId> {
     match store.read(|c| tree::lookup(c, root, path))? {
-        Some(Entry::File(FileState::Regular { content, .. })) => Ok(content),
+        Some(Entry::File(file)) => match file.state() {
+            FileState::Regular { content, .. } => Ok(content),
+            _ => Err(Error::InvalidArgument(format!(
+                "{path:?} is not a regular file"
+            ))),
+        },
         Some(_) => Err(Error::InvalidArgument(format!(
             "{path:?} is not a regular file"
         ))),
@@ -591,20 +596,24 @@ fn older_version(
         )));
     }
     let older = match entry {
-        // Only the mode changed: nothing to read.
-        Some(Entry::File(FileState::Regular { content, .. })) if content == newer.blob => {
-            Some((newer.path.clone(), content, None))
-        }
-        Some(Entry::File(FileState::Regular { content, .. })) => {
-            let text = read_version(store, content, memory)?;
-            text.map(|text| (newer.path.clone(), content, Some(text)))
-        }
+        Some(Entry::File(file)) => match file.state() {
+            FileState::Regular { content, .. } if content == newer.blob => {
+                // Only the mode changed: nothing to read.
+                Some((newer.path.clone(), content, None))
+            }
+            FileState::Regular { content, .. } => {
+                let text = read_version(store, content, memory)?;
+                text.map(|text| (newer.path.clone(), content, Some(text)))
+            }
+            // A symlink or a submodule is not a file that could have been
+            // renamed into this one.
+            _ => None,
+        },
         // As in git, only a path with no file before can be a rename. A
         // symlink or submodule that becomes a regular file is not one.
         None | Some(Entry::Dir(_)) => {
             return renamed_from(store, root, changeset, newer, budget, search, memory);
         }
-        Some(Entry::File(_)) => None,
     };
     Ok(Older::Found(older, RenameSearch::default()))
 }
@@ -751,8 +760,8 @@ fn deleted_files<'c>(
             .iter()
             .filter(|(_, state)| state.is_none())
         {
-            if let Some(Entry::File(state)) = lookup_cached(c, &mut trees, root, other)? {
-                deleted.push((other, state));
+            if let Some(Entry::File(file)) = lookup_cached(c, &mut trees, root, other)? {
+                deleted.push((other, file.state()));
             }
         }
         Ok(deleted)
