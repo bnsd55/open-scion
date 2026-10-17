@@ -17,6 +17,7 @@ name = "scion_tier"
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+ed25519-dalek.workspace = true
 clap.workspace = true
 hashlink.workspace = true
 rusqlite.workspace = true

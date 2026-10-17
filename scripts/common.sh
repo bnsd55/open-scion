@@ -130,11 +130,19 @@ stop() {
 
 # The server, then a cache in front of it, then a daemon in front of the
 # cache. The daemon keeps its objects in $WORK/daemon, from run to run.
+# Object reads need a ticket: the server signs with one key, which it makes
+# once in $WORK and keeps from run to run, and the cache verifies with the
+# key's public half. The daemon only forwards the tickets.
 start_scion() {
+  if [ ! -f "$WORK/ticket.key" ]; then
+    "$BIN/scion-server" ticket-key --out "$WORK/ticket.key" > "$WORK/ticket.pub"
+  fi
   start server serving "$BIN/scion-server" --data "$WORK/server" serve \
-    --listen "127.0.0.1:$SERVER_PORT"
+    --listen "127.0.0.1:$SERVER_PORT" \
+    --ticket-key "$WORK/ticket.key"
   start cache serving "$BIN/scion-cache" --listen "127.0.0.1:$CACHE_PORT" \
-    --upstream "$SERVER"
+    --upstream "$SERVER" \
+    --ticket-public-key "$(cat "$WORK/ticket.pub")"
   start daemon serving "$BIN/scion-daemon" --data "$WORK/daemon" --socket "$SOCKET" \
     --upstream "http://127.0.0.1:$CACHE_PORT"
 }
@@ -145,10 +153,11 @@ stop_scion() {
   stop server
 }
 
-# One sparse checkout through the daemon, into "$1". For `batch`, in the
+# One sparse checkout through the daemon, into "$1". The ref and the ticket
+# come from the server, the objects ride the daemon. For `batch`, in the
 # scripts that source this file.
 # shellcheck disable=SC2016,SC2034 # expanded by the sh that batch starts
-CHECKOUT='"$BIN/scn" --server "$DAEMON" checkout main --sparse "$SPARSE_DIR" --into "$1" > /dev/null'
+CHECKOUT='"$BIN/scn" --server "$SERVER" --objects "$DAEMON" checkout main --sparse "$SPARSE_DIR" --into "$1" > /dev/null'
 
 # batch NAME JOBS CMD: runs the sh command CMD in JOBS processes at once, under
 # /usr/bin/time -p. In each, $1 is its own new directory, $WORK/NAME/<job>.

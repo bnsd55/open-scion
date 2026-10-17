@@ -33,10 +33,12 @@ use crate::auth::Caller;
 use crate::deadline::Deadline;
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
+use crate::meta::MetaTx as _;
 use crate::objects::ObjectsService;
 use crate::quotas::{Call, Quotas};
 use crate::store::{MAX_OBJECT_BYTES, READER_BYTES, Store};
-use crate::{blame, db, names, read, write};
+use crate::tickets::Keys;
+use crate::{blame, names, read, write};
 
 /// Most changeset bytes in one `Log` reply; the client pages for more.
 const LOG_BUDGET_BYTES: usize = MAX_MESSAGE_BYTES / 2;
@@ -143,6 +145,7 @@ pub async fn serve(
     listener: TcpListener,
     access: impl Into<Access>,
     options: ServeOptions,
+    tickets: Option<Arc<Keys>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), tonic::transport::Error> {
     let ServeOptions {
@@ -178,12 +181,12 @@ pub async fn serve(
     ));
     let scion = InterceptedService::new(
         ScionService::new(worker.clone(), Arc::clone(&access), lands, quotas.clone()).into_server(),
-        auth.clone(),
-    );
-    let objects = InterceptedService::new(
-        ObjectsService::new(worker, access, quotas).into_server(),
         auth,
     );
+    // No token interceptor on `objects`: `GetObjects` authenticates by
+    // ticket alone, and the service's other calls check the token
+    // themselves. So a tier needs no token of the server to fetch objects.
+    let objects = ObjectsService::new(worker, access, quotas, tickets).into_server();
     // The health service answers `grpc.health.v1.Check` and `Watch` on the
     // same port, without a token: a probe carries none. The store opens
     // before this call, so the server starts serving.
@@ -663,7 +666,7 @@ impl Scion for ScionService {
         let (repo, mut upload) = self
             .worker
             .run(move |store| {
-                let repo = store.read(|c| db::repo_id(c, &first.repo))?;
+                let repo = store.read(|c| c.repo_id(&first.repo))?;
                 Ok((repo, store.blobs().upload()?.append(&first.data)?))
             })
             .await?;
@@ -1116,6 +1119,7 @@ fn file_state(state: FileState) -> v1::FileState {
 
 #[cfg(test)]
 mod tests {
+    use crate::db;
     use std::time::Instant;
 
     use scion_core::{Changeset, FileState, IdentityTime};
@@ -1227,7 +1231,10 @@ mod tests {
             changes: [(RepoPath::new("f").unwrap(), Some(state))].into(),
         };
         let cs = store
-            .write(|c| db::insert_changeset(c, db::create_repo(c, "r")?, &changeset))
+            .write(|c| {
+                let repo = c.create_repo("r")?;
+                c.insert_changeset(repo, &changeset)
+            })
             .unwrap();
         (dir, store, cs, blob)
     }
@@ -1593,11 +1600,11 @@ mod tests {
         };
         let (b, cs) = store
             .write(|c| {
-                let repo = db::create_repo(c, "r")?;
-                let root = db::insert_changeset(c, repo, &put(vec![], "a"))?;
-                let b = db::insert_changeset(c, repo, &put(vec![root], "b"))?;
-                assert!(db::cas_ref(c, repo, "main", None, b)?);
-                Ok((b, db::insert_changeset(c, repo, &put(vec![root], "c"))?))
+                let repo = c.create_repo("r")?;
+                let root = c.insert_changeset(repo, &put(vec![], "a"))?;
+                let b = c.insert_changeset(repo, &put(vec![root], "b"))?;
+                assert!(c.cas_ref(repo, "main", None, b)?);
+                Ok((b, c.insert_changeset(repo, &put(vec![root], "c"))?))
             })
             .unwrap();
         let service = Arc::new(test_service(store.clone()));
@@ -1648,7 +1655,10 @@ mod tests {
             .read(|c| Ok(c.query_row(sql, [], |row| row.get(0))?))
             .unwrap();
         assert_eq!(state, "pending");
-        let main = store.read(|c| db::get_ref(c, db::repo_id(c, "r")?, "main"));
+        let main = store.read(|c| {
+            let repo = c.repo_id("r")?;
+            c.get_ref(repo, "main")
+        });
         assert_eq!(main.unwrap().unwrap().target, b, "main did not move");
     }
 
@@ -1698,7 +1708,7 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         let ids = store
             .write(|c| {
-                let repo = db::create_repo(c, "r")?;
+                let repo = c.create_repo("r")?;
                 db::testing::insert_graph(c, repo, &[vec![], vec![0], vec![0]])
             })
             .unwrap();
