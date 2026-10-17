@@ -168,7 +168,7 @@ fn a_land_replans_when_imports_move_its_ref() {
     let metrics = Arc::new(scion_proto::metrics::Metrics::default());
     let mut replans = 0;
     for _ in 0..10 {
-        replans = replan_scenario(Arc::clone(&metrics));
+        replans = replan_scenario(&metrics);
         if replans >= 1 {
             break;
         }
@@ -176,9 +176,9 @@ fn a_land_replans_when_imports_move_its_ref() {
     assert!(replans >= 1, "no land replanned in 10 runs");
 }
 
-fn replan_scenario(metrics: Arc<scion_proto::metrics::Metrics>) -> u64 {
+fn replan_scenario(metrics: &Arc<scion_proto::metrics::Metrics>) -> u64 {
     let f = setup();
-    let lands = Lands::new(None, Some(Arc::clone(&metrics)));
+    let lands = Lands::new(None, Some(Arc::clone(metrics)));
     // The land's changeset: parent = root, so it must rebase onto
     // whatever `main` is when it lands.
     let cs = f.commit(f.root, vec![put(&f.store, "a/b/c", "landed")]);
