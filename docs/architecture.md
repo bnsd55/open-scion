@@ -1561,6 +1561,7 @@ limit and its upgrade path. This is the list on `main` today.
 |---|---|---|---|
 | `scion-core/src/codec.rs` (`put_len`) | Encoding panics if a field is longer than `u32::MAX`. Every ingest path caps sizes far below that. | `try_encode` returning `Result`, if a path ever does not. | |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
+| `scion-server/src/store.rs` (`flush_dirs`) | The power-loss suite cannot catch a lost fsync of a blob directory: LazyFS persists a rename at rename time, so the cut never drops a directory entry. The `fsync` of each directory after a rename (section 3) is therefore untested by that suite. | A block-level replay that drops un-flushed writes in order (dm-log-writes replay to each FLUSH), when a bug report or a change to the rename path says a directory entry was lost. | |
 | `scion-server/src/main.rs` (`Command`) | The `Serve` subcommand holds its flags by value: 309 bytes against `Import`'s 109, 20 bytes over `clippy::large_enum_variant`, so the lint is off for the enum. | Box the TLS and ticket paths of `Serve` if a variant grows further. | |
 | `scion-server/src/import.rs` (`TX_BUDGET`) | A transaction of an import ends at 1 s, but one commit's record and check can run longer, and a server write then waits for it. Ceiling: the changes and trees of the biggest commit. | A separate write connection for the import, or per-statement yields. | [#100](https://github.com/bnsd55/open-scion/issues/100) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | Per-ref serialization in a shared database ([design](design/scalable-backend.md)). | [#47](https://github.com/bnsd55/open-scion/issues/47) |
@@ -1613,6 +1614,34 @@ A second test kills the server while it upgrades a database of schema
 version 2. Each kill leaves the database at one whole migration step (the
 first version, the last, or one between them), and the next start upgrades
 it.
+
+**The power-loss suite.** The server writes into a
+[LazyFS](https://github.com/dsrhaslab/lazyfs) mount, pinned to release
+0.3.1. LazyFS holds its own page cache and writes a file's data to the
+backing directory only when the application fsyncs it. The cut is one
+command on its faults fifo, `clear-cache`: it drops every cached write
+that was not fsynced, file by file. Then the suite kills the server and
+reopens the store from the backing directory, where it checks the same
+invariants as the crash suite. So the suite tests sync-before-reply: a
+reply that went out before the data was fsynced is lost by the cut, and
+the check fails. It caught a mutation without the fsync of a blob file
+before its row, and a mutation with SQLite's `synchronous = OFF`. What
+it does not prove:
+
+- A drive's volatile cache. The cut models what the process had not
+  fsynced, not what the drive held in cache; a `sync_all` that only
+  flushes a drive cache passes it. Upgrade to a model that replays
+  writes to each FLUSH point (dm-log-writes) when a report says that
+  acknowledged writes were lost on such hardware.
+- Directory entries. LazyFS persists a rename at rename time, so the
+  `fsync` of the blob directory after the rename (section 3) is never
+  exercised (section 9).
+- Reordering of writes. The cut takes everything unsynced at once.
+
+The suite is Linux-only (macOS syncs with `F_FULLFSYNC`, and its CI job
+has no LazyFS); there the crash suite is what runs. As in the crash
+suite, `SCION_POWER_SEED` replays a run and `SCION_POWER_ROUNDS` sets
+the number of cuts.
 
 What the suite does not prove:
 

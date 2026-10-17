@@ -59,6 +59,54 @@ jobs:
         env:
           PROPTEST_CASES: "2000"
 
+  power-loss:
+    name: power-loss
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SCION_POWER_REQUIRE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@v2
+      - name: cache the LazyFS build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/lazyfs/lazyfs/build
+            ${{ runner.temp }}/lazyfs/libs/libpcache/build
+          key: lazyfs-0.3.1-045a0b3
+      - name: LazyFS (pinned 0.3.1, commit 045a0b3)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libfuse3-dev libfuse3-3 fuse3
+          # The mount script passes -o allow_other; a non-root user may only
+          # do that when fuse.conf allows it.
+          sudo sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
+          cd "$RUNNER_TEMP"
+          # The cache may hold the two build directories already; overlay a
+          # fresh pinned clone over them instead of cloning in place.
+          git clone --depth 1 --branch 0.3.1 https://github.com/dsrhaslab/lazyfs lazyfs-checkout
+          got=$(git -C lazyfs-checkout rev-parse HEAD)
+          echo "pinned: $got"
+          test "$got" = "045a0b3a1126725e693934e29d3ba15e08cc39ec"
+          mkdir -p lazyfs
+          cp -a lazyfs-checkout/. lazyfs/
+          rm -rf lazyfs-checkout
+          if [ ! -x lazyfs/lazyfs/build/lazyfs ]; then
+            (cd lazyfs/libs/libpcache && ./build.sh)
+            (cd lazyfs/lazyfs && ./build.sh)
+          fi
+          test -x lazyfs/lazyfs/build/lazyfs
+          test -f lazyfs/libs/libpcache/build/libpcache.so.0
+      - name: run
+        env:
+          SCION_LAZYFS: ${{ runner.temp }}/lazyfs
+        run: cargo test -p open-scion-server --test power
+
   msrv:
     name: check (MSRV)
     runs-on: ubuntu-latest
