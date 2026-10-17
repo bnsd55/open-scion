@@ -126,6 +126,9 @@ export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
 ./target/release/scn blame main:README.md         # last changeset of each line
 ./target/release/scn cat main:README.md
 ./target/release/scn checkout main --into /tmp/work   # --sparse DIR for part of it
+./target/release/scn mount /tmp/view main             # files load when first read
+./target/release/scn commit -m "from the mount" --from-mount /tmp/view
+./target/release/scn unmount /tmp/view
 echo hello > hello.txt
 cs=$(./target/release/scn commit -m "add hello" --put hello.txt=hello.txt)
 ./target/release/scn diff main "$cs"              # A hello.txt, as git diff --name-status
@@ -138,6 +141,13 @@ cs=$(./target/release/scn commit -m "add hello" --put hello.txt=hello.txt)
 Every `scn` command takes `--json` for machine-readable output. A `scn`
 error exits 2. A checkout that a signal stops removes what it wrote, and
 then dies by the signal (a shell reports 130 for Ctrl-C).
+
+`scn mount` serves a ref over NFSv3 from `scn` itself, so a file loads when
+it is first read, not when the checkout starts. Writes land in a private
+overlay directory, and `scn commit --from-mount DIR` commits exactly what
+the mount holds. It is for single-user machines only: any local user who
+can read the mount table can reach the mounted content through the NFS
+port. `scn unmount DIR` stops it and removes the overlay.
 
 ### Health and metrics
 

@@ -29,6 +29,10 @@ pub struct CommitArgs {
     /// Author as `Name <email>`.
     #[arg(long, env = "SCION_AUTHOR", default_value = "scn <scn@localhost>")]
     author: String,
+    /// Take the changes from the overlay of a `scn mount` on DIR, instead
+    /// of --put and --delete.
+    #[arg(long = "from-mount", value_name = "DIR", conflicts_with_all = ["puts", "deletes", "executable"])]
+    from_mount: Option<PathBuf>,
 }
 
 fn parse_put(spec: &str) -> Result<(String, PathBuf), String> {
@@ -38,31 +42,63 @@ fn parse_put(spec: &str) -> Result<(String, PathBuf), String> {
     Ok((path.to_owned(), PathBuf::from(file)))
 }
 
+/// What to commit for one path: a file, a symlink, or a deletion.
+enum Edit {
+    /// The local file replaces the path, or adds it.
+    Put { file: PathBuf, exec: bool },
+    /// The symlink names these bytes.
+    Link(Vec<u8>),
+    /// The path of the base is deleted.
+    Delete,
+}
+
 /// Uploads the files, creates the changeset, and prints its ID.
 pub async fn commit(ctx: &mut Ctx, args: CommitArgs) -> Result<()> {
     let (name, email) = parse_author(&args.author)?;
-    // Each path and the local file to put there, or `None` to delete it.
-    let mut edits = BTreeMap::new();
-    let puts = args.puts.iter().map(|(path, file)| (path, Some(file)));
-    for (path, file) in puts.chain(args.deletes.iter().map(|path| (path, None))) {
-        let path = RepoPath::new(path.as_str()).with_context(|| format!("bad path {path:?}"))?;
-        ensure!(
-            !edits.contains_key(&path),
-            "{path:?} is given more than once"
-        );
-        edits.insert(path, file);
-    }
+    let edits = match &args.from_mount {
+        None => arg_edits(&args)?,
+        Some(dir) => {
+            let record = crate::cmd::mount::session_for_dir(dir)
+                .with_context(|| format!("cannot commit from the mount on {}", dir.display()))?;
+            let mut edits = BTreeMap::new();
+            for (path, change) in crate::cmd::mount::overlay_changes(&record)? {
+                let edit = match change {
+                    crate::vfs::Change::Put { exec } => {
+                        let file = record
+                            .overlay
+                            .join(crate::vfs::CHANGES)
+                            .join(String::from_utf8_lossy(path.as_bytes()).as_ref());
+                        Edit::Put { file, exec }
+                    }
+                    crate::vfs::Change::PutLink(target) => Edit::Link(target),
+                    crate::vfs::Change::Delete => Edit::Delete,
+                };
+                ensure!(!edits.contains_key(&path), "{path:?} changes twice");
+                edits.insert(path, edit);
+            }
+            edits
+        }
+    };
 
     let parent = ctx.resolve(&args.base).await?;
     let mut changes = BTreeMap::new();
-    for (path, file) in edits {
-        let state = match file {
-            None => None,
-            Some(file) => {
+    for (path, edit) in edits {
+        let state = match edit {
+            Edit::Delete => None,
+            Edit::Link(target) => {
+                // SHORTCUT: reads each target whole, so memory caps the
+                // length. Upgrade: stream chunks.
+                let content = ctx
+                    .put_blob(target)
+                    .await
+                    .context("cannot upload a symlink target")?;
+                Some(FileState::Symlink { target: content })
+            }
+            Edit::Put { file, exec } => {
                 // SHORTCUT: reads each file whole, so memory caps the file
                 // size (the server caps it at 100 MiB). Upgrade: stream
                 // chunks from the file.
-                let data = std::fs::read(file)
+                let data = std::fs::read(&file)
                     .with_context(|| format!("cannot read {}", file.display()))?;
                 let content = ctx
                     .put_blob(data)
@@ -70,7 +106,7 @@ pub async fn commit(ctx: &mut Ctx, args: CommitArgs) -> Result<()> {
                     .with_context(|| format!("cannot upload {}", file.display()))?;
                 Some(FileState::Regular {
                     content,
-                    executable: args.executable,
+                    executable: exec,
                 })
             }
         };
@@ -97,6 +133,28 @@ pub async fn commit(ctx: &mut Ctx, args: CommitArgs) -> Result<()> {
         println!("{id}");
     }
     Ok(())
+}
+
+/// The edits of the command line: --put and --delete.
+fn arg_edits(args: &CommitArgs) -> Result<BTreeMap<RepoPath, Edit>> {
+    let mut edits = BTreeMap::new();
+    let puts = args.puts.iter().map(|(path, file)| (path, Some(file)));
+    for (path, file) in puts.chain(args.deletes.iter().map(|path| (path, None))) {
+        let path = RepoPath::new(path.as_str()).with_context(|| format!("bad path {path:?}"))?;
+        ensure!(
+            !edits.contains_key(&path),
+            "{path:?} is given more than once"
+        );
+        let edit = match file {
+            None => Edit::Delete,
+            Some(file) => Edit::Put {
+                file: file.clone(),
+                exec: args.executable,
+            },
+        };
+        edits.insert(path, edit);
+    }
+    Ok(edits)
 }
 
 /// Splits `Name <email>` into name and email bytes.
