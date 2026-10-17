@@ -33,7 +33,6 @@ mod common;
 
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;
@@ -42,37 +41,37 @@ use std::time::{Duration, SystemTime};
 
 use common::*;
 
-/// The LazyFS checkout the suite runs against: it must hold
+/// The `LazyFS` checkout the suite runs against: it must hold
 /// `lazyfs/build/lazyfs` and `libs/libpcache/build`.
 fn lazyfs_dir() -> Option<PathBuf> {
     let dir = std::env::var_os("SCION_LAZYFS")?;
     let dir = PathBuf::from(dir);
     let binary = dir.join("lazyfs/build/lazyfs");
-    if !binary.is_file() {
-        panic!(
-            "SCION_LAZYFS={} holds no lazyfs/build/lazyfs",
-            dir.display()
-        );
-    }
+    assert!(
+        binary.is_file(),
+        "SCION_LAZYFS={} holds no lazyfs/build/lazyfs",
+        dir.display()
+    );
     Some(dir)
 }
 
 /// Whether the test may run: only with `SCION_LAZYFS` set, and only when
 /// `SCION_POWER_REQUIRE=1` asks for it, so plain `cargo test --workspace`
-/// skips it with a message. A run whose LazyFS is missing then fails, not
+/// skips it with a message. A run whose `LazyFS` is missing then fails, not
 /// skips, so the CI job cannot pass by skipping.
 fn may_run() -> bool {
     if std::env::var("SCION_POWER_REQUIRE").as_deref() != Ok("1") {
         println!("skipping the power-loss suite: set SCION_POWER_REQUIRE=1 to run it");
         return false;
     }
-    if lazyfs_dir().is_none() {
-        panic!("SCION_LAZYFS is not set (it must name the pinned LazyFS checkout)");
-    }
+    assert!(
+        lazyfs_dir().is_some(),
+        "SCION_LAZYFS is not set (it must name the pinned `LazyFS` checkout)"
+    );
     true
 }
 
-/// One LazyFS mount over a fresh backing directory, and the server's data
+/// One `LazyFS` mount over a fresh backing directory, and the server's data
 /// directory in it.
 struct Lazyfs {
     child: Child,
@@ -83,7 +82,7 @@ struct Lazyfs {
 }
 
 impl Lazyfs {
-    /// Mounts a fresh LazyFS over a fresh backing directory. `lazyfs` is the
+    /// Mounts a fresh `LazyFS` over a fresh backing directory. `lazyfs` is the
     /// pinned checkout; `round` keeps the paths and the mapper names apart.
     fn start(dir: &Path, lazyfs: &Path, round: usize) -> Self {
         let round_dir = dir.join(format!("r{round}"));
@@ -111,7 +110,7 @@ impl Lazyfs {
         let script = lazyfs.join("lazyfs/scripts/mount-lazyfs.sh");
         let library = lazyfs.join("libs/libpcache/build");
         // The script leaves the daemon running in the background, and it
-        // looks for the binary relative to the LazyFS directory.
+        // looks for the binary relative to the `LazyFS` directory.
         let child = Command::new(script)
             .current_dir(lazyfs.join("lazyfs"))
             .arg("-c")
@@ -171,7 +170,7 @@ impl Drop for Lazyfs {
     }
 }
 
-/// Waits until the mount appears, for at most 60 s: LazyFS pre-allocates its
+/// Waits until the mount appears, for at most 60 s: `LazyFS` pre-allocates its
 /// cache before it serves, which takes a few seconds.
 fn wait_mounted(mount: &Path) {
     let want = mount.to_str().unwrap().to_owned();
@@ -182,7 +181,7 @@ fn wait_mounted(mount: &Path) {
         }
         assert!(
             start.elapsed() < Duration::from_secs(60),
-            "LazyFS did not mount {}",
+            "`LazyFS` did not mount {}",
             mount.display()
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -245,7 +244,7 @@ async fn every_reply_survives_a_power_cut() {
             .collect();
         match rng.below(3) {
             0 => {
-                // The LazyFS cache is slower than the crash suite's tmpfs,
+                // The `LazyFS` cache is slower than the crash suite's tmpfs,
                 // so the cut waits longer before it takes a quiet moment.
                 let run = 500 + rng.below(2000);
                 tokio::time::sleep(Duration::from_millis(u64::try_from(run).unwrap())).await;
@@ -273,7 +272,7 @@ async fn every_reply_survives_a_power_cut() {
             ledger.lands.append(&mut got.lands);
         }
         total += ledger.lands.len();
-        // The store reopens from the backing directory: what LazyFS
+        // The store reopens from the backing directory: what `LazyFS`
         // persisted, and nothing else.
         let data = lazy.backing.join("data");
         let server = Server::start(&data, &log);
@@ -283,6 +282,6 @@ async fn every_reply_survives_a_power_cut() {
         drop(server);
         drop(lazy);
     }
-    println!("{rounds} cuts; {total} lands, {cut_lands} of them cut mid-call",);
+    println!("{rounds} cuts; {total} lands, {cut_lands} of them cut mid-call");
     assert!(total > 0, "the clients did little work");
 }
