@@ -702,7 +702,17 @@ mod tests {
                 .collect();
             let mut memo = Memo::default();
             let view = store
-                .write(|c| project(&mut *c, root_id, &ctx, &mut memo))
+                .read(|c| project(&mut *c, root_id, &ctx, &mut memo, &alive()))
+                .unwrap();
+            // The derivation stores nothing: put the derived trees, then
+            // the walk can read the views below.
+            store
+                .write(|c| {
+                    for tree in &memo.trees {
+                        c.put_tree(tree)?;
+                    }
+                    Ok(())
+                })
                 .unwrap();
 
             // Walk the view against the model, collecting what it shows.
@@ -851,5 +861,5 @@ mod tests {
             }
         }
         Ok(())
-}
+    }
 }
