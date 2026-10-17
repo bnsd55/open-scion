@@ -77,6 +77,9 @@ fn postgres_marker(data: &Path) -> Result<()> {
                 .into(),
         ));
     }
+    // The open may name a directory that does not exist yet: the marker
+    // is its first file.
+    std::fs::create_dir_all(data).map_err(crate::error::Error::Io)?;
     std::fs::write(data.join(MARKER), "postgres\n").map_err(crate::error::Error::Io)?;
     Ok(())
 }

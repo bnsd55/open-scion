@@ -4,29 +4,39 @@
 //! a bug that the queries of the other backend hit at runtime. This test
 //! reads both sets of migrations and compares what each builds.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// One column of a table: its coarse kind, which the two dialects spell
-/// differently, and its constraints.
+/// differently, and the foreign key it carries, if any.
 #[derive(Debug, PartialEq, Eq, Default)]
-#[allow(clippy::struct_excessive_bools)]
 struct Column {
     kind: &'static str,
     not_null: bool,
-    primary_key: bool,
-    unique: bool,
-    /// The `table(column)` a `REFERENCES` names, if the column has one.
+    /// The `table(column)` the column references, if it has one.
     references: Option<String>,
     /// The literal a `DEFAULT` names, if the column has one.
     default: Option<String>,
-    /// Whether the column carries a `CHECK`. The two dialects spell the
-    /// same check differently, so only its presence compares.
-    checked: bool,
 }
 
-/// The schema: table name, then its columns with their shape.
-type Schema = BTreeMap<String, Vec<(String, Column)>>;
+/// One table: its columns, and the constraints that name several of
+/// them. A key of two columns is one group, not two flags: a schema
+/// that splits a group, or joins two, drifts.
+#[derive(Debug, PartialEq, Eq, Default)]
+struct Table {
+    columns: Vec<(String, Column)>,
+    /// The columns of the primary key, in order.
+    primary_key: Vec<String>,
+    /// The column groups of every UNIQUE, in no order.
+    uniques: BTreeSet<BTreeSet<String>>,
+    /// The expressions of every CHECK, normalized, in no order. The two
+    /// dialects spell the same check with different functions, which
+    /// `normalize_check` folds.
+    checks: BTreeSet<String>,
+}
+
+/// The schema: table name, then its shape.
+type Schema = BTreeMap<String, Table>;
 
 /// One index: its name, the table it orders, the columns it orders by,
 /// and its partial filter, which the two dialects spell the same way.
@@ -86,25 +96,29 @@ fn apply(
             .trim_matches('"')
             .to_owned();
         let end = matching_paren(rest, open);
-        schema.insert(name, columns_of(&rest[open + 1..end], dialect));
+        schema.insert(name, table_of(&rest[open + 1..end], dialect));
     } else if let Some(rest) = statement.strip_prefix("ALTER TABLE ") {
         let mut words = rest.split_whitespace();
         let table = words.next().unwrap().trim_matches('"').to_owned();
         let action = words.collect::<Vec<_>>().join(" ");
         if let Some(new) = action.strip_prefix("RENAME TO ") {
             let new = new.trim().trim_matches('"').to_owned();
-            let columns = schema.remove(&table).unwrap();
-            schema.insert(new, columns);
+            let table = schema.remove(&table).unwrap();
+            schema.insert(new, table);
         } else {
             let rest = action.strip_prefix("ADD ").unwrap_or(&action);
             let rest = rest.strip_prefix("COLUMN ").unwrap_or(rest);
-            let mut words = rest.split_whitespace();
             let name = column_name_of(rest);
+            let mut words = rest.split_whitespace();
             let _ = words.next();
             let kind = words.next().unwrap();
             let constraints = words.collect::<Vec<_>>().join(" ");
-            let column = column_of(&constraints, kind, dialect);
-            schema.entry(table).or_default().push((name, column));
+            let (column, check) = column_of(&constraints, kind, dialect);
+            let table = schema.entry(table).or_default();
+            if let Some(check) = check {
+                table.checks.insert(check);
+            }
+            table.columns.push((name, column));
         }
     } else if let Some(rest) = statement
         .strip_prefix("CREATE INDEX ")
@@ -151,7 +165,123 @@ fn column_name_of(rest: &str) -> String {
         .to_owned()
 }
 
-fn column_of(constraints: &str, kind: &str, dialect: Dialect) -> Column {
+/// The columns of a `CREATE TABLE` body, constraints included, as one
+/// table.
+fn table_of(body: &str, dialect: Dialect) -> Table {
+    let mut table = Table::default();
+    for def in split_defs(body) {
+        let def = def.trim();
+        let words: Vec<&str> = def.split_whitespace().collect();
+        let Some(first) = words.first() else {
+            continue;
+        };
+        let name = first.trim_matches('"');
+        if matches!(
+            name,
+            "FOREIGN" | "CHECK" | "UNIQUE" | "PRIMARY" | "CONSTRAINT"
+        ) {
+            apply_table_constraint(def, &mut table);
+            continue;
+        }
+        let Some(kind) = words.get(1) else {
+            continue;
+        };
+        if !is_type(kind) {
+            continue; // a constraint line, such as `REFERENCES`
+        }
+        let constraints = words[2..].join(" ");
+        let (column, check) = column_of(&constraints, kind, dialect);
+        if let Some(check) = check {
+            table.checks.insert(check);
+        }
+        if constraints.contains("PRIMARY KEY") {
+            table.primary_key.push(name.to_owned());
+        }
+        if constraints.contains("UNIQUE") {
+            table.uniques.insert(BTreeSet::from([name.to_owned()]));
+        }
+        table.columns.push((name.to_owned(), column));
+    }
+    table
+}
+
+/// Applies one table-level constraint to `table`.
+fn apply_table_constraint(def: &str, table: &mut Table) {
+    let names = |rest: &str| -> Vec<String> {
+        let open = rest.find('(').unwrap();
+        let close = matching_paren(rest, open);
+        rest[open + 1..close]
+            .split(',')
+            .map(|n| n.trim().trim_matches('"').to_owned())
+            .collect()
+    };
+    // A named constraint keeps only its shape: `CONSTRAINT name UNIQUE
+    // (a, b)` is the `UNIQUE (a, b)` after it.
+    let rest = def.strip_prefix("CONSTRAINT ").unwrap_or(def);
+    let rest = match rest.split_once(' ') {
+        Some((first, tail)) if !matches!(first, "PRIMARY" | "UNIQUE" | "FOREIGN" | "CHECK") => tail,
+        _ => rest,
+    };
+    if let Some(rest) = rest.strip_prefix("PRIMARY KEY") {
+        table.primary_key = names(rest);
+    } else if let Some(rest) = rest.strip_prefix("UNIQUE") {
+        table.uniques.insert(names(rest).into_iter().collect());
+    } else if let Some(rest) = rest.strip_prefix("CHECK") {
+        let open = rest.find('(').unwrap();
+        let close = matching_paren(rest, open);
+        table.checks.insert(normalize_check(&rest[open + 1..close]));
+    } else if let Some(rest) = rest.strip_prefix("FOREIGN KEY") {
+        let from = names(rest);
+        // `FOREIGN KEY (a, b) REFERENCES t (x, y)`: each column of the
+        // key names the column of the target it pairs with.
+        let Some((_from, columns)) = rest.split_once("REFERENCES") else {
+            return;
+        };
+        // The target table is the words before its column list.
+        let target = columns
+            .split('(')
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .last()
+            .unwrap_or("")
+            .trim_matches('"')
+            .to_owned();
+        let target_open = columns.find('(').expect("a target names its columns");
+        let target_close = matching_paren(columns, target_open);
+        let to: Vec<String> = columns[target_open + 1..target_close]
+            .split(',')
+            .map(|n| n.trim().trim_matches('"').to_owned())
+            .collect();
+        for (from, to) in from.into_iter().zip(to) {
+            if let Some((_, column)) = table.columns.iter_mut().find(|(n, _)| *n == from) {
+                column.references = Some(format!("{target}({to})"));
+            }
+        }
+    }
+}
+
+/// The check of a column definition, normalized, if it has one.
+fn check_of(constraints: &str) -> Option<String> {
+    let at = constraints.find("CHECK")?;
+    let rest = &constraints[at..];
+    let open = rest.find('(')? + at;
+    let close = matching_paren(constraints, open);
+    Some(normalize_check(&constraints[open + 1..close]))
+}
+
+/// The same check in both dialects: one text, without whitespace, with
+/// the functions the dialects spell differently folded together, and
+/// every letter lower.
+fn normalize_check(expr: &str) -> String {
+    expr.to_lowercase()
+        .replace("octet_length(", "length(")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
+fn column_of(constraints: &str, kind: &str, dialect: Dialect) -> (Column, Option<String>) {
     let kind = match dialect {
         Dialect::Sqlite => sqlite_kind(kind),
         Dialect::Postgres => postgres_kind(kind),
@@ -190,91 +320,15 @@ fn column_of(constraints: &str, kind: &str, dialect: Dialect) -> Column {
                 }
             })
     };
-    Column {
-        kind,
-        not_null: constraints.contains("NOT NULL"),
-        primary_key: constraints.contains("PRIMARY KEY"),
-        unique: constraints.contains("UNIQUE"),
-        references,
-        default,
-        checked: constraints.contains("CHECK"),
-    }
-}
-
-/// The columns of a `CREATE TABLE` body, constraints included.
-fn columns_of(body: &str, dialect: Dialect) -> Vec<(String, Column)> {
-    let defs = split_defs(body);
-    let mut columns: Vec<(String, Column)> = Vec::new();
-    let mut table_primary_key: Option<Vec<String>> = None;
-    for def in defs {
-        let words: Vec<&str> = def.split_whitespace().collect();
-        let Some(first) = words.first() else {
-            continue;
-        };
-        let name = first.trim_matches('"');
-        if matches!(
-            name,
-            "FOREIGN" | "CHECK" | "UNIQUE" | "PRIMARY" | "CONSTRAINT"
-        ) {
-            apply_table_constraint(def, &mut columns, &mut table_primary_key);
-            continue;
-        }
-        let Some(kind) = words.get(1) else {
-            continue;
-        };
-        if !is_type(kind) {
-            continue; // a constraint line, such as `REFERENCES`
-        }
-        let constraints = words[2..].join(" ");
-        columns.push((name.to_owned(), column_of(&constraints, kind, dialect)));
-    }
-    // A table-level `PRIMARY KEY (a, b)` marks its columns.
-    if let Some(keys) = table_primary_key {
-        for (name, column) in &mut columns {
-            if keys.contains(name) {
-                column.primary_key = true;
-            }
-        }
-    }
-    columns
-}
-
-/// Applies one table-level constraint to `columns`.
-fn apply_table_constraint(
-    def: &str,
-    columns: &mut [(String, Column)],
-    table_primary_key: &mut Option<Vec<String>>,
-) {
-    let names = |rest: &str| -> Vec<String> {
-        let open = rest.find('(').unwrap();
-        let close = matching_paren(rest, open);
-        rest[open + 1..close]
-            .split(',')
-            .map(|n| n.trim().trim_matches('"').to_owned())
-            .collect()
-    };
-    if let Some(rest) = def.strip_prefix("PRIMARY KEY") {
-        *table_primary_key = Some(names(rest));
-    } else if let Some(rest) = def.strip_prefix("UNIQUE") {
-        for name in names(rest) {
-            if let Some((_, column)) = columns.iter_mut().find(|(n, _)| *n == name) {
-                column.unique = true;
-            }
-        }
-    } else if let Some(rest) = def.strip_prefix("FOREIGN KEY") {
-        let columns_of_key = names(rest);
-        if let Some(table) = def.split("REFERENCES").nth(1).and_then(|t| {
-            t.split_whitespace()
-                .next()
-                .map(|t| t.trim_matches('"').to_owned())
-        }) {
-            for name in columns_of_key {
-                if let Some((_, column)) = columns.iter_mut().find(|(n, _)| *n == name) {
-                    column.references = Some(table.clone());
-                }
-            }
-        }
-    }
+    (
+        Column {
+            kind,
+            not_null: constraints.contains("NOT NULL"),
+            references,
+            default,
+        },
+        check_of(constraints),
+    )
 }
 
 /// Splits the body of a `CREATE TABLE` on the commas that no parenthesis
@@ -348,6 +402,56 @@ fn postgres_kind(kind: &str) -> &'static str {
     }
 }
 
+/// The diffs of one table's shape between the two dialects: its
+/// columns, its primary key, its UNIQUE groups, and its CHECKs.
+fn table_diffs(name: &str, table: &Table, pg_table: &Table) -> Vec<String> {
+    let mut diffs = Vec::new();
+    for (column, shape) in &table.columns {
+        let Some(pg_shape) = pg_table
+            .columns
+            .iter()
+            .find(|(n, _)| n == column)
+            .map(|(_, c)| c)
+        else {
+            diffs.push(format!(
+                "column {name}.{column} is missing from the Postgres schema"
+            ));
+            continue;
+        };
+        if pg_shape != shape {
+            diffs.push(format!(
+                "column {name}.{column} is {shape:?} in SQLite, {pg_shape:?} in Postgres"
+            ));
+        }
+    }
+    for (column, _) in &pg_table.columns {
+        if !table.columns.iter().any(|(n, _)| n == column) {
+            diffs.push(format!(
+                "column {name}.{column} is missing from the SQLite schema"
+            ));
+        }
+    }
+    if table.primary_key != pg_table.primary_key {
+        diffs.push(format!(
+            "table {name} has the primary key {:?} in SQLite, {:?} in Postgres",
+            table.primary_key, pg_table.primary_key
+        ));
+    }
+    if table.uniques != pg_table.uniques {
+        diffs.push(format!(
+            "table {name} has the UNIQUE groups {:?} in SQLite, {:?} in Postgres",
+            table.uniques, pg_table.uniques
+        ));
+    }
+    if table.checks != pg_table.checks {
+        diffs.push(format!(
+            "table {name} has the CHECKs {:?} in SQLite, {:?} in Postgres",
+            table.checks, pg_table.checks
+        ));
+    }
+    diffs
+}
+
 #[test]
 fn the_postgres_schema_holds_the_tables_and_columns_of_the_sqlite_schema() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
@@ -361,39 +465,16 @@ fn the_postgres_schema_holds_the_tables_and_columns_of_the_sqlite_schema() {
         println!("{message}");
         *ok = false;
     };
-    for (name, columns) in &sqlite {
-        let Some(pg_columns) = postgres.get(name) else {
+    for (name, table) in &sqlite {
+        let Some(pg_table) = postgres.get(name) else {
             say(
                 format!("table {name} is missing from the Postgres schema"),
                 &mut ok,
             );
             continue;
         };
-        for (column, shape) in columns {
-            let Some(pg_shape) = pg_columns.iter().find(|(n, _)| n == column).map(|(_, c)| c)
-            else {
-                say(
-                    format!("column {name}.{column} is missing from the Postgres schema"),
-                    &mut ok,
-                );
-                continue;
-            };
-            if pg_shape != shape {
-                say(
-                    format!(
-                        "column {name}.{column} is {shape:?} in SQLite, {pg_shape:?} in Postgres"
-                    ),
-                    &mut ok,
-                );
-            }
-        }
-        for (column, _) in pg_columns {
-            if !columns.iter().any(|(n, _)| n == column) {
-                say(
-                    format!("column {name}.{column} is missing from the SQLite schema"),
-                    &mut ok,
-                );
-            }
+        for diff in table_diffs(name, table, pg_table) {
+            say(diff, &mut ok);
         }
     }
     for name in postgres.keys() {

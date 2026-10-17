@@ -296,6 +296,10 @@ impl PgClient {
                         )));
                         continue;
                     }
+                    // Whether any setup ever held: a lock that a client
+                    // never got at all is another server's, not a lost
+                    // one, and the message says so.
+                    let mut setup_held = setup.ok();
                     // A client the server closed, as after a restart of the
                     // database, connects again: the caller sees one error at
                     // most, not one until the process restarts. A reconnect
@@ -306,6 +310,7 @@ impl PgClient {
                             Ok(fresh) => {
                                 client = fresh;
                                 setup = Setup::new(schema.as_deref(), exclusive, &mut client);
+                                setup_held = setup_held || setup.ok();
                                 if lost_tx {
                                     tx = TxState::Lost;
                                 }
@@ -319,11 +324,15 @@ impl PgClient {
                         }
                     }
                     if !setup.ok() {
-                        let _ = job.reply.send(Err(Error::FailedPrecondition(
+                        let message = if setup_held {
                             "this server process lost the database to another \
                              server process; it serves nothing from here on"
-                                .into(),
-                        )));
+                        } else {
+                            "another server holds this database"
+                        };
+                        let _ = job
+                            .reply
+                            .send(Err(Error::FailedPrecondition(message.into())));
                         continue;
                     }
                     if job.kind == Kind::Raw {
@@ -433,7 +442,9 @@ fn drop_stale_schemas(maker: &PgClient) {
     let Ok(got) = maker.query_opt("SELECT pg_try_advisory_lock($1)", &[P::i64(CLEAN_LOCK)]) else {
         return;
     };
-    if got.is_none() {
+    // The answer is a row that holds the verdict: a `false` row means
+    // another cleanup runs, and this one stands down.
+    if !got.is_some_and(|row| row.get::<_, bool>(0)) {
         return;
     }
     // The registry names every test schema with its start time, in
@@ -450,6 +461,11 @@ fn drop_stale_schemas(maker: &PgClient) {
     ) {
         for row in rows {
             let name: String = row.get(0);
+            // Only the names this backend makes: no other schema drops,
+            // whatever a row of the registry names.
+            if !name.starts_with("scion_test_") {
+                continue;
+            }
             let _ = maker.batch(&format!(
                 "DROP SCHEMA IF EXISTS {name} CASCADE;
                  DELETE FROM public.scion_test_schemas WHERE schema = '{name}'"
@@ -772,6 +788,10 @@ impl Drop for PgTx<'_> {
 struct Setup {
     schema: Option<String>,
     exclusive: bool,
+    /// The setup ran to the end: the schema was set, and the lock, if
+    /// one was asked for, was given. A client whose setup failed serves
+    /// nothing, whatever it holds a lock with.
+    applied: bool,
     locked: bool,
 }
 
@@ -780,6 +800,7 @@ impl Setup {
         let mut setup = Self {
             schema: schema.map(str::to_owned),
             exclusive,
+            applied: false,
             locked: !exclusive,
         };
         if setup.apply(client) {
@@ -790,15 +811,16 @@ impl Setup {
             Self {
                 schema: setup.schema,
                 exclusive: setup.exclusive,
+                applied: false,
                 locked: false,
             }
         }
     }
 
-    /// Whether the setup holds: a schema was named and set, and a
-    /// one-server lock, if one was asked for, is held.
+    /// Whether the setup holds: it ran to the end, and a one-server
+    /// lock, if one was asked for, is held.
     fn ok(&self) -> bool {
-        !self.exclusive || self.locked
+        self.applied && (!self.exclusive || self.locked)
     }
 
     fn apply(&mut self, client: &mut Client) -> bool {
@@ -819,6 +841,7 @@ impl Setup {
             return false;
         }
         self.locked = self.exclusive;
+        self.applied = true;
         true
     }
 }
@@ -842,8 +865,11 @@ impl TxState {
         matches!(self, TxState::Lost)
     }
 
-    fn after(self, sql: &str, _ok: bool) -> Self {
-        if sql.starts_with("BEGIN") && !self.lost() {
+    fn after(self, sql: &str, ok: bool) -> Self {
+        // Only a BEGIN that ran opens a transaction: one the connection
+        // refused leaves the worker outside it, and the caller's Drop
+        // rolls no transaction back that never opened.
+        if sql.starts_with("BEGIN") && ok && !self.lost() {
             return TxState::InTx;
         }
         if sql.starts_with("ROLLBACK") || (sql.starts_with("COMMIT") && !self.lost()) {
@@ -984,19 +1010,26 @@ fn connect_on(url: &str, ca: Option<&Path>, options: &str) -> Result<Client> {
 /// importer retries a batch on it, and the gRPC status becomes
 /// UNAVAILABLE. The rest keep their database error.
 fn map_pg_error(e: postgres::Error) -> Error {
+    // The error reaches the log in full, whatever it maps to: a caller
+    // that only sees Busy reads "database is busy" and no more.
+    tracing::warn!("the database refused a statement: {e}");
+    // A connection the database dropped is as retryable as a busy one.
+    if e.is_closed() {
+        return Error::Busy;
+    }
     match e.code() {
         // Deadlock, serialization failure, an administrative shutdown, a
-        // database that starts up, any lost connection.
+        // database that starts up.
         Some(code)
             if matches!(code.code(), "40P01" | "40001" | "57P01" | "57P03")
                 || code.code().starts_with("08") =>
         {
             Error::Busy
         }
-        // A connection the database dropped answers with no SQLSTATE at
-        // all: as retryable as one it named.
-        None => Error::Busy,
-        Some(_) => Error::Pg(e),
+        // The rest keep their database error: a bug of this backend, such
+        // as a bad parameter, must not look busy, or the importer retries
+        // it and the log says nothing but "busy".
+        _ => Error::Pg(e),
     }
 }
 
