@@ -12,8 +12,8 @@
 //!
 //! A file's size comes from its blob, so the first stat of a file that
 //! was never read fetches the blob, and `ls -l` of a directory fetches
-//! every blob in it. Upgrade, after #13 PR-C: a `GetSizes` call, served
-//! from the stored frame's header. The one place to change is `size_of`.
+//! every blob in it. Upgrade, after #172: a `GetSizes` call, served from
+//! the stored frame's header. The one place to change is `size_of`.
 //!
 //! No protection: see `docs/architecture.md`, section 8. Any local user who
 //! can read the mount table can reach the mounted content through the NFS
@@ -483,7 +483,7 @@ impl Vfs {
 
     /// The size of the blob of the file at `path`. The size comes from
     /// the blob, so a stat of a file that was never read fetches it.
-    /// SHORTCUT: after #13 gets a `GetSizes` call served from the stored
+    /// SHORTCUT: after #172 gets a `GetSizes` call served from the stored
     /// frame's header, this fetches no blob.
     async fn size_of(&self, blob: BlobId, path: Option<&RepoPath>) -> Result<u64, nfsstat3> {
         Ok(self.fetch_blob(blob, path).await.map_err(io_err)?.len() as u64)
@@ -1529,7 +1529,7 @@ mod tests {
         // A lookup fetches the tree of the directory, but no blob; the
         // blob comes with the first read, and the cache answers the second
         // one. (A listing fetches sizes too: nfsserve's readdir carries
-        // attributes, and until #13 PR-C a size comes from the blob.)
+        // attributes, and until #172 a size comes from the blob.)
         let test = start(&[("a", b"data\n", Some(false))]).await;
         let root = NFSFileSystem::root_dir(&test.vfs);
         let id = test

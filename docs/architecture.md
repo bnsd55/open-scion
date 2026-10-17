@@ -1478,7 +1478,7 @@ system's NFS client. A directory's tree is fetched when the directory is
 first listed or looked up in; a file's blob when the file is first read or
 sized, through the same `Objects` calls a checkout sends. Every read
 carries the mount's read ticket, which the mount refreshes through
-`GetRootTree` of the mounted changeset before it expires. Until #13 adds
+`GetRootTree` of the mounted changeset before it expires. Until #172 adds
 `GetSizes`, a file's size comes from its blob, so the first stat of a
 file that was never read fetches the blob, and `ls -l` of a directory
 fetches every blob in it.
@@ -1579,7 +1579,7 @@ limit and its upgrade path. This is the list on `main` today.
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each symlink target whole, so memory caps the target length. | Stream chunks from the file. | |
 | `scn/src/cmd/commit.rs` (`parse_author`) | The author time zone is always UTC, since `std` cannot read the local time zone. | A time zone crate. | |
-| `scn/src/vfs.rs` (`size_of`) | A file's size comes from its blob, so the first stat of a file that was never read fetches the blob, and `ls -l` of a directory fetches every blob in it. | After #13 gets a `GetSizes` call served from the stored frame's header. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
+| `scn/src/vfs.rs` (`size_of`) | A file's size comes from its blob, so the first stat of a file that was never read fetches the blob, and `ls -l` of a directory fetches every blob in it. | After #172 gets a `GetSizes` call served from the stored frame's header. | [#172](https://github.com/bnsd55/open-scion/issues/172) |
 | `scn/src/vfs.rs` (`io_err`) | Takes the error by value so `.map_err(io_err)` reads clean. | Take it by reference if the lint allows it one day. | |
 
 ## 10. Testing
