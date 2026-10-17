@@ -46,7 +46,7 @@ pub type Client = ScionClient<InterceptedService<Channel, Call>>;
 /// A connected client for the object reads that a cache tier can answer.
 pub type Objects = ObjectsClient<InterceptedService<Channel, Call>>;
 
-/// Adds the bearer token, the deadline ([`CALL_TIMEOUT`]) and the request
+/// Adds the bearer token, the deadline (`CALL_TIMEOUT`) and the request
 /// ID to every call. One command makes one ID ([`Ctx::connect`]) and sends
 /// it on every call, to the server and to the tier, so one operation can
 /// be followed across the logs of every hop.

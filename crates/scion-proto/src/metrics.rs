@@ -153,7 +153,7 @@ impl Metrics {
         self.bytes_out[rpc.0].fetch_add(bytes_out, Ordering::Relaxed);
     }
 
-    /// Counts one land that ended as `outcome` (0-3, in [`LANDS`] order).
+    /// Counts one land that ended as `outcome` (0-3, in `LANDS` order).
     pub fn land(&self, outcome: usize) {
         if outcome < LANDS.len() {
             self.lands[outcome].fetch_add(1, Ordering::Relaxed);
@@ -535,7 +535,7 @@ impl<S> tower::Layer<S> for MetricsLayer {
 }
 
 /// The wrapped service: it times the call and hands the reply's frames to
-/// [`CountingBody`].
+/// `CountingBody`.
 #[derive(Clone)]
 pub struct MetricsService<S> {
     inner: S,

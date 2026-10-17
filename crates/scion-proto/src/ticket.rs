@@ -7,7 +7,7 @@
 //!
 //! The bytes (version 1): a version byte, the expiry as u64 Unix seconds,
 //! big-endian, the 32-byte root tree, the repo and the principal, each with
-//! a u16 length, and the Ed25519 signature. The signature covers [`PREFIX`]
+//! a u16 length, and the Ed25519 signature. The signature covers `PREFIX`
 //! and every byte before it, and is checked with
 //! [`VerifyingKey::verify_strict`], trying each configured public key (at
 //! most 2, for a rotation; there is no key id). A parser takes exact
@@ -144,7 +144,7 @@ fn signed_bytes(body: &[u8]) -> Vec<u8> {
 /// # Panics
 ///
 /// Never: the length check before the split makes the last slice exactly
-/// [`SIGNATURE_BYTES`] long.
+/// `SIGNATURE_BYTES` long.
 pub fn parse(bytes: &[u8], keys: &[VerifyingKey], now: u64) -> Result<Ticket, TicketError> {
     let (body, signature_bytes) = split(bytes)?;
     let signature = Signature::from_bytes(signature_bytes.try_into().unwrap());
