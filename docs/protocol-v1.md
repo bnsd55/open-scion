@@ -100,6 +100,26 @@ caller cannot tell whether such a repo exists. A change fails with
 `PERMISSION_DENIED` when the caller may read the repo but not make the
 change (sections 6.1 to 6.3).
 
+**Folder read rules.** A read or write rule MAY name a path prefix, and the
+caller reads the paths at or below its prefixes. A caller whose read rules
+name prefixes is a *partial reader*: the server derives its view of the
+repo, the real trees with every entry its rules do not cover removed, and
+serves it. A path outside its prefixes answers exactly as a missing one,
+the same code and the same text, in every RPC. `ResolveRef` resolves as
+for any caller; `GetRootTree` answers the root of the view and mints the
+read ticket on that root, so `GetObjects` serves only what the view
+reaches; `ReadFile` and `ListDir` read through the view. The caller's
+history is not served in this version: `GetChangeset`, `Log`, `Blame`,
+`MergeBase`, `IsAncestor` and `Diff` answer `UNIMPLEMENTED`, the same text
+on every call, and so does every write (`PutBlob`, `CreateChangeset`,
+`Land`, `GetLand`). A file that gives a partial reader a write rule is
+refused at load, so no partial reader holds a write rule: a write rule for
+a repo MUST be matched by a whole-repo read rule. A ticket outlives a
+reload that narrows its principal: its bearer grace is its life, at most
+15 minutes from signing (section 7.2). The access file holds at most 32
+distinct canonical read rule sets per repo, and a set at most 256
+prefixes; a file over either cap is refused at load.
+
 **Per-principal quotas.** A server MAY cap what one principal holds at once.
 The caps are `--max-principal-requests` (calls in flight, counted from the
 server takes the call until its reply starts), `--max-principal-upload-bytes`
@@ -201,7 +221,7 @@ contract. A client MUST NOT depend on its text.
 | `RESOURCE_EXHAUSTED` | `GetObjects` only: no memory for the first object within 30 s, or before the caller's deadline (section 7.3). | Yes, after a wait |
 | `DATA_LOSS` | From a tier only: its upstream sent bytes that are not the object asked for (section 8). | MAY |
 | `INTERNAL` | A database, I/O or stored-data error, or a server bug. The message is `internal error`; the detail stays in the server log. | MAY |
-| `UNIMPLEMENTED` | The server does not have the call, or the request is compressed. | After the cause is fixed |
+| `UNIMPLEMENTED` | The server does not have the call, the request is compressed, or the caller is a partial reader of folder read rules and the call reads history or writes (section 2). | After the cause is fixed |
 
 A land that conflicts or is rejected is not an error. It is a state in a
 successful `Land` reply (section 6.3).
@@ -801,7 +821,9 @@ read the repo.
 the root tree of a changeset that the repo has, with a signed read ticket for
 it (section 7.3). `NOT_FOUND` if the repo does not exist, the caller may not
 read it, or the changeset does not exist for that repo. The answer never
-changes.
+changes. A partial reader of folder read rules gets the root of its view,
+and the ticket is signed on that view root: `GetObjects` cannot reach past
+it (section 2).
 
 ### 7.3 GetObjects
 

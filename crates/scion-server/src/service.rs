@@ -41,7 +41,7 @@ use crate::objects::ObjectsService;
 use crate::quotas::{Call, Quotas};
 use crate::store::{MAX_OBJECT_BYTES, READER_BYTES};
 use crate::tickets::Keys;
-use crate::{blame, names, read, write};
+use crate::{blame, names, read, views, write};
 
 /// Most changeset bytes in one `Log` reply; the client pages for more.
 /// Most store operations running at once.
@@ -388,6 +388,24 @@ pub(crate) fn check_reader(access: &Access, caller: &Caller, repo: &str) -> Resu
     access.check_read(caller, repo).map_err(Status::from)
 }
 
+/// The refusal of every RPC that a partial reader may not use, uniform for
+/// every principal with folder read rules: the feature is off for such a
+/// caller, with no per-object difference. `check_reader` first, so a repo
+/// that the caller may not see answers as a missing one.
+pub(crate) fn check_whole_reader(
+    access: &Access,
+    caller: &Caller,
+    repo: &str,
+) -> Result<(), Status> {
+    check_reader(access, caller, repo)?;
+    if access.partial(caller, repo) {
+        return Err(Status::unimplemented(
+            "not available to a principal with folder read rules",
+        ));
+    }
+    Ok(())
+}
+
 /// `ResolveRef`, served by both services.
 pub(crate) async fn resolve_ref(
     worker: &Worker,
@@ -398,8 +416,6 @@ pub(crate) async fn resolve_ref(
     let caller = caller(&request)?;
     let _call = quotas.enter(&caller).map_err(Status::from)?;
     let ResolveRefRequest { repo, name } = request.into_inner();
-    check_reader(access, &caller, &repo)?;
-    check_name("ref", &name)?;
     check_reader(access, &caller, &repo)?;
     check_name("ref", &name)?;
     let id = worker
@@ -843,7 +859,13 @@ impl Scion for ScionService {
             .ok_or_else(|| Status::invalid_argument("empty upload"))??;
         check_name("repo", &first.repo)?;
         // An upload names no path, so a caller that may change some path of
-        // the repo may upload.
+        // the repo may upload. A partial reader uploads nothing in v0.1 of
+        // the folder rules ([#121]).
+        if self.access.partial(&caller, &first.repo) {
+            return Err(Status::unimplemented(
+                "not available to a principal with folder read rules",
+            ));
+        }
         self.access.check_writer(&caller, &first.repo)?;
         // The first message's bytes, and the budget that the later messages
         // of this upload take from. Held until the reply, on every path.
@@ -888,7 +910,7 @@ impl Scion for ScionService {
         let caller = caller(&request)?;
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let CreateChangesetRequest { repo, changeset } = request.into_inner();
-        check_reader(&self.access, &caller, &repo)?;
+        check_whole_reader(&self.access, &caller, &repo)?;
         let access = Arc::clone(&self.access);
         let id = self
             .worker
@@ -918,7 +940,7 @@ impl Scion for ScionService {
         let caller = caller(&request)?;
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let req = request.into_inner();
-        check_reader(&self.access, &caller, &req.repo)?;
+        check_whole_reader(&self.access, &caller, &req.repo)?;
         check_name("target_ref", &req.target_ref)?;
         check_name("request_key", &req.request_key)?;
         let req = land::LandRequest {
@@ -950,7 +972,7 @@ impl Scion for ScionService {
         let caller = caller(&request)?;
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let GetLandRequest { repo, land_id } = request.into_inner();
-        check_reader(&self.access, &caller, &repo)?;
+        check_whole_reader(&self.access, &caller, &repo)?;
         let land_id = land_id
             .parse()
             .map_err(|_| Status::invalid_argument("land_id must be a number"))?;
@@ -980,7 +1002,7 @@ impl Scion for ScionService {
         // apart: the reply counts what it leaves in HTTP/2 on it.
         let stalled = scion_proto::listen::Stalled::of(&request);
         let req = request.into_inner();
-        check_reader(&self.access, &caller, &req.repo)?;
+        check_whole_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let data = self
             .worker
@@ -1009,14 +1031,38 @@ impl Scion for ScionService {
         // The handle of the caller's connection, before the request is taken
         // apart: the reply counts what it leaves in HTTP/2 on it.
         let stalled = scion_proto::listen::Stalled::of(&request);
+        // The derivation of a first view walks the real tree, under the
+        // call's deadline.
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_path(req.path)?;
+        // A partial reader reads its view: the paths that its read rules
+        // cover, through trees the server derived for it ([#121]). A hidden
+        // path is not in the view, so it answers as a missing one.
+        let view = match self.access.read_digest(&caller, &req.repo) {
+            Some(digest) => {
+                let prefixes = self
+                    .access
+                    .read_rule_set(&caller, &req.repo)
+                    .unwrap_or_default();
+                Some((digest, prefixes))
+            }
+            None => None,
+        };
         let (blob, size) = self
             .worker
             .run(move |store| {
-                let blob = read::file_blob(&store, &req.repo, id, &path)?;
+                let blob = match &view {
+                    Some((digest, prefixes)) => {
+                        let repo_id = store.read(|c| c.repo_id(&req.repo))?;
+                        let root =
+                            views::view_root(&store, repo_id, digest, id, prefixes, &deadline)?;
+                        read::file_blob_at(&store, root, &path)?
+                    }
+                    None => read::file_blob(&store, &req.repo, id, &path)?,
+                };
                 Ok((blob, store.blobs().size(blob)?))
             })
             .await?;
@@ -1053,13 +1099,39 @@ impl Scion for ScionService {
         // The handle of the caller's connection, before the request is taken
         // apart: the reply counts what it leaves in HTTP/2 on it.
         let stalled = scion_proto::listen::Stalled::of(&request);
+        // The derivation of a first view walks the real tree, under the
+        // call's deadline.
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_optional_path(req.path)?;
+        // A partial reader lists its view: only the entries its read rules
+        // cover, and a hidden path answers as a missing one ([#121]).
+        let view = match self.access.read_digest(&caller, &req.repo) {
+            Some(digest) => {
+                let prefixes = self
+                    .access
+                    .read_rule_set(&caller, &req.repo)
+                    .unwrap_or_default();
+                Some((digest, prefixes))
+            }
+            None => None,
+        };
         let data = self
             .worker
-            .run(move |store| Ok(read::list_dir(&store, &req.repo, id, path.as_ref())?.encode()))
+            .run(move |store| {
+                let tree = match &view {
+                    Some((digest, prefixes)) => {
+                        let repo_id = store.read(|c| c.repo_id(&req.repo))?;
+                        let root =
+                            views::view_root(&store, repo_id, digest, id, prefixes, &deadline)?;
+                        read::list_dir_at(&store, root, path.as_ref())?
+                    }
+                    None => read::list_dir(&store, &req.repo, id, path.as_ref())?,
+                };
+                Ok(tree.encode())
+            })
             .await?;
         self.stream_whole(call, data, stalled, |data| ListDirResponse { tree: data })
             .await
@@ -1073,7 +1145,7 @@ impl Scion for ScionService {
         let stalled = scion_proto::listen::Stalled::of(&request);
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
-        check_reader(&self.access, &caller, &req.repo)?;
+        check_whole_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         // `read::MAX_SCAN` also bounds the entries.
         let limit = (req.limit as usize).max(1);
@@ -1116,7 +1188,7 @@ impl Scion for ScionService {
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
-        check_reader(&self.access, &caller, &req.repo)?;
+        check_whole_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_path(req.path.clone())?;
         // Taken before the worker permit, and held until the job ends, also
@@ -1198,7 +1270,7 @@ impl Scion for ScionService {
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
-        check_reader(&self.access, &caller, &req.repo)?;
+        check_whole_reader(&self.access, &caller, &req.repo)?;
         let a = parse_id(&req.a_changeset_id, "a_changeset_id")?;
         let b = parse_id(&req.b_changeset_id, "b_changeset_id")?;
         let bases = self
@@ -1219,7 +1291,7 @@ impl Scion for ScionService {
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
-        check_reader(&self.access, &caller, &req.repo)?;
+        check_whole_reader(&self.access, &caller, &req.repo)?;
         let ancestor = parse_id(&req.ancestor_id, "ancestor_id")?;
         let descendant = parse_id(&req.descendant_id, "descendant_id")?;
         let is_ancestor = self
@@ -1234,7 +1306,7 @@ impl Scion for ScionService {
         let caller = caller(&request)?;
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let req = request.into_inner();
-        check_reader(&self.access, &caller, &req.repo)?;
+        check_whole_reader(&self.access, &caller, &req.repo)?;
         let old = parse_id(&req.old_changeset_id, "old_changeset_id")?;
         let new = parse_id(&req.new_changeset_id, "new_changeset_id")?;
         let path = parse_optional_path(req.path)?;

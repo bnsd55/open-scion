@@ -45,7 +45,7 @@ use crate::meta::{Meta, MetaTx, RefState, RepoId};
 use crate::store::Blobs;
 
 /// The schema version this build makes and reads.
-pub(crate) const PG_SCHEMA_VERSION: u32 = 1;
+pub(crate) const PG_SCHEMA_VERSION: u32 = 2;
 
 /// The advisory lock of the one server process of a database.
 const SERVER_LOCK: i64 = 0x5343_494F_4E53_5256;
@@ -54,8 +54,10 @@ const SCHEMA_LOCK: i64 = 0x5343_494F_4E53_4348;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database
 /// from version `n - 1` to version `n`. A released migration never changes.
-const PG_MIGRATIONS: [&str; PG_SCHEMA_VERSION as usize] =
-    [include_str!("../migrations/postgres/0001_init.sql")];
+const PG_MIGRATIONS: [&str; PG_SCHEMA_VERSION as usize] = [
+    include_str!("../migrations/postgres/0001_init.sql"),
+    include_str!("../migrations/postgres/0002_view_roots.sql"),
+];
 
 /// Handle to one Postgres database. Cheap to clone.
 #[derive(Clone)]
@@ -1494,6 +1496,68 @@ impl MetaTx for PgTx<'_> {
             &[P::text(kind), P::i64(version), P::i64(limit)],
         )?;
         Ok(usize::try_from(deleted).unwrap_or(0))
+    }
+
+    /// The view root that a rule-set digest derives for a changeset, if
+    /// derived already.
+    ///
+    /// # Errors
+    ///
+    /// Database errors, or a stored root that is not a tree ID.
+    fn get_view_root(
+        &mut self,
+        repo: RepoId,
+        digest: &[u8; 32],
+        cs: ChangesetId,
+    ) -> Result<Option<TreeId>> {
+        let bytes: Option<Vec<u8>> = self
+            .c
+            .query_opt(
+                "SELECT root FROM view_roots WHERE repo_id = $1 AND digest = $2 AND cs = $3",
+                &[
+                    P::i64(repo.0),
+                    P::bytes(digest),
+                    P::bytes(&id_bytes(cs.as_bytes())),
+                ],
+            )?
+            .map(|row| row.get(0));
+        bytes
+            .map(|b| {
+                TreeId::try_from(b.as_slice()).map_err(|_| Error::Corrupt("bad view root".into()))
+            })
+            .transpose()
+    }
+
+    /// Records the view root of a rule-set digest for a changeset. A second
+    /// write must agree with the first: derivation is deterministic, so a
+    /// mismatch means corruption.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if a different root is already stored.
+    fn put_view_root(
+        &mut self,
+        repo: RepoId,
+        digest: &[u8; 32],
+        cs: ChangesetId,
+        root: TreeId,
+    ) -> Result<()> {
+        let inserted = self.c.execute(
+            "INSERT INTO view_roots (repo_id, digest, cs, root) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (repo_id, digest, cs) DO NOTHING",
+            &[
+                P::i64(repo.0),
+                P::bytes(digest),
+                P::bytes(&id_bytes(cs.as_bytes())),
+                P::bytes(&id_bytes(root.as_bytes())),
+            ],
+        )?;
+        if inserted == 0 && self.get_view_root(repo, digest, cs)? != Some(root) {
+            return Err(Error::Corrupt(format!(
+                "the view root of {cs} for the rule set differs from the stored value"
+            )));
+        }
+        Ok(())
     }
 
     /// Stores a tree. Safe to repeat.

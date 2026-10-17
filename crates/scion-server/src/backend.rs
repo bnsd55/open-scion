@@ -405,6 +405,31 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn get_view_root(
+        &mut self,
+        repo: RepoId,
+        digest: &[u8; 32],
+        cs: ChangesetId,
+    ) -> Result<Option<TreeId>> {
+        match self {
+            Self::Sqlite(tx) => tx.get_view_root(repo, digest, cs),
+            Self::Postgres(pg) => pg.get_view_root(repo, digest, cs),
+        }
+    }
+
+    fn put_view_root(
+        &mut self,
+        repo: RepoId,
+        digest: &[u8; 32],
+        cs: ChangesetId,
+        root: TreeId,
+    ) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.put_view_root(repo, digest, cs, root),
+            Self::Postgres(pg) => pg.put_view_root(repo, digest, cs, root),
+        }
+    }
+
     fn put_tree(&mut self, tree: &Tree) -> Result<TreeId> {
         match self {
             Self::Sqlite(tx) => tx.put_tree(tree),

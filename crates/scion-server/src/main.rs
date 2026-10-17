@@ -132,6 +132,7 @@ enum Command {
     /// Print the BLAKE3 digest of a token, as a `token` line of an access
     /// file wants it. The file holds digests, never tokens.
     HashToken {
+        /// The token to digest.
         #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
         token: String,
     },

@@ -176,6 +176,26 @@ pub trait MetaTx {
     /// Deletes up to `limit` derived values of `kind` below `version`.
     fn delete_derived_below(&mut self, kind: &str, version: u32, limit: usize) -> Result<usize>;
 
+    /// The view root that a rule-set digest derives for a changeset, if
+    /// derived already.
+    fn get_view_root(
+        &mut self,
+        repo: RepoId,
+        digest: &[u8; 32],
+        cs: ChangesetId,
+    ) -> Result<Option<TreeId>>;
+
+    /// Records the view root of a rule-set digest for a changeset. A second
+    /// write must agree with the first: derivation is deterministic, so a
+    /// mismatch means corruption.
+    fn put_view_root(
+        &mut self,
+        repo: RepoId,
+        digest: &[u8; 32],
+        cs: ChangesetId,
+        root: TreeId,
+    ) -> Result<()>;
+
     /// Stores a tree. Safe to repeat.
     fn put_tree(&mut self, tree: &Tree) -> Result<TreeId>;
 

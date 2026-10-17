@@ -25,7 +25,10 @@ The pieces:
 ```
 
 That is the whole deployment: clients talk to `127.0.0.1:7878` (or `--listen`
-HOST:PORT). Without `--ticket-key` no object is readable, so a real server
+HOST:PORT). The data directory holds every blob and every row, so keep it
+mode 0700 and owned by the user the server runs as: the server refuses one
+that group or others can write, or that sits under a directory another user
+can change. Without `--ticket-key` no object is readable, so a real server
 adds a ticket key (section 2):
 
 ```sh
@@ -43,7 +46,9 @@ file instead (see "Tokens: one, or an access file", below).
 
 A cache serves object reads to a region and forwards everything else. Each
 hop has its own token pair: what the tier requires from its clients
-(`--token`), and what it sends upstream (`--upstream-token`).
+(`--token`), and what it sends upstream (`--upstream-token`). A `scn`
+client's `--token` is what it sends, the other side of the pair of the tier
+in front of it.
 
 ```sh
 ./scion-cache --token <CACHE_TOKEN> --upstream-token <SERVER_TOKEN> \
@@ -77,7 +82,10 @@ daemon. With the chain above, the daemon of a user runs
 `--token <USER_TOKEN>`, where `<USER_TOKEN>` is that user's token at the
 server too. A new node can start warm: copy a snapshot file from the cache
 (`--snapshot DIR --snapshot-repo R`, refreshed every `--snapshot-every`
-seconds) and start the daemon with `--seed FILE`.
+seconds) and start the daemon with `--seed FILE`. A snapshot holds every
+object of its repo by ID, so snapshot only repos that ALL the node's users
+may read WHOLE: a seeded daemon serves paths that folder read rules hide,
+because it checks objects, not rules.
 
 ### Tokens: one, or an access file
 
@@ -87,7 +95,7 @@ per-repo read and write rules:
 
 ```sh
 TOK=$(./scion-server hash-token --token <SECRET>)
-printf 'token\tops\t%s\nwrite\tops\tr\n' "$TOK" > /srv/scion/access.txt
+printf 'token\tops\t%s\nread\tops\tr\nwrite\tops\tr\n' "$TOK" > /srv/scion/access.txt
 chmod 600 /srv/scion/access.txt
 ./scion-server --data /srv/scion serve --access /srv/scion/access.txt \
   --ticket-key /srv/scion-keys/ticket.key
@@ -98,6 +106,15 @@ MiB upload bytes, 64 pending lands per principal); raise or lower them with
 `--max-principal-requests`, `--max-principal-upload-bytes`,
 `--max-principal-pending-lands`. With `--token`, every caller is the same
 principal, so the caps are off unless a flag sets one.
+
+Rewriting the access file takes effect at the next start (or restart): the
+server reads it once. A ticket keeps working for its whole life after a
+reload that narrows its principal, up to 15 minutes from signing, on this
+server and on any cache that holds the repo's objects. To revoke reads:
+rewrite the file and restart, and either wait out the tickets (15 minutes)
+or rotate the ticket key (`--ticket-key`) to cut them off at once. Objects
+already on a user's daemon are out of reach of both; give a daemon only
+repos all its users may read whole.
 
 ### Network and TLS
 
