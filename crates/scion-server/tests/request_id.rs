@@ -73,11 +73,15 @@ fn bound_addr(log: &Path) -> Option<SocketAddr> {
 
 /// Waits for the server to print its address.
 fn wait_url(server: &Server) -> String {
-    for _ in 0..100 {
+    // The bound address in the log is the state to wait for: the server
+    // started and listens. The ceiling is generous, so a loaded machine
+    // still reaches it.
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(30) {
         if let Some(addr) = bound_addr(&server.log) {
             return format!("http://{addr}");
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(10));
     }
     panic!("the server did not start");
 }
