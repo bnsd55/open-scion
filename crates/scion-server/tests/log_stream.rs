@@ -1,9 +1,9 @@
-//! `Log` streams its entries in parts, as `ListDir` and `GetChangeset`
-//! stream theirs: the parts take the one counted path, so a client that
-//! stops reading is counted and cut off. The unary replies that are left
-//! are bounded by the message limit: a reply over it is refused by the
-//! server's encoder, and a test pins that wiring, so nobody removes it by
-//! accident.
+//! `Log` and `Blame` stream their replies in parts, as `ListDir` and
+//! `GetChangeset` stream theirs: the parts take the one counted path, so a
+//! client that stops reading is counted and cut off. The unary replies
+//! that are left are bounded by the message limit: a reply over it is
+//! refused by the server's encoder, and a test pins that wiring, so nobody
+//! removes it by accident.
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use scion_core::{Changeset, FileState, RepoPath};
 use scion_proto::MAX_MESSAGE_BYTES;
 use scion_proto::auth::Bearer;
 use scion_proto::listen::Limits;
+use scion_proto::v1::BlameRequest;
 use scion_proto::v1::LogRequest;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_server::meta::{Meta as _, MetaTx as _};
@@ -248,11 +249,14 @@ impl scion_proto::v1::scion_server::Scion for Huge {
         Ok(Response::new(dead()))
     }
 
+    type BlameStream =
+        tokio_stream::wrappers::ReceiverStream<Result<scion_proto::v1::BlameResponse, Status>>;
+
     async fn blame(
         &self,
         _: Request<scion_proto::v1::BlameRequest>,
-    ) -> Result<Response<scion_proto::v1::BlameResponse>, Status> {
-        Err(Status::unimplemented("test stub"))
+    ) -> Result<Response<Self::BlameStream>, Status> {
+        Ok(Response::new(dead()))
     }
 
     async fn merge_base(
@@ -304,4 +308,49 @@ async fn a_unary_reply_over_the_message_limit_is_refused() {
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::OutOfRange, "{err}");
     assert!(err.to_string().contains("encoded message length"), "{err}");
+}
+
+/// A client that stops reading a `Blame` reply: the reply's producer stops
+/// at its stall, and the stalled bytes go on the connection's count. Past
+/// `--max-stalled-bytes` the connection closes, so the stalled stream ends
+/// with the transport error. The clock is paused and moved past the stall,
+/// and the reply stays unread: reading it would grant the client's HTTP/2
+/// windows back, and the reply would flow instead of stalling.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_blame_reply_is_counted_and_closes_the_connection() {
+    // Twenty changesets with 300 KB messages each: a blame of the file
+    // names each author, so its reply is about six parts, and the client's
+    // connection takes under two.
+    let (_data, store, ids) = chain(20, 300_000);
+    // The cap of the test connection: one stalled reply of 4 MiB is over it.
+    let limits = Limits {
+        stalled_bytes: NonZeroU64::new(1 << 20).unwrap(),
+        ..Limits::default()
+    };
+    let url = serve(store, limits).await;
+    let mut client = client(&url).await;
+
+    let tip = ids[ids.len() - 1];
+    let mut reply = client
+        .blame(BlameRequest {
+            repo: REPO.to_string(),
+            changeset_id: tip.as_bytes().to_vec(),
+            path: b"d/f.txt".to_vec(),
+            cursor: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // The stall is waited out in steps while the tasks run.
+    for _ in 0..140 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+    }
+    // The count is over the cap: the connection's read side failed, and
+    // hyper closed the connection, so the stalled stream ends with the
+    // transport error. A clean end would mean the reply flowed, and
+    // nothing was counted.
+    let end = reply.message().await;
+    assert!(end.is_err(), "the stalled reply was not cut off: {end:?}");
 }

@@ -6,9 +6,10 @@ step is run by a person.
 
 ## Before a release
 
-- CI is green on `main`: `cargo fmt --check`, `cargo clippy --workspace
-  --all-targets -- -D warnings`, `cargo test --workspace`, the MSRV check
-  and the fuzz smoke test.
+- CI is green on `main`. The jobs (`.github/workflows/ci.yml`): `fmt +
+  clippy`, `cargo-deny`, `test`, `test (macOS)`, `power-loss`,
+  `publish check`, `check (MSRV)`, `conformance (grpcurl)`, `docker demo`
+  and `fuzz smoke (60 s)`. A red job blocks the release.
 - The milestone for the version has no open issues.
 - Every crate carries the metadata that crates.io wants: a description,
   the license (`MIT OR Apache-2.0`), the repository and homepage, keywords
@@ -36,7 +37,8 @@ step is run by a person.
    ```
 
    It must end with `Packaged` five times and `Verifying` five times.
-   `cargo package` uploads nothing.
+   `cargo package` uploads nothing. CI runs the same check as its
+   `publish check` job, in one dependency-order invocation.
 4. **Tag.** Cut an annotated tag from the commit that the release
    notes describe:
 
