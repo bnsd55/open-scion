@@ -29,8 +29,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin scion \
-    && mkdir -p /data /certs \
-    && chown scion:scion /data /certs
+    && mkdir -p /data /certs /work \
+    && chown scion:scion /data /certs /work
 
 COPY --from=build /out/scion-server /out/scion-cache /out/scn /usr/local/bin/
 
