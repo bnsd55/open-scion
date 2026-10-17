@@ -31,6 +31,7 @@ use crate::access::Access;
 use crate::deadline::Deadline;
 use crate::error::{Error, Result};
 use crate::meta::MetaTx as _;
+use crate::metrics::Metrics;
 use crate::quotas::{Call, Quotas};
 use crate::read;
 use crate::service::{Worker, check_reader, parse_id, resolve_ref};
@@ -73,6 +74,8 @@ impl Plan {
 pub struct ObjectsService {
     worker: Worker,
     access: Arc<Access>,
+    /// The registry that counts the view derivations.
+    metrics: Arc<Metrics>,
     /// What one principal may hold at once.
     quotas: Quotas,
     /// The tokens of the server: every call of this service but
@@ -91,6 +94,7 @@ impl ObjectsService {
         access: Arc<Access>,
         quotas: Quotas,
         tickets: Option<Arc<Keys>>,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             worker,
@@ -98,6 +102,7 @@ impl ObjectsService {
             access,
             quotas,
             tickets,
+            metrics,
             in_flight: Arc::new(Semaphore::new(IN_FLIGHT_BYTES)),
         }
     }
@@ -382,15 +387,18 @@ impl Objects for ObjectsService {
                     .read_rule_set(&caller, &repo)
                     .unwrap_or_default(),
                 self.access.view_digests(&repo),
+                Arc::clone(&self.metrics),
             )
         });
         let (tree, repo) = self
             .worker
             .run(move |store| {
                 let tree = match &rule_set {
-                    Some((digest, prefixes, live)) => {
+                    Some((digest, prefixes, live, metrics)) => {
                         let repo_id = store.read(|c| c.repo_id(&repo))?;
-                        views::view_root(&store, repo_id, digest, cs, prefixes, live, &deadline)?
+                        views::view_root(
+                            &store, repo_id, digest, cs, prefixes, live, metrics, &deadline,
+                        )?
                     }
                     None => read::root_tree(&store, &repo, cs)?,
                 };

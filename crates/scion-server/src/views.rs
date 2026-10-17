@@ -40,11 +40,6 @@ use crate::store::Store;
 /// below the tree's path, relative to it, in the rule set's canonical form.
 type Context = Vec<Vec<u8>>;
 
-/// The real trees the last derivation fetched, for the measurement and the
-/// memo tests. The walk reads one tree per real directory it visits; a
-/// per-tree memo hit skips its whole subtree.
-pub(crate) static WALKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// What a context says about one directory entry.
 #[derive(Debug)]
 enum Below {
@@ -85,6 +80,10 @@ struct Memo {
     derived: std::collections::HashMap<(TreeId, [u8; 32]), Option<TreeId>>,
     trees: Vec<Tree>,
     rows: Vec<(TreeId, [u8; 32], TreeId)>,
+    /// Real trees the walk opened, one per directory. A per-tree memo hit
+    /// skips its whole subtree, so the count says how much the derivation
+    /// really read.
+    walked: u64,
 }
 
 /// The version of the projection. Bumped when the derivation changes, so
@@ -109,6 +108,7 @@ pub(crate) const VIEW_EXPIRE_STEP: usize = 256;
 ///
 /// Store errors, or [`crate::error::Error::DeadlineExceeded`] once
 /// `deadline` passes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn view_root(
     store: &Store,
     repo: RepoId,
@@ -116,6 +116,7 @@ pub(crate) fn view_root(
     cs: ChangesetId,
     prefixes: &[RepoPath],
     live: &[[u8; 32]],
+    metrics: &crate::metrics::Metrics,
     deadline: &Deadline,
 ) -> Result<TreeId> {
     let real = crate::tree::root_tree(store, repo, cs)?;
@@ -153,6 +154,9 @@ pub(crate) fn view_root(
         memo.rows.push((real, ctx_digest, id));
         id
     };
+    // The real trees the walk opened, as an operator metric: a count that
+    // stays high on every changeset says the memo is not serving.
+    metrics.view_tree_walked(memo.walked);
     // One short write: the new view trees, their rows, and the sweep. All
     // are safe to repeat; a row that another server stored already must
     // agree, or the derivation is not a pure function and that is a bug.
@@ -212,7 +216,7 @@ fn project(
         return Ok(Some(hit));
     }
     let tree = c.get_tree(id)?;
-    WALKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    memo.walked += 1;
     let mut kept = std::collections::BTreeMap::new();
     for (name, entry) in &tree.entries {
         // A file is visible when a prefix names it exactly; a prefix
@@ -586,16 +590,20 @@ mod tests {
             .collect();
         let deadline = alive();
         let live = [digest];
-        let first = view_root(&store, repo, &digest, tip, &prefixes, &live, &deadline).unwrap();
-        // The second derivation of the same changeset finds the root row.
-        WALKED.store(0, std::sync::atomic::Ordering::Relaxed);
-        let again = view_root(&store, repo, &digest, tip, &prefixes, &live, &deadline).unwrap();
+        let metrics = crate::metrics::Metrics::default();
+        let first = view_root(
+            &store, repo, &digest, tip, &prefixes, &live, &metrics, &deadline,
+        )
+        .unwrap();
+        // The second derivation of the same changeset finds the root row:
+        // the walk counter does not move.
+        let walked_before = metrics.view_trees_walked();
+        let again = view_root(
+            &store, repo, &digest, tip, &prefixes, &live, &metrics, &deadline,
+        )
+        .unwrap();
         assert_eq!(again, first, "the same view");
-        assert_eq!(
-            WALKED.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "no walk"
-        );
+        assert_eq!(metrics.view_trees_walked() - walked_before, 0, "no walk");
         // A new changeset that changes only a hidden path keeps the view.
         let cs2 = store
             .write(|c| {
@@ -625,7 +633,10 @@ mod tests {
         // its root tree is new, so the walk visits the root and stops —
         // every folder below comes from the rows.
         let before = rows(&store);
-        let third = view_root(&store, repo, &digest, cs2, &prefixes, &live, &deadline).unwrap();
+        let third = view_root(
+            &store, repo, &digest, cs2, &prefixes, &live, &metrics, &deadline,
+        )
+        .unwrap();
         assert_eq!(third, first, "the same view, from the rows");
         assert_eq!(rows(&store) - before, 1, "only the new root row");
     }
@@ -641,7 +652,11 @@ mod tests {
             .collect();
         let deadline = alive();
         let live = [digest];
-        let head = view_root(&store, repo, &digest, tip, &prefixes, &live, &deadline).unwrap();
+        let metrics = crate::metrics::Metrics::default();
+        let head = view_root(
+            &store, repo, &digest, tip, &prefixes, &live, &metrics, &deadline,
+        )
+        .unwrap();
         // head+1: the file under `left` changes; `right` keeps its tree.
         let head_plus_1 = store
             .write(|c| {
@@ -677,6 +692,7 @@ mod tests {
             head_plus_1,
             &prefixes,
             &live,
+            &metrics,
             &deadline,
         )
         .unwrap();
@@ -739,10 +755,11 @@ mod tests {
             Deadline::new(std::time::Instant::now() + std::time::Duration::from_secs(600));
 
         // head: the first derivation walks the tree.
-        WALKED.store(0, std::sync::atomic::Ordering::Relaxed);
+        let metrics = crate::metrics::Metrics::default();
         let live = [digest];
-        let (root_1, head_walk, head_time) =
-            time_walk(&store, repo, digest, tip, &prefixes, &live, &deadline);
+        let (root_1, head_walk, head_time) = time_walk(
+            &store, repo, digest, tip, &prefixes, &live, &metrics, &deadline,
+        );
 
         // head+1: one file under tokio/src changes.
         let blob = store.blobs().put(b"one changed file\n").unwrap();
@@ -772,7 +789,6 @@ mod tests {
             .unwrap();
 
         // The same rule set, the next changeset.
-        WALKED.store(0, std::sync::atomic::Ordering::Relaxed);
         let (_root_2, plus_walk, plus_time) = time_walk(
             &store,
             repo,
@@ -780,6 +796,7 @@ mod tests {
             head_plus_1,
             &prefixes,
             &live,
+            &metrics,
             &deadline,
         );
         let _ = root_1;
@@ -795,15 +812,13 @@ mod tests {
         cs: ChangesetId,
         prefixes: &[RepoPath],
         live: &[[u8; 32]],
+        metrics: &crate::metrics::Metrics,
         deadline: &Deadline,
     ) -> (TreeId, u64, std::time::Duration) {
         let start = std::time::Instant::now();
-        let view = view_root(store, repo, &digest, cs, prefixes, live, deadline).unwrap();
-        (
-            view,
-            WALKED.swap(0, std::sync::atomic::Ordering::Relaxed),
-            start.elapsed(),
-        )
+        let before = metrics.view_trees_walked();
+        let view = view_root(store, repo, &digest, cs, prefixes, live, metrics, deadline).unwrap();
+        (view, metrics.view_trees_walked() - before, start.elapsed())
     }
 
     /// Every `.rs` file path under `tokio/src`, at most
