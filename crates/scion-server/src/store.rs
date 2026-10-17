@@ -26,9 +26,9 @@ use std::io::{self, ErrorKind, Read, Seek, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use rustix::fs::FlockOperation;
@@ -36,6 +36,7 @@ use rustix::io::Errno;
 use scion_core::{BlobHasher, BlobId};
 
 use crate::db::SqliteTx;
+use crate::deadline::Deadline;
 use crate::derived::DeriveFlights;
 use crate::error::{Error, Result};
 
@@ -84,14 +85,15 @@ pub(crate) const READERS: usize = 8;
 pub(crate) const DERIVE_WALKS_CAP: usize = 8;
 
 /// Counts one writer that is waiting for the write connection, and
-/// subtracts it again when the writer gets in or gives up. A derive walk
-/// between steps checks the count, and pauses long enough for a waiting
-/// writer to take the connection before the walk's next step.
-struct WriteWaiter<'a>(&'a AtomicUsize);
+/// subtracts it again, with a wake, when the writer gets in or gives up.
+/// A derive walk between steps waits while the count is above zero.
+struct WriteWaiter<'a>(&'a Mutex<usize>, &'a Condvar);
 
 impl Drop for WriteWaiter<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Release);
+        let mut waiting = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        *waiting -= 1;
+        self.1.notify_all();
     }
 }
 
@@ -129,10 +131,13 @@ struct Inner {
     /// The derive walks of this store: which are in flight, and the cap
     /// on how many may be.
     derive: DeriveFlights,
-    /// Writers that are waiting for the write connection. A derive walk
-    /// checks the count between its steps, and lets a waiting writer in
-    /// before it takes the connection again.
-    write_waiters: AtomicUsize,
+    /// Writers that are waiting for the write connection, with the condvar
+    /// woken when one gets in or gives up. A derive walk between steps
+    /// waits while the count is above zero, so writers have strict
+    /// priority over walk steps: a steady stream of writers delays a cold
+    /// read up to its deadline, never a land ([#142]).
+    writers: Mutex<usize>,
+    write_woken: Condvar,
 }
 
 impl Store {
@@ -272,15 +277,60 @@ impl Store {
                 txes: AtomicU64::new(0),
                 fail_commits: AtomicU64::new(0),
                 derive: DeriveFlights::new(walks_cap),
-                write_waiters: AtomicUsize::new(0),
+                writers: Mutex::new(0),
+                write_woken: Condvar::new(),
             }),
         })
     }
 
     /// How many writers are waiting for the write connection.
+    #[cfg(test)]
     #[must_use]
-    pub(crate) fn write_waiters(&self) -> usize {
-        self.inner.write_waiters.load(Ordering::Acquire)
+    pub(crate) fn writers_waiting(&self) -> usize {
+        *self
+            .inner
+            .writers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits while writers are waiting for the write connection, until the
+    /// deadline. Writers have strict priority over walk steps: a steady
+    /// stream of writers delays a cold read up to its deadline, never a
+    /// land ([#142]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::DeadlineExceeded`] once the deadline has passed.
+    pub(crate) fn wait_for_writers(&self, deadline: Option<&Deadline>) -> Result<()> {
+        let mut waiting = self
+            .inner
+            .writers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while *waiting > 0 {
+            let Some(deadline) = deadline else {
+                waiting = self
+                    .inner
+                    .write_woken
+                    .wait(waiting)
+                    .unwrap_or_else(PoisonError::into_inner);
+                continue;
+            };
+            let budget = deadline.at().saturating_duration_since(Instant::now());
+            let (guard, timed_out) = self
+                .inner
+                .write_woken
+                .wait_timeout_while(waiting, budget, |waiting| *waiting > 0)
+                .unwrap_or_else(PoisonError::into_inner);
+            waiting = guard;
+            if timed_out.timed_out() {
+                return Err(Error::DeadlineExceeded(
+                    "the call ran past its deadline".to_owned(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The derive walks of this store: which are in flight, and the cap on
@@ -426,8 +476,12 @@ impl Store {
     ///
     /// Returns what `f` returns, or a database error from begin or commit.
     pub fn commit<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
-        self.inner.write_waiters.fetch_add(1, Ordering::Relaxed);
-        let _waiting = WriteWaiter(&self.inner.write_waiters);
+        *self
+            .inner
+            .writers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += 1;
+        let _waiting = WriteWaiter(&self.inner.writers, &self.inner.write_woken);
         let mut db = self.lock();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = f(&mut SqliteTx(&tx))?;

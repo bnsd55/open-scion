@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use scion_core::{Changeset, ChangesetId};
 
@@ -402,7 +402,7 @@ fn fill_until<K: Kind>(
         ControlFlow::Break(value) => return Ok(value),
         ControlFlow::Continue(pending) => pending,
     };
-    derive_steps::<K>(store, repo, &pending, check)?
+    derive_steps::<K>(store, repo, &pending, deadline, check)?
         .ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
 }
 
@@ -581,6 +581,7 @@ fn derive_steps<K: Kind>(
     store: &Store,
     repo: RepoId,
     pending: &[ChangesetId],
+    deadline: Option<&Deadline>,
     check: impl Fn() -> Result<()>,
 ) -> Result<Option<K::Value>> {
     let mut value = None;
@@ -592,13 +593,10 @@ fn derive_steps<K: Kind>(
             Ok(value)
         })?;
         // A writer that waited for the connection while this step held it
-        // gets in before the next step takes it again. Without the pause,
-        // a walk re-locks the connection for every step, and a parked
-        // writer waits for the whole walk: the mutex hands the connection
-        // to the running walker, not to the parked writer ([#142]).
-        if store.write_waiters() > 0 {
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        // gets in before the next step takes it again: the walk waits
+        // while writers wait, so the mutex handoff is deterministic, not
+        // a race the walker wins under load ([#142]).
+        store.wait_for_writers(deadline)?;
     }
     Ok(value)
 }
@@ -811,6 +809,11 @@ mod tests {
     /// that closes the gate waits for a count, so it knows its walking
     /// owners are inside, with their walk permits taken.
     static COLD_ENTERED: AtomicUsize = AtomicUsize::new(0);
+
+    /// The derive count that a writer's transaction saw when it got the
+    /// write connection: the writer-priority test reads it to tell a walk
+    /// that waited from a walk that re-took the connection first.
+    static DERIVES_AT_WRITE: AtomicUsize = AtomicUsize::new(0);
 
     /// The gate of the flight tests: a closed gate holds each derive until
     /// the test releases it, one release per derive, and an open gate lets
@@ -1224,7 +1227,7 @@ mod tests {
         assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), 5);
         assert_eq!(DERIVES.get(), 5);
 
-        let late = derive_steps::<ChangedPathsV1>(&store, repo, &pending, || Ok(())).unwrap();
+        let late = derive_steps::<ChangedPathsV1>(&store, repo, &pending, None, || Ok(())).unwrap();
         assert_eq!(late, Some(5));
         assert_eq!(DERIVES.get(), 5, "the late steps derive nothing again");
     }
@@ -1752,5 +1755,65 @@ mod tests {
             let _ = land_repo;
         });
         COLD_SLEEP.store(0, Ordering::Relaxed);
+    }
+    #[test]
+    fn a_walk_waits_while_a_writer_waits_for_the_connection() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        COLD_DERIVES.store(0, Ordering::Relaxed);
+        let (_dir, store, repo, ids) = store_with(&chain(12));
+        let tip = *ids.last().unwrap();
+        // The walk holds the connection inside its first step, at the
+        // closed gate. A writer arrives and waits for the connection: it
+        // cannot get in while the step's transaction holds it. When the
+        // step ends, the walk waits while the writer waits, so the
+        // writer's write runs first, and only then the walk's next derive
+        // passes the gate. A walk that did not wait would take the
+        // connection back at once, and the writer would wait for the
+        // whole walk.
+        std::thread::scope(|scope| {
+            let _gate = gate_closed();
+            let walker = scope.spawn(|| get::<Cold<1>>(&store, repo, tip).unwrap());
+            wait_entered(1);
+            // The writer reads the walk's derive count inside its own
+            // transaction, right after it got the connection: that is the
+            // one moment that separates the two designs. A walk that
+            // waits while a writer waits has derived only the first
+            // step's two changesets by then; a walk that re-took the
+            // connection has derived its second step too.
+            let writer = scope.spawn(|| {
+                store
+                    .write(|_| {
+                        DERIVES_AT_WRITE
+                            .store(COLD_ENTERED.load(Ordering::SeqCst), Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+            // The writer is provably waiting: it counted itself when its
+            // commit started, and it cannot have gotten in, because the
+            // walk's step still holds the connection.
+            for _ in 0..2_000 {
+                if store.writers_waiting() > 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(store.writers_waiting() > 0, "the writer never waited");
+            // Twelve releases bank the whole walk, so a walk that does not
+            // wait for the writer walks on to the end and is caught by the
+            // snapshot, instead of blocking at the gate forever.
+            gate_release(12);
+            // The writer's write finishes before the walk derives again.
+            writer.join().unwrap();
+            assert_eq!(
+                DERIVES_AT_WRITE.load(Ordering::SeqCst),
+                2,
+                "the walk derived while a writer waited"
+            );
+            // The writer is done: the walk goes on, and the gate lets it.
+            gate_open();
+            assert_eq!(walker.join().unwrap(), 12);
+        });
+        assert_eq!(COLD_DERIVES.load(Ordering::Relaxed), 12);
     }
 }
