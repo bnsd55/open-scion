@@ -18,6 +18,7 @@ use scion_server::{Store, service, tree};
 use scion_tier::{
     CACHE_UPSTREAM_TIMEOUT, DAEMON_UPSTREAM_TIMEOUT, DiskStore, MemoryStore, Tier, bind_unix,
 };
+use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -101,6 +102,7 @@ impl Tiers {
                 pending_lands: None,
                 land_stale_secs: 1 << 40,
                 tls: None,
+                metrics: Arc::default(),
             },
             Some(std::sync::Arc::new(tickets)),
             pending(),

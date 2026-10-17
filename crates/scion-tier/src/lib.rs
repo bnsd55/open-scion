@@ -386,6 +386,9 @@ struct Inner<S> {
     busy: Duration,
     /// Calls sent upstream, of every kind.
     upstream_calls: Arc<AtomicU64>,
+    /// The registry that counts objects served from the store and fetched
+    /// from upstream, and, when the binary exports, the `Objects` calls.
+    metrics: Arc<scion_proto::metrics::Metrics>,
     /// The reply budget, as on the server: object bytes read or copied for a
     /// reply and not yet taken by its client.
     in_flight: Arc<Semaphore>,
@@ -486,6 +489,7 @@ impl<S: Store> Tier<S> {
                 timeout,
                 busy: BUSY_TIMEOUT,
                 upstream_calls,
+                metrics: Arc::new(scion_proto::metrics::Metrics::default()),
                 in_flight: Arc::new(Semaphore::new(IN_FLIGHT_BYTES)),
                 fetch_slots: Arc::new(Semaphore::new(FETCH_SLOTS)),
                 fetching: Arc::new(Semaphore::new(FETCH_BYTES)),
@@ -505,6 +509,19 @@ impl<S: Store> Tier<S> {
     #[must_use]
     pub fn upstream_calls(&self) -> u64 {
         self.inner.upstream_calls.load(Ordering::Relaxed)
+    }
+
+    /// How many objects this tier has served from its store, and how many
+    /// it has fetched from upstream, over the life of the process.
+    #[must_use]
+    pub fn cache_hits_and_misses(&self) -> (u64, u64) {
+        self.inner.metrics.cache_counts()
+    }
+
+    /// The registry this tier counts in: `scion-cache` exports it.
+    #[must_use]
+    pub fn metrics(&self) -> Arc<scion_proto::metrics::Metrics> {
+        Arc::clone(&self.inner.metrics)
     }
 
     /// Serves the `Objects` calls on `incoming` connections, to callers that
@@ -527,10 +544,14 @@ impl<S: Store> Tier<S> {
         I: Stream<Item = io::Result<IO>> + Send + 'static,
         IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
     {
-        let objects = ObjectsServer::new(self)
-            .max_decoding_message_size(MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_PART_MESSAGE_BYTES);
-        let objects = InterceptedService::new(objects, Auth::new(token));
+        // Outside the token check, so a refused call counts too.
+        let objects = scion_proto::metrics::MetricsLayer::new(Arc::clone(&self.inner.metrics))
+            .layer(InterceptedService::new(
+                ObjectsServer::new(self)
+                    .max_decoding_message_size(MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_PART_MESSAGE_BYTES),
+                Auth::new(token),
+            ));
         // The health service answers `grpc.health.v1.Check` and `Watch` on
         // the same port, without a token: a probe carries none. The store
         // and the upstream channel opened before this call, so the tier
@@ -653,6 +674,7 @@ impl<S: Store> Tier<S> {
                     Ok(Some(stored)) => {
                         if !missed {
                             progress.hits.fetch_add(1, Ordering::Relaxed);
+                            self.inner.metrics.cache_hit();
                             tracing::debug!(%key, "hit");
                         }
                         // The walk proved it, so the snapshot of the
@@ -669,6 +691,7 @@ impl<S: Store> Tier<S> {
             if !missed {
                 missed = true;
                 progress.misses.fetch_add(1, Ordering::Relaxed);
+                self.inner.metrics.cache_miss();
                 tracing::debug!(%key, "miss");
             }
             let data = match self.fetch(ask, i, progress).await {
@@ -1577,6 +1600,36 @@ mod tests {
             until: Until::NONE,
             stalled: None,
         }
+    }
+
+    #[tokio::test]
+    async fn the_cache_counts_its_hits_and_misses() {
+        let setup = setup(2, 1 << 20).await;
+        let tier = &setup.tier;
+        assert_eq!(tier.cache_hits_and_misses(), (0, 0));
+        // A miss: the object is not in the store yet.
+        let (object, _permit) = tier
+            .produce(&ask(&setup, &setup.keys, "r"), 0, &Progress::default())
+            .await
+            .unwrap();
+        let Body::Chunks(chunks) = object.unwrap().body else {
+            panic!("unpacked into chunks")
+        };
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(tier.cache_hits_and_misses(), (0, 1));
+        // The same object again: a hit, once its fetch has settled.
+        while !lock(&tier.inner.flights).is_empty() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let (object, _permit) = tier
+            .produce(&ask(&setup, &setup.keys, "r"), 0, &Progress::default())
+            .await
+            .unwrap();
+        let Body::Chunks(chunks) = object.unwrap().body else {
+            panic!("unpacked into chunks")
+        };
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(tier.cache_hits_and_misses(), (1, 1));
     }
 
     #[tokio::test]

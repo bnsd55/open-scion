@@ -16,6 +16,7 @@ use scion_server::meta::MetaTx as _;
 use scion_server::read::MAX_SCAN;
 use scion_server::{Store, service, tree};
 use serde_json::Value;
+use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -87,6 +88,7 @@ impl Server {
                 pending_lands: None,
                 land_stale_secs: 1 << 40,
                 tls: None,
+                metrics: Arc::default(),
             },
             None,
             std::future::pending(),

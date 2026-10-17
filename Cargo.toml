@@ -21,8 +21,15 @@ open-scion-tier = { version = "0.1.0", path = "crates/scion-tier" }
 
 anyhow = "1.0"
 async-trait = "0.1"
+bytes = "1.12"
 ed25519-dalek = { version = "3.0", default-features = false, features = ["fast", "rand_core"] }
 getrandom = "0.4"
+http = "1.5"
+http-body = "1.1"
+http-body-util = "0.1"
+hyper = "1.12"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = "0.5"
 blake3 = "1.8"
 clap = { version = "4.6", features = ["derive", "env"] }
 gix = "0.89"

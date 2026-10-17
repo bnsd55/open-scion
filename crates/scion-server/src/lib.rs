@@ -31,6 +31,7 @@ pub mod import;
 pub mod land;
 pub mod memory;
 pub mod meta;
+pub mod metrics;
 pub mod names;
 pub mod objects;
 pub mod quotas;

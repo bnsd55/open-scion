@@ -30,6 +30,7 @@ use scion_proto::v1::{
 use scion_server::import::{ImportOptions, import_git};
 use scion_server::meta::MetaTx as _;
 use scion_server::{Store, service, tree};
+use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -130,6 +131,7 @@ impl Server {
                 pending_lands: None,
                 land_stale_secs: 1 << 40,
                 tls: None,
+                metrics: Arc::default(),
             },
             tickets,
             std::future::pending(),
