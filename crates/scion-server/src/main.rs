@@ -472,9 +472,9 @@ fn load_tickets(
         return Ok(None);
     };
     let keys = scion_server::tickets::Keys::load(
-        &read_hex(seed)?,
+        &read_hex(seed, true)?,
         &match old {
-            Some(file) => vec![read_hex(file)?],
+            Some(file) => vec![read_hex(file, false)?],
             None => Vec::new(),
         },
     )
@@ -482,10 +482,15 @@ fn load_tickets(
     Ok(Some(Arc::new(keys)))
 }
 
-/// The file's trimmed text, as a key wants it. The file must be readable
-/// by its owner alone: a seed that group or others can read mints
-/// permissions to anyone who can read it.
-fn read_hex(file: &Path) -> anyhow::Result<String> {
+/// The file's trimmed text, as a key wants it.
+///
+/// A seed must be readable by its owner alone: it mints permissions to
+/// anyone who can read it. A public key is not a secret, so anyone may
+/// read it; but group or others must not be able to WRITE it, because a
+/// changed key breaks every tier that verifies against the old one, and a
+/// new one mints nothing good. Both refuse a symlink, and both sit under
+/// directories that only their owner (or root) can change.
+fn read_hex(file: &Path, secret: bool) -> anyhow::Result<String> {
     let meta = std::fs::symlink_metadata(file)
         .with_context(|| format!("cannot read {}", file.display()))?;
     anyhow::ensure!(
@@ -493,12 +498,22 @@ fn read_hex(file: &Path) -> anyhow::Result<String> {
         "{} is not a file (a symlink is refused too)",
         file.display()
     );
-    anyhow::ensure!(
-        meta.mode().trailing_zeros() >= 6,
-        "{} can be read by group or others (fix: chmod 600 {})",
-        file.display(),
-        file.display()
-    );
+    let mode = meta.mode();
+    if secret {
+        anyhow::ensure!(
+            mode.trailing_zeros() >= 6,
+            "{} can be read by group or others (fix: chmod 600 {})",
+            file.display(),
+            file.display()
+        );
+    } else {
+        anyhow::ensure!(
+            mode & 0o022 == 0,
+            "{} can be written by group or others (fix: chmod go-w {})",
+            file.display(),
+            file.display()
+        );
+    }
     let me = rustix::process::geteuid().as_raw();
     scion_proto::auth::check_ancestors(file, me)
         .with_context(|| format!("{} sits in a directory that is not private", file.display()))?;
