@@ -94,7 +94,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # The layer cache holds the release build: the first run takes about
-      # five minutes, a run after an ordinary push about one.
+      # five minutes, a run after an ordinary push about one. The cache
+      # export needs the container driver, not the default docker one.
+      - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
           context: .
