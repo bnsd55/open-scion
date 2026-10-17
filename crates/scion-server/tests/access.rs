@@ -1319,7 +1319,12 @@ async fn a_read_file_runs_while_the_blame_slots_are_full() {
         let mut client = scion.clone();
         let request = req::blame(tip.as_bytes(), b"big");
         blames.push(tokio::spawn(async move {
-            client.blame(request).await.unwrap().into_inner()
+            let mut pages = client.blame(request).await.unwrap().into_inner();
+            let mut ranges = Vec::new();
+            while let Some(page) = pages.message().await.unwrap() {
+                ranges.extend(page.ranges);
+            }
+            ranges
         }));
     }
     // The blames hold their slots while they diff. A read needs none of
@@ -1335,7 +1340,7 @@ async fn a_read_file_runs_while_the_blame_slots_are_full() {
     }
     assert_eq!(read_back, text.as_bytes(), "the read answered at once");
     for blamed in blames {
-        let reply = blamed.await.unwrap();
-        assert!(!reply.ranges.is_empty(), "the blame answered");
+        let ranges = blamed.await.unwrap();
+        assert!(!ranges.is_empty(), "the blame answered");
     }
 }
