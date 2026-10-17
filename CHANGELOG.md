@@ -54,8 +54,11 @@ until that section gets its release date.
   `UNIMPLEMENTED`: the ref and the ticket come from the server, so a tier
   can never mint a permission.
 - The server signs with an Ed25519 key from `--ticket-key FILE` (make one
-  with `scion-server ticket-key --out FILE`; rotation with
-  `--ticket-key-old`). A `scion-cache` verifies with
+  with `scion-server ticket-key --out FILE`, which prints the public key,
+  for the tiers, to stdout; rotation with `--ticket-key-old`). Only the
+  seed is a secret: the server refuses a seed file that anyone but its
+  owner can read, and a public-key file (the `--ticket-key-old` argument)
+  that group or others can write (`#168`). A `scion-cache` verifies with
   `--ticket-public-key HEX`, at most 2 keys during a rotation. A
   `scion-daemon` takes no key: it checks no ticket, and serves what its
   store holds only to the one OS user that owns its private 0600 socket,
@@ -87,13 +90,14 @@ until that section gets its release date.
   verified durability, and one write path for changesets and their root
   trees. Group commit: concurrent blob syncs and database commits share one
   full drive flush, so a successful reply never shows state that a power
-  loss can undo. `scion-server fsck <data>` reports the damage in a data
-  directory: it is read-only, it can run while the server runs, and one
+  loss can undo. `scion-server --data <data> fsck` reports the damage in a
+  data directory: it is read-only, it can run while the server runs, and one
   line per problem names the kind, the ID and the path; it exits 0 when it
   saw no damage, 1 when it did, and 2 when it could not run.
-- `scion-server gc <data>` collects the blobs that nothing names: a
-  `repo_blobs` row whose blob no stored changeset of its repo puts, and a
-  blob file that no repo's row names, each older than a grace period
+- `scion-server gc` (`--data <data>`) collects the blobs that nothing
+  names: a `repo_blobs` row whose blob no stored changeset of its repo
+  puts, and a blob file that no repo's row names, each older than a grace
+  period
   (`--grace-secs`, seven days; `--dry-run` reports and removes nothing).
   Rows go before files, so a crash leaves orphan files only, which the
   next run removes. It runs beside a live server: a changeset that commits
@@ -126,7 +130,9 @@ until that section gets its release date.
   write that waits for an import's write lock. Writes still take turns on
   one write connection.
 - `scion-server serve` logs the address that it bound, so `--listen
-  127.0.0.1:0` shows the port that the OS chose.
+  127.0.0.1:0` shows the port that the OS chose. A refused call or a
+  failed one logs who made it and on which repo (`#148`), with no token
+  or path content in the line.
 
 #### Lands
 
@@ -325,7 +331,6 @@ until that section gets its release date.
 #### scn
 
 - `scn`, the command-line client: `cat`, `ls`, `log`, `show`, `commit`,
-- `scn`, the command-line client: `cat`, `ls`, `log`, `show`, `commit`,
   `land` and `bench`, with `--json` output. `scn merge-base`, `scn
   is-ancestor` (exit 0 or 1) and `scn diff` for the query API, and
   `scn blame`. Every `scn` error exits 2, so it never reads as the "no" of
@@ -334,9 +339,9 @@ until that section gets its release date.
   DIR [REV]` serves one ref as an NFSv3 filesystem from `scn` itself, on a
   free port of 127.0.0.1, so a directory's tree loads when it is first
   listed or looked up in, and a file's blob when it is first read or
-  sized. Until `#13` PR-C adds `GetSizes`, a file's size comes from its
-  blob, so a first stat of an unread file fetches the blob. Writes land in
-  a private overlay directory (mode 0700 under the system's temporary
+  sized. Until `#172` adds `GetSizes`, a file's size comes from its
+  blob, so a first stat of an unread file fetches the blob. Writes land
+  in a private overlay directory (mode 0700 under the system's temporary
   directory), and `scn commit --from-mount DIR` commits exactly what the
   overlay holds, with no scan of the tree. `scn unmount DIR` stops the
   mount and removes the overlay. For single-user machines only: the NFS
@@ -377,9 +382,17 @@ until that section gets its release date.
 #### Docs and scripts
 
 - `docs/protocol-v1.md`: the contract of the `Scion` and `Objects`
-  services, for independent clients, tiers and servers.- `scripts/demo.sh`, a demo that anyone can rerun on a fixed public
+  services, for independent clients, tiers and servers.
+- `scripts/demo.sh`, a demo that anyone can rerun on a fixed public
   repository, and `scripts/bench-checkout.sh`, a checkout benchmark
   against git. `docs/benchmarks.md` gives the method.
+- `scripts/grpc-conformance.sh` (`#163`): a conformance check that
+  speaks the API with grpcurl, so a client that is not the Rust one is
+  covered by CI.
+- An operations guide, `docs/operations.md` (`#169`): deploy, keys,
+  backup, upgrade, routines, and what to watch.
+- A container image and a compose example (`#164`): a server and a cache
+  with TLS, and a checkout through the cache.
 
 ### Changed
 

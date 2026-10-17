@@ -178,18 +178,32 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/scion-core/fuzz
+          workspaces: |
+            crates/scion-core/fuzz
+            crates/scion-proto/fuzz
+            crates/scion-server/fuzz
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - name: fuzz decode
-        working-directory: crates/scion-core
+      - name: fuzz the parsers
         run: |
-          fuzz_dir="$GITHUB_WORKSPACE/crates/scion-core/fuzz"
-          mkdir -p "$fuzz_dir/corpus/decode"
           # The prebuilt cargo-fuzz defaults to a musl target, where the
           # address sanitizer cannot run.
-          cargo fuzz run --target x86_64-unknown-linux-gnu decode \
-            "$fuzz_dir/corpus/decode" "$fuzz_dir/seeds/decode" -- -max_total_time=60
+          for crate in scion-core scion-proto scion-server; do
+            fuzz_dir="$GITHUB_WORKSPACE/crates/$crate/fuzz"
+            for target_file in "$fuzz_dir"/fuzz_targets/*.rs; do
+              target=$(basename "$target_file" .rs)
+              mkdir -p "$fuzz_dir/corpus/$target"
+              seeds=()
+              [ -d "$fuzz_dir/seeds/$target" ] && seeds+=("$fuzz_dir/seeds/$target")
+              (cd "$GITHUB_WORKSPACE/crates/$crate" && cargo fuzz run \
+                --target x86_64-unknown-linux-gnu "$target" \
+                "$fuzz_dir/corpus/$target" "${seeds[@]}" \
+                -- -max_total_time=15)
+            done
+          done

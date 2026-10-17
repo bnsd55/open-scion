@@ -1,0 +1,3 @@
+token	alice	d4289b3345cfbdfb36fb37ee89e85bd74447f837b04c18aee6233c731b1419a7
+write	alice	main	# comment
+bad line
