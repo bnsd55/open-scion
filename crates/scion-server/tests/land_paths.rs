@@ -52,7 +52,7 @@ fn req(cs: ChangesetId, key: &str) -> LandRequest {
 
 /// A repo whose `main` points at a root with `a/b/c`, `a/f` and `b/y`.
 struct Fixture {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     store: Store,
     root: ChangesetId,
 }
@@ -71,7 +71,7 @@ impl Fixture {
     /// The path of the metadata database, for a poll that must not share
     /// the store's reader pool.
     fn db_path(&self) -> std::path::PathBuf {
-        self._dir.path().join("scion.db")
+        self.dir.path().join("scion.db")
     }
 
     /// Inserts the changeset on `base`; the blobs of its puts were stored
@@ -158,7 +158,7 @@ fn setup() -> Fixture {
         })
         .unwrap();
     Fixture {
-        _dir: dir,
+        dir,
         store,
         root: root_id,
     }
