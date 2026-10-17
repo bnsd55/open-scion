@@ -10,7 +10,8 @@ use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{
     CreateChangesetRequest, GetChangesetRequest, ListDirRequest, PutBlobRequest,
 };
-use scion_server::{Store, db, service};
+use scion_server::meta::MetaTx;
+use scion_server::{Store, service};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 use tonic::Status;
@@ -21,6 +22,26 @@ const REPO: &str = "main";
 const TOKEN: &str = "secret";
 
 type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
+
+/// The identity of every changeset in these tests.
+fn author() -> IdentityTime {
+    IdentityTime {
+        name: b"t".to_vec(),
+        email: b"t@x".to_vec(),
+        unix_secs: 1_700_000_000,
+        tz_offset_minutes: 0,
+    }
+}
+
+/// Stores `repo` with `root` as its root changeset.
+fn seed_root(store: &Store, root: &Changeset) -> scion_core::ChangesetId {
+    store
+        .write(|c| {
+            let repo = c.create_repo(REPO)?;
+            c.insert_changeset(repo, root)
+        })
+        .unwrap()
+}
 
 /// A repo whose one changeset adds `names` files at the root, so its
 /// `TreeV1` and `ChangesetV1` bytes are over one part. The changeset is made
@@ -33,12 +54,7 @@ async fn big_repo(names: usize) -> (tempfile::TempDir, Scion, ChangesetId) {
     // The root changeset, so the changeset under test has a parent.
     let root = Changeset {
         parents: vec![],
-        author: IdentityTime {
-            name: b"t".to_vec(),
-            email: b"t@x".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        },
+        author: author(),
         committer: None,
         message: b"root\n".to_vec(),
         changes: [(
@@ -50,9 +66,7 @@ async fn big_repo(names: usize) -> (tempfile::TempDir, Scion, ChangesetId) {
         )]
         .into(),
     };
-    let root = store
-        .write(|c| db::insert_changeset(c, db::create_repo(c, REPO)?, &root))
-        .unwrap();
+    let root = seed_root(&store, &root);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -67,6 +81,7 @@ async fn big_repo(names: usize) -> (tempfile::TempDir, Scion, ChangesetId) {
             land_stale_secs: 1 << 40,
             tls: None,
         },
+        None,
         std::future::pending(),
     ));
     let channel = Channel::from_shared(format!("http://{addr}"))
@@ -99,12 +114,7 @@ async fn big_repo(names: usize) -> (tempfile::TempDir, Scion, ChangesetId) {
 
     let changeset = Changeset {
         parents: vec![root],
-        author: IdentityTime {
-            name: b"t".to_vec(),
-            email: b"t@x".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        },
+        author: author(),
         committer: None,
         message: b"big\n".to_vec(),
         changes: (0..names)
