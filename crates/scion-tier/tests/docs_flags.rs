@@ -29,6 +29,26 @@ fn doc_text() -> String {
     std::fs::read_to_string(&doc).expect("docs/operations.md opens")
 }
 
+/// The doc names `flag` as a flag: `--repo` does not match `--repo-dir`,
+/// and `--max-bytes` does not match `--max-bytes-foo`. The next char
+/// after the flag must not go on with a flag name.
+fn doc_names_flag(doc: &str, flag: &str) -> bool {
+    let goes_on = |c: char| c.is_ascii_lowercase() || c == '-' || c.is_ascii_digit();
+    let mut from = 0;
+    while let Some(at) = doc[from..].find(flag) {
+        let at = from + at;
+        let whole = doc[at + flag.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !goes_on(c));
+        if whole {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
+}
+
 fn tier_flags(binary: &str) -> Vec<String> {
     let exe = if binary == "scion-cache" {
         env!("CARGO_BIN_EXE_scion-cache")
@@ -57,7 +77,7 @@ fn every_tier_flag_is_in_the_operations_guide() {
     for binary in ["scion-cache", "scion-daemon"] {
         for flag in tier_flags(binary) {
             assert!(
-                doc.contains(&flag),
+                doc_names_flag(&doc, &flag),
                 "{binary} names {flag}, but docs/operations.md never does"
             );
         }

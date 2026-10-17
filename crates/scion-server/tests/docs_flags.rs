@@ -29,10 +29,30 @@ fn doc_text() -> String {
     std::fs::read_to_string(&doc).expect("docs/operations.md opens")
 }
 
+/// The doc names `flag` as a flag: `--repo` does not match `--repo-dir`,
+/// and `--max-bytes` does not match `--max-bytes-foo`. The next char
+/// after the flag must not go on with a flag name.
+fn doc_names_flag(doc: &str, flag: &str) -> bool {
+    let goes_on = |c: char| c.is_ascii_lowercase() || c == '-' || c.is_ascii_digit();
+    let mut from = 0;
+    while let Some(at) = doc[from..].find(flag) {
+        let at = from + at;
+        let whole = doc[at + flag.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !goes_on(c));
+        if whole {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
+}
+
 fn assert_flags_documented(binary: &str, args: &[&str], doc: &str, flags: &[String]) {
     for flag in flags {
         assert!(
-            doc.contains(flag),
+            doc_names_flag(doc, flag),
             "{binary} {} names {flag}, but docs/operations.md never does",
             args.join(" ")
         );
@@ -91,4 +111,18 @@ fn help_flags_parses() {
                 \x20 -h, --help     Print help\n\
                 Give `--token` or `--access`, not both. A land over 86400 s\n";
     assert_eq!(help_flags(text), vec!["--access", "--data", "--token"]);
+}
+
+/// `doc_names_flag` matches whole flag names only, at any position:
+/// `--repo` matches when the doc also names `--repo-dir` later or
+/// earlier, `--max-bytes` does not match a doc that only names
+/// `--max-bytes-foo`, and a flag at the very end matches.
+#[test]
+fn doc_names_flag_matches_whole_names() {
+    let doc = "run `--repo-dir` here, `--max-bytes-foo` there, but --repo at the end";
+    assert!(doc_names_flag(doc, "--repo"));
+    assert!(doc_names_flag(doc, "--repo-dir"));
+    assert!(!doc_names_flag(doc, "--max-bytes"));
+    assert!(!doc_names_flag(doc, "--repor"));
+    assert!(!doc_names_flag(doc, "--missing"));
 }
