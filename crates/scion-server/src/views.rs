@@ -29,10 +29,10 @@
 
 use scion_core::{ChangesetId, Entry, RepoPath, Tree, TreeId};
 
+use crate::backend::Backend;
 use crate::deadline::Deadline;
 use crate::error::Result;
-use crate::meta::{MetaTx, RepoId};
-use crate::store::Store;
+use crate::meta::{Meta as _, MetaTx, RepoId};
 
 /// The context of a tree in the projection: the read prefixes that fall
 /// below the tree's path, relative to it, in the rule set's canonical form.
@@ -103,7 +103,7 @@ fn view_key(digest: &[u8; 32]) -> [u8; 32] {
 /// Store errors, or [`crate::error::Error::DeadlineExceeded`] once
 /// `deadline` passes.
 pub(crate) fn view_root(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     digest: &[u8; 32],
     cs: ChangesetId,
@@ -231,7 +231,7 @@ mod tests {
         Deadline::new(Instant::now() + Duration::from_secs(600))
     }
 
-    fn file(store: &Store, content: &[u8]) -> Entry {
+    fn file(store: &Backend, content: &[u8]) -> Entry {
         let blob = store.blobs().put(content).unwrap();
         let len = u64::try_from(content.len()).unwrap();
         Entry::File(FileEntry::new(
@@ -243,9 +243,9 @@ mod tests {
         ))
     }
 
-    fn store() -> (tempfile::TempDir, Store) {
+    fn store() -> (tempfile::TempDir, Backend) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(crate::Store::open(dir.path()).unwrap());
         (dir, store)
     }
 

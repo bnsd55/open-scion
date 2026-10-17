@@ -28,13 +28,15 @@ use tonic::{Request, Response, Status};
 use tracing::Instrument as _;
 
 use crate::access::Access;
+use crate::backend::Backend;
 use crate::deadline::Deadline;
 use crate::error::{Error, Result};
+use crate::meta::Meta as _;
 use crate::meta::MetaTx as _;
 use crate::quotas::{Call, Quotas};
 use crate::read;
 use crate::service::{Worker, check_reader, parse_id, resolve_ref};
-use crate::store::{self, Store};
+use crate::store::{self};
 use crate::tickets::Keys;
 use crate::views;
 
@@ -121,12 +123,12 @@ fn parse_ref(object: &ObjectRef) -> Result<Key, Status> {
 
 /// Reads an object, as planned. [`read_object`], except in tests that count
 /// reads.
-type Read = fn(&Store, Key, Plan) -> Result<Outgoing>;
+type Read = fn(&Backend, Key, Plan) -> Result<Outgoing>;
 
 /// How `key` goes out, without reading its bytes. A blob goes out as its
 /// stored zstd file if the client accepts `zstd`. Only an object that the
 /// ticket's walk proved goes out: everything else is not found.
-fn plan(store: &Store, key: Key, allowed: &HashSet<Key>, zstd: bool) -> Result<Plan> {
+fn plan(store: &Backend, key: Key, allowed: &HashSet<Key>, zstd: bool) -> Result<Plan> {
     if !allowed.contains(&key) {
         // The walk did not reach this object from the ticket's root tree.
         return Err(Error::NotFound(format!("{key:?} is not in the ticket")));
@@ -169,7 +171,7 @@ fn plan(store: &Store, key: Key, allowed: &HashSet<Key>, zstd: bool) -> Result<P
 /// their IDs on the way out of the store. A ZSTD blob is its stored file,
 /// read in chunks and not unpacked: the receiver checks it. A RAW blob is
 /// unpacked in chunks, so it is never in memory twice.
-fn read_object(store: &Store, key: Key, plan: Plan) -> Result<Outgoing> {
+fn read_object(store: &Backend, key: Key, plan: Plan) -> Result<Outgoing> {
     let (kind, id, body) = match key {
         Key::Tree(id) => {
             let data = store.read(|c| c.get_tree_body(id))?;
@@ -491,7 +493,11 @@ impl Objects for ObjectsService {
 /// `store`: the caller keeps the keys, and `plan` serves only the proven
 /// ones. A tree that `store` does not hold, or one whose bytes do not
 /// match its ID, refuses the ref.
-fn prove(store: &Store, root: [u8; 32], refs: &[(Key, Vec<u8>)]) -> Result<(HashSet<Key>, usize)> {
+fn prove(
+    store: &Backend,
+    root: [u8; 32],
+    refs: &[(Key, Vec<u8>)],
+) -> Result<(HashSet<Key>, usize)> {
     let mut walk = scion_proto::ticket::Walker::new(root);
     let mut allowed = HashSet::new();
     store.read(|c| {
@@ -527,6 +533,8 @@ fn of(key: &Key) -> (ObjectKind, [u8; 32]) {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::Backend;
+    use crate::store::Store;
     use std::io::Read as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -576,16 +584,20 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_client_that_stops_reading_is_cut_off_and_frees_its_budget() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let raw = match &store {
+            Backend::Sqlite(raw) => raw,
+            Backend::Postgres(_) => unreachable!(),
+        };
         let keys: Vec<Key> = [b"one".as_slice(), b"second", b"three"]
             .iter()
             .map(|data| Key::Blob(store.blobs().put(data).unwrap()))
             .collect();
-        let second = packed_len(&store, keys[1]);
+        let second = packed_len(raw, keys[1]);
         // Files of two sizes, so the free budget shows which object holds a
         // share. With one size, the first object, before it is sent, looks
         // like the second.
-        assert_ne!(packed_len(&store, keys[0]), second);
+        assert_ne!(packed_len(raw, keys[0]), second);
         let budget = 1000;
         let in_flight = Arc::new(Semaphore::new(budget));
         let stall = Duration::from_millis(50);
@@ -619,13 +631,13 @@ mod tests {
     #[tokio::test]
     async fn a_call_with_no_budget_for_its_first_object_fails_and_reads_nothing() {
         static READS: AtomicUsize = AtomicUsize::new(0);
-        fn counted(store: &Store, key: Key, plan: Plan) -> Result<Outgoing> {
+        fn counted(store: &Backend, key: Key, plan: Plan) -> Result<Outgoing> {
             READS.fetch_add(1, Ordering::SeqCst);
             read_object(store, key, plan)
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let a = Key::Blob(store.blobs().put(b"a blob").unwrap());
         let budget = 1000;
         let in_flight = Arc::new(Semaphore::new(budget));
@@ -667,7 +679,7 @@ mod tests {
     #[tokio::test]
     async fn a_walk_bigger_than_the_free_budget_ends_resource_exhausted() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let a = Key::Blob(store.blobs().put(b"a blob").unwrap());
         let budget = 1000;
         let in_flight = Arc::new(Semaphore::new(budget));
@@ -706,7 +718,7 @@ mod tests {
     #[tokio::test]
     async fn a_wait_for_room_ends_before_the_deadline() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let a = Key::Blob(store.blobs().put(b"a blob").unwrap());
         let in_flight = Arc::new(Semaphore::new(1000));
         let _others = reply::try_take(&in_flight, 1000).unwrap();
@@ -739,14 +751,14 @@ mod tests {
     async fn reading_a_blob_to_unpack_it_takes_the_decoder_too() {
         static HELD: AtomicUsize = AtomicUsize::new(0);
         static BUDGET: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
-        fn watched(store: &Store, key: Key, plan: Plan) -> Result<Outgoing> {
+        fn watched(store: &Backend, key: Key, plan: Plan) -> Result<Outgoing> {
             let free = BUDGET.get().unwrap().available_permits();
             HELD.store(IN_FLIGHT_BYTES - free, Ordering::SeqCst);
             read_object(store, key, plan)
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let content = vec![b'x'; 5000];
         let key = Key::Blob(store.blobs().put(&content).unwrap());
         let in_flight =
@@ -795,7 +807,7 @@ mod tests {
     #[tokio::test]
     async fn a_blob_goes_out_as_its_stored_file_in_parts_or_unpacked() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         // Over three parts once packed: bytes that do not compress.
         let mut state = 1_u64;
         let content: Vec<u8> = (0..3 * CHUNK_BYTES + 100)

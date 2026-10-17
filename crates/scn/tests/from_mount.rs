@@ -13,7 +13,7 @@ use open_scion::cmd::mount::{MountRecord, write_sessions};
 use open_scion::vfs::{NFSFileSystem, Vfs};
 use scion_core::{ChangesetId, FileState};
 use scion_proto::v1::GetRootTreeRequest;
-use scion_server::Store;
+use scion_server::Backend;
 
 mod common;
 
@@ -36,7 +36,7 @@ fn scn(url: &str, home: &std::path::Path, args: &[&str]) -> String {
 
 /// Lands `keep.txt` and `docs/{a.txt,b.txt}` on `store`, and points
 /// `main` at the last changeset.
-fn start(store: &Store) -> ChangesetId {
+fn start(store: &Backend) -> ChangesetId {
     let store = store.clone();
     let store = &store;
     let first = land(
@@ -140,7 +140,7 @@ fn mount(tiers: &common::Tiers, base: &ChangesetId) -> Mount {
 #[test]
 fn a_mounts_overlay_commits_without_a_scan() {
     let data = tempfile::tempdir().unwrap();
-    let store = Store::open(data.path()).unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
     let base = start(&store);
     let tiers = common::Tiers::start(data, store);
     let mounted = mount(&tiers, &base);

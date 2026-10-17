@@ -1423,8 +1423,8 @@ mod tests {
         GetRootTreeRequest as Ask, GetRootTreeResponse, ObjectPart, ResolveRefRequest,
         ResolveRefResponse,
     };
-    use scion_server::meta::MetaTx as _;
-    use scion_server::{Store, service, tree};
+    use scion_server::meta::{Meta as _, MetaTx as _};
+    use scion_server::{Backend, service, tree};
     use std::collections::HashMap as StdHashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -1448,7 +1448,7 @@ mod tests {
     async fn start(files: &[(&str, &[u8], Option<bool>)]) -> Test {
         let data = tempfile::tempdir().unwrap();
         let overlay = tempfile::tempdir().unwrap();
-        let store = Store::open(&data.path().join("store")).unwrap();
+        let store = Backend::open_test(&data.path().join("store")).unwrap();
         let mut contents = Vec::new();
         let mut lens = tree::lens_of(&store);
         let base = store

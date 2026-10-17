@@ -8,8 +8,9 @@ use std::collections::{HashMap, HashSet};
 
 use scion_core::{BlobId, FileState, GitOid, RepoPath};
 
+use crate::backend::Backend;
 use crate::error::Result;
-use crate::store::{BlobReader, Store};
+use crate::store::BlobReader;
 
 /// git's similarity scale: this score means the same content.
 pub const SAME: u32 = 60_000;
@@ -68,7 +69,7 @@ impl Chunks {
     /// # Errors
     ///
     /// As [`crate::store::Blobs::reader`] and [`BlobReader::read_part`].
-    pub fn read(store: &Store, blob: BlobId) -> Result<Self> {
+    pub fn read(store: &Backend, blob: BlobId) -> Result<Self> {
         let mut reader: BlobReader = store.blobs().reader(blob)?;
         let mut chunker = Chunker::default();
         while let Some(part) = reader.read_part(PART_BYTES)? {
@@ -276,7 +277,7 @@ pub struct Outcome {
 ///
 /// A failure to read a size, or what `read` returns.
 pub fn renames(
-    store: &Store,
+    store: &Backend,
     added: &[(&RepoPath, FileState)],
     deleted: &[(&RepoPath, FileState)],
     read: impl FnMut(&RepoPath, BlobId, usize) -> Result<Option<Chunks>>,
@@ -377,7 +378,7 @@ fn git_score(shared: u64, size: usize, other: usize) -> u32 {
 
 /// The state of one [`renames`] call.
 struct Search<'a, R> {
-    store: &'a Store,
+    store: &'a Backend,
     read: R,
     budget: Budget<'a>,
     added: &'a [(&'a RepoPath, FileState)],
@@ -683,6 +684,8 @@ impl<R: FnMut(&RepoPath, BlobId, usize) -> Result<Option<Chunks>>> Search<'_, R>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::Backend;
+    use crate::store::Store;
 
     /// A file cut in two parts anywhere after its first 8,000 bytes has
     /// the same chunks as when it comes whole, also where a part ends
@@ -729,7 +732,7 @@ mod tests {
     #[test]
     fn a_blob_added_at_many_paths_is_indexed_once() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let new = store.blobs().put(&lines(0..4000)).unwrap();
         // 90% like `new`.
         let old = store
@@ -764,7 +767,7 @@ mod tests {
     #[test]
     fn a_file_refused_is_read_once() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let new = store.blobs().put(&lines(0..1000)).unwrap();
         let refused = store.blobs().put(&lines(0..900)).unwrap();
         let paths = ["a/new", "b/new"].map(|p| RepoPath::new(p).unwrap());

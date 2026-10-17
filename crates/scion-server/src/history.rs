@@ -752,7 +752,9 @@ mod tests {
     use scion_core::{BlobId, FileState, IdentityTime};
 
     use super::*;
+    use crate::backend::Backend;
     use crate::db::testing;
+    use crate::meta::Meta as _;
     use crate::meta::RepoId;
     use crate::read;
     use crate::store::Store;
@@ -792,9 +794,9 @@ mod tests {
     }
 
     /// A new store with repo `r`.
-    fn open() -> (tempfile::TempDir, Store, RepoId) {
+    fn open() -> (tempfile::TempDir, Backend, RepoId) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let repo = store.write(|c| c.create_repo("r")).unwrap();
         (dir, store, repo)
     }
@@ -802,11 +804,11 @@ mod tests {
     /// The changes of one changeset of a chain: puts (`true`) and deletes.
     type Edits<'a> = &'a [(&'a str, bool)];
 
-    /// Stores a first-parent chain in `repo`, from `parent` on, through the
+    /// Backends a first-parent chain in `repo`, from `parent` on, through the
     /// one write path (`stored`) or with no derived data. Changeset `i`
     /// makes the changes `history[i]`. Returns the IDs, oldest first.
     fn store_chain(
-        store: &Store,
+        store: &Backend,
         repo: RepoId,
         parent: Option<ChangesetId>,
         history: &[Edits<'_>],
@@ -834,7 +836,7 @@ mod tests {
     }
 
     /// Every changeset of a path log from `from`, at most `limit` per call.
-    fn path_log(store: &Store, from: ChangesetId, p: &str, limit: usize) -> Vec<ChangesetId> {
+    fn path_log(store: &Backend, from: ChangesetId, p: &str, limit: usize) -> Vec<ChangesetId> {
         let mut ids = Vec::new();
         let mut next = Some(from);
         while let Some(from) = next {
@@ -866,7 +868,7 @@ mod tests {
             // time.
             let ids = store
                 .write(|c| {
-                    let ids = testing::insert_history(c, repo, &parents, &edits)?;
+                    let ids = testing::insert_history(c.sqlite().unwrap(), repo, &parents, &edits)?;
                     for &tip in &ids {
                         derived::derive::<PathHistory>(c, repo, tip, &mut crate::tree::lens_none())?;
                     }

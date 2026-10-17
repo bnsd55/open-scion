@@ -8,9 +8,9 @@ use scion_proto::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{GetLandRequest, LogRequest, PutBlobRequest};
 use scion_server::access::Access;
-use scion_server::meta::{MetaTx as _, RefState};
+use scion_server::meta::{Meta as _, MetaTx as _, RefState};
 use scion_server::quotas::Quotas;
-use scion_server::{Store, service};
+use scion_server::{Backend, service};
 use std::fmt::Write as _;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -55,9 +55,9 @@ fn access(principals: &[&str]) -> Access {
 
 /// A store whose repo `main` has one root changeset that puts `README`,
 /// with its blob registered, as an upload through `PutBlob` would leave it.
-fn store() -> (tempfile::TempDir, Store) {
+fn store() -> (tempfile::TempDir, Backend) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Backend::open_test(dir.path()).unwrap();
     let blob = store.blobs().put(b"# hello\n").unwrap();
     store
         .write(|c| {
@@ -95,7 +95,7 @@ fn store() -> (tempfile::TempDir, Store) {
 type Stop = tokio::sync::oneshot::Sender<()>;
 
 /// Where `main` of `REPO` points.
-fn main_ref(store: &Store) -> RefState {
+fn main_ref(store: &Backend) -> RefState {
     store
         .read(|c| {
             let repo = c.repo_id(REPO)?;
@@ -107,13 +107,13 @@ fn main_ref(store: &Store) -> RefState {
 
 /// A server of `store` with `access` and `quotas`. Hold the stop signal, or
 /// the server shuts down.
-async fn server(store: &Store, access: Access, quotas: Quotas) -> (Stop, Channel) {
+async fn server(store: &Backend, access: Access, quotas: Quotas) -> (Stop, Channel) {
     server_with_tickets(store, access, quotas, None).await
 }
 
 /// The same, with the ticket keys of `GetRootTree` and the object reads.
 async fn server_with_tickets(
-    store: &Store,
+    store: &Backend,
     access: Access,
     quotas: Quotas,
     tickets: Option<scion_server::tickets::Keys>,
@@ -430,7 +430,7 @@ fn objects(channel: Channel) -> scion_proto::v1::objects_client::ObjectsClient<C
 
 /// The ticket of `principal` for the root tree of `main`, signed by the
 /// server's own keys.
-fn ticket_for(keys: &scion_server::tickets::Keys, principal: &str, store: &Store) -> Vec<u8> {
+fn ticket_for(keys: &scion_server::tickets::Keys, principal: &str, store: &Backend) -> Vec<u8> {
     let cs = main_ref(store).target;
     let root = scion_server::read::root_tree(store, REPO, cs).unwrap();
     keys.sign(REPO, principal, *root.as_bytes()).unwrap()

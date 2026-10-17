@@ -19,13 +19,13 @@ use scion_core::{
     TreeId,
 };
 
+use crate::backend::Backend;
 use crate::deadline::{CALL_LIMIT, Deadline};
 use crate::error::{Error, Result};
 use crate::history;
 use crate::memory::{BYTES_PER_LINE, Bytes, Held};
-use crate::meta::MetaTx;
+use crate::meta::{Meta as _, MetaTx};
 use crate::similar::{self, Budget, Chunks, MAX_PAIRS, Progress};
-use crate::store::Store;
 use crate::tree;
 
 /// Most versions of a file one call diffs.
@@ -183,7 +183,7 @@ enum Older {
 /// whole budget, or a take waited past `until`.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn blame(
-    store: &Store,
+    store: &Backend,
     repo: &str,
     cs: ChangesetId,
     path: &RepoPath,
@@ -483,7 +483,7 @@ fn next_resume(
 ///
 /// [`Error::NotFound`] if no file is there. [`Error::InvalidArgument`] if
 /// it is not a regular file.
-fn regular_blob(store: &Store, root: TreeId, path: &RepoPath) -> Result<BlobId> {
+fn regular_blob(store: &Backend, root: TreeId, path: &RepoPath) -> Result<BlobId> {
     match store.read(|c| tree::lookup(c, root, path))? {
         Some(Entry::File(file)) => match file.state() {
             FileState::Regular { content, .. } => Ok(content),
@@ -548,7 +548,7 @@ impl std::ops::Deref for HeldText {
 /// # Errors
 ///
 /// [`Error::ResourceExhausted`] if a take waited past `until`.
-fn read_version(store: &Store, blob: BlobId, memory: &Bytes) -> Result<Option<HeldText>> {
+fn read_version(store: &Backend, blob: BlobId, memory: &Bytes) -> Result<Option<HeldText>> {
     let size = store.blobs().size(blob)?;
     if size > memory.cap() {
         return Ok(None);
@@ -580,7 +580,7 @@ fn diff_cost(text: &[u8]) -> usize {
 /// return value holds them, and pairs with the text. A version whose bytes
 /// do not fit the whole budget counts as absent, so the walk goes on.
 fn older_version(
-    store: &Store,
+    store: &Backend,
     root: TreeId,
     changeset: &Changeset,
     newer: Newer<'_>,
@@ -640,7 +640,7 @@ fn older_version(
 /// [`Error::InvalidArgument`] if `search` is not where this search can
 /// stop.
 fn renamed_from(
-    store: &Store,
+    store: &Backend,
     root: TreeId,
     changeset: &Changeset,
     newer: Newer<'_>,
@@ -748,7 +748,7 @@ fn renamed_from(
 /// Each file that `changeset` deletes, in path order, as it was in `root`,
 /// the tree of its first parent.
 fn deleted_files<'c>(
-    store: &Store,
+    store: &Backend,
     root: TreeId,
     changeset: &'c Changeset,
 ) -> Result<Vec<(&'c RepoPath, FileState)>> {
@@ -1106,7 +1106,7 @@ pub fn encode_cursor(resume: &Resume, repo: &str, cs: ChangesetId, path: &RepoPa
 /// [`Error::ResourceExhausted`] if the cursor does not fit the budget, or a
 /// take waited past `until`.
 pub fn decode_cursor(
-    store: &Store,
+    store: &Backend,
     repo: &str,
     bytes: &[u8],
     cs: ChangesetId,
@@ -1172,14 +1172,19 @@ pub fn decode_cursor(
         until,
     )?;
     let mut table = Vec::with_capacity(table_count as usize);
-    for _ in 0..table_count {
-        let id = ChangesetId::from_bytes(r.array::<32>()?);
-        let known = store.read(|c| c.has_changeset(repo_id, id))?;
-        if !known {
-            return Err(bad(&format!("it names {id} which {repo} does not have")));
+    // The table's names are checked in one read transaction: a blame
+    // resume decodes on every call, so a table of a hundred names costs
+    // one read, not a hundred.
+    store.read(|c| {
+        for _ in 0..table_count {
+            let id = ChangesetId::from_bytes(r.array::<32>()?);
+            if !c.has_changeset(repo_id, id)? {
+                return Err(bad(&format!("it names {id} which {repo} does not have")));
+            }
+            table.push(id);
         }
-        table.push(id);
-    }
+        Ok(())
+    })?;
     let window = decode_window(&mut r, &table, run_count, open)?;
     r.finish()?;
     let resume = Resume {

@@ -14,7 +14,7 @@ use scion_server::meta::MetaTx;
 use std::sync::Arc;
 
 use scion_server::metrics::Metrics;
-use scion_server::{Store, service};
+use scion_server::{Backend, Store, service};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 use tonic::Status;
@@ -74,7 +74,7 @@ async fn big_repo(names: usize) -> (tempfile::TempDir, Scion, ChangesetId) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(service::serve(
-        store,
+        Backend::Sqlite(store.clone()),
         listener,
         TOKEN,
         service::ServeOptions {
