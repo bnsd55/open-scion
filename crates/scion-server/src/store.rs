@@ -1177,6 +1177,7 @@ impl BlobBatch<'_> {
         // exactly `len` bytes.
         let mut tmp = tempfile::NamedTempFile::new_in(&self.blobs.mine)?;
         zstd::stream::compress_sized_into(raw, &mut tmp, 3, len as u64)?;
+        fsync(tmp.as_file())?;
         fs::create_dir_all(&dir)?;
         tmp.persist(&path).map_err(|e| e.error)?;
         self.dirs.insert(dir);
