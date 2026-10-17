@@ -429,3 +429,10 @@ until that section gets its release date.
   warning about skipped inexact rename detection; the exact renames in the
   reply are still whole. Every call of the same diff reports the flag the
   same way.
+
+### Fixed
+
+- `scn` prints each part of an error once: tonic's transport error Display
+  already ends with its source's text, and the printed chain said `tcp
+  connect error` and `invalid URL, scheme is missing` twice.
+- `scion-server hash-token --token` has a help text.

@@ -43,7 +43,9 @@ file instead (see "Tokens: one, or an access file", below).
 
 A cache serves object reads to a region and forwards everything else. Each
 hop has its own token pair: what the tier requires from its clients
-(`--token`), and what it sends upstream (`--upstream-token`).
+(`--token`), and what it sends upstream (`--upstream-token`). A `scn`
+client's `--token` is what it sends, the other side of the pair of the tier
+in front of it.
 
 ```sh
 ./scion-cache --token <CACHE_TOKEN> --upstream-token <SERVER_TOKEN> \

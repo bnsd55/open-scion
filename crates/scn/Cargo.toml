@@ -38,6 +38,8 @@ tempfile.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zstd.workspace = true
+# A unit test drives a real `connect()` to a closed port.
+tokio.workspace = true
 # The upgrade test reads the database of a schema-6 data directory.
 rusqlite.workspace = true
 
