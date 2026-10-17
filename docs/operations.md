@@ -37,7 +37,7 @@ chmod 600 /srv/scion-keys/ticket.key
 
 Choose the tokens with care: `--token T` makes one principal, `default`, with
 every right on every repo. For several people or services, use an access
-file instead (section 1.4).
+file instead (see "Tokens: one, or an access file", below).
 
 ### Server and a regional cache
 
@@ -229,8 +229,6 @@ The routines are these:
   versions itself.
 - A cache is stateless except its snapshots: its whole state is memory plus
   the snapshot files, so restart it whenever you like.
-
-## 6. What to watch
 
 ## 6. What to watch
 
