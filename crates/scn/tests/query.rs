@@ -450,3 +450,36 @@ fn diff_prints_a_rename_split_across_replies() {
     assert_eq!(entries[0]["old"]["id"], id.as_str());
     assert_eq!(entries[0]["new"]["id"], id.as_str());
 }
+
+#[test]
+fn ls_show_and_log_read_whole_replies() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    // A directory whose TreeV1 and a changeset whose ChangesetV1 are both
+    // over one part, so `scn ls` and `scn show` read streamed replies; and
+    // `scn log` on the same head.
+    let state = |n: usize| {
+        Some(FileState::Regular {
+            content: BlobId::of(&n.to_le_bytes()),
+            executable: false,
+        })
+    };
+    let changes: BTreeMap<RepoPath, Option<FileState>> = (0..40_000)
+        .map(|n| {
+            (
+                RepoPath::new(format!("f{n:05}.bin").as_bytes()).unwrap(),
+                state(n),
+            )
+        })
+        .collect();
+    let (_, head) = two_changesets(&store, BTreeMap::new(), changes);
+    let server = Server::start(data, store);
+
+    let ls = server.text(&["ls", &format!("{head}:")]);
+    assert_eq!(ls.lines().count(), 40_000, "every entry listed");
+    assert!(ls.contains("f00000.bin"), "{ls:?}");
+    let show = server.text(&["show", &head.to_string()]);
+    assert!(show.contains("f00000.bin"), "{show:?}");
+    let log = server.text(&["log", &head.to_string(), "--limit", "1"]);
+    assert!(log.contains(&head.to_string()[..12]), "{log:?}");
+}
