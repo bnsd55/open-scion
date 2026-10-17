@@ -7,14 +7,14 @@ use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileState, PathElem, RepoPath, Tree, TreeId,
 };
 
+use crate::backend::Backend;
 use crate::deadline::Deadline;
 use crate::derived;
 use crate::error::{Error, Result};
 use crate::graph;
 use crate::history::{self, PathHistory};
-use crate::meta::{MetaTx, RepoId};
+use crate::meta::{Meta as _, MetaTx, RepoId};
 use crate::similar::{self, Budget, Chunks, MAX_PAIRS, Progress};
-use crate::store::Store;
 use crate::tree;
 
 /// Where a ref points.
@@ -22,7 +22,7 @@ use crate::tree;
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or ref does not exist.
-pub fn resolve_ref(store: &Store, repo: &str, name: &str) -> Result<ChangesetId> {
+pub fn resolve_ref(store: &Backend, repo: &str, name: &str) -> Result<ChangesetId> {
     store.read(|c| {
         let repo = c.repo_id(repo)?;
         c.get_ref(repo, name)?
@@ -36,7 +36,7 @@ pub fn resolve_ref(store: &Store, repo: &str, name: &str) -> Result<ChangesetId>
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or changeset does not exist.
-pub fn get_changeset(store: &Store, repo: &str, id: ChangesetId) -> Result<Changeset> {
+pub fn get_changeset(store: &Backend, repo: &str, id: ChangesetId) -> Result<Changeset> {
     store.read(|c| {
         let repo = c.repo_id(repo)?;
         c.get_changeset(repo, id)
@@ -48,7 +48,7 @@ pub fn get_changeset(store: &Store, repo: &str, id: ChangesetId) -> Result<Chang
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or changeset does not exist.
-pub fn root_tree(store: &Store, repo: &str, cs: ChangesetId) -> Result<TreeId> {
+pub fn root_tree(store: &Backend, repo: &str, cs: ChangesetId) -> Result<TreeId> {
     let repo = store.read(|c| c.repo_id(repo))?;
     tree::root_tree(store, repo, cs)
 }
@@ -59,7 +59,7 @@ pub fn root_tree(store: &Store, repo: &str, cs: ChangesetId) -> Result<TreeId> {
 ///
 /// [`Error::NotFound`] if nothing is at `path`. [`Error::InvalidArgument`] if
 /// `path` is a directory or a submodule.
-pub fn read_file(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Result<Vec<u8>> {
+pub fn read_file(store: &Backend, repo: &str, cs: ChangesetId, path: &RepoPath) -> Result<Vec<u8>> {
     store.blobs().get(file_blob(store, repo, cs, path)?)
 }
 
@@ -68,7 +68,7 @@ pub fn read_file(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) ->
 /// # Errors
 ///
 /// As [`read_file`], without reading the blob.
-pub fn file_blob(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Result<BlobId> {
+pub fn file_blob(store: &Backend, repo: &str, cs: ChangesetId, path: &RepoPath) -> Result<BlobId> {
     let root = root_tree(store, repo, cs)?;
     match store.read(|c| tree::lookup(c, root, path))? {
         Some(Entry::File(file)) => match file.state().blob() {
@@ -87,7 +87,7 @@ pub fn file_blob(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) ->
 /// [`Error::NotFound`] if nothing is at `path`. [`Error::InvalidArgument`] if
 /// `path` is a file.
 pub fn list_dir(
-    store: &Store,
+    store: &Backend,
     repo: &str,
     cs: ChangesetId,
     path: Option<&RepoPath>,
@@ -135,7 +135,7 @@ pub struct LogPage {
 /// [`Error::NotFound`] if the repo or changeset does not exist.
 #[cfg(test)]
 pub fn log(
-    store: &Store,
+    store: &Backend,
     repo: &str,
     cs: ChangesetId,
     limit: usize,
@@ -166,7 +166,7 @@ pub fn log(
 /// [`Error::DeadlineExceeded`] if `deadline` passed while the path history
 /// was derived; the steps before it stay.
 pub fn log_page(
-    store: &Store,
+    store: &Backend,
     repo: &str,
     cs: ChangesetId,
     path: Option<&RepoPath>,
@@ -254,7 +254,7 @@ pub fn changes_path(cs: &Changeset, path: &RepoPath) -> bool {
 /// [`Error::NotFound`] if the repo or a changeset does not exist.
 /// [`Error::DeadlineExceeded`] once `deadline` has passed.
 pub fn is_ancestor(
-    store: &Store,
+    store: &Backend,
     repo: &str,
     ancestor: ChangesetId,
     descendant: ChangesetId,
@@ -279,7 +279,7 @@ pub fn is_ancestor(
 /// [`Error::NotFound`] if the repo or a changeset does not exist.
 /// [`Error::DeadlineExceeded`] once `deadline` has passed.
 pub fn merge_base(
-    store: &Store,
+    store: &Backend,
     repo: &str,
     a: ChangesetId,
     b: ChangesetId,
@@ -382,7 +382,7 @@ pub struct DiffPage {
 ///
 /// [`Error::NotFound`] if the repo or a changeset does not exist.
 pub fn diff(
-    store: &Store,
+    store: &Backend,
     repo: &str,
     old: ChangesetId,
     new: ChangesetId,
@@ -399,7 +399,7 @@ pub fn diff(
 ///
 /// [`Error::NotFound`] if the repo or a changeset does not exist.
 pub fn diff_with(
-    store: &Store,
+    store: &Backend,
     repo: &str,
     old: ChangesetId,
     new: ChangesetId,
@@ -452,7 +452,7 @@ pub fn diff_with(
 /// The renames among `entries`, a whole diff: each path of a rename, with
 /// the other path, and whether renames may be missing (the inexact search
 /// did not run, or stopped at its budget).
-fn renames(store: &Store, entries: &[DiffEntry]) -> Result<(HashMap<RepoPath, Rename>, bool)> {
+fn renames(store: &Backend, entries: &[DiffEntry]) -> Result<(HashMap<RepoPath, Rename>, bool)> {
     let (mut added, mut deleted) = (Vec::new(), Vec::new());
     for entry in entries {
         match (entry.old, entry.new) {
@@ -507,7 +507,7 @@ fn renames(store: &Store, entries: &[DiffEntry]) -> Result<(HashMap<RepoPath, Re
 /// The entries of the diff of two root trees, as [`diff`] returns them, up
 /// to one more than `limit`.
 fn diff_walk(
-    store: &Store,
+    store: &Backend,
     (old_root, new_root): (TreeId, TreeId),
     path: Option<&RepoPath>,
     after: Option<&RepoPath>,
@@ -543,7 +543,7 @@ fn diff_walk(
 
 /// The state of one [`diff`] walk.
 struct DiffWalk<'a> {
-    store: &'a Store,
+    store: &'a Backend,
     /// The path of the entries being compared, as raw bytes.
     path: Vec<u8>,
     /// What the walk found, up to one more than `limit`.

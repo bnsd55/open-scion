@@ -10,7 +10,7 @@ use std::process::Command;
 
 use scion_core::{BlobId, FileState};
 use scion_proto::v1::GetObjectsRequest;
-use scion_server::Store;
+use scion_server::Backend;
 use tonic::Code;
 
 mod common;
@@ -84,7 +84,7 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Node> {
 #[test]
 fn checkout_through_the_daemon_and_the_cache_matches_a_direct_checkout() {
     let data = tempfile::tempdir().unwrap();
-    let store = Store::open(data.path()).unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
     let (files, big) = common::files(&store);
     let first = land(&store, &changeset(None, &files));
     // For a later change. A blob is not part of any tree until a changeset
@@ -142,7 +142,7 @@ fn checkout_through_the_daemon_and_the_cache_matches_a_direct_checkout() {
 #[test]
 fn a_bad_ticket_fails_the_call_at_the_daemon() {
     let data = tempfile::tempdir().unwrap();
-    let store = Store::open(data.path()).unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
     let tiers = Tiers::start(data, store);
     let refs = (0..3u8)
         .map(|i| blob_ref(BlobId::of(&[i]), b"nowhere"))

@@ -11,13 +11,13 @@ use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileEntry, FileState, PathElem, RepoPath, Tree, TreeId,
 };
 
+use crate::backend::Backend;
 use crate::db;
 use crate::derived::{self, Kind};
 use crate::error::{ApplyError, Error, Result};
 use crate::graph::CommitGraph;
 use crate::history::PathHistory;
 use crate::meta::{MetaTx, RepoId};
-use crate::store::Store;
 
 /// The byte length of a blob, as the tree entries carry it. The store reads
 /// it from the blob's frame header without unpacking it.
@@ -26,7 +26,7 @@ pub type BlobLens<'a> = &'a mut dyn FnMut(BlobId) -> Result<u64>;
 /// The lens of the store's blobs, from each frame header, for the callers
 /// that hold the store: `store_changeset` and the root-tree derivation it
 /// triggers on the first parent.
-pub fn lens_of(store: &Store) -> impl FnMut(BlobId) -> Result<u64> + '_ {
+pub fn lens_of(store: &Backend) -> impl FnMut(BlobId) -> Result<u64> + '_ {
     |blob| Ok(store.blobs().size(blob)? as u64)
 }
 
@@ -46,7 +46,7 @@ pub(crate) fn lens_none() -> impl FnMut(BlobId) -> Result<u64> {
 ///
 /// [`Error::NotFound`] if a blob is not stored.
 pub fn lens_of_puts(
-    store: &Store,
+    store: &Backend,
     puts: impl Iterator<Item = BlobId>,
 ) -> Result<HashMap<BlobId, u64>> {
     let mut lens = HashMap::new();
@@ -160,7 +160,7 @@ impl Kind for RootTree {
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. [`Error::Corrupt`] if a
 /// stored changeset does not apply to its parent tree.
-pub fn root_tree(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
+pub fn root_tree(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
     derived::get::<RootTree>(store, repo, cs)
 }
 
@@ -170,7 +170,7 @@ pub fn root_tree(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<TreeId>
 /// # Errors
 ///
 /// As [`derive_root_tree`].
-pub fn fill_root_tree(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
+pub fn fill_root_tree(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
     derived::fill::<RootTree>(store, repo, cs)
 }
 
@@ -361,7 +361,10 @@ impl Dir {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::Backend;
     use crate::db::SqliteTx;
+    use crate::meta::Meta as _;
+    use crate::store::Store;
     use scion_core::{BlobId, Changeset, IdentityTime};
 
     /// `(path, Some(content))` puts a regular file; `(path, None)` deletes.
@@ -622,7 +625,7 @@ mod tests {
         ];
         for stored in [true, false] {
             let dir = tempfile::tempdir().unwrap();
-            let store = Store::open(dir.path()).unwrap();
+            let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
             // The chain's six puts name blobs "1".."6"; their files feed the
             // real lens, so stored and re-derived trees carry true lengths.
             for c in ["1", "2", "3", "4", "5", "6"] {
@@ -672,7 +675,7 @@ mod tests {
     #[test]
     fn get_root_tree_flushes_once_after_it_derives() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         store.blobs().put(b"1").unwrap();
         // A changeset with no root tree row yet.
         let cs = store
@@ -696,7 +699,7 @@ mod tests {
     #[test]
     fn root_tree_derives_a_long_chain_and_caches_it() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let author = IdentityTime {
             name: b"a".to_vec(),
             email: b"a@x".to_vec(),

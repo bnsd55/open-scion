@@ -87,14 +87,14 @@ pub trait Meta: Send + Sync + 'static {
     /// # Errors
     ///
     /// What `f` returns, or a database error from begin or commit.
-    fn commit<T>(&self, f: impl FnMut(&mut Self::Tx<'_>) -> Result<T>) -> Result<T>;
+    fn commit<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T>;
 
     /// [`Meta::commit`], and then [`Meta::flush`]: durable on return.
     ///
     /// # Errors
     ///
     /// As [`Meta::commit`] and [`Meta::flush`].
-    fn write<T>(&self, f: impl FnMut(&mut Self::Tx<'_>) -> Result<T>) -> Result<T>;
+    fn write<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T>;
 
     /// Returns once every commit made before this call is durable. No
     /// reply shows a commit that is not durable.
@@ -248,11 +248,103 @@ pub trait MetaTx {
 
     /// Whether `repo` may name `blob`.
     fn repo_has_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool>;
+
+    /// Every repo, in ID order. The walker of `gc`.
+    fn repos(&mut self) -> Result<Vec<RepoId>>;
+
+    /// The `(repo, changeset ID, body)` of the stored changesets after
+    /// `(repo, cs)`, in that order, at most `limit`. The batched walk of
+    /// `gc`'s live set.
+    fn repo_changesets_after(
+        &mut self,
+        from_repo: RepoId,
+        from_cs: &[u8],
+        limit: usize,
+    ) -> Result<Vec<RepoChangeset>>;
+
+    /// The changeset IDs that `repo` holds, all of them.
+    fn repo_changeset_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>>;
+
+    /// The body of changeset `cs`, or `None` when it is not stored.
+    /// Unchecked: `fsck` reads damaged bodies.
+    fn stored_changeset_body(&mut self, cs: &[u8]) -> Result<Option<Vec<u8>>>;
+
+    /// The blobs that `repo` may name, all of them.
+    fn repo_blob_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>>;
+
+    /// Removes the row that names `blob` for `repo`.
+    fn delete_repo_blob(&mut self, repo: RepoId, blob: &[u8]) -> Result<()>;
+
+    /// Whether any repo names `blob`.
+    fn any_repo_names(&mut self, blob: &[u8]) -> Result<bool>;
+
+    /// Orders this transaction against `gc`'s row check and delete for
+    /// `blob`: after it returns, either every changeset this transaction
+    /// later stores is seen by the collector's re-read, or the collector's
+    /// removal is done before this transaction's row check. On the data
+    /// directory it is free: the one write connection orders the two
+    /// already. A shared database needs the lock, so its changeset and land
+    /// transactions take it for every blob they put, and the collector
+    /// takes it around its row check, delete and unlink.
+    fn lock_blob(&mut self, blob: BlobId) -> Result<()>;
+
+    /// The `(changeset ID, body)` of the changesets after `from`, in ID
+    /// order, at most `limit`. `fsck`'s walk over every stored changeset.
+    fn changeset_bodies_after(
+        &mut self,
+        from: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+
+    /// The `(tree ID, body)` of the trees after `from`, in ID order, at
+    /// most `limit`.
+    fn tree_bodies_after(&mut self, from: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+
+    /// The `(node ID, body)` of the history nodes after `from`, in ID
+    /// order, at most `limit`.
+    fn history_node_bodies_after(
+        &mut self,
+        from: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+
+    /// The `repo_blobs` rows after `(repo, blob)`, at most `limit`.
+    fn repo_blob_rows_after(
+        &mut self,
+        from_repo: RepoId,
+        from_blob: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(RepoId, Vec<u8>)>>;
+
+    /// The refs whose target no `repo_changesets` row of their repo holds.
+    fn dangling_refs(&mut self) -> Result<Vec<(RepoId, String, Vec<u8>)>>;
+
+    /// Every land whose input or result changeset is not stored, as
+    /// `(land, changeset, which column)`.
+    fn lands_with_missing_changesets(&mut self) -> Result<Vec<(i64, Vec<u8>, &'static str)>>;
+
+    /// The derived rows after `(kind, version, cs)`, at most `limit`, with
+    /// whether their changeset is stored.
+    fn derived_rows_after(
+        &mut self,
+        kind: &str,
+        version: u32,
+        cs: &[u8],
+        limit: usize,
+    ) -> Result<Vec<FsckDerivedRow>>;
 }
 
 /// The row ID of a repository, private to the backend.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RepoId(pub i64);
+
+/// One stored changeset with its repo, as the collector's walk reads it:
+/// `(repo, changeset ID, body)`.
+pub struct RepoChangeset(pub RepoId, pub Vec<u8>, pub Vec<u8>);
+
+/// A derived row of `fsck`: kind, version, changeset, value, and whether
+/// the changeset is stored.
+pub struct FsckDerivedRow(pub String, pub u32, pub Vec<u8>, pub Vec<u8>, pub bool);
 
 /// Where a ref points, and the version to compare-and-swap against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -285,11 +377,11 @@ impl Meta for Store {
         Store::read_unflushed(self, |c| f(&mut SqliteTx(c)))
     }
 
-    fn commit<T>(&self, mut f: impl FnMut(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
+    fn commit<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
         Store::commit(self, |c| f(&mut SqliteTx(c)))
     }
 
-    fn write<T>(&self, mut f: impl FnMut(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
+    fn write<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
         Store::write(self, |c| f(&mut SqliteTx(c)))
     }
 

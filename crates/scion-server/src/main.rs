@@ -16,11 +16,12 @@ use scion_server::derived::{self, Kind};
 use scion_server::graph::CommitGraph;
 use scion_server::history::PathHistory;
 use scion_server::import::{ImportOptions, import_git};
+use scion_server::meta::Meta as _;
 use scion_server::meta::MetaTx as _;
 use scion_server::metrics::{self, Metrics};
 use scion_server::quotas::Quotas;
 use scion_server::tree::RootTree;
-use scion_server::{Error, Store, fsck, gc, read, service};
+use scion_server::{Backend, Error, fsck, gc, read, service};
 use tracing_subscriber::EnvFilter;
 
 /// The scion server: import, serve and derive.
@@ -30,6 +31,20 @@ struct Cli {
     /// The data directory. Holds the SQLite database and the objects.
     #[arg(long, env = "SCION_DATA", default_value = "scion-data")]
     data: PathBuf,
+    /// Serve metadata from Postgres at this URL instead of the SQLite
+    /// database of the data directory. The URL holds the credentials, so it
+    /// is never logged.
+    #[arg(
+        long,
+        env = "SCION_POSTGRES_URL",
+        hide_env_values = true,
+        value_name = "URL"
+    )]
+    postgres_url: Option<String>,
+    /// Verify the certificate of the Postgres server with this CA (PEM).
+    /// Required when `--postgres-url` names a host that is not local.
+    #[arg(long, requires = "postgres_url", value_name = "FILE")]
+    postgres_ca: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -200,7 +215,7 @@ enum KindName {
 
 /// Runs `fsck` against `store`, prints one line per problem, and exits:
 /// 0 when it saw no damage, 1 when it did, 2 when it could not run.
-fn fsck_command(store: &Store) -> anyhow::Result<()> {
+fn fsck_command(store: &Backend) -> anyhow::Result<()> {
     let report = match fsck::run(store, fsck::BATCH, &mut |_| {}) {
         Ok(report) => report,
         Err(e) => {
@@ -227,7 +242,7 @@ fn fsck_command(store: &Store) -> anyhow::Result<()> {
 
 /// Runs `gc` against `store` and prints what it collected. Exits 2 when it
 /// could not run.
-fn gc_command(store: &Store, grace: Duration, dry_run: bool) {
+fn gc_command(store: &Backend, grace: Duration, dry_run: bool) {
     let report = match gc::run(store, grace, dry_run, &mut |_| {}) {
         Ok(report) => report,
         Err(e) => {
@@ -258,14 +273,21 @@ async fn main() -> anyhow::Result<()> {
     // can run beside the server. `derive` removes rows of older versions of a
     // kind, which a running server of an older build may read, so it opens as
     // the server.
-    let open = match cli.command {
-        Command::Import { .. } | Command::Fsck | Command::Gc { .. } => Store::open_shared,
-        Command::Serve { .. } | Command::Derive { .. } => Store::open,
+    let store = match cli.command {
+        Command::Import { .. } | Command::Fsck | Command::Gc { .. } => Backend::open_shared(
+            &cli.data,
+            cli.postgres_url.as_deref(),
+            cli.postgres_ca.as_deref(),
+        ),
         Command::HashToken { .. } => return hash_token(),
         Command::TicketKey { .. } => return write_ticket_key(),
-    };
-    let store = open(&cli.data)
-        .with_context(|| format!("cannot open data directory {}", cli.data.display()))?;
+        Command::Serve { .. } | Command::Derive { .. } => Backend::open(
+            &cli.data,
+            cli.postgres_url.as_deref(),
+            cli.postgres_ca.as_deref(),
+        ),
+    }
+    .with_context(|| format!("cannot open data directory {}", cli.data.display()))?;
     match cli.command {
         Command::Serve {
             listen,
@@ -324,11 +346,15 @@ async fn main() -> anyhow::Result<()> {
         Command::HashToken { .. } | Command::TicketKey { .. } => {
             unreachable!("handled before the store opens")
         }
-        Command::Fsck => return fsck_command(&store),
+        Command::Fsck => {
+            return fsck_command(&store);
+        }
         Command::Gc {
             grace_secs,
             dry_run,
-        } => gc_command(&store, Duration::from_secs(grace_secs), dry_run),
+        } => {
+            gc_command(&store, Duration::from_secs(grace_secs), dry_run);
+        }
         Command::Import {
             repo,
             rev,
@@ -446,7 +472,7 @@ struct ServeConfig {
 /// the caller stops it.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn serve(
-    store: Store,
+    store: Backend,
     listen: SocketAddr,
     access: scion_server::access::Access,
     config: ServeConfig,
