@@ -53,6 +53,23 @@ export SCION_TICKET_PUB="$PUB"
 echo "starting the server and the cache"
 docker compose up -d server cache
 
+# The one-shot containers resolve the services through the network's DNS,
+# which needs a moment on a fresh network. On a timeout, the service logs
+# say why.
+wait_for() {
+    for _ in $(seq 1 30); do
+        if docker compose run --rm scn "getent hosts $1 >/dev/null"; then
+            return 0
+        fi
+        sleep 1
+    done
+    docker compose logs --tail 20
+    echo "$1 did not come up" >&2
+    exit 1
+}
+wait_for server
+wait_for cache
+
 # --- a repo with one commit, then a checkout through the cache ---------
 echo "seeding the demo repo"
 docker compose run --rm scn '
