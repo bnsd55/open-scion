@@ -266,7 +266,9 @@ fn store_batch(
 ) -> Result<()> {
     #[cfg(test)]
     let slow_record = SLOW_RECORD.with(Cell::get);
-    let shared = store.is_shared();
+    // A Postgres database has one writer: a long batch holds it, like a
+    // shared data directory's write lock does. The budget applies to both.
+    let shared = store.is_shared() || matches!(store, Backend::Postgres(_));
     let mut rest = prepared;
     while !rest.is_empty() {
         let mut taken = 0;

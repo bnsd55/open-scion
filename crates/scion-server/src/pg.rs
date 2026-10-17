@@ -21,7 +21,7 @@
 //! - Land IDs come from an identity sequence, so no ID is handed out
 //!   twice, and the newest land holds the largest one.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use gix::ObjectId;
@@ -46,6 +46,11 @@ use crate::store::Blobs;
 
 /// The schema version this build makes and reads.
 pub(crate) const PG_SCHEMA_VERSION: u32 = 1;
+
+/// The advisory lock of the one server process of a database.
+const SERVER_LOCK: i64 = 0x5343_494F_4E53_5256;
+/// The advisory lock of one migration run of a database.
+const SCHEMA_LOCK: i64 = 0x5343_494F_4E53_4348;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database
 /// from version `n - 1` to version `n`. A released migration never changes.
@@ -81,7 +86,17 @@ impl Readers {
     fn new_with(size: usize, url: &str, ca: Option<&Path>, options: &str) -> Result<Self> {
         // The open is sequential, so every client sees the same schema.
         let idle = (0..size)
-            .map(|_| connect_with(url, ca, options))
+            .map(|_| {
+                let client = connect_with(url, ca, options)?;
+                let on: String = client.query("SHOW synchronous_commit", &[])?[0].get(0);
+                if on != "on" {
+                    return Err(Error::FailedPrecondition(format!(
+                        "the database runs synchronous_commit={on}; this \
+                         backend needs synchronous_commit=on"
+                    )));
+                }
+                Ok(client)
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             idle: Mutex::new(idle),
@@ -232,13 +247,38 @@ struct PgClient {
 
 impl PgClient {
     /// Puts `client` on its own worker thread.
-    fn spawn(client: Client) -> PgClient {
+    fn spawn(cfg: ClientConfig) -> PgClient {
         let (jobs, rx) = std::sync::mpsc::channel::<Job>();
         std::thread::Builder::new()
             .name("postgres-client".into())
             .spawn(move || {
-                let mut client = client;
+                let ClientConfig {
+                    mut client,
+                    url,
+                    ca,
+                    options,
+                    mut exclusive,
+                } = cfg;
                 for job in rx {
+                    // A client the server closed, as after a restart of the
+                    // database, connects again: the caller sees one error at
+                    // most, not one until the process restarts.
+                    if client.is_closed() {
+                        match connect_on(&url, ca.as_deref(), &options) {
+                            Ok(fresh) => {
+                                client = fresh;
+                                if exclusive {
+                                    exclusive = server_lock_raw(&mut client);
+                                }
+                            }
+                            Err(error) => {
+                                if job.reply.send(Err(error)).is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     let refs: Vec<&(dyn ToSql + Sync)> = job
                         .params
                         .iter()
@@ -249,7 +289,7 @@ impl PgClient {
                         Kind::Count => client.execute(&job.sql, &refs).map(Reply::Count),
                         Kind::Rows => client.query(&job.sql, &refs).map(Reply::Rows),
                     }
-                    .map_err(Error::Pg);
+                    .map_err(map_pg_error);
                     if job.reply.send(out).is_err() {
                         break;
                     }
@@ -304,6 +344,51 @@ impl PgClient {
     }
 }
 
+/// Drops the test schemas whose connections are all gone: a test run
+/// leaves them behind, because a server holds its schema while it runs.
+/// One process at a time holds the cleanup lock, so the test binaries
+/// that run in parallel clean nothing under each other's feet. A schema
+/// whose owner still runs is named in `pg_stat_activity`: its
+/// `application_name` is the schema.
+fn drop_stale_schemas(maker: &PgClient) {
+    let Ok(got) = maker.query_opt("SELECT pg_try_advisory_lock($1)", &[P::i64(CLEAN_LOCK)]) else {
+        return;
+    };
+    if got.is_none() {
+        return;
+    }
+    if let Ok(rows) = maker.query(
+        "SELECT nspname FROM pg_catalog.pg_namespace
+         WHERE nspname LIKE 'scion_test_%'
+           AND nspname NOT IN (
+               SELECT application_name FROM pg_catalog.pg_stat_activity
+               WHERE application_name LIKE 'scion_test_%')",
+        &[],
+    ) {
+        for row in rows {
+            let name: String = row.get(0);
+            let _ = maker.batch(&format!("DROP SCHEMA IF EXISTS {name} CASCADE"));
+        }
+    }
+    let _ = maker.query_opt("SELECT pg_advisory_unlock($1)", &[P::i64(CLEAN_LOCK)]);
+}
+
+/// The advisory lock of the test-schema cleanup.
+const CLEAN_LOCK: i64 = 0x5343_494F_4E53_5445;
+
+/// The libpq options of every connection of this backend. The commit of
+/// a transaction reaches the drive before it returns, and no statement
+/// runs longer than the graph-walk bound.
+fn base_options(schema: Option<&str>) -> String {
+    let mut options = String::from("-csynchronous_commit=on -cstatement_timeout=600000");
+    if let Some(schema) = schema {
+        options.push_str(&format!(
+            " -csearch_path={schema} -capplication_name={schema}"
+        ));
+    }
+    options
+}
+
 impl Pg {
     /// Opens the database at `url`, and the blob folder under `data`, as
     /// its server: the one `Pg` that may land. `readers` clients serve
@@ -316,7 +401,23 @@ impl Pg {
     /// A URL that does not parse, a database that does not connect, a
     /// schema of a newer build, or a migration that fails.
     pub fn open(url: &str, ca: Option<&Path>, readers: usize, data: &Path) -> Result<Self> {
-        Self::open_in(url, ca, readers, data, None)
+        Self::open_in(url, ca, readers, data, None, false)
+    }
+
+    /// [`Pg::open`], as the one server process of the database: a second
+    /// `serve` or `derive` on the same URL is refused. Import runs beside a
+    /// server, so it opens without the lock.
+    ///
+    /// # Errors
+    ///
+    /// As [`Pg::open`], and another process holds the one-server lock.
+    pub fn open_exclusive(
+        url: &str,
+        ca: Option<&Path>,
+        readers: usize,
+        data: &Path,
+    ) -> Result<Self> {
+        Self::open_in(url, ca, readers, data, None, true)
     }
 
     /// [`Pg::open`], in `schema` instead of the database's default one, for
@@ -331,24 +432,39 @@ impl Pg {
             // One throwaway client makes the schema, before any connection
             // narrows its search path to it.
             let maker = connect(url, None)?;
+            drop_stale_schemas(&maker);
             maker.batch(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))?;
         }
-        Self::open_in(url, None, readers, data, Some(schema))
+        Self::open_in(url, None, readers, data, Some(schema), false)
     }
 
     /// [`Pg::open`], in the search path of `schema` when it is set.
+    #[allow(clippy::unused_self)]
     fn open_in(
         url: &str,
         ca: Option<&Path>,
         readers: usize,
         data: &Path,
         schema: Option<&str>,
+        exclusive: bool,
     ) -> Result<Self> {
-        let options = schema
-            .map(|schema| format!("-csearch_path={schema}"))
-            .unwrap_or_default();
-        let writer = connect_with(url, ca, &options)?;
-        migrate(&writer)?;
+        let options = base_options(schema);
+        let mut writer = if exclusive {
+            connect_exclusive(url, ca, &options)?
+        } else {
+            connect_with(url, ca, &options)?
+        };
+        migrate(&mut writer)?;
+        // The durability of a commit is a promise of this backend: check
+        // that the server kept its side of it.
+        let on: String = writer.query("SHOW synchronous_commit", &[])?[0].get(0);
+        if on != "on" {
+            return Err(Error::FailedPrecondition(format!(
+                "the database runs synchronous_commit={on}; this backend \
+                 promises that a returned commit is durable, so it needs \
+                 synchronous_commit=on"
+            )));
+        }
         let blobs = Blobs::open(data)?;
         blobs.sweep_tmp(false)?;
         Ok(Self {
@@ -381,11 +497,11 @@ impl Pg {
     /// every commit is durable when it returns, so what `f` saw is durable.
     pub fn read<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
         let mut reader = self.inner.readers.take();
-        let mut tx = PgTx::begin(reader.client())?;
+        let mut tx = PgTx::begin_read(reader.client())?;
         let out = f(&mut tx);
-        // A read transaction: nothing to keep. An explicit rollback, so an
-        // error of the rollback cannot hide the error of `f`.
-        tx.rollback()?;
+        // A read transaction: nothing to keep. The rollback's own error
+        // must not hide the error of `f`; the drop rolls back anyway.
+        let _ = tx.rollback();
         out
     }
 
@@ -398,8 +514,9 @@ impl Pg {
     /// What `f` returns, or a database error from begin or commit.
     pub fn commit<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
         let mut writer = self.lock_writer();
-        // A transaction takes its isolation from the session: READ
-        // COMMITTED, the Postgres default.
+        // A write transaction runs at READ COMMITTED, the Postgres
+        // default: every change of the caller checks the newest state of
+        // the row it touches (the CAS predicates).
         let mut tx = PgTx::begin(&mut writer)?;
         match f(&mut tx) {
             Ok(value) => {
@@ -407,9 +524,9 @@ impl Pg {
                 Ok(value)
             }
             Err(error) => {
-                // An explicit rollback, so an error of the rollback cannot
-                // hide the error of `f`.
-                tx.rollback()?;
+                // The rollback's own error must not hide the error of `f`;
+                // the drop rolls back anyway.
+                let _ = tx.rollback();
                 Err(error)
             }
         }
@@ -447,6 +564,17 @@ impl<'a> PgTx<'a> {
     /// Begins one transaction on the client.
     fn begin(c: &'a mut PgClient) -> Result<PgTx<'a>> {
         c.execute("BEGIN", &[])?;
+        Ok(Self { c, ended: false })
+    }
+
+    /// Begins one read-only transaction at repeatable read: every
+    /// statement of the caller's read sees one snapshot, not the newest
+    /// state of each statement.
+    fn begin_read(c: &'a mut PgClient) -> Result<PgTx<'a>> {
+        c.execute(
+            "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+            &[],
+        )?;
         Ok(Self { c, ended: false })
     }
 
@@ -490,6 +618,31 @@ impl Drop for PgTx<'_> {
 /// Connects one client of `url`. TLS follows the rule of the gRPC client: a
 /// host on this machine may go without TLS; a host off it must present a
 /// certificate that `ca` signed.
+/// What a worker needs to run, and to connect again when its client dies.
+struct ClientConfig {
+    client: Client,
+    url: String,
+    ca: Option<PathBuf>,
+    options: String,
+    /// Re-take the one-server lock after every reconnect.
+    exclusive: bool,
+}
+
+/// The advisory lock of the one server process of a database: a second
+/// `serve` or `derive` on the same URL is refused.
+fn server_lock(client: &PgClient) -> bool {
+    client
+        .query_opt("SELECT pg_try_advisory_lock($1)", &[P::i64(SERVER_LOCK)])
+        .is_ok_and(|row| row.is_some_and(|row| row.get::<_, bool>(0)))
+}
+
+/// [`server_lock`] on the raw client of a worker, which reconnects alone.
+fn server_lock_raw(client: &mut Client) -> bool {
+    client
+        .query_opt("SELECT pg_try_advisory_lock($1)", &[&(SERVER_LOCK as i64)])
+        .is_ok_and(|row| row.is_some_and(|row| row.get::<_, bool>(0)))
+}
+
 fn connect(url: &str, ca: Option<&Path>) -> Result<PgClient> {
     connect_with(url, ca, "")
 }
@@ -498,15 +651,38 @@ fn connect(url: &str, ca: Option<&Path>) -> Result<PgClient> {
 /// runs on a plain thread: `postgres` drives its own runtime, which must
 /// not start inside the server's tokio one.
 fn connect_with(url: &str, ca: Option<&Path>, options: &str) -> Result<PgClient> {
-    let url = url.to_owned();
-    let options = options.to_owned();
-    let client = std::thread::scope(|scope| {
-        scope
-            .spawn(move || connect_on(&url, ca, &options))
-            .join()
-            .unwrap()
-    })?;
-    Ok(PgClient::spawn(client))
+    let client =
+        std::thread::scope(|scope| scope.spawn(|| connect_on(url, ca, options)).join().unwrap())?;
+    Ok(PgClient::spawn(ClientConfig {
+        client,
+        url: url.to_owned(),
+        ca: ca.map(Path::to_path_buf),
+        options: options.to_owned(),
+        exclusive: false,
+    }))
+}
+
+/// [`connect_with`], as the one server process of the database: the
+/// advisory lock it takes survives as long as the client, and a
+/// reconnecting client takes it again.
+fn connect_exclusive(url: &str, ca: Option<&Path>, options: &str) -> Result<PgClient> {
+    let client =
+        std::thread::scope(|scope| scope.spawn(|| connect_on(url, ca, options)).join().unwrap())?;
+    let mut client = client;
+    let exclusive = server_lock_raw(&mut client);
+    if !exclusive {
+        return Err(Error::FailedPrecondition(
+            "another server process already uses this database; one server              may serve one database"
+                .into(),
+        ));
+    }
+    Ok(PgClient::spawn(ClientConfig {
+        client,
+        url: url.to_owned(),
+        ca: ca.map(Path::to_path_buf),
+        options: options.to_owned(),
+        exclusive: true,
+    }))
 }
 
 /// [`connect_with`]'s work: parse, then connect.
@@ -517,18 +693,38 @@ fn connect_on(url: &str, ca: Option<&Path>, options: &str) -> Result<Client> {
     if !options.is_empty() {
         config.options(options);
     }
-    let local = match config.get_hosts().first() {
-        Some(postgres::config::Host::Tcp(host)) => {
-            host == "localhost"
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        }
-        // A Unix socket is as local as it gets.
-        Some(postgres::config::Host::Unix(_)) => true,
-        None => false,
-    };
+    // A dead connection is noticed in seconds, not held open forever.
+    config.connect_timeout(std::time::Duration::from_secs(10));
+    config.keepalives(true);
+    // The host is on this machine only when every host of the URL is, and
+    // no `hostaddr` names one by address: an address has no name to check
+    // a certificate against.
+    let local = !config.get_hosts().is_empty()
+        && config.get_hostaddrs().is_empty()
+        && config.get_hosts().iter().all(|host| match host {
+            postgres::config::Host::Tcp(host) => {
+                host == "localhost"
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            }
+            // A Unix socket is as local as it gets.
+            postgres::config::Host::Unix(_) => true,
+        });
+    let wants_tls = config.get_ssl_mode() == postgres::config::SslMode::Require;
+    // Off this machine the traffic is encrypted, whatever a man in the
+    // middle answers to the start: `prefer` falls back to plaintext when
+    // the server's answer says no, so it is refused here.
+    if !local && !wants_tls {
+        return Err(Error::InvalidArgument(
+            "the database host is off this machine, so its traffic must be \
+             encrypted: name sslmode=require or stronger in the URL"
+                .to_owned(),
+        ));
+    }
     let client = match (local, ca) {
+        // The connector upgrades every connection, and checks the
+        // certificate the server presents against `ca`.
         (_, Some(ca)) => config.connect(make_tls(ca)?)?,
         (true, None) => config.connect(NoTls)?,
         (false, None) => {
@@ -540,6 +736,24 @@ fn connect_on(url: &str, ca: Option<&Path>, options: &str) -> Result<Client> {
         }
     };
     Ok(client)
+}
+
+/// A database error that a caller may retry maps to [`Error::Busy`]: the
+/// importer retries a batch on it, and the gRPC status becomes
+/// UNAVAILABLE. The rest keep their database error.
+fn map_pg_error(e: postgres::Error) -> Error {
+    if let Some(code) = e.code() {
+        if matches!(
+            code.code(),
+            // Deadlock, serialization failure, an administrative shutdown,
+            // a database that starts up, any lost connection.
+            "40P01" | "40001" | "57P01" | "57P03"
+        ) || code.code().starts_with("08")
+        {
+            return Error::Busy;
+        }
+    }
+    Error::Pg(e)
 }
 
 /// The TLS connector of a database whose host is off this machine: the
@@ -572,18 +786,23 @@ fn make_tls(ca: &Path) -> Result<MakeRustlsConnect> {
 /// Brings the database to this build's schema: runs every migration it has
 /// not run yet, in one transaction each, and refuses a schema of a newer
 /// build.
-fn migrate(client: &PgClient) -> Result<()> {
-    client.batch(
+fn migrate(client: &mut PgClient) -> Result<()> {
+    // One transaction holds the schema lock, so a server and an import
+    // started together migrate one after the other, and the version the
+    // loser reads is the one the winner left.
+    let mut tx = PgTx::begin(client)?;
+    tx.c.execute("SELECT pg_advisory_xact_lock($1)", &[P::i64(SCHEMA_LOCK)])?;
+    tx.c.batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
              version BIGINT PRIMARY KEY,
              name    TEXT NOT NULL
          )",
     )?;
-    let version = client
-        .query("SELECT max(version) FROM schema_migrations", &[])?
-        .first()
-        .and_then(|row| row.get::<_, Option<i64>>(0))
-        .unwrap_or(0);
+    let version: i64 =
+        tx.c.query("SELECT max(version) FROM schema_migrations", &[])?
+            .first()
+            .and_then(|row| row.get::<_, Option<i64>>(0))
+            .unwrap_or(0);
     let version = u32::try_from(version).map_err(|_| {
         Error::FailedPrecondition(format!(
             "database schema version {version} is not a version"
@@ -600,15 +819,13 @@ fn migrate(client: &PgClient) -> Result<()> {
         if n <= version {
             continue;
         }
-        // The batch is one implicit transaction: the migration and its
-        // schema_migrations row land together.
-        client.batch(&format!(
+        tx.c.batch(&format!(
             "{sql}\nINSERT INTO schema_migrations (version, name) \
              VALUES ({}, 'postgres schema')",
             i64::from(n)
         ))?;
     }
-    Ok(())
+    tx.commit()
 }
 
 /// Reads a tree's rows and checks them against its ID.
@@ -1104,7 +1321,7 @@ impl MetaTx for PgTx<'_> {
                     )));
                 }
             }
-            let land_id: i64 = self
+            let inserted = self
                 .c
                 .query_opt(
                     "INSERT INTO lands
@@ -1113,6 +1330,7 @@ impl MetaTx for PgTx<'_> {
                      VALUES ($1, $2, $3, $4, $5, $6, $7,
                          CASE WHEN $6 = 'pending' THEN NULL ELSE now_epoch() END,
                          now_epoch())
+                     ON CONFLICT DO NOTHING
                      RETURNING land_id",
                     &[
                         P::i64(repo.0),
@@ -1124,8 +1342,47 @@ impl MetaTx for PgTx<'_> {
                         P::text(&detail),
                     ],
                 )?
-                .and_then(|row| row.get(0))
-                .unwrap_or(0);
+                .map(|row| row.get::<_, i64>(0));
+            let land_id = match inserted {
+                Some(land_id) => land_id,
+                // Another writer recorded the same key first: its land
+                // wins, and its input must match this one's.
+                None => {
+                    let (land_id, input, target) = self
+                        .c
+                        .query_opt(
+                            "SELECT land_id, input_cs, target_ref FROM lands
+                             WHERE repo_id = $1 AND caller = $2 AND request_key = $3",
+                            &[
+                                P::i64(repo.0),
+                                P::text(&caller.0),
+                                P::text(&req.request_key),
+                            ],
+                        )?
+                        .map(|row| {
+                            (
+                                row.get::<_, i64>(0),
+                                row.get::<_, Vec<u8>>(1),
+                                row.get::<_, String>(2),
+                            )
+                        })
+                        .ok_or_else(|| {
+                            Error::Corrupt(format!(
+                                "land {:?} of {:?} was recorded by another \
+                                 process and then vanished",
+                                req.request_key, caller.0
+                            ))
+                        })?;
+                    if input != req.changeset.as_bytes() || target != req.target_ref {
+                        return Err(Error::InvalidArgument(format!(
+                            "request key {:?} was already used for a \
+                             different land",
+                            req.request_key
+                        )));
+                    }
+                    land_id
+                }
+            };
             self.expire_lands()?;
             land_id
         };
@@ -1348,6 +1605,9 @@ impl Meta for Pg {
 
     fn flush(&self) -> Result<()> {
         // synchronous_commit is on: a commit is durable when it returns.
+        // The blob files are the backend's own disk state, though: they
+        // reach the drive on their own schedule, like a SQLite store's.
+        self.inner.blobs.full_flush()?;
         Ok(())
     }
 }

@@ -1,20 +1,25 @@
-//! The Postgres schema keeps the tables and columns of the SQLite schema.
-//! Both backends hold the same rows, so a column that one has and the
-//! other lacks is a bug that the queries of the other backend hit at
-//! runtime. This test reads both sets of migrations and compares the
-//! tables, their columns, and the coarse kind of each column.
+//! The Postgres schema holds the tables and columns of the SQLite schema,
+//! with the same shape: a column that one has and the other lacks, a type
+//! that differs, or a key, a foreign key, or an index on one side only is
+//! a bug that the queries of the other backend hit at runtime. This test
+//! reads both sets of migrations and compares what each builds.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// One column of a table: its coarse kind, which the two dialects spell
-/// differently.
-#[derive(Debug, PartialEq, Eq)]
+/// differently, and its constraints.
+#[derive(Debug, PartialEq, Eq, Default)]
 struct Column {
     kind: &'static str,
+    not_null: bool,
+    primary_key: bool,
+    unique: bool,
+    /// The table a `REFERENCES` names, if the column has one.
+    references: Option<String>,
 }
 
-/// The schema: table name, then its columns with their kinds.
+/// The schema: table name, then its columns with their shape.
 type Schema = BTreeMap<String, Vec<(String, Column)>>;
 
 #[derive(Clone, Copy)]
@@ -25,7 +30,7 @@ enum Dialect {
 
 /// Reads every `.sql` file of `dir`, oldest first, and applies its
 /// statements: tables appear, gain columns, and rename.
-fn read_schema(dir: &Path, dialect: Dialect) -> Schema {
+fn read_schema(dir: &Path, dialect: Dialect) -> (Schema, Vec<String>) {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
         .map(|e| e.unwrap().path())
@@ -33,17 +38,18 @@ fn read_schema(dir: &Path, dialect: Dialect) -> Schema {
         .collect();
     paths.sort();
     let mut schema = Schema::new();
+    let mut indexes = Vec::new();
     for path in paths {
         let sql = std::fs::read_to_string(&path).unwrap();
         for statement in sql.split(';') {
-            apply(statement, dialect, &mut schema);
+            apply(statement, dialect, &mut schema, &mut indexes);
         }
     }
-    schema
+    (schema, indexes)
 }
 
 /// Applies one SQL statement to `schema`.
-fn apply(statement: &str, dialect: Dialect, schema: &mut Schema) {
+fn apply(statement: &str, dialect: Dialect, schema: &mut Schema, indexes: &mut Vec<String>) {
     // A comment belongs to no statement.
     let sql: String = statement
         .lines()
@@ -73,18 +79,155 @@ fn apply(statement: &str, dialect: Dialect, schema: &mut Schema) {
             let rest = action.strip_prefix("ADD ").unwrap_or(&action);
             let rest = rest.strip_prefix("COLUMN ").unwrap_or(rest);
             let mut words = rest.split_whitespace();
-            let column = words.next().unwrap().trim_matches('"').to_owned();
+            let name = column_name_of(rest);
+            let _ = words.next();
             let kind = words.next().unwrap();
-            let kind = match dialect {
-                Dialect::Sqlite => sqlite_kind(kind),
-                Dialect::Postgres => postgres_kind(kind),
-            };
-            schema
-                .entry(table)
-                .or_default()
-                .push((column, Column { kind }));
+            let constraints = words.collect::<Vec<_>>().join(" ");
+            let column = column_of(&constraints, kind, dialect);
+            schema.entry(table).or_default().push((name, column));
+        }
+    } else if let Some(rest) = statement.strip_prefix("CREATE INDEX ") {
+        indexes.push(index_name(rest));
+    } else if let Some(rest) = statement.strip_prefix("CREATE UNIQUE INDEX ") {
+        indexes.push(index_name(rest));
+    }
+}
+
+/// The name an index definition starts with.
+fn index_name(rest: &str) -> String {
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
+    rest.split_whitespace()
+        .next()
+        .unwrap()
+        .trim_matches('"')
+        .to_owned()
+}
+
+/// The column of an `ADD COLUMN` line: the words after the name are its
+/// type, then its constraints.
+fn column_name_of(rest: &str) -> String {
+    rest.split_whitespace()
+        .next()
+        .unwrap()
+        .trim_matches('"')
+        .to_owned()
+}
+
+fn column_of(constraints: &str, kind: &str, dialect: Dialect) -> Column {
+    let kind = match dialect {
+        Dialect::Sqlite => sqlite_kind(kind),
+        Dialect::Postgres => postgres_kind(kind),
+    };
+    let references = constraints
+        .split_whitespace()
+        .zip(constraints.split_whitespace().skip(1))
+        .find(|(prev, _)| *prev == "REFERENCES")
+        .map(|(_, table)| table.trim_matches(',').trim_matches('"').to_owned());
+    Column {
+        kind,
+        not_null: constraints.contains("NOT NULL"),
+        primary_key: constraints.contains("PRIMARY KEY"),
+        unique: constraints.contains("UNIQUE"),
+        references,
+    }
+}
+
+/// The columns of a `CREATE TABLE` body, constraints included.
+fn columns_of(body: &str, dialect: Dialect) -> Vec<(String, Column)> {
+    let defs = split_defs(body);
+    let mut columns: Vec<(String, Column)> = Vec::new();
+    let mut table_primary_key: Option<Vec<String>> = None;
+    for def in defs {
+        let words: Vec<&str> = def.split_whitespace().collect();
+        let Some(first) = words.first() else {
+            continue;
+        };
+        let name = first.trim_matches('"');
+        if matches!(
+            name,
+            "FOREIGN" | "CHECK" | "UNIQUE" | "PRIMARY" | "CONSTRAINT"
+        ) {
+            apply_table_constraint(def, &mut columns, &mut table_primary_key);
+            continue;
+        }
+        let Some(kind) = words.get(1) else {
+            continue;
+        };
+        if !is_type(kind) {
+            continue; // a constraint line, such as `REFERENCES`
+        }
+        let constraints = words[2..].join(" ");
+        columns.push((name.to_owned(), column_of(&constraints, kind, dialect)));
+    }
+    // A table-level `PRIMARY KEY (a, b)` marks its columns.
+    if let Some(keys) = table_primary_key {
+        for (name, column) in &mut columns {
+            if keys.contains(name) {
+                column.primary_key = true;
+            }
         }
     }
+    columns
+}
+
+/// Applies one table-level constraint to `columns`.
+fn apply_table_constraint(
+    def: &str,
+    columns: &mut [(String, Column)],
+    table_primary_key: &mut Option<Vec<String>>,
+) {
+    let names = |rest: &str| -> Vec<String> {
+        let open = rest.find('(').unwrap();
+        let close = matching_paren(rest, open);
+        rest[open + 1..close]
+            .split(',')
+            .map(|n| n.trim().trim_matches('"').to_owned())
+            .collect()
+    };
+    if let Some(rest) = def.strip_prefix("PRIMARY KEY") {
+        *table_primary_key = Some(names(rest));
+    } else if let Some(rest) = def.strip_prefix("UNIQUE") {
+        for name in names(rest) {
+            if let Some((_, column)) = columns.iter_mut().find(|(n, _)| *n == name) {
+                column.unique = true;
+            }
+        }
+    } else if let Some(rest) = def.strip_prefix("FOREIGN KEY") {
+        let columns_of_key = names(rest);
+        if let Some(table) = def.split("REFERENCES").nth(1).and_then(|t| {
+            t.split_whitespace()
+                .next()
+                .map(|t| t.trim_matches('"').to_owned())
+        }) {
+            for name in columns_of_key {
+                if let Some((_, column)) = columns.iter_mut().find(|(n, _)| *n == name) {
+                    column.references = Some(table.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Splits the body of a `CREATE TABLE` on the commas that no parenthesis
+/// of a constraint or a foreign key hides.
+fn split_defs(body: &str) -> Vec<&str> {
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut defs = Vec::new();
+    for (i, c) in body.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                defs.push(&body[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    defs.push(&body[start..]);
+    defs
 }
 
 /// The index of the parenthesis that closes the one at `open`.
@@ -103,55 +246,6 @@ fn matching_paren(s: &str, open: usize) -> usize {
         }
     }
     panic!("unclosed parenthesis in {s:?}")
-}
-
-/// Splits the body of a `CREATE TABLE` on the commas that no parenthesis
-/// of a constraint or a foreign key hides, then keeps the column lines.
-fn columns_of(body: &str, dialect: Dialect) -> Vec<(String, Column)> {
-    let mut depth = 0usize;
-    let mut start = 0usize;
-    let mut defs = Vec::new();
-    for (i, c) in body.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ',' if depth == 0 => {
-                defs.push(&body[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    defs.push(&body[start..]);
-    defs.iter()
-        .filter_map(|def| {
-            let mut words = def.split_whitespace();
-            let name = words.next()?.trim_matches('"');
-            if !is_column_name(name) {
-                return None; // a constraint line
-            }
-            let kind = words.next()?;
-            if !is_type(kind) {
-                return None; // a constraint line, such as REFERENCES
-            }
-            let kind = match dialect {
-                Dialect::Sqlite => sqlite_kind(kind),
-                Dialect::Postgres => postgres_kind(kind),
-            };
-            Some((name.to_owned(), Column { kind }))
-        })
-        .collect()
-}
-
-/// Whether `name` names a column, not a constraint.
-fn is_column_name(name: &str) -> bool {
-    !matches!(
-        name,
-        "FOREIGN" | "CHECK" | "UNIQUE" | "PRIMARY" | "CONSTRAINT"
-    ) && name
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
 }
 
 /// Whether `kind` is a type of either dialect, not a keyword of a
@@ -189,35 +283,73 @@ fn postgres_kind(kind: &str) -> &'static str {
 #[test]
 fn the_postgres_schema_holds_the_tables_and_columns_of_the_sqlite_schema() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-    let sqlite = read_schema(&dir, Dialect::Sqlite);
-    let postgres = read_schema(&dir.join("postgres"), Dialect::Postgres);
+    let (sqlite, sqlite_indexes) = read_schema(&dir, Dialect::Sqlite);
+    let (postgres, postgres_indexes) = read_schema(&dir.join("postgres"), Dialect::Postgres);
     assert!(!sqlite.is_empty(), "the SQLite migrations hold tables");
     assert!(!postgres.is_empty(), "the Postgres migrations hold tables");
 
     let mut ok = true;
+    let mut say = |message: String, ok: &mut bool| {
+        println!("{message}");
+        *ok = false;
+    };
     for (name, columns) in &sqlite {
         let Some(pg_columns) = postgres.get(name) else {
-            println!("table {name} is missing from the Postgres schema");
-            ok = false;
+            say(
+                format!("table {name} is missing from the Postgres schema"),
+                &mut ok,
+            );
             continue;
         };
-        for (column, _) in columns {
-            if !pg_columns.iter().any(|(n, _)| n == column) {
-                println!("column {name}.{column} is missing from the Postgres schema");
-                ok = false;
+        for (column, shape) in columns {
+            let Some(pg_shape) = pg_columns.iter().find(|(n, _)| n == column).map(|(_, c)| c)
+            else {
+                say(
+                    format!("column {name}.{column} is missing from the Postgres schema"),
+                    &mut ok,
+                );
+                continue;
+            };
+            if pg_shape != shape {
+                say(
+                    format!(
+                        "column {name}.{column} is {shape:?} in SQLite, {pg_shape:?} in Postgres"
+                    ),
+                    &mut ok,
+                );
             }
         }
         for (column, _) in pg_columns {
             if !columns.iter().any(|(n, _)| n == column) {
-                println!("column {name}.{column} is missing from the SQLite schema");
-                ok = false;
+                say(
+                    format!("column {name}.{column} is missing from the SQLite schema"),
+                    &mut ok,
+                );
             }
         }
     }
     for name in postgres.keys() {
         if !sqlite.contains_key(name) {
-            println!("table {name} is missing from the SQLite schema");
-            ok = false;
+            say(
+                format!("table {name} is missing from the SQLite schema"),
+                &mut ok,
+            );
+        }
+    }
+    for index in &sqlite_indexes {
+        if !postgres_indexes.contains(index) {
+            say(
+                format!("index {index} is missing from the Postgres schema"),
+                &mut ok,
+            );
+        }
+    }
+    for index in &postgres_indexes {
+        if !sqlite_indexes.contains(index) {
+            say(
+                format!("index {index} is missing from the SQLite schema"),
+                &mut ok,
+            );
         }
     }
     assert!(ok, "the schemas drift");

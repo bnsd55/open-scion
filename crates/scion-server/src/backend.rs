@@ -55,8 +55,45 @@ impl BackendTx<'_> {
     }
 }
 
-/// Clients that a Postgres backend pools for its reads.
-const PG_READERS: usize = 4;
+/// Clients that a Postgres backend pools for its reads: as many as a
+/// data directory holds, so the graph-walk bound of the server keeps its
+/// meaning on both backends.
+const PG_READERS: usize = crate::store::READERS;
+
+const _: () = assert!(PG_READERS == crate::store::READERS);
+
+/// The file that names the backend of a data directory. Absent, the
+/// directory is a SQLite one: directories of older builds have no file.
+const MARKER: &str = "backend";
+
+/// Marks `data` as Postgres-backed, and refuses to open Postgres on a
+/// directory whose metadata a SQLite store already holds.
+fn postgres_marker(data: &Path) -> Result<()> {
+    let db = data.join("scion.db");
+    if db.exists() && std::fs::metadata(&db).map(|m| m.len() > 0).unwrap_or(false) {
+        return Err(crate::error::Error::InvalidArgument(
+            "this data directory already keeps its metadata in its own \
+             database: drop --postgres-url to use it"
+                .into(),
+        ));
+    }
+    std::fs::write(data.join(MARKER), "postgres\n").map_err(crate::error::Error::Io)?;
+    Ok(())
+}
+
+/// Refuses to open the data directory as SQLite when its marker names
+/// Postgres: its rows live in the database, and a second, empty store
+/// here would look like a server with no data at all.
+fn refuse_postgres_marker(data: &Path) -> Result<()> {
+    if std::fs::read_to_string(data.join(MARKER)).is_ok_and(|s| s.trim() == "postgres") {
+        return Err(crate::error::Error::InvalidArgument(
+            "this data directory keeps its metadata in Postgres: \
+             give --postgres-url"
+                .into(),
+        ));
+    }
+    Ok(())
+}
 
 /// The URL of the test database.
 fn test_url() -> Result<String> {
@@ -86,8 +123,16 @@ impl Backend {
     /// What the store or the database returns.
     pub fn open(data: &Path, postgres_url: Option<&str>, ca: Option<&Path>) -> Result<Self> {
         match postgres_url {
-            Some(url) => Ok(Self::Postgres(Pg::open(url, ca, PG_READERS, data)?)),
-            None => Ok(Self::Sqlite(Store::open(data)?)),
+            Some(url) => {
+                postgres_marker(data)?;
+                Ok(Self::Postgres(Pg::open_exclusive(
+                    url, ca, PG_READERS, data,
+                )?))
+            }
+            None => {
+                refuse_postgres_marker(data)?;
+                Ok(Self::Sqlite(Store::open(data)?))
+            }
         }
     }
 
@@ -100,8 +145,14 @@ impl Backend {
     /// What the store or the database returns.
     pub fn open_shared(data: &Path, postgres_url: Option<&str>, ca: Option<&Path>) -> Result<Self> {
         match postgres_url {
-            Some(url) => Ok(Self::Postgres(Pg::open(url, ca, PG_READERS, data)?)),
-            None => Ok(Self::Sqlite(Store::open_shared(data)?)),
+            Some(url) => {
+                postgres_marker(data)?;
+                Ok(Self::Postgres(Pg::open(url, ca, PG_READERS, data)?))
+            }
+            None => {
+                refuse_postgres_marker(data)?;
+                Ok(Self::Sqlite(Store::open_shared(data)?))
+            }
         }
     }
 
@@ -114,9 +165,11 @@ impl Backend {
     #[doc(hidden)]
     pub fn open_test_shared(data: &Path) -> Result<Self> {
         if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
+            postgres_marker(data)?;
             let pg = Pg::open_test(&test_url()?, &test_schema(data), PG_READERS, data)?;
             return Ok(Self::Postgres(pg));
         }
+        refuse_postgres_marker(data)?;
         Self::open_shared(data, None, None)
     }
 
@@ -131,9 +184,11 @@ impl Backend {
     #[doc(hidden)]
     pub fn open_test(data: &Path) -> Result<Self> {
         if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
+            postgres_marker(data)?;
             let pg = Pg::open_test(&test_url()?, &test_schema(data), PG_READERS, data)?;
             return Ok(Self::Postgres(pg));
         }
+        refuse_postgres_marker(data)?;
         Self::open(data, None, None)
     }
 

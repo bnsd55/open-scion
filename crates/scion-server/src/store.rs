@@ -741,7 +741,7 @@ impl Blobs {
     /// Waits for a full flush that starts after this call: the blob root
     /// directory, then the drive cache. That covers everything that reached
     /// the drive before it, the database too, which lives on the same drive.
-    fn full_flush(&self) -> io::Result<()> {
+    pub(crate) fn full_flush(&self) -> io::Result<()> {
         self.group_flush
             .run(|| fs::File::open(&self.root)?.sync_all())
     }

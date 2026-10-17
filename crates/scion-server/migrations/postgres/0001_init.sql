@@ -119,5 +119,5 @@ CREATE TABLE history_nodes (
 
 -- The database server's time, in Unix seconds: what SQLite's `unixepoch()`
 -- gives, so the two backends age lands the same way.
-CREATE FUNCTION now_epoch() RETURNS BIGINT LANGUAGE SQL IMMUTABLE PARALLEL SAFE
+CREATE FUNCTION now_epoch() RETURNS BIGINT LANGUAGE SQL STABLE PARALLEL SAFE
     RETURN extract(epoch FROM now())::bigint;

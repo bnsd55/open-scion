@@ -277,7 +277,11 @@ async fn main() -> anyhow::Result<()> {
             cli.postgres_url.as_deref(),
             cli.postgres_ca.as_deref(),
         ),
-        Command::Fsck | Command::Gc { .. } => Backend::open_shared(&cli.data, None, None),
+        Command::Fsck | Command::Gc { .. } => Backend::open_shared(
+            &cli.data,
+            cli.postgres_url.as_deref(),
+            cli.postgres_ca.as_deref(),
+        ),
         Command::HashToken { .. } => return hash_token(),
         Command::TicketKey { .. } => return write_ticket_key(),
         Command::Serve { .. } | Command::Derive { .. } => Backend::open(
