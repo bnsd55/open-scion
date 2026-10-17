@@ -312,10 +312,11 @@ impl ScionService {
 /// first (section 2 of protocol-v1).
 ///
 /// SHORTCUT: a unary reply's bytes stay in HTTP/2 uncounted until the
-/// client reads them or the connection closes; the encode limit bounds the
-/// encoded bytes of one at the message limit. Every reply that can grow
-/// with its input streams; a new unary RPC must stream, or bound its
-/// reply, before it ships.
+/// client reads them or the connection closes; the largest one left is
+/// `Diff` (about 120 KB), so a client that never reads holds at most its
+/// connections x streams of those. Every reply that can grow with its
+/// input streams; a new unary RPC must stream, or bound its reply, before
+/// it ships.
 pub fn into_server<S: Scion + Send + 'static>(service: S) -> ScionServer<S> {
     ScionServer::new(service)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)

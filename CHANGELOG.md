@@ -181,9 +181,11 @@ until that section gets its release date.
   reading is counted by the connection's stall cap, which then closes the
   connection. A client joins the parts in order; the last part's
   `next_changeset_id` (for `Log`) or `next_cursor` (for `Blame`) starts
-  the next call. A unary reply over the 64 MiB a reply message may hold
-  is refused by the server's encoder, so the memory a client that never
-  reads holds for one is bounded by construction; a test pins that
+  the next call. The largest unary reply left is `Diff` (at most 1,000
+  paths, about 120 KB) and the rest are KBs, so a client that never reads
+  holds at most its 128 connections x 256 streams of those, until its
+  connections close; a unary reply over the 64 MiB a reply message may
+  hold is refused by the server's encoder, and a test pins that
   wiring.
 - Path history as derived data (kind `path_history`, schema version 5).
   `Log` with a path reads only the changesets that change the path, so one
