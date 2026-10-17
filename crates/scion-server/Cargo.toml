@@ -21,6 +21,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
 clap.workspace = true
 gix.workspace = true
 hashlink.workspace = true
@@ -33,16 +35,21 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
+tonic-health.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+tempfile.workspace = true
+tonic-health.workspace = true
 # A test runs code while a commit is visible and its COMMIT still runs.
 rusqlite = { workspace = true, features = ["hooks"] }
 # Tests of the reply timeouts run on a paused clock.
 tokio = { workspace = true, features = ["test-util"] }
+# A test fetches from a real server through a tier with no token.
+open-scion-tier = { workspace = true }
 
 [lints]
 workspace = true

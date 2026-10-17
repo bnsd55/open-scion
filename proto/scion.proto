@@ -65,10 +65,13 @@ service Scion {
   rpc Diff(DiffRequest) returns (DiffResponse);
 }
 
-// Object reads that any cache tier can answer. Every call but ResolveRef names
-// an immutable object, so a tier may cache its answer forever. A client asks
-// only for the objects it wants, starting at the root tree, and checks each
-// object against its ID on arrival.
+// Object reads. `ResolveRef` and `GetRootTree` go to the server: they need
+// the token, and the server answers `GetRootTree` with a read ticket.
+// `GetObjects` takes that ticket and no token, so a cache tier can answer
+// it. Each name names an immutable object, so a tier may cache its answer,
+// but only after a walk from the ticket's root tree reaches it. A client
+// asks only for the objects it wants, starting at the root tree, and checks
+// each object against its ID on arrival.
 service Objects {
   // Where a ref points. Mutable: a tier forwards it and never caches it.
   rpc ResolveRef(ResolveRefRequest) returns (ResolveRefResponse);
@@ -210,38 +213,32 @@ message LogEntry {
 message BlameRequest {
   string repo = 1;
   bytes changeset_id = 2;
-  // A regular file of at most 16 MiB and 1,048,576 lines.
   bytes path = 3;
-  // Optional. Where a rename search stopped: a reply's
-  // next_rename_searched and next_rename_best, sent back unchanged with
-  // its next_changeset_id and next_path. 0 and empty start no search.
-  uint64 rename_searched = 4;
-  bytes rename_best = 5;
+  // Optional. Where the last call stopped: a reply's next_cursor, sent
+  // back unchanged with the same repo, changeset_id and path. Empty starts
+  // a first blame. The cursor is opaque to clients.
+  bytes cursor = 7;
+  reserved 4, 5;
+  reserved "rename_searched", "rename_best";
 }
 
 message BlameResponse {
-  // Line ranges in file order. Together they cover every line once.
+  // Line ranges in file order. Together they cover the lines of the
+  // window this call answered, from after_line to its end, once each.
   repeated BlameRange ranges = 1;
   // The author of each changeset that a range names, once each.
   repeated BlameChangeset changesets = 2;
-  // Set when a call stopped at its bound before every line had a
-  // changeset. The ranges without a changeset came from this changeset or
-  // an older one. Blame next_path here to continue.
-  bytes next_changeset_id = 3;
-  // The path of the file at next_changeset_id, set with it. It differs from
-  // the requested path when the walk followed a rename. Empty from a server
-  // that does not follow renames: then it is the requested path.
-  bytes next_path = 4;
-  // Set when the call stopped in the search for the file that
-  // next_changeset_id renamed to next_path, or right after it: how many of
-  // the files it deletes the search has looked at, all of them if the
-  // search ended. With next_rename_best, the client MUST send it back
-  // unchanged as rename_searched and rename_best in the next call. 0 and
-  // empty when the call did not stop at a search.
-  uint64 next_rename_searched = 5;
-  // With next_rename_searched: the deleted file that the search picks so
-  // far, if any. Else empty.
-  bytes next_rename_best = 6;
+  // Set when more lines are left to blame: the lines after this call's
+  // window, or the rest of this window when the call stopped at a bound.
+  // The ranges without a changeset came from the changeset in the cursor
+  // or an older one. The client MUST send next_cursor back unchanged, with
+  // the same repo, changeset_id and path, to get the next part. Empty when
+  // the blame is done. Opaque: the server decodes it, and a cursor that
+  // was not made for this repo, changeset and path is refused.
+  bytes next_cursor = 7;
+  reserved 3, 4, 5, 6;
+  reserved "next_changeset_id", "next_path", "next_rename_searched",
+      "next_rename_best";
 }
 
 message BlameRange {
@@ -249,10 +246,10 @@ message BlameRange {
   uint32 start_line = 1;
   uint32 line_count = 2;
   // The changeset that last changed these lines. Empty when the call
-  // stopped first: see BlameResponse.next_changeset_id.
+  // stopped before it named them: the cursor says where it went on.
   bytes changeset_id = 3;
   // The first line, counting from 1, in the file at changeset_id (at its
-  // BlameChangeset.path), or at next_changeset_id (at next_path) when
+  // BlameChangeset.path), or in the version the walk stopped at when
   // changeset_id is empty.
   uint32 origin_line = 4;
 }
@@ -368,6 +365,10 @@ message GetRootTreeRequest {
 
 message GetRootTreeResponse {
   bytes tree_id = 1;
+  // A read ticket for this tree: bound to the repo, the caller's principal
+  // and this root tree, good for a short time. GetObjects takes it, and no
+  // token.
+  bytes ticket = 2;
 }
 
 enum ObjectKind {
@@ -379,6 +380,11 @@ enum ObjectKind {
 message ObjectRef {
   ObjectKind kind = 1;
   bytes id = 2;
+  // The path of the object, from the root tree of the ticket. Empty names
+  // the root tree itself. A tree must be a directory entry at the path, a
+  // blob the blob of a regular file or of a symlink entry there; a walk
+  // never goes through a symlink, and a gitlink ends it.
+  bytes path = 3;
 }
 
 // How an object's bytes travel. A tree's bytes are its TreeV1 bytes, and a
@@ -393,8 +399,12 @@ enum Encoding {
 }
 
 message GetObjectsRequest {
-  string repo = 1;
-  // 1 to 1000 objects.
+  reserved 1;
+  // A read ticket: permission to read the objects of one root tree of one
+  // repo, for one principal, for a short time. The server gives it with
+  // every GetRootTree reply.
+  bytes ticket = 4;
+  // 1 to 1000 objects, each with its path from that root tree.
   repeated ObjectRef refs = 2;
   // The encodings the client accepts besides RAW, which every client
   // accepts. The server sends each object RAW or in one of these.

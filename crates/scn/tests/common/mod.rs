@@ -13,7 +13,8 @@ use scion_proto::auth::Bearer;
 use scion_proto::listen::Limits;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::{ObjectKind, ObjectRef};
-use scion_server::{Store, db, service, tree};
+use scion_server::meta::MetaTx as _;
+use scion_server::{Store, service, tree};
 use scion_tier::{
     CACHE_UPSTREAM_TIMEOUT, DAEMON_UPSTREAM_TIMEOUT, DiskStore, MemoryStore, Tier, bind_unix,
 };
@@ -40,17 +41,21 @@ pub async fn connect(url: &str) -> Client {
     ObjectsClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap())
 }
 
-pub fn tree_ref(id: TreeId) -> ObjectRef {
+/// A ref of `id` at `path`, from the root tree of the ticket that carries
+/// it. An empty `path` names the root tree itself.
+pub fn tree_ref(id: TreeId, path: &[u8]) -> ObjectRef {
     ObjectRef {
         kind: ObjectKind::Tree.into(),
         id: id.as_bytes().to_vec(),
+        path: path.to_vec(),
     }
 }
 
-pub fn blob_ref(id: BlobId) -> ObjectRef {
+pub fn blob_ref(id: BlobId, path: &[u8]) -> ObjectRef {
     ObjectRef {
         kind: ObjectKind::Blob.into(),
         id: id.as_bytes().to_vec(),
+        path: path.to_vec(),
     }
 }
 
@@ -81,18 +86,36 @@ impl Tiers {
         };
         let pending = std::future::pending;
 
+        // The server mints the tickets; the cache verifies them; the daemon
+        // only forwards them.
+        let tickets = scion_server::tickets::Keys::generate();
+        let verify_keys = tickets.for_verify().to_vec();
         let (listener, server) = tcp();
         runtime.spawn(service::serve(
             store.clone(),
             listener,
             TOKEN,
-            Limits::default(),
-            None,
+            service::ServeOptions {
+                limits: Limits::default(),
+                quotas: scion_server::quotas::Quotas::off(),
+                pending_lands: None,
+                land_stale_secs: 1 << 40,
+                tls: None,
+            },
+            Some(std::sync::Arc::new(tickets)),
             pending(),
         ));
 
         let memory = MemoryStore::new(64 << 20);
-        let cache = Tier::new(memory, &server, TOKEN, CACHE_UPSTREAM_TIMEOUT, None).unwrap();
+        let cache = Tier::new(
+            memory,
+            &server,
+            TOKEN,
+            CACHE_UPSTREAM_TIMEOUT,
+            None,
+            verify_keys,
+        )
+        .unwrap();
         let (listener, cache_url) = tcp();
         let incoming = TcpListenerStream::new(listener);
         runtime.spawn(
@@ -103,8 +126,15 @@ impl Tiers {
 
         let node = tempfile::tempdir().unwrap();
         let store_dir = DiskStore::open(&node.path().join("data"), 64 << 20).unwrap();
-        let daemon =
-            Tier::new(store_dir, &cache_url, TOKEN, DAEMON_UPSTREAM_TIMEOUT, None).unwrap();
+        let daemon = Tier::new(
+            store_dir,
+            &cache_url,
+            TOKEN,
+            DAEMON_UPSTREAM_TIMEOUT,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
         // The socket's directory must be private.
         fs::set_permissions(node.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let path = node.path().join("daemon.sock");
@@ -229,10 +259,10 @@ pub fn changeset(parent: Option<ChangesetId>, files: &[(&str, FileState)]) -> Ch
 pub fn land(store: &Store, cs: &Changeset) -> ChangesetId {
     store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
+            let repo = c.create_repo(REPO)?;
             let (id, _) = tree::store_changeset(c, repo, cs)?;
-            let version = db::get_ref(c, repo, "main")?.map(|r| r.version);
-            assert!(db::cas_ref(c, repo, "main", version, id)?);
+            let version = c.get_ref(repo, "main")?.map(|r| r.version);
+            assert!(c.cas_ref(repo, "main", version, id)?);
             Ok(id)
         })
         .unwrap()

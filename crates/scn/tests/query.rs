@@ -11,8 +11,9 @@ use std::process::{Command, Output};
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, GitOid, IdentityTime, RepoPath};
 use scion_proto::listen::Limits;
 use scion_server::import::{ImportOptions, import_git};
+use scion_server::meta::MetaTx as _;
 use scion_server::read::MAX_DIFF_ENTRIES;
-use scion_server::{Store, db, service, tree};
+use scion_server::{Store, service, tree};
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -83,7 +84,13 @@ impl Server {
             store,
             listener,
             TOKEN,
-            Limits::default(),
+            service::ServeOptions {
+                limits: Limits::default(),
+                quotas: scion_server::quotas::Quotas::off(),
+                pending_lands: None,
+                land_stale_secs: 1 << 40,
+                tls: None,
+            },
             None,
             std::future::pending(),
         ));
@@ -324,7 +331,7 @@ fn two_changesets(
 ) -> (ChangesetId, ChangesetId) {
     store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
+            let repo = c.create_repo(REPO)?;
             let mut parents = Vec::new();
             for changes in [base, changes] {
                 let cs = Changeset {
