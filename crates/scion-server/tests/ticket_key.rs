@@ -23,6 +23,30 @@ fn mode_of(path: &Path) -> u32 {
 }
 
 #[test]
+fn ticket_key_prints_one_line_of_64_hex() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(&[
+        "ticket-key".as_ref(),
+        "--out".as_ref(),
+        dir.path().join("seed.key").as_os_str(),
+    ]);
+    assert!(out.status.success());
+    // stdout carries the command's output and nothing else: callers take
+    // the key with $(...). The logs, if any, go to stderr.
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let line = lines.next().expect("a public key line");
+    assert_eq!(line.len(), 64, "{line:?}");
+    assert!(line.chars().all(|c| c.is_ascii_hexdigit()), "{line:?}");
+    assert_eq!(lines.next(), None, "stdout is one line");
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn a_ticket_key_file_is_private_and_made_once() {
     let dir = tempfile::tempdir().unwrap();
     let key = dir.path().join("ticket.key");
@@ -95,11 +119,11 @@ fn serve_refuses_a_seed_that_group_or_others_can_read() {
             key.to_str().unwrap(),
         ])
         .env("NO_COLOR", "1")
-        // The info lines go to stdout, and the test waits for the one that
+        // The info lines go to stderr, and the test waits for the one that
         // says the server listens.
         .env("RUST_LOG", "info")
-        .stdout(std::fs::File::create(dir.path().join("serve.log")).unwrap())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(dir.path().join("serve.log")).unwrap())
         .spawn()
         .unwrap();
     wait_serving(&mut child, &dir.path().join("serve.log"));
@@ -203,11 +227,11 @@ fn an_old_public_key_is_readable_by_anyone_but_writable_by_its_owner_alone() {
             old.to_str().unwrap(),
         ])
         .env("NO_COLOR", "1")
-        // The info lines go to stdout, and the test waits for the one that
+        // The info lines go to stderr, and the test waits for the one that
         // says the server listens.
         .env("RUST_LOG", "info")
-        .stdout(std::fs::File::create(dir.path().join("serve.log")).unwrap())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(dir.path().join("serve.log")).unwrap())
         .spawn()
         .unwrap();
     wait_serving(&mut child, &dir.path().join("serve.log"));

@@ -5,8 +5,8 @@
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt as _;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use scion_core::{BlobId, Entry, FileState, PathElem, Tree};
@@ -97,6 +97,9 @@ struct Fake {
     mode: Mode,
     calls: Arc<AtomicUsize>,
     roots: Arc<AtomicUsize>,
+    /// How often each ID rode on a `GetObjects` reply, so a test can tell
+    /// a joined fetch from a repeated one.
+    sent: Arc<Mutex<HashMap<Vec<u8>, usize>>>,
 }
 
 impl Fake {
@@ -251,6 +254,7 @@ impl Fake {
             delay,
             calls: Arc::default(),
             roots: Arc::default(),
+            sent: Arc::default(),
         }
     }
 
@@ -280,6 +284,14 @@ impl Fake {
 
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    fn sent(&self, id: &[u8]) -> usize {
+        self.sent.lock().unwrap().get(id).copied().unwrap_or(0)
+    }
+
+    fn sent_total(&self) -> usize {
+        self.sent.lock().unwrap().values().sum()
     }
 
     fn roots(&self) -> usize {
@@ -326,6 +338,9 @@ impl Objects for Fake {
             tokio::time::sleep(self.delay).await;
         }
         let request = request.into_inner();
+        for r in &request.refs {
+            *self.sent.lock().unwrap().entry(r.id.clone()).or_insert(0) += 1;
+        }
         // A call for a poisoned ID fails before its reply starts, so the
         // tier sends the status of the call, not an error in its stream.
         if request.refs.iter().any(|r| self.poison.contains(&r.id)) {
@@ -761,6 +776,23 @@ async fn cache_for(fake: &Fake) -> (Tier<MemoryStore>, String) {
     serve_cache(&upstream, CACHE_UPSTREAM_TIMEOUT, &fake.keys()).await
 }
 
+/// Waits until the fake's counters stop moving, so an assert sees the final
+/// counts, not the middle of a background chain. 10 s ceiling.
+async fn quiesce(fake: &Fake) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let before = (fake.calls(), fake.roots(), fake.sent_total());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if before == (fake.calls(), fake.roots(), fake.sent_total()) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the counters never settled"
+        );
+    }
+}
+
 /// Starts a `GetObjects` call for `objects` from a new client of `url`, and
 /// gives the first upstream call time to start.
 async fn spawn_get(
@@ -769,19 +801,28 @@ async fn spawn_get(
     objects: &[Object],
 ) -> tokio::task::JoinHandle<Result<Vec<Object>, Status>> {
     let mut client = connect(url, Some(TOKEN)).await;
+    let wanted: Vec<Vec<u8>> = objects.iter().map(|o| o.id.clone()).collect();
     let objects = objects.to_vec();
     let fake = fake.clone();
-    let calls = fake.calls.clone();
-    let call =
-        tokio::spawn(
-            async move { get(&mut client, &fake, &objects.iter().collect::<Vec<_>>()).await },
-        );
-    // The first upstream call must have started before the caller goes on,
-    // or a later call would start its own fetch instead of joining this
-    // one. Wait for the state, not for a duration: the fake counts the
-    // calls it receives, and the tier registers its flight before the call.
+    let server = fake.clone();
+    let call = tokio::spawn(async move {
+        get(&mut client, &server, &objects.iter().collect::<Vec<_>>()).await
+    });
+    // Every object of this call must have reached upstream before the
+    // caller goes on: the tier registers each object's flight before it
+    // asks upstream, so a later call finds the flights and joins them
+    // instead of starting its own fetch. Wait for the state, not for a
+    // duration.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let _ = (deadline, &calls);
+    for id in wanted {
+        while fake.sent(id.as_slice()) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first call never reached upstream"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
     call
 }
 
@@ -791,18 +832,34 @@ async fn one_missing_object_fails_only_itself() {
     // Slow, so the second call joins the first call's fetch.
     let fake = Fake::new(&[&there], Duration::from_millis(300));
     let (_cache, url) = cache_for(&fake).await;
-    let leader = spawn_get(&url, &fake, &[missing, there.clone()]).await;
+    // No join wait for this leader: its chain may stop at the missing
+    // object before it asks `there` at all.
+    let mut leader_client = connect(&url, Some(TOKEN)).await;
+    let fake_for_leader = fake.clone();
+    let there_for_leader = there.clone();
+    let leader = tokio::spawn(async move {
+        get(
+            &mut leader_client,
+            &fake_for_leader,
+            &[&missing, &there_for_leader],
+        )
+        .await
+    });
 
     // The second call waits for the same fetch, and gets its object.
     let mut second = connect(&url, Some(TOKEN)).await;
     assert_eq!(
         get(&mut second, &fake, &[&there]).await.unwrap(),
-        vec![there]
+        vec![there.clone()]
     );
     let status = leader.await.unwrap().unwrap_err();
     assert_eq!(status.code(), Code::NotFound, "{status:?}");
+    quiesce(&fake).await;
     // One call for both objects, then one for the object after the missing one.
     assert_eq!(fake.calls(), 2);
+    // The join: `there` rode on the first call's reply alone. Had the
+    // second call fetched alone, it would have ridden twice.
+    assert_eq!(fake.sent(there.id.as_slice()), 1, "there was fetched twice");
 }
 
 #[tokio::test]
@@ -845,7 +902,9 @@ async fn a_reply_that_stops_early_is_asked_again_for_the_rest() {
     let leader = spawn_get(&url, &fake, &objects).await;
 
     // The second call waits for the last object of the first call's fetch,
-    // which gets it only by asking upstream again.
+    // which gets it only by asking upstream again. The short replies make
+    // both callers' chains refetch `three`, so no count of the requests
+    // that carry it is stable; what the test pins is the final call count.
     let mut second = connect(&url, Some(TOKEN)).await;
     let last = &objects[2];
     assert_eq!(
@@ -853,6 +912,7 @@ async fn a_reply_that_stops_early_is_asked_again_for_the_rest() {
         vec![last.clone()]
     );
     assert_eq!(leader.await.unwrap().unwrap(), objects);
+    quiesce(&fake).await;
     // The root tree of the walk, then the three fetches the reply needed.
     assert_eq!(fake.calls(), 4);
 }
@@ -867,9 +927,13 @@ async fn a_caller_that_goes_away_does_not_fail_the_calls_that_wait_with_it() {
     // The first caller goes away while the fetch it started runs.
     leader.abort();
 
-    assert_eq!(joiner.await.unwrap().unwrap(), vec![y]);
+    assert_eq!(joiner.await.unwrap().unwrap(), vec![y.clone()]);
+    quiesce(&fake).await;
     // The root tree of the walk, then the shared fetch of both objects.
     assert_eq!(fake.calls(), 2);
+    // The join: `y` rode on the leader's call alone, which the joiner
+    // survived; had it fetched alone, `y` would have ridden twice.
+    assert_eq!(fake.sent(y.id.as_slice()), 1, "y was fetched twice");
 }
 
 #[tokio::test]
