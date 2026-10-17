@@ -11,7 +11,7 @@ use scion_server::land::{LandRequest, LandState, Lands};
 use scion_server::meta::MetaTx as _;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 const REPO: &str = "r";
@@ -158,67 +158,88 @@ fn setup() -> Fixture {
     }
 }
 
-/// A land whose ref an import keeps moving replans and lands once: the
-/// retry loop plans again from the new head instead of failing the land.
+/// A land whose ref an import moves under it plans again from the new
+/// head and lands once, and the replan shows in the process's counters.
+/// One scenario does not always reach the replan: the import can commit
+/// between the land's attempts. The test runs the scenario until the
+/// counter moves, at most 10 times.
 #[test]
 fn a_land_replans_when_imports_move_its_ref() {
+    let metrics = Arc::new(scion_proto::metrics::Metrics::default());
+    let mut replans = 0;
+    for _ in 0..10 {
+        replans = replan_scenario(Arc::clone(&metrics));
+        if replans >= 1 {
+            break;
+        }
+    }
+    assert!(replans >= 1, "no land replanned in 10 runs");
+}
+
+fn replan_scenario(metrics: Arc<scion_proto::metrics::Metrics>) -> u64 {
     let f = setup();
-    let lands = Lands::default();
+    let lands = Lands::new(None, Some(Arc::clone(&metrics)));
     // The land's changeset: parent = root, so it must rebase onto
     // whatever `main` is when it lands.
     let cs = f.commit(f.root, vec![put(&f.store, "a/b/c", "landed")]);
 
     // The import: a writer that moves `main` without the lands' ref lock,
-    // as an import in another process does. Each import carries a wide
-    // tree, so the land's plan and commit take long enough for an import
-    // to move the ref in between. It stops after a few moves, so a later
-    // attempt of the loop can land.
-    let stop = Arc::new(AtomicBool::new(false));
-    // How many imports moved main so far; the test requires that at least
-    // one move landed while the land ran, so the test cannot pass without
-    // the ref racing the land.
+    // as an import in another process does. It waits for the land to
+    // record its pending row, then moves main exactly once: the move is
+    // certain to happen while the land runs, not timed against it.
     let rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let racer = {
         let store = f.store.clone();
-        let stop = Arc::clone(&stop);
         let rounds = Arc::clone(&rounds);
         std::thread::spawn(move || {
-            let mut done = 0;
-            while !stop.load(Ordering::SeqCst) && done < 6 {
-                std::thread::sleep(Duration::from_millis(2));
-                let moved = store
-                    .write(|c| {
-                        let repo = c.repo_id(REPO)?;
-                        let head = c.get_ref(repo, "main")?.unwrap();
-                        let cs = Changeset {
-                            parents: vec![head.target],
-                            author: author(),
-                            committer: None,
-                            message: format!("import {done}").into_bytes(),
-                            changes: [].into(),
-                        };
-                        let id = c.insert_changeset(repo, &cs)?;
-                        c.cas_ref(repo, "main", Some(head.version), id)
+            let until = Instant::now() + Duration::from_secs(30);
+            loop {
+                let pending: i64 = store
+                    .read(|c| {
+                        let sql = "SELECT count(*) FROM lands WHERE state = 'pending'";
+                        Ok(c.query_row(sql, [], |row| row.get(0))?)
                     })
                     .unwrap();
-                if moved {
-                    done += 1;
-                    rounds.fetch_add(1, Ordering::SeqCst);
+                if pending >= 1 {
+                    break;
                 }
+                assert!(
+                    Instant::now() < until,
+                    "the land never recorded its pending row"
+                );
+                std::thread::sleep(Duration::from_millis(1));
             }
+            // The land has recorded its request and reads the head soon
+            // after; a move now lands between its plan and its commit.
+            std::thread::sleep(Duration::from_millis(2));
+            store
+                .write(|c| {
+                    let repo = c.repo_id(REPO)?;
+                    let head = c.get_ref(repo, "main")?.unwrap();
+                    let cs = Changeset {
+                        parents: vec![head.target],
+                        author: author(),
+                        committer: None,
+                        message: b"import".to_vec(),
+                        changes: [].into(),
+                    };
+                    let id = c.insert_changeset(repo, &cs)?;
+                    c.cas_ref(repo, "main", Some(head.version), id)
+                })
+                .unwrap();
+            rounds.fetch_add(1, Ordering::SeqCst);
         })
     };
-    std::thread::sleep(Duration::from_millis(2));
 
-    // The land lands although imports move the ref while it runs.
-    let during = rounds.load(Ordering::SeqCst);
+    // The land lands although the import moves the ref while it runs.
     let out = lands.land(&f.store, &caller(), &req(cs, "k")).unwrap();
-    let raced_in = rounds.load(Ordering::SeqCst) - during;
-    stop.store(true, Ordering::SeqCst);
-    racer.join().unwrap();
-    assert!(raced_in >= 1, "no import moved main while the land ran");
-
     assert_eq!(out.state, LandState::Landed, "{}", out.detail);
+    racer.join().unwrap();
+    assert_eq!(
+        rounds.load(Ordering::SeqCst),
+        1,
+        "the import did not move main while the land ran"
+    );
     let landed = out.result.expect("landed");
     // The landed changeset sits on the first-parent history of main: an
     // import that moved the ref after the land sits on top of it.
@@ -246,6 +267,7 @@ fn a_land_replans_when_imports_move_its_ref() {
     // A retry with the same key returns the same outcome.
     let again = lands.land(&f.store, &caller(), &req(cs, "k")).unwrap();
     assert_eq!(again, out);
+    metrics.land_replans()
 }
 
 /// A read that panics with its transaction open must not poison the
