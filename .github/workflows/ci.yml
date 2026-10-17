@@ -72,14 +72,32 @@ jobs:
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@v2
-      - name: device mapper
+      - name: cache the LazyFS build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/lazyfs/lazyfs/build
+            ${{ runner.temp }}/lazyfs/libs/libpcache/build
+          key: lazyfs-0.3.1-045a0b3
+      - name: LazyFS (pinned 0.3.1, commit 045a0b3)
         run: |
-          sudo modprobe dm_flakey || true
-          command -v dmsetup >/dev/null 2>&1 || {
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq dmsetup
-          }
-      - run: cargo test -p open-scion-server --test power
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libfuse3-3 fuse3
+          cd "$RUNNER_TEMP"
+          git clone --depth 1 --branch 0.3.1 https://github.com/dsrhaslab/lazyfs lazyfs
+          got=$(git -C lazyfs rev-parse HEAD)
+          echo "pinned: $got"
+          test "$got" = "045a0b3a1126725e693934e29d3ba15e08cc39ec"
+          if [ ! -x lazyfs/build/lazyfs ]; then
+            (cd lazyfs/libs/libpcache && ./build.sh)
+            (cd lazyfs && ./build.sh)
+          fi
+          test -x lazyfs/build/lazyfs
+          test -f lazyfs/libs/libpcache/build/libpcache.so.0
+      - name: run
+        env:
+          SCION_LAZYFS: ${{ runner.temp }}/lazyfs
+        run: cargo test -p open-scion-server --test power
 
   msrv:
     name: check (MSRV)
