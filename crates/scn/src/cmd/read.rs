@@ -110,7 +110,16 @@ pub async fn ls(ctx: &mut Ctx, spec: &str) -> Result<()> {
         } else {
             ""
         };
-        println!("{mode} {kind:<7} {}{slash}", lossy(name.as_bytes()));
+        let size = match entry {
+            // A regular file or symlink carries its blob's byte length; a
+            // directory or a gitlink has no blob, so it shows no size.
+            Entry::File(file) if file.state().blob().is_some() => file.size().to_string(),
+            _ => String::new(),
+        };
+        println!(
+            "{mode} {kind:<7} {size:>10} {}{slash}",
+            lossy(name.as_bytes())
+        );
     }
     Ok(())
 }
@@ -199,7 +208,12 @@ pub async fn show(ctx: &mut Ctx, rev: &str) -> Result<()> {
             .map(|(path, state)| {
                 let mut change = match state {
                     Some(state) => {
+                        // A change names a state, not a length, so its JSON
+                        // carries no size.
                         let mut put = entry_json(&Entry::File(FileEntry::new(*state, 0)));
+                        if let Some(object) = put.as_object_mut() {
+                            object.remove("size");
+                        }
                         put["op"] = "put".into();
                         put
                     }
@@ -309,10 +323,13 @@ pub(crate) fn entry_json(entry: &Entry) -> Value {
         },
     };
     let mut value = json!({ "kind": describe(entry).1, "id": id });
-    if let Entry::File(file) = entry
-        && let FileState::Regular { executable, .. } = file.state()
-    {
-        value["executable"] = executable.into();
+    if let Entry::File(file) = entry {
+        if file.state().blob().is_some() {
+            value["size"] = file.size().into();
+        }
+        if let FileState::Regular { executable, .. } = file.state() {
+            value["executable"] = executable.into();
+        }
     }
     value
 }

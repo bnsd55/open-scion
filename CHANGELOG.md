@@ -365,6 +365,10 @@ until that section gets its release date.
   is-ancestor` (exit 0 or 1) and `scn diff` for the query API, and
   `scn blame`. Every `scn` error exits 2, so it never reads as the "no" of
   `scn is-ancestor`.
+- `scn ls` shows each entry's size: `scion-server` 0.1 trees carry the
+  byte length of every file and symlink, so the listing knows it with no
+  extra call; directories and gitlinks show none. `--json` adds `size` to
+  the entries that carry one.
 - `scn mount` and `scn unmount` (`#11`): a virtual checkout. `scn mount
   DIR [REV]` serves one ref as an NFSv3 filesystem from `scn` itself, on a
   free port of 127.0.0.1, so a directory's tree loads when it is first
