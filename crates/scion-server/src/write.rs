@@ -37,8 +37,11 @@ pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<Chang
     let parent = check_request(&cs)?;
     // A cheap read first, so a request on a missing repo or parent, or one
     // that names a blob the repo does not have, reads no blob. The
-    // transaction checks the parent again. A repo never loses a blob, so the
-    // member check still holds then.
+    // transaction checks the parent again. The member set changes only by
+    // `gc`, which removes a row past the grace period that no stored
+    // changeset names; the changeset's own transaction re-adds the row of
+    // each blob it puts, so a stored changeset never names a blob that the
+    // repo may not.
     let repo_id = store.read(|c| {
         let repo_id = check_parent(c, repo, parent)?;
         check_members(c, repo, repo_id, &cs)?;

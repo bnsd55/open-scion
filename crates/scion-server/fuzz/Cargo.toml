@@ -1,0 +1,31 @@
+[package]
+name = "scion-server-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+open-scion-core = { path = "../../scion-core" }
+open-scion-server = { path = ".." }
+tempfile = "3"
+
+[[bin]]
+name = "blame-cursor"
+path = "fuzz_targets/blame-cursor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "access"
+path = "fuzz_targets/access.rs"
+test = false
+doc = false
+bench = false
+
+# Fuzzing builds on nightly with its own lockfile, outside the main workspace.
+[workspace]
