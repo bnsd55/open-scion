@@ -1,238 +1,192 @@
-//! Power-loss suite: the real `scion-server` binary writes to an ext4 file
-//! system on a loop device behind a `dm-flakey` table, and the test cuts
-//! power by dropping, from one moment on, every write that the page cache
-//! sends to the device. What a reply acknowledged was synced before the
-//! reply went out, so it must survive the cut; what was still only in the
-//! page cache is lost. After each cut, the ext4 journal replays and the
-//! store reopens, and [`check`] (shared with the crash suite) checks the
-//! same invariants as after a SIGKILL.
+//! Power-loss suite: the real `scion-server` binary writes into a `LazyFS`
+//! mount. `LazyFS` keeps its own page cache and writes a file's cached data
+//! to the backing directory only when the application fsyncs it. The cut is
+//! one command on its faults fifo, `clear-cache`: it drops every cached
+//! write that was not fsynced, file by file, so what a reply acknowledged
+//! must have been synced before the reply went out, and what was still only
+//! in the cache is lost. After the cut, the server is killed, and the store
+//! reopens from the backing directory, where [`check`] (shared with the
+//! crash suite) checks the same invariants as after a SIGKILL.
 //!
-//! The model: a cut loses the writes that the page cache had not sent to
-//! the device yet, so the suite tests sync-before-reply. It does not model
-//! a drive's volatile cache, which can also lose writes that reached the
-//! device before the cut but were never flushed. The stronger model keeps
-//! every write (dm-log-writes) and replays it to each FLUSH point.
+//! The model: the cut loses the writes that the application had not fsynced
+//! when the cut came, so the suite tests sync-before-reply. It does not
+//! model a drive's volatile cache, which can also lose writes that reached
+//! the drive but were never flushed, and it does not reorder writes.
 //!
 //! SHORTCUT: the cut is sync-before-reply, and the sync path tested is the
-//! Linux one; macOS syncs differently (`F_FULLFSYNC`) and its CI job has no
-//! device mapper, so there the crash suite is what runs. Upgrade to
-//! dm-log-writes replay to each FLUSH point when a report says that
-//! acknowledged writes were lost on hardware with a volatile cache.
+//! Linux one; macOS syncs differently (`F_FULLFSYNC`) and its CI job cannot
+//! run `LazyFS`, so there the crash suite is what runs. Upgrade to a model
+//! that replays writes to each FLUSH point (dm-log-writes) when a report
+//! says that acknowledged writes were lost on hardware with a volatile
+//! cache.
 //!
-//! Needs root rights, which it takes through passwordless `sudo` (losetup,
-//! dmsetup, mount, mkfs.ext4, fsck.ext4). It runs only when
-//! `SCION_POWER_REQUIRE=1` is set, so `cargo test --workspace` skips it
-//! with a message; its CI job sets the variable, and then a missing right
-//! fails, not skips. As in the crash suite, `SCION_POWER_SEED=<n>` replays
-//! a run and `SCION_POWER_ROUNDS=<n>` sets the number of cuts (default 4).
+//! The suite needs a `LazyFS` build, pinned to release 0.3.1, commit
+//! `045a0b3a1126725e693934e29d3ba15e08cc39ec` (the CI job clones and builds
+//! it, and caches the binary). `SCION_LAZYFS` names the `LazyFS` checkout;
+//! without it the suite skips with a message, and with
+//! `SCION_POWER_REQUIRE=1` set (its CI job does) a missing build fails, not
+//! skips. As in the crash suite, `SCION_POWER_SEED=<n>` replays a run and
+//! `SCION_POWER_ROUNDS=<n>` sets the number of cuts (default 4).
 #![cfg(all(unix, target_os = "linux"))]
 
 mod common;
 
 use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 use common::*;
 
-/// Whether the test may run: only with `SCION_POWER_REQUIRE=1`, its CI
-/// job's mark. A run without root rights then fails, so the job cannot
-/// pass by skipping.
+/// The LazyFS checkout the suite runs against: it must hold
+/// `lazyfs/build/lazyfs` and `libs/libpcache/build`.
+fn lazyfs_dir() -> Option<PathBuf> {
+    let dir = std::env::var_os("SCION_LAZYFS")?;
+    let dir = PathBuf::from(dir);
+    let binary = dir.join("lazyfs/build/lazyfs");
+    if !binary.is_file() {
+        panic!(
+            "SCION_LAZYFS={} holds no lazyfs/build/lazyfs",
+            dir.display()
+        );
+    }
+    Some(dir)
+}
+
+/// Whether the test may run: only with `SCION_LAZYFS` set, and only when
+/// `SCION_POWER_REQUIRE=1` asks for it, so plain `cargo test --workspace`
+/// skips it with a message. A run whose LazyFS is missing then fails, not
+/// skips, so the CI job cannot pass by skipping.
 fn may_run() -> bool {
     if std::env::var("SCION_POWER_REQUIRE").as_deref() != Ok("1") {
         println!("skipping the power-loss suite: set SCION_POWER_REQUIRE=1 to run it");
         return false;
     }
-    if !root() {
-        let ok = Command::new("sudo")
-            .arg("-n")
-            .arg("true")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        assert!(
-            ok,
-            "no root rights through sudo (need losetup, dmsetup, mount, mkfs.ext4, fsck.ext4)"
-        );
+    if lazyfs_dir().is_none() {
+        panic!("SCION_LAZYFS is not set (it must name the pinned LazyFS checkout)");
     }
     true
 }
 
-/// Whether this process is root already.
-fn root() -> bool {
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "0")
-        .unwrap_or(false)
-}
-
-/// The command to run `program` with root rights: itself when already root,
-/// else through passwordless `sudo`.
-fn priv_cmd(program: &str) -> Command {
-    if root() {
-        return Command::new(program);
-    }
-    let mut sudo = Command::new("sudo");
-    sudo.arg("-n").arg(program);
-    sudo
-}
-
-/// Runs a privileged command, and panics with its output if it fails.
-fn run(program: &str, args: &[&str]) {
-    let out = priv_cmd(program).args(args).output().unwrap();
-    if !out.status.success() {
-        panic!(
-            "{program} {args:?} failed:\n{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-}
-
-/// The trimmed output of a privileged command.
-fn run_out(program: &str, args: &[&str]) -> String {
-    let out = priv_cmd(program).args(args).output().unwrap();
-    assert!(
-        out.status.success(),
-        "{program} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
-}
-
-/// One ext4 image on a loop device, given to the store through a
-/// device-mapper table, and its mount point.
-struct Device {
-    image: PathBuf,
+/// One LazyFS mount over a fresh backing directory, and the server's data
+/// directory in it.
+struct Lazyfs {
+    child: Child,
+    fifo: PathBuf,
+    completed: fs::File,
     mount: PathBuf,
-    loop_dev: String,
-    name: String,
+    backing: PathBuf,
 }
 
-impl Device {
-    /// Creates a fresh ext4 on a loop device, mounts it through a plain
-    /// table, and gives the mount to the current user, so the server can
-    /// create its data directory in it. `run_token` keeps the mapper's name
-    /// apart from other runs on the same machine.
-    fn create(dir: &Path, run_token: u64, round: usize) -> Self {
-        let sub = dir.join(format!("r{round}"));
-        fs::create_dir(&sub).unwrap();
-        let image = sub.join("ext4.img");
-        // A sparse file; the ext4 of one round holds far less than this.
-        fs::File::create(&image)
-            .unwrap()
-            .set_len(512 << 20)
-            .unwrap();
-        let image = image.to_str().unwrap();
-        run("mkfs.ext4", &["-q", "-F", image]);
-        // Direct I/O: the loop device keeps no cache of its own, so the
-        // page cache the cut drops is the ext4 one, nothing below it.
-        let loop_dev = run_out("losetup", &["--find", "--show", "--direct-io=on", image]);
-        let sectors = run_out("blockdev", &["--getsz", &loop_dev]);
-        let name = format!("scion-power-{run_token:x}-{round}");
-        // A run that died before its cleanup may have left the name.
-        Command::new("dmsetup")
-            .args(["remove", &name])
-            .output()
-            .ok();
-        run(
-            "dmsetup",
-            &[
-                "create",
-                &name,
-                "--table",
-                &format!("0 {sectors} linear {loop_dev} 0"),
-            ],
-        );
-        let (major, minor) = dm_major_minor(&name);
-        let node = sub.join("dm.b");
-        let node = node.to_str().unwrap();
-        run("mknod", &[node, "b", &major, &minor]);
-        let mount = sub.join("mnt");
+impl Lazyfs {
+    /// Mounts a fresh LazyFS over a fresh backing directory. `lazyfs` is the
+    /// pinned checkout; `round` keeps the paths and the mapper names apart.
+    fn start(dir: &Path, lazyfs: &Path, round: usize) -> Self {
+        let round_dir = dir.join(format!("r{round}"));
+        fs::create_dir_all(&round_dir).unwrap();
+        let backing = round_dir.join("backing");
+        let mount = round_dir.join("mnt");
+        fs::create_dir(&backing).unwrap();
         fs::create_dir(&mount).unwrap();
-        let mount = mount.to_str().unwrap();
-        run("mount", &["-t", "ext4", node, mount]);
-        give_to_user(mount);
+        let fifo = round_dir.join("faults.fifo");
+        let completed_path = round_dir.join("faults.fifo.completed");
+        let config = round_dir.join("lazyfs.toml");
+        fs::write(
+            &config,
+            format!(
+                "[faults]\nfifo_path=\"{}\"\nfifo_path_completed=\"{}\"\n\
+                 [cache]\napply_eviction=false\n[cache.simple]\n\
+                 custom_size=\"256mb\"\nblocks_per_page=1\n\
+                 [filesystem]\nlog_all_operations=false\nlogfile=\"{}\"\n",
+                fifo.display(),
+                completed_path.display(),
+                round_dir.join("lazyfs.log").display(),
+            ),
+        )
+        .unwrap();
+        let script = lazyfs.join("lazyfs/scripts/mount-lazyfs.sh");
+        let library = lazyfs.join("libs/libpcache/build");
+        // The script leaves the daemon running in the background, and it
+        // looks for the binary relative to the LazyFS directory.
+        let child = Command::new(script)
+            .current_dir(lazyfs.join("lazyfs"))
+            .arg("-c")
+            .arg(&config)
+            .arg("-m")
+            .arg(&mount)
+            .arg("-r")
+            .arg(&backing)
+            .arg("-s")
+            .env("LD_LIBRARY_PATH", library)
+            .stdout(fs::File::create(format!("/tmp/mount-{round}.log")).unwrap())
+            .stderr({
+                let mut o = fs::OpenOptions::new();
+                o.append(true);
+                o.open(format!("/tmp/mount-{round}.log")).unwrap()
+            })
+            .spawn()
+            .unwrap();
+        wait_mounted(&mount);
+        // The daemon keeps the completed fifo's write end open forever, so
+        // the file never sees an EOF: the cut below reads one message, not
+        // to the end.
+        let completed = fs::File::open(&completed_path).unwrap();
         Self {
-            image: PathBuf::from(image),
-            mount: PathBuf::from(mount),
-            loop_dev,
-            name,
+            child,
+            fifo,
+            completed,
+            mount,
+            backing,
         }
     }
 
-    /// The cut: from now on the device drops every write. The table says
-    /// one second up, then a day of dropped writes; reads keep working, so
-    /// the server sees success for writes it never synced.
-    fn cut(&self) {
-        let sectors = run_out("blockdev", &["--getsz", &self.loop_dev]);
-        let table = format!(
-            "0 {sectors} flakey {} 0 1 86400 1 drop_writes",
-            self.loop_dev
-        );
-        run("dmsetup", &["suspend", &self.name]);
-        run("dmsetup", &["load", &self.name, "--table", &table]);
-        run("dmsetup", &["resume", &self.name]);
-    }
-
-    /// After the cut: unmount (the writes it still had are dropped, as at a
-    /// power cut), drop the device, replay the ext4 journal, and mount the
-    /// image again on a fresh loop device, for the store to reopen.
-    fn remount(&self) {
-        let image = self.image.to_str().unwrap();
-        let mount = self.mount.to_str().unwrap();
-        run("umount", &[mount]);
-        run("dmsetup", &["remove", &self.name]);
-        run("losetup", &["-d", &self.loop_dev]);
-        run("fsck.ext4", &["-y", image]);
-        run("mount", &["-t", "ext4", "-o", "loop", image, mount]);
-        give_to_user(mount);
+    /// The cut: drops every cached write that was not fsynced. The command
+    /// runs through the faults fifo, and the completed fifo answers when the
+    /// cache is cleared.
+    fn cut(&mut self) {
+        let mut fifo = fs::OpenOptions::new().write(true).open(&self.fifo).unwrap();
+        fifo.write_all(b"lazyfs::clear-cache\n").unwrap();
+        let mut done = [0u8; 64];
+        let n = self.completed.read(&mut done).unwrap();
+        let done = String::from_utf8_lossy(&done[..n]).into_owned();
+        assert!(done.contains("finished::clear-cache"), "{done:?}");
     }
 }
 
-impl Drop for Device {
+impl Drop for Lazyfs {
     fn drop(&mut self) {
-        let mount = self.mount.to_str().unwrap();
-        let image = self.image.to_str().unwrap();
-        // Best effort: a drop in the middle of a round undoes what the
-        // round set up, and a drop after one undoes the second mount.
-        for args in [
-            vec!["umount", mount],
-            vec!["dmsetup", "remove", &self.name],
-            vec!["losetup", "-d", &self.loop_dev],
-        ] {
-            priv_cmd(args[0]).args(&args[1..]).output().ok();
-        }
-        let _ = fs::remove_dir_all(image.rsplit_once('/').map(|(dir, _)| dir).unwrap());
+        // Best effort: the daemon dies with the mount, and the round's
+        // directories go away with the test's temp directory.
+        let _ = Command::new("fusermount3")
+            .arg("-u")
+            .arg(&self.mount)
+            .output();
+        let _ = Command::new("umount").arg(&self.mount).output();
+        self.child.kill().ok();
+        self.child.wait().ok();
     }
 }
 
-/// The mapper device's major and minor numbers, from `dmsetup`.
-fn dm_major_minor(name: &str) -> (String, String) {
-    let info = run_out(
-        "dmsetup",
-        &["info", "-c", "--noheadings", "-o", "major,minor", name],
-    );
-    let (major, minor) = info.split_once(':').unwrap();
-    (major.to_owned(), minor.to_owned())
-}
-
-/// Gives a mount point, which `mount` made root's, to the current user.
-fn give_to_user(mount: &str) {
-    let uid = run_out_plain("id", &["-u"]);
-    let gid = run_out_plain("id", &["-g"]);
-    run("chown", &[&format!("{uid}:{gid}"), mount]);
-}
-
-/// Like [`run_out`], but without root rights.
-fn run_out_plain(program: &str, args: &[&str]) -> String {
-    let out = Command::new(program).args(args).output().unwrap();
-    assert!(out.status.success(), "{program} failed");
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+/// Waits until the mount appears, for at most 60 s: LazyFS pre-allocates its
+/// cache before it serves, which takes a few seconds.
+fn wait_mounted(mount: &Path) {
+    let want = mount.to_str().unwrap().to_owned();
+    let start = std::time::Instant::now();
+    loop {
+        if fs::read_to_string("/proc/mounts").unwrap().contains(&want) {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "LazyFS did not mount {}",
+            mount.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// `SCION_POWER_SEED`, or a new seed. Printed, so a failed run can be run
@@ -249,16 +203,17 @@ fn seed() -> u64 {
     seed
 }
 
-/// The real server, several clients, and a power cut at three kinds of
-/// moment, as in the crash suite: at a random moment, in the middle of a
-/// large upload, and while a land is pending. Every reply the clients got
-/// must survive: the cut takes what the page cache had not sent, so a
-/// missing sync before a reply loses that reply.
+/// The real server, several clients, and a cut at three kinds of moment, as
+/// in the crash suite: at a random moment, in the middle of a large upload,
+/// and while a land is pending. Every reply the clients got must survive:
+/// the cut takes what was never fsynced, so a missing sync before a reply
+/// loses that reply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_reply_survives_a_power_cut() {
     if !may_run() {
         return;
     }
+    let lazyfs = lazyfs_dir().unwrap();
     let seed = seed();
     let mut rng = Rng::new(seed);
     let rounds = usize::try_from(env("SCION_POWER_ROUNDS", 4)).unwrap();
@@ -271,11 +226,15 @@ async fn every_reply_survives_a_power_cut() {
         // and the checks start over with it.
         let mut ledger = Ledger::default();
         let mut checked = Checked::default();
-        let dev = Device::create(dir.path(), seed, round);
-        let data = dev.mount.join("data");
+        let mut lazy = Lazyfs::start(dir.path(), &lazyfs, round);
+        let data = lazy.mount.join("data");
+        eprintln!("round {round}: mounted");
         create_repo(&data);
+        eprintln!("round {round}: repo created");
         let server = Server::start(&data, &log);
+        eprintln!("round {round}: server up");
         check(&server.url, &data, &mut ledger, &mut checked, &mut rng).await;
+        eprintln!("round {round}: check 1 done");
         let signals = Arc::new(Signals::default());
         let clients: Vec<_> = (0..CLIENTS)
             .map(|c| {
@@ -286,8 +245,8 @@ async fn every_reply_survives_a_power_cut() {
             .collect();
         match rng.below(3) {
             0 => {
-                // The loop device is slower than the crash suite's tmpfs, so
-                // the cut waits longer before it takes a quiet moment.
+                // The LazyFS cache is slower than the crash suite's tmpfs,
+                // so the cut waits longer before it takes a quiet moment.
                 let run = 500 + rng.below(2000);
                 tokio::time::sleep(Duration::from_millis(u64::try_from(run).unwrap())).await;
             }
@@ -301,13 +260,12 @@ async fn every_reply_survives_a_power_cut() {
                 wait_until(|| pending_lands(&db) > 0).await;
             }
         }
-        // Kill first, cut second: a server alive under the cut can sit in
-        // an uninterruptible page-fault wait on the device and never finish
-        // exiting. With the server gone, the kernel's writeback still sends
-        // what the page cache had, and the cut drops exactly those.
+        eprintln!("round {round}: clients spawning");
         signals.killed.store(true, Ordering::SeqCst);
+        eprintln!("round {round}: cutting");
+        lazy.cut();
+        eprintln!("round {round}: cut done");
         drop(server);
-        dev.cut();
         for client in clients {
             let mut got = client.await.unwrap();
             ledger.blobs.append(&mut got.blobs);
@@ -315,10 +273,15 @@ async fn every_reply_survives_a_power_cut() {
             ledger.lands.append(&mut got.lands);
         }
         total += ledger.lands.len();
-        dev.remount();
+        // The store reopens from the backing directory: what LazyFS
+        // persisted, and nothing else.
+        let data = lazy.backing.join("data");
         let server = Server::start(&data, &log);
+        eprintln!("round {round}: restart up");
         check(&server.url, &data, &mut ledger, &mut checked, &mut rng).await;
+        eprintln!("round {round}: check 2 done");
         drop(server);
+        drop(lazy);
     }
     println!("{rounds} cuts; {total} lands, {cut_lands} of them cut mid-call",);
     assert!(total > 0, "the clients did little work");
