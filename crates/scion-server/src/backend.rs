@@ -117,6 +117,41 @@ fn test_schema(data: &Path) -> String {
 }
 
 impl Backend {
+    /// The derive walks of this backend: which are in flight, and the cap
+    /// on how many may be.
+    pub(crate) fn derive_flights(&self) -> &crate::derived::DeriveFlights {
+        match self {
+            Self::Sqlite(store) => store.derive_flights(),
+            Self::Postgres(pg) => pg.derive_flights(),
+        }
+    }
+
+    /// How many writers wait for the write connection.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn writers_waiting(&self) -> usize {
+        match self {
+            Self::Sqlite(store) => store.writers_waiting(),
+            Self::Postgres(pg) => pg.writers_waiting(),
+        }
+    }
+
+    /// Waits while writers wait for the write connection, until the
+    /// deadline: a derivation step yields to a writer that waited.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::DeadlineExceeded`] once the deadline has passed.
+    pub(crate) fn wait_for_writers(
+        &self,
+        deadline: Option<&crate::deadline::Deadline>,
+    ) -> Result<()> {
+        match self {
+            Self::Sqlite(store) => store.wait_for_writers(deadline),
+            Self::Postgres(pg) => pg.wait_for_writers(deadline),
+        }
+    }
+
     /// Opens the backend of a server: Postgres at `postgres_url` when it is
     /// set, the data directory otherwise. `ca` verifies the certificate of
     /// the Postgres server; it is required for a host that is not local.

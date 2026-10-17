@@ -73,6 +73,13 @@ struct PgInner {
     readers: Readers,
     /// The blob folder: blob files stay on local disk in every backend.
     blobs: Blobs,
+    /// Writers that wait for the write client: the derivation walk waits
+    /// while they wait, so a steady stream of writers delays a cold read
+    /// up to its deadline, never a land ([#142]).
+    writers: Mutex<usize>,
+    write_woken: Condvar,
+    /// The walks in flight of this backend's derivations.
+    derive: crate::derived::DeriveFlights,
 }
 
 /// Clients for [`Pg::read`], so at most [`READERS`](crate::store::READERS)
@@ -601,6 +608,9 @@ impl Pg {
                 writer: Mutex::new(writer),
                 readers: Readers::new_with(readers, url, ca, &options, schema)?,
                 blobs,
+                writers: Mutex::new(0),
+                write_woken: Condvar::new(),
+                derive: crate::derived::DeriveFlights::new(crate::store::DERIVE_WALKS_CAP),
             }),
         })
     }
@@ -613,7 +623,7 @@ impl Pg {
 
     /// A read on the write client, so it sees the caller's own commits.
     pub fn read_unflushed<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
-        let mut writer = self.lock_writer();
+        let (mut writer, _waiting) = self.lock_writer();
         let mut pg = PgTx {
             c: &mut writer,
             ended: true,
@@ -642,7 +652,7 @@ impl Pg {
     ///
     /// What `f` returns, or a database error from begin or commit.
     pub fn commit<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
-        let mut writer = self.lock_writer();
+        let (mut writer, _waiting) = self.lock_writer();
         // A write transaction runs at READ COMMITTED, the Postgres
         // default: every change of the caller checks the newest state of
         // the row it touches (the CAS predicates).
@@ -670,11 +680,93 @@ impl Pg {
         self.commit(f)
     }
 
-    fn lock_writer(&self) -> MutexGuard<'_, PgClient> {
-        self.inner
-            .writer
+    /// Takes the write client, counted as a writer that waits: the
+    /// derivation walk waits while writers wait, so a steady stream of
+    /// writers delays a cold read up to its deadline, never a land
+    /// ([#142]). The count falls when the client is back, so a walk step
+    /// that ends hands the client to a writer, not to its own next step.
+    fn lock_writer(&self) -> (MutexGuard<'_, PgClient>, PgWriteWaiter<'_>) {
+        *self
+            .inner
+            .writers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += 1;
+        (
+            self.inner
+                .writer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            PgWriteWaiter(&self.inner.writers, &self.inner.write_woken),
+        )
+    }
+
+    /// The walks in flight of this backend's derivations.
+    pub(crate) fn derive_flights(&self) -> &crate::derived::DeriveFlights {
+        &self.inner.derive
+    }
+
+    /// How many writers wait for the write client right now.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn writers_waiting(&self) -> usize {
+        *self
+            .inner
+            .writers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits while writers wait for the write client, until the deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::DeadlineExceeded`] once the deadline has passed.
+    pub(crate) fn wait_for_writers(
+        &self,
+        deadline: Option<&crate::deadline::Deadline>,
+    ) -> Result<()> {
+        let mut waiting = self
+            .inner
+            .writers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while *waiting > 0 {
+            let Some(deadline) = deadline else {
+                waiting = self
+                    .inner
+                    .write_woken
+                    .wait(waiting)
+                    .unwrap_or_else(PoisonError::into_inner);
+                continue;
+            };
+            let budget = deadline
+                .at()
+                .saturating_duration_since(std::time::Instant::now());
+            let (guard, timed_out) = self
+                .inner
+                .write_woken
+                .wait_timeout_while(waiting, budget, |waiting| *waiting > 0)
+                .unwrap_or_else(PoisonError::into_inner);
+            waiting = guard;
+            if timed_out.timed_out() {
+                return Err(Error::DeadlineExceeded(
+                    "the call ran past its deadline".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The count of a taken write client, while it is taken: it falls, and
+/// wakes the waiters, when the client is back.
+struct PgWriteWaiter<'a>(&'a Mutex<usize>, &'a Condvar);
+
+impl Drop for PgWriteWaiter<'_> {
+    fn drop(&mut self) {
+        let mut waiting = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        *waiting -= 1;
+        self.1.notify_all();
     }
 }
 
