@@ -557,6 +557,24 @@ pub async fn retry_lands(scion: &Scion, ledger: &mut Ledger, checked: &mut Check
     }
 }
 
+/// Collects the parts of one `GetChangeset` reply into its bytes.
+async fn changeset_bytes(
+    scion: &mut Scion,
+    request: GetChangesetRequest,
+    what: &str,
+) -> Vec<u8> {
+    let mut stream = scion
+        .get_changeset(request)
+        .await
+        .unwrap_or_else(|s| panic!("{what}: {s:?}"))
+        .into_inner();
+    let mut bytes = Vec::new();
+    while let Some(part) = stream.message().await.unwrap() {
+        bytes.extend_from_slice(&part.changeset);
+    }
+    bytes
+}
+
 /// The changesets on each ref's first-parent history, but the root, with
 /// the ref. Checks that each one hashes to its ID, and that its root tree
 /// differs from its parent's by exactly its changes.
@@ -573,11 +591,8 @@ pub async fn walk_refs(
                 repo: REPO.into(),
                 changeset_id: at.as_bytes().to_vec(),
             };
-            let reply = scion.get_changeset(request).await;
-            let bytes = reply
-                .unwrap_or_else(|s| panic!("{target}: {at}: {s:?}"))
-                .into_inner();
-            let (changeset, id) = Changeset::decode_with_id(&bytes.changeset).unwrap();
+            let bytes = changeset_bytes(scion, request, &format!("{target}: {at}")).await;
+            let (changeset, id) = Changeset::decode_with_id(&bytes).unwrap();
             assert_eq!(id, at, "{target}: changeset {at} does not match its ID");
             let Some(&parent) = changeset.parents.first() else {
                 break;
@@ -679,8 +694,7 @@ pub async fn check(
             repo: REPO.into(),
             changeset_id: sent.id.as_bytes().to_vec(),
         };
-        let reply = scion.get_changeset(request).await;
-        reply.unwrap_or_else(|s| panic!("created changeset {}: {s:?}", sent.id));
+        changeset_bytes(&mut scion, request, &format!("created changeset {}", sent.id)).await;
     }
 
     // Every blob that the metadata names is intact, and so is every blob
