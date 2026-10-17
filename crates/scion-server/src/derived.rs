@@ -21,12 +21,11 @@
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 
-use rusqlite::Connection;
 use scion_core::{Changeset, ChangesetId};
 
-use crate::db::{self, RepoId};
 use crate::deadline::Deadline;
 use crate::error::{Error, Result};
+use crate::meta::{MetaTx, RepoId};
 use crate::store::Store;
 
 /// Most changesets that one step walks or derives, and most rows of older
@@ -72,7 +71,7 @@ pub trait Kind {
     /// Database errors, or [`Error::Corrupt`] if the stored changeset does
     /// not fit its parents' values.
     fn derive(
-        c: &Connection,
+        c: &mut dyn MetaTx,
         id: ChangesetId,
         changeset: &Changeset,
         parents: Vec<Self::Value>,
@@ -199,7 +198,7 @@ fn fill_until<K: Kind>(
 pub fn backfill<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<()> {
     fill::<K>(store, repo, cs)?;
     // A short step means that no older row is left.
-    while store.commit(remove_old::<K>)? == STEP {}
+    while store.commit(|c| remove_old::<K>(c))? == STEP {}
     store.flush()
 }
 
@@ -211,7 +210,7 @@ pub fn backfill<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`].
-pub fn derive<K: Kind>(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
+pub fn derive<K: Kind>(c: &mut dyn MetaTx, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
     let mut walk = match Walk::start::<K>(c, repo, cs)? {
         ControlFlow::Break(value) => return Ok(value),
         ControlFlow::Continue(walk) => walk,
@@ -227,8 +226,8 @@ pub fn derive<K: Kind>(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result<
 /// # Errors
 ///
 /// [`Error::Corrupt`] if a different value is already stored.
-pub fn put<K: Kind>(c: &Connection, cs: ChangesetId, value: &K::Value) -> Result<()> {
-    db::put_derived(c, K::NAME, K::VERSION, cs, &K::encode(value))
+pub fn put<K: Kind>(c: &mut dyn MetaTx, cs: ChangesetId, value: &K::Value) -> Result<()> {
+    c.put_derived(K::NAME, K::VERSION, cs, &K::encode(value))
 }
 
 /// For a kind that is stored when a changeset is written: derives and stores
@@ -241,7 +240,7 @@ pub fn put<K: Kind>(c: &Connection, cs: ChangesetId, value: &K::Value) -> Result
 /// # Errors
 ///
 /// Errors of [`Kind::derive`].
-pub fn on_write<K: Kind>(c: &Connection, id: ChangesetId, changeset: &Changeset) -> Result<()> {
+pub fn on_write<K: Kind>(c: &mut dyn MetaTx, id: ChangesetId, changeset: &Changeset) -> Result<()> {
     if load::<K>(c, id)?.is_none()
         && let Some(parents) = parent_values::<K>(c, changeset)?
     {
@@ -300,11 +299,11 @@ impl Walk {
     /// parent of a changeset in a repo is in that repo too, so the rest of
     /// the walk stays in it.
     fn start<K: Kind>(
-        c: &Connection,
+        c: &mut dyn MetaTx,
         repo: RepoId,
         cs: ChangesetId,
     ) -> Result<ControlFlow<K::Value, Self>> {
-        let generation = db::generation(c, repo, cs)?;
+        let generation = c.generation(repo, cs)?;
         if let Some(value) = load::<K>(c, cs)? {
             return Ok(ControlFlow::Break(value));
         }
@@ -318,7 +317,7 @@ impl Walk {
     /// Visits at most `limit` changesets. Each one without a stored value
     /// goes to `pending`, and the walk goes on to the parents that `K`
     /// reads.
-    fn step<K: Kind>(&mut self, c: &Connection, limit: usize) -> Result<()> {
+    fn step<K: Kind>(&mut self, c: &mut dyn MetaTx, limit: usize) -> Result<()> {
         for _ in 0..limit {
             let Some((id, generation)) = self.next.pop() else {
                 break;
@@ -326,11 +325,11 @@ impl Walk {
             if K::ALL_PARENTS && !self.seen.insert(id) {
                 continue;
             }
-            if db::get_derived(c, K::NAME, K::VERSION, id)?.is_some() {
+            if c.get_derived(K::NAME, K::VERSION, id)?.is_some() {
                 continue;
             }
             self.pending.push((generation, id));
-            let mut parents = db::parents(c, id, generation)?;
+            let mut parents = c.parents(id, generation)?;
             if !K::ALL_PARENTS {
                 parents.truncate(1);
             }
@@ -374,7 +373,7 @@ fn derive_steps<K: Kind>(
 /// stored, for example by a concurrent [`fill`], is read, not derived
 /// again. Returns the value for the last one.
 fn derive_chain<K: Kind>(
-    c: &Connection,
+    c: &mut dyn MetaTx,
     repo: RepoId,
     ids: &[ChangesetId],
 ) -> Result<Option<K::Value>> {
@@ -384,7 +383,7 @@ fn derive_chain<K: Kind>(
             value = Some(known);
             continue;
         }
-        let changeset = db::get_changeset(c, repo, id)?;
+        let changeset = c.get_changeset(repo, id)?;
         let parents = parent_values::<K>(c, &changeset)?.ok_or_else(|| {
             Error::Corrupt(format!(
                 "derived {} v{} is missing for a parent of {id}",
@@ -401,7 +400,10 @@ fn derive_chain<K: Kind>(
 
 /// The stored values of `K` for the parents of `changeset` that `K` reads,
 /// in parent order, or `None` if one of them has no value.
-fn parent_values<K: Kind>(c: &Connection, changeset: &Changeset) -> Result<Option<Vec<K::Value>>> {
+fn parent_values<K: Kind>(
+    c: &mut dyn MetaTx,
+    changeset: &Changeset,
+) -> Result<Option<Vec<K::Value>>> {
     let read = if K::ALL_PARENTS { usize::MAX } else { 1 };
     let mut values = Vec::new();
     for &parent in changeset.parents.iter().take(read) {
@@ -422,8 +424,8 @@ fn parent_values<K: Kind>(c: &Connection, changeset: &Changeset) -> Result<Optio
 /// # Errors
 ///
 /// Database errors.
-pub fn remove_old<K: Kind>(c: &Connection) -> Result<usize> {
-    let removed = db::delete_derived_below(c, K::NAME, K::VERSION, STEP)?;
+pub fn remove_old<K: Kind>(c: &mut dyn MetaTx) -> Result<usize> {
+    let removed = c.delete_derived_below(K::NAME, K::VERSION, STEP)?;
     if removed > 0 {
         tracing::debug!(
             kind = K::NAME,
@@ -440,8 +442,8 @@ pub fn remove_old<K: Kind>(c: &Connection) -> Result<usize> {
 /// # Errors
 ///
 /// [`Error::Corrupt`] if the stored bytes are not a value.
-pub(crate) fn load<K: Kind>(c: &Connection, cs: ChangesetId) -> Result<Option<K::Value>> {
-    db::get_derived(c, K::NAME, K::VERSION, cs)?
+pub(crate) fn load<K: Kind>(c: &mut dyn MetaTx, cs: ChangesetId) -> Result<Option<K::Value>> {
+    c.get_derived(K::NAME, K::VERSION, cs)?
         .map(|bytes| {
             K::decode(&bytes).ok_or_else(|| {
                 Error::Corrupt(format!("derived {} v{} for {cs}", K::NAME, K::VERSION))
@@ -450,8 +452,8 @@ pub(crate) fn load<K: Kind>(c: &Connection, cs: ChangesetId) -> Result<Option<K:
         .transpose()
 }
 
-fn require(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result<()> {
-    if db::has_changeset(c, repo, cs)? {
+fn require(c: &mut dyn MetaTx, repo: RepoId, cs: ChangesetId) -> Result<()> {
+    if c.has_changeset(repo, cs)? {
         Ok(())
     } else {
         Err(Error::NotFound(format!("changeset {cs}")))
@@ -460,6 +462,8 @@ fn require(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::db::SqliteTx;
+    use rusqlite::Connection;
     use std::cell::Cell;
     use std::collections::HashMap;
 
@@ -489,7 +493,7 @@ mod tests {
         type Value = u64;
 
         fn derive(
-            _: &Connection,
+            _: &mut dyn MetaTx,
             id: ChangesetId,
             cs: &Changeset,
             parents: Vec<u64>,
@@ -530,7 +534,7 @@ mod tests {
         type Value = Vec<ChangesetId>;
 
         fn derive(
-            _: &Connection,
+            _: &mut dyn MetaTx,
             id: ChangesetId,
             cs: &Changeset,
             parents: Vec<Vec<ChangesetId>>,
@@ -593,7 +597,7 @@ mod tests {
     /// Stores `history` in a new repo `r` through the one write path, which
     /// stores root trees and the commit graph, and nothing else. Returns the
     /// IDs, oldest first.
-    fn store_chain(c: &Connection, history: &[Edits]) -> Result<(RepoId, Vec<ChangesetId>)> {
+    fn store_chain(c: &mut dyn MetaTx, history: &[Edits]) -> Result<(RepoId, Vec<ChangesetId>)> {
         chain_with(c, history, |c, repo, cs| {
             Ok(tree::store_changeset(c, repo, cs)?.0)
         })
@@ -602,11 +606,11 @@ mod tests {
     /// Stores `history` in a new repo `r` with `store`. Returns the IDs,
     /// oldest first.
     fn chain_with(
-        c: &Connection,
+        c: &mut dyn MetaTx,
         history: &[Edits],
-        store: impl Fn(&Connection, RepoId, &Changeset) -> Result<ChangesetId>,
+        store: impl Fn(&mut dyn MetaTx, RepoId, &Changeset) -> Result<ChangesetId>,
     ) -> Result<(RepoId, Vec<ChangesetId>)> {
-        let repo = db::create_repo(c, "r")?;
+        let repo = c.create_repo("r")?;
         let mut ids: Vec<ChangesetId> = Vec::new();
         for edits in history {
             let changes = edits
@@ -688,7 +692,7 @@ mod tests {
         assert!(stored.iter().all(|(_, value)| value.len() == 8));
 
         // A stored value does not leak to a repo without the changeset.
-        let other = store.write(|c| db::create_repo(c, "other")).unwrap();
+        let other = store.write(|c| c.create_repo("other")).unwrap();
         let tip = ids[2];
         assert!(matches!(
             get::<ChangedPathsV1>(&store, other, tip),
@@ -723,8 +727,9 @@ mod tests {
             let c = Connection::open(dir.path().join("scion.db")).unwrap();
             migrate(&c, 2).unwrap();
             // The write path of version 2 stored root trees only.
-            let (repo, ids) = chain_with(&c, &HISTORY, |c, repo, cs| {
-                let id = db::insert_changeset(c, repo, cs)?;
+            let mut tx = SqliteTx(&c);
+            let (repo, ids) = chain_with(&mut tx, &HISTORY, |c, repo, cs| {
+                let id = c.insert_changeset(repo, cs)?;
                 tree::derive_root_tree(c, repo, id)?;
                 Ok(id)
             })
@@ -891,7 +896,10 @@ mod tests {
 
         // Version 1 removes neither its own rows nor the rows of version 2,
         // which is newer. No step removes the rows of another kind.
-        assert_eq!(store.commit(remove_old::<ChangedPathsV1>).unwrap(), 0);
+        assert_eq!(
+            store.commit(|c| remove_old::<ChangedPathsV1>(c)).unwrap(),
+            0
+        );
         assert_eq!(kind_rows(&store, 1).len(), 7 - STEP);
         assert_eq!(kind_rows(&store, 2).len(), STEP);
         assert_eq!(root_trees(&store), 7);
@@ -937,7 +945,7 @@ mod tests {
 
         let cs = Changeset {
             parents: vec![ids[6]],
-            ..store.read(|c| db::get_changeset(c, repo, ids[0])).unwrap()
+            ..store.read(|c| c.get_changeset(repo, ids[0])).unwrap()
         };
         store
             .write(|c| tree::store_changeset(c, repo, &cs))
@@ -954,7 +962,7 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         let (repo, ids) = store
             .write(|c| {
-                let repo = db::create_repo(c, "r")?;
+                let repo = c.create_repo("r")?;
                 Ok((repo, testing::insert_graph(c, repo, parents)?))
             })
             .unwrap();
@@ -1034,7 +1042,10 @@ mod tests {
         // The parents of 3 have no value yet.
         let on_write = |cs: ChangesetId| {
             store
-                .write(|c| on_write::<Ancestry>(c, cs, &db::get_changeset(c, repo, cs)?))
+                .write(|c| {
+                    let cs_row = c.get_changeset(repo, cs)?;
+                    on_write::<Ancestry>(c, cs, &cs_row)
+                })
                 .unwrap();
         };
         on_write(ids[3]);

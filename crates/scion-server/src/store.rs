@@ -10,6 +10,15 @@
 //! <data>/tmp/                      staging for atomic blob writes and uploads,
 //!                                  one folder per process, held with a lock
 //! ```
+//!
+//! The locks are `flock`s on open files. A forked child shares its parent's
+//! file descriptions, and with them the locks, until it execs, so a child
+//! spawned while a store is dropped can hold the dropped store's lock for
+//! that window. This server never forks, and a store drops only when its
+//! last user is done with it, so a server cannot hit the window. A library
+//! user that forks while it drops a `Store` can: its tests that assert a
+//! released lock must keep child spawns out of that window, as
+//! `spawn_guard` does in this crate's tests.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -26,10 +35,11 @@ use rustix::fs::FlockOperation;
 use rustix::io::Errno;
 use scion_core::{BlobHasher, BlobId};
 
+use crate::db::SqliteTx;
 use crate::error::{Error, Result};
 
 /// The schema version this build makes and reads.
-pub(crate) const SCHEMA_VERSION: u32 = 5;
+pub(crate) const SCHEMA_VERSION: u32 = 6;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database from
 /// version `n - 1` to version `n`. A released migration never changes.
@@ -39,6 +49,7 @@ const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [
     include_str!("../migrations/0003_derived_values.sql"),
     include_str!("../migrations/0004_repo_blobs.sql"),
     include_str!("../migrations/0005_path_history.sql"),
+    include_str!("../migrations/0006_land_created_at.sql"),
 ];
 
 /// Largest object accepted or read back, uncompressed: 100 MiB, the hard
@@ -92,6 +103,10 @@ struct Inner {
     /// write lock.
     #[cfg(test)]
     txes: AtomicU64,
+    /// How many of the next commits fail as a busy database, for tests of
+    /// the import's busy retry: the transaction ran and rolled back, so
+    /// nothing was written, exactly as a real busy commit ends.
+    fail_commits: AtomicU64,
 }
 
 impl Store {
@@ -196,7 +211,7 @@ impl Store {
             if server { "OFF" } else { "ON" }
         ))?;
         // Only a `Store` that is alone changes the schema.
-        let version = user_version(&db)?;
+        let version = user_version(&mut SqliteTx(&db))?;
         if !alone && version < SCHEMA_VERSION {
             return Err(Error::FailedPrecondition(format!(
                 "database schema version {version} is older than this build \
@@ -222,6 +237,7 @@ impl Store {
                 _server_lock: server_lock,
                 #[cfg(test)]
                 txes: AtomicU64::new(0),
+                fail_commits: AtomicU64::new(0),
             }),
         })
     }
@@ -251,7 +267,7 @@ impl Store {
     /// # Errors
     ///
     /// Returns what `f` returns, or an error from [`Store::flush`].
-    pub fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub fn read<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
         let (result, seen) = self.read_counted(f);
         // An error is an answer too.
         self.wait_durable(seen)?;
@@ -264,10 +280,10 @@ impl Store {
     /// replies.
     pub(crate) fn read_counted<T>(
         &self,
-        f: impl FnOnce(&Connection) -> Result<T>,
+        f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>,
     ) -> (Result<T>, u64) {
         let reader = self.inner.readers.take();
-        let result = f(&reader);
+        let result = f(&mut SqliteTx(&reader));
         (result, self.inner.committing.load(Ordering::Acquire))
     }
 
@@ -307,8 +323,9 @@ impl Store {
     /// # Errors
     ///
     /// Returns what `f` returns.
-    pub fn read_unflushed<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        f(&self.lock())
+    pub fn read_unflushed<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
+        let db = self.lock();
+        f(&mut SqliteTx(&db))
     }
 
     /// Whether another process may use the directory at the same time. A
@@ -316,6 +333,23 @@ impl Store {
     /// took the directory alone is not shared.
     pub(crate) fn is_shared(&self) -> bool {
         !self.inner.alone
+    }
+
+    /// Sets how many of the next commits fail as a busy database. Tests of
+    /// the import's busy retry use it: the failing transaction ran and
+    /// rolled back, so the retry re-runs it whole.
+    #[doc(hidden)]
+    pub fn fail_next_commits(&self, n: u32) {
+        self.inner
+            .fail_commits
+            .store(u64::from(n), Ordering::Relaxed);
+    }
+
+    /// Sets how long the write connection waits for a busy database. Tests
+    /// use it to make a busy lock fail fast, so a retry is deterministic.
+    #[doc(hidden)]
+    pub fn set_busy_timeout(&self, timeout: Duration) {
+        let _ = self.lock().busy_timeout(timeout);
     }
 
     /// Write transactions run so far.
@@ -331,7 +365,7 @@ impl Store {
     /// # Errors
     ///
     /// As [`Store::commit`] and [`Store::flush`].
-    pub fn write<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub fn write<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
         let value = self.commit(f)?;
         self.flush()?;
         Ok(value)
@@ -343,13 +377,21 @@ impl Store {
     /// # Errors
     ///
     /// Returns what `f` returns, or a database error from begin or commit.
-    pub fn commit<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub fn commit<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
         let mut db = self.lock();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let value = f(&tx)?;
+        let value = f(&mut SqliteTx(&tx))?;
         // Counted before a read can see it, and again once it ended (see
         // `read` and `flush`).
         self.inner.committing.fetch_add(1, Ordering::Release);
+        if self.inner.fail_commits.load(Ordering::Relaxed) > 0 {
+            self.inner.fail_commits.fetch_sub(1, Ordering::Relaxed);
+            // Counted as ended, as a real failed commit is. The transaction
+            // drops here, which rolls it back: nothing was written, exactly
+            // as a commit past `busy_timeout` ends.
+            self.inner.committed.fetch_add(1, Ordering::Release);
+            return Err(Error::Busy);
+        }
         let committed = tx.commit();
         self.inner.committed.fetch_add(1, Ordering::Release);
         #[cfg(test)]
@@ -545,14 +587,14 @@ fn in_use(dir: &Path, name: &str, by: &str) -> Error {
     .into()
 }
 
-fn user_version(db: &Connection) -> Result<u32> {
+fn user_version(db: &mut SqliteTx<'_>) -> Result<u32> {
     Ok(db.pragma_query_value(None, "user_version", |row| row.get(0))?)
 }
 
 /// Runs the migrations from the database's version up to `target`. Only
 /// tests stop below [`SCHEMA_VERSION`], to make an older database.
 pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
-    let version = user_version(db)?;
+    let version = user_version(&mut SqliteTx(db))?;
     if version > SCHEMA_VERSION {
         return Err(Error::Corrupt(format!(
             "database schema version {version} is newer than this build ({SCHEMA_VERSION})"
@@ -870,6 +912,8 @@ impl Blobs {
             Err(e) => return Err(e),
         };
         let corrupt = |why: String| {
+            // No repo on this line: a blob may be shared by repos. The call
+            // whose read failed logs the repo and the caller.
             tracing::warn!(blob = %id, %why, "stored blob is corrupt");
             Ok(BlobStatus::Corrupt)
         };
@@ -1114,7 +1158,8 @@ impl BlobBatch<'_> {
     fn write(&mut self, id: BlobId, len: usize, raw: impl Read) -> Result<()> {
         match self.keep(id)? {
             BlobStatus::Valid => return Ok(()),
-            // The rename below replaces it in one step.
+            // The rename below replaces it in one step. No repo on this
+            // line: a blob may be shared by repos.
             BlobStatus::Corrupt => tracing::warn!(blob = %id, "rewriting a corrupt blob file"),
             BlobStatus::Missing => {}
         }
@@ -1286,8 +1331,88 @@ fn fsync_dir(path: &Path) -> io::Result<()> {
     fsync(&fs::File::open(path)?)
 }
 
+/// Keeps child processes out of the window where a test drops a store and
+/// asserts its lock released. A forked child shares the flock of every open
+/// file description until it execs, so a child spawned while another test
+/// drops a store can hold the dropped store's lock past that assertion.
+/// Every test that spawns a child takes the read side across the spawn, and
+/// a test that asserts a lock is released takes the write side across its
+/// drop and reopen: a pending write side also stops new read sides, so the
+/// spawners finish before the release window opens.
+#[cfg(test)]
+pub(crate) mod spawn_guard {
+    use super::{flock, lock_file};
+    use rustix::fs::FlockOperation;
+    use std::path::Path;
+    use std::sync::RwLock;
+    use std::time::{Duration, Instant};
+
+    static SPAWNS: RwLock<()> = RwLock::new(());
+
+    /// Holds the read side while `f` spawns its child: any number of tests
+    /// may spawn at once.
+    pub fn across_spawn<T>(f: impl FnOnce() -> T) -> T {
+        let _held = SPAWNS.read().expect("the spawn guard is not poisoned");
+        f()
+    }
+
+    /// Waits until the server lock of `dir` is free. Call it on the
+    /// write side (inside [`Self::across_release`]), after dropping the
+    /// stores and before the reopen that must see the lock released.
+    ///
+    /// The poll takes the real condition — the lock is free — instead of
+    /// a timing guess: it opens `<dir>/server.lock` and takes a
+    /// non-blocking exclusive flock every 1 ms, up to 2 s, then fails
+    /// with the holder message, so a real leak still fails. The delay it
+    /// absorbs is the operating system's: macOS tears a reaped child's
+    /// inherited `flock` down one tick after `waitpid`, and about 7% of
+    /// immediate reopens after a Rust spawn and its wait fail with
+    /// `EWOULDBLOCK` there, sub-ms; Linux shows 0 of 2,000 rounds (a
+    /// standalone probe). The server never spawns a child, so
+    /// `Store::open` itself needs none of this.
+    pub fn wait_for_lock_release(dir: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let file = lock_file(dir, "server.lock")
+                .unwrap_or_else(|e| panic!("cannot open the lock of {dir:?}: {e}"));
+            let free = flock(&file, FlockOperation::NonBlockingLockExclusive).unwrap_or(false);
+            drop(file);
+            if free {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the server lock of {} was never released within 2 s",
+                dir.display()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Primes gix's one-time `git` installation lookup under the read
+    /// side. The first `gix::open` in a process forks `git` outside our
+    /// control (gix-path), and caches the result afterwards. Every test
+    /// that reaches `gix` calls this first, so that fork waits out any
+    /// release window like our own spawns do.
+    pub fn prime_gix_lookup() {
+        across_spawn(|| {
+            let _ = gix::path::env::installation_config();
+        });
+    }
+
+    /// Holds the write side while `f` drops a store and checks its lock is
+    /// released: no child is in its fork-to-exec window, and no new spawn
+    /// starts, until `f` is done.
+    pub fn across_release<T>(f: impl FnOnce() -> T) -> T {
+        let _held = SPAWNS.write().expect("the spawn guard is not poisoned");
+        f()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::db::SqliteTx;
+    use crate::meta::MetaTx as _;
     use std::cell::{Cell, RefCell};
     use std::panic;
     use std::rc::Rc;
@@ -1319,22 +1444,76 @@ mod tests {
         ));
     }
 
+    /// A forked child shares the flock of every open file description
+    /// until it execs, so a `git` spawn beside a dropped store can keep
+    /// the dropped store's lock for the fork-to-exec window. Without
+    /// [`spawn_guard`] this test fails within a few hundred cycles; with
+    /// it, the spawns wait out every release window.
+    ///
+    /// The read side covers a spawn until the child has exited
+    /// (`status`), so no child of this binary holds any descriptor once
+    /// the read side is released, whatever the platform does at `exec`.
+    /// Spawns outside the guard, like gix's one-time `git` lookup, are
+    /// primed under the read side before any test opens a store (see
+    /// [`spawn_guard::prime_gix_lookup`]).
+    #[test]
+    fn a_dropped_store_lock_is_shared_by_a_forked_child_until_it_execs() {
+        use std::process::Command;
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let spawner = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    super::spawn_guard::across_spawn(|| {
+                        // Any child shares the lock between its fork and
+                        // its exec; `/bin/true` keeps this test fast, and
+                        // the unguarded repro failed with `git` too, with
+                        // and without `current_dir`.
+                        let _ = Command::new("/bin/true").status();
+                    });
+                }
+            })
+        };
+        for _ in 0..100 {
+            let dir = tempfile::tempdir().unwrap();
+            let first = Store::open(dir.path()).unwrap();
+            let clone = first.clone();
+            super::spawn_guard::across_release(|| {
+                drop(first);
+                drop(clone);
+                // The window between the drops and this open is where a
+                // forked child still holds the lock, one tick past the
+                // reaper on macOS. The poll waits for the real
+                // condition: the lock is free.
+                super::spawn_guard::wait_for_lock_release(dir.path());
+                Store::open(dir.path()).unwrap();
+            });
+        }
+        stop.store(true, Ordering::Relaxed);
+        spawner.join().unwrap();
+    }
+
     #[test]
     fn a_data_directory_opens_in_one_server_store_at_a_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = Store::open(dir.path()).unwrap();
-        let clone = first.clone();
-        assert_in_use(Store::open(dir.path()), dir.path(), "another server");
-        // Shared stores open beside it, and a server beside them.
-        let shared = [0, 1].map(|_| Store::open_shared(dir.path()).unwrap());
-        drop(first);
-        assert!(
-            Store::open(dir.path()).is_err(),
-            "a live clone keeps the lock"
-        );
-        drop(clone);
-        Store::open(dir.path()).unwrap();
-        drop(shared);
+        // The last part of this test drops every store and asserts the
+        // lock released, so no child may spawn beside it.
+        super::spawn_guard::across_release(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let first = Store::open(dir.path()).unwrap();
+            let clone = first.clone();
+            assert_in_use(Store::open(dir.path()), dir.path(), "another server");
+            // Shared stores open beside it, and a server beside them.
+            let shared = [0, 1].map(|_| Store::open_shared(dir.path()).unwrap());
+            drop(first);
+            assert!(
+                Store::open(dir.path()).is_err(),
+                "a live clone keeps the lock"
+            );
+            drop(clone);
+            super::spawn_guard::wait_for_lock_release(dir.path());
+            Store::open(dir.path()).unwrap();
+            drop(shared);
+        });
     }
 
     /// Asserts that an open failed because `by` uses the directory.
@@ -1359,167 +1538,203 @@ mod tests {
 
     #[test]
     fn only_an_open_that_is_alone_removes_temp_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let tmp = dir.path().join("tmp");
-        let server = Store::open(dir.path()).unwrap();
-        // The temp file of a write that the server has not renamed yet.
-        fs::write(tmp.join("live"), b"x").unwrap();
-        let shared = Store::open_shared(dir.path()).unwrap();
-        assert!(tmp.join("live").exists(), "another process uses it");
-        drop(server);
-        drop(shared);
-        // Now it is what a crash left behind.
-        Store::open_shared(dir.path()).unwrap();
-        assert!(!tmp.join("live").exists());
+        // The drops and reopens of this test must see a lock released, so
+        // no child may be in its fork-to-exec window (see `spawn_guard`).
+        super::spawn_guard::across_release(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let tmp = dir.path().join("tmp");
+            let server = Store::open(dir.path()).unwrap();
+            // The temp file of a write that the server has not renamed yet.
+            fs::write(tmp.join("live"), b"x").unwrap();
+            let shared = Store::open_shared(dir.path()).unwrap();
+            assert!(tmp.join("live").exists(), "another process uses it");
+            drop(server);
+            drop(shared);
+            super::spawn_guard::wait_for_lock_release(dir.path());
+            // Now it is what a crash left behind.
+            Store::open_shared(dir.path()).unwrap();
+            assert!(!tmp.join("live").exists());
+        });
     }
 
     #[test]
     fn an_open_removes_the_temp_files_of_a_dead_process() {
-        let dir = tempfile::tempdir().unwrap();
-        let tmp = dir.path().join("tmp");
-        let server = Store::open(dir.path()).unwrap();
-        // A live importer: its folder is held with its lock, and a blob
-        // write of it that was never renamed sits in the folder.
-        let importer = Store::open_shared(dir.path()).unwrap();
-        let live_dir = importer.blobs().mine.clone();
-        let live_file = live_dir.join("stage");
-        fs::write(&live_file, b"x").unwrap();
-        // What a crashed import left: a folder whose holder is gone.
-        let dead = tmp.join("dead-1");
-        fs::create_dir(&dead).unwrap();
-        fs::write(dead.join(".lock"), b"").unwrap();
-        fs::write(dead.join("stage"), b"x").unwrap();
-        // Another open, while the server and the importer use the directory:
-        // it removes what the dead process left, and nothing else.
-        Store::open_shared(dir.path()).unwrap();
-        assert!(!dead.exists(), "a dead process's folder is removed");
-        assert!(live_dir.exists(), "a live folder is not swept");
-        assert!(
-            live_file.exists(),
-            "a live process's temp file is not swept"
-        );
-        // The server's own staging folder is held, and still works.
-        let id = server.blobs().put(b"x").unwrap();
-        assert_eq!(server.blobs().verify(id).unwrap(), BlobStatus::Valid);
-        // The importer's folder is held only while it lives. Once it is
-        // gone, the next open removes the folder, with the file in it.
-        drop(importer);
-        Store::open_shared(dir.path()).unwrap();
-        assert!(!live_file.exists(), "a dead process's folder is removed");
+        // The drops and reopens of this test must see a lock released, so
+        // no child may be in its fork-to-exec window (see `spawn_guard`).
+        super::spawn_guard::across_release(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let tmp = dir.path().join("tmp");
+            let server = Store::open(dir.path()).unwrap();
+            // A live importer: its folder is held with its lock, and a blob
+            // write of it that was never renamed sits in the folder.
+            let importer = Store::open_shared(dir.path()).unwrap();
+            let live_dir = importer.blobs().mine.clone();
+            let live_file = live_dir.join("stage");
+            fs::write(&live_file, b"x").unwrap();
+            // What a crashed import left: a folder whose holder is gone.
+            let dead = tmp.join("dead-1");
+            fs::create_dir(&dead).unwrap();
+            fs::write(dead.join(".lock"), b"").unwrap();
+            fs::write(dead.join("stage"), b"x").unwrap();
+            // Another open, while the server and the importer use the directory:
+            // it removes what the dead process left, and nothing else.
+            Store::open_shared(dir.path()).unwrap();
+            assert!(!dead.exists(), "a dead process's folder is removed");
+            assert!(live_dir.exists(), "a live folder is not swept");
+            assert!(
+                live_file.exists(),
+                "a live process's temp file is not swept"
+            );
+            // The server's own staging folder is held, and still works.
+            let id = server.blobs().put(b"x").unwrap();
+            assert_eq!(server.blobs().verify(id).unwrap(), BlobStatus::Valid);
+            // The importer's folder is held only while it lives. Once it is
+            // gone, the next open removes the folder, with the file in it.
+            drop(importer);
+            // The server store stays alive, so the directory stays in use:
+            // no release to wait for.
+            Store::open_shared(dir.path()).unwrap();
+            assert!(!live_file.exists(), "a dead process's folder is removed");
+        });
     }
 
     #[test]
     fn only_an_open_that_is_alone_upgrades_the_schema() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let c = Connection::open(dir.path().join("scion.db")).unwrap();
-            migrate(&c, 1).unwrap();
-        }
-        let version = |store: &Store| store.read(user_version).unwrap();
-        // Another process of this build uses the directory.
-        let live = hold_lock(dir.path(), FlockOperation::NonBlockingLockShared, &build());
-        for open in [Store::open, Store::open_shared] {
-            match open(dir.path()) {
-                Err(Error::FailedPrecondition(msg)) => {
-                    assert!(msg.contains("version 1 is older"), "{msg}");
-                }
-                other => panic!("expected the open to fail, got {:?}", other.err()),
+        // The drops and reopens of this test must see a lock released, so
+        // no child may be in its fork-to-exec window (see `spawn_guard`).
+        super::spawn_guard::across_release(|| {
+            let dir = tempfile::tempdir().unwrap();
+            {
+                let c = Connection::open(dir.path().join("scion.db")).unwrap();
+                migrate(&c, 1).unwrap();
             }
-        }
-        drop(live);
-        let store = Store::open_shared(dir.path()).unwrap();
-        assert_eq!(version(&store), SCHEMA_VERSION);
-        // A newer schema is refused, alone or not.
-        store
-            .write(|c| Ok(c.pragma_update(None, "user_version", 99)?))
-            .unwrap();
-        drop(store);
-        for open in [Store::open, Store::open_shared] {
-            assert!(matches!(open(dir.path()), Err(Error::Corrupt(_))));
-        }
+            let version = |store: &Store| store.read(user_version).unwrap();
+            // Another process of this build uses the directory.
+            let live = hold_lock(dir.path(), FlockOperation::NonBlockingLockShared, &build());
+            for open in [Store::open, Store::open_shared] {
+                match open(dir.path()) {
+                    Err(Error::FailedPrecondition(msg)) => {
+                        assert!(msg.contains("version 1 is older"), "{msg}");
+                    }
+                    other => panic!("expected the open to fail, got {:?}", other.err()),
+                }
+            }
+            drop(live);
+            super::spawn_guard::wait_for_lock_release(dir.path());
+            let store = Store::open_shared(dir.path()).unwrap();
+            assert_eq!(version(&store), SCHEMA_VERSION);
+            // A newer schema is refused, alone or not.
+            store
+                .write(|c| Ok(c.pragma_update(None, "user_version", 99)?))
+                .unwrap();
+            drop(store);
+            super::spawn_guard::wait_for_lock_release(dir.path());
+            for open in [Store::open, Store::open_shared] {
+                assert!(matches!(open(dir.path()), Err(Error::Corrupt(_))));
+            }
+        });
     }
 
     #[test]
     fn a_process_that_holds_the_directory_alone_keeps_every_store_out() {
-        let dir = tempfile::tempdir().unwrap();
-        let old = hold_lock(dir.path(), FlockOperation::NonBlockingLockExclusive, "");
-        let by = "a process that holds it alone";
-        assert_in_use(Store::open(dir.path()), dir.path(), by);
-        assert_in_use(Store::open_shared(dir.path()), dir.path(), by);
-        drop(old);
-        // A store of this build holds the directory shared once it is open,
-        // so an older build, which takes it alone, is kept out in turn.
-        let store = Store::open(dir.path()).unwrap();
-        let file = lock_file(dir.path(), "lock").unwrap();
-        assert!(!flock(&file, FlockOperation::NonBlockingLockExclusive).unwrap());
-        drop(store);
+        // The drops and reopens of this test must see a lock released, so
+        // no child may be in its fork-to-exec window (see `spawn_guard`).
+        super::spawn_guard::across_release(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let old = hold_lock(dir.path(), FlockOperation::NonBlockingLockExclusive, "");
+            let by = "a process that holds it alone";
+            assert_in_use(Store::open(dir.path()), dir.path(), by);
+            assert_in_use(Store::open_shared(dir.path()), dir.path(), by);
+            drop(old);
+            super::spawn_guard::wait_for_lock_release(dir.path());
+            // A store of this build holds the directory shared once it is open,
+            // so an older build, which takes it alone, is kept out in turn.
+            let store = Store::open(dir.path()).unwrap();
+            let file = lock_file(dir.path(), "lock").unwrap();
+            assert!(!flock(&file, FlockOperation::NonBlockingLockExclusive).unwrap());
+            drop(store);
+            super::spawn_guard::wait_for_lock_release(dir.path());
+        });
     }
 
     #[test]
     fn processes_of_two_builds_never_share_a_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let ours = build();
-        // A build with one more kind.
-        let other = format!("{ours}, blame 1");
-        let refused = |opened: Result<Store>| match opened {
-            Err(Error::FailedPrecondition(msg)) => {
-                assert!(msg.contains("another build"), "{msg}");
-            }
-            other => panic!("expected the open to fail, got {:?}", other.err()),
-        };
-        let server = Store::open(dir.path()).unwrap();
-        refused(Store::open_as(dir.path(), false, &other));
-        Store::open_shared(dir.path()).unwrap();
-        drop(server);
-        // The import of the other build opened alone, so its build counts.
-        let import = Store::open_as(dir.path(), false, &other).unwrap();
-        refused(Store::open(dir.path()));
-        refused(Store::open_shared(dir.path()));
-        drop(import);
-        Store::open(dir.path()).unwrap();
+        // The drops and reopens of this test must see a lock released, so
+        // no child may be in its fork-to-exec window (see `spawn_guard`).
+        super::spawn_guard::across_release(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let ours = build();
+            // A build with one more kind.
+            let other = format!("{ours}, blame 1");
+            let refused = |opened: Result<Store>| match opened {
+                Err(Error::FailedPrecondition(msg)) => {
+                    assert!(msg.contains("another build"), "{msg}");
+                }
+                other => panic!("expected the open to fail, got {:?}", other.err()),
+            };
+            let server = Store::open(dir.path()).unwrap();
+            refused(Store::open_as(dir.path(), false, &other));
+            Store::open_shared(dir.path()).unwrap();
+            drop(server);
+            // The import of the other build opened alone, so its build counts.
+            let import = Store::open_as(dir.path(), false, &other).unwrap();
+            refused(Store::open(dir.path()));
+            refused(Store::open_shared(dir.path()));
+            drop(import);
+            super::spawn_guard::wait_for_lock_release(dir.path());
+            Store::open(dir.path()).unwrap();
+        });
     }
 
     #[test]
     fn an_open_removes_temp_files_before_another_open_ends() {
-        // What a crashed import left: its staging folder with many temp
-        // files, so removing it takes a while.
-        const LEFT: usize = 5_000;
-        let dir = tempfile::tempdir().unwrap();
-        let tmp = dir.path().join("tmp");
-        let dead = tmp.join("dead");
-        fs::create_dir_all(&dead).unwrap();
-        fs::write(dead.join(".lock"), b"").unwrap();
-        for i in 0..LEFT {
-            fs::write(dead.join(format!("left{i}")), b"").unwrap();
-        }
-        // The sweep removes the dead folder's files in the order that the
-        // folder lists them.
-        let listed_first = fs::read_dir(&dead).unwrap().next().unwrap().unwrap().path();
-        let path = dir.path().to_owned();
-        let first = thread::spawn(move || Store::open(&path));
-        while listed_first.exists() && !first.is_finished() {
-            thread::yield_now();
-        }
-        // The first open is removing the dead folder. A second open waits
-        // for it, so the folder that it writes next is safe from that sweep:
-        // the dead folder is gone, and the two live ones stay.
-        let second = Store::open_shared(dir.path()).unwrap();
-        assert_eq!(fs::read_dir(&tmp).unwrap().count(), 2);
-        drop((first.join().unwrap().unwrap(), second));
+        // The drops and reopens of this test must see a lock released, so
+        // no child may be in its fork-to-exec window (see `spawn_guard`).
+        super::spawn_guard::across_release(|| {
+            // What a crashed import left: its staging folder with many temp
+            // files, so removing it takes a while.
+            const LEFT: usize = 5_000;
+            let dir = tempfile::tempdir().unwrap();
+            let tmp = dir.path().join("tmp");
+            let dead = tmp.join("dead");
+            fs::create_dir_all(&dead).unwrap();
+            fs::write(dead.join(".lock"), b"").unwrap();
+            for i in 0..LEFT {
+                fs::write(dead.join(format!("left{i}")), b"").unwrap();
+            }
+            // The sweep removes the dead folder's files in the order that the
+            // folder lists them.
+            let listed_first = fs::read_dir(&dead).unwrap().next().unwrap().unwrap().path();
+            let path = dir.path().to_owned();
+            let first = thread::spawn(move || Store::open(&path));
+            while listed_first.exists() && !first.is_finished() {
+                thread::yield_now();
+            }
+            // The first open is removing the dead folder. A second open waits
+            // for it, so the folder that it writes next is safe from that sweep:
+            // the dead folder is gone, and the two live ones stay.
+            let second = Store::open_shared(dir.path()).unwrap();
+            assert_eq!(fs::read_dir(&tmp).unwrap().count(), 2);
+            drop((first.join().unwrap().unwrap(), second));
+        });
     }
 
     #[test]
     fn opens_take_turns() {
-        let dir = tempfile::tempdir().unwrap();
-        // Another store is opening the directory.
-        let opening = lock_file(dir.path(), "open.lock").unwrap();
-        assert!(flock(&opening, FlockOperation::NonBlockingLockExclusive).unwrap());
-        let path = dir.path().to_owned();
-        let open = thread::spawn(move || Store::open_shared(&path).map(drop));
-        thread::sleep(Duration::from_millis(200));
-        assert!(!open.is_finished(), "an open waits for the one in progress");
-        drop(opening);
-        open.join().unwrap().unwrap();
+        // The drops and reopens of this test must see a lock released, so
+        // no child may be in its fork-to-exec window (see `spawn_guard`).
+        super::spawn_guard::across_release(|| {
+            let dir = tempfile::tempdir().unwrap();
+            // Another store is opening the directory.
+            let opening = lock_file(dir.path(), "open.lock").unwrap();
+            assert!(flock(&opening, FlockOperation::NonBlockingLockExclusive).unwrap());
+            let path = dir.path().to_owned();
+            let open = thread::spawn(move || Store::open_shared(&path).map(drop));
+            thread::sleep(Duration::from_millis(200));
+            assert!(!open.is_finished(), "an open waits for the one in progress");
+            drop(opening);
+            open.join().unwrap().unwrap();
+        });
     }
 
     #[test]
@@ -1923,8 +2138,8 @@ mod tests {
         store.blobs().full_flushes() - before
     }
 
-    fn create_repo(c: &Connection) -> Result<()> {
-        crate::db::create_repo(c, "main").map(drop)
+    fn create_repo(c: &mut SqliteTx<'_>) -> Result<()> {
+        c.create_repo("main").map(drop)
     }
 
     #[test]
@@ -1953,12 +2168,12 @@ mod tests {
         assert_eq!(flushes_in_read(&store), 0);
     }
 
-    fn repos(c: &Connection) -> Result<i64> {
+    fn repos(c: &mut SqliteTx<'_>) -> Result<i64> {
         Ok(c.query_row("SELECT count(*) FROM repos", [], |row| row.get(0))?)
     }
 
-    fn add_repo(name: &str) -> impl Fn(&Connection) -> Result<()> {
-        move |c| crate::db::create_repo(c, name).map(drop)
+    fn add_repo(name: &'static str) -> impl Fn(&mut SqliteTx<'_>) -> Result<()> {
+        move |c| c.create_repo(name).map(drop)
     }
 
     #[test]

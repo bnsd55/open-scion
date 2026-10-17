@@ -203,10 +203,14 @@ impl Access {
     ///
     /// [`Error::NotFound`].
     pub fn check_read(&self, caller: &Caller, repo: &str) -> Result<()> {
-        match self.rights(caller, repo) {
-            Some(_) => Ok(()),
-            None => Err(db::no_repo(repo)),
+        tracing::Span::current().record("repo", repo);
+        if self.rights(caller, repo).is_some() {
+            return Ok(());
         }
+        // The reply says that the repo does not exist; the log says why.
+        // One line for the refusal.
+        tracing::warn!(principal = %caller.0, "may not read the repo");
+        Err(db::no_repo(repo))
     }
 
     /// Fails unless `caller` may change every path of `paths` in `repo`.
@@ -222,17 +226,24 @@ impl Access {
         repo: &str,
         paths: impl IntoIterator<Item = &'p RepoPath>,
     ) -> Result<()> {
+        tracing::Span::current().record("repo", repo);
         let grant = match self.rights(caller, repo) {
-            None => return Err(db::no_repo(repo)),
+            None => {
+                tracing::warn!(principal = %caller.0, "may not read the repo");
+                return Err(db::no_repo(repo));
+            }
             Some(Rights::Everything) => return Ok(()),
             Some(Rights::Grant(grant)) => grant,
         };
         match paths.into_iter().find(|path| !grant.may_write(path)) {
             None => Ok(()),
-            Some(path) => Err(Error::PermissionDenied(format!(
-                "principal {:?} may not write {path:?} in repo {repo:?}",
-                caller.0
-            ))),
+            Some(path) => {
+                tracing::warn!(principal = %caller.0, path = ?path, "may not write the path");
+                Err(Error::PermissionDenied(format!(
+                    "principal {:?} may not write {path:?} in repo {repo:?}",
+                    caller.0
+                )))
+            }
         }
     }
 

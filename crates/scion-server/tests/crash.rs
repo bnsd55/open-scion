@@ -15,6 +15,8 @@
 //! kills (default 6).
 #![cfg(unix)]
 
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
@@ -37,8 +39,9 @@ use scion_proto::v1::{
     ObjectRef, PutBlobRequest, ResolveRefRequest,
 };
 use scion_proto::{CHUNK_BYTES, MAX_OBJECT_REFS};
+use scion_server::meta::MetaTx as _;
 use scion_server::store::BlobStatus;
-use scion_server::{Store, db, tree};
+use scion_server::{Store, tree};
 use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -126,17 +129,23 @@ impl Server {
             .append(true)
             .open(log)
             .unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_scion-server"))
-            .arg("--data")
-            .arg(data)
-            .args(["serve", "--token", TOKEN, "--listen", "127.0.0.1:0"])
-            // Plain log lines, so the address parses without escape codes.
-            .env("NO_COLOR", "1")
-            .env("RUST_LOG", "info")
-            .stdout(log_file.try_clone().unwrap())
-            .stderr(log_file)
-            .spawn()
-            .unwrap();
+        // The child shares a flock until it execs (see `common::spawn_guard`):
+        // the read side keeps this spawn out of a lock-release window of
+        // another test.
+        let child = common::spawn_guard::across_spawn(|| {
+            Command::new(env!("CARGO_BIN_EXE_scion-server"))
+                .arg("--data")
+                .arg(data)
+                .args(["serve", "--token", TOKEN, "--listen", "127.0.0.1:0"])
+                // Plain log lines, so the address parses without escape
+                // codes.
+                .env("NO_COLOR", "1")
+                .env("RUST_LOG", "info")
+                .stdout(log_file.try_clone().unwrap())
+                .stderr(log_file)
+                .spawn()
+        })
+        .unwrap();
         Self {
             child,
             addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
@@ -258,10 +267,10 @@ fn create_repo(data: &Path) {
     };
     store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
+            let repo = c.create_repo(REPO)?;
             let (id, _) = tree::store_changeset(c, repo, &root)?;
             for name in REFS {
-                assert!(db::cas_ref(c, repo, name, None, id)?);
+                assert!(c.cas_ref(repo, name, None, id)?);
             }
             Ok(())
         })

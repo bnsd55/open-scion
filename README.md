@@ -170,6 +170,27 @@ the principal's write prefixes answers `PERMISSION_DENIED` and names the
 path. A land is checked for the principal that lands it, even when another
 principal made the changeset.
 
+### Quotas
+
+With `--access`, three caps bound what one principal holds at once, and a
+call over a cap fails before any work with `RESOURCE_EXHAUSTED`, naming the
+flag of the cap it hit:
+
+| Flag | Default with `--access` | Bounds |
+|---|---|---|
+| `--max-principal-requests` | 64 | Calls in flight, until each reply starts |
+| `--max-principal-upload-bytes` | 536870912 (512 MiB) | Upload message bytes in flight |
+| `--max-principal-pending-lands` | 64 | Lands in the `PENDING` state |
+
+The pending-lands count comes from the store, so it is right after a
+restart. A land that stays `PENDING` for longer than `--land-stale-secs`
+(a day) is rejected by a sweep that runs at start and then once per hour:
+no caller can still be finishing it, because a call runs at most 600 s. A
+retry of a rejected land needs a new request key.
+
+With `--token T`, every client is the same principal, so a per-principal
+quota would be a global one: the three caps are off unless a flag sets one.
+
 Checkouts can go through the cache tiers: a `scion-daemon` per machine, on a
 Unix socket, in front of a regional `scion-cache`, in front of the server.
 Each tier keeps what it fetched, so a second checkout on the machine sends

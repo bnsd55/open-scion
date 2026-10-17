@@ -230,6 +230,37 @@ const TIMERS: Timers = Timers {
     grace: CONNECTION_GRACE,
 };
 
+/// The gRPC health service (`grpc.health.v1`), on the same port as the
+/// other services and without a token, so a probe needs none. It is
+/// `SERVING` for the whole server (the empty name) and for every name in
+/// `services`; when shutdown starts, every one of these names flips to
+/// `NOT_SERVING`, before the drain, while the server still answers.
+///
+/// Returns the service to add to the router, and the wrapped shutdown.
+pub async fn health(
+    services: &[&'static str],
+    shutdown: impl Future<Output = ()>,
+) -> (
+    tonic_health::pb::health_server::HealthServer<impl tonic_health::pb::health_server::Health>,
+    impl Future<Output = ()>,
+) {
+    let (reporter, service) = tonic_health::server::health_reporter();
+    for name in std::iter::once("").chain(services.iter().copied()) {
+        reporter
+            .set_service_status(name, tonic_health::ServingStatus::Serving)
+            .await;
+    }
+    let shutdown = async move {
+        shutdown.await;
+        for name in std::iter::once("").chain(services.iter().copied()) {
+            reporter
+                .set_service_status(name, tonic_health::ServingStatus::NotServing)
+                .await;
+        }
+    };
+    (service, shutdown)
+}
+
 impl Limits {
     /// Serves the services that `router` adds to a server, on `incoming`
     /// connections, within these limits and with the timers above, until
@@ -266,7 +297,26 @@ impl Limits {
         I: Stream<Item = io::Result<IO>> + Send + 'static,
         IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
     {
+        // One span per call: the RPC and the peer at the start, and the
+        // principal and the repo once the call knows them. `error_span`, so
+        // the span is open under any filter, and a `WARN` line under a
+        // `warn` filter still shows its fields.
         let server = Server::builder()
+            .trace_fn(|request| {
+                let peer = request
+                    .extensions()
+                    .get::<tonic::transport::server::TcpConnectInfo>()
+                    .and_then(tonic::transport::server::TcpConnectInfo::remote_addr)
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_default();
+                tracing::error_span!(
+                    "call",
+                    rpc = %request.uri().path(),
+                    peer,
+                    principal = tracing::field::Empty,
+                    repo = tracing::field::Empty,
+                )
+            })
             .max_concurrent_streams(self.streams.get())
             .http2_keepalive_interval(Some(timers.keepalive))
             .http2_keepalive_timeout(Some(timers.keepalive_timeout))

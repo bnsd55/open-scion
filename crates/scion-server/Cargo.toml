@@ -33,12 +33,15 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
+tonic-health.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+tempfile.workspace = true
+tonic-health.workspace = true
 # A test runs code while a commit is visible and its COMMIT still runs.
 rusqlite = { workspace = true, features = ["hooks"] }
 # Tests of the reply timeouts run on a paused clock.
