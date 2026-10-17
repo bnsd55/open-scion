@@ -107,6 +107,23 @@ jobs:
           SCION_LAZYFS: ${{ runner.temp }}/lazyfs
         run: cargo test -p open-scion-server --test power
 
+  publish-check:
+    name: publish check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+      # One invocation, in dependency order: cargo resolves a packaged
+      # crate's path dependencies from the siblings of the same run, so a
+      # split run fails on the first unpublished dependency. The verify
+      # build is the point: a build.rs input or an include! path that does
+      # not ship only fails here.
+      - run: cargo package -p open-scion-core -p open-scion-proto -p open-scion-server -p open-scion-tier -p open-scion
+
   msrv:
     name: check (MSRV)
     runs-on: ubuntu-latest
