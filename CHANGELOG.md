@@ -65,10 +65,24 @@ until that section gets its release date.
   `GetObjects` to `--objects` (a `scion-cache` or `scion-daemon`) with the
   checkout's ticket and each ref's path. Without `--objects`, object reads
   go to `--server`. On `ticket expired`, `scn` mints a fresh ticket for the
-  same changeset, once per call, and goes on.
+  same changeset, once per call, and goes on. A `scn mount` sends its
+  ticket with every read, and refreshes it through `GetRootTree` of the
+  mounted changeset — never of the ref, which may have moved — before it
+  expires, and again on `ticket expired`.
 
 #### The server
 
+- Prometheus metrics on `scion-server --metrics-listen ADDR` (default off)
+  and `scion-cache --metrics-listen ADDR`: request counts by RPC and code,
+  a latency histogram with factor-4 buckets (1, 4, 16, 64, 256 ms, 1, 4,
+  16, 64 s), reply bytes by RPC, lands by outcome, and the tier's cache
+  hits and misses. The registry, the counting layer and the HTTP export
+  live in `scion-proto`, shared by the server and the tier. The listener
+  is plain HTTP on a loopback address unless `--insecure-listen` allows
+  more; it serves one connection at a time with a 5 s header read timeout,
+  and ends on the process's shutdown signal (Ctrl+C or SIGTERM). The
+  registry is atomics, so a request never takes a lock or allocates
+  (#144).
 - `scion-server`: SQLite metadata and trees, a blob folder with batched,
   verified durability, and one write path for changesets and their root
   trees. Group commit: concurrent blob syncs and database commits share one
@@ -77,6 +91,14 @@ until that section gets its release date.
   directory: it is read-only, it can run while the server runs, and one
   line per problem names the kind, the ID and the path; it exits 0 when it
   saw no damage, 1 when it did, and 2 when it could not run.
+- `scion-server gc <data>` collects the blobs that nothing names: a
+  `repo_blobs` row whose blob no stored changeset of its repo puts, and a
+  blob file that no repo's row names, each older than a grace period
+  (`--grace-secs`, seven days; `--dry-run` reports and removes nothing).
+  Rows go before files, so a crash leaves orphan files only, which the
+  next run removes. It runs beside a live server: a changeset that commits
+  while it works pins its blobs, and `PutBlob` of a stored blob touches the
+  file, so the grace counts from the last upload.
 - Server-side commits (`CreateChangeset`) and lands: path-level conflict
   checks through a per-ref index, one transaction per land, retries by
   request key, and a bounded retry when the ref moves. A land stops in its
@@ -138,7 +160,10 @@ until that section gets its release date.
   An older server ignores the new `path` field, so `scn log --path`
   against it prints unfiltered history.
 - `Blame`, a new RPC: which changeset last changed each line of a file, on
-  first-parent history. It follows renames as `git blame` does by
+  first-parent history. It walks versions through the path history, so it
+  reads one changeset and a few node rows per version, however many
+  changesets lie between two versions, and holds those node bytes of the
+  blame memory share. It follows renames as `git blame` does by
   default: a deleted file with the same content, else a similar one (50%
   or more). Each changeset in a reply names the path of the file there
   (`BlameChangeset.path`). `scn blame` shows each line's path when some
@@ -300,10 +325,26 @@ until that section gets its release date.
 #### scn
 
 - `scn`, the command-line client: `cat`, `ls`, `log`, `show`, `commit`,
+- `scn`, the command-line client: `cat`, `ls`, `log`, `show`, `commit`,
   `land` and `bench`, with `--json` output. `scn merge-base`, `scn
   is-ancestor` (exit 0 or 1) and `scn diff` for the query API, and
   `scn blame`. Every `scn` error exits 2, so it never reads as the "no" of
   `scn is-ancestor`.
+- `scn mount` and `scn unmount` (`#11`): a virtual checkout. `scn mount
+  DIR [REV]` serves one ref as an NFSv3 filesystem from `scn` itself, on a
+  free port of 127.0.0.1, so a directory's tree loads when it is first
+  listed or looked up in, and a file's blob when it is first read or
+  sized. Until `#13` PR-C adds `GetSizes`, a file's size comes from its
+  blob, so a first stat of an unread file fetches the blob. Writes land in
+  a private overlay directory (mode 0700 under the system's temporary
+  directory), and `scn commit --from-mount DIR` commits exactly what the
+  overlay holds, with no scan of the tree. `scn unmount DIR` stops the
+  mount and removes the overlay. For single-user machines only: the NFS
+  server sees neither the caller's user ID nor its source port, and the
+  mount path with its random secret is in the mount table that every
+  local user can read, so any local user who can read the mount table can
+  reach the mounted content, and root always can. The secret stops stray
+  and accidental callers only; it is not a protection.
 - `scn checkout`, into a new directory or an existing empty one. An
   existing directory is kept, with its mode and owner, and its parent need
   not be writable. It must not be writable by all users unless it has the

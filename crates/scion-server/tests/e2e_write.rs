@@ -8,6 +8,9 @@ use scion_proto::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ReadFileRequest};
 use scion_server::meta::MetaTx as _;
+use scion_server::metrics::Metrics;
+use std::sync::Arc;
+
 use scion_server::{Store, service};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
@@ -95,6 +98,7 @@ async fn uploaded_file_reads_back_through_a_created_changeset() {
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
+            metrics: Arc::new(Metrics::default()),
         },
         None,
         async {

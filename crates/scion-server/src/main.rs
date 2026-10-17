@@ -6,6 +6,7 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -16,9 +17,10 @@ use scion_server::graph::CommitGraph;
 use scion_server::history::PathHistory;
 use scion_server::import::{ImportOptions, import_git};
 use scion_server::meta::MetaTx as _;
+use scion_server::metrics::{self, Metrics};
 use scion_server::quotas::Quotas;
 use scion_server::tree::RootTree;
-use scion_server::{Error, Store, fsck, read, service};
+use scion_server::{Error, Store, fsck, gc, read, service};
 use tracing_subscriber::EnvFilter;
 
 /// The scion server: import, serve and derive.
@@ -33,6 +35,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // SHORTCUT: `Serve` holds its flags by value, 309 bytes against `Import`'s 109: 20 bytes over the lint. Box the TLS paths if a variant grows further.
 enum Command {
     /// Serve the gRPC API.
     Serve {
@@ -104,6 +107,11 @@ enum Command {
         /// connection over it is closed with them.
         #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
         max_stalled_bytes: NonZeroU64,
+        /// Serve Prometheus metrics over plain HTTP on this address. Off by
+        /// default. Follows the listen rule: a non-loopback address needs
+        /// `--insecure-listen`, because the metrics travel unencrypted.
+        #[arg(long, value_name = "ADDR")]
+        metrics_listen: Option<SocketAddr>,
     },
     /// Print the BLAKE3 digest of a token, as a `token` line of an access
     /// file wants it. The file holds digests, never tokens.
@@ -145,6 +153,20 @@ enum Command {
     /// One line per problem: kind, ID, path. Exit 0 when it saw no damage,
     /// 1 when it did, 2 when it could not run.
     Fsck,
+    /// Collect the blob files and the rows that nothing names any more: a
+    /// row whose blob no stored changeset of its repo puts, and a file that
+    /// no repo's row names, both older than the grace period. Safe beside a
+    /// live server; safe to repeat. Rows go before files, so a crash leaves
+    /// orphan files only, which the next run removes.
+    Gc {
+        /// How old a blob file must be before the collector may remove it:
+        /// an upload that a client is about to name is younger than this.
+        #[arg(long, default_value_t = gc::DEFAULT_GRACE_SECS)]
+        grace_secs: u64,
+        /// Report what a real run would collect, and remove nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Derive one kind of derived data for the history of a ref, in bounded
     /// steps, and remove the rows of its older versions. Safe to repeat.
     Derive {
@@ -203,6 +225,25 @@ fn fsck_command(store: &Store) -> anyhow::Result<()> {
     std::process::exit(1);
 }
 
+/// Runs `gc` against `store` and prints what it collected. Exits 2 when it
+/// could not run.
+fn gc_command(store: &Store, grace: Duration, dry_run: bool) {
+    let report = match gc::run(store, grace, dry_run, &mut |_| {}) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("scion-server gc: {e}");
+            std::process::exit(2);
+        }
+    };
+    println!(
+        "gc: {} repos, {} rows pruned, {} files removed{}",
+        report.repos,
+        report.rows_pruned,
+        report.files_removed,
+        if dry_run { " (dry run)" } else { "" },
+    );
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
@@ -215,7 +256,7 @@ async fn main() -> anyhow::Result<()> {
     // kind, which a running server of an older build may read, so it opens as
     // the server.
     let open = match cli.command {
-        Command::Import { .. } | Command::Fsck => Store::open_shared,
+        Command::Import { .. } | Command::Fsck | Command::Gc { .. } => Store::open_shared,
         Command::Serve { .. } | Command::Derive { .. } => Store::open,
         Command::HashToken { .. } => return hash_token(),
         Command::TicketKey { .. } => return write_ticket_key(),
@@ -238,6 +279,7 @@ async fn main() -> anyhow::Result<()> {
             max_connections,
             max_streams,
             max_stalled_bytes,
+            metrics_listen,
             ticket_key,
             ticket_key_old,
         } => {
@@ -270,6 +312,7 @@ async fn main() -> anyhow::Result<()> {
                     max_connections,
                     max_streams,
                     max_stalled_bytes,
+                    metrics_listen,
                 },
                 tickets,
             )
@@ -279,6 +322,10 @@ async fn main() -> anyhow::Result<()> {
             unreachable!("handled before the store opens")
         }
         Command::Fsck => return fsck_command(&store),
+        Command::Gc {
+            grace_secs,
+            dry_run,
+        } => gc_command(&store, Duration::from_secs(grace_secs), dry_run),
         Command::Import {
             repo,
             rev,
@@ -389,6 +436,7 @@ struct ServeConfig {
     max_connections: NonZeroUsize,
     max_streams: NonZeroU32,
     max_stalled_bytes: NonZeroU64,
+    metrics_listen: Option<SocketAddr>,
 }
 
 /// Serves the gRPC API on `listen`, with the TLS files of the flags, until
@@ -407,6 +455,35 @@ async fn serve(
          token would travel unencrypted. Pass --tls-cert and --tls-key, or \
          --insecure-listen to allow it."
     );
+    // The registry always counts; only its plain-HTTP export is optional.
+    // The metrics listener has no token, so unlike the gRPC listener, TLS
+    // does not excuse a non-loopback address: `--insecure-listen` must allow
+    // it.
+    let metrics = Arc::new(Metrics::default());
+    // One signal task ends the gRPC listener and the metrics export alike.
+    let (end_tx, end_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(async move {
+        scion_proto::metrics::shutdown_signal().await;
+        let _ = end_tx.send(());
+    });
+    if let Some(metrics_listen) = config.metrics_listen {
+        let address = metrics_listen.to_string();
+        let checked = metrics::loopback_or_allow(metrics_listen, config.insecure_listen);
+        anyhow::ensure!(checked.is_ok(), "{}", checked.unwrap_err());
+        let metrics_listener = tokio::net::TcpListener::bind(metrics_listen)
+            .await
+            .with_context(|| format!("cannot listen on {address}"))?;
+        let metrics_addr = metrics_listener.local_addr()?;
+        tracing::info!(listen = %metrics_addr, "serving metrics");
+        let mut stopped = end_rx.clone();
+        tokio::spawn(metrics::serve(
+            metrics_listener,
+            metrics.clone(),
+            async move {
+                let _ = stopped.changed().await;
+            },
+        ));
+    }
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("cannot listen on {listen}"))?;
@@ -428,10 +505,12 @@ async fn serve(
             pending_lands: config.pending_lands,
             land_stale_secs: config.land_stale_secs,
             tls: config.server_tls,
+            metrics,
         },
         tickets,
-        async {
-            tokio::signal::ctrl_c().await.ok();
+        async move {
+            let mut end_rx = end_rx;
+            let _ = end_rx.changed().await;
         },
     ))
     .await?;

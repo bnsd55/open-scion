@@ -12,8 +12,11 @@ use scion_proto::v1::{
     LogRequest, MergeBaseRequest, ObjectKind, ObjectRef, PutBlobRequest, ReadFileRequest,
     ResolveRefRequest,
 };
+use std::sync::Arc;
+
 use scion_server::access::Access;
 use scion_server::meta::MetaTx as _;
+use scion_server::metrics::Metrics;
 use scion_server::{Store, service};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
@@ -139,6 +142,7 @@ async fn server(store: &Store, access: Access, token: &str) -> (Stop, Scion, Obj
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
+            metrics: Arc::new(Metrics::default()),
         },
         None,
         async {

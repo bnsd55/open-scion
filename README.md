@@ -115,16 +115,20 @@ benchmark against git are in [docs/benchmarks.md](docs/benchmarks.md).
 cargo build --release
 export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
 ./target/release/scion-server --data /tmp/scion import /path/to/a/git/repo
-./target/release/scion-server --data /tmp/scion ticket-key --out /tmp/scion/ticket.key
-# prints the public key; pass it to the tiers below
+./target/release/scion-server --data /tmp/scion ticket-key --out /tmp/scion/ticket.key > /tmp/scion/ticket.pub
+# the public key is now in ticket.pub; pass it to the tiers below
 ./target/release/scion-server --data /tmp/scion serve --ticket-key /tmp/scion/ticket.key &
 ./target/release/scion-server --data /tmp/scion fsck              # check the data directory; safe while the server runs
+./target/release/scion-server --data /tmp/scion gc --dry-run      # what a collection would remove; safe while the server runs
 
 ./target/release/scn log -n 5
 ./target/release/scn log --path src -n 5          # changesets that changed src/
 ./target/release/scn blame main:README.md         # last changeset of each line
 ./target/release/scn cat main:README.md
 ./target/release/scn checkout main --into /tmp/work   # --sparse DIR for part of it
+./target/release/scn mount /tmp/view main             # files load when first read
+./target/release/scn commit -m "from the mount" --from-mount /tmp/view
+./target/release/scn unmount /tmp/view
 echo hello > hello.txt
 cs=$(./target/release/scn commit -m "add hello" --put hello.txt=hello.txt)
 ./target/release/scn diff main "$cs"              # A hello.txt, as git diff --name-status
@@ -137,6 +141,40 @@ cs=$(./target/release/scn commit -m "add hello" --put hello.txt=hello.txt)
 Every `scn` command takes `--json` for machine-readable output. A `scn`
 error exits 2. A checkout that a signal stops removes what it wrote, and
 then dies by the signal (a shell reports 130 for Ctrl-C).
+
+`scn mount` serves a ref over NFSv3 from `scn` itself, so a file loads when
+it is first read, not when the checkout starts. Writes land in a private
+overlay directory, and `scn commit --from-mount DIR` commits exactly what
+the mount holds. It is for single-user machines only: any local user who
+can read the mount table can reach the mounted content through the NFS
+port. `scn unmount DIR` stops it and removes the overlay.
+
+### Health and metrics
+
+The server, a cache and a daemon serve the standard gRPC health service
+(`grpc.health.v1.Check` and `Watch`) on their main port, without a token:
+a probe carries none, so a load balancer or `grpcurl` can check them.
+
+The server and a cache can also export Prometheus metrics: start them with
+`--metrics-listen 127.0.0.1:9090` (off by default) and scrape
+`GET /metrics`. The listener is plain HTTP with no token, so it is refused
+on a non-loopback address unless `--insecure-listen` is given. The
+registry counts requests by RPC and code, a latency histogram, reply
+bytes, lands by outcome, and a tier's cache hits and misses; the details
+are in [docs/architecture.md](docs/architecture.md), section 11.
+
+### Garbage collection
+
+```sh
+./target/release/scion-server --data /tmp/scion gc --dry-run   # report only
+./target/release/scion-server --data /tmp/scion gc             # collect, safe beside a live server
+```
+
+`gc` removes the blob files and rows that nothing names any more: a row
+whose blob no stored changeset of its repo puts, and a file that no repo's
+row names, both older than the grace period (`--grace-secs`, a week).
+Rows go before files, so a crash leaves orphan files only, which the next
+run removes. It is safe beside a live server and safe to repeat.
 
 ### Access file
 
