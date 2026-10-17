@@ -118,7 +118,7 @@ impl Lazyfs {
                  [filesystem]\nlog_all_operations=true\nlogfile=\"{}\"\n",
                 fifo.display(),
                 completed_path.display(),
-                trace,
+                trace.display(),
             ),
         )
         .unwrap();
