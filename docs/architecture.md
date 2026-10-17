@@ -149,6 +149,19 @@ One data directory holds everything (`store.rs`):
 <data>/tmp/                    staging for atomic blob writes and uploads
 ```
 
+**Checking a data directory.** `scion-server fsck <data>` reports the
+damage it finds, and changes nothing: it reads, and leaves every repair
+to you. It checks every blob file against its ID, every blob that a row
+names, every changeset, tree and history node against its ID, every ref
+and derived row against the changesets it names, and every derived
+value with its kind's decoder. It reads in short batches, so it can run
+while the server runs; each check looks at the state at the moment it
+looks, so a clean report means "no damage seen", not a snapshot. One
+line per problem: kind, ID, path. Exit 0 when it saw no damage, 1 when
+it did, 2 when it could not run. Rows of a derived version this build
+does not know are reported as `derived-old`, and are not damage: the
+steps of the kind remove them (section 4).
+
 **SQLite tables** ([`migrations/`](../crates/scion-server/migrations)):
 
 | Table | Holds |

@@ -118,6 +118,7 @@ export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
 ./target/release/scion-server --data /tmp/scion ticket-key --out /tmp/scion/ticket.key
 # prints the public key; pass it to the tiers below
 ./target/release/scion-server --data /tmp/scion serve --ticket-key /tmp/scion/ticket.key &
+./target/release/scion-server --data /tmp/scion fsck              # check the data directory; safe while the server runs
 
 ./target/release/scn log -n 5
 ./target/release/scn log --path src -n 5          # changesets that changed src/

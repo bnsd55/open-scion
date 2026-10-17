@@ -94,11 +94,31 @@ thread_local! {
 pub struct NodeId(pub(crate) [u8; 32]);
 
 impl NodeId {
+    /// The ID of `body`: the hash of its bytes.
     pub(crate) fn of(body: &[u8]) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(DOMAIN);
         hasher.update(body);
         Self(*hasher.finalize().as_bytes())
+    }
+}
+
+impl NodeId {
+    /// The bytes of the ID.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Whether `body` decodes as a history node.
+pub(crate) fn node_decodes(body: &[u8]) -> bool {
+    let Some((kind, payload)) = body.split_first() else {
+        return false;
+    };
+    match *kind {
+        LEAF => decode_node(payload).is_some(),
+        INDEX => decode_index(payload).is_some(),
+        _ => false,
     }
 }
 

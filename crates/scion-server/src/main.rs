@@ -18,7 +18,7 @@ use scion_server::import::{ImportOptions, import_git};
 use scion_server::meta::MetaTx as _;
 use scion_server::quotas::Quotas;
 use scion_server::tree::RootTree;
-use scion_server::{Error, Store, read, service};
+use scion_server::{Error, Store, fsck, read, service};
 use tracing_subscriber::EnvFilter;
 
 /// The scion server: import, serve and derive.
@@ -138,6 +138,13 @@ enum Command {
         /// Path to the git repository.
         git_dir: PathBuf,
     },
+    /// Check a data directory and report the damage it finds. Read-only: it
+    /// changes nothing, and it can run while the server runs. It reads in
+    /// short batches, and each check looks at the state at the moment it
+    /// looks, so a clean report means "no damage seen", not a snapshot.
+    /// One line per problem: kind, ID, path. Exit 0 when it saw no damage,
+    /// 1 when it did, 2 when it could not run.
+    Fsck,
     /// Derive one kind of derived data for the history of a ref, in bounded
     /// steps, and remove the rows of its older versions. Safe to repeat.
     Derive {
@@ -169,6 +176,33 @@ enum KindName {
     PathHistory,
 }
 
+/// Runs `fsck` against `store`, prints one line per problem, and exits:
+/// 0 when it saw no damage, 1 when it did, 2 when it could not run.
+fn fsck_command(store: &Store) -> anyhow::Result<()> {
+    let report = match fsck::run(store, fsck::BATCH, &mut |_| {}) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("scion-server fsck: {e}");
+            std::process::exit(2);
+        }
+    };
+    for problem in &report.problems {
+        println!("{problem}");
+    }
+    for (kind, version) in &report.old {
+        println!("derived-old {kind} v{version}");
+    }
+    println!(
+        "fsck: {} problems, {} derived rows of unknown versions",
+        report.problems.len(),
+        report.old.len()
+    );
+    if report.is_clean() {
+        std::process::exit(0);
+    }
+    std::process::exit(1);
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
@@ -181,7 +215,7 @@ async fn main() -> anyhow::Result<()> {
     // kind, which a running server of an older build may read, so it opens as
     // the server.
     let open = match cli.command {
-        Command::Import { .. } => Store::open_shared,
+        Command::Import { .. } | Command::Fsck => Store::open_shared,
         Command::Serve { .. } | Command::Derive { .. } => Store::open,
         Command::HashToken { .. } => return hash_token(),
         Command::TicketKey { .. } => return write_ticket_key(),
@@ -244,6 +278,7 @@ async fn main() -> anyhow::Result<()> {
         Command::HashToken { .. } | Command::TicketKey { .. } => {
             unreachable!("handled before the store opens")
         }
+        Command::Fsck => return fsck_command(&store),
         Command::Import {
             repo,
             rev,
