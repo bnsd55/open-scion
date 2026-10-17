@@ -2,10 +2,12 @@
 //! (`SQLite` and the object folder are synchronous), and maps errors to status
 //! codes.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use prost::Message as _;
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, RepoPath};
 use scion_proto::listen::{self, Limits};
 use scion_proto::tls::ServerTls;
@@ -311,9 +313,9 @@ impl ScionService {
 ///
 /// SHORTCUT: a unary reply's bytes stay in HTTP/2 uncounted until the
 /// client reads them or the connection closes; the encode limit bounds the
-/// encoded bytes of one at the message limit. Upgrade: stream Blame
-/// ([#175](https://github.com/bnsd55/open-scion/issues/175)), the one unary
-/// reply that legitimately grows toward it.
+/// encoded bytes of one at the message limit. Every reply that can grow
+/// with its input streams; a new unary RPC must stream, or bound its
+/// reply, before it ships.
 pub fn into_server<S: Scion + Send + 'static>(service: S) -> ScionServer<S> {
     ScionServer::new(service)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
@@ -465,6 +467,8 @@ type GetChangesetStream = ReceiverStream<Part<GetChangesetResponse>>;
 type ListDirStream = ReceiverStream<Part<ListDirResponse>>;
 
 type LogStream = ReceiverStream<Part<LogResponse>>;
+
+type BlameStream = ReceiverStream<Part<BlameResponse>>;
 
 /// The share of `READ_BUDGET_BYTES` that a `ReadFile` reply of a `size`-byte
 /// file holds. A file of one part is read in one job, so the reply holds only
@@ -677,6 +681,87 @@ async fn reserve<'a, T>(
             Taken::Stalled
         }
     }
+}
+
+/// What a streamed `Blame` reply sends: the ranges of the walk and the
+/// changesets they name, where the walk continues, and the state the reply
+/// holds until its client takes it.
+struct BlameSend {
+    ranges: Vec<BlameRange>,
+    changesets: Vec<BlameChangeset>,
+    cursor: Vec<u8>,
+    /// The request slot, held until the reply ends.
+    _call: Call,
+    stalled: Option<scion_proto::listen::Stalled>,
+}
+
+/// Splits a computed blame into parts: groups of ranges whose encoded
+/// bytes, with the changesets they name that no earlier part carried, stay
+/// within [`CHUNK_BYTES`]. The last part carries where the walk continues.
+fn blame_page_parts(send: &mut BlameSend) -> Vec<BlameResponse> {
+    // Where each named changeset sits, so a range names its changeset's
+    // part: the first part that names it carries it.
+    let mut at: HashMap<Vec<u8>, usize> = HashMap::with_capacity(send.changesets.len());
+    for (i, changeset) in send.changesets.iter().enumerate() {
+        at.insert(changeset.changeset_id.clone(), i);
+    }
+    let mut carried = vec![false; send.changesets.len()];
+    let mut parts = Vec::new();
+    let mut ranges: Vec<BlameRange> = Vec::new();
+    let mut changesets: Vec<BlameChangeset> = Vec::new();
+    let mut bytes = 0usize;
+    for range in std::mem::take(&mut send.ranges) {
+        let range_bytes = range.encoded_len();
+        let named = at.get(&range.changeset_id).copied();
+        let mut new_bytes = 0usize;
+        if let Some(i) = named.filter(|i| !carried[*i]) {
+            new_bytes = send.changesets[i].encoded_len();
+        }
+        if !ranges.is_empty() && bytes + range_bytes + new_bytes > CHUNK_BYTES {
+            bytes = 0;
+            parts.push(BlameResponse {
+                ranges: std::mem::take(&mut ranges),
+                changesets: std::mem::take(&mut changesets),
+                next_cursor: Vec::new(),
+            });
+        }
+        bytes += range_bytes + new_bytes;
+        if let Some(i) = named.filter(|i| !carried[*i]) {
+            changesets.push(std::mem::take(&mut send.changesets[i]));
+            carried[i] = true;
+        }
+        ranges.push(range);
+    }
+    parts.push(BlameResponse {
+        ranges,
+        changesets,
+        next_cursor: std::mem::take(&mut send.cursor),
+    });
+    parts
+}
+
+/// Streams a `Blame` reply: sends the parts of the computed blame, until
+/// the client has them all or stops taking parts. A stall counts
+/// [`STALLED_REPLY_BYTES`] on the connection, as any streamed reply does.
+async fn blame_parts(mut send: BlameSend, tx: mpsc::Sender<Part<BlameResponse>>) {
+    for part in blame_page_parts(&mut send) {
+        match reserve(&tx, READ_STALL_TIMEOUT, send.stalled.as_ref()).await {
+            Taken::Slots(mut slots) => {
+                if let Some(slot) = slots.next() {
+                    slot.send(Ok(part));
+                }
+            }
+            Taken::Gone => return,
+            Taken::Stalled => {
+                let detail = format!("the client took no data for {READ_STALL_TIMEOUT:?}");
+                let _ = tx.try_send(Err(Status::deadline_exceeded(detail)));
+                return;
+            }
+        }
+    }
+    // Keeps the request slot until the client has taken the last part; a
+    // client that never does is counted.
+    reserve(&tx, READ_STALL_TIMEOUT, send.stalled.as_ref()).await;
 }
 
 /// Fetches one page of the log: a graph query when `path` is set, because
@@ -999,6 +1084,8 @@ impl Scion for ScionService {
 
     type LogStream = LogStream;
 
+    type BlameStream = BlameStream;
+
     async fn read_file(
         &self,
         request: Request<ReadFileRequest>,
@@ -1107,12 +1194,12 @@ impl Scion for ScionService {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    async fn blame(
-        &self,
-        request: Request<BlameRequest>,
-    ) -> Result<Response<BlameResponse>, Status> {
+    async fn blame(&self, request: Request<BlameRequest>) -> Result<Response<BlameStream>, Status> {
         let caller = caller(&request)?;
-        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
+        let call = self.quotas.enter(&caller).map_err(Status::from)?;
+        // The handle of the caller's connection, before the request is
+        // taken apart: the reply counts what it leaves in HTTP/2 on it.
+        let stalled = scion_proto::listen::Stalled::of(&request);
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
@@ -1182,11 +1269,18 @@ impl Scion for ScionService {
             .resume
             .map(|resume| blame::encode_cursor(&resume, &req.repo, id, &path))
             .unwrap_or_default();
-        Ok(Response::new(BlameResponse {
+        // The blame is computed; the reply goes on in the producer, so the
+        // request slot lives until the reply ends.
+        let send = BlameSend {
             ranges,
             changesets,
-            next_cursor,
-        }))
+            cursor: next_cursor,
+            _call: call,
+            stalled,
+        };
+        let (tx, rx) = mpsc::channel(2);
+        tokio::spawn(blame_parts(send, tx).instrument(tracing::Span::current()));
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn merge_base(

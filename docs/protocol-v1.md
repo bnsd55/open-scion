@@ -541,8 +541,14 @@ stops at 600 s; what it derived stays, so the next call goes on from there.
 
 ### 6.10 Blame
 
-`rpc Blame(BlameRequest) returns (BlameResponse)`. For each line of a file,
-the changeset that last changed it on first-parent history, across renames.
+`rpc Blame(BlameRequest) returns (stream BlameResponse)`. For each line of
+a file, the changeset that last changed it on first-parent history, across
+renames. The reply streams in parts: the ranges go out in groups, each
+part's ranges, with the changesets its ranges name that no earlier part
+carried, within 1 MiB of encoded bytes, in file order. A client joins the
+parts' ranges in order and unions the changesets by ID; only the last part
+carries `next_cursor`. The reply ends with `DEADLINE_EXCEEDED` when the
+client takes no part for 120 s, as `ReadFile` does.
 
 **Lines.** A line ends after a `\n` byte, or at the end of the file. An empty
 file has no lines and gets no ranges.

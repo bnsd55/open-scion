@@ -17,6 +17,63 @@ type Sources = HashMap<ChangesetId, (IdentityTime, Vec<u8>)>;
 /// first-parent history, across renames. A reply that stops at the server's
 /// bound names where to continue, so this asks again there until every line
 /// has a changeset.
+/// One call's reply, with its parts joined: the ranges in order, and the
+/// cursor of the last part, which is where the walk continues.
+struct Page {
+    ranges: Vec<scion_proto::v1::BlameRange>,
+    cursor: Vec<u8>,
+}
+
+/// Asks one call and joins its parts: each part holds a group of ranges
+/// with the changesets its ranges name; the last part's `next_cursor` is
+/// where the walk continues.
+async fn blame_call(
+    ctx: &mut Ctx,
+    spec: &str,
+    changeset_id: &ChangesetId,
+    path: &scion_core::RepoPath,
+    cursor: &[u8],
+    sources: &mut Sources,
+) -> Result<Page> {
+    let mut pages = ctx
+        .client
+        .blame(BlameRequest {
+            repo: ctx.repo.clone(),
+            changeset_id: changeset_id.as_bytes().to_vec(),
+            path: path.as_bytes().to_vec(),
+            cursor: cursor.to_vec(),
+        })
+        .await
+        .with_context(|| format!("cannot blame {spec}"))?
+        .into_inner();
+    let mut ranges = Vec::new();
+    let mut next = Vec::new();
+    loop {
+        let page = pages
+            .message()
+            .await
+            .with_context(|| format!("cannot blame {spec}"))?;
+        let Some(page) = page else { break };
+        for c in page.changesets {
+            let author = IdentityTime {
+                name: c.author_name,
+                email: c.author_email,
+                unix_secs: c.author_unix_secs,
+                tz_offset_minutes: c.author_tz_offset_minutes,
+            };
+            sources.insert(id_from::<ChangesetId>(&c.changeset_id)?, (author, c.path));
+        }
+        ranges.extend(page.ranges);
+        next = page.next_cursor;
+    }
+    Ok(Page {
+        ranges,
+        cursor: next,
+    })
+}
+
+/// Prints, for each line of the file at `spec` (`REV:PATH`), the changeset
+/// that last changed it on first-parent history, across renames.
 pub async fn blame(ctx: &mut Ctx, spec: &str) -> Result<()> {
     let (rev, path) = split_spec(spec)?;
     let path = path.with_context(|| format!("{spec:?}: expected REV:PATH"))?;
@@ -29,36 +86,19 @@ pub async fn blame(ctx: &mut Ctx, spec: &str) -> Result<()> {
     // its line in the file at `at`. Empty before the first reply.
     let mut lines: Vec<(Option<ChangesetId>, u32)> = Vec::new();
     loop {
-        let reply = ctx
-            .client
-            .blame(BlameRequest {
-                repo: ctx.repo.clone(),
-                changeset_id: changeset_id.as_bytes().to_vec(),
-                path: path.as_bytes().to_vec(),
-                cursor: cursor.clone(),
-            })
-            .await
-            .with_context(|| format!("cannot blame {spec}"))?
-            .into_inner();
-        for c in reply.changesets {
-            let author = IdentityTime {
-                name: c.author_name,
-                email: c.author_email,
-                unix_secs: c.author_unix_secs,
-                tz_offset_minutes: c.author_tz_offset_minutes,
-            };
-            sources.insert(id_from::<ChangesetId>(&c.changeset_id)?, (author, c.path));
-        }
+        let page = blame_call(ctx, spec, &changeset_id, &path, &cursor, &mut sources).await?;
+        let reply_cursor = page.cursor;
+        let ranges = page.ranges;
         // The source of each line of the window the reply covers. The
         // ranges cover it in order, so the first range names its first
         // line. An empty file has none, and no cursor to go on with.
-        let at_line = match reply.ranges.first() {
+        let at_line = match ranges.first() {
             Some(r) => r.start_line as usize - 1,
-            None if reply.next_cursor.is_empty() => break,
+            None if reply_cursor.is_empty() => break,
             None => bail!("server sent no blame ranges"),
         };
         let mut here = Vec::new();
-        for range in &reply.ranges {
+        for range in &ranges {
             if range.start_line as usize != at_line + here.len() + 1 {
                 bail!("server sent blame ranges out of order");
             }
@@ -90,13 +130,13 @@ pub async fn blame(ctx: &mut Ctx, spec: &str) -> Result<()> {
                     .context("server sent a blame shorter than the file")?;
             }
         }
-        if reply.next_cursor.is_empty() {
+        if reply_cursor.is_empty() {
             break;
         }
-        if reply.next_cursor == cursor {
+        if reply_cursor == cursor {
             bail!("server sent the same cursor again");
         }
-        cursor = reply.next_cursor;
+        cursor = reply_cursor;
     }
     let lines: Vec<(ChangesetId, u32)> = lines
         .into_iter()
