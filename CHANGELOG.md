@@ -440,6 +440,9 @@ until that section gets its release date.
 
 ### Fixed
 
+- The server refuses a data directory that group or others can write, or
+  that sits under a directory another user can change: the blobs and the
+  metadata inside are only as private as the directory.
 - `scn` prints each part of an error once: tonic's transport error Display
   already ends with its source's text, and the printed chain said `tcp
   connect error` and `invalid URL, scheme is missing` twice.

@@ -25,7 +25,10 @@ The pieces:
 ```
 
 That is the whole deployment: clients talk to `127.0.0.1:7878` (or `--listen`
-HOST:PORT). Without `--ticket-key` no object is readable, so a real server
+HOST:PORT). The data directory holds every blob and every row, so keep it
+mode 0700 and owned by the user the server runs as: the server refuses one
+that group or others can write, or that sits under a directory another user
+can change. Without `--ticket-key` no object is readable, so a real server
 adds a ticket key (section 2):
 
 ```sh
