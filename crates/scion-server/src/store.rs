@@ -36,6 +36,7 @@ use rustix::io::Errno;
 use scion_core::{BlobHasher, BlobId};
 
 use crate::db::SqliteTx;
+use crate::derived::DeriveFlights;
 use crate::error::{Error, Result};
 
 /// The schema version this build makes and reads.
@@ -76,6 +77,11 @@ pub struct Store {
 /// the graph queries that can run at once, so those never take every one.
 pub(crate) const READERS: usize = 8;
 
+/// The cap on derive walks in flight, across all kinds and repos of one
+/// [`Store`]. Each walk holds the write connection in turns, so walks
+/// beyond the cap only repeat work and starve writes ([#142]).
+pub(crate) const DERIVE_WALKS_CAP: usize = 8;
+
 struct Inner {
     /// Read-only connections for [`Store::read`]. They come before `db`, so
     /// they close first: the last connection to close checkpoints the log,
@@ -107,6 +113,9 @@ struct Inner {
     /// the import's busy retry: the transaction ran and rolled back, so
     /// nothing was written, exactly as a real busy commit ends.
     fail_commits: AtomicU64,
+    /// The derive walks of this store: which are in flight, and the cap
+    /// on how many may be.
+    derive: DeriveFlights,
 }
 
 impl Store {
@@ -125,7 +134,14 @@ impl Store {
     /// database cannot be created, or if the schema is newer than this build,
     /// or older while another `Store` uses the directory.
     pub fn open(dir: &Path) -> Result<Self> {
-        Self::open_as(dir, true, &build())
+        Self::open_as(dir, true, &build(), DERIVE_WALKS_CAP)
+    }
+
+    /// Opens or creates a data directory as its server, with a cap of
+    /// `walks` derive walks in flight. For tests of the cap.
+    #[cfg(test)]
+    pub(crate) fn open_with_walks(dir: &Path, walks: usize) -> Result<Self> {
+        Self::open_as(dir, true, &build(), walks)
     }
 
     /// Opens or creates a data directory for a process that does not land,
@@ -144,11 +160,11 @@ impl Store {
     ///
     /// As [`Store::open`], except that a server `Store` is no conflict.
     pub fn open_shared(dir: &Path) -> Result<Self> {
-        Self::open_as(dir, false, &build())
+        Self::open_as(dir, false, &build(), DERIVE_WALKS_CAP)
     }
 
     /// Opens a data directory for a process of build `build` ([`build`]).
-    fn open_as(dir: &Path, server: bool, build: &str) -> Result<Self> {
+    fn open_as(dir: &Path, server: bool, build: &str, walks_cap: usize) -> Result<Self> {
         fs::create_dir_all(dir)?;
         // A second server fails here, before it waits for anything.
         let server_lock = if server {
@@ -238,8 +254,16 @@ impl Store {
                 #[cfg(test)]
                 txes: AtomicU64::new(0),
                 fail_commits: AtomicU64::new(0),
+                derive: DeriveFlights::new(walks_cap),
             }),
         })
+    }
+
+    /// The derive walks of this store: which are in flight, and the cap on
+    /// how many may be.
+    #[must_use]
+    pub(crate) fn derive_flights(&self) -> &DeriveFlights {
+        &self.inner.derive
     }
 
     /// The blob folder.
@@ -1693,11 +1717,11 @@ mod tests {
                 other => panic!("expected the open to fail, got {:?}", other.err()),
             };
             let server = Store::open(dir.path()).unwrap();
-            refused(Store::open_as(dir.path(), false, &other));
+            refused(Store::open_as(dir.path(), false, &other, DERIVE_WALKS_CAP));
             Store::open_shared(dir.path()).unwrap();
             drop(server);
             // The import of the other build opened alone, so its build counts.
-            let import = Store::open_as(dir.path(), false, &other).unwrap();
+            let import = Store::open_as(dir.path(), false, &other, DERIVE_WALKS_CAP).unwrap();
             refused(Store::open(dir.path()));
             refused(Store::open_shared(dir.path()));
             drop(import);
