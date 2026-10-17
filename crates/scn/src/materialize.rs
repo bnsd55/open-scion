@@ -132,7 +132,7 @@ pub fn check_name(name: &[u8]) -> Result<(), &'static str> {
 /// Fails if `dest` is a symlink, a file, or a directory that is not empty,
 /// that another user owns, or that all users can write without the sticky
 /// bit.
-pub fn check_dest(dest: &Path) -> Result<()> {
+pub(crate) fn check_dest(dest: &Path) -> Result<()> {
     open_dest(dest).map(drop)
 }
 
@@ -999,7 +999,7 @@ fn entries(dir: &OwnedFd) -> io::Result<Vec<Vec<u8>>> {
 }
 
 /// Whether `path` is `dir` or below it.
-pub fn is_within(path: &[u8], dir: &[u8]) -> bool {
+pub(crate) fn is_within(path: &[u8], dir: &[u8]) -> bool {
     path.strip_prefix(dir)
         .is_some_and(|rest| rest.first().is_none_or(|&b| b == b'/'))
 }

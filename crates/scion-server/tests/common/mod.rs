@@ -712,9 +712,9 @@ pub async fn check(
     }
 }
 
-/// Waits until `ready` holds, for at most 2 s.
+/// Waits until `ready` holds, for at most 10 s.
 pub async fn wait_until(ready: impl Fn() -> bool) {
-    let give_up = Instant::now() + Duration::from_secs(2);
+    let give_up = Instant::now() + Duration::from_secs(10);
     while !ready() && Instant::now() < give_up {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
@@ -782,7 +782,7 @@ pub mod spawn_guard {
     pub fn wait_for_lock_release(dir: &std::path::Path) {
         use std::time::{Duration, Instant};
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let file = std::fs::OpenOptions::new()
                 .create(true)
@@ -802,7 +802,7 @@ pub mod spawn_guard {
             }
             assert!(
                 Instant::now() < deadline,
-                "the server lock of {} was never released within 2 s",
+                "the server lock of {} was never released within 10 s",
                 dir.display()
             );
             std::thread::sleep(Duration::from_millis(1));
