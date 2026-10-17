@@ -48,6 +48,9 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 
 use common::*;
+use scion_core::BlobId;
+use scion_server::Store;
+use scion_server::store::BlobStatus;
 
 /// The `LazyFS` checkout the suite runs against: it must hold
 /// `lazyfs/build/lazyfs` and `libs/libpcache/build`.
@@ -104,9 +107,16 @@ impl Lazyfs {
         let config = round_dir.join("lazyfs.toml");
         // The ops trace lives in the round tempdir, which goes away with
         // the test; a CI job that wants it after a failure names a fixed
-        // directory to upload from.
+        // directory to upload from. `LazyFS` does not create the folder of
+        // its logfile, so the test does.
         let trace = match std::env::var_os("SCION_LAZYFS_TRACE_DIR") {
-            Some(dir) => PathBuf::from(dir).join(format!("lazyfs-r{round}.log")),
+            Some(dir) => {
+                let trace = PathBuf::from(dir).join(format!("lazyfs-r{round}.log"));
+                if let Some(dir) = trace.parent() {
+                    fs::create_dir_all(dir).unwrap();
+                }
+                trace
+            }
             None => round_dir.join("lazyfs.log"),
         };
         fs::write(
@@ -299,4 +309,215 @@ async fn every_reply_survives_a_power_cut() {
     }
     println!("{rounds} cuts; {total} lands, {cut_lands} of them cut mid-call");
     assert!(total > 0, "the clients did little work");
+}
+
+/// How many clients put the same blob at once in one wave of the W1 test.
+const RACERS: usize = 16;
+
+/// How many waves of racing puts one round of the W1 test runs.
+const WAVES: usize = 4;
+
+/// One wave of the W1 test: `RACERS` clients put the same bytes at once,
+/// started together by a barrier, so two of them always race one blob ID.
+/// Every reply must name that blob.
+async fn race_wave(url: String, content: Vec<u8>) -> Vec<BlobId> {
+    let barrier = Arc::new(tokio::sync::Barrier::new(RACERS));
+    let racers: Vec<_> = (0..RACERS)
+        .map(|_| {
+            let (url, content, barrier) = (url.clone(), content.clone(), Arc::clone(&barrier));
+            tokio::spawn(async move {
+                let (mut scion, _objects) = connect(&url).await.unwrap();
+                barrier.wait().await;
+                (put_blob(&mut scion, &content).await.unwrap(), content)
+            })
+        })
+        .collect();
+    let mut ids = Vec::new();
+    for racer in racers {
+        let (id, content) = racer.await.unwrap();
+        assert_eq!(id, BlobId::of(&content));
+        ids.push(id);
+    }
+    ids
+}
+
+/// Issue #185, window W1. Many clients put the SAME blob at once, wave
+/// after wave: both racers of a blob ID see it missing, both write and
+/// fsync a temp file, and both rename onto the same path (`Store::replace`).
+/// Under `LazyFS` the loser's rename may free the winner's cached item, and
+/// a later cut loses the winner's acknowledged write. The test makes the
+/// race certain, cuts once after the acked waves and once while a wave is
+/// in flight, and then reopens the store from the backing directory: every
+/// acknowledged blob must be there and intact, and no blob file may be
+/// corrupt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_puts_of_one_blob_survive_a_cut() {
+    if !may_run() {
+        return;
+    }
+    let lazyfs = lazyfs_dir().unwrap();
+    let seed = seed();
+    let mut rng = Rng::new(seed);
+    let rounds = usize::try_from(env("SCION_RACE_ROUNDS", 8)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("race.log");
+    let mut total = 0;
+    // Rounds from 100 up: the trace file and the mount log of a round are
+    // named after it, and must not collide with the other tests' rounds.
+    for round in 100..100 + rounds {
+        let mut lazy = Lazyfs::start(dir.path(), &lazyfs, round);
+        let data = lazy.mount.join("data");
+        create_repo(&data);
+        let server = Server::start(&data, &log);
+        // Acked waves: every put is answered before the cut, so every one
+        // of them must survive it.
+        let mut acked = Vec::new();
+        for _ in 0..WAVES - 1 {
+            let content = rng.bytes(3 << 10);
+            let ids = race_wave(server.url.clone(), content).await;
+            assert!(ids.windows(2).all(|w| w[0] == w[1]), "one blob ID");
+            acked.extend(ids);
+        }
+        lazy.cut();
+        // A wave cut in flight: a put whose sync the cut caught may lose
+        // its file, but a reply still binds the server, and whatever
+        // reached the backing must be whole.
+        let content = rng.bytes(3 << 10);
+        let flight = race_wave(server.url.clone(), content);
+        let delay = u64::try_from(rng.below(40)).unwrap() + 4;
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        lazy.cut();
+        acked.extend(flight.await);
+        drop(server);
+        // The store reopens from the backing directory: what `LazyFS`
+        // persisted, and nothing else.
+        let data = lazy.backing.join("data");
+        let store = Store::open_shared(&data).unwrap();
+        for id in &acked {
+            let status = store.blobs().verify(*id).unwrap();
+            assert_eq!(status, BlobStatus::Valid, "acknowledged blob {id}");
+        }
+        for id in blob_files(&data) {
+            let status = store.blobs().verify(id).unwrap();
+            assert_eq!(status, BlobStatus::Valid, "stored blob file {id}");
+        }
+        drop(store);
+        drop(lazy);
+        total += RACERS * WAVES;
+    }
+    println!("{total} racing puts across {rounds} rounds");
+}
+
+/// Every file under `dir`, with its bytes: what the W2 test compares the
+/// backing store against.
+fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files: Vec<_> = walk(dir)
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Issue #185, window W2. The checker writes directly into the backing
+/// directory while the `LazyFS` daemon still runs, as `check` does. If the
+/// daemon's exit writes its cache back over those direct writes, the
+/// checker's own view of the store is not what the drive holds. The test
+/// forces the order: the server writes through the mount and is killed,
+/// the checker opens the store directly on the backing and snapshots every
+/// byte, the mount goes away, and every byte must still be what the
+/// checker saw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checker_writes_outlive_the_lazyfs_exit() {
+    if !may_run() {
+        return;
+    }
+    let lazyfs = lazyfs_dir().unwrap();
+    let seed = seed();
+    let mut rng = Rng::new(seed);
+    let rounds = usize::try_from(env("SCION_CHECKER_ROUNDS", 4)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("checker.log");
+    for round in 200..200 + rounds {
+        let mut lazy = Lazyfs::start(dir.path(), &lazyfs, round);
+        let data = lazy.mount.join("data");
+        create_repo(&data);
+        let server = Server::start(&data, &log);
+        // The server writes through the mount: blobs, acknowledged.
+        let (mut scion, _objects) = connect(&server.url).await.unwrap();
+        let mut acked = Vec::new();
+        for _ in 0..4 {
+            let content = rng.bytes(1 << 10);
+            let id = put_blob(&mut scion, &content).await.unwrap();
+            acked.push((id, content));
+        }
+        // The cut, and writes the server fsyncs after it: their pages sit
+        // in the daemon's cache, clean, when the server dies.
+        lazy.cut();
+        for _ in 0..3 {
+            let content = rng.bytes(1 << 10);
+            let id = put_blob(&mut scion, &content).await.unwrap();
+            acked.push((id, content));
+        }
+        drop(scion);
+        drop(server);
+        // The checker writes directly into the backing, as `check` does: it
+        // opens the store, reads the metadata, and verifies every blob. Its
+        // close checkpoints the WAL, so the snapshot of what it wrote comes
+        // after the close: from there on, only the daemon's exit can change
+        // a byte.
+        let backing = lazy.backing.join("data");
+        let store = Store::open_shared(&backing).unwrap();
+        for (id, _) in &acked {
+            let status = store.blobs().verify(*id).unwrap();
+            assert_eq!(status, BlobStatus::Valid, "acknowledged blob {id}");
+        }
+        drop(store);
+        let before = snapshot(&backing);
+        // The mount goes away: the daemon's exit. Its cache must not
+        // rewrite what the checker wrote and saw.
+        drop(lazy);
+        let after = snapshot(&backing);
+        if before != after {
+            // Name the files that changed, with their sizes: the trace
+            // says what the daemon wrote and when.
+            let changed: Vec<String> = before
+                .iter()
+                .zip(&after)
+                .filter(|(b, a)| b != a)
+                .map(|((path, before), (_, after))| {
+                    format!(
+                        "{}: {} bytes before, {} after",
+                        path.display(),
+                        before.len(),
+                        after.len()
+                    )
+                })
+                .collect();
+            panic!("the backing changed while the mount went away: {changed:?}");
+        }
+        // What the checker verified still verifies.
+        let store = Store::open_shared(&backing).unwrap();
+        for (id, _) in &acked {
+            let status = store.blobs().verify(*id).unwrap();
+            assert_eq!(status, BlobStatus::Valid, "blob {id} after the exit");
+        }
+        drop(store);
+    }
 }
