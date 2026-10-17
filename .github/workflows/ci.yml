@@ -156,7 +156,7 @@ jobs:
         run: sh docker/demo.sh
 
   fuzz:
-    name: fuzz smoke (3 x 20 s)
+    name: fuzz smoke (60 s)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -187,6 +187,6 @@ jobs:
               (cd "$GITHUB_WORKSPACE/crates/$crate" && cargo fuzz run \
                 --target x86_64-unknown-linux-gnu "$target" \
                 "$fuzz_dir/corpus/$target" "${seeds[@]}" \
-                -- -max_total_time=20)
+                -- -max_total_time=15)
             done
           done

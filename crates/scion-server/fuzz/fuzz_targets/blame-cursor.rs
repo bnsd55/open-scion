@@ -13,10 +13,11 @@ use scion_server::blame::{self, Resume};
 use scion_server::memory::Bytes;
 use scion_server::meta::MetaTx as _;
 use scion_server::{Store, tree};
-use tempfile::TempDir;
 use std::sync::OnceLock;
+use tempfile::TempDir;
 
 const REPO: &str = "f";
+const PATH: &str = "f";
 
 /// The store the whole run shares: one SQLite file in one temp directory,
 /// with a chain of three changesets that each put `f`. Built once per
@@ -48,7 +49,7 @@ fn fixture() -> &'static (TempDir, Store, ChangesetId) {
                         changes: [(
                             RepoPath::new(PATH).unwrap(),
                             Some(FileState::Regular {
-                                content: scion_core::BlobId::of(line),
+                                content,
                                 executable: false,
                             }),
                         )]
@@ -65,8 +66,6 @@ fn fixture() -> &'static (TempDir, Store, ChangesetId) {
         (dir, store, tip)
     })
 }
-
-const PATH: &str = "f";
 
 fuzz_target!(|data: &[u8]| {
     let (_dir, store, tip) = fixture();
@@ -87,9 +86,8 @@ fuzz_target!(|data: &[u8]| {
         // What the decoder read encodes and decodes again to the same
         // cursor: one round of encode+decode lands on a fixed point.
         let re = blame::encode_cursor(&resume, REPO, tip, &path);
-        let again =
-            blame::decode_cursor(store, REPO, &re, tip, &path, &memory, None)
-                .expect("an encoded cursor decodes");
+        let again = blame::decode_cursor(store, REPO, &re, tip, &path, &memory, None)
+            .expect("an encoded cursor decodes");
         assert_eq!(resume, again.0, "the cursor round-trips");
     }
 });
