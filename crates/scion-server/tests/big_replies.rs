@@ -11,6 +11,9 @@ use scion_proto::v1::{
     CreateChangesetRequest, GetChangesetRequest, ListDirRequest, PutBlobRequest,
 };
 use scion_server::meta::MetaTx;
+use std::sync::Arc;
+
+use scion_server::metrics::Metrics;
 use scion_server::{Store, service};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
@@ -80,6 +83,7 @@ async fn big_repo(names: usize) -> (tempfile::TempDir, Scion, ChangesetId) {
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
+            metrics: Arc::new(Metrics::default()),
         },
         None,
         std::future::pending(),
