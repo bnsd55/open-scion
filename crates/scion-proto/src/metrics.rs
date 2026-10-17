@@ -267,7 +267,9 @@ impl Metrics {
                 let _ = writeln!(text, "scion_lands_total{{outcome=\"{name}\"}} {value}");
             }
         }
-        text.push_str("# HELP scion_land_replans_total Lands whose ref moved under them, planned again.\n");
+        text.push_str(
+            "# HELP scion_land_replans_total Lands whose ref moved under them, planned again.\n",
+        );
         text.push_str("# TYPE scion_land_replans_total counter\n");
         let replans = self.land_replans.load(Ordering::Relaxed);
         if replans > 0 {

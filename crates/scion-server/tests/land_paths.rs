@@ -192,7 +192,10 @@ fn replan_scenario(metrics: &Arc<scion_proto::metrics::Metrics>) -> u64 {
         let store = f.store.clone();
         let rounds = Arc::clone(&rounds);
         std::thread::spawn(move || {
-            let until = Instant::now() + Duration::from_secs(30);
+            // CI runs the whole workspace at once on a few cores: the
+            // scenario's first steps can wait far longer than they do
+            // alone, so the wait is minutes, not seconds.
+            let until = Instant::now() + Duration::from_secs(120);
             loop {
                 let pending: i64 = store
                     .read(|c| {
