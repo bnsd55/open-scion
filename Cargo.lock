@@ -2456,6 +2456,7 @@ dependencies = [
  "open-scion-proto",
  "open-scion-tier",
  "proptest",
+ "prost",
  "rusqlite",
  "rustix",
  "tempfile",
