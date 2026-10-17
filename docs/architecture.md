@@ -1475,13 +1475,12 @@ filesystem, so files load when they are first read
 ([#11](https://github.com/bnsd55/open-scion/issues/11)). The server runs
 inside `scn`, on a free port of 127.0.0.1, and the mount uses the operating
 system's NFS client. A directory's tree is fetched when the directory is
-first listed or looked up in; a file's blob when the file is first read or
-sized, through the same `Objects` calls a checkout sends. Every read
-carries the mount's read ticket, which the mount refreshes through
-`GetRootTree` of the mounted changeset before it expires. Until #172 adds
-`GetSizes`, a file's size comes from its blob, so the first stat of a
-file that was never read fetches the blob, and `ls -l` of a directory
-fetches every blob in it.
+first listed or looked up in; a file's blob when the file is first read,
+through the same `Objects` calls a checkout sends. Every read carries the
+mount's read ticket, which the mount refreshes through `GetRootTree` of the
+mounted changeset before it expires. A file's size comes from its tree
+entry, so a stat never fetches the blob, and `ls -l` of a directory
+fetches trees only.
 
 Writes go to an overlay directory beside the mount (a private directory
 under the system's temporary directory). `scn commit --from-mount DIR`
@@ -1579,7 +1578,7 @@ limit and its upgrade path. This is the list on `main` today.
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each symlink target whole, so memory caps the target length. | Stream chunks from the file. | |
 | `scn/src/cmd/commit.rs` (`parse_author`) | The author time zone is always UTC, since `std` cannot read the local time zone. | A time zone crate. | |
-| `scn/src/vfs.rs` (`size_of`) | A file's size comes from its blob, so the first stat of a file that was never read fetches the blob, and `ls -l` of a directory fetches every blob in it. | After #172 gets a `GetSizes` call served from the stored frame's header. | [#172](https://github.com/bnsd55/open-scion/issues/172) |
+| `scion-server/src/derived.rs` (`store_chain`) | Test chains write no blob files, so the tree build's lens answers 0 for every blob; the trees it builds are only compared to themselves. | Store the chain's blobs in the fixture. | |
 | `scn/src/vfs.rs` (`io_err`) | Takes the error by value so `.map_err(io_err)` reads clean. | Take it by reference if the lint allows it one day. | |
 
 ## 10. Testing

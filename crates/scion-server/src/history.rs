@@ -169,6 +169,7 @@ impl Kind for PathHistory {
         id: ChangesetId,
         changeset: &Changeset,
         parents: Vec<NodeId>,
+        _lens: crate::tree::BlobLens<'_>,
     ) -> Result<NodeId> {
         let by = Stamp {
             id,
@@ -822,7 +823,7 @@ mod tests {
                         .collect();
                     let cs = changeset(ids.last().copied().or(parent), &edits);
                     ids.push(if stored {
-                        tree::store_changeset(c, repo, &cs)?.0
+                        tree::store_changeset(c, repo, &cs, &mut crate::tree::lens_none())?.0
                     } else {
                         c.insert_changeset(repo, &cs)?
                     });
@@ -867,7 +868,7 @@ mod tests {
                 .write(|c| {
                     let ids = testing::insert_history(c, repo, &parents, &edits)?;
                     for &tip in &ids {
-                        derived::derive::<PathHistory>(c, repo, tip)?;
+                        derived::derive::<PathHistory>(c, repo, tip, &mut crate::tree::lens_none())?;
                     }
                     Ok(ids)
                 })
@@ -1227,6 +1228,11 @@ mod tests {
             &[&[("x", true)], &[("y", true)], &[("x", false)]],
             false,
         );
+        // The chain puts blobs "0" and "1"; their files feed the real lens
+        // that the write path below derives the chain's trees with.
+        for i in ["0", "1"] {
+            store.blobs().put(i.as_bytes()).unwrap();
+        }
         let draft = changeset(Some(old[2]), &[("y", Some(blob))]);
         let draft = write::create_changeset(&store, "r", &draft.encode()).unwrap();
         let stored = |cs| store.read(|c| derived::load::<PathHistory>(c, cs)).unwrap();

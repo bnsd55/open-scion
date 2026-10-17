@@ -15,8 +15,8 @@ use std::time::Instant;
 use gix::diff::blob::sources::byte_lines;
 use gix::diff::blob::{Algorithm, Diff, InternedInput};
 use scion_core::{
-    BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, PathElem, RepoPath, Tree,
-    TreeId,
+    BlobId, Changeset, ChangesetId, Entry, FileEntry, FileState, IdentityTime, PathElem, RepoPath,
+    Tree, TreeId,
 };
 
 use crate::deadline::{CALL_LIMIT, Deadline};
@@ -485,7 +485,10 @@ fn next_resume(
 /// it is not a regular file.
 fn regular_blob(store: &Store, root: TreeId, path: &RepoPath) -> Result<BlobId> {
     match store.read(|c| tree::lookup(c, root, path))? {
-        Some(Entry::File(FileState::Regular { content, .. })) => Ok(content),
+        Some(Entry::File(FileEntry {
+            state: FileState::Regular { content, .. },
+            ..
+        })) => Ok(content),
         Some(_) => Err(Error::InvalidArgument(format!(
             "{path:?} is not a regular file"
         ))),
@@ -592,10 +595,14 @@ fn older_version(
     }
     let older = match entry {
         // Only the mode changed: nothing to read.
-        Some(Entry::File(FileState::Regular { content, .. })) if content == newer.blob => {
-            Some((newer.path.clone(), content, None))
-        }
-        Some(Entry::File(FileState::Regular { content, .. })) => {
+        Some(Entry::File(FileEntry {
+            state: FileState::Regular { content, .. },
+            ..
+        })) if content == newer.blob => Some((newer.path.clone(), content, None)),
+        Some(Entry::File(FileEntry {
+            state: FileState::Regular { content, .. },
+            ..
+        })) => {
             let text = read_version(store, content, memory)?;
             text.map(|text| (newer.path.clone(), content, Some(text)))
         }
@@ -751,8 +758,8 @@ fn deleted_files<'c>(
             .iter()
             .filter(|(_, state)| state.is_none())
         {
-            if let Some(Entry::File(state)) = lookup_cached(c, &mut trees, root, other)? {
-                deleted.push((other, state));
+            if let Some(Entry::File(file)) = lookup_cached(c, &mut trees, root, other)? {
+                deleted.push((other, file.state));
             }
         }
         Ok(deleted)

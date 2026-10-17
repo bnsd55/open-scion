@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 use gix::ObjectId;
 use rusqlite::{Connection, params};
 use scion_core::{
-    BlobId, Changeset, ChangesetId, Entry, FileState, GitOid, IdentityTime, PathElem, RepoPath,
+    BlobId, Changeset, ChangesetId, Entry, FileEntry, FileState, GitOid, IdentityTime, PathElem,
+    RepoPath,
 };
 use scion_server::auth::Caller;
 use scion_server::deadline::Deadline;
@@ -364,19 +365,28 @@ fn files_read_back_with_git_content() {
     let root = changeset_of(&store, &h.root);
     let tip = changeset_of(&store, &h.submodule);
     let exec = |cs, name| match root_entry(&store, cs, name) {
-        Some(Entry::File(FileState::Regular { executable, .. })) => executable,
+        Some(Entry::File(FileEntry {
+            state: FileState::Regular { executable, .. },
+            ..
+        })) => executable,
         other => panic!("{name}: {other:?}"),
     };
     assert!(exec(root, "run.sh"));
     assert!(!exec(tip, "run.sh"));
     assert!(matches!(
         root_entry(&store, root, "link"),
-        Some(Entry::File(FileState::Symlink { .. }))
+        Some(Entry::File(FileEntry {
+            state: FileState::Symlink { .. },
+            ..
+        }))
     ));
     let submodule = GitOid::Sha1(oid(SUBMODULE).as_slice().try_into().unwrap());
     assert_eq!(
         root_entry(&store, tip, "sub"),
-        Some(Entry::File(FileState::Gitlink { commit: submodule }))
+        Some(Entry::File(FileEntry::new(
+            FileState::Gitlink { commit: submodule },
+            0
+        )))
     );
     assert_eq!(root_entry(&store, tip, "link"), None, "deleted on main");
     assert!(matches!(
@@ -540,7 +550,7 @@ fn verification_catches_a_tree_that_differs_from_git() {
     store
         .write(|c| {
             let repo = c.repo_id("r")?;
-            let root = tree::derive_root_tree(c, repo, first.tip)?;
+            let root = tree::derive_root_tree(c, repo, first.tip, &mut |_| Ok(0))?;
             let extra = BTreeMap::from([(
                 path("extra.txt"),
                 Some(FileState::Regular {
@@ -548,7 +558,7 @@ fn verification_catches_a_tree_that_differs_from_git() {
                     executable: false,
                 }),
             )]);
-            let bad = tree::apply(c, Some(root), &extra)?;
+            let bad = tree::apply(c, Some(root), &extra, &mut |_| Ok(0))?;
             c.execute(
                 "UPDATE derived SET value = ?1 WHERE kind = 'root_tree' AND cs = ?2",
                 params![bad.as_bytes(), first.tip.as_bytes()],

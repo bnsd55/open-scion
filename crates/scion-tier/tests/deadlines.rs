@@ -54,10 +54,13 @@ impl Deepest {
         let data = Bytes::from(vec![7; 1000]);
         let entries = [(
             scion_core::PathElem::new(b"x".to_vec()).unwrap(),
-            scion_core::Entry::File(scion_core::FileState::Regular {
-                content: BlobId::of(&data),
-                executable: false,
-            }),
+            scion_core::Entry::File(scion_core::FileEntry::new(
+                scion_core::FileState::Regular {
+                    content: BlobId::of(&data),
+                    executable: false,
+                },
+                0,
+            )),
         )]
         .into_iter()
         .collect();

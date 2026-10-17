@@ -377,7 +377,9 @@ fn chain<S: Into<Option<FileState>>>(
                         .map(|(p, state)| (RepoPath::new(p).unwrap(), state.into()))
                         .collect(),
                 };
-                ids.push(tree::store_changeset(c, repo, &cs)?.0);
+                // The blobs of this chain are never read, only named; their lengths
+                // are irrelevant to log and blame.
+                ids.push(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0);
             }
             Ok(ids)
         })

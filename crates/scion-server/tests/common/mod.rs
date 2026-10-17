@@ -242,7 +242,7 @@ pub fn create_repo(data: &Path) {
     store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
-            let (id, _) = tree::store_changeset(c, repo, &root)?;
+            let (id, _) = tree::store_changeset(c, repo, &root, &mut tree::lens_of(&store))?;
             for name in REFS {
                 assert!(c.cas_ref(repo, name, None, id)?);
             }
@@ -501,7 +501,7 @@ pub fn metadata(store: &Store, seen: &mut HashSet<Vec<u8>>) -> (BTreeSet<BlobId>
                     } else {
                         let entries = Tree::decode(&body).unwrap().entries.into_values();
                         let file = |entry| match entry {
-                            Entry::File(state) => Some(state),
+                            Entry::File(file) => Some(file.state),
                             Entry::Dir(_) => None,
                         };
                         entries.filter_map(file).collect()

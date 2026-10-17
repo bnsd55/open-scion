@@ -16,6 +16,13 @@ until that section gets its release date.
 
 #### Objects and byte format
 
+- A tree entry carries its blob's byte length (`#172`): `ls -l` and a mount
+  stat read the size from the tree and fetch no blob. The change re-hashed
+  every tree; schema 7 drops stored trees and their derived rows, and they
+  rebuild from the stored changesets on demand. A tier that still holds
+  old tree bytes under old IDs never serves them again: nothing asks for
+  those IDs, and the hash check guards everything else.
+
 - Per-principal quotas (`#15`). With `--access`, `--max-principal-requests`
   (64), `--max-principal-upload-bytes` (512 MiB) and
   `--max-principal-pending-lands` (64) bound what one principal holds at

@@ -283,7 +283,7 @@ fn store_batch(
                     if !slow_record.is_zero() {
                         std::thread::sleep(slow_record);
                     }
-                    let root = record(c, repo_id, *commit, cs)?;
+                    let root = record(c, repo_id, *commit, cs, &mut crate::tree::lens_of(store))?;
                     if plan.verify.contains(commit) {
                         checker.check(c, *commit, *git_tree, root)?;
                     }
@@ -408,8 +408,14 @@ fn plan(
 
 /// Records that a git commit became the changeset `cs` whose changes build
 /// the tree `root`. Safe to repeat.
-fn record(c: &mut dyn MetaTx, repo: RepoId, commit: ObjectId, cs: &Changeset) -> Result<TreeId> {
-    let (id, root) = tree::store_changeset(c, repo, cs).map_err(|e| match e {
+fn record(
+    c: &mut dyn MetaTx,
+    repo: RepoId,
+    commit: ObjectId,
+    cs: &Changeset,
+    lens: crate::tree::BlobLens<'_>,
+) -> Result<TreeId> {
+    let (id, root) = tree::store_changeset(c, repo, cs, lens).map_err(|e| match e {
         Error::Apply(e) => Error::Corrupt(format!(
             "commit {commit}: changes do not apply to the first parent: {e}"
         )),
@@ -643,12 +649,12 @@ impl Checker<'_> {
                     (Some(GitEntry::Dir(git_id)), Some(Entry::Dir(scion_id))) => {
                         stack.push((path, *git_id, *scion_id));
                     }
-                    (Some(GitEntry::File(kind, oid)), Some(Entry::File(state))) => {
+                    (Some(GitEntry::File(kind, oid)), Some(Entry::File(file))) => {
                         let expected = file_state(*kind, *oid, |oid| self.blob(oid))?;
-                        if expected != *state {
-                            return Err(differs(format!("git {expected:?}, Scion {state:?}")));
+                        if expected != file.state {
+                            return Err(differs(format!("git {expected:?}, Scion {file:?}")));
                         }
-                        if let Some(blob) = state.blob()
+                        if let Some(blob) = file.state.blob()
                             && self.intact.get(&blob).is_none()
                         {
                             let problem = match self.store.blobs().verify(blob)? {

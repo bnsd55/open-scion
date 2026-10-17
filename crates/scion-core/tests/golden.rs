@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 
 use scion_core::{
-    BlobHasher, BlobId, Changeset, DecodeError, Entry, FileState, GitOid, IdentityTime, PathElem,
-    PathError, RepoPath, Tree, TreeId,
+    BlobHasher, BlobId, Changeset, DecodeError, Entry, FileEntry, FileState, GitOid, IdentityTime,
+    PathElem, PathError, RepoPath, Tree, TreeId,
 };
 
 /// Builds expected bytes straight from the grammar.
@@ -20,6 +20,10 @@ impl W {
         self
     }
     fn u32(mut self, v: u32) -> Self {
+        self.0.extend_from_slice(&v.to_be_bytes());
+        self
+    }
+    fn u64(mut self, v: u64) -> Self {
         self.0.extend_from_slice(&v.to_be_bytes());
         self
     }
@@ -134,26 +138,47 @@ fn tree() -> Tree {
     let name = |n: &str| PathElem::new(n).unwrap();
     Tree {
         entries: BTreeMap::from([
-            (name("README.md"), Entry::File(regular(b"# demo\n", false))),
+            (
+                name("README.md"),
+                Entry::File(FileEntry::new(
+                    regular(b"# demo\n", false),
+                    b"# demo\n".len() as u64,
+                )),
+            ),
             (name("bin"), Entry::Dir(TreeId::from_bytes([0x11; 32]))),
             (
                 name("link"),
-                Entry::File(FileState::Symlink {
-                    target: BlobId::of(b"README.md"),
-                }),
+                Entry::File(FileEntry::new(
+                    FileState::Symlink {
+                        target: BlobId::of(b"README.md"),
+                    },
+                    b"README.md".len() as u64,
+                )),
             ),
-            (name("run.sh"), Entry::File(regular(b"#!/bin/sh\n", true))),
+            (
+                name("run.sh"),
+                Entry::File(FileEntry::new(
+                    regular(b"#!/bin/sh\n", true),
+                    b"#!/bin/sh\n".len() as u64,
+                )),
+            ),
             (
                 name("sub"),
-                Entry::File(FileState::Gitlink {
-                    commit: GitOid::Sha1([0x22; 20]),
-                }),
+                Entry::File(FileEntry::new(
+                    FileState::Gitlink {
+                        commit: GitOid::Sha1([0x22; 20]),
+                    },
+                    0,
+                )),
             ),
             (
                 name("sub256"),
-                Entry::File(FileState::Gitlink {
-                    commit: GitOid::Sha256([0x33; 32]),
-                }),
+                Entry::File(FileEntry::new(
+                    FileState::Gitlink {
+                        commit: GitOid::Sha256([0x33; 32]),
+                    },
+                    0,
+                )),
             ),
         ]),
     }
@@ -285,16 +310,19 @@ fn tree_bytes() {
         .u8(1)
         .raw(BlobId::of(b"# demo\n").as_bytes())
         .u8(0)
+        .u64(b"# demo\n".len() as u64)
         .bytes(b"bin")
         .u8(4)
         .raw(&[0x11; 32])
         .bytes(b"link")
         .u8(2)
         .raw(BlobId::of(b"README.md").as_bytes())
+        .u64(b"README.md".len() as u64)
         .bytes(b"run.sh")
         .u8(1)
         .raw(BlobId::of(b"#!/bin/sh\n").as_bytes())
         .u8(1)
+        .u64(b"#!/bin/sh\n".len() as u64)
         .bytes(b"sub")
         .u8(3)
         .u8(1)
@@ -309,7 +337,7 @@ fn tree_bytes() {
     assert_eq!(t.id().as_bytes(), &hash(b"scion\0tree\0v1\0", &expected));
     assert_eq!(
         t.id().to_string(),
-        "0805b28a7256edcb1ddd744168b11e88fd319832d33165b85375f1a077cdf456"
+        "aa0a80bc7aa457e6f83bc5ffb4369f6ee1ea5d187d8f6a1a8901d9efba315571"
     );
     assert_eq!(Tree::decode(&expected).unwrap(), t);
 }

@@ -5,7 +5,9 @@
 use std::fs;
 
 use rusqlite::{Connection, params};
-use scion_core::{BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, RepoPath};
+use scion_core::{
+    BlobId, Changeset, ChangesetId, Entry, FileEntry, FileState, IdentityTime, RepoPath,
+};
 use scion_server::error::ApplyError;
 use scion_server::meta::MetaTx as _;
 use scion_server::store::BlobStatus;
@@ -253,16 +255,17 @@ fn created_changesets_have_the_expected_root_tree() {
         let root = tree::root_tree(&f.store, repo, cs).unwrap();
         f.store.read(|c| tree::lookup(c, root, &path(p))).unwrap()
     };
-    let file = |state| Some(Entry::File(state));
+    // The tree lens reads the stored blob files, so entries carry true lengths.
+    let file = |state: FileState, len: u64| Some(Entry::File(FileEntry::new(state, len)));
     assert_eq!(lookup(first, "a"), None);
-    assert_eq!(lookup(first, "dir/b"), file(regular("b")));
-    assert_eq!(lookup(first, "dir/c"), file(regular("c")));
-    assert_eq!(lookup(first, "dir/new"), file(exec));
-    assert_eq!(lookup(second, "dir/b/inner"), file(regular("b")));
-    assert_eq!(lookup(second, "dir/new"), file(exec));
+    assert_eq!(lookup(first, "dir/b"), file(regular("b"), 1));
+    assert_eq!(lookup(first, "dir/c"), file(regular("c"), 1));
+    assert_eq!(lookup(first, "dir/new"), file(exec, 3));
+    assert_eq!(lookup(second, "dir/b/inner"), file(regular("b"), 1));
+    assert_eq!(lookup(second, "dir/new"), file(exec, 3));
     assert_eq!(
         lookup(f.root, "a"),
-        file(regular("a")),
+        file(regular("a"), 1),
         "the parent is unchanged"
     );
 }
@@ -281,7 +284,7 @@ fn a_blob_that_a_changeset_of_the_repo_names_needs_no_upload() {
         .write(|c| {
             let repo = c.create_repo("imported")?;
             let root = changeset(vec![], &[("f", Some(file))]);
-            Ok(tree::store_changeset(c, repo, &root)?.0)
+            Ok(tree::store_changeset(c, repo, &root, &mut |_| Ok(0))?.0)
         })
         .unwrap();
     // A rename names it again.

@@ -347,14 +347,14 @@ impl Walker {
                     walked.extend_from_slice(part);
                     at.copy_from_slice(tree_id.as_bytes());
                 }
-                Entry::File(state) => {
+                Entry::File(entry) => {
                     if !last {
                         // A walk never goes through a file, a symlink or a
                         // gitlink.
                         return Ok(Walk::Absent);
                     }
                     let reaches = kind == ObjectKind::Blob
-                        && state.blob().is_some_and(|blob| blob.as_bytes() == id);
+                        && entry.state.blob().is_some_and(|blob| blob.as_bytes() == id);
                     return Ok(if reaches { Walk::Reached } else { Walk::Absent });
                 }
             }
@@ -399,7 +399,7 @@ enum Held<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scion_core::{BlobId, Entry, FileState, GitOid, PathElem, Tree, TreeId};
+    use scion_core::{BlobId, Entry, FileEntry, FileState, GitOid, PathElem, Tree, TreeId};
 
     #[test]
     fn a_signed_ticket_parses_for_its_life() {
@@ -523,10 +523,13 @@ mod tests {
         let leaf = Tree {
             entries: [(
                 PathElem::new("leaf").unwrap(),
-                Entry::File(FileState::Regular {
-                    content: BlobId::of(b"file\n"),
-                    executable: false,
-                }),
+                Entry::File(FileEntry::new(
+                    FileState::Regular {
+                        content: BlobId::of(b"file\n"),
+                        executable: false,
+                    },
+                    b"file\n".len() as u64,
+                )),
             )]
             .into(),
         };
@@ -535,15 +538,21 @@ mod tests {
                 (PathElem::new("a").unwrap(), Entry::Dir(leaf.id())),
                 (
                     PathElem::new("link").unwrap(),
-                    Entry::File(FileState::Symlink {
-                        target: BlobId::of(b"leaf"),
-                    }),
+                    Entry::File(FileEntry::new(
+                        FileState::Symlink {
+                            target: BlobId::of(b"leaf"),
+                        },
+                        b"leaf".len() as u64,
+                    )),
                 ),
                 (
                     PathElem::new("sub").unwrap(),
-                    Entry::File(FileState::Gitlink {
-                        commit: GitOid::Sha1([0; 20]),
-                    }),
+                    Entry::File(FileEntry::new(
+                        FileState::Gitlink {
+                            commit: GitOid::Sha1([0; 20]),
+                        },
+                        0,
+                    )),
                 ),
             ]
             .into(),

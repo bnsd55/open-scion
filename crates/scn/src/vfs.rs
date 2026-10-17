@@ -7,13 +7,12 @@
 //! this project's choice: the NFS server is `nfsserve`, mounted with the
 //! operating system's NFS client; a directory's tree is fetched when the
 //! directory is first listed or looked up in; a file's blob when the file
-//! is first read or sized. Writes go to an overlay directory beside the
+//! is first read. Writes go to an overlay directory beside the
 //! mount, which is the change list that `scn commit --from-mount` commits.
 //!
-//! A file's size comes from its blob, so the first stat of a file that
-//! was never read fetches the blob, and `ls -l` of a directory fetches
-//! every blob in it. Upgrade, after #172: a `GetSizes` call, served from
-//! the stored frame's header. The one place to change is `size_of`.
+//! A file's size comes from its tree entry, so a stat never fetches the
+//! blob. A read checks the blob's bytes against the size the tree claimed
+//! and refuses a mismatch.
 //!
 //! No protection: see `docs/architecture.md`, section 8. Any local user who
 //! can read the mount table can reach the mounted content through the NFS
@@ -38,7 +37,7 @@ use nfsserve::nfs::{
 };
 pub use nfsserve::vfs::NFSFileSystem;
 use nfsserve::vfs::{DirEntry, ReadDirResult, VFSCapabilities};
-use scion_core::{BlobId, ChangesetId, Entry, FileState, RepoPath, Tree, TreeId};
+use scion_core::{BlobId, ChangesetId, Entry, FileEntry, FileState, RepoPath, Tree, TreeId};
 use scion_proto::object::{self, Assembler, Header};
 use scion_proto::ticket::{self, TICKET_SKEW_SECS};
 use scion_proto::v1::{Encoding, GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
@@ -128,12 +127,13 @@ enum Kind {
     },
     /// A directory made on the mount. It holds nothing of the ref.
     LocalDir,
-    /// A regular file of the ref.
-    Store { blob: BlobId, exec: bool },
+    /// A regular file of the ref: its blob and the length its tree claims.
+    Store { blob: BlobId, exec: bool, len: u64 },
     /// A regular file of the overlay: its bytes are the file.
     Local { exec: bool },
-    /// A symlink of the ref: the blob that holds the target bytes.
-    StoreLink { blob: BlobId },
+    /// A symlink of the ref: the blob that holds the target bytes, and the
+    /// length its tree claims for it.
+    StoreLink { blob: BlobId, len: u64 },
     /// A symlink made on the mount.
     Link { target: Vec<u8> },
 }
@@ -481,14 +481,6 @@ impl Vfs {
         Ok(data)
     }
 
-    /// The size of the blob of the file at `path`. The size comes from
-    /// the blob, so a stat of a file that was never read fetches it.
-    /// SHORTCUT: after #172 gets a `GetSizes` call served from the stored
-    /// frame's header, this fetches no blob.
-    async fn size_of(&self, blob: BlobId, path: Option<&RepoPath>) -> Result<u64, nfsstat3> {
-        Ok(self.fetch_blob(blob, path).await.map_err(io_err)?.len() as u64)
-    }
-
     /// Fetches the tree of the directory `id` into its listing, once.
     async fn list_dir(&self, nodes: &mut Nodes, id: u64) -> Result<(), nfsstat3> {
         let (dir_path, tree) = {
@@ -522,17 +514,28 @@ impl Vfs {
                         tree: Some(tree),
                         listed: None,
                     },
-                    Entry::File(FileState::Regular {
-                        content,
-                        executable,
+                    Entry::File(FileEntry {
+                        state:
+                            FileState::Regular {
+                                content,
+                                executable,
+                            },
+                        len,
                     }) => Kind::Store {
                         blob: content,
                         exec: executable,
+                        len,
                     },
-                    Entry::File(FileState::Symlink { target }) => Kind::StoreLink { blob: target },
+                    Entry::File(FileEntry {
+                        state: FileState::Symlink { target },
+                        len,
+                    }) => Kind::StoreLink { blob: target, len },
                     // A gitlink names a commit of another repository, not
                     // an object of this one.
-                    Entry::File(FileState::Gitlink { .. }) => continue,
+                    Entry::File(FileEntry {
+                        state: FileState::Gitlink { .. },
+                        ..
+                    }) => continue,
                 };
                 let child = Self::add(nodes, Some(path), kind, true);
                 listed.insert(name.as_bytes().to_vec(), child);
@@ -631,7 +634,7 @@ impl NFSFileSystem for Vfs {
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
         let nodes = self.nodes.read().await;
-        self.attr_of(&nodes, id).await
+        self.attr_of(&nodes, id)
     }
 
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
@@ -669,7 +672,7 @@ impl NFSFileSystem for Vfs {
                 .map_err(|_| nfsstat3::NFS3ERR_IO)?;
             f.set_len(bytes).map_err(|_| nfsstat3::NFS3ERR_IO)?;
         }
-        self.attr_of(&nodes, id).await
+        self.attr_of(&nodes, id)
     }
 
     async fn read(
@@ -685,11 +688,25 @@ impl NFSFileSystem for Vfs {
         let nodes = self.nodes.read().await;
         let node = nodes.by_id.get(&id).ok_or(nfsstat3::NFS3ERR_STALE)?;
         match &node.kind {
-            Kind::Store { blob, .. } => {
+            Kind::Store { blob, len, .. } => {
                 let data = self
                     .fetch_blob(*blob, node.path.as_ref())
                     .await
                     .map_err(io_err)?;
+                if data.len() as u64 != *len {
+                    // The tree said one size, the blob holds another: one of
+                    // them is wrong, and reading on would serve lies.
+                    let why = format!(
+                        "{}: {} bytes, the tree says {len}",
+                        node.path.as_ref().map_or_else(
+                            || "<unnamed>".to_owned(),
+                            |p| String::from_utf8_lossy(p.as_bytes()).to_string()
+                        ),
+                        data.len()
+                    );
+                    warn("a blob does not match the size of its tree entry", &why);
+                    return Err(nfsstat3::NFS3ERR_IO);
+                }
                 let len = data.len() as u64;
                 let from = usize::try_from(offset.min(len)).unwrap_or(usize::MAX);
                 let to = usize::try_from(offset.saturating_add(u64::from(count)).min(len))
@@ -970,7 +987,7 @@ impl NFSFileSystem for Vfs {
         };
         let mut out = Vec::new();
         for (name, id) in entries.into_iter().skip(begin).take(max_entries) {
-            let attr = self.attr_of(&nodes, id).await?;
+            let attr = self.attr_of(&nodes, id)?;
             out.push(DirEntry {
                 fileid: id,
                 name: filename3::from(name),
@@ -1045,13 +1062,12 @@ impl NFSFileSystem for Vfs {
 
 impl Vfs {
     /// The attributes of the node `id`.
-    async fn attr_of(&self, nodes: &Nodes, id: u64) -> Result<fattr3, nfsstat3> {
+    fn attr_of(&self, nodes: &Nodes, id: u64) -> Result<fattr3, nfsstat3> {
         let node = nodes.by_id.get(&id).ok_or(nfsstat3::NFS3ERR_STALE)?;
         match &node.kind {
             Kind::Dir { .. } | Kind::LocalDir => Ok(self.attr(ftype3::NF3DIR, 0o755, 4096, id)),
-            Kind::Store { blob, exec } => {
-                let size = self.size_of(*blob, node.path.as_ref()).await?;
-                Ok(self.attr(ftype3::NF3REG, file_mode(0o644, *exec), size, id))
+            Kind::Store { exec, len, .. } => {
+                Ok(self.attr(ftype3::NF3REG, file_mode(0o644, *exec), *len, id))
             }
             Kind::Local { .. } => {
                 // The file may have been chmodded: take the real mode.
@@ -1060,10 +1076,7 @@ impl Vfs {
                 let exec = meta.permissions().mode() & 0o111 != 0;
                 Ok(self.attr(ftype3::NF3REG, file_mode(0o644, exec), meta.len(), id))
             }
-            Kind::StoreLink { blob } => {
-                let size = self.size_of(*blob, node.path.as_ref()).await?;
-                Ok(self.attr(ftype3::NF3LNK, 0o777, size, id))
-            }
+            Kind::StoreLink { len, .. } => Ok(self.attr(ftype3::NF3LNK, 0o777, *len, id)),
             Kind::Link { target } => Ok(self.attr(ftype3::NF3LNK, 0o777, target.len() as u64, id)),
         }
     }
@@ -1116,7 +1129,7 @@ impl Vfs {
         let (blob, path, exec) = {
             let node = nodes.by_id.get(&id).ok_or(nfsstat3::NFS3ERR_STALE)?;
             match &node.kind {
-                Kind::Store { blob, exec } => {
+                Kind::Store { blob, exec, .. } => {
                     (*blob, node.path.clone().expect("a file has a path"), *exec)
                 }
                 Kind::Local { .. } => return Ok(()),
@@ -1141,11 +1154,25 @@ impl Vfs {
     async fn file_bytes(&self, nodes: &Nodes, id: u64) -> Result<Vec<u8>, nfsstat3> {
         let node = nodes.by_id.get(&id).ok_or(nfsstat3::NFS3ERR_STALE)?;
         match &node.kind {
-            Kind::Store { blob, .. } | Kind::StoreLink { blob } => Ok(self
-                .fetch_blob(*blob, node.path.as_ref())
-                .await
-                .map_err(io_err)?
-                .to_vec()),
+            Kind::Store { blob, len, .. } | Kind::StoreLink { blob, len } => {
+                let bytes = self
+                    .fetch_blob(*blob, node.path.as_ref())
+                    .await
+                    .map_err(io_err)?;
+                if bytes.len() as u64 != *len {
+                    let why = format!(
+                        "{}: {} bytes, the tree says {len}",
+                        node.path.as_ref().map_or_else(
+                            || "<unnamed>".to_owned(),
+                            |p| String::from_utf8_lossy(p.as_bytes()).to_string()
+                        ),
+                        bytes.len()
+                    );
+                    warn("a blob does not match the size of its tree entry", &why);
+                    return Err(nfsstat3::NFS3ERR_IO);
+                }
+                Ok(bytes.to_vec())
+            }
             Kind::Local { .. } => {
                 let file = self.overlay_file(node.path.as_ref().expect("a file has a path"));
                 std::fs::read(&file).map_err(|_| nfsstat3::NFS3ERR_IO)
@@ -1401,6 +1428,7 @@ mod tests {
         let overlay = tempfile::tempdir().unwrap();
         let store = Store::open(&data.path().join("store")).unwrap();
         let mut contents = Vec::new();
+        let mut lens = tree::lens_of(&store);
         let base = store
             .write(|c| {
                 let repo = c.create_repo(REPO)?;
@@ -1433,7 +1461,7 @@ mod tests {
                     message: b"test\n".to_vec(),
                     changes: changes.into_iter().collect(),
                 };
-                let (id, _) = tree::store_changeset(c, repo, &cs)?;
+                let (id, _) = tree::store_changeset(c, repo, &cs, &mut lens)?;
                 let version = c.get_ref(repo, "main")?.map(|r| r.version);
                 c.cas_ref(repo, "main", version, id)?;
                 Ok(id)
@@ -1767,10 +1795,13 @@ mod tests {
             let tree = Tree {
                 entries: [(
                     PathElem::new("a").unwrap(),
-                    Entry::File(FileState::Regular {
-                        content: BlobId::try_from(blob.id.as_slice()).unwrap(),
-                        executable: false,
-                    }),
+                    Entry::File(FileEntry::new(
+                        FileState::Regular {
+                            content: BlobId::try_from(blob.id.as_slice()).unwrap(),
+                            executable: false,
+                        },
+                        blob.data.len() as u64,
+                    )),
                 )]
                 .into(),
             };

@@ -36,6 +36,8 @@ open-scion-server.workspace = true
 open-scion-tier.workspace = true
 tempfile.workspace = true
 zstd.workspace = true
+# The upgrade test reads the database of a schema-6 data directory.
+rusqlite.workspace = true
 
 [lints]
 workspace = true

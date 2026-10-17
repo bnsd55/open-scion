@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal, kill_process};
 use scion_core::{
-    BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, PathElem, RepoPath, Tree,
-    TreeId,
+    BlobId, Changeset, ChangesetId, Entry, FileEntry, FileState, IdentityTime, PathElem, RepoPath,
+    Tree, TreeId,
 };
 use scion_proto::CHUNK_BYTES;
 use scion_proto::listen::Limits;
@@ -415,7 +415,15 @@ fn store_changesets(store: &Store, cases: &[Files]) -> Vec<ChangesetId> {
             let repo = c.create_repo(REPO)?;
             cases
                 .iter()
-                .map(|files| Ok(tree::store_changeset(c, repo, &root_changeset(files))?.0))
+                .map(|files| {
+                    Ok(tree::store_changeset(
+                        c,
+                        repo,
+                        &root_changeset(files),
+                        &mut tree::lens_of(store),
+                    )?
+                    .0)
+                })
                 .collect()
         })
         .unwrap()
@@ -598,10 +606,13 @@ impl Liar {
             (two, one)
         };
         let file = |object: &Object| {
-            Entry::File(FileState::Regular {
-                content: BlobId::try_from(object.id.as_slice()).unwrap(),
-                executable: false,
-            })
+            Entry::File(FileEntry::new(
+                FileState::Regular {
+                    content: BlobId::try_from(object.id.as_slice()).unwrap(),
+                    executable: false,
+                },
+                object.data.len() as u64,
+            ))
         };
         let tree = Tree {
             entries: [
@@ -942,10 +953,13 @@ impl Expiring {
         let tree = Tree {
             entries: [(
                 PathElem::new("a").unwrap(),
-                Entry::File(FileState::Regular {
-                    content: BlobId::try_from(blob.id.as_slice()).unwrap(),
-                    executable: false,
-                }),
+                Entry::File(FileEntry::new(
+                    FileState::Regular {
+                        content: BlobId::try_from(blob.id.as_slice()).unwrap(),
+                        executable: false,
+                    },
+                    blob.data.len() as u64,
+                )),
             )]
             .into(),
         };
@@ -1036,4 +1050,124 @@ fn an_expired_ticket_is_minted_again_once() {
     assert_eq!(fs::read(dest.join("a")).unwrap(), b"x\n");
     // One mint for the checkout, one for the refresh: no more.
     assert_eq!(mints.load(Ordering::SeqCst), 2);
+}
+
+/// The body of a schema-6 tree: entries carry no byte lengths, so this
+/// build cannot decode it.
+fn old_tree(entries: &[(&str, BlobId, bool)]) -> Vec<u8> {
+    const TAG_REGULAR: u8 = 1;
+    let mut w = vec![1u8];
+    w.extend_from_slice(&u32::try_from(entries.len()).unwrap().to_be_bytes());
+    for (name, blob, exec) in entries {
+        w.extend_from_slice(&u32::try_from(name.len()).unwrap().to_be_bytes());
+        w.extend_from_slice(name.as_bytes());
+        w.push(TAG_REGULAR);
+        w.extend_from_slice(blob.as_bytes());
+        w.push(u8::from(*exec));
+    }
+    w
+}
+
+/// A data directory that the previous release (schema 6) wrote: its trees
+/// carry no byte lengths. Opening it on this build upgrades the database,
+/// drops the old trees, and re-derives them from the blob store, so the
+/// checkout works and fsck is clean.
+#[test]
+fn a_schema_6_data_dir_upgrades_and_checks_out() {
+    let data = tempfile::tempdir().unwrap();
+    // The changeset and blob bytes are the bytes the old release wrote
+    // too: #172 changed trees only.
+    let store = Store::open(data.path()).unwrap();
+    let hello = store.blobs().put(b"hello").unwrap();
+    let world = store.blobs().put(b"hello world").unwrap();
+    let author = IdentityTime {
+        name: b"Ada".to_vec(),
+        email: b"ada@example.com".to_vec(),
+        unix_secs: 1_700_000_000,
+        tz_offset_minutes: 0,
+    };
+    let changeset = |parent: Option<ChangesetId>, content: BlobId| Changeset {
+        parents: parent.into_iter().collect(),
+        author: author.clone(),
+        committer: None,
+        message: b"upgrade\n".to_vec(),
+        changes: [(
+            RepoPath::new("a").unwrap(),
+            Some(FileState::Regular {
+                content,
+                executable: false,
+            }),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let mut lens: std::collections::HashMap<BlobId, u64> =
+        [(hello, 5u64), (world, 11)].into_iter().collect();
+    let (root, child) = store
+        .write(|c| {
+            let repo = c.create_repo(REPO)?;
+            let mut missing = |b| {
+                lens.remove(&b)
+                    .ok_or_else(|| scion_server::error::Error::NotFound(format!("blob {b}")))
+            };
+            let root = tree::store_changeset(c, repo, &changeset(None, hello), &mut missing)?.0;
+            let child =
+                tree::store_changeset(c, repo, &changeset(Some(root), world), &mut missing)?.0;
+            assert!(c.cas_ref(repo, "main", None, child)?);
+            Ok((root, child))
+        })
+        .unwrap();
+    drop(store);
+
+    // Back to the disk state of the previous release: schema 6, and tree
+    // bodies whose entries carry no byte lengths.
+    let olds = [
+        (root, old_tree(&[("a", hello, false)])),
+        (child, old_tree(&[("a", world, false)])),
+    ];
+    {
+        let c = rusqlite::Connection::open(data.path().join("scion.db")).unwrap();
+        for (cs, body) in olds {
+            let id: Vec<u8> = c
+                .query_row(
+                    "SELECT value FROM derived WHERE kind = 'root_tree' AND cs = ?1",
+                    [cs.as_bytes().to_vec()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(id.len(), 32, "the changeset has a root tree row");
+            c.execute("UPDATE trees SET body = ?1 WHERE id = ?2", [body, id])
+                .unwrap();
+        }
+        c.execute_batch("DELETE FROM derived; PRAGMA user_version = 6;")
+            .unwrap();
+    }
+
+    // This build upgrades the directory on open.
+    let store = Store::open(data.path()).unwrap();
+    let version: u32 = store
+        .read(|c| Ok(c.pragma_query_value(None, "user_version", |row| row.get(0))?))
+        .unwrap();
+    assert_eq!(version, 7);
+    let trees: i64 = store
+        .read(|c| Ok(c.query_row("SELECT count() FROM trees", [], |row| row.get(0))?))
+        .unwrap();
+    assert_eq!(trees, 0, "the old trees are gone");
+    let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+
+    // A checkout of the upgraded directory re-derives the trees. The db
+    // path outlives `data`, which `Server::start` takes.
+    let db_path = data.path().join("scion.db");
+    let server = Server::start(data, store);
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("dest");
+    let out = server.scn(&["checkout", "main", "--into", text(&dest)]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(fs::read(dest.join("a")).unwrap(), b"hello world");
+    let c = rusqlite::Connection::open(&db_path).unwrap();
+    let trees: i64 = c
+        .query_row("SELECT count() FROM trees", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(trees, 2, "the checkout re-derived and stored the trees");
 }

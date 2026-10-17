@@ -348,7 +348,7 @@ fn two_changesets(
                     message: b"change".to_vec(),
                     changes,
                 };
-                parents.push(tree::store_changeset(c, repo, &cs)?.0);
+                parents.push(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0);
             }
             Ok((parents[0], parents[1]))
         })

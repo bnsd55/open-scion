@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::{
-    BlobId, Changeset, ChangesetId, Entry, FileState, GitOid, IdentityTime, PathElem, PathError,
-    RepoPath, Tree, TreeId,
+    BlobId, Changeset, ChangesetId, Entry, FileEntry, FileState, GitOid, IdentityTime, PathElem,
+    PathError, RepoPath, Tree, TreeId,
 };
 
 const VERSION: u8 = 1;
@@ -194,7 +194,12 @@ impl Tree {
         for (name, entry) in &self.entries {
             put_bytes(&mut w, name.as_bytes());
             match entry {
-                Entry::File(file) => put_file(&mut w, file),
+                Entry::File(file) => {
+                    put_file(&mut w, &file.state);
+                    if let Some(len) = file.encoded_len() {
+                        w.extend_from_slice(&len.to_be_bytes());
+                    }
+                }
                 Entry::Dir(id) => {
                     w.push(TAG_DIR);
                     w.extend_from_slice(id.as_bytes());
@@ -217,9 +222,17 @@ impl Tree {
         for _ in 0..r.u32()? {
             let name = PathElem::new(r.bytes()?).map_err(DecodeError::BadPath)?;
             ensure_after(&entries, &name)?;
-            let entry = match r.u8()? {
+            let tag = r.u8()?;
+            let entry = match tag {
                 TAG_DIR => Entry::Dir(TreeId::from_bytes(r.array()?)),
-                tag => Entry::File(r.file(tag)?),
+                TAG_REGULAR | TAG_SYMLINK => Entry::File(FileEntry {
+                    state: r.file(tag)?,
+                    len: u64::from_be_bytes(r.array()?),
+                }),
+                _ => Entry::File(FileEntry {
+                    state: r.file(tag)?,
+                    len: 0,
+                }),
             };
             entries.push((name, entry));
         }

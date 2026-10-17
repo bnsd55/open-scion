@@ -3,7 +3,9 @@
 use std::io::Write as _;
 
 use anyhow::{Context, Result, bail};
-use scion_core::{Changeset, ChangesetId, Entry, FileState, IdentityTime, RepoPath, Tree};
+use scion_core::{
+    Changeset, ChangesetId, Entry, FileEntry, FileState, IdentityTime, RepoPath, Tree,
+};
 use scion_proto::v1::{
     GetChangesetRequest, ListDirRequest, LogRequest, ReadFileRequest, ReadFileResponse,
 };
@@ -158,7 +160,7 @@ pub async fn show(ctx: &mut Ctx, rev: &str) -> Result<()> {
             .map(|(path, state)| {
                 let mut change = match state {
                     Some(state) => {
-                        let mut put = entry_json(&Entry::File(*state));
+                        let mut put = entry_json(&Entry::File(FileEntry::new(*state, 0)));
                         put["op"] = "put".into();
                         put
                     }
@@ -214,14 +216,26 @@ fn decode_changeset(id: ChangesetId, bytes: &[u8]) -> Result<Changeset> {
 fn describe(entry: &Entry) -> (&'static str, &'static str) {
     match entry {
         Entry::Dir(_) => ("040000", "dir"),
-        Entry::File(FileState::Regular {
-            executable: false, ..
+        Entry::File(FileEntry {
+            state: FileState::Regular {
+                executable: false, ..
+            },
+            ..
         }) => ("100644", "file"),
-        Entry::File(FileState::Regular {
-            executable: true, ..
+        Entry::File(FileEntry {
+            state: FileState::Regular {
+                executable: true, ..
+            },
+            ..
         }) => ("100755", "file"),
-        Entry::File(FileState::Symlink { .. }) => ("120000", "symlink"),
-        Entry::File(FileState::Gitlink { .. }) => ("160000", "gitlink"),
+        Entry::File(FileEntry {
+            state: FileState::Symlink { .. },
+            ..
+        }) => ("120000", "symlink"),
+        Entry::File(FileEntry {
+            state: FileState::Gitlink { .. },
+            ..
+        }) => ("160000", "gitlink"),
     }
 }
 
@@ -262,13 +276,21 @@ fn changeset_json(id: ChangesetId, cs: &Changeset) -> Value {
 pub(crate) fn entry_json(entry: &Entry) -> Value {
     let id = match entry {
         Entry::Dir(id) => id.to_string(),
-        Entry::File(
-            FileState::Regular { content: blob, .. } | FileState::Symlink { target: blob },
-        ) => blob.to_string(),
-        Entry::File(FileState::Gitlink { commit }) => commit.to_string(),
+        Entry::File(FileEntry {
+            state: FileState::Regular { content: blob, .. } | FileState::Symlink { target: blob },
+            ..
+        }) => blob.to_string(),
+        Entry::File(FileEntry {
+            state: FileState::Gitlink { commit },
+            ..
+        }) => commit.to_string(),
     };
     let mut value = json!({ "kind": describe(entry).1, "id": id });
-    if let Entry::File(FileState::Regular { executable, .. }) = entry {
+    if let Entry::File(FileEntry {
+        state: FileState::Regular { executable, .. },
+        ..
+    }) = entry
+    {
         value["executable"] = (*executable).into();
     }
     value

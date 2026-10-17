@@ -58,7 +58,7 @@ pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<Chang
             // A retry. Its tree was checked and recorded the first time.
             return Ok(id);
         }
-        tree::store_changeset(c, repo_id, &cs).map(|(id, _)| id)
+        tree::store_changeset(c, repo_id, &cs, &mut crate::tree::lens_of(store)).map(|(id, _)| id)
     })
 }
 

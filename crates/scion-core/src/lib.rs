@@ -139,11 +139,40 @@ pub struct Changeset {
     pub changes: BTreeMap<RepoPath, Option<FileState>>,
 }
 
+/// A file entry of a tree: what the path holds, and the byte length of
+/// the blob that backs it. The length is the file's size for a regular
+/// entry and the link target's length for a symlink; it is part of the
+/// tree's ID, so it is as trustworthy as the tree. A gitlink names no
+/// blob: its `len` is 0 and its encoding carries no length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileEntry {
+    /// What the path holds.
+    pub state: FileState,
+    /// Byte length of the blob `state` names, 0 for a gitlink.
+    pub len: u64,
+}
+
+impl FileEntry {
+    /// Wraps a state that names a blob, with that blob's byte length. A
+    /// gitlink has no blob, so it wraps as a plain entry of length 0.
+    #[must_use]
+    pub fn new(state: FileState, len: u64) -> Self {
+        let len = if state.blob().is_some() { len } else { 0 };
+        Self { state, len }
+    }
+
+    /// The length the tree encodes: `len` for a blob-backed state, and
+    /// nothing at all for a gitlink, whose payload ends at the commit.
+    pub(crate) fn encoded_len(&self) -> Option<u64> {
+        self.state.blob().map(|_| self.len)
+    }
+}
+
 /// One entry in a [`Tree`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Entry {
-    /// A file, symlink or gitlink.
-    File(FileState),
+    /// A file, symlink or gitlink, with the length of its blob.
+    File(FileEntry),
     /// A subdirectory.
     Dir(TreeId),
 }
