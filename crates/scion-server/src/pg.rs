@@ -87,7 +87,7 @@ impl Readers {
         // The open is sequential, so every client sees the same schema.
         let idle = (0..size)
             .map(|_| {
-                let client = connect_with(url, ca, options)?;
+                let mut client = connect_with(url, ca, options, None)?;
                 let on: String = client.query("SHOW synchronous_commit", &[])?[0].get(0);
                 if on != "on" {
                     return Err(Error::FailedPrecondition(format!(
@@ -257,6 +257,7 @@ impl PgClient {
                     url,
                     ca,
                     options,
+                    schema,
                     mut exclusive,
                 } = cfg;
                 for job in rx {
@@ -265,10 +266,17 @@ impl PgClient {
                     // most, not one until the process restarts.
                     if client.is_closed() {
                         match connect_on(&url, ca.as_deref(), &options) {
-                            Ok(fresh) => {
-                                client = fresh;
-                                if exclusive {
-                                    exclusive = server_lock_raw(&mut client);
+                            Ok(mut fresh) => {
+                                if apply_schema(&mut fresh, schema.as_deref()).is_ok() {
+                                    client = fresh;
+                                    if exclusive {
+                                        exclusive = server_lock_raw(&mut client);
+                                    }
+                                } else {
+                                    let _ = job.reply.send(Err(Error::Corrupt(
+                                        "the database worker lost its schema".into(),
+                                    )));
+                                    continue;
                                 }
                             }
                             Err(error) => {
@@ -378,15 +386,11 @@ const CLEAN_LOCK: i64 = 0x5343_494F_4E53_5445;
 
 /// The libpq options of every connection of this backend. The commit of
 /// a transaction reaches the drive before it returns, and no statement
-/// runs longer than the graph-walk bound.
-fn base_options(schema: Option<&str>) -> String {
-    let mut options = String::from("-csynchronous_commit=on -cstatement_timeout=600000");
-    if let Some(schema) = schema {
-        options.push_str(&format!(
-            " -csearch_path={schema} -capplication_name={schema}"
-        ));
-    }
-    options
+/// runs longer than the graph-walk bound. The search path is not set
+/// here: it is a statement on the live connection, which the server
+/// cannot lose between connections.
+fn base_options() -> String {
+    String::from("-csynchronous_commit=on -cstatement_timeout=600000")
 }
 
 impl Pg {
@@ -448,11 +452,11 @@ impl Pg {
         schema: Option<&str>,
         exclusive: bool,
     ) -> Result<Self> {
-        let options = base_options(schema);
+        let options = base_options();
         let mut writer = if exclusive {
-            connect_exclusive(url, ca, &options)?
+            connect_exclusive(url, ca, &options, schema)?
         } else {
-            connect_with(url, ca, &options)?
+            connect_with(url, ca, &options, schema)?
         };
         migrate(&mut writer)?;
         // The durability of a commit is a promise of this backend: check
@@ -624,6 +628,8 @@ struct ClientConfig {
     url: String,
     ca: Option<PathBuf>,
     options: String,
+    /// The schema a reconnect narrows itself to again.
+    schema: Option<String>,
     /// Re-take the one-server lock after every reconnect.
     exclusive: bool,
 }
@@ -644,35 +650,66 @@ fn server_lock_raw(client: &mut Client) -> bool {
 }
 
 fn connect(url: &str, ca: Option<&Path>) -> Result<PgClient> {
-    connect_with(url, ca, "")
+    connect_with(url, ca, "", None)
 }
 
 /// Connects one client of `url`, with libpq `options` added. The connect
 /// runs on a plain thread: `postgres` drives its own runtime, which must
 /// not start inside the server's tokio one.
-fn connect_with(url: &str, ca: Option<&Path>, options: &str) -> Result<PgClient> {
+fn connect_with(
+    url: &str,
+    ca: Option<&Path>,
+    options: &str,
+    schema: Option<&str>,
+) -> Result<PgClient> {
     let client =
         std::thread::scope(|scope| scope.spawn(|| connect_on(url, ca, options)).join().unwrap())?;
+    let mut client = client;
+    apply_schema(&mut client, schema)?;
     Ok(PgClient::spawn(ClientConfig {
         client,
         url: url.to_owned(),
         ca: ca.map(Path::to_path_buf),
         options: options.to_owned(),
+        schema: schema.map(str::to_owned),
         exclusive: false,
     }))
+}
+
+/// Names `schema` on the live connection: every statement that follows
+/// resolves its unqualified names inside it, and the cleanup of stale
+/// test schemas sees the connection in `pg_stat_activity` under that
+/// name. A schema that does not exist yet still sets: the search path
+/// may name a schema the caller creates next.
+fn apply_schema(client: &mut Client, schema: Option<&str>) -> Result<()> {
+    match schema {
+        Some(schema) => client
+            .batch_execute(&format!(
+                "SET search_path TO {schema}; SET application_name TO '{schema}'"
+            ))
+            .map_err(map_pg_error),
+        None => Ok(()),
+    }
 }
 
 /// [`connect_with`], as the one server process of the database: the
 /// advisory lock it takes survives as long as the client, and a
 /// reconnecting client takes it again.
-fn connect_exclusive(url: &str, ca: Option<&Path>, options: &str) -> Result<PgClient> {
+fn connect_exclusive(
+    url: &str,
+    ca: Option<&Path>,
+    options: &str,
+    schema: Option<&str>,
+) -> Result<PgClient> {
     let client =
         std::thread::scope(|scope| scope.spawn(|| connect_on(url, ca, options)).join().unwrap())?;
     let mut client = client;
+    apply_schema(&mut client, schema)?;
     let exclusive = server_lock_raw(&mut client);
     if !exclusive {
         return Err(Error::FailedPrecondition(
-            "another server process already uses this database; one server              may serve one database"
+            "another server process already uses this database; one server \
+             may serve one database"
                 .into(),
         ));
     }
@@ -681,6 +718,7 @@ fn connect_exclusive(url: &str, ca: Option<&Path>, options: &str) -> Result<PgCl
         url: url.to_owned(),
         ca: ca.map(Path::to_path_buf),
         options: options.to_owned(),
+        schema: schema.map(str::to_owned),
         exclusive: true,
     }))
 }
