@@ -485,6 +485,9 @@ enum Parts {
         worker: Worker,
         blob: BlobId,
         open: Option<Box<crate::store::BlobReader>>,
+        /// The reader has ended: no part is left, and the next call ends the
+        /// reply without opening the blob again.
+        ended: bool,
     },
     /// Parts copied out of one in-memory buffer, as a `ListDir` or
     /// `GetChangeset` reply has. Each part is its own buffer, so a part that
@@ -496,7 +499,15 @@ impl Parts {
     /// Reads the next part of up to `CHUNK_BYTES`, or `None` after the last.
     async fn next_part(&mut self) -> Result<Option<Vec<u8>>, Status> {
         match self {
-            Parts::Blob { worker, blob, open } => {
+            Parts::Blob {
+                worker,
+                blob,
+                open,
+                ended,
+            } => {
+                if *ended {
+                    return Ok(None);
+                }
                 let blob = *blob;
                 let read = {
                     let open = open.take();
@@ -512,6 +523,7 @@ impl Parts {
                         })
                         .await?
                 };
+                *ended = read.1.is_none();
                 *open = read.1.map(Box::new);
                 Ok(read.0)
             }
@@ -605,6 +617,7 @@ async fn send_file(
             worker,
             blob,
             open: None,
+            ended: false,
         },
         share,
         call,
@@ -1439,6 +1452,33 @@ mod tests {
         assert!(lines[0].contains("may not read the repo"), "{}", lines[0]);
         assert!(lines[0].contains("principal=\"p\""), "{}", lines[0]);
         assert!(lines[0].contains("rpc=\"GetLand\""), "{}", lines[0]);
+    }
+
+    #[tokio::test]
+    async fn a_read_file_reply_of_many_parts_stays_exactly_the_file() {
+        let data = content(3);
+        let (_dir, store, _, blob) = file_store(&data);
+        let budget = read_share(data.len());
+        let (task, mut rx, reads) = reply(store, blob, budget, Duration::from_secs(60)).await;
+        let mut parts = 0;
+        let mut read = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(part) = rx.recv().await {
+                let part = part.unwrap();
+                assert!(part.data.len() <= CHUNK_BYTES, "a part over the cap");
+                read.extend(part.data);
+                parts += 1;
+            }
+        })
+        .await
+        .expect("the reply ends; it never repeats a part");
+        assert_eq!(parts, 3, "one part per chunk, no replay");
+        assert_eq!(read, data, "the parts are the file, in order");
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the reply ends")
+            .unwrap();
+        assert_eq!(reads.available_permits(), budget, "the share is free");
     }
 
     #[tokio::test]
