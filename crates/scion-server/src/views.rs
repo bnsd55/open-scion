@@ -223,6 +223,8 @@ fn context_digest(ctx: &Context) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::TestCaseError;
     use scion_core::{FileEntry, FileState, PathElem};
     use std::time::{Duration, Instant};
 
@@ -456,4 +458,398 @@ mod tests {
         };
         assert_eq!(*kept, docs_id, "the fully visible folder is unchanged");
     }
+
+    // ---- The model check: random trees and rule sets against a naive
+    // ---- projection.
+
+    /// The file paths of a random tree: unique, nested, names from a small
+    /// alphabet so names repeat across directories and subtrees share
+    /// content. A path that is also a prefix of another path loses its
+    /// file role: a real tree holds one entry per name, file or dir.
+    fn file_paths() -> impl proptest::strategy::Strategy<Value = Vec<String>> {
+        proptest::collection::vec("[ab]{1,4}", 2..24).prop_map(|parts| {
+            let mut paths: Vec<String> = Vec::new();
+            for (i, name) in parts.iter().enumerate() {
+                let parent = if i == 0 {
+                    String::new()
+                } else {
+                    paths[(name.len() + i) % paths.len()].clone()
+                };
+                let candidate = if parent.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{parent}/{name}")
+                };
+                if !paths.contains(&candidate) {
+                    paths.push(candidate);
+                }
+            }
+            // A path with a descendant in the set is a directory, not a
+            // file: drop its file role.
+            let has_descendant = |p: &String| paths.iter().any(|q| q.starts_with(&format!("{p}/")));
+            let keep: Vec<String> = paths
+                .iter()
+                .filter(|p| !has_descendant(p))
+                .cloned()
+                .collect();
+            paths = keep;
+            paths.sort();
+            paths
+        })
+    }
+
+    /// The content of a file: unique per path, so every blob ID differs.
+    fn content_of(path: &str) -> Vec<u8> {
+        format!("content of {path}\n").into_bytes()
+    }
+
+    fn elem(raw: &[u8]) -> PathElem {
+        PathElem::new(raw.to_vec()).unwrap()
+    }
+
+    fn file_entry(store: &Store, content: &[u8]) -> Entry {
+        let blob = store.blobs().put(content).unwrap();
+        let len = u64::try_from(content.len()).unwrap();
+        Entry::File(FileEntry::new(
+            FileState::Regular {
+                content: blob,
+                executable: false,
+            },
+            len,
+        ))
+    }
+
+    /// Builds and stores the real trees for the paths: every intermediate
+    /// directory exists, files carry their deterministic content. Returns
+    /// the non-root trees by path and the stored root's ID.
+    fn build_trees(
+        store: &Store,
+        paths: &[String],
+    ) -> (std::collections::BTreeMap<String, Tree>, TreeId) {
+        let mut all: Vec<String> = vec![String::new()];
+        for p in paths {
+            let parts: Vec<&str> = p.split('/').collect();
+            for i in 1..parts.len() {
+                let dir = parts[..i].join("/");
+                if !all.contains(&dir) {
+                    all.push(dir);
+                }
+            }
+        }
+        all.sort();
+        // Deepest first, so a child tree exists when its parent needs it.
+        all.reverse();
+        let mut dirs: std::collections::BTreeMap<String, Tree> = std::collections::BTreeMap::new();
+        let mut ids: std::collections::BTreeMap<String, TreeId> = std::collections::BTreeMap::new();
+        for path in &all {
+            let prefix = if path.is_empty() {
+                String::new()
+            } else {
+                format!("{path}/")
+            };
+            let mut entries = std::collections::BTreeMap::new();
+            for (d, id) in &ids {
+                if let Some(rest) = d.strip_prefix(prefix.as_str()).filter(|r| !r.contains('/')) {
+                    entries.insert(elem(rest.as_bytes()), Entry::Dir(*id));
+                }
+            }
+            for p in paths {
+                if let Some(rest) = p.strip_prefix(prefix.as_str()).filter(|r| !r.contains('/')) {
+                    entries.insert(elem(rest.as_bytes()), file_entry(store, &content_of(p)));
+                }
+            }
+            let tree = Tree { entries };
+            let id = store.write(|c| c.put_tree(&tree)).unwrap();
+            ids.insert(path.clone(), id);
+            dirs.insert(path.clone(), tree);
+        }
+        let root = dirs
+            .remove("")
+            .expect("every path has the root as a prefix");
+        let root_id = store.write(|c| c.put_tree(&root)).unwrap();
+        (dirs, root_id)
+    }
+
+    /// The canonical rule set: a sorted subset of the paths (files and
+    /// directories), with any rule another rule covers removed.
+    fn canonical_rules(paths: &[String], seeds: &[u16]) -> Vec<String> {
+        let mut all: Vec<String> = Vec::new();
+        for p in paths {
+            let parts: Vec<&str> = p.split('/').collect();
+            for i in 1..parts.len() {
+                let dir = parts[..i].join("/");
+                if !all.contains(&dir) {
+                    all.push(dir);
+                }
+            }
+            if !all.contains(p) {
+                all.push(p.clone());
+            }
+        }
+        all.sort();
+        let mut picked: Vec<String> = Vec::new();
+        for s in seeds {
+            let pick = &all[usize::from(*s) % all.len()];
+            if !picked.contains(pick) {
+                picked.push(pick.clone());
+            }
+        }
+        picked.sort();
+        let mut kept_rules: Vec<String> = Vec::new();
+        for r in &picked {
+            let covered = kept_rules
+                .iter()
+                .any(|k| k != r && r.starts_with(&format!("{k}/")));
+            if !covered {
+                kept_rules.push(r.clone());
+            }
+        }
+        kept_rules
+    }
+
+    /// The naive model: a path is kept iff some rule covers it.
+    fn kept(path: &str, rules: &[String]) -> bool {
+        rules
+            .iter()
+            .any(|r| path == r || path.starts_with(&format!("{r}/")))
+    }
+
+    /// What the model says about a directory: nothing below it is kept,
+    /// some is, or all of it is.
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    enum DirState {
+        Hidden,
+        Partial,
+        Whole,
+    }
+
+    fn dir_state(dir: &str, paths: &[String], rules: &[String]) -> DirState {
+        let below: Vec<&String> = paths
+            .iter()
+            .filter(|p| p.starts_with(&format!("{dir}/")))
+            .collect();
+        let any = below.iter().any(|p| kept(p, rules));
+        let all = below.iter().all(|p| kept(p, rules));
+        match (any, all) {
+            (false, _) => DirState::Hidden,
+            (true, true) => DirState::Whole,
+            (true, false) => DirState::Partial,
+        }
+    }
+
+    /// The model of the view tree at `dir` (the root at the empty path):
+    /// the names it shows and, for directories, whether it holds the real
+    /// tree (`Whole`) or a derived view (`Partial`). Files are shown iff
+    /// kept.
+    fn model_view(dir: &str, paths: &[String], rules: &[String]) -> Vec<(String, DirState)> {
+        let prefix = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
+        let mut direct: Vec<String> = Vec::new();
+        for p in paths {
+            if let Some(rest) = p.strip_prefix(prefix.as_str()) {
+                let first = rest.split('/').next().unwrap().to_owned();
+                if !direct.contains(&first) {
+                    direct.push(first);
+                }
+            }
+        }
+        let mut shown = Vec::new();
+        for name in direct {
+            let child = if dir.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}{name}")
+            };
+            let is_dir = paths.iter().any(|p| {
+                p.strip_prefix(prefix.as_str())
+                    .is_some_and(|rest| rest.starts_with(&format!("{name}/")))
+            });
+            if is_dir {
+                match dir_state(&child, paths, rules) {
+                    DirState::Hidden => {}
+                    state => shown.push((name, state)),
+                }
+            } else if kept(&child, rules) {
+                shown.push((name, DirState::Whole));
+            }
+        }
+        shown
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(256))]
+
+        /// The view that `project` derives equals the naive model, keeps
+        /// real IDs for fully covered directories, and leaks nothing.
+        #[test]
+        fn the_view_equals_the_model(
+            paths in file_paths(),
+            rule_seeds in proptest::collection::vec(proptest::num::u16::ANY, 1..8),
+        ) {
+            prop_assume!(!paths.is_empty());
+            let rules = canonical_rules(&paths, &rule_seeds);
+            prop_assume!(!rules.is_empty(), "every rule was covered by another");
+            let (_dir, store) = store();
+            let (dirs, root_id) = build_trees(&store, &paths);
+
+            // The rule set, in the canonical form the caller passes.
+            let ctx: Context = rules
+                .iter()
+                .map(|r| RepoPath::new(r.clone()).unwrap().as_bytes().to_vec())
+                .collect();
+            let mut memo = Memo::default();
+            let view = store
+                .write(|c| project(&mut *c, root_id, &ctx, &mut memo))
+                .unwrap();
+
+            // Walk the view against the model, collecting what it shows.
+            let mut w = Walk {
+                store: &store,
+                dirs: &dirs,
+                paths: &paths,
+                rules: &rules,
+                names: std::collections::BTreeSet::new(),
+                blobs: std::collections::BTreeSet::new(),
+                tree_ids: Vec::new(),
+            };
+            walk(&mut w, view, "")?;
+
+            // Nothing hidden leaks: a name that is hidden everywhere it
+            // exists, the blob of an uncovered file, and the real ID of a
+            // directory whose view is not the real tree.
+            let every_name: std::collections::BTreeSet<String> = paths
+                .iter()
+                .flat_map(|p| p.split('/').map(str::to_owned).collect::<Vec<_>>())
+                .collect();
+            let mut places: Vec<String> = vec![String::new()];
+            for p in &paths {
+                let parts: Vec<&str> = p.split('/').collect();
+                for i in 1..parts.len() {
+                    places.push(parts[..i].join("/"));
+                }
+            }
+            places.sort();
+            places.dedup();
+            for name in every_name {
+                let shown_somewhere = places.iter().any(|d| {
+                    model_view(d, &paths, &rules)
+                        .iter()
+                        .any(|(n, _)| n.as_bytes() == name.as_bytes())
+                });
+                if !shown_somewhere {
+                    prop_assert!(
+                        !w.names.contains(&name.clone().into_bytes()),
+                        "the hidden name {name} shows in a view"
+                    );
+                }
+            }
+            for p in &paths {
+                if !kept(p, &rules) {
+                    let blob = scion_core::BlobId::of(&content_of(p))
+                        .as_bytes()
+                        .to_vec();
+                    prop_assert!(
+                        !w.blobs.contains(&blob),
+                        "the blob of the hidden file {p} shows in a view"
+                    );
+                }
+            }
+            for d in dirs.keys() {
+                if dir_state(d, &paths, &rules) != DirState::Whole {
+                    let real = tree_id_of(&dirs[d]);
+                    prop_assert!(
+                        !w.tree_ids.contains(&real),
+                        "the real tree of the hidden or partial directory {d} shows in a view"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The content address of a tree that was built in memory: its
+    /// canonical encoding hashes to the ID the store gave it.
+    fn tree_id_of(tree: &Tree) -> TreeId {
+        tree.encode_with_id().1
+    }
+
+    /// What the view walk carries: the store, the real trees by path, the
+    /// rule set, and what the view has shown so far.
+    struct Walk<'a> {
+        store: &'a Store,
+        dirs: &'a std::collections::BTreeMap<String, Tree>,
+        paths: &'a [String],
+        rules: &'a [String],
+        names: std::collections::BTreeSet<Vec<u8>>,
+        blobs: std::collections::BTreeSet<Vec<u8>>,
+        tree_ids: Vec<TreeId>,
+    }
+
+    /// Walks the view tree, comparing it against the model, and collecting
+    /// every name, blob ID and tree ID the view shows.
+    fn walk(w: &mut Walk<'_>, view: Option<TreeId>, dir: &str) -> Result<(), TestCaseError> {
+        let paths: &[String] = w.paths;
+        let rules: &[String] = w.rules;
+        let shown = match view {
+            Some(id) => w.store.write(|c| c.get_tree(id)).unwrap(),
+            None => Tree::default(),
+        };
+        let model = model_view(dir, paths, rules);
+        let shown_names: Vec<Vec<u8>> = shown
+            .entries
+            .keys()
+            .map(|k| k.as_bytes().to_vec())
+            .collect();
+        let model_names: Vec<Vec<u8>> = model.iter().map(|(n, _)| n.clone().into_bytes()).collect();
+        prop_assert_eq!(shown_names, model_names, "the view differs from the model");
+        for (name, state) in &model {
+            let child_path = if dir.is_empty() {
+                name.clone()
+            } else {
+                format!("{dir}/{name}")
+            };
+            let entry = shown.entries.get(&elem(name.as_bytes())).unwrap();
+            match state {
+                DirState::Whole => {
+                    if paths.contains(&child_path) {
+                        // A file: the real entry.
+                        let Entry::File(f) = entry else {
+                            panic!("{child_path} is a file in the view");
+                        };
+                        w.names.insert(name.clone().into_bytes());
+                        if let FileState::Regular { content: blob, .. } = f.state() {
+                            w.blobs.insert(blob.as_bytes().to_vec());
+                        }
+                    } else {
+                        // A directory whose subtree is fully covered: the
+                        // real tree ID.
+                        let Entry::Dir(id) = entry else {
+                            panic!("{child_path} is a directory in the view");
+                        };
+                        prop_assert_eq!(
+                            *id,
+                            tree_id_of(&w.dirs[&child_path]),
+                            "a fully covered directory shows the real tree"
+                        );
+                        w.names.insert(name.clone().into_bytes());
+                        w.tree_ids.push(*id);
+                    }
+                }
+                DirState::Partial => {
+                    // A derived view: walk it against the model of the
+                    // covered part.
+                    let Entry::Dir(id) = entry else {
+                        panic!("{child_path} is a directory in the view");
+                    };
+                    w.names.insert(name.clone().into_bytes());
+                    w.tree_ids.push(*id);
+                    walk(w, Some(*id), &child_path)?;
+                }
+                DirState::Hidden => unreachable!("hidden entries are not shown"),
+            }
+        }
+        Ok(())
+}
 }
