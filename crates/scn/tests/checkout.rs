@@ -1168,7 +1168,12 @@ fn a_schema_6_data_dir_upgrades_and_checks_out() {
         .read(|c| Ok(c.query_row("SELECT count() FROM trees", [], |row| row.get(0))?))
         .unwrap();
     assert_eq!(trees, 0, "the old trees are gone");
-    let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
+    let report = scion_server::fsck::run(
+        &scion_server::Backend::Sqlite(store.clone()),
+        1,
+        &mut |_| {},
+    )
+    .unwrap();
     assert!(report.problems.is_empty(), "{:?}", report.problems);
 
     // A checkout of the upgraded directory re-derives the trees. The db

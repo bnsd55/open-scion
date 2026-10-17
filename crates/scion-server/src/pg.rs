@@ -41,7 +41,7 @@ use crate::land::{
     EXPIRE_PER_LAND, LAND_RETENTION_SECS, LandOutcome, LandRequest, LandState, decode_paths,
     encode_paths,
 };
-use crate::meta::{Meta, MetaTx, RefState, RepoId};
+use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId};
 use crate::store::Blobs;
 
 /// The schema version this build makes and reads.
@@ -1096,6 +1096,15 @@ fn id_bytes(id: &[u8; 32]) -> Vec<u8> {
     id.to_vec()
 }
 
+/// The 63-bit key of the advisory lock for `blob`: the first 8 bytes of its
+/// ID, masked to the positive range, so both sides key one blob alike.
+fn blob_lock_key(blob: &BlobId) -> i64 {
+    let bytes = blob.as_bytes();
+    let mut key = [0_u8; 8];
+    key.copy_from_slice(&bytes[..8]);
+    (i64::from_be_bytes(key) >> 1) & i64::MAX
+}
+
 impl MetaTx for PgTx<'_> {
     /// Creates a repository, or returns the existing one with that name.
     fn create_repo(&mut self, name: &str) -> Result<RepoId> {
@@ -1129,6 +1138,16 @@ impl MetaTx for PgTx<'_> {
     ///
     /// [`Error::NotFound`] if a parent is not in `repo`.
     fn insert_changeset(&mut self, repo: RepoId, cs: &Changeset) -> Result<ChangesetId> {
+        // The collector takes the same locks around its row check and
+        // delete, so a changeset that names a blob it is about to remove
+        // commits first, and the collector's re-read pins the blob. Sorted,
+        // so both sides take their locks in one order.
+        let mut puts: Vec<BlobId> = crate::db::puts(cs).map(|(_, blob)| blob).collect();
+        puts.sort();
+        puts.dedup();
+        for blob in &puts {
+            self.lock_blob(*blob)?;
+        }
         let (body, id) = cs.encode_with_id();
         let mut parent_gen = 0;
         for parent in &cs.parents {
@@ -1764,6 +1783,235 @@ impl MetaTx for PgTx<'_> {
         }
         let len = body.len();
         Ok((body, len))
+    }
+    /// Every repo, in ID order.
+    fn repos(&mut self) -> Result<Vec<RepoId>> {
+        let rows = self
+            .c
+            .query("SELECT repo_id FROM repos ORDER BY repo_id", &[])?;
+        Ok(rows.iter().map(|row| RepoId(row.get(0))).collect())
+    }
+
+    /// The `(repo, changeset ID, body)` of the stored changesets after
+    /// `(repo, cs)`, in that order, at most `limit`.
+    fn repo_changesets_after(
+        &mut self,
+        from_repo: RepoId,
+        from_cs: &[u8],
+        limit: usize,
+    ) -> Result<Vec<RepoChangeset>> {
+        let rows = self.c.query(
+            "SELECT rc.repo_id, rc.cs, ch.body
+             FROM repo_changesets rc JOIN changesets ch ON ch.id = rc.cs
+             WHERE (rc.repo_id, rc.cs) > ($1, $2)
+             ORDER BY rc.repo_id, rc.cs LIMIT $3",
+            &[
+                P::i64(from_repo.0),
+                P::bytes(from_cs),
+                P::i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+            ],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| RepoChangeset(RepoId(row.get(0)), row.get(1), row.get(2)))
+            .collect())
+    }
+
+    /// The changeset IDs that `repo` holds, all of them.
+    fn repo_changeset_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>> {
+        let rows = self.c.query(
+            "SELECT cs FROM repo_changesets WHERE repo_id = $1 ORDER BY cs",
+            &[P::i64(repo.0)],
+        )?;
+        Ok(rows.iter().map(|row| row.get(0)).collect())
+    }
+
+    /// The body of changeset `cs`, or `None` when it is not stored.
+    fn stored_changeset_body(&mut self, cs: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .c
+            .query_opt("SELECT body FROM changesets WHERE id = $1", &[P::bytes(cs)])?
+            .map(|row| row.get(0)))
+    }
+
+    /// The blobs that `repo` may name, all of them.
+    fn repo_blob_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>> {
+        let rows = self.c.query(
+            "SELECT blob FROM repo_blobs WHERE repo_id = $1 ORDER BY blob",
+            &[P::i64(repo.0)],
+        )?;
+        Ok(rows.iter().map(|row| row.get(0)).collect())
+    }
+
+    /// Removes the row that names `blob` for `repo`.
+    fn delete_repo_blob(&mut self, repo: RepoId, blob: &[u8]) -> Result<()> {
+        self.c.execute(
+            "DELETE FROM repo_blobs WHERE repo_id = $1 AND blob = $2",
+            &[P::i64(repo.0), P::bytes(blob)],
+        )?;
+        Ok(())
+    }
+
+    /// Whether any repo names `blob`. Driven from `repos`, as the SQLite
+    /// one is: `repo_blobs` has no index on `blob` alone.
+    fn any_repo_names(&mut self, blob: &[u8]) -> Result<bool> {
+        Ok(self
+            .c
+            .query_opt(
+                "SELECT 1 FROM repos r
+                 WHERE EXISTS (SELECT 1 FROM repo_blobs rb
+                               WHERE rb.repo_id = r.repo_id AND rb.blob = $1)
+                 LIMIT 1",
+                &[P::bytes(blob)],
+            )?
+            .is_some())
+    }
+
+    /// The order the collector and the changeset transactions keep: the
+    /// lock of one blob, held to the end of this transaction. Every
+    /// changeset and land transaction takes it for each blob it puts, and
+    /// the collector around its row check, delete and unlink.
+    fn lock_blob(&mut self, blob: BlobId) -> Result<()> {
+        self.c.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[P::i64(blob_lock_key(&blob))],
+        )?;
+        Ok(())
+    }
+
+    /// The `(changeset ID, body)` of the changesets after `from`, in ID
+    /// order, at most `limit`.
+    fn changeset_bodies_after(
+        &mut self,
+        from: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let rows = self.c.query(
+            "SELECT id, body FROM changesets WHERE id > $1 ORDER BY id LIMIT $2",
+            &[
+                P::bytes(from),
+                P::i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+            ],
+        )?;
+        Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+    }
+
+    /// The `(tree ID, body)` of the trees after `from`, in ID order, at
+    /// most `limit`.
+    fn tree_bodies_after(&mut self, from: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let rows = self.c.query(
+            "SELECT id, body FROM trees WHERE id > $1 ORDER BY id LIMIT $2",
+            &[
+                P::bytes(from),
+                P::i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+            ],
+        )?;
+        Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+    }
+
+    /// The `(node ID, body)` of the history nodes after `from`, in ID
+    /// order, at most `limit`.
+    fn history_node_bodies_after(
+        &mut self,
+        from: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let rows = self.c.query(
+            "SELECT id, body FROM history_nodes WHERE id > $1 ORDER BY id LIMIT $2",
+            &[
+                P::bytes(from),
+                P::i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+            ],
+        )?;
+        Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+    }
+
+    /// The `repo_blobs` rows after `(repo, blob)`, at most `limit`.
+    fn repo_blob_rows_after(
+        &mut self,
+        from_repo: RepoId,
+        from_blob: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(RepoId, Vec<u8>)>> {
+        let rows = self.c.query(
+            "SELECT repo_id, blob FROM repo_blobs
+             WHERE (repo_id, blob) > ($1, $2) ORDER BY repo_id, blob LIMIT $3",
+            &[
+                P::i64(from_repo.0),
+                P::bytes(from_blob),
+                P::i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+            ],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| (RepoId(row.get(0)), row.get(1)))
+            .collect())
+    }
+
+    /// The refs whose target no `repo_changesets` row of their repo holds.
+    fn dangling_refs(&mut self) -> Result<Vec<(RepoId, String, Vec<u8>)>> {
+        let rows = self.c.query(
+            "SELECT repo_id, name, target FROM refs r
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM repo_changesets rc
+                 WHERE rc.repo_id = r.repo_id AND rc.cs = r.target
+             )",
+            &[],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| (RepoId(row.get(0)), row.get(1), row.get(2)))
+            .collect())
+    }
+
+    /// Every land whose input or result changeset is not stored, as
+    /// `(land, changeset, which column)`.
+    fn lands_with_missing_changesets(&mut self) -> Result<Vec<(i64, Vec<u8>, &'static str)>> {
+        let mut out = Vec::new();
+        for (column, when) in [
+            ("input_cs", "1 = 1"),
+            ("result_cs", "result_cs IS NOT NULL"),
+        ] {
+            let sql = format!(
+                "SELECT land_id, {column} FROM lands l
+                 WHERE {when} AND NOT EXISTS (
+                     SELECT 1 FROM changesets c WHERE c.id = l.{column}
+                 )"
+            );
+            let rows = self.c.query(&sql, &[])?;
+            for row in rows {
+                out.push((row.get(0), row.get(1), column));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The derived rows after `(kind, version, cs)`, at most `limit`, with
+    /// whether their changeset is stored.
+    fn derived_rows_after(
+        &mut self,
+        kind: &str,
+        version: u32,
+        cs: &[u8],
+        limit: usize,
+    ) -> Result<Vec<FsckDerivedRow>> {
+        let rows = self.c.query(
+            "SELECT d.kind, d.version, d.cs, d.value,
+                    EXISTS (SELECT 1 FROM changesets c WHERE c.id = d.cs)
+             FROM derived d
+             WHERE (d.kind, d.version, d.cs) > ($1, $2, $3)
+             ORDER BY d.kind, d.version, d.cs LIMIT $4",
+            &[
+                P::text(kind),
+                P::i64(i64::from(version)),
+                P::bytes(cs),
+                P::i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+            ],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| FsckDerivedRow(row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
+            .collect())
     }
 }
 

@@ -20,7 +20,6 @@ use scion_server::meta::Meta as _;
 use scion_server::meta::MetaTx as _;
 use scion_server::metrics::{self, Metrics};
 use scion_server::quotas::Quotas;
-use scion_server::store::Store;
 use scion_server::tree::RootTree;
 use scion_server::{Backend, Error, fsck, gc, read, service};
 use tracing_subscriber::EnvFilter;
@@ -216,7 +215,7 @@ enum KindName {
 
 /// Runs `fsck` against `store`, prints one line per problem, and exits:
 /// 0 when it saw no damage, 1 when it did, 2 when it could not run.
-fn fsck_command(store: &Store) -> anyhow::Result<()> {
+fn fsck_command(store: &Backend) -> anyhow::Result<()> {
     let report = match fsck::run(store, fsck::BATCH, &mut |_| {}) {
         Ok(report) => report,
         Err(e) => {
@@ -243,7 +242,7 @@ fn fsck_command(store: &Store) -> anyhow::Result<()> {
 
 /// Runs `gc` against `store` and prints what it collected. Exits 2 when it
 /// could not run.
-fn gc_command(store: &Store, grace: Duration, dry_run: bool) {
+fn gc_command(store: &Backend, grace: Duration, dry_run: bool) {
     let report = match gc::run(store, grace, dry_run, &mut |_| {}) {
         Ok(report) => report,
         Err(e) => {
@@ -348,31 +347,13 @@ async fn main() -> anyhow::Result<()> {
             unreachable!("handled before the store opens")
         }
         Command::Fsck => {
-            let store = match &store {
-                Backend::Sqlite(store) => store,
-                Backend::Postgres(_) => {
-                    eprintln!(
-                        "scion-server fsck: fsck reads the data directory's own database, which the Postgres backend does not keep"
-                    );
-                    std::process::exit(2);
-                }
-            };
-            return fsck_command(store);
+            return fsck_command(&store);
         }
         Command::Gc {
             grace_secs,
             dry_run,
         } => {
-            let store = match &store {
-                Backend::Sqlite(store) => store,
-                Backend::Postgres(_) => {
-                    eprintln!(
-                        "scion-server gc: gc prunes the data directory's own database, which the Postgres backend does not keep"
-                    );
-                    std::process::exit(2);
-                }
-            };
-            gc_command(store, Duration::from_secs(grace_secs), dry_run);
+            gc_command(&store, Duration::from_secs(grace_secs), dry_run);
         }
         Command::Import {
             repo,
