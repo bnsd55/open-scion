@@ -5,9 +5,11 @@
 //! transaction of their write, so all trees from one apply or derivation
 //! commit together.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
-use scion_core::{Changeset, ChangesetId, Entry, FileState, PathElem, RepoPath, Tree, TreeId};
+use scion_core::{
+    BlobId, Changeset, ChangesetId, Entry, FileEntry, FileState, PathElem, RepoPath, Tree, TreeId,
+};
 
 use crate::db;
 use crate::derived::{self, Kind};
@@ -16,6 +18,57 @@ use crate::graph::CommitGraph;
 use crate::history::PathHistory;
 use crate::meta::{MetaTx, RepoId};
 use crate::store::Store;
+
+/// The byte length of a blob, as the tree entries carry it. The store reads
+/// it from the blob's frame header without unpacking it.
+pub type BlobLens<'a> = &'a mut dyn FnMut(BlobId) -> Result<u64>;
+
+/// The lens of the store's blobs, from each frame header, for the callers
+/// that hold the store: `store_changeset` and the root-tree derivation it
+/// triggers on the first parent.
+pub fn lens_of(store: &Store) -> impl FnMut(BlobId) -> Result<u64> + '_ {
+    |blob| Ok(store.blobs().size(blob)? as u64)
+}
+
+/// A lens that answers 0 for everything. For tests that build trees from
+/// blobs they never store: the trees are only compared to themselves.
+#[cfg(test)]
+pub(crate) fn lens_none() -> impl FnMut(BlobId) -> Result<u64> {
+    |_| Ok(0)
+}
+
+/// The lengths of the blobs that `puts` names, read from their frame
+/// headers. Call it before a write transaction, so the one write
+/// connection does no file I/O. A blob that is not stored fails here,
+/// before any write.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if a blob is not stored.
+pub fn lens_of_puts(
+    store: &Store,
+    puts: impl Iterator<Item = BlobId>,
+) -> Result<HashMap<BlobId, u64>> {
+    let mut lens = HashMap::new();
+    for blob in puts {
+        if lens.contains_key(&blob) {
+            continue;
+        }
+        lens.insert(blob, store.blobs().size(blob)? as u64);
+    }
+    Ok(lens)
+}
+
+/// A lens over lengths that a caller read before its transaction.
+pub fn lens_from<S: std::hash::BuildHasher>(
+    map: &HashMap<BlobId, u64, S>,
+) -> impl FnMut(BlobId) -> Result<u64> + '_ {
+    move |blob| {
+        map.get(&blob)
+            .copied()
+            .ok_or_else(|| Error::NotFound(format!("blob {blob}")))
+    }
+}
 
 /// Applies `changes` to `base` (`None` is the empty tree), stores the new
 /// trees, and returns the new root.
@@ -31,6 +84,7 @@ pub fn apply(
     c: &mut dyn MetaTx,
     base: Option<TreeId>,
     changes: &BTreeMap<RepoPath, Option<FileState>>,
+    lens: BlobLens<'_>,
 ) -> Result<TreeId> {
     let mut root = base.map_or_else(|| Dir::Loaded(BTreeMap::new()), Dir::Stored);
     for (path, _) in changes.iter().filter(|(_, change)| change.is_none()) {
@@ -38,7 +92,13 @@ pub fn apply(
     }
     for (path, state) in changes {
         if let Some(state) = state {
-            root.put(c, path, &parts(path), 0, *state)?;
+            // A gitlink names no blob, so it carries no length; its entry
+            // ends at the commit bytes.
+            let entry = match state.blob() {
+                Some(blob) => FileEntry::new(*state, lens(blob)?),
+                None => FileEntry::new(*state, 0),
+            };
+            root.put(c, path, &parts(path), 0, entry)?;
         }
     }
     root.store(c)
@@ -77,8 +137,9 @@ impl Kind for RootTree {
         id: ChangesetId,
         changeset: &Changeset,
         parents: Vec<TreeId>,
+        lens: BlobLens<'_>,
     ) -> Result<TreeId> {
-        apply(c, parents.first().copied(), &changeset.changes).map_err(|e| match e {
+        apply(c, parents.first().copied(), &changeset.changes, lens).map_err(|e| match e {
             Error::Apply(e) => Error::Corrupt(format!("stored changeset {id} does not apply: {e}")),
             other => other,
         })
@@ -120,8 +181,13 @@ pub fn fill_root_tree(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<Tr
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. [`Error::Corrupt`] if a
 /// stored changeset does not apply to its parent tree.
-pub fn derive_root_tree(c: &mut dyn MetaTx, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
-    derived::derive::<RootTree>(c, repo, cs)
+pub fn derive_root_tree(
+    c: &mut dyn MetaTx,
+    repo: RepoId,
+    cs: ChangesetId,
+    lens: BlobLens<'_>,
+) -> Result<TreeId> {
+    derived::derive::<RootTree>(c, repo, cs, lens)
 }
 
 /// Stores a changeset in `repo` with its root tree: the first parent's tree
@@ -154,21 +220,22 @@ pub fn store_changeset(
     c: &mut dyn MetaTx,
     repo: RepoId,
     cs: &Changeset,
+    lens: BlobLens<'_>,
 ) -> Result<(ChangesetId, TreeId)> {
     let base = cs
         .parents
         .first()
-        .map(|&parent| derive_root_tree(c, repo, parent))
+        .map(|&parent| derive_root_tree(c, repo, parent, lens))
         .transpose()?;
-    let tree = apply(c, base, &cs.changes)?;
+    let tree = apply(c, base, &cs.changes, lens)?;
     let id = c.insert_changeset(repo, cs)?;
     for (_, blob) in db::puts(cs) {
         c.add_repo_blob(repo, blob)?;
     }
     derived::put::<RootTree>(c, id, &tree)?;
     derived::remove_old::<RootTree>(c)?;
-    derived::on_write::<CommitGraph>(c, id, cs)?;
-    derived::on_write::<PathHistory>(c, id, cs)?;
+    derived::on_write::<CommitGraph>(c, id, cs, lens)?;
+    derived::on_write::<PathHistory>(c, id, cs, lens)?;
     Ok((id, tree))
 }
 
@@ -192,7 +259,7 @@ enum Dir {
 }
 
 enum Node {
-    File(FileState),
+    File(FileEntry),
     Dir(Dir),
 }
 
@@ -205,7 +272,7 @@ impl Dir {
                 .into_iter()
                 .map(|(name, entry)| {
                     let node = match entry {
-                        Entry::File(state) => Node::File(state),
+                        Entry::File(file) => Node::File(file),
                         Entry::Dir(id) => Node::Dir(Self::Stored(id)),
                     };
                     (name, node)
@@ -243,7 +310,7 @@ impl Dir {
         path: &RepoPath,
         parts: &[PathElem],
         depth: usize,
-        state: FileState,
+        file: FileEntry,
     ) -> Result<()> {
         let entries = self.entries(c)?;
         let name = &parts[depth];
@@ -251,14 +318,14 @@ impl Dir {
             if matches!(entries.get(name), Some(Node::Dir(_))) {
                 return Err(ApplyError::DirInTheWay(path.clone()).into());
             }
-            entries.insert(name.clone(), Node::File(state));
+            entries.insert(name.clone(), Node::File(file));
             return Ok(());
         }
         let child = entries
             .entry(name.clone())
             .or_insert_with(|| Node::Dir(Self::Loaded(BTreeMap::new())));
         match child {
-            Node::Dir(dir) => dir.put(c, path, parts, depth + 1, state),
+            Node::Dir(dir) => dir.put(c, path, parts, depth + 1, file),
             Node::File(_) => Err(ApplyError::FileInTheWay {
                 path: path.clone(),
                 file: prefix(&parts[..=depth]),
@@ -280,7 +347,7 @@ impl Dir {
                 let mut tree = Tree::default();
                 for (name, node) in entries {
                     let entry = match node {
-                        Node::File(state) => Entry::File(state),
+                        Node::File(file) => Entry::File(file),
                         Node::Dir(dir) => Entry::Dir(dir.store(c)?),
                     };
                     tree.entries.insert(name, entry);
@@ -347,17 +414,19 @@ mod tests {
                 c,
                 None,
                 &changes(&[("a/b/c", Some("1")), ("a/d", Some("2")), ("e", Some("3"))]),
+                &mut lens_none(),
             )?;
             assert_eq!(files(c, t1), ["a/b/c", "a/d", "e"]);
             let t2 = apply(
                 c,
                 Some(t1),
                 &changes(&[("a/b/c", None), ("f/g", Some("4"))]),
+                &mut lens_none(),
             )?;
             assert_eq!(files(c, t2), ["a/d", "e", "f/g"], "empty a/b is pruned");
             assert_eq!(
                 lookup(c, t2, &path("a/d"))?,
-                Some(Entry::File(regular("2")))
+                Some(Entry::File(FileEntry::new(regular("2"), 0)))
             );
             assert_eq!(lookup(c, t2, &path("a/b"))?, None);
             assert_eq!(lookup(c, t2, &path("e/x"))?, None, "a file has no children");
@@ -368,9 +437,14 @@ mod tests {
     #[test]
     fn same_content_gives_same_tree_id() {
         with_db(|c| {
-            let direct = apply(c, None, &changes(&[("x/y", Some("1"))]))?;
-            let t = apply(c, None, &changes(&[("x/y", Some("1")), ("z", Some("2"))]))?;
-            let via_delete = apply(c, Some(t), &changes(&[("z", None)]))?;
+            let direct = apply(c, None, &changes(&[("x/y", Some("1"))]), &mut lens_none())?;
+            let t = apply(
+                c,
+                None,
+                &changes(&[("x/y", Some("1")), ("z", Some("2"))]),
+                &mut lens_none(),
+            )?;
+            let via_delete = apply(c, Some(t), &changes(&[("z", None)]), &mut lens_none())?;
             assert_eq!(direct, via_delete);
             Ok(())
         });
@@ -379,10 +453,20 @@ mod tests {
     #[test]
     fn file_and_directory_swap_in_one_changeset() {
         with_db(|c| {
-            let t = apply(c, None, &changes(&[("a", Some("1"))]))?;
-            let t = apply(c, Some(t), &changes(&[("a", None), ("a/b", Some("2"))]))?;
+            let t = apply(c, None, &changes(&[("a", Some("1"))]), &mut lens_none())?;
+            let t = apply(
+                c,
+                Some(t),
+                &changes(&[("a", None), ("a/b", Some("2"))]),
+                &mut lens_none(),
+            )?;
             assert_eq!(files(c, t), ["a/b"]);
-            let t = apply(c, Some(t), &changes(&[("a", Some("3")), ("a/b", None)]))?;
+            let t = apply(
+                c,
+                Some(t),
+                &changes(&[("a", Some("3")), ("a/b", None)]),
+                &mut lens_none(),
+            )?;
             assert_eq!(files(c, t), ["a"]);
             Ok(())
         });
@@ -391,7 +475,12 @@ mod tests {
     #[test]
     fn structural_conflicts_are_rejected() {
         with_db(|c| {
-            let t = apply(c, None, &changes(&[("a", Some("1")), ("d/x", Some("2"))]))?;
+            let t = apply(
+                c,
+                None,
+                &changes(&[("a", Some("1")), ("d/x", Some("2"))]),
+                &mut lens_none(),
+            )?;
             let cases: [(Edits<'_>, ApplyError); 6] = [
                 (
                     &[("a/b", Some("x"))],
@@ -413,7 +502,7 @@ mod tests {
                 ),
             ];
             for (edits, expected) in cases {
-                match apply(c, Some(t), &changes(edits)) {
+                match apply(c, Some(t), &changes(edits), &mut lens_none()) {
                     Err(Error::Apply(e)) => assert_eq!(e, expected),
                     other => panic!("expected {expected:?}, got {other:?}"),
                 }
@@ -451,9 +540,12 @@ mod tests {
         files(c, root)
             .into_iter()
             .map(|path| {
-                let Some(Entry::File(FileState::Regular { content, .. })) =
+                let Some(Entry::File(file)) =
                     lookup(c, root, &RepoPath::new(path.as_str()).unwrap()).unwrap()
                 else {
+                    panic!("{path} is not a regular file");
+                };
+                let FileState::Regular { content, .. } = file.state() else {
                     panic!("{path} is not a regular file");
                 };
                 let byte = (0..=u8::MAX)
@@ -495,7 +587,10 @@ mod tests {
                         })
                         .collect();
                     let flat_changes = edits.iter().map(|(p, c)| ((*p).to_owned(), *c)).collect();
-                    match (apply_flat(&model, &flat_changes), apply(c, tree, &changes)) {
+                    match (
+                        apply_flat(&model, &flat_changes),
+                        apply(c, tree, &changes, &mut lens_none()),
+                    ) {
                         (Some(next), Ok(next_tree)) => {
                             assert_eq!(snapshot(c, next_tree), next);
                             model = next;
@@ -521,13 +616,18 @@ mod tests {
             &[("e", None), ("a/d", Some("6")), ("f/g/h", None)],
         ];
         let golden = [
-            "512cf237e5e62fc7d013ee67bd701857d637c2c7b3c60897ee9f57d4f63212b5",
-            "8e7be185763f5990a6b48bca674e5766e80aa28a5769f46c530d8e4de2b1c8be",
-            "27d510c1cac510175ac54737191dab75dbc4e3de391ee9c3b56233d74a70124c",
+            "2fcd3277f226b4342d77cb088de545ac630a6f1289d51f9464aba202e6cd6fda",
+            "b50d00563540613f21dc430f76afedd5da998681d321db7d3f5ef990a7f3a90c",
+            "b4717ab9e5bbd8b20c844a4236fededbea08e83cedbd871731fa9e948a0cbac8",
         ];
         for stored in [true, false] {
             let dir = tempfile::tempdir().unwrap();
             let store = Store::open(dir.path()).unwrap();
+            // The chain's six puts name blobs "1".."6"; their files feed the
+            // real lens, so stored and re-derived trees carry true lengths.
+            for c in ["1", "2", "3", "4", "5", "6"] {
+                store.blobs().put(c.as_bytes()).unwrap();
+            }
             let (repo, ids) = store
                 .write(|c| {
                     let repo = c.create_repo("r")?;
@@ -535,7 +635,7 @@ mod tests {
                     for edits in history {
                         let cs = changeset(ids.last().copied(), edits);
                         ids.push(if stored {
-                            store_changeset(c, repo, &cs)?.0
+                            store_changeset(c, repo, &cs, &mut lens_of(&store))?.0
                         } else {
                             c.insert_changeset(repo, &cs)?
                         });
@@ -573,6 +673,7 @@ mod tests {
     fn get_root_tree_flushes_once_after_it_derives() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
+        store.blobs().put(b"1").unwrap();
         // A changeset with no root tree row yet.
         let cs = store
             .write(|c| {
@@ -602,6 +703,11 @@ mod tests {
             unix_secs: 0,
             tz_offset_minutes: 0,
         };
+        // Every put of the chain names its index as the blob; their files
+        // feed the real lens that reads the chain's trees with.
+        for i in 0..2000 {
+            store.blobs().put(i.to_string().as_bytes()).unwrap();
+        }
         let (repo, tip) = store
             .write(|c| {
                 let repo = c.create_repo("r")?;

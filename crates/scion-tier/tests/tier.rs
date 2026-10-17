@@ -111,10 +111,13 @@ impl Fake {
             .zip(&paths)
             .map(|(o, path)| {
                 let state = if o.kind == i32::from(ObjectKind::Blob) {
-                    scion_core::Entry::File(FileState::Regular {
-                        content: BlobId::try_from(o.id.as_slice()).unwrap(),
-                        executable: false,
-                    })
+                    scion_core::Entry::File(scion_core::FileEntry::new(
+                        FileState::Regular {
+                            content: BlobId::try_from(o.id.as_slice()).unwrap(),
+                            executable: false,
+                        },
+                        0,
+                    ))
                 } else {
                     scion_core::Entry::Dir(scion_core::TreeId::try_from(o.id.as_slice()).unwrap())
                 };
@@ -156,10 +159,13 @@ impl Fake {
             .zip(&paths)
             .map(|(o, path)| {
                 let state = if o.kind == i32::from(ObjectKind::Blob) {
-                    scion_core::Entry::File(FileState::Regular {
-                        content: BlobId::try_from(o.id.as_slice()).unwrap(),
-                        executable: false,
-                    })
+                    scion_core::Entry::File(scion_core::FileEntry::new(
+                        FileState::Regular {
+                            content: BlobId::try_from(o.id.as_slice()).unwrap(),
+                            executable: false,
+                        },
+                        0,
+                    ))
                 } else {
                     scion_core::Entry::Dir(scion_core::TreeId::try_from(o.id.as_slice()).unwrap())
                 };
@@ -517,10 +523,13 @@ async fn a_tier_refuses_an_object_whose_bytes_do_not_match_its_id() {
     let tree = Tree {
         entries: [(
             PathElem::new("f").unwrap(),
-            Entry::File(FileState::Regular {
-                content: BlobId::of(b"good\n"),
-                executable: false,
-            }),
+            Entry::File(scion_core::FileEntry::new(
+                FileState::Regular {
+                    content: BlobId::of(b"good\n"),
+                    executable: false,
+                },
+                b"good\n".len() as u64,
+            )),
         )]
         .into(),
     };

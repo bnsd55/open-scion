@@ -181,7 +181,7 @@ fn fill(file: &mut impl io::Read, buf: &mut [u8]) -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use scion_core::{BlobId, Entry, FileState, PathElem, Tree};
+    use scion_core::{BlobId, Entry, FileEntry, FileState, PathElem, Tree};
     use scion_proto::object;
     use scion_proto::ticket::{self, now};
     use scion_proto::v1::objects_server::Objects as _;
@@ -207,10 +207,13 @@ mod tests {
         let entries = [("one", b"one\n".as_slice()), ("two", b"two\n")].map(|(name, data)| {
             (
                 PathElem::new(name.as_bytes().to_vec()).unwrap(),
-                Entry::File(FileState::Regular {
-                    content: BlobId::of(data),
-                    executable: false,
-                }),
+                Entry::File(FileEntry::new(
+                    FileState::Regular {
+                        content: BlobId::of(data),
+                        executable: false,
+                    },
+                    data.len() as u64,
+                )),
             )
         });
         let (tree, id) = Tree {

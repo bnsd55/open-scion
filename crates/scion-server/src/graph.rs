@@ -88,6 +88,7 @@ impl Kind for CommitGraph {
         id: ChangesetId,
         changeset: &Changeset,
         parents: Vec<Node>,
+        _lens: crate::tree::BlobLens<'_>,
     ) -> Result<Node> {
         let generation = 1 + parents.iter().map(|p| p.generation).max().unwrap_or(0);
         let (Some(first), Some(&first_id)) = (parents.first(), changeset.parents.first()) else {
@@ -670,7 +671,12 @@ mod tests {
             .write(|c| {
                 for &id in &ids {
                     let cs = c.get_changeset(repo, id)?;
-                    derived::on_write::<CommitGraph>(c, id, &cs)?;
+                    derived::on_write::<CommitGraph>(
+                        c,
+                        id,
+                        &cs,
+                        &mut crate::tree::lens_of(&store),
+                    )?;
                 }
                 Ok(())
             })
@@ -881,7 +887,7 @@ mod tests {
                         .into(),
                     };
                     let id = c.insert_changeset(repo, &cs)?;
-                    derived::on_write::<CommitGraph>(c, id, &cs)?;
+                    derived::on_write::<CommitGraph>(c, id, &cs, &mut crate::tree::lens_of(store))?;
                     Ok::<_, Error>(id)
                 };
                 let mut ids: Vec<ChangesetId> = Vec::with_capacity(n);
@@ -971,13 +977,19 @@ mod tests {
         assert_eq!(met, [ids[2]]);
         assert_eq!(store.commits(), commits, "the next queries derive nothing");
 
-        // A write stores the node of a changeset whose parents have one.
+        // The write derives root trees, whose entries name the graph's
+        // blobs "f0".."f5"; their files feed the real lens.
+        for i in 0..6 {
+            store.blobs().put(format!("f{i}").as_bytes()).unwrap();
+        }
         let cs = Changeset {
             parents: vec![ids[4], ids[1]],
             ..store.read(|c| c.get_changeset(repo, ids[4])).unwrap()
         };
         let (merge, _) = store
-            .write(|c| crate::tree::store_changeset(c, repo, &cs))
+            .write(|c| {
+                crate::tree::store_changeset(c, repo, &cs, &mut crate::tree::lens_of(&store))
+            })
             .unwrap();
         let commits = store.commits();
         assert!(is_ancestor(&store, repo, ids[1], merge, &later()).unwrap());

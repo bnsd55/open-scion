@@ -246,7 +246,7 @@ fn chain(store: &Store, changes: Vec<BTreeMap<RepoPath, Option<FileState>>>) -> 
                     message: format!("change {}", ids.len()).into_bytes(),
                     changes,
                 };
-                ids.push(tree::store_changeset(c, repo, &cs)?.0);
+                ids.push(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0);
             }
             Ok(ids)
         })
@@ -294,7 +294,7 @@ fn graph_queries_across_many_merges_answer() {
                     message: message.into_bytes(),
                     changes: BTreeMap::new(),
                 };
-                Ok::<_, Error>(tree::store_changeset(c, repo, &cs)?.0)
+                Ok::<_, Error>(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0)
             };
             let mut main = vec![put(vec![], "root".into())?];
             let mut sides = Vec::new();

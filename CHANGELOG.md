@@ -16,6 +16,13 @@ until that section gets its release date.
 
 #### Objects and byte format
 
+- A tree entry carries its blob's byte length (`#172`): `ls -l` and a mount
+  stat read the size from the tree and fetch no blob. The change re-hashed
+  every tree; schema 7 drops stored trees and their derived rows, and they
+  rebuild from the stored changesets on demand. A tier that still holds
+  old tree bytes under old IDs never serves them again: nothing asks for
+  those IDs, and the hash check guards everything else.
+
 - Per-principal quotas (`#15`). With `--access`, `--max-principal-requests`
   (64), `--max-principal-upload-bytes` (512 MiB) and
   `--max-principal-pending-lands` (64) bound what one principal holds at
@@ -54,8 +61,11 @@ until that section gets its release date.
   `UNIMPLEMENTED`: the ref and the ticket come from the server, so a tier
   can never mint a permission.
 - The server signs with an Ed25519 key from `--ticket-key FILE` (make one
-  with `scion-server ticket-key --out FILE`; rotation with
-  `--ticket-key-old`). A `scion-cache` verifies with
+  with `scion-server ticket-key --out FILE`, which prints the public key,
+  for the tiers, to stdout; rotation with `--ticket-key-old`). Only the
+  seed is a secret: the server refuses a seed file that anyone but its
+  owner can read, and a public-key file (the `--ticket-key-old` argument)
+  that group or others can write (`#168`). A `scion-cache` verifies with
   `--ticket-public-key HEX`, at most 2 keys during a rotation. A
   `scion-daemon` takes no key: it checks no ticket, and serves what its
   store holds only to the one OS user that owns its private 0600 socket,
@@ -72,6 +82,14 @@ until that section gets its release date.
 
 #### The server
 
+- One request ID per client operation, carried through every hop
+  (`#144` follow-up). `scn` makes one 16-digit hex ID per command and
+  sends it on every call in `x-request-id`; a tier forwards the ID its
+  caller sent. Every served call records it as the `request_id` field of
+  its `call` span, so one
+  checkout can be followed across scn, daemon, cache and server logs. A
+  header over 64 bytes, or not visible ASCII, is dropped whole: nothing
+  of it is logged.
 - Prometheus metrics on `scion-server --metrics-listen ADDR` (default off)
   and `scion-cache --metrics-listen ADDR`: request counts by RPC and code,
   a latency histogram with factor-4 buckets (1, 4, 16, 64, 256 ms, 1, 4,
@@ -87,13 +105,14 @@ until that section gets its release date.
   verified durability, and one write path for changesets and their root
   trees. Group commit: concurrent blob syncs and database commits share one
   full drive flush, so a successful reply never shows state that a power
-  loss can undo. `scion-server fsck <data>` reports the damage in a data
-  directory: it is read-only, it can run while the server runs, and one
+  loss can undo. `scion-server --data <data> fsck` reports the damage in a
+  data directory: it is read-only, it can run while the server runs, and one
   line per problem names the kind, the ID and the path; it exits 0 when it
   saw no damage, 1 when it did, and 2 when it could not run.
-- `scion-server gc <data>` collects the blobs that nothing names: a
-  `repo_blobs` row whose blob no stored changeset of its repo puts, and a
-  blob file that no repo's row names, each older than a grace period
+- `scion-server gc` (`--data <data>`) collects the blobs that nothing
+  names: a `repo_blobs` row whose blob no stored changeset of its repo
+  puts, and a blob file that no repo's row names, each older than a grace
+  period
   (`--grace-secs`, seven days; `--dry-run` reports and removes nothing).
   Rows go before files, so a crash leaves orphan files only, which the
   next run removes. It runs beside a live server: a changeset that commits
@@ -126,7 +145,9 @@ until that section gets its release date.
   write that waits for an import's write lock. Writes still take turns on
   one write connection.
 - `scion-server serve` logs the address that it bound, so `--listen
-  127.0.0.1:0` shows the port that the OS chose.
+  127.0.0.1:0` shows the port that the OS chose. A refused call or a
+  failed one logs who made it and on which repo (`#148`), with no token
+  or path content in the line.
 
 #### Lands
 
@@ -148,6 +169,13 @@ until that section gets its release date.
   list a directory, and walk first-parent history. `ReadFile` checks the
   content against its ID before the last part, and ends a reply whose
   client stops reading with `DEADLINE_EXCEEDED` after 120 s.
+- `GetChangeset` and `ListDir` stream their `ChangesetV1` and `TreeV1`
+  bytes in 1 MiB parts, as `ReadFile` streams a file (section 6.6 and 6.8
+  of protocol-v1), so a directory or a changeset over the 64 MiB message
+  cap still reads whole. The client puts the parts together and checks
+  the changeset bytes against the ID it asked for, and stops with an
+  error once the joined bytes pass 1 GiB, so a broken or hostile server
+  cannot stream until the client runs out of memory.
 - Path history as derived data (kind `path_history`, schema version 5).
   `Log` with a path reads only the changesets that change the path, so one
   call returns up to 1,000 entries however far apart they are. A call
@@ -325,7 +353,6 @@ until that section gets its release date.
 #### scn
 
 - `scn`, the command-line client: `cat`, `ls`, `log`, `show`, `commit`,
-- `scn`, the command-line client: `cat`, `ls`, `log`, `show`, `commit`,
   `land` and `bench`, with `--json` output. `scn merge-base`, `scn
   is-ancestor` (exit 0 or 1) and `scn diff` for the query API, and
   `scn blame`. Every `scn` error exits 2, so it never reads as the "no" of
@@ -334,9 +361,9 @@ until that section gets its release date.
   DIR [REV]` serves one ref as an NFSv3 filesystem from `scn` itself, on a
   free port of 127.0.0.1, so a directory's tree loads when it is first
   listed or looked up in, and a file's blob when it is first read or
-  sized. Until `#13` PR-C adds `GetSizes`, a file's size comes from its
-  blob, so a first stat of an unread file fetches the blob. Writes land in
-  a private overlay directory (mode 0700 under the system's temporary
+  sized. Until `#172` adds `GetSizes`, a file's size comes from its
+  blob, so a first stat of an unread file fetches the blob. Writes land
+  in a private overlay directory (mode 0700 under the system's temporary
   directory), and `scn commit --from-mount DIR` commits exactly what the
   overlay holds, with no scan of the tree. `scn unmount DIR` stops the
   mount and removes the overlay. For single-user machines only: the NFS
@@ -377,9 +404,17 @@ until that section gets its release date.
 #### Docs and scripts
 
 - `docs/protocol-v1.md`: the contract of the `Scion` and `Objects`
-  services, for independent clients, tiers and servers.- `scripts/demo.sh`, a demo that anyone can rerun on a fixed public
+  services, for independent clients, tiers and servers.
+- `scripts/demo.sh`, a demo that anyone can rerun on a fixed public
   repository, and `scripts/bench-checkout.sh`, a checkout benchmark
   against git. `docs/benchmarks.md` gives the method.
+- `scripts/grpc-conformance.sh` (`#163`): a conformance check that
+  speaks the API with grpcurl, so a client that is not the Rust one is
+  covered by CI.
+- An operations guide, `docs/operations.md` (`#169`): deploy, keys,
+  backup, upgrade, routines, and what to watch.
+- A container image and a compose example (`#164`): a server and a cache
+  with TLS, and a checkout through the cache.
 
 ### Changed
 

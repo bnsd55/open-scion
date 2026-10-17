@@ -110,10 +110,11 @@ const _: () = {
 };
 
 /// Most memory that decoding a tree holds, per byte of its `TreeV1` bytes.
-/// An entry takes at least 38 bytes encoded; decoded, it is a name and an
-/// entry in a list and again in a map, plus the name's own buffer (see the
-/// test `decoding_a_tree_fits_its_factor`).
-const TREE_DECODE_FACTOR: usize = 6;
+/// An entry takes at least 38 bytes encoded (47 for a file, which also
+/// carries its byte length); decoded, it is a name and an entry in a list
+/// and again in a map, plus the name's own buffer (see the test
+/// `decoding_a_tree_fits_its_factor`).
+const TREE_DECODE_FACTOR: usize = 7;
 
 /// One object, by kind and ID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -414,6 +415,14 @@ struct Progress {
     fetched_to: AtomicUsize,
 }
 
+/// The bytes of the call's request-ID header, if it sent one.
+fn request_id_bytes<T>(request: &Request<T>) -> Option<&[u8]> {
+    request
+        .metadata()
+        .get(scion_proto::request_id::REQUEST_ID)
+        .map(tonic::metadata::MetadataValue::as_bytes)
+}
+
 /// What one reply asks for.
 struct Ask {
     /// The repo of the ticket, for the store's bookkeeping and the logs.
@@ -430,6 +439,10 @@ struct Ask {
     zstd: bool,
     /// When the reply ends its waits: the caller's deadline less a margin.
     until: Until,
+    /// The request ID of the call: the caller's if it sent one that fits,
+    /// else one this process made. It rides on the fetch to upstream, so
+    /// one operation shows the same ID in the logs of every hop.
+    request_id: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     /// The handle of the caller's connection, which counts what a stalled
     /// reply leaves in HTTP/2.
     stalled: Option<scion_proto::listen::Stalled>,
@@ -937,7 +950,14 @@ impl<S: Store> Tier<S> {
             let flight = if let Some(flight) = joined {
                 Some(flight)
             } else {
-                self.start(key, path, later.clone(), until, &ask.ticket)
+                self.start(
+                    key,
+                    path,
+                    later.clone(),
+                    until,
+                    &ask.ticket,
+                    ask.request_id.clone(),
+                )
             };
             let Some(mut flight) = flight else {
                 return Ok(None);
@@ -982,6 +1002,7 @@ impl<S: Store> Tier<S> {
         later: Vec<(Key, Vec<u8>)>,
         until: Until,
         ticket: &scion_proto::ticket::Ticket,
+        request_id: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     ) -> Option<watch::Receiver<Outcome>> {
         let stored = |k| matches!(self.inner.store.size(k), Ok(Some(_)));
         let mut flights = lock(&self.inner.flights);
@@ -1009,6 +1030,7 @@ impl<S: Store> Tier<S> {
             ticket: ticket.clone(),
             waiting,
             until,
+            request_id,
         };
         tokio::spawn(flight.run());
         Some(rx)
@@ -1030,6 +1052,10 @@ struct Flight<S: Store> {
     /// When the fetch ends its waits: the deadline of the caller that
     /// started it, less the margin.
     until: Until,
+    /// The request ID of the call that started the fetch. It rides on the
+    /// upstream request, so one operation names itself in the logs of
+    /// every hop.
+    request_id: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
 }
 
 /// The next object of an upstream reply.
@@ -1111,12 +1137,18 @@ impl<S: Store> Flight<S> {
                 .iter()
                 .map(|(key, path, _)| key.to_ref(path))
                 .collect();
-            // Upstream gets what is left of the deadline.
-            let request = self.until.request(GetObjectsRequest {
+            // Upstream gets what is left of the deadline, and the call's
+            // request ID, so its logs name the same operation.
+            let mut request = self.until.request(GetObjectsRequest {
                 refs,
                 accept: vec![Encoding::Zstd.into()],
                 ticket: self.ticket.bytes.clone(),
             });
+            if let Some(id) = &self.request_id {
+                request
+                    .metadata_mut()
+                    .insert(scion_proto::request_id::REQUEST_ID, id.clone());
+            }
             let mut upstream = self.tier.inner.upstream.clone();
             let mut stream = self
                 .tier
@@ -1270,6 +1302,10 @@ impl<S: Store> Objects for Tier<S> {
     ) -> Result<Response<ObjectStream>, Status> {
         let until = Until::of(&request);
         let stalled = scion_proto::listen::Stalled::of(&request);
+        // The caller's request ID, if it sent one that fits; else one this
+        // process makes. The fetch to upstream carries it.
+        let request_id = scion_proto::request_id::sanitize(request_id_bytes(&request))
+            .and_then(|id| id.parse().ok());
         let GetObjectsRequest {
             refs,
             accept,
@@ -1304,6 +1340,7 @@ impl<S: Store> Objects for Tier<S> {
             keys,
             zstd: accept.contains(&Encoding::Zstd.into()),
             until,
+            request_id,
             stalled,
         };
         // The first object is found before the reply starts, as on the
@@ -1398,7 +1435,7 @@ mod tests {
     use tokio_stream::wrappers::TcpListenerStream;
 
     use super::*;
-    use scion_core::{Entry, FileState, PathElem};
+    use scion_core::{Entry, FileEntry, FileState, PathElem};
 
     /// What the fake upstream keeps for one object: its kind with its raw
     /// bytes.
@@ -1489,10 +1526,13 @@ mod tests {
                 .map(|(key, path)| {
                     (
                         PathElem::new(path.clone()).unwrap(),
-                        Entry::File(FileState::Regular {
-                            content: BlobId::try_from(key.id().as_slice()).unwrap(),
-                            executable: false,
-                        }),
+                        Entry::File(FileEntry::new(
+                            FileState::Regular {
+                                content: BlobId::try_from(key.id().as_slice()).unwrap(),
+                                executable: false,
+                            },
+                            0,
+                        )),
                     )
                 })
                 .collect(),
@@ -1598,6 +1638,7 @@ mod tests {
             keys,
             zstd: false,
             until: Until::NONE,
+            request_id: None,
             stalled: None,
         }
     }
@@ -1964,6 +2005,7 @@ mod tests {
             keys: vec![(key, b"f".to_vec())],
             zstd: false,
             until: Until::NONE,
+            request_id: None,
             stalled: None,
         }
     }
@@ -2016,7 +2058,7 @@ mod tests {
 
     #[test]
     fn decoding_a_tree_fits_its_factor() {
-        use scion_core::{Entry, PathElem};
+        use scion_core::{BlobId, Entry, FileEntry, FileState, PathElem};
         // The smallest entry: a one-byte name of a directory.
         let tree = |names: &[&str]| Tree {
             entries: names
@@ -2031,6 +2073,27 @@ mod tests {
         };
         let entry = tree(&["a", "b"]).encode().len() - tree(&["a"]).encode().len();
         assert_eq!(entry, 38);
+        // A file entry carries its byte length, so it encodes wider; its
+        // decoded pair is wider too. It sets the factor.
+        let file = |names: &[&str]| Tree {
+            entries: names
+                .iter()
+                .map(|name| {
+                    (
+                        PathElem::new(*name).unwrap(),
+                        Entry::File(FileEntry::new(
+                            FileState::Regular {
+                                content: BlobId::of(b"x"),
+                                executable: false,
+                            },
+                            1,
+                        )),
+                    )
+                })
+                .collect(),
+        };
+        let file_entry = file(&["a", "b"]).encode().len() - file(&["a"]).encode().len();
+        assert_eq!(file_entry, 47);
         // Decoded: the pair in a list and in a map node, and the name's
         // buffer (a small allocation takes 16 bytes or more).
         let pair = std::mem::size_of::<(PathElem, Entry)>();
@@ -2040,6 +2103,11 @@ mod tests {
             decoded <= TREE_DECODE_FACTOR * entry,
             "{decoded} > {}",
             TREE_DECODE_FACTOR * entry
+        );
+        assert!(
+            decoded <= TREE_DECODE_FACTOR * file_entry,
+            "{decoded} > {}",
+            TREE_DECODE_FACTOR * file_entry
         );
     }
 

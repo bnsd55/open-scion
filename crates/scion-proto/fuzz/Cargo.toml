@@ -1,0 +1,23 @@
+[package]
+name = "scion-proto-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ed25519-dalek = { version = "3.0", default-features = false, features = ["fast", "rand_core"] }
+open-scion-proto = { path = ".." }
+
+[[bin]]
+name = "ticket"
+path = "fuzz_targets/ticket.rs"
+test = false
+doc = false
+bench = false
+
+# Fuzzing builds on nightly with its own lockfile, outside the main workspace.
+[workspace]

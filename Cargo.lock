@@ -2386,6 +2386,7 @@ dependencies = [
  "open-scion-server",
  "open-scion-tier",
  "rcgen",
+ "rusqlite",
  "rustix",
  "serde_json",
  "signal-hook",
@@ -2393,6 +2394,8 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tracing",
+ "tracing-subscriber",
  "zstd",
 ]
 

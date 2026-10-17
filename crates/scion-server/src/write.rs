@@ -37,16 +37,20 @@ pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<Chang
     let parent = check_request(&cs)?;
     // A cheap read first, so a request on a missing repo or parent, or one
     // that names a blob the repo does not have, reads no blob. The
-    // transaction checks the parent again. A repo never loses a blob, so the
-    // member check still holds then.
+    // transaction checks the parent again. The member set changes only by
+    // `gc`, which removes a row past the grace period that no stored
+    // changeset names; the changeset's own transaction re-adds the row of
+    // each blob it puts, so a stored changeset never names a blob that the
+    // repo may not.
     let repo_id = store.read(|c| {
         let repo_id = check_parent(c, repo, parent)?;
         check_members(c, repo, repo_id, &cs)?;
         Ok(repo_id)
     })?;
     // The blob check touches only the object folder, so it runs before the
-    // write transaction.
-    check_blobs(store, repo, &cs)?;
+    // write transaction. It also reads the blob lengths the tree build
+    // needs, so the write connection does no file I/O.
+    let lens = check_blobs(store, repo, &cs)?;
     // See `tree::store_changeset`. The write's flush covers these steps.
     tree::fill_root_tree(store, repo_id, parent)?;
     store.write(|c| {
@@ -55,7 +59,7 @@ pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<Chang
             // A retry. Its tree was checked and recorded the first time.
             return Ok(id);
         }
-        tree::store_changeset(c, repo_id, &cs).map(|(id, _)| id)
+        tree::store_changeset(c, repo_id, &cs, &mut tree::lens_from(&lens)).map(|(id, _)| id)
     })
 }
 
@@ -158,22 +162,31 @@ fn check_request(cs: &Changeset) -> Result<ChangesetId> {
 /// lose. Call it only after [`check_members`]: every blob here is the repo's.
 ///
 /// [`BlobBatch::keep`]: crate::store::BlobBatch::keep
-fn check_blobs(store: &Store, repo: &str, cs: &Changeset) -> Result<()> {
+fn check_blobs(
+    store: &Store,
+    repo: &str,
+    cs: &Changeset,
+) -> Result<std::collections::HashMap<scion_core::BlobId, u64>> {
     let mut blobs = store.blobs().batch();
     // A blob seen before was intact, or the loop would have stopped.
     let mut seen = BTreeSet::new();
+    let mut lens = std::collections::HashMap::new();
     for (path, blob) in db::puts(cs) {
         if !seen.insert(blob) {
             continue;
         }
         let problem = match blobs.keep(blob)? {
-            BlobStatus::Valid => continue,
+            BlobStatus::Valid => {
+                lens.insert(blob, store.blobs().size(blob)? as u64);
+                continue;
+            }
             BlobStatus::Missing => "is not stored",
             BlobStatus::Corrupt => "is corrupt",
         };
         return Err(bad_blob(blob, path, problem, repo));
     }
-    blobs.sync()
+    blobs.sync()?;
+    Ok(lens)
 }
 
 #[cfg(test)]

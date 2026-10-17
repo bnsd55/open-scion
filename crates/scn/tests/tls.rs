@@ -107,7 +107,7 @@ fn land(store: &Store) {
     store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
-            let (id, _) = tree::store_changeset(c, repo, &cs)?;
+            let (id, _) = tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?;
             let version = c.get_ref(repo, "main")?.map(|r| r.version);
             assert!(c.cas_ref(repo, "main", version, id)?);
             Ok(id)
