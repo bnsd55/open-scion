@@ -204,7 +204,7 @@ impl Store {
         // flushes the pages it copies before the log can be reused.
         db.execute_batch(&format!(
             "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = OFF;
+             PRAGMA synchronous = FULL;
              PRAGMA fullfsync = {};
              PRAGMA checkpoint_fullfsync = ON;
              PRAGMA foreign_keys = ON;",
