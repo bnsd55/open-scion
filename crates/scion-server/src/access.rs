@@ -794,4 +794,159 @@ mod tests {
             }
         }
     }
+
+    // ---- The canonicalization properties: random rule shapes against a
+    // ---- naive model of what canonical means.
+
+    use proptest::prelude::*;
+
+    /// Random read and write prefixes: short names from a small alphabet,
+    /// so prefixes overlap, nest and repeat.
+    fn prefixes() -> impl proptest::strategy::Strategy<Value = Vec<String>> {
+        proptest::collection::vec(proptest::collection::vec("[ab]{1,3}", 1..3), 0..10).prop_map(
+            |parts| {
+                parts
+                    .into_iter()
+                    .map(|names| names.join("/"))
+                    .collect::<Vec<_>>()
+            },
+        )
+    }
+
+    /// The grant of a rules file with `read` and `write` prefix rules.
+    fn grant(read: &[String], write: &[String]) -> Grant {
+        let as_paths = |list: &[String]| {
+            list.iter()
+                .map(|p| RepoPath::new(p.clone()).unwrap())
+                .collect()
+        };
+        Grant {
+            read_all: false,
+            read: as_paths(read),
+            write_all: false,
+            write: as_paths(write),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(128))]
+
+        /// Canonicalizing twice gives the same set as once, and the write
+        /// prefixes land in the canonical read set.
+        #[test]
+        fn canon_is_idempotent(read in prefixes(), write in prefixes()) {
+            let g = grant(&read, &write);
+            let canon = g.canonical_read();
+            // The canonical set, fed back as read prefixes: canon of canon.
+            let again = grant(
+                &canon
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|p| std::str::from_utf8(p.as_bytes()).unwrap().to_owned())
+                    .collect::<Vec<_>>(),
+                &[],
+            );
+            prop_assert_eq!(again.canonical_read(), canon);
+        }
+
+        /// Two grants that cover the same paths canonicalize to one set
+        /// and one digest: reordering, duplicates and covered sub-prefixes
+        /// change nothing, while dropping or adding coverage changes the
+        /// digest.
+        #[test]
+        fn same_coverage_one_digest(set in prefixes()) {
+            prop_assume!(!set.is_empty());
+            let g = grant(&set, &[]);
+            let canon = g.canonical_read().unwrap();
+            prop_assume!(!canon.is_empty());
+            let digest = rule_set_digest(Some(&canon));
+            let canon_len = canon.len();
+            let canon = canon
+                .iter()
+                .map(|p| std::str::from_utf8(p.as_bytes()).unwrap().to_owned())
+                .collect::<Vec<_>>();
+
+            // Reordered and duplicated: same coverage.
+            let mut shuffled: Vec<String> = canon.clone();
+            shuffled.reverse();
+            shuffled.extend(shuffled.clone());
+            prop_assert_eq!(
+                grant(&shuffled, &[])
+                    .canonical_read()
+                    .map(|c| c.iter().map(|p| std::str::from_utf8(p.as_bytes()).unwrap().to_owned()).collect::<Vec<_>>()),
+                Some(canon.clone())
+            );
+            prop_assert_eq!(rule_set_digest(Some(&grant(&shuffled, &[]).canonical_read().unwrap())), digest);
+
+            // Covered sub-prefixes of every prefix: same coverage. Each
+            // sub-prefix is below its parent, so the parent covers it.
+            let mut padded: Vec<String> = shuffled.clone();
+            for p in &shuffled {
+                padded.push(format!("{p}/a"));
+                padded.push(format!("{p}/a/b"));
+            }
+            prop_assert_eq!(
+                grant(&padded, &[])
+                    .canonical_read()
+                    .map(|c| c.iter().map(|p| std::str::from_utf8(p.as_bytes()).unwrap().to_owned()).collect::<Vec<_>>()),
+                Some(canon.clone())
+            );
+
+            // A prefix of a disjoint namespace adds coverage: different
+            // digest. The alphabet of `prefixes` has no `c`.
+            let mut more = padded.clone();
+            more.push("c".into());
+            let other = grant(&more, &[]).canonical_read().unwrap();
+            prop_assert_ne!(rule_set_digest(Some(&other)), digest);
+
+            // One prefix fewer: less coverage, different digest.
+            if canon_len > 1 {
+                let fewer: Vec<String> = canon[..canon_len - 1].to_vec();
+                let less = grant(&fewer, &[]).canonical_read().unwrap();
+                prop_assert_ne!(rule_set_digest(Some(&less)), digest);
+            }
+        }
+
+        /// The caps: one set over the prefix cap is refused, at and under
+        /// it parses; one repo over the rule-set cap is refused, at and
+        /// under it parses.
+        #[test]
+        fn the_caps_refuse_over_cap_sets(extra in 0u32..8, under in 0u32..8) {
+            use std::fmt::Write as _;
+
+            // The prefix cap: MAX + 1 + extra distinct read prefixes.
+            let mut text = format!("token\tp\t{}\n", hex("t"));
+            let over = MAX_PREFIXES_PER_SET + 1 + extra as usize;
+            for n in 0..over {
+                let _ = writeln!(text, "read\tp\trepo\td{n}");
+            }
+            prop_assert!(Access::parse(&text).is_err(), "over the prefix cap: accepted");
+
+            // At and under the cap: MAX - under prefixes parse.
+            let mut text = format!("token\tp\t{}\n", hex("t"));
+            let cap = MAX_PREFIXES_PER_SET - under as usize;
+            for n in 0..cap {
+                let _ = writeln!(text, "read\tp\trepo\td{n}");
+            }
+            Access::parse(&text).unwrap();
+
+            // The rule-set cap: each principal holds one distinct set.
+            let count = MAX_RULE_SETS_PER_REPO + 1 + extra as usize;
+            let mut text = String::new();
+            for n in 0..count {
+                let _ = writeln!(text, "token\tp{n}\t{}\nread\tp{n}\trepo\td{n}", hex(&format!("t{n}")));
+            }
+            prop_assert!(Access::parse(&text).is_err(), "over the rule-set cap: accepted");
+
+            // At and under: count - under distinct sets parse. Prefixes
+            // stay distinct, so the sets stay distinct.
+            let count = MAX_RULE_SETS_PER_REPO - under as usize;
+            let mut text = String::new();
+            for n in 0..count {
+                let _ = writeln!(text, "token\tp{n}\t{}\nread\tp{n}\trepo\td{n}", hex(&format!("t{n}")));
+            }
+            Access::parse(&text).unwrap();
+        }
+    }
 }

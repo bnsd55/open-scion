@@ -1339,3 +1339,311 @@ async fn a_read_file_runs_while_the_blame_slots_are_full() {
         assert!(!reply.ranges.is_empty(), "the blame answered");
     }
 }
+// ---- The model check through the server: a partial reader's reads of
+// ---- every path answer exactly like the model.
+
+use proptest::prelude::*;
+
+/// The file paths of a random tree: unique, nested, names from a small
+/// alphabet. A path with a descendant in the set loses its file role.
+fn file_paths() -> impl proptest::strategy::Strategy<Value = Vec<String>> {
+    proptest::collection::vec(proptest::collection::vec("[ab]{1,3}", 1..3), 2..12).prop_map(
+        |parts| {
+            let mut paths: Vec<String> = Vec::new();
+            for names in parts {
+                let candidate = names.join("/");
+                if !paths.contains(&candidate) {
+                    paths.push(candidate);
+                }
+            }
+            let has_descendant = |p: &String| paths.iter().any(|q| q.starts_with(&format!("{p}/")));
+            let mut keep: Vec<String> = paths
+                .iter()
+                .filter(|p| !has_descendant(p))
+                .cloned()
+                .collect();
+            keep.sort();
+            keep
+        },
+    )
+}
+
+/// The content of a file: unique per path.
+fn content_of(path: &str) -> Vec<u8> {
+    format!("content of {path}\n").into_bytes()
+}
+
+/// The read prefixes of the rules: a sorted subset of the paths and
+/// their directories, with covered ones dropped (the file
+/// canonicalizes anyway).
+fn rules(paths: &[String], seeds: &[u16]) -> Vec<String> {
+    let mut all: Vec<String> = Vec::new();
+    for p in paths {
+        let parts: Vec<&str> = p.split('/').collect();
+        for i in 1..parts.len() {
+            let dir = parts[..i].join("/");
+            if !all.contains(&dir) {
+                all.push(dir);
+            }
+        }
+        if !all.contains(p) {
+            all.push(p.clone());
+        }
+    }
+    all.sort();
+    let mut picked: Vec<String> = Vec::new();
+    for s in seeds {
+        let pick = &all[usize::from(*s) % all.len()];
+        if !picked.contains(pick) {
+            picked.push(pick.clone());
+        }
+    }
+    picked.sort();
+    let mut kept_rules: Vec<String> = Vec::new();
+    for r in &picked {
+        let covered = picked
+            .iter()
+            .any(|k| k != r && r.starts_with(&format!("{k}/")));
+        if !covered {
+            kept_rules.push(r.clone());
+        }
+    }
+    kept_rules
+}
+
+/// The model: a path is kept iff a rule covers it.
+fn kept(path: &str, rules: &[String]) -> bool {
+    rules
+        .iter()
+        .any(|r| path == r || path.starts_with(&format!("{r}/")))
+}
+
+/// What the model shows at `dir` (the root at the empty path): the
+/// names of the kept entries, files and directories.
+fn shown_children(dir: &str, paths: &[String], rules: &[String]) -> Vec<Vec<u8>> {
+    let prefix = if dir.is_empty() {
+        String::new()
+    } else {
+        format!("{dir}/")
+    };
+    let mut direct: Vec<String> = Vec::new();
+    for p in paths {
+        if let Some(rest) = p.strip_prefix(prefix.as_str()) {
+            let first = rest.split('/').next().unwrap().to_owned();
+            if !direct.contains(&first) {
+                direct.push(first);
+            }
+        }
+    }
+    let mut shown = Vec::new();
+    for name in direct {
+        let child = if dir.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}{name}")
+        };
+        let is_dir = paths.iter().any(|p| {
+            p.strip_prefix(prefix.as_str())
+                .is_some_and(|rest| rest.starts_with(&format!("{name}/")))
+        });
+        let kept = if is_dir {
+            paths.iter().any(|p| {
+                p.strip_prefix(prefix.as_str())
+                    .is_some_and(|rest| rest.starts_with(&format!("{name}/")))
+                    && kept(
+                        &if dir.is_empty() {
+                            p.clone()
+                        } else {
+                            format!("{prefix}{p}")
+                        },
+                        rules,
+                    )
+            })
+        } else {
+            kept(&child, rules)
+        };
+        if kept {
+            shown.push(name.into_bytes());
+        }
+    }
+    shown.sort();
+    shown
+}
+
+proptest! {
+    #![proptest_config(proptest::test_runner::Config::with_cases(12))]
+
+    /// Through the server: for random trees and rules, a partial
+    /// reader's ReadFile of every file path answers the covered
+    /// content, and a hidden path answers byte for byte like a missing
+    /// one; ListDir of every directory answers exactly the model's
+    /// names, and a hidden or absent directory answers like a missing
+    /// one.
+    #[test]
+    fn a_partial_reader_answers_like_the_model(
+        paths in file_paths(),
+        rule_seeds in proptest::collection::vec(proptest::num::u16::ANY, 1..5),
+    ) {
+        use std::fmt::Write as _;
+        prop_assume!(!paths.is_empty());
+        let rule_set = rules(&paths, &rule_seeds);
+        prop_assume!(!rule_set.is_empty());
+
+        // The store: one root changeset whose tree holds every path,
+        // and each file's blob, as an upload would leave them.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut changes = std::collections::BTreeMap::new();
+        for p in &paths {
+            let blob = store.blobs().put(&content_of(p)).unwrap();
+            changes.insert(
+                RepoPath::new(p.clone()).unwrap(),
+                Some(FileState::Regular {
+                    content: blob,
+                    executable: false,
+                }),
+            );
+        }
+        let cs = Changeset {
+            parents: vec![],
+            author: IdentityTime {
+                name: b"Ada".to_vec(),
+                email: b"ada@example.com".to_vec(),
+                unix_secs: 1_700_000_000,
+                tz_offset_minutes: 0,
+            },
+            committer: None,
+            message: b"change\n".to_vec(),
+            changes,
+        };
+        let tip = store
+            .write(|c| {
+                let repo = c.create_repo(REPO)?;
+                let tip = c.insert_changeset(repo, &cs)?;
+                c.cas_ref(repo, "main", None, tip)?;
+                for p in &paths {
+                    let blob = store.blobs().put(&content_of(p)).unwrap();
+                    c.add_repo_blob(repo, blob)?;
+                }
+                Ok(tip)
+            })
+            .unwrap();
+
+        // The access file: pat reads through the prefixes.
+        let mut text = format!("token\tpat\t{}\n", hex("pat"));
+        for r in &rule_set {
+            let _ = writeln!(text, "read\tpat\t{REPO}\t{r}");
+        }
+        let access = Access::parse(&text).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (_stop, mut scion, _objects) = server(&store, access, "pat").await;
+
+            // The reference answers of a path and a directory that do
+            // not exist. A hidden path answers in the same shape: the
+            // same code, and a message that names the requested path
+            // and nothing else (the caller chose the path, so the echo
+            // says nothing about the repo).
+            let missing_file = scion
+                .read_file(req::read_file(tip.as_bytes(), b"zz/zz"))
+                .await
+                .unwrap_err();
+            let missing_dir = scion
+                .list_dir(ListDirRequest {
+                    repo: REPO.into(),
+                    changeset_id: tip.as_bytes().to_vec(),
+                    path: b"zz/zz".to_vec(),
+                })
+                .await
+                .unwrap_err();
+            let shape = |status: &tonic::Status, path: &str| {
+                status.code() == tonic::Code::NotFound
+                    && status.message() == format!("path \"{path}\" not found")
+            };
+            prop_assert!(
+                shape(&missing_file, "zz/zz") && shape(&missing_dir, "zz/zz"),
+                "the reference answers drifted: {missing_file:?}, {missing_dir:?}"
+            );
+
+            // ReadFile of every file path.
+            for p in &paths {
+                let at = p.as_bytes();
+                if kept(p, &rule_set) {
+                    let reply = scion
+                        .read_file(req::read_file(tip.as_bytes(), at))
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    let mut bytes = Vec::new();
+                    let mut reply = reply;
+                    while let Some(part) = reply.message().await.unwrap() {
+                        bytes.extend_from_slice(&part.data);
+                    }
+                    prop_assert_eq!(bytes, content_of(p), "the content differs from the model");
+                } else {
+                    let hidden = scion
+                        .read_file(req::read_file(tip.as_bytes(), at))
+                        .await
+                        .unwrap_err();
+                    prop_assert!(
+                        shape(&hidden, p),
+                        "the answer for the hidden file {p} differs from a missing one"
+                    );
+                }
+            }
+
+            // ListDir of the root and of every directory, kept or not.
+            let mut dirs: Vec<String> = vec![String::new()];
+            for p in &paths {
+                let parts: Vec<&str> = p.split('/').collect();
+                for i in 1..parts.len() {
+                    dirs.push(parts[..i].join("/"));
+                }
+            }
+            dirs.sort();
+            dirs.dedup();
+            for d in &dirs {
+                let listing = scion
+                    .list_dir(ListDirRequest {
+                        repo: REPO.into(),
+                        changeset_id: tip.as_bytes().to_vec(),
+                        path: d.as_bytes().to_vec(),
+                    })
+                    .await;
+                let expected = shown_children(d, &paths, &rule_set);
+                match listing {
+                    Ok(reply) => {
+                        let mut bytes = Vec::new();
+                        let mut stream = reply.into_inner();
+                        while let Some(part) = stream.message().await.unwrap() {
+                            bytes.extend_from_slice(&part.tree);
+                        }
+                        let (listed, _id) = Tree::decode_with_id(&bytes).unwrap();
+                        let names: Vec<Vec<u8>> = listed
+                            .entries
+                            .keys()
+                            .map(|k| k.as_bytes().to_vec())
+                            .collect();
+                        prop_assert_eq!(names, expected, "the listing differs from the model");
+                    }
+                    Err(status) => {
+                        prop_assert!(
+                            expected.is_empty(),
+                            "the directory {d:?} lists nothing but was expected to"
+                        );
+                        prop_assert!(
+                            shape(&status, d),
+                            "the answer for the hidden directory {d} differs from a missing one"
+                        );
+                    }
+                }
+            }
+            Ok::<(), TestCaseError>(())
+        })
+        .unwrap();
+    }
+}
