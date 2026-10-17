@@ -34,7 +34,7 @@ services:
       - /data/ticket.key
     volumes:
       - server-data:/data
-      - ./certs:/certs:ro
+      - demo-certs:/certs:ro
 
   cache:
     image: open-scion-demo
@@ -52,7 +52,7 @@ services:
       - https://server:7878
       - --upstream-token
       - dev
-      - --ca
+      - --tls-ca
       - /certs/ca.pem
       - --ticket-public-key
       - ${SCION_TICKET_PUB:-}
@@ -77,8 +77,23 @@ services:
       SCION_TOKEN: dev
       SCION_REPO: demo
     volumes:
-      - ./certs:/certs:ro
+      - demo-certs:/certs:ro
       - demo-work:/work
+
+  # A one-shot with `--user root` copies the host's ./certs into this
+  # volume, so the keys inside are 0600 and owned by the containers' user,
+  # while the host copies stay with the developer.
+  demo-certs:
+
+  # Copies the host's ./certs into the demo-certs volume, with the modes
+  # and the owner the containers need. `docker/demo.sh` runs it once.
+  certs-init:
+    image: open-scion-demo
+    user: root
+    entrypoint: ["sh", "-c"]
+    volumes:
+      - ./certs:/host-certs:ro
+      - demo-certs:/certs
 
 volumes:
   server-data:

@@ -50,6 +50,15 @@ if [ -z "$PUB" ]; then
 fi
 export SCION_TICKET_PUB="$PUB"
 
+# The containers read the certificates from a volume, so the keys inside
+# are 0600 and owned by their user, whatever owns the host's copies.
+docker compose run --rm certs-init '
+    cp /host-certs/* /certs/
+    chmod 600 /certs/*.key
+    chmod 644 /certs/*.crt /certs/*.pem
+    chown -R 10001:10001 /certs
+'
+
 echo "starting the server and the cache"
 docker compose up -d server cache
 
