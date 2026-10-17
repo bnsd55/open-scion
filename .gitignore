@@ -1,7 +1,7 @@
 target/
-/crates/scion-core/fuzz/target/
-/crates/scion-core/fuzz/corpus/
-/crates/scion-core/fuzz/artifacts/
-/crates/scion-core/fuzz/coverage/
+/crates/*/fuzz/target/
+/crates/*/fuzz/corpus/
+/crates/*/fuzz/artifacts/
+/crates/*/fuzz/coverage/
 /.claude/
 /scion-data/
