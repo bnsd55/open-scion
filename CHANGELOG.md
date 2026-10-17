@@ -14,6 +14,9 @@ until that section gets its release date.
 
 ### Added
 
+- The server counts lands whose ref moved under them and were planned
+  again in `scion_land_replans_total`, next to the land outcome counters.
+
 #### Objects and byte format
 
 - A tree entry carries its blob's byte length (`#172`): `ls -l` and a mount
