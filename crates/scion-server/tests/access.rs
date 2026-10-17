@@ -19,6 +19,8 @@ use scion_server::meta::Meta as _;
 use scion_server::meta::MetaTx as _;
 use scion_server::metrics::Metrics;
 use scion_server::{Backend, service};
+use std::future::Future;
+use std::pin::Pin;
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 use tonic::metadata::AsciiMetadataValue;
@@ -28,14 +30,23 @@ use tonic::{Code, Request, Status};
 
 const REPO: &str = "main";
 
-/// Adds `authorization: Bearer <token>` to every request.
+/// Adds `authorization: Bearer <token>` to every request. `None` adds
+/// nothing: the client of a caller that sends no token, of the same client
+/// type as one that does.
 #[derive(Clone)]
-struct Bearer(AsciiMetadataValue);
+struct Bearer(Option<AsciiMetadataValue>);
+
+impl Bearer {
+    fn token(value: AsciiMetadataValue) -> Self {
+        Self(Some(value))
+    }
+}
 
 impl Interceptor for Bearer {
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
-        let value = self.0.clone();
-        request.metadata_mut().insert("authorization", value);
+        if let Some(value) = self.0.clone() {
+            request.metadata_mut().insert("authorization", value);
+        }
         Ok(request)
     }
 }
@@ -125,11 +136,11 @@ fn put(store: &Backend, content: &[u8]) -> BlobId {
     blob
 }
 
-/// A server of `store` with `access`, and a client of each service as
-/// `token`. The first reply is the server's stop signal: hold it, or the
-/// server shuts down when the caller drops it.
+/// A server of `store` with `access`. The first reply is the server's stop
+/// signal: hold it, or the server shuts down when the caller drops it. The
+/// second is its `http://` URL.
 type Stop = tokio::sync::oneshot::Sender<()>;
-async fn server(store: &Backend, access: Access, token: &str) -> (Stop, Scion, Objects) {
+async fn serve(store: &Backend, access: Access) -> (Stop, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -150,16 +161,50 @@ async fn server(store: &Backend, access: Access, token: &str) -> (Stop, Scion, O
             stopped.await.ok();
         },
     ));
-    let channel = Channel::from_shared(format!("http://{addr}"))
+    (stop, format!("http://{addr}"))
+}
+
+/// A client of `url` as `token`; `None` sends no token at all.
+async fn scion(url: &str, token: Option<&str>) -> Scion {
+    let channel = Channel::from_shared(url.to_owned())
         .unwrap()
         .connect()
         .await
         .unwrap();
-    let bearer = Bearer(format!("Bearer {token}").parse().unwrap());
+    match token {
+        None => ScionClient::with_interceptor(channel, Bearer(None)),
+        Some(token) => {
+            let bearer = Bearer::token(format!("Bearer {token}").parse().unwrap());
+            ScionClient::with_interceptor(channel, bearer)
+        }
+    }
+}
+
+/// An `Objects` client of `url` as `token`; `None` sends no token.
+async fn objects(url: &str, token: Option<&str>) -> Objects {
+    let channel = Channel::from_shared(url.to_owned())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    match token {
+        None => ObjectsClient::with_interceptor(channel, Bearer(None)),
+        Some(token) => {
+            let bearer = Bearer::token(format!("Bearer {token}").parse().unwrap());
+            ObjectsClient::with_interceptor(channel, bearer)
+        }
+    }
+}
+
+/// A server of `store` with `access`, and a client of each service as
+/// `token`. The first reply is the server's stop signal: hold it, or the
+/// server shuts down when the caller drops it.
+async fn server(store: &Backend, access: Access, token: &str) -> (Stop, Scion, Objects) {
+    let (stop, url) = serve(store, access).await;
     (
         stop,
-        ScionClient::with_interceptor(channel.clone(), bearer.clone()),
-        ObjectsClient::with_interceptor(channel, bearer),
+        scion(&url, Some(token)).await,
+        objects(&url, Some(token)).await,
     )
 }
 
@@ -470,12 +515,408 @@ async fn a_principal_without_a_read_rule_sees_no_repo_on_any_rpc() {
         "GetRootTree",
         objects.get_root_tree(req::get_root_tree(root)).await,
     );
-    // SHORTCUT: GetObjects fails closed until C5 verifies tickets; then it
-    // hides like the rest and this goes back to `denied`.
+    // The ticket is the only permission of an object read, so a call with
+    // no ticket, or a bad one, says nothing about any object: it is
+    // refused with `PERMISSION_DENIED` and names none. What hides is an
+    // object outside a valid ticket's walk: that one is answered
+    // `NOT_FOUND`, as tests/tickets.rs pins (`refused`).
     let Err(status) = objects.get_objects(req::get_objects(blob)).await else {
         panic!("GetObjects: accepted")
     };
     assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+}
+
+/// The code that says "accepted".
+const OK: Code = Code::Ok;
+/// `UNAUTHENTICATED`, the answer to a call with no token, or a wrong one.
+const U: Code = Code::Unauthenticated;
+/// `NOT_FOUND`, the answer that hides a repo the caller may not read.
+const N: Code = Code::NotFound;
+/// `PERMISSION_DENIED`, the answer of a caller that may read but not write.
+const P: Code = Code::PermissionDenied;
+
+/// One caller column of the matrix. Adding a principal kind is one row
+/// here and one entry in each row's `want`.
+struct Who {
+    name: &'static str,
+    /// The server to call: the one with the rules of `access`, or the one
+    /// whose only principal has no rule for any repo.
+    rules: bool,
+    /// The token to send; `None` sends no token at all.
+    token: Option<&'static str>,
+}
+
+/// The caller columns, in the order of every row's `want`.
+const CALLERS: [Who; 6] = [
+    Who {
+        name: "no token",
+        rules: true,
+        token: None,
+    },
+    Who {
+        name: "wrong token",
+        rules: true,
+        token: Some("wrong"),
+    },
+    Who {
+        name: "no rule",
+        rules: false,
+        token: Some("mallory"),
+    },
+    Who {
+        name: "read-only",
+        rules: true,
+        token: Some("bob"),
+    },
+    Who {
+        name: "prefix write",
+        rules: true,
+        token: Some("alice"),
+    },
+    Who {
+        name: "full write",
+        rules: true,
+        token: Some("ci"),
+    },
+];
+
+/// The clients of one caller column.
+#[derive(Clone)]
+struct Clients {
+    scion: Scion,
+    objects: Objects,
+}
+
+/// The IDs the calls name.
+struct Prep {
+    root: Vec<u8>,
+    blob: Vec<u8>,
+    /// A changeset of `main` that puts `docs/guide`, inside alice's
+    /// prefix, stored on the server.
+    guide: Vec<u8>,
+    /// A blob the repo has, for the rows that create changesets.
+    content: Vec<u8>,
+    /// Each caller column's own land id, as its land row answered. A
+    /// column whose land was refused has none.
+    lands: std::sync::Arc<std::sync::Mutex<[String; 6]>>,
+}
+
+type Fut = Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>;
+type Call = fn(&Clients, &Prep, usize) -> Fut;
+
+/// One row of the matrix: an RPC of one service, and the code it answers
+/// each caller column with.
+struct Row {
+    rpc: &'static str,
+    want: [Code; 6],
+    call: Call,
+}
+
+fn put_blob(clients: &Clients, _prep: &Prep, _col: usize) -> Fut {
+    let mut scion = clients.scion.clone();
+    Box::pin(async move {
+        scion.put_blob(tokio_stream::once(req::put_blob())).await?;
+        Ok(())
+    })
+}
+
+fn create_inside(clients: &Clients, prep: &Prep, _col: usize) -> Fut {
+    let mut scion = clients.scion.clone();
+    let bytes = changeset_bytes(prep, "docs/guide");
+    Box::pin(async move {
+        scion
+            .create_changeset(CreateChangesetRequest {
+                repo: REPO.into(),
+                changeset: bytes,
+            })
+            .await?;
+        Ok(())
+    })
+}
+
+fn create_outside(clients: &Clients, prep: &Prep, _col: usize) -> Fut {
+    let mut scion = clients.scion.clone();
+    let bytes = changeset_bytes(prep, "src/a");
+    Box::pin(async move {
+        scion
+            .create_changeset(CreateChangesetRequest {
+                repo: REPO.into(),
+                changeset: bytes,
+            })
+            .await?;
+        Ok(())
+    })
+}
+
+fn land_inside(clients: &Clients, prep: &Prep, col: usize) -> Fut {
+    let mut scion = clients.scion.clone();
+    let id = prep.guide.clone();
+    let lands = std::sync::Arc::clone(&prep.lands);
+    Box::pin(async move {
+        let reply = scion
+            .land(land_req(&id, "matrix-inside"))
+            .await?
+            .into_inner();
+        lands.lock().unwrap()[col] = reply.land_id;
+        Ok(())
+    })
+}
+
+fn land_outside(clients: &Clients, prep: &Prep, col: usize) -> Fut {
+    let mut scion = clients.scion.clone();
+    let id = prep.root.clone();
+    let lands = std::sync::Arc::clone(&prep.lands);
+    Box::pin(async move {
+        let reply = scion
+            .land(land_req(&id, "matrix-outside"))
+            .await?
+            .into_inner();
+        lands.lock().unwrap()[col] = reply.land_id;
+        Ok(())
+    })
+}
+
+/// Reads the outcome of the caller's own land: the id its land row
+/// recorded. A caller whose land was refused has none, and its answer
+/// hides like any other.
+fn get_land(clients: &Clients, prep: &Prep, col: usize) -> Fut {
+    let mut scion = clients.scion.clone();
+    let id = prep.lands.lock().unwrap()[col].clone();
+    Box::pin(async move {
+        let req = GetLandRequest {
+            repo: REPO.into(),
+            land_id: if id.is_empty() { "1".into() } else { id },
+        };
+        scion.get_land(req).await?;
+        Ok(())
+    })
+}
+
+macro_rules! read_row {
+    ($rpc:literal, $call:expr) => {
+        Row {
+            rpc: $rpc,
+            want: [U, U, N, OK, OK, OK],
+            call: $call,
+        }
+    };
+}
+
+/// The encoded bytes of a changeset on top of the root, at `path`.
+fn changeset_bytes(prep: &Prep, path: &str) -> Vec<u8> {
+    let parent = ChangesetId::from_bytes(prep.root.clone().try_into().unwrap());
+    let content = BlobId::from_bytes(prep.content.clone().try_into().unwrap());
+    changeset(vec![parent], path, Some(regular(content))).encode()
+}
+
+fn land_req(id: &[u8], key: &str) -> LandRequest {
+    LandRequest {
+        repo: REPO.into(),
+        changeset_id: id.to_vec(),
+        target_ref: "main".into(),
+        request_key: key.to_string(),
+    }
+}
+
+/// A read of one changeset, drained to its end.
+macro_rules! read_call {
+    ($method:ident, $req:expr) => {
+        |clients: &Clients, prep: &Prep, _col: usize| {
+            let mut scion = clients.scion.clone();
+            let req = $req(prep);
+            Box::pin(async move {
+                scion.$method(req).await?;
+                Ok(())
+            }) as Fut
+        }
+    };
+}
+
+/// A streaming read, drained to its end.
+macro_rules! stream_call {
+    ($method:ident, $req:expr) => {
+        |clients: &Clients, prep: &Prep, _col: usize| {
+            let mut scion = clients.scion.clone();
+            let req = $req(prep);
+            Box::pin(async move {
+                let mut stream = scion.$method(req).await?.into_inner();
+                while let Some(part) = stream.message().await? {
+                    let _ = part;
+                }
+                Ok(())
+            }) as Fut
+        }
+    };
+}
+
+fn resolve_ref_scion(clients: &Clients, _prep: &Prep, _col: usize) -> Fut {
+    let mut scion = clients.scion.clone();
+    Box::pin(async move {
+        scion.resolve_ref(req::resolve_ref()).await?;
+        Ok(())
+    })
+}
+
+fn resolve_ref_objects(clients: &Clients, _prep: &Prep, _col: usize) -> Fut {
+    let mut objects = clients.objects.clone();
+    Box::pin(async move {
+        objects.resolve_ref(req::resolve_ref()).await?;
+        Ok(())
+    })
+}
+
+fn get_root_tree(clients: &Clients, prep: &Prep, _col: usize) -> Fut {
+    let mut objects = clients.objects.clone();
+    let root = prep.root.clone();
+    Box::pin(async move {
+        objects.get_root_tree(req::get_root_tree(&root)).await?;
+        Ok(())
+    })
+}
+
+fn get_objects(clients: &Clients, prep: &Prep, _col: usize) -> Fut {
+    let mut objects = clients.objects.clone();
+    let blob = prep.blob.clone();
+    Box::pin(async move {
+        let mut stream = objects
+            .get_objects(req::get_objects(&blob))
+            .await?
+            .into_inner();
+        while let Some(part) = stream.message().await? {
+            let _ = part;
+        }
+        Ok(())
+    })
+}
+
+/// The matrix: every RPC of both services, and the code it answers each
+/// caller column with. The rows that write name the paths they write, so
+/// a prefix principal's cells split inside and outside its prefixes.
+/// The table is data, so a new principal column (folder read rules,
+/// #121) is one row in `CALLERS` and one entry in each `want`.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn the_authz_matrix_answers_as_documented() {
+    let (_dir, store, root, blob) = store();
+
+    // A changeset inside alice's prefix, stored as if she had created it.
+    let guide_blob = put(&store, b"guide");
+    let guide = store
+        .write(|c| {
+            let repo = c.repo_id(REPO)?;
+            let id = c.insert_changeset(
+                repo,
+                &changeset(vec![root], "docs/guide", Some(regular(guide_blob))),
+            )?;
+            c.add_repo_blob(repo, guide_blob)?;
+            Ok(id)
+        })
+        .unwrap();
+    let prep = Prep {
+        root: root.as_bytes().to_vec(),
+        blob: blob.as_bytes().to_vec(),
+        guide: guide.as_bytes().to_vec(),
+        content: put(&store, b"matrix").as_bytes().to_vec(),
+        lands: std::sync::Mutex::new([const { String::new() }; 6]).into(),
+    };
+
+    // Two servers: one with the rules of `access`, one whose only
+    // principal has no rule for any repo. Every column calls its own.
+    let (_rules_stop, rules_url) = serve(&store, access()).await;
+    let (_no_rules_stop, no_rules_url) = serve(&store, no_rules()).await;
+    let mut clients = Vec::new();
+    for who in &CALLERS {
+        let url = if who.rules { &rules_url } else { &no_rules_url };
+        clients.push(Clients {
+            scion: scion(url, who.token).await,
+            objects: objects(url, who.token).await,
+        });
+    }
+
+    let rows: Vec<Row> = vec![
+        Row {
+            rpc: "PutBlob",
+            // An upload names no path: a caller that may change some path
+            // of the repo may upload.
+            want: [U, U, N, P, OK, OK],
+            call: put_blob,
+        },
+        Row {
+            rpc: "CreateChangeset (inside the prefix)",
+            want: [U, U, N, P, OK, OK],
+            call: create_inside,
+        },
+        Row {
+            rpc: "CreateChangeset (outside the prefix)",
+            want: [U, U, N, P, P, OK],
+            call: create_outside,
+        },
+        Row {
+            rpc: "Land (inside the prefix)",
+            want: [U, U, N, P, OK, OK],
+            call: land_inside,
+        },
+        Row {
+            rpc: "Land (outside the prefix)",
+            want: [U, U, N, P, P, OK],
+            call: land_outside,
+        },
+        Row {
+            rpc: "GetLand (the caller's own)",
+            // Land outcomes are scoped to the caller that made them: a
+            // read-only principal has none, so its answer is the same
+            // NOT_FOUND as a land it never made.
+            want: [U, U, N, N, OK, OK],
+            call: get_land,
+        },
+        read_row!("Scion/ResolveRef", resolve_ref_scion),
+        read_row!(
+            "GetChangeset",
+            stream_call!(get_changeset, |p: &Prep| req::get_changeset(&p.root))
+        ),
+        read_row!(
+            "ReadFile",
+            stream_call!(read_file, |p: &Prep| req::read_file(&p.root, b"README"))
+        ),
+        read_row!(
+            "ListDir",
+            stream_call!(list_dir, |p: &Prep| req::list_dir(&p.root))
+        ),
+        read_row!("Log", read_call!(log, |p: &Prep| req::log(&p.root))),
+        read_row!(
+            "Blame",
+            read_call!(blame, |p: &Prep| req::blame(&p.root, b"README"))
+        ),
+        read_row!(
+            "MergeBase",
+            read_call!(merge_base, |p: &Prep| req::merge_base(&p.root))
+        ),
+        read_row!(
+            "IsAncestor",
+            read_call!(is_ancestor, |p: &Prep| req::is_ancestor(&p.root))
+        ),
+        read_row!("Diff", read_call!(diff, |p: &Prep| req::diff(&p.root))),
+        read_row!("Objects/ResolveRef", resolve_ref_objects),
+        read_row!("GetRootTree", get_root_tree),
+        Row {
+            rpc: "GetObjects (no ticket)",
+            // The ticket is the only permission of an object read: a call
+            // with none is refused, and names no object.
+            want: [P, P, P, P, P, P],
+            call: get_objects,
+        },
+    ];
+
+    for row in &rows {
+        for (col, who) in CALLERS.iter().enumerate() {
+            let reply = (row.call)(&clients[col], &prep, col).await;
+            let got = match reply {
+                Ok(()) => OK,
+                Err(status) => status.code(),
+            };
+            assert_eq!(got, row.want[col], "{} / {}", row.rpc, who.name);
+        }
+    }
 }
 
 /// Four `Blame` calls of one big file run at once: each takes one of the 4

@@ -399,6 +399,9 @@ struct Inner<S> {
     /// stored.
     fetching: Arc<Semaphore>,
     flights: Mutex<Flights>,
+    /// Fires when a flight gives up an entry, so a waiter for the table to
+    /// empty wakes once per settle instead of polling.
+    settled: tokio::sync::Notify,
     /// The keys that a ticket of a call must verify against: the keys of
     /// the upstream server, one of which is enough. Empty on a daemon,
     /// which does not check tickets, only forwards them.
@@ -507,6 +510,7 @@ impl<S: Store> Tier<S> {
                 fetch_slots: Arc::new(Semaphore::new(FETCH_SLOTS)),
                 fetching: Arc::new(Semaphore::new(FETCH_BYTES)),
                 flights: Mutex::default(),
+                settled: tokio::sync::Notify::new(),
                 ticket_keys,
             }),
         })
@@ -1100,6 +1104,7 @@ impl<S: Store> Flight<S> {
             }
             tx.send_replace(Some(outcome.map_err(Failed::from)));
             lock(&self.tier.inner.flights).remove(&key);
+            self.tier.inner.settled.notify_waiters();
         }
     }
 
@@ -1257,6 +1262,7 @@ impl<S: Store> Drop for Flight<S> {
         for (key, ..) in &self.waiting {
             flights.remove(key);
         }
+        self.tier.inner.settled.notify_waiters();
     }
 }
 
@@ -1428,6 +1434,26 @@ pub async fn bind_unix(path: &Path) -> io::Result<UnixListener> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Waits until no fetch is in flight, so a test asserts on state, not on
+    /// timing. The tier notifies when a flight settles; the ceiling bounds a
+    /// missed wake or a stalled fetch at 10 s.
+    async fn settled<S: Store>(tier: &Tier<S>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let notified = tier.inner.settled.notified();
+            if lock(&tier.inner.flights).is_empty() {
+                return;
+            }
+            tokio::select! {
+                () = notified => {}
+                () = tokio::time::sleep_until(deadline) => {
+                    panic!("the flights never settled: {:?}", lock(&tier.inner.flights).keys().collect::<Vec<_>>())
+                }
+            }
+        }
+    }
+
     use std::pin::Pin;
 
     use tokio::net::TcpListener;
@@ -1659,9 +1685,7 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(tier.cache_hits_and_misses(), (0, 1));
         // The same object again: a hit, once its fetch has settled.
-        while !lock(&tier.inner.flights).is_empty() {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        settled(tier).await;
         let (object, _permit) = tier
             .produce(&ask(&setup, &setup.keys, "r"), 0, &Progress::default())
             .await
@@ -1690,9 +1714,7 @@ mod tests {
                 .unwrap();
             // A RAW blob from upstream is kept packed.
             assert_eq!(object::unpack(&stored, blob.len()).unwrap(), *blob);
-            while !lock(&f.tier.inner.flights).is_empty() {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
+            settled(&f.tier).await;
         }
         // The first fetch asked for all four; each later one only for itself.
         assert_eq!(f.fake.asked.load(Ordering::SeqCst), 4 + 3);
@@ -1703,9 +1725,7 @@ mod tests {
         let f = setup(3, 1 << 20).await;
         let asked = || f.fake.asked.load(Ordering::SeqCst);
         let settled = || async {
-            while !lock(&f.tier.inner.flights).is_empty() {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
+            settled(&f.tier).await;
         };
 
         // A fetch of the last two objects ends, and stores them.
@@ -1767,10 +1787,16 @@ mod tests {
             });
             // The fetch ends; the reply finds no room, lets the bytes go and
             // waits. The prove of the walk fetches the root tree first, so
-            // the ask count starts at 1.
-            while fake.asked.load(Ordering::SeqCst) < 2 || !lock(&tier.inner.flights).is_empty() {
+            // the ask count starts at 1. Both waits are on state, bounded.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while fake.asked.load(Ordering::SeqCst) < 2 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the walk never fetched"
+                );
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
+            settled(tier).await;
             tokio::time::sleep(Duration::from_millis(20)).await;
             assert!(!producing.is_finished());
             drop(full);

@@ -263,8 +263,11 @@ fn gc_command(store: &Store, grace: Duration, dry_run: bool) {
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
+    // Logs go to stderr: stdout carries the output of `ticket-key` and
+    // `hash-token`, which callers capture with $(...).
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
     // `hash-token` needs no data directory. An import does not land, so it
