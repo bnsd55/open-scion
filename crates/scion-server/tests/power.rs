@@ -13,6 +13,14 @@
 //! model a drive's volatile cache, which can also lose writes that reached
 //! the drive but were never flushed, and it does not reorder writes.
 //!
+//! SHORTCUT: the cut cannot catch a lost fsync of a directory. `LazyFS`
+//! persists a rename at rename time, so the directory-entry durability
+//! that `fsync_dir` guards (the `fsync` of the blob directory after the
+//! rename) is not modelled; the mutation without it passes. Upgrade to a
+//! block-level replay that drops un-flushed writes in order
+//! (dm-log-writes replay to each FLUSH), when a bug report or a change to
+//! the rename path says a directory entry was lost.
+//!
 //! SHORTCUT: the cut is sync-before-reply, and the sync path tested is the
 //! Linux one; macOS syncs differently (`F_FULLFSYNC`) and its CI job cannot
 //! run `LazyFS`, so there the crash suite is what runs. Upgrade to a model
