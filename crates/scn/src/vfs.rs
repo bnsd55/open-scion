@@ -1452,6 +1452,7 @@ mod tests {
                 pending_lands: None,
                 land_stale_secs: 1 << 40,
                 tls: None,
+                metrics: std::sync::Arc::new(scion_server::metrics::Metrics::default()),
             },
             Some(std::sync::Arc::new(scion_server::tickets::Keys::generate())),
             std::future::pending(),
