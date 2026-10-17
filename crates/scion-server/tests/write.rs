@@ -7,11 +7,12 @@ use std::fs;
 use rusqlite::{Connection, params};
 use scion_core::{BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, RepoPath};
 use scion_server::error::ApplyError;
+use scion_server::meta::MetaTx as _;
 use scion_server::store::BlobStatus;
 use scion_server::write::{
     MAX_CHANGES, MAX_COMMIT_MESSAGE_BYTES, MAX_IDENTITY_BYTES, create_changeset,
 };
-use scion_server::{Error, Store, db, tree};
+use scion_server::{Error, Store, tree};
 use tempfile::TempDir;
 
 const REPO: &str = "main";
@@ -33,9 +34,8 @@ fn fixture() -> Fixture {
     }
     let (root, other_root) = store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
-            let root = db::insert_changeset(
-                c,
+            let repo = c.create_repo(REPO)?;
+            let root = c.insert_changeset(
                 repo,
                 &changeset(
                     vec![],
@@ -46,14 +46,14 @@ fn fixture() -> Fixture {
                     ],
                 ),
             )?;
-            assert!(db::cas_ref(c, repo, "main", None, root)?);
+            assert!(c.cas_ref(repo, "main", None, root)?);
             // As if uploaded to `main`.
             for content in ["a", "b", "c", "new"] {
-                db::add_repo_blob(c, repo, BlobId::of(content.as_bytes()))?;
+                c.add_repo_blob(repo, BlobId::of(content.as_bytes()))?;
             }
-            let other = db::create_repo(c, "other")?;
+            let other = c.create_repo("other")?;
             let other_root =
-                db::insert_changeset(c, other, &changeset(vec![], &[("x", Some(regular("a")))]))?;
+                c.insert_changeset(other, &changeset(vec![], &[("x", Some(regular("a")))]))?;
             Ok((root, other_root))
         })
         .unwrap();
@@ -107,7 +107,7 @@ fn count_changesets(c: &Connection) -> scion_server::Result<i64> {
 #[test]
 fn concurrent_creates_of_one_changeset_store_it_once() {
     let f = fixture();
-    let before = f.store.read(count_changesets).unwrap();
+    let before = f.store.read(|c| count_changesets(c)).unwrap();
     let (bytes, expected) = changeset(
         vec![f.root],
         &[("a", None), ("dir/new", Some(regular("new")))],
@@ -123,13 +123,13 @@ fn concurrent_creates_of_one_changeset_store_it_once() {
             .collect()
     });
     assert!(ids.iter().all(|id| *id == expected), "{ids:?}");
-    assert_eq!(f.store.read(count_changesets).unwrap(), before + 1);
+    assert_eq!(f.store.read(|c| count_changesets(c)).unwrap(), before + 1);
 }
 
 #[test]
 fn bad_requests_are_rejected_and_store_nothing() {
     let f = fixture();
-    let before = f.store.read(count_changesets).unwrap();
+    let before = f.store.read(|c| count_changesets(c)).unwrap();
     let ok = |edit: fn(&mut Changeset)| {
         let mut cs = changeset(vec![f.root], &[("dir/new", Some(regular("new")))]);
         edit(&mut cs);
@@ -220,7 +220,7 @@ fn bad_requests_are_rejected_and_store_nothing() {
         create_changeset(&f.store, "nope", &valid),
         Err(Error::NotFound(_))
     ));
-    assert_eq!(f.store.read(count_changesets).unwrap(), before);
+    assert_eq!(f.store.read(|c| count_changesets(c)).unwrap(), before);
 }
 
 #[test]
@@ -248,7 +248,7 @@ fn created_changesets_have_the_expected_root_tree() {
     )
     .unwrap();
 
-    let repo = f.store.read(|c| db::repo_id(c, REPO)).unwrap();
+    let repo = f.store.read(|c| c.repo_id(REPO)).unwrap();
     let lookup = |cs, p: &str| {
         let root = tree::root_tree(&f.store, repo, cs).unwrap();
         f.store.read(|c| tree::lookup(c, root, &path(p))).unwrap()
@@ -279,7 +279,7 @@ fn a_blob_that_a_changeset_of_the_repo_names_needs_no_upload() {
     let root = f
         .store
         .write(|c| {
-            let repo = db::create_repo(c, "imported")?;
+            let repo = c.create_repo("imported")?;
             let root = changeset(vec![], &[("f", Some(file))]);
             Ok(tree::store_changeset(c, repo, &root)?.0)
         })
@@ -376,11 +376,11 @@ fn a_changeset_that_does_not_match_its_id_reads_as_corrupt() {
                 "UPDATE changesets SET body = ?1 WHERE id = ?2",
                 params![other, f.root.as_bytes()],
             )?;
-            db::repo_id(c, REPO)
+            c.repo_id(REPO)
         })
         .unwrap();
 
-    match f.store.read(|c| db::get_changeset(c, repo, f.root)) {
+    match f.store.read(|c| c.get_changeset(repo, f.root)) {
         Err(Error::Corrupt(why)) => assert!(why.contains("does not match its ID"), "{why}"),
         other => panic!("expected Corrupt, got {other:?}"),
     }

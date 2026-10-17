@@ -548,16 +548,18 @@ impl<S: tonic::server::NamedService> tonic::server::NamedService for MetricsServ
 }
 
 // The wrapped service answers a request of `tonic::body::Body` (what the
-// router feeds) with its own body type wrapped in the interceptor's
-// `ResponseBody`; the reply goes back to the router as a `tonic::body::Body`
-// again, around a [`CountingBody`].
-impl<S> tower::Service<http::Request<tonic::body::Body>> for MetricsService<S>
+// router feeds) with a reply of any body type, behind an interceptor or
+// not; the reply goes back to the router as a `tonic::body::Body` again,
+// around a [`CountingBody`].
+impl<S, B> tower::Service<http::Request<tonic::body::Body>> for MetricsService<S>
 where
     S: tower::Service<
             http::Request<tonic::body::Body>,
-            Response = http::Response<tonic::service::interceptor::ResponseBody<tonic::body::Body>>,
+            Response = http::Response<B>,
             Error = std::convert::Infallible,
         >,
+    B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     S::Future: Send + 'static,
 {
     type Response = http::Response<tonic::body::Body>;

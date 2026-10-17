@@ -14,15 +14,14 @@ use std::time::Instant;
 
 use gix::diff::blob::sources::byte_lines;
 use gix::diff::blob::{Algorithm, Diff, InternedInput};
-use rusqlite::Connection;
 use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, PathElem, RepoPath, Tree,
     TreeId,
 };
 
-use crate::db;
 use crate::error::{Error, Result};
 use crate::memory::{BYTES_PER_LINE, Bytes, Held};
+use crate::meta::MetaTx;
 use crate::read::{self, MAX_SCAN};
 use crate::similar::{self, Budget, Chunks, MAX_PAIRS, Progress};
 use crate::store::Store;
@@ -191,7 +190,7 @@ pub fn blame(
     // says. The lines outside the window are done: they hold a placeholder
     // changeset that no reply reports.
     let (start, start_path) = resume.next.clone().unwrap_or((cs, path.clone()));
-    let repo = store.read(|c| db::repo_id(c, repo))?;
+    let repo = store.read(|c| c.repo_id(repo))?;
     let root = tree::root_tree(store, repo, start)?;
     let mut blob = regular_blob(store, root, &start_path)?;
     // The text of the version the walk starts at. Its bytes stay taken for
@@ -708,7 +707,7 @@ fn deleted_files<'c>(
 
 /// [`tree::lookup`] that loads each tree at most once across calls.
 fn lookup_cached(
-    c: &Connection,
+    c: &mut dyn MetaTx,
     trees: &mut HashMap<TreeId, Tree>,
     root: TreeId,
     path: &RepoPath,
@@ -720,7 +719,7 @@ fn lookup_cached(
         };
         let tree = match trees.entry(id) {
             Slot::Occupied(slot) => slot.into_mut(),
-            Slot::Vacant(slot) => slot.insert(db::get_tree(c, id)?),
+            Slot::Vacant(slot) => slot.insert(c.get_tree(id)?),
         };
         let name = PathElem::new(name).expect("a RepoPath part is a valid name");
         match tree.entries.get(&name) {
@@ -1053,7 +1052,7 @@ pub fn decode_cursor(
     until: Option<Instant>,
 ) -> Result<(Resume, Held)> {
     let bad = |why: &str| Error::InvalidArgument(format!("bad blame cursor: {why}"));
-    let repo_id = store.read(|c| db::repo_id(c, repo))?;
+    let repo_id = store.read(|c| c.repo_id(repo))?;
     let mut r = CursorReader(bytes);
     if r.u8()? != CURSOR_VERSION {
         return Err(bad("unknown version"));
@@ -1066,7 +1065,7 @@ pub fn decode_cursor(
         1 => {
             let id = ChangesetId::from_bytes(r.array::<32>()?);
             let at = RepoPath::new(r.bytes_field()?).map_err(|_| bad("bad path"))?;
-            let known = store.read(|c| db::has_changeset(c, repo_id, id))?;
+            let known = store.read(|c| c.has_changeset(repo_id, id))?;
             if !known {
                 return Err(bad(&format!(
                     "it goes on at {id} which {repo} does not have"
@@ -1108,7 +1107,7 @@ pub fn decode_cursor(
     let mut table = Vec::with_capacity(table_count as usize);
     for _ in 0..table_count {
         let id = ChangesetId::from_bytes(r.array::<32>()?);
-        let known = store.read(|c| db::has_changeset(c, repo_id, id))?;
+        let known = store.read(|c| c.has_changeset(repo_id, id))?;
         if !known {
             return Err(bad(&format!("it names {id} which {repo} does not have")));
         }

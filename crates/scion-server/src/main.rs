@@ -1,8 +1,12 @@
 //! The `scion-server` binary: `import`, `serve` and `derive`.
 
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -12,12 +16,11 @@ use scion_server::derived::{self, Kind};
 use scion_server::graph::CommitGraph;
 use scion_server::history::PathHistory;
 use scion_server::import::{ImportOptions, import_git};
-use scion_server::quotas::Quotas;
-use std::sync::Arc;
-
+use scion_server::meta::MetaTx as _;
 use scion_server::metrics::{self, Metrics};
+use scion_server::quotas::Quotas;
 use scion_server::tree::RootTree;
-use scion_server::{Error, Store, db, read, service};
+use scion_server::{Error, Store, fsck, gc, read, service};
 use tracing_subscriber::EnvFilter;
 
 /// The scion server: import, serve and derive.
@@ -32,6 +35,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // SHORTCUT: `Serve` holds its flags by value, 309 bytes against `Import`'s 109: 20 bytes over the lint. Box the TLS paths if a variant grows further.
 enum Command {
     /// Serve the gRPC API.
     Serve {
@@ -90,6 +94,15 @@ enum Command {
         /// Most calls (HTTP/2 streams) that one connection may have open at once.
         #[arg(long, default_value_t = listen::DEFAULT_STREAMS)]
         max_streams: NonZeroU32,
+        /// File with the Ed25519 seed (64 hex characters) that signs the
+        /// tickets of `GetRootTree` replies, from `ticket-key`. Without it,
+        /// no object is readable: a read needs a ticket.
+        #[arg(long, value_name = "FILE")]
+        ticket_key: Option<PathBuf>,
+        /// File with the previous ticket key (64 hex characters of its
+        /// public key), whose tickets stay valid during a rotation.
+        #[arg(long, value_name = "FILE", requires = "ticket_key")]
+        ticket_key_old: Option<PathBuf>,
         /// Most bytes that the stalled replies of one connection may hold. A
         /// connection over it is closed with them.
         #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
@@ -105,6 +118,14 @@ enum Command {
     HashToken {
         #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
         token: String,
+    },
+    /// Generate an Ed25519 key for the tickets of object reads: writes the
+    /// secret seed to `--out`, and prints the public key as 64 hex
+    /// characters, for `--ticket-key-old` and the tiers to verify with.
+    TicketKey {
+        /// File to write the secret seed to, as 64 hex characters.
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
     },
     /// Import a local git repository, one way. Safe to repeat. It can run
     /// while the server runs.
@@ -124,6 +145,27 @@ enum Command {
         verify: usize,
         /// Path to the git repository.
         git_dir: PathBuf,
+    },
+    /// Check a data directory and report the damage it finds. Read-only: it
+    /// changes nothing, and it can run while the server runs. It reads in
+    /// short batches, and each check looks at the state at the moment it
+    /// looks, so a clean report means "no damage seen", not a snapshot.
+    /// One line per problem: kind, ID, path. Exit 0 when it saw no damage,
+    /// 1 when it did, 2 when it could not run.
+    Fsck,
+    /// Collect the blob files and the rows that nothing names any more: a
+    /// row whose blob no stored changeset of its repo puts, and a file that
+    /// no repo's row names, both older than the grace period. Safe beside a
+    /// live server; safe to repeat. Rows go before files, so a crash leaves
+    /// orphan files only, which the next run removes.
+    Gc {
+        /// How old a blob file must be before the collector may remove it:
+        /// an upload that a client is about to name is younger than this.
+        #[arg(long, default_value_t = gc::DEFAULT_GRACE_SECS)]
+        grace_secs: u64,
+        /// Report what a real run would collect, and remove nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Derive one kind of derived data for the history of a ref, in bounded
     /// steps, and remove the rows of its older versions. Safe to repeat.
@@ -156,6 +198,52 @@ enum KindName {
     PathHistory,
 }
 
+/// Runs `fsck` against `store`, prints one line per problem, and exits:
+/// 0 when it saw no damage, 1 when it did, 2 when it could not run.
+fn fsck_command(store: &Store) -> anyhow::Result<()> {
+    let report = match fsck::run(store, fsck::BATCH, &mut |_| {}) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("scion-server fsck: {e}");
+            std::process::exit(2);
+        }
+    };
+    for problem in &report.problems {
+        println!("{problem}");
+    }
+    for (kind, version) in &report.old {
+        println!("derived-old {kind} v{version}");
+    }
+    println!(
+        "fsck: {} problems, {} derived rows of unknown versions",
+        report.problems.len(),
+        report.old.len()
+    );
+    if report.is_clean() {
+        std::process::exit(0);
+    }
+    std::process::exit(1);
+}
+
+/// Runs `gc` against `store` and prints what it collected. Exits 2 when it
+/// could not run.
+fn gc_command(store: &Store, grace: Duration, dry_run: bool) {
+    let report = match gc::run(store, grace, dry_run, &mut |_| {}) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("scion-server gc: {e}");
+            std::process::exit(2);
+        }
+    };
+    println!(
+        "gc: {} repos, {} rows pruned, {} files removed{}",
+        report.repos,
+        report.rows_pruned,
+        report.files_removed,
+        if dry_run { " (dry run)" } else { "" },
+    );
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
@@ -168,9 +256,10 @@ async fn main() -> anyhow::Result<()> {
     // kind, which a running server of an older build may read, so it opens as
     // the server.
     let open = match cli.command {
-        Command::Import { .. } => Store::open_shared,
+        Command::Import { .. } | Command::Fsck | Command::Gc { .. } => Store::open_shared,
         Command::Serve { .. } | Command::Derive { .. } => Store::open,
         Command::HashToken { .. } => return hash_token(),
+        Command::TicketKey { .. } => return write_ticket_key(),
     };
     let store = open(&cli.data)
         .with_context(|| format!("cannot open data directory {}", cli.data.display()))?;
@@ -191,6 +280,8 @@ async fn main() -> anyhow::Result<()> {
             max_streams,
             max_stalled_bytes,
             metrics_listen,
+            ticket_key,
+            ticket_key_old,
         } => {
             // The second reply says whether the mode is one token: with one
             // principal, a per-principal cap is a global one, so the quotas
@@ -207,6 +298,7 @@ async fn main() -> anyhow::Result<()> {
                 tls_key.as_deref(),
                 tls_client_ca.as_deref(),
             )?;
+            let tickets = load_tickets(ticket_key.as_deref(), ticket_key_old.as_deref())?;
             serve(
                 store,
                 listen,
@@ -222,10 +314,18 @@ async fn main() -> anyhow::Result<()> {
                     max_stalled_bytes,
                     metrics_listen,
                 },
+                tickets,
             )
             .await?;
         }
-        Command::HashToken { .. } => unreachable!("handled before the store opens"),
+        Command::HashToken { .. } | Command::TicketKey { .. } => {
+            unreachable!("handled before the store opens")
+        }
+        Command::Fsck => return fsck_command(&store),
+        Command::Gc {
+            grace_secs,
+            dry_run,
+        } => gc_command(&store, Duration::from_secs(grace_secs), dry_run),
         Command::Import {
             repo,
             rev,
@@ -253,7 +353,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let (name, tip) = tokio::task::spawn_blocking(move || {
                 let tip = read::resolve_ref(&store, &repo, &target_ref)?;
-                let repo_id = store.read(|c| db::repo_id(c, &repo))?;
+                let repo_id = store.read(|c| c.repo_id(&repo))?;
                 let name = match kind {
                     KindName::RootTree => {
                         derived::backfill::<RootTree>(&store, repo_id, tip)?;
@@ -347,6 +447,7 @@ async fn serve(
     listen: SocketAddr,
     access: scion_server::access::Access,
     config: ServeConfig,
+    tickets: Option<Arc<scion_server::tickets::Keys>>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         listen.ip().is_loopback() || config.insecure_listen || config.server_tls.is_some(),
@@ -406,6 +507,7 @@ async fn serve(
             tls: config.server_tls,
             metrics,
         },
+        tickets,
         async move {
             let mut end_rx = end_rx;
             let _ = end_rx.changed().await;
@@ -436,6 +538,79 @@ fn load_access(
         }
         (None, None) => anyhow::bail!("give --token or --access"),
     }
+}
+
+/// The ticket keys of `serve`: a signing key, and the public key that a
+/// rotation keeps alive. Both files hold 64 hex characters.
+fn load_tickets(
+    seed: Option<&Path>,
+    old: Option<&Path>,
+) -> anyhow::Result<Option<Arc<scion_server::tickets::Keys>>> {
+    let Some(seed) = seed else {
+        anyhow::ensure!(old.is_none(), "--ticket-key-old needs --ticket-key");
+        return Ok(None);
+    };
+    let keys = scion_server::tickets::Keys::load(
+        &read_hex(seed)?,
+        &match old {
+            Some(file) => vec![read_hex(file)?],
+            None => Vec::new(),
+        },
+    )
+    .map_err(|why| anyhow::anyhow!("{why}"))?;
+    Ok(Some(Arc::new(keys)))
+}
+
+/// The file's trimmed text, as a key wants it. The file must be readable
+/// by its owner alone: a seed that group or others can read mints
+/// permissions to anyone who can read it.
+fn read_hex(file: &Path) -> anyhow::Result<String> {
+    let meta = std::fs::symlink_metadata(file)
+        .with_context(|| format!("cannot read {}", file.display()))?;
+    anyhow::ensure!(
+        meta.is_file(),
+        "{} is not a file (a symlink is refused too)",
+        file.display()
+    );
+    anyhow::ensure!(
+        meta.mode().trailing_zeros() >= 6,
+        "{} can be read by group or others (fix: chmod 600 {})",
+        file.display(),
+        file.display()
+    );
+    let me = rustix::process::geteuid().as_raw();
+    scion_proto::auth::check_ancestors(file, me)
+        .with_context(|| format!("{} sits in a directory that is not private", file.display()))?;
+    let text =
+        std::fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))?;
+    Ok(text.trim().to_owned())
+}
+
+/// Writes a fresh ticket key to `--out` and prints its public key. The
+/// file is created, never replaced: a second run to the same path fails,
+/// because silently changing the key breaks every tier that was given the
+/// old public half. The file is 0600: the seed mints permissions.
+fn write_ticket_key() -> anyhow::Result<()> {
+    let Cli { command, .. } = Cli::parse();
+    let Command::TicketKey { out } = command else {
+        unreachable!("write_ticket_key handles only the ticket-key command")
+    };
+    let keys = scion_server::tickets::Keys::generate();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&out)
+        .with_context(|| {
+            format!(
+                "cannot create {} (it exists already? the key must not change under the tiers)",
+                out.display()
+            )
+        })?;
+    file.write_all(format!("{}\n", keys.seed_hex()).as_bytes())
+        .with_context(|| format!("cannot write {}", out.display()))?;
+    println!("{}", keys.public_hex());
+    Ok(())
 }
 
 /// Prints the BLAKE3 digest of the token of `hash-token`.

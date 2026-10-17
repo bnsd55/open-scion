@@ -10,8 +10,9 @@ use scion_proto::auth::Bearer;
 use scion_proto::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{BlameRequest, CreateChangesetRequest, LandRequest, ReadFileRequest};
+use scion_server::meta::MetaTx as _;
 use scion_server::metrics::Metrics;
-use scion_server::{Store, db, service};
+use scion_server::{Store, service};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 use tonic::service::interceptor::InterceptedService;
@@ -92,10 +93,10 @@ async fn setup() -> (
     );
     let root = store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
-            let root = db::insert_changeset(c, repo, &root)?;
+            let repo = c.create_repo(REPO)?;
+            let root = c.insert_changeset(repo, &root)?;
             // The land target: main points at the root.
-            db::cas_ref(c, repo, "main", None, root)?;
+            c.cas_ref(repo, "main", None, root)?;
             Ok(root)
         })
         .unwrap();
@@ -116,6 +117,7 @@ async fn setup() -> (
             tls: None,
             metrics: metrics.clone(),
         },
+        None,
         async {
             stopped.await.ok();
         },
@@ -135,7 +137,7 @@ fn on_top(store: &Store, parent: ChangesetId, path: &str, content: &[u8]) -> Cha
     store.blobs().put(content).unwrap();
     store
         .write(|c| {
-            let repo = db::repo_id(c, REPO)?;
+            let repo = c.repo_id(REPO)?;
             let cs = Changeset {
                 parents: vec![parent],
                 author: author(1_700_000_001),
@@ -151,7 +153,7 @@ fn on_top(store: &Store, parent: ChangesetId, path: &str, content: &[u8]) -> Cha
                 .into_iter()
                 .collect(),
             };
-            db::insert_changeset(c, repo, &cs)
+            c.insert_changeset(repo, &cs)
         })
         .unwrap()
 }

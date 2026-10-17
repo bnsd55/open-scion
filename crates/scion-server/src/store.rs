@@ -28,13 +28,14 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use rustix::fs::FlockOperation;
 use rustix::io::Errno;
 use scion_core::{BlobHasher, BlobId};
 
+use crate::db::SqliteTx;
 use crate::error::{Error, Result};
 
 /// The schema version this build makes and reads.
@@ -102,6 +103,10 @@ struct Inner {
     /// write lock.
     #[cfg(test)]
     txes: AtomicU64,
+    /// How many of the next commits fail as a busy database, for tests of
+    /// the import's busy retry: the transaction ran and rolled back, so
+    /// nothing was written, exactly as a real busy commit ends.
+    fail_commits: AtomicU64,
 }
 
 impl Store {
@@ -206,7 +211,7 @@ impl Store {
             if server { "OFF" } else { "ON" }
         ))?;
         // Only a `Store` that is alone changes the schema.
-        let version = user_version(&db)?;
+        let version = user_version(&mut SqliteTx(&db))?;
         if !alone && version < SCHEMA_VERSION {
             return Err(Error::FailedPrecondition(format!(
                 "database schema version {version} is older than this build \
@@ -232,6 +237,7 @@ impl Store {
                 _server_lock: server_lock,
                 #[cfg(test)]
                 txes: AtomicU64::new(0),
+                fail_commits: AtomicU64::new(0),
             }),
         })
     }
@@ -261,7 +267,7 @@ impl Store {
     /// # Errors
     ///
     /// Returns what `f` returns, or an error from [`Store::flush`].
-    pub fn read<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub fn read<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
         let (result, seen) = self.read_counted(f);
         // An error is an answer too.
         self.wait_durable(seen)?;
@@ -274,10 +280,10 @@ impl Store {
     /// replies.
     pub(crate) fn read_counted<T>(
         &self,
-        f: impl FnOnce(&Connection) -> Result<T>,
+        f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>,
     ) -> (Result<T>, u64) {
         let reader = self.inner.readers.take();
-        let result = f(&reader);
+        let result = f(&mut SqliteTx(&reader));
         (result, self.inner.committing.load(Ordering::Acquire))
     }
 
@@ -317,8 +323,9 @@ impl Store {
     /// # Errors
     ///
     /// Returns what `f` returns.
-    pub fn read_unflushed<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        f(&self.lock())
+    pub fn read_unflushed<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
+        let db = self.lock();
+        f(&mut SqliteTx(&db))
     }
 
     /// Whether another process may use the directory at the same time. A
@@ -326,6 +333,23 @@ impl Store {
     /// took the directory alone is not shared.
     pub(crate) fn is_shared(&self) -> bool {
         !self.inner.alone
+    }
+
+    /// Sets how many of the next commits fail as a busy database. Tests of
+    /// the import's busy retry use it: the failing transaction ran and
+    /// rolled back, so the retry re-runs it whole.
+    #[doc(hidden)]
+    pub fn fail_next_commits(&self, n: u32) {
+        self.inner
+            .fail_commits
+            .store(u64::from(n), Ordering::Relaxed);
+    }
+
+    /// Sets how long the write connection waits for a busy database. Tests
+    /// use it to make a busy lock fail fast, so a retry is deterministic.
+    #[doc(hidden)]
+    pub fn set_busy_timeout(&self, timeout: Duration) {
+        let _ = self.lock().busy_timeout(timeout);
     }
 
     /// Write transactions run so far.
@@ -341,7 +365,7 @@ impl Store {
     /// # Errors
     ///
     /// As [`Store::commit`] and [`Store::flush`].
-    pub fn write<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub fn write<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
         let value = self.commit(f)?;
         self.flush()?;
         Ok(value)
@@ -353,13 +377,21 @@ impl Store {
     /// # Errors
     ///
     /// Returns what `f` returns, or a database error from begin or commit.
-    pub fn commit<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    pub fn commit<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
         let mut db = self.lock();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let value = f(&tx)?;
+        let value = f(&mut SqliteTx(&tx))?;
         // Counted before a read can see it, and again once it ended (see
         // `read` and `flush`).
         self.inner.committing.fetch_add(1, Ordering::Release);
+        if self.inner.fail_commits.load(Ordering::Relaxed) > 0 {
+            self.inner.fail_commits.fetch_sub(1, Ordering::Relaxed);
+            // Counted as ended, as a real failed commit is. The transaction
+            // drops here, which rolls it back: nothing was written, exactly
+            // as a commit past `busy_timeout` ends.
+            self.inner.committed.fetch_add(1, Ordering::Release);
+            return Err(Error::Busy);
+        }
         let committed = tx.commit();
         self.inner.committed.fetch_add(1, Ordering::Release);
         #[cfg(test)]
@@ -555,14 +587,14 @@ fn in_use(dir: &Path, name: &str, by: &str) -> Error {
     .into()
 }
 
-fn user_version(db: &Connection) -> Result<u32> {
+fn user_version(db: &mut SqliteTx<'_>) -> Result<u32> {
     Ok(db.pragma_query_value(None, "user_version", |row| row.get(0))?)
 }
 
 /// Runs the migrations from the database's version up to `target`. Only
 /// tests stop below [`SCHEMA_VERSION`], to make an older database.
 pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
-    let version = user_version(db)?;
+    let version = user_version(&mut SqliteTx(db))?;
     if version > SCHEMA_VERSION {
         return Err(Error::Corrupt(format!(
             "database schema version {version} is newer than this build ({SCHEMA_VERSION})"
@@ -849,6 +881,11 @@ impl Blobs {
         Ok(reader)
     }
 
+    /// The folder of blob files, `objects/blob`.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Opens a blob's file: one zstd frame, which nothing here unpacks or
     /// checks.
     pub(crate) fn open_file(&self, id: BlobId) -> Result<fs::File> {
@@ -1120,13 +1157,33 @@ impl BlobBatch<'_> {
     /// is intact. A file that is not intact is replaced.
     fn write(&mut self, id: BlobId, len: usize, raw: impl Read) -> Result<()> {
         match self.keep(id)? {
-            BlobStatus::Valid => return Ok(()),
+            BlobStatus::Valid => {
+                // A put that keeps the stored copy writes nothing, so the
+                // file's mtime would stay at its first upload. Touch it:
+                // the grace period of `gc` counts from the last upload,
+                // not the first, so a client that uploaded again does not
+                // lose the blob before it names it.
+                self.touch(id)?;
+                return Ok(());
+            }
             // The rename below replaces it in one step. No repo on this
             // line: a blob may be shared by repos.
             BlobStatus::Corrupt => tracing::warn!(blob = %id, "rewriting a corrupt blob file"),
             BlobStatus::Missing => {}
         }
         self.replace(id, len, raw)
+    }
+
+    /// Refreshes the mtime of a stored blob file, as one `utimensat`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the file cannot be opened or its time not set.
+    fn touch(&self, id: BlobId) -> Result<()> {
+        let (_, path) = self.blobs.location(id);
+        let file = fs::File::options().write(true).open(&path)?;
+        file.set_modified(SystemTime::now())?;
+        Ok(())
     }
 
     /// Writes blob `id`, whose `len` bytes `raw` gives, whether or not the
@@ -1374,6 +1431,8 @@ pub(crate) mod spawn_guard {
 
 #[cfg(test)]
 mod tests {
+    use crate::db::SqliteTx;
+    use crate::meta::MetaTx as _;
     use std::cell::{Cell, RefCell};
     use std::panic;
     use std::rc::Rc;
@@ -2099,8 +2158,8 @@ mod tests {
         store.blobs().full_flushes() - before
     }
 
-    fn create_repo(c: &Connection) -> Result<()> {
-        crate::db::create_repo(c, "main").map(drop)
+    fn create_repo(c: &mut SqliteTx<'_>) -> Result<()> {
+        c.create_repo("main").map(drop)
     }
 
     #[test]
@@ -2129,12 +2188,12 @@ mod tests {
         assert_eq!(flushes_in_read(&store), 0);
     }
 
-    fn repos(c: &Connection) -> Result<i64> {
+    fn repos(c: &mut SqliteTx<'_>) -> Result<i64> {
         Ok(c.query_row("SELECT count(*) FROM repos", [], |row| row.get(0))?)
     }
 
-    fn add_repo(name: &str) -> impl Fn(&Connection) -> Result<()> {
-        move |c| crate::db::create_repo(c, name).map(drop)
+    fn add_repo(name: &'static str) -> impl Fn(&mut SqliteTx<'_>) -> Result<()> {
+        move |c| c.create_repo(name).map(drop)
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod listen;
 pub mod metrics;
 pub mod object;
 pub mod reply;
+pub mod ticket;
 pub mod tls;
 
 /// The buffer type of `ObjectPart.data`: parts of one object are slices of one

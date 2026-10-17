@@ -12,8 +12,9 @@ use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPa
 use scion_proto::listen::Limits;
 use scion_server::blame::MAX_BLAME_VERSIONS;
 use scion_server::import::{ImportOptions, import_git};
+use scion_server::meta::MetaTx as _;
 use scion_server::read::MAX_SCAN;
-use scion_server::{Store, db, service, tree};
+use scion_server::{Store, service, tree};
 use serde_json::Value;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -89,6 +90,7 @@ impl Server {
                 tls: None,
                 metrics: Arc::default(),
             },
+            None,
             std::future::pending(),
         ));
         Self {
@@ -357,7 +359,7 @@ fn chain<S: Into<Option<FileState>>>(
 ) -> Vec<ChangesetId> {
     store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
+            let repo = c.create_repo(REPO)?;
             let mut ids: Vec<ChangesetId> = Vec::new();
             for (message, files) in changesets {
                 let cs = Changeset {

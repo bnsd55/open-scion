@@ -60,6 +60,12 @@ struct Cli {
     /// Bearer token to send upstream.
     #[arg(long, env = "SCION_UPSTREAM_TOKEN", hide_env_values = true)]
     upstream_token: String,
+    /// The public keys (64 hex characters, from `scion-server ticket-key`)
+    /// that a ticket of a call must verify against. One is enough; a
+    /// second keeps the old key alive during a rotation. Without one, no
+    /// object is served.
+    #[arg(long, value_name = "HEX")]
+    ticket_public_key: Vec<String>,
     /// Most connections served at once. More clients wait until one closes.
     #[arg(long, default_value_t = listen::DEFAULT_CONNECTIONS)]
     max_connections: NonZeroUsize,
@@ -129,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
         &cli.upstream_token,
         CACHE_UPSTREAM_TIMEOUT,
         Some(&client_tls),
+        ticket_keys(&cli.ticket_public_key)?,
     )?;
     if let Some(dir) = cli.snapshot {
         std::fs::DirBuilder::new()
@@ -234,4 +241,18 @@ async fn snapshots(
             }
         }
     }
+}
+
+/// The keys that a ticket of a call must verify against: at most two, the
+/// second one from a rotation.
+fn ticket_keys(hex: &[String]) -> anyhow::Result<Vec<ed25519_dalek::VerifyingKey>> {
+    anyhow::ensure!(hex.len() <= 2, "give at most two --ticket-key");
+    hex.iter()
+        .map(|key| {
+            let bytes = scion_tier::key_from_hex(key)
+                .ok_or_else(|| anyhow::anyhow!("--ticket-key must be 64 hex characters"))?;
+            ed25519_dalek::VerifyingKey::from_bytes(&bytes)
+                .map_err(|why| anyhow::anyhow!("bad --ticket-key: {why}"))
+        })
+        .collect()
 }

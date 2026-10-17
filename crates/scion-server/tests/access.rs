@@ -15,8 +15,9 @@ use scion_proto::v1::{
 use std::sync::Arc;
 
 use scion_server::access::Access;
+use scion_server::meta::MetaTx as _;
 use scion_server::metrics::Metrics;
-use scion_server::{Store, db, service};
+use scion_server::{Store, service};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 use tonic::metadata::AsciiMetadataValue;
@@ -97,12 +98,12 @@ fn store() -> (tempfile::TempDir, Store, ChangesetId, BlobId) {
     let blob = store.blobs().put(b"# hello\n").unwrap();
     let root = store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
+            let repo = c.create_repo(REPO)?;
             let root =
-                db::insert_changeset(c, repo, &changeset(vec![], "README", Some(regular(blob))))?;
-            db::cas_ref(c, repo, "main", None, root)?;
+                c.insert_changeset(repo, &changeset(vec![], "README", Some(regular(blob))))?;
+            c.cas_ref(repo, "main", None, root)?;
             // As if uploaded to `main` with `PutBlob`.
-            db::add_repo_blob(c, repo, blob)?;
+            c.add_repo_blob(repo, blob)?;
             Ok(root)
         })
         .unwrap();
@@ -115,8 +116,8 @@ fn put(store: &Store, content: &[u8]) -> BlobId {
     let blob = store.blobs().put(content).unwrap();
     store
         .write(|c| {
-            let repo = db::repo_id(c, REPO)?;
-            db::add_repo_blob(c, repo, blob)?;
+            let repo = c.repo_id(REPO)?;
+            c.add_repo_blob(repo, blob)?;
             Ok(())
         })
         .unwrap();
@@ -143,6 +144,7 @@ async fn server(store: &Store, access: Access, token: &str) -> (Stop, Scion, Obj
             tls: None,
             metrics: Arc::new(Metrics::default()),
         },
+        None,
         async {
             stopped.await.ok();
         },
@@ -402,12 +404,13 @@ mod req {
 
     pub fn get_objects(blob: &[u8]) -> GetObjectsRequest {
         GetObjectsRequest {
-            repo: REPO.into(),
             refs: vec![ObjectRef {
                 kind: ObjectKind::Blob as i32,
                 id: blob.to_vec(),
+                path: Vec::new(),
             }],
             accept: Vec::new(),
+            ticket: Vec::new(),
         }
     }
 }
@@ -466,10 +469,12 @@ async fn a_principal_without_a_read_rule_sees_no_repo_on_any_rpc() {
         "GetRootTree",
         objects.get_root_tree(req::get_root_tree(root)).await,
     );
-    denied(
-        "GetObjects",
-        objects.get_objects(req::get_objects(blob)).await,
-    );
+    // SHORTCUT: GetObjects fails closed until C5 verifies tickets; then it
+    // hides like the rest and this goes back to `denied`.
+    let Err(status) = objects.get_objects(req::get_objects(blob)).await else {
+        panic!("GetObjects: accepted")
+    };
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
 }
 
 /// Four `Blame` calls of one big file run at once: each takes one of the 4
@@ -491,10 +496,10 @@ async fn a_read_file_runs_while_the_blame_slots_are_full() {
     }
     let tip = store
         .write(|c| {
-            let repo = db::repo_id(c, REPO)?;
+            let repo = c.repo_id(REPO)?;
             let mut id = root;
             for put in puts {
-                id = db::insert_changeset(c, repo, &changeset(vec![id], "big", put))?;
+                id = c.insert_changeset(repo, &changeset(vec![id], "big", put))?;
             }
             Ok(id)
         })

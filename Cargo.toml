@@ -21,6 +21,8 @@ open-scion-tier = { version = "0.1.0", path = "crates/scion-tier" }
 
 anyhow = "1.0"
 bytes = "1.12"
+ed25519-dalek = { version = "3.0", default-features = false, features = ["fast", "rand_core"] }
+getrandom = "0.4"
 http = "1.5"
 http-body = "1.1"
 http-body-util = "0.1"
