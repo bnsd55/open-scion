@@ -202,7 +202,7 @@ it is safe to repeat).
 
 ## 5. Routines
 
-There is no garbage-collector command; the routines are these:
+The routines are these:
 
 - `fsck` on a schedule (it is read-only, so it can run beside a live
   server), and always on a fresh backup copy. Exit 1 with the problem lines
@@ -214,8 +214,16 @@ There is no garbage-collector command; the routines are these:
   `--land-stale-secs` (a day, by default) is rejected by a sweep that runs
   at start and then hourly. `finished` rows of the lands table are dropped
   after 7 days (7 days is `LAND_RETENTION_SECS` in `land.rs`): every new
-  land's transaction deletes the finished rows that are older, so the table
-  never grows without bound while lands are being made.
+  land's transaction deletes finished rows older than that, at most 100 per
+  land recorded, and the newest land always stays.
+- `scion-server gc` collects what nothing names any more: a row whose blob
+  no stored changeset of its repo puts, and a blob file that no repo's row
+  names, both older than `--grace-secs` (a week, by default: an upload that
+  a client is about to name is younger). It is safe beside a live server
+  and safe to repeat; rows go before files, so a crash leaves orphan files
+  only, which the next run removes. `--dry-run` reports a run's result
+  without removing anything. Run it on a schedule, and `fsck` after it the
+  first few times, until you trust the two together.
 - Derived data can be rebuilt with `scion-server derive --kind ... --ref
   ...` (server stopped); it is safe to repeat and removes rows of older
   versions itself.
@@ -224,15 +232,28 @@ There is no garbage-collector command; the routines are these:
 
 ## 6. What to watch
 
+## 6. What to watch
+
+**Metrics.** The server and the cache export Prometheus metrics at
+`GET /metrics` on the address of `--metrics-listen` (off by default;
+`scion-daemon` exports none). The endpoint is plain HTTP with no token, so
+it refuses a non-loopback address unless `--insecure-listen` is given; the
+usual shape is `--metrics-listen 127.0.0.1:9100` on the machine that runs
+the process, scraped from there. The names:
+
+- `scion_requests_total` — requests by RPC and code (the outcome codes are
+  where refusals and failures show).
+- `scion_request_seconds` — one latency histogram per RPC.
+- `scion_rpc_bytes_total` — request and reply bytes by RPC.
+- `scion_lands_total` — lands by outcome.
+- `scion_cache_hits_total` / `scion_cache_misses_total` — what a tier
+  served from its store against what it fetched upstream.
+
 **Health.** The server, cache and daemon answer standard gRPC health checks
 (`grpc.health.v1.Check` and `Watch`) on their serving port, without a
-token, for the services `scion.v1.Scion` and `scion.v1.Objects`. The server
+ token, for the services `scion.v1.Scion` and `scion.v1.Objects`. The server
 serves no gRPC reflection, so a probe tool must know the health protocol
 itself (`grpc_health_probe` does).
-
-**There is no metrics endpoint.** Nothing scrapes or exposes counters
-today; the logs are the observability. This is a known gap, not a
-convention to build on.
 
 **The log lines.** Every process logs to stderr with `tracing`; the lines
 that mean something:
