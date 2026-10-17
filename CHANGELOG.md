@@ -176,6 +176,14 @@ until that section gets its release date.
   the changeset bytes against the ID it asked for, and stops with an
   error once the joined bytes pass 1 GiB, so a broken or hostile server
   cannot stream until the client runs out of memory.
+- `Log` streams its entries in 1 MiB parts, as `GetChangeset` streams a
+  changeset (`#175`), so a client that stops reading is counted by the
+  connection's stall cap, which then closes the connection. A client
+  joins the parts' entries in order; the last part's
+  `next_changeset_id` starts the next call. A unary reply over the 64 MiB
+  a reply message may hold is refused by the server's encoder, so the
+  memory a client that never reads holds for one is bounded by
+  construction; a test pins that wiring.
 - Path history as derived data (kind `path_history`, schema version 5).
   `Log` with a path reads only the changesets that change the path, so one
   call returns up to 1,000 entries however far apart they are. A call
@@ -357,6 +365,10 @@ until that section gets its release date.
   is-ancestor` (exit 0 or 1) and `scn diff` for the query API, and
   `scn blame`. Every `scn` error exits 2, so it never reads as the "no" of
   `scn is-ancestor`.
+- `scn ls` shows each entry's size: `scion-server` 0.1 trees carry the
+  byte length of every file and symlink, so the listing knows it with no
+  extra call; directories and gitlinks show none. `--json` adds `size` to
+  the entries that carry one.
 - `scn mount` and `scn unmount` (`#11`): a virtual checkout. `scn mount
   DIR [REV]` serves one ref as an NFSv3 filesystem from `scn` itself, on a
   free port of 127.0.0.1, so a directory's tree loads when it is first
@@ -429,3 +441,13 @@ until that section gets its release date.
   warning about skipped inexact rename detection; the exact renames in the
   reply are still whole. Every call of the same diff reports the flag the
   same way.
+
+### Fixed
+
+- The server refuses a data directory that group or others can write, or
+  that sits under a directory another user can change: the blobs and the
+  metadata inside are only as private as the directory.
+- `scn` prints each part of an error once: tonic's transport error Display
+  already ends with its source's text, and the printed chain said `tcp
+  connect error` and `invalid URL, scheme is missing` twice.
+- `scion-server hash-token --token` has a help text.

@@ -41,8 +41,10 @@ service Scion {
   // streams a file.
   rpc ListDir(ListDirRequest) returns (stream ListDirResponse);
   // Walks first parents, newest first. With a path, returns only the
-  // changesets that change it.
-  rpc Log(LogRequest) returns (LogResponse);
+  // changesets that change it. Streams the entries in parts, as ListDir
+  // streams a tree: each part is a page of entries, and the last part's
+  // next_changeset_id is where the next call starts.
+  rpc Log(LogRequest) returns (stream LogResponse);
   // Which changeset last changed each line of a file, on first-parent
   // history.
   rpc Blame(BlameRequest) returns (BlameResponse);

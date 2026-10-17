@@ -20,7 +20,9 @@ struct Cli {
         global = true
     )]
     server: String,
-    /// Bearer token for the server.
+    /// Bearer token for the server. Pass it in `SCION_TOKEN`, not here:
+    /// the command line is readable by every local user (`ps`), the
+    /// environment of your own process is not.
     #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
     token: String,
     /// Address of a scion-cache or scion-daemon that serves `GetObjects`
@@ -130,10 +132,48 @@ async fn main() -> ExitCode {
     match run(cli).await {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("scn: {e:#}");
+            let err: &(dyn std::error::Error + 'static) = e.as_ref();
+            eprintln!("scn: {}", chain_text(err));
             ExitCode::from(ERROR_EXIT)
         }
     }
+}
+
+/// The text of one error and its causes, joined with `: `, each part once.
+///
+/// tonic's transport errors end their Display with their source's text,
+/// and `{:#}` printed that source again: `tcp connect error` twice, `bad
+/// URL, scheme is missing` twice. A cause whose text the message so far
+/// already ends with adds nothing new, so print only the rest of it.
+fn chain_text(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = error.to_string();
+    let mut source = error.source();
+    while let Some(err) = source {
+        let text = err.to_string();
+        let (have, add) = (out.as_bytes(), text.as_bytes());
+        // The longest suffix of `out` that is a prefix of `text`.
+        let mut overlap = 0;
+        for k in (1..=have.len().min(add.len())).rev() {
+            if have[have.len() - k..] == add[..k] {
+                overlap = k;
+                break;
+            }
+        }
+        let rest = &text[overlap..];
+        if overlap == 0 {
+            out.push_str(": ");
+            out.push_str(&text);
+        } else if rest.starts_with(": ") || rest.is_empty() {
+            out.push_str(rest);
+        } else {
+            // The overlap ended inside a word. Print the whole cause, so
+            // the parts stay whole.
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = err.source();
+    }
+    out
 }
 
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
@@ -174,4 +214,93 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
     };
     done.map(|()| ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chain_text;
+
+    /// A cause whose Display ends with its source's text, as tonic's
+    /// transport errors have.
+    #[derive(Debug)]
+    struct Doubled(std::io::Error);
+
+    impl Doubled {
+        fn of(text: &str) -> Self {
+            Self(std::io::Error::other(text))
+        }
+    }
+
+    impl std::fmt::Display for Doubled {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "outer: {}", self.0)
+        }
+    }
+
+    impl std::error::Error for Doubled {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    /// A cause the message does not name at all, as most errors have.
+    #[derive(Debug)]
+    struct Unrelated(std::io::Error);
+
+    impl std::fmt::Display for Unrelated {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "outer text")
+        }
+    }
+
+    impl std::error::Error for Unrelated {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn a_cause_the_message_already_names_prints_once() {
+        let err = Doubled::of("scheme is missing");
+        assert_eq!(chain_text(&err), "outer: scheme is missing");
+    }
+
+    #[test]
+    fn a_cause_that_extends_the_last_part_prints_its_rest() {
+        let err = Doubled::of("tcp connect error: refused");
+        assert_eq!(chain_text(&err), "outer: tcp connect error: refused");
+    }
+
+    #[test]
+    fn a_cause_that_names_something_new_prints_whole() {
+        let err = Unrelated(std::io::Error::other("something else"));
+        assert_eq!(chain_text(&err), "outer text: something else");
+    }
+
+    #[tokio::test]
+    async fn a_real_bad_url_prints_its_parts_once() {
+        // `Endpoint::from_shared` takes it; the connect rejects a URL
+        // with no scheme, as `scn --server no-scheme` sees.
+        let err = tonic::transport::Endpoint::from_shared(String::from("no-scheme"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap_err();
+        let err: &(dyn std::error::Error + 'static) = &err;
+        let text = chain_text(err);
+        assert_eq!(text.matches("scheme is missing").count(), 1, "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_real_refused_connection_prints_its_parts_once() {
+        let err = tonic::transport::Endpoint::from_shared(String::from("http://127.0.0.1:1"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap_err();
+        let err: &(dyn std::error::Error + 'static) = &err;
+        let text = chain_text(err);
+        assert_eq!(text.matches("tcp connect error").count(), 1, "{text}");
+        assert!(text.contains("Connection refused"), "{text}");
+    }
 }

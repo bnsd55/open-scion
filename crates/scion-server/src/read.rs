@@ -70,6 +70,16 @@ pub fn read_file(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) ->
 /// As [`read_file`], without reading the blob.
 pub fn file_blob(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Result<BlobId> {
     let root = root_tree(store, repo, cs)?;
+    file_blob_at(store, root, path)
+}
+
+/// The blob at `path` below the root tree `root`, which a partial reader's
+/// view may name instead of the changeset's real root.
+///
+/// # Errors
+///
+/// As [`read_file`].
+pub fn file_blob_at(store: &Store, root: TreeId, path: &RepoPath) -> Result<BlobId> {
     match store.read(|c| tree::lookup(c, root, path))? {
         Some(Entry::File(file)) => match file.state().blob() {
             Some(blob) => Ok(blob),
@@ -93,6 +103,16 @@ pub fn list_dir(
     path: Option<&RepoPath>,
 ) -> Result<Tree> {
     let root = root_tree(store, repo, cs)?;
+    list_dir_at(store, root, path)
+}
+
+/// The tree at `path` below the root tree `root`, which a partial reader's
+/// view may name instead of the changeset's real root.
+///
+/// # Errors
+///
+/// As [`list_dir`].
+pub fn list_dir_at(store: &Store, root: TreeId, path: Option<&RepoPath>) -> Result<Tree> {
     store.read(|c| {
         let Some(path) = path else {
             return c.get_tree(root);

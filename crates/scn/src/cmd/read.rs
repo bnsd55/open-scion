@@ -3,9 +3,7 @@
 use std::io::Write as _;
 
 use anyhow::{Context, Result, bail};
-use scion_core::{
-    Changeset, ChangesetId, Entry, FileEntry, FileState, IdentityTime, RepoPath, Tree,
-};
+use scion_core::{Changeset, ChangesetId, Entry, FileState, IdentityTime, RepoPath, Tree};
 use scion_proto::v1::{
     GetChangesetRequest, ListDirRequest, LogRequest, ReadFileRequest, ReadFileResponse,
 };
@@ -110,7 +108,16 @@ pub async fn ls(ctx: &mut Ctx, spec: &str) -> Result<()> {
         } else {
             ""
         };
-        println!("{mode} {kind:<7} {}{slash}", lossy(name.as_bytes()));
+        let size = match entry {
+            // A regular file or symlink carries its blob's byte length; a
+            // directory or a gitlink has no blob, so it shows no size.
+            Entry::File(file) if file.state().blob().is_some() => file.size().to_string(),
+            _ => String::new(),
+        };
+        println!(
+            "{mode} {kind:<7} {size:>10} {}{slash}",
+            lossy(name.as_bytes())
+        );
     }
     Ok(())
 }
@@ -123,7 +130,7 @@ pub async fn log(ctx: &mut Ctx, rev: &str, path: Option<&RepoPath>, limit: u32) 
     let mut next = Some(ctx.resolve(rev).await?);
     let mut entries = Vec::new();
     while let Some(from) = next.filter(|_| entries.len() < limit as usize) {
-        let reply = ctx
+        let mut pages = ctx
             .client
             .log(LogRequest {
                 repo: ctx.repo.clone(),
@@ -134,11 +141,25 @@ pub async fn log(ctx: &mut Ctx, rev: &str, path: Option<&RepoPath>, limit: u32) 
             .await
             .with_context(|| format!("cannot read the log of {rev}"))?
             .into_inner();
-        for entry in &reply.entries {
-            let id = id_from(&entry.changeset_id)?;
-            entries.push((id, decode_changeset(id, &entry.changeset)?));
+        // Each part is a page of entries; the last part's
+        // `next_changeset_id` is where the history walk stopped.
+        let mut joined = 0usize;
+        loop {
+            let page = pages
+                .message()
+                .await
+                .with_context(|| format!("cannot read the log of {rev}"))?;
+            let Some(page) = page else { break };
+            for entry in &page.entries {
+                let id = id_from(&entry.changeset_id)?;
+                joined += entry.changeset.len();
+                if joined > MAX_JOINED_REPLY_BYTES {
+                    bail!("the log of {rev} is over the {MAX_JOINED_REPLY_BYTES} a client joins");
+                }
+                entries.push((id, decode_changeset(id, &entry.changeset)?));
+            }
+            next = opt_id(&page.next_changeset_id)?;
         }
-        next = opt_id(&reply.next_changeset_id)?;
     }
     if ctx.json {
         let entries: Vec<Value> = entries
@@ -185,7 +206,7 @@ pub async fn show(ctx: &mut Ctx, rev: &str) -> Result<()> {
             .map(|(path, state)| {
                 let mut change = match state {
                     Some(state) => {
-                        let mut put = entry_json(&Entry::File(FileEntry::new(*state, 0)));
+                        let mut put = state_json(state);
                         put["op"] = "put".into();
                         put
                     }
@@ -284,23 +305,34 @@ fn changeset_json(id: ChangesetId, cs: &Changeset) -> Value {
 }
 
 /// An entry as JSON: kind, ID, and the executable flag of a regular file.
-pub(crate) fn entry_json(entry: &Entry) -> Value {
-    let id = match entry {
-        Entry::Dir(id) => id.to_string(),
-        Entry::File(file) => match file.state() {
-            FileState::Regular { content: blob, .. } | FileState::Symlink { target: blob } => {
-                blob.to_string()
-            }
-            FileState::Gitlink { commit } => commit.to_string(),
-        },
+/// The JSON of a file state: kind, ID, and the executable flag. A state
+/// names a blob, not a length, so it carries no size.
+fn state_json(state: &FileState) -> Value {
+    let (kind, id) = match state {
+        FileState::Regular { content: blob, .. } => ("file", blob.to_string()),
+        FileState::Symlink { target: blob } => ("symlink", blob.to_string()),
+        FileState::Gitlink { commit } => ("gitlink", commit.to_string()),
     };
-    let mut value = json!({ "kind": describe(entry).1, "id": id });
-    if let Entry::File(file) = entry
-        && let FileState::Regular { executable, .. } = file.state()
-    {
-        value["executable"] = executable.into();
+    let mut value = json!({ "kind": kind, "id": id });
+    if let FileState::Regular { executable, .. } = state {
+        value["executable"] = (*executable).into();
     }
     value
+}
+
+/// An entry as JSON: kind, ID, the executable flag of a regular file, and
+/// the size of an entry that names a blob.
+pub(crate) fn entry_json(entry: &Entry) -> Value {
+    match entry {
+        Entry::Dir(id) => json!({ "kind": "dir", "id": id.to_string() }),
+        Entry::File(file) => {
+            let mut value = state_json(&file.state());
+            if file.state().blob().is_some() {
+                value["size"] = file.size().into();
+            }
+            value
+        }
+    }
 }
 
 #[cfg(test)]

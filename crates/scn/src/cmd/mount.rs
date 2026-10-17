@@ -224,7 +224,7 @@ fn overlay_dir() -> Result<PathBuf> {
 }
 
 /// The path of the session file, under the home directory.
-pub fn session_file() -> Result<PathBuf> {
+pub(crate) fn session_file() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("cannot read $HOME"))?;
@@ -235,7 +235,7 @@ pub fn session_file() -> Result<PathBuf> {
 }
 
 /// Reads the session file.
-pub fn load_sessions() -> Vec<MountRecord> {
+pub(crate) fn load_sessions() -> Vec<MountRecord> {
     let Ok(file) = session_file() else {
         return Vec::new();
     };
@@ -271,7 +271,7 @@ fn parse_sessions(json: &serde_json::Value) -> Vec<MountRecord> {
 }
 
 /// Adds `record` to the session file, replacing the record of its dir.
-pub fn save_session(record: &MountRecord) -> Result<()> {
+pub(crate) fn save_session(record: &MountRecord) -> Result<()> {
     let file = session_file()?;
     let mut sessions = load_sessions();
     sessions.retain(|known| known.dir != record.dir);

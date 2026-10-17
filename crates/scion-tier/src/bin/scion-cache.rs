@@ -80,7 +80,9 @@ struct Cli {
     snapshot: Option<PathBuf>,
     /// A repo to write snapshots of: the objects that went into its
     /// replies, most recently used first. Repeat for more. Give a node only
-    /// snapshots of repos that all its users may read.
+    /// repos that ALL its users may read WHOLE: a snapshot holds every
+    /// object of the repo by ID, so a daemon seeded with it serves paths
+    /// that folder read rules hide.
     #[arg(long, value_name = "REPO", requires = "snapshot")]
     snapshot_repo: Vec<String>,
     /// Most object bytes in one snapshot.
@@ -103,8 +105,11 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Logs go to stderr: stdout may carry command output that callers
+    // capture with $(...).
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
     anyhow::ensure!(!cli.token.is_empty(), "--token must not be empty");

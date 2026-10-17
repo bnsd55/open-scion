@@ -100,6 +100,26 @@ caller cannot tell whether such a repo exists. A change fails with
 `PERMISSION_DENIED` when the caller may read the repo but not make the
 change (sections 6.1 to 6.3).
 
+**Folder read rules.** A read or write rule MAY name a path prefix, and the
+caller reads the paths at or below its prefixes. A caller whose read rules
+name prefixes is a *partial reader*: the server derives its view of the
+repo, the real trees with every entry its rules do not cover removed, and
+serves it. A path outside its prefixes answers exactly as a missing one,
+the same code and the same text, in every RPC. `ResolveRef` resolves as
+for any caller; `GetRootTree` answers the root of the view and mints the
+read ticket on that root, so `GetObjects` serves only what the view
+reaches; `ReadFile` and `ListDir` read through the view. The caller's
+history is not served in this version: `GetChangeset`, `Log`, `Blame`,
+`MergeBase`, `IsAncestor` and `Diff` answer `UNIMPLEMENTED`, the same text
+on every call, and so does every write (`PutBlob`, `CreateChangeset`,
+`Land`, `GetLand`). A file that gives a partial reader a write rule is
+refused at load, so no partial reader holds a write rule: a write rule for
+a repo MUST be matched by a whole-repo read rule. A ticket outlives a
+reload that narrows its principal: its bearer grace is its life, at most
+15 minutes from signing (section 7.2). The access file holds at most 32
+distinct canonical read rule sets per repo, and a set at most 256
+prefixes; a file over either cap is refused at load.
+
 **Per-principal quotas.** A server MAY cap what one principal holds at once.
 The caps are `--max-principal-requests` (calls in flight, counted from the
 server takes the call until its reply starts), `--max-principal-upload-bytes`
@@ -201,7 +221,7 @@ contract. A client MUST NOT depend on its text.
 | `RESOURCE_EXHAUSTED` | `GetObjects` only: no memory for the first object within 30 s, or before the caller's deadline (section 7.3). | Yes, after a wait |
 | `DATA_LOSS` | From a tier only: its upstream sent bytes that are not the object asked for (section 8). | MAY |
 | `INTERNAL` | A database, I/O or stored-data error, or a server bug. The message is `internal error`; the detail stays in the server log. | MAY |
-| `UNIMPLEMENTED` | The server does not have the call, or the request is compressed. | After the cause is fixed |
+| `UNIMPLEMENTED` | The server does not have the call, the request is compressed, or the caller is a partial reader of folder read rules and the call reads history or writes (section 2). | After the cause is fixed |
 
 A land that conflicts or is rejected is not an error. It is a state in a
 successful `Land` reply (section 6.3).
@@ -497,8 +517,13 @@ the tree ID when it knows it.
 
 ### 6.9 Log
 
-`rpc Log(LogRequest) returns (LogResponse)`. Walks first parents from
-`changeset_id`, newest first, starting with `changeset_id` itself.
+`rpc Log(LogRequest) returns (stream LogResponse)`. Walks first parents from
+`changeset_id`, newest first, starting with `changeset_id` itself. The reply
+streams its entries in parts: the entries of the reply go out in groups,
+each part's entries within 1 MiB of encoded bytes, in history order. A
+client joins the parts' entries in order into one page; the caps below hold
+over the whole stream, not per part. Only the last part carries
+`next_changeset_id`; the parts before it carry it empty.
 
 - With a `path`, the reply holds only the changesets whose changes include
   the path or a path below it. The test uses each changeset's own list of
@@ -516,9 +541,12 @@ the tree ID when it knows it.
 - `next_changeset_id` is the first changeset that this reply does not cover,
   or empty when the history ends. To continue, a client calls `Log` again
   with `changeset_id` set to it and the same `path`. This server sends no
-  reply with no entries and a `next_changeset_id`. An earlier server did, for
-  a path changed long ago, and v1 allows it. So a client MUST continue until
-  it has enough entries or `next_changeset_id` is empty.
+  last part with no entries and a `next_changeset_id`. An earlier server
+  did, for a path changed long ago, and v1 allows it. So a client MUST
+  continue until it has enough entries or `next_changeset_id` is empty.
+- The reply ends with `DEADLINE_EXCEEDED` when the client takes no part for
+  120 s (the stall limit), as `ReadFile` (section 6.7) does; the entries it
+  holds stay in HTTP/2 until the stream ends or the connection closes.
 
 **Cost.** A `Log` with a path waits in the queue of `MergeBase` and
 `IsAncestor` (section 2). On a server whose database is older than its path
@@ -529,7 +557,7 @@ stops at 600 s; what it derived stays, so the next call goes on from there.
 |---|---|
 | `INVALID_ARGUMENT` | A bad repo name or ID; a bad path. |
 | `NOT_FOUND` | The repo or changeset does not exist. |
-| `DEADLINE_EXCEEDED` | With a `path`: the server ran past 600 s from the start of the call. |
+| `DEADLINE_EXCEEDED` | With a `path`: the server ran past 600 s from the start of the call. After zero or more parts: the client took no part for 120 s. |
 
 ### 6.10 Blame
 
@@ -793,7 +821,9 @@ read the repo.
 the root tree of a changeset that the repo has, with a signed read ticket for
 it (section 7.3). `NOT_FOUND` if the repo does not exist, the caller may not
 read it, or the changeset does not exist for that repo. The answer never
-changes.
+changes. A partial reader of folder read rules gets the root of its view,
+and the ticket is signed on that view root: `GetObjects` cannot reach past
+it (section 2).
 
 ### 7.3 GetObjects
 

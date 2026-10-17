@@ -150,7 +150,7 @@ async fn verify(mut ctx: Ctx, start: ChangesetId, landed: &[ChangesetId]) -> Res
     let mut cur = Some(ctx.resolve("main").await?);
     let mut history = HashSet::new();
     'walk: while let Some(from) = cur {
-        let page = ctx
+        let mut pages = ctx
             .client
             .log(LogRequest {
                 repo: ctx.repo.clone(),
@@ -161,16 +161,18 @@ async fn verify(mut ctx: Ctx, start: ChangesetId, landed: &[ChangesetId]) -> Res
             .await?
             .into_inner();
         cur = None;
-        for entry in page.entries {
-            let id: ChangesetId = id_from(&entry.changeset_id)?;
-            if id == start {
-                break 'walk;
+        while let Some(page) = pages.message().await? {
+            for entry in page.entries {
+                let id: ChangesetId = id_from(&entry.changeset_id)?;
+                if id == start {
+                    break 'walk;
+                }
+                ensure!(history.insert(id), "changeset {id} appears twice on main");
+                cur = Changeset::decode(&entry.changeset)?
+                    .parents
+                    .first()
+                    .copied();
             }
-            ensure!(history.insert(id), "changeset {id} appears twice on main");
-            cur = Changeset::decode(&entry.changeset)?
-                .parents
-                .first()
-                .copied();
         }
     }
     check_landed(landed, &history)

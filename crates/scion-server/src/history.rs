@@ -20,10 +20,10 @@
 //!
 //! Two queries read it, each one node per path part:
 //!
-//! - `Log` with a path ([`newest_change`]): the newest change of a path
+//! - `Log` with a path (`newest_change`): the newest change of a path
 //!   from a changeset is `last` at the path in that changeset's tree. The
 //!   change before it is `last` in the tree of that change's first parent.
-//! - The conflict check of a land on an old base ([`touched_after`]).
+//! - The conflict check of a land on an old base (`touched_after`).
 //!   Generations strictly increase along first parents, so on that history
 //!   a path changed after the base exactly when a generation in its entry is
 //!   above the base's.

@@ -102,16 +102,23 @@ impl Lazyfs {
         let fifo = round_dir.join("faults.fifo");
         let completed_path = round_dir.join("faults.fifo.completed");
         let config = round_dir.join("lazyfs.toml");
+        // The ops trace lives in the round tempdir, which goes away with
+        // the test; a CI job that wants it after a failure names a fixed
+        // directory to upload from.
+        let trace = match std::env::var_os("SCION_LAZYFS_TRACE_DIR") {
+            Some(dir) => PathBuf::from(dir).join(format!("lazyfs-r{round}.log")),
+            None => round_dir.join("lazyfs.log"),
+        };
         fs::write(
             &config,
             format!(
                 "[faults]\nfifo_path=\"{}\"\nfifo_path_completed=\"{}\"\n\
                  [cache]\napply_eviction=false\n[cache.simple]\n\
                  custom_size=\"256mb\"\nblocks_per_page=1\n\
-                 [filesystem]\nlog_all_operations=false\nlogfile=\"{}\"\n",
+                 [filesystem]\nlog_all_operations=true\nlogfile=\"{}\"\n",
                 fifo.display(),
                 completed_path.display(),
-                round_dir.join("lazyfs.log").display(),
+                trace.display(),
             ),
         )
         .unwrap();

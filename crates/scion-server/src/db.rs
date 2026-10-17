@@ -493,6 +493,47 @@ impl MetaTx for SqliteTx<'_> {
 
     /// Stores a tree. Safe to repeat.
     ///
+    fn get_view_root(
+        &mut self,
+        repo: RepoId,
+        digest: &[u8; 32],
+        cs: ChangesetId,
+    ) -> Result<Option<TreeId>> {
+        let bytes: Option<Vec<u8>> = self
+            .0
+            .prepare_cached(
+                "SELECT root FROM view_roots WHERE repo_id = ?1 AND digest = ?2 AND cs = ?3",
+            )?
+            .query_row(params![repo.0, digest, cs.as_bytes()], |row| row.get(0))
+            .optional()?;
+        bytes
+            .map(|b| {
+                TreeId::try_from(b.as_slice()).map_err(|_| Error::Corrupt("bad view root".into()))
+            })
+            .transpose()
+    }
+
+    fn put_view_root(
+        &mut self,
+        repo: RepoId,
+        digest: &[u8; 32],
+        cs: ChangesetId,
+        root: TreeId,
+    ) -> Result<()> {
+        let inserted = self
+            .0
+            .prepare_cached(
+                "INSERT OR IGNORE INTO view_roots (repo_id, digest, cs, root) VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(params![repo.0, digest, cs.as_bytes(), root.as_bytes()])?;
+        if inserted == 0 && self.get_view_root(repo, digest, cs)? != Some(root) {
+            return Err(Error::Corrupt(format!(
+                "the view root of {cs} for the rule set differs from the stored value"
+            )));
+        }
+        Ok(())
+    }
+
     /// # Errors
     ///
     /// Database errors.
