@@ -293,7 +293,7 @@ fn blame_bounded(
 }
 
 #[test]
-fn a_path_log_reads_past_max_scan_changesets_and_blame_resumes() {
+fn a_blame_of_a_file_changed_once_in_max_scan_changesets_is_one_call() {
     let (_data, store) = open_store();
     let f = store.blobs().put(b"one\ntwo\n").unwrap();
     // `f` changes only in the root, then MAX_SCAN changesets change `g`.
@@ -306,13 +306,12 @@ fn a_path_log_reads_past_max_scan_changesets_and_blame_resumes() {
     // A path log reads the path history, so one call finds the root.
     assert_eq!(path_log(&store, tip, "f"), (vec![root], None));
 
-    let first = blame(&store, tip, "f");
-    assert_eq!(first.ranges, [range(1, 2, None, 1)]);
-    assert!(goes_on(first.resume.as_ref(), root, "f"));
-    let rest = blame(&store, root, "f");
-    assert_eq!(rest.ranges, [range(1, 2, Some(root), 1)]);
-    assert_eq!(rest.resume, None);
-    assert_eq!(rest.changesets, [(root, author(), path("f"))]);
+    // Blame walks versions through the path history too: one call names
+    // both lines, however many changesets lie between the versions.
+    let result = blame(&store, tip, "f");
+    assert_eq!(result.ranges, [range(1, 2, Some(root), 1)]);
+    assert_eq!(result.resume, None);
+    assert_eq!(result.changesets, [(root, author(), path("f"))]);
 }
 
 #[test]
@@ -555,6 +554,122 @@ fn blame_calls(
         })
         .collect();
     (lines, calls)
+}
+
+/// The versions of the file at `p` on the first-parent history of `cs`:
+/// the changesets whose changes touch `p` or anything below it, newest
+/// first. The oracle of the blame walk, kept here as the test double of
+/// the scan that `read::next_change` did before blame read the path
+/// history.
+fn scan_versions(store: &Backend, cs: ChangesetId, p: &str) -> Vec<ChangesetId> {
+    let repo = store.write(|c| c.repo_id(REPO)).unwrap();
+    let mut found = Vec::new();
+    let mut next = Some(cs);
+    while let Some(id) = next {
+        let cs = store.read(|c| c.get_changeset(repo, id)).unwrap();
+        next = cs.parents.first().copied();
+        if cs.changes.keys().any(|changed| {
+            let (changed, p) = (changed.as_bytes(), p.as_bytes());
+            changed.starts_with(p) && matches!(changed.get(p.len()), None | Some(b'/'))
+        }) {
+            found.push(id);
+        }
+    }
+    found
+}
+
+/// The lines of `text`, without the trailing empty one. The texts of
+/// these chains end in a newline and hold no empty lines.
+fn lines_of(text: &[u8]) -> Vec<&[u8]> {
+    let mut lines: Vec<&[u8]> = text.split(|&b| b == b'\n').collect();
+    lines.retain(|line| !line.is_empty());
+    lines
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
+
+    /// On any chain of whole-text puts and deletes, whose lines are
+    /// unique over the whole history and name the version that made
+    /// them, the blame of each line of the file is the version that made
+    /// it, at its line there. The versions come from the first-parent
+    /// scan (the oracle), and a diff of unique lines can only match the
+    /// identical line.
+    #[test]
+    fn a_blame_names_the_version_that_made_each_line(
+        versions in proptest::collection::vec(
+            proptest::option::of(proptest::collection::vec(1usize..5, 1..8)),
+            1..24,
+        ),
+    ) {
+        let (_data, store) = open_store();
+        // Version `i` puts, if `Some`, a text whose lines are `v{i}-line`,
+        // unique over the whole history; `None` deletes the file.
+        let mut texts: Vec<Vec<String>> = versions
+            .iter()
+            .enumerate()
+            .map(|(i, counts)| {
+                (0..counts.iter().flatten().count())
+                    .map(|k| format!("v{i}-line{k}\n"))
+                    .collect()
+            })
+            .collect();
+        let mut changes: Vec<Vec<(&str, Option<FileState>)>> = Vec::new();
+        let mut exists = false;
+        for text in &texts {
+            if text.is_empty() {
+                // A delete of a missing file is not a change: an empty
+                // changeset sits between versions, and the scan skips it.
+                changes.push(if exists { vec![("f", None)] } else { vec![] });
+                exists = false;
+            } else {
+                let blob = store.blobs().put(text.concat().as_bytes()).unwrap();
+                changes.push(vec![("f", Some(regular(blob)))]);
+                exists = true;
+            }
+        }
+        if !exists {
+            // The walk's last version must have the file: put it back.
+            let f = store.blobs().put(b"final\n").unwrap();
+            changes.push(vec![("f", Some(regular(f)))]);
+            texts.push(vec!["final\n".to_owned()]);
+        }
+        let ids = chain(&store, changes);
+        let tip = *ids.last().unwrap();
+
+        // The versions, newest first, from the first-parent scan.
+        let versions = scan_versions(&store, tip, "f");
+        let text_of = |version: ChangesetId| -> Vec<u8> {
+            texts[ids.iter().position(|&id| id == version).unwrap()]
+                .concat()
+                .into_bytes()
+        };
+        let final_text = text_of(versions[0]);
+
+        // The blame, walked to the end as a client does.
+        let blamed = blame_lines(&store, tip, "f");
+
+        // Each line of the file, in order, belongs to the version that
+        // made it, at its line there. A line names its version, so the
+        // version that has it is that one, whichever the walk's order.
+        let mut expected: Vec<(ChangesetId, u32, RepoPath)> = Vec::new();
+        for line in lines_of(&final_text) {
+            let version = versions
+                .iter()
+                .find(|v| lines_of(&text_of(**v)).contains(&line))
+                .unwrap();
+            let at = u32::try_from(
+                lines_of(&text_of(*version))
+                    .iter()
+                    .position(|own| *own == line)
+                    .unwrap(),
+            )
+            .unwrap()
+                + 1;
+            expected.push((*version, at, path("f")));
+        }
+        proptest::prop_assert_eq!(blamed, expected);
+    }
 }
 
 /// `git blame --first-parent` of `file`, in the form of [`blame_lines`].
@@ -1441,6 +1556,36 @@ fn cursor_bytes(resume: &Resume, cs: ChangesetId, p: &str) -> Vec<u8> {
     blame::encode_cursor(resume, REPO, cs, &path(p))
 }
 
+/// A cursor with line numbers near `usize::MAX` decodes: the window math
+/// saturates instead of overflowing. Found by the `blame-cursor` fuzz
+/// target: `after_line + MAX_BLAME_WINDOW_LINES` wrapped around, and a
+/// release build silently took the wrapped window.
+#[test]
+fn a_cursor_with_huge_line_numbers_decodes_without_overflow() {
+    let (_data, store) = open_store();
+    let put = |data: &[u8]| regular(store.blobs().put(data).unwrap());
+    let ids = chain(&store, vec![vec![("f", put(b"a\n"))]]);
+    let resume = Resume {
+        after_line: usize::MAX,
+        counted: usize::MAX,
+        ..Resume::default()
+    };
+    let bytes = cursor_bytes(&resume, ids[0], "f");
+    let (decoded, _hold) = blame::decode_cursor(
+        &store,
+        REPO,
+        &bytes,
+        ids[0],
+        &path("f"),
+        &Bytes::new(1 << 30),
+        None,
+    )
+    .expect("a cursor with the biggest line numbers decodes");
+    assert_eq!(decoded.after_line, usize::MAX);
+    assert_eq!(decoded.counted, usize::MAX);
+    assert_eq!(decoded.window, Vec::new());
+}
+
 #[test]
 fn a_cursor_names_only_changesets_of_its_repo() {
     let (_data, store) = open_store();
@@ -1494,6 +1639,46 @@ fn a_cursor_names_only_changesets_of_its_repo() {
     )
     .unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+}
+
+#[test]
+fn a_pool_too_small_for_the_first_node_share_is_resource_exhausted() {
+    let (_data, store) = open_store();
+    let f = store.blobs().put(b"x\n").unwrap();
+    // `d` holds 100 names, so its level is chunked: the first lookup of
+    // `d/f` reads a few node rows, about 3 KB, more than the pool holds
+    // past the text and the answer's rows.
+    let mut changes = vec![vec![("d/f", regular(f))]];
+    let names: Vec<String> = (0..100).map(|i| format!("d/g{i}")).collect();
+    changes[0].extend(names.iter().map(|name| (name.as_str(), regular(f))));
+    let ids = chain(&store, changes);
+    let result = blame_bounded(&store, ids[0], "d/f", 2 << 10);
+    assert!(
+        matches!(result, Err(Error::ResourceExhausted(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_cursor_of_an_unknown_version_is_refused() {
+    let (_data, store) = open_store();
+    let put = |data: &[u8]| regular(store.blobs().put(data).unwrap());
+    let ids = chain(&store, vec![vec![("f", put(b"a\n"))]]);
+    let mut made = cursor_bytes(&Resume::default(), ids[0], "f");
+    made[0] += 1;
+    let result = blame::decode_cursor(
+        &store,
+        REPO,
+        &made,
+        ids[0],
+        &path("f"),
+        &Bytes::new(1 << 20),
+        None,
+    );
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
 }
 
 #[test]

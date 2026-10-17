@@ -9,11 +9,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use scion_core::{BlobId, Changeset, ChangesetId, RepoPath};
 use scion_proto::auth::{Bearer, check_ancestors};
+use scion_proto::request_id;
 use scion_proto::tls::ClientTls;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ResolveRefRequest};
 use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_PART_MESSAGE_BYTES};
+use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Endpoint};
@@ -34,16 +36,52 @@ pub type Client = ScionClient<InterceptedService<Channel, Call>>;
 /// A connected client for the object reads that a cache tier can answer.
 pub type Objects = ObjectsClient<InterceptedService<Channel, Call>>;
 
-/// Adds the bearer token and the deadline ([`CALL_TIMEOUT`]) to every call.
+/// Adds the bearer token, the deadline ([`CALL_TIMEOUT`]) and the request
+/// ID to every call. One command makes one ID ([`Ctx::connect`]) and sends
+/// it on every call, to the server and to the tier, so one operation can
+/// be followed across the logs of every hop.
 #[derive(Clone)]
-pub struct Call(Bearer);
+pub struct Call {
+    bearer: Bearer,
+    request_id: MetadataValue<Ascii>,
+}
+
+impl Call {
+    /// One command's interceptor: its token and its request ID.
+    pub fn new(bearer: Bearer, request_id: MetadataValue<Ascii>) -> Self {
+        Self { bearer, request_id }
+    }
+}
 
 impl Interceptor for Call {
     fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
-        let mut request = self.0.call(request)?;
+        let mut request = self.bearer.call(request)?;
         request.set_timeout(CALL_TIMEOUT);
+        request
+            .metadata_mut()
+            .insert(request_id::REQUEST_ID, self.request_id.clone());
         Ok(request)
     }
+}
+
+/// The `Objects` client of `url`, for the tests, with a 10s timeout.
+///
+/// # Panics
+///
+/// Panics when `url` is not a valid address.
+pub async fn test_objects(url: &str, token: &str) -> Objects {
+    let channel = Endpoint::from_shared(url.to_owned())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let call = Call::new(
+        Bearer::new(token).unwrap(),
+        request_id::generate()
+            .parse()
+            .expect("the request ID is ASCII"),
+    );
+    ObjectsClient::with_interceptor(channel, call)
 }
 
 /// What every command needs.
@@ -51,8 +89,12 @@ impl Interceptor for Call {
 pub struct Ctx {
     /// The gRPC client.
     pub client: Client,
-    /// The `Objects` client, on the same connection.
+    /// The `Objects` client for reads of trees and blobs: `--objects`, or
+    /// the server when no tier is given. Its `GetObjects` needs a ticket.
     pub objects: Objects,
+    /// The `Objects` client of the server: `ResolveRef` and `GetRootTree`
+    /// go there, with a token, never to a tier.
+    pub roots: Objects,
     /// Repository name.
     pub repo: String,
     /// Print JSON instead of text.
@@ -62,8 +104,14 @@ pub struct Ctx {
 impl Ctx {
     /// Connects to `server`: `http://HOST:PORT`, or `unix:///PATH` for a
     /// daemon on this node.
+    ///
+    /// # Errors
+    ///
+    /// Errors when the address is bad, the server does not answer, or the
+    /// token is refused.
     pub async fn connect(
         server: &str,
+        objects: Option<&str>,
         token: &str,
         ca: Option<&Path>,
         repo: String,
@@ -92,29 +140,68 @@ impl Ctx {
             .connect()
             .await
             .with_context(|| format!("cannot connect to {server}"))?;
-        let call = Call(Bearer::new(token).context("token is not valid ASCII")?);
-        let objects = ObjectsClient::with_interceptor(channel.clone(), call.clone())
+        let call = Call::new(
+            Bearer::new(token).context("token is not valid ASCII")?,
+            request_id::generate()
+                .parse()
+                .context("the request ID is not ASCII")?,
+        );
+        let roots = ObjectsClient::with_interceptor(channel.clone(), call.clone())
             .max_decoding_message_size(MAX_PART_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
+        let objects = match objects {
+            // The reads of trees and blobs go to the tier, with the ticket
+            // that the server minted; the token of the tier is this
+            // client's token, which the deployment shares with its daemon.
+            Some(objects) => {
+                let mut address = objects.to_owned();
+                if let Some(socket) = objects
+                    .strip_prefix("unix://")
+                    .or_else(|| objects.strip_prefix("unix:"))
+                {
+                    let socket =
+                        check_socket(Path::new(socket), rustix::process::geteuid().as_raw())?;
+                    let socket = socket.to_str().context("the socket path is not UTF-8")?;
+                    address = format!("unix://{socket}");
+                }
+                let endpoint = Endpoint::from_shared(address).context("bad --objects address")?;
+                let endpoint = ClientTls::load(ca, None, None)
+                    .and_then(|tls| tls.apply_to(objects, endpoint))
+                    .with_context(|| format!("cannot trust the certificate of {objects}"))?;
+                let channel = endpoint
+                    .connect_timeout(CONNECT_TIMEOUT)
+                    .timeout(CALL_TIMEOUT)
+                    .connect()
+                    .await
+                    .with_context(|| format!("cannot connect to {objects}"))?;
+                ObjectsClient::with_interceptor(channel, call.clone())
+                    .max_decoding_message_size(MAX_PART_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_MESSAGE_BYTES)
+            }
+            None => ObjectsClient::with_interceptor(channel.clone(), call.clone())
+                .max_decoding_message_size(MAX_PART_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_MESSAGE_BYTES),
+        };
         let client = ScionClient::with_interceptor(channel, call)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
         Ok(Self {
             client,
             objects,
+            roots,
             repo,
             json,
         })
     }
 
-    /// Turns a ref name or a 64-digit changeset ID into a changeset ID. A ref
-    /// is resolved through `Objects`, which a cache tier forwards.
+    /// Turns a ref name or a 64-digit changeset ID into a changeset ID. A
+    /// ref is resolved on the server: a tier serves no refs.
     pub async fn resolve(&mut self, rev: &str) -> Result<ChangesetId> {
         if let Ok(id) = rev.parse() {
             return Ok(id);
         }
         let reply = self
-            .objects
+            .roots
             .resolve_ref(ResolveRefRequest {
                 repo: self.repo.clone(),
                 name: rev.to_owned(),
@@ -230,11 +317,25 @@ mod tests {
     /// silently, and each tier on the way can end its waits in time.
     #[test]
     fn every_call_carries_the_deadline() {
-        let mut call = Call(Bearer::new("token").unwrap());
+        let mut call = Call::new(
+            Bearer::new("token").unwrap(),
+            "0123456789abcdef".parse().unwrap(),
+        );
         let request = call.call(Request::new(())).unwrap();
         // 600 s less the margin that a reader of `grpc-timeout` keeps.
         let wait = Until::of(&request).wait(Duration::MAX);
         assert!(wait > Duration::from_secs(595) && wait <= Duration::from_secs(599));
+    }
+
+    /// One command sends its one request ID on every call.
+    #[test]
+    fn every_call_carries_the_request_id() {
+        let mut call = Call::new(Bearer::new("token").unwrap(), "test-id-1".parse().unwrap());
+        let request = call.call(Request::new(())).unwrap();
+        assert_eq!(
+            request.metadata().get(request_id::REQUEST_ID).unwrap(),
+            "test-id-1"
+        );
     }
 
     #[test]
@@ -292,7 +393,7 @@ mod tests {
         let resolved = fs::canonicalize(&real).unwrap().join("daemon.sock");
         assert_eq!(check_socket(&path, owner).unwrap(), resolved);
         let server = format!("unix://{}", path.display());
-        Ctx::connect(&server, "token", None, "r".into(), false)
+        Ctx::connect(&server, None, "token", None, "r".into(), false)
             .await
             .unwrap();
     }

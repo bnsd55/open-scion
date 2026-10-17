@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::task::Poll;
 
 use anyhow::{Context, Result, anyhow, bail};
-use hashlink::LinkedHashSet;
+use hashlink::LinkedHashMap;
 use scion_core::{BlobId, Entry, FileState, PathElem, RepoPath, Tree, TreeId};
 use scion_proto::MAX_OBJECT_REFS;
 use scion_proto::object::{self, Assembler, Header};
@@ -129,8 +129,10 @@ fn exit((kind, name): Stop, what: &str) -> ! {
 async fn run(ctx: &mut Ctx, args: &CheckoutArgs) -> Result<()> {
     check_dest(&args.into)?;
     let id = ctx.resolve(&args.rev).await?;
+    // The server mints the checkout's ticket: the read permission of the
+    // whole walk below this root tree, and the root itself, signed together.
     let reply = ctx
-        .objects
+        .roots
         .get_root_tree(GetRootTreeRequest {
             repo: ctx.repo.clone(),
             changeset_id: id.as_bytes().to_vec(),
@@ -139,9 +141,28 @@ async fn run(ctx: &mut Ctx, args: &CheckoutArgs) -> Result<()> {
         .with_context(|| format!("cannot read the tree of {}", args.rev))?
         .into_inner();
     let root = id_from(&reply.tree_id)?;
-    let files = walk(&mut ctx.objects, &ctx.repo, root, &args.sparse).await?;
+    let mut grant = Grant {
+        repo: &ctx.repo,
+        changeset: *id.as_bytes(),
+        ticket: reply.ticket,
+    };
+    let files = walk(
+        &mut ctx.objects,
+        &mut ctx.roots,
+        &mut grant,
+        root,
+        &args.sparse,
+    )
+    .await?;
     let mut dest = Checkout::start(&args.into)?;
-    write_files(&mut ctx.objects, &ctx.repo, &mut dest, &files).await?;
+    write_files(
+        &mut ctx.objects,
+        &mut ctx.roots,
+        &mut grant,
+        &mut dest,
+        &files,
+    )
+    .await?;
     dest.finish()?;
     let count = files.len();
     let into = args.into.display();
@@ -166,24 +187,29 @@ async fn run(ctx: &mut Ctx, args: &CheckoutArgs) -> Result<()> {
 /// filesystem are caught when written.
 async fn walk(
     objects: &mut Objects,
-    repo: &str,
+    roots: &mut Objects,
+    grant: &mut Grant<'_>,
     root: TreeId,
     sparse: &[RepoPath],
 ) -> Result<Files> {
     let mut files = Files::new();
     let mut found = HashSet::new();
-    let mut level: Vec<(Option<RepoPath>, TreeId)> = vec![(None, root)];
+    // A tree's path is its address in the ticket's walk: empty for the root,
+    // and the parent path plus the name for the rest.
+    let mut level: Vec<(Option<RepoPath>, TreeId, Vec<u8>)> = vec![(None, root, Vec::new())];
     while !level.is_empty() {
         let mut trees = HashMap::new();
-        let ids = level.iter().map(|(_, id)| *id.as_bytes());
-        fetch(objects, repo, ObjectKind::Tree, ids, |id, data| {
+        let ids = level
+            .iter()
+            .map(|(_, id, path)| (*id.as_bytes(), path.clone()));
+        fetch(objects, roots, ObjectKind::Tree, ids, grant, |id, data| {
             let id = TreeId::from_bytes(id);
             trees.insert(id, decode_tree(id, &data)?);
             Ok(())
         })
         .await?;
         let mut next = Vec::new();
-        for (dir, id) in level {
+        for (dir, id, tree_path) in level {
             let tree = trees.get(&id).context("server skipped a tree")?;
             for (name, entry) in &tree.entries {
                 let path = join(dir.as_ref(), name)?;
@@ -199,6 +225,13 @@ async fn walk(
                 if !keep {
                     continue;
                 }
+                // The ref path of an entry is its parent tree's path plus
+                // its name, not its whole local path.
+                let mut ref_path = tree_path.clone();
+                if !ref_path.is_empty() {
+                    ref_path.extend_from_slice(b"/");
+                }
+                ref_path.extend_from_slice(name.as_bytes());
                 if sparse.contains(&path) {
                     found.insert(path.clone());
                 }
@@ -210,7 +243,7 @@ async fn walk(
                     bail!("refusing to write {path:?}: {why}");
                 }
                 match entry {
-                    Entry::Dir(id) => next.push((Some(path), *id)),
+                    Entry::Dir(id) => next.push((Some(path), *id, ref_path)),
                     Entry::File(state) => {
                         files.insert(path, *state);
                     }
@@ -235,7 +268,8 @@ async fn walk(
 /// Fails if a fetch or a write fails.
 async fn write_files(
     objects: &mut Objects,
-    repo: &str,
+    roots: &mut Objects,
+    grant: &mut Grant<'_>,
     dest: &mut Checkout,
     files: &Files,
 ) -> Result<()> {
@@ -246,11 +280,14 @@ async fn write_files(
             by_blob.entry(blob).or_default().push((path, state));
         }
     }
-    let ids = files
-        .values()
-        .filter_map(FileState::blob)
-        .map(|id| *id.as_bytes());
-    fetch(objects, repo, ObjectKind::Blob, ids, |id, data| {
+    let ids = files.iter().filter_map(|(path, state)| {
+        // The path of a file that the blob backs is the address that the
+        // ticket's walk reaches.
+        state
+            .blob()
+            .map(|blob| (*blob.as_bytes(), path.as_bytes().to_vec()))
+    });
+    fetch(objects, roots, ObjectKind::Blob, ids, grant, |id, data| {
         let id = BlobId::from_bytes(id);
         check_blob(id, &data)?;
         for &(path, state) in by_blob.get(&id).into_iter().flatten() {
@@ -268,45 +305,62 @@ async fn write_files(
 
 /// Fetches objects of one kind, each once and in the order given, and calls
 /// `got` with each object's ID and bytes as it arrives, unpacked within the
-/// object limit. A reply may stop early; the rest are asked for again.
+/// object limit. Each ref carries the path that the ticket's walk reaches;
+/// a path that the ticket does not reach is refused. A reply may stop
+/// early; the rest are asked for again.
 ///
 /// # Errors
 ///
 /// Fails if a call fails, if the server sends an object that was not asked
 /// for or none of those asked for, if an object's parts or encoding are bad,
-/// or if `got` fails.
+/// or if `got` fails. On `ticket expired`, the ticket is minted again from
+/// the server, once per call, and the call is retried.
 async fn fetch(
     objects: &mut Objects,
-    repo: &str,
+    roots: &mut Objects,
     kind: ObjectKind,
-    ids: impl IntoIterator<Item = [u8; 32]>,
+    ids: impl IntoIterator<Item = ([u8; 32], Vec<u8>)>,
+    grant: &mut Grant<'_>,
     mut got: impl FnMut([u8; 32], Vec<u8>) -> Result<()>,
 ) -> Result<()> {
-    let mut want: LinkedHashSet<[u8; 32]> = ids.into_iter().collect();
+    // The path of each id, in the order of the first ask.
+    let mut want: LinkedHashMap<[u8; 32], Vec<u8>> = ids.into_iter().collect();
+    let mut minted = false;
     while !want.is_empty() {
         let refs = want
             .iter()
             .take(MAX_OBJECT_REFS)
-            .map(|id| ObjectRef {
+            .map(|(id, path)| ObjectRef {
                 kind: kind.into(),
                 id: id.to_vec(),
+                path: path.clone(),
             })
-            .collect();
+            .collect::<Vec<ObjectRef>>();
         // Blobs come as the zstd files that the server and the daemon store,
         // and are unpacked here, once.
-        let mut stream = objects
+        let call = objects
             .get_objects(GetObjectsRequest {
-                repo: repo.to_owned(),
                 refs,
                 accept: vec![Encoding::Zstd.into()],
+                ticket: grant.ticket.clone(),
             })
-            .await
-            .context("cannot fetch objects")?
-            .into_inner();
+            .await;
+        let stream = match call {
+            Ok(stream) => stream,
+            Err(status) if expired(&status) && !minted => {
+                // The checkout outlived its 15-minute ticket: mint a new
+                // one for the same root tree, once per call, and continue.
+                minted = true;
+                grant.ticket = mint(roots, grant.repo, &grant.changeset).await?;
+                continue;
+            }
+            Err(status) => return Err(status).context("cannot fetch objects"),
+        };
+        let mut stream = stream.into_inner();
         let before = want.len();
         while let Some(first) = stream.message().await.context("cannot fetch objects")? {
             let id: [u8; 32] = id_from(&first.id)?;
-            if first.kind != i32::from(kind) || !want.remove(&id) {
+            if first.kind != i32::from(kind) || want.remove(&id).is_none() {
                 bail!("server sent an object that was not asked for");
             }
             let name = match kind {
@@ -328,6 +382,36 @@ async fn fetch(
         }
     }
     Ok(())
+}
+
+/// Is this a failure that a fresh ticket can fix?
+/// The read permission of one checkout: the server's ticket over its root
+/// tree, and what mints a fresh ticket when this one expires.
+struct Grant<'a> {
+    repo: &'a str,
+    changeset: [u8; 32],
+    ticket: Vec<u8>,
+}
+
+fn expired(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::PermissionDenied && status.message().contains("ticket expired")
+}
+
+/// Mints a ticket for the root tree of `changeset` on the server: the same
+/// walk, refreshed.
+async fn mint(roots: &mut Objects, repo: &str, changeset: &[u8; 32]) -> Result<Vec<u8>> {
+    let reply = roots
+        .get_root_tree(GetRootTreeRequest {
+            repo: repo.to_owned(),
+            changeset_id: changeset.to_vec(),
+        })
+        .await
+        .context("cannot mint a fresh ticket")?
+        .into_inner();
+    if reply.ticket.is_empty() {
+        bail!("cannot mint a fresh ticket: the server sent no ticket");
+    }
+    Ok(reply.ticket)
 }
 
 /// Decodes a tree sent for `id`, and checks that it is that tree.

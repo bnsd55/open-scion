@@ -88,6 +88,9 @@ async fn main() -> anyhow::Result<()> {
         &cli.upstream_token,
         DAEMON_UPSTREAM_TIMEOUT,
         Some(&client_tls),
+        // A daemon does not check tickets: it forwards them, and its
+        // upstream does the checking. Only the walk gates what it serves.
+        Vec::new(),
     )?;
     let socket = cli.socket.unwrap_or_else(|| cli.data.join("daemon.sock"));
     let listener = bind_unix(&socket)

@@ -12,8 +12,12 @@ use scion_proto::v1::{
     LogRequest, MergeBaseRequest, ObjectKind, ObjectRef, PutBlobRequest, ReadFileRequest,
     ResolveRefRequest,
 };
+use std::sync::Arc;
+
 use scion_server::access::Access;
-use scion_server::meta::{Meta as _, MetaTx as _};
+use scion_server::meta::Meta as _;
+use scion_server::meta::MetaTx as _;
+use scion_server::metrics::Metrics;
 use scion_server::{Backend, service};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
@@ -139,7 +143,9 @@ async fn server(store: &Backend, access: Access, token: &str) -> (Stop, Scion, O
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
+            metrics: Arc::new(Metrics::default()),
         },
+        None,
         async {
             stopped.await.ok();
         },
@@ -399,12 +405,13 @@ mod req {
 
     pub fn get_objects(blob: &[u8]) -> GetObjectsRequest {
         GetObjectsRequest {
-            repo: REPO.into(),
             refs: vec![ObjectRef {
                 kind: ObjectKind::Blob as i32,
                 id: blob.to_vec(),
+                path: Vec::new(),
             }],
             accept: Vec::new(),
+            ticket: Vec::new(),
         }
     }
 }
@@ -463,10 +470,12 @@ async fn a_principal_without_a_read_rule_sees_no_repo_on_any_rpc() {
         "GetRootTree",
         objects.get_root_tree(req::get_root_tree(root)).await,
     );
-    denied(
-        "GetObjects",
-        objects.get_objects(req::get_objects(blob)).await,
-    );
+    // SHORTCUT: GetObjects fails closed until C5 verifies tickets; then it
+    // hides like the rest and this goes back to `denied`.
+    let Err(status) = objects.get_objects(req::get_objects(blob)).await else {
+        panic!("GetObjects: accepted")
+    };
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
 }
 
 /// Four `Blame` calls of one big file run at once: each takes one of the 4

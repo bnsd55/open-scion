@@ -13,6 +13,8 @@ REPO_COMMIT=${REPO_COMMIT:-be689a35f5ade5a39e507f79d3ec85cdab27806f}
 SPARSE_DIR=${SPARSE_DIR:-tokio/src}
 SERVER_PORT=${SERVER_PORT:-17878}
 CACHE_PORT=${CACHE_PORT:-17879}
+SERVER_METRICS_PORT=${SERVER_METRICS_PORT:-17880}
+CACHE_METRICS_PORT=${CACHE_METRICS_PORT:-17881}
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 case ${CARGO_TARGET_DIR:-} in
@@ -20,7 +22,7 @@ case ${CARGO_TARGET_DIR:-} in
   /*) BIN=$CARGO_TARGET_DIR/release ;;
   *) BIN=$ROOT/$CARGO_TARGET_DIR/release ;;
 esac
-SERVER=http://127.0.0.1:$SERVER_PORT
+export SERVER=http://127.0.0.1:$SERVER_PORT
 
 # The scripts give every address, name and directory as a flag, so the
 # caller's environment must not change them. Git runs without the user's and
@@ -42,7 +44,7 @@ note() { echo "-- $*" >&2; }
 # The tools that a plain Linux or macOS may lack. The rest are POSIX.
 need() {
   local c
-  for c in cargo git pkill seq; do
+  for c in cargo git pkill seq curl; do
     command -v "$c" > /dev/null || die "needs $c"
   done
   [ -x /usr/bin/time ] || die "needs /usr/bin/time (Debian, Ubuntu: apt install time)"
@@ -130,13 +132,31 @@ stop() {
 
 # The server, then a cache in front of it, then a daemon in front of the
 # cache. The daemon keeps its objects in $WORK/daemon, from run to run.
+# Object reads need a ticket: the server signs with one key, which it makes
+# once in $WORK and keeps from run to run, and the cache verifies with the
+# key's public half. The daemon only forwards the tickets.
 start_scion() {
+  if [ ! -f "$WORK/ticket.key" ]; then
+    "$BIN/scion-server" ticket-key --out "$WORK/ticket.key" > "$WORK/ticket.pub"
+  fi
   start server serving "$BIN/scion-server" --data "$WORK/server" serve \
-    --listen "127.0.0.1:$SERVER_PORT"
+    --listen "127.0.0.1:$SERVER_PORT" \
+    --ticket-key "$WORK/ticket.key" \
+    --metrics-listen "127.0.0.1:$SERVER_METRICS_PORT"
   start cache serving "$BIN/scion-cache" --listen "127.0.0.1:$CACHE_PORT" \
-    --upstream "$SERVER"
+    --upstream "$SERVER" \
+    --ticket-public-key "$(cat "$WORK/ticket.pub")" \
+    --metrics-listen "127.0.0.1:$CACHE_METRICS_PORT"
   start daemon serving "$BIN/scion-daemon" --data "$WORK/daemon" --socket "$SOCKET" \
     --upstream "http://127.0.0.1:$CACHE_PORT"
+}
+
+# scrape_metrics URL: the total of the out-bytes counters of the registry at
+# URL. A counter that never incremented does not render, hence the +0.
+scrape_metrics() {
+  command curl -fsS "$1/metrics" | awk '
+    /^scion_rpc_bytes_total\{.*direction="out"/ { s += $NF }
+    END { print s + 0 }'
 }
 
 stop_scion() {
@@ -145,10 +165,11 @@ stop_scion() {
   stop server
 }
 
-# One sparse checkout through the daemon, into "$1". For `batch`, in the
+# One sparse checkout through the daemon, into "$1". The ref and the ticket
+# come from the server, the objects ride the daemon. For `batch`, in the
 # scripts that source this file.
 # shellcheck disable=SC2016,SC2034 # expanded by the sh that batch starts
-CHECKOUT='"$BIN/scn" --server "$DAEMON" checkout main --sparse "$SPARSE_DIR" --into "$1" > /dev/null'
+CHECKOUT='"$BIN/scn" --server "$SERVER" --objects "$DAEMON" checkout main --sparse "$SPARSE_DIR" --into "$1" > /dev/null'
 
 # batch NAME JOBS CMD: runs the sh command CMD in JOBS processes at once, under
 # /usr/bin/time -p. In each, $1 is its own new directory, $WORK/NAME/<job>.

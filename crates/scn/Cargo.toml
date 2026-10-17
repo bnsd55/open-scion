@@ -17,8 +17,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 clap.workspace = true
 hashlink.workspace = true
+nfsserve.workspace = true
 rustix.workspace = true
 open-scion-core.workspace = true
 open-scion-proto.workspace = true
@@ -33,6 +35,8 @@ rcgen.workspace = true
 open-scion-server.workspace = true
 open-scion-tier.workspace = true
 tempfile.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 zstd.workspace = true
 
 [lints]

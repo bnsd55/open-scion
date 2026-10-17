@@ -60,6 +60,12 @@ struct Cli {
     /// Bearer token to send upstream.
     #[arg(long, env = "SCION_UPSTREAM_TOKEN", hide_env_values = true)]
     upstream_token: String,
+    /// The public keys (64 hex characters, from `scion-server ticket-key`)
+    /// that a ticket of a call must verify against. One is enough; a
+    /// second keeps the old key alive during a rotation. Without one, no
+    /// object is served.
+    #[arg(long, value_name = "HEX")]
+    ticket_public_key: Vec<String>,
     /// Most connections served at once. More clients wait until one closes.
     #[arg(long, default_value_t = listen::DEFAULT_CONNECTIONS)]
     max_connections: NonZeroUsize,
@@ -88,6 +94,11 @@ struct Cli {
     /// connection over it is closed with them.
     #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
     max_stalled_bytes: NonZeroU64,
+    /// Serve Prometheus metrics over plain HTTP on this address. Off by
+    /// default. Follows the listen rule: a non-loopback address needs
+    /// `--insecure-listen`, because the metrics travel unencrypted.
+    #[arg(long, value_name = "ADDR")]
+    metrics_listen: Option<SocketAddr>,
 }
 
 #[tokio::main]
@@ -124,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
         &cli.upstream_token,
         CACHE_UPSTREAM_TIMEOUT,
         Some(&client_tls),
+        ticket_keys(&cli.ticket_public_key)?,
     )?;
     if let Some(dir) = cli.snapshot {
         std::fs::DirBuilder::new()
@@ -140,6 +152,32 @@ async fn main() -> anyhow::Result<()> {
             every,
         ));
     }
+    // One signal task ends the Objects listener and the metrics export
+    // alike.
+    let (end_tx, end_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(async move {
+        scion_proto::metrics::shutdown_signal().await;
+        let _ = end_tx.send(());
+    });
+    if let Some(metrics_listen) = cli.metrics_listen {
+        let address = metrics_listen.to_string();
+        let checked = scion_proto::metrics::loopback_or_allow(metrics_listen, cli.insecure_listen);
+        anyhow::ensure!(checked.is_ok(), "{}", checked.unwrap_err());
+        let metrics_listener = tokio::net::TcpListener::bind(metrics_listen)
+            .await
+            .with_context(|| format!("cannot listen on {address}"))?;
+        let metrics_addr = metrics_listener.local_addr()?;
+        tracing::info!(listen = %metrics_addr, "serving metrics");
+        let metrics = tier.metrics();
+        let mut stopped = end_rx.clone();
+        tokio::spawn(scion_proto::metrics::serve(
+            metrics_listener,
+            metrics,
+            async move {
+                let _ = stopped.changed().await;
+            },
+        ));
+    }
     let listener = tokio::net::TcpListener::bind(cli.listen)
         .await
         .with_context(|| format!("cannot listen on {}", cli.listen))?;
@@ -154,8 +192,9 @@ async fn main() -> anyhow::Result<()> {
         listen::tcp(listener),
         limits,
         server_tls,
-        async {
-            tokio::signal::ctrl_c().await.ok();
+        async move {
+            let mut end_rx = end_rx;
+            let _ = end_rx.changed().await;
         },
     ))
     .await?;
@@ -202,4 +241,18 @@ async fn snapshots(
             }
         }
     }
+}
+
+/// The keys that a ticket of a call must verify against: at most two, the
+/// second one from a rotation.
+fn ticket_keys(hex: &[String]) -> anyhow::Result<Vec<ed25519_dalek::VerifyingKey>> {
+    anyhow::ensure!(hex.len() <= 2, "give at most two --ticket-key");
+    hex.iter()
+        .map(|key| {
+            let bytes = scion_tier::key_from_hex(key)
+                .ok_or_else(|| anyhow::anyhow!("--ticket-key must be 64 hex characters"))?;
+            ed25519_dalek::VerifyingKey::from_bytes(&bytes)
+                .map_err(|why| anyhow::anyhow!("bad --ticket-key: {why}"))
+        })
+        .collect()
 }

@@ -48,6 +48,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use crate::request_id;
+
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -309,10 +311,21 @@ impl Limits {
                     .and_then(tonic::transport::server::TcpConnectInfo::remote_addr)
                     .map(|addr| addr.to_string())
                     .unwrap_or_default();
+                // The caller's request ID, if it sent one that fits. A
+                // header that does not fit is dropped whole, not cleaned
+                // up: nothing of it is logged.
+                let request_id = request_id::sanitize(
+                    request
+                        .headers()
+                        .get(request_id::REQUEST_ID)
+                        .map(http::HeaderValue::as_bytes),
+                )
+                .unwrap_or_default();
                 tracing::error_span!(
                     "call",
                     rpc = %request.uri().path(),
                     peer,
+                    request_id = %request_id,
                     principal = tracing::field::Empty,
                     repo = tracing::field::Empty,
                 )

@@ -51,6 +51,7 @@ JOBS=10 SPARSE_DIR=tokio-util scripts/bench-checkout.sh
 | `AGENTS` | 100 | demo | Agents that land at the same time (`scn bench --agents`) |
 | `LANDS` | 2000 | demo | Lands by all agents together (`scn bench --lands`) |
 | `JOBS` | 10 (demo), 50 (bench) | both | Checkouts at the same time |
+| `REPS` | 5 | bench | Repetitions of each run; the table shows the median with min and max |
 | `SPARSE_DIR` | `tokio/src` | both | The directory that each checkout writes |
 | `REPO_URL`, `REPO_COMMIT` | the dataset above | both | The repository and the commit to import |
 | `SERVER_PORT`, `CACHE_PORT` | 17878, 17879 | both | Loopback ports of the server and the cache |
@@ -74,10 +75,13 @@ no machine details, so a table can be shared as it is.
 
 ## The checkout benchmark
 
-Five runs. In each run, `JOBS` jobs start at the same time, and each writes
-the same files: the files below `SPARSE_DIR` at the commit, and nothing else.
-The script checks this: the first job of each run must write the same files,
-with the same content, as the first job of the first run.
+`REPS` repetitions, 5 by default. In each repetition, five runs follow one
+another, alternating between the tools, so machine drift hits both alike:
+the cold scion run, the plain and partial git clones, the warm scion run,
+the mirror git clone. In each run, `JOBS` jobs start at the same time, and
+each writes the same files: the files below `SPARSE_DIR` at the commit, and
+nothing else. The script checks this: the first job of each run must write
+the same files, with the same content, as the first job of the first run.
 
 | Run | Each job runs | State before the run |
 |---|---|---|
@@ -110,7 +114,7 @@ which this benchmark does not run.
 | wall s | Wall time of the run: from the start of the first job to the end of the last. `/usr/bin/time -p` around the whole batch measures it. |
 | CPU s | User plus system CPU time of every process of the run: the jobs, and the server side. For scion, the server side is `scion-server`, `scion-cache` and `scion-daemon`. For git, it is `git daemon` and the `upload-pack` and `pack-objects` processes that it starts. The server side starts fresh for each run, so this includes its start and stop. |
 | server CPU s | The server alone: `scion-server`, or `git daemon` and its processes. This is the server load. |
-| server MiB | The object bytes that the server sent. For git: the pack files that the clones received. For scion: what the daemon's data directory gained in the run, which is what the server sent: the daemon stores each object in the form in which it arrives, a blob as the server's zstd file. Not counted: protocol framing, the `ResolveRef` and `GetRootTree` answers, and git's ref negotiation. |
+| server MiB | The bytes that the server sent. For git: the pack files that the clones received. For scion: the server's out-bytes counters (`scion_rpc_bytes_total{direction="out"}`), scraped from its metrics export before and after the run. The counters include every reply byte: the objects, protocol framing, and the `ResolveRef` and `GetRootTree` answers, so a scion number counts a little more than git's pack bytes do. |
 
 The second table divides each git run by a scion run in the same state. A
 plain clone and a partial clone keep nothing on the machine, so they compare
@@ -124,13 +128,16 @@ measured.
   network latency and bandwidth do not slow a transfer.
 - A cache shared by many machines. There is one daemon and one cache.
 - Cold disk reads. The script does not drop the operating system's file
-  cache, so the server reads its files from memory after the import.
+  cache, so the server reads its files from memory after the import. On
+  macOS, dropping it needs `sudo`, so a cold run means a cold daemon and
+  cache, not a cold OS page cache.
+- The cost of the access checks and tickets against git, which has none:
+  both sides pay what their own checks cost, inside the numbers.
 - Virtual checkout, where files load when first read
   ([#11](https://github.com/bnsd55/open-scion/issues/11)).
 
 ## Results
 
-Numbers to be filled after [#53](https://github.com/bnsd55/open-scion/issues/53)
-(wire format) lands. #53 makes the server send blobs in their stored zstd
-form, which changes the bytes and the CPU time of every scion run. Results
-come from one machine, as ratios between the tools.
+The numbers here come later, from one quiet machine, as ratios between the
+tools. A table of one run names no machine details, so it can be shared as
+it is.

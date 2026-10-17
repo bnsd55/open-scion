@@ -88,6 +88,71 @@ jobs:
         env:
           PROPTEST_CASES: "2000"
 
+  power-loss:
+    name: power-loss
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SCION_POWER_REQUIRE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@v2
+      - name: cache the LazyFS build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/lazyfs/lazyfs/build
+            ${{ runner.temp }}/lazyfs/libs/libpcache/build
+          key: lazyfs-0.3.1-045a0b3
+      - name: LazyFS (pinned 0.3.1, commit 045a0b3)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libfuse3-dev libfuse3-3 fuse3
+          # The mount script passes -o allow_other; a non-root user may only
+          # do that when fuse.conf allows it.
+          sudo sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
+          cd "$RUNNER_TEMP"
+          # The cache may hold the two build directories already; overlay a
+          # fresh pinned clone over them instead of cloning in place.
+          git clone --depth 1 --branch 0.3.1 https://github.com/dsrhaslab/lazyfs lazyfs-checkout
+          got=$(git -C lazyfs-checkout rev-parse HEAD)
+          echo "pinned: $got"
+          test "$got" = "045a0b3a1126725e693934e29d3ba15e08cc39ec"
+          mkdir -p lazyfs
+          cp -a lazyfs-checkout/. lazyfs/
+          rm -rf lazyfs-checkout
+          if [ ! -x lazyfs/lazyfs/build/lazyfs ]; then
+            (cd lazyfs/libs/libpcache && ./build.sh)
+            (cd lazyfs/lazyfs && ./build.sh)
+          fi
+          test -x lazyfs/lazyfs/build/lazyfs
+          test -f lazyfs/libs/libpcache/build/libpcache.so.0
+      - name: run
+        env:
+          SCION_LAZYFS: ${{ runner.temp }}/lazyfs
+        run: cargo test -p open-scion-server --test power
+
+  publish-check:
+    name: publish check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+      # One invocation, in dependency order: cargo resolves a packaged
+      # crate's path dependencies from the siblings of the same run, so a
+      # split run fails on the first unpublished dependency. The verify
+      # build is the point: a build.rs input or an include! path that does
+      # not ship only fails here.
+      - run: cargo package -p open-scion-core -p open-scion-proto -p open-scion-server -p open-scion-tier -p open-scion
+
   msrv:
     name: check (MSRV)
     runs-on: ubuntu-latest
@@ -100,24 +165,74 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
 
+  grpc-conformance:
+    name: conformance (grpcurl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p open-scion-server
+      # A client that is not the Rust one (issue #32): grpcurl calls
+      # ResolveRef, GetRootTree and GetObjects with a ticket, and every
+      # object hashes to its ID with b3sum. The script fetches the pinned
+      # grpcurl release and checks its sha256 before it runs.
+      - run: scripts/grpc-conformance.sh
+
+  docker:
+    name: docker demo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The layer cache holds the release build: the first run takes about
+      # five minutes, a run after an ordinary push about one. The cache
+      # export needs the container driver, not the default docker one.
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: open-scion-demo
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: run the demo
+        run: sh docker/demo.sh
+
   fuzz:
     name: fuzz smoke (60 s)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/scion-core/fuzz
+          workspaces: |
+            crates/scion-core/fuzz
+            crates/scion-proto/fuzz
+            crates/scion-server/fuzz
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - name: fuzz decode
-        working-directory: crates/scion-core
+      - name: fuzz the parsers
         run: |
-          fuzz_dir="$GITHUB_WORKSPACE/crates/scion-core/fuzz"
-          mkdir -p "$fuzz_dir/corpus/decode"
           # The prebuilt cargo-fuzz defaults to a musl target, where the
           # address sanitizer cannot run.
-          cargo fuzz run --target x86_64-unknown-linux-gnu decode \
-            "$fuzz_dir/corpus/decode" "$fuzz_dir/seeds/decode" -- -max_total_time=60
+          for crate in scion-core scion-proto scion-server; do
+            fuzz_dir="$GITHUB_WORKSPACE/crates/$crate/fuzz"
+            for target_file in "$fuzz_dir"/fuzz_targets/*.rs; do
+              target=$(basename "$target_file" .rs)
+              mkdir -p "$fuzz_dir/corpus/$target"
+              seeds=()
+              [ -d "$fuzz_dir/seeds/$target" ] && seeds+=("$fuzz_dir/seeds/$target")
+              (cd "$GITHUB_WORKSPACE/crates/$crate" && cargo fuzz run \
+                --target x86_64-unknown-linux-gnu "$target" \
+                "$fuzz_dir/corpus/$target" "${seeds[@]}" \
+                -- -max_total_time=15)
+            done
+          done

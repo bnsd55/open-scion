@@ -21,6 +21,14 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+bytes.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+tower.workspace = true
 clap.workspace = true
 gix.workspace = true
 hashlink.workspace = true
@@ -49,6 +57,8 @@ tonic-health.workspace = true
 rusqlite = { workspace = true, features = ["hooks"] }
 # Tests of the reply timeouts run on a paused clock.
 tokio = { workspace = true, features = ["test-util"] }
+# A test fetches from a real server through a tier with no token.
+open-scion-tier = { workspace = true }
 
 [lints]
 workspace = true

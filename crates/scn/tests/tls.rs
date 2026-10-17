@@ -9,6 +9,7 @@ use scion_proto::listen::Limits;
 use scion_server::meta::Meta as _;
 use scion_server::meta::MetaTx as _;
 use scion_server::{Backend, service, tree};
+use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
@@ -133,7 +134,9 @@ async fn serve_tls(certs: &TestCerts) -> String {
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: Some(tls),
+            metrics: Arc::default(),
         },
+        None,
         std::future::pending(),
     ));
     format!("https://{addr}")

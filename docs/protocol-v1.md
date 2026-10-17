@@ -22,12 +22,12 @@ this file says so. Every other rule is this project's choice.
 | Service | Calls | Who answers |
 |---|---|---|
 | `Scion` | Writes (`PutBlob`, `CreateChangeset`, `Land`, `GetLand`), path reads (`ResolveRef`, `GetChangeset`, `ReadFile`, `ListDir`, `Log`, `Blame`) and queries (`MergeBase`, `IsAncestor`, `Diff`) | The server only |
-| `Objects` | `ResolveRef`, `GetRootTree`, `GetObjects` | The server, or any cache tier (section 8) |
+| `Objects` | `ResolveRef`, `GetRootTree`, `GetObjects` | The server answers all three; a cache tier answers only `GetObjects` (section 8) |
 
 Both services are on one address. Every read except `ResolveRef` and
 `GetLand` names an immutable object by ID, never a ref, so its answer never
 changes. A client resolves a ref first. `Scion.ResolveRef` is deprecated: a
-client SHOULD use `Objects.ResolveRef`, which a tier forwards. A v1 server
+client SHOULD use `Objects.ResolveRef`. A v1 server
 MUST keep both.
 
 ## 2. Transport and authentication
@@ -83,10 +83,12 @@ A request with a `grpc-encoding` other than `identity` fails with
 **Authentication.** Every call on both services MUST carry the metadata
 `authorization: Bearer <token>`: the exact prefix `Bearer `, then the token.
 The token is printable ASCII, as a gRPC metadata value is; a tier refuses an
-upstream token that is not. A missing or wrong token fails the call with
-`UNAUTHENTICATED` before the request is read. A token names a principal. A
-server started with `--token T` has one principal, `default`, which may read
-and write every repo. A server
+upstream token that is not. Every call needs one — except
+`Objects.GetObjects` (section 7.3), whose permission is its read ticket, and
+which MUST carry none. On every call that needs one, a missing or wrong
+token fails with `UNAUTHENTICATED` before the request is read. A token names
+a principal. A server started with `--token T`
+has one principal, `default`, which may read and write every repo. A server
 started with `--access FILE` reads the principal of each token and its rules
 from the file; the file's format is a deployment matter and lives in the
 README. The principal of a call's token is its caller. Land request keys and
@@ -164,7 +166,8 @@ repo does not have is `NOT_FOUND`, the same as one that does not exist. A
 repo has the blobs uploaded to it and the blobs that its changesets name. A
 changeset names only blobs of its repo (section 6.2), so `ReadFile`,
 `ListDir`, `Log`, `Blame` and `Diff` reach only the repo's own content.
-`GetObjects` is not scoped to a repo in v1 (section 5).
+`GetObjects` is scoped by its ticket to one repo and root tree
+(section 7.3).
 
 **Message size limits.**
 
@@ -254,15 +257,11 @@ can answer a request for an object. A client checks what it can by hash.
   elsewhere), which changesets `Log` selects, `Blame`, `MergeBase`,
   `IsAncestor`, which paths `Diff` lists, and `Land` outcomes.
 
-In v0.1 a client also trusts every tier on its path for the `ResolveRef` and
-`GetRootTree` answers that the tier passes on (section 8).
-
 **An object ID is not a permission.** A changeset cannot name a blob of
 another repo (section 6.2), and no answer of `PutBlob` or `CreateChangeset`
-shows whether another repo has a blob. But in v1 `GetObjects` sends any
-stored tree or blob to any caller that may read the repo it names, whatever
-repo stored the object. Read tickets are not in v1
-([#13](https://github.com/bnsd55/open-scion/issues/13)).
+shows whether another repo has a blob. An object read is no exception:
+`GetObjects` carries a read ticket (section 7.3), and serves only what the
+walk from the ticket's root tree reaches.
 
 ## 6. The `Scion` service
 
@@ -782,9 +781,10 @@ read the repo.
 ### 7.2 GetRootTree
 
 `rpc GetRootTree(GetRootTreeRequest) returns (GetRootTreeResponse)`. The ID of
-the root tree of a changeset that the repo has. `NOT_FOUND` if the repo does
-not exist, the caller may not read it, or the changeset does not exist for
-that repo. The answer never changes.
+the root tree of a changeset that the repo has, with a signed read ticket for
+it (section 7.3). `NOT_FOUND` if the repo does not exist, the caller may not
+read it, or the changeset does not exist for that repo. The answer never
+changes.
 
 ### 7.3 GetObjects
 
@@ -793,7 +793,11 @@ trees and blobs named by `refs`, each in an encoding that the request
 accepts, in parts.
 
 **Request.** `refs` names 1 to 1,000 objects, each a `kind` (`TREE` or
-`BLOB`) and a 32-byte `id`. A ref can repeat. `accept` lists the encodings
+`BLOB`), a 32-byte `id`, and the `path` from the ticket's root tree that
+reaches it. The `ticket` field carries a read ticket (section 7.2), which is
+the only permission of the call: it names the repo and the root tree, and
+every object must be reachable from that tree over the path that its ref
+names. The call carries no token. A ref can repeat. `accept` lists the encodings
 that the client accepts besides `RAW`, which every client accepts. In v1 the
 only other encoding is `ZSTD`. An empty list means `RAW` only. A server
 ignores a value that it does not know. The server checks the whole request
@@ -904,11 +908,22 @@ order is daemon, cache, server. These rules hold for any tier:
 - A tier MUST serve the `Objects` service with the same calls, fields, limits
   and reply rules as the server. A client MUST NOT need to know whether it
   talks to a tier or to the server.
-- A tier MUST require a bearer token on every call, as the server does.
-- A tier MUST forward every `ResolveRef` call to its upstream, and MUST NOT
-  keep the answer.
-- A tier MAY keep a `GetRootTree` answer forever, keyed by (repo,
-  changeset), but only as its upstream gave it. It MUST NOT compute one.
+- A tier MUST require a bearer token on every call, as the server does,
+  except `GetObjects`, whose permission is its ticket (section 7.3).
+- A tier MUST NOT serve `ResolveRef` or `GetRootTree` at all: both answer
+  `UNIMPLEMENTED`. A client resolves a ref and gets the ticket of its root
+  tree from the server, and brings that ticket to the tier's `GetObjects`. A
+  tier that fetched root trees for its callers would be a way to get a
+  ticket for any repo.
+- A tier that is a daemon checks no ticket at all and runs no walk: it
+  only forwards the ticket and the paths it received to its upstream, whose
+  signature check and walk are what keep unproven reads out. There is one
+  daemon per OS user, enforced by its 0600 socket in its private directory:
+  the user it serves can read the daemon's store files anyway, so serving
+  what its store holds adds nothing. A daemon that serves several OS users
+  MUST check tickets and walk, like a cache. A tier that is a cache MUST check each ticket it
+  receives against the public keys of its upstream server (at most 2, for a
+  rotation), as the server does.
 - A tier MAY keep objects forever. A tier never trusts upstream bytes: it
   MUST check each object from its upstream as a client does (sections 5
   and 7.3), before it stores, forwards or sends it. An object that fails the
@@ -951,7 +966,8 @@ order is daemon, cache, server. These rules hold for any tier:
 - The `Scion` service goes only to the server.
 
 **The daemon's socket.** `scion-daemon` listens on a Unix socket with mode
-0600, in a directory that only its user can reach. A client sends its token
+0600, in a directory that only its user can reach. One daemon serves one OS
+user; a user who wants a daemon runs their own. A client sends its token
 to the socket, so it SHOULD check first that the socket file is a socket
 (not a symlink) owned by its own user or by root. It SHOULD also check each
 directory above the socket, up to `/`: owned by root or by its own user,
@@ -1012,8 +1028,6 @@ version, a server stops serving its package; its clients then get
 
 - Certificate revocation and a public CA store; trust comes only from a CA
   file ([#14](https://github.com/bnsd55/open-scion/issues/14)).
-- More than one principal, per-path write rules and read tickets
-  ([#13](https://github.com/bnsd55/open-scion/issues/13)).
 - Calls that create a repo or a ref, delete a ref, move a ref other than by
   `Land`, or list repos or refs. `scion-server import` creates repos and refs.
 - Client changesets with no parent, several parents or a committer. Only git

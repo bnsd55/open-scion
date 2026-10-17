@@ -1041,3 +1041,249 @@ mod tests {
         assert!(!got.contains_key(&c.0));
     }
 }
+
+// The queries of `fsck`, which checks this backend's files and tables. They
+// live here, with the rest of this backend's SQL, so that another backend
+// brings its own check.
+
+/// The changesets after `from`, in ID order, at most `limit`.
+pub(crate) fn fsck_changesets(
+    tx: &mut SqliteTx<'_>,
+    from: &[u8],
+    limit: usize,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let c = tx.0;
+    let mut stmt =
+        c.prepare("SELECT id, body FROM changesets WHERE id > ?1 ORDER BY id LIMIT ?2")?;
+    let rows = stmt.query_map(
+        params![from, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// The trees after `from`, in ID order, at most `limit`.
+pub(crate) fn fsck_trees(
+    tx: &mut SqliteTx<'_>,
+    from: &[u8],
+    limit: usize,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let c = tx.0;
+    let mut stmt = c.prepare("SELECT id, body FROM trees WHERE id > ?1 ORDER BY id LIMIT ?2")?;
+    let rows = stmt.query_map(
+        params![from, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// The history nodes after `from`, in ID order, at most `limit`.
+pub(crate) fn fsck_history_nodes(
+    tx: &mut SqliteTx<'_>,
+    from: &[u8],
+    limit: usize,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let c = tx.0;
+    let mut stmt =
+        c.prepare("SELECT id, body FROM history_nodes WHERE id > ?1 ORDER BY id LIMIT ?2")?;
+    let rows = stmt.query_map(
+        params![from, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// The `repo_blobs` rows after `(repo, blob)`, at most `limit`.
+pub(crate) fn fsck_repo_blobs(
+    tx: &mut SqliteTx<'_>,
+    repo: i64,
+    blob: &[u8],
+    limit: usize,
+) -> Result<Vec<(i64, Vec<u8>)>> {
+    let c = tx.0;
+    let mut stmt = c.prepare(
+        "SELECT repo_id, blob FROM repo_blobs
+         WHERE (repo_id, blob) > (?1, ?2) ORDER BY repo_id, blob LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        params![repo, blob, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// The refs whose target no `repo_changesets` row of their repo holds.
+pub(crate) fn fsck_dangling_refs(tx: &mut SqliteTx<'_>) -> Result<Vec<(i64, String, Vec<u8>)>> {
+    let c = tx.0;
+    let mut stmt = c.prepare(
+        "SELECT repo_id, name, target FROM refs r
+         WHERE NOT EXISTS (
+             SELECT 1 FROM repo_changesets rc
+             WHERE rc.repo_id = r.repo_id AND rc.cs = r.target
+         )",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Every land whose input or result changeset is not stored, as
+/// (land, changeset, which column).
+pub(crate) fn fsck_lands_missing(
+    tx: &mut SqliteTx<'_>,
+) -> Result<Vec<(i64, Vec<u8>, &'static str)>> {
+    let c = tx.0;
+    let mut out = Vec::new();
+    for (column, when) in [
+        ("input_cs", "1 = 1"),
+        ("result_cs", "result_cs IS NOT NULL"),
+    ] {
+        let sql = format!(
+            "SELECT land_id, {column} FROM lands l
+             WHERE {when} AND NOT EXISTS (
+                 SELECT 1 FROM changesets c WHERE c.id = l.{column}
+             )"
+        );
+        let mut stmt = c.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (land, cs) = row?;
+            out.push((land, cs, column));
+        }
+    }
+    Ok(out)
+}
+
+/// A derived row of `fsck`: kind, version, changeset, value, and whether
+/// the changeset is stored.
+pub(crate) type FsckDerivedRow = (String, u32, Vec<u8>, Vec<u8>, bool);
+
+/// The derived rows after `(kind, version, cs)`, at most `limit`.
+pub(crate) fn fsck_derived(
+    tx: &mut SqliteTx<'_>,
+    kind: &str,
+    version: u32,
+    cs: &[u8],
+    limit: usize,
+) -> Result<Vec<FsckDerivedRow>> {
+    let c = tx.0;
+    let mut stmt = c.prepare(
+        "SELECT d.kind, d.version, d.cs, d.value,
+                EXISTS (SELECT 1 FROM changesets c WHERE c.id = d.cs)
+         FROM derived d
+         WHERE (d.kind, d.version, d.cs) > (?1, ?2, ?3)
+         ORDER BY d.kind, d.version, d.cs LIMIT ?4",
+    )?;
+    let rows = stmt.query_map(
+        params![kind, version, cs, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+// The queries of `gc`, which collects the blobs and rows that nothing
+// names. They live here, with the rest of this backend's SQL, so that
+// another backend brings its own collector.
+
+/// The IDs of every repo, in order.
+pub(crate) fn gc_repos(tx: &mut SqliteTx<'_>) -> Result<Vec<i64>> {
+    let c = tx.0;
+    let mut stmt = c.prepare("SELECT repo_id FROM repos ORDER BY repo_id")?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// The `(repo, changeset ID, body)` of the stored changesets after
+/// `(repo, cs)`, in that order, at most `limit`.
+/// `(repo, cs)`, in that order, at most `limit`.
+/// One stored changeset with its repo, as `(repo, changeset ID, body)`.
+pub(crate) type GcChangeset = (i64, Vec<u8>, Vec<u8>);
+
+/// The stored changesets after `(repo, cs)`, in that order, at most `limit`.
+pub(crate) fn gc_changesets(
+    tx: &mut SqliteTx<'_>,
+    from_repo: i64,
+    from_cs: &[u8],
+    limit: usize,
+) -> Result<Vec<GcChangeset>> {
+    let c = tx.0;
+    let mut stmt = c.prepare(
+        "SELECT rc.repo_id, rc.cs, ch.body
+         FROM repo_changesets rc JOIN changesets ch ON ch.id = rc.cs
+         WHERE (rc.repo_id, rc.cs) > (?1, ?2)
+         ORDER BY rc.repo_id, rc.cs LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        params![from_repo, from_cs, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// The changeset IDs that `repo` holds, all of them.
+pub(crate) fn gc_repo_changesets(tx: &mut SqliteTx<'_>, repo: i64) -> Result<Vec<Vec<u8>>> {
+    let c = tx.0;
+    let mut stmt = c.prepare("SELECT cs FROM repo_changesets WHERE repo_id = ?1 ORDER BY cs")?;
+    let rows = stmt.query_map(params![repo], |row| row.get(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// The body of changeset `cs`, or `None` when it is not stored.
+pub(crate) fn gc_changeset_body(tx: &mut SqliteTx<'_>, cs: &[u8]) -> Result<Option<Vec<u8>>> {
+    let c = tx.0;
+    let mut stmt = c.prepare("SELECT body FROM changesets WHERE id = ?1")?;
+    let mut rows = stmt.query(params![cs])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
+/// The blobs that `repo` may name, all of them.
+pub(crate) fn gc_repo_blobs(tx: &mut SqliteTx<'_>, repo: i64) -> Result<Vec<Vec<u8>>> {
+    let c = tx.0;
+    let mut stmt = c.prepare("SELECT blob FROM repo_blobs WHERE repo_id = ?1 ORDER BY blob")?;
+    let rows = stmt.query_map(params![repo], |row| row.get(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Removes the row that names `blob` for `repo`.
+pub(crate) fn gc_delete_repo_blob(tx: &mut SqliteTx<'_>, repo: i64, blob: &[u8]) -> Result<()> {
+    let c = tx.0;
+    c.prepare_cached("DELETE FROM repo_blobs WHERE repo_id = ?1 AND blob = ?2")?
+        .execute(params![repo, blob])?;
+    Ok(())
+}
+
+/// Whether any repo names `blob`. `repo_blobs` has no index on `blob`
+/// alone, so the query drives from `repos` and looks the pair up in the
+/// `(repo_id, blob)` primary key of each repo.
+pub(crate) fn gc_any_repo_blob(tx: &mut SqliteTx<'_>, blob: &[u8]) -> Result<bool> {
+    let c = tx.0;
+    Ok(c.prepare_cached(
+        "SELECT 1 FROM repos r
+             WHERE EXISTS (SELECT 1 FROM repo_blobs rb
+                           WHERE rb.repo_id = r.repo_id AND rb.blob = ?1)
+             LIMIT 1",
+    )?
+    .exists(params![blob])?)
+}

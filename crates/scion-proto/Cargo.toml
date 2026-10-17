@@ -17,6 +17,15 @@ name = "scion_proto"
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+bytes.workspace = true
+ed25519-dalek.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+open-scion-core.workspace = true
+tower.workspace = true
 prost.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true

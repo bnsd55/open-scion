@@ -1,7 +1,8 @@
 //! gRPC API for Scion, generated from `proto/scion.proto`, plus the rules that
 //! every server of the API shares: bearer tokens ([`auth`]), checks on request
 //! fields ([`check`]), how a caller's deadline passes down ([`deadline`]), how
-//! one object travels in parts and encodings ([`object`]), how a
+//! one object travels in parts and encodings ([`object`]), the operator
+//! metrics ([`metrics`]), how a
 //! `GetObjects` reply streams objects ([`reply`]), and how many connections
 //! and streams a process serves ([`listen`]), and TLS for those connections
 //! ([`tls`]).
@@ -10,8 +11,11 @@ pub mod auth;
 pub mod check;
 pub mod deadline;
 pub mod listen;
+pub mod metrics;
 pub mod object;
 pub mod reply;
+pub mod request_id;
+pub mod ticket;
 pub mod tls;
 
 /// The buffer type of `ObjectPart.data`: parts of one object are slices of one
