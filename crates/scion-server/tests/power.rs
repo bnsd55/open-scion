@@ -478,15 +478,18 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
         drop(scion);
         drop(server);
         // The checker writes directly into the backing, as `check` does: it
-        // opens the store, reads the metadata, and verifies every blob.
+        // opens the store, reads the metadata, and verifies every blob. Its
+        // close checkpoints the WAL, so the snapshot of what it wrote comes
+        // after the close: from there on, only the daemon's exit can change
+        // a byte.
         let backing = lazy.backing.join("data");
         let store = Store::open_shared(&backing).unwrap();
-        let before = snapshot(&backing);
         for (id, _) in &acked {
             let status = store.blobs().verify(*id).unwrap();
             assert_eq!(status, BlobStatus::Valid, "acknowledged blob {id}");
         }
         drop(store);
+        let before = snapshot(&backing);
         // The mount goes away: the daemon's exit. Its cache must not
         // rewrite what the checker wrote and saw.
         drop(lazy);
