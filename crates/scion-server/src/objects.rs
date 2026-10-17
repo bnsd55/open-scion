@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use scion_core::{BlobId, TreeId};
-use scion_proto::auth::Auth;
+use scion_proto::auth::{Auth, Caller};
 use scion_proto::deadline::Until;
 use scion_proto::object::{self, Header, zstd_bound};
 use scion_proto::reply::{
@@ -30,7 +30,7 @@ use tracing::Instrument as _;
 use crate::access::Access;
 use crate::error::{Error, Result};
 use crate::meta::MetaTx as _;
-use crate::quotas::Quotas;
+use crate::quotas::{Call, Quotas};
 use crate::read;
 use crate::service::{Worker, check_reader, parse_id, resolve_ref};
 use crate::store::{self, Store};
@@ -241,6 +241,8 @@ struct Reply {
     /// The handle of the caller's connection: the reply counts what it
     /// leaves in HTTP/2 on it.
     stalled: Option<scion_proto::listen::Stalled>,
+    /// The quota slot of the ticket's principal, held to the stream's end.
+    call: Call,
 }
 
 /// Streams `keys`: the first object here, the rest from the producer task.
@@ -259,6 +261,7 @@ async fn start_reply(
         in_flight,
         waits,
         stalled,
+        call,
     } = reply;
     let mut rest = keys.into_iter();
     let Some(key) = rest.next() else {
@@ -284,6 +287,9 @@ async fn start_reply(
     tokio::spawn(
         async move {
             let _walk_share = walk_share;
+            // The principal's quota slot is held to the end of the stream,
+            // so past the end of the call.
+            let _keep = call;
             let (worker, in_flight) = (&worker, &in_flight);
             let produce = |key| {
                 find(
@@ -388,8 +394,9 @@ impl Objects for ObjectsService {
         &self,
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<Self::GetObjectsStream>, Status> {
-        // No caller and no quota slot here: the ticket is the only
-        // permission of an object read.
+        // The ticket is the only permission here, but it names a signed
+        // principal: its per-principal request quota covers this stream
+        // too. The slot lives to the stream's end, as the reply does.
         let waits = Waits {
             until: Until::of(&request),
             ..WAITS
@@ -419,6 +426,10 @@ impl Objects for ObjectsService {
                     tracing::warn!(reason = %why, "a GetObjects ticket was refused");
                     Status::permission_denied(format!("bad ticket: {why}"))
                 })?;
+        let call = self
+            .quotas
+            .enter(&Caller(ticket.principal.clone()))
+            .map_err(Status::from)?;
         let refs = refs
             .into_iter()
             .map(|r| Ok((parse_ref(&r)?, r.path)))
@@ -444,6 +455,7 @@ impl Objects for ObjectsService {
                 in_flight,
                 waits,
                 stalled,
+                call,
             },
             read_object,
             zstd,
@@ -563,6 +575,7 @@ mod tests {
                 in_flight: Arc::clone(&in_flight),
                 waits: waits(stall),
                 stalled: None,
+                call: Call::default(),
             },
             read_object,
             true,
@@ -605,6 +618,7 @@ mod tests {
                     in_flight: Arc::clone(&in_flight),
                     waits: wait,
                     stalled: None,
+                    call: Call::default(),
                 },
                 counted,
                 true,
@@ -645,6 +659,7 @@ mod tests {
                     in_flight: Arc::clone(&in_flight),
                     waits: waits(Duration::from_millis(100)),
                     stalled: None,
+                    call: Call::default(),
                 },
                 read_object,
                 true,
@@ -685,6 +700,7 @@ mod tests {
                 in_flight,
                 waits,
                 stalled: None,
+                call: Call::default(),
             },
             read_object,
             true,
@@ -721,6 +737,7 @@ mod tests {
                 in_flight: Arc::clone(&in_flight),
                 waits: WAITS,
                 stalled: None,
+                call: Call::default(),
             },
             watched,
             false,
@@ -788,6 +805,7 @@ mod tests {
                     in_flight: Arc::clone(&in_flight),
                     waits: WAITS,
                     stalled: None,
+                    call: Call::default(),
                 },
                 read_object,
                 zstd,
