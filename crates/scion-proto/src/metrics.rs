@@ -94,6 +94,9 @@ pub struct Metrics {
     /// Objects a tier served from its store, and fetched from upstream.
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
+    /// Real trees a view derivation fetched, folders of a partial
+    /// reader's view (folder read rules).
+    view_trees_walked: AtomicU64,
 }
 
 /// A metric name, as the index of its RPC.
@@ -168,6 +171,17 @@ impl Metrics {
     /// Counts an object a tier fetched from upstream.
     pub fn cache_miss(&self) {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts `n` real trees a view derivation fetched.
+    pub fn view_tree_walked(&self, n: u64) {
+        self.view_trees_walked.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// The view-walk counter, for a test that reads it without a scrape.
+    #[must_use]
+    pub fn view_trees_walked(&self) -> u64 {
+        self.view_trees_walked.load(Ordering::Relaxed)
     }
 
     /// The cache counters, for a test that reads them without a scrape.
@@ -254,6 +268,15 @@ impl Metrics {
                 let _ = writeln!(text, "scion_lands_total{{outcome=\"{name}\"}} {value}");
             }
         }
+        text.push_str(
+            "# HELP scion_view_trees_walked_total Real trees a view derivation fetched.\n",
+        );
+        text.push_str("# TYPE scion_view_trees_walked_total counter\n");
+        let _ = writeln!(
+            text,
+            "scion_view_trees_walked_total {}",
+            self.view_trees_walked.load(Ordering::Relaxed)
+        );
         text.push_str("# HELP scion_cache_hits_total Objects a tier served from its store.\n");
         text.push_str("# TYPE scion_cache_hits_total counter\n");
         text.push_str("# HELP scion_cache_misses_total Objects a tier fetched from upstream.\n");
