@@ -555,13 +555,11 @@ fn blame_calls(
 /// the scan that `read::next_change` did before blame read the path
 /// history.
 fn scan_versions(store: &Store, cs: ChangesetId, p: &str) -> Vec<ChangesetId> {
-    let repo = store.write(|c| scion_server::db::repo_id(c, REPO)).unwrap();
+    let repo = store.write(|c| c.repo_id(REPO)).unwrap();
     let mut found = Vec::new();
     let mut next = Some(cs);
     while let Some(id) = next {
-        let cs = store
-            .read(|c| scion_server::db::get_changeset(c, repo, id))
-            .unwrap();
+        let cs = store.read(|c| c.get_changeset(repo, id)).unwrap();
         next = cs.parents.first().copied();
         if cs.changes.keys().any(|changed| {
             let (changed, p) = (changed.as_bytes(), p.as_bytes());
