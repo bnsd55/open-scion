@@ -68,6 +68,12 @@ fn changeset(parents: Vec<ChangesetId>, changes: Vec<(RepoPath, Option<FileState
 }
 
 impl Fixture {
+    /// The path of the metadata database, for a poll that must not share
+    /// the store's reader pool.
+    fn db_path(&self) -> std::path::PathBuf {
+        self._dir.path().join("scion.db")
+    }
+
     /// Inserts the changeset on `base`; the blobs of its puts were stored
     /// by the caller.
     fn commit(
@@ -190,18 +196,26 @@ fn replan_scenario(metrics: &Arc<scion_proto::metrics::Metrics>) -> u64 {
     let rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let racer = {
         let store = f.store.clone();
+        let db_path = f.db_path();
         let rounds = Arc::clone(&rounds);
         std::thread::spawn(move || {
-            // CI runs the whole workspace at once on a few cores: the
-            // scenario's first steps can wait far longer than they do
-            // alone, so the wait is minutes, not seconds.
+            // The poll runs on its own read-only connection: a Store::read
+            // waits for the commits it saw to be durable, which the land
+            // it races can hold for a while. CI runs the whole workspace
+            // at once on a few cores, so the wait is minutes, not seconds.
+            let conn = rusqlite::Connection::open_with_flags(
+                db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
             let until = Instant::now() + Duration::from_secs(120);
             loop {
-                let pending: i64 = store
-                    .read(|c| {
-                        let sql = "SELECT count(*) FROM lands WHERE state = 'pending'";
-                        Ok(c.query_row(sql, [], |row| row.get(0))?)
-                    })
+                let pending: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM lands WHERE state = 'pending'",
+                        [],
+                        |row| row.get(0),
+                    )
                     .unwrap();
                 if pending >= 1 {
                     break;
