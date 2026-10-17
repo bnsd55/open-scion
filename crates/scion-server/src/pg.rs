@@ -82,12 +82,21 @@ struct Readers {
 }
 
 impl Readers {
-    /// [`Readers::new`], with libpq `options` on every client.
-    fn new_with(size: usize, url: &str, ca: Option<&Path>, options: &str) -> Result<Self> {
+    /// [`Readers::new`], with libpq `options` on every client. The
+    /// schema is the search path each reader sets up on its own worker:
+    /// without it a reader reads the database's default, which holds no
+    /// tables of this store.
+    fn new_with(
+        size: usize,
+        url: &str,
+        ca: Option<&Path>,
+        options: &str,
+        schema: Option<&str>,
+    ) -> Result<Self> {
         // The open is sequential, so every client sees the same schema.
         let idle = (0..size)
             .map(|_| {
-                let client = connect_with(url, ca, options, None)?;
+                let client = connect_with(url, ca, options, schema)?;
                 let on: String = client.query("SHOW synchronous_commit", &[])?[0].get(0);
                 if on != "on" {
                     return Err(Error::FailedPrecondition(format!(
@@ -572,7 +581,7 @@ impl Pg {
         Ok(Self {
             inner: Arc::new(PgInner {
                 writer: Mutex::new(writer),
-                readers: Readers::new_with(readers, url, ca, &options)?,
+                readers: Readers::new_with(readers, url, ca, &options, schema)?,
                 blobs,
             }),
         })
