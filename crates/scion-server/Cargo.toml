@@ -52,6 +52,9 @@ tokio-postgres-rustls = "0.14"
 
 [dev-dependencies]
 proptest.workspace = true
+# A test holds a row lock from its own connection, so the server's write
+# waits for it like a writer waits for any other.
+postgres = "0.19"
 tempfile.workspace = true
 tonic-health.workspace = true
 # A test runs code while a commit is visible and its COMMIT still runs.

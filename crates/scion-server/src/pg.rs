@@ -493,7 +493,10 @@ const CLEAN_LOCK: i64 = 0x5343_494F_4E53_5445;
 /// here: it is a statement on the live connection, which the server
 /// cannot lose between connections.
 fn base_options() -> String {
-    String::from("-csynchronous_commit=on -cstatement_timeout=600000")
+    // A lock a writer waits for is a busy database: 5 s, like the busy
+    // timeout of the SQLite store. A statement itself may walk the graph
+    // for minutes, so only the lock is under the short clock.
+    String::from("-csynchronous_commit=on -cstatement_timeout=600000 -clock_timeout=5000")
 }
 
 impl Pg {
@@ -1035,14 +1038,20 @@ fn connect_exclusive(
         std::thread::scope(|scope| scope.spawn(|| connect_on(url, ca, options)).join().unwrap())?;
     // The lock is taken on the worker thread, like every statement: the
     // caller may be a tokio one, which must never block on this client.
-    Ok(PgClient::spawn(ClientConfig {
+    let client = PgClient::spawn(ClientConfig {
         client,
         url: url.to_owned(),
         ca: ca.map(Path::to_path_buf),
         options: options.to_owned(),
         schema: schema.map(str::to_owned),
         exclusive: true,
-    }))
+    });
+    // Whether the lock was given is decided at the spawn: one probe job
+    // brings a refusal here, to the open, so an operator whose second
+    // server starts against a taken database sees it now, and not in the
+    // errors of the first call a client makes.
+    client.query_opt("SELECT 1", &[])?;
+    Ok(client)
 }
 
 /// [`connect_with`]'s work: parse, then connect.
@@ -1110,13 +1119,20 @@ fn map_pg_error(e: postgres::Error) -> Error {
     }
     match e.code() {
         // Deadlock, serialization failure, an administrative shutdown, a
-        // database that starts up.
+        // database that starts up, a lock another writer holds.
         Some(code)
-            if matches!(code.code(), "40P01" | "40001" | "57P01" | "57P03")
+            if matches!(code.code(), "40P01" | "40001" | "57P01" | "57P03" | "55P03")
                 || code.code().starts_with("08") =>
         {
             tracing::warn!("the database is busy: {e}");
             Error::Busy
+        }
+        // The lock or the statement waited past its clock, as a SQLite
+        // write does past its busy timeout: the caller has been at it
+        // too long, and the client retries past its own deadline.
+        Some(code) if code.code() == "57014" => {
+            tracing::warn!("the database gave the statement up: {e}");
+            Error::DeadlineExceeded("the database kept the caller waiting".to_owned())
         }
         // A violation the code handles (a duplicate key, a check, a
         // foreign key) is one answer among many: it logs quietly.
@@ -1166,22 +1182,36 @@ fn make_tls(ca: &Path) -> Result<MakeRustlsConnect> {
 /// not run yet, in one transaction each, and refuses a schema of a newer
 /// build.
 fn migrate(client: &mut PgClient) -> Result<()> {
-    // One transaction holds the schema lock, so a server and an import
-    // started together migrate one after the other, and the version the
-    // loser reads is the one the winner left.
-    let mut tx = PgTx::begin(client)?;
-    tx.c.execute("SELECT pg_advisory_xact_lock($1)", &[P::i64(SCHEMA_LOCK)])?;
-    tx.c.batch(
+    // One process at a time migrates: a lock of the session, held across
+    // the migrations, so a server and an import started together take
+    // turns, and the version the loser reads is the one the winner left.
+    // A lock past its 5 s clock leaves the taker busy, and the importer
+    // retries.
+    client.query_opt("SELECT pg_advisory_lock($1)", &[P::i64(SCHEMA_LOCK)])?;
+    let outcome = migrate_under_lock(client);
+    // The lock lives on the client's session: it goes back whatever the
+    // migrations did. A client that died mid-migration lost the lock with
+    // its connection, and the unlock names a lock the new connection
+    // never held, which answers false and costs nothing.
+    let _ = client.query_opt("SELECT pg_advisory_unlock($1)", &[P::i64(SCHEMA_LOCK)]);
+    outcome
+}
+
+/// The migrations themselves, under the session's schema lock.
+fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
+    // The ledger of the versions, made first, in its own transaction: a
+    // migration that fails leaves the ledger and every version before it.
+    client.batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
              version BIGINT PRIMARY KEY,
              name    TEXT NOT NULL
          )",
     )?;
-    let version: i64 =
-        tx.c.query("SELECT max(version) FROM schema_migrations", &[])?
-            .first()
-            .and_then(|row| row.get::<_, Option<i64>>(0))
-            .unwrap_or(0);
+    let version: i64 = client
+        .query("SELECT max(version) FROM schema_migrations", &[])?
+        .first()
+        .and_then(|row| row.get::<_, Option<i64>>(0))
+        .unwrap_or(0);
     let version = u32::try_from(version).map_err(|_| {
         Error::FailedPrecondition(format!(
             "database schema version {version} is not a version"
@@ -1198,13 +1228,18 @@ fn migrate(client: &mut PgClient) -> Result<()> {
         if n <= version {
             continue;
         }
+        // One transaction per migration, with its version bump: a
+        // migration that fails rolls its own statements back, and the
+        // versions before it stand.
+        let mut tx = PgTx::begin(client)?;
         tx.c.batch(&format!(
             "{sql}\nINSERT INTO schema_migrations (version, name) \
              VALUES ({}, 'postgres schema')",
             i64::from(n)
         ))?;
+        tx.commit()?;
     }
-    tx.commit()
+    Ok(())
 }
 
 /// Reads a tree's rows and checks them against its ID.

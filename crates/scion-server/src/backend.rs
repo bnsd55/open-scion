@@ -234,6 +234,19 @@ impl Backend {
         std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres")
     }
 
+    /// The schema a test backend of this directory uses, when the tests
+    /// run on Postgres. Hidden: a test holds a lock in it from a
+    /// connection of its own.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_schema(data: &Path) -> Option<String> {
+        if Self::test_is_postgres() {
+            Some(test_schema(data))
+        } else {
+            None
+        }
+    }
+
     /// Write transactions run so far. SQLite only.
     #[doc(hidden)]
     #[must_use]
