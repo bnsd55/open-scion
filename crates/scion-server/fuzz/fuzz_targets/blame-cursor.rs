@@ -13,6 +13,7 @@ use scion_server::blame::{self, Resume};
 use scion_server::memory::Bytes;
 use scion_server::meta::MetaTx as _;
 use scion_server::{Store, tree};
+use tempfile::TempDir;
 use std::sync::OnceLock;
 
 const REPO: &str = "f";
@@ -20,14 +21,14 @@ const REPO: &str = "f";
 /// The store the whole run shares: one SQLite file in one temp directory,
 /// with a chain of three changesets that each put `f`. Built once per
 /// process, because SQLite setup would otherwise eat the fuzzing time.
-/// The static lives forever, so the temp directory is never removed while
-/// the fuzzer runs.
-fn fixture() -> &'static (Store, ChangesetId) {
-    static FIXTURE: OnceLock<(Store, ChangesetId)> = OnceLock::new();
+/// The directory stays in the static for the life of the process: keeping
+/// it reachable keeps LeakSanitizer quiet and its cleanup never runs
+/// while the fuzzer runs.
+fn fixture() -> &'static (TempDir, Store, ChangesetId) {
+    static FIXTURE: OnceLock<(TempDir, Store, ChangesetId)> = OnceLock::new();
     FIXTURE.get_or_init(|| {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = Store::open(dir.path()).expect("store");
-        std::mem::forget(dir);
         let tip = store
             .write(|c| {
                 let repo = c.create_repo(REPO)?;
@@ -61,14 +62,14 @@ fn fixture() -> &'static (Store, ChangesetId) {
             .expect("the chain stores")
             .pop()
             .expect("three changesets");
-        (store, tip)
+        (dir, store, tip)
     })
 }
 
 const PATH: &str = "f";
 
 fuzz_target!(|data: &[u8]| {
-    let (store, tip) = fixture();
+    let (_dir, store, tip) = fixture();
     let tip = *tip;
     let path = RepoPath::new(PATH).expect("a valid path");
 
