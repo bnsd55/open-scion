@@ -295,10 +295,10 @@ pub(crate) fn entry_json(entry: &Entry) -> Value {
         },
     };
     let mut value = json!({ "kind": describe(entry).1, "id": id });
-    if let Entry::File(file) = entry {
-        if let FileState::Regular { executable, .. } = file.state() {
-            value["executable"] = executable.into();
-        }
+    if let Entry::File(file) = entry
+        && let FileState::Regular { executable, .. } = file.state()
+    {
+        value["executable"] = executable.into();
     }
     value
 }

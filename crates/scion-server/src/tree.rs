@@ -41,6 +41,10 @@ pub(crate) fn lens_none() -> impl FnMut(BlobId) -> Result<u64> {
 /// headers. Call it before a write transaction, so the one write
 /// connection does no file I/O. A blob that is not stored fails here,
 /// before any write.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if a blob is not stored.
 pub fn lens_of_puts(
     store: &Store,
     puts: impl Iterator<Item = BlobId>,
@@ -56,7 +60,9 @@ pub fn lens_of_puts(
 }
 
 /// A lens over lengths that a caller read before its transaction.
-pub fn lens_from(map: &HashMap<BlobId, u64>) -> impl FnMut(BlobId) -> Result<u64> + '_ {
+pub fn lens_from<S: std::hash::BuildHasher>(
+    map: &HashMap<BlobId, u64, S>,
+) -> impl FnMut(BlobId) -> Result<u64> + '_ {
     move |blob| {
         map.get(&blob)
             .copied()

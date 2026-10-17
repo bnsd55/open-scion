@@ -328,12 +328,12 @@ fn check_trees(
                         // The entry's length must be the blob's own: a tree
                         // whose size lies makes every stat of the file lie.
                         match store.blobs().size(blob) {
-                            Ok(size) if size as u64 == file.len() => {}
+                            Ok(size) if size as u64 == file.size() => {}
                             Ok(size) => report.problem(Problem::new(
                                 "tree-size",
                                 id.to_string(),
                                 None,
-                                format!("entry says {} bytes, the blob holds {size}", file.len()),
+                                format!("entry says {} bytes, the blob holds {size}", file.size()),
                             )),
                             Err(e) => report.problem(Problem::new(
                                 "tree-size",

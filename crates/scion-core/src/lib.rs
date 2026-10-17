@@ -167,9 +167,10 @@ impl FileEntry {
         self.state
     }
 
-    /// Byte length of the blob `state` names, 0 for a gitlink.
+    /// Byte length of the blob `state` names, 0 for a gitlink. A file's
+    /// size: what a stat of the file answers.
     #[must_use]
-    pub fn len(&self) -> u64 {
+    pub fn size(&self) -> u64 {
         self.len
     }
 

@@ -425,13 +425,13 @@ impl Vfs {
         let header = Header::of(&first, true).map_err(bad)?;
         // The tree said how big this blob is. A first part whose size
         // disagrees ends the fetch before any part of the body reads.
-        if let Some(want) = expect {
-            if header.size as u64 != want {
-                bail!(
-                    "the server sent {} bytes, the tree says {want}",
-                    header.size
-                );
-            }
+        if let Some(want) = expect
+            && header.size as u64 != want
+        {
+            bail!(
+                "the server sent {} bytes, the tree says {want}",
+                header.size
+            );
         }
         let mut assembled = Assembler::new(header, first);
         while !assembled.is_done() {
@@ -531,7 +531,7 @@ impl Vfs {
                         tree: Some(tree),
                         listed: None,
                     },
-                    Entry::File(file) => match (file.state(), file.len()) {
+                    Entry::File(file) => match (file.state(), file.size()) {
                         (
                             FileState::Regular {
                                 content,

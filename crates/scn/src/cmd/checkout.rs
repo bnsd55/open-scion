@@ -243,11 +243,11 @@ async fn walk(
                 if sparse.contains(&path) {
                     found.insert(path.clone());
                 }
-                if let Entry::File(file) = entry {
-                    if let FileState::Gitlink { commit } = file.state() {
-                        eprintln!("note: skipping submodule {path:?} at {commit}");
-                        continue;
-                    }
+                if let Entry::File(file) = entry
+                    && let FileState::Gitlink { commit } = file.state()
+                {
+                    eprintln!("note: skipping submodule {path:?} at {commit}");
+                    continue;
                 }
                 if let Err(why) = check_name(name.as_bytes()) {
                     bail!("refusing to write {path:?}: {why}");
@@ -301,7 +301,7 @@ async fn write_files(
         by_blob
             .get(&BlobId::from_bytes(id))
             .and_then(|files| files.first())
-            .map(|(_, file)| file.len())
+            .map(|(_, file)| file.size())
     };
     fetch(
         objects,
@@ -315,11 +315,11 @@ async fn write_files(
             for &(path, file) in by_blob.get(&id).into_iter().flatten() {
                 // The tree claimed a size for this blob; the bytes that arrived
                 // must have it, or the checkout would write a lie.
-                if file.len() != data.len() as u64 {
+                if file.size() != data.len() as u64 {
                     bail!(
                         "{path:?}: {} bytes arrived, the tree says {}",
                         data.len(),
-                        file.len()
+                        file.size()
                     );
                 }
                 match file.state() {
@@ -405,13 +405,13 @@ async fn fetch(
             let header = Header::of(&first, true).map_err(bad)?;
             // The tree said how big this blob is. A first part whose size
             // disagrees ends the fetch before any part of the body reads.
-            if let Some(want) = size_of(id) {
-                if header.size as u64 != want {
-                    bail!(
-                        "server sent {name}: {} bytes, the tree says {want}",
-                        header.size
-                    );
-                }
+            if let Some(want) = size_of(id)
+                && header.size as u64 != want
+            {
+                bail!(
+                    "server sent {name}: {} bytes, the tree says {want}",
+                    header.size
+                );
             }
             let mut object = Assembler::new(header, first);
             while !object.is_done() {
