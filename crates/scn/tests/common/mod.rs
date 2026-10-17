@@ -13,7 +13,8 @@ use scion_proto::auth::Bearer;
 use scion_proto::listen::Limits;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::{ObjectKind, ObjectRef};
-use scion_server::{Store, db, service, tree};
+use scion_server::meta::MetaTx as _;
+use scion_server::{Store, service, tree};
 use scion_tier::{
     CACHE_UPSTREAM_TIMEOUT, DAEMON_UPSTREAM_TIMEOUT, DiskStore, MemoryStore, Tier, bind_unix,
 };
@@ -94,8 +95,13 @@ impl Tiers {
             store.clone(),
             listener,
             TOKEN,
-            Limits::default(),
-            None,
+            service::ServeOptions {
+                limits: Limits::default(),
+                quotas: scion_server::quotas::Quotas::off(),
+                pending_lands: None,
+                land_stale_secs: 1 << 40,
+                tls: None,
+            },
             Some(std::sync::Arc::new(tickets)),
             pending(),
         ));
@@ -253,10 +259,10 @@ pub fn changeset(parent: Option<ChangesetId>, files: &[(&str, FileState)]) -> Ch
 pub fn land(store: &Store, cs: &Changeset) -> ChangesetId {
     store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
+            let repo = c.create_repo(REPO)?;
             let (id, _) = tree::store_changeset(c, repo, cs)?;
-            let version = db::get_ref(c, repo, "main")?.map(|r| r.version);
-            assert!(db::cas_ref(c, repo, "main", version, id)?);
+            let version = c.get_ref(repo, "main")?.map(|r| r.version);
+            assert!(c.cas_ref(repo, "main", version, id)?);
             Ok(id)
         })
         .unwrap()

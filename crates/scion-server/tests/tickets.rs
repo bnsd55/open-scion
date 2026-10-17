@@ -9,8 +9,9 @@ use scion_proto::listen::Limits;
 use scion_proto::object::{Assembler, Header};
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::{GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
+use scion_server::meta::MetaTx as _;
 use scion_server::tickets::Keys;
-use scion_server::{Store, db, service};
+use scion_server::{Store, service};
 use tokio::net::TcpListener;
 use tonic::Code;
 use tonic::service::interceptor::InterceptedService;
@@ -59,8 +60,8 @@ async fn server() -> (
     let (_bytes, id) = changeset.encode_with_id();
     store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
-            db::insert_changeset(c, repo, &changeset)
+            let repo = c.create_repo(REPO)?;
+            c.insert_changeset(repo, &changeset)
         })
         .unwrap();
 
@@ -72,8 +73,13 @@ async fn server() -> (
         store,
         listener,
         TOKEN,
-        Limits::default(),
-        None,
+        service::ServeOptions {
+            limits: Limits::default(),
+            quotas: scion_server::quotas::Quotas::off(),
+            pending_lands: None,
+            land_stale_secs: 1 << 40,
+            tls: None,
+        },
         Some(keys.clone().into()),
         async {
             stopped.await.ok();
@@ -289,8 +295,8 @@ async fn server_of_readme() -> (
     let (_bytes, cs) = changeset.encode_with_id();
     server_store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
-            db::insert_changeset(c, repo, &changeset)
+            let repo = c.create_repo(REPO)?;
+            c.insert_changeset(repo, &changeset)
         })
         .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -301,8 +307,13 @@ async fn server_of_readme() -> (
         server_store,
         listener,
         TOKEN,
-        Limits::default(),
-        None,
+        service::ServeOptions {
+            limits: Limits::default(),
+            quotas: scion_server::quotas::Quotas::off(),
+            pending_lands: None,
+            land_stale_secs: 1 << 40,
+            tls: None,
+        },
         Some(keys.clone().into()),
         async {
             stopped.await.ok();
@@ -512,10 +523,10 @@ async fn tiers() -> (Tiers, tokio::sync::oneshot::Sender<()>, tempfile::TempDir)
     let (_bytes, side_cs) = side.encode_with_id();
     store
         .write(|c| {
-            let repo = db::create_repo(c, "main")?;
-            db::insert_changeset(c, repo, &main)?;
-            let repo = db::create_repo(c, "side")?;
-            db::insert_changeset(c, repo, &side)
+            let repo = c.create_repo("main")?;
+            c.insert_changeset(repo, &main)?;
+            let repo = c.create_repo("side")?;
+            c.insert_changeset(repo, &side)
         })
         .unwrap();
 
@@ -527,8 +538,13 @@ async fn tiers() -> (Tiers, tokio::sync::oneshot::Sender<()>, tempfile::TempDir)
         store,
         listener,
         TOKEN,
-        Limits::default(),
-        None,
+        service::ServeOptions {
+            limits: Limits::default(),
+            quotas: scion_server::quotas::Quotas::off(),
+            pending_lands: None,
+            land_stale_secs: 1 << 40,
+            tls: None,
+        },
         Some(keys.clone().into()),
         async {
             stopped.await.ok();

@@ -86,7 +86,15 @@ impl Interceptor for Auth {
             .and_then(|value| value.as_bytes().strip_prefix(b"Bearer "))
             .and_then(|token| self.principal(token))
             .cloned()
-            .ok_or_else(|| Status::unauthenticated("missing or wrong token"))?;
+            .ok_or_else(|| {
+                // One line for the refusal. The span's fields name the RPC
+                // and the peer. Never the token, not even its digest.
+                tracing::warn!(
+                    reason = "missing or wrong token",
+                    "the call is unauthenticated"
+                );
+                Status::unauthenticated("missing or wrong token")
+            })?;
         request.extensions_mut().insert(caller);
         Ok(request)
     }

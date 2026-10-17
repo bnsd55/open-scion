@@ -1,6 +1,8 @@
 //! Git import against fixture repositories built with the `git` CLI.
 #![cfg(unix)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -18,9 +20,10 @@ use scion_core::{
 };
 use scion_server::auth::Caller;
 use scion_server::deadline::Deadline;
-use scion_server::import::{ImportOptions, ImportReport, import_git};
+use scion_server::import::{BUSY_TRIES, CHECKS, ImportOptions, ImportReport, import_git};
 use scion_server::land::{LandRequest, LandState, Lands};
-use scion_server::{Error, Store, db, read, tree, write};
+use scion_server::meta::{MetaTx as _, RefState};
+use scion_server::{Error, Store, read, tree, write};
 use tempfile::TempDir;
 
 const SUBMODULE: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -44,26 +47,31 @@ impl Git {
     /// Runs git with `stdin`, fails the test unless it succeeds, and returns
     /// raw stdout.
     fn raw(&self, args: &[&str], stdin: &[u8]) -> Vec<u8> {
-        let mut child = Command::new("git")
-            // No auto gc or maintenance: they pack loose objects in the
-            // background and delete the loose files, also while the import
-            // of the same repository still reads them.
-            .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
-            .args(args)
-            .current_dir(self.path())
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_AUTHOR_NAME", "Ada")
-            .env("GIT_AUTHOR_EMAIL", "ada@example.com")
-            .env("GIT_AUTHOR_DATE", "1700000000 +0530")
-            .env("GIT_COMMITTER_NAME", "Bob")
-            .env("GIT_COMMITTER_EMAIL", "bob@example.com")
-            .env("GIT_COMMITTER_DATE", "1700000100 -0700")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        // The child shares a flock until it execs (see `common::spawn_guard`):
+        // the read side keeps this spawn out of a lock-release window of
+        // another test.
+        let mut child = common::spawn_guard::across_spawn(|| {
+            Command::new("git")
+                // No auto gc or maintenance: they pack loose objects in the
+                // background and delete the loose files, also while the
+                // import of the same repository still reads them.
+                .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
+                .args(args)
+                .current_dir(self.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "Ada")
+                .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+                .env("GIT_AUTHOR_DATE", "1700000000 +0530")
+                .env("GIT_COMMITTER_NAME", "Bob")
+                .env("GIT_COMMITTER_EMAIL", "bob@example.com")
+                .env("GIT_COMMITTER_DATE", "1700000100 -0700")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        })
+        .unwrap();
         child.stdin.take().unwrap().write_all(stdin).unwrap();
         let out = child.wait_with_output().unwrap();
         assert!(
@@ -240,6 +248,7 @@ fn open_store() -> (TempDir, Store) {
 }
 
 fn try_import(store: &Store, git: &Git, rev: &str) -> Result<ImportReport, Error> {
+    common::spawn_guard::prime_gix_lookup();
     import_git(store, "r", git.path(), &opts(rev))
 }
 
@@ -311,13 +320,16 @@ fn import_matches_git_and_repeats_as_a_no_op() {
     assert_eq!(report.tip, changeset_of(&store, &h.submodule));
     assert_eq!(read::resolve_ref(&store, "r", "main").unwrap(), report.tip);
 
-    let before = store.read(|c| Ok(row_counts(c))).unwrap();
+    let before = store.read(|c| Ok(row_counts(&*c))).unwrap();
     let again = import(&store, &git, "HEAD");
     assert_eq!((again.commits, again.imported, again.verified), (7, 0, 0));
     assert_eq!(again.tip, report.tip);
-    assert_eq!(store.read(|c| Ok(row_counts(c))).unwrap(), before);
+    assert_eq!(store.read(|c| Ok(row_counts(&*c))).unwrap(), before);
     let main = store
-        .read(|c| db::get_ref(c, db::repo_id(c, "r")?, "main"))
+        .read(|c| {
+            let repo = c.repo_id("r")?;
+            c.get_ref(repo, "main")
+        })
         .unwrap()
         .unwrap();
     assert_eq!(main.version, 1, "a repeated import does not move the ref");
@@ -527,7 +539,8 @@ fn verification_catches_a_tree_that_differs_from_git() {
     // The next commit applies its changes on top, so it inherits the file.
     store
         .write(|c| {
-            let root = tree::derive_root_tree(c, db::repo_id(c, "r")?, first.tip)?;
+            let repo = c.repo_id("r")?;
+            let root = tree::derive_root_tree(c, repo, first.tip)?;
             let extra = BTreeMap::from([(
                 path("extra.txt"),
                 Some(FileState::Regular {
@@ -599,9 +612,12 @@ fn verification_catches_a_corrupt_blob() {
     }
 }
 
-fn main_ref(store: &Store) -> db::RefState {
+fn main_ref(store: &Store) -> RefState {
     store
-        .read(|c| db::get_ref(c, db::repo_id(c, "r")?, "main"))
+        .read(|c| {
+            let repo = c.repo_id("r")?;
+            c.get_ref(repo, "main")
+        })
         .unwrap()
         .unwrap()
 }
@@ -651,6 +667,7 @@ fn import_never_moves_a_ref_off_a_land() {
     // The commits are imported, so another ref can take them.
     let mut other = opts(&next);
     other.target_ref = "git/main".to_owned();
+    common::spawn_guard::prime_gix_lookup();
     let report = import_git(&store, "r", git.path(), &other).unwrap();
     assert_eq!(report.imported, 0);
     assert_eq!(
@@ -751,7 +768,7 @@ fn identity() -> IdentityTime {
 
 /// Creates a changeset on `base` that puts `path`, through the write path.
 fn create(store: &Store, base: ChangesetId, path: &str) -> ChangesetId {
-    let repo = store.read(|c| db::repo_id(c, "r")).unwrap();
+    let repo = store.read(|c| c.repo_id("r")).unwrap();
     let upload = store.blobs().upload().unwrap();
     let upload = upload.append(path.as_bytes()).unwrap();
     let file = FileState::Regular {
@@ -799,7 +816,7 @@ fn an_import_process_shares_the_data_directory_with_lands() {
 
     // A land whose base is not on main builds main's path index at the
     // start, and leaves main alone.
-    let repo = store.read(|c| db::repo_id(c, "r")).unwrap();
+    let repo = store.read(|c| c.repo_id("r")).unwrap();
     let side = Changeset {
         parents: vec![],
         author: identity(),
@@ -807,9 +824,7 @@ fn an_import_process_shares_the_data_directory_with_lands() {
         message: b"side".to_vec(),
         changes: BTreeMap::new(),
     };
-    let side = store
-        .write(|c| db::insert_changeset(c, repo, &side))
-        .unwrap();
+    let side = store.write(|c| c.insert_changeset(repo, &side)).unwrap();
     let out = land(&store, &lands, create(&store, side, "s.txt"));
     assert_eq!(out.state, LandState::Rejected, "{}", out.detail);
     assert_eq!(main_ref(&store).target, start);
@@ -831,11 +846,13 @@ fn an_import_process_shares_the_data_directory_with_lands() {
     // Agents land on main while another process imports more commits into
     // another ref.
     let more = git.fast_commits(60, 400);
-    let import = import_process(data, &git, &more, "git/main")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let import = common::spawn_guard::across_spawn(|| {
+        import_process(data, &git, &more, "git/main")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+    })
+    .unwrap();
     let done = AtomicBool::new(false);
     let landed: Vec<ChangesetId> = thread::scope(|scope| {
         let agents: Vec<_> = (0..4)
@@ -888,13 +905,137 @@ fn an_import_process_shares_the_data_directory_with_lands() {
 #[test]
 fn a_second_server_process_is_refused() {
     let (dir, _server) = open_store();
-    let out = server_process(
-        dir.path(),
-        &["serve", "--token", "t", "--listen", "127.0.0.1:0"],
-    )
-    .output()
+    let out = common::spawn_guard::across_spawn(|| {
+        server_process(
+            dir.path(),
+            &["serve", "--token", "t", "--listen", "127.0.0.1:0"],
+        )
+        .output()
+    })
     .unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("in use by another server"), "{stderr}");
+}
+
+/// Creates the import's repo up front, so the import's first write is a
+/// batch, not the repo's create.
+fn make_repo(store: &Store) {
+    store.write(|c| c.create_repo("r")).unwrap();
+}
+
+/// A store that shares its data directory, so an import keeps its write
+/// transactions short and yields between them.
+fn open_shared_store() -> (tempfile::TempDir, Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_shared(dir.path()).unwrap();
+    (dir, store)
+}
+
+/// Waits until the store has `n` changesets, so a test can hold the write
+/// lock while the import's next batch runs.
+fn wait_for_writes(dir: &Path, n: i64) {
+    let watcher = Connection::open(dir.join("scion.db")).unwrap();
+    let mut enough = false;
+    for _ in 0..10000 {
+        let cs: i64 = watcher
+            .query_row("SELECT count(*) FROM changesets", [], |row| row.get(0))
+            .unwrap_or(0);
+        if cs >= n {
+            enough = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(enough, "the import never stored {n} changesets");
+}
+
+/// Holds the store's write lock from another connection for `hold_ms`. The
+/// thread ends on its own; it commits when the hold is over. The hold takes
+/// the lock the moment a batch's commit ends, so it must outlast the flush
+/// that follows the commit plus the yield before the next batch begins.
+fn hold_for(dir: &Path, hold_ms: u64) {
+    let db = Connection::open(dir.join("scion.db")).unwrap();
+    thread::spawn(move || {
+        // The lock may be held by a batch of the import; wait for it, then
+        // hold past the writer's busy timeout.
+        db.busy_timeout(Duration::from_secs(30)).unwrap();
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let deadline = Instant::now() + Duration::from_millis(hold_ms);
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        db.execute_batch("COMMIT").unwrap();
+    });
+}
+
+#[test]
+fn an_import_batch_waits_out_a_busy_write_lock() {
+    let git = Git::init();
+    let rev = git.fast_commits(0, 3000);
+    let (dir, store) = open_shared_store();
+    // A busy lock fails fast, so the retry is deterministic: the holder
+    // keeps the lock far longer than the store waits for it.
+    store.set_busy_timeout(Duration::from_millis(100));
+    let report = thread::scope(|s| {
+        let importer = s.spawn(|| try_import(&store, &git, &rev).unwrap());
+        // Once changesets are stored, a batch is running or just ended: the
+        // hold takes the lock the moment that batch ends, so the next batch
+        // begins inside the hold. A batch is safe to run again whole.
+        wait_for_writes(dir.path(), 50);
+        hold_for(dir.path(), 1500);
+        importer.join().unwrap()
+    });
+    assert_eq!((report.commits, report.imported), (3000, 3000));
+}
+
+#[test]
+fn an_import_that_stays_busy_fails_with_the_busy_error() {
+    let git = Git::init();
+    let rev = git.fast_commits(0, 60);
+    let (_dir, store) = open_store();
+    make_repo(&store);
+    // Every batch commit fails: the retry bound runs out, and the import
+    // gives up with the busy error instead of retrying forever.
+    store.fail_next_commits(BUSY_TRIES + 1);
+    let error = try_import(&store, &git, &rev).unwrap_err();
+    assert!(matches!(error, Error::Busy), "{error:?}");
+    // Nothing was written: the ref is not there, and no changeset is.
+    let refs: i64 = store
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM refs", [], |row| row.get(0))?))
+        .unwrap();
+    assert_eq!(refs, 0);
+    let cs: i64 = store
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM changesets", [], |row| row.get(0))?))
+        .unwrap();
+    assert_eq!(cs, 0);
+}
+
+#[test]
+fn a_rolled_back_import_batch_verifies_again_when_it_reruns() {
+    let git = Git::init();
+    let rev = git.fast_commits(0, 40);
+    // A clean import of the same history checks every commit once; its walk
+    // count is what one pass over the plan costs.
+    let (_clean_dir, clean) = open_store();
+    make_repo(&clean);
+    let clean_report = try_import(&clean, &git, &rev).unwrap();
+    let one_pass = CHECKS.get();
+    CHECKS.with(|checks| checks.set(0));
+    // The retried import's batch runs whole, checks every commit, and its
+    // commit fails as busy. The retry runs the batch again, and the checker
+    // reset makes it verify from scratch: every committed changeset was
+    // checked by the transaction that stored it.
+    let (_dir, store) = open_store();
+    make_repo(&store);
+    store.fail_next_commits(1);
+    let report = try_import(&store, &git, &rev).unwrap();
+    assert_eq!((report.commits, report.imported), (40, 40));
+    assert_eq!(report.verified, clean_report.verified);
+    let walks = CHECKS.get();
+    assert_eq!(
+        walks,
+        2 * one_pass,
+        "the checks of the rolled-back batch ran again"
+    );
 }

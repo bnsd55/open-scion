@@ -77,6 +77,18 @@ How one request flows through the server:
    sees `CANCELLED` or `DEADLINE_EXCEEDED`.
 4. `error.rs` maps errors to gRPC codes. Database, I/O, git and corruption
    errors reply `INTERNAL`. The detail goes only to the server log.
+5. Each call runs in one tracing span that the server opens: the RPC and
+   the peer at the start, and the principal and the repo once the call
+   knows them (`caller()` records the principal, the access checks record
+   the repo). The refusals log one `WARN` line at the decision: a wrong
+   token, a repo that the caller may not read (the reply still says that
+   it does not exist), or a path or repo that it may not change. A
+   malformed request or a missing object logs nothing at `WARN`. A failure
+   keeps its detail in the log, inside the span, so that line carries the
+   RPC, the principal and the repo too. A reply that runs past its call
+   takes the span with it. A line never carries the token, not even its
+   digest. The store and its index sit below the repos, so their lines
+   name no repo.
 
 ## 2. Object model
 
@@ -782,20 +794,21 @@ care about history and blame only for commits on the main line.
 computed. These steps, the diff and the bounds below are this project's
 choices. For a file at a changeset:
 
-1. Read the file. A directory, a symlink, a submodule, or a file over 16 MiB
-   (`MAX_BLAME_BYTES`) or 1,048,576 lines (`MAX_BLAME_LINES`) is
-   `INVALID_ARGUMENT`. A binary file is blamed line by line, as `git blame`
-   does: git decides that a file is binary only to show diffs, and `git
-   blame` diffs it as text all the same.
+1. Read the file. A directory, a symlink, or a submodule is
+   `INVALID_ARGUMENT`. A file whose bytes do not fit the shared blame
+   memory budget (below) is `RESOURCE_EXHAUSTED`. A binary file is blamed
+   line by line, as `git blame` does: git decides that a file is binary
+   only to show diffs, and `git blame` diffs it as text all the same.
 2. Walk first parents to the next changeset C that changes the path. The
    older version is the file at the path in C's first parent. If no file is
    there (nothing, or a directory), it is the file that C renamed to the path,
    if any (below). Diff the older version with C's version, line by line. The
    lines that C added go to C. The other lines move to their place in the
    older version, at its path.
-3. Repeat from C's first parent until every line has a changeset. If there is
-   no older version, or it is over a limit of step 1, every line left goes
-   to C. So a file deleted and added again starts over, as in git.
+3. Repeat from C's first parent until every line has a changeset. If there
+   is no older version, or its bytes do not fit the budget left, every line
+   left goes to C. So a file deleted and added again starts over, as in
+   git.
 
 **Renames.** Blame follows a rename, as `git blame` does by default. Where C
 adds the path, the source is one of the files that C deletes. `Blame` and
@@ -845,31 +858,44 @@ histories where they agree: edits, merges, a file that becomes a directory
 and a file again, and renames for each rule above.
 
 **Bounds and resume.** A `Blame` call checks at most 1,000 changesets
-(`MAX_SCAN`) on its walk, and reads one changeset per check. It also
-diffs at most 100 versions, and about 1M lines (`MAX_BLAME_DIFF_LINES`,
-both sides of each diff). Every byte
-that blame reads counts against this budget, once per 64 bytes: a diffed
-line counts once per 64 bytes, a rename search counts each chunk it reads,
-each row of a chunk table it indexes or compares, and 64 for each file size
-it reads (`SIZE_COST`), and a file read and then refused for its lines
-counts its size. A version with the same content as the newer one (a mode
-change, or a rename with no edit) is not read and costs nothing. The first
-step of a call always runs, so a call always makes progress.
+(`MAX_SCAN`) on its walk, and reads one changeset per check. It also diffs
+at most 100 versions, and about 1M lines (`MAX_BLAME_DIFF_LINES`, both
+sides of each diff, a line counts once per 64 bytes; a rename search counts
+each chunk it reads, each row of a chunk table it indexes or compares, and
+64 for each file size it reads, `SIZE_COST`). A version with the same
+content as the newer one (a mode change, or a rename with no edit) is not
+read and costs nothing. The first step of a call always runs, so a call
+always makes progress.
+
+The memory of all `Blame` calls together holds 1 GiB
+(`BLAME_MEMORY_BUDGET`). A call takes from it the bytes of every version
+it reads, and 128 bytes per line of the blamed file (the answer's rows,
+and the state of one diff, measured at 78 bytes per line on a file of
+1,048,576 lines), for as long as the call runs. A call's first take may wait for another call to free bytes, until the
+call's 600 s deadline, then fails with `RESOURCE_EXHAUSTED`. Every later
+take of a call fails at once if the bytes are not free: a call that holds
+budget never waits for more, so two calls can never wait for each other
+with nobody able to finish. An older version whose
+bytes do not fit the whole budget counts as absent, so its lines go to the
+changeset that replaced it, and only its read cost counts (once per 64
+bytes, as before). A blamed file whose share (its bytes, and 128 bytes per
+line) is more than the whole budget is `RESOURCE_EXHAUSTED` at once: a
+file of 16-byte lines fits at about 7 lines per byte of budget, so a 1 GiB
+budget refuses a file above about 13 million such lines.
 
 A rename search uses the budget that the call has left, and checks it
 before each deleted file. Where the budget runs out, the call stops there.
-The reply names the changeset that adds the file, and where the search
-stopped: how many deleted files it looked at, in path order, and the most
-similar so far (`next_rename_searched`, `next_rename_best`). The next call
-reads that best file again and goes on with the next deleted file. So the
-answer is that of one search with no budget, and every deleted file is
-looked at, as in git. When the search is the first step of a call, it looks
-at one more deleted file even past the budget, so it always moves. The
-server checks the place it is sent: the count is at most the number of
-deleted files, and the best file is a deleted regular file before that
-count. A count of all the deleted files is a search that ended: the next
-call uses its best file and does not search again. The client must send
-the place back unchanged.
+The reply's cursor names the changeset that adds the file, and where the
+search stopped: how many deleted files it looked at, in path order, and the
+most similar so far. The next call reads that best file again and goes on
+with the next deleted file. So the answer is that of one search with no
+budget, and every deleted file is looked at, as in git. When the search is
+the first step of a call, it looks at one more deleted file even past the
+budget, so it always moves. The server checks the place it reads back from
+the cursor: the count is at most the number of deleted files, and the best
+file is a deleted regular file before that count. A count of all the
+deleted files is a search that ended: the next call uses its best file and
+does not search again. The client must send the cursor back unchanged.
 
 So a call reads about 64 MiB in the steps that fit in its budget, plus the
 blamed file, plus a few files past the budget. The first step, which always
@@ -887,18 +913,36 @@ release builds, that diff takes about 1.5 times as long as the worst diff
 under the old 1 MiB limit (a 1 MiB file of about 700,000 such lines). A
 rename search that reads 100 MiB takes about a tenth of the old worst diff,
 and one call now reads less than that, a 16 MiB file with one line changed about 1/100 of it, and 100
-mode changes of a 16 MiB file less than that. Memory per call is at most two
-versions of 16 MiB (two to diff, or one and a rename source), the chunk
-tables of two files, about 50 bytes per line of the blamed file, and the
-tables of one diff.
+mode changes of a 16 MiB file less than that. Memory per call is the bytes
+of the versions it holds (two to diff, or one and a rename source), the
+chunk tables of two files, and 128 bytes per line of the blamed file, all
+taken from the shared 1 GiB budget, plus the tables of one diff, which the
+budget takes per step and frees after it.
 
 At most 4 `Blame` calls run at once, so they never take more than 4 of the
-permits that writes and lands share. When a call stops at a bound,
-`next_changeset_id` names where to continue. In a `Blame` reply, the ranges
-left have no changeset, and `origin_line` gives their line in the file at `next_changeset_id` and
-`next_path`. The path differs from the blamed path when the walk followed a
-rename. A blame of `next_path` there continues the work exactly. `scn blame`
-asks again until it is done. Blame from the path history will remove these
+permits that writes and lands share, also while a call waits for its
+budget inside the job; a fifth blame waits for a slot in async code. When a call stops at a bound, its
+reply carries an opaque cursor (a `bytes` field) instead of single resume
+fields. It holds where the walk goes on (a changeset and path), where its
+rename search stopped, which lines of the file this call answered (a
+window of at most 1,048,576 lines, as runs of lines with the same
+changeset, or still open with their line in the version at the walk's
+position), and a digest of the repo, changeset and path of the request
+that made it. The changesets sit once in a table in the cursor, and a run
+names its index, so the worst window (its lines alternating between the
+100 changesets one call walks and open lines) measures about 4.2 MB. The
+client sends the cursor back unchanged with the same repo, changeset and
+path; anything else is `INVALID_ARGUMENT`. The server checks the version,
+the lengths, the digest, that every changeset the cursor names is one of
+the repo, that the runs fill the window, and that every open line's place
+is inside the version at the walk's position, and takes the cursor's bytes
+and state from the blame memory budget before it reads them. Each new
+window re-walks from the changeset of the request: the walk from the tip
+to where the cursor stopped costs one `MAX_SCAN` check per changeset, a
+few reads per changeset, and re-reads the versions' trees but not their
+file texts (the cursor carries the line state, so the call diffs only the
+versions of its window). `scn blame` asks again until the cursor is empty.
+Blame from the path history will remove these
 bounds ([#61](https://github.com/bnsd55/open-scion/issues/61)).
 
 **Graph and diff queries** (`read::merge_base`, `read::is_ancestor`,
@@ -1417,11 +1461,11 @@ an untrusted network.
 
 | Area | Today | Limit |
 |---|---|---|
-| Authentication | The server knows the principal of each of its tokens: `--token T` makes one principal, `default`, which may read and write every repo, and `--access FILE` maps the BLAKE3 digest of each token to a principal, with which repos it may read and which paths of a repo it may write (write implies read; a principal with no rule for a repo cannot see it, so every call answers `NOT_FOUND`, as for a repo that does not exist). The server and each tier compare BLAKE3 digests of the tokens in constant time, and `scion-server hash-token` prints the digest that an access file wants, so the file never holds a token. A tier sends its own token upstream. | A tier knows one token, so one principal upstream. `GetObjects` carries no token: its permission is the read ticket, which the walk of every serving tier checks (see "Read tickets" below). There are no per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). |
+| Authentication | The server knows the principal of each of its tokens: `--token T` makes one principal, `default`, which may read and write every repo, and `--access FILE` maps the BLAKE3 digest of each token to a principal, with which repos it may read and which paths of a repo it may write (write implies read; a principal with no rule for a repo cannot see it, so every call answers `NOT_FOUND`, as for a repo that does not exist). The server and each tier compare BLAKE3 digests of the tokens in constant time, and `scion-server hash-token` prints the digest that an access file wants, so the file never holds a token. A tier sends its own token upstream. | A tier knows one token, so one principal upstream. `GetObjects` carries no token: its permission is the read ticket, which the walk of every serving tier checks (see "Read tickets" below). Per-principal caps are on with `--access` (section 2 of protocol-v1); the request and upload-byte counts live in memory. |
 | Network | The server listens on `127.0.0.1:7878` and `scion-cache` on `127.0.0.1:7879` by default. A non-loopback address is refused unless `--insecure-listen` is given, or the process serves TLS (`--tls-cert` and `--tls-key`; a private CA is trusted by `scn` with `--tls-ca`). With `--tls-client-ca`, a tier must present a client certificate that CA signed. `scion-daemon` listens only on a Unix socket with mode 0600, in a directory that only its user can reach; it refuses any other. `scn` refuses a socket that another user owns. Both refuse a socket or data directory under a directory that another user can change: one that another user owns, or that group or others can write and has no sticky bit. | With TLS, the process trusts the server's certificate only if a CA is given; there are no public roots. Without TLS, the token and all data travel unencrypted: a bearer token over plain TCP to a non-loopback address stays refused. TLS certificates are not checked against hostnames beyond what the CA signs, and there is no revocation ([#14](https://github.com/bnsd55/open-scion/issues/14) tracks TLS; revocation has no issue). By choice, as OpenSSH's `StrictModes`, the directory checks refuse a group-writable directory (`chmod go-w` fixes it; with umask 002, new directories are group-writable), and read only the owner and the mode bits, not ACLs: an ACL that lets other users write a directory gets past them. |
 | Repo isolation | Every call first checks the caller's read rule for the repo, and a repo it may not read answers `NOT_FOUND`. Changesets and derived root trees are reached only through `repo_changesets`. A changeset names only blobs of its own repo (`repo_blobs`, section 5), so the path reads (`ReadFile`, `ListDir`, `Log`, `Blame`, `Diff`) reach only the repo's own content. Path history nodes are reached only through the derived value of a changeset that the repo has, and name only changesets on its first-parent history. No answer of the write calls shows whether another repo has a blob: `CreateChangeset` gives the error of content that no repo stored, before any file is read, and `PutBlob` of such content takes the same write path as for new content. Two leaks stay: the rename frees the old file, and the page cache makes a shared blob fast. | `GetObjects` reads only what a read ticket's walk reaches; see "Read tickets" below. |
 | Lands | `GetLand` and request keys are scoped by the caller's principal: two tokens of one principal share a scope, and the retry of a land finds the outcome of its request key. | With `--token`, every caller is the same principal, `default`, so all callers share one scope. |
-| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 1 MiB plus 1 KiB: one part of an object), blobs up to 100 MiB, 16 uploads at once (each holds one message in memory), 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget and `ReadFile` replies a 256 MiB budget. A reply of either whose client stops reading ends after 120 s. Every receiver of an object unpacks it within the size its first part gives, at most 100 MiB, with a zstd window of at most 8 MiB, and accepts only plain Zstandard frames (no skippable or legacy frames, no dictionary). The zstd library is built without its legacy decoders. Names of 1 to 256 bytes with no control characters. The path indexes of all refs hold at most 128 MiB together. A `Log` reply holds at most 1,000 entries, and with a path it reads about 64 MiB of path history at most; a `Blame` call checks at most 1,000 changesets; `Blame` reads files of at most 16 MiB and 1,048,576 lines, diffs at most 100 versions and about 1M lines (a line counts once per 64 bytes), compares at most 100 deleted files and about 100 MiB to find a rename, and at most 4 run at once. At most 4 `MergeBase`, `IsAncestor` and `Log` calls with a path run at once, each until its 600 s deadline; a `Diff` reply holds at most 1,000 paths. The server and each tier serve at most 128 connections at once (`--max-connections`), each with at most 256 open streams (`--max-streams`); a client beyond either waits. A connection closes 20 s after it gets its place if no HTTP/2 preface came; after the preface, 20 s after an unanswered ping, which goes out after 60 s without a frame; and in any case 10 min after it was asked to close at 30 min of age. So a connection beyond the cap waits at most 40 min. | No per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)). Finished `lands` rows expire after 7 days, pending ones stay (section 5). A reply whose client stops reading keeps memory that no budget counts, until its stream ends or its connection closes: a `GetObjects` or `ReadFile` reply three parts (in its channel, read ahead by hyper, in the h2 send buffer) plus up to 400 KiB more of h2 send buffer, under 4 MiB; a unary reply its whole message, up to 64 MiB. A reply that stalls adds what it leaves in HTTP/2, under 4 MiB, to a count of its connection, and a connection whose stalled replies hold more than 64 MiB together (`--max-stalled-bytes`) is closed with them: hyper cannot reset one stalled stream, so the connection is the unit of accounting. So the ceiling is connections x 64 MiB for streamed replies, 8 GiB at the defaults, and a unary reply that its client never reads is not counted (hyper gives the server no hook that sees it stall): connections x streams x 64 MiB = 2 TiB. What a dead peer holds is freed within 80 s of its last frame (keepalive), or within 20 s if it never sent the preface. A live client that stops reading keeps the rest until its connection is closed at 40 min of age. |
+| Input limits | Strict, fuzzed decoder. Messages up to 64 MiB (a `GetObjects` reply message up to 1 MiB plus 1 KiB: one part of an object), blobs up to 100 MiB, 16 uploads at once (each holds one message in memory), 1,000 objects per `GetObjects` call. `GetObjects` replies share a 400 MiB budget and `ReadFile` replies a 256 MiB budget. A reply of either whose client stops reading ends after 120 s. Every receiver of an object unpacks it within the size its first part gives, at most 100 MiB, with a zstd window of at most 8 MiB, and accepts only plain Zstandard frames (no skippable or legacy frames, no dictionary). The zstd library is built without its legacy decoders. Names of 1 to 256 bytes with no control characters. The path indexes of all refs hold at most 128 MiB together. A `Log` reply holds at most 1,000 entries, and with a path it reads about 64 MiB of path history at most; a `Blame` call checks at most 1,000 changesets; `Blame` diffs at most 100 versions and about 1M lines (a line counts once per 64 bytes), compares at most 100 deleted files and about 100 MiB to find a rename, and at most 4 run at once, sharing a 1 GiB memory budget (128 bytes per line of the blamed file, plus the bytes of every version read). At most 4 `MergeBase`, `IsAncestor` and `Log` calls with a path run at once, each until its 600 s deadline; a `Diff` reply holds at most 1,000 paths. The server and each tier serve at most 128 connections at once (`--max-connections`), each with at most 256 open streams (`--max-streams`); a client beyond either waits. A connection closes 20 s after it gets its place if no HTTP/2 preface came; after the preface, 20 s after an unanswered ping, which goes out after 60 s without a frame; and in any case 10 min after it was asked to close at 30 min of age. So a connection beyond the cap waits at most 40 min. | Per-principal caps are on with `--access` (section 2 of protocol-v1); the request and upload-byte counts live in memory. Finished `lands` rows expire after 7 days, pending ones stay (section 5). A reply whose client stops reading keeps memory that no budget counts, until its stream ends or its connection closes: a `GetObjects` or `ReadFile` reply three parts (in its channel, read ahead by hyper, in the h2 send buffer) plus up to 400 KiB more of h2 send buffer, under 4 MiB; a unary reply its whole message, up to 64 MiB. A reply that stalls adds what it leaves in HTTP/2, under 4 MiB, to a count of its connection, and a connection whose stalled replies hold more than 64 MiB together (`--max-stalled-bytes`) is closed with them: hyper cannot reset one stalled stream, so the connection is the unit of accounting. So the ceiling is connections x 64 MiB for streamed replies, 8 GiB at the defaults, and a unary reply that its client never reads is not counted (hyper gives the server no hook that sees it stall): connections x streams x 64 MiB = 2 TiB. What a dead peer holds is freed within 80 s of its last frame (keepalive), or within 20 s if it never sent the preface. A live client that stops reading keeps the rest until its connection is closed at 40 min of age. |
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. Each tier also checks every object from upstream before it stores or sends it, and the daemon checks each object again when it reads it from disk. The server sends a blob's zstd file without unpacking it, so the receiver finds a damaged file. | The client resolves its ref and reads its root tree on the server, so no tier passes on a `ResolveRef` or `GetRootTree` answer: they are `UNIMPLEMENTED` on a tier. The read ticket binds the walk to the root tree that the server signed, so a tier cannot name another one. |
 | Checkout | `scn checkout` writes into a private temp directory with a random name. It renames it onto a new destination, or moves its entries up into an existing empty directory that the user owns, never over an entry already there. It never follows a symlink while writing or removing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure, or on SIGINT, SIGTERM or SIGHUP, the destination stays as it was. | The directory that gets the checkout (an existing destination, or a new one's parent) must not be writable by all users, unless it has the sticky bit: they could swap parts of the checkout. An existing destination that breaks this is refused. Members of a group that can write it are trusted. Where the filesystem has no rename that never replaces (NFS), any empty mode 0700 directory of the user at a top-level directory name counts as the checkout's claim after `mkdirat` fails with `EEXIST`, and is replaced. Where it has no hard links either (some FUSE filesystems), any symlink of the user with the same target at a top-level symlink name counts as made after `symlinkat` fails with `EEXIST`, and is kept. This is for a lost NFS version 3 reply, but a trusted user (the owner, a group member, root) can also put such an entry there: it is taken, and no data is lost. A filesystem that shows one owner for every entry (a FUSE or SMB mount with `-o uid=`) passes every ownership check. In the temp directory, an entry found after `EEXIST` that is what the call makes counts as made, unless a recorded path in the same directory has its inode. A filesystem that folds names but shows another inode number under each name (CIFS with `noserverino`, FUSE without `use_ino`) would let such a fold through only for two empty files or two symlinks with one target: the two paths then share one entry, with the same content. A folded directory always fails: each directory that the checkout made already holds an entry. The check reads only the mode bits, not ACLs: an ACL that lets other users add or delete entries gets past it. No Windows rules: Windows is unsupported, so device names and names that end
 | Cache tiers | A tier refuses every call but `GetObjects` with `UNIMPLEMENTED`, and `GetObjects` serves only what the read ticket's walk reaches (see "Read tickets" below). A snapshot file (`--snapshot`) holds whole objects of the repos named, and whoever can read the file can read them. | The file is mode 0600 in a directory made with mode 0700, but a node gets it by any copy tool or a shared mount: give a node only snapshots of repos that all its users may read. |
@@ -1477,13 +1521,13 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | Per-ref serialization in a shared database ([design](design/scalable-backend.md)). | [#47](https://github.com/bnsd55/open-scion/issues/47) |
 | `scion-server/src/objects.rs` (`find`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
 | `scion-server/src/read.rs` (`MAX_SCAN`) | Blame walks first parents on every call, at most 1,000 changesets per call. A file changed long ago costs many calls. | Blame from the path history. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
-| `scion-server/src/tree.rs` (`Dir::store`), `scion-server/src/history.rs` (`put_node`) | A change rewrites each directory on its paths whole: a tree of every live name, a history node of every name the directory ever had. With names of 12 bytes, a write in a directory of 10,000 names stores 500 KB of tree and 630 KB of history. | Nodes cut into chunks, so a write stores only the chunks it changes. Trees need a new format for it. | [#114](https://github.com/bnsd55/open-scion/issues/114) |
+| `scion-server/src/tree.rs` (`Dir::store`) | A change rewrites each directory on its paths whole: a tree of every live name. With names of 12 bytes, a write in a directory of 10,000 names stores 500 KB of tree. | Trees cut into chunks, so a write stores only the chunks it changes. Trees need a new format for it. | [#114](https://github.com/bnsd55/open-scion/issues/114) |
+| `scion-server/src/history.rs` (`Edit::stored`) | An edit of a chunked level holds and re-encodes the whole chunk index of the level, so a write re-stores the index row that changed: about 32 KB at 100,000 names, about 2.7 MB at 10M. | Keep the index stacked in the edit, and edit one index chunk per level of the stack. | [#114](https://github.com/bnsd55/open-scion/issues/114) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_VERSIONS`) | One call diffs at most 100 versions of a file. A file with more versions costs more calls. | Blame as derived data, kept per file version. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_DIFF_LINES`) | One call diffs about 1M lines, and a long line counts once per 64 bytes. A diff of many repeated lines grows faster than its lines, so one diff of two files of 1,048,576 lines is the worst case of a call. A rename search shares the budget and goes on over calls, so a changeset that deletes many large files costs one call per about 64 MiB of them. | Blame from derived data, so a call does not diff whole versions, and an index of each changeset's deleted files by chunk, so a search reads only files that share chunks with the new file. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
-| `scion-server/src/blame.rs` (`MAX_BLAME_BYTES`) | A file over 16 MiB is refused. An older version over the limit counts as absent, so its lines go to the changeset that replaced it. `git blame` reads any size. | Blame from derived data, so a call does not read whole versions. | [#90](https://github.com/bnsd55/open-scion/issues/90) |
-| `scion-server/src/blame.rs` (`MAX_BLAME_LINES`) | A file with more than 1,048,576 lines is refused, and an older version with more counts as absent. `git blame` reads any number. | Blame from derived data, and a reply that a client asks for in parts. | [#90](https://github.com/bnsd55/open-scion/issues/90) |
 | `scion-tier/src/lib.rs` (`produce`) | Two blocking hops per hit (size, then read) and no read-ahead, as on the server. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
 | `scion-tier/src/lib.rs` (`produce`) | A daemon checks no ticket and runs no walk: it forwards the ticket and paths upstream, whose check and walk keep unproven reads out. Safe only while one daemon serves one OS user over its 0600 socket in a private directory; that user can read the daemon's store files anyway. | A daemon that serves several OS users must check tickets and walk, like a cache. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
+| `scion-server/src/quotas.rs` (`Quotas`) | The request and upload-byte caps live in memory, so a restart forgets them; only the pending-lands cap counts rows of the store. A restart also frees every count. | Count the in-flight work in the store, or share the counts across processes. | [#15](https://github.com/bnsd55/open-scion/issues/15) |
 | `scn/src/client.rs` (`lossy`) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | Escape or base64 raw bytes in JSON. | |
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |
 | `scn/src/cmd/commit.rs` (`commit`) | The author time zone is always UTC. | A time zone crate. | |

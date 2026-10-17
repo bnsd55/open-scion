@@ -25,13 +25,16 @@ use scion_proto::v1::{
 use scion_proto::{Bytes, CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_PART_MESSAGE_BYTES};
 use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
+use tracing::Instrument as _;
 
 use crate::access::Access;
 use crate::error::{Error, Result};
+use crate::meta::MetaTx as _;
+use crate::quotas::Quotas;
+use crate::read;
 use crate::service::{Worker, check_reader, parse_id, resolve_ref};
 use crate::store::{self, Store};
 use crate::tickets::Keys;
-use crate::{db, read};
 
 // The store keeps exactly the objects that the API promises to send.
 const _: () = assert!(store::MAX_OBJECT_BYTES == scion_proto::MAX_OBJECT_BYTES);
@@ -68,6 +71,8 @@ impl Plan {
 pub struct ObjectsService {
     worker: Worker,
     access: Arc<Access>,
+    /// What one principal may hold at once.
+    quotas: Quotas,
     /// The tokens of the server: every call of this service but
     /// `GetObjects` needs one. An object read's permission is its ticket.
     auth: Auth,
@@ -79,11 +84,17 @@ pub struct ObjectsService {
 }
 
 impl ObjectsService {
-    pub(crate) fn new(worker: Worker, access: Arc<Access>, tickets: Option<Arc<Keys>>) -> Self {
+    pub(crate) fn new(
+        worker: Worker,
+        access: Arc<Access>,
+        quotas: Quotas,
+        tickets: Option<Arc<Keys>>,
+    ) -> Self {
         Self {
             worker,
             auth: access.auth(),
             access,
+            quotas,
             tickets,
             in_flight: Arc::new(Semaphore::new(IN_FLIGHT_BYTES)),
         }
@@ -126,7 +137,7 @@ fn plan(store: &Store, key: Key, allowed: &HashSet<Key>, zstd: bool) -> Result<P
     };
     let id = match key {
         Key::Tree(id) => {
-            let size = store.read(|c| db::tree_size(c, id))?;
+            let size = store.read(|c| c.tree_size(id))?;
             if size > store::MAX_OBJECT_BYTES {
                 return corrupt("larger than the object limit");
             }
@@ -159,7 +170,7 @@ fn plan(store: &Store, key: Key, allowed: &HashSet<Key>, zstd: bool) -> Result<P
 fn read_object(store: &Store, key: Key, plan: Plan) -> Result<Outgoing> {
     let (kind, id, body) = match key {
         Key::Tree(id) => {
-            let data = store.read(|c| db::get_tree_body(c, id))?;
+            let data = store.read(|c| c.get_tree_body(id))?;
             (
                 ObjectKind::Tree,
                 *id.as_bytes(),
@@ -220,24 +231,35 @@ const WAITS: Waits = Waits {
     until: Until::NONE,
 };
 
-/// object. That comes before the caller's deadline, so the caller gets this
-/// status, not a timeout of its own. `stalled` is the handle of the
-/// connection, which counts what a stalled reply leaves in HTTP/2.
-/// The waits are the caller's budget and the deadlines of its waits, and
-/// `decoded` is the memory the trees of the ticket's walk decoded; the
-/// reply needs every part of it, hence the argument count.
-#[allow(clippy::too_many_arguments)]
+/// What one `GetObjects` reply runs with, fixed when it starts. A wait for
+/// room ends before the caller's deadline, so the caller gets that status,
+/// not a timeout of its own.
+struct Reply {
+    /// The share of `IN_FLIGHT_BYTES` that all replies share.
+    in_flight: Arc<Semaphore>,
+    waits: Waits,
+    /// The handle of the caller's connection: the reply counts what it
+    /// leaves in HTTP/2 on it.
+    stalled: Option<scion_proto::listen::Stalled>,
+}
+
+/// Streams `keys`: the first object here, the rest from the producer task.
+/// `decoded` is the memory that the trees of the ticket's walk decoded; the
+/// reply takes its share of the budget for it, held to the stream's end.
 async fn start_reply(
     worker: Worker,
     keys: Vec<Key>,
     allowed: HashSet<Key>,
-    in_flight: Arc<Semaphore>,
-    waits: Waits,
+    reply: Reply,
     read: Read,
     zstd: bool,
-    stalled: Option<scion_proto::listen::Stalled>,
     decoded: usize,
 ) -> Result<ObjectStream, Status> {
+    let Reply {
+        in_flight,
+        waits,
+        stalled,
+    } = reply;
     let mut rest = keys.into_iter();
     let Some(key) = rest.next() else {
         return Err(Status::invalid_argument("a call names at least one object"));
@@ -259,22 +281,26 @@ async fn start_reply(
         .await
         .ok_or_else(reply::busy)?;
     let (tx, stream) = reply::channel();
-    tokio::spawn(async move {
-        let _walk_share = walk_share;
-        let (worker, in_flight) = (&worker, &in_flight);
-        let produce = |key| {
-            find(
-                worker,
-                in_flight,
-                waits.until.wait(waits.busy),
-                read,
-                &allowed,
-                zstd,
-                key,
-            )
-        };
-        reply::send_objects(first, rest, tx, waits.stall, stalled, produce).await;
-    });
+    tokio::spawn(
+        async move {
+            let _walk_share = walk_share;
+            let (worker, in_flight) = (&worker, &in_flight);
+            let produce = |key| {
+                find(
+                    worker,
+                    in_flight,
+                    waits.until.wait(waits.busy),
+                    read,
+                    &allowed,
+                    zstd,
+                    key,
+                )
+            };
+            reply::send_objects(first, rest, tx, waits.stall, stalled, produce).await;
+        }
+        // The reply runs outside the call, but stays in its span.
+        .instrument(tracing::Span::current()),
+    );
     Ok(stream)
 }
 
@@ -317,9 +343,11 @@ impl Objects for ObjectsService {
         &self,
         mut request: Request<ResolveRefRequest>,
     ) -> Result<Response<ResolveRefResponse>, Status> {
+        // No interceptor on this service: `GetObjects` has none, and the
+        // service's token-checked calls name their caller themselves.
         let caller = self.auth.caller_of(&request)?;
         request.extensions_mut().insert(caller);
-        resolve_ref(&self.worker, &self.access, request)
+        resolve_ref(&self.worker, &self.access, &self.quotas, request)
             .await
             .map(Response::new)
     }
@@ -329,6 +357,7 @@ impl Objects for ObjectsService {
         request: Request<GetRootTreeRequest>,
     ) -> Result<Response<GetRootTreeResponse>, Status> {
         let caller = self.auth.caller_of(&request)?;
+        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let GetRootTreeRequest { repo, changeset_id } = request.into_inner();
         check_reader(&self.access, &caller, &repo)?;
         let cs = parse_id(&changeset_id, "changeset_id")?;
@@ -359,9 +388,8 @@ impl Objects for ObjectsService {
         &self,
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<Self::GetObjectsStream>, Status> {
-        // No caller here: the ticket is the only permission of an object
-        // read, and the token interceptor has already authenticated the
-        // connection.
+        // No caller and no quota slot here: the ticket is the only
+        // permission of an object read.
         let waits = Waits {
             until: Until::of(&request),
             ..WAITS
@@ -406,15 +434,19 @@ impl Objects for ObjectsService {
             })
             .await?;
         let in_flight = Arc::clone(&self.in_flight);
+        // The reply runs to the stream's end, not to this handler's return:
+        // its work goes on in the producer task.
         let stream = start_reply(
             self.worker.clone(),
             keys,
             allowed,
-            in_flight,
-            waits,
+            Reply {
+                in_flight,
+                waits,
+                stalled,
+            },
             read_object,
             zstd,
-            stalled,
             decoded,
         );
         Ok(Response::new(stream.await?))
@@ -432,7 +464,7 @@ fn prove(store: &Store, root: [u8; 32], refs: &[(Key, Vec<u8>)]) -> Result<(Hash
         let mut reader = |id: [u8; 32]| {
             // The walk only hands back the 32 bytes it got from a tree.
             let id = TreeId::try_from(id.as_slice()).expect("a walk names a tree id");
-            match db::get_tree_body(c, id) {
+            match c.get_tree_body(id) {
                 Ok(bytes) => Ok(Some(bytes)),
                 Err(Error::NotFound(_)) => Ok(None),
                 Err(why) => Err(why),
@@ -527,11 +559,13 @@ mod tests {
             Worker::new(store),
             keys.clone(),
             keys.iter().copied().collect(),
-            Arc::clone(&in_flight),
-            waits(stall),
+            Reply {
+                in_flight: Arc::clone(&in_flight),
+                waits: waits(stall),
+                stalled: None,
+            },
             read_object,
             true,
-            None,
             0,
         );
         let mut stream = reply.await.unwrap();
@@ -567,11 +601,13 @@ mod tests {
                 worker.clone(),
                 vec![a],
                 HashSet::from([a]),
-                Arc::clone(&in_flight),
-                wait,
+                Reply {
+                    in_flight: Arc::clone(&in_flight),
+                    waits: wait,
+                    stalled: None,
+                },
                 counted,
                 true,
-                None,
                 0,
             );
             tokio::time::timeout(Duration::from_secs(10), reply)
@@ -605,11 +641,13 @@ mod tests {
                 worker.clone(),
                 vec![a],
                 HashSet::from([a]),
-                Arc::clone(&in_flight),
-                waits(Duration::from_millis(100)),
+                Reply {
+                    in_flight: Arc::clone(&in_flight),
+                    waits: waits(Duration::from_millis(100)),
+                    stalled: None,
+                },
                 read_object,
                 true,
-                None,
                 decoded,
             );
             tokio::time::timeout(Duration::from_secs(10), reply)
@@ -643,11 +681,13 @@ mod tests {
             Worker::new(store),
             vec![a],
             HashSet::from([a]),
-            in_flight,
-            waits,
+            Reply {
+                in_flight,
+                waits,
+                stalled: None,
+            },
             read_object,
             true,
-            None,
             0,
         );
         let status = tokio::time::timeout(Duration::from_secs(5), reply)
@@ -677,11 +717,13 @@ mod tests {
             Worker::new(store),
             vec![key],
             HashSet::from([key]),
-            Arc::clone(&in_flight),
-            WAITS,
+            Reply {
+                in_flight: Arc::clone(&in_flight),
+                waits: WAITS,
+                stalled: None,
+            },
             watched,
             false,
-            None,
             0,
         );
         let objects = collect(reply.await.unwrap(), false).await;
@@ -742,11 +784,13 @@ mod tests {
                 worker.clone(),
                 keys,
                 HashSet::from([Key::Blob(id)]),
-                Arc::clone(&in_flight),
-                WAITS,
+                Reply {
+                    in_flight: Arc::clone(&in_flight),
+                    waits: WAITS,
+                    stalled: None,
+                },
                 read_object,
                 zstd,
-                None,
                 0,
             );
             async move { collect(reply.await.unwrap(), zstd).await }
