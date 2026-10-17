@@ -107,6 +107,18 @@ jobs:
           SCION_LAZYFS: ${{ runner.temp }}/lazyfs
         run: cargo test -p open-scion-server --test power
 
+  publish-check:
+    name: publish check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # One invocation, in dependency order: cargo resolves a packaged
+      # crate's path dependencies from the siblings of the same run, so a
+      # split run fails on the first unpublished dependency.
+      - run: cargo package -p open-scion-core -p open-scion-proto -p open-scion-server -p open-scion-tier -p open-scion --no-verify
+
   msrv:
     name: check (MSRV)
     runs-on: ubuntu-latest
