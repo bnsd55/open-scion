@@ -286,7 +286,7 @@ pub fn id_from<T: for<'a> TryFrom<&'a [u8]>>(bytes: &[u8]) -> Result<T> {
 }
 
 /// Splits `REV:PATH` into its parts. The path is optional.
-pub fn split_spec(spec: &str) -> Result<(&str, Option<RepoPath>)> {
+pub(crate) fn split_spec(spec: &str) -> Result<(&str, Option<RepoPath>)> {
     match spec.split_once(':') {
         None => Ok((spec, None)),
         Some((rev, "")) => Ok((rev, None)),
@@ -305,12 +305,12 @@ pub fn parse_repo_path(path: &str) -> Result<RepoPath> {
 /// Raw bytes as text for display.
 // SHORTCUT: lossy, also in JSON output, so non-UTF-8 names and messages print
 // with replacement characters. Upgrade: escape or base64 raw bytes in JSON.
-pub fn lossy(bytes: &[u8]) -> Cow<'_, str> {
+pub(crate) fn lossy(bytes: &[u8]) -> Cow<'_, str> {
     String::from_utf8_lossy(bytes)
 }
 
 /// Seconds since the Unix epoch.
-pub fn now_unix_secs() -> Result<i64> {
+pub(crate) fn now_unix_secs() -> Result<i64> {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("the system clock is before 1970")?
