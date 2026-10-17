@@ -15,12 +15,18 @@ fn documents() -> Vec<PathBuf> {
         .iter()
         .map(|name| Path::new(ROOT).join(name))
         .collect();
-    let docs = Path::new(ROOT).join("docs");
-    let mut listed: Vec<PathBuf> = fs::read_dir(docs)
-        .expect("docs/ exists")
-        .map(|entry| entry.expect("a docs entry").path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
-        .collect();
+    let mut stack = vec![PathBuf::from(ROOT).join("docs")];
+    let mut listed: Vec<PathBuf> = Vec::new();
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("docs/ exists") {
+            let path = entry.expect("a docs entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "md") {
+                listed.push(path);
+            }
+        }
+    }
     listed.sort();
     files.append(&mut listed);
     files
@@ -93,10 +99,8 @@ fn slug(text: &str) -> String {
 /// One inline link's target, or a reference definition's target.
 fn targets(markdown: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
-    let bytes = markdown.as_bytes();
     let mut in_fence = false;
-    for (i, line) in markdown.lines().enumerate() {
-        let _ = i;
+    for line in markdown.lines() {
         if line.trim_start().starts_with("```") {
             in_fence = !in_fence;
             continue;
@@ -136,18 +140,17 @@ fn targets(markdown: &str) -> Vec<String> {
                 }
             }
         }
-        let _ = bytes;
     }
     found
 }
 
-#[test]
-fn every_markdown_link_resolves() {
-    let root = Path::new(ROOT);
+/// The links of `documents` (absolute paths) that do not resolve, against
+/// the repo at `root`. `checked` counts the links the checker looked at.
+fn broken_links(documents: &[PathBuf], root: &Path) -> (Vec<String>, usize) {
     let mut broken: Vec<String> = Vec::new();
     let mut checked = 0usize;
-    for document in documents() {
-        let markdown = fs::read_to_string(&document)
+    for document in documents {
+        let markdown = fs::read_to_string(document)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", document.display()));
         let dir = document.parent().expect("a document has a parent");
         for target in targets(&markdown) {
@@ -179,6 +182,7 @@ fn every_markdown_link_resolves() {
                 ));
                 continue;
             }
+
             let Some(anchor) = anchor else { continue };
             let text = fs::read_to_string(&resolved)
                 .unwrap_or_else(|e| panic!("cannot read {}: {e}", resolved.display()));
@@ -193,6 +197,13 @@ fn every_markdown_link_resolves() {
             }
         }
     }
+    (broken, checked)
+}
+
+#[test]
+fn every_markdown_link_resolves() {
+    let root = Path::new(ROOT);
+    let (broken, checked) = broken_links(&documents(), root);
     assert!(checked > 0, "the documents hold links");
     assert!(
         broken.is_empty(),
@@ -200,4 +211,53 @@ fn every_markdown_link_resolves() {
         broken.len(),
         broken.join("\n")
     );
+}
+
+#[test]
+fn a_broken_link_is_reported() {
+    // One tree: `a.md` links to a file that is not there, and to a heading
+    // that `b.md` does not have. The checker must name both.
+    let root = tempfile::tempdir().expect("a temp tree");
+    fs::write(
+        root.path().join("a.md"),
+        "[file](missing.md)\n[anchor](b.md#no)\n",
+    )
+    .unwrap();
+    fs::write(root.path().join("b.md"), "# Real\n").unwrap();
+    let documents = vec![root.path().join("a.md"), root.path().join("b.md")];
+    let (broken, checked) = broken_links(&documents, root.path());
+    assert_eq!(checked, 2);
+    assert_eq!(broken.len(), 2, "{}", broken.join("\n"));
+    assert!(broken[0].contains("a.md -> missing.md (no file)"));
+    assert!(broken[1].contains("b.md#no"));
+}
+
+#[cfg(test)]
+mod checker {
+    use super::{slug, targets};
+
+    #[test]
+    fn a_slug_follows_the_github_rules() {
+        assert_eq!(slug("6. What to watch"), "6-what-to-watch");
+        // Punctuation and formatting drop; digits, letters, `-` and `_` stay.
+        // Each space maps to one hyphen, and a kept hyphen stays.
+        assert_eq!(slug("The `Meta` trait (v1)"), "the-meta-trait-v1");
+        assert_eq!(slug("server --data <dir>"), "server---data-dir");
+        assert_eq!(slug("todo"), "todo");
+    }
+
+    #[test]
+    fn a_duplicate_heading_takes_the_next_suffix() {
+        // The test's own list holds duplicates of one heading, so its second
+        // occurrence is what GitHub renders as `x-1`.
+        let first = slug("Blobs");
+        assert_eq!(first, "blobs");
+        assert_eq!(format!("{first}-1"), "blobs-1");
+    }
+
+    #[test]
+    fn targets_finds_inline_and_reference_links() {
+        let markdown = "[a](b.md) ![img](c.png \"t\")\n\n[d]: e.md#f\n";
+        assert_eq!(targets(markdown), vec!["b.md", "c.png \"t\"", "e.md#f"]);
+    }
 }
