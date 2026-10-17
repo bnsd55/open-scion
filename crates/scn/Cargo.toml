@@ -33,6 +33,8 @@ rcgen.workspace = true
 open-scion-server.workspace = true
 open-scion-tier.workspace = true
 tempfile.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 zstd.workspace = true
 
 [lints]
