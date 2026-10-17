@@ -57,7 +57,7 @@ services:
       - --ticket-public-key
       - ${SCION_TICKET_PUB:-}
     volumes:
-      - ./certs:/certs:ro
+      - demo-certs:/certs:ro
     depends_on:
       - server
 
