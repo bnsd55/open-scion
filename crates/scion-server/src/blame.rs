@@ -1180,6 +1180,29 @@ pub fn decode_cursor(
         }
         table.push(id);
     }
+    let window = decode_window(&mut r, &table, run_count, open)?;
+    r.finish()?;
+    let resume = Resume {
+        next,
+        search: RenameSearch { searched, best },
+        after_line,
+        counted,
+        window,
+    };
+    Ok((resume, hold))
+}
+
+/// The window's lines from the `run_count` runs that follow the table:
+/// a run of unnamed lines, each with its place in the version at `next`,
+/// or one named by its place in the table. The runs must fill the window
+/// exactly, and claim no more lines than a word holds.
+fn decode_window(
+    r: &mut CursorReader<'_>,
+    table: &[ChangesetId],
+    run_count: u32,
+    open: usize,
+) -> Result<Vec<Line>> {
+    let bad = |why: &str| Error::InvalidArgument(format!("bad blame cursor: {why}"));
     let mut window = Vec::with_capacity(open);
     let mut total = 0usize;
     for _ in 0..run_count {
@@ -1189,7 +1212,11 @@ pub fn decode_cursor(
             return Err(bad("bad line kind"));
         }
         let len = usize::try_from(len).map_err(|_| bad("a run is too long"))?;
-        total += len;
+        // A run may claim more lines than a word holds: the window bound,
+        // not a wrapped total, must decide what the cursor names.
+        total = total
+            .checked_add(len)
+            .ok_or_else(|| bad("the cursor's lines fill more than its window"))?;
         if total > open {
             return Err(bad("the cursor's lines fill more than its window"));
         }
@@ -1212,15 +1239,7 @@ pub fn decode_cursor(
     if total != open {
         return Err(bad("the cursor's lines do not fill its window"));
     }
-    r.finish()?;
-    let resume = Resume {
-        next,
-        search: RenameSearch { searched, best },
-        after_line,
-        counted,
-        window,
-    };
-    Ok((resume, hold))
+    Ok(window)
 }
 
 /// Reads a cursor from the front of its bytes.

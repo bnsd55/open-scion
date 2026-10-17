@@ -116,6 +116,42 @@ or rotate the ticket key (`--ticket-key`) to cut them off at once. Objects
 already on a user's daemon are out of reach of both; give a daemon only
 repos all its users may read whole.
 
+### Folder read rules
+
+A `read` or `write` rule may name a path prefix as its fourth field, by
+path parts: `read alice main src` lets alice read `src` and below
+(`src/a` yes, `srcx` no), and nothing else of that repo. No prefix means
+the whole repo. A write rule needs a whole-repo read rule — no blind
+writes — and a file that gives a partial reader (one whose read rules are
+all prefixes) a write rule is refused at load. The server derives each
+principal's canonical prefixes into a rule-set digest, which keys the
+derived view data; a repo holds at most 32 distinct rule sets, a set at
+most 256 prefixes, and an access file over either cap is refused at load.
+
+A partial reader reads the repo through its *view*: the real trees with
+every entry outside its prefixes removed. `ResolveRef` answers the ref's
+real changeset; `GetRootTree` answers the view root, with a read ticket
+bound to it; `ListDir`, `ReadFile` and `GetObjects` serve from that view,
+and a path outside the prefixes answers `NOT_FOUND`, the same as a
+missing one, with no hint that it is hidden. The history and query calls
+(`GetChangeset`, `Log`, `Blame`, `MergeBase`, `IsAncestor`, `Diff`) answer
+`UNIMPLEMENTED` for a partial reader, one uniform answer on every call.
+The first read of a rule set walks the real tree to derive the view, so
+its latency varies with the repo; later reads of the same rule set and
+changeset find the derived view.
+
+Narrowing a principal's rules takes the same path as any access-file
+change: rewrite the file and restart. A ticket signed under the wider
+rules keeps working for its whole life, up to 15 minutes — wait it out,
+or rotate the ticket key (section 2) to cut the old tickets off at once.
+Objects a user already pulled to their daemon are outside the server's
+reach either way.
+
+Snapshots interact with the rules: a snapshot holds every object of its
+repo by ID, so a daemon seeded from one serves paths that folder read
+rules hide. Snapshot only repos that all of a node's users may read whole
+(see "Server, cache, and a daemon per user").
+
 ### Network and TLS
 
 The server and the cache refuse a non-loopback address unless they serve TLS

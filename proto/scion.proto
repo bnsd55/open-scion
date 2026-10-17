@@ -46,8 +46,10 @@ service Scion {
   // next_changeset_id is where the next call starts.
   rpc Log(LogRequest) returns (stream LogResponse);
   // Which changeset last changed each line of a file, on first-parent
-  // history.
-  rpc Blame(BlameRequest) returns (BlameResponse);
+  // history. Streams the reply in parts, as Log streams its entries: each
+  // part is a group of ranges with the changesets they name, and the last
+  // part's next_cursor is where the next call starts.
+  rpc Blame(BlameRequest) returns (stream BlameResponse);
 
   // Queries on the changeset graph and on snapshots. Each call has a bound
   // on its work.
@@ -227,18 +229,22 @@ message BlameRequest {
 }
 
 message BlameResponse {
+  // One part of a streamed reply. A part holds a group of ranges, with the
+  // changesets its ranges name that no earlier part carried. A client
+  // joins the parts' ranges in order and unions the changesets by ID.
   // Line ranges in file order. Together they cover the lines of the
   // window this call answered, from after_line to its end, once each.
   repeated BlameRange ranges = 1;
   // The author of each changeset that a range names, once each.
   repeated BlameChangeset changesets = 2;
-  // Set when more lines are left to blame: the lines after this call's
-  // window, or the rest of this window when the call stopped at a bound.
-  // The ranges without a changeset came from the changeset in the cursor
-  // or an older one. The client MUST send next_cursor back unchanged, with
-  // the same repo, changeset_id and path, to get the next part. Empty when
-  // the blame is done. Opaque: the server decodes it, and a cursor that
-  // was not made for this repo, changeset and path is refused.
+  // Set in the last part when more lines are left to blame: the lines
+  // after this call's window, or the rest of this window when the call
+  // stopped at a bound. The ranges without a changeset came from the
+  // changeset in the cursor or an older one. The client MUST send
+  // next_cursor back unchanged, with the same repo, changeset_id and path,
+  // to get the next part. Empty when the blame is done. Opaque: the server
+  // decodes it, and a cursor that was not made for this repo, changeset
+  // and path is refused.
   bytes next_cursor = 7;
   reserved 3, 4, 5, 6;
   reserved "next_changeset_id", "next_path", "next_rename_searched",

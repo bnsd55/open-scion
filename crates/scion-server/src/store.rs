@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use rustix::fs::FlockOperation;
@@ -37,6 +37,8 @@ use rustix::io::Errno;
 use scion_core::{BlobHasher, BlobId};
 
 use crate::db::SqliteTx;
+use crate::deadline::Deadline;
+use crate::derived::DeriveFlights;
 use crate::error::{Error, Result};
 
 /// The schema version this build makes and reads.
@@ -79,6 +81,24 @@ pub struct Store {
 /// the graph queries that can run at once, so those never take every one.
 pub(crate) const READERS: usize = 8;
 
+/// The cap on derive walks in flight, across all kinds and repos of one
+/// [`Store`]. Each walk holds the write connection in turns, so walks
+/// beyond the cap only repeat work and starve writes ([#142]).
+pub(crate) const DERIVE_WALKS_CAP: usize = 8;
+
+/// Counts one writer that is waiting for the write connection, and
+/// subtracts it again, with a wake, when the writer gets in or gives up.
+/// A derive walk between steps waits while the count is above zero.
+struct WriteWaiter<'a>(&'a Mutex<usize>, &'a Condvar);
+
+impl Drop for WriteWaiter<'_> {
+    fn drop(&mut self) {
+        let mut waiting = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        *waiting -= 1;
+        self.1.notify_all();
+    }
+}
+
 struct Inner {
     /// Read-only connections for [`Store::read`]. They come before `db`, so
     /// they close first: the last connection to close checkpoints the log,
@@ -110,6 +130,16 @@ struct Inner {
     /// the import's busy retry: the transaction ran and rolled back, so
     /// nothing was written, exactly as a real busy commit ends.
     fail_commits: AtomicU64,
+    /// The derive walks of this store: which are in flight, and the cap
+    /// on how many may be.
+    derive: DeriveFlights,
+    /// Writers that are waiting for the write connection, with the condvar
+    /// woken when one gets in or gives up. A derive walk between steps
+    /// waits while the count is above zero, so writers have strict
+    /// priority over walk steps: a steady stream of writers delays a cold
+    /// read up to its deadline, never a land ([#142]).
+    writers: Mutex<usize>,
+    write_woken: Condvar,
 }
 
 impl Store {
@@ -128,7 +158,14 @@ impl Store {
     /// database cannot be created, or if the schema is newer than this build,
     /// or older while another `Store` uses the directory.
     pub fn open(dir: &Path) -> Result<Self> {
-        Self::open_as(dir, true, &build())
+        Self::open_as(dir, true, &build(), DERIVE_WALKS_CAP)
+    }
+
+    /// Opens or creates a data directory as its server, with a cap of
+    /// `walks` derive walks in flight. For tests of the cap.
+    #[cfg(test)]
+    pub(crate) fn open_with_walks(dir: &Path, walks: usize) -> Result<Self> {
+        Self::open_as(dir, true, &build(), walks)
     }
 
     /// Opens or creates a data directory for a process that does not land,
@@ -147,11 +184,11 @@ impl Store {
     ///
     /// As [`Store::open`], except that a server `Store` is no conflict.
     pub fn open_shared(dir: &Path) -> Result<Self> {
-        Self::open_as(dir, false, &build())
+        Self::open_as(dir, false, &build(), DERIVE_WALKS_CAP)
     }
 
     /// Opens a data directory for a process of build `build` ([`build`]).
-    fn open_as(dir: &Path, server: bool, build: &str) -> Result<Self> {
+    fn open_as(dir: &Path, server: bool, build: &str, walks_cap: usize) -> Result<Self> {
         fs::create_dir_all(dir)?;
         // The blobs and the metadata are only as private as the directory:
         // a group- or others-writable directory lets another user read or
@@ -259,8 +296,68 @@ impl Store {
                 #[cfg(test)]
                 txes: AtomicU64::new(0),
                 fail_commits: AtomicU64::new(0),
+                derive: DeriveFlights::new(walks_cap),
+                writers: Mutex::new(0),
+                write_woken: Condvar::new(),
             }),
         })
+    }
+
+    /// How many writers are waiting for the write connection.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn writers_waiting(&self) -> usize {
+        *self
+            .inner
+            .writers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits while writers are waiting for the write connection, until the
+    /// deadline. Writers have strict priority over walk steps: a steady
+    /// stream of writers delays a cold read up to its deadline, never a
+    /// land ([#142]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::DeadlineExceeded`] once the deadline has passed.
+    pub(crate) fn wait_for_writers(&self, deadline: Option<&Deadline>) -> Result<()> {
+        let mut waiting = self
+            .inner
+            .writers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while *waiting > 0 {
+            let Some(deadline) = deadline else {
+                waiting = self
+                    .inner
+                    .write_woken
+                    .wait(waiting)
+                    .unwrap_or_else(PoisonError::into_inner);
+                continue;
+            };
+            let budget = deadline.at().saturating_duration_since(Instant::now());
+            let (guard, timed_out) = self
+                .inner
+                .write_woken
+                .wait_timeout_while(waiting, budget, |waiting| *waiting > 0)
+                .unwrap_or_else(PoisonError::into_inner);
+            waiting = guard;
+            if timed_out.timed_out() {
+                return Err(Error::DeadlineExceeded(
+                    "the call ran past its deadline".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The derive walks of this store: which are in flight, and the cap on
+    /// how many may be.
+    #[must_use]
+    pub(crate) fn derive_flights(&self) -> &DeriveFlights {
+        &self.inner.derive
     }
 
     /// The blob folder.
@@ -399,6 +496,12 @@ impl Store {
     ///
     /// Returns what `f` returns, or a database error from begin or commit.
     pub fn commit<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
+        *self
+            .inner
+            .writers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += 1;
+        let _waiting = WriteWaiter(&self.inner.writers, &self.inner.write_woken);
         let mut db = self.lock();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = f(&mut SqliteTx(&tx))?;
@@ -1758,11 +1861,11 @@ mod tests {
                 other => panic!("expected the open to fail, got {:?}", other.err()),
             };
             let server = Store::open(dir.path()).unwrap();
-            refused(Store::open_as(dir.path(), false, &other));
+            refused(Store::open_as(dir.path(), false, &other, DERIVE_WALKS_CAP));
             Store::open_shared(dir.path()).unwrap();
             drop(server);
             // The import of the other build opened alone, so its build counts.
-            let import = Store::open_as(dir.path(), false, &other).unwrap();
+            let import = Store::open_as(dir.path(), false, &other, DERIVE_WALKS_CAP).unwrap();
             refused(Store::open(dir.path()));
             refused(Store::open_shared(dir.path()));
             drop(import);
