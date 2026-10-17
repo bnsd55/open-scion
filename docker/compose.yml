@@ -67,8 +67,11 @@ services:
     entrypoint: ["sh", "-c"]
     working_dir: /work
     environment:
-      # scn's globals, so the commands below stay short.
+      # scn's globals, so the commands below stay short. Object reads go to
+      # the cache with a ticket; ResolveRef and GetRootTree go to the
+      # server.
       SCION_SERVER: https://server:7878
+      SCION_OBJECTS: https://cache:7879
       SCION_TLS_CA: /certs/ca.pem
       SCION_TOKEN: dev
       SCION_REPO: demo
