@@ -1,9 +1,11 @@
-//! `scion-server`: serve the Scion API, import a git repository, or derive
-//! derived data ahead of reads.
+//! The `scion-server` binary: `import`, `serve` and `derive`.
 
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -13,15 +15,18 @@ use scion_server::derived::{self, Kind};
 use scion_server::graph::CommitGraph;
 use scion_server::history::PathHistory;
 use scion_server::import::{ImportOptions, import_git};
+use scion_server::meta::MetaTx as _;
+use scion_server::quotas::Quotas;
 use scion_server::tree::RootTree;
-use scion_server::{Error, Store, db, read, service};
+use scion_server::{Error, Store, fsck, read, service};
 use tracing_subscriber::EnvFilter;
 
+/// The scion server: import, serve and derive.
 #[derive(Parser)]
-#[command(version, about = "Server for the Scion version control system")]
+#[command(version, about, long_about = None)]
 struct Cli {
-    /// Data directory. Created if missing.
-    #[arg(long, env = "SCION_DATA", default_value = "scion-data", global = true)]
+    /// The data directory. Holds the SQLite database and the objects.
+    #[arg(long, env = "SCION_DATA", default_value = "scion-data")]
     data: PathBuf,
     #[command(subcommand)]
     command: Command,
@@ -36,7 +41,9 @@ enum Command {
         listen: SocketAddr,
         /// Bearer token that clients must send. Its principal, `default`,
         /// may read and write every repo. Give `--token` or `--access`, not
-        /// both.
+        /// both. With this, the per-principal quotas are off unless a flag
+        /// sets one: every client is the same principal, so a cap would be
+        /// a global one.
         #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
         token: Option<String>,
         /// Access file: tokens with principals, and which repos and paths
@@ -44,6 +51,24 @@ enum Command {
         /// not both.
         #[arg(long, value_name = "FILE")]
         access: Option<PathBuf>,
+        /// Most requests one principal may hold at once. With `--access`
+        /// the default is 64; with `--token` the check is off.
+        #[arg(long)]
+        max_principal_requests: Option<usize>,
+        /// Most upload bytes one principal may hold in flight. With
+        /// `--access` the default is 536870912 (512 MiB); with `--token`
+        /// the check is off.
+        #[arg(long, value_name = "BYTES")]
+        max_principal_upload_bytes: Option<usize>,
+        /// Most pending lands one principal may hold at once. With
+        /// `--access` the default is 64; with `--token` the check is off.
+        #[arg(long)]
+        max_principal_pending_lands: Option<usize>,
+        /// A land that has been pending for longer than this many seconds is
+        /// rejected by the sweep, so a restart cannot leave one pending
+        /// forever. The default is 86400 (24 hours).
+        #[arg(long, default_value_t = 24 * 60 * 60)]
+        land_stale_secs: i64,
         /// Allow a non-loopback address. Without TLS, traffic, including the
         /// token, is not encrypted, so use this only on a trusted network.
         /// With `--tls-cert` and `--tls-key`, a non-loopback address is
@@ -66,6 +91,15 @@ enum Command {
         /// Most calls (HTTP/2 streams) that one connection may have open at once.
         #[arg(long, default_value_t = listen::DEFAULT_STREAMS)]
         max_streams: NonZeroU32,
+        /// File with the Ed25519 seed (64 hex characters) that signs the
+        /// tickets of `GetRootTree` replies, from `ticket-key`. Without it,
+        /// no object is readable: a read needs a ticket.
+        #[arg(long, value_name = "FILE")]
+        ticket_key: Option<PathBuf>,
+        /// File with the previous ticket key (64 hex characters of its
+        /// public key), whose tickets stay valid during a rotation.
+        #[arg(long, value_name = "FILE", requires = "ticket_key")]
+        ticket_key_old: Option<PathBuf>,
         /// Most bytes that the stalled replies of one connection may hold. A
         /// connection over it is closed with them.
         #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
@@ -76,6 +110,14 @@ enum Command {
     HashToken {
         #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
         token: String,
+    },
+    /// Generate an Ed25519 key for the tickets of object reads: writes the
+    /// secret seed to `--out`, and prints the public key as 64 hex
+    /// characters, for `--ticket-key-old` and the tiers to verify with.
+    TicketKey {
+        /// File to write the secret seed to, as 64 hex characters.
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
     },
     /// Import a local git repository, one way. Safe to repeat. It can run
     /// while the server runs.
@@ -96,6 +138,13 @@ enum Command {
         /// Path to the git repository.
         git_dir: PathBuf,
     },
+    /// Check a data directory and report the damage it finds. Read-only: it
+    /// changes nothing, and it can run while the server runs. It reads in
+    /// short batches, and each check looks at the state at the moment it
+    /// looks, so a clean report means "no damage seen", not a snapshot.
+    /// One line per problem: kind, ID, path. Exit 0 when it saw no damage,
+    /// 1 when it did, 2 when it could not run.
+    Fsck,
     /// Derive one kind of derived data for the history of a ref, in bounded
     /// steps, and remove the rows of its older versions. Safe to repeat.
     Derive {
@@ -127,25 +176,35 @@ enum KindName {
     PathHistory,
 }
 
-/// The TLS of a `serve` command: none, or the certificate, key and client CA
-/// of the flags. Clap requires the certificate and the key together, and the
-/// client CA on a certificate.
-fn server_tls(
-    cert: Option<&Path>,
-    key: Option<&Path>,
-    client_ca: Option<&Path>,
-) -> anyhow::Result<Option<ServerTls>> {
-    match (cert, key) {
-        (None, None) => Ok(None),
-        (Some(cert), Some(key)) => {
-            let tls = ServerTls::load(cert, key, client_ca)?;
-            Ok(Some(tls))
+/// Runs `fsck` against `store`, prints one line per problem, and exits:
+/// 0 when it saw no damage, 1 when it did, 2 when it could not run.
+fn fsck_command(store: &Store) -> anyhow::Result<()> {
+    let report = match fsck::run(store, fsck::BATCH, &mut |_| {}) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("scion-server fsck: {e}");
+            std::process::exit(2);
         }
-        _ => unreachable!("clap requires --tls-cert and --tls-key together"),
+    };
+    for problem in &report.problems {
+        println!("{problem}");
     }
+    for (kind, version) in &report.old {
+        println!("derived-old {kind} v{version}");
+    }
+    println!(
+        "fsck: {} problems, {} derived rows of unknown versions",
+        report.problems.len(),
+        report.old.len()
+    );
+    if report.is_clean() {
+        std::process::exit(0);
+    }
+    std::process::exit(1);
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
@@ -156,9 +215,10 @@ async fn main() -> anyhow::Result<()> {
     // kind, which a running server of an older build may read, so it opens as
     // the server.
     let open = match cli.command {
-        Command::Import { .. } => Store::open_shared,
+        Command::Import { .. } | Command::Fsck => Store::open_shared,
         Command::Serve { .. } | Command::Derive { .. } => Store::open,
         Command::HashToken { .. } => return hash_token(),
+        Command::TicketKey { .. } => return write_ticket_key(),
     };
     let store = open(&cli.data)
         .with_context(|| format!("cannot open data directory {}", cli.data.display()))?;
@@ -167,6 +227,10 @@ async fn main() -> anyhow::Result<()> {
             listen,
             token,
             access,
+            max_principal_requests,
+            max_principal_upload_bytes,
+            max_principal_pending_lands,
+            land_stale_secs,
             insecure_listen,
             tls_cert,
             tls_key,
@@ -174,25 +238,47 @@ async fn main() -> anyhow::Result<()> {
             max_connections,
             max_streams,
             max_stalled_bytes,
+            ticket_key,
+            ticket_key_old,
         } => {
+            // The second reply says whether the mode is one token: with one
+            // principal, a per-principal cap is a global one, so the quotas
+            // are off unless a flag sets one.
+            let (access, single) = load_access(token, access)?;
+            let caps = caps(
+                single,
+                max_principal_requests,
+                max_principal_upload_bytes,
+                max_principal_pending_lands,
+            );
             let server_tls = server_tls(
                 tls_cert.as_deref(),
                 tls_key.as_deref(),
                 tls_client_ca.as_deref(),
             )?;
+            let tickets = load_tickets(ticket_key.as_deref(), ticket_key_old.as_deref())?;
             serve(
                 store,
                 listen,
-                load_access(token, access)?,
-                insecure_listen,
-                server_tls,
-                max_connections,
-                max_streams,
-                max_stalled_bytes,
+                access,
+                ServeConfig {
+                    insecure_listen,
+                    quotas: caps.quotas,
+                    pending_lands: caps.pending_lands,
+                    land_stale_secs,
+                    server_tls,
+                    max_connections,
+                    max_streams,
+                    max_stalled_bytes,
+                },
+                tickets,
             )
             .await?;
         }
-        Command::HashToken { .. } => unreachable!("handled before the store opens"),
+        Command::HashToken { .. } | Command::TicketKey { .. } => {
+            unreachable!("handled before the store opens")
+        }
+        Command::Fsck => return fsck_command(&store),
         Command::Import {
             repo,
             rev,
@@ -220,7 +306,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let (name, tip) = tokio::task::spawn_blocking(move || {
                 let tip = read::resolve_ref(&store, &repo, &target_ref)?;
-                let repo_id = store.read(|c| db::repo_id(c, &repo))?;
+                let repo_id = store.read(|c| c.repo_id(&repo))?;
                 let name = match kind {
                     KindName::RootTree => {
                         derived::backfill::<RootTree>(&store, repo_id, tip)?;
@@ -244,6 +330,67 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The TLS of a `serve` command: none, or the certificate, key and client CA
+/// of the flags. Clap requires the certificate and the key together, and the
+/// client CA on a certificate.
+fn server_tls(
+    cert: Option<&Path>,
+    key: Option<&Path>,
+    client_ca: Option<&Path>,
+) -> anyhow::Result<Option<ServerTls>> {
+    match (cert, key) {
+        (None, None) => Ok(None),
+        (Some(cert), Some(key)) => {
+            let tls = ServerTls::load(cert, key, client_ca)?;
+            Ok(Some(tls))
+        }
+        _ => unreachable!("clap requires --tls-cert and --tls-key together"),
+    }
+}
+
+/// The three per-principal caps, as the flags set them. With one principal
+/// (the `--token` mode) a per-principal cap is a global one, so each cap is
+/// off unless a flag sets it; with an access file the defaults apply.
+struct Caps {
+    quotas: Quotas,
+    pending_lands: Option<usize>,
+}
+
+fn caps(
+    single: bool,
+    requests: Option<usize>,
+    upload_bytes: Option<usize>,
+    pending_lands: Option<usize>,
+) -> Caps {
+    let with_default = |flag: Option<usize>, default: usize| {
+        if single {
+            flag
+        } else {
+            Some(flag.unwrap_or(default))
+        }
+    };
+    Caps {
+        quotas: Quotas::new(
+            with_default(requests, 64),
+            with_default(upload_bytes, 512 << 20),
+        ),
+        pending_lands: with_default(pending_lands, 64),
+    }
+}
+
+/// What a `serve` command serves with, besides the data directory and the
+/// access rules.
+struct ServeConfig {
+    insecure_listen: bool,
+    quotas: Quotas,
+    pending_lands: Option<usize>,
+    land_stale_secs: i64,
+    server_tls: Option<ServerTls>,
+    max_connections: NonZeroUsize,
+    max_streams: NonZeroU32,
+    max_stalled_bytes: NonZeroU64,
+}
+
 /// Serves the gRPC API on `listen`, with the TLS files of the flags, until
 /// the caller stops it.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -251,14 +398,11 @@ async fn serve(
     store: Store,
     listen: SocketAddr,
     access: scion_server::access::Access,
-    insecure_listen: bool,
-    server_tls: Option<ServerTls>,
-    max_connections: NonZeroUsize,
-    max_streams: NonZeroU32,
-    max_stalled_bytes: NonZeroU64,
+    config: ServeConfig,
+    tickets: Option<Arc<scion_server::tickets::Keys>>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        listen.ip().is_loopback() || insecure_listen || server_tls.is_some(),
+        listen.ip().is_loopback() || config.insecure_listen || config.server_tls.is_some(),
         "{listen} is not a loopback address; without TLS the traffic and the \
          token would travel unencrypted. Pass --tls-cert and --tls-key, or \
          --insecure-listen to allow it."
@@ -269,17 +413,23 @@ async fn serve(
     // The bound address, so port 0 shows the port that the OS chose.
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "serving");
-    let limits = Limits {
-        connections: max_connections,
-        streams: max_streams,
-        stalled_bytes: max_stalled_bytes,
-    };
+
     Box::pin(service::serve(
         store,
         listener,
         access,
-        limits,
-        server_tls,
+        service::ServeOptions {
+            limits: Limits {
+                connections: config.max_connections,
+                streams: config.max_streams,
+                stalled_bytes: config.max_stalled_bytes,
+            },
+            quotas: config.quotas,
+            pending_lands: config.pending_lands,
+            land_stale_secs: config.land_stale_secs,
+            tls: config.server_tls,
+        },
+        tickets,
         async {
             tokio::signal::ctrl_c().await.ok();
         },
@@ -293,21 +443,95 @@ async fn serve(
 fn load_access(
     token: Option<String>,
     file: Option<PathBuf>,
-) -> anyhow::Result<scion_server::access::Access> {
+) -> anyhow::Result<(scion_server::access::Access, bool)> {
     match (token, file) {
         (Some(_), Some(_)) => anyhow::bail!("give --token or --access, not both"),
         (Some(token), None) => {
             anyhow::ensure!(!token.is_empty(), "--token must not be empty");
-            Ok(scion_server::access::Access::single(&token))
+            Ok((scion_server::access::Access::single(&token), true))
         }
         (None, Some(file)) => {
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("cannot read {}", file.display()))?;
-            scion_server::access::Access::parse(&text)
-                .map_err(|why| anyhow::anyhow!("bad access file {}: {why}", file.display()))
+            let access = scion_server::access::Access::parse(&text)
+                .map_err(|why| anyhow::anyhow!("bad access file {}: {why}", file.display()))?;
+            Ok((access, false))
         }
         (None, None) => anyhow::bail!("give --token or --access"),
     }
+}
+
+/// The ticket keys of `serve`: a signing key, and the public key that a
+/// rotation keeps alive. Both files hold 64 hex characters.
+fn load_tickets(
+    seed: Option<&Path>,
+    old: Option<&Path>,
+) -> anyhow::Result<Option<Arc<scion_server::tickets::Keys>>> {
+    let Some(seed) = seed else {
+        anyhow::ensure!(old.is_none(), "--ticket-key-old needs --ticket-key");
+        return Ok(None);
+    };
+    let keys = scion_server::tickets::Keys::load(
+        &read_hex(seed)?,
+        &match old {
+            Some(file) => vec![read_hex(file)?],
+            None => Vec::new(),
+        },
+    )
+    .map_err(|why| anyhow::anyhow!("{why}"))?;
+    Ok(Some(Arc::new(keys)))
+}
+
+/// The file's trimmed text, as a key wants it. The file must be readable
+/// by its owner alone: a seed that group or others can read mints
+/// permissions to anyone who can read it.
+fn read_hex(file: &Path) -> anyhow::Result<String> {
+    let meta = std::fs::symlink_metadata(file)
+        .with_context(|| format!("cannot read {}", file.display()))?;
+    anyhow::ensure!(
+        meta.is_file(),
+        "{} is not a file (a symlink is refused too)",
+        file.display()
+    );
+    anyhow::ensure!(
+        meta.mode().trailing_zeros() >= 6,
+        "{} can be read by group or others (fix: chmod 600 {})",
+        file.display(),
+        file.display()
+    );
+    let me = rustix::process::geteuid().as_raw();
+    scion_proto::auth::check_ancestors(file, me)
+        .with_context(|| format!("{} sits in a directory that is not private", file.display()))?;
+    let text =
+        std::fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))?;
+    Ok(text.trim().to_owned())
+}
+
+/// Writes a fresh ticket key to `--out` and prints its public key. The
+/// file is created, never replaced: a second run to the same path fails,
+/// because silently changing the key breaks every tier that was given the
+/// old public half. The file is 0600: the seed mints permissions.
+fn write_ticket_key() -> anyhow::Result<()> {
+    let Cli { command, .. } = Cli::parse();
+    let Command::TicketKey { out } = command else {
+        unreachable!("write_ticket_key handles only the ticket-key command")
+    };
+    let keys = scion_server::tickets::Keys::generate();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&out)
+        .with_context(|| {
+            format!(
+                "cannot create {} (it exists already? the key must not change under the tiers)",
+                out.display()
+            )
+        })?;
+    file.write_all(format!("{}\n", keys.seed_hex()).as_bytes())
+        .with_context(|| format!("cannot write {}", out.display()))?;
+    println!("{}", keys.public_hex());
+    Ok(())
 }
 
 /// Prints the BLAKE3 digest of the token of `hash-token`.

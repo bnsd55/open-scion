@@ -83,10 +83,12 @@ A request with a `grpc-encoding` other than `identity` fails with
 **Authentication.** Every call on both services MUST carry the metadata
 `authorization: Bearer <token>`: the exact prefix `Bearer `, then the token.
 The token is printable ASCII, as a gRPC metadata value is; a tier refuses an
-upstream token that is not. A missing or wrong token fails the call with
-`UNAUTHENTICATED` before the request is read. A token names a principal. A
-server started with `--token T` has one principal, `default`, which may read
-and write every repo. A server
+upstream token that is not. Every call needs one — except
+`Objects.GetObjects` (section 7.3), whose permission is its read ticket, and
+which MUST carry none. On every call that needs one, a missing or wrong
+token fails with `UNAUTHENTICATED` before the request is read. A token names
+a principal. A server started with `--token T`
+has one principal, `default`, which may read and write every repo. A server
 started with `--access FILE` reads the principal of each token and its rules
 from the file; the file's format is a deployment matter and lives in the
 README. The principal of a call's token is its caller. Land request keys and
@@ -97,6 +99,31 @@ land IDs are scoped by (repo, principal).
 caller cannot tell whether such a repo exists. A change fails with
 `PERMISSION_DENIED` when the caller may read the repo but not make the
 change (sections 6.1 to 6.3).
+
+**Per-principal quotas.** A server MAY cap what one principal holds at once.
+The caps are `--max-principal-requests` (calls in flight, counted from the
+server takes the call until its reply starts), `--max-principal-upload-bytes`
+(bytes of upload messages in flight) and `--max-principal-pending-lands`
+(lands in the `PENDING` state, counted in the store, so the count is right
+after a restart). A call over a cap fails before any work with
+`RESOURCE_EXHAUSTED`, and the message names the flag of the cap it hit. A
+cap applies to one principal, so other principals are not slowed. A
+server started with `--token T` has one principal, so its quotas are off
+unless a flag sets one. An upload whose message would cross the byte cap
+fails with `RESOURCE_EXHAUSTED`, and the bytes it already sent do not count
+once the call ends.
+
+**Stale pending lands.** A land that stays `PENDING` for longer than
+`--land-stale-secs` (a day) was left pending by a server stop: no caller of
+today can still be finishing it, because a call runs at most 600 s. A sweep
+that runs at start and then once per hour rejects such a land: `GetLand`
+then reports the outcome `REJECTED`, and the detail says that the land was
+stale and that a retry needs a new request key. The sweep holds the same
+per-ref lock that the land path holds, so a live retry finishes or keeps
+its land pending first; the sweep rejects only a row with no live call
+left. A retry with the same request key cannot resume a rejected land, so
+a client that wants the change retried MUST send a new request key. The
+sweep never moves a ref.
 
 **Timeouts.** The server ends a call with `CANCELLED` when its reply has not
 started after 600 s, or earlier if the client's `grpc-timeout` is shorter.
@@ -757,9 +784,10 @@ read the repo.
 ### 7.2 GetRootTree
 
 `rpc GetRootTree(GetRootTreeRequest) returns (GetRootTreeResponse)`. The ID of
-the root tree of a changeset that the repo has. `NOT_FOUND` if the repo does
-not exist, the caller may not read it, or the changeset does not exist for
-that repo. The answer never changes.
+the root tree of a changeset that the repo has, with a signed read ticket for
+it (section 7.3). `NOT_FOUND` if the repo does not exist, the caller may not
+read it, or the changeset does not exist for that repo. The answer never
+changes.
 
 ### 7.3 GetObjects
 
@@ -768,7 +796,11 @@ trees and blobs named by `refs`, each in an encoding that the request
 accepts, in parts.
 
 **Request.** `refs` names 1 to 1,000 objects, each a `kind` (`TREE` or
-`BLOB`) and a 32-byte `id`. A ref can repeat. `accept` lists the encodings
+`BLOB`), a 32-byte `id`, and the `path` from the ticket's root tree that
+reaches it. The `ticket` field carries a read ticket (section 7.2), which is
+the only permission of the call: it names the repo and the root tree, and
+every object must be reachable from that tree over the path that its ref
+names. The call carries no token. A ref can repeat. `accept` lists the encodings
 that the client accepts besides `RAW`, which every client accepts. In v1 the
 only other encoding is `ZSTD`. An empty list means `RAW` only. A server
 ignores a value that it does not know. The server checks the whole request
@@ -879,11 +911,22 @@ order is daemon, cache, server. These rules hold for any tier:
 - A tier MUST serve the `Objects` service with the same calls, fields, limits
   and reply rules as the server. A client MUST NOT need to know whether it
   talks to a tier or to the server.
-- A tier MUST require a bearer token on every call, as the server does.
-- A tier MUST forward every `ResolveRef` call to its upstream, and MUST NOT
-  keep the answer.
-- A tier MAY keep a `GetRootTree` answer forever, keyed by (repo,
-  changeset), but only as its upstream gave it. It MUST NOT compute one.
+- A tier MUST require a bearer token on every call, as the server does,
+  except `GetObjects`, whose permission is its ticket (section 7.3).
+- A tier MUST NOT serve `ResolveRef` or `GetRootTree` at all: both answer
+  `UNIMPLEMENTED`. A client resolves a ref and gets the ticket of its root
+  tree from the server, and brings that ticket to the tier's `GetObjects`. A
+  tier that fetched root trees for its callers would be a way to get a
+  ticket for any repo.
+- A tier that is a daemon checks no ticket at all and runs no walk: it
+  only forwards the ticket and the paths it received to its upstream, whose
+  signature check and walk are what keep unproven reads out. There is one
+  daemon per OS user, enforced by its 0600 socket in its private directory:
+  the user it serves can read the daemon's store files anyway, so serving
+  what its store holds adds nothing. A daemon that serves several OS users
+  MUST check tickets and walk, like a cache. A tier that is a cache MUST check each ticket it
+  receives against the public keys of its upstream server (at most 2, for a
+  rotation), as the server does.
 - A tier MAY keep objects forever. A tier never trusts upstream bytes: it
   MUST check each object from its upstream as a client does (sections 5
   and 7.3), before it stores, forwards or sends it. An object that fails the
@@ -926,7 +969,8 @@ order is daemon, cache, server. These rules hold for any tier:
 - The `Scion` service goes only to the server.
 
 **The daemon's socket.** `scion-daemon` listens on a Unix socket with mode
-0600, in a directory that only its user can reach. A client sends its token
+0600, in a directory that only its user can reach. One daemon serves one OS
+user; a user who wants a daemon runs their own. A client sends its token
 to the socket, so it SHOULD check first that the socket file is a socket
 (not a symlink) owned by its own user or by root. It SHOULD also check each
 directory above the socket, up to `/`: owned by root or by its own user,
@@ -989,7 +1033,6 @@ version, a server stops serving its package; its clients then get
   file ([#14](https://github.com/bnsd55/open-scion/issues/14)).
 - More than one principal, per-path write rules and read tickets
   ([#13](https://github.com/bnsd55/open-scion/issues/13)).
-- Per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)).
 - Calls that create a repo or a ref, delete a ref, move a ref other than by
   `Land`, or list repos or refs. `scion-server import` creates repos and refs.
 - Client changesets with no parent, several parents or a committer. Only git

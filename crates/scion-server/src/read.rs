@@ -3,17 +3,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 
-use rusqlite::Connection;
 use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileState, PathElem, RepoPath, Tree, TreeId,
 };
 
-use crate::db::{self, RepoId};
 use crate::deadline::Deadline;
 use crate::derived;
 use crate::error::{Error, Result};
 use crate::graph;
 use crate::history::{self, PathHistory};
+use crate::meta::{MetaTx, RepoId};
 use crate::similar::{self, Budget, Chunks, MAX_PAIRS, Progress};
 use crate::store::Store;
 use crate::tree;
@@ -25,8 +24,8 @@ use crate::tree;
 /// [`Error::NotFound`] if the repo or ref does not exist.
 pub fn resolve_ref(store: &Store, repo: &str, name: &str) -> Result<ChangesetId> {
     store.read(|c| {
-        let repo = db::repo_id(c, repo)?;
-        db::get_ref(c, repo, name)?
+        let repo = c.repo_id(repo)?;
+        c.get_ref(repo, name)?
             .map(|r| r.target)
             .ok_or_else(|| Error::NotFound(format!("ref {name:?}")))
     })
@@ -39,8 +38,8 @@ pub fn resolve_ref(store: &Store, repo: &str, name: &str) -> Result<ChangesetId>
 /// [`Error::NotFound`] if the repo or changeset does not exist.
 pub fn get_changeset(store: &Store, repo: &str, id: ChangesetId) -> Result<Changeset> {
     store.read(|c| {
-        let repo = db::repo_id(c, repo)?;
-        db::get_changeset(c, repo, id)
+        let repo = c.repo_id(repo)?;
+        c.get_changeset(repo, id)
     })
 }
 
@@ -50,7 +49,7 @@ pub fn get_changeset(store: &Store, repo: &str, id: ChangesetId) -> Result<Chang
 ///
 /// [`Error::NotFound`] if the repo or changeset does not exist.
 pub fn root_tree(store: &Store, repo: &str, cs: ChangesetId) -> Result<TreeId> {
-    let repo = store.read(|c| db::repo_id(c, repo))?;
+    let repo = store.read(|c| c.repo_id(repo))?;
     tree::root_tree(store, repo, cs)
 }
 
@@ -96,10 +95,10 @@ pub fn list_dir(
     let root = root_tree(store, repo, cs)?;
     store.read(|c| {
         let Some(path) = path else {
-            return db::get_tree(c, root);
+            return c.get_tree(root);
         };
         match tree::lookup(c, root, path)? {
-            Some(Entry::Dir(id)) => db::get_tree(c, id),
+            Some(Entry::Dir(id)) => c.get_tree(id),
             Some(Entry::File(_)) => Err(Error::InvalidArgument(format!("{path:?} is a file"))),
             None => Err(Error::NotFound(format!("path {path:?}"))),
         }
@@ -177,7 +176,7 @@ pub fn log_page(
     let limit = limit.min(MAX_SCAN);
     let Some(path) = path else {
         return store.read(|c| {
-            let repo = db::repo_id(c, repo)?;
+            let repo = c.repo_id(repo)?;
             let mut entries = Vec::new();
             let mut next = Some(cs);
             let mut budget = limit;
@@ -187,7 +186,7 @@ pub fn log_page(
             Ok(LogPage { entries, next })
         });
     };
-    let repo = store.read(|c| db::repo_id(c, repo))?;
+    let repo = store.read(|c| c.repo_id(repo))?;
     derived::get_by::<PathHistory>(store, repo, cs, deadline)?;
     // Each statement sees its own snapshot, and none needs another's: a
     // changeset, a node and a value of this version never change and are
@@ -207,7 +206,7 @@ pub fn log_page(
                 next = None;
                 break;
             };
-            let changeset = db::get_changeset(c, repo, id)?;
+            let changeset = c.get_changeset(repo, id)?;
             next = changeset.parents.first().copied();
             entries.push((id, changeset));
         }
@@ -219,7 +218,7 @@ pub fn log_page(
 /// reply without a path. Checks at most `budget` changesets, and leaves
 /// `next` at the first one it did not check.
 pub(crate) fn next_change(
-    c: &Connection,
+    c: &mut dyn MetaTx,
     repo: RepoId,
     next: &mut Option<ChangesetId>,
     budget: &mut usize,
@@ -228,7 +227,7 @@ pub(crate) fn next_change(
         return Ok(None);
     };
     *budget -= 1;
-    let changeset = db::get_changeset(c, repo, id)?;
+    let changeset = c.get_changeset(repo, id)?;
     *next = changeset.parents.first().copied();
     Ok(Some((id, changeset)))
 }
@@ -261,7 +260,7 @@ pub fn is_ancestor(
     descendant: ChangesetId,
     deadline: &Deadline,
 ) -> Result<bool> {
-    let repo = store.read(|c| db::repo_id(c, repo))?;
+    let repo = store.read(|c| c.repo_id(repo))?;
     graph::is_ancestor(store, repo, ancestor, descendant, deadline)
 }
 
@@ -286,7 +285,7 @@ pub fn merge_base(
     b: ChangesetId,
     deadline: &Deadline,
 ) -> Result<Vec<ChangesetId>> {
-    let repo = store.read(|c| db::repo_id(c, repo))?;
+    let repo = store.read(|c| c.repo_id(repo))?;
     graph::merge_bases(store, repo, a, b, deadline)
 }
 
@@ -622,7 +621,7 @@ impl DiffWalk<'_> {
     /// a read connection on its own, so a long walk does not hold one.
     fn children(&self, entry: Option<Entry>) -> Result<BTreeMap<PathElem, Entry>> {
         match entry {
-            Some(Entry::Dir(id)) => Ok(self.store.read(|c| db::get_tree(c, id))?.entries),
+            Some(Entry::Dir(id)) => Ok(self.store.read(|c| c.get_tree(id))?.entries),
             _ => Ok(BTreeMap::new()),
         }
     }

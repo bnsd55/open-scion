@@ -16,6 +16,19 @@ until that section gets its release date.
 
 #### Objects and byte format
 
+- Per-principal quotas (`#15`). With `--access`, `--max-principal-requests`
+  (64), `--max-principal-upload-bytes` (512 MiB) and
+  `--max-principal-pending-lands` (64) bound what one principal holds at
+  once; a call over a cap fails before any work with `RESOURCE_EXHAUSTED`,
+  naming the flag of the cap it hit. With `--token T`, one client is one
+  principal, so the caps are off unless a flag sets one. The pending-lands
+  count comes from the store, so it is right after a restart. A land that
+  stays `PENDING` for longer than `--land-stale-secs` (a day) is rejected by
+  a sweep at start and then once per hour: no caller can still be finishing
+  it, because a call runs at most 600 s, and the sweep holds the same
+  per-ref lock as the land path, so a live retry wins. A retry of a
+  rejected land needs a new request key.
+
 - `scion-core`: the object model (changesets, trees, blob IDs) and a frozen,
   canonical v1 byte format, with golden tests, property tests and a fuzz
   target. Blobs belong to repos (schema version 4, table `repo_blobs`): a
@@ -25,7 +38,34 @@ until that section gets its release date.
   no longer name another repo's blob and then read it. `PutBlob` keeps a
   stored copy only for a blob that its repo has, and else writes the
   content again, so its time does not show that another repo has the
-  content. `GetObjects` still reads any object by ID (#13).
+  content.
+
+#### Read tickets (#13)
+
+- An object ID alone is no longer a permission. `GetRootTree` returns the
+  root tree with a signed read ticket: repo, principal, root tree and
+  expiry (15 minutes, checked against the server's clock with 60 seconds of
+  skew), signed with Ed25519 over a versioned body. `GetObjects` carries
+  the ticket, and each ref names its path from the ticket's root tree; the
+  server and every tier walk the path, and a walk that does not reach the
+  object ends it `NOT_FOUND`. The ticket is the only permission of an
+  object read: it carries no token. Every other call needs a token, as
+  before. A tier refuses `ResolveRef` and `GetRootTree` with
+  `UNIMPLEMENTED`: the ref and the ticket come from the server, so a tier
+  can never mint a permission.
+- The server signs with an Ed25519 key from `--ticket-key FILE` (make one
+  with `scion-server ticket-key --out FILE`; rotation with
+  `--ticket-key-old`). A `scion-cache` verifies with
+  `--ticket-public-key HEX`, at most 2 keys during a rotation. A
+  `scion-daemon` takes no key: it checks no ticket, and serves what its
+  store holds only to the one OS user that owns its private 0600 socket,
+  who can read its store files anyway. It forwards the ticket upstream,
+  whose check and walk keep unproven reads out. One daemon per OS user.
+- `scn` resolves and reads the root tree on `--server`, and sends
+  `GetObjects` to `--objects` (a `scion-cache` or `scion-daemon`) with the
+  checkout's ticket and each ref's path. Without `--objects`, object reads
+  go to `--server`. On `ticket expired`, `scn` mints a fresh ticket for the
+  same changeset, once per call, and goes on.
 
 #### The server
 
@@ -33,7 +73,10 @@ until that section gets its release date.
   verified durability, and one write path for changesets and their root
   trees. Group commit: concurrent blob syncs and database commits share one
   full drive flush, so a successful reply never shows state that a power
-  loss can undo.
+  loss can undo. `scion-server fsck <data>` reports the damage in a data
+  directory: it is read-only, it can run while the server runs, and one
+  line per problem names the kind, the ID and the path; it exits 0 when it
+  saw no damage, 1 when it did, and 2 when it could not run.
 - Server-side commits (`CreateChangeset`) and lands: path-level conflict
   checks through a per-ref index, one transaction per land, retries by
   request key, and a bounded retry when the ref moves. A land stops in its
@@ -163,6 +206,12 @@ until that section gets its release date.
   `default`, which may read and write every repo.
 - Bearer-token auth, loopback-only listening by default, request limits
   and name validation at the RPC boundary.
+- The gRPC health service (`grpc.health.v1`) on the same port as the other
+  services, without a token, so a probe needs none: `scion-server` and
+  `scion-cache` (and `scion-daemon`, which shares the tier's server)
+  answer `Check` and `Watch` with `SERVING` once the store and the
+  upstream channel are open, and with `NOT_SERVING` while a shutdown
+  drains.
 - TLS and mTLS: the server and `scion-cache` serve TLS with `--tls-cert`
   and `--tls-key` (a non-loopback address then needs no
   `--insecure-listen`), and require a client certificate with

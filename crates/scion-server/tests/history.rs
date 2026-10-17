@@ -1,6 +1,8 @@
 //! Path history (`Log` with a path) and blame, with their bounds.
 #![cfg(unix)]
 
+mod common;
+
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
@@ -15,8 +17,9 @@ use scion_server::blame::{
 use scion_server::deadline::Deadline;
 use scion_server::import::{ImportOptions, import_git};
 use scion_server::memory::Bytes;
+use scion_server::meta::MetaTx as _;
 use scion_server::read::{self, MAX_SCAN};
-use scion_server::{Error, Store, db, tree};
+use scion_server::{Error, Store, tree};
 use tempfile::TempDir;
 
 const REPO: &str = "r";
@@ -83,6 +86,7 @@ fn commit(dir: &Path, message: &str, files: &[(&str, Option<&str>)]) -> String {
 }
 
 fn import(store: &Store, dir: &Path) -> ChangesetId {
+    common::spawn_guard::prime_gix_lookup();
     let opts = ImportOptions {
         rev: "HEAD".into(),
         target_ref: "main".into(),
@@ -217,7 +221,7 @@ fn regular(content: BlobId) -> FileState {
 fn chain<S: Into<Option<FileState>>>(store: &Store, puts: Vec<Vec<(&str, S)>>) -> Vec<ChangesetId> {
     store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
+            let repo = c.create_repo(REPO)?;
             let mut ids: Vec<ChangesetId> = Vec::new();
             for puts in puts {
                 let cs = Changeset {
@@ -1525,7 +1529,7 @@ fn chain_in<S: Into<Option<FileState>>>(
     assert_ne!(name, REPO);
     store
         .write(|c| {
-            let repo = db::create_repo(c, name)?;
+            let repo = c.create_repo(name)?;
             let mut ids: Vec<ChangesetId> = Vec::new();
             for puts in puts {
                 let cs = Changeset {

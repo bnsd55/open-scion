@@ -36,16 +36,16 @@ use std::time::Duration;
 use std::{fmt, fs, io, iter};
 
 use anyhow::Context as _;
-use hashlink::LruCache;
-use scion_core::{BlobId, ChangesetId, Tree, TreeId};
+use scion_core::{BlobId, Tree, TreeId};
 use scion_proto::auth::{Auth, Bearer};
 use scion_proto::check;
 use scion_proto::deadline::Until;
-use scion_proto::listen::Limits;
+use scion_proto::listen::{self, Limits};
 use scion_proto::object::{self, Assembler, Header, MAX_ENCODED_BYTES, UNPACK_BYTES, zstd_bound};
 use scion_proto::reply::{
     self, BUSY_TIMEOUT, Body, IN_FLIGHT_BYTES, ObjectStream, Outgoing, STALL_TIMEOUT,
 };
+use scion_proto::ticket::Walk;
 use scion_proto::tls::{ClientTls, ServerTls};
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::objects_server::{Objects, ObjectsServer};
@@ -66,9 +66,6 @@ use tonic::{Code, Request, Response, Status, Streaming};
 
 use store::lock;
 pub use store::{DiskStore, MemoryStore, Store};
-
-/// Most `GetRootTree` answers a tier keeps.
-const MAX_ROOT_TREES: usize = 10_000;
 
 /// Most objects that one fetch asks upstream for. A reply sends at most
 /// 64 MiB, so fetching far ahead of it only fills the store.
@@ -152,10 +149,11 @@ impl Key {
         }
     }
 
-    fn to_ref(self) -> ObjectRef {
+    fn to_ref(self, path: &[u8]) -> ObjectRef {
         ObjectRef {
             kind: self.kind().into(),
             id: self.id().to_vec(),
+            path: path.to_vec(),
         }
     }
 
@@ -324,20 +322,45 @@ fn split(found: Found) -> Result<reply::Found, Status> {
     }
 }
 
-/// The fetches in progress, by repo and object.
-type Flights = HashMap<(String, Key), watch::Receiver<Outcome>>;
+/// The fetches in progress, by object. Objects are content-addressed, so
+/// one ID is one object, whatever repo it came from.
+type Flights = HashMap<Key, watch::Receiver<Outcome>>;
+
+/// The 32 bytes of 64 hex characters, for a key flag. `None` if the text is
+/// not that.
+#[must_use]
+pub fn key_from_hex(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = hex.as_bytes()[2 * i] as char;
+        let lo = hex.as_bytes()[2 * i + 1] as char;
+        let hi = u8::from_str_radix(&hi.to_string(), 16).ok()?;
+        let lo = u8::from_str_radix(&lo.to_string(), 16).ok()?;
+        *byte = hi << 4 | lo;
+    }
+    Some(out)
+}
 
 /// Adds the tier's own token to every upstream call, and counts the calls.
 #[derive(Clone)]
 struct UpstreamAuth {
-    bearer: Bearer,
+    bearer: Option<Bearer>,
     calls: Arc<AtomicU64>,
 }
 
 impl Interceptor for UpstreamAuth {
     fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        self.bearer.call(request)
+        match &mut self.bearer {
+            // An object read's permission is its ticket: a tier sends no
+            // token unless it was given one.
+            Some(bearer) => bearer.call(request),
+            None => Ok(request),
+        }
     }
 }
 
@@ -372,8 +395,10 @@ struct Inner<S> {
     /// stored.
     fetching: Arc<Semaphore>,
     flights: Mutex<Flights>,
-    /// `GetRootTree` answers from upstream, by repo and changeset.
-    root_trees: Mutex<LruCache<(String, ChangesetId), TreeId>>,
+    /// The keys that a ticket of a call must verify against: the keys of
+    /// the upstream server, one of which is enough. Empty on a daemon,
+    /// which does not check tickets, only forwards them.
+    ticket_keys: Vec<ed25519_dalek::VerifyingKey>,
 }
 
 /// What one reply has done: hits and misses for the log, and how far into
@@ -388,8 +413,16 @@ struct Progress {
 
 /// What one reply asks for.
 struct Ask {
+    /// The repo of the ticket, for the store's bookkeeping and the logs.
     repo: String,
-    keys: Vec<Key>,
+    /// The ticket of the call: the only permission of the objects it
+    /// names, and the repo and root tree that its walk starts from.
+    ticket: scion_proto::ticket::Ticket,
+    /// The walk of the ticket's root tree, shared by the reply's objects,
+    /// so a tree on the way is read once.
+    walk: Arc<Mutex<scion_proto::ticket::Walker>>,
+    /// Each object with the path that its ref names, from the root tree.
+    keys: Vec<(Key, Vec<u8>)>,
     /// The client accepts zstd.
     zstd: bool,
     /// When the reply ends its waits: the caller's deadline less a margin.
@@ -401,7 +434,9 @@ struct Ask {
 
 impl<S: Store> Tier<S> {
     /// A tier that keeps objects in `store` and sends misses to `upstream`
-    /// (`http://HOST:PORT` or `unix:///PATH`) with `upstream_token`. It waits
+    /// (`http://HOST:PORT` or `unix:///PATH`). A non-empty `upstream_token`
+    /// rides on every call; an empty one sends none, which is enough for
+    /// `GetObjects` of a server: its permission is the ticket. It waits
     /// at most `timeout` for each step of upstream, and connects on the first
     /// call. With `client_tls`, the upstream is trusted with that CA, and a
     /// client certificate is presented for mTLS.
@@ -416,6 +451,7 @@ impl<S: Store> Tier<S> {
         upstream_token: &str,
         timeout: Duration,
         client_tls: Option<&ClientTls>,
+        ticket_keys: Vec<ed25519_dalek::VerifyingKey>,
     ) -> anyhow::Result<Self> {
         let endpoint = Endpoint::from_shared(upstream.to_owned())
             .with_context(|| format!("bad upstream address {upstream:?}"))?;
@@ -430,7 +466,11 @@ impl<S: Store> Tier<S> {
             endpoint
         };
         let channel = endpoint.connect_lazy();
-        let bearer = Bearer::new(upstream_token).context("upstream token is not valid ASCII")?;
+        let bearer = if upstream_token.is_empty() {
+            None
+        } else {
+            Some(Bearer::new(upstream_token).context("upstream token is not valid ASCII")?)
+        };
         let upstream_calls = Arc::default();
         let auth = UpstreamAuth {
             bearer,
@@ -450,7 +490,7 @@ impl<S: Store> Tier<S> {
                 fetch_slots: Arc::new(Semaphore::new(FETCH_SLOTS)),
                 fetching: Arc::new(Semaphore::new(FETCH_BYTES)),
                 flights: Mutex::default(),
-                root_trees: Mutex::new(LruCache::new(MAX_ROOT_TREES)),
+                ticket_keys,
             }),
         })
     }
@@ -491,24 +531,32 @@ impl<S: Store> Tier<S> {
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_PART_MESSAGE_BYTES);
         let objects = InterceptedService::new(objects, Auth::new(token));
-        let router = |mut server: Server| server.add_service(objects);
+        // The health service answers `grpc.health.v1.Check` and `Watch` on
+        // the same port, without a token: a probe carries none. The store
+        // and the upstream channel opened before this call, so the tier
+        // starts serving.
+        let (health, shutdown) = listen::health(&["scion.v1.Objects"], shutdown).await;
+        let router = |mut server: Server| server.add_service(health).add_service(objects);
         limits
             .serve(router, incoming, tls.map(|tls| tls.config()), shutdown)
             .await
     }
 
-    /// Runs store work on a blocking thread.
+    /// Runs store work on a blocking thread. `repo` names the call's repo
+    /// in the one line that a failure of this work makes.
     async fn blocking<T: Send + 'static>(
         &self,
+        repo: &str,
         f: impl FnOnce(&S) -> io::Result<T> + Send + 'static,
     ) -> Result<T, Status> {
+        let repo = repo.to_owned();
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || f(&inner.store))
             .await
             .unwrap_or_else(|e| Err(io::Error::other(e)))
             .map_err(|e| {
                 // The detail stays in the log, as on the server.
-                tracing::error!(error = %e, "store failed");
+                tracing::error!(repo = %repo, error = %e, "store failed");
                 Status::internal("internal error")
             })
     }
@@ -554,6 +602,7 @@ impl<S: Store> Tier<S> {
         )
         .await;
         tracing::info!(
+            repo = %ask.repo,
             objects = ask.keys.len(),
             hits = progress.hits.load(Ordering::Relaxed),
             misses = progress.misses.load(Ordering::Relaxed),
@@ -568,12 +617,29 @@ impl<S: Store> Tier<S> {
     // as on the server. Upgrade (issue #6): read a batch capped by bytes per
     // hop, or keep a few reads in flight.
     async fn produce(&self, ask: &Ask, i: usize, progress: &Progress) -> Option<Found> {
-        let key = *ask.keys.get(i)?;
+        let (key, _path) = ask.keys[i].clone();
         // A share taken before the object was in hand.
         let mut held = None;
         let mut missed = false;
+        // The ticket's walk proves the object before it goes out: over its
+        // path from the ticket's root tree, fetching a tree that the store
+        // lacks with the same ticket. Anything the walk does not reach
+        // never goes out.
+        //
+        // SHORTCUT: a daemon skips the walk (it checks no ticket, so it has
+        // no root tree to walk from). That is safe only while a daemon
+        // serves the one OS user that owns its private 0600 socket in its
+        // private directory: that user can read the daemon's store files
+        // anyway, so serving unproved objects adds nothing. Trigger to
+        // upgrade: a daemon that serves several OS users must walk (and
+        // then check tickets), like a cache.
+        if !self.inner.ticket_keys.is_empty()
+            && let Err(failed) = self.prove(i, ask).await
+        {
+            return Some((Err(failed), self.share(held, 1, ask).await?));
+        }
         loop {
-            let size = match self.blocking(move |store| store.size(key)).await {
+            let size = match self.blocking(&ask.repo, move |store| store.size(key)).await {
                 Ok(size) => size,
                 Err(status) => return Some((Err(status.into()), self.share(held, 1, ask).await?)),
             };
@@ -581,7 +647,7 @@ impl<S: Store> Tier<S> {
                 let mut permit = self
                     .share(held.take(), size + key.read_bytes(size), ask)
                     .await?;
-                let stored = self.stored(key, size).await;
+                let stored = self.stored(&ask.repo, key, size).await;
                 reply::trim(&mut permit, size);
                 match stored {
                     Ok(Some(stored)) => {
@@ -589,13 +655,9 @@ impl<S: Store> Tier<S> {
                             progress.hits.fetch_add(1, Ordering::Relaxed);
                             tracing::debug!(%key, "hit");
                         }
-                        // After the call's checks, in `get_objects`.
-                        // SHORTCUT: the record takes the request's repo
-                        // field, and GetObjects does not check that the
-                        // object belongs to that repo until #13 PR-C, which
-                        // moves this after the ticket walk, under the
-                        // ticket's repo.
-                        self.inner.store.served(&ask.repo, key);
+                        // The walk proved it, so the snapshot of the
+                        // ticket's repo gains it.
+                        self.inner.store.served(&ask.ticket.repo, key);
                         return self.outgoing(key, stored, permit, ask).await;
                     }
                     // The stored copy went (dropped, or bad) after its size
@@ -624,14 +686,83 @@ impl<S: Store> Tier<S> {
                 None => reply::try_take(&self.inner.in_flight, data.len()),
             };
             if let Some(permit) = permit {
-                // SHORTCUT: as at the hit above, #13 PR-C moves this after
-                // the ticket walk, under the ticket's repo.
-                self.inner.store.served(&ask.repo, key);
+                // The walk proved it, so the snapshot of the ticket's repo
+                // gains it.
+                self.inner.store.served(&ask.ticket.repo, key);
                 return self.outgoing(key, data, permit, ask).await;
             }
             let size = data.len();
             drop(data);
             held = Some(self.share(None, size + key.read_bytes(size), ask).await?);
+        }
+    }
+
+    /// Proves `ask.keys[i]` for the reply: the walk from the ticket's root
+    /// tree must reach it, over its path, through the trees of the store
+    /// checked against their IDs. A tree that the store lacks is fetched
+    /// with the ticket first, and the walk runs again. A path that the walk
+    /// does not reach fails the object: nothing goes out for it.
+    async fn prove(&self, i: usize, ask: &Ask) -> Result<(), Failed> {
+        let (key, path) = &ask.keys[i];
+        let (kind, id) = (key.kind(), key.id());
+        // The trees fetched for this walk, so a store that keeps nothing
+        // does not send the walk into an endless fetch of the same tree.
+        let mut learned: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+        loop {
+            let walk = Arc::clone(&ask.walk);
+            let path = path.clone();
+            let learned_now = learned.clone();
+            let verdict = self
+                .blocking(&ask.repo, move |store: &S| {
+                    let mut walk = walk.lock().unwrap();
+                    let mut reader = |tree_id: [u8; 32]| {
+                        if let Some(bytes) = learned_now.get(&tree_id) {
+                            return Ok(Some(bytes.clone()));
+                        }
+                        let key = Key::Tree(TreeId::from_bytes(tree_id));
+                        match store.size(key) {
+                            Ok(Some(size)) => Ok(store.get(key, size)?.map(|bytes| bytes.to_vec())),
+                            Ok(None) => Ok(None),
+                            Err(why) => Err(why),
+                        }
+                    };
+                    walk.reach(&mut reader, kind, &id, &path)
+                })
+                .await;
+            match verdict {
+                Ok(Walk::Reached) => return Ok(()),
+                Ok(Walk::Missing { id, path }) => {
+                    // The tree on the way is not in the store: fetch it
+                    // with the ticket, then walk again. Its bytes are kept
+                    // here whether the store keeps them or not.
+                    let tree = Key::Tree(TreeId::from_bytes(id));
+                    if let Some(bytes) = self.fetch_for(tree, &path, Vec::new(), ask).await? {
+                        learned.insert(id, bytes.to_vec());
+                    }
+                }
+                Ok(Walk::Absent) => {
+                    // Expected when a client asks outside its checkout,
+                    // so it stays at debug.
+                    tracing::debug!(
+                        repo = %ask.ticket.repo,
+                        principal = %ask.ticket.principal,
+                        object = ?key,
+                        "the walk did not reach the object from the ticket's root tree"
+                    );
+                    return Err(Failed {
+                        status: Status::not_found(format!("{key:?} is not in the ticket")),
+                        whole_call: false,
+                        until: ask.until,
+                    });
+                }
+                Err(why) => {
+                    return Err(Failed {
+                        status: Status::internal(format!("cannot read a tree of the walk: {why}")),
+                        whole_call: false,
+                        until: ask.until,
+                    });
+                }
+            }
         }
     }
 
@@ -689,7 +820,9 @@ impl<S: Store> Tier<S> {
         self.cover(&mut permit, stored.len() + size + UNPACK_BYTES, ask.until)
             .await?;
         let chunks = self
-            .blocking(move |_| object::read_chunks(object::unpacker(&stored)?, size))
+            .blocking(&ask.repo, move |_| {
+                object::read_chunks(object::unpacker(&stored)?, size)
+            })
             .await;
         reply::trim(&mut permit, size);
         let header = Header {
@@ -724,8 +857,8 @@ impl<S: Store> Tier<S> {
 
     /// Reads `key` in its stored form from the store, at most `size` bytes.
     /// `None` if it is not there.
-    async fn stored(&self, key: Key, size: usize) -> Result<Option<Bytes>, Status> {
-        self.blocking(move |store| store.get(key, size)).await
+    async fn stored(&self, repo: &str, key: Key, size: usize) -> Result<Option<Bytes>, Status> {
+        self.blocking(repo, move |store| store.get(key, size)).await
     }
 
     /// Gets `ask.keys[i]` in its stored form from upstream. Joins the fetch
@@ -752,18 +885,36 @@ impl<S: Store> Tier<S> {
         i: usize,
         progress: &Progress,
     ) -> Result<Option<Bytes>, Failed> {
-        let (repo, keys, until) = (&ask.repo, &ask.keys, ask.until);
-        let key = keys[i];
+        let keys = &ask.keys;
+        let (key, path) = keys[i].clone();
+        let later = if i < progress.fetched_to.load(Ordering::Relaxed) {
+            Vec::new()
+        } else {
+            let end = keys.len().min(i + MAX_BATCH);
+            progress.fetched_to.store(end, Ordering::Relaxed);
+            keys[i + 1..end].to_vec()
+        };
+        self.fetch_for(key, &path, later, ask).await
+    }
+
+    /// Gets `key` in its stored form from upstream, with the path that its
+    /// ref names and the ticket of the call, taking `later` along. The walk
+    /// of the ticket's root tree names a tree that the store lacks, so the
+    /// fetch runs before the walk can finish.
+    async fn fetch_for(
+        &self,
+        key: Key,
+        path: &[u8],
+        later: Vec<(Key, Vec<u8>)>,
+        ask: &Ask,
+    ) -> Result<Option<Bytes>, Failed> {
+        let until = ask.until;
         loop {
-            let joined = lock(&self.inner.flights).get(&(repo.clone(), key)).cloned();
+            let joined = lock(&self.inner.flights).get(&key).cloned();
             let flight = if let Some(flight) = joined {
                 Some(flight)
-            } else if i < progress.fetched_to.load(Ordering::Relaxed) {
-                self.start(repo, key, Vec::new(), until)
             } else {
-                let end = keys.len().min(i + MAX_BATCH);
-                progress.fetched_to.store(end, Ordering::Relaxed);
-                self.start(repo, key, keys[i + 1..end].to_vec(), until)
+                self.start(key, path, later.clone(), until, &ask.ticket)
             };
             let Some(mut flight) = flight else {
                 return Ok(None);
@@ -803,34 +954,36 @@ impl<S: Store> Tier<S> {
     /// neither has not been fetched yet, and only one fetch starts for it.
     fn start(
         &self,
-        repo: &str,
         key: Key,
-        later: Vec<Key>,
+        path: &[u8],
+        later: Vec<(Key, Vec<u8>)>,
         until: Until,
+        ticket: &scion_proto::ticket::Ticket,
     ) -> Option<watch::Receiver<Outcome>> {
         let stored = |k| matches!(self.inner.store.size(k), Ok(Some(_)));
         let mut flights = lock(&self.inner.flights);
-        if let Some(rx) = flights.get(&(repo.to_owned(), key)) {
+        if let Some(rx) = flights.get(&key) {
             return Some(rx.clone());
         }
         if stored(key) {
             return None;
         }
         let mut waiting = VecDeque::new();
-        for k in iter::once(key).chain(later) {
-            if let Entry::Vacant(slot) = flights.entry((repo.to_owned(), k))
+        for (k, p) in iter::once((key, path.to_vec())).chain(later) {
+            if let Entry::Vacant(slot) = flights.entry(k)
                 && (k == key || !stored(k))
             {
                 let (tx, rx) = watch::channel(None);
                 slot.insert(rx);
-                waiting.push_back((k, tx));
+                waiting.push_back((k, p, tx));
             }
         }
-        let rx = flights[&(repo.to_owned(), key)].clone();
+        let rx = flights[&key].clone();
         drop(flights);
         let flight = Flight {
             tier: self.clone(),
-            repo: repo.to_owned(),
+            repo: ticket.repo.clone(),
+            ticket: ticket.clone(),
             waiting,
             until,
         };
@@ -839,16 +992,18 @@ impl<S: Store> Tier<S> {
     }
 }
 
-/// One fetch from upstream: a few objects of one repo, which other replies
-/// can wait for. It runs on its own task, so it never waits for a reply, and
-/// it ends when every object is fetched or failed. Objects still waiting when
-/// it ends leave the fetch table, so a later call starts anew.
+/// One fetch from upstream: a few objects, which other replies can wait
+/// for. It runs on its own task, so it never waits for a reply, and it ends
+/// when every object is fetched or failed. Objects still waiting when it
+/// ends leave the fetch table, so a later call starts anew.
 struct Flight<S: Store> {
     tier: Tier<S>,
     repo: String,
-    /// The objects not fetched yet, in request order, each with the sender
-    /// that its waiters listen to.
-    waiting: VecDeque<(Key, watch::Sender<Outcome>)>,
+    /// The ticket that names every object of this fetch to upstream.
+    ticket: scion_proto::ticket::Ticket,
+    /// The objects not fetched yet, in request order, each with the path
+    /// that its ref names and the sender that its waiters listen to.
+    waiting: VecDeque<(Key, Vec<u8>, watch::Sender<Outcome>)>,
     /// When the fetch ends its waits: the deadline of the caller that
     /// started it, less the margin.
     until: Until,
@@ -870,13 +1025,18 @@ impl<S: Store> Flight<S> {
     async fn run(mut self) {
         tracing::debug!(objects = self.waiting.len(), "fetching from upstream");
         if let Err(status) = self.fetch_all().await {
-            tracing::warn!(%status, objects = self.waiting.len(), "fetch from upstream failed");
+            tracing::warn!(
+                repo = %self.repo,
+                %status,
+                objects = self.waiting.len(),
+                "fetch from upstream failed"
+            );
             let failed = Failed {
                 status,
                 whole_call: true,
                 until: self.until,
             };
-            for (_, tx) in &self.waiting {
+            for (_, _, tx) in &self.waiting {
                 tx.send_replace(Some(Err(failed.clone())));
             }
         }
@@ -885,12 +1045,12 @@ impl<S: Store> Flight<S> {
     /// Hands the first waiting object, or why upstream could not give that
     /// one object, to its waiters. The other objects keep waiting.
     fn settle_front(&mut self, outcome: Result<Bytes, Status>) {
-        if let Some((key, tx)) = self.waiting.pop_front() {
+        if let Some((key, _, tx)) = self.waiting.pop_front() {
             if let Err(status) = &outcome {
-                tracing::warn!(%key, %status, "upstream could not give an object");
+                tracing::warn!(repo = %self.repo, %key, %status, "upstream could not give an object");
             }
             tx.send_replace(Some(outcome.map_err(Failed::from)));
-            lock(&self.tier.inner.flights).remove(&(self.repo.clone(), key));
+            lock(&self.tier.inner.flights).remove(&key);
         }
     }
 
@@ -923,12 +1083,16 @@ impl<S: Store> Flight<S> {
                     "the deadline passed before the fetch could ask upstream",
                 ));
             }
-            let refs = self.waiting.iter().map(|(key, _)| key.to_ref()).collect();
+            let refs = self
+                .waiting
+                .iter()
+                .map(|(key, path, _)| key.to_ref(path))
+                .collect();
             // Upstream gets what is left of the deadline.
             let request = self.until.request(GetObjectsRequest {
-                repo: self.repo.clone(),
                 refs,
                 accept: vec![Encoding::Zstd.into()],
+                ticket: self.ticket.bytes.clone(),
             });
             let mut upstream = self.tier.inner.upstream.clone();
             let mut stream = self
@@ -948,9 +1112,10 @@ impl<S: Store> Flight<S> {
                 };
                 // Unpacking and hashing up to 100 MiB takes a while: check
                 // and store on a blocking thread.
+                let repo = self.repo.clone();
                 let checked = self
                     .tier
-                    .blocking(move |store| {
+                    .blocking(&self.repo, move |store| {
                         let stored = match key.to_stored(&header, data) {
                             Ok(stored) => Bytes::from(stored),
                             Err(why) => return Ok(Err(why)),
@@ -958,7 +1123,7 @@ impl<S: Store> Flight<S> {
                         // A failed put is logged; the object still goes to
                         // its waiters.
                         if let Err(e) = store.put(key, &stored) {
-                            tracing::warn!(%key, error = %e, "cannot store an object");
+                            tracing::warn!(%repo, %key, error = %e, "cannot store an object");
                         }
                         Ok(Ok(stored))
                     })
@@ -988,7 +1153,7 @@ impl<S: Store> Flight<S> {
             Err(status) if about_one_object(&status) => return Ok(Next::Failed(status)),
             Err(status) => return Err(status),
         };
-        let Some(&(key, _)) = self.waiting.front().filter(|(key, _)| key.names(&first)) else {
+        let Some(&(key, _, _)) = self.waiting.front().filter(|(key, ..)| key.names(&first)) else {
             return Err(Status::internal(
                 "upstream sent an object that was not asked for",
             ));
@@ -1034,8 +1199,8 @@ impl<S: Store> Flight<S> {
 impl<S: Store> Drop for Flight<S> {
     fn drop(&mut self) {
         let mut flights = lock(&self.tier.inner.flights);
-        for (key, _) in &self.waiting {
-            flights.remove(&(self.repo.clone(), *key));
+        for (key, ..) in &self.waiting {
+            flights.remove(key);
         }
     }
 }
@@ -1047,63 +1212,31 @@ fn about_one_object(status: &Status) -> bool {
     matches!(status.code(), Code::NotFound | Code::DataLoss)
 }
 
-/// Checks a repo name by the server's rule, so a tier refuses the calls that
-/// the server refuses.
-// SHORTCUT: a tier does not ask whether the repo exists, and serves a stored
-// object to any caller with the token, for any repo name. Safe with one
-// principal; the server also shares trees and blobs across repos. Upgrade
-// (issue #13): read tickets, checked by every tier.
-fn check_repo(repo: &str) -> Result<(), Status> {
-    check::name("repo", repo).map_err(Status::invalid_argument)
-}
-
+/// The `Objects` service of a tier: `GetObjects` of a ticket, and nothing
+/// else.
 #[tonic::async_trait]
 impl<S: Store> Objects for Tier<S> {
+    /// No refs here either: a caller resolves on the server, then brings
+    /// the ticket of its root tree to `GetObjects`.
     async fn resolve_ref(
         &self,
-        request: Request<ResolveRefRequest>,
+        _: Request<ResolveRefRequest>,
     ) -> Result<Response<ResolveRefResponse>, Status> {
-        // A ref moves, so its answer is always forwarded and never kept.
-        let until = Until::of(&request);
-        let mut upstream = self.inner.upstream.clone();
-        let reply = self
-            .within(
-                until,
-                upstream.resolve_ref(until.request(request.into_inner())),
-            )
-            .await?;
-        Ok(Response::new(reply.into_inner()))
+        Err(Status::unimplemented(
+            "ask the server for the ref and its ticket",
+        ))
     }
 
+    /// No root trees here: a caller gets its ticket from the server, and
+    /// only `GetObjects` of a ticket comes to a tier. A tier that fetched
+    /// root trees for callers would be a way to mint a ticket for any repo.
     async fn get_root_tree(
         &self,
-        request: Request<GetRootTreeRequest>,
+        _: Request<GetRootTreeRequest>,
     ) -> Result<Response<GetRootTreeResponse>, Status> {
-        let until = Until::of(&request);
-        let request = request.into_inner();
-        check_repo(&request.repo)?;
-        let changeset: ChangesetId = check::id(&request.changeset_id, "changeset_id")?;
-        let slot = (request.repo.clone(), changeset);
-        let kept = lock(&self.inner.root_trees).get(&slot).copied();
-        let tree = if let Some(tree) = kept {
-            tracing::debug!(%changeset, "root tree hit");
-            tree
-        } else {
-            tracing::debug!(%changeset, "root tree miss");
-            let mut upstream = self.inner.upstream.clone();
-            let reply = self
-                .within(until, upstream.get_root_tree(until.request(request)))
-                .await?
-                .into_inner();
-            let tree: TreeId = TreeId::try_from(reply.tree_id.as_slice())
-                .map_err(|_| Status::internal("upstream sent a bad tree id"))?;
-            // Only an answer from upstream is kept, never one made here.
-            lock(&self.inner.root_trees).insert(slot, tree);
-            tree
-        };
-        Ok(Response::new(GetRootTreeResponse {
-            tree_id: tree.as_bytes().to_vec(),
-        }))
+        Err(Status::unimplemented(
+            "ask the server for the root tree and its ticket",
+        ))
     }
 
     type GetObjectsStream = ObjectStream;
@@ -1114,12 +1247,37 @@ impl<S: Store> Objects for Tier<S> {
     ) -> Result<Response<ObjectStream>, Status> {
         let until = Until::of(&request);
         let stalled = scion_proto::listen::Stalled::of(&request);
-        let GetObjectsRequest { repo, refs, accept } = request.into_inner();
-        check_repo(&repo)?;
+        let GetObjectsRequest {
+            refs,
+            accept,
+            ticket,
+        } = request.into_inner();
         check::object_count(refs.len())?;
-        let keys = refs.iter().map(Key::parse).collect::<Result<Vec<_>, _>>()?;
+        // The ticket is the only permission of an object read here too:
+        // on a cache it is verified against the keys of the upstream
+        // server; on a daemon, which only forwards tickets, it is read
+        // without its signature, and the walk from its root tree still
+        // gates what leaves.
+        let ticket = if self.inner.ticket_keys.is_empty() {
+            scion_proto::ticket::parse_unverified(&ticket, scion_proto::ticket::now())
+        } else {
+            scion_proto::ticket::parse(&ticket, &self.inner.ticket_keys, scion_proto::ticket::now())
+        }
+        .map_err(|why| {
+            // The reason only: no ticket bytes, and no signature.
+            tracing::warn!(reason = %why, "a GetObjects ticket was refused");
+            Status::permission_denied(format!("bad ticket: {why}"))
+        })?;
+        let keys = refs
+            .into_iter()
+            .map(|r| Ok((Key::parse(&r)?, r.path)))
+            .collect::<Result<Vec<_>, Status>>()?;
         let ask = Ask {
-            repo,
+            repo: ticket.repo.clone(),
+            walk: Arc::new(Mutex::new(scion_proto::ticket::Walker::new(
+                ticket.root_tree,
+            ))),
+            ticket,
             keys,
             zstd: accept.contains(&Encoding::Zstd.into()),
             until,
@@ -1217,12 +1375,19 @@ mod tests {
     use tokio_stream::wrappers::TcpListenerStream;
 
     use super::*;
+    use scion_core::{Entry, FileState, PathElem};
+
+    /// What the fake upstream keeps for one object: its kind with its raw
+    /// bytes.
+    type Raw = (ObjectKind, Vec<u8>);
 
     /// An upstream that serves fixed blobs RAW, and counts the objects asked
     /// for and the most in one call.
     #[derive(Clone)]
     struct Fake {
-        blobs: Arc<HashMap<Vec<u8>, Vec<u8>>>,
+        objects: Arc<HashMap<Vec<u8>, Raw>>,
+        key: ed25519_dalek::SigningKey,
+        root: TreeId,
         asked: Arc<AtomicUsize>,
         largest: Arc<AtomicUsize>,
     }
@@ -1240,9 +1405,22 @@ mod tests {
 
         async fn get_root_tree(
             &self,
-            _: Request<GetRootTreeRequest>,
+            request: Request<GetRootTreeRequest>,
         ) -> Result<Response<GetRootTreeResponse>, Status> {
-            Err(Status::unimplemented("no changesets"))
+            // A ticket for the repo of the request, for the one root tree.
+            let repo = request.into_inner().repo;
+            let ticket = scion_proto::ticket::sign(
+                &self.key,
+                &repo,
+                "test",
+                *self.root.as_bytes(),
+                scion_proto::ticket::now(),
+            )
+            .unwrap();
+            Ok(Response::new(GetRootTreeResponse {
+                tree_id: self.root.as_bytes().to_vec(),
+                ticket,
+            }))
         }
 
         type GetObjectsStream = Replies;
@@ -1257,9 +1435,9 @@ mod tests {
             let replies: Vec<_> = refs
                 .into_iter()
                 .flat_map(|r| {
-                    let data = self.blobs[&r.id].clone();
+                    let (kind, data) = self.objects[&r.id].clone();
                     let header = Header {
-                        kind: ObjectKind::Blob,
+                        kind,
                         id: r.id.try_into().unwrap(),
                         encoding: Encoding::Raw,
                         encoded_size: data.len(),
@@ -1275,12 +1453,42 @@ mod tests {
 
     /// `count` small blobs, their keys, an upstream that serves them, and a
     /// tier in front of it with a store of `limit` bytes.
-    async fn setup(count: u32, limit: usize) -> (Vec<Vec<u8>>, Vec<Key>, Fake, Tier<MemoryStore>) {
+    async fn setup(count: u32, limit: usize) -> Setup {
         let blobs: Vec<Vec<u8>> = (0..count).map(|i| i.to_le_bytes().to_vec()).collect();
         let keys: Vec<Key> = blobs.iter().map(|b| Key::Blob(BlobId::of(b))).collect();
-        let ids = keys.iter().map(|k| k.id().to_vec());
+        // A real root tree, so the walk of a ticket reaches every blob
+        // at its index.
+        let paths: Vec<Vec<u8>> = (0..count).map(|i| i.to_string().into_bytes()).collect();
+        let tree = Tree {
+            entries: keys
+                .iter()
+                .zip(&paths)
+                .map(|(key, path)| {
+                    (
+                        PathElem::new(path.clone()).unwrap(),
+                        Entry::File(FileState::Regular {
+                            content: BlobId::try_from(key.id().as_slice()).unwrap(),
+                            executable: false,
+                        }),
+                    )
+                })
+                .collect(),
+        };
+        let (tree_bytes, root) = tree.encode_with_id();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let mut objects: HashMap<_, _> = keys
+            .iter()
+            .zip(&blobs)
+            .map(|(k, blob)| (k.id().to_vec(), (ObjectKind::Blob, blob.clone())))
+            .collect();
+        objects.insert(
+            root.as_bytes().to_vec(),
+            (ObjectKind::Tree, tree_bytes.clone()),
+        );
         let fake = Fake {
-            blobs: Arc::new(ids.zip(blobs.clone()).collect()),
+            objects: Arc::new(objects),
+            key: key.clone(),
+            root,
             asked: Arc::default(),
             largest: Arc::default(),
         };
@@ -1291,16 +1499,80 @@ mod tests {
                 .add_service(ObjectsServer::new(fake.clone()))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
-        let store = MemoryStore::new(limit).recording(&["r".into()]);
-        let tier = Tier::new(store, &url, "token", CACHE_UPSTREAM_TIMEOUT, None).unwrap();
-        (blobs, keys, fake, tier)
+        let store = MemoryStore::new(limit).recording(&["r".into(), "q".into()]);
+        let tier = Tier::new(
+            store,
+            &url,
+            "token",
+            CACHE_UPSTREAM_TIMEOUT,
+            None,
+            vec![key.verifying_key()],
+        )
+        .unwrap();
+        let ticket = scion_proto::ticket::sign(
+            &key,
+            "r",
+            "test",
+            *root.as_bytes(),
+            scion_proto::ticket::now(),
+        )
+        .unwrap();
+        Setup {
+            blobs,
+            keys,
+            paths,
+            fake,
+            tier,
+            key,
+            root,
+            ticket,
+        }
     }
 
-    /// What one reply asks for, RAW only.
-    fn ask(keys: &[Key]) -> Ask {
+    /// The fixture of the tests: blobs, their keys and paths, an upstream
+    /// that serves them, a tier that trusts its key, and the root tree.
+    struct Setup {
+        blobs: Vec<Vec<u8>>,
+        keys: Vec<Key>,
+        paths: Vec<Vec<u8>>,
+        fake: Fake,
+        tier: Tier<MemoryStore>,
+        key: ed25519_dalek::SigningKey,
+        root: TreeId,
+        ticket: Vec<u8>,
+    }
+
+    /// What one reply asks for: `keys` with the paths of the fixture, and
+    /// a ticket of `repo` for the root tree.
+    fn ask(setup: &Setup, keys: &[Key], repo: &str) -> Ask {
+        let ticket = scion_proto::ticket::sign(
+            &setup.key,
+            repo,
+            "test",
+            *setup.root.as_bytes(),
+            scion_proto::ticket::now(),
+        )
+        .unwrap();
+        let ticket = scion_proto::ticket::parse(
+            &ticket,
+            &[setup.key.verifying_key()],
+            scion_proto::ticket::now(),
+        )
+        .unwrap();
+        let keys = keys
+            .iter()
+            .map(|key| {
+                let i = setup.keys.iter().position(|k| k == key).unwrap();
+                (*key, setup.paths[i].clone())
+            })
+            .collect();
         Ask {
-            repo: "r".into(),
-            keys: keys.to_vec(),
+            repo: repo.to_owned(),
+            walk: Arc::new(Mutex::new(scion_proto::ticket::Walker::new(
+                *setup.root.as_bytes(),
+            ))),
+            ticket,
+            keys,
             zstd: false,
             until: Until::NONE,
             stalled: None,
@@ -1310,45 +1582,48 @@ mod tests {
     #[tokio::test]
     async fn a_store_that_keeps_nothing_costs_one_fetch_per_later_miss() {
         // A limit of 0 bytes: the store keeps nothing.
-        let (blobs, keys, fake, tier) = setup(4, 0).await;
+        let f = setup(4, 0).await;
 
         // The objects of one call, each reached after the fetch before it
         // has ended, so none can join a fetch in progress.
         let progress = Progress::default();
-        for (i, blob) in blobs.iter().enumerate() {
-            let stored = tier
-                .fetch(&ask(&keys), i, &progress)
+        for (i, blob) in f.blobs.iter().enumerate() {
+            let stored = f
+                .tier
+                .fetch(&ask(&f, &f.keys, "r"), i, &progress)
                 .await
                 .unwrap()
                 .unwrap();
             // A RAW blob from upstream is kept packed.
             assert_eq!(object::unpack(&stored, blob.len()).unwrap(), *blob);
-            while !lock(&tier.inner.flights).is_empty() {
+            while !lock(&f.tier.inner.flights).is_empty() {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }
         // The first fetch asked for all four; each later one only for itself.
-        assert_eq!(fake.asked.load(Ordering::SeqCst), 4 + 3);
+        assert_eq!(f.fake.asked.load(Ordering::SeqCst), 4 + 3);
     }
 
     #[tokio::test]
     async fn an_object_that_a_fetch_has_stored_is_never_fetched_again() {
-        let (blobs, keys, fake, tier) = setup(3, 1 << 20).await;
-        let asked = || fake.asked.load(Ordering::SeqCst);
+        let f = setup(3, 1 << 20).await;
+        let asked = || f.fake.asked.load(Ordering::SeqCst);
         let settled = || async {
-            while !lock(&tier.inner.flights).is_empty() {
+            while !lock(&f.tier.inner.flights).is_empty() {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         };
 
         // A fetch of the last two objects ends, and stores them.
-        tier.fetch(&ask(&keys), 1, &Progress::default())
+        f.tier
+            .fetch(&ask(&f, &f.keys, "r"), 1, &Progress::default())
             .await
             .unwrap();
         settled().await;
         assert_eq!(asked(), 2);
         // A batch that starts at the first object leaves out the two stored.
-        tier.fetch(&ask(&keys), 0, &Progress::default())
+        f.tier
+            .fetch(&ask(&f, &f.keys, "r"), 0, &Progress::default())
             .await
             .unwrap();
         settled().await;
@@ -1356,15 +1631,20 @@ mod tests {
         // A reply that missed an object just before its fetch stored it, and
         // asks after the fetch has ended, is sent to the store. This is the
         // window between a reply's store check and its fetch.
-        for i in 0..blobs.len() {
-            let fetched = tier.fetch(&ask(&keys), i, &Progress::default()).await;
+        for i in 0..f.blobs.len() {
+            let fetched = f
+                .tier
+                .fetch(&ask(&f, &f.keys, "r"), i, &Progress::default())
+                .await;
             assert!(fetched.unwrap().is_none(), "read it from the store");
         }
         assert_eq!(asked(), 3, "nothing was fetched twice");
         // Through a reply, the object comes from the store, with its share.
-        for (i, blob) in blobs.iter().enumerate() {
-            let (object, _permit) = tier
-                .produce(&ask(&keys), i, &Progress::default())
+        // The first prove fetches the root tree of the ticket: one more ask.
+        for (i, blob) in f.blobs.iter().enumerate() {
+            let (object, _permit) = f
+                .tier
+                .produce(&ask(&f, &f.keys, "r"), i, &Progress::default())
                 .await
                 .unwrap();
             // Unpacked for a client that takes only RAW.
@@ -1373,23 +1653,28 @@ mod tests {
             };
             assert_eq!(chunks, std::slice::from_ref(blob));
         }
-        assert_eq!(asked(), 3);
+        // 3 blobs from earlier fetches, plus the root tree of the walk.
+        assert_eq!(asked(), 3 + 1);
     }
 
     #[tokio::test]
     async fn a_reply_that_waits_for_budget_reads_the_object_again() {
         // A store that keeps the object, then one that keeps nothing.
         for (limit, asked) in [(1 << 20, 1), (0, 2)] {
-            let (blobs, keys, fake, tier) = setup(1, limit).await;
+            let f = setup(1, limit).await;
+            let fake = &f.fake;
+            let tier = &f.tier;
             let full = reply::try_take(&tier.inner.in_flight, IN_FLIGHT_BYTES).unwrap();
             let waiting = tier.clone();
+            let ask = ask(&f, &f.keys, "r");
             let producing = tokio::spawn(async move {
-                let found = waiting.produce(&ask(&keys), 0, &Progress::default()).await;
+                let found = waiting.produce(&ask, 0, &Progress::default()).await;
                 found.map(|(parts, _permit)| parts)
             });
             // The fetch ends; the reply finds no room, lets the bytes go and
-            // waits.
-            while fake.asked.load(Ordering::SeqCst) == 0 || !lock(&tier.inner.flights).is_empty() {
+            // waits. The prove of the walk fetches the root tree first, so
+            // the ask count starts at 1.
+            while fake.asked.load(Ordering::SeqCst) < 2 || !lock(&tier.inner.flights).is_empty() {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1402,9 +1687,13 @@ mod tests {
             let Body::Chunks(chunks) = object.body else {
                 panic!("unpacked into chunks")
             };
-            assert_eq!(chunks, [blobs[0].clone()]);
+            assert_eq!(chunks, [f.blobs[0].clone()]);
             // Read again from the store, or fetched again if it was not kept.
-            assert_eq!(fake.asked.load(Ordering::SeqCst), asked, "limit {limit}");
+            assert_eq!(
+                fake.asked.load(Ordering::SeqCst),
+                asked + 1,
+                "limit {limit}"
+            );
             // Every share went back.
             assert_eq!(tier.inner.in_flight.available_permits(), IN_FLIGHT_BYTES);
             assert_eq!(tier.inner.fetching.available_permits(), FETCH_BYTES);
@@ -1413,13 +1702,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_cold_call_fetches_in_batches_of_at_most_max_batch() {
-        let (_, keys, fake, tier) = setup(300, 1 << 20).await;
+        let f = setup(300, 1 << 20).await;
+        let keys: Vec<Key> = f.keys.clone();
         let request = GetObjectsRequest {
-            repo: "r".into(),
-            refs: keys.iter().map(|key| key.to_ref()).collect(),
+            refs: keys
+                .iter()
+                .zip(&f.paths)
+                .map(|(key, path)| key.to_ref(path))
+                .collect(),
             accept: vec![Encoding::Zstd.into()],
+            ticket: f.ticket.clone(),
         };
-        let reply = tier.get_objects(Request::new(request)).await.unwrap();
+        let reply = f.tier.get_objects(Request::new(request)).await.unwrap();
         let mut stream = reply.into_inner();
         let mut got = 0;
         while let Some(part) = stream.next().await {
@@ -1429,37 +1723,75 @@ mod tests {
             got += 1;
         }
         assert_eq!(got, 300);
-        assert_eq!(fake.asked.load(Ordering::SeqCst), 300);
-        assert_eq!(fake.largest.load(Ordering::SeqCst), MAX_BATCH);
-        assert_eq!(tier.upstream_calls(), 3);
+        // 300 blobs and the root tree of the ticket.
+        assert_eq!(f.fake.asked.load(Ordering::SeqCst), 300 + 1);
+        assert_eq!(f.fake.largest.load(Ordering::SeqCst), MAX_BATCH);
+        assert_eq!(f.tier.upstream_calls(), 4);
     }
 
     #[tokio::test]
     async fn each_object_sent_for_a_repo_is_noted_for_its_snapshot() {
-        let (blobs, keys, fake, tier) = setup(3, 1 << 20).await;
+        let f = setup(3, 1 << 20).await;
+        let keys = &f.keys;
         // The first is a hit, the second comes from upstream.
-        let frame = Bytes::from(object::pack(&blobs[0]).unwrap());
-        tier.store().put(keys[0], &frame).unwrap();
+        let frame = Bytes::from(object::pack(&f.blobs[0]).unwrap());
+        f.tier.store().put(keys[0], &frame).unwrap();
         for (repo, keys) in [("r", &keys[..2]), ("q", &keys[2..])] {
+            // A ticket of the repo, for the root tree.
+            let ticket = scion_proto::ticket::sign(
+                &f.key,
+                repo,
+                "test",
+                *f.root.as_bytes(),
+                scion_proto::ticket::now(),
+            )
+            .unwrap();
+            let ticket = scion_proto::ticket::parse(
+                &ticket,
+                &[f.key.verifying_key()],
+                scion_proto::ticket::now(),
+            )
+            .unwrap();
+            let paths: Vec<Vec<u8>> = keys
+                .iter()
+                .map(|key| {
+                    let i = f.keys.iter().position(|k| k == key).unwrap();
+                    f.paths[i].clone()
+                })
+                .collect();
             let request = GetObjectsRequest {
-                repo: repo.into(),
-                refs: keys.iter().map(|key| key.to_ref()).collect(),
+                refs: keys
+                    .iter()
+                    .zip(&paths)
+                    .map(|(key, path)| key.to_ref(path))
+                    .collect(),
                 accept: vec![Encoding::Zstd.into()],
+                ticket: ticket.bytes,
             };
-            let reply = tier.get_objects(Request::new(request)).await.unwrap();
+            let reply = f.tier.get_objects(Request::new(request)).await.unwrap();
             let parts: Vec<_> = reply.into_inner().collect().await;
             assert_eq!(parts.len(), keys.len(), "{parts:?}");
         }
-        assert_eq!(fake.asked.load(Ordering::SeqCst), 2);
-        // Only "r" is recorded, and only what went into its replies.
-        let noted: Vec<Key> = tier
+        // keys[1] and keys[2] from upstream, and the root tree once.
+        assert_eq!(f.fake.asked.load(Ordering::SeqCst), 2 + 1);
+        // Only what each ticket's repo saw is recorded, and the walk of the
+        // ticket reached it.
+        let noted: Vec<Key> = f
+            .tier
             .store()
             .snapshot("r", 1 << 20)
             .into_iter()
             .map(|(key, _)| key)
             .collect();
         assert_eq!(noted, keys[..2]);
-        assert_eq!(tier.store().snapshot("q", 1 << 20), []);
+        let noted_q: Vec<Key> = f
+            .tier
+            .store()
+            .snapshot("q", 1 << 20)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(noted_q, keys[2..]);
     }
 
     #[test]
@@ -1553,8 +1885,34 @@ mod tests {
             "token",
             CACHE_UPSTREAM_TIMEOUT,
             None,
+            Vec::new(),
         )
         .unwrap()
+    }
+
+    /// An ask for a test that only fetches, so no ticket of this tier ever
+    /// gets checked: any verified ticket names a walk that `fetch` alone
+    /// never runs.
+    fn only_fetch_ask(key: Key) -> Ask {
+        let key_ed = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+        let ticket =
+            scion_proto::ticket::sign(&key_ed, "r", "test", [7; 32], scion_proto::ticket::now())
+                .unwrap();
+        let ticket = scion_proto::ticket::parse(
+            &ticket,
+            &[key_ed.verifying_key()],
+            scion_proto::ticket::now(),
+        )
+        .unwrap();
+        Ask {
+            repo: "r".to_owned(),
+            walk: Arc::new(Mutex::new(scion_proto::ticket::Walker::new([7; 32]))),
+            ticket,
+            keys: vec![(key, b"f".to_vec())],
+            zstd: false,
+            until: Until::NONE,
+            stalled: None,
+        }
     }
 
     #[tokio::test]
@@ -1570,7 +1928,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (ask, progress) = (ask(&[key]), Progress::default());
+        let (ask, progress) = (only_fetch_ask(key), Progress::default());
         let fetch = tier.fetch(&ask, 0, &progress);
         let failed = tokio::time::timeout(Duration::from_secs(10), fetch)
             .await
@@ -1643,7 +2001,7 @@ mod tests {
 
         // The upstream reply stays open meanwhile, so the wait is bounded:
         // the fetch fails, and so does every object it holds.
-        let (ask, progress) = (ask(&[key]), Progress::default());
+        let (ask, progress) = (only_fetch_ask(key), Progress::default());
         let fetch = tier.fetch(&ask, 0, &progress);
         let failed = tokio::time::timeout(Duration::from_secs(10), fetch)
             .await
@@ -1661,10 +2019,11 @@ mod tests {
         let key = Key::Blob(BlobId::of(&data));
         let tier = stalled_upstream(&data).await;
         let fetching = tier.clone();
-        let fetch =
-            tokio::spawn(
-                async move { fetching.fetch(&ask(&[key]), 0, &Progress::default()).await },
-            );
+        let fetch = tokio::spawn(async move {
+            fetching
+                .fetch(&only_fetch_ask(key), 0, &Progress::default())
+                .await
+        });
 
         // The content, the frame packed from it and the codec, no more: a
         // small object takes no room for the largest one.
