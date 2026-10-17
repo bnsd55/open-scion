@@ -55,6 +55,35 @@ jobs:
         env:
           PROPTEST_CASES: "2000"
 
+  test-postgres:
+    name: test (postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p open-scion-server
+        env:
+          PROPTEST_CASES: "2000"
+          SCION_TEST_BACKEND: postgres
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+
   test-macos:
     name: test (macOS)
     runs-on: macos-latest
@@ -190,8 +219,10 @@ jobs:
           tags: open-scion-demo
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: run the demo
+      - name: run the demo (SQLite)
         run: sh docker/demo.sh
+      - name: run the demo (Postgres)
+        run: sh docker/demo.sh postgres
 
   fuzz:
     name: fuzz smoke (60 s)

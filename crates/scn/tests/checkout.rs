@@ -28,8 +28,9 @@ use scion_proto::v1::{
     ResolveRefRequest, ResolveRefResponse,
 };
 use scion_server::import::{ImportOptions, import_git};
+use scion_server::meta::Meta as _;
 use scion_server::meta::MetaTx as _;
-use scion_server::{Store, service, tree};
+use scion_server::{Backend, Store, service, tree};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -115,7 +116,7 @@ struct Server {
 }
 
 impl Server {
-    fn start(data: TempDir, store: Store) -> Self {
+    fn start(data: TempDir, store: Backend) -> Self {
         let runtime = Runtime::new().unwrap();
         let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -196,9 +197,9 @@ fn temp_dirs(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn open_store() -> (TempDir, Store) {
+fn open_store() -> (TempDir, Backend) {
     let data = tempfile::tempdir().unwrap();
-    let store = Store::open(data.path()).unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
     (data, store)
 }
 
@@ -409,7 +410,7 @@ fn root_changeset(files: Files) -> Changeset {
 }
 
 /// Stores each file list as a root changeset in a new repo.
-fn store_changesets(store: &Store, cases: &[Files]) -> Vec<ChangesetId> {
+fn store_changesets(store: &Backend, cases: &[Files]) -> Vec<ChangesetId> {
     store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -1173,7 +1174,7 @@ fn a_schema_6_data_dir_upgrades_and_checks_out() {
     // A checkout of the upgraded directory re-derives the trees. The db
     // path outlives `data`, which `Server::start` takes.
     let db_path = data.path().join("scion.db");
-    let server = Server::start(data, store);
+    let server = Server::start(data, Backend::Sqlite(store.clone()));
     let tmp = tempfile::tempdir().unwrap();
     let dest = tmp.path().join("dest");
     let out = server.scn(&["checkout", "main", "--into", text(&dest)]);

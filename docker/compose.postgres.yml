@@ -1,0 +1,82 @@
+# The Postgres variant of the demo: it only ever loads together with
+# compose.yml,
+#
+#     docker compose -f compose.yml -f compose.postgres.yml ...
+#
+# which docker/demo.sh does for `sh docker/demo.sh postgres`. The base
+# file holds the services that do not change; this file adds the
+# database and re-points the server's command at it.
+#
+# The server reaches the database over the network, so its traffic is
+# encrypted and checked: the URL names sslmode=require, and the server
+# checks the database's certificate against the demo CA with
+# --postgres-ca (what #178 requires of a host that is not local). The
+# demo CA signs the postgres certificate at compose time, like the
+# server's and the cache's.
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: scion
+      POSTGRES_PASSWORD: dev
+      POSTGRES_DB: scion
+    command:
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/pg-certs/postgres.crt
+      - -c
+      - ssl_key_file=/pg-certs/postgres.key
+    volumes:
+      - pg-certs:/pg-certs:ro
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scion -d scion"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  # Postgres refuses to start when its key is group- or world-readable,
+  # and a read-only mount cannot be chmod-ed, so the demo copies the
+  # host's certificate into a volume the postgres user owns — the way
+  # certs-init does for the scion services.
+  pg-certs-init:
+    image: open-scion-demo
+    user: root
+    entrypoint: ["sh", "-c"]
+    command:
+      - cp /host-certs/postgres.crt /host-certs/postgres.key /pg-certs/
+        && chmod 600 /pg-certs/postgres.key
+        && chmod 644 /pg-certs/postgres.crt
+        && chown 999:999 /pg-certs/*
+    volumes:
+      - ./certs:/host-certs:ro
+      - pg-certs:/pg-certs
+
+  server:
+    command:
+      - --data
+      - /data
+      - --postgres-url
+      - postgres://scion:dev@postgres:5432/scion?sslmode=require
+      - --postgres-ca
+      - /certs/ca.pem
+      - serve
+      - --listen
+      - 0.0.0.0:7878
+      - --token
+      - dev
+      - --tls-cert
+      - /certs/server.crt
+      - --tls-key
+      - /certs/server.key
+      - --ticket-key
+      - /data/ticket.key
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  pg-certs:

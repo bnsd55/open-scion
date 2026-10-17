@@ -32,13 +32,14 @@ use tracing::Instrument as _;
 
 use crate::access::Access;
 use crate::auth::Caller;
+use crate::backend::Backend;
 use crate::deadline::Deadline;
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
-use crate::meta::MetaTx as _;
+use crate::meta::{Meta as _, MetaTx as _};
 use crate::objects::ObjectsService;
 use crate::quotas::{Call, Quotas};
-use crate::store::{MAX_OBJECT_BYTES, READER_BYTES, Store};
+use crate::store::{MAX_OBJECT_BYTES, READER_BYTES};
 use crate::tickets::Keys;
 use crate::{blame, names, read, write};
 
@@ -146,7 +147,7 @@ pub struct ServeOptions {
 ///
 /// Transport errors.
 pub async fn serve(
-    store: Store,
+    store: Backend,
     listener: TcpListener,
     access: impl Into<Access>,
     options: ServeOptions,
@@ -299,7 +300,7 @@ impl ScionService {
     async fn graph_query<T, F>(&self, deadline: Deadline, query: F) -> Result<T, Status>
     where
         T: Send + 'static,
-        F: FnOnce(&Store, &Deadline) -> Result<T> + Send + 'static,
+        F: FnOnce(&Backend, &Deadline) -> Result<T> + Send + 'static,
     {
         run_graph_query(&self.worker, &self.graph_queries, deadline, query).await
     }
@@ -324,14 +325,14 @@ pub fn into_server<S: Scion + Send + 'static>(service: S) -> ScionServer<S> {
 /// on the work in flight, so both services queue behind the same limit.
 #[derive(Clone)]
 pub(crate) struct Worker {
-    store: Store,
+    store: Backend,
     /// Bounds blocking work, so a flood of requests queues instead of
     /// spawning unbounded threads.
     permits: Arc<Semaphore>,
 }
 
 impl Worker {
-    pub(crate) fn new(store: Store) -> Self {
+    pub(crate) fn new(store: Backend) -> Self {
         Self {
             store,
             permits: Arc::new(Semaphore::new(MAX_BLOCKING)),
@@ -340,7 +341,7 @@ impl Worker {
 
     /// A handle to the store, for work outside the permit queue, such as the
     /// stale-land sweep.
-    pub(crate) fn store(&self) -> Store {
+    pub(crate) fn store(&self) -> Backend {
         self.store.clone()
     }
 
@@ -348,7 +349,7 @@ impl Worker {
     pub(crate) async fn run<T, F>(&self, f: F) -> Result<T, Status>
     where
         T: Send + 'static,
-        F: FnOnce(Store) -> Result<T> + Send + 'static,
+        F: FnOnce(Backend) -> Result<T> + Send + 'static,
     {
         let permit = Arc::clone(&self.permits)
             .acquire_owned()
@@ -1310,7 +1311,9 @@ fn file_state(state: FileState) -> v1::FileState {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::Backend;
     use crate::db;
+    use crate::store::Store;
     use std::time::Instant;
 
     use scion_core::{Changeset, FileState, IdentityTime};
@@ -1338,7 +1341,7 @@ mod tests {
     }
 
     /// A service whose one principal may do everything.
-    fn test_service(store: Store) -> ScionService {
+    fn test_service(store: Backend) -> ScionService {
         ScionService::new(
             Worker::new(store),
             Arc::new(Access::single("t")),
@@ -1401,9 +1404,9 @@ mod tests {
         )
     }
 
-    fn file_store(content: &[u8]) -> (tempfile::TempDir, Store, ChangesetId, BlobId) {
+    fn file_store(content: &[u8]) -> (tempfile::TempDir, Backend, ChangesetId, BlobId) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let blob = store.blobs().put(content).unwrap();
         let state = FileState::Regular {
             content: blob,
@@ -1438,7 +1441,7 @@ mod tests {
     /// Starts [`send_file`] for `blob` with all of a budget of `budget`.
     /// Returns the task, the reply and the budget.
     async fn reply(
-        store: Store,
+        store: Backend,
         blob: BlobId,
         budget: usize,
         stall: Duration,
@@ -1768,7 +1771,7 @@ mod tests {
         // main goes root ─ B. The land's base is root, below the floor of a
         // new path index at B, so its plan walks back.
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let blob = store.blobs().put(b"x").unwrap();
         let put = |parents, path: &str| Changeset {
             parents,
@@ -1843,7 +1846,7 @@ mod tests {
         }
         let sql = "SELECT state FROM lands WHERE request_key = 'k'";
         let state: String = store
-            .read(|c| Ok(c.query_row(sql, [], |row| row.get(0))?))
+            .read(|c| Ok(c.sqlite().unwrap().query_row(sql, [], |row| row.get(0))?))
             .unwrap();
         assert_eq!(state, "pending");
         let main = store.read(|c| {
@@ -1896,11 +1899,11 @@ mod tests {
     async fn at_most_max_graph_queries_run_at_once() {
         // root ─ a, and root ─ b.
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let ids = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
-                db::testing::insert_graph(c, repo, &[vec![], vec![0], vec![0]])
+                db::testing::insert_graph(c.sqlite().unwrap(), repo, &[vec![], vec![0], vec![0]])
             })
             .unwrap();
         let bytes = |i: usize| ids[i].as_bytes().to_vec();
@@ -1997,7 +2000,7 @@ mod tests {
     #[tokio::test]
     async fn a_worker_panic_does_not_reach_the_client() {
         let dir = tempfile::tempdir().unwrap();
-        let worker = Worker::new(Store::open(dir.path()).unwrap());
+        let worker = Worker::new(Backend::Sqlite(Store::open(dir.path()).unwrap()));
         let status = worker
             .run(|_| -> Result<()> { panic!("secret detail") })
             .await
