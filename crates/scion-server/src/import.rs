@@ -8,7 +8,6 @@
 //! Git headers that Scion does not model (`encoding`, `gpgsig`, `mergetag`)
 //! are dropped, so a changeset ID is not a function of the git object name.
 
-#[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -45,11 +44,25 @@ const TX_BUDGET: Duration = Duration::from_secs(1);
 /// transaction begins.
 const TX_YIELD: Duration = Duration::from_millis(100);
 
+/// How many times one batch waits out a busy write lock and runs again.
+/// The batch's writes are idempotent, so a retry is safe; past the bound
+/// the import fails with the busy error. A client that shares the data
+/// directory reads this to bound its own wait for an import.
+pub const BUSY_TRIES: u32 = 10;
+
 // How long the write transaction sleeps per commit of a batch, for the
 // tests of a slow batch. It models a batch whose records are slow.
 #[cfg(test)]
 thread_local! {
     static SLOW_RECORD: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+}
+
+thread_local! {
+    /// Tree checks that [`Checker::check`] ran on this thread. Tests of a
+    /// rolled-back batch read it: with the checker reset, the checks of
+    /// the rolled-back transaction run again in the retry.
+    #[doc(hidden)]
+    pub static CHECKS: Cell<usize> = const { Cell::new(0) };
 }
 /// Cache for decoded git objects. A tree diff re-reads the trees that the
 /// previous commit's diff just read.
@@ -132,7 +145,14 @@ fn import_with_cache(
         .map_err(|e| Error::Git(format!("cannot resolve {:?} to a commit: {e}", opts.rev)))?
         .id;
 
-    let repo_id = store.write(|c| c.create_repo(repo))?;
+    // A shared import re-runs often: look the repo up before opening a
+    // write transaction for it, so the common path does not commit at all
+    // just to find a repo that is already there.
+    let repo_id = match store.read(|c| c.repo_id(repo)) {
+        Ok(repo_id) => repo_id,
+        Err(Error::NotFound(_)) => store.write(|c| c.create_repo(repo))?,
+        Err(error) => return Err(error),
+    };
     let mut known = store.read(|c| c.imported_commits(repo_id))?;
     let plan = plan(&git, tip, &known, opts.verify_sample)?;
     tracing::info!(
@@ -248,24 +268,44 @@ fn store_batch(
     let mut rest = prepared;
     while !rest.is_empty() {
         let mut taken = 0;
-        let started_tx = Instant::now();
-        store.write(|c| {
-            for (commit, cs, git_tree) in rest {
-                #[cfg(test)]
-                if !slow_record.is_zero() {
-                    std::thread::sleep(slow_record);
+        // The write lock of a shared data directory stays busy when the
+        // servers that share it write without a pause, and `busy_timeout`
+        // then expires with the transaction rolled back and nothing
+        // written. A batch is safe to run again whole: every write in it is
+        // content-addressed or `INSERT OR IGNORE`, so it retries a bounded
+        // number of times, and waits between tries so it takes its turn.
+        let mut tries = 0;
+        loop {
+            let started_tx = Instant::now();
+            let result = store.write(|c| {
+                for (commit, cs, git_tree) in rest {
+                    #[cfg(test)]
+                    if !slow_record.is_zero() {
+                        std::thread::sleep(slow_record);
+                    }
+                    let root = record(c, repo_id, *commit, cs)?;
+                    if plan.verify.contains(commit) {
+                        checker.check(c, *commit, *git_tree, root)?;
+                    }
+                    taken += 1;
+                    if shared && started_tx.elapsed() >= TX_BUDGET {
+                        break;
+                    }
                 }
-                let root = record(c, repo_id, *commit, cs)?;
-                if plan.verify.contains(commit) {
-                    checker.check(c, *commit, *git_tree, root)?;
+                Ok(taken)
+            });
+            match result {
+                Ok(_) => break,
+                Err(Error::Busy) if tries < BUSY_TRIES => {
+                    tries += 1;
+                    taken = 0;
+                    checker.reset_for_retry();
+                    tracing::warn!(tries, "the database stayed busy; the batch retries");
+                    std::thread::sleep(TX_YIELD);
                 }
-                taken += 1;
-                if shared && started_tx.elapsed() >= TX_BUDGET {
-                    break;
-                }
+                Err(e) => return Err(e),
             }
-            Ok(taken)
-        })?;
+        }
         rest = &rest[taken..];
         *done += taken;
         tracing::info!(
@@ -559,6 +599,14 @@ struct Checker<'a> {
 }
 
 impl Checker<'_> {
+    /// Drops the state of checks that a rolled-back transaction recorded,
+    /// so a batch that runs again verifies from scratch. The git-to-blob
+    /// map stays: it hashes content, so it never lies.
+    fn reset_for_retry(&mut self) {
+        self.equal.clear();
+        self.intact.clear();
+    }
+
     /// Fails unless the Scion tree `scion` has exactly the names, kinds,
     /// flags and content of the git tree `git_tree`.
     fn check(
@@ -573,6 +621,9 @@ impl Checker<'_> {
             if !self.equal.insert((git_id, scion_id)) {
                 continue;
             }
+            // Counted per walk, not per call: a pair the cache already
+            // cleared did no work.
+            CHECKS.with(|checks| checks.set(checks.get() + 1));
             let want = read_tree(self.git, commit, Some(git_id))?;
             let have: BTreeMap<Vec<u8>, Entry> = c
                 .get_tree(scion_id)?
@@ -957,9 +1008,10 @@ mod tests {
 
         let commits = store.commits();
         assert_eq!(import("main").imported, 1);
-        // The repo, the root trees of the four parents in steps, the batch
-        // and the ref. The batch derives nothing while it holds the lock.
-        assert_eq!(store.commits() - commits, 3 + derived::steps(4));
+        // The repo is already there: its lookup is a read, so only the root
+        // trees of the four parents in steps, the batch and the ref commit.
+        // The batch derives nothing while it holds the lock.
+        assert_eq!(store.commits() - commits, 2 + derived::steps(4));
     }
 
     #[test]

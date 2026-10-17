@@ -103,6 +103,10 @@ struct Inner {
     /// write lock.
     #[cfg(test)]
     txes: AtomicU64,
+    /// How many of the next commits fail as a busy database, for tests of
+    /// the import's busy retry: the transaction ran and rolled back, so
+    /// nothing was written, exactly as a real busy commit ends.
+    fail_commits: AtomicU64,
 }
 
 impl Store {
@@ -233,6 +237,7 @@ impl Store {
                 _server_lock: server_lock,
                 #[cfg(test)]
                 txes: AtomicU64::new(0),
+                fail_commits: AtomicU64::new(0),
             }),
         })
     }
@@ -330,6 +335,23 @@ impl Store {
         !self.inner.alone
     }
 
+    /// Sets how many of the next commits fail as a busy database. Tests of
+    /// the import's busy retry use it: the failing transaction ran and
+    /// rolled back, so the retry re-runs it whole.
+    #[doc(hidden)]
+    pub fn fail_next_commits(&self, n: u32) {
+        self.inner
+            .fail_commits
+            .store(u64::from(n), Ordering::Relaxed);
+    }
+
+    /// Sets how long the write connection waits for a busy database. Tests
+    /// use it to make a busy lock fail fast, so a retry is deterministic.
+    #[doc(hidden)]
+    pub fn set_busy_timeout(&self, timeout: Duration) {
+        let _ = self.lock().busy_timeout(timeout);
+    }
+
     /// Write transactions run so far.
     #[cfg(test)]
     pub(crate) fn txes(&self) -> u64 {
@@ -362,6 +384,14 @@ impl Store {
         // Counted before a read can see it, and again once it ended (see
         // `read` and `flush`).
         self.inner.committing.fetch_add(1, Ordering::Release);
+        if self.inner.fail_commits.load(Ordering::Relaxed) > 0 {
+            self.inner.fail_commits.fetch_sub(1, Ordering::Relaxed);
+            // Counted as ended, as a real failed commit is. The transaction
+            // drops here, which rolls it back: nothing was written, exactly
+            // as a commit past `busy_timeout` ends.
+            self.inner.committed.fetch_add(1, Ordering::Release);
+            return Err(Error::Busy);
+        }
         let committed = tx.commit();
         self.inner.committed.fetch_add(1, Ordering::Release);
         #[cfg(test)]

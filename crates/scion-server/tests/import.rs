@@ -20,7 +20,7 @@ use scion_core::{
 };
 use scion_server::auth::Caller;
 use scion_server::deadline::Deadline;
-use scion_server::import::{ImportOptions, ImportReport, import_git};
+use scion_server::import::{BUSY_TRIES, CHECKS, ImportOptions, ImportReport, import_git};
 use scion_server::land::{LandRequest, LandState, Lands};
 use scion_server::meta::{MetaTx as _, RefState};
 use scion_server::{Error, Store, read, tree, write};
@@ -916,4 +916,126 @@ fn a_second_server_process_is_refused() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("in use by another server"), "{stderr}");
+}
+
+/// Creates the import's repo up front, so the import's first write is a
+/// batch, not the repo's create.
+fn make_repo(store: &Store) {
+    store.write(|c| c.create_repo("r")).unwrap();
+}
+
+/// A store that shares its data directory, so an import keeps its write
+/// transactions short and yields between them.
+fn open_shared_store() -> (tempfile::TempDir, Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_shared(dir.path()).unwrap();
+    (dir, store)
+}
+
+/// Waits until the store has `n` changesets, so a test can hold the write
+/// lock while the import's next batch runs.
+fn wait_for_writes(dir: &Path, n: i64) {
+    let watcher = Connection::open(dir.join("scion.db")).unwrap();
+    let mut enough = false;
+    for _ in 0..10000 {
+        let cs: i64 = watcher
+            .query_row("SELECT count(*) FROM changesets", [], |row| row.get(0))
+            .unwrap_or(0);
+        if cs >= n {
+            enough = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(enough, "the import never stored {n} changesets");
+}
+
+/// Holds the store's write lock from another connection for `hold_ms`. The
+/// thread ends on its own; it commits when the hold is over. The hold takes
+/// the lock the moment a batch's commit ends, so it must outlast the flush
+/// that follows the commit plus the yield before the next batch begins.
+fn hold_for(dir: &Path, hold_ms: u64) {
+    let db = Connection::open(dir.join("scion.db")).unwrap();
+    thread::spawn(move || {
+        // The lock may be held by a batch of the import; wait for it, then
+        // hold past the writer's busy timeout.
+        db.busy_timeout(Duration::from_secs(30)).unwrap();
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let deadline = Instant::now() + Duration::from_millis(hold_ms);
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        db.execute_batch("COMMIT").unwrap();
+    });
+}
+
+#[test]
+fn an_import_batch_waits_out_a_busy_write_lock() {
+    let git = Git::init();
+    let rev = git.fast_commits(0, 3000);
+    let (dir, store) = open_shared_store();
+    // A busy lock fails fast, so the retry is deterministic: the holder
+    // keeps the lock far longer than the store waits for it.
+    store.set_busy_timeout(Duration::from_millis(100));
+    let report = thread::scope(|s| {
+        let importer = s.spawn(|| try_import(&store, &git, &rev).unwrap());
+        // Once changesets are stored, a batch is running or just ended: the
+        // hold takes the lock the moment that batch ends, so the next batch
+        // begins inside the hold. A batch is safe to run again whole.
+        wait_for_writes(dir.path(), 50);
+        hold_for(dir.path(), 1500);
+        importer.join().unwrap()
+    });
+    assert_eq!((report.commits, report.imported), (3000, 3000));
+}
+
+#[test]
+fn an_import_that_stays_busy_fails_with_the_busy_error() {
+    let git = Git::init();
+    let rev = git.fast_commits(0, 60);
+    let (_dir, store) = open_store();
+    make_repo(&store);
+    // Every batch commit fails: the retry bound runs out, and the import
+    // gives up with the busy error instead of retrying forever.
+    store.fail_next_commits(BUSY_TRIES + 1);
+    let error = try_import(&store, &git, &rev).unwrap_err();
+    assert!(matches!(error, Error::Busy), "{error:?}");
+    // Nothing was written: the ref is not there, and no changeset is.
+    let refs: i64 = store
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM refs", [], |row| row.get(0))?))
+        .unwrap();
+    assert_eq!(refs, 0);
+    let cs: i64 = store
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM changesets", [], |row| row.get(0))?))
+        .unwrap();
+    assert_eq!(cs, 0);
+}
+
+#[test]
+fn a_rolled_back_import_batch_verifies_again_when_it_reruns() {
+    let git = Git::init();
+    let rev = git.fast_commits(0, 40);
+    // A clean import of the same history checks every commit once; its walk
+    // count is what one pass over the plan costs.
+    let (_clean_dir, clean) = open_store();
+    make_repo(&clean);
+    let clean_report = try_import(&clean, &git, &rev).unwrap();
+    let one_pass = CHECKS.get();
+    CHECKS.with(|checks| checks.set(0));
+    // The retried import's batch runs whole, checks every commit, and its
+    // commit fails as busy. The retry runs the batch again, and the checker
+    // reset makes it verify from scratch: every committed changeset was
+    // checked by the transaction that stored it.
+    let (_dir, store) = open_store();
+    make_repo(&store);
+    store.fail_next_commits(1);
+    let report = try_import(&store, &git, &rev).unwrap();
+    assert_eq!((report.commits, report.imported), (40, 40));
+    assert_eq!(report.verified, clean_report.verified);
+    let walks = CHECKS.get();
+    assert_eq!(
+        walks,
+        2 * one_pass,
+        "the checks of the rolled-back batch ran again"
+    );
 }
