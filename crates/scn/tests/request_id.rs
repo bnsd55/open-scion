@@ -93,6 +93,9 @@ fn checkout(tiers: &Tiers, rev: &str, dest: &Path) {
 fn a_checkout_shows_one_id_at_every_hop() {
     let _serial = SERIAL.lock().unwrap();
     init_log();
+    // The two tests share one log, so this test reads only the lines that
+    // it logged itself.
+    let mark = log_text().len();
     let data = tempfile::tempdir().unwrap();
     let store = Store::open(&data.path().join("scion")).unwrap();
     let content = store.blobs().put(b"the demo file\n").unwrap();
@@ -108,12 +111,12 @@ fn a_checkout_shows_one_id_at_every_hop() {
 
     let dest = data.path().join("out");
     checkout(&tiers, "main", &dest);
-    let text = log_text();
+    let text = &log_text()[mark..];
 
     // Every hop of the one checkout — the daemon's and the cache's
     // GetObjects calls, and the server's ResolveRef — names the one
     // request ID that the scn command made and sent, a 16-digit hex ID.
-    let ids = span_ids(&text);
+    let ids = span_ids(text);
     assert!(!ids.is_empty(), "no call spans in the log:\n{text}");
     assert_eq!(ids.len(), 1, "one ID across every hop: {ids:?}");
     let id = *ids.iter().next().unwrap();

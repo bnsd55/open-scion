@@ -47,6 +47,7 @@ pub struct Call {
 }
 
 impl Call {
+    /// One command's interceptor: its token and its request ID.
     pub fn new(bearer: Bearer, request_id: MetadataValue<Ascii>) -> Self {
         Self { bearer, request_id }
     }
@@ -74,7 +75,12 @@ pub async fn test_objects(url: &str, token: &str) -> Objects {
         .connect()
         .await
         .unwrap();
-    let call = Call(Bearer::new(token).unwrap());
+    let call = Call::new(
+        Bearer::new(token).unwrap(),
+        request_id::generate()
+            .parse()
+            .expect("the request ID is ASCII"),
+    );
     ObjectsClient::with_interceptor(channel, call)
 }
 

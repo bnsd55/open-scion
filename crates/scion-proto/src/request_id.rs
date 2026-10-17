@@ -1,10 +1,9 @@
 //! The request ID: one per client operation, carried through every hop.
 //!
 //! `scn` makes one per command and sends it on every call. A tier forwards
-//! the one its caller sent, and makes one only when the caller sent none.
-//! Every served call records it as the `request_id` field of its `call`
-//! span, so one checkout can be followed across scn, daemon, cache and
-//! server logs.
+//! the one its caller sent. Every served call records it as the
+//! `request_id` field of its `call` span, so one checkout can be followed
+//! across scn, daemon, cache and server logs.
 //!
 //! The header is [`REQUEST_ID`]. A value is 1 to 64 bytes of visible ASCII
 //! without a space. A header that is longer, or not visible ASCII, is
@@ -39,8 +38,7 @@ pub fn sanitize(bytes: Option<&[u8]>) -> Option<String> {
     Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
-/// A request ID this process made: 16 lowercase hex digits from the time
-/// and a counter.
+/// A request ID: 16 lowercase hex digits from the time and a counter.
 #[must_use]
 pub fn generate() -> String {
     // The nanos fit u64 until the year 2554.
@@ -53,13 +51,6 @@ pub fn generate() -> String {
         "{:016x}",
         nanos ^ counter.wrapping_mul(0x9e37_79b9_7f4a_7c15)
     )
-}
-
-/// The request ID a tier sends upstream: the caller's if it sent one that
-/// is kept, else one this process made.
-#[must_use]
-pub fn for_inbound(bytes: Option<&[u8]>) -> String {
-    sanitize(bytes).unwrap_or_else(generate)
 }
 
 #[cfg(test)]
@@ -100,14 +91,5 @@ mod tests {
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         );
         assert_ne!(a, b, "two IDs made one after the other differ");
-    }
-
-    #[test]
-    fn a_tier_keeps_what_its_caller_sent() {
-        assert_eq!(for_inbound(Some(b"mine")), "mine");
-        // A refused header makes one, of the made-here shape.
-        let made = for_inbound(Some(b"no space"));
-        assert_eq!(made.len(), 16);
-        assert!(made.bytes().all(|b| b.is_ascii_hexdigit()));
     }
 }

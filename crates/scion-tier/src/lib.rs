@@ -414,7 +414,6 @@ struct Progress {
     fetched_to: AtomicUsize,
 }
 
-/// What one reply asks for.
 /// The bytes of the call's request-ID header, if it sent one.
 fn request_id_bytes<T>(request: &Request<T>) -> Option<&[u8]> {
     request
@@ -423,6 +422,7 @@ fn request_id_bytes<T>(request: &Request<T>) -> Option<&[u8]> {
         .map(tonic::metadata::MetadataValue::as_bytes)
 }
 
+/// What one reply asks for.
 struct Ask {
     /// The repo of the ticket, for the store's bookkeeping and the logs.
     repo: String,
