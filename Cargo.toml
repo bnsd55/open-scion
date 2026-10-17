@@ -61,3 +61,14 @@ missing_docs = "warn"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+
+# Debug builds and test builds carry line tables only: enough for file:line
+# backtraces, a fraction of the disk and the link time of full debug info.
+# The shared build slots used to set this per command; it belongs to the
+# workspace, so every cargo command gets it, ours, CI's, or a
+# contributor's.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
