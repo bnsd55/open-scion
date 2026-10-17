@@ -1532,22 +1532,14 @@ mod tests {
             // still counts the owner's walk alone, so the default cap of
             // 8 keeps seven walks free for other repos and kinds ([#142]).
             wait_entered(1);
-            let walks = store.derive_flights();
-            let joined = |walks: &DeriveFlights| {
-                walks
-                    .flights
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .get(&FlightKey::of::<Cold<1>>(repo))
-                    .map_or(0, Arc::strong_count)
-            };
             for _ in 0..2_000 {
-                if joined(walks) >= 9 {
+                if joined_on(&store, repo) >= 9 {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            assert_eq!(joined(walks), 9, "the seven callers never joined");
+            assert_eq!(joined_on(&store, repo), 9, "the seven callers never joined");
+            let walks = store.derive_flights();
             assert_eq!(
                 *walks
                     .in_flight
@@ -1619,6 +1611,20 @@ mod tests {
         assert!(beside);
     }
 
+    /// How many Arcs the flight of `Cold<1>` for `repo` has: the map's one,
+    /// the walking owner's, and one per caller that joined the flight and
+    /// still waits on it. A test that must have a waiter on the flight
+    /// before the walk ends polls this count.
+    fn joined_on(store: &Store, repo: RepoId) -> usize {
+        store
+            .derive_flights()
+            .flights
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&FlightKey::of::<Cold<1>>(repo))
+            .map_or(0, Arc::strong_count)
+    }
+
     #[test]
     fn a_waiter_that_leaves_does_not_trap_the_next_caller() {
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1627,15 +1633,14 @@ mod tests {
         let tip = *ids.last().unwrap();
         // The owner's walk stops at a step boundary past its deadline, with
         // the last changesets still missing. The gate walks it one derive
-        // at a time: two releases finish the first step, and a pause after
-        // them makes sure the deadline, set at the start, has passed when
-        // the second step ends.
+        // at a time: the second pair of releases goes out only once the
+        // waiter has joined the walk's flight and the deadline, built
+        // here, has passed - the state decides the order, not a clock's
+        // mercy to thread starts.
+        let owner_deadline = Deadline::new(Instant::now() + Duration::from_millis(50));
         std::thread::scope(|scope| {
             let _gate = gate_closed();
-            let owner = scope.spawn(|| {
-                let deadline = Deadline::new(Instant::now() + Duration::from_millis(50));
-                get_by::<Cold<1>>(&store, repo, tip, &deadline)
-            });
+            let owner = scope.spawn(|| get_by::<Cold<1>>(&store, repo, tip, &owner_deadline));
             wait_entered(1);
             // A waiter of the same repo, spawned while the owner walks: it
             // joins the walk's flight. The walk's end wakes it.
@@ -1643,8 +1648,19 @@ mod tests {
                 let deadline = Deadline::new(Instant::now() + Duration::from_secs(5));
                 get_by::<Cold<1>>(&store, repo, ids[1], &deadline).unwrap()
             });
+            // The waiter is provably on the flight, and the owner's
+            // deadline has provably passed, before the walk is let on.
+            for _ in 0..2_000 {
+                if joined_on(&store, repo) >= 3 && Instant::now() >= owner_deadline.at() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                joined_on(&store, repo) >= 3 && Instant::now() >= owner_deadline.at(),
+                "the waiter never joined the flight"
+            );
             gate_release(2);
-            std::thread::sleep(Duration::from_millis(100));
             gate_release(2);
             // A waiter of a changeset the stopped walk DID store: it wakes
             // when the walk ends, reads its value, and leaves without
@@ -1678,18 +1694,32 @@ mod tests {
         // wakes when the walk ends, finds its value still missing, and owns
         // the next walk itself: it walks only what is left, and every
         // changeset is derived once, never redone.
+        let owner_deadline = Deadline::new(Instant::now() + Duration::from_millis(50));
         std::thread::scope(|scope| {
             let _gate = gate_closed();
-            let owner = scope.spawn(|| {
-                let deadline = Deadline::new(Instant::now() + Duration::from_millis(50));
-                get_by::<Cold<1>>(&store, repo, tip, &deadline)
-            });
+            let owner = scope.spawn(|| get_by::<Cold<1>>(&store, repo, tip, &owner_deadline));
             wait_entered(1);
             // The waiter joins the walk while it is still in flight, so
-            // the walk's end is what wakes it.
-            let waiter = scope.spawn(|| get::<Cold<1>>(&store, repo, tip).unwrap());
+            // the walk's end is what wakes it. The test waits for the
+            // waiter's Arc to be on the flight, and for the deadline to
+            // have passed, before it lets the walk on: a waiter that
+            // arrived after the walk ended would join nothing and check
+            // something else.
+            let waiter = scope.spawn(|| {
+                let deadline = Deadline::new(Instant::now() + Duration::from_secs(5));
+                get_by::<Cold<1>>(&store, repo, tip, &deadline).unwrap()
+            });
+            for _ in 0..2_000 {
+                if joined_on(&store, repo) >= 3 && Instant::now() >= owner_deadline.at() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                joined_on(&store, repo) >= 3 && Instant::now() >= owner_deadline.at(),
+                "the waiter never joined the flight"
+            );
             gate_release(2);
-            std::thread::sleep(Duration::from_millis(100));
             gate_release(2);
             let owner = owner.join().unwrap();
             assert!(
