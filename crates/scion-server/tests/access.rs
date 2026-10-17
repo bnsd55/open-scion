@@ -53,7 +53,6 @@ impl Interceptor for Bearer {
 type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
 type Objects = ObjectsClient<InterceptedService<Channel, Bearer>>;
 
-
 /// alice may write `docs` of `main`, bob may only read `main`, ci may write
 /// all of `main`. Every token is its principal's name.
 fn access() -> Access {
@@ -596,6 +595,9 @@ struct Prep {
     guide: Vec<u8>,
     /// A blob the repo has, for the rows that create changesets.
     content: Vec<u8>,
+    /// Each caller column's own land id, as its land row answered. A
+    /// column whose land was refused has none.
+    lands: std::sync::Arc<std::sync::Mutex<[String; 6]>>,
 }
 
 type Fut = Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>;
@@ -609,7 +611,7 @@ struct Row {
     call: Call,
 }
 
-fn put_blob(clients: &Clients, _prep: &Prep) -> Fut {
+fn put_blob(clients: &Clients, _prep: &Prep, _col: usize) -> Fut {
     let mut scion = clients.scion.clone();
     Box::pin(async move {
         scion.put_blob(tokio_stream::once(req::put_blob())).await?;
@@ -617,7 +619,7 @@ fn put_blob(clients: &Clients, _prep: &Prep) -> Fut {
     })
 }
 
-fn create_inside(clients: &Clients, prep: &Prep) -> Fut {
+fn create_inside(clients: &Clients, prep: &Prep, _col: usize) -> Fut {
     let mut scion = clients.scion.clone();
     let bytes = changeset_bytes(prep, "docs/guide");
     Box::pin(async move {
@@ -631,7 +633,7 @@ fn create_inside(clients: &Clients, prep: &Prep) -> Fut {
     })
 }
 
-fn create_outside(clients: &Clients, prep: &Prep) -> Fut {
+fn create_outside(clients: &Clients, prep: &Prep, _col: usize) -> Fut {
     let mut scion = clients.scion.clone();
     let bytes = changeset_bytes(prep, "src/a");
     Box::pin(async move {
@@ -648,12 +650,13 @@ fn create_outside(clients: &Clients, prep: &Prep) -> Fut {
 fn land_inside(clients: &Clients, prep: &Prep, col: usize) -> Fut {
     let mut scion = clients.scion.clone();
     let id = prep.guide.clone();
+    let lands = std::sync::Arc::clone(&prep.lands);
     Box::pin(async move {
         let reply = scion
             .land(land_req(&id, "matrix-inside"))
             .await?
             .into_inner();
-        prep.lands.lock().unwrap()[col] = reply.land_id;
+        lands.lock().unwrap()[col] = reply.land_id;
         Ok(())
     })
 }
@@ -661,9 +664,13 @@ fn land_inside(clients: &Clients, prep: &Prep, col: usize) -> Fut {
 fn land_outside(clients: &Clients, prep: &Prep, col: usize) -> Fut {
     let mut scion = clients.scion.clone();
     let id = prep.root.clone();
+    let lands = std::sync::Arc::clone(&prep.lands);
     Box::pin(async move {
-        let reply = scion.land(land_req(&id, "matrix-outside")).await?.into_inner();
-        prep.lands.lock().unwrap()[col] = reply.land_id;
+        let reply = scion
+            .land(land_req(&id, "matrix-outside"))
+            .await?
+            .into_inner();
+        lands.lock().unwrap()[col] = reply.land_id;
         Ok(())
     })
 }
@@ -713,7 +720,7 @@ fn land_req(id: &[u8], key: &str) -> LandRequest {
 /// A read of one changeset, drained to its end.
 macro_rules! read_call {
     ($method:ident, $req:expr) => {
-        |clients: &Clients, prep: &Prep| {
+        |clients: &Clients, prep: &Prep, _col: usize| {
             let mut scion = clients.scion.clone();
             let req = $req(prep);
             Box::pin(async move {
@@ -727,7 +734,7 @@ macro_rules! read_call {
 /// A streaming read, drained to its end.
 macro_rules! stream_call {
     ($method:ident, $req:expr) => {
-        |clients: &Clients, prep: &Prep| {
+        |clients: &Clients, prep: &Prep, _col: usize| {
             let mut scion = clients.scion.clone();
             let req = $req(prep);
             Box::pin(async move {
@@ -741,7 +748,7 @@ macro_rules! stream_call {
     };
 }
 
-fn resolve_ref_scion(clients: &Clients, _prep: &Prep) -> Fut {
+fn resolve_ref_scion(clients: &Clients, _prep: &Prep, _col: usize) -> Fut {
     let mut scion = clients.scion.clone();
     Box::pin(async move {
         scion.resolve_ref(req::resolve_ref()).await?;
@@ -749,7 +756,7 @@ fn resolve_ref_scion(clients: &Clients, _prep: &Prep) -> Fut {
     })
 }
 
-fn resolve_ref_objects(clients: &Clients, _prep: &Prep) -> Fut {
+fn resolve_ref_objects(clients: &Clients, _prep: &Prep, _col: usize) -> Fut {
     let mut objects = clients.objects.clone();
     Box::pin(async move {
         objects.resolve_ref(req::resolve_ref()).await?;
@@ -757,7 +764,7 @@ fn resolve_ref_objects(clients: &Clients, _prep: &Prep) -> Fut {
     })
 }
 
-fn get_root_tree(clients: &Clients, prep: &Prep) -> Fut {
+fn get_root_tree(clients: &Clients, prep: &Prep, _col: usize) -> Fut {
     let mut objects = clients.objects.clone();
     let root = prep.root.clone();
     Box::pin(async move {
@@ -766,7 +773,7 @@ fn get_root_tree(clients: &Clients, prep: &Prep) -> Fut {
     })
 }
 
-fn get_objects(clients: &Clients, prep: &Prep) -> Fut {
+fn get_objects(clients: &Clients, prep: &Prep, _col: usize) -> Fut {
     let mut objects = clients.objects.clone();
     let blob = prep.blob.clone();
     Box::pin(async move {
@@ -784,7 +791,10 @@ fn get_objects(clients: &Clients, prep: &Prep) -> Fut {
 /// The matrix: every RPC of both services, and the code it answers each
 /// caller column with. The rows that write name the paths they write, so
 /// a prefix principal's cells split inside and outside its prefixes.
+/// The table is data, so a new principal column (folder read rules,
+/// #121) is one row in `CALLERS` and one entry in each `want`.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn the_authz_matrix_answers_as_documented() {
     let (_dir, store, root, blob) = store();
 
@@ -806,7 +816,7 @@ async fn the_authz_matrix_answers_as_documented() {
         blob: blob.as_bytes().to_vec(),
         guide: guide.as_bytes().to_vec(),
         content: put(&store, b"matrix").as_bytes().to_vec(),
-        lands: std::sync::Mutex::new([String::new(); 6]),
+        lands: std::sync::Mutex::new([const { String::new() }; 6]).into(),
     };
 
     // Two servers: one with the rules of `access`, one whose only
