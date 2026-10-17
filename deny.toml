@@ -2,10 +2,12 @@
 
 [advisories]
 version = 2
-# Yanked and unmaintained releases are noted, not fatal: the finding is
-# reviewed, then handled, before a denial would hide it behind an ignore.
+# Yanked releases anywhere in the tree are noted, not fatal. An
+# unmaintained direct dependency fails, so it gets acted on; an
+# unmaintained transitive one is only noted, so an upstream flag cannot
+# turn every PR red with no code change to make.
 yanked = "warn"
-unmaintained = "all"
+unmaintained = "workspace"
 
 [licenses]
 version = 2
