@@ -12,7 +12,6 @@ homepage = "https://github.com/bnsd55/open-scion"
 keywords = ["vcs", "version-control", "monorepo", "git", "source-control"]
 categories = ["development-tools"]
 authors = ["Ben Shaharizad <bnsd55@gmail.com>"]
-readme = "README.md"
 
 [workspace.dependencies]
 open-scion-core = { version = "0.1.0", path = "crates/scion-core" }

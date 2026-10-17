@@ -1,13 +1,15 @@
 # open-scion-server
 
-Server for the Scion version control system: storage, commits, lands and reads.
+Server for the Scion version control system: storage, commits, lands
+and reads.
 
-The `scion-server` binary: one store per data directory, gRPC over TLS, crash-safe lands and blob storage.
+The `scion-server` binary: one store per data directory, gRPC over TLS,
+crash-safe lands and blob storage.
 
 Part of [open-scion](https://github.com/bnsd55/open-scion), a version
 control system for large monorepos. See the repository for the design
 and the rest of the system.
 
 ```sh
-cargo add open-scion-server
+cargo install open-scion-server
 ```
