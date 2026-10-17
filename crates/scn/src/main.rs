@@ -20,7 +20,9 @@ struct Cli {
         global = true
     )]
     server: String,
-    /// Bearer token for the server.
+    /// Bearer token for the server. Pass it in `SCION_TOKEN`, not here:
+    /// the command line is readable by every local user (`ps`), the
+    /// environment of your own process is not.
     #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
     token: String,
     /// Address of a scion-cache or scion-daemon that serves `GetObjects`
