@@ -118,16 +118,21 @@ async fn serve(store: &Store, access: Access) -> (tokio::sync::oneshot::Sender<(
     (stop, format!("http://{addr}"))
 }
 
-/// A client of `url` as `token`; `None` sends no token at all.
-fn client_with(channel: Channel, token: Option<&str>) -> (Scion, Objects) {
+/// A client pair of `url` as `token`; `None` sends no token at all.
+struct Pair {
+    scion: Scion,
+    objects: Objects,
+}
+
+fn client_with(channel: Channel, token: Option<&str>) -> Pair {
     let bearer = match token {
         None => Bearer(None),
         Some(token) => Bearer::from_token(token),
     };
-    (
-        ScionClient::with_interceptor(channel.clone(), bearer.clone()),
-        ObjectsClient::with_interceptor(channel, bearer),
-    )
+    Pair {
+        scion: ScionClient::with_interceptor(channel.clone(), bearer.clone()),
+        objects: ObjectsClient::with_interceptor(channel, bearer),
+    }
 }
 
 impl Bearer {
@@ -140,8 +145,17 @@ impl Bearer {
     }
 }
 
-/// One call of one RPC with a default request, drained to its end.
-type Call = fn(&Scion, &Objects) -> Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>;
+/// The requests that must be refused only for their token: real bytes, a
+/// real changeset on `main`, and a real land. If the server refused one
+/// of these for another reason, the side-effect check would say nothing.
+struct Payload {
+    put_blob: PutBlobRequest,
+    create_changeset: CreateChangesetRequest,
+    land: LandRequest,
+}
+
+/// One call of one RPC, drained to its end.
+type Call = fn(&Pair, &Payload) -> Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>;
 
 /// The RPCs of one service, and the call that reaches each. The row's
 /// name is the method name as the proto spells it; the test fails when a
@@ -156,9 +170,9 @@ struct Row {
 /// the same name (the two services share `ResolveRef`) is covered by its
 /// own row.
 macro_rules! scion_only {
-    ($method:ident, $request:ty) => {
-        |scion: &Scion, _objects: &Objects| {
-            let mut scion = scion.clone();
+    ($method:ident, $request:ident) => {
+        |pair: &Pair, _payload: &Payload| {
+            let mut scion = pair.scion.clone();
             Box::pin(async move {
                 scion.$method(<$request as Default>::default()).await?;
                 Ok(())
@@ -169,8 +183,8 @@ macro_rules! scion_only {
 
 macro_rules! objects_only {
     ($method:ident, $request:ty) => {
-        |_scion: &Scion, objects: &Objects| {
-            let mut objects = objects.clone();
+        |pair: &Pair, _payload: &Payload| {
+            let mut objects = pair.objects.clone();
             Box::pin(async move {
                 objects.$method(<$request as Default>::default()).await?;
                 Ok(())
@@ -186,12 +200,11 @@ fn rows() -> Vec<Row> {
         Row {
             service: "scion.v1.Scion",
             rpc: "PutBlob",
-            call: |scion: &Scion, _objects: &Objects| {
-                let mut scion = scion.clone();
+            call: |pair: &Pair, payload: &Payload| {
+                let mut scion = pair.scion.clone();
+                let request = payload.put_blob.clone();
                 Box::pin(async move {
-                    scion
-                        .put_blob(tokio_stream::once(PutBlobRequest::default()))
-                        .await?;
+                    scion.put_blob(tokio_stream::once(request)).await?;
                     Ok(())
                 }) as Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>
             },
@@ -199,12 +212,26 @@ fn rows() -> Vec<Row> {
         Row {
             service: "scion.v1.Scion",
             rpc: "CreateChangeset",
-            call: scion_only!(create_changeset, CreateChangesetRequest),
+            call: |pair: &Pair, payload: &Payload| {
+                let mut scion = pair.scion.clone();
+                let request = payload.create_changeset.clone();
+                Box::pin(async move {
+                    scion.create_changeset(request).await?;
+                    Ok(())
+                }) as Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>
+            },
         },
         Row {
             service: "scion.v1.Scion",
             rpc: "Land",
-            call: scion_only!(land, LandRequest),
+            call: |pair: &Pair, payload: &Payload| {
+                let mut scion = pair.scion.clone();
+                let request = payload.land.clone();
+                Box::pin(async move {
+                    scion.land(request).await?;
+                    Ok(())
+                }) as Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>
+            },
         },
         Row {
             service: "scion.v1.Scion",
@@ -272,8 +299,8 @@ fn rows() -> Vec<Row> {
             // The one RPC with no token check: its permission is the
             // read ticket (docs/architecture.md, section 8). A call with
             // no ticket at all is refused with PERMISSION_DENIED.
-            call: |_scion: &Scion, objects: &Objects| {
-                let mut objects = objects.clone();
+            call: |pair: &Pair, _payload: &Payload| {
+                let mut objects = pair.objects.clone();
                 Box::pin(async move {
                     objects
                         .get_objects(GetObjectsRequest {
@@ -300,6 +327,15 @@ fn declared() -> (Vec<(String, String)>, Vec<String>) {
     // The proto of the repository: the same file the build compiles.
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../proto/scion.proto");
     let text = std::fs::read_to_string(&path).expect("proto/scion.proto is readable");
+    let package = text
+        .lines()
+        .map(str::trim)
+        .find_map(|line| {
+            line.strip_prefix("package ")
+                .and_then(|rest| rest.strip_suffix(';'))
+        })
+        .expect("the proto declares a package")
+        .to_owned();
     let mut service = String::new();
     let mut declared = Vec::new();
     for line in text.lines().map(str::trim) {
@@ -309,7 +345,7 @@ fn declared() -> (Vec<(String, String)>, Vec<String>) {
         {
             // The file's package makes the full name the generated code
             // publishes as SERVICE_NAME.
-            service = format!("scion.v1.{}", name.trim());
+            service = format!("{package}.{}", name.trim());
         } else if let Some(rest) = line.strip_prefix("rpc ") {
             let name = rest.split('(').next().expect("rpc NAME(").trim().to_owned();
             declared.push((service.clone(), name));
@@ -320,32 +356,32 @@ fn declared() -> (Vec<(String, String)>, Vec<String>) {
 }
 
 /// The repo's state that the calls must not change: the version of
-/// `main`, and the row count of every metadata table.
-fn crate_error(error: rusqlite::Error) -> scion_server::Error {
-    scion_server::Error::from(error)
-}
+/// `main`, and the row count of every metadata table. The tables come
+/// from `sqlite_master`, so a new table joins the check on its own.
 fn state_of(store: &Store) -> (i64, Vec<i64>) {
     let counts = store
         .read(|c| {
-            [
-                "changesets",
-                "changeset_parents",
-                "repo_changesets",
-                "trees",
-                "repo_blobs",
-                "derived",
-                "view_roots",
-                "refs",
-                "lands",
-            ]
-            .iter()
-            .map(|table| {
-                c.query_row::<i64, _, _>(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                    row.get(0)
+            let mut names = c
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                     ORDER BY name",
+                )
+                .map_err(scion_server::Error::from)?;
+            let names = names
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(scion_server::Error::from)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(scion_server::Error::from)?;
+            names
+                .iter()
+                .map(|name| {
+                    c.query_row::<i64, _, _>(&format!("SELECT COUNT(*) FROM {name}"), [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(scion_server::Error::from)
                 })
-                .map_err(crate_error)
-            })
-            .collect::<Result<Vec<i64>, _>>()
+                .collect()
         })
         .expect("the row counts read");
     let version = store
@@ -357,7 +393,38 @@ fn state_of(store: &Store) -> (i64, Vec<i64>) {
     (version, counts)
 }
 
+/// The changeset bytes of a new child of `root` that sets `path` to the
+/// blob `content`, and its id.
+fn changeset_on(
+    root: &scion_core::ChangesetId,
+    content: scion_core::BlobId,
+    path: &str,
+) -> (Vec<u8>, scion_core::ChangesetId) {
+    let cs = scion_core::Changeset {
+        parents: vec![*root],
+        author: scion_core::IdentityTime {
+            name: b"Ada".to_vec(),
+            email: b"ada@example.com".to_vec(),
+            unix_secs: 1_700_000_001,
+            tz_offset_minutes: 0,
+        },
+        committer: None,
+        message: b"a change\n".to_vec(),
+        changes: [(
+            scion_core::RepoPath::new(path).unwrap(),
+            Some(scion_core::FileState::Regular {
+                content,
+                executable: false,
+            }),
+        )]
+        .into(),
+    };
+    let (bytes, id) = cs.encode_with_id();
+    (bytes, id)
+}
+
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
     let (declared, generated) = declared();
     // The proto and the generated code agree on the services.
@@ -387,24 +454,64 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
         );
     }
 
-    let (_dir, store, _root) = store();
+    let (_dir, store, root) = store();
     let (stop, url) = serve(&store, access()).await;
-    let before = state_of(&store);
 
     let channel = Channel::from_shared(url.clone())
         .unwrap()
         .connect()
         .await
         .unwrap();
-    let (none_scion, none_objects) = client_with(channel.clone(), None);
-    let (wrong_scion, wrong_objects) = client_with(channel, Some("wrong"));
+    let none = client_with(channel.clone(), None);
+    let wrong = client_with(channel.clone(), Some("wrong"));
+    let mut ci = client_with(channel, Some("ci"));
+
+    // With the right token, a real upload stores a blob. Its id feeds
+    // the changeset and land payloads.
+    let blob = ci
+        .scion
+        .put_blob(tokio_stream::once(PutBlobRequest {
+            repo: REPO.into(),
+            data: b"# side effect\n".to_vec(),
+        }))
+        .await
+        .expect("the right token may upload")
+        .into_inner()
+        .blob_id;
+    let content = scion_core::BlobId::from_bytes(blob.as_slice().try_into().unwrap());
+    let (landed, landed_id) = changeset_on(&root, content, "LANDED");
+    let (refused, _refused_id) = changeset_on(&root, content, "REFUSED");
+    let payload = Payload {
+        put_blob: PutBlobRequest {
+            repo: REPO.into(),
+            data: b"refused\n".to_vec(),
+        },
+        create_changeset: CreateChangesetRequest {
+            repo: REPO.into(),
+            changeset: refused,
+        },
+        land: LandRequest {
+            repo: REPO.into(),
+            changeset_id: landed_id.as_bytes().to_vec(),
+            target_ref: "main".into(),
+            request_key: "refused".into(),
+        },
+    };
+    // The land names a changeset the server holds.
+    ci.scion
+        .create_changeset(CreateChangesetRequest {
+            repo: REPO.into(),
+            changeset: landed,
+        })
+        .await
+        .expect("the right token may create the changeset the land names");
+    // The baseline: everything the setup stored, nothing more. The
+    // refused calls and the controls are compared against it.
+    let before = state_of(&store);
 
     for row in &rows {
-        for (who, clients) in [
-            ("no token", (&none_scion, &none_objects)),
-            ("wrong token", (&wrong_scion, &wrong_objects)),
-        ] {
-            let reply = (row.call)(clients.0, clients.1).await;
+        for (who, pair) in [("no token", &none), ("wrong token", &wrong)] {
+            let reply = (row.call)(pair, &payload).await;
             let status = match reply {
                 Ok(()) => panic!("{}.{}, {who}: the call went through", row.service, row.rpc),
                 Err(status) => status,
@@ -424,10 +531,57 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
             );
         }
     }
-
-    // No call moved a ref or stored a blob.
+    // No refused call moved a ref, stored a blob, or landed anything.
     let after = state_of(&store);
     assert_eq!(before, after, "a refused call changed the repo");
+
+    // The positive control: the same requests, sent with the right
+    // token, do change the state. Without this, the no-change assert
+    // above would pass for a server that refuses everything.
+    ci.scion
+        .put_blob(tokio_stream::once(payload.put_blob.clone()))
+        .await
+        .expect("the upload the refused calls carried is a valid one");
+    assert_ne!(
+        state_of(&store),
+        after,
+        "the control upload changed nothing"
+    );
+    ci.scion
+        .create_changeset(payload.create_changeset.clone())
+        .await
+        .expect("the changeset the refused calls carried is a valid one");
+    assert_ne!(
+        state_of(&store),
+        after,
+        "the control changeset changed nothing"
+    );
+    ci.scion
+        .land(LandRequest {
+            repo: REPO.into(),
+            changeset_id: payload.land.changeset_id.clone(),
+            target_ref: "main".into(),
+            request_key: "control".into(),
+        })
+        .await
+        .expect("the land the refused calls carried is a valid one");
+    assert_ne!(state_of(&store), after, "the control land changed nothing");
+
+    // And with the right token, no row answers UNAUTHENTICATED: the
+    // refusal of the calls above is about the token, nothing else.
+    for row in &rows {
+        let reply = (row.call)(&ci, &payload).await;
+        if let Err(status) = reply {
+            assert_ne!(
+                status.code(),
+                Code::Unauthenticated,
+                "{}.{} with the right token: {}",
+                row.service,
+                row.rpc,
+                status.message()
+            );
+        }
+    }
 
     stop.send(()).ok();
 }
