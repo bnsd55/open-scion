@@ -66,7 +66,7 @@ pub trait Kind {
     /// Writes that it makes, such as trees, go in the caller's transaction.
     ///
     /// It may also read the stored value of an older changeset that it
-    /// reaches through those parents ([`load`]). Each one has a value.
+    /// reaches through those parents (`load`). Each one has a value.
     ///
     /// # Errors
     ///
