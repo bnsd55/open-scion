@@ -1464,9 +1464,38 @@ followed again. A tier serves only `Objects`, so of the `scn` commands only
 `scripts/bench-checkout.sh` runs 50 sparse checkouts at once through one
 daemon, cold and warm, against `git clone` doing the same checkout
 ([benchmarks](benchmarks.md),
-[#6](https://github.com/bnsd55/open-scion/issues/6)). Planned: virtual
-checkout, where files load when first read
-([#11](https://github.com/bnsd55/open-scion/issues/11)).
+[#6](https://github.com/bnsd55/open-scion/issues/6)).
+
+### Virtual checkout
+
+`scn mount DIR [REV]` serves one ref of the repository as an NFSv3
+filesystem, so files load when they are first read
+([#11](https://github.com/bnsd55/open-scion/issues/11)). The server runs
+inside `scn`, on a free port of 127.0.0.1, and the mount uses the operating
+system's NFS client. A directory's tree is fetched when the directory is
+first listed or looked up in; a file's blob when the file is first read or
+sized, through the same `Objects` calls a checkout sends. Every read
+carries the mount's read ticket, which the mount refreshes through
+`GetRootTree` of the mounted changeset before it expires. Until #13 adds
+`GetSizes`, a file's size comes from its blob, so the first stat of a
+file that was never read fetches the blob, and `ls -l` of a directory
+fetches every blob in it.
+
+Writes go to an overlay directory beside the mount (a private directory
+under the system's temporary directory). `scn commit --from-mount DIR`
+commits exactly what the overlay holds: its files and symlinks, plus the
+recorded deletions. The mount never changes the ref; `scn land` moves it.
+
+`scn unmount DIR` stops the mount and removes its overlay. A mount that
+dies leaves its overlay behind, and the mount record in
+`~/.scion/mounts.json` says where it is.
+
+For single-user machines only. The NFS server sees neither the caller's
+user ID nor its source port, so it cannot tell local users apart, and the
+mount path, which carries the mount's random secret, is in the mount table
+that every local user can read. Any local user who can read the mount table
+can reach the mounted content through the NFS port, and root always can. The
+secret stops stray and accidental callers only; it is not a protection.
 
 ## 8. Security model
 
@@ -1483,6 +1512,7 @@ an untrusted network.
 | Object integrity | The client checks every tree and blob against its ID, so a server or tier cannot change an object. Each tier also checks every object from upstream before it stores or sends it, and the daemon checks each object again when it reads it from disk. The server sends a blob's zstd file without unpacking it, so the receiver finds a damaged file. | The client resolves its ref and reads its root tree on the server, so no tier passes on a `ResolveRef` or `GetRootTree` answer: they are `UNIMPLEMENTED` on a tier. The read ticket binds the walk to the root tree that the server signed, so a tier cannot name another one. |
 | Checkout | `scn checkout` writes into a private temp directory with a random name. It renames it onto a new destination, or moves its entries up into an existing empty directory that the user owns, never over an entry already there. It never follows a symlink while writing or removing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure, or on SIGINT, SIGTERM or SIGHUP, the destination stays as it was. | The directory that gets the checkout (an existing destination, or a new one's parent) must not be writable by all users, unless it has the sticky bit: they could swap parts of the checkout. An existing destination that breaks this is refused. Members of a group that can write it are trusted. Where the filesystem has no rename that never replaces (NFS), any empty mode 0700 directory of the user at a top-level directory name counts as the checkout's claim after `mkdirat` fails with `EEXIST`, and is replaced. Where it has no hard links either (some FUSE filesystems), any symlink of the user with the same target at a top-level symlink name counts as made after `symlinkat` fails with `EEXIST`, and is kept. This is for a lost NFS version 3 reply, but a trusted user (the owner, a group member, root) can also put such an entry there: it is taken, and no data is lost. A filesystem that shows one owner for every entry (a FUSE or SMB mount with `-o uid=`) passes every ownership check. In the temp directory, an entry found after `EEXIST` that is what the call makes counts as made, unless a recorded path in the same directory has its inode. A filesystem that folds names but shows another inode number under each name (CIFS with `noserverino`, FUSE without `use_ino`) would let such a fold through only for two empty files or two symlinks with one target: the two paths then share one entry, with the same content. A folded directory always fails: each directory that the checkout made already holds an entry. The check reads only the mode bits, not ACLs: an ACL that lets other users add or delete entries gets past it. No Windows rules: Windows is unsupported, so device names and names that end
 | Cache tiers | A tier refuses every call but `GetObjects` with `UNIMPLEMENTED`, and `GetObjects` serves only what the read ticket's walk reaches (see "Read tickets" below). A snapshot file (`--snapshot`) holds whole objects of the repos named, and whoever can read the file can read them. | The file is mode 0600 in a directory made with mode 0700, but a node gets it by any copy tool or a shared mount: give a node only snapshots of repos that all its users may read. |
+| Virtual checkout | `scn mount` binds to 127.0.0.1 on a free port, and every mount path and file handle carries a secret of 16 random bytes: a mount of a wrong path is refused (`MNT3ERR_NOENT`), and a handle that was not made by this mount is refused (`NFS3ERR_STALE`). The mount point's directory is the user's, and the overlay lives in a mode 0700 directory of the system's temporary directory. `scn mount` says at start, and in `--help`, that it is for single-user machines. The mount sends its read ticket with every `GetObjects`, and refreshes it through `GetRootTree` of the mounted changeset before it expires. | Single-user machines only, and the secret is not a protection: the NFS server sees neither the caller's user ID nor its source port (`nfsserve` passes neither to the file system), so it cannot tell local users apart, and the mount path with its secret is in the mount table that every local user can read. Any local user who can read the mount table can reach the mounted content through the NFS port, and root always can ([#11](https://github.com/bnsd55/open-scion/issues/11)). |
 | Errors | Internal errors reply `internal error`. The detail stays in the server or tier log. | |
 
 ### Read tickets
@@ -1531,6 +1561,7 @@ limit and its upgrade path. This is the list on `main` today.
 |---|---|---|---|
 | `scion-core/src/codec.rs` (`put_len`) | Encoding panics if a field is longer than `u32::MAX`. Every ingest path caps sizes far below that. | `try_encode` returning `Result`, if a path ever does not. | |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
+| `scion-server/src/store.rs` (`flush_dirs`) | The power-loss suite cannot catch a lost fsync of a blob directory: LazyFS persists a rename at rename time, so the cut never drops a directory entry. The `fsync` of each directory after a rename (section 3) is therefore untested by that suite. | A block-level replay that drops un-flushed writes in order (dm-log-writes replay to each FLUSH), when a bug report or a change to the rename path says a directory entry was lost. | |
 | `scion-server/src/main.rs` (`Command`) | The `Serve` subcommand holds its flags by value: 309 bytes against `Import`'s 109, 20 bytes over `clippy::large_enum_variant`, so the lint is off for the enum. | Box the TLS and ticket paths of `Serve` if a variant grows further. | |
 | `scion-server/src/import.rs` (`TX_BUDGET`) | A transaction of an import ends at 1 s, but one commit's record and check can run longer, and a server write then waits for it. Ceiling: the changes and trees of the biggest commit. | A separate write connection for the import, or per-statement yields. | [#100](https://github.com/bnsd55/open-scion/issues/100) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | Per-ref serialization in a shared database ([design](design/scalable-backend.md)). | [#47](https://github.com/bnsd55/open-scion/issues/47) |
@@ -1544,7 +1575,10 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/quotas.rs` (`Quotas`) | The request and upload-byte caps live in memory, so a restart forgets them; only the pending-lands cap counts rows of the store. A restart also frees every count. | Count the in-flight work in the store, or share the counts across processes. | [#15](https://github.com/bnsd55/open-scion/issues/15) |
 | `scn/src/client.rs` (`lossy`) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | Escape or base64 raw bytes in JSON. | |
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |
-| `scn/src/cmd/commit.rs` (`commit`) | The author time zone is always UTC. | A time zone crate. | |
+| `scn/src/cmd/commit.rs` (`commit`) | Reads each symlink target whole, so memory caps the target length. | Stream chunks from the file. | |
+| `scn/src/cmd/commit.rs` (`parse_author`) | The author time zone is always UTC, since `std` cannot read the local time zone. | A time zone crate. | |
+| `scn/src/vfs.rs` (`size_of`) | A file's size comes from its blob, so the first stat of a file that was never read fetches the blob, and `ls -l` of a directory fetches every blob in it. | After #13 gets a `GetSizes` call served from the stored frame's header. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
+| `scn/src/vfs.rs` (`io_err`) | Takes the error by value so `.map_err(io_err)` reads clean. | Take it by reference if the lint allows it one day. | |
 
 ## 10. Testing
 
@@ -1580,6 +1614,34 @@ A second test kills the server while it upgrades a database of schema
 version 2. Each kill leaves the database at one whole migration step (the
 first version, the last, or one between them), and the next start upgrades
 it.
+
+**The power-loss suite.** The server writes into a
+[LazyFS](https://github.com/dsrhaslab/lazyfs) mount, pinned to release
+0.3.1. LazyFS holds its own page cache and writes a file's data to the
+backing directory only when the application fsyncs it. The cut is one
+command on its faults fifo, `clear-cache`: it drops every cached write
+that was not fsynced, file by file. Then the suite kills the server and
+reopens the store from the backing directory, where it checks the same
+invariants as the crash suite. So the suite tests sync-before-reply: a
+reply that went out before the data was fsynced is lost by the cut, and
+the check fails. It caught a mutation without the fsync of a blob file
+before its row, and a mutation with SQLite's `synchronous = OFF`. What
+it does not prove:
+
+- A drive's volatile cache. The cut models what the process had not
+  fsynced, not what the drive held in cache; a `sync_all` that only
+  flushes a drive cache passes it. Upgrade to a model that replays
+  writes to each FLUSH point (dm-log-writes) when a report says that
+  acknowledged writes were lost on such hardware.
+- Directory entries. LazyFS persists a rename at rename time, so the
+  `fsync` of the blob directory after the rename (section 3) is never
+  exercised (section 9).
+- Reordering of writes. The cut takes everything unsynced at once.
+
+The suite is Linux-only (macOS syncs with `F_FULLFSYNC`, and its CI job
+has no LazyFS); there the crash suite is what runs. As in the crash
+suite, `SCION_POWER_SEED` replays a run and `SCION_POWER_ROUNDS` sets
+the number of cuts.
 
 What the suite does not prove:
 

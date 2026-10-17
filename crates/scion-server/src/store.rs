@@ -1254,6 +1254,12 @@ impl BlobBatch<'_> {
     /// Like [`BlobBatch::sync`], but leaves the full flush of the drive cache
     /// to the next [`Store::flush`]. Returns whether the batch wrote or kept
     /// any blob.
+    // SHORTCUT: the power-loss suite's cut drops unsynced file data, but
+    // LazyFS persists a rename at rename time, so the directory fsync here
+    // is never exercised by it. Upgrade: a block-level replay that drops
+    // un-flushed writes in order (dm-log-writes replay to each FLUSH), when
+    // a bug report or a change to this rename path says a directory entry
+    // was lost.
     fn flush_dirs(self) -> Result<bool> {
         for dir in &self.dirs {
             fsync_dir(dir)?;

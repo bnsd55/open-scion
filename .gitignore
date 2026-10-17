@@ -5,3 +5,5 @@ target/
 /crates/*/fuzz/coverage/
 /.claude/
 /scion-data/
+/docker/demo/certs/
+/docker/demo/work/

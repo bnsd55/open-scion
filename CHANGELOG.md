@@ -65,7 +65,10 @@ until that section gets its release date.
   `GetObjects` to `--objects` (a `scion-cache` or `scion-daemon`) with the
   checkout's ticket and each ref's path. Without `--objects`, object reads
   go to `--server`. On `ticket expired`, `scn` mints a fresh ticket for the
-  same changeset, once per call, and goes on.
+  same changeset, once per call, and goes on. A `scn mount` sends its
+  ticket with every read, and refreshes it through `GetRootTree` of the
+  mounted changeset — never of the ref, which may have moved — before it
+  expires, and again on `ticket expired`.
 
 #### The server
 
@@ -322,10 +325,26 @@ until that section gets its release date.
 #### scn
 
 - `scn`, the command-line client: `cat`, `ls`, `log`, `show`, `commit`,
+- `scn`, the command-line client: `cat`, `ls`, `log`, `show`, `commit`,
   `land` and `bench`, with `--json` output. `scn merge-base`, `scn
   is-ancestor` (exit 0 or 1) and `scn diff` for the query API, and
   `scn blame`. Every `scn` error exits 2, so it never reads as the "no" of
   `scn is-ancestor`.
+- `scn mount` and `scn unmount` (`#11`): a virtual checkout. `scn mount
+  DIR [REV]` serves one ref as an NFSv3 filesystem from `scn` itself, on a
+  free port of 127.0.0.1, so a directory's tree loads when it is first
+  listed or looked up in, and a file's blob when it is first read or
+  sized. Until `#13` PR-C adds `GetSizes`, a file's size comes from its
+  blob, so a first stat of an unread file fetches the blob. Writes land in
+  a private overlay directory (mode 0700 under the system's temporary
+  directory), and `scn commit --from-mount DIR` commits exactly what the
+  overlay holds, with no scan of the tree. `scn unmount DIR` stops the
+  mount and removes the overlay. For single-user machines only: the NFS
+  server sees neither the caller's user ID nor its source port, and the
+  mount path with its random secret is in the mount table that every
+  local user can read, so any local user who can read the mount table can
+  reach the mounted content, and root always can. The secret stops stray
+  and accidental callers only; it is not a protection.
 - `scn checkout`, into a new directory or an existing empty one. An
   existing directory is kept, with its mode and owner, and its parent need
   not be writable. It must not be writable by all users unless it has the
