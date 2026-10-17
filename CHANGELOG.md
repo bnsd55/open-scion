@@ -77,6 +77,14 @@ until that section gets its release date.
   directory: it is read-only, it can run while the server runs, and one
   line per problem names the kind, the ID and the path; it exits 0 when it
   saw no damage, 1 when it did, and 2 when it could not run.
+- `scion-server gc <data>` collects the blobs that nothing names: a
+  `repo_blobs` row whose blob no stored changeset of its repo puts, and a
+  blob file that no repo's row names, each older than a grace period
+  (`--grace-secs`, seven days; `--dry-run` reports and removes nothing).
+  Rows go before files, so a crash leaves orphan files only, which the
+  next run removes. It runs beside a live server: a changeset that commits
+  while it works pins its blobs, and `PutBlob` of a stored blob touches the
+  file, so the grace counts from the last upload.
 - Server-side commits (`CreateChangeset`) and lands: path-level conflict
   checks through a per-ref index, one transaction per land, retries by
   request key, and a bounded retry when the ref moves. A land stops in its
