@@ -96,3 +96,22 @@ fn a_sqlite_open_of_a_postgres_backed_directory_is_refused() {
         .expect("the marker refuses the SQLite backend");
     assert!(error.to_string().contains("--postgres-url"), "{error}");
 }
+
+#[test]
+fn a_postgres_open_makes_the_data_directory_it_names() {
+    if skip_on_sqlite() {
+        return;
+    }
+    // The first serve on a fresh host names the marker before anything
+    // else makes the directory: the open creates it, and the marker is in
+    // it, so the next SQLite open is refused.
+    let dir = tempfile::tempdir().unwrap();
+    let fresh = dir.path().join("not-made-yet");
+    let store = Backend::open_test(&fresh).unwrap();
+    assert!(fresh.join("backend").exists(), "the marker names Postgres");
+    drop(store);
+    let error = Backend::open_shared(&fresh, None, None)
+        .err()
+        .expect("the marker refuses the SQLite backend");
+    assert!(error.to_string().contains("--postgres-url"), "{error}");
+}

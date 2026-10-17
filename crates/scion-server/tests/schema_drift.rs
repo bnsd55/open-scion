@@ -10,17 +10,32 @@ use std::path::{Path, PathBuf};
 /// One column of a table: its coarse kind, which the two dialects spell
 /// differently, and its constraints.
 #[derive(Debug, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct Column {
     kind: &'static str,
     not_null: bool,
     primary_key: bool,
     unique: bool,
-    /// The table a `REFERENCES` names, if the column has one.
+    /// The `table(column)` a `REFERENCES` names, if the column has one.
     references: Option<String>,
+    /// The literal a `DEFAULT` names, if the column has one.
+    default: Option<String>,
+    /// Whether the column carries a `CHECK`. The two dialects spell the
+    /// same check differently, so only its presence compares.
+    checked: bool,
 }
 
 /// The schema: table name, then its columns with their shape.
 type Schema = BTreeMap<String, Vec<(String, Column)>>;
+
+/// One index: its name, the table it orders, the columns it orders by,
+/// and its partial filter, which the two dialects spell the same way.
+#[derive(Debug, PartialEq, Eq)]
+struct Index {
+    table: String,
+    columns: Vec<String>,
+    filter: String,
+}
 
 #[derive(Clone, Copy)]
 enum Dialect {
@@ -30,7 +45,7 @@ enum Dialect {
 
 /// Reads every `.sql` file of `dir`, oldest first, and applies its
 /// statements: tables appear, gain columns, and rename.
-fn read_schema(dir: &Path, dialect: Dialect) -> (Schema, Vec<String>) {
+fn read_schema(dir: &Path, dialect: Dialect) -> (Schema, BTreeMap<String, Index>) {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
         .map(|e| e.unwrap().path())
@@ -38,7 +53,7 @@ fn read_schema(dir: &Path, dialect: Dialect) -> (Schema, Vec<String>) {
         .collect();
     paths.sort();
     let mut schema = Schema::new();
-    let mut indexes = Vec::new();
+    let mut indexes = BTreeMap::new();
     for path in paths {
         let sql = std::fs::read_to_string(&path).unwrap();
         for statement in sql.split(';') {
@@ -49,7 +64,12 @@ fn read_schema(dir: &Path, dialect: Dialect) -> (Schema, Vec<String>) {
 }
 
 /// Applies one SQL statement to `schema`.
-fn apply(statement: &str, dialect: Dialect, schema: &mut Schema, indexes: &mut Vec<String>) {
+fn apply(
+    statement: &str,
+    dialect: Dialect,
+    schema: &mut Schema,
+    indexes: &mut BTreeMap<String, Index>,
+) {
     // A comment belongs to no statement.
     let sql: String = statement
         .lines()
@@ -86,22 +106,39 @@ fn apply(statement: &str, dialect: Dialect, schema: &mut Schema, indexes: &mut V
             let column = column_of(&constraints, kind, dialect);
             schema.entry(table).or_default().push((name, column));
         }
-    } else if let Some(rest) = statement.strip_prefix("CREATE INDEX ") {
-        indexes.push(index_name(rest));
-    } else if let Some(rest) = statement.strip_prefix("CREATE UNIQUE INDEX ") {
-        indexes.push(index_name(rest));
+    } else if let Some(rest) = statement
+        .strip_prefix("CREATE INDEX ")
+        .or_else(|| statement.strip_prefix("CREATE UNIQUE INDEX "))
+    {
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
+        let mut words = rest.split_whitespace();
+        let name = words.next().unwrap().trim_matches('"').to_owned();
+        let table = words
+            .nth(1)
+            .expect("an index names its table")
+            .trim_matches('"')
+            .to_owned();
+        let open = rest.find('(').expect("an index lists its columns");
+        let close = matching_paren(rest, open);
+        let columns = rest[open + 1..close]
+            .split(',')
+            .map(|c| c.trim().trim_matches('"').to_owned())
+            .collect();
+        let filter = rest[close + 1..]
+            .trim()
+            .trim_start_matches("WHERE")
+            .trim()
+            .to_owned();
+        indexes.insert(
+            name,
+            Index {
+                table,
+                columns,
+                filter,
+            },
+        );
     }
-}
-
-/// The name an index definition starts with.
-fn index_name(rest: &str) -> String {
-    let rest = rest.trim_start();
-    let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
-    rest.split_whitespace()
-        .next()
-        .unwrap()
-        .trim_matches('"')
-        .to_owned()
 }
 
 /// The column of an `ADD COLUMN` line: the words after the name are its
@@ -119,17 +156,48 @@ fn column_of(constraints: &str, kind: &str, dialect: Dialect) -> Column {
         Dialect::Sqlite => sqlite_kind(kind),
         Dialect::Postgres => postgres_kind(kind),
     };
-    let references = constraints
-        .split_whitespace()
-        .zip(constraints.split_whitespace().skip(1))
-        .find(|(prev, _)| *prev == "REFERENCES")
-        .map(|(_, table)| table.trim_matches(',').trim_matches('"').to_owned());
+    let words: Vec<&str> = constraints.split_whitespace().collect();
+    let references = words.iter().position(|w| *w == "REFERENCES").map(|i| {
+        let table = words[i + 1].trim_matches(',').trim_matches('"');
+        // `REFERENCES t (c)`: the column the reference names, which
+        // the parenthesis after the table holds.
+        match words.get(i + 2) {
+            Some(col) => format!(
+                "{table}({})",
+                col.trim_start_matches('(')
+                    .trim_end_matches([')', ','])
+                    .trim_matches('"')
+            ),
+            None => table.to_owned(),
+        }
+    });
+    // A `GENERATED` column has no default: its value comes from the
+    // sequence, which SQLite spells as a bare `INTEGER PRIMARY KEY`.
+    let default = if constraints.contains("GENERATED") {
+        None
+    } else {
+        words
+            .iter()
+            .position(|w| *w == "DEFAULT")
+            // A zero blob is `x''` in SQLite and `''::bytea` in Postgres:
+            // both spell the empty byte string.
+            .map(|i| {
+                let raw = words[i + 1];
+                if raw.starts_with("x'") || raw.ends_with("::bytea") {
+                    "empty bytes".to_owned()
+                } else {
+                    raw.trim_matches('\'').to_owned()
+                }
+            })
+    };
     Column {
         kind,
         not_null: constraints.contains("NOT NULL"),
         primary_key: constraints.contains("PRIMARY KEY"),
         unique: constraints.contains("UNIQUE"),
         references,
+        default,
+        checked: constraints.contains("CHECK"),
     }
 }
 
@@ -289,7 +357,7 @@ fn the_postgres_schema_holds_the_tables_and_columns_of_the_sqlite_schema() {
     assert!(!postgres.is_empty(), "the Postgres migrations hold tables");
 
     let mut ok = true;
-    let mut say = |message: String, ok: &mut bool| {
+    let say = |message: String, ok: &mut bool| {
         println!("{message}");
         *ok = false;
     };
@@ -336,20 +404,23 @@ fn the_postgres_schema_holds_the_tables_and_columns_of_the_sqlite_schema() {
             );
         }
     }
-    for index in &sqlite_indexes {
-        if !postgres_indexes.contains(index) {
-            say(
-                format!("index {index} is missing from the Postgres schema"),
+    for (name, index) in &sqlite_indexes {
+        match postgres_indexes.get(name) {
+            Some(pg_index) if pg_index != index => say(
+                format!("index {name} is {index:?} in SQLite, {pg_index:?} in Postgres"),
                 &mut ok,
-            );
+            ),
+            None => {
+                println!("index {name} is missing from the Postgres schema");
+                ok = false;
+            }
+            Some(_) => {}
         }
     }
-    for index in &postgres_indexes {
-        if !sqlite_indexes.contains(index) {
-            say(
-                format!("index {index} is missing from the SQLite schema"),
-                &mut ok,
-            );
+    for name in postgres_indexes.keys() {
+        if !sqlite_indexes.contains_key(name) {
+            println!("index {name} is missing from the SQLite schema");
+            ok = false;
         }
     }
     assert!(ok, "the schemas drift");

@@ -70,7 +70,7 @@ const MARKER: &str = "backend";
 /// directory whose metadata a SQLite store already holds.
 fn postgres_marker(data: &Path) -> Result<()> {
     let db = data.join("scion.db");
-    if db.exists() && std::fs::metadata(&db).map(|m| m.len() > 0).unwrap_or(false) {
+    if db.metadata().is_ok_and(|m| m.len() > 0) {
         return Err(crate::error::Error::InvalidArgument(
             "this data directory already keeps its metadata in its own \
              database: drop --postgres-url to use it"
@@ -122,17 +122,14 @@ impl Backend {
     ///
     /// What the store or the database returns.
     pub fn open(data: &Path, postgres_url: Option<&str>, ca: Option<&Path>) -> Result<Self> {
-        match postgres_url {
-            Some(url) => {
-                postgres_marker(data)?;
-                Ok(Self::Postgres(Pg::open_exclusive(
-                    url, ca, PG_READERS, data,
-                )?))
-            }
-            None => {
-                refuse_postgres_marker(data)?;
-                Ok(Self::Sqlite(Store::open(data)?))
-            }
+        if let Some(url) = postgres_url {
+            postgres_marker(data)?;
+            Ok(Self::Postgres(Pg::open_exclusive(
+                url, ca, PG_READERS, data,
+            )?))
+        } else {
+            refuse_postgres_marker(data)?;
+            Ok(Self::Sqlite(Store::open(data)?))
         }
     }
 
@@ -144,15 +141,12 @@ impl Backend {
     ///
     /// What the store or the database returns.
     pub fn open_shared(data: &Path, postgres_url: Option<&str>, ca: Option<&Path>) -> Result<Self> {
-        match postgres_url {
-            Some(url) => {
-                postgres_marker(data)?;
-                Ok(Self::Postgres(Pg::open(url, ca, PG_READERS, data)?))
-            }
-            None => {
-                refuse_postgres_marker(data)?;
-                Ok(Self::Sqlite(Store::open_shared(data)?))
-            }
+        if let Some(url) = postgres_url {
+            postgres_marker(data)?;
+            Ok(Self::Postgres(Pg::open(url, ca, PG_READERS, data)?))
+        } else {
+            refuse_postgres_marker(data)?;
+            Ok(Self::Sqlite(Store::open_shared(data)?))
         }
     }
 

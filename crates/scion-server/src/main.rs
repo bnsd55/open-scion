@@ -272,12 +272,7 @@ async fn main() -> anyhow::Result<()> {
     // kind, which a running server of an older build may read, so it opens as
     // the server.
     let store = match cli.command {
-        Command::Import { .. } => Backend::open_shared(
-            &cli.data,
-            cli.postgres_url.as_deref(),
-            cli.postgres_ca.as_deref(),
-        ),
-        Command::Fsck | Command::Gc { .. } => Backend::open_shared(
+        Command::Import { .. } | Command::Fsck | Command::Gc { .. } => Backend::open_shared(
             &cli.data,
             cli.postgres_url.as_deref(),
             cli.postgres_ca.as_deref(),

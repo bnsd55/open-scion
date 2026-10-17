@@ -571,11 +571,11 @@ mod tests {
             .iter()
             .map(|data| Key::Blob(store.blobs().put(data).unwrap()))
             .collect();
-        let second = packed_len(&raw, keys[1]);
+        let second = packed_len(raw, keys[1]);
         // Files of two sizes, so the free budget shows which object holds a
         // share. With one size, the first object, before it is sent, looks
         // like the second.
-        assert_ne!(packed_len(&raw, keys[0]), second);
+        assert_ne!(packed_len(raw, keys[0]), second);
         let budget = 1000;
         let in_flight = Arc::new(Semaphore::new(budget));
         let stall = Duration::from_millis(50);
