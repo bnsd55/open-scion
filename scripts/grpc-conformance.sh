@@ -88,16 +88,18 @@ done
 [ -n "$SERVER_ADDR" ] || { cat "$WORK/server.log" >&2; die "the server never said its address"; }
 note "server at $SERVER_ADDR"
 
-# grpcurl against the proto file: the server serves no reflection.
-GRPCURL_OPTS=(-import-path proto -proto scion.proto -plaintext -H 'authorization: Bearer t')
+# grpcurl against the proto file: the server serves no reflection. The
+# script runs under /bin/sh, which is dash on Ubuntu: no arrays, so one
+# helper carries the flags.
+call() { # call METHOD JSON -> grpcurl's output on stdout
+  "$GRPCURL" -import-path proto -proto scion.proto -plaintext \
+    -H 'authorization: Bearer t' -d "$2" "$SERVER_ADDR" "$1"
+}
 
 # The ref, then the ticket of its root tree.
-CS=$($GRPCURL "${GRPCURL_OPTS[@]}" -d "{\"repo\":\"r\",\"name\":\"main\"}" \
-  "$SERVER_ADDR" scion.v1.Scion/ResolveRef | jq -r .changesetId)
+CS=$(call scion.v1.Scion/ResolveRef '{"repo":"r","name":"main"}' | jq -r .changesetId)
 [ -n "$CS" ] || die "ResolveRef answered no changeset"
-REPLY=$($GRPCURL "${GRPCURL_OPTS[@]}" \
-  -d "{\"repo\":\"r\",\"changesetId\":\"$CS\"}" \
-  "$SERVER_ADDR" scion.v1.Objects/GetRootTree)
+REPLY=$(call scion.v1.Objects/GetRootTree "{\"repo\":\"r\",\"changesetId\":\"$CS\"}")
 ROOT=$(echo "$REPLY" | jq -r .treeId)
 TICKET=$(echo "$REPLY" | jq -r .ticket)
 [ -n "$ROOT" ] && [ "$ROOT" != "null" ] && [ -n "$TICKET" ] && [ "$TICKET" != "null" ] \
@@ -108,8 +110,9 @@ TICKET=$(echo "$REPLY" | jq -r .ticket)
 get() { # get KIND B64ID PATH -> raw bytes on stdout
   # `path` is a bytes field, so it rides base64 in the JSON, as the ID does.
   p64=$(printf '%s' "$3" | base64)
-  $GRPCURL "${GRPCURL_OPTS[@]}" -d "{\"ticket\":\"$TICKET\",\"refs\":[{\"kind\":\"$1\",\"id\":\"$2\",\"path\":\"$p64\"}]}" \
-    "$SERVER_ADDR" scion.v1.Objects/GetObjects | jq -r .data | base64 -d
+  call scion.v1.Objects/GetObjects \
+    "{\"ticket\":\"$TICKET\",\"refs\":[{\"kind\":\"$1\",\"id\":\"$2\",\"path\":\"$p64\"}]}" \
+    | jq -r .data | base64 -d
 }
 tree_entries() { # TreeV1 bytes on stdin: prints "name tag id64" per entry
   python3 -c '
