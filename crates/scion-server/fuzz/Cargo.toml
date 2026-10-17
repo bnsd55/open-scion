@@ -15,7 +15,7 @@ tempfile = "3"
 
 [[bin]]
 name = "blame-cursor"
-path = "fuzz_targets/blame_cursor.rs"
+path = "fuzz_targets/blame-cursor.rs"
 test = false
 doc = false
 bench = false
