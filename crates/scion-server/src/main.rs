@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -15,7 +16,7 @@ use scion_server::import::{ImportOptions, import_git};
 use scion_server::meta::MetaTx as _;
 use scion_server::quotas::Quotas;
 use scion_server::tree::RootTree;
-use scion_server::{Error, Store, fsck, read, service};
+use scion_server::{Error, Store, fsck, gc, read, service};
 use tracing_subscriber::EnvFilter;
 
 /// The scion server: import, serve and derive.
@@ -125,6 +126,20 @@ enum Command {
     /// One line per problem: kind, ID, path. Exit 0 when it saw no damage,
     /// 1 when it did, 2 when it could not run.
     Fsck,
+    /// Collect the blob files and the rows that nothing names any more: a
+    /// row whose blob no stored changeset of its repo puts, and a file that
+    /// no repo's row names, both older than the grace period. Safe beside a
+    /// live server; safe to repeat. Rows go before files, so a crash leaves
+    /// orphan files only, which the next run removes.
+    Gc {
+        /// How old a blob file must be before the collector may remove it:
+        /// an upload that a client is about to name is younger than this.
+        #[arg(long, default_value_t = gc::DEFAULT_GRACE_SECS)]
+        grace_secs: u64,
+        /// Report what a real run would collect, and remove nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Derive one kind of derived data for the history of a ref, in bounded
     /// steps, and remove the rows of its older versions. Safe to repeat.
     Derive {
@@ -183,6 +198,25 @@ fn fsck_command(store: &Store) -> anyhow::Result<()> {
     std::process::exit(1);
 }
 
+/// Runs `gc` against `store` and prints what it collected. Exits 2 when it
+/// could not run.
+fn gc_command(store: &Store, grace: Duration, dry_run: bool) {
+    let report = match gc::run(store, grace, dry_run, &mut |_| {}) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("scion-server gc: {e}");
+            std::process::exit(2);
+        }
+    };
+    println!(
+        "gc: {} repos, {} rows pruned, {} files removed{}",
+        report.repos,
+        report.rows_pruned,
+        report.files_removed,
+        if dry_run { " (dry run)" } else { "" },
+    );
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
@@ -195,7 +229,7 @@ async fn main() -> anyhow::Result<()> {
     // kind, which a running server of an older build may read, so it opens as
     // the server.
     let open = match cli.command {
-        Command::Import { .. } | Command::Fsck => Store::open_shared,
+        Command::Import { .. } | Command::Fsck | Command::Gc { .. } => Store::open_shared,
         Command::Serve { .. } | Command::Derive { .. } => Store::open,
         Command::HashToken { .. } => return hash_token(),
     };
@@ -252,6 +286,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::HashToken { .. } => unreachable!("handled before the store opens"),
         Command::Fsck => return fsck_command(&store),
+        Command::Gc {
+            grace_secs,
+            dry_run,
+        } => gc_command(&store, Duration::from_secs(grace_secs), dry_run),
         Command::Import {
             repo,
             rev,

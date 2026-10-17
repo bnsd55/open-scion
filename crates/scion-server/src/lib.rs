@@ -24,6 +24,7 @@ pub mod deadline;
 pub mod derived;
 pub mod error;
 pub mod fsck;
+pub mod gc;
 pub mod graph;
 pub mod history;
 pub mod import;
