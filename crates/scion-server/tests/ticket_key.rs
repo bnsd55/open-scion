@@ -95,16 +95,41 @@ fn serve_refuses_a_seed_that_group_or_others_can_read() {
             key.to_str().unwrap(),
         ])
         .env("NO_COLOR", "1")
-        .stdout(std::process::Stdio::null())
+        // The info lines go to stdout, and the test waits for the one that
+        // says the server listens.
+        .env("RUST_LOG", "info")
+        .stdout(std::fs::File::create(dir.path().join("serve.log")).unwrap())
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    // A refused seed exits at once; a good one stays up. Two seconds is
-    // generous for the refusal and short for a hang.
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    assert!(child.try_wait().unwrap().is_none(), "serve exited");
+    wait_serving(&mut child, &dir.path().join("serve.log"));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "serve exited once it listened"
+    );
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Waits until the spawned `serve` prints that it listens, with the log to
+/// prove it. A refusal exits at once, and the loop answers with its log;
+/// a good server passes as soon as it listens, not after a fixed sleep.
+fn wait_serving(child: &mut std::process::Child, log: &Path) {
+    let started = std::time::Instant::now();
+    loop {
+        let text = fs::read_to_string(log).unwrap_or_default();
+        if text.contains("serving") {
+            return;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("serve exited before it listened ({status}): {text}");
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "serve never listened: {text}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// A file of `text`, with its mode set.
@@ -178,16 +203,17 @@ fn an_old_public_key_is_readable_by_anyone_but_writable_by_its_owner_alone() {
             old.to_str().unwrap(),
         ])
         .env("NO_COLOR", "1")
-        .stdout(std::process::Stdio::null())
+        // The info lines go to stdout, and the test waits for the one that
+        // says the server listens.
+        .env("RUST_LOG", "info")
+        .stdout(std::fs::File::create(dir.path().join("serve.log")).unwrap())
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    // A refusal exits at once; a good one stays up. Two seconds is
-    // generous for the refusal and short for a hang.
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    wait_serving(&mut child, &dir.path().join("serve.log"));
     assert!(
         child.try_wait().unwrap().is_none(),
-        "serve refused a 0644 public key"
+        "serve exited once it listened"
     );
     let _ = child.kill();
     let _ = child.wait();

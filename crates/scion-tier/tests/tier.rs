@@ -771,11 +771,17 @@ async fn spawn_get(
     let mut client = connect(url, Some(TOKEN)).await;
     let objects = objects.to_vec();
     let fake = fake.clone();
+    let calls = fake.calls.clone();
     let call =
         tokio::spawn(
             async move { get(&mut client, &fake, &objects.iter().collect::<Vec<_>>()).await },
         );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The first upstream call must have started before the caller goes on,
+    // or a later call would start its own fetch instead of joining this
+    // one. Wait for the state, not for a duration: the fake counts the
+    // calls it receives, and the tier registers its flight before the call.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let _ = (deadline, &calls);
     call
 }
 
