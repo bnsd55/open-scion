@@ -1172,14 +1172,19 @@ pub fn decode_cursor(
         until,
     )?;
     let mut table = Vec::with_capacity(table_count as usize);
-    for _ in 0..table_count {
-        let id = ChangesetId::from_bytes(r.array::<32>()?);
-        let known = store.read(|c| c.has_changeset(repo_id, id))?;
-        if !known {
-            return Err(bad(&format!("it names {id} which {repo} does not have")));
+    // The table's names are checked in one read transaction: a blame
+    // resume decodes on every call, so a table of a hundred names costs
+    // one read, not a hundred.
+    store.read(|c| {
+        for _ in 0..table_count {
+            let id = ChangesetId::from_bytes(r.array::<32>()?);
+            if !c.has_changeset(repo_id, id)? {
+                return Err(bad(&format!("it names {id} which {repo} does not have")));
+            }
+            table.push(id);
         }
-        table.push(id);
-    }
+        Ok(())
+    })?;
     let window = decode_window(&mut r, &table, run_count, open)?;
     r.finish()?;
     let resume = Resume {
