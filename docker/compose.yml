@@ -80,11 +80,6 @@ services:
       - demo-certs:/certs:ro
       - demo-work:/work
 
-  # A one-shot with `--user root` copies the host's ./certs into this
-  # volume, so the keys inside are 0600 and owned by the containers' user,
-  # while the host copies stay with the developer.
-  demo-certs:
-
   # Copies the host's ./certs into the demo-certs volume, with the modes
   # and the owner the containers need. `docker/demo.sh` runs it once.
   certs-init:
@@ -98,3 +93,7 @@ services:
 volumes:
   server-data:
   demo-work:
+  # A one-shot with `--user root` copies the host's ./certs into this
+  # volume, so the keys inside are 0600 and owned by the containers' user,
+  # while the host copies stay with the developer.
+  demo-certs:
