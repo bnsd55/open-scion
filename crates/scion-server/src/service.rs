@@ -576,7 +576,7 @@ async fn run_graph_query<T, F>(
 ) -> Result<T, Status>
 where
     T: Send + 'static,
-    F: FnOnce(&Store, &Deadline) -> Result<T> + Send + 'static,
+    F: FnOnce(&Backend, &Deadline) -> Result<T> + Send + 'static,
 {
     // The query checks it at each read: a request timeout, or a client
     // that cancels, drops this call but not a job that is running. The

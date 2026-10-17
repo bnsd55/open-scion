@@ -15,10 +15,10 @@ use scion_proto::auth::Bearer;
 use scion_proto::listen::Limits;
 use scion_proto::v1::LogRequest;
 use scion_proto::v1::scion_client::ScionClient;
-use scion_server::meta::MetaTx as _;
+use scion_server::meta::{Meta as _, MetaTx as _};
 use scion_server::metrics::Metrics;
 use scion_server::tree;
-use scion_server::{Store, service};
+use scion_server::{Backend, Store, service};
 use tonic::codec::Streaming;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -35,9 +35,9 @@ type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
 fn chain(
     count: usize,
     name_len: usize,
-) -> (tempfile::TempDir, Store, Vec<scion_core::ChangesetId>) {
+) -> (tempfile::TempDir, Backend, Vec<scion_core::ChangesetId>) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
     let ids = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -72,7 +72,7 @@ fn chain(
 }
 
 /// Serves `store` with `limits`.
-async fn serve(store: Store, limits: Limits) -> String {
+async fn serve(store: Backend, limits: Limits) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(service::serve(

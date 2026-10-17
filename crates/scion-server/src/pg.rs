@@ -1010,9 +1010,6 @@ fn connect_on(url: &str, ca: Option<&Path>, options: &str) -> Result<Client> {
 /// importer retries a batch on it, and the gRPC status becomes
 /// UNAVAILABLE. The rest keep their database error.
 fn map_pg_error(e: postgres::Error) -> Error {
-    // The error reaches the log in full, whatever it maps to: a caller
-    // that only sees Busy reads "database is busy" and no more.
-    tracing::warn!("the database refused a statement: {e}");
     // A connection the database dropped is as retryable as a busy one.
     if e.is_closed() {
         return Error::Busy;
@@ -1024,12 +1021,23 @@ fn map_pg_error(e: postgres::Error) -> Error {
             if matches!(code.code(), "40P01" | "40001" | "57P01" | "57P03")
                 || code.code().starts_with("08") =>
         {
+            tracing::warn!("the database is busy: {e}");
             Error::Busy
         }
-        // The rest keep their database error: a bug of this backend, such
-        // as a bad parameter, must not look busy, or the importer retries
-        // it and the log says nothing but "busy".
-        _ => Error::Pg(e),
+        // A violation the code handles (a duplicate key, a check, a
+        // foreign key) is one answer among many: it logs quietly.
+        Some(code) if code.code().starts_with("23") => {
+            tracing::debug!("the database refused a statement: {e}");
+            Error::Pg(e)
+        }
+        // The rest keep their database error, and reach the log in full:
+        // a bug of this backend, such as a bad parameter, must not look
+        // busy, or the importer retries it and the log says nothing but
+        // "busy".
+        _ => {
+            tracing::warn!("the database refused a statement: {e}");
+            Error::Pg(e)
+        }
     }
 }
 
