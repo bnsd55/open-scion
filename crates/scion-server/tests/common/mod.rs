@@ -558,11 +558,7 @@ pub async fn retry_lands(scion: &Scion, ledger: &mut Ledger, checked: &mut Check
 }
 
 /// Collects the parts of one `GetChangeset` reply into its bytes.
-async fn changeset_bytes(
-    scion: &mut Scion,
-    request: GetChangesetRequest,
-    what: &str,
-) -> Vec<u8> {
+async fn changeset_bytes(scion: &mut Scion, request: GetChangesetRequest, what: &str) -> Vec<u8> {
     let mut stream = scion
         .get_changeset(request)
         .await
@@ -694,7 +690,12 @@ pub async fn check(
             repo: REPO.into(),
             changeset_id: sent.id.as_bytes().to_vec(),
         };
-        changeset_bytes(&mut scion, request, &format!("created changeset {}", sent.id)).await;
+        changeset_bytes(
+            &mut scion,
+            request,
+            &format!("created changeset {}", sent.id),
+        )
+        .await;
     }
 
     // Every blob that the metadata names is intact, and so is every blob
