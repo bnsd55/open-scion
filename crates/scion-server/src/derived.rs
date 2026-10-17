@@ -612,9 +612,8 @@ mod tests {
     /// stores root trees and the commit graph, and nothing else. Returns the
     /// IDs, oldest first.
     fn store_chain(c: &mut dyn MetaTx, history: &[Edits]) -> Result<(RepoId, Vec<ChangesetId>)> {
-        // SHORTCUT: the tests store no blobs, so the lens read fails; a
-        // test lens answers 0 for everything. The trees it builds are only
-        // compared to themselves.
+        // The tests store no blob files, so a test lens answers 0 for
+        // everything: the trees it builds are only compared to themselves.
         chain_with(c, history, |c, repo, cs| {
             Ok(tree::store_changeset(c, repo, cs, &mut tree::lens_none())?.0)
         })

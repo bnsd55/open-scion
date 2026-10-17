@@ -365,20 +365,17 @@ fn files_read_back_with_git_content() {
     let root = changeset_of(&store, &h.root);
     let tip = changeset_of(&store, &h.submodule);
     let exec = |cs, name| match root_entry(&store, cs, name) {
-        Some(Entry::File(FileEntry {
-            state: FileState::Regular { executable, .. },
-            ..
-        })) => executable,
+        Some(Entry::File(file)) => match file.state() {
+            FileState::Regular { executable, .. } => executable,
+            _ => panic!("{name}: not a regular file"),
+        },
         other => panic!("{name}: {other:?}"),
     };
     assert!(exec(root, "run.sh"));
     assert!(!exec(tip, "run.sh"));
     assert!(matches!(
         root_entry(&store, root, "link"),
-        Some(Entry::File(FileEntry {
-            state: FileState::Symlink { .. },
-            ..
-        }))
+        Some(Entry::File(file)) if matches!(file.state(), FileState::Symlink { .. })
     ));
     let submodule = GitOid::Sha1(oid(SUBMODULE).as_slice().try_into().unwrap());
     assert_eq!(

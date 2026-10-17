@@ -1578,7 +1578,6 @@ limit and its upgrade path. This is the list on `main` today.
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each symlink target whole, so memory caps the target length. | Stream chunks from the file. | |
 | `scn/src/cmd/commit.rs` (`parse_author`) | The author time zone is always UTC, since `std` cannot read the local time zone. | A time zone crate. | |
-| `scion-server/src/derived.rs` (`store_chain`) | Test chains write no blob files, so the tree build's lens answers 0 for every blob; the trees it builds are only compared to themselves. | Store the chain's blobs in the fixture. | |
 | `scn/src/vfs.rs` (`io_err`) | Takes the error by value so `.map_err(io_err)` reads clean. | Take it by reference if the lint allows it one day. | |
 
 ## 10. Testing

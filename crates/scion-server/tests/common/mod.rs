@@ -501,7 +501,7 @@ pub fn metadata(store: &Store, seen: &mut HashSet<Vec<u8>>) -> (BTreeSet<BlobId>
                     } else {
                         let entries = Tree::decode(&body).unwrap().entries.into_values();
                         let file = |entry| match entry {
-                            Entry::File(file) => Some(file.state),
+                            Entry::File(file) => Some(file.state()),
                             Entry::Dir(_) => None,
                         };
                         entries.filter_map(file).collect()

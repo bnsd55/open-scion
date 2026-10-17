@@ -147,9 +147,9 @@ pub struct Changeset {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileEntry {
     /// What the path holds.
-    pub state: FileState,
+    state: FileState,
     /// Byte length of the blob `state` names, 0 for a gitlink.
-    pub len: u64,
+    len: u64,
 }
 
 impl FileEntry {
@@ -159,6 +159,18 @@ impl FileEntry {
     pub fn new(state: FileState, len: u64) -> Self {
         let len = if state.blob().is_some() { len } else { 0 };
         Self { state, len }
+    }
+
+    /// What the path holds.
+    #[must_use]
+    pub fn state(&self) -> FileState {
+        self.state
+    }
+
+    /// Byte length of the blob `state` names, 0 for a gitlink.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.len
     }
 
     /// The length the tree encodes: `len` for a blob-backed state, and

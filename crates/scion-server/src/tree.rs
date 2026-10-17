@@ -5,7 +5,7 @@
 //! transaction of their write, so all trees from one apply or derivation
 //! commit together.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileEntry, FileState, PathElem, RepoPath, Tree, TreeId,
@@ -35,6 +35,33 @@ pub fn lens_of(store: &Store) -> impl FnMut(BlobId) -> Result<u64> + '_ {
 #[cfg(test)]
 pub(crate) fn lens_none() -> impl FnMut(BlobId) -> Result<u64> {
     |_| Ok(0)
+}
+
+/// The lengths of the blobs that `puts` names, read from their frame
+/// headers. Call it before a write transaction, so the one write
+/// connection does no file I/O. A blob that is not stored fails here,
+/// before any write.
+pub fn lens_of_puts(
+    store: &Store,
+    puts: impl Iterator<Item = BlobId>,
+) -> Result<HashMap<BlobId, u64>> {
+    let mut lens = HashMap::new();
+    for blob in puts {
+        if lens.contains_key(&blob) {
+            continue;
+        }
+        lens.insert(blob, store.blobs().size(blob)? as u64);
+    }
+    Ok(lens)
+}
+
+/// A lens over lengths that a caller read before its transaction.
+pub fn lens_from(map: &HashMap<BlobId, u64>) -> impl FnMut(BlobId) -> Result<u64> + '_ {
+    move |blob| {
+        map.get(&blob)
+            .copied()
+            .ok_or_else(|| Error::NotFound(format!("blob {blob}")))
+    }
 }
 
 /// Applies `changes` to `base` (`None` is the empty tree), stores the new
@@ -507,11 +534,12 @@ mod tests {
         files(c, root)
             .into_iter()
             .map(|path| {
-                let Some(Entry::File(FileEntry {
-                    state: FileState::Regular { content, .. },
-                    ..
-                })) = lookup(c, root, &RepoPath::new(path.as_str()).unwrap()).unwrap()
+                let Some(Entry::File(file)) =
+                    lookup(c, root, &RepoPath::new(path.as_str()).unwrap()).unwrap()
                 else {
+                    panic!("{path} is not a regular file");
+                };
+                let FileState::Regular { content, .. } = file.state() else {
                     panic!("{path} is not a regular file");
                 };
                 let byte = (0..=u8::MAX)

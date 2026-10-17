@@ -36,6 +36,7 @@ fn fixture() -> &'static (TempDir, Store, ChangesetId) {
                 let mut ids: Vec<ChangesetId> = Vec::new();
                 for (n, line) in [b"a\n".as_slice(), b"b\n", b"c\n"].iter().enumerate() {
                     let content = store.blobs().put(line).expect("blob");
+                    let len = line.len() as u64;
                     let cs = Changeset {
                         parents: ids.last().copied().into_iter().collect(),
                         author: IdentityTime {
@@ -56,7 +57,14 @@ fn fixture() -> &'static (TempDir, Store, ChangesetId) {
                         .into_iter()
                         .collect(),
                     };
-                    ids.push(tree::store_changeset(c, repo, &cs)?.0);
+                    ids.push(tree::store_changeset(c, repo, &cs, &mut move |b| {
+                        if b == content {
+                            Ok(len)
+                        } else {
+                            Err(scion_server::error::Error::NotFound(format!("blob {b}")))
+                        }
+                    })?
+                    .0);
                 }
                 Ok(ids)
             })

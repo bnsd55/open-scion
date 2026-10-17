@@ -541,3 +541,33 @@ fn ids_parse_from_hex_and_bytes() {
         Ok((tree.clone(), tree.id()))
     );
 }
+
+/// The encoding is canonical for every entry kind: a tree encodes, decodes
+/// and encodes again to the same bytes. The `FileEntry` fields are private
+/// and `new` normalizes a gitlink's length to 0, so no two unequal values
+/// can encode the same bytes.
+#[test]
+fn a_tree_of_every_kind_round_trips() {
+    let name = |n: &str| PathElem::new(n).unwrap();
+    let tree = tree();
+    let bytes = tree.encode();
+    let (decoded, id) = Tree::decode_with_id(&bytes).unwrap();
+    assert_eq!(decoded, tree);
+    assert_eq!(decoded.encode(), bytes);
+    assert_eq!(decoded.id(), id);
+
+    // A gitlink names no blob, so it encodes no length: `new` records 0
+    // whatever the caller passes, and the decode of its bytes agrees.
+    let gitlink = FileState::Gitlink {
+        commit: GitOid::Sha1([0x44; 20]),
+    };
+    let plain = Tree {
+        entries: BTreeMap::from([(name("sub"), Entry::File(FileEntry::new(gitlink, 0)))]),
+    };
+    let lied = Tree {
+        entries: BTreeMap::from([(name("sub"), Entry::File(FileEntry::new(gitlink, 5)))]),
+    };
+    assert_eq!(plain, lied, "the length of a gitlink is not a field");
+    assert_eq!(plain.encode(), lied.encode());
+    assert_eq!(Tree::decode(&lied.encode()).unwrap(), plain);
+}

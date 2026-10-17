@@ -721,6 +721,18 @@ impl Objects for Liar {
         let GetObjectsRequest { refs, .. } = request.into_inner();
         let mut honest: Vec<Object> = refs.iter().map(|r| self.objects[&r.id].clone()).collect();
         let replies: Vec<Result<Object, Status>> = if refs[0].kind == i32::from(ObjectKind::Tree) {
+            // A tree reply that ends in the middle of its second part. A
+            // blob cannot play this: its first part's size is checked
+            // against the tree, so an oversized object is refused first.
+            if self.repo.lock().unwrap().as_str() == "truncated" {
+                let mut header = honest[0].header(Encoding::Raw, CHUNK_BYTES + 4);
+                header.size = CHUNK_BYTES + 4;
+                let mut parts = header.parts(vec![vec![0; CHUNK_BYTES].into(), vec![0; 4].into()]);
+                parts.truncate(1);
+                return Ok(Response::new(Box::pin(tokio_stream::iter(
+                    parts.into_iter().map(Ok),
+                ))));
+            }
             honest.into_iter().map(Ok).collect()
         } else {
             match self.repo.lock().unwrap().as_str() {
@@ -760,6 +772,15 @@ impl Objects for Liar {
                     Ok(honest[0].clone()),
                     Err(Status::internal("lost the disk")),
                 ],
+                // A first part whose size differs from what the tree says:
+                // the client must refuse at once, before the body reads.
+                "size-lies" => {
+                    let frame = object::pack(&honest[0].data).unwrap();
+                    let mut header = honest[0].header(Encoding::Zstd, frame.len());
+                    header.size += 999;
+                    let parts = header.parts(vec![frame.into()]).into_iter().map(Ok);
+                    return Ok(Response::new(Box::pin(tokio_stream::iter(parts))));
+                }
                 // The first blob as a good zstd frame of other bytes.
                 "zstd-other" => {
                     let frame = object::pack(b"evil\n").unwrap();
@@ -777,16 +798,6 @@ impl Objects for Liar {
                     let mut header = honest[0].header(Encoding::Zstd, frame.len());
                     header.size += 1;
                     let parts = header.parts(vec![frame.into()]).into_iter().map(Ok);
-                    return Ok(Response::new(Box::pin(tokio_stream::iter(parts))));
-                }
-                // The first part of an object of two parts, then the end.
-                "truncated" => {
-                    let mut header = honest[0].header(Encoding::Raw, CHUNK_BYTES + 4);
-                    header.size = CHUNK_BYTES + 4;
-                    let mut parts =
-                        header.parts(vec![vec![0; CHUNK_BYTES].into(), vec![0; 4].into()]);
-                    parts.truncate(1);
-                    let parts = parts.into_iter().map(Ok);
                     return Ok(Response::new(Box::pin(tokio_stream::iter(parts))));
                 }
                 other => panic!("no such misbehavior: {other}"),
@@ -841,8 +852,11 @@ fn a_misbehaving_server_is_caught_and_nothing_is_written() {
         ("wrong-kind", "not asked for"),
         ("none", "none of the requested objects"),
         ("error", "lost the disk"),
+        ("size-lies", "the tree says"),
         ("zstd-other", "server sent blob"),
-        ("zstd-lying", "server sent a bad object"),
+        // A frame whose header gives one byte more than it holds: the size
+        // lie of the first part, refused before the body reads.
+        ("zstd-lying", "the tree says"),
         ("truncated", "in the middle of an object"),
     ] {
         let dest = tmp.path().join(misbehavior);

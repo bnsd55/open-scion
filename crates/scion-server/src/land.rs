@@ -619,8 +619,11 @@ fn settle(
 
     // See `tree::store_changeset`. The land's flush covers these steps.
     tree::fill_root_tree(store, repo, head.target)?;
+    // The blob lengths the tree build needs, read before the write
+    // transaction, so the write connection does no file I/O.
+    let lens = tree::lens_of_puts(store, crate::db::puts(&rebased).map(|(_, blob)| blob))?;
     let landed = store.commit(|c| {
-        let (id, _) = tree::store_changeset(c, repo, &rebased, &mut crate::tree::lens_of(store))?;
+        let (id, _) = tree::store_changeset(c, repo, &rebased, &mut tree::lens_from(&lens))?;
         if !c.cas_ref(repo, target, Some(head.version), id)? {
             // The error rolls back the transaction, rebased changeset included.
             return Err(Error::Aborted(format!(

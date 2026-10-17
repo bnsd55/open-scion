@@ -71,7 +71,7 @@ pub fn read_file(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) ->
 pub fn file_blob(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Result<BlobId> {
     let root = root_tree(store, repo, cs)?;
     match store.read(|c| tree::lookup(c, root, path))? {
-        Some(Entry::File(file)) => match file.state.blob() {
+        Some(Entry::File(file)) => match file.state().blob() {
             Some(blob) => Ok(blob),
             None => Err(Error::InvalidArgument(format!("{path:?} is a submodule"))),
         },
@@ -630,7 +630,7 @@ impl DiffWalk<'_> {
 /// The file state of an entry, if it is a file.
 fn file(entry: Option<Entry>) -> Option<FileState> {
     match entry {
-        Some(Entry::File(file)) => Some(file.state),
+        Some(Entry::File(file)) => Some(file.state()),
         _ => None,
     }
 }

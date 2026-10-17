@@ -354,7 +354,10 @@ impl Walker {
                         return Ok(Walk::Absent);
                     }
                     let reaches = kind == ObjectKind::Blob
-                        && entry.state.blob().is_some_and(|blob| blob.as_bytes() == id);
+                        && entry
+                            .state()
+                            .blob()
+                            .is_some_and(|blob| blob.as_bytes() == id);
                     return Ok(if reaches { Walk::Reached } else { Walk::Absent });
                 }
             }

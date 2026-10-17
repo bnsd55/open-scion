@@ -321,19 +321,19 @@ fn check_trees(
                         let scion_core::Entry::File(file) = file else {
                             continue;
                         };
-                        let Some(blob) = file.state.blob() else {
+                        let Some(blob) = file.state().blob() else {
                             continue;
                         };
                         named_blob_exists(store, blob, report, &format!("named by tree {id}"));
                         // The entry's length must be the blob's own: a tree
                         // whose size lies makes every stat of the file lie.
                         match store.blobs().size(blob) {
-                            Ok(size) if size as u64 == file.len => {}
+                            Ok(size) if size as u64 == file.len() => {}
                             Ok(size) => report.problem(Problem::new(
                                 "tree-size",
                                 id.to_string(),
                                 None,
-                                format!("entry says {} bytes, the blob holds {size}", file.len),
+                                format!("entry says {} bytes, the blob holds {size}", file.len()),
                             )),
                             Err(e) => report.problem(Problem::new(
                                 "tree-size",

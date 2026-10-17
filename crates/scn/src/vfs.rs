@@ -37,7 +37,7 @@ use nfsserve::nfs::{
 };
 pub use nfsserve::vfs::NFSFileSystem;
 use nfsserve::vfs::{DirEntry, ReadDirResult, VFSCapabilities};
-use scion_core::{BlobId, ChangesetId, Entry, FileEntry, FileState, RepoPath, Tree, TreeId};
+use scion_core::{BlobId, ChangesetId, Entry, FileState, RepoPath, Tree, TreeId};
 use scion_proto::object::{self, Assembler, Header};
 use scion_proto::ticket::{self, TICKET_SKEW_SECS};
 use scion_proto::v1::{Encoding, GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
@@ -390,6 +390,7 @@ impl Vfs {
         kind: ObjectKind,
         id: [u8; 32],
         path: Option<&RepoPath>,
+        expect: Option<u64>,
     ) -> Result<Vec<u8>> {
         let mut objects = self.objects.clone();
         let ask = |ticket: Vec<u8>| GetObjectsRequest {
@@ -421,7 +422,18 @@ impl Vfs {
             bail!("the server sent an object that was not asked for");
         }
         let bad = |why| anyhow!("the server sent a bad object: {why}");
-        let mut assembled = Assembler::new(Header::of(&first, true).map_err(bad)?, first);
+        let header = Header::of(&first, true).map_err(bad)?;
+        // The tree said how big this blob is. A first part whose size
+        // disagrees ends the fetch before any part of the body reads.
+        if let Some(want) = expect {
+            if header.size as u64 != want {
+                bail!(
+                    "the server sent {} bytes, the tree says {want}",
+                    header.size
+                );
+            }
+        }
+        let mut assembled = Assembler::new(header, first);
         while !assembled.is_done() {
             let part = stream
                 .message()
@@ -438,7 +450,7 @@ impl Vfs {
     /// mounted root tree.
     async fn fetch_tree(&self, id: TreeId, path: Option<&RepoPath>) -> Result<Tree> {
         let data = self
-            .fetch_object(ObjectKind::Tree, *id.as_bytes(), path)
+            .fetch_object(ObjectKind::Tree, *id.as_bytes(), path, None)
             .await
             .with_context(|| format!("cannot read tree {id}"))?;
         let (tree, actual) = Tree::decode_with_id(&data)
@@ -455,7 +467,12 @@ impl Vfs {
     /// network fetch: one slow fetch must not stop the other reads of the
     /// mount. Two calls that race on one blob both fetch, and both insert
     /// a correct copy; the last one wins.
-    async fn fetch_blob(&self, id: BlobId, path: Option<&RepoPath>) -> Result<Arc<Vec<u8>>> {
+    async fn fetch_blob(
+        &self,
+        id: BlobId,
+        path: Option<&RepoPath>,
+        len: u64,
+    ) -> Result<Arc<Vec<u8>>> {
         if let Some(data) = {
             let mut blobs = self.blobs.lock().await;
             blobs.0.get_mut(&id).map(|data| Arc::clone(data))
@@ -463,7 +480,7 @@ impl Vfs {
             return Ok(data);
         }
         let raw = self
-            .fetch_object(ObjectKind::Blob, *id.as_bytes(), path)
+            .fetch_object(ObjectKind::Blob, *id.as_bytes(), path, Some(len))
             .await
             .with_context(|| format!("cannot read blob {id}"))?;
         if BlobId::of(&raw) != id {
@@ -514,28 +531,25 @@ impl Vfs {
                         tree: Some(tree),
                         listed: None,
                     },
-                    Entry::File(FileEntry {
-                        state:
+                    Entry::File(file) => match (file.state(), file.len()) {
+                        (
                             FileState::Regular {
                                 content,
                                 executable,
                             },
-                        len,
-                    }) => Kind::Store {
-                        blob: content,
-                        exec: executable,
-                        len,
+                            len,
+                        ) => Kind::Store {
+                            blob: content,
+                            exec: executable,
+                            len,
+                        },
+                        (FileState::Symlink { target }, len) => {
+                            Kind::StoreLink { blob: target, len }
+                        }
+                        // A gitlink names a commit of another repository,
+                        // not an object of this one.
+                        (FileState::Gitlink { .. }, _) => continue,
                     },
-                    Entry::File(FileEntry {
-                        state: FileState::Symlink { target },
-                        len,
-                    }) => Kind::StoreLink { blob: target, len },
-                    // A gitlink names a commit of another repository, not
-                    // an object of this one.
-                    Entry::File(FileEntry {
-                        state: FileState::Gitlink { .. },
-                        ..
-                    }) => continue,
                 };
                 let child = Self::add(nodes, Some(path), kind, true);
                 listed.insert(name.as_bytes().to_vec(), child);
@@ -690,7 +704,7 @@ impl NFSFileSystem for Vfs {
         match &node.kind {
             Kind::Store { blob, len, .. } => {
                 let data = self
-                    .fetch_blob(*blob, node.path.as_ref())
+                    .fetch_blob(*blob, node.path.as_ref(), *len)
                     .await
                     .map_err(io_err)?;
                 if data.len() as u64 != *len {
@@ -1126,12 +1140,17 @@ impl Vfs {
     /// The first write of a file of the ref: its blob goes to the overlay.
     /// Keeps the executable bit.
     async fn materialize(&self, nodes: &mut Nodes, id: u64) -> Result<(), nfsstat3> {
-        let (blob, path, exec) = {
+        let (blob, path, exec, len) = {
             let node = nodes.by_id.get(&id).ok_or(nfsstat3::NFS3ERR_STALE)?;
             match &node.kind {
-                Kind::Store { blob, exec, .. } => {
-                    (*blob, node.path.clone().expect("a file has a path"), *exec)
-                }
+                Kind::Store {
+                    blob, exec, len, ..
+                } => (
+                    *blob,
+                    node.path.clone().expect("a file has a path"),
+                    *exec,
+                    *len,
+                ),
                 Kind::Local { .. } => return Ok(()),
                 Kind::Dir { .. } | Kind::LocalDir => return Err(nfsstat3::NFS3ERR_ISDIR),
                 Kind::Link { .. } | Kind::StoreLink { .. } => {
@@ -1139,7 +1158,10 @@ impl Vfs {
                 }
             }
         };
-        let bytes = self.fetch_blob(blob, Some(&path)).await.map_err(io_err)?;
+        let bytes = self
+            .fetch_blob(blob, Some(&path), len)
+            .await
+            .map_err(io_err)?;
         write_file(&self.overlay_file(&path), &bytes, exec).map_err(|e| {
             warn("cannot write a file of the mount", &e);
             nfsstat3::NFS3ERR_IO
@@ -1156,7 +1178,7 @@ impl Vfs {
         match &node.kind {
             Kind::Store { blob, len, .. } | Kind::StoreLink { blob, len } => {
                 let bytes = self
-                    .fetch_blob(*blob, node.path.as_ref())
+                    .fetch_blob(*blob, node.path.as_ref(), *len)
                     .await
                     .map_err(io_err)?;
                 if bytes.len() as u64 != *len {
@@ -1394,7 +1416,7 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scion_core::{Changeset, FileState, IdentityTime, PathElem};
+    use scion_core::{Changeset, FileEntry, FileState, IdentityTime, PathElem};
     use scion_proto::listen::Limits;
     use scion_proto::v1::objects_server::{Objects, ObjectsServer};
     use scion_proto::v1::{

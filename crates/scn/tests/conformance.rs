@@ -246,7 +246,7 @@ async fn snapshot(
             match entry {
                 Entry::Dir(id) => trees.push((id, below)),
                 Entry::File(file) => {
-                    if let Some(blob) = file.state.blob() {
+                    if let Some(blob) = file.state().blob() {
                         blobs.push((blob, below));
                     }
                 }
