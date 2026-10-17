@@ -102,6 +102,7 @@ impl Lazyfs {
         let fifo = round_dir.join("faults.fifo");
         let completed_path = round_dir.join("faults.fifo.completed");
         let config = round_dir.join("lazyfs.toml");
+        let trace = format!("/tmp/lazyfs-r{round}.log");
         fs::write(
             &config,
             format!(
@@ -111,7 +112,7 @@ impl Lazyfs {
                  [filesystem]\nlog_all_operations=true\nlogfile=\"{}\"\n",
                 fifo.display(),
                 completed_path.display(),
-                format!("/tmp/lazyfs-r{round}.log"),
+                trace,
             ),
         )
         .unwrap();
