@@ -1474,10 +1474,11 @@ proptest! {
     #![proptest_config(proptest::test_runner::Config::with_cases(12))]
 
     /// Through the server: for random trees and rules, a partial
-    /// reader's ReadFile of every file path answers the covered
-    /// content, and a hidden path answers byte for byte like a missing
-    /// one; ListDir of every directory answers exactly the model's
-    /// names, and a hidden or absent directory answers like a missing
+    /// reader's ReadFile of every file path answers the covered content,
+    /// and a hidden path answers byte for byte the same as the same path
+    /// in a second world with the same rules where it does not exist;
+    /// ListDir of every directory answers exactly the model's names, and
+    /// a hidden directory answers byte for byte the same as an absent
     /// one.
     #[test]
     fn a_partial_reader_answers_like_the_model(
@@ -1536,40 +1537,65 @@ proptest! {
         }
         let access = Access::parse(&text).unwrap();
 
+        // The second world: the same rules, but a tree where every hidden
+        // path does not exist. A hidden path of the first world must
+        // answer exactly like its absent twin here, byte for byte.
+        let kept_paths: Vec<String> = paths
+            .iter()
+            .filter(|p| kept(p, &rule_set))
+            .cloned()
+            .collect();
+        let dir_b = tempfile::tempdir().unwrap();
+        let store_b = Store::open(dir_b.path()).unwrap();
+        let mut kept_changes = std::collections::BTreeMap::new();
+        for p in &kept_paths {
+            let blob = store_b.blobs().put(&content_of(p)).unwrap();
+            kept_changes.insert(
+                RepoPath::new(p.clone()).unwrap(),
+                Some(FileState::Regular {
+                    content: blob,
+                    executable: false,
+                }),
+            );
+        }
+        let cs_b = Changeset {
+            parents: vec![],
+            author: IdentityTime {
+                name: b"Ada".to_vec(),
+                email: b"ada@example.com".to_vec(),
+                unix_secs: 1_700_000_000,
+                tz_offset_minutes: 0,
+            },
+            committer: None,
+            message: b"change\n".to_vec(),
+            changes: kept_changes,
+        };
+        let tip_b = store_b
+            .write(|c| {
+                let repo = c.create_repo(REPO)?;
+                let tip = c.insert_changeset(repo, &cs_b)?;
+                c.cas_ref(repo, "main", None, tip)?;
+                for p in &kept_paths {
+                    let blob = store_b.blobs().put(&content_of(p)).unwrap();
+                    c.add_repo_blob(repo, blob)?;
+                }
+                Ok(tip)
+            })
+            .unwrap();
+
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(async {
-            let (_stop, mut scion, _objects) = server(&store, access, "pat").await;
-
-            // The reference answers of a path and a directory that do
-            // not exist. A hidden path answers in the same shape: the
-            // same code, and a message that names the requested path
-            // and nothing else (the caller chose the path, so the echo
-            // says nothing about the repo).
-            let missing_file = scion
-                .read_file(req::read_file(tip.as_bytes(), b"zz/zz"))
-                .await
-                .unwrap_err();
-            let missing_dir = scion
-                .list_dir(ListDirRequest {
-                    repo: REPO.into(),
-                    changeset_id: tip.as_bytes().to_vec(),
-                    path: b"zz/zz".to_vec(),
-                })
-                .await
-                .unwrap_err();
-            let shape = |status: &tonic::Status, path: &str| {
-                status.code() == tonic::Code::NotFound
-                    && status.message() == format!("path \"{path}\" not found")
+            let (_stop, mut scion, _objects) = server(&store, access.clone(), "pat").await;
+            let (_stop_b, mut scion_b, _objects_b) = server(&store_b, access, "pat").await;
+            let same = |a: &tonic::Status, b: &tonic::Status| {
+                a.code() == b.code() && a.message() == b.message()
             };
-            prop_assert!(
-                shape(&missing_file, "zz/zz") && shape(&missing_dir, "zz/zz"),
-                "the reference answers drifted: {missing_file:?}, {missing_dir:?}"
-            );
 
-            // ReadFile of every file path.
+            // ReadFile of every file path: covered content, or byte for
+            // byte the answer of the same path in the world without it.
             for p in &paths {
                 let at = p.as_bytes();
                 if kept(p, &rule_set) {
@@ -1589,9 +1615,13 @@ proptest! {
                         .read_file(req::read_file(tip.as_bytes(), at))
                         .await
                         .unwrap_err();
+                    let absent = scion_b
+                        .read_file(req::read_file(tip_b.as_bytes(), at))
+                        .await
+                        .unwrap_err();
                     prop_assert!(
-                        shape(&hidden, p),
-                        "the answer for the hidden file {p} differs from a missing one"
+                        same(&hidden, &absent),
+                        "the hidden file {p} answers {hidden:?}, the absent one {absent:?}"
                     );
                 }
             }
@@ -1635,9 +1665,17 @@ proptest! {
                             expected.is_empty(),
                             "the directory {d:?} lists nothing but was expected to"
                         );
+                        let absent = scion_b
+                            .list_dir(ListDirRequest {
+                                repo: REPO.into(),
+                                changeset_id: tip_b.as_bytes().to_vec(),
+                                path: d.as_bytes().to_vec(),
+                            })
+                            .await
+                            .unwrap_err();
                         prop_assert!(
-                            shape(&status, d),
-                            "the answer for the hidden directory {d} differs from a missing one"
+                            same(&status, &absent),
+                            "the hidden directory {d} answers {status:?}, the absent one {absent:?}"
                         );
                     }
                 }
