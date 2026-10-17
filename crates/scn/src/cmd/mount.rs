@@ -57,8 +57,11 @@ pub struct MountRecord {
 /// `scn commit --from-mount DIR` commits.
 pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
     let base = ctx.resolve(&args.rev).await?;
+    // The server mints the mount's ticket: the read permission of the
+    // whole walk below the root tree of the mounted changeset. It goes to
+    // the server, never to a tier, which mints no tickets.
     let reply = ctx
-        .objects
+        .roots
         .get_root_tree(GetRootTreeRequest {
             repo: ctx.repo.clone(),
             changeset_id: base.as_bytes().to_vec(),
@@ -71,8 +74,17 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
     // The overlay holds the changes; it dies with the mount.
     let overlay = overlay_dir()?;
     let objects = ctx.objects.clone();
+    let roots = ctx.roots.clone();
     let repo = ctx.repo.clone();
-    let vfs = Vfs::new(objects, repo, base, root, overlay.join(CHANGES));
+    let vfs = Vfs::new(
+        objects,
+        roots,
+        repo,
+        base,
+        root,
+        &reply.ticket,
+        overlay.join(CHANGES),
+    );
     let secret = vfs.secret_name();
 
     let listener = NFSTcpListener::bind("127.0.0.1:0", vfs)

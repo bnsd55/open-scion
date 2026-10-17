@@ -40,7 +40,8 @@ pub use nfsserve::vfs::NFSFileSystem;
 use nfsserve::vfs::{DirEntry, ReadDirResult, VFSCapabilities};
 use scion_core::{BlobId, ChangesetId, Entry, FileState, RepoPath, Tree, TreeId};
 use scion_proto::object::{self, Assembler, Header};
-use scion_proto::v1::{Encoding, GetObjectsRequest, ObjectKind, ObjectRef};
+use scion_proto::ticket::{self, TICKET_SKEW_SECS};
+use scion_proto::v1::{Encoding, GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
 
 use crate::client::{Objects, id_from};
 use crate::materialize::check_name;
@@ -62,6 +63,51 @@ const ROOT_ID: u64 = 1;
 /// The bytes of the blobs that are in memory, least recently used first,
 /// and their bytes together.
 type Blobs = tokio::sync::Mutex<(LinkedHashMap<BlobId, Arc<Vec<u8>>>, usize)>;
+
+/// The mount's read ticket: the bytes the calls carry, and when they stop
+/// working. The expiry comes from `parse_unverified`, which a daemon may
+/// run: it forwards tickets, and never vouches for one.
+struct Grant {
+    bytes: Vec<u8>,
+    /// When the ticket expires, in seconds since the epoch.
+    expires: u64,
+}
+
+impl Grant {
+    /// The grant of `bytes`; a ticket that does not parse counts as
+    /// already expired, so the first read mints a fresh one.
+    fn of(bytes: &[u8]) -> Self {
+        let expires = match ticket::parse_unverified(bytes, ticket::now()) {
+            Ok(parsed) => parsed.expires,
+            Err(_) => 0,
+        };
+        Self {
+            bytes: bytes.to_vec(),
+            expires,
+        }
+    }
+
+    /// Whether the ticket still works with time to spare: more than the
+    /// clock-skew window left. A tier's clock may be ahead by up to that
+    /// window, so a ticket with less left can be refused at any moment,
+    /// and the mount mints a fresh one first.
+    fn fresh(&self, now: u64) -> bool {
+        self.expires.saturating_sub(now) > TICKET_SKEW_SECS
+    }
+}
+
+/// The seconds of now, since the epoch. A clock before the epoch counts as
+/// expired tickets, which only costs a refresh.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Is this a failure that a fresh ticket can fix?
+fn expired(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::PermissionDenied && status.message().contains("ticket expired")
+}
 
 /// One node: a directory, a regular file or a symlink, of the ref or of the
 /// overlay.
@@ -151,11 +197,24 @@ impl Nodes {
 /// The NFS file system of one mount.
 pub struct Vfs {
     objects: Objects,
+    /// The client of the server, for the refresh of the ticket: a
+    /// `GetRootTree` goes there, never to a tier, which serves no refs and
+    /// mints no tickets.
+    roots: Objects,
     repo: String,
-    /// The changeset this mount holds, for a ticket refresh of its tree.
-    /// Unused until #13 PR-C: then the refresh calls `GetRootTree` of it.
-    #[allow(dead_code)]
+    /// The changeset this mount holds. Its root tree is what a fresh
+    /// ticket names, so a ref that moved after the mount never changes
+    /// what this mount reads.
     changeset: ChangesetId,
+    /// The mount's read ticket, and when it stops working. Every
+    /// `GetObjects` carries it; the mount mints a fresh one through
+    /// `roots` before it expires, and again on a refusal that says
+    /// `ticket expired`.
+    ticket: tokio::sync::RwLock<Grant>,
+    /// Mints one ticket at a time: reads that find an old ticket together
+    /// wait for one `GetRootTree`, and the first to finish refreshes for
+    /// all of them.
+    mint: tokio::sync::Mutex<()>,
     nodes: tokio::sync::RwLock<Nodes>,
     /// Decoded blobs, least recently used first, with their bytes together.
     /// The daemon holds the stored form on disk; this saves the unpacking
@@ -173,19 +232,28 @@ pub struct Vfs {
 
 impl Vfs {
     /// A virtual checkout of `changeset`, whose root tree is `root`, of
-    /// `repo`. The objects come from `objects`, which may be a daemon.
+    /// `repo`. The objects come from `objects`, which may be a tier; the
+    /// ticket is refreshed through `roots`, which is the server. `ticket`
+    /// is the read ticket that minted for `root`; a ticket that does not
+    /// parse is stored as expired, so the first read mints a fresh one.
     /// Changes go to `overlay`.
     pub fn new(
         objects: Objects,
+        roots: Objects,
         repo: String,
         changeset: ChangesetId,
         root: TreeId,
+        ticket: &[u8],
         overlay: PathBuf,
     ) -> Self {
+        let grant = Grant::of(ticket);
         Self {
             objects,
+            roots,
             repo,
             changeset,
+            ticket: tokio::sync::RwLock::new(grant),
+            mint: tokio::sync::Mutex::new(()),
             nodes: tokio::sync::RwLock::new(Nodes {
                 next: 2,
                 by_id: BTreeMap::from([(
@@ -275,27 +343,75 @@ impl Vfs {
         nodes.by_path.get(&path.map(ToOwned::to_owned)).copied()
     }
 
-    /// One object of `kind`, checked, in its plain form.
-    /// // SHORTCUT: after #13 PR-C, every `GetObjects` of a mount must
-    /// carry an access ticket, and a mount lives longer than a ticket
-    /// (15 minutes). Refresh it by calling `GetRootTree` of the MOUNTED
-    /// changeset — never of the ref, which may have moved — and send the
-    /// new ticket with the next `GetObjects`. Build this when PR-C merges.
-    async fn fetch_object(&self, kind: ObjectKind, id: [u8; 32]) -> Result<Vec<u8>> {
-        let mut objects = self.objects.clone();
-        let refs = vec![ObjectRef {
-            kind: i32::from(kind),
-            id: id.to_vec(),
-        }];
-        let mut stream = objects
-            .get_objects(GetObjectsRequest {
+    /// The ticket to read with: the current one while it has time left,
+    /// and else a fresh mint over the MOUNTED changeset, never over a ref,
+    /// which may have moved since the mount ([#11]). With `force`, always
+    /// mints, for a refusal that said `ticket expired`.
+    async fn ticket(&self, force: bool) -> Result<Vec<u8>> {
+        if !force {
+            let grant = self.ticket.read().await;
+            if grant.fresh(now_secs()) {
+                return Ok(grant.bytes.clone());
+            }
+        }
+        // One mint at a time; the others take the ticket it made.
+        let _once = self.mint.lock().await;
+        if !force {
+            let grant = self.ticket.read().await;
+            if grant.fresh(now_secs()) {
+                return Ok(grant.bytes.clone());
+            }
+        }
+        let reply = self
+            .roots
+            .clone()
+            .get_root_tree(GetRootTreeRequest {
                 repo: self.repo.clone(),
-                refs,
-                accept: vec![Encoding::Zstd.into()],
+                changeset_id: self.changeset.as_bytes().to_vec(),
             })
             .await
-            .context("cannot fetch objects")?
+            .context("cannot refresh the mount's ticket")?
             .into_inner();
+        if reply.ticket.is_empty() {
+            bail!("the server sent no ticket for the mount");
+        }
+        *self.ticket.write().await = Grant::of(&reply.ticket);
+        Ok(reply.ticket)
+    }
+
+    /// One object of `kind` at `path` from the mounted root tree, checked,
+    /// in its plain form. The empty path names the root tree itself; the
+    /// path is what the ticket's walk reaches. The mount's ticket goes out
+    /// with every call: refreshed before it expires, and again on a
+    /// refusal that says `ticket expired`, then the call is asked once
+    /// more.
+    async fn fetch_object(
+        &self,
+        kind: ObjectKind,
+        id: [u8; 32],
+        path: Option<&RepoPath>,
+    ) -> Result<Vec<u8>> {
+        let mut objects = self.objects.clone();
+        let ask = |ticket: Vec<u8>| GetObjectsRequest {
+            refs: vec![ObjectRef {
+                kind: i32::from(kind),
+                id: id.to_vec(),
+                path: path.map(|p| p.as_bytes().to_vec()).unwrap_or_default(),
+            }],
+            accept: vec![Encoding::Zstd.into()],
+            ticket,
+        };
+        let mut ticket = self.ticket(false).await?;
+        let mut call = objects.get_objects(ask(ticket.clone())).await;
+        if let Err(status) = &call
+            && expired(status)
+        {
+            // The ticket died mid-mount: mint over the mounted changeset
+            // and ask again, once.
+            ticket = self.ticket(true).await?;
+            call = objects.get_objects(ask(ticket)).await;
+        }
+        let mut stream = call.context("cannot fetch objects")?.into_inner();
         let first = stream
             .message()
             .await
@@ -318,10 +434,11 @@ impl Vfs {
         object::decode(&header, data).map_err(bad)
     }
 
-    /// The tree `id`, checked.
-    async fn fetch_tree(&self, id: TreeId) -> Result<Tree> {
+    /// The tree `id`, checked: the directory entry at `path` from the
+    /// mounted root tree.
+    async fn fetch_tree(&self, id: TreeId, path: Option<&RepoPath>) -> Result<Tree> {
         let data = self
-            .fetch_object(ObjectKind::Tree, *id.as_bytes())
+            .fetch_object(ObjectKind::Tree, *id.as_bytes(), path)
             .await
             .with_context(|| format!("cannot read tree {id}"))?;
         let (tree, actual) = Tree::decode_with_id(&data)
@@ -338,7 +455,7 @@ impl Vfs {
     /// network fetch: one slow fetch must not stop the other reads of the
     /// mount. Two calls that race on one blob both fetch, and both insert
     /// a correct copy; the last one wins.
-    async fn fetch_blob(&self, id: BlobId) -> Result<Arc<Vec<u8>>> {
+    async fn fetch_blob(&self, id: BlobId, path: Option<&RepoPath>) -> Result<Arc<Vec<u8>>> {
         if let Some(data) = {
             let mut blobs = self.blobs.lock().await;
             blobs.0.get_mut(&id).map(|data| Arc::clone(data))
@@ -346,7 +463,7 @@ impl Vfs {
             return Ok(data);
         }
         let raw = self
-            .fetch_object(ObjectKind::Blob, *id.as_bytes())
+            .fetch_object(ObjectKind::Blob, *id.as_bytes(), path)
             .await
             .with_context(|| format!("cannot read blob {id}"))?;
         if BlobId::of(&raw) != id {
@@ -364,11 +481,12 @@ impl Vfs {
         Ok(data)
     }
 
-    /// // SHORTCUT: the size comes from the blob, so a stat of a file that
-    /// was never read fetches the blob. After #13 PR-C, a `GetSizes` call
-    /// served from the stored frame's header replaces this.
-    async fn size_of(&self, blob: BlobId) -> Result<u64, nfsstat3> {
-        Ok(self.fetch_blob(blob).await.map_err(io_err)?.len() as u64)
+    /// The size of the blob of the file at `path`. The size comes from
+    /// the blob, so a stat of a file that was never read fetches it.
+    /// SHORTCUT: after #13 gets a `GetSizes` call served from the stored
+    /// frame's header, this fetches no blob.
+    async fn size_of(&self, blob: BlobId, path: Option<&RepoPath>) -> Result<u64, nfsstat3> {
+        Ok(self.fetch_blob(blob, path).await.map_err(io_err)?.len() as u64)
     }
 
     /// Fetches the tree of the directory `id` into its listing, once.
@@ -386,10 +504,13 @@ impl Vfs {
         };
         let mut listed = BTreeMap::new();
         if let Some(tree) = tree {
-            let tree = self.fetch_tree(tree).await.map_err(|e| {
-                warn("cannot read a tree of the mount", &e);
-                nfsstat3::NFS3ERR_IO
-            })?;
+            let tree = self
+                .fetch_tree(tree, dir_path.as_ref())
+                .await
+                .map_err(|e| {
+                    warn("cannot read a tree of the mount", &e);
+                    nfsstat3::NFS3ERR_IO
+                })?;
             for (name, entry) in tree.entries {
                 let path = Self::child(dir_path.as_ref(), name.as_bytes())?;
                 if nodes.deleted.contains(&path) || nodes.by_path.contains_key(&Some(path.clone()))
@@ -565,7 +686,10 @@ impl NFSFileSystem for Vfs {
         let node = nodes.by_id.get(&id).ok_or(nfsstat3::NFS3ERR_STALE)?;
         match &node.kind {
             Kind::Store { blob, .. } => {
-                let data = self.fetch_blob(*blob).await.map_err(io_err)?;
+                let data = self
+                    .fetch_blob(*blob, node.path.as_ref())
+                    .await
+                    .map_err(io_err)?;
                 let len = data.len() as u64;
                 let from = usize::try_from(offset.min(len)).unwrap_or(usize::MAX);
                 let to = usize::try_from(offset.saturating_add(u64::from(count)).min(len))
@@ -926,7 +1050,7 @@ impl Vfs {
         match &node.kind {
             Kind::Dir { .. } | Kind::LocalDir => Ok(self.attr(ftype3::NF3DIR, 0o755, 4096, id)),
             Kind::Store { blob, exec } => {
-                let size = self.size_of(*blob).await?;
+                let size = self.size_of(*blob, node.path.as_ref()).await?;
                 Ok(self.attr(ftype3::NF3REG, file_mode(0o644, *exec), size, id))
             }
             Kind::Local { .. } => {
@@ -937,7 +1061,7 @@ impl Vfs {
                 Ok(self.attr(ftype3::NF3REG, file_mode(0o644, exec), meta.len(), id))
             }
             Kind::StoreLink { blob } => {
-                let size = self.size_of(*blob).await?;
+                let size = self.size_of(*blob, node.path.as_ref()).await?;
                 Ok(self.attr(ftype3::NF3LNK, 0o777, size, id))
             }
             Kind::Link { target } => Ok(self.attr(ftype3::NF3LNK, 0o777, target.len() as u64, id)),
@@ -1002,7 +1126,7 @@ impl Vfs {
                 }
             }
         };
-        let bytes = self.fetch_blob(blob).await.map_err(io_err)?;
+        let bytes = self.fetch_blob(blob, Some(&path)).await.map_err(io_err)?;
         write_file(&self.overlay_file(&path), &bytes, exec).map_err(|e| {
             warn("cannot write a file of the mount", &e);
             nfsstat3::NFS3ERR_IO
@@ -1017,9 +1141,11 @@ impl Vfs {
     async fn file_bytes(&self, nodes: &Nodes, id: u64) -> Result<Vec<u8>, nfsstat3> {
         let node = nodes.by_id.get(&id).ok_or(nfsstat3::NFS3ERR_STALE)?;
         match &node.kind {
-            Kind::Store { blob, .. } | Kind::StoreLink { blob } => {
-                Ok(self.fetch_blob(*blob).await.map_err(io_err)?.to_vec())
-            }
+            Kind::Store { blob, .. } | Kind::StoreLink { blob } => Ok(self
+                .fetch_blob(*blob, node.path.as_ref())
+                .await
+                .map_err(io_err)?
+                .to_vec()),
             Kind::Local { .. } => {
                 let file = self.overlay_file(node.path.as_ref().expect("a file has a path"));
                 std::fs::read(&file).map_err(|_| nfsstat3::NFS3ERR_IO)
@@ -1241,11 +1367,20 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scion_core::{Changeset, FileState, IdentityTime};
+    use scion_core::{Changeset, FileState, IdentityTime, PathElem};
     use scion_proto::listen::Limits;
-    use scion_proto::v1::GetRootTreeRequest;
-    use scion_server::{Store, db, service, tree};
+    use scion_proto::v1::objects_server::{Objects, ObjectsServer};
+    use scion_proto::v1::{
+        GetRootTreeRequest as Ask, GetRootTreeResponse, ObjectPart, ResolveRefRequest,
+        ResolveRefResponse,
+    };
+    use scion_server::meta::MetaTx as _;
+    use scion_server::{Store, service, tree};
+    use std::collections::HashMap as StdHashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{Request, Response, Status, transport::Server};
     const REPO: &str = "r";
     const TOKEN: &str = "secret";
 
@@ -1268,7 +1403,7 @@ mod tests {
         let mut contents = Vec::new();
         let base = store
             .write(|c| {
-                let repo = db::create_repo(c, REPO)?;
+                let repo = c.create_repo(REPO)?;
                 let mut blobs = store.blobs().batch();
                 for (_path, bytes, exec) in files {
                     let content = blobs.put(bytes).unwrap();
@@ -1299,8 +1434,8 @@ mod tests {
                     changes: changes.into_iter().collect(),
                 };
                 let (id, _) = tree::store_changeset(c, repo, &cs)?;
-                let version = db::get_ref(c, repo, "main")?.map(|r| r.version);
-                db::cas_ref(c, repo, "main", version, id)?;
+                let version = c.get_ref(repo, "main")?.map(|r| r.version);
+                c.cas_ref(repo, "main", version, id)?;
                 Ok(id)
             })
             .unwrap();
@@ -1318,9 +1453,12 @@ mod tests {
                 land_stale_secs: 1 << 40,
                 tls: None,
             },
+            Some(std::sync::Arc::new(scion_server::tickets::Keys::generate())),
             std::future::pending(),
         ));
         let client = crate::client::test_objects(&url, TOKEN).await;
+        // The server of the mount: the client that mints fresh tickets.
+        let roots = crate::client::test_objects(&url, TOKEN).await;
         let reply = client
             .clone()
             .get_root_tree(GetRootTreeRequest {
@@ -1333,9 +1471,11 @@ mod tests {
         let root = id_from(&reply.tree_id).unwrap();
         let vfs = Vfs::new(
             client,
+            roots,
             REPO.to_owned(),
             base,
             root,
+            &reply.ticket,
             overlay.path().to_path_buf(),
         );
         Test {
@@ -1558,5 +1698,201 @@ mod tests {
                 .overlay_file(&RepoPath::new("old").unwrap())
                 .exists()
         );
+    }
+
+    /// The attributes of a ticket near and past its expiry: fresh only
+    /// with more than the clock-skew window left, and an unparsed ticket
+    /// counts as expired.
+    #[test]
+    fn a_ticket_near_its_expiry_is_not_fresh() {
+        let grant = Grant {
+            bytes: Vec::new(),
+            expires: 1_000,
+        };
+        assert!(grant.fresh(1_000 - TICKET_SKEW_SECS - 1));
+        assert!(!grant.fresh(1_000 - TICKET_SKEW_SECS));
+        assert!(!grant.fresh(1_000));
+        assert!(!grant.fresh(2_000));
+        assert!(!Grant::of(b"not a ticket").fresh(0));
+    }
+
+    /// An object as the fake server sends it: RAW, one part.
+    struct Sent {
+        kind: i32,
+        id: Vec<u8>,
+        data: Vec<u8>,
+    }
+
+    impl Sent {
+        /// The parts of the object: its header, then its bytes.
+        fn parts(&self) -> Vec<Result<ObjectPart, Status>> {
+            let header = Header {
+                kind: ObjectKind::try_from(self.kind).unwrap(),
+                id: self.id.clone().try_into().unwrap(),
+                encoding: Encoding::Raw,
+                encoded_size: self.data.len(),
+                size: self.data.len(),
+            };
+            header
+                .parts(object::read_chunks(&self.data[..], self.data.len()).unwrap())
+                .into_iter()
+                .map(Ok)
+                .collect::<Vec<Result<ObjectPart, Status>>>()
+        }
+    }
+
+    /// An objects server whose first ticket is refused: a `GetObjects`
+    /// that carries it ends permission-denied with `ticket expired`, and
+    /// every ticket minted after works. It counts its mints, so the test
+    /// can see the refresh.
+    struct Expiring {
+        root: TreeId,
+        objects: StdHashMap<Vec<u8>, Sent>,
+        key: std::sync::Arc<scion_server::tickets::Keys>,
+        /// The ticket of the first mint, which `get_objects` refuses.
+        first: std::sync::Mutex<Vec<u8>>,
+        /// Shared with the test, which reads it while the server runs.
+        mints: std::sync::Arc<AtomicUsize>,
+    }
+
+    impl Expiring {
+        /// One file `a` of one byte, under the root tree.
+        fn new() -> Self {
+            let blob = Sent {
+                kind: ObjectKind::Blob.into(),
+                id: BlobId::of(b"x\n").as_bytes().to_vec(),
+                data: b"x\n".to_vec(),
+            };
+            let tree = Tree {
+                entries: [(
+                    PathElem::new("a").unwrap(),
+                    Entry::File(FileState::Regular {
+                        content: BlobId::try_from(blob.id.as_slice()).unwrap(),
+                        executable: false,
+                    }),
+                )]
+                .into(),
+            };
+            let (data, root) = tree.encode_with_id();
+            let tree = Sent {
+                kind: ObjectKind::Tree.into(),
+                id: root.as_bytes().to_vec(),
+                data,
+            };
+            Self {
+                root,
+                objects: [(blob.id.clone(), blob), (tree.id.clone(), tree)]
+                    .into_iter()
+                    .collect(),
+                key: std::sync::Arc::new(scion_server::tickets::Keys::generate()),
+                first: std::sync::Mutex::new(Vec::new()),
+                mints: std::sync::Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl Objects for Expiring {
+        async fn resolve_ref(
+            &self,
+            _: Request<ResolveRefRequest>,
+        ) -> Result<Response<ResolveRefResponse>, Status> {
+            Err(Status::unimplemented("a mount reads by ID"))
+        }
+
+        async fn get_root_tree(
+            &self,
+            _: Request<Ask>,
+        ) -> Result<Response<GetRootTreeResponse>, Status> {
+            let mint = self.mints.fetch_add(1, Ordering::SeqCst) + 1;
+            // The mint in the principal: two tickets of one second are
+            // otherwise the same bytes, and the fake could not tell the
+            // first one from a fresh one.
+            let ticket = self
+                .key
+                .sign(REPO, &format!("default-{mint}"), *self.root.as_bytes())
+                .map_err(Status::internal)
+                .unwrap();
+            if mint == 1 {
+                *self.first.lock().unwrap() = ticket.clone();
+            }
+            Ok(Response::new(GetRootTreeResponse {
+                tree_id: self.root.as_bytes().to_vec(),
+                ticket,
+            }))
+        }
+
+        type GetObjectsStream =
+            std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<ObjectPart, Status>> + Send>>;
+
+        async fn get_objects(
+            &self,
+            request: Request<GetObjectsRequest>,
+        ) -> Result<Response<Self::GetObjectsStream>, Status> {
+            let GetObjectsRequest { refs, ticket, .. } = request.into_inner();
+            if ticket == *self.first.lock().unwrap() {
+                return Err(Status::permission_denied("bad ticket: ticket expired"));
+            }
+            let parts = refs
+                .iter()
+                .flat_map(|r| self.objects[&r.id].parts())
+                .collect::<Vec<Result<ObjectPart, Status>>>();
+            Ok(Response::new(Box::pin(tokio_stream::iter(parts))))
+        }
+    }
+
+    /// A mount that lives past the life of its first ticket keeps reading:
+    /// the refusal mints a fresh ticket over the mounted changeset, once,
+    /// and the read is asked again with it. The next read mints no more.
+    #[tokio::test]
+    async fn a_mount_past_its_ticket_keeps_reading() {
+        let fake = Expiring::new();
+        let mints = fake.mints.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(
+            Server::builder()
+                .add_service(ObjectsServer::new(fake))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let objects = crate::client::test_objects(&url, TOKEN).await;
+        let roots = crate::client::test_objects(&url, TOKEN).await;
+        let reply = objects
+            .clone()
+            .get_root_tree(Ask {
+                repo: REPO.to_owned(),
+                changeset_id: [7u8; 32].to_vec(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let root = id_from(&reply.tree_id).unwrap();
+        let overlay = tempfile::tempdir().unwrap();
+        let vfs = Vfs::new(
+            objects,
+            roots,
+            REPO.to_owned(),
+            ChangesetId::from_bytes([7u8; 32]),
+            root,
+            &reply.ticket,
+            overlay.path().to_path_buf(),
+        );
+        // The first read: the ticket it was minted is refused, so the
+        // mount mints again and reads with the fresh one.
+        let id = vfs
+            .lookup(
+                NFSFileSystem::root_dir(&vfs),
+                &filename3::from(b"a".to_vec()),
+            )
+            .await
+            .unwrap();
+        let (data, eof) = vfs.read(id, 0, 1000).await.unwrap();
+        assert_eq!(data, b"x\n");
+        assert!(eof);
+        assert_eq!(mints.load(Ordering::SeqCst), 2);
+        // The second read mints no more: the fresh ticket works.
+        let (data, _) = vfs.read(id, 0, 1000).await.unwrap();
+        assert_eq!(data, b"x\n");
+        assert_eq!(mints.load(Ordering::SeqCst), 2);
     }
 }

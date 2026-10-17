@@ -90,22 +90,21 @@ struct Mount {
 
 /// Mounts the tree of `base` through the VFS.
 fn mount(tiers: &common::Tiers, base: &ChangesetId) -> Mount {
-    let objects = tiers
-        .runtime
-        .block_on(async { test_objects(&tiers.server, TOKEN).await });
-    let reply = tiers
-        .runtime
-        .block_on(async {
-            objects
-                .clone()
-                .get_root_tree(GetRootTreeRequest {
-                    repo: REPO.to_owned(),
-                    changeset_id: base.as_bytes().to_vec(),
-                })
-                .await
-        })
-        .unwrap()
-        .into_inner();
+    let (objects, roots, reply) = tiers.runtime.block_on(async {
+        let objects = test_objects(&tiers.server, TOKEN).await;
+        // The refresh of the ticket goes to the server, like a mount's.
+        let roots = test_objects(&tiers.server, TOKEN).await;
+        let reply = objects
+            .clone()
+            .get_root_tree(GetRootTreeRequest {
+                repo: REPO.to_owned(),
+                changeset_id: base.as_bytes().to_vec(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        (objects, roots, reply)
+    });
     let root = id_from(&reply.tree_id).unwrap();
 
     let home = tempfile::tempdir().unwrap();
@@ -114,7 +113,15 @@ fn mount(tiers: &common::Tiers, base: &ChangesetId) -> Mount {
     let view = home.path().join("view");
     std::fs::create_dir_all(&view).unwrap();
     let overlay = home.path().join("overlay");
-    let vfs = Vfs::new(objects, REPO.to_owned(), *base, root, overlay.join("tree"));
+    let vfs = Vfs::new(
+        objects,
+        roots,
+        REPO.to_owned(),
+        *base,
+        root,
+        &reply.ticket,
+        overlay.join("tree"),
+    );
     // The session file the commit reads, under the home of the `scn` runs.
     std::fs::create_dir_all(home.path().join(".scion")).unwrap();
     write_sessions(

@@ -65,7 +65,10 @@ until that section gets its release date.
   `GetObjects` to `--objects` (a `scion-cache` or `scion-daemon`) with the
   checkout's ticket and each ref's path. Without `--objects`, object reads
   go to `--server`. On `ticket expired`, `scn` mints a fresh ticket for the
-  same changeset, once per call, and goes on.
+  same changeset, once per call, and goes on. A `scn mount` sends its
+  ticket with every read, and refreshes it through `GetRootTree` of the
+  mounted changeset — never of the ref, which may have moved — before it
+  expires, and again on `ticket expired`.
 
 #### The server
 
