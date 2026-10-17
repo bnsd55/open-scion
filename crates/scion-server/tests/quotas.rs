@@ -11,6 +11,7 @@ use scion_server::access::Access;
 use scion_server::meta::{MetaTx as _, RefState};
 use scion_server::quotas::Quotas;
 use scion_server::{Store, service};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::ReceiverStream;
@@ -46,11 +47,8 @@ fn access(principals: &[&str]) -> Access {
     for name in principals {
         let line = format!("token\t{name}\t{}\n", hex(name));
         text.push_str(&line);
-        text.push_str("write\t");
-        text.push_str(name);
-        text.push('\t');
-        text.push_str(REPO);
-        text.push('\n');
+        let _ = writeln!(text, "read\t{name}\t{REPO}");
+        let _ = writeln!(text, "write\t{name}\t{REPO}");
     }
     Access::parse(&text).unwrap()
 }
