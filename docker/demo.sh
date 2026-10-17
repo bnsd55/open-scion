@@ -92,13 +92,12 @@ git -C work/seed -c user.name=demo -c user.email=demo@localhost commit -qm "the 
 docker compose run --rm --entrypoint scion-server server \
     --data /data import --repo demo /host-work/seed
 
-docker compose run --rm scn '
+ID=$(docker compose run --rm scn '
     set -eu
     mkdir -p /work/src
     printf "hello from scion\n" > /work/src/README.md
-    scn commit -m "the demo commit" --put README.md=/work/src/README.md
-' > work/commit.json
-ID=$(sed -n "s/.*\"changeset\": *\"\([0-9a-f]*\)\".*/\1/p" work/commit.json)
+    scn commit --json -m "the demo commit" --put README.md=/work/src/README.md
+' | sed -n "s/.*\"changeset\": *\"\([0-9a-f]*\)\".*/\1/p")
 docker compose run --rm scn "scn land $ID --onto main"
 
 echo "checking out main through the cache"
