@@ -107,9 +107,16 @@ impl Lazyfs {
         let config = round_dir.join("lazyfs.toml");
         // The ops trace lives in the round tempdir, which goes away with
         // the test; a CI job that wants it after a failure names a fixed
-        // directory to upload from.
+        // directory to upload from. `LazyFS` does not create the folder of
+        // its logfile, so the test does.
         let trace = match std::env::var_os("SCION_LAZYFS_TRACE_DIR") {
-            Some(dir) => PathBuf::from(dir).join(format!("lazyfs-r{round}.log")),
+            Some(dir) => {
+                let trace = PathBuf::from(dir).join(format!("lazyfs-r{round}.log"));
+                if let Some(dir) = trace.parent() {
+                    fs::create_dir_all(dir).unwrap();
+                }
+                trace
+            }
             None => round_dir.join("lazyfs.log"),
         };
         fs::write(
@@ -484,10 +491,24 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
         // rewrite what the checker wrote and saw.
         drop(lazy);
         let after = snapshot(&backing);
-        assert_eq!(
-            before, after,
-            "the backing changed while the mount went away"
-        );
+        if before != after {
+            // Name the files that changed, with their sizes: the trace
+            // says what the daemon wrote and when.
+            let changed: Vec<String> = before
+                .iter()
+                .zip(&after)
+                .filter(|(b, a)| b != a)
+                .map(|((path, before), (_, after))| {
+                    format!(
+                        "{}: {} bytes before, {} after",
+                        path.display(),
+                        before.len(),
+                        after.len()
+                    )
+                })
+                .collect();
+            panic!("the backing changed while the mount went away: {changed:?}");
+        }
         // What the checker verified still verifies.
         let store = Store::open_shared(&backing).unwrap();
         for (id, _) in &acked {
