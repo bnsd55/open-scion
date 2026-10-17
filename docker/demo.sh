@@ -89,7 +89,8 @@ printf "hello from git\n" > work/seed/README.md
 git -C work/seed init -q
 git -C work/seed add -A
 git -C work/seed -c user.name=demo -c user.email=demo@localhost commit -qm "the seed commit"
-docker compose run --rm --entrypoint scion-server server import --repo demo /host-work/seed
+docker compose run --rm --entrypoint scion-server server \
+    --data /data import --repo demo /host-work/seed
 
 docker compose run --rm scn '
     set -eu
