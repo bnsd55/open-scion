@@ -32,10 +32,13 @@
 //!   during the transaction: a `CreateChangeset` either committed before
 //!   it (and is seen), or runs after it (finds no row, refuses, and the
 //!   client uploads again).
-//! - The sweep unlinks a file only when no row names it and the file's
-//!   mtime is the one the listing saw. A new row can only arrive with a
-//!   fresh file write, which changes the mtime, so the re-check closes
-//!   the window between the row check and the unlink.
+//! - The sweep unlinks inside short write transactions of
+//!   [`SWEEP_BATCH`] files each: the row check and the unlink share the
+//!   write lock, so no writer can add a row between them - and a writer
+//!   need not rewrite the file to add one, so a check outside the lock is
+//!   not enough. The mtime re-stat stays as a second guard. An unlink is
+//!   not rolled back by the transaction; a crash after it and before the
+//!   commit is fine, because the file had no row.
 //!
 //! A reader that is between its row check and its file open when the sweep
 //! unlinks sees the same window that `fsck` reads through; a read of a
@@ -54,6 +57,10 @@ use std::str::FromStr as _;
 
 /// Rows to read per batch, as `fsck` reads.
 pub const BATCH: usize = 4096;
+
+/// Files to check and unlink per write transaction of the sweep, so a
+/// writer waits milliseconds, not the whole sweep.
+pub const SWEEP_BATCH: usize = 1000;
 
 /// The grace period, when `--grace-secs` is not given: seven days.
 pub const DEFAULT_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
@@ -240,6 +247,7 @@ fn sweep_files(
     between: &mut dyn FnMut(Stage),
     report: &mut Report,
 ) -> crate::error::Result<()> {
+    let mut candidates = Vec::new();
     for (path, listed) in blob_files(store)? {
         let Some(id) = blob_id_of(&path) else {
             continue; // not a blob name: fsck reports it, the sweep leaves it
@@ -251,18 +259,32 @@ fn sweep_files(
             report.files_young += 1;
             continue;
         }
-        // The re-read and the re-stat below close the window: a row can
-        // only come back with a fresh file write, which changes the mtime.
-        let named = store.read(|c| db::gc_any_repo_blob(c, id.as_bytes()))?;
-        if named || file_mtime(&path)? != Some(listed) {
-            continue;
-        }
-        if !dry_run {
-            std::fs::remove_file(&path)?;
-        }
-        report.files_removed += 1;
+        candidates.push((path, listed, id));
     }
+    // The listing is done; a test writes between it and the sweep.
     between(Stage::BlobFiles);
+    // The unlink runs inside a write transaction with the row check, so no
+    // writer can add a row between the two: the server has one writer, and
+    // it waits for the transaction. The mtime re-stat stays as a second
+    // guard. An unlink is not rolled back by the transaction, and a crash
+    // after it and before the commit is fine: the file had no row.
+    for batch in candidates.chunks(SWEEP_BATCH) {
+        store.write(|c| {
+            for (path, listed, id) in batch {
+                if db::gc_any_repo_blob(c, id.as_bytes())? {
+                    continue;
+                }
+                if file_mtime(path)? != Some(*listed) {
+                    continue;
+                }
+                if !dry_run {
+                    std::fs::remove_file(path)?;
+                }
+                report.files_removed += 1;
+            }
+            Ok(())
+        })?;
+    }
     Ok(())
 }
 
@@ -612,6 +634,43 @@ mod tests {
         age_file(&store, x, OLD);
         let report = collect(&store, Duration::from_secs(DEFAULT_GRACE_SECS), &mut |_| {});
         assert_eq!(report.files_removed, 1, "{report:?}");
+    }
+
+    #[test]
+    fn a_row_added_between_the_listing_and_the_sweep_keeps_its_file() {
+        let (_dir, store) = store();
+        let x = store.blobs().put(b"listed\n").unwrap();
+        age_file(&store, x, OLD);
+        let mut injected = false;
+        let report = {
+            let mut between = |stage: Stage| {
+                if stage == Stage::BlobFiles && !injected {
+                    injected = true;
+                    // A changeset commits after the listing and names the
+                    // listed blob. `insert_changeset` adds its row without
+                    // writing the file: the blob is already stored.
+                    let state = FileState::Regular {
+                        content: x,
+                        executable: false,
+                    };
+                    land(&store, &cs(None, &[("x.txt", state)]));
+                }
+            };
+            collect(
+                &store,
+                Duration::from_secs(DEFAULT_GRACE_SECS),
+                &mut between,
+            )
+        };
+        assert!(injected);
+        assert_eq!(report.files_removed, 0, "{report:?}");
+        // The file is there, and fsck finds nothing.
+        assert_eq!(
+            store.blobs().verify(x).unwrap(),
+            crate::store::BlobStatus::Valid
+        );
+        let check = crate::fsck::run(&store, 1, &mut |_| {}).unwrap();
+        assert!(check.is_clean(), "{check:?}");
     }
 
     #[test]
