@@ -22,12 +22,12 @@ this file says so. Every other rule is this project's choice.
 | Service | Calls | Who answers |
 |---|---|---|
 | `Scion` | Writes (`PutBlob`, `CreateChangeset`, `Land`, `GetLand`), path reads (`ResolveRef`, `GetChangeset`, `ReadFile`, `ListDir`, `Log`, `Blame`) and queries (`MergeBase`, `IsAncestor`, `Diff`) | The server only |
-| `Objects` | `ResolveRef`, `GetRootTree`, `GetObjects` | The server, or any cache tier (section 8) |
+| `Objects` | `ResolveRef`, `GetRootTree`, `GetObjects` | The server answers all three; a cache tier answers only `GetObjects` (section 8) |
 
 Both services are on one address. Every read except `ResolveRef` and
 `GetLand` names an immutable object by ID, never a ref, so its answer never
 changes. A client resolves a ref first. `Scion.ResolveRef` is deprecated: a
-client SHOULD use `Objects.ResolveRef`, which a tier forwards. A v1 server
+client SHOULD use `Objects.ResolveRef`. A v1 server
 MUST keep both.
 
 ## 2. Transport and authentication
@@ -166,7 +166,8 @@ repo does not have is `NOT_FOUND`, the same as one that does not exist. A
 repo has the blobs uploaded to it and the blobs that its changesets name. A
 changeset names only blobs of its repo (section 6.2), so `ReadFile`,
 `ListDir`, `Log`, `Blame` and `Diff` reach only the repo's own content.
-`GetObjects` is not scoped to a repo in v1 (section 5).
+`GetObjects` is scoped by its ticket to one repo and root tree
+(section 7.3).
 
 **Message size limits.**
 
@@ -256,15 +257,11 @@ can answer a request for an object. A client checks what it can by hash.
   elsewhere), which changesets `Log` selects, `Blame`, `MergeBase`,
   `IsAncestor`, which paths `Diff` lists, and `Land` outcomes.
 
-In v0.1 a client also trusts every tier on its path for the `ResolveRef` and
-`GetRootTree` answers that the tier passes on (section 8).
-
 **An object ID is not a permission.** A changeset cannot name a blob of
 another repo (section 6.2), and no answer of `PutBlob` or `CreateChangeset`
-shows whether another repo has a blob. But in v1 `GetObjects` sends any
-stored tree or blob to any caller that may read the repo it names, whatever
-repo stored the object. Read tickets are not in v1
-([#13](https://github.com/bnsd55/open-scion/issues/13)).
+shows whether another repo has a blob. An object read is no exception:
+`GetObjects` carries a read ticket (section 7.3), and serves only what the
+walk from the ticket's root tree reaches.
 
 ## 6. The `Scion` service
 
@@ -1040,8 +1037,6 @@ version, a server stops serving its package; its clients then get
 
 - Certificate revocation and a public CA store; trust comes only from a CA
   file ([#14](https://github.com/bnsd55/open-scion/issues/14)).
-- More than one principal, per-path write rules and read tickets
-  ([#13](https://github.com/bnsd55/open-scion/issues/13)).
 - Calls that create a repo or a ref, delete a ref, move a ref other than by
   `Land`, or list repos or refs. `scion-server import` creates repos and refs.
 - Client changesets with no parent, several parents or a committer. Only git

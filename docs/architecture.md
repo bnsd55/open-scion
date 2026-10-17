@@ -149,7 +149,7 @@ One data directory holds everything (`store.rs`):
 <data>/tmp/                    staging for atomic blob writes and uploads
 ```
 
-**Checking a data directory.** `scion-server fsck <data>` reports the
+**Checking a data directory.** `scion-server --data <dir> fsck` reports the
 damage it finds, and changes nothing: it reads, and leaves every repair
 to you. It checks every blob file against its ID, every blob that a row
 names, every changeset, tree and history node against its ID, every ref
@@ -170,7 +170,7 @@ steps of the kind remove them (section 4).
 | `changesets` | ID, generation and `ChangesetV1` bytes. Global: one row per changeset, whatever repos have it. |
 | `changeset_parents` | Parent `n` of each changeset, also indexed by parent. |
 | `repo_changesets` | Which changesets a repo may read. Every changeset read checks this table. |
-| `repo_blobs` | Which blobs a repo may name: those uploaded to it, and those that its changesets name. `CreateChangeset` checks this table. A row is never removed, and is not a promise that the blob is stored. |
+| `repo_blobs` | Which blobs a repo may name: those uploaded to it, and those that its changesets name. `CreateChangeset` checks this table. A row goes only when `scion-server gc` collects it: a blob past the grace period that no stored changeset of the repo puts. A row is not a promise that the blob is stored. |
 | `refs` | Ref name to target and `version`. A ref moves only by compare-and-swap on `version`. A foreign key keeps the target in the repo. |
 | `lands` | One row per land request, unique on (repo, caller, request key): state, result, detail, conflict paths, and when it finished. A finished row expires after 7 days (section 5). |
 | `trees` | `TreeV1` bytes by tree ID. Global. |
@@ -485,7 +485,9 @@ started.
    blob. A blob of another repo gets the error of content that no repo
    stored, before any file is read, so neither the answer nor its time shows
    that another repo has it. The error names the first such path, in path
-   order. Rows are never removed, so this check still holds at step 5.
+   order. The check holds at step 5: the changeset's transaction re-adds
+   the row of each blob it puts, and gc removes only rows past the grace
+   period that no stored changeset names (`gc.rs`).
 4. Read back each blob it names, before the write transaction. A blob that many
    paths name is read once. The error names the first path, in path order,
    whose blob is missing or corrupt.
@@ -1476,7 +1478,7 @@ system's NFS client. A directory's tree is fetched when the directory is
 first listed or looked up in; a file's blob when the file is first read or
 sized, through the same `Objects` calls a checkout sends. Every read
 carries the mount's read ticket, which the mount refreshes through
-`GetRootTree` of the mounted changeset before it expires. Until #13 adds
+`GetRootTree` of the mounted changeset before it expires. Until #172 adds
 `GetSizes`, a file's size comes from its blob, so the first stat of a
 file that was never read fetches the blob, and `ls -l` of a directory
 fetches every blob in it.
@@ -1560,6 +1562,7 @@ limit and its upgrade path. This is the list on `main` today.
 |---|---|---|---|
 | `scion-core/src/codec.rs` (`put_len`) | Encoding panics if a field is longer than `u32::MAX`. Every ingest path caps sizes far below that. | `try_encode` returning `Result`, if a path ever does not. | |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
+| `scion-server/src/store.rs` (`flush_dirs`) | The power-loss suite cannot catch a lost fsync of a blob directory: LazyFS persists a rename at rename time, so the cut never drops a directory entry. The `fsync` of each directory after a rename (section 3) is therefore untested by that suite. | A block-level replay that drops un-flushed writes in order (dm-log-writes replay to each FLUSH), when a bug report or a change to the rename path says a directory entry was lost. | |
 | `scion-server/src/main.rs` (`Command`) | The `Serve` subcommand holds its flags by value: 309 bytes against `Import`'s 109, 20 bytes over `clippy::large_enum_variant`, so the lint is off for the enum. | Box the TLS and ticket paths of `Serve` if a variant grows further. | |
 | `scion-server/src/import.rs` (`TX_BUDGET`) | A transaction of an import ends at 1 s, but one commit's record and check can run longer, and a server write then waits for it. Ceiling: the changes and trees of the biggest commit. | A separate write connection for the import, or per-statement yields. | [#100](https://github.com/bnsd55/open-scion/issues/100) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | Per-ref serialization in a shared database ([design](design/scalable-backend.md)). | [#47](https://github.com/bnsd55/open-scion/issues/47) |
@@ -1576,7 +1579,7 @@ limit and its upgrade path. This is the list on `main` today.
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each symlink target whole, so memory caps the target length. | Stream chunks from the file. | |
 | `scn/src/cmd/commit.rs` (`parse_author`) | The author time zone is always UTC, since `std` cannot read the local time zone. | A time zone crate. | |
-| `scn/src/vfs.rs` (`size_of`) | A file's size comes from its blob, so the first stat of a file that was never read fetches the blob, and `ls -l` of a directory fetches every blob in it. | After #13 gets a `GetSizes` call served from the stored frame's header. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
+| `scn/src/vfs.rs` (`size_of`) | A file's size comes from its blob, so the first stat of a file that was never read fetches the blob, and `ls -l` of a directory fetches every blob in it. | After #172 gets a `GetSizes` call served from the stored frame's header. | [#172](https://github.com/bnsd55/open-scion/issues/172) |
 | `scn/src/vfs.rs` (`io_err`) | Takes the error by value so `.map_err(io_err)` reads clean. | Take it by reference if the lint allows it one day. | |
 
 ## 10. Testing
@@ -1613,6 +1616,34 @@ A second test kills the server while it upgrades a database of schema
 version 2. Each kill leaves the database at one whole migration step (the
 first version, the last, or one between them), and the next start upgrades
 it.
+
+**The power-loss suite.** The server writes into a
+[LazyFS](https://github.com/dsrhaslab/lazyfs) mount, pinned to release
+0.3.1. LazyFS holds its own page cache and writes a file's data to the
+backing directory only when the application fsyncs it. The cut is one
+command on its faults fifo, `clear-cache`: it drops every cached write
+that was not fsynced, file by file. Then the suite kills the server and
+reopens the store from the backing directory, where it checks the same
+invariants as the crash suite. So the suite tests sync-before-reply: a
+reply that went out before the data was fsynced is lost by the cut, and
+the check fails. It caught a mutation without the fsync of a blob file
+before its row, and a mutation with SQLite's `synchronous = OFF`. What
+it does not prove:
+
+- A drive's volatile cache. The cut models what the process had not
+  fsynced, not what the drive held in cache; a `sync_all` that only
+  flushes a drive cache passes it. Upgrade to a model that replays
+  writes to each FLUSH point (dm-log-writes) when a report says that
+  acknowledged writes were lost on such hardware.
+- Directory entries. LazyFS persists a rename at rename time, so the
+  `fsync` of the blob directory after the rename (section 3) is never
+  exercised (section 9).
+- Reordering of writes. The cut takes everything unsynced at once.
+
+The suite is Linux-only (macOS syncs with `F_FULLFSYNC`, and its CI job
+has no LazyFS); there the crash suite is what runs. As in the crash
+suite, `SCION_POWER_SEED` replays a run and `SCION_POWER_ROUNDS` sets
+the number of cuts.
 
 What the suite does not prove:
 

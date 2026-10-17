@@ -1140,7 +1140,11 @@ pub fn decode_cursor(
     if after_line > counted {
         return Err(bad("the window starts past the file"));
     }
-    let open = (after_line + MAX_BLAME_WINDOW_LINES).min(counted) - after_line;
+    // `after_line + WINDOW` would overflow on a cursor of huge numbers, so
+    // the window is the distance that is left, at most the window's lines.
+    let open = counted
+        .saturating_sub(after_line)
+        .min(MAX_BLAME_WINDOW_LINES);
     // Each run covers at least one line, and each changeset in the table
     // names at least one run, so both counts are past these bounds only in
     // a cursor that was never made. Check them before any allocation.

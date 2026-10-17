@@ -1549,6 +1549,36 @@ fn cursor_bytes(resume: &Resume, cs: ChangesetId, p: &str) -> Vec<u8> {
     blame::encode_cursor(resume, REPO, cs, &path(p))
 }
 
+/// A cursor with line numbers near `usize::MAX` decodes: the window math
+/// saturates instead of overflowing. Found by the `blame-cursor` fuzz
+/// target: `after_line + MAX_BLAME_WINDOW_LINES` wrapped around, and a
+/// release build silently took the wrapped window.
+#[test]
+fn a_cursor_with_huge_line_numbers_decodes_without_overflow() {
+    let (_data, store) = open_store();
+    let put = |data: &[u8]| regular(store.blobs().put(data).unwrap());
+    let ids = chain(&store, vec![vec![("f", put(b"a\n"))]]);
+    let resume = Resume {
+        after_line: usize::MAX,
+        counted: usize::MAX,
+        ..Resume::default()
+    };
+    let bytes = cursor_bytes(&resume, ids[0], "f");
+    let (decoded, _hold) = blame::decode_cursor(
+        &store,
+        REPO,
+        &bytes,
+        ids[0],
+        &path("f"),
+        &Bytes::new(1 << 30),
+        None,
+    )
+    .expect("a cursor with the biggest line numbers decodes");
+    assert_eq!(decoded.after_line, usize::MAX);
+    assert_eq!(decoded.counted, usize::MAX);
+    assert_eq!(decoded.window, Vec::new());
+}
+
 #[test]
 fn a_cursor_names_only_changesets_of_its_repo() {
     let (_data, store) = open_store();
