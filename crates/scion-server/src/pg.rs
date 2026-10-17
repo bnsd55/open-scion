@@ -515,12 +515,16 @@ impl Pg {
                 }
             })?;
             drop_stale_schemas(&maker);
+            // One maker at a time: two concurrent `CREATE TABLE IF NOT
+            // EXISTS` of the registry race on the type catalog, and the
+            // loser dies. The lock lives for this one transaction only.
             maker.as_raw({
                 let name = schema.to_owned();
                 move |client| {
                     client
                         .batch_execute(&format!(
-                            "CREATE SCHEMA IF NOT EXISTS {name};
+                            "SELECT pg_advisory_xact_lock({CLEAN_LOCK});
+                                 CREATE SCHEMA IF NOT EXISTS {name};
                                  CREATE TABLE IF NOT EXISTS public.scion_test_schemas (
                                      schema  TEXT PRIMARY KEY,
                                      started BIGINT NOT NULL
