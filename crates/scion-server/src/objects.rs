@@ -28,6 +28,7 @@ use tonic::{Request, Response, Status};
 use tracing::Instrument as _;
 
 use crate::access::Access;
+use crate::deadline::Deadline;
 use crate::error::{Error, Result};
 use crate::meta::MetaTx as _;
 use crate::quotas::{Call, Quotas};
@@ -365,6 +366,9 @@ impl Objects for ObjectsService {
     ) -> Result<Response<GetRootTreeResponse>, Status> {
         let caller = self.auth.caller_of(&request)?;
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
+        // The derivation of a first view walks the real tree, under the
+        // call's deadline.
+        let deadline = Deadline::of_call(&request, crate::deadline::CALL_LIMIT);
         let GetRootTreeRequest { repo, changeset_id } = request.into_inner();
         check_reader(&self.access, &caller, &repo)?;
         let cs = parse_id(&changeset_id, "changeset_id")?;
@@ -385,7 +389,7 @@ impl Objects for ObjectsService {
                 let tree = match &rule_set {
                     Some((digest, prefixes)) => {
                         let repo_id = store.read(|c| c.repo_id(&repo))?;
-                        views::view_root(&store, repo_id, digest, cs, prefixes)?
+                        views::view_root(&store, repo_id, digest, cs, prefixes, &deadline)?
                     }
                     None => read::root_tree(&store, &repo, cs)?,
                 };

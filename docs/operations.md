@@ -77,7 +77,10 @@ daemon. With the chain above, the daemon of a user runs
 `--token <USER_TOKEN>`, where `<USER_TOKEN>` is that user's token at the
 server too. A new node can start warm: copy a snapshot file from the cache
 (`--snapshot DIR --snapshot-repo R`, refreshed every `--snapshot-every`
-seconds) and start the daemon with `--seed FILE`.
+seconds) and start the daemon with `--seed FILE`. A snapshot holds every
+object of its repo by ID, so snapshot only repos that ALL the node's users
+may read WHOLE: a seeded daemon serves paths that folder read rules hide,
+because it checks objects, not rules.
 
 ### Tokens: one, or an access file
 
@@ -98,6 +101,15 @@ MiB upload bytes, 64 pending lands per principal); raise or lower them with
 `--max-principal-requests`, `--max-principal-upload-bytes`,
 `--max-principal-pending-lands`. With `--token`, every caller is the same
 principal, so the caps are off unless a flag sets one.
+
+Rewriting the access file takes effect at the next start (or restart): the
+server reads it once. A ticket keeps working for its whole life after a
+reload that narrows its principal, up to 15 minutes from signing, on this
+server and on any cache that holds the repo's objects. To revoke reads:
+rewrite the file and restart, and either wait out the tickets (15 minutes)
+or rotate the ticket key (`--ticket-key`) to cut them off at once. Objects
+already on a user's daemon are out of reach of both; give a daemon only
+repos all its users may read whole.
 
 ### Network and TLS
 

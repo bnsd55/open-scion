@@ -8,16 +8,18 @@
 //! - A principal reads a whole repo, or the paths at or below its read
 //!   prefixes. A read prefix names a path of the repo, by path parts: `src`
 //!   covers `src` and `src/a`, not `srcx`. A read rule with no prefix covers
-//!   the whole repo. A principal that reads through prefixes is a *partial
-//!   reader*; until the server derives its view of the repo
-//!   ([#121](https://github.com/bnsd55/open-scion/issues/121)), every read
-//!   of content answers `UNIMPLEMENTED` for it, uniformly.
+//!   the whole repo. A principal whose read rules are all prefixes is a
+//!   *partial reader*: it reads what they cover through the view that
+//!   [`crate::views`] derives for it, and a path outside them answers as a
+//!   missing one. Its history reads answer
+//!   [`UNIMPLEMENTED`](crate::error::Error::Unimplemented), uniformly, and
+//!   so would its writes; a file that gives a partial reader a write rule
+//!   is refused at load.
 //! - A write rule names a path prefix of a repo. A principal may change a
 //!   path at or below one of its prefixes, by path parts: `src` covers `src`
 //!   and `src/a`, not `srcx`. A rule with no prefix covers the whole repo. A
-//!   rule covers every ref of its repo. A write rule also lets the principal
-//!   read what it may write: a write prefix is a read prefix too, and a
-//!   whole-repo write rule needs a whole-repo read rule (no blind writes).
+//!   rule covers every ref of its repo. A write rule needs a whole-repo read
+//!   rule: no blind writes, and no silent non-writer.
 //! - A principal with no rule for a repo cannot see it: every call answers
 //!   as for a repo that does not exist.
 //!
@@ -88,11 +90,6 @@ struct Grant {
 }
 
 impl Grant {
-    #[cfg_attr(not(test), allow(dead_code))] // used by the view derivation (#121)
-    fn may_read(&self, path: &RepoPath) -> bool {
-        self.read_all || self.read.iter().any(|prefix| at_or_below(path, prefix))
-    }
-
     fn may_write(&self, path: &RepoPath) -> bool {
         self.write_all || self.write.iter().any(|prefix| at_or_below(path, prefix))
     }
@@ -161,22 +158,25 @@ fn rule_set_digest(canonical: Option<&[RepoPath]>) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// No blind writes: a principal that may change every path of a repo must
-/// read every path of it. `write_all` holds each whole-repo write rule with
-/// its line, for the error.
+/// No blind writes, and no silent non-writer: a principal that holds any
+/// write rule of a repo must read the whole repo. A partial reader cannot
+/// write in v0.1 of the folder rules ([#183] holds the follow-up), so a
+/// file that would make one is refused at load, with the line to fix.
+/// `writes` holds each write rule with its line, for the error.
 fn check_write_needs_read(
     access: &Access,
-    write_all: &[(usize, String, String)],
+    writes: &[(usize, String, String)],
 ) -> Result<(), String> {
-    for (n, principal, repo) in write_all {
+    for (n, principal, repo) in writes {
         let whole_read = access
             .grants
             .get(&(principal.clone(), repo.clone()))
             .is_some_and(|grant| grant.read_all);
         if !whole_read {
             return Err(format!(
-                "line {n}: a write rule without a prefix needs a read rule without one, \
-                 so principal {principal:?} may read {repo:?} whole"
+                "line {n}: a write rule needs a read rule without a prefix, so principal \
+                 {principal:?} may read {repo:?} whole: partial readers cannot write in \
+                 v0.1 ([#183](https://github.com/bnsd55/open-scion/issues/183))"
             ));
         }
     }
@@ -189,17 +189,18 @@ fn check_write_needs_read(
 fn check_caps(access: &Access) -> Result<(), String> {
     let mut per_repo: HashMap<&str, BTreeSet<[u8; 32]>> = HashMap::new();
     for ((principal, repo), grant) in &access.grants {
-        let canonical = grant.canonical_read();
-        if canonical
-            .as_ref()
-            .is_some_and(|prefixes| prefixes.len() > MAX_PREFIXES_PER_SET)
-        {
+        // The whole repo needs no view, so it takes no set and no prefix
+        // slot: only prefix rule sets count toward the caps.
+        let Some(prefixes) = grant.canonical_read() else {
+            continue;
+        };
+        if prefixes.len() > MAX_PREFIXES_PER_SET {
             return Err(format!(
                 "principal {principal:?} holds more than {MAX_PREFIXES_PER_SET} read \
                  prefixes of repo {repo:?}"
             ));
         }
-        let digest = rule_set_digest(canonical.as_deref());
+        let digest = rule_set_digest(Some(&prefixes));
         if per_repo.entry(repo.as_str()).or_default().insert(digest)
             && per_repo[repo.as_str()].len() > MAX_RULE_SETS_PER_REPO
         {
@@ -251,9 +252,9 @@ impl Access {
         };
         // Each principal that a rule names, and the line, for the error.
         let mut named = Vec::new();
-        // Each whole-repo write rule, with its line, for the check that its
-        // principal reads the whole repo too.
-        let mut write_all = Vec::new();
+        // Each write rule, with its line, for the check that its principal
+        // reads the whole repo: a partial reader cannot write in v0.1.
+        let mut writes = Vec::new();
         for (n, line) in (1..).zip(text.lines()) {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -290,23 +291,18 @@ impl Access {
                 ["write", principal, repo, rest @ ..] if rest.len() <= 1 => {
                     let grant = access.grant(principal, repo).map_err(at)?;
                     match rest {
-                        [] => {
-                            grant.write_all = true;
-                            // The check that it has a whole-repo read rule
-                            // waits for the end of the file: the `read`
-                            // line may come after the `write` line.
-                            write_all.push((n, (*principal).to_owned(), (*repo).to_owned()));
-                        }
+                        [] => grant.write_all = true,
                         [prefix] => {
                             let prefix = RepoPath::new(*prefix)
                                 .map_err(|e| at(format!("bad path {prefix:?}: {e}")))?;
-                            // A write prefix is a read prefix too: a
-                            // principal reads back what it writes.
-                            grant.write.push(prefix.clone());
-                            grant.read.push(prefix);
+                            grant.write.push(prefix);
                         }
                         _ => unreachable!("matched at most one prefix"),
                     }
+                    // The check that this principal reads the whole repo
+                    // waits for the end of the file: the `read` line may
+                    // come after the `write` line.
+                    writes.push((n, (*principal).to_owned(), (*repo).to_owned()));
                     named.push((n, (*principal).to_owned()));
                 }
                 _ => {
@@ -322,7 +318,7 @@ impl Access {
                 return Err(format!("line {n}: principal {principal:?} has no token"));
             }
         }
-        check_write_needs_read(&access, &write_all)?;
+        check_write_needs_read(&access, &writes)?;
         check_caps(&access)?;
         Ok(access)
     }
@@ -512,6 +508,7 @@ mod tests {
              token\tbob\t{}\n\
              token\tci\t{}\n\
              \n\
+             read\talice\tmain\n\
              write\talice\tmain\tsrc\n\
              read\tbob\tmain\n\
              read\tci\tmain\n\
@@ -614,19 +611,15 @@ mod tests {
         let access = Access::parse(&text).unwrap();
         let alice = caller("alice");
         assert!(access.partial(&alice, "main"));
-        for ok in ["src", "src/a", "src/a/b"] {
-            assert!(access.read_rule_set(&alice, "main").is_some());
-            assert!(
-                grant_of(&access, "alice", "main").may_read(&path(ok)),
-                "{ok}"
-            );
-        }
-        for hidden in ["srcx", "sr", "docs/a"] {
-            assert!(
-                !grant_of(&access, "alice", "main").may_read(&path(hidden)),
-                "{hidden}"
-            );
-        }
+        // The prefixes the server derives for the caller: `src` covers its
+        // own path and everything below, by path parts.
+        let prefixes = access.read_rule_set(&alice, "main").unwrap();
+        let covered: Vec<&str> = prefixes
+            .iter()
+            .map(|p| std::str::from_utf8(p.as_bytes()).unwrap())
+            .collect();
+        assert_eq!(covered, ["src"]);
+        assert!(access.partial(&alice, "main"));
         // A whole-repo reader is not partial.
         let text = format!(
             "token\tbob\t{}\n\
@@ -638,33 +631,29 @@ mod tests {
         assert!(access.read_rule_set(&caller("bob"), "main").is_none());
     }
 
-    /// The grant of `principal` in `repo`, for the read checks above.
-    fn grant_of<'a>(access: &'a Access, principal: &str, repo: &str) -> &'a Grant {
-        access
-            .grants
-            .get(&(principal.to_owned(), repo.to_owned()))
-            .unwrap()
-    }
-
     #[test]
-    fn a_write_prefix_is_a_read_prefix_and_a_whole_write_needs_a_whole_read() {
-        // A write prefix implies the matching read.
+    fn a_write_needs_a_whole_read() {
+        // Any write rule without a whole-repo read rule is refused at
+        // load: a partial reader cannot write in v0.1.
         let text = format!(
             "token\talice\t{}\n\
              write\talice\tmain\tsrc/net\n",
             hex("a")
         );
-        let access = Access::parse(&text).unwrap();
-        assert!(access.partial(&caller("alice"), "main"));
-        assert!(grant_of(&access, "alice", "main").may_read(&path("src/net/x")));
-        assert!(!grant_of(&access, "alice", "main").may_read(&path("docs")));
+        let err = Access::parse(&text).unwrap_err();
+        assert!(err.contains("partial readers cannot write"), "{err}");
+        assert!(err.contains("line 2"), "{err}");
         // A whole-repo write rule without a whole-repo read rule is refused,
         // also when the read rule has prefixes or comes first.
         let token = format!("token\tbob\t{}\n", hex("b"));
         for extra in [String::new(), "read\tbob\tmain\tsrc\n".to_owned()] {
             let text = format!("{token}{extra}write\tbob\tmain\n");
             match Access::parse(&text) {
-                Err(why) => assert!(why.contains("needs a read rule without one"), "{why}"),
+                Err(why) => assert!(
+                    why.contains("needs a read rule without a prefix")
+                        && why.contains("partial readers cannot write"),
+                    "{why}"
+                ),
                 Ok(_) => panic!("{text:?}: accepted"),
             }
         }
@@ -680,19 +669,18 @@ mod tests {
              read\talice\tmain\tsrc\n\
              read\talice\tmain\tdocs\n\
              read\talice\tmain\tsrc\n\
-             read\talice\tmain\tsrc/net\n\
-             write\talice\tmain\tapi\n",
+             read\talice\tmain\tsrc/net\n",
             hex("a")
         );
         let access = Access::parse(&text).unwrap();
         let set = access.read_rule_set(&caller("alice"), "main").unwrap();
-        // `src/net` is covered by `src`; `api` comes from the write rule;
+        // `src/net` is covered by `src`;
         // the order is sorted; `src` twice is once.
         let shown: Vec<&str> = set
             .iter()
             .map(|p| std::str::from_utf8(p.as_bytes()).unwrap())
             .collect();
-        assert_eq!(shown, ["api", "docs", "src"]);
+        assert_eq!(shown, ["docs", "src"]);
     }
 
     #[test]

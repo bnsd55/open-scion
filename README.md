@@ -186,23 +186,30 @@ with `#` are skipped:
 
 ```text
 # token <principal> <the BLAKE3 digest of the token>
-token	alice	d4289b3345cfbdfb36fb37ee89e85bd74447f837b04c18aee6233c731b1419a7
+token	alice	<64 hex digits>
+token	pat	<64 hex digits>
 token	ci	<64 hex digits>
 # read <principal> <repo> [prefix]: reads at or below the prefix, by
 # path parts. No prefix means the whole repo.
 read	ci	main
 # write <principal> <repo> [prefix]: changes at or below the prefix, by
-# path parts. No prefix means the whole repo. Write implies read of what
-# it writes; a whole-repo write rule needs a whole-repo read rule.
+# path parts. No prefix means the whole repo. A write rule needs a
+# whole-repo read rule: a partial reader cannot write in v0.1 (#183).
+read	alice	main
 write	alice	main	src
 write	ci	main
 ```
 
 A principal whose read rules are all prefixes is a *partial reader*: it
 reads only what they cover, through the view of the repo that the server
-derives for it (in work). Until then its content reads answer
-`UNIMPLEMENTED`, uniform for every such principal. The file holds at most
-32 distinct read rule sets per repo, and a set at most 256 prefixes.
+derives for it. `ResolveRef` and `GetRootTree` answer the real changeset
+ID and the view root; `ReadFile` and `ListDir` read through the view, and
+a path outside the prefixes is answered exactly like a missing one. The
+history RPCs (`GetChangeset`, `Log`, `Blame`, `MergeBase`, `IsAncestor`,
+`Diff`), every write, and `GetObjects` without a view-root ticket answer
+`UNIMPLEMENTED` with the same text for every such principal. A file that
+gives a partial reader a write rule is refused at load. The file holds at
+most 32 distinct read rule sets per repo, and a set at most 256 prefixes.
 
 The file holds digests, never tokens. Print the digest of a token with
 `scion-server hash-token`:

@@ -848,6 +848,9 @@ impl Scion for ScionService {
         // The handle of the caller's connection, before the request is taken
         // apart: the reply counts what it leaves in HTTP/2 on it.
         let stalled = scion_proto::listen::Stalled::of(&request);
+        // The derivation of a first view walks the real tree, under the
+        // call's deadline.
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
@@ -871,7 +874,8 @@ impl Scion for ScionService {
                 let blob = match &view {
                     Some((digest, prefixes)) => {
                         let repo_id = store.read(|c| c.repo_id(&req.repo))?;
-                        let root = views::view_root(&store, repo_id, digest, id, prefixes)?;
+                        let root =
+                            views::view_root(&store, repo_id, digest, id, prefixes, &deadline)?;
                         read::file_blob_at(&store, root, &path)?
                     }
                     None => read::file_blob(&store, &req.repo, id, &path)?,
@@ -912,6 +916,9 @@ impl Scion for ScionService {
         // The handle of the caller's connection, before the request is taken
         // apart: the reply counts what it leaves in HTTP/2 on it.
         let stalled = scion_proto::listen::Stalled::of(&request);
+        // The derivation of a first view walks the real tree, under the
+        // call's deadline.
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
@@ -934,7 +941,8 @@ impl Scion for ScionService {
                 let tree = match &view {
                     Some((digest, prefixes)) => {
                         let repo_id = store.read(|c| c.repo_id(&req.repo))?;
-                        let root = views::view_root(&store, repo_id, digest, id, prefixes)?;
+                        let root =
+                            views::view_root(&store, repo_id, digest, id, prefixes, &deadline)?;
                         read::list_dir_at(&store, root, path.as_ref())?
                     }
                     None => read::list_dir(&store, &req.repo, id, path.as_ref())?,

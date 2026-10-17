@@ -9,18 +9,27 @@
 //! would be empty is hidden: its parent's view omits the entry, the same
 //! as a missing one.
 //!
-//! The root of the view is cached per (repo, rule-set digest, changeset) in
-//! `view_roots`. The derivation is a pure function of the rule set and the
-//! real trees, so two servers that derive the same view store the same
-//! bytes and agree on the row.
+//! The root of the view is cached per (repo, view key, changeset) in
+//! `view_roots`, where the view key is the rule-set digest bound with the
+//! projection version. The derivation is a pure function of the rule set
+//! and the real trees, so two servers that derive the same view store the
+//! same bytes and agree on the row.
 //!
 //! What the derivation costs, and what that leaks (accepted in the design):
 //! the first read of a rule set walks the real tree, so its latency varies
-//! with the repo; later reads of the same digest and changeset find the row
+//! with the repo; later reads of the same key and changeset find the row
 //! and skip the walk.
+//!
+//! SHORTCUT: the store caches the view root only, not each derived tree;
+//! a cache miss re-walks the whole tree. File-granular rules over a large
+//! flat tree pay the walk once per changeset. Per-tree rows (one per
+//! (key, tree, context)) are the upgrade path if that shows in practice.
+//! SHORTCUT: rows of old keys (a changed rule set, a bumped projection
+//! version) are never removed; [#183] holds the cleanup.
 
 use scion_core::{ChangesetId, Entry, RepoPath, Tree, TreeId};
 
+use crate::deadline::Deadline;
 use crate::error::Result;
 use crate::meta::{MetaTx, RepoId};
 use crate::store::Store;
@@ -61,71 +70,111 @@ fn below(ctx: &[Vec<u8>], name: &[u8]) -> Below {
 }
 
 /// The subtrees derived so far, by (tree ID, context digest), so shared
-/// subtrees are derived once per derivation.
+/// subtrees are derived once per derivation, and the new view trees it
+/// built, for the one short write that stores them.
 #[derive(Default)]
-struct Memo(std::collections::HashMap<(TreeId, [u8; 32]), Option<TreeId>>);
+struct Memo {
+    derived: std::collections::HashMap<(TreeId, [u8; 32]), Option<TreeId>>,
+    trees: Vec<Tree>,
+}
+
+/// The version of the projection. Bumped when the derivation changes, so
+/// views of an old version stop being served: the version is bound into
+/// the view key, and the old rows are never read again.
+const PROJECTION_VERSION: u8 = 1;
+
+/// The view key: the rule-set digest bound with the projection version.
+fn view_key(digest: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&[PROJECTION_VERSION]);
+    hasher.update(digest);
+    *hasher.finalize().as_bytes()
+}
 
 /// The view root that `prefixes` derives for `cs`: the ID of the tree that
 /// holds exactly what the rule set covers. The first call for a (repo,
-/// digest, changeset) walks the real tree; the later ones find the row.
+/// key, changeset) walks the real tree; the later ones find the row. The
+/// walk runs on a read connection under `deadline` and stores nothing;
+/// one short write follows with the new trees and the row, so a slow
+/// derivation never holds the write lock.
 ///
 /// # Errors
 ///
-/// Store errors.
+/// Store errors, or [`crate::error::Error::DeadlineExceeded`] once
+/// `deadline` passes.
 pub(crate) fn view_root(
     store: &Store,
     repo: RepoId,
     digest: &[u8; 32],
     cs: ChangesetId,
     prefixes: &[RepoPath],
+    deadline: &Deadline,
 ) -> Result<TreeId> {
-    let cached = store.write(|c| c.get_view_root(repo, digest, cs))?;
-    if let Some(cached) = cached {
+    let key = view_key(digest);
+    if let Some(cached) = store.read(|c| c.get_view_root(repo, &key, cs))? {
         return Ok(cached);
     }
     let real = crate::tree::root_tree(store, repo, cs)?;
     let context: Vec<Vec<u8>> = prefixes.iter().map(|p| p.as_bytes().to_vec()).collect();
+    // The derivation reads real trees only: it holds no write lock, and it
+    // gives up when the call that asked for it has gone.
     let mut memo = Memo::default();
     // A rule set with prefixes covers at least one path of the repo, but it
     // may cover only paths that this changeset's tree does not have: then
     // the view is the empty tree, which is a valid root. The root is never
     // dropped.
+    let view = if let Some(view) =
+        store.read(|c| project(&mut *c, real, &context, &mut memo, deadline))?
+    {
+        view
+    } else {
+        let empty = Tree::default();
+        let id = empty.encode_with_id().1;
+        memo.trees.push(empty);
+        id
+    };
+    // One short write: the new view trees, then the row. Both are safe to
+    // repeat; a row that another server stored already must agree, or the
+    // derivation is not a pure function and that is a bug.
     store.write(|c| {
-        let view = match project(&mut *c, real, &context, &mut memo)? {
-            Some(view) => view,
-            None => c.put_tree(&Tree::default())?,
-        };
-        c.put_view_root(repo, digest, cs, view)?;
+        for tree in &memo.trees {
+            c.put_tree(tree)?;
+        }
+        c.put_view_root(repo, &key, cs, view)?;
         Ok(view)
     })
 }
 
 /// Projects the tree `id` under `ctx`, the visible suffixes below it.
 /// Returns `None` when nothing below is visible, so the caller hides the
-/// entry that holds it.
+/// entry that holds it. Stores nothing: the derived trees wait in `memo`
+/// for the caller's one write.
 ///
 /// # Errors
 ///
-/// Store errors.
+/// Store errors, or [`crate::error::Error::DeadlineExceeded`] once
+/// `deadline` passes.
 fn project(
     c: &mut dyn MetaTx,
     id: TreeId,
     ctx: &Context,
     memo: &mut Memo,
+    deadline: &Deadline,
 ) -> Result<Option<TreeId>> {
     if ctx.is_empty() {
         return Ok(None);
     }
+    deadline.check()?;
     let key = (id, context_digest(ctx));
-    if let Some(hit) = memo.0.get(&key) {
+    if let Some(hit) = memo.derived.get(&key) {
         return Ok(*hit);
     }
     let tree = c.get_tree(id)?;
     let mut kept = std::collections::BTreeMap::new();
     for (name, entry) in &tree.entries {
+        // A file is visible when a prefix names it exactly; a prefix
+        // can name nothing below a file.
         match entry {
-            // A file is visible when a prefix names it exactly; a prefix
-            // can name nothing below a file.
             Entry::File(_) => {
                 if ctx.iter().any(|prefix| prefix == name.as_bytes()) {
                     kept.insert(name.clone(), *entry);
@@ -139,19 +188,23 @@ fn project(
                 // The child's view takes its ID; an empty view hides the
                 // entry, the same as a missing one.
                 Below::Some(sub) => {
-                    if let Some(view_id) = project(c, *child, &sub, memo)? {
+                    if let Some(view_id) = project(c, *child, &sub, memo, deadline)? {
                         kept.insert(name.clone(), Entry::Dir(view_id));
                     }
                 }
             },
         }
+        deadline.check()?;
     }
     let view = if kept.is_empty() {
         None
     } else {
-        Some(c.put_tree(&Tree { entries: kept })?)
+        let view = Tree { entries: kept };
+        let id = view.encode_with_id().1;
+        memo.trees.push(view);
+        Some(id)
     };
-    memo.0.insert(key, view);
+    memo.derived.insert(key, view);
     Ok(view)
 }
 
@@ -171,6 +224,12 @@ fn context_digest(ctx: &Context) -> [u8; 32] {
 mod tests {
     use super::*;
     use scion_core::{FileEntry, FileState, PathElem};
+    use std::time::{Duration, Instant};
+
+    /// A deadline that no test outlives.
+    fn alive() -> Deadline {
+        Deadline::new(Instant::now() + Duration::from_secs(600))
+    }
 
     fn file(store: &Store, content: &[u8]) -> Entry {
         let blob = store.blobs().put(content).unwrap();
@@ -224,10 +283,18 @@ mod tests {
         let ctx: Context = vec![b"README".to_vec(), b"docs".to_vec(), b"ops/public".to_vec()];
         let mut memo = Memo::default();
         let view = store
-            .write(|c| project(&mut *c, root_id, &ctx, &mut memo))
+            .read(|c| project(&mut *c, root_id, &ctx, &mut memo, &alive()))
             .unwrap()
             .expect("the root keeps a visible path");
-        let shown = store.write(|c| c.get_tree(view)).unwrap();
+        store
+            .write(|c| {
+                for tree in &memo.trees {
+                    c.put_tree(tree)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let shown = store.read(|c| c.get_tree(view)).unwrap();
         let names: Vec<Vec<u8>> = shown
             .entries
             .keys()
@@ -254,7 +321,7 @@ mod tests {
         let ctx: Context = vec![b"absent".to_vec()];
         let mut memo = Memo::default();
         let none = store
-            .write(|c| project(&mut *c, root_id, &ctx, &mut memo))
+            .read(|c| project(&mut *c, root_id, &ctx, &mut memo, &alive()))
             .unwrap();
         assert!(none.is_none());
 
@@ -309,9 +376,34 @@ mod tests {
         let ctx: Context = vec![b"left/a".to_vec()];
         let mut memo = Memo::default();
         let view = store
-            .write(|c| project(&mut *c, root_id, &ctx, &mut memo))
+            .read(|c| project(&mut *c, root_id, &ctx, &mut memo, &alive()))
             .unwrap()
             .unwrap();
+        // The same real tree under the other context derives a second,
+        // different view: one tree, two views.
+        let ctx2: Context = vec![b"right/b".to_vec()];
+        let view2 = store
+            .read(|c| project(&mut *c, root_id, &ctx2, &mut memo, &alive()))
+            .unwrap()
+            .unwrap();
+        assert_ne!(view, view2, "one real tree, two contexts, two views");
+        // The derivation stores nothing: put the derived trees, then the
+        // views below are readable.
+        store
+            .write(|c| {
+                for tree in &memo.trees {
+                    c.put_tree(tree)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let right_tree = store.read(|c| c.get_tree(view2)).unwrap();
+        let right_names: Vec<Vec<u8>> = right_tree
+            .entries
+            .keys()
+            .map(|k| k.as_bytes().to_vec())
+            .collect();
+        assert_eq!(right_names, [b"right".to_vec()]);
         let shown = store.write(|c| c.get_tree(view)).unwrap();
         let names: Vec<Vec<u8>> = shown
             .entries
@@ -322,14 +414,46 @@ mod tests {
         let Entry::Dir(left_view) = shown.entries.get(&name(b"left")).unwrap() else {
             panic!("left is a directory in the view");
         };
-        let left_tree = store.write(|c| c.get_tree(*left_view)).unwrap();
+        let left_tree = store.read(|c| c.get_tree(*left_view)).unwrap();
         let kept: Vec<Vec<u8>> = left_tree
             .entries
             .keys()
             .map(|k| k.as_bytes().to_vec())
             .collect();
         assert_eq!(kept, [b"a".to_vec()]);
-        assert_eq!(memo.0.len(), 2, "the root and the shared child");
+        assert_eq!(memo.derived.len(), 4, "root and child, two contexts");
+        assert_eq!(memo.trees.len(), 4, "each derived tree waits, unstored");
         let _ = left;
+    }
+
+    /// A folder whose whole subtree is visible keeps the real tree ID: the
+    /// view of a fully covered directory is the directory itself.
+    #[test]
+    fn a_fully_visible_folder_keeps_the_real_tree_id() {
+        let (_dir, store) = store();
+        let docs = Tree {
+            entries: [(name(b"note"), file(&store, b"note\n"))].into(),
+        };
+        let (docs_id, root_id) = store
+            .write(|c| {
+                let docs_id = c.put_tree(&docs)?;
+                let root = Tree {
+                    entries: [(name(b"docs"), Entry::Dir(docs_id))].into(),
+                };
+                Ok((docs_id, c.put_tree(&root)?))
+            })
+            .unwrap();
+        // The rule covers `docs` whole: the view keeps the real `docs` ID.
+        let ctx: Context = vec![b"docs".to_vec()];
+        let mut memo = Memo::default();
+        let view = store
+            .read(|c| project(&mut *c, root_id, &ctx, &mut memo, &alive()))
+            .unwrap()
+            .unwrap();
+        let shown = store.read(|c| c.get_tree(view)).unwrap();
+        let Entry::Dir(kept) = shown.entries.get(&name(b"docs")).unwrap() else {
+            panic!("docs is a directory in the view");
+        };
+        assert_eq!(*kept, docs_id, "the fully visible folder is unchanged");
     }
 }
