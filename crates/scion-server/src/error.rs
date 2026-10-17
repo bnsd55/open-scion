@@ -50,7 +50,12 @@ pub enum Error {
     Corrupt(String),
     /// The database failed.
     #[error("database: {0}")]
-    Db(#[from] rusqlite::Error),
+    Db(rusqlite::Error),
+    /// The database's write lock stayed busy past `busy_timeout`. A caller
+    /// that shares the data directory held it; the transaction rolled back
+    /// and wrote nothing, so the same work may run again.
+    #[error("database is busy")]
+    Busy,
     /// The object folder failed.
     #[error("i/o: {0}")]
     Io(#[from] std::io::Error),
@@ -75,6 +80,18 @@ pub enum Error {
 /// Result with the server [`Error`].
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+impl From<rusqlite::Error> for Error {
+    fn from(e: rusqlite::Error) -> Self {
+        // A busy database is not a database failure: the transaction rolled
+        // back and wrote nothing, so the same work may run again.
+        if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) {
+            Error::Busy
+        } else {
+            Error::Db(e)
+        }
+    }
+}
+
 impl From<Error> for Status {
     fn from(e: Error) -> Self {
         match e {
@@ -87,16 +104,25 @@ impl From<Error> for Status {
             Error::ResourceExhausted(_) => Status::resource_exhausted(e.to_string()),
             // Another process that shares the data directory held the
             // database's write lock for longer than `busy_timeout`.
-            Error::Db(ref db)
-                if db.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) =>
-            {
+            Error::Busy => {
                 // No repo on this line: the database is shared by repos. The
                 // call whose work failed logs the repo and the caller.
                 tracing::warn!(error = %e, "the database stayed busy");
                 Status::unavailable("the database is busy; retry")
             }
-            Error::Corrupt(_) | Error::Db(_) | Error::Io(_) | Error::Git(_) => {
+            Error::Corrupt(_) | Error::Io(_) | Error::Git(_) => {
                 // Details stay in the server log, not in the reply.
+                tracing::error!(error = %e, "internal error");
+                Status::internal("internal error")
+            }
+            // A busy database that reached the error as a raw SQLite error
+            // (not through `From<rusqlite::Error>`) is still only busy: the
+            // transaction rolled back and wrote nothing.
+            Error::Db(e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) => {
+                tracing::warn!(error = %e, "the database stayed busy");
+                Status::unavailable("the database is busy; retry")
+            }
+            Error::Db(_) => {
                 tracing::error!(error = %e, "internal error");
                 Status::internal("internal error")
             }
@@ -114,6 +140,7 @@ mod tests {
     #[test]
     fn a_busy_database_is_unavailable_so_that_the_client_retries() {
         let db = |code| Error::Db(rusqlite::Error::SqliteFailure(ffi::Error::new(code), None));
+        assert_eq!(Status::from(Error::Busy).code(), Code::Unavailable);
         assert_eq!(Status::from(db(ffi::SQLITE_BUSY)).code(), Code::Unavailable);
         assert_eq!(Status::from(db(ffi::SQLITE_CORRUPT)).code(), Code::Internal);
     }

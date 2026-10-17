@@ -6,7 +6,8 @@ use std::process::Command;
 
 use scion_core::{Changeset, IdentityTime};
 use scion_proto::listen::Limits;
-use scion_server::{Store, db, service, tree};
+use scion_server::meta::MetaTx as _;
+use scion_server::{Store, service, tree};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
@@ -104,10 +105,10 @@ fn land(store: &Store) {
     };
     store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
+            let repo = c.create_repo(REPO)?;
             let (id, _) = tree::store_changeset(c, repo, &cs)?;
-            let version = db::get_ref(c, repo, "main")?.map(|r| r.version);
-            assert!(db::cas_ref(c, repo, "main", version, id)?);
+            let version = c.get_ref(repo, "main")?.map(|r| r.version);
+            assert!(c.cas_ref(repo, "main", version, id)?);
             Ok(id)
         })
         .unwrap();
@@ -132,6 +133,7 @@ async fn serve_tls(certs: &TestCerts) -> String {
             land_stale_secs: 1 << 40,
             tls: Some(tls),
         },
+        None,
         std::future::pending(),
     ));
     format!("https://{addr}")

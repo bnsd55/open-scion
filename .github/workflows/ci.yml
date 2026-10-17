@@ -71,6 +71,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
 
+  grpc-conformance:
+    name: conformance (grpcurl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p open-scion-server
+      # A client that is not the Rust one (issue #32): grpcurl calls
+      # ResolveRef, GetRootTree and GetObjects with a ticket, and every
+      # object hashes to its ID with b3sum. The script fetches the pinned
+      # grpcurl release and checks its sha256 before it runs.
+      - run: scripts/grpc-conformance.sh
+
   docker:
     name: docker demo
     runs-on: ubuntu-latest

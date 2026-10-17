@@ -8,8 +8,9 @@ use scion_proto::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{GetLandRequest, LogRequest, PutBlobRequest};
 use scion_server::access::Access;
+use scion_server::meta::{MetaTx as _, RefState};
 use scion_server::quotas::Quotas;
-use scion_server::{Store, db, service};
+use scion_server::{Store, service};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::AsciiMetadataValue;
@@ -61,9 +62,8 @@ fn store() -> (tempfile::TempDir, Store) {
     let blob = store.blobs().put(b"# hello\n").unwrap();
     store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
-            let root = db::insert_changeset(
-                c,
+            let repo = c.create_repo(REPO)?;
+            let root = c.insert_changeset(
                 repo,
                 &Changeset {
                     parents: vec![],
@@ -85,8 +85,8 @@ fn store() -> (tempfile::TempDir, Store) {
                     .into(),
                 },
             )?;
-            db::cas_ref(c, repo, "main", None, root)?;
-            db::add_repo_blob(c, repo, blob)?;
+            c.cas_ref(repo, "main", None, root)?;
+            c.add_repo_blob(repo, blob)?;
             Ok(root)
         })
         .unwrap();
@@ -96,9 +96,12 @@ fn store() -> (tempfile::TempDir, Store) {
 type Stop = tokio::sync::oneshot::Sender<()>;
 
 /// Where `main` of `REPO` points.
-fn main_ref(store: &Store) -> db::RefState {
+fn main_ref(store: &Store) -> RefState {
     store
-        .read(|c| db::get_ref(c, db::repo_id(c, REPO)?, "main"))
+        .read(|c| {
+            let repo = c.repo_id(REPO)?;
+            c.get_ref(repo, "main")
+        })
         .unwrap()
         .unwrap()
 }
@@ -106,6 +109,16 @@ fn main_ref(store: &Store) -> db::RefState {
 /// A server of `store` with `access` and `quotas`. Hold the stop signal, or
 /// the server shuts down.
 async fn server(store: &Store, access: Access, quotas: Quotas) -> (Stop, Channel) {
+    server_with_tickets(store, access, quotas, None).await
+}
+
+/// The same, with the ticket keys of `GetRootTree` and the object reads.
+async fn server_with_tickets(
+    store: &Store,
+    access: Access,
+    quotas: Quotas,
+    tickets: Option<scion_server::tickets::Keys>,
+) -> (Stop, Channel) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -120,6 +133,7 @@ async fn server(store: &Store, access: Access, quotas: Quotas) -> (Stop, Channel
             land_stale_secs: 1 << 40,
             tls: None,
         },
+        tickets.map(std::sync::Arc::new),
         async {
             stopped.await.ok();
         },
@@ -354,8 +368,8 @@ async fn a_stream_holds_its_slot_until_the_stream_ends() {
     // `README` is the big one.
     store
         .write(|c| {
-            let repo = db::repo_id(c, REPO)?;
-            db::add_repo_blob(c, repo, blob)?;
+            let repo = c.repo_id(REPO)?;
+            c.add_repo_blob(repo, blob)?;
             let cs = Changeset {
                 parents: vec![],
                 author: scion_core::IdentityTime {
@@ -375,9 +389,9 @@ async fn a_stream_holds_its_slot_until_the_stream_ends() {
                 )]
                 .into(),
             };
-            let id = db::insert_changeset(c, repo, &cs)?;
-            let version = db::get_ref(c, repo, "main")?.unwrap().version;
-            assert!(db::cas_ref(c, repo, "main", Some(version), id)?);
+            let id = c.insert_changeset(repo, &cs)?;
+            let version = c.get_ref(repo, "main")?.unwrap().version;
+            assert!(c.cas_ref(repo, "main", Some(version), id)?);
             Ok(())
         })
         .unwrap();
@@ -403,5 +417,128 @@ async fn a_stream_holds_its_slot_until_the_stream_ends() {
     drop(stream);
     drop(alice);
     until(|| async { probe(&prober).await == Code::NotFound }).await;
+    stop.send(()).ok();
+}
+
+/// A client of `Objects` that carries no token: `GetObjects` needs none,
+/// its permission is the ticket.
+fn objects(channel: Channel) -> scion_proto::v1::objects_client::ObjectsClient<Channel> {
+    scion_proto::v1::objects_client::ObjectsClient::new(channel)
+}
+
+/// The ticket of `principal` for the root tree of `main`, signed by the
+/// server's own keys.
+fn ticket_for(keys: &scion_server::tickets::Keys, principal: &str, store: &Store) -> Vec<u8> {
+    let cs = main_ref(store).target;
+    let root = scion_server::read::root_tree(store, REPO, cs).unwrap();
+    keys.sign(REPO, principal, *root.as_bytes()).unwrap()
+}
+
+/// A read of `blob` as `main`'s `README`, over `ticket`.
+fn read_request(ticket: Vec<u8>, blob: scion_core::BlobId) -> scion_proto::v1::GetObjectsRequest {
+    scion_proto::v1::GetObjectsRequest {
+        ticket,
+        accept: Vec::new(),
+        refs: vec![scion_proto::v1::ObjectRef {
+            kind: scion_proto::v1::ObjectKind::Blob as i32,
+            id: blob.as_bytes().to_vec(),
+            path: b"README".to_vec(),
+        }],
+    }
+}
+
+/// A `GetObjects` stream of a blob of several parts, which the test
+/// holds without reading, so its producer stays alive.
+async fn hold_objects(
+    channel: Channel,
+    ticket: Vec<u8>,
+    blob: scion_core::BlobId,
+) -> tonic::Streaming<scion_proto::v1::ObjectPart> {
+    objects(channel)
+        .get_objects(read_request(ticket, blob))
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+/// The quota of a `GetObjects` stream names the principal that its
+/// ticket signs: a principal at its cap gets `RESOURCE_EXHAUSTED` on one
+/// more read, while another principal's read goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_get_objects_stream_holds_its_principals_slot() {
+    let (_dir, store) = store();
+    let access = access(&["alice", "bob"]);
+    let keys = scion_server::tickets::Keys::generate();
+    // One request in flight per principal.
+    let (stop, channel) = server_with_tickets(
+        &store,
+        access,
+        Quotas::new(Some(1), None),
+        Some(keys.clone()),
+    )
+    .await;
+    // A file of several parts and well above the h2 windows of a tonic
+    // client, so the reply's producer stays blocked on a client that takes
+    // no message.
+    let big = vec![b'z'; 8 * 1024 * 1024];
+    let blob = store.blobs().put(&big).unwrap();
+    store
+        .write(|c| {
+            let repo = c.repo_id(REPO)?;
+            c.add_repo_blob(repo, blob)?;
+            let cs = Changeset {
+                parents: vec![],
+                author: scion_core::IdentityTime {
+                    name: b"Ada".to_vec(),
+                    email: b"ada@example.com".to_vec(),
+                    unix_secs: 1_700_000_000,
+                    tz_offset_minutes: 0,
+                },
+                committer: None,
+                message: b"big\n".to_vec(),
+                changes: [(
+                    RepoPath::new("README").unwrap(),
+                    Some(FileState::Regular {
+                        content: blob,
+                        executable: false,
+                    }),
+                )]
+                .into(),
+            };
+            let id = c.insert_changeset(repo, &cs)?;
+            let version = c.get_ref(repo, "main")?.unwrap().version;
+            assert!(c.cas_ref(repo, "main", Some(version), id)?);
+            Ok(())
+        })
+        .unwrap();
+    let alice_ticket = ticket_for(&keys, "alice", &store);
+    let bob_ticket = ticket_for(&keys, "bob", &store);
+
+    // Alice opens a GetObjects stream and stops reading it: the producer
+    // stays alive, and with it the slot of her ticket's principal.
+    let stream = hold_objects(channel.clone(), alice_ticket.clone(), blob).await;
+    // Her next GetObjects is refused while the first holds the slot.
+    let denied = objects(channel.clone())
+        .get_objects(read_request(alice_ticket.clone(), blob))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), Code::ResourceExhausted, "{denied:?}");
+
+    // Bob's ticket names his own principal: his read goes through while
+    // alice holds hers.
+    let _ = objects(channel.clone())
+        .get_objects(read_request(bob_ticket, blob))
+        .await
+        .unwrap();
+
+    // Alice drops her stream, so her slot comes back.
+    drop(stream);
+    until(|| async {
+        objects(channel.clone())
+            .get_objects(read_request(alice_ticket.clone(), blob))
+            .await
+            .is_ok()
+    })
+    .await;
     stop.send(()).ok();
 }
