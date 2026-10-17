@@ -620,7 +620,6 @@ fn log_page_parts(entries: Vec<(ChangesetId, Changeset)>, walk: &mut LogWalk) ->
     for (id, changeset) in entries {
         if walk.left == 0 {
             // The call owes no more entries: this one starts the next call.
-            walk.next = Some(id);
             break;
         }
         let body = changeset.encode();
@@ -750,6 +749,10 @@ async fn log_parts(mut walk: LogWalk, page: read::LogPage, tx: mpsc::Sender<Part
             Ok(page) => page,
             Err(status) => return fail(status),
         };
+        // The next page's continuation is the walk's: without this, the
+        // page after the second one starts at the second page's start, and
+        // the reply repeats it.
+        walk.next = page.next;
     }
 }
 
