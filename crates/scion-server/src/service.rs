@@ -619,7 +619,13 @@ fn log_page_parts(entries: Vec<(ChangesetId, Changeset)>, walk: &mut LogWalk) ->
     let mut bytes = 0usize;
     for (id, changeset) in entries {
         if walk.left == 0 {
-            // The call owes no more entries: this one starts the next call.
+            // Unreachable while `log_parts` fetches every page with
+            // `limit = walk.left.min(MAX_SCAN)`: a page then never holds
+            // more entries than the call still owes, so the page ends
+            // before the call's credit does. If a page ever did hold more,
+            // this entry is the first uncovered one, and the next call
+            // starts here.
+            debug_assert!(false, "a page held more than the call still owes");
             break;
         }
         let body = changeset.encode();
