@@ -1464,9 +1464,38 @@ followed again. A tier serves only `Objects`, so of the `scn` commands only
 `scripts/bench-checkout.sh` runs 50 sparse checkouts at once through one
 daemon, cold and warm, against `git clone` doing the same checkout
 ([benchmarks](benchmarks.md),
-[#6](https://github.com/bnsd55/open-scion/issues/6)). Planned: virtual
-checkout, where files load when first read
-([#11](https://github.com/bnsd55/open-scion/issues/11)).
+[#6](https://github.com/bnsd55/open-scion/issues/6)).
+
+### Virtual checkout
+
+`scn mount DIR [REV]` serves one ref of the repository as an NFSv3
+filesystem, so files load when they are first read
+([#11](https://github.com/bnsd55/open-scion/issues/11)). The server runs
+inside `scn`, on a free port of 127.0.0.1, and the mount uses the operating
+system's NFS client. A directory's tree is fetched when the directory is
+first listed or looked up in; a file's blob when the file is first read or
+sized, through the same `Objects` calls a checkout sends. Every read
+carries the mount's read ticket, which the mount refreshes through
+`GetRootTree` of the mounted changeset before it expires. Until #13 adds
+`GetSizes`, a file's size comes from its blob, so the first stat of a
+file that was never read fetches the blob, and `ls -l` of a directory
+fetches every blob in it.
+
+Writes go to an overlay directory beside the mount (a private directory
+under the system's temporary directory). `scn commit --from-mount DIR`
+commits exactly what the overlay holds: its files and symlinks, plus the
+recorded deletions. The mount never changes the ref; `scn land` moves it.
+
+`scn unmount DIR` stops the mount and removes its overlay. A mount that
+dies leaves its overlay behind, and the mount record in
+`~/.scion/mounts.json` says where it is.
+
+For single-user machines only. The NFS server sees neither the caller's
+user ID nor its source port, so it cannot tell local users apart, and the
+mount path, which carries the mount's random secret, is in the mount table
+that every local user can read. Any local user who can read the mount table
+can reach the mounted content through the NFS port, and root always can. The
+secret stops stray and accidental callers only; it is not a protection.
 
 ## 8. Security model
 
@@ -1482,6 +1511,7 @@ an untrusted network.
 
 | Checkout | `scn checkout` writes into a private temp directory with a random name. It renames it onto a new destination, or moves its entries up into an existing empty directory that the user owns, never over an entry already there. It never follows a symlink while writing or removing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure, or on SIGINT, SIGTERM or SIGHUP, the destination stays as it was. | The directory that gets the checkout (an existing destination, or a new one's parent) must not be writable by all users, unless it has the sticky bit: they could swap parts of the checkout. An existing destination that breaks this is refused. Members of a group that can write it are trusted. Where the filesystem has no rename that never replaces (NFS), any empty mode 0700 directory of the user at a top-level directory name counts as the checkout's claim after `mkdirat` fails with `EEXIST`, and is replaced. Where it has no hard links either (some FUSE filesystems), any symlink of the user with the same target at a top-level symlink name counts as made after `symlinkat` fails with `EEXIST`, and is kept. This is for a lost NFS version 3 reply, but a trusted user (the owner, a group member, root) can also put such an entry there: it is taken, and no data is lost. A filesystem that shows one owner for every entry (a FUSE or SMB mount with `-o uid=`) passes every ownership check. In the temp directory, an entry found after `EEXIST` that is what the call makes counts as made, unless a recorded path in the same directory has its inode. A filesystem that folds names but shows another inode number under each name (CIFS with `noserverino`, FUSE without `use_ino`) would let such a fold through only for two empty files or two symlinks with one target: the two paths then share one entry, with the same content. A folded directory always fails: each directory that the checkout made already holds an entry. The check reads only the mode bits, not ACLs: an ACL that lets other users add or delete entries gets past it. No Windows rules: Windows is unsupported, so device names and names that end
 | Cache tiers | A tier refuses every call but `GetObjects` with `UNIMPLEMENTED`, and `GetObjects` serves only what the read ticket's walk reaches (see "Read tickets" below). A snapshot file (`--snapshot`) holds whole objects of the repos named, and whoever can read the file can read them. | The file is mode 0600 in a directory made with mode 0700, but a node gets it by any copy tool or a shared mount: give a node only snapshots of repos that all its users may read. |
+| Virtual checkout | `scn mount` binds to 127.0.0.1 on a free port, and every mount path and file handle carries a secret of 16 random bytes: a mount of a wrong path is refused (`MNT3ERR_NOENT`), and a handle that was not made by this mount is refused (`NFS3ERR_STALE`). The mount point's directory is the user's, and the overlay lives in a mode 0700 directory of the system's temporary directory. `scn mount` says at start, and in `--help`, that it is for single-user machines. The mount sends its read ticket with every `GetObjects`, and refreshes it through `GetRootTree` of the mounted changeset before it expires. | Single-user machines only, and the secret is not a protection: the NFS server sees neither the caller's user ID nor its source port (`nfsserve` passes neither to the file system), so it cannot tell local users apart, and the mount path with its secret is in the mount table that every local user can read. Any local user who can read the mount table can reach the mounted content through the NFS port, and root always can ([#11](https://github.com/bnsd55/open-scion/issues/11)). |
 | Errors | Internal errors reply `internal error`. The detail stays in the server or tier log. | |
 
 ### Read tickets
@@ -1544,7 +1574,10 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/quotas.rs` (`Quotas`) | The request and upload-byte caps live in memory, so a restart forgets them; only the pending-lands cap counts rows of the store. A restart also frees every count. | Count the in-flight work in the store, or share the counts across processes. | [#15](https://github.com/bnsd55/open-scion/issues/15) |
 | `scn/src/client.rs` (`lossy`) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | Escape or base64 raw bytes in JSON. | |
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |
-| `scn/src/cmd/commit.rs` (`commit`) | The author time zone is always UTC. | A time zone crate. | |
+| `scn/src/cmd/commit.rs` (`commit`) | Reads each symlink target whole, so memory caps the target length. | Stream chunks from the file. | |
+| `scn/src/cmd/commit.rs` (`parse_author`) | The author time zone is always UTC, since `std` cannot read the local time zone. | A time zone crate. | |
+| `scn/src/vfs.rs` (`size_of`) | A file's size comes from its blob, so the first stat of a file that was never read fetches the blob, and `ls -l` of a directory fetches every blob in it. | After #13 gets a `GetSizes` call served from the stored frame's header. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
+| `scn/src/vfs.rs` (`io_err`) | Takes the error by value so `.map_err(io_err)` reads clean. | Take it by reference if the lint allows it one day. | |
 
 ## 10. Testing
 

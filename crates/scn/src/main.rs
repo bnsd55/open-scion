@@ -1,16 +1,12 @@
 //! `scn`: command-line client for a Scion server.
 
-mod client;
-mod cmd;
-mod materialize;
-
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use scion_core::RepoPath;
 
-use crate::client::Ctx;
+use open_scion::client::Ctx;
 
 #[derive(Parser)]
 #[command(version, about = "Client for the Scion version control system")]
@@ -64,7 +60,7 @@ enum Command {
         rev: String,
         /// Show only the changesets that change this file, or anything
         /// below this directory.
-        #[arg(long, value_parser = client::parse_repo_path)]
+        #[arg(long, value_parser = open_scion::client::parse_repo_path)]
         path: Option<RepoPath>,
         /// How many changesets to show.
         #[arg(short = 'n', long, default_value_t = 10)]
@@ -83,13 +79,18 @@ enum Command {
     },
     /// Write the files of a changeset into a new directory:
     /// `scn checkout main --sparse src --into ./work`.
-    Checkout(cmd::checkout::CheckoutArgs),
+    Checkout(open_scion::cmd::checkout::CheckoutArgs),
+    /// Serve a ref as a filesystem that reads files on demand:
+    /// `scn mount ./view main`.
+    Mount(open_scion::cmd::mount::MountArgs),
+    /// Stop a mount of `scn mount`.
+    Unmount(open_scion::cmd::mount::UnmountArgs),
     /// Create a changeset on the server. Moves no ref; use `scn land` next.
-    Commit(cmd::commit::CommitArgs),
+    Commit(open_scion::cmd::commit::CommitArgs),
     /// Rebase a changeset onto a ref and move the ref.
-    Land(cmd::land::LandArgs),
+    Land(open_scion::cmd::land::LandArgs),
     /// Many agents commit and land at the same time; print throughput.
-    Bench(cmd::bench::BenchArgs),
+    Bench(open_scion::cmd::bench::BenchArgs),
     /// Print the best common ancestors of two revisions, over all parents,
     /// as `git merge-base --all`.
     MergeBase {
@@ -114,7 +115,7 @@ enum Command {
         /// The new revision.
         new: String,
         /// Only this file, or the files below this directory.
-        #[arg(long, value_parser = client::parse_repo_path)]
+        #[arg(long, value_parser = open_scion::client::parse_repo_path)]
         path: Option<RepoPath>,
     },
 }
@@ -146,28 +147,30 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     )
     .await?;
     let done = match cli.command {
-        Command::Cat { spec } => cmd::read::cat(&mut ctx, &spec).await,
-        Command::Ls { spec } => cmd::read::ls(&mut ctx, &spec).await,
+        Command::Cat { spec } => open_scion::cmd::read::cat(&mut ctx, &spec).await,
+        Command::Ls { spec } => open_scion::cmd::read::ls(&mut ctx, &spec).await,
         Command::Log { rev, path, limit } => {
-            cmd::read::log(&mut ctx, &rev, path.as_ref(), limit).await
+            open_scion::cmd::read::log(&mut ctx, &rev, path.as_ref(), limit).await
         }
-        Command::Blame { spec } => cmd::blame::blame(&mut ctx, &spec).await,
-        Command::Show { rev } => cmd::read::show(&mut ctx, &rev).await,
-        Command::Checkout(args) => cmd::checkout::checkout(&mut ctx, args).await,
-        Command::Commit(args) => cmd::commit::commit(&mut ctx, args).await,
-        Command::Land(args) => cmd::land::land(&mut ctx, args).await,
-        Command::Bench(args) => cmd::bench::bench(&ctx, args).await,
-        Command::MergeBase { a, b } => cmd::query::merge_base(&mut ctx, &a, &b).await,
+        Command::Blame { spec } => open_scion::cmd::blame::blame(&mut ctx, &spec).await,
+        Command::Show { rev } => open_scion::cmd::read::show(&mut ctx, &rev).await,
+        Command::Checkout(args) => open_scion::cmd::checkout::checkout(&mut ctx, args).await,
+        Command::Mount(args) => open_scion::cmd::mount::mount(&mut ctx, args).await,
+        Command::Unmount(args) => open_scion::cmd::mount::unmount(&mut ctx, args).await,
+        Command::Commit(args) => open_scion::cmd::commit::commit(&mut ctx, args).await,
+        Command::Land(args) => open_scion::cmd::land::land(&mut ctx, args).await,
+        Command::Bench(args) => open_scion::cmd::bench::bench(&ctx, args).await,
+        Command::MergeBase { a, b } => open_scion::cmd::query::merge_base(&mut ctx, &a, &b).await,
         Command::IsAncestor {
             ancestor,
             descendant,
         } => {
-            let yes = cmd::query::is_ancestor(&mut ctx, &ancestor, &descendant).await?;
+            let yes = open_scion::cmd::query::is_ancestor(&mut ctx, &ancestor, &descendant).await?;
             // 0 for yes, 1 for no.
             return Ok(ExitCode::from(u8::from(!yes)));
         }
         Command::Diff { old, new, path } => {
-            cmd::query::diff(&mut ctx, &old, &new, path.as_ref()).await
+            open_scion::cmd::query::diff(&mut ctx, &old, &new, path.as_ref()).await
         }
     };
     done.map(|()| ExitCode::SUCCESS)

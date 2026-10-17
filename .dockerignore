@@ -1,0 +1,9 @@
+# Keep the build context small: only the sources the build reads.
+.git
+.claude
+.github
+docs
+target
+docker/demo/certs
+docker/demo/work
+**/target
