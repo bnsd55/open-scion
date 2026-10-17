@@ -28,6 +28,16 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long `scn` waits to connect.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Most bytes that the parts of one streamed reply may join to. The server
+/// bounds one part at 1 MiB, but not the whole reply: a directory or a
+/// changeset may be as big as its repo made it. The client joins the parts
+/// in memory before it decodes, so a broken or hostile server could stream
+/// until `scn` runs out of memory. One GiB is far over what this client
+/// makes in one object (its largest changeset comes from an import of a
+/// machine's history, well under 100 MiB), so hitting it is a server fault,
+/// not a repo that grew.
+pub(crate) const MAX_JOINED_REPLY_BYTES: usize = 1 << 30;
+
 /// A connected client.
 pub type Client = ScionClient<InterceptedService<Channel, Call>>;
 

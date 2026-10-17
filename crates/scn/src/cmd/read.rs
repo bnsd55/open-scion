@@ -10,7 +10,7 @@ use scion_proto::v1::{
 use serde_json::{Value, json};
 use tonic::{Status, Streaming};
 
-use crate::client::{Ctx, id_from, lossy, split_spec};
+use crate::client::{Ctx, MAX_JOINED_REPLY_BYTES, id_from, lossy, split_spec};
 
 /// Prints a file's raw bytes. The content is printed as it is, also with
 /// `--json`.
@@ -50,6 +50,25 @@ pub(crate) async fn read_stream(
     Ok(reply.into_inner())
 }
 
+/// Joins the parts of one streamed reply into the bytes of its object.
+/// Stops with an error once the joined bytes pass `limit`, so a broken or
+/// hostile server cannot stream until the client runs out of memory.
+async fn join_parts<S, T, F>(reply: &mut S, field: F, limit: usize) -> Result<Vec<u8>>
+where
+    S: tokio_stream::Stream<Item = Result<T, Status>> + Unpin,
+    F: Fn(&T) -> &[u8],
+{
+    let mut bytes = Vec::new();
+    while let Some(part) = tokio_stream::StreamExt::next(reply).await.transpose()? {
+        bytes.extend_from_slice(field(&part));
+        anyhow::ensure!(
+            bytes.len() <= limit,
+            "the server sent more than {limit} bytes for one object"
+        );
+    }
+    Ok(bytes)
+}
+
 /// Lists a directory, one entry per line: git-style mode, kind, name.
 /// Directories end in `/`.
 pub async fn ls(ctx: &mut Ctx, spec: &str) -> Result<()> {
@@ -65,14 +84,9 @@ pub async fn ls(ctx: &mut Ctx, spec: &str) -> Result<()> {
         .await
         .with_context(|| format!("cannot list {spec}"))?
         .into_inner();
-    let mut tree_bytes = Vec::new();
-    while let Some(part) = reply
-        .message()
+    let tree_bytes = join_parts(&mut reply, |part| &part.tree, MAX_JOINED_REPLY_BYTES)
         .await
-        .with_context(|| format!("cannot list {spec}"))?
-    {
-        tree_bytes.extend_from_slice(&part.tree);
-    }
+        .with_context(|| format!("cannot list {spec}"))?;
     let tree = Tree::decode(&tree_bytes).context("server sent a bad tree")?;
     if ctx.json {
         let entries: Vec<Value> = tree
@@ -157,14 +171,9 @@ pub async fn show(ctx: &mut Ctx, rev: &str) -> Result<()> {
         .await
         .with_context(|| format!("cannot read changeset {rev}"))?
         .into_inner();
-    let mut cs_bytes = Vec::new();
-    while let Some(part) = reply
-        .message()
+    let cs_bytes = join_parts(&mut reply, |part| &part.changeset, MAX_JOINED_REPLY_BYTES)
         .await
-        .with_context(|| format!("cannot read changeset {rev}"))?
-    {
-        cs_bytes.extend_from_slice(&part.changeset);
-    }
+        .with_context(|| format!("cannot read changeset {rev}"))?;
     let cs = decode_changeset(id, &cs_bytes)?;
     if ctx.json {
         let mut value = changeset_json(id, &cs);
@@ -288,4 +297,43 @@ pub(crate) fn entry_json(entry: &Entry) -> Value {
         value["executable"] = (*executable).into();
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scion_proto::v1::{GetChangesetResponse, ListDirResponse};
+
+    /// A stream of `parts` parts of `part_len` bytes.
+    fn parts_of(
+        parts: usize,
+        part_len: usize,
+    ) -> impl tokio_stream::Stream<Item = Result<ListDirResponse, Status>> {
+        tokio_stream::iter((0..parts).map(move |_| {
+            Ok(ListDirResponse {
+                tree: vec![b'x'; part_len],
+            })
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_reply_past_the_bound_ends_with_an_error() {
+        let mut reply = parts_of(4, 10);
+        let err = join_parts(&mut reply, |p| &p.tree, 25)
+            .await
+            .expect_err("over the bound");
+        assert!(err.to_string().contains("more than 25 bytes"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_reply_at_the_bound_joins_whole() {
+        let mut reply = parts_of(2, 10);
+        let bytes = join_parts(&mut reply, |p| &p.tree, 20).await.unwrap();
+        assert_eq!(bytes.len(), 20);
+        let mut reply = tokio_stream::iter(Vec::<Result<GetChangesetResponse, Status>>::new());
+        assert_eq!(
+            join_parts(&mut reply, |p| &p.changeset, 20).await.unwrap(),
+            Vec::<u8>::new()
+        );
+    }
 }

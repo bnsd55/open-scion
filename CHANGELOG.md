@@ -100,7 +100,9 @@ until that section gets its release date.
   bytes in 1 MiB parts, as `ReadFile` streams a file (section 6.6 and 6.8
   of protocol-v1), so a directory or a changeset over the 64 MiB message
   cap still reads whole. The client puts the parts together and checks
-  the changeset bytes against the ID it asked for.
+  the changeset bytes against the ID it asked for, and stops with an
+  error once the joined bytes pass 1 GiB, so a broken or hostile server
+  cannot stream until the client runs out of memory.
 - Path history as derived data (kind `path_history`, schema version 5).
   `Log` with a path reads only the changesets that change the path, so one
   call returns up to 1,000 entries however far apart they are. A call
