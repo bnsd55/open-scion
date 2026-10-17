@@ -149,7 +149,7 @@ One data directory holds everything (`store.rs`):
 <data>/tmp/                    staging for atomic blob writes and uploads
 ```
 
-**Checking a data directory.** `scion-server fsck <data>` reports the
+**Checking a data directory.** `scion-server --data <dir> fsck` reports the
 damage it finds, and changes nothing: it reads, and leaves every repair
 to you. It checks every blob file against its ID, every blob that a row
 names, every changeset, tree and history node against its ID, every ref
@@ -170,7 +170,7 @@ steps of the kind remove them (section 4).
 | `changesets` | ID, generation and `ChangesetV1` bytes. Global: one row per changeset, whatever repos have it. |
 | `changeset_parents` | Parent `n` of each changeset, also indexed by parent. |
 | `repo_changesets` | Which changesets a repo may read. Every changeset read checks this table. |
-| `repo_blobs` | Which blobs a repo may name: those uploaded to it, and those that its changesets name. `CreateChangeset` checks this table. A row is never removed, and is not a promise that the blob is stored. |
+| `repo_blobs` | Which blobs a repo may name: those uploaded to it, and those that its changesets name. `CreateChangeset` checks this table. A row goes only when `scion-server gc` collects it: a blob past the grace period that no stored changeset of the repo puts. A row is not a promise that the blob is stored. |
 | `refs` | Ref name to target and `version`. A ref moves only by compare-and-swap on `version`. A foreign key keeps the target in the repo. |
 | `lands` | One row per land request, unique on (repo, caller, request key): state, result, detail, conflict paths, and when it finished. A finished row expires after 7 days (section 5). |
 | `trees` | `TreeV1` bytes by tree ID. Global. |
@@ -485,7 +485,9 @@ started.
    blob. A blob of another repo gets the error of content that no repo
    stored, before any file is read, so neither the answer nor its time shows
    that another repo has it. The error names the first such path, in path
-   order. Rows are never removed, so this check still holds at step 5.
+   order. The check holds at step 5: the changeset's transaction re-adds
+   the row of each blob it puts, and gc removes only rows past the grace
+   period that no stored changeset names (`gc.rs`).
 4. Read back each blob it names, before the write transaction. A blob that many
    paths name is read once. The error names the first path, in path order,
    whose blob is missing or corrupt.
