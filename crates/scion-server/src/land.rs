@@ -171,24 +171,32 @@ pub struct Lands {
     /// Indexes that [`Lands::evict`] dropped. Their bytes are back in
     /// `used`. A land frees them after its write connection and ref lock.
     evicted: Mutex<Vec<PathIndex>>,
+    /// The metrics that count lands by outcome, when the process exports
+    /// any.
+    metrics: Option<Arc<crate::metrics::Metrics>>,
 }
 
 impl Default for Lands {
     fn default() -> Self {
-        Self::new(None)
+        Self::new(None, None)
     }
 }
 
 impl Lands {
-    /// Limits each principal to `pending_limit` lands pending at once;
-    /// `None` turns the check off.
+    /// Limits each principal to `pending_limit` lands pending at once
+    /// (`None` turns the check off), and counts the outcomes in `metrics`
+    /// when the process exports any.
     #[must_use]
-    pub fn new(pending_limit: Option<usize>) -> Self {
+    pub fn new(
+        pending_limit: Option<usize>,
+        metrics: Option<Arc<crate::metrics::Metrics>>,
+    ) -> Self {
         Self {
             pending_limit,
             refs: Mutex::new(LruCache::new_unbounded()),
             used: Arc::default(),
             evicted: Mutex::default(),
+            metrics,
         }
     }
 
@@ -255,6 +263,15 @@ impl Lands {
         let evicted = mem::take(&mut *self.evicted.lock().unwrap_or_else(PoisonError::into_inner));
         drop(evicted);
         let outcome = outcome?;
+        if let Some(metrics) = &self.metrics {
+            metrics.land(match outcome.state {
+                LandState::Landed => 0,
+                LandState::Conflict => 1,
+                LandState::Rejected => 2,
+                // A pending land waits for a retry with its key.
+                LandState::Pending => 3,
+            });
+        }
         // Lands on one ref commit one at a time. Waiting for the flush after
         // the ref lock is released lets them share it.
         store.flush()?;
@@ -2672,7 +2689,7 @@ mod tests {
     fn the_sweep_rejects_only_pending_lands_past_the_cutoff() {
         let f = fixture();
         let cs = f.commit(f.root, &[put("a/x", "new")]);
-        let lands = Lands::new(Some(8));
+        let lands = Lands::new(Some(8), None);
         let recorded = f
             .store
             .write(|c| c.record_land(&caller(), &req(cs, "old"), None))
