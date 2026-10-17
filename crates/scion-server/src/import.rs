@@ -8,7 +8,6 @@
 //! Git headers that Scion does not model (`encoding`, `gpgsig`, `mergetag`)
 //! are dropped, so a changeset ID is not a function of the git object name.
 
-#[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -17,19 +16,18 @@ use std::time::{Duration, Instant};
 use gix::ObjectId;
 use gix::actor::SignatureRef;
 use hashlink::LruCache;
-use rusqlite::{Connection, params};
 use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileState, GitOid, IdentityTime, PathElem, RepoPath,
     TreeId,
 };
 
-use crate::db::{self, RepoId};
 use crate::error::{Error, Result};
+use crate::meta::{MetaTx, RepoId};
 use crate::store::{BlobBatch, BlobStatus, MAX_OBJECT_BYTES, Store};
 use crate::tree;
 
 /// `git_import.git_algo` for SHA-1 object names.
-const SHA1: i64 = 1;
+pub(crate) const SHA1: i64 = 1;
 /// Commits per blob batch: their blobs are prepared and made durable
 /// together, outside any write transaction.
 const BATCH: usize = 1000;
@@ -46,11 +44,25 @@ const TX_BUDGET: Duration = Duration::from_secs(1);
 /// transaction begins.
 const TX_YIELD: Duration = Duration::from_millis(100);
 
+/// How many times one batch waits out a busy write lock and runs again.
+/// The batch's writes are idempotent, so a retry is safe; past the bound
+/// the import fails with the busy error. A client that shares the data
+/// directory reads this to bound its own wait for an import.
+pub const BUSY_TRIES: u32 = 10;
+
 // How long the write transaction sleeps per commit of a batch, for the
 // tests of a slow batch. It models a batch whose records are slow.
 #[cfg(test)]
 thread_local! {
     static SLOW_RECORD: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+}
+
+thread_local! {
+    /// Tree checks that [`Checker::check`] ran on this thread. Tests of a
+    /// rolled-back batch read it: with the checker reset, the checks of
+    /// the rolled-back transaction run again in the retry.
+    #[doc(hidden)]
+    pub static CHECKS: Cell<usize> = const { Cell::new(0) };
 }
 /// Cache for decoded git objects. A tree diff re-reads the trees that the
 /// previous commit's diff just read.
@@ -133,8 +145,15 @@ fn import_with_cache(
         .map_err(|e| Error::Git(format!("cannot resolve {:?} to a commit: {e}", opts.rev)))?
         .id;
 
-    let repo_id = store.write(|c| db::create_repo(c, repo))?;
-    let mut known = store.read(|c| imported_commits(c, repo_id))?;
+    // A shared import re-runs often: look the repo up before opening a
+    // write transaction for it, so the common path does not commit at all
+    // just to find a repo that is already there.
+    let repo_id = match store.read(|c| c.repo_id(repo)) {
+        Ok(repo_id) => repo_id,
+        Err(Error::NotFound(_)) => store.write(|c| c.create_repo(repo))?,
+        Err(error) => return Err(error),
+    };
+    let mut known = store.read(|c| c.imported_commits(repo_id))?;
     let plan = plan(&git, tip, &known, opts.verify_sample)?;
     tracing::info!(
         reachable = plan.reachable,
@@ -249,24 +268,44 @@ fn store_batch(
     let mut rest = prepared;
     while !rest.is_empty() {
         let mut taken = 0;
-        let started_tx = Instant::now();
-        store.write(|c| {
-            for (commit, cs, git_tree) in rest {
-                #[cfg(test)]
-                if !slow_record.is_zero() {
-                    std::thread::sleep(slow_record);
+        // The write lock of a shared data directory stays busy when the
+        // servers that share it write without a pause, and `busy_timeout`
+        // then expires with the transaction rolled back and nothing
+        // written. A batch is safe to run again whole: every write in it is
+        // content-addressed or `INSERT OR IGNORE`, so it retries a bounded
+        // number of times, and waits between tries so it takes its turn.
+        let mut tries = 0;
+        loop {
+            let started_tx = Instant::now();
+            let result = store.write(|c| {
+                for (commit, cs, git_tree) in rest {
+                    #[cfg(test)]
+                    if !slow_record.is_zero() {
+                        std::thread::sleep(slow_record);
+                    }
+                    let root = record(c, repo_id, *commit, cs)?;
+                    if plan.verify.contains(commit) {
+                        checker.check(c, *commit, *git_tree, root)?;
+                    }
+                    taken += 1;
+                    if shared && started_tx.elapsed() >= TX_BUDGET {
+                        break;
+                    }
                 }
-                let root = record(c, repo_id, *commit, cs)?;
-                if plan.verify.contains(commit) {
-                    checker.check(c, *commit, *git_tree, root)?;
+                Ok(taken)
+            });
+            match result {
+                Ok(_) => break,
+                Err(Error::Busy) if tries < BUSY_TRIES => {
+                    tries += 1;
+                    taken = 0;
+                    checker.reset_for_retry();
+                    tracing::warn!(tries, "the database stayed busy; the batch retries");
+                    std::thread::sleep(TX_YIELD);
                 }
-                taken += 1;
-                if shared && started_tx.elapsed() >= TX_BUDGET {
-                    break;
-                }
+                Err(e) => return Err(e),
             }
-            Ok(taken)
-        })?;
+        }
         rest = &rest[taken..];
         *done += taken;
         tracing::info!(
@@ -367,39 +406,17 @@ fn plan(
     })
 }
 
-/// Stores one changeset, its git mapping and its root tree. Returns the root
-/// tree.
-fn record(c: &Connection, repo: RepoId, commit: ObjectId, cs: &Changeset) -> Result<TreeId> {
+/// Records that a git commit became the changeset `cs` whose changes build
+/// the tree `root`. Safe to repeat.
+fn record(c: &mut dyn MetaTx, repo: RepoId, commit: ObjectId, cs: &Changeset) -> Result<TreeId> {
     let (id, root) = tree::store_changeset(c, repo, cs).map_err(|e| match e {
         Error::Apply(e) => Error::Corrupt(format!(
             "commit {commit}: changes do not apply to the first parent: {e}"
         )),
         other => other,
     })?;
-    c.prepare_cached(
-        "INSERT OR IGNORE INTO git_import (repo_id, git_algo, git_oid, cs)
-         VALUES (?1, ?2, ?3, ?4)",
-    )?
-    .execute(params![repo.0, SHA1, commit.as_slice(), id.as_bytes()])?;
+    c.put_git_import(repo, commit, id)?;
     Ok(root)
-}
-
-/// Every git commit already imported into `repo`.
-fn imported_commits(c: &Connection, repo: RepoId) -> Result<HashMap<ObjectId, ChangesetId>> {
-    let mut stmt =
-        c.prepare("SELECT git_oid, cs FROM git_import WHERE repo_id = ?1 AND git_algo = ?2")?;
-    let rows = stmt.query_map(params![repo.0, SHA1], |row| {
-        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })?;
-    let mut out = HashMap::new();
-    for row in rows {
-        let (oid, cs) = row?;
-        let corrupt = || Error::Corrupt("git_import row".to_owned());
-        let oid = ObjectId::try_from(oid.as_slice()).map_err(|_| corrupt())?;
-        let cs = ChangesetId::try_from(cs.as_slice()).map_err(|_| corrupt())?;
-        out.insert(oid, cs);
-    }
-    Ok(out)
 }
 
 /// Points `name` at `tip`, creating it if missing. Leaves it alone if it is
@@ -416,9 +433,9 @@ fn point_ref(store: &Store, repo: RepoId, name: &str, tip: ChangesetId) -> Resul
     // The walks run in reads, outside any write transaction, so a server
     // that shares the data directory does not wait for them. They have no
     // bound. The swap fails if the ref moved after the read.
-    let contains = |head, cs| store.read(|c| db::is_ancestor(c, repo, cs, head, usize::MAX));
+    let contains = |head, cs| store.read(|c| c.is_ancestor(repo, cs, head, usize::MAX));
     loop {
-        let current = store.read(|c| db::get_ref(c, repo, name))?;
+        let current = store.read(|c| c.get_ref(repo, name))?;
         if let Some(current) = current {
             // Already there, or the ref already contains the tip (changes
             // were landed on top of an earlier import): nothing to do.
@@ -434,7 +451,7 @@ fn point_ref(store: &Store, repo: RepoId, name: &str, tip: ChangesetId) -> Resul
             }
         }
         let expected = current.map(|r| r.version);
-        if store.write(|c| db::cas_ref(c, repo, name, expected, tip))? {
+        if store.write(|c| c.cas_ref(repo, name, expected, tip))? {
             return Ok(());
         }
         tracing::info!(name, "the ref moved during the import; checking it again");
@@ -582,11 +599,19 @@ struct Checker<'a> {
 }
 
 impl Checker<'_> {
+    /// Drops the state of checks that a rolled-back transaction recorded,
+    /// so a batch that runs again verifies from scratch. The git-to-blob
+    /// map stays: it hashes content, so it never lies.
+    fn reset_for_retry(&mut self) {
+        self.equal.clear();
+        self.intact.clear();
+    }
+
     /// Fails unless the Scion tree `scion` has exactly the names, kinds,
     /// flags and content of the git tree `git_tree`.
     fn check(
         &mut self,
-        c: &Connection,
+        c: &mut dyn MetaTx,
         commit: ObjectId,
         git_tree: ObjectId,
         scion: TreeId,
@@ -596,8 +621,12 @@ impl Checker<'_> {
             if !self.equal.insert((git_id, scion_id)) {
                 continue;
             }
+            // Counted per walk, not per call: a pair the cache already
+            // cleared did no work.
+            CHECKS.with(|checks| checks.set(checks.get() + 1));
             let want = read_tree(self.git, commit, Some(git_id))?;
-            let have: BTreeMap<Vec<u8>, Entry> = db::get_tree(c, scion_id)?
+            let have: BTreeMap<Vec<u8>, Entry> = c
+                .get_tree(scion_id)?
                 .entries
                 .into_iter()
                 .map(|(name, entry)| (name.as_bytes().to_vec(), entry))
@@ -915,11 +944,11 @@ mod tests {
         };
         let (repo, tip, x) = server
             .write(|c| {
-                let repo = db::create_repo(c, "r")?;
-                let root = db::insert_changeset(c, repo, &changeset(vec![], "root"))?;
-                let tip = db::insert_changeset(c, repo, &changeset(vec![root], "tip"))?;
-                let x = db::insert_changeset(c, repo, &changeset(vec![root], "x"))?;
-                assert!(db::cas_ref(c, repo, "main", None, root)?);
+                let repo = c.create_repo("r")?;
+                let root = c.insert_changeset(repo, &changeset(vec![], "root"))?;
+                let tip = c.insert_changeset(repo, &changeset(vec![root], "tip"))?;
+                let x = c.insert_changeset(repo, &changeset(vec![root], "x"))?;
+                assert!(c.cas_ref(repo, "main", None, root)?);
                 Ok((repo, tip, x))
             })
             .unwrap();
@@ -931,7 +960,7 @@ mod tests {
             let (server, started) = (server.clone(), Arc::clone(&started));
             thread::spawn(move || {
                 server.write(|c| {
-                    let moved = db::cas_ref(c, repo, "main", Some(1), x)?;
+                    let moved = c.cas_ref(repo, "main", Some(1), x)?;
                     started.wait();
                     thread::sleep(Duration::from_millis(300));
                     Ok(moved)
@@ -946,7 +975,7 @@ mod tests {
             matches!(moved, Err(Error::FailedPrecondition(_))),
             "{moved:?}"
         );
-        let main = server.read(|c| db::get_ref(c, repo, "main")).unwrap();
+        let main = server.read(|c| c.get_ref(repo, "main")).unwrap();
         assert_eq!(main.unwrap().target, x);
     }
 
@@ -979,9 +1008,10 @@ mod tests {
 
         let commits = store.commits();
         assert_eq!(import("main").imported, 1);
-        // The repo, the root trees of the four parents in steps, the batch
-        // and the ref. The batch derives nothing while it holds the lock.
-        assert_eq!(store.commits() - commits, 3 + derived::steps(4));
+        // The repo is already there: its lookup is a read, so only the root
+        // trees of the four parents in steps, the batch and the ref commit.
+        // The batch derives nothing while it holds the lock.
+        assert_eq!(store.commits() - commits, 2 + derived::steps(4));
     }
 
     #[test]
@@ -1024,7 +1054,7 @@ mod tests {
             let name = format!("w{writes}");
             // Every write succeeds: a wait past the 5 s busy_timeout fails
             // here, which one transaction of the whole batch would cause.
-            server.write(|c| db::create_repo(c, &name)).unwrap();
+            server.write(|c| c.create_repo(&name)).unwrap();
             writes += 1;
             thread::sleep(Duration::from_millis(10));
         }

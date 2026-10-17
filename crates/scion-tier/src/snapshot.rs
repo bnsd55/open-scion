@@ -181,8 +181,9 @@ fn fill(file: &mut impl io::Read, buf: &mut [u8]) -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use scion_core::{BlobId, Tree};
+    use scion_core::{BlobId, Entry, FileState, PathElem, Tree};
     use scion_proto::object;
+    use scion_proto::ticket::{self, now};
     use scion_proto::v1::objects_server::Objects as _;
     use scion_proto::v1::{Encoding, GetObjectsRequest};
     use tokio_stream::StreamExt as _;
@@ -200,9 +201,22 @@ mod tests {
     }
 
     /// A tree, two blobs, and a snapshot of them in `dir`, written by a
-    /// cache that sent them for repo `r` in that order.
-    fn snapshot_in(dir: &Path) -> (Vec<(Key, Bytes)>, std::path::PathBuf) {
-        let (tree, id) = Tree::default().encode_with_id();
+    /// cache that sent them for repo `r` in that order. The tree reaches
+    /// both blobs at `one` and `two`, so a ticket for it serves them.
+    fn snapshot_in(dir: &Path) -> (Vec<(Key, Bytes)>, std::path::PathBuf, [u8; 32]) {
+        let entries = [("one", b"one\n".as_slice()), ("two", b"two\n")].map(|(name, data)| {
+            (
+                PathElem::new(name.as_bytes().to_vec()).unwrap(),
+                Entry::File(FileState::Regular {
+                    content: BlobId::of(data),
+                    executable: false,
+                }),
+            )
+        });
+        let (tree, id) = Tree {
+            entries: entries.into_iter().collect(),
+        }
+        .encode_with_id();
         let objects = vec![
             (Key::Tree(id), Bytes::from(tree)),
             blob(b"one\n"),
@@ -216,7 +230,7 @@ mod tests {
         let path = dir.join("r.scnsnap");
         let bytes = write(&path, "r", &cache.snapshot("r", 1 << 20)).unwrap();
         assert_eq!(bytes, objects.iter().map(|(_, data)| data.len()).sum());
-        (objects, path)
+        (objects, path, *id.as_bytes())
     }
 
     #[test]
@@ -230,7 +244,7 @@ mod tests {
     #[test]
     fn a_cold_store_starts_with_the_snapshot_and_a_warm_one_ignores_it() {
         let dir = tempfile::tempdir().unwrap();
-        let (objects, path) = snapshot_in(dir.path());
+        let (objects, path, _) = snapshot_in(dir.path());
         let size = |i: usize| objects[i].1.len();
         // Room for the last two only: the least recently used drops first.
         let limit = size(1) + size(2);
@@ -288,27 +302,37 @@ mod tests {
     #[tokio::test]
     async fn a_seeded_daemon_serves_the_snapshot_without_its_upstream() {
         let dir = tempfile::tempdir().unwrap();
-        let (objects, path) = snapshot_in(dir.path());
+        let (objects, path, root) = snapshot_in(dir.path());
         let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
         seed(&store, &path).unwrap().unwrap();
         // Nothing listens on the discard port.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[6; 32]);
         let tier = Tier::new(
             store,
             "http://127.0.0.1:9",
             "t",
             DAEMON_UPSTREAM_TIMEOUT,
             None,
+            vec![key.verifying_key()],
         )
         .unwrap();
+        // A ticket for the seeded root tree; its walk finds everything in
+        // the store, so the daemon serves without its upstream.
+        let ticket = ticket::sign(&key, "r", "test", root, now()).unwrap();
+        let paths = [b"one".to_vec(), b"two".to_vec()];
         let request = GetObjectsRequest {
-            repo: "r".into(),
-            refs: objects.iter().map(|(key, _)| key.to_ref()).collect(),
+            refs: objects[1..]
+                .iter()
+                .zip(paths)
+                .map(|((key, _), path)| key.to_ref(&path))
+                .collect(),
             accept: vec![Encoding::Zstd.into()],
+            ticket,
         };
         let reply = tier.get_objects(Request::new(request)).await.unwrap();
         let parts: Vec<_> = reply.into_inner().collect().await;
-        assert_eq!(parts.len(), objects.len());
-        for (part, (key, data)) in parts.into_iter().zip(&objects) {
+        assert_eq!(parts.len(), objects.len() - 1);
+        for (part, (key, data)) in parts.into_iter().zip(&objects[1..]) {
             let part = part.unwrap();
             assert_eq!(part.id, key.id());
             assert_eq!(part.data, *data);

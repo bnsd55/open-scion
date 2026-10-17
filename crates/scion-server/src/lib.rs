@@ -11,6 +11,7 @@
 //! - [`read`], [`blame`], [`write`], [`land`]: the operations behind the RPCs.
 //!   A long one stops at its call's [`deadline`].
 //!   [`similar`] finds renames for `Diff` and `Blame`.
+//! - [`fsck`]: reports the damage in a data directory. Read-only.
 //! - [`import`]: one-way import from a git repository.
 //! - [`service`], [`objects`] and [`auth`]: the gRPC front end. [`access`]:
 //!   which principal may read or write what.
@@ -22,11 +23,14 @@ pub mod db;
 pub mod deadline;
 pub mod derived;
 pub mod error;
+pub mod fsck;
+pub mod gc;
 pub mod graph;
 pub mod history;
 pub mod import;
 pub mod land;
 pub mod memory;
+pub mod meta;
 pub mod names;
 pub mod objects;
 pub mod quotas;
@@ -34,6 +38,7 @@ pub mod read;
 pub mod service;
 pub mod similar;
 pub mod store;
+pub mod tickets;
 pub mod tree;
 pub mod write;
 

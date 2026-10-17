@@ -23,6 +23,11 @@ struct Cli {
     /// Bearer token for the server.
     #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
     token: String,
+    /// Address of a scion-cache or scion-daemon that serves `GetObjects`
+    /// with a ticket: `http://HOST:PORT` or `unix:///PATH`. Without it,
+    /// object reads go to `--server`, which also has them.
+    #[arg(long, env = "SCION_OBJECTS", global = true)]
+    objects: Option<String>,
     /// Trust this CA (PEM) for an https server.
     #[arg(long, env = "SCION_TLS_CA", global = true, value_name = "FILE")]
     tls_ca: Option<PathBuf>,
@@ -134,6 +139,7 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let mut ctx = Ctx::connect(
         &cli.server,
+        cli.objects.as_deref(),
         &cli.token,
         cli.tls_ca.as_deref(),
         cli.repo,

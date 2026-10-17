@@ -66,8 +66,12 @@ pub async fn test_objects(url: &str, token: &str) -> Objects {
 pub struct Ctx {
     /// The gRPC client.
     pub client: Client,
-    /// The `Objects` client, on the same connection.
+    /// The `Objects` client for reads of trees and blobs: `--objects`, or
+    /// the server when no tier is given. Its `GetObjects` needs a ticket.
     pub objects: Objects,
+    /// The `Objects` client of the server: `ResolveRef` and `GetRootTree`
+    /// go there, with a token, never to a tier.
+    pub roots: Objects,
     /// Repository name.
     pub repo: String,
     /// Print JSON instead of text.
@@ -84,6 +88,7 @@ impl Ctx {
     /// token is refused.
     pub async fn connect(
         server: &str,
+        objects: Option<&str>,
         token: &str,
         ca: Option<&Path>,
         repo: String,
@@ -113,28 +118,62 @@ impl Ctx {
             .await
             .with_context(|| format!("cannot connect to {server}"))?;
         let call = Call(Bearer::new(token).context("token is not valid ASCII")?);
-        let objects = ObjectsClient::with_interceptor(channel.clone(), call.clone())
+        let roots = ObjectsClient::with_interceptor(channel.clone(), call.clone())
             .max_decoding_message_size(MAX_PART_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
+        let objects = match objects {
+            // The reads of trees and blobs go to the tier, with the ticket
+            // that the server minted; the token of the tier is this
+            // client's token, which the deployment shares with its daemon.
+            Some(objects) => {
+                let mut address = objects.to_owned();
+                if let Some(socket) = objects
+                    .strip_prefix("unix://")
+                    .or_else(|| objects.strip_prefix("unix:"))
+                {
+                    let socket =
+                        check_socket(Path::new(socket), rustix::process::geteuid().as_raw())?;
+                    let socket = socket.to_str().context("the socket path is not UTF-8")?;
+                    address = format!("unix://{socket}");
+                }
+                let endpoint = Endpoint::from_shared(address).context("bad --objects address")?;
+                let endpoint = ClientTls::load(ca, None, None)
+                    .and_then(|tls| tls.apply_to(objects, endpoint))
+                    .with_context(|| format!("cannot trust the certificate of {objects}"))?;
+                let channel = endpoint
+                    .connect_timeout(CONNECT_TIMEOUT)
+                    .timeout(CALL_TIMEOUT)
+                    .connect()
+                    .await
+                    .with_context(|| format!("cannot connect to {objects}"))?;
+                ObjectsClient::with_interceptor(channel, call.clone())
+                    .max_decoding_message_size(MAX_PART_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_MESSAGE_BYTES)
+            }
+            None => ObjectsClient::with_interceptor(channel.clone(), call.clone())
+                .max_decoding_message_size(MAX_PART_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_MESSAGE_BYTES),
+        };
         let client = ScionClient::with_interceptor(channel, call)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
         Ok(Self {
             client,
             objects,
+            roots,
             repo,
             json,
         })
     }
 
-    /// Turns a ref name or a 64-digit changeset ID into a changeset ID. A ref
-    /// is resolved through `Objects`, which a cache tier forwards.
+    /// Turns a ref name or a 64-digit changeset ID into a changeset ID. A
+    /// ref is resolved on the server: a tier serves no refs.
     pub async fn resolve(&mut self, rev: &str) -> Result<ChangesetId> {
         if let Ok(id) = rev.parse() {
             return Ok(id);
         }
         let reply = self
-            .objects
+            .roots
             .resolve_ref(ResolveRefRequest {
                 repo: self.repo.clone(),
                 name: rev.to_owned(),
@@ -312,7 +351,7 @@ mod tests {
         let resolved = fs::canonicalize(&real).unwrap().join("daemon.sock");
         assert_eq!(check_socket(&path, owner).unwrap(), resolved);
         let server = format!("unix://{}", path.display());
-        Ctx::connect(&server, "token", None, "r".into(), false)
+        Ctx::connect(&server, None, "token", None, "r".into(), false)
             .await
             .unwrap();
     }
