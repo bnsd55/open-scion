@@ -1,5 +1,7 @@
-//! `scion-server fsck <data>`: checks a data directory and reports what it
-//! finds. It changes nothing: it reads, and leaves every repair to you.
+//! `scion-server fsck <data>`: checks a SQLite data directory and reports
+//! what it finds. It changes nothing: it reads, and leaves every repair to
+//! you. It belongs to the SQLite backend: its SQL lives in `db.rs`, and
+//! another backend brings its own check.
 //!
 //! It reads in short batches, so it runs beside a live server. Each check
 //! looks at the state at the moment it looks: a row's blob file is checked
@@ -21,7 +23,6 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr as _;
 
-use rusqlite::Connection;
 use scion_core::{BlobId, Changeset, ChangesetId, Tree, TreeId};
 
 use crate::db;
@@ -227,7 +228,7 @@ fn check_changesets(
     loop {
         let from = last.clone().unwrap_or_default();
         let rows = store.read(|c| {
-            changeset_batch(c, from.as_slice(), batch).map(|rows| {
+            db::fsck_changesets(c, from.as_slice(), batch).map(|rows| {
                 rows.into_iter()
                     .map(|(id, body)| {
                         let decoded = ChangesetId::try_from(id.as_slice())
@@ -274,22 +275,6 @@ fn check_changesets(
     Ok(())
 }
 
-/// One batch of changeset rows after `from`.
-fn changeset_batch(
-    c: &Connection,
-    from: &[u8],
-    batch: usize,
-) -> crate::error::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut stmt =
-        c.prepare("SELECT id, body FROM changesets WHERE id > ?1 ORDER BY id LIMIT ?2")?;
-    let rows = stmt.query_map(
-        rusqlite::params![from, i64::try_from(batch).unwrap_or(i64::MAX)],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
 /// Checks every tree: it decodes and matches its ID, and every blob of its
 /// file entries exists when the row is read.
 fn check_trees(
@@ -301,16 +286,7 @@ fn check_trees(
     let mut last: Option<Vec<u8>> = None;
     loop {
         let from = last.clone().unwrap_or_default();
-        let rows = store.read(|c| {
-            let mut stmt =
-                c.prepare("SELECT id, body FROM trees WHERE id > ?1 ORDER BY id LIMIT ?2")?;
-            let rows = stmt.query_map(
-                rusqlite::params![from, i64::try_from(batch).unwrap_or(i64::MAX)],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Into::into)
-        })?;
+        let rows = store.read(|c| db::fsck_trees(c, from.as_slice(), batch))?;
         let count = rows.len();
         let next = rows.last().map(|(id, _)| id.clone());
         for (id, body) in rows {
@@ -371,16 +347,7 @@ fn check_history_nodes(
     let mut last: Option<Vec<u8>> = None;
     loop {
         let from = last.clone().unwrap_or_default();
-        let rows = store.read(|c| {
-            let mut stmt =
-                c.prepare("SELECT id, body FROM history_nodes WHERE id > ?1 ORDER BY id LIMIT ?2")?;
-            let rows = stmt.query_map(
-                rusqlite::params![from, i64::try_from(batch).unwrap_or(i64::MAX)],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Into::into)
-        })?;
+        let rows = store.read(|c| db::fsck_history_nodes(c, from.as_slice(), batch))?;
         let count = rows.len();
         let next = rows.last().map(|(id, _)| id.clone());
         for (id, body) in rows {
@@ -422,22 +389,8 @@ fn check_repo_blobs(
     let mut last: Option<(i64, Vec<u8>)> = None;
     loop {
         let (from_repo, from_blob) = last.clone().unwrap_or((0, Vec::new()));
-        let rows = store.read(|c| {
-            let mut stmt = c.prepare(
-                "SELECT repo_id, blob FROM repo_blobs
-                 WHERE (repo_id, blob) > (?1, ?2) ORDER BY repo_id, blob LIMIT ?3",
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![
-                    from_repo,
-                    from_blob,
-                    i64::try_from(batch).unwrap_or(i64::MAX)
-                ],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Into::into)
-        })?;
+        let rows =
+            store.read(|c| db::fsck_repo_blobs(c, from_repo, from_blob.as_slice(), batch))?;
         let count = rows.len();
         let next = rows.last().cloned();
         for (repo, blob) in rows {
@@ -487,64 +440,29 @@ fn named_blob_exists(store: &Store, blob: BlobId, report: &mut Report, why: &str
 
 /// Checks every ref: its target is a changeset of its repo.
 fn check_refs(store: &Store, report: &mut Report) -> crate::error::Result<()> {
-    store.read(|c| {
-        let mut stmt = c.prepare(
-            "SELECT repo_id, name, target FROM refs r
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM repo_changesets rc
-                 WHERE rc.repo_id = r.repo_id AND rc.cs = r.target
-             )",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (repo, name, target) = row?;
-            report.problem(Problem::new(
-                "ref-dangling",
-                format!("{repo}/{name}"),
-                None,
-                format!("points at {}", id_string(&target)),
-            ));
-        }
-        Ok(())
-    })?;
+    let rows = store.read(db::fsck_dangling_refs)?;
+    for (repo, name, target) in rows {
+        report.problem(Problem::new(
+            "ref-dangling",
+            format!("{repo}/{name}"),
+            None,
+            format!("points at {}", id_string(&target)),
+        ));
+    }
     Ok(())
 }
 
 /// Checks every land: its changesets are stored.
 fn check_lands(store: &Store, report: &mut Report) -> crate::error::Result<()> {
-    store.read(|c| {
-        for (column, when) in [
-            ("input_cs", "1 = 1"),
-            ("result_cs", "result_cs IS NOT NULL"),
-        ] {
-            let sql = format!(
-                "SELECT land_id, {column} FROM lands l
-                 WHERE {when} AND NOT EXISTS (
-                     SELECT 1 FROM changesets c WHERE c.id = l.{column}
-                 )"
-            );
-            let mut stmt = c.prepare(&sql)?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })?;
-            for row in rows {
-                let (land, cs) = row?;
-                report.problem(Problem::new(
-                    "changeset-missing",
-                    id_string(&cs),
-                    None,
-                    format!("named by lands (land {land}, {column})"),
-                ));
-            }
-        }
-        Ok(())
-    })?;
+    let rows = store.read(db::fsck_lands_missing)?;
+    for (land, cs, column) in rows {
+        report.problem(Problem::new(
+            "changeset-missing",
+            id_string(&cs),
+            None,
+            format!("named by lands (land {land}, {column})"),
+        ));
+    }
     Ok(())
 }
 
@@ -562,32 +480,13 @@ fn check_derived(
         let (from_kind, from_version, from_cs) =
             last.clone().unwrap_or((String::new(), 0, Vec::new()));
         let rows = store.read(|c| {
-            let mut stmt = c.prepare(
-                "SELECT d.kind, d.version, d.cs, d.value,
-                        EXISTS (SELECT 1 FROM changesets c WHERE c.id = d.cs)
-                 FROM derived d
-                 WHERE (d.kind, d.version, d.cs) > (?1, ?2, ?3)
-                 ORDER BY d.kind, d.version, d.cs LIMIT ?4",
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![
-                    from_kind,
-                    from_version,
-                    from_cs,
-                    i64::try_from(batch).unwrap_or(i64::MAX)
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, u32>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                        row.get::<_, Vec<u8>>(3)?,
-                        row.get::<_, bool>(4)?,
-                    ))
-                },
-            )?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Into::into)
+            db::fsck_derived(
+                c,
+                from_kind.as_str(),
+                from_version,
+                from_cs.as_slice(),
+                batch,
+            )
         })?;
         let count = rows.len();
         let next = rows
@@ -645,6 +544,8 @@ fn id_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::SqliteTx;
+    use crate::meta::MetaTx as _;
     use scion_core::{FileState, IdentityTime, RepoPath};
     use std::time::Duration;
     use tempfile::TempDir;
@@ -672,12 +573,14 @@ mod tests {
 
     /// Stores `cs` in the repo and moves `main` to it, as a land does.
     fn land(store: &Store, cs: &Changeset) -> ChangesetId {
+        use crate::meta::MetaTx as _;
         store
             .write(|c| {
-                let repo = db::create_repo(c, REPO)?;
-                let (id, _) = crate::tree::store_changeset(c, repo, cs)?;
-                let version = db::get_ref(c, repo, "main")?.map(|r| r.version);
-                assert!(db::cas_ref(c, repo, "main", version, id)?);
+                let mut tx = SqliteTx(c);
+                let repo = tx.create_repo(REPO)?;
+                let (id, _) = crate::tree::store_changeset(&mut tx, repo, cs)?;
+                let version = tx.get_ref(repo, "main")?.map(|r| r.version);
+                assert!(tx.cas_ref(repo, "main", version, id)?);
                 Ok(id)
             })
             .unwrap()
@@ -731,19 +634,21 @@ mod tests {
         assert!(report.old.is_empty());
     }
 
+    /// The blob of the first put of the changeset `id`.
+    fn first_put(store: &Store, id: ChangesetId) -> BlobId {
+        store
+            .read(|c| {
+                let mut tx = SqliteTx(c);
+                let repo = tx.repo_id(REPO)?;
+                Ok(db::puts(&tx.get_changeset(repo, id)?).next().unwrap().1)
+            })
+            .unwrap()
+    }
+
     #[test]
     fn a_truncated_blob_file_is_corrupt() {
         let (_dir, store, id) = store();
-        let blob = store
-            .read(|c| {
-                Ok(
-                    db::puts(&crate::db::get_changeset(c, db::repo_id(c, REPO)?, id)?)
-                        .next()
-                        .unwrap()
-                        .1,
-                )
-            })
-            .unwrap();
+        let blob = first_put(&store, id);
         let path = store.blobs().location(blob).1;
         let bytes = std::fs::read(&path).unwrap();
         std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
@@ -758,16 +663,7 @@ mod tests {
     #[test]
     fn a_missing_blob_file_that_a_row_names_is_missing() {
         let (_dir, store, id) = store();
-        let blob = store
-            .read(|c| {
-                Ok(
-                    db::puts(&crate::db::get_changeset(c, db::repo_id(c, REPO)?, id)?)
-                        .next()
-                        .unwrap()
-                        .1,
-                )
-            })
-            .unwrap();
+        let blob = first_put(&store, id);
         std::fs::remove_file(store.blobs().location(blob).1).unwrap();
         let report = run(&store, 1, &mut |_| {}).unwrap();
         assert!(
@@ -809,7 +705,10 @@ mod tests {
     fn a_broken_tree_body_is_bad() {
         let (_dir, store, id) = store();
         let tree = store
-            .read(|c| Ok(crate::tree::root_tree(&store, db::repo_id(c, REPO)?, id).unwrap()))
+            .read(|c| {
+                let repo = SqliteTx(c).repo_id(REPO)?;
+                Ok(crate::tree::root_tree(&store, repo, id).unwrap())
+            })
             .unwrap();
         store
             .write(|c| {

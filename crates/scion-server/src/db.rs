@@ -1041,3 +1041,157 @@ mod tests {
         assert!(!got.contains_key(&c.0));
     }
 }
+
+// The queries of `fsck`, which checks this backend's files and tables. They
+// live here, with the rest of this backend's SQL, so that another backend
+// brings its own check.
+
+/// The changesets after `from`, in ID order, at most `limit`.
+pub(crate) fn fsck_changesets(
+    tx: &mut SqliteTx<'_>,
+    from: &[u8],
+    limit: usize,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let c = tx.0;
+    let mut stmt =
+        c.prepare("SELECT id, body FROM changesets WHERE id > ?1 ORDER BY id LIMIT ?2")?;
+    let rows = stmt.query_map(
+        params![from, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// The trees after `from`, in ID order, at most `limit`.
+pub(crate) fn fsck_trees(
+    tx: &mut SqliteTx<'_>,
+    from: &[u8],
+    limit: usize,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let c = tx.0;
+    let mut stmt = c.prepare("SELECT id, body FROM trees WHERE id > ?1 ORDER BY id LIMIT ?2")?;
+    let rows = stmt.query_map(
+        params![from, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// The history nodes after `from`, in ID order, at most `limit`.
+pub(crate) fn fsck_history_nodes(
+    tx: &mut SqliteTx<'_>,
+    from: &[u8],
+    limit: usize,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let c = tx.0;
+    let mut stmt =
+        c.prepare("SELECT id, body FROM history_nodes WHERE id > ?1 ORDER BY id LIMIT ?2")?;
+    let rows = stmt.query_map(
+        params![from, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// The `repo_blobs` rows after `(repo, blob)`, at most `limit`.
+pub(crate) fn fsck_repo_blobs(
+    tx: &mut SqliteTx<'_>,
+    repo: i64,
+    blob: &[u8],
+    limit: usize,
+) -> Result<Vec<(i64, Vec<u8>)>> {
+    let c = tx.0;
+    let mut stmt = c.prepare(
+        "SELECT repo_id, blob FROM repo_blobs
+         WHERE (repo_id, blob) > (?1, ?2) ORDER BY repo_id, blob LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        params![repo, blob, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// The refs whose target no `repo_changesets` row of their repo holds.
+pub(crate) fn fsck_dangling_refs(tx: &mut SqliteTx<'_>) -> Result<Vec<(i64, String, Vec<u8>)>> {
+    let c = tx.0;
+    let mut stmt = c.prepare(
+        "SELECT repo_id, name, target FROM refs r
+         WHERE NOT EXISTS (
+             SELECT 1 FROM repo_changesets rc
+             WHERE rc.repo_id = r.repo_id AND rc.cs = r.target
+         )",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Every land whose input or result changeset is not stored, as
+/// (land, changeset, which column).
+pub(crate) fn fsck_lands_missing(
+    tx: &mut SqliteTx<'_>,
+) -> Result<Vec<(i64, Vec<u8>, &'static str)>> {
+    let c = tx.0;
+    let mut out = Vec::new();
+    for (column, when) in [
+        ("input_cs", "1 = 1"),
+        ("result_cs", "result_cs IS NOT NULL"),
+    ] {
+        let sql = format!(
+            "SELECT land_id, {column} FROM lands l
+             WHERE {when} AND NOT EXISTS (
+                 SELECT 1 FROM changesets c WHERE c.id = l.{column}
+             )"
+        );
+        let mut stmt = c.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (land, cs) = row?;
+            out.push((land, cs, column));
+        }
+    }
+    Ok(out)
+}
+
+/// A derived row of `fsck`: kind, version, changeset, value, and whether
+/// the changeset is stored.
+pub(crate) type FsckDerivedRow = (String, u32, Vec<u8>, Vec<u8>, bool);
+
+/// The derived rows after `(kind, version, cs)`, at most `limit`.
+pub(crate) fn fsck_derived(
+    tx: &mut SqliteTx<'_>,
+    kind: &str,
+    version: u32,
+    cs: &[u8],
+    limit: usize,
+) -> Result<Vec<FsckDerivedRow>> {
+    let c = tx.0;
+    let mut stmt = c.prepare(
+        "SELECT d.kind, d.version, d.cs, d.value,
+                EXISTS (SELECT 1 FROM changesets c WHERE c.id = d.cs)
+         FROM derived d
+         WHERE (d.kind, d.version, d.cs) > (?1, ?2, ?3)
+         ORDER BY d.kind, d.version, d.cs LIMIT ?4",
+    )?;
+    let rows = stmt.query_map(
+        params![kind, version, cs, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
