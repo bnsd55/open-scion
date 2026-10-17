@@ -103,7 +103,7 @@ docker compose run --rm scn "scn land $ID --onto main"
 echo "checking out main through the cache"
 docker compose run --rm scn '
     set -eu
-    scn checkout main -d /work/out
+    scn checkout main --into /work/out
     diff -r /work/src /work/out
     echo DEMO-OK
 '
