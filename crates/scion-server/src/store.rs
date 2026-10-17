@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use rustix::fs::FlockOperation;
@@ -1157,13 +1157,33 @@ impl BlobBatch<'_> {
     /// is intact. A file that is not intact is replaced.
     fn write(&mut self, id: BlobId, len: usize, raw: impl Read) -> Result<()> {
         match self.keep(id)? {
-            BlobStatus::Valid => return Ok(()),
+            BlobStatus::Valid => {
+                // A put that keeps the stored copy writes nothing, so the
+                // file's mtime would stay at its first upload. Touch it:
+                // the grace period of `gc` counts from the last upload,
+                // not the first, so a client that uploaded again does not
+                // lose the blob before it names it.
+                self.touch(id)?;
+                return Ok(());
+            }
             // The rename below replaces it in one step. No repo on this
             // line: a blob may be shared by repos.
             BlobStatus::Corrupt => tracing::warn!(blob = %id, "rewriting a corrupt blob file"),
             BlobStatus::Missing => {}
         }
         self.replace(id, len, raw)
+    }
+
+    /// Refreshes the mtime of a stored blob file, as one `utimensat`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the file cannot be opened or its time not set.
+    fn touch(&self, id: BlobId) -> Result<()> {
+        let (_, path) = self.blobs.location(id);
+        let file = fs::File::options().write(true).open(&path)?;
+        file.set_modified(SystemTime::now())?;
+        Ok(())
     }
 
     /// Writes blob `id`, whose `len` bytes `raw` gives, whether or not the
