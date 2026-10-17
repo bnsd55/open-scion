@@ -413,12 +413,13 @@ impl PgClient {
     }
 }
 
-/// Drops the test schemas whose connections are all gone: a test run
+/// Drops the test schemas whose tests ended minutes ago: a test run
 /// leaves them behind, because a server holds its schema while it runs.
 /// One process at a time holds the cleanup lock, so the test binaries
 /// that run in parallel clean nothing under each other's feet. A schema
-/// whose owner still runs is named in `pg_stat_activity`: its
-/// `application_name` is the schema.
+/// whose owner still runs is named in `pg_stat_activity` under its
+/// `application_name`, and registered with its start time, so the
+/// schema of a test that just began is never dropped.
 fn drop_stale_schemas(maker: &PgClient) {
     let Ok(got) = maker.query_opt("SELECT pg_try_advisory_lock($1)", &[P::i64(CLEAN_LOCK)]) else {
         return;
@@ -426,17 +427,24 @@ fn drop_stale_schemas(maker: &PgClient) {
     if got.is_none() {
         return;
     }
+    // The registry names every test schema with its start time, in
+    // `public`, spelled in full: the maker's search path is the
+    // database's default, and no test schema holds the table.
     if let Ok(rows) = maker.query(
-        "SELECT nspname FROM pg_catalog.pg_namespace
-         WHERE nspname LIKE 'scion_test_%'
-           AND nspname NOT IN (
+        "SELECT r.schema FROM public.scion_test_schemas AS r
+         JOIN pg_catalog.pg_namespace AS n ON n.nspname = r.schema
+         WHERE r.started < extract(epoch from now())::bigint - 600
+           AND r.schema NOT IN (
                SELECT application_name FROM pg_catalog.pg_stat_activity
                WHERE application_name LIKE 'scion_test_%')",
         &[],
     ) {
         for row in rows {
             let name: String = row.get(0);
-            let _ = maker.batch(&format!("DROP SCHEMA IF EXISTS {name} CASCADE"));
+            let _ = maker.batch(&format!(
+                "DROP SCHEMA IF EXISTS {name} CASCADE;
+                 DELETE FROM public.scion_test_schemas WHERE schema = '{name}'"
+            ));
         }
     }
     let _ = maker.query_opt("SELECT pg_advisory_unlock($1)", &[P::i64(CLEAN_LOCK)]);
@@ -513,7 +521,11 @@ impl Pg {
                     client
                         .batch_execute(&format!(
                             "CREATE SCHEMA IF NOT EXISTS {name};
-                                 INSERT INTO scion_test_schemas (schema, started)
+                                 CREATE TABLE IF NOT EXISTS public.scion_test_schemas (
+                                     schema  TEXT PRIMARY KEY,
+                                     started BIGINT NOT NULL
+                                 );
+                                 INSERT INTO public.scion_test_schemas (schema, started)
                                  VALUES ('{name}', extract(epoch from now())::bigint)
                                  ON CONFLICT (schema) DO UPDATE SET started = excluded.started"
                         ))
