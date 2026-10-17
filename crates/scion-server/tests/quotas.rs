@@ -11,6 +11,7 @@ use scion_server::access::Access;
 use scion_server::meta::{MetaTx as _, RefState};
 use scion_server::quotas::Quotas;
 use scion_server::{Store, service};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::AsciiMetadataValue;
@@ -132,6 +133,7 @@ async fn server_with_tickets(
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
+            metrics: Arc::default(),
         },
         tickets.map(std::sync::Arc::new),
         async {

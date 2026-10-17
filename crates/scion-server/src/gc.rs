@@ -575,7 +575,7 @@ mod tests {
         );
         // A land whose deadline has passed stays pending: its changeset is
         // stored, so its puts are already live.
-        let lands = Lands::new(None);
+        let lands = Lands::new(None, None);
         let req = LandRequest {
             repo: REPO.to_owned(),
             changeset: tip,

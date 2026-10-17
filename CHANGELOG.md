@@ -69,6 +69,17 @@ until that section gets its release date.
 
 #### The server
 
+- Prometheus metrics on `scion-server --metrics-listen ADDR` (default off)
+  and `scion-cache --metrics-listen ADDR`: request counts by RPC and code,
+  a latency histogram with factor-4 buckets (1, 4, 16, 64, 256 ms, 1, 4,
+  16, 64 s), reply bytes by RPC, lands by outcome, and the tier's cache
+  hits and misses. The registry, the counting layer and the HTTP export
+  live in `scion-proto`, shared by the server and the tier. The listener
+  is plain HTTP on a loopback address unless `--insecure-listen` allows
+  more; it serves one connection at a time with a 5 s header read timeout,
+  and ends on the process's shutdown signal (Ctrl+C or SIGTERM). The
+  registry is atomics, so a request never takes a lock or allocates
+  (#144).
 - `scion-server`: SQLite metadata and trees, a blob folder with batched,
   verified durability, and one write path for changesets and their root
   trees. Group commit: concurrent blob syncs and database commits share one
@@ -146,7 +157,10 @@ until that section gets its release date.
   An older server ignores the new `path` field, so `scn log --path`
   against it prints unfiltered history.
 - `Blame`, a new RPC: which changeset last changed each line of a file, on
-  first-parent history. It follows renames as `git blame` does by
+  first-parent history. It walks versions through the path history, so it
+  reads one changeset and a few node rows per version, however many
+  changesets lie between two versions, and holds those node bytes of the
+  blame memory share. It follows renames as `git blame` does by
   default: a deleted file with the same content, else a similar one (50%
   or more). Each changeset in a reply names the path of the file there
   (`BlameChangeset.path`). `scn blame` shows each line's path when some

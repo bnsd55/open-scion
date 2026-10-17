@@ -94,6 +94,11 @@ struct Cli {
     /// connection over it is closed with them.
     #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
     max_stalled_bytes: NonZeroU64,
+    /// Serve Prometheus metrics over plain HTTP on this address. Off by
+    /// default. Follows the listen rule: a non-loopback address needs
+    /// `--insecure-listen`, because the metrics travel unencrypted.
+    #[arg(long, value_name = "ADDR")]
+    metrics_listen: Option<SocketAddr>,
 }
 
 #[tokio::main]
@@ -147,6 +152,32 @@ async fn main() -> anyhow::Result<()> {
             every,
         ));
     }
+    // One signal task ends the Objects listener and the metrics export
+    // alike.
+    let (end_tx, end_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(async move {
+        scion_proto::metrics::shutdown_signal().await;
+        let _ = end_tx.send(());
+    });
+    if let Some(metrics_listen) = cli.metrics_listen {
+        let address = metrics_listen.to_string();
+        let checked = scion_proto::metrics::loopback_or_allow(metrics_listen, cli.insecure_listen);
+        anyhow::ensure!(checked.is_ok(), "{}", checked.unwrap_err());
+        let metrics_listener = tokio::net::TcpListener::bind(metrics_listen)
+            .await
+            .with_context(|| format!("cannot listen on {address}"))?;
+        let metrics_addr = metrics_listener.local_addr()?;
+        tracing::info!(listen = %metrics_addr, "serving metrics");
+        let metrics = tier.metrics();
+        let mut stopped = end_rx.clone();
+        tokio::spawn(scion_proto::metrics::serve(
+            metrics_listener,
+            metrics,
+            async move {
+                let _ = stopped.changed().await;
+            },
+        ));
+    }
     let listener = tokio::net::TcpListener::bind(cli.listen)
         .await
         .with_context(|| format!("cannot listen on {}", cli.listen))?;
@@ -161,8 +192,9 @@ async fn main() -> anyhow::Result<()> {
         listen::tcp(listener),
         limits,
         server_tls,
-        async {
-            tokio::signal::ctrl_c().await.ok();
+        async move {
+            let mut end_rx = end_rx;
+            let _ = end_rx.changed().await;
         },
     ))
     .await?;

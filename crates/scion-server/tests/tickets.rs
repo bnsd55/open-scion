@@ -12,6 +12,7 @@ use scion_proto::v1::{GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectR
 use scion_server::meta::MetaTx as _;
 use scion_server::tickets::Keys;
 use scion_server::{Store, service};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tonic::Code;
 use tonic::service::interceptor::InterceptedService;
@@ -79,6 +80,7 @@ async fn server() -> (
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
+            metrics: Arc::default(),
         },
         Some(keys.clone().into()),
         async {
@@ -313,6 +315,7 @@ async fn server_of_readme() -> (
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
+            metrics: Arc::default(),
         },
         Some(keys.clone().into()),
         async {
@@ -544,6 +547,7 @@ async fn tiers() -> (Tiers, tokio::sync::oneshot::Sender<()>, tempfile::TempDir)
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
+            metrics: Arc::default(),
         },
         Some(keys.clone().into()),
         async {

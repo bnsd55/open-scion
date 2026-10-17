@@ -870,8 +870,11 @@ Tests compare the result with `git blame --first-parent`, line by line, on
 histories where they agree: edits, merges, a file that becomes a directory
 and a file again, and renames for each rule above.
 
-**Bounds and resume.** A `Blame` call checks at most 1,000 changesets
-(`MAX_SCAN`) on its walk, and reads one changeset per check. It also diffs
+**Bounds and resume.** A `Blame` call walks versions through the path
+history: the versions come from `history::newest_change`, so a call reads
+one changeset and a few node rows per version, however many changesets lie
+between two versions, and holds those node bytes of its memory share. It
+also diffs
 at most 100 versions, and about 1M lines (`MAX_BLAME_DIFF_LINES`, both
 sides of each diff, a line counts once per 64 bytes; a rename search counts
 each chunk it reads, each row of a chunk table it indexes or compares, and
@@ -951,12 +954,10 @@ the repo, that the runs fill the window, and that every open line's place
 is inside the version at the walk's position, and takes the cursor's bytes
 and state from the blame memory budget before it reads them. Each new
 window re-walks from the changeset of the request: the walk from the tip
-to where the cursor stopped costs one `MAX_SCAN` check per changeset, a
-few reads per changeset, and re-reads the versions' trees but not their
-file texts (the cursor carries the line state, so the call diffs only the
-versions of its window). `scn blame` asks again until the cursor is empty.
-Blame from the path history will remove these
-bounds ([#61](https://github.com/bnsd55/open-scion/issues/61)).
+to where the cursor stopped reads the path history again, a few node rows
+per version, and re-reads the versions' trees but not their file texts
+(the cursor carries the line state, so the call diffs only the versions of
+its window). `scn blame` asks again until the cursor is empty.
 
 **Graph and diff queries** (`read::merge_base`, `read::is_ancestor`,
 `read::diff`). The article lists computing diffs and finding merge bases
@@ -1531,10 +1532,10 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-core/src/codec.rs` (`put_len`) | Encoding panics if a field is longer than `u32::MAX`. Every ingest path caps sizes far below that. | `try_encode` returning `Result`, if a path ever does not. | |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
 | `scion-server/src/store.rs` (`flush_dirs`) | The power-loss suite cannot catch a lost fsync of a blob directory: LazyFS persists a rename at rename time, so the cut never drops a directory entry. The `fsync` of each directory after a rename (section 3) is therefore untested by that suite. | A block-level replay that drops un-flushed writes in order (dm-log-writes replay to each FLUSH), when a bug report or a change to the rename path says a directory entry was lost. | |
+| `scion-server/src/main.rs` (`Command`) | The `Serve` subcommand holds its flags by value: 309 bytes against `Import`'s 109, 20 bytes over `clippy::large_enum_variant`, so the lint is off for the enum. | Box the TLS and ticket paths of `Serve` if a variant grows further. | |
 | `scion-server/src/import.rs` (`TX_BUDGET`) | A transaction of an import ends at 1 s, but one commit's record and check can run longer, and a server write then waits for it. Ceiling: the changes and trees of the biggest commit. | A separate write connection for the import, or per-statement yields. | [#100](https://github.com/bnsd55/open-scion/issues/100) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | Per-ref serialization in a shared database ([design](design/scalable-backend.md)). | [#47](https://github.com/bnsd55/open-scion/issues/47) |
 | `scion-server/src/objects.rs` (`find`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
-| `scion-server/src/read.rs` (`MAX_SCAN`) | Blame walks first parents on every call, at most 1,000 changesets per call. A file changed long ago costs many calls. | Blame from the path history. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
 | `scion-server/src/tree.rs` (`Dir::store`) | A change rewrites each directory on its paths whole: a tree of every live name. With names of 12 bytes, a write in a directory of 10,000 names stores 500 KB of tree. | Trees cut into chunks, so a write stores only the chunks it changes. Trees need a new format for it. | [#114](https://github.com/bnsd55/open-scion/issues/114) |
 | `scion-server/src/history.rs` (`Edit::stored`) | An edit of a chunked level holds and re-encodes the whole chunk index of the level, so a write re-stores the index row that changed: about 32 KB at 100,000 names, about 2.7 MB at 10M. | Keep the index stacked in the edit, and edit one index chunk per level of the stack. | [#114](https://github.com/bnsd55/open-scion/issues/114) |
 | `scion-server/src/blame.rs` (`MAX_BLAME_VERSIONS`) | One call diffs at most 100 versions of a file. A file with more versions costs more calls. | Blame as derived data, kept per file version. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
@@ -1632,3 +1633,47 @@ stored copy. A damaged copy on the daemon is fetched again. A damaged blob
 on the server ends each tier's reply with `DATA_LOSS`, and no tier keeps it.
 One known difference is left out: a tier sends an object that it holds for
 any valid repo name ([#13](https://github.com/bnsd55/open-scion/issues/13)).
+
+## 11. Metrics
+
+`scion-server --metrics-listen 127.0.0.1:9090` and
+`scion-cache --metrics-listen 127.0.0.1:9091` serve a Prometheus text
+registry (format 0.0.4) at `GET /metrics`, one reply per connection. The
+flag is off by default; a server without it answers exactly as before. The
+listener is plain HTTP without any token, so like every other listener it
+is refused on a non-loopback address unless `--insecure-listen` is given;
+TLS does not change that, because the endpoint is unauthenticated by
+design.
+
+The registry, the counting layer and the HTTP export live in
+`scion-proto`, and the server and a tier share one implementation: the
+tier serves the `Objects` calls through the same layer and adds its cache
+counters to the same registry. The registry is a fixed set of atomics. A
+call counts its metrics on the request path without taking a lock or
+allocating: it increments counters, and its latency and byte counts go
+into fixed buckets. The values are read on export only.
+
+| Metric | Kind | Meaning |
+|---|---|---|
+| `scion_requests_total{rpc,code}` | counter | Every counted RPC by path (`Scion/Blame`, `Objects/GetObjects`, ...) and gRPC status. |
+| `scion_request_seconds{rpc}` | histogram | A call's duration from the moment the layer sees the request until the reply ends or is dropped. Buckets at 1, 4, 16, 64, 256 ms and 1, 4, 16, 64 s, then `+Inf`. |
+| `scion_rpc_bytes_total{rpc,direction}` | counter | Reply bytes out; request bytes in, counted from the `content-length` header, which a gRPC client does not send. |
+| `scion_lands_total{outcome}` | counter | Lands by outcome: `landed`, `conflict`, `rejected`, `retry` (a pending land waits for its retry). |
+| `scion_cache_hits_total`, `scion_cache_misses_total` | counter | A tier's object reads served from its store or its snapshot, and read from upstream. A tier's scrape also shows its `Objects` calls in `scion_requests_total` and `scion_request_seconds`. |
+
+The layer sits inside the axum router, around both gRPC services and
+outside the access checks. A refusal (bad token, unknown repo, a budget
+exhausted) is a trailers-only reply whose code is in the reply's headers,
+not in a body trailer, so the layer reads the code from the headers and
+counts the call at once. A streamed reply counts when the client reads it
+to the end or drops it: a dropped reply counts as `cancelled`. The `ok`
+line of a streamed RPC therefore grows only as replies complete, and the
+cancelled line shows clients that went away mid-stream. An unknown gRPC
+code is counted as `unrecognised`.
+
+The export is hyper's HTTP/1 server, one connection at a time: no keep
+alive, a 5 s header read timeout, so a silent client cannot hold it, and
+a reply only to `GET /metrics`. It ends with the process's shutdown
+signal (Ctrl+C or SIGTERM), the same one that ends the gRPC listener. A
+test reads `proto/scion.proto` and fails when an rpc has no slot in the
+registry's table.
