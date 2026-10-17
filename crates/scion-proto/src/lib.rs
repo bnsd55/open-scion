@@ -14,6 +14,7 @@ pub mod listen;
 pub mod metrics;
 pub mod object;
 pub mod reply;
+pub mod request_id;
 pub mod ticket;
 pub mod tls;
 

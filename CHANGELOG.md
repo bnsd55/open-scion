@@ -82,6 +82,14 @@ until that section gets its release date.
 
 #### The server
 
+- One request ID per client operation, carried through every hop
+  (`#144` follow-up). `scn` makes one 16-digit hex ID per command and
+  sends it on every call in `x-request-id`; a tier forwards the ID its
+  caller sent. Every served call records it as the `request_id` field of
+  its `call` span, so one
+  checkout can be followed across scn, daemon, cache and server logs. A
+  header over 64 bytes, or not visible ASCII, is dropped whole: nothing
+  of it is logged.
 - Prometheus metrics on `scion-server --metrics-listen ADDR` (default off)
   and `scion-cache --metrics-listen ADDR`: request counts by RPC and code,
   a latency histogram with factor-4 buckets (1, 4, 16, 64, 256 ms, 1, 4,

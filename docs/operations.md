@@ -259,7 +259,11 @@ serves no gRPC reflection, so a probe tool must know the health protocol
 itself (`grpc_health_probe` does).
 
 **The log lines.** Every process logs to stderr with `tracing`; the lines
-that mean something:
+that mean something. Every line of a call carries the `call` span's
+fields, `rpc`, `peer` and `request_id`: one `scn` command sends one
+`x-request-id` through every hop, so a grep for `request_id=<id>` in the
+logs of scn, the daemon, the cache and the server shows the whole path
+of one operation.
 
 - `the call is unauthenticated` — a call without a valid token. A few are
   normal (a scanner, a stale client); a stream of them is a client with a
