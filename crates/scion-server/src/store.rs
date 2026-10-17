@@ -24,6 +24,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, ErrorKind, Read, Seek, Write};
 use std::ops::Deref;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -152,11 +153,29 @@ impl Store {
     /// Opens a data directory for a process of build `build` ([`build`]).
     fn open_as(dir: &Path, server: bool, build: &str) -> Result<Self> {
         fs::create_dir_all(dir)?;
+        // The blobs and the metadata are only as private as the directory:
+        // a group- or others-writable directory lets another user read or
+        // replace them, and so does one under a directory another user can
+        // change.
+        let me = rustix::process::geteuid().as_raw();
+        let meta = fs::symlink_metadata(dir)?;
+        if meta.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "{} can be written by group or others (fix: chmod go-w {})",
+                    dir.display(),
+                    dir.display()
+                ),
+            )
+            .into());
+        }
+        let dir = scion_proto::auth::check_ancestors(dir, me)?;
         // A second server fails here, before it waits for anything.
         let server_lock = if server {
-            let file = lock_file(dir, "server.lock")?;
+            let file = lock_file(&dir, "server.lock")?;
             if !flock(&file, FlockOperation::NonBlockingLockExclusive)? {
-                return Err(in_use(dir, "server.lock", "another server"));
+                return Err(in_use(&dir, "server.lock", "another server"));
             }
             Some(file)
         } else {
@@ -166,12 +185,12 @@ impl Store {
         // one ends. If `lock` can be taken exclusive, no other process uses
         // the directory. Shared from then on, it keeps out a process of an
         // older build, which holds it exclusive for its whole life.
-        let opening = lock_file(dir, "open.lock")?;
+        let opening = lock_file(&dir, "open.lock")?;
         flock(&opening, FlockOperation::LockExclusive)?;
-        let lock = lock_file(dir, "lock")?;
+        let lock = lock_file(&dir, "lock")?;
         let alone = flock(&lock, FlockOperation::NonBlockingLockExclusive)?;
         if !flock(&lock, FlockOperation::NonBlockingLockShared)? {
-            return Err(in_use(dir, "lock", "a process that holds it alone"));
+            return Err(in_use(&dir, "lock", "a process that holds it alone"));
         }
         // The first process writes its build into `lock`, and every other
         // one must have the same build.
@@ -189,7 +208,7 @@ impl Store {
                 )));
             }
         }
-        let blobs = Blobs::open(dir)?;
+        let blobs = Blobs::open(&dir)?;
         // Every open removes the folders of dead processes; only an open
         // that is alone also removes files, which a build older than the
         // folders may have left.
@@ -1449,6 +1468,44 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn an_open_refuses_a_data_directory_that_group_or_others_can_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let writable = |path: &Path| {
+            let mut mode = fs::metadata(path).unwrap().permissions();
+            mode.set_mode(0o777);
+            fs::set_permissions(path, mode).unwrap();
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        fs::create_dir(&path).unwrap();
+        writable(&path);
+        let Err(err) = Store::open(&path) else {
+            panic!("the open of a writable data directory must fail");
+        };
+        assert!(
+            err.to_string()
+                .contains("can be written by group or others"),
+            "{err}"
+        );
+        // The same through a parent that another user can change: a
+        // group-writable directory without the sticky bit above the data.
+        let parent = dir.path().join("shared");
+        fs::create_dir(&parent).unwrap();
+        writable(&parent);
+        let path = parent.join("data");
+        fs::create_dir(&path).unwrap();
+        let Err(err) = Store::open(&path) else {
+            panic!("the open under a swappable parent must fail");
+        };
+        assert!(
+            err.to_string().contains("could swap")
+                || err.to_string().contains("not private")
+                || err.to_string().contains("owned by another user"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn a_blob_size_comes_from_its_frame_header() {
