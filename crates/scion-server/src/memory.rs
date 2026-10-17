@@ -220,6 +220,35 @@ mod tests {
     }
 
     #[test]
+    fn keep_gives_the_rest_back_at_once() {
+        let bytes = Bytes::new(100);
+        let mut held = bytes.take(60, None).expect("fits");
+        held.keep(10);
+        assert_eq!(held.n, 10, "keep holds the kept part");
+        // The other 50 are free again: a take of them succeeds at once.
+        let rest = bytes.try_take(50).expect("keep freed the rest");
+        drop((held, rest));
+        assert!(bytes.try_take(100).is_ok(), "the whole pool came back");
+    }
+
+    #[test]
+    fn keep_wakes_a_waiter_for_the_bytes_it_gives_back() {
+        let bytes = Arc::new(Bytes::new(100));
+        let mut held = bytes.take(60, None).expect("fits");
+        let waiter = {
+            let bytes = Arc::clone(&bytes);
+            std::thread::spawn(move || {
+                let until = Instant::now() + Duration::from_millis(500);
+                bytes.take(50, Some(until))
+            })
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        held.keep(10);
+        let got = waiter.join().unwrap().expect("keep woke the waiter");
+        drop((held, got));
+    }
+
+    #[test]
     fn a_call_that_holds_bytes_never_waits_for_more() {
         let bytes = Bytes::new(100);
         let held = bytes.take(60, None).expect("fits");
