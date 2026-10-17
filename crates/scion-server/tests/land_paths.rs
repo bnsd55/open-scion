@@ -174,12 +174,17 @@ fn a_land_replans_when_imports_move_its_ref() {
     // to move the ref in between. It stops after a few moves, so a later
     // attempt of the loop can land.
     let stop = Arc::new(AtomicBool::new(false));
+    // How many imports moved main so far; the test requires that at least
+    // one move landed while the land ran, so the test cannot pass without
+    // the ref racing the land.
+    let rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let racer = {
         let store = f.store.clone();
         let stop = Arc::clone(&stop);
+        let rounds = Arc::clone(&rounds);
         std::thread::spawn(move || {
-            let mut rounds = 0;
-            while !stop.load(Ordering::SeqCst) && rounds < 4 {
+            let mut done = 0;
+            while !stop.load(Ordering::SeqCst) && done < 6 {
                 std::thread::sleep(Duration::from_millis(2));
                 let moved = store
                     .write(|c| {
@@ -189,7 +194,7 @@ fn a_land_replans_when_imports_move_its_ref() {
                             parents: vec![head.target],
                             author: author(),
                             committer: None,
-                            message: format!("import {rounds}").into_bytes(),
+                            message: format!("import {done}").into_bytes(),
                             changes: [].into(),
                         };
                         let id = c.insert_changeset(repo, &cs)?;
@@ -197,7 +202,8 @@ fn a_land_replans_when_imports_move_its_ref() {
                     })
                     .unwrap();
                 if moved {
-                    rounds += 1;
+                    done += 1;
+                    rounds.fetch_add(1, Ordering::SeqCst);
                 }
             }
         })
@@ -205,9 +211,12 @@ fn a_land_replans_when_imports_move_its_ref() {
     std::thread::sleep(Duration::from_millis(2));
 
     // The land lands although imports move the ref while it runs.
+    let during = rounds.load(Ordering::SeqCst);
     let out = lands.land(&f.store, &caller(), &req(cs, "k")).unwrap();
+    let raced_in = rounds.load(Ordering::SeqCst) - during;
     stop.store(true, Ordering::SeqCst);
     racer.join().unwrap();
+    assert!(raced_in >= 1, "no import moved main while the land ran");
 
     assert_eq!(out.state, LandState::Landed, "{}", out.detail);
     let landed = out.result.expect("landed");
