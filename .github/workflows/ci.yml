@@ -106,6 +106,15 @@ jobs:
         env:
           SCION_LAZYFS: ${{ runner.temp }}/lazyfs
         run: cargo test -p open-scion-server --test power
+      # The suite writes the LazyFS ops trace to /tmp/lazyfs-r<N>.log; on a
+      # failure the trace says what the cut actually persisted.
+      - name: upload the LazyFS trace
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lazyfs-trace
+          path: /tmp/lazyfs-r*.log
+          if-no-files-found: ignore
 
   publish-check:
     name: publish check

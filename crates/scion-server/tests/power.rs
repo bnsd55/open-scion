@@ -108,10 +108,10 @@ impl Lazyfs {
                 "[faults]\nfifo_path=\"{}\"\nfifo_path_completed=\"{}\"\n\
                  [cache]\napply_eviction=false\n[cache.simple]\n\
                  custom_size=\"256mb\"\nblocks_per_page=1\n\
-                 [filesystem]\nlog_all_operations=false\nlogfile=\"{}\"\n",
+                 [filesystem]\nlog_all_operations=true\nlogfile=\"{}\"\n",
                 fifo.display(),
                 completed_path.display(),
-                round_dir.join("lazyfs.log").display(),
+                format!("/tmp/lazyfs-r{round}.log"),
             ),
         )
         .unwrap();
