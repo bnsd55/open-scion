@@ -26,7 +26,7 @@ use std::io::{self, ErrorKind, Read, Seek, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -83,6 +83,18 @@ pub(crate) const READERS: usize = 8;
 /// beyond the cap only repeat work and starve writes ([#142]).
 pub(crate) const DERIVE_WALKS_CAP: usize = 8;
 
+/// Counts one writer that is waiting for the write connection, and
+/// subtracts it again when the writer gets in or gives up. A derive walk
+/// between steps checks the count, and pauses long enough for a waiting
+/// writer to take the connection before the walk's next step.
+struct WriteWaiter<'a>(&'a AtomicUsize);
+
+impl Drop for WriteWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
 struct Inner {
     /// Read-only connections for [`Store::read`]. They come before `db`, so
     /// they close first: the last connection to close checkpoints the log,
@@ -117,6 +129,10 @@ struct Inner {
     /// The derive walks of this store: which are in flight, and the cap
     /// on how many may be.
     derive: DeriveFlights,
+    /// Writers that are waiting for the write connection. A derive walk
+    /// checks the count between its steps, and lets a waiting writer in
+    /// before it takes the connection again.
+    write_waiters: AtomicUsize,
 }
 
 impl Store {
@@ -256,8 +272,15 @@ impl Store {
                 txes: AtomicU64::new(0),
                 fail_commits: AtomicU64::new(0),
                 derive: DeriveFlights::new(walks_cap),
+                write_waiters: AtomicUsize::new(0),
             }),
         })
+    }
+
+    /// How many writers are waiting for the write connection.
+    #[must_use]
+    pub(crate) fn write_waiters(&self) -> usize {
+        self.inner.write_waiters.load(Ordering::Acquire)
     }
 
     /// The derive walks of this store: which are in flight, and the cap on
@@ -403,6 +426,8 @@ impl Store {
     ///
     /// Returns what `f` returns, or a database error from begin or commit.
     pub fn commit<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
+        self.inner.write_waiters.fetch_add(1, Ordering::Relaxed);
+        let _waiting = WriteWaiter(&self.inner.write_waiters);
         let mut db = self.lock();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = f(&mut SqliteTx(&tx))?;

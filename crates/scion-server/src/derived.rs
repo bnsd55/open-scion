@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use scion_core::{Changeset, ChangesetId};
 
@@ -591,6 +591,14 @@ fn derive_steps<K: Kind>(
             remove_old::<K>(c)?;
             Ok(value)
         })?;
+        // A writer that waited for the connection while this step held it
+        // gets in before the next step takes it again. Without the pause,
+        // a walk re-locks the connection for every step, and a parked
+        // writer waits for the whole walk: the mutex hands the connection
+        // to the running walker, not to the parked writer ([#142]).
+        if store.write_waiters() > 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
     Ok(value)
 }
@@ -1734,7 +1742,7 @@ mod tests {
             // transactions, four seconds of holding; the land finishes in
             // well under the first two walkers' four transactions.
             assert!(
-                waited < Duration::from_millis(2_500),
+                waited < Duration::from_millis(1_500),
                 "the land waited {waited:?}"
             );
             COLD_SLEEP.store(0, Ordering::Relaxed);
