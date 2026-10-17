@@ -123,7 +123,7 @@ pub async fn log(ctx: &mut Ctx, rev: &str, path: Option<&RepoPath>, limit: u32) 
     let mut next = Some(ctx.resolve(rev).await?);
     let mut entries = Vec::new();
     while let Some(from) = next.filter(|_| entries.len() < limit as usize) {
-        let reply = ctx
+        let mut pages = ctx
             .client
             .log(LogRequest {
                 repo: ctx.repo.clone(),
@@ -134,11 +134,25 @@ pub async fn log(ctx: &mut Ctx, rev: &str, path: Option<&RepoPath>, limit: u32) 
             .await
             .with_context(|| format!("cannot read the log of {rev}"))?
             .into_inner();
-        for entry in &reply.entries {
-            let id = id_from(&entry.changeset_id)?;
-            entries.push((id, decode_changeset(id, &entry.changeset)?));
+        // Each part is a page of entries; the last part's
+        // `next_changeset_id` is where the history walk stopped.
+        let mut joined = 0usize;
+        loop {
+            let page = pages
+                .message()
+                .await
+                .with_context(|| format!("cannot read the log of {rev}"))?;
+            let Some(page) = page else { break };
+            for entry in &page.entries {
+                let id = id_from(&entry.changeset_id)?;
+                joined += entry.changeset.len();
+                if joined > MAX_JOINED_REPLY_BYTES {
+                    bail!("the log of {rev} is over the {MAX_JOINED_REPLY_BYTES} a client joins");
+                }
+                entries.push((id, decode_changeset(id, &entry.changeset)?));
+            }
+            next = opt_id(&page.next_changeset_id)?;
         }
-        next = opt_id(&reply.next_changeset_id)?;
     }
     if ctx.json {
         let entries: Vec<Value> = entries

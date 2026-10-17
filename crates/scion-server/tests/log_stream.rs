@@ -1,0 +1,159 @@
+//! `Log` streams its entries in parts, as `ListDir` and `GetChangeset`
+//! stream theirs: the parts take the one counted path, so a client that
+//! stops reading is counted and cut off. The unary replies that are left
+//! carry a guard cap: a reply whose encoding is over it is refused, so the
+//! documented ceiling of the unary memory a client that never reads holds
+//! does not depend on today's RPC list.
+
+use std::num::NonZeroU64;
+use std::sync::Arc;
+use std::time::Duration;
+
+use scion_core::{Changeset, FileState, RepoPath};
+use scion_proto::auth::Bearer;
+use scion_proto::listen::Limits;
+use scion_proto::v1::LogRequest;
+use scion_proto::v1::scion_client::ScionClient;
+use scion_server::meta::MetaTx as _;
+use scion_server::metrics::Metrics;
+use scion_server::tree;
+use scion_server::{Store, service};
+use tonic::codec::Streaming;
+use tonic::service::interceptor::InterceptedService;
+use tonic::transport::Channel;
+
+const REPO: &str = "main";
+const TOKEN: &str = "secret";
+
+type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
+
+/// A repo whose chain of `count` changesets each change one file, with a
+/// `name_len`-byte author name, so a `Log` or `Blame` reply of it grows by
+/// about `name_len` per entry.
+fn chain(
+    count: usize,
+    name_len: usize,
+) -> (tempfile::TempDir, Store, Vec<scion_core::ChangesetId>) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let ids = store
+        .write(|c| {
+            let repo = c.create_repo(REPO)?;
+            let mut ids = Vec::new();
+            for i in 0..count {
+                let mut content = Vec::new();
+                for line in 0..=i {
+                    content.extend_from_slice(format!("line {line}\n").as_bytes());
+                }
+                let regular = FileState::Regular {
+                    content: store.blobs().put(&content).unwrap(),
+                    executable: false,
+                };
+                let cs = Changeset {
+                    parents: ids.last().copied().into_iter().collect(),
+                    author: scion_core::IdentityTime {
+                        name: vec![b'a'; name_len],
+                        email: b"t@x".to_vec(),
+                        unix_secs: 1_700_000_000,
+                        tz_offset_minutes: 0,
+                    },
+                    committer: None,
+                    message: format!("change {i}\n").into_bytes(),
+                    changes: [(RepoPath::new(b"d/f.txt").unwrap(), Some(regular))].into(),
+                };
+                ids.push(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0);
+            }
+            Ok(ids)
+        })
+        .unwrap();
+    (dir, store, ids)
+}
+
+/// Serves `store` with `limits`.
+async fn serve(store: Store, limits: Limits) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(service::serve(
+        store,
+        listener,
+        TOKEN,
+        service::ServeOptions {
+            limits,
+            quotas: scion_server::quotas::Quotas::off(),
+            pending_lands: None,
+            land_stale_secs: 1 << 40,
+            tls: None,
+            metrics: Arc::new(Metrics::default()),
+        },
+        None,
+        std::future::pending(),
+    ));
+    format!("http://{addr}")
+}
+
+async fn client(url: &str) -> Scion {
+    // The smallest windows, as the stall tests of `listen.rs` build their
+    // clients: with the defaults, the client's connection buffers take a
+    // whole reply of a few parts, and nothing stalls.
+    let channel = Channel::from_shared(url.to_owned())
+        .unwrap()
+        .initial_stream_window_size(65_535)
+        .initial_connection_window_size(65_535)
+        .connect()
+        .await
+        .unwrap();
+    ScionClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap())
+}
+
+/// A `Log` call whose reply the caller never reads.
+async fn stalled_log(client: &mut Scion, from: &[u8]) -> Streaming<scion_proto::v1::LogResponse> {
+    client
+        .log(LogRequest {
+            repo: REPO.to_string(),
+            changeset_id: from.to_vec(),
+            limit: 1_000,
+            path: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+}
+
+/// A client that stops reading: the parts of the reply pile up in HTTP/2,
+/// the reply's producer stops at its stall, and the stalled bytes go on the
+/// connection's count. Past `--max-stalled-bytes` the connection closes, so
+/// the stalled stream ends with the transport error. The clock is paused
+/// and moved past the stall, so the test does not wait the real 120 s out.
+/// The reply stays unread until the end: reading it grants the client's
+/// HTTP/2 windows back, and the reply flows instead of stalling.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_log_reply_is_counted_and_closes_the_connection() {
+    // Twenty changesets with 300 KB messages each: the tip's page is about
+    // six parts, and the client's connection takes under two, so a client
+    // that never reads stalls the producer inside the reply.
+    let (_data, store, ids) = chain(20, 300_000);
+    // The cap of the test connection: one stalled reply of 4 MiB is over it.
+    let limits = Limits {
+        stalled_bytes: NonZeroU64::new(1 << 20).unwrap(),
+        ..Limits::default()
+    };
+    let url = serve(store, limits).await;
+    let mut client = client(&url).await;
+
+    let tip = ids[ids.len() - 1];
+    let mut reply = stalled_log(&mut client, tip.as_bytes()).await;
+
+    // The clock moves only when every task waits, and the reply's parts
+    // travel over real sockets, so the stall is waited out in steps while
+    // the tasks run. The reply stays unread: its client reads nothing.
+    for _ in 0..140 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+    }
+    // The count is over the cap: the connection's read side failed, and
+    // hyper closed the connection, so the stalled stream ends with the
+    // transport error. A clean end would mean the reply flowed, and
+    // nothing was counted.
+    let end = reply.message().await;
+    assert!(end.is_err(), "the stalled reply was not cut off: {end:?}");
+}

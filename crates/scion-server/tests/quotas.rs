@@ -275,7 +275,7 @@ async fn a_principal_at_its_cap_is_refused_while_another_goes_on() {
     assert!(denied.to_string().contains("--max-principal-requests 1"));
 
     // Bob is under his own cap: while alice is held, his calls complete.
-    client(channel.clone(), "bob")
+    let mut pages = client(channel.clone(), "bob")
         .log(LogRequest {
             repo: REPO.to_string(),
             changeset_id: main_ref(&store).target.as_bytes().to_vec(),
@@ -283,7 +283,9 @@ async fn a_principal_at_its_cap_is_refused_while_another_goes_on() {
             path: Vec::new(),
         })
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner();
+    while pages.message().await.unwrap().is_some() {}
     let _ = probe(&client(channel.clone(), "bob")).await;
 
     // Alice ends her upload, so her slot comes back and her next request

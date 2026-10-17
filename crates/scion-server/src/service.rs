@@ -6,7 +6,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use scion_core::{BlobId, ChangesetId, FileState, RepoPath};
+use scion_core::{BlobId, Changeset, ChangesetId, FileState, RepoPath};
 use scion_proto::listen::{self, Limits};
 use scion_proto::tls::ServerTls;
 use scion_proto::v1::scion_server::{Scion, ScionServer};
@@ -43,7 +43,6 @@ use crate::tickets::Keys;
 use crate::{blame, names, read, write};
 
 /// Most changeset bytes in one `Log` reply; the client pages for more.
-const LOG_BUDGET_BYTES: usize = MAX_MESSAGE_BYTES / 2;
 /// Most store operations running at once.
 const MAX_BLOCKING: usize = 256;
 /// Most uploads read at once. Each holds one request message in memory, of up
@@ -407,9 +406,11 @@ pub(crate) async fn resolve_ref(
     let id = worker
         .run(move |store| read::resolve_ref(&store, &repo, &name))
         .await?;
-    Ok(ResolveRefResponse {
+    let reply = ResolveRefResponse {
         changeset_id: id.as_bytes().to_vec(),
-    })
+    };
+    check_unary(&reply)?;
+    Ok(reply)
 }
 
 fn parse_path(bytes: Vec<u8>) -> Result<RepoPath, Status> {
@@ -466,6 +467,36 @@ type ReadFileStream = ReceiverStream<Part<ReadFileResponse>>;
 type GetChangesetStream = ReceiverStream<Part<GetChangesetResponse>>;
 
 type ListDirStream = ReceiverStream<Part<ListDirResponse>>;
+
+type LogStream = ReceiverStream<Part<LogResponse>>;
+
+/// The largest encoded reply of a unary call: the largest message any
+/// client accepts (section 2 of protocol-v1). A streamed reply is counted
+/// on its connection when the client stops reading (see `send_parts`); a
+/// unary reply is not, so its size is capped here instead, on the encoding
+/// side of the same limit: at the defaults, the ceiling of the unary
+/// memory a client that never reads can hold is connections x streams x
+/// this. `Blame` reaches it: a file whose every line changes in every
+/// version of the walk has a range per diffed line.
+///
+/// SHORTCUT: a unary reply's bytes stay in HTTP/2 uncounted until the
+/// client reads them or the connection closes; the cap bounds the encoded
+/// bytes at the message limit. Stream a reply if a client that never
+/// reads it matters more than the protocol change.
+pub(crate) const MAX_UNARY_REPLY_BYTES: usize = scion_proto::MAX_MESSAGE_BYTES;
+
+/// Refuses a unary reply whose encoding would be over
+/// [`MAX_UNARY_REPLY_BYTES`], so the documented ceiling holds by
+/// construction and not by today's RPC list.
+pub(crate) fn check_unary<T: prost::Message>(msg: &T) -> Result<(), Status> {
+    let len = msg.encoded_len();
+    if len > MAX_UNARY_REPLY_BYTES {
+        return Err(Status::resource_exhausted(format!(
+            "the reply would hold {len} bytes, over the {MAX_UNARY_REPLY_BYTES} a reply message may hold"
+        )));
+    }
+    Ok(())
+}
 
 /// The share of `READ_BUDGET_BYTES` that a `ReadFile` reply of a `size`-byte
 /// file holds. A file of one part is read in one job, so the reply holds only
@@ -561,6 +592,159 @@ impl Parts {
 /// the channel only when the channel is empty, so its second slot is always
 /// free for the error that ends a reply early: a store error, or the stall.
 /// A client never takes a short reply for a whole one.
+/// Runs a graph query on `permits`, the way [`ScionService::graph_query`]
+/// does, for a page of a streamed `Log` reply.
+async fn run_graph_query<T, F>(
+    worker: &Worker,
+    permits: &Arc<Semaphore>,
+    deadline: Deadline,
+    query: F,
+) -> Result<T, Status>
+where
+    T: Send + 'static,
+    F: FnOnce(&Store, &Deadline) -> Result<T> + Send + 'static,
+{
+    // The query checks it at each read: a request timeout, or a client
+    // that cancels, drops this call but not a job that is running. The
+    // guard ends the deadline when this call ends or is dropped.
+    let _call = deadline.guard();
+    let slot = Arc::clone(permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| Status::unavailable("server is shutting down"))?;
+    worker
+        .run(move |store| {
+            let _slot = slot;
+            query(&store, &deadline)
+        })
+        .await
+}
+
+/// What a streamed `Log` reply still has to walk: where the last page
+/// stopped, how many entries the call still owes, and the bounds of the
+/// next page.
+struct LogWalk {
+    worker: Worker,
+    repo: String,
+    graph_queries: Arc<Semaphore>,
+    /// The request slot, held until the reply ends.
+    _call: Call,
+    next: Option<ChangesetId>,
+    left: usize,
+    path: Option<RepoPath>,
+    deadline: Deadline,
+    stalled: Option<scion_proto::listen::Stalled>,
+}
+
+/// Splits a fetched page into parts: groups of entries whose encoded bytes
+/// stay within [`CHUNK_BYTES`], one part each. The last part carries where
+/// the walk continues; the walk stops, with the rest of the page unsent, at
+/// the `limit` of the call.
+fn log_page_parts(entries: Vec<(ChangesetId, Changeset)>, walk: &mut LogWalk) -> Vec<LogResponse> {
+    let mut parts = Vec::new();
+    let mut group: Vec<LogEntry> = Vec::new();
+    let mut bytes = 0usize;
+    for (id, changeset) in entries {
+        if walk.left == 0 {
+            // The call owes no more entries: this one starts the next call.
+            walk.next = Some(id);
+            break;
+        }
+        let body = changeset.encode();
+        if !group.is_empty() && bytes + body.len() > CHUNK_BYTES {
+            bytes = 0;
+            parts.push(LogResponse {
+                entries: std::mem::take(&mut group),
+                next_changeset_id: Vec::new(),
+            });
+        }
+        bytes += body.len();
+        walk.left -= 1;
+        group.push(LogEntry {
+            changeset_id: id.as_bytes().to_vec(),
+            changeset: body,
+        });
+    }
+    parts.push(LogResponse {
+        entries: group,
+        next_changeset_id: id_bytes(walk.next),
+    });
+    parts
+}
+
+/// Streams a `Log` reply: sends the parts of the first page, then fetches
+/// the page after it and sends that, until the history ends, the call has
+/// served `limit` entries, or the client stops taking parts. A stall counts
+/// [`STALLED_REPLY_BYTES`] on the connection, as any streamed reply does.
+async fn log_parts(mut walk: LogWalk, page: read::LogPage, tx: mpsc::Sender<Part<LogResponse>>) {
+    let fail = |status: Status| {
+        // Fails only if the client has gone.
+        let _ = tx.try_send(Err(status));
+    };
+    macro_rules! send {
+        ($part:expr) => {
+            match tokio::time::timeout(READ_STALL_TIMEOUT, tx.reserve_many(2)).await {
+                Ok(Ok(mut slots)) => {
+                    if let Some(slot) = slots.next() {
+                        slot.send(Ok($part));
+                    }
+                }
+                Ok(Err(_)) => return,
+                Err(_) => {
+                    // The parts of the reply stay in HTTP/2 until the
+                    // connection ends; the connection counts them.
+                    if let Some(stalled) = &walk.stalled {
+                        stalled.add(scion_proto::reply::STALLED_REPLY_BYTES);
+                    }
+                    let detail = format!("the client took no data for {READ_STALL_TIMEOUT:?}");
+                    return fail(Status::deadline_exceeded(detail));
+                }
+            }
+        };
+    }
+    let mut page = page;
+    loop {
+        for part in log_page_parts(std::mem::take(&mut page.entries), &mut walk) {
+            send!(part);
+        }
+        if walk.left == 0 {
+            return;
+        }
+        let Some(from) = walk.next else {
+            return;
+        };
+        let limit = walk.left.min(read::MAX_SCAN);
+        page = if let Some(path) = walk.path.clone() {
+            let repo = walk.repo.clone();
+            let deadline = walk.deadline.clone();
+            match run_graph_query(
+                &walk.worker,
+                &walk.graph_queries,
+                deadline,
+                move |store, deadline| {
+                    read::log_page(store, &repo, from, Some(&path), limit, deadline)
+                },
+            )
+            .await
+            {
+                Ok(page) => page,
+                Err(status) => return fail(status),
+            }
+        } else {
+            let worker = walk.worker.clone();
+            let repo = walk.repo.clone();
+            let deadline = walk.deadline.clone();
+            match worker
+                .run(move |store| read::log_page(&store, &repo, from, None, limit, &deadline))
+                .await
+            {
+                Ok(page) => page,
+                Err(status) => return fail(status),
+            }
+        };
+    }
+}
+
 async fn send_parts<T: Send + 'static>(
     mut parts: Parts,
     _share: OwnedSemaphorePermit,
@@ -695,9 +879,11 @@ impl Scion for ScionService {
             .worker
             .run(move |store| write::put_blob(&store, repo, upload))
             .await?;
-        Ok(Response::new(PutBlobResponse {
+        let reply = PutBlobResponse {
             blob_id: id.as_bytes().to_vec(),
-        }))
+        };
+        check_unary(&reply)?;
+        Ok(Response::new(reply))
     }
 
     async fn create_changeset(
@@ -720,9 +906,11 @@ impl Scion for ScionService {
                 write::create_changeset(&store, &repo, &changeset)
             })
             .await?;
-        Ok(Response::new(CreateChangesetResponse {
+        let reply = CreateChangesetResponse {
             changeset_id: id.as_bytes().to_vec(),
-        }))
+        };
+        check_unary(&reply)?;
+        Ok(Response::new(reply))
     }
 
     async fn land(
@@ -759,7 +947,9 @@ impl Scion for ScionService {
                 lands.land(&store, &caller, &req)
             })
             .await?;
-        Ok(Response::new(land_response(outcome)))
+        let reply = land_response(outcome);
+        check_unary(&reply)?;
+        Ok(Response::new(reply))
     }
 
     async fn get_land(
@@ -777,7 +967,9 @@ impl Scion for ScionService {
             .worker
             .run(move |store| land::get_land(&store, &caller, &repo, land_id))
             .await?;
-        Ok(Response::new(land_response(outcome)))
+        let reply = land_response(outcome);
+        check_unary(&reply)?;
+        Ok(Response::new(reply))
     }
 
     async fn resolve_ref(
@@ -816,6 +1008,8 @@ impl Scion for ScionService {
     type GetChangesetStream = GetChangesetStream;
 
     type ListDirStream = ListDirStream;
+
+    type LogStream = LogStream;
 
     async fn read_file(
         &self,
@@ -882,9 +1076,12 @@ impl Scion for ScionService {
             .await
     }
 
-    async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogResponse>, Status> {
+    async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogStream>, Status> {
         let caller = caller(&request)?;
-        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
+        let call = self.quotas.enter(&caller).map_err(Status::from)?;
+        // The handle of the caller's connection, before the request is taken
+        // apart: the reply counts what it leaves in HTTP/2 on it.
+        let stalled = scion_proto::listen::Stalled::of(&request);
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
@@ -892,39 +1089,39 @@ impl Scion for ScionService {
         // `read::MAX_SCAN` also bounds the entries.
         let limit = (req.limit as usize).max(1);
         let path = parse_optional_path(req.path)?;
-        let page = if let Some(path) = path {
+        let repo = req.repo.clone();
+        let page = if let Some(path) = path.clone() {
             // It may derive the path history of a long history first, so it
             // runs as a graph query, with its slot and its deadline.
-            self.graph_query(deadline, move |store, deadline| {
-                read::log_page(store, &req.repo, id, Some(&path), limit, deadline)
+            self.graph_query(deadline.clone(), move |store, deadline| {
+                read::log_page(store, &repo, id, Some(&path), limit, deadline)
             })
             .await?
         } else {
+            let repo = req.repo.clone();
+            let deadline = deadline.clone();
             self.worker
-                .run(move |store| read::log_page(&store, &req.repo, id, None, limit, &deadline))
+                .run(move |store| read::log_page(&store, &repo, id, None, limit, &deadline))
                 .await?
         };
-        // Always send the first entry; stop before the reply gets too big.
-        let mut next = page.next;
-        let mut budget = LOG_BUDGET_BYTES;
-        let mut entries = Vec::new();
-        for (id, changeset) in page.entries {
-            let body = changeset.encode();
-            if !entries.is_empty() && body.len() > budget {
-                // Not sent, so the next call starts here.
-                next = Some(id);
-                break;
-            }
-            budget = budget.saturating_sub(body.len());
-            entries.push(LogEntry {
-                changeset_id: id.as_bytes().to_vec(),
-                changeset: body,
-            });
-        }
-        Ok(Response::new(LogResponse {
-            entries,
-            next_changeset_id: id_bytes(next),
-        }))
+        // The first page goes out as the first parts; the rest follow,
+        // page by page, until the history or `limit` ends the walk. The
+        // reply's work goes on in the producer, so the request slot lives
+        // until the reply ends.
+        let walk = LogWalk {
+            worker: self.worker.clone(),
+            repo: req.repo.clone(),
+            graph_queries: Arc::clone(&self.graph_queries),
+            _call: call,
+            next: page.next,
+            left: limit,
+            path,
+            deadline,
+            stalled,
+        };
+        let (tx, rx) = mpsc::channel(2);
+        tokio::spawn(log_parts(walk, page, tx).instrument(tracing::Span::current()));
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn blame(
@@ -1002,11 +1199,13 @@ impl Scion for ScionService {
             .resume
             .map(|resume| blame::encode_cursor(&resume, &req.repo, id, &path))
             .unwrap_or_default();
-        Ok(Response::new(BlameResponse {
+        let reply = BlameResponse {
             ranges,
             changesets,
             next_cursor,
-        }))
+        };
+        check_unary(&reply)?;
+        Ok(Response::new(reply))
     }
 
     async fn merge_base(
@@ -1025,9 +1224,11 @@ impl Scion for ScionService {
                 read::merge_base(store, &req.repo, a, b, deadline)
             })
             .await?;
-        Ok(Response::new(MergeBaseResponse {
+        let reply = MergeBaseResponse {
             changeset_ids: bases.iter().map(|id| id.as_bytes().to_vec()).collect(),
-        }))
+        };
+        check_unary(&reply)?;
+        Ok(Response::new(reply))
     }
 
     async fn is_ancestor(
@@ -1046,7 +1247,9 @@ impl Scion for ScionService {
                 read::is_ancestor(store, &req.repo, ancestor, descendant, deadline)
             })
             .await?;
-        Ok(Response::new(IsAncestorResponse { is_ancestor }))
+        let reply = IsAncestorResponse { is_ancestor };
+        check_unary(&reply)?;
+        Ok(Response::new(reply))
     }
 
     async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<DiffResponse>, Status> {
@@ -1093,11 +1296,13 @@ impl Scion for ScionService {
                 }
             })
             .collect();
-        Ok(Response::new(DiffResponse {
+        let reply = DiffResponse {
             entries,
             next_after: path_bytes(page.next_after),
             renames_incomplete: page.renames_incomplete,
-        }))
+        };
+        check_unary(&reply)?;
+        Ok(Response::new(reply))
     }
 }
 
@@ -1134,9 +1339,30 @@ mod tests {
     use std::time::Instant;
 
     use scion_core::{Changeset, FileState, IdentityTime};
+    use scion_proto::v1::LogResponse;
     use tonic::Code;
 
     use super::*;
+
+    /// A unary reply over the cap is refused, so the ceiling of the memory
+    /// a client that never reads holds for one holds by construction, not
+    /// by today's RPC list. No legitimate reply reaches it: the cap is the
+    /// largest message a client accepts, and no unary reply may hold more.
+    #[test]
+    fn a_unary_reply_over_the_cap_is_refused() {
+        let mut reply = LogResponse::default();
+        reply.entries.push(scion_proto::v1::LogEntry {
+            changeset_id: vec![0; 32],
+            changeset: vec![0; MAX_UNARY_REPLY_BYTES],
+        });
+        let err = check_unary(&reply).unwrap_err();
+        assert_eq!(err.code(), Code::ResourceExhausted, "{err}");
+        assert!(
+            err.to_string().contains("a reply message may hold"),
+            "{err}"
+        );
+        assert!(check_unary(&LogResponse::default()).is_ok());
+    }
 
     /// The log of the test binary, into this one buffer.
     static LOG: std::sync::LazyLock<Captured> = std::sync::LazyLock::new(Captured::default);
@@ -1761,7 +1987,17 @@ mod tests {
                         });
                         let reply = service.log(request).await.unwrap().into_inner();
                         let ids: Vec<Vec<u8>> =
-                            reply.entries.into_iter().map(|e| e.changeset_id).collect();
+                            tokio_stream::StreamExt::collect::<Vec<_>>(reply.map(|page| {
+                                page.unwrap()
+                                    .entries
+                                    .into_iter()
+                                    .map(|e| e.changeset_id)
+                                    .collect::<Vec<_>>()
+                            }))
+                            .await
+                            .into_iter()
+                            .flatten()
+                            .collect();
                         ids == [a]
                     } else if i % 3 == 0 {
                         let request = as_default(MergeBaseRequest {
