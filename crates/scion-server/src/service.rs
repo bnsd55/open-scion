@@ -24,6 +24,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
+
+use crate::metrics::{Metrics, MetricsLayer};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::Instrument as _;
@@ -113,7 +115,7 @@ const _: () = assert!(read_share(MAX_OBJECT_BYTES) <= READ_BUDGET_BYTES);
 const _: () = assert!(READ_BUDGET_BYTES <= u32::MAX as usize);
 
 /// What a server serves with, besides the data directory and the access
-/// rules: its limits, its per-principal quotas, and its TLS.
+/// rules: its limits, its per-principal quotas, its TLS, and its metrics.
 pub struct ServeOptions {
     /// The connection and stream caps of `listen`.
     pub limits: Limits,
@@ -126,6 +128,10 @@ pub struct ServeOptions {
     /// With TLS, every connection is a TLS connection, whose handshake
     /// `listen` ends within its timeout.
     pub tls: Option<ServerTls>,
+    /// The registry that counts every call, whatever `--metrics-listen`
+    /// exports. A server without the export still counts, so the flag can
+    /// turn on without a restart.
+    pub metrics: Arc<Metrics>,
 }
 
 /// Serves the API on `listener` within `options`, until `shutdown` resolves,
@@ -154,11 +160,12 @@ pub async fn serve(
         pending_lands,
         land_stale_secs,
         tls,
+        metrics,
     } = options;
     let access = Arc::new(access.into());
     let auth = access.auth();
     let worker = Worker::new(store);
-    let lands = Arc::new(Lands::new(pending_lands));
+    let lands = Arc::new(Lands::new(pending_lands, Some(Arc::clone(&metrics))));
     // The sweep stops when the server does: the shutdown future resolves,
     // the watch says so, and the loop breaks. The same watch ends the
     // server itself.
@@ -179,14 +186,18 @@ pub async fn serve(
         land_stale_secs,
         stop_rx,
     ));
-    let scion = InterceptedService::new(
+    // Outside the access rules, so a refused call counts too. The layer
+    // only wraps replies in a counting body; the handlers stay as they are.
+    let scion = MetricsLayer::new(Arc::clone(&metrics)).layer(InterceptedService::new(
         ScionService::new(worker.clone(), Arc::clone(&access), lands, quotas.clone()).into_server(),
-        auth,
-    );
+        auth.clone(),
+    ));
     // No token interceptor on `objects`: `GetObjects` authenticates by
     // ticket alone, and the service's other calls check the token
     // themselves. So a tier needs no token of the server to fetch objects.
-    let objects = ObjectsService::new(worker, access, quotas, tickets).into_server();
+    // The counting layer wraps it all the same, outside the ticket checks.
+    let objects = MetricsLayer::new(metrics)
+        .layer(ObjectsService::new(worker, access, quotas, tickets).into_server());
     // The health service answers `grpc.health.v1.Check` and `Watch` on the
     // same port, without a token: a probe carries none. The store opens
     // before this call, so the server starts serving.

@@ -9,6 +9,10 @@ use tonic::Request;
 
 use crate::error::{Error, Result};
 
+/// The limit of a job whose call gave no deadline of its own: the same
+/// default as a request timeout.
+pub(crate) const CALL_LIMIT: Duration = Duration::from_secs(600);
+
 /// When a job gives up: at an instant, or once the call that asked for it
 /// has gone. A request timeout or a client that cancels drops the call, but
 /// not a job that is already running, so the long loops of a job check this.
