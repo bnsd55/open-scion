@@ -17,6 +17,8 @@
 
 pub mod access;
 pub mod auth;
+pub mod backend;
+pub use backend::Backend;
 pub mod blame;
 pub mod db;
 pub mod deadline;
@@ -30,6 +32,7 @@ pub mod memory;
 pub mod meta;
 pub mod names;
 pub mod objects;
+mod pg;
 pub mod quotas;
 pub mod read;
 pub mod service;

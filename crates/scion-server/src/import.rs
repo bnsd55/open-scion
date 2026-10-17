@@ -21,9 +21,11 @@ use scion_core::{
     TreeId,
 };
 
+use crate::backend::Backend;
 use crate::error::{Error, Result};
+use crate::meta::Meta as _;
 use crate::meta::{MetaTx, RepoId};
-use crate::store::{BlobBatch, BlobStatus, MAX_OBJECT_BYTES, Store};
+use crate::store::{BlobBatch, BlobStatus, MAX_OBJECT_BYTES};
 use crate::tree;
 
 /// `git_import.git_algo` for SHA-1 object names.
@@ -112,7 +114,7 @@ pub struct ImportReport {
 /// `opts.target_ref` points at a changeset that the tip does not descend
 /// from; the commits stay imported and the ref is left alone.
 pub fn import_git(
-    store: &Store,
+    store: &Backend,
     repo: &str,
     git_dir: &Path,
     opts: &ImportOptions,
@@ -122,7 +124,7 @@ pub fn import_git(
 
 /// [`import_git`] with at most `cache_entries` entries in each blob cache.
 fn import_with_cache(
-    store: &Store,
+    store: &Backend,
     repo: &str,
     git_dir: &Path,
     opts: &ImportOptions,
@@ -254,7 +256,7 @@ fn import_with_cache(
 /// nobody to wait for it, and runs the whole batch in one transaction.
 #[allow(clippy::too_many_arguments)]
 fn store_batch(
-    store: &Store,
+    store: &Backend,
     repo_id: RepoId,
     prepared: &[(ObjectId, Changeset, ObjectId)],
     plan: &Plan,
@@ -429,7 +431,7 @@ fn record(c: &mut dyn MetaTx, repo: RepoId, commit: ObjectId, cs: &Changeset) ->
 /// The move is a compare-and-swap on the ref's version, as a land's is. A
 /// server can land on the ref while the import checks it, so a lost swap
 /// checks the ref again.
-fn point_ref(store: &Store, repo: RepoId, name: &str, tip: ChangesetId) -> Result<()> {
+fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Result<()> {
     // The walks run in reads, outside any write transaction, so a server
     // that shares the data directory does not wait for them. They have no
     // bound. The swap fails if the ref moved after the read.
@@ -588,7 +590,7 @@ impl Importer<'_> {
 /// Checks Scion trees against git trees.
 struct Checker<'a> {
     git: &'a gix::Repository,
-    store: &'a Store,
+    store: &'a Backend,
     /// Tree pairs already found equal, so shared subtrees are checked once.
     equal: HashSet<(ObjectId, TreeId)>,
     /// Blob IDs hashed from git content, apart from the importer's cache.
@@ -850,6 +852,8 @@ fn per_sec(count: usize, since: Instant) -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::Backend;
+    use crate::store::Store;
     use std::fs;
     use std::process::Command;
     use std::sync::{Arc, Barrier};
@@ -912,7 +916,7 @@ mod tests {
         };
         let import = |cache_entries| {
             let data = tempfile::tempdir().unwrap();
-            let store = Store::open(data.path()).unwrap();
+            let store = Backend::Sqlite(Store::open(data.path()).unwrap());
             import_with_cache(&store, "main", dir, &opts, cache_entries).unwrap()
         };
         let tiny = import(2);
@@ -927,8 +931,8 @@ mod tests {
     fn a_land_while_the_import_checks_the_ref_is_never_overwritten() {
         crate::store::spawn_guard::prime_gix_lookup();
         let data = tempfile::tempdir().unwrap();
-        let server = Store::open(data.path()).unwrap();
-        let importer = Store::open_shared(data.path()).unwrap();
+        let server = Backend::Sqlite(Store::open(data.path()).unwrap());
+        let importer = Backend::Sqlite(Store::open_shared(data.path()).unwrap());
         // main is at root. Git has root ─ tip, and a land puts X on root.
         let changeset = |parents, message: &str| Changeset {
             parents,
@@ -991,7 +995,7 @@ mod tests {
             git(dir, &["commit", "-q", "-m", &i.to_string()]);
         }
         let data = tempfile::tempdir().unwrap();
-        let store = Store::open(data.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(data.path()).unwrap());
         let import = |rev: &str| {
             let opts = ImportOptions {
                 rev: rev.into(),
@@ -1003,7 +1007,7 @@ mod tests {
         import("main~1");
         // As after a version bump of the root tree: no stored root trees.
         let sql = "DELETE FROM derived WHERE kind = ?1";
-        let removed = store.write(|c| Ok(c.execute(sql, [RootTree::NAME])?));
+        let removed = store.write(|c| Ok(c.sqlite().unwrap().execute(sql, [RootTree::NAME])?));
         assert_eq!(removed.unwrap(), 4);
 
         let commits = store.commits();
@@ -1029,8 +1033,8 @@ mod tests {
             );
         }
         let data = tempfile::tempdir().unwrap();
-        let server = Store::open(data.path()).unwrap();
-        let importer = Store::open_shared(data.path()).unwrap();
+        let server = Backend::Sqlite(Store::open(data.path()).unwrap());
+        let importer = Backend::Sqlite(Store::open_shared(data.path()).unwrap());
         let opts = ImportOptions {
             rev: "main".into(),
             target_ref: "main".into(),
@@ -1081,7 +1085,7 @@ mod tests {
             );
         }
         let data = tempfile::tempdir().unwrap();
-        let importer = Store::open(data.path()).unwrap();
+        let importer = Backend::Sqlite(Store::open(data.path()).unwrap());
         let opts = ImportOptions {
             rev: "main".into(),
             target_ref: "main".into(),

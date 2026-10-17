@@ -19,12 +19,12 @@ use scion_core::{
     TreeId,
 };
 
+use crate::backend::Backend;
 use crate::error::{Error, Result};
 use crate::memory::{BYTES_PER_LINE, Bytes, Held};
-use crate::meta::MetaTx;
+use crate::meta::{Meta as _, MetaTx};
 use crate::read::{self, MAX_SCAN};
 use crate::similar::{self, Budget, Chunks, MAX_PAIRS, Progress};
-use crate::store::Store;
 use crate::tree;
 
 /// Most versions of a file one call diffs.
@@ -176,7 +176,7 @@ enum Older {
 /// whole budget, or a take waited past `until`.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn blame(
-    store: &Store,
+    store: &Backend,
     repo: &str,
     cs: ChangesetId,
     path: &RepoPath,
@@ -429,7 +429,7 @@ fn next_resume(
 ///
 /// [`Error::NotFound`] if no file is there. [`Error::InvalidArgument`] if
 /// it is not a regular file.
-fn regular_blob(store: &Store, root: TreeId, path: &RepoPath) -> Result<BlobId> {
+fn regular_blob(store: &Backend, root: TreeId, path: &RepoPath) -> Result<BlobId> {
     match store.read(|c| tree::lookup(c, root, path))? {
         Some(Entry::File(FileState::Regular { content, .. })) => Ok(content),
         Some(_) => Err(Error::InvalidArgument(format!(
@@ -489,7 +489,7 @@ impl std::ops::Deref for HeldText {
 /// # Errors
 ///
 /// [`Error::ResourceExhausted`] if a take waited past `until`.
-fn read_version(store: &Store, blob: BlobId, memory: &Bytes) -> Result<Option<HeldText>> {
+fn read_version(store: &Backend, blob: BlobId, memory: &Bytes) -> Result<Option<HeldText>> {
     let size = store.blobs().size(blob)?;
     if size > memory.cap() {
         return Ok(None);
@@ -521,7 +521,7 @@ fn diff_cost(text: &[u8]) -> usize {
 /// return value holds them, and pairs with the text. A version whose bytes
 /// do not fit the whole budget counts as absent, so the walk goes on.
 fn older_version(
-    store: &Store,
+    store: &Backend,
     root: TreeId,
     changeset: &Changeset,
     newer: Newer<'_>,
@@ -577,7 +577,7 @@ fn older_version(
 /// [`Error::InvalidArgument`] if `search` is not where this search can
 /// stop.
 fn renamed_from(
-    store: &Store,
+    store: &Backend,
     root: TreeId,
     changeset: &Changeset,
     newer: Newer<'_>,
@@ -685,7 +685,7 @@ fn renamed_from(
 /// Each file that `changeset` deletes, in path order, as it was in `root`,
 /// the tree of its first parent.
 fn deleted_files<'c>(
-    store: &Store,
+    store: &Backend,
     root: TreeId,
     changeset: &'c Changeset,
 ) -> Result<Vec<(&'c RepoPath, FileState)>> {
@@ -1043,7 +1043,7 @@ pub fn encode_cursor(resume: &Resume, repo: &str, cs: ChangesetId, path: &RepoPa
 /// [`Error::ResourceExhausted`] if the cursor does not fit the budget, or a
 /// take waited past `until`.
 pub fn decode_cursor(
-    store: &Store,
+    store: &Backend,
     repo: &str,
     bytes: &[u8],
     cs: ChangesetId,

@@ -13,8 +13,8 @@ use scion_proto::v1::{
     ResolveRefRequest,
 };
 use scion_server::access::Access;
-use scion_server::meta::MetaTx as _;
-use scion_server::{Store, service};
+use scion_server::meta::{Meta as _, MetaTx as _};
+use scion_server::{Backend, service};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 use tonic::metadata::AsciiMetadataValue;
@@ -89,9 +89,9 @@ fn regular(content: BlobId) -> FileState {
 
 /// A store whose repo `main` has one root changeset that puts `README`,
 /// and its blob. Returns the store, root changeset, and blob id.
-fn store() -> (tempfile::TempDir, Store, ChangesetId, BlobId) {
+fn store() -> (tempfile::TempDir, Backend, ChangesetId, BlobId) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Backend::open_test(dir.path()).unwrap();
     let blob = store.blobs().put(b"# hello\n").unwrap();
     let root = store
         .write(|c| {
@@ -109,7 +109,7 @@ fn store() -> (tempfile::TempDir, Store, ChangesetId, BlobId) {
 
 /// Stores `content` as a blob of `REPO`, as an upload through `PutBlob`
 /// would.
-fn put(store: &Store, content: &[u8]) -> BlobId {
+fn put(store: &Backend, content: &[u8]) -> BlobId {
     let blob = store.blobs().put(content).unwrap();
     store
         .write(|c| {
@@ -125,7 +125,7 @@ fn put(store: &Store, content: &[u8]) -> BlobId {
 /// `token`. The first reply is the server's stop signal: hold it, or the
 /// server shuts down when the caller drops it.
 type Stop = tokio::sync::oneshot::Sender<()>;
-async fn server(store: &Store, access: Access, token: &str) -> (Stop, Scion, Objects) {
+async fn server(store: &Backend, access: Access, token: &str) -> (Stop, Scion, Objects) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();

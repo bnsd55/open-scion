@@ -25,12 +25,13 @@ use tonic::{Request, Response, Status};
 use tracing::Instrument as _;
 
 use crate::access::Access;
+use crate::backend::Backend;
 use crate::error::{Error, Result};
-use crate::meta::MetaTx as _;
+use crate::meta::{Meta as _, MetaTx as _};
 use crate::quotas::{Call, Quotas};
 use crate::read;
 use crate::service::{Worker, caller, check_reader, parse_id, resolve_ref};
-use crate::store::{self, Store};
+use crate::store::{self};
 
 // The store keeps exactly the objects that the API promises to send.
 const _: () = assert!(store::MAX_OBJECT_BYTES == scion_proto::MAX_OBJECT_BYTES);
@@ -102,11 +103,11 @@ fn parse_ref(object: &ObjectRef) -> Result<Key, Status> {
 
 /// Reads an object, as planned. [`read_object`], except in tests that count
 /// reads.
-type Read = fn(&Store, Key, Plan) -> Result<Outgoing>;
+type Read = fn(&Backend, Key, Plan) -> Result<Outgoing>;
 
 /// How `key` goes out, without reading its bytes. A blob goes out as its
 /// stored zstd file if the client accepts `zstd`.
-fn plan(store: &Store, key: Key, zstd: bool) -> Result<Plan> {
+fn plan(store: &Backend, key: Key, zstd: bool) -> Result<Plan> {
     let corrupt = |why: &str| Err(Error::Corrupt(format!("{key:?}: {why}")));
     let raw = |size| Plan {
         encoding: Encoding::Raw,
@@ -145,7 +146,7 @@ fn plan(store: &Store, key: Key, zstd: bool) -> Result<Plan> {
 /// their IDs on the way out of the store. A ZSTD blob is its stored file,
 /// read in chunks and not unpacked: the receiver checks it. A RAW blob is
 /// unpacked in chunks, so it is never in memory twice.
-fn read_object(store: &Store, key: Key, plan: Plan) -> Result<Outgoing> {
+fn read_object(store: &Backend, key: Key, plan: Plan) -> Result<Outgoing> {
     // SHORTCUT: an object ID is treated as permission to read the object, so
     // this serves any tree or blob by ID for a repo the caller may read.
     // The access rules check only the repo of the call, not the object
@@ -364,6 +365,8 @@ impl Objects for ObjectsService {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::Backend;
+    use crate::store::Store;
     use std::io::Read as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -393,7 +396,7 @@ mod tests {
     }
 
     /// The length of a blob's stored file.
-    fn packed_len(store: &Store, key: Key) -> usize {
+    fn packed_len(store: &Backend, key: Key) -> usize {
         let Key::Blob(id) = key else {
             panic!("not a blob")
         };
@@ -413,7 +416,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_client_that_stops_reading_is_cut_off_and_frees_its_budget() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let keys: Vec<Key> = [b"one".as_slice(), b"second", b"three"]
             .iter()
             .map(|data| Key::Blob(store.blobs().put(data).unwrap()))
@@ -452,13 +455,13 @@ mod tests {
     #[tokio::test]
     async fn a_call_with_no_budget_for_its_first_object_fails_and_reads_nothing() {
         static READS: AtomicUsize = AtomicUsize::new(0);
-        fn counted(store: &Store, key: Key, plan: Plan) -> Result<Outgoing> {
+        fn counted(store: &Backend, key: Key, plan: Plan) -> Result<Outgoing> {
             READS.fetch_add(1, Ordering::SeqCst);
             read_object(store, key, plan)
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let a = Key::Blob(store.blobs().put(b"a blob").unwrap());
         let budget = 1000;
         let in_flight = Arc::new(Semaphore::new(budget));
@@ -496,7 +499,7 @@ mod tests {
     #[tokio::test]
     async fn a_wait_for_room_ends_before_the_deadline() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let a = Key::Blob(store.blobs().put(b"a blob").unwrap());
         let in_flight = Arc::new(Semaphore::new(1000));
         let _others = reply::try_take(&in_flight, 1000).unwrap();
@@ -525,14 +528,14 @@ mod tests {
     async fn reading_a_blob_to_unpack_it_takes_the_decoder_too() {
         static HELD: AtomicUsize = AtomicUsize::new(0);
         static BUDGET: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
-        fn watched(store: &Store, key: Key, plan: Plan) -> Result<Outgoing> {
+        fn watched(store: &Backend, key: Key, plan: Plan) -> Result<Outgoing> {
             let free = BUDGET.get().unwrap().available_permits();
             HELD.store(IN_FLIGHT_BYTES - free, Ordering::SeqCst);
             read_object(store, key, plan)
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let content = vec![b'x'; 5000];
         let key = Key::Blob(store.blobs().put(&content).unwrap());
         let in_flight =
@@ -577,7 +580,7 @@ mod tests {
     #[tokio::test]
     async fn a_blob_goes_out_as_its_stored_file_in_parts_or_unpacked() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         // Over three parts once packed: bytes that do not compress.
         let mut state = 1_u64;
         let content: Vec<u8> = (0..3 * CHUNK_BYTES + 100)

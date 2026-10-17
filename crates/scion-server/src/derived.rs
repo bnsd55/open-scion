@@ -23,10 +23,11 @@ use std::ops::ControlFlow;
 
 use scion_core::{Changeset, ChangesetId};
 
+use crate::backend::Backend;
 use crate::deadline::Deadline;
 use crate::error::{Error, Result};
+use crate::meta::Meta as _;
 use crate::meta::{MetaTx, RepoId};
-use crate::store::Store;
 
 /// Most changesets that one step walks or derives, and most rows of older
 /// versions that one step removes. A step holds the write connection, so
@@ -92,7 +93,7 @@ pub trait Kind {
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`], or of [`Store::flush`].
-pub fn get<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
+pub fn get<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
     get_until::<K>(store, repo, cs, None)
 }
 
@@ -103,7 +104,7 @@ pub fn get<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::V
 ///
 /// As [`get`], and [`Error::DeadlineExceeded`].
 pub fn get_by<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     cs: ChangesetId,
     deadline: &Deadline,
@@ -112,7 +113,7 @@ pub fn get_by<K: Kind>(
 }
 
 fn get_until<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     cs: ChangesetId,
     deadline: Option<&Deadline>,
@@ -154,7 +155,7 @@ fn get_until<K: Kind>(
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`].
-pub fn fill<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
+pub fn fill<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
     fill_until::<K>(store, repo, cs, None)
 }
 
@@ -165,7 +166,7 @@ pub fn fill<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::
 ///
 /// As [`fill`], and [`Error::DeadlineExceeded`].
 pub fn fill_by<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     cs: ChangesetId,
     deadline: &Deadline,
@@ -174,7 +175,7 @@ pub fn fill_by<K: Kind>(
 }
 
 fn fill_until<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     cs: ChangesetId,
     deadline: Option<&Deadline>,
@@ -195,7 +196,7 @@ fn fill_until<K: Kind>(
 /// # Errors
 ///
 /// As [`fill`] and [`Store::flush`].
-pub fn backfill<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<()> {
+pub fn backfill<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<()> {
     fill::<K>(store, repo, cs)?;
     // A short step means that no older row is left.
     while store.commit(|c| remove_old::<K>(c))? == STEP {}
@@ -254,7 +255,7 @@ pub fn on_write<K: Kind>(c: &mut dyn MetaTx, id: ChangesetId, changeset: &Change
 /// The walk of [`fill`]: the stored value for `cs`, or else the changesets
 /// to derive, parents first. Runs `check` before each step after the first.
 fn walk_all<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     cs: ChangesetId,
     check: impl Fn() -> Result<()>,
@@ -350,7 +351,7 @@ impl Walk {
 /// [`STEP`] changesets per transaction. Returns the value for the last one.
 /// Runs `check` before each step.
 fn derive_steps<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     pending: &[ChangesetId],
     check: impl Fn() -> Result<()>,
@@ -462,7 +463,9 @@ fn require(c: &mut dyn MetaTx, repo: RepoId, cs: ChangesetId) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::Backend;
     use crate::db::SqliteTx;
+    use crate::store::Store;
     use rusqlite::Connection;
     use std::cell::Cell;
     use std::collections::HashMap;
@@ -587,14 +590,14 @@ mod tests {
     }
 
     /// A new store with `history` in repo `r`, as [`store_chain`] stores it.
-    fn store_with(history: &[Edits]) -> (tempfile::TempDir, Store, RepoId, Vec<ChangesetId>) {
+    fn store_with(history: &[Edits]) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let (repo, ids) = store.write(|c| store_chain(c, history)).unwrap();
         (dir, store, repo, ids)
     }
 
-    /// Stores `history` in a new repo `r` through the one write path, which
+    /// Backends `history` in a new repo `r` through the one write path, which
     /// stores root trees and the commit graph, and nothing else. Returns the
     /// IDs, oldest first.
     fn store_chain(c: &mut dyn MetaTx, history: &[Edits]) -> Result<(RepoId, Vec<ChangesetId>)> {
@@ -603,7 +606,7 @@ mod tests {
         })
     }
 
-    /// Stores `history` in a new repo `r` with `store`. Returns the IDs,
+    /// Backends `history` in a new repo `r` with `store`. Returns the IDs,
     /// oldest first.
     fn chain_with(
         c: &mut dyn MetaTx,
@@ -654,8 +657,8 @@ mod tests {
     }
 
     /// The rows of kind `name` at `version`, as (changeset, value).
-    fn rows_of(store: &Store, name: &str, version: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let all = store.read(|c| Ok(rows(c))).unwrap();
+    fn rows_of(store: &Backend, name: &str, version: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let all = store.read(|c| Ok(rows(c.sqlite().unwrap()))).unwrap();
         all.into_iter()
             .filter(|(kind, v, ..)| kind == name && *v == version)
             .map(|(_, _, cs, value)| (cs, value))
@@ -663,7 +666,7 @@ mod tests {
     }
 
     /// The rows of the test kind at `version`, as (changeset, value).
-    fn kind_rows(store: &Store, version: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn kind_rows(store: &Backend, version: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
         rows_of(store, ChangedPathsV1::NAME, version)
     }
 
@@ -746,12 +749,19 @@ mod tests {
                 .all(|(kind, v, ..)| kind == RootTree::NAME && *v == RootTree::VERSION)
         );
 
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let version: u32 = store
-            .read(|c| Ok(c.pragma_query_value(None, "user_version", |row| row.get(0))?))
+            .read(|c| {
+                Ok(c.sqlite()
+                    .unwrap()
+                    .pragma_query_value(None, "user_version", |row| row.get(0))?)
+            })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(store.read(|c| Ok(rows(c))).unwrap(), before);
+        assert_eq!(
+            store.read(|c| Ok(rows(c.sqlite().unwrap()))).unwrap(),
+            before
+        );
         // Each root tree is read from its copied row.
         for &cs in &ids {
             let tree = tree::root_tree(&store, repo, cs).unwrap();
@@ -768,8 +778,8 @@ mod tests {
     }
 
     /// How many root tree rows the store holds.
-    fn root_trees(store: &Store) -> usize {
-        let all = store.read(|c| Ok(rows(c))).unwrap();
+    fn root_trees(store: &Backend) -> usize {
+        let all = store.read(|c| Ok(rows(c.sqlite().unwrap()))).unwrap();
         all.iter()
             .filter(|(kind, ..)| kind == RootTree::NAME)
             .count()
@@ -939,7 +949,7 @@ mod tests {
         let older = "INSERT INTO derived (kind, version, cs, value)
                      SELECT kind, 0, cs, value FROM derived WHERE kind = ?1";
         let added = store
-            .write(|c| Ok(c.execute(older, [RootTree::NAME])?))
+            .write(|c| Ok(c.sqlite().unwrap().execute(older, [RootTree::NAME])?))
             .unwrap();
         assert_eq!(added, 7);
 
@@ -957,13 +967,18 @@ mod tests {
 
     /// A new store with the graph `parents` in repo `r`, with no derived
     /// rows. Each changeset puts one file.
-    fn store_graph(parents: &[Vec<usize>]) -> (tempfile::TempDir, Store, RepoId, Vec<ChangesetId>) {
+    fn store_graph(
+        parents: &[Vec<usize>],
+    ) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let (repo, ids) = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
-                Ok((repo, testing::insert_graph(c, repo, parents)?))
+                Ok((
+                    repo,
+                    testing::insert_graph(c.sqlite().unwrap(), repo, parents)?,
+                ))
             })
             .unwrap();
         (dir, store, repo, ids)

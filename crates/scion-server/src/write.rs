@@ -9,10 +9,12 @@ use std::collections::BTreeSet;
 
 use scion_core::{BlobId, Changeset, ChangesetId, RepoPath};
 
+use crate::backend::Backend;
 use crate::db;
 use crate::error::{Error, Result};
+use crate::meta::Meta as _;
 use crate::meta::{MetaTx, RepoId};
-use crate::store::{BlobStatus, Store, Upload};
+use crate::store::{BlobStatus, Upload};
 use crate::tree;
 
 /// Most path changes in one created changeset.
@@ -32,7 +34,7 @@ pub const MAX_IDENTITY_BYTES: usize = 1 << 10;
 /// has, no committer, fits the request limits, and every blob it names is in
 /// the repo and stored intact. [`Error::Apply`] if the changes do not apply
 /// to the parent's tree. [`Error::Io`] if a blob cannot be read.
-pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<ChangesetId> {
+pub fn create_changeset(store: &Backend, repo: &str, bytes: &[u8]) -> Result<ChangesetId> {
     let (cs, id) = decode(bytes)?;
     let parent = check_request(&cs)?;
     // A cheap read first, so a request on a missing repo or parent, or one
@@ -80,7 +82,7 @@ pub fn decode(bytes: &[u8]) -> Result<(Changeset, ChangesetId)> {
 /// # Errors
 ///
 /// Database errors, and as [`Blobs::put_upload`](crate::store::Blobs::put_upload).
-pub fn put_blob(store: &Store, repo: RepoId, upload: Upload) -> Result<BlobId> {
+pub fn put_blob(store: &Backend, repo: RepoId, upload: Upload) -> Result<BlobId> {
     let id = upload.id();
     // The flush below covers what this read saw.
     let member = store.read_unflushed(|c| c.repo_has_blob(repo, id))?;
@@ -158,7 +160,7 @@ fn check_request(cs: &Changeset) -> Result<ChangesetId> {
 /// lose. Call it only after [`check_members`]: every blob here is the repo's.
 ///
 /// [`BlobBatch::keep`]: crate::store::BlobBatch::keep
-fn check_blobs(store: &Store, repo: &str, cs: &Changeset) -> Result<()> {
+fn check_blobs(store: &Backend, repo: &str, cs: &Changeset) -> Result<()> {
     let mut blobs = store.blobs().batch();
     // A blob seen before was intact, or the loop would have stopped.
     let mut seen = BTreeSet::new();
@@ -178,6 +180,8 @@ fn check_blobs(store: &Store, repo: &str, cs: &Changeset) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::Backend;
+    use crate::store::Store;
     use std::collections::BTreeMap;
 
     use scion_core::{FileState, GitOid, IdentityTime};
@@ -201,9 +205,9 @@ mod tests {
     }
 
     /// A store with repo `main` and an empty root changeset in it.
-    fn store_with_root() -> (tempfile::TempDir, Store, ChangesetId) {
+    fn store_with_root() -> (tempfile::TempDir, Backend, ChangesetId) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let root = store
             .write(|c| {
                 let repo = c.create_repo("main")?;
@@ -227,18 +231,18 @@ mod tests {
     }
 
     /// Repo `name`, made if missing.
-    fn repo(store: &Store, name: &str) -> RepoId {
+    fn repo(store: &Backend, name: &str) -> RepoId {
         store.write(|c| c.create_repo(name)).unwrap()
     }
 
     /// Uploads `content` to `repo`, as `PutBlob` does.
-    fn upload(store: &Store, repo: RepoId, content: &[u8]) -> BlobId {
+    fn upload(store: &Backend, repo: RepoId, content: &[u8]) -> BlobId {
         let upload = store.blobs().upload().unwrap().append(content).unwrap();
         put_blob(store, repo, upload).unwrap()
     }
 
     /// Adds `blob` to the blobs of `main`, without storing it.
-    fn give_main(store: &Store, blob: BlobId) {
+    fn give_main(store: &Backend, blob: BlobId) {
         store
             .write(|c| {
                 let repo = c.repo_id("main")?;
@@ -249,7 +253,7 @@ mod tests {
 
     /// The `InvalidArgument` text of a `create_changeset` that fails, with
     /// the blob IDs in it replaced.
-    fn refusal(store: &Store, bytes: &[u8], blobs: &[BlobId]) -> String {
+    fn refusal(store: &Backend, bytes: &[u8], blobs: &[BlobId]) -> String {
         match create_changeset(store, "main", bytes) {
             Err(Error::InvalidArgument(why)) => blobs
                 .iter()
@@ -349,7 +353,7 @@ mod tests {
     #[test]
     fn a_changeset_makes_its_blobs_durable_before_it_commits() {
         let (_dir, store, root) = store_with_root();
-        // Stored by an upload that never synced.
+        // Backendd by an upload that never synced.
         let mut upload = store.blobs().batch();
         let blob = upload.put(b"new").unwrap();
         drop(upload);

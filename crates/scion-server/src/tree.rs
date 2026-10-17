@@ -9,13 +9,13 @@ use std::collections::BTreeMap;
 
 use scion_core::{Changeset, ChangesetId, Entry, FileState, PathElem, RepoPath, Tree, TreeId};
 
+use crate::backend::Backend;
 use crate::db;
 use crate::derived::{self, Kind};
 use crate::error::{ApplyError, Error, Result};
 use crate::graph::CommitGraph;
 use crate::history::PathHistory;
 use crate::meta::{MetaTx, RepoId};
-use crate::store::Store;
 
 /// Applies `changes` to `base` (`None` is the empty tree), stores the new
 /// trees, and returns the new root.
@@ -99,7 +99,7 @@ impl Kind for RootTree {
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. [`Error::Corrupt`] if a
 /// stored changeset does not apply to its parent tree.
-pub fn root_tree(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
+pub fn root_tree(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
     derived::get::<RootTree>(store, repo, cs)
 }
 
@@ -109,7 +109,7 @@ pub fn root_tree(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<TreeId>
 /// # Errors
 ///
 /// As [`derive_root_tree`].
-pub fn fill_root_tree(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
+pub fn fill_root_tree(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
     derived::fill::<RootTree>(store, repo, cs)
 }
 
@@ -294,7 +294,10 @@ impl Dir {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::Backend;
     use crate::db::SqliteTx;
+    use crate::meta::Meta as _;
+    use crate::store::Store;
     use scion_core::{BlobId, Changeset, IdentityTime};
 
     /// `(path, Some(content))` puts a regular file; `(path, None)` deletes.
@@ -527,7 +530,7 @@ mod tests {
         ];
         for stored in [true, false] {
             let dir = tempfile::tempdir().unwrap();
-            let store = Store::open(dir.path()).unwrap();
+            let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
             let (repo, ids) = store
                 .write(|c| {
                     let repo = c.create_repo("r")?;
@@ -572,7 +575,7 @@ mod tests {
     #[test]
     fn get_root_tree_flushes_once_after_it_derives() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         // A changeset with no root tree row yet.
         let cs = store
             .write(|c| {
@@ -595,7 +598,7 @@ mod tests {
     #[test]
     fn root_tree_derives_a_long_chain_and_caches_it() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let author = IdentityTime {
             name: b"a".to_vec(),
             email: b"a@x".to_vec(),

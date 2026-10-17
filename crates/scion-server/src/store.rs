@@ -101,7 +101,6 @@ struct Inner {
     _server_lock: Option<fs::File>,
     /// Write transactions run so far, for tests of how imports share the
     /// write lock.
-    #[cfg(test)]
     txes: AtomicU64,
     /// How many of the next commits fail as a busy database, for tests of
     /// the import's busy retry: the transaction ran and rolled back, so
@@ -235,7 +234,6 @@ impl Store {
                 alone,
                 _lock: lock,
                 _server_lock: server_lock,
-                #[cfg(test)]
                 txes: AtomicU64::new(0),
                 fail_commits: AtomicU64::new(0),
             }),
@@ -249,8 +247,9 @@ impl Store {
     }
 
     /// Commits made so far.
-    #[cfg(test)]
-    pub(crate) fn commits(&self) -> u64 {
+    #[doc(hidden)]
+    #[must_use]
+    pub fn commits(&self) -> u64 {
         self.inner.committed.load(Ordering::Acquire)
     }
 
@@ -267,7 +266,7 @@ impl Store {
     /// # Errors
     ///
     /// Returns what `f` returns, or an error from [`Store::flush`].
-    pub fn read<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
+    pub fn read<T>(&self, f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>) -> Result<T> {
         let (result, seen) = self.read_counted(f);
         // An error is an answer too.
         self.wait_durable(seen)?;
@@ -280,7 +279,7 @@ impl Store {
     /// replies.
     pub(crate) fn read_counted<T>(
         &self,
-        f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>,
+        f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>,
     ) -> (Result<T>, u64) {
         let reader = self.inner.readers.take();
         let result = f(&mut SqliteTx(&reader));
@@ -323,7 +322,10 @@ impl Store {
     /// # Errors
     ///
     /// Returns what `f` returns.
-    pub fn read_unflushed<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
+    pub fn read_unflushed<T>(
+        &self,
+        f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>,
+    ) -> Result<T> {
         let db = self.lock();
         f(&mut SqliteTx(&db))
     }
@@ -353,8 +355,9 @@ impl Store {
     }
 
     /// Write transactions run so far.
-    #[cfg(test)]
-    pub(crate) fn txes(&self) -> u64 {
+    #[doc(hidden)]
+    #[must_use]
+    pub fn txes(&self) -> u64 {
         self.inner.txes.load(Ordering::Relaxed)
     }
 
@@ -365,7 +368,7 @@ impl Store {
     /// # Errors
     ///
     /// As [`Store::commit`] and [`Store::flush`].
-    pub fn write<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
+    pub fn write<T>(&self, f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>) -> Result<T> {
         let value = self.commit(f)?;
         self.flush()?;
         Ok(value)
@@ -377,7 +380,10 @@ impl Store {
     /// # Errors
     ///
     /// Returns what `f` returns, or a database error from begin or commit.
-    pub fn commit<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
+    pub fn commit<T>(
+        &self,
+        f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>,
+    ) -> Result<T> {
         let mut db = self.lock();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = f(&mut SqliteTx(&tx))?;
@@ -645,7 +651,7 @@ pub struct Blobs {
 }
 
 impl Blobs {
-    fn open(dir: &Path) -> Result<Self> {
+    pub(crate) fn open(dir: &Path) -> Result<Self> {
         // Folders of `tmp/` made in this process, so each `Blobs` gets its own.
         static FOLDERS: AtomicU64 = AtomicU64::new(0);
         let objects = dir.join("objects");
@@ -702,7 +708,7 @@ impl Blobs {
     /// when this open is alone, files of a build older than the folders. No
     /// blob name points at any of them. The folders of live processes are
     /// held, and this process's own folder is held too.
-    fn sweep_tmp(&self, alone: bool) -> io::Result<()> {
+    pub(crate) fn sweep_tmp(&self, alone: bool) -> io::Result<()> {
         let mut removed = 0;
         for entry in fs::read_dir(&self.tmp)? {
             let path = entry?.path();

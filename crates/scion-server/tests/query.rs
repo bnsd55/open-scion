@@ -14,16 +14,27 @@ use std::time::{Duration, Instant};
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_server::deadline::Deadline;
 use scion_server::import::{ImportOptions, import_git};
-use scion_server::meta::MetaTx as _;
+use scion_server::meta::{Meta as _, MetaTx as _};
 use scion_server::read::{self, DiffEntry, MAX_DIFF_ENTRIES, MAX_RENAME_CHUNKS, Rename};
-use scion_server::{Error, Store, tree};
+use scion_server::{Backend, Error, tree};
 use tempfile::TempDir;
 
 const REPO: &str = "r";
 
-fn open_store() -> (TempDir, Store) {
+/// Ends the test with one printed line when it runs on Postgres: it
+/// asserts the data directory's own mechanics, which the Postgres backend
+/// does not have. The PR body lists these tests.
+fn skip_on_postgres(why: &str) -> bool {
+    if Backend::test_is_postgres() {
+        eprintln!("skip on postgres: {why}");
+        return true;
+    }
+    false
+}
+
+fn open_store() -> (TempDir, Backend) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Backend::open_test(dir.path()).unwrap();
     (dir, store)
 }
 
@@ -89,7 +100,7 @@ fn merge(dir: &Path, what: &[&str]) -> String {
     git(dir, &["rev-parse", "HEAD"])
 }
 
-fn import(store: &Store, dir: &Path) {
+fn import(store: &Backend, dir: &Path) {
     common::spawn_guard::prime_gix_lookup();
     let opts = ImportOptions {
         rev: "HEAD".into(),
@@ -100,21 +111,20 @@ fn import(store: &Store, dir: &Path) {
 }
 
 /// The changeset that a git commit was imported as.
-fn changeset_of(store: &Store, commit: &str) -> ChangesetId {
+fn changeset_of(store: &Backend, commit: &str) -> ChangesetId {
     let oid = gix::ObjectId::from_hex(commit.as_bytes()).unwrap();
     store
         .read(|c| {
-            let cs: Vec<u8> = c.query_row(
-                "SELECT cs FROM git_import WHERE git_oid = ?1",
-                [oid.as_slice()],
-                |row| row.get(0),
-            )?;
-            Ok(ChangesetId::try_from(cs.as_slice()).unwrap())
+            let repo = c.repo_id(REPO)?;
+            Ok(c.imported_commits(repo)?
+                .get(&oid)
+                .copied()
+                .unwrap_or_else(|| panic!("{commit} is not imported")))
         })
         .unwrap()
 }
 
-fn generation(store: &Store, id: ChangesetId) -> i64 {
+fn generation(store: &Backend, id: ChangesetId) -> i64 {
     store
         .read(|c| {
             let repo = c.repo_id(REPO)?;
@@ -233,7 +243,7 @@ fn author() -> IdentityTime {
 
 /// Stores a first-parent chain in a new repo: one changeset per entry of
 /// `changes`. Returns the IDs, oldest first.
-fn chain(store: &Store, changes: Vec<BTreeMap<RepoPath, Option<FileState>>>) -> Vec<ChangesetId> {
+fn chain(store: &Backend, changes: Vec<BTreeMap<RepoPath, Option<FileState>>>) -> Vec<ChangesetId> {
     store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -344,7 +354,7 @@ fn tree_order(p: &RepoPath) -> Vec<Vec<u8>> {
 }
 
 fn diff_all(
-    store: &Store,
+    store: &Backend,
     old: ChangesetId,
     new: ChangesetId,
     prefix: Option<&RepoPath>,
@@ -508,6 +518,11 @@ fn diff_matches_git_name_status_and_resumes_after_any_path() {
 
 #[test]
 fn diff_skips_a_subtree_with_the_same_id_on_both_sides() {
+    // Asserts the rows of the data directory's database.
+    if skip_on_postgres("asserts the rows of the data directory's database") {
+        return;
+    }
+
     let (_data, store) = open_store();
     let state = |data: &[u8]| {
         Some(FileState::Regular {
@@ -529,7 +544,9 @@ fn diff_skips_a_subtree_with_the_same_id_on_both_sides() {
             let Some(scion_core::Entry::Dir(keep)) = tree::lookup(c, root, &path("keep"))? else {
                 panic!("keep is a directory");
             };
-            c.execute("DELETE FROM trees WHERE id = ?1", [keep.as_bytes()])?;
+            c.sqlite()
+                .unwrap()
+                .execute("DELETE FROM trees WHERE id = ?1", [keep.as_bytes()])?;
             Ok(())
         })
         .unwrap();
@@ -886,7 +903,7 @@ fn diff_finds_renames_as_git_diff_does() {
 }
 
 /// Stores `data` as a blob and returns a regular file state for it.
-fn stored(store: &Store, data: &[u8]) -> FileState {
+fn stored(store: &Backend, data: &[u8]) -> FileState {
     FileState::Regular {
         content: store.blobs().put(data).unwrap(),
         executable: false,
@@ -895,7 +912,7 @@ fn stored(store: &Store, data: &[u8]) -> FileState {
 
 /// Every page of a diff, as a client reads it.
 fn diff_pages(
-    store: &Store,
+    store: &Backend,
     old: ChangesetId,
     new: ChangesetId,
     prefix: Option<&RepoPath>,

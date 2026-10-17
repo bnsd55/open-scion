@@ -7,8 +7,8 @@ use scion_proto::auth::Bearer;
 use scion_proto::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ReadFileRequest};
-use scion_server::meta::MetaTx as _;
-use scion_server::{Store, service};
+use scion_server::meta::{Meta as _, MetaTx as _};
+use scion_server::{Backend, service};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 use tonic::Code;
@@ -72,7 +72,7 @@ fn regular(content: BlobId) -> FileState {
 #[allow(clippy::too_many_lines)]
 async fn uploaded_file_reads_back_through_a_created_changeset() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Backend::open_test(dir.path()).unwrap();
     let readme = store.blobs().put(b"# hello\n").unwrap();
     let root = store
         .write(|c| {

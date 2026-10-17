@@ -1,0 +1,1353 @@
+//! The Postgres metadata backend of [`Meta`](crate::meta::Meta)
+//! ([#47](https://github.com/bnsd55/open-scion/issues/47)).
+//!
+//! One shared database takes the place of one data directory: many
+//! processes can hold clients, and Postgres sorts the writers out, so
+//! there is no directory lock, one write connection, or reader pool of a
+//! fixed set of pages. A small pool of clients stands in for the read
+//! connections, and one client for writes, in the shape of
+//! [`Store`](crate::store::Store).
+//!
+//! The rules that a backend must keep hold here too:
+//!
+//! - `synchronous_commit = on` on every client, so a commit is durable
+//!   when the statement returns. `flush` is a no-op, `read` need not wait,
+//!   and `read_counted` returns no count, because there is nothing to wait
+//!   for.
+//! - Reads and writes run at READ COMMITTED. Rows that content addresses
+//!   never change once written, and refs and lands move only through
+//!   compare-and-swap predicates (`version = $n`, `state = 'pending'`), so
+//!   a lost swap is visible to the caller, as on SQLite.
+//! - Land IDs come from an identity sequence, so no ID is handed out
+//!   twice, and the newest land holds the largest one.
+
+use std::path::Path;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+
+use gix::ObjectId;
+use postgres::types::ToSql;
+use postgres::{Client, Config, NoTls};
+
+/// Shorthand for the owned query parameter.
+type P = Param;
+use scion_core::{BlobId, Changeset, ChangesetId, RepoPath, Tree, TreeId};
+use tokio_postgres_rustls::MakeRustlsConnect;
+
+use crate::auth::Caller;
+use crate::error::{Error, Result};
+use crate::history::NodeId;
+use crate::import::SHA1;
+use crate::land::{
+    EXPIRE_PER_LAND, LAND_RETENTION_SECS, LandOutcome, LandRequest, LandState, decode_paths,
+    encode_paths,
+};
+use crate::meta::{Meta, MetaTx, RefState, RepoId};
+use crate::store::Blobs;
+
+/// The schema version this build makes and reads.
+pub(crate) const PG_SCHEMA_VERSION: u32 = 1;
+
+/// Schema migrations in order. Migration `n`, from 1, moves the database
+/// from version `n - 1` to version `n`. A released migration never changes.
+const PG_MIGRATIONS: [&str; PG_SCHEMA_VERSION as usize] =
+    [include_str!("../migrations/postgres/0001_init.sql")];
+
+/// Handle to one Postgres database. Cheap to clone.
+#[derive(Clone)]
+pub struct Pg {
+    inner: Arc<PgInner>,
+}
+
+struct PgInner {
+    /// The write client, for every commit and [`Pg::read_unflushed`].
+    writer: Mutex<PgClient>,
+    /// Clients for [`Pg::read`], at most [`READERS`](crate::store::READERS)
+    /// at once, like the readers of a SQLite store.
+    readers: Readers,
+    /// The blob folder: blob files stay on local disk in every backend.
+    blobs: Blobs,
+}
+
+/// Clients for [`Pg::read`], so at most [`READERS`](crate::store::READERS)
+/// reads run at once. A caller takes one out and returns it when it is
+/// done.
+struct Readers {
+    idle: Mutex<Vec<PgClient>>,
+    returned: Condvar,
+}
+
+impl Readers {
+    /// [`Readers::new`], with libpq `options` on every client.
+    fn new_with(size: usize, url: &str, ca: Option<&Path>, options: &str) -> Result<Self> {
+        // The open is sequential, so every client sees the same schema.
+        let idle = (0..size)
+            .map(|_| connect_with(url, ca, options))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            idle: Mutex::new(idle),
+            returned: Condvar::new(),
+        })
+    }
+
+    /// Takes a reader, or waits for one.
+    fn take(&self) -> ReaderGuard<'_> {
+        let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        while idle.is_empty() {
+            idle = self
+                .returned
+                .wait(idle)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        let client = idle.pop().expect("the pool is not empty");
+        ReaderGuard {
+            readers: self,
+            client: Some(client),
+        }
+    }
+}
+
+/// A reader that is out of the pool. Returns it when it drops.
+struct ReaderGuard<'a> {
+    readers: &'a Readers,
+    client: Option<PgClient>,
+}
+
+impl ReaderGuard<'_> {
+    fn client(&mut self) -> &mut PgClient {
+        self.client.as_mut().expect("a taken reader has a client")
+    }
+}
+
+impl Drop for ReaderGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take() {
+            self.readers
+                .idle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(client);
+            self.readers.returned.notify_one();
+        }
+    }
+}
+
+/// A value that a query binds, owned, so it can cross to the worker
+/// thread. The parameters of this schema are integers, text, and bytes.
+#[derive(Debug, Clone)]
+enum Param {
+    I64(i64),
+    Text(String),
+    Bytes(Vec<u8>),
+    OptBytes(Option<Vec<u8>>),
+}
+
+impl Param {
+    /// An integer parameter.
+    fn i64(v: i64) -> Param {
+        Param::I64(v)
+    }
+
+    /// A text parameter.
+    fn text(v: impl Into<String>) -> Param {
+        Param::Text(v.into())
+    }
+
+    /// A byte parameter.
+    fn bytes(v: &[u8]) -> Param {
+        Param::Bytes(v.to_vec())
+    }
+
+    /// An optional byte parameter.
+    fn opt_bytes(v: Option<Vec<u8>>) -> Param {
+        Param::OptBytes(v)
+    }
+}
+
+impl ToSql for Param {
+    fn to_sql(
+        &self,
+        t: &postgres::types::Type,
+        out: &mut postgres::types::private::BytesMut,
+    ) -> std::result::Result<postgres::types::IsNull, Box<dyn std::error::Error + Send + Sync>>
+    {
+        match self {
+            Self::I64(v) => v.to_sql(t, out),
+            Self::Text(v) => v.to_sql(t, out),
+            Self::Bytes(v) => v.to_sql(t, out),
+            Self::OptBytes(v) => v.to_sql(t, out),
+        }
+    }
+
+    fn accepts(_: &postgres::types::Type) -> bool {
+        true
+    }
+
+    fn to_sql_checked(
+        &self,
+        t: &postgres::types::Type,
+        out: &mut postgres::types::private::BytesMut,
+    ) -> std::result::Result<postgres::types::IsNull, Box<dyn std::error::Error + Send + Sync>>
+    {
+        match self {
+            Self::I64(v) => v.to_sql(t, out),
+            Self::Text(v) => v.to_sql(t, out),
+            Self::Bytes(v) => v.to_sql(t, out),
+            Self::OptBytes(v) => v.to_sql(t, out),
+        }
+    }
+}
+
+/// The reply of one statement.
+enum Reply {
+    Rows(Vec<postgres::Row>),
+    Count(u64),
+}
+
+/// What a statement returns.
+#[derive(Clone, Copy)]
+enum Kind {
+    /// All rows of a SELECT.
+    Rows,
+    /// The affected-row count of an INSERT, UPDATE or DELETE.
+    Count,
+    /// A batch of statements, as one transaction, such as a migration.
+    Batch,
+}
+
+/// One statement to run on the worker thread.
+struct Job {
+    sql: String,
+    params: Vec<Param>,
+    kind: Kind,
+    reply: std::sync::mpsc::Sender<Result<Reply>>,
+}
+
+/// A client of the database, driven by one worker thread. The sync
+/// `postgres` client runs its own tokio runtime, which must not start
+/// inside the server's, so a statement is sent to the worker and the
+/// caller blocks for its reply. The client itself never crosses threads.
+struct PgClient {
+    jobs: std::sync::mpsc::Sender<Job>,
+}
+
+impl PgClient {
+    /// Puts `client` on its own worker thread.
+    fn spawn(client: Client) -> PgClient {
+        let (jobs, rx) = std::sync::mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("postgres-client".into())
+            .spawn(move || {
+                let mut client = client;
+                for job in rx {
+                    let refs: Vec<&(dyn ToSql + Sync)> = job
+                        .params
+                        .iter()
+                        .map(|p| p as &(dyn ToSql + Sync))
+                        .collect();
+                    let out = match job.kind {
+                        Kind::Batch => client.batch_execute(&job.sql).map(|(): ()| Reply::Count(0)),
+                        Kind::Count => client.execute(&job.sql, &refs).map(Reply::Count),
+                        Kind::Rows => client.query(&job.sql, &refs).map(Reply::Rows),
+                    }
+                    .map_err(Error::Pg);
+                    if job.reply.send(out).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn the postgres worker");
+        Self { jobs }
+    }
+
+    /// Runs one statement and waits for its reply.
+    fn ask(&self, sql: &str, params: Vec<Param>, kind: Kind) -> Result<Reply> {
+        let (reply, rx) = std::sync::mpsc::channel();
+        self.jobs
+            .send(Job {
+                sql: sql.to_owned(),
+                params,
+                kind,
+                reply,
+            })
+            .map_err(|_| Error::Corrupt("the database worker stopped".into()))?;
+        rx.recv()
+            .map_err(|_| Error::Corrupt("the database worker stopped".into()))?
+    }
+
+    /// The rows of one query.
+    fn query(&self, sql: &str, params: &[Param]) -> Result<Vec<postgres::Row>> {
+        match self.ask(sql, params.to_vec(), Kind::Rows)? {
+            Reply::Rows(rows) => Ok(rows),
+            Reply::Count(_) => unreachable!("a query returns rows"),
+        }
+    }
+
+    /// The first row of a query, or [`None`] when it has none.
+    fn query_opt(&self, sql: &str, params: &[Param]) -> Result<Option<postgres::Row>> {
+        Ok(self.query(sql, params)?.into_iter().next())
+    }
+
+    /// The affected-row count of one statement.
+    fn execute(&self, sql: &str, params: &[Param]) -> Result<u64> {
+        match self.ask(sql, params.to_vec(), Kind::Count)? {
+            Reply::Count(n) => Ok(n),
+            Reply::Rows(_) => unreachable!("an execute returns a count"),
+        }
+    }
+
+    /// A batch of statements, as one transaction.
+    fn batch(&self, sql: &str) -> Result<()> {
+        match self.ask(sql, Vec::new(), Kind::Batch)? {
+            Reply::Count(_) => Ok(()),
+            Reply::Rows(_) => unreachable!("a batch returns a count"),
+        }
+    }
+}
+
+impl Pg {
+    /// Opens the database at `url`, and the blob folder under `data`, as
+    /// its server: the one `Pg` that may land. `readers` clients serve
+    /// reads beside it. With `ca`, a certificate the server must present
+    /// is checked against this CA (PEM); a CA is required for a host that
+    /// is not on this machine.
+    ///
+    /// # Errors
+    ///
+    /// A URL that does not parse, a database that does not connect, a
+    /// schema of a newer build, or a migration that fails.
+    pub fn open(url: &str, ca: Option<&Path>, readers: usize, data: &Path) -> Result<Self> {
+        Self::open_in(url, ca, readers, data, None)
+    }
+
+    /// [`Pg::open`], in `schema` instead of the database's default one, for
+    /// tests: each data directory gets its own corner of one database. The
+    /// schema is created if missing, and the migrations run in it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Pg::open`].
+    pub fn open_test(url: &str, schema: &str, readers: usize, data: &Path) -> Result<Self> {
+        {
+            // One throwaway client makes the schema, before any connection
+            // narrows its search path to it.
+            let maker = connect(url, None)?;
+            maker.batch(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))?;
+        }
+        Self::open_in(url, None, readers, data, Some(schema))
+    }
+
+    /// [`Pg::open`], in the search path of `schema` when it is set.
+    fn open_in(
+        url: &str,
+        ca: Option<&Path>,
+        readers: usize,
+        data: &Path,
+        schema: Option<&str>,
+    ) -> Result<Self> {
+        let options = schema
+            .map(|schema| format!("-csearch_path={schema}"))
+            .unwrap_or_default();
+        let writer = connect_with(url, ca, &options)?;
+        migrate(&writer)?;
+        let blobs = Blobs::open(data)?;
+        blobs.sweep_tmp(false)?;
+        Ok(Self {
+            inner: Arc::new(PgInner {
+                writer: Mutex::new(writer),
+                readers: Readers::new_with(readers, url, ca, &options)?,
+                blobs,
+            }),
+        })
+    }
+
+    /// The blob folder.
+    #[must_use]
+    pub fn blobs(&self) -> &Blobs {
+        &self.inner.blobs
+    }
+
+    /// A read on the write client, so it sees the caller's own commits.
+    pub fn read_unflushed<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
+        let mut writer = self.lock_writer();
+        let mut pg = PgTx {
+            c: &mut writer,
+            ended: true,
+        };
+        f(&mut pg)
+    }
+
+    /// A strong read on one client of the pool. The read runs in one
+    /// transaction, so all its statements see one snapshot; on this backend
+    /// every commit is durable when it returns, so what `f` saw is durable.
+    pub fn read<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
+        let mut reader = self.inner.readers.take();
+        let mut tx = PgTx::begin(reader.client())?;
+        let out = f(&mut tx);
+        // A read transaction: nothing to keep. An explicit rollback, so an
+        // error of the rollback cannot hide the error of `f`.
+        tx.rollback()?;
+        out
+    }
+
+    /// Runs `f` in one write transaction. It commits when `f` returns `Ok`
+    /// and rolls back otherwise. A commit is durable when it returns, so
+    /// this is also `write`.
+    ///
+    /// # Errors
+    ///
+    /// What `f` returns, or a database error from begin or commit.
+    pub fn commit<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
+        let mut writer = self.lock_writer();
+        // A transaction takes its isolation from the session: READ
+        // COMMITTED, the Postgres default.
+        let mut tx = PgTx::begin(&mut writer)?;
+        match f(&mut tx) {
+            Ok(value) => {
+                tx.commit()?;
+                Ok(value)
+            }
+            Err(error) => {
+                // An explicit rollback, so an error of the rollback cannot
+                // hide the error of `f`.
+                tx.rollback()?;
+                Err(error)
+            }
+        }
+    }
+
+    /// [`Pg::commit`]: on this backend, durable on return.
+    ///
+    /// # Errors
+    ///
+    /// As [`Pg::commit`].
+    pub fn write<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
+        self.commit(f)
+    }
+
+    fn lock_writer(&self) -> MutexGuard<'_, PgClient> {
+        self.inner
+            .writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One client of the database, inside one transaction. The queries are its
+/// [`MetaTx`] methods. The transaction is begun and ended with statements
+/// of the client, so a `PgTx` is a plain client handle: it stays covariant
+/// in its lifetime, which the backend enum's transaction needs.
+pub struct PgTx<'a> {
+    c: &'a mut PgClient,
+    /// The transaction was ended by `commit` or `rollback`; a drop then
+    /// leaves the client alone.
+    ended: bool,
+}
+
+impl<'a> PgTx<'a> {
+    /// Begins one transaction on the client.
+    fn begin(c: &'a mut PgClient) -> Result<PgTx<'a>> {
+        c.execute("BEGIN", &[])?;
+        Ok(Self { c, ended: false })
+    }
+
+    /// One transaction over the same client, for a caller that wraps this
+    /// one. It ends nothing: `commit` and `rollback` stay with the original.
+    pub(crate) fn reborrow(&mut self) -> PgTx<'_> {
+        PgTx {
+            c: self.c,
+            ended: true,
+        }
+    }
+
+    /// Commits the transaction. The client runs again afterwards.
+    fn commit(&mut self) -> Result<()> {
+        self.ended = true;
+        self.c.execute("COMMIT", &[])?;
+        Ok(())
+    }
+
+    /// Rolls the transaction back. The client runs again afterwards.
+    fn rollback(&mut self) -> Result<()> {
+        if self.ended {
+            return Ok(());
+        }
+        self.ended = true;
+        self.c.execute("ROLLBACK", &[])?;
+        Ok(())
+    }
+}
+
+impl Drop for PgTx<'_> {
+    fn drop(&mut self) {
+        // A transaction that its caller did not end rolls back, as a
+        // dropped SQLite transaction does.
+        if !self.ended {
+            let _ = self.c.execute("ROLLBACK", &[]);
+        }
+    }
+}
+
+/// Connects one client of `url`. TLS follows the rule of the gRPC client: a
+/// host on this machine may go without TLS; a host off it must present a
+/// certificate that `ca` signed.
+fn connect(url: &str, ca: Option<&Path>) -> Result<PgClient> {
+    connect_with(url, ca, "")
+}
+
+/// Connects one client of `url`, with libpq `options` added. The connect
+/// runs on a plain thread: `postgres` drives its own runtime, which must
+/// not start inside the server's tokio one.
+fn connect_with(url: &str, ca: Option<&Path>, options: &str) -> Result<PgClient> {
+    let url = url.to_owned();
+    let options = options.to_owned();
+    let client = std::thread::scope(|scope| {
+        scope
+            .spawn(move || connect_on(&url, ca, &options))
+            .join()
+            .unwrap()
+    })?;
+    Ok(PgClient::spawn(client))
+}
+
+/// [`connect_with`]'s work: parse, then connect.
+fn connect_on(url: &str, ca: Option<&Path>, options: &str) -> Result<Client> {
+    let mut config: Config = url
+        .parse()
+        .map_err(|e| Error::InvalidArgument(format!("cannot parse the database URL: {e}")))?;
+    if !options.is_empty() {
+        config.options(options);
+    }
+    let local = match config.get_hosts().first() {
+        Some(postgres::config::Host::Tcp(host)) => {
+            host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }
+        // A Unix socket is as local as it gets.
+        Some(postgres::config::Host::Unix(_)) => true,
+        None => false,
+    };
+    let client = match (local, ca) {
+        (_, Some(ca)) => config.connect(make_tls(ca)?)?,
+        (true, None) => config.connect(NoTls)?,
+        (false, None) => {
+            return Err(Error::InvalidArgument(
+                "the database host is off this machine: give --postgres-ca, \
+                 so that its certificate can be checked"
+                    .to_owned(),
+            ));
+        }
+    };
+    Ok(client)
+}
+
+/// The TLS connector of a database whose host is off this machine: the
+/// certificate it presents must be one `ca` signed. There is no mode that
+/// accepts any certificate.
+fn make_tls(ca: &Path) -> Result<MakeRustlsConnect> {
+    use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject as _};
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::CryptoProvider};
+
+    let mut roots = RootCertStore::empty();
+    for certificate in CertificateDer::pem_file_iter(ca)
+        .map_err(|e| Error::InvalidArgument(format!("cannot read the database CA: {e}")))?
+    {
+        let certificate = certificate
+            .map_err(|e| Error::InvalidArgument(format!("the database CA is not PEM: {e}")))?;
+        roots
+            .add(certificate)
+            .map_err(|_| Error::InvalidArgument("the database CA is not a root".to_owned()))?;
+    }
+    let provider: Arc<CryptoProvider> =
+        Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::InvalidArgument(format!("no supported TLS version: {e}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(MakeRustlsConnect::new(config))
+}
+
+/// Brings the database to this build's schema: runs every migration it has
+/// not run yet, in one transaction each, and refuses a schema of a newer
+/// build.
+fn migrate(client: &PgClient) -> Result<()> {
+    client.batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+             version BIGINT PRIMARY KEY,
+             name    TEXT NOT NULL
+         )",
+    )?;
+    let version = client
+        .query("SELECT max(version) FROM schema_migrations", &[])?
+        .first()
+        .and_then(|row| row.get::<_, Option<i64>>(0))
+        .unwrap_or(0);
+    let version = u32::try_from(version).map_err(|_| {
+        Error::FailedPrecondition(format!(
+            "database schema version {version} is not a version"
+        ))
+    })?;
+    if version > PG_SCHEMA_VERSION {
+        return Err(Error::FailedPrecondition(format!(
+            "database schema version {version} is newer than this build \
+             ({PG_SCHEMA_VERSION}); run this build's older server, or upgrade it"
+        )));
+    }
+    for (n, sql) in PG_MIGRATIONS.iter().enumerate() {
+        let n = u32::try_from(n + 1).expect("a schema version fits in a u32");
+        if n <= version {
+            continue;
+        }
+        // The batch is one implicit transaction: the migration and its
+        // schema_migrations row land together.
+        client.batch(&format!(
+            "{sql}\nINSERT INTO schema_migrations (version, name) \
+             VALUES ({}, 'postgres schema')",
+            i64::from(n)
+        ))?;
+    }
+    Ok(())
+}
+
+/// Reads a tree's rows and checks them against its ID.
+fn load_tree(c: &PgClient, id: TreeId) -> Result<(Tree, Vec<u8>)> {
+    let body: Vec<u8> = c
+        .query_opt(
+            "SELECT body FROM trees WHERE id = $1",
+            &[P::bytes(&id_bytes(id.as_bytes()))],
+        )?
+        .ok_or_else(|| Error::NotFound(format!("tree {id}")))?
+        .get(0);
+    let (tree, actual) =
+        Tree::decode_with_id(&body).map_err(|e| Error::Corrupt(format!("tree {id}: {e}")))?;
+    if actual != id {
+        return Err(Error::Corrupt(format!("tree {id} does not match its ID")));
+    }
+    Ok((tree, body))
+}
+
+/// The error of a graph walk that reached its bound.
+fn too_deep(max_visits: usize) -> Error {
+    Error::ResourceExhausted(format!(
+        "the history is too deep: the answer needs more than {max_visits} changesets"
+    ))
+}
+
+fn to_id(bytes: &[u8]) -> Result<ChangesetId> {
+    ChangesetId::try_from(bytes).map_err(|e| Error::Corrupt(format!("stored changeset ID: {e}")))
+}
+
+/// The bytes of a content address, as a BYTEA parameter.
+fn id_bytes(id: &[u8; 32]) -> Vec<u8> {
+    id.to_vec()
+}
+
+impl MetaTx for PgTx<'_> {
+    /// Creates a repository, or returns the existing one with that name.
+    fn create_repo(&mut self, name: &str) -> Result<RepoId> {
+        self.c.execute(
+            "INSERT INTO repos (name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
+            &[P::text(name)],
+        )?;
+        self.repo_id(name)
+    }
+
+    /// Looks up a repository by name.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if no repository has that name.
+    fn repo_id(&mut self, name: &str) -> Result<RepoId> {
+        let row = self
+            .c
+            .query_opt(
+                "SELECT repo_id FROM repos WHERE name = $1",
+                &[P::text(name)],
+            )?
+            .ok_or_else(|| Error::NotFound(format!("repo {name:?}")))?;
+        Ok(RepoId(row.get(0)))
+    }
+
+    /// Stores a changeset and adds it to `repo`. Every parent must already
+    /// be in `repo`. Safe to repeat.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if a parent is not in `repo`.
+    fn insert_changeset(&mut self, repo: RepoId, cs: &Changeset) -> Result<ChangesetId> {
+        let (body, id) = cs.encode_with_id();
+        let mut parent_gen = 0;
+        for parent in &cs.parents {
+            parent_gen = parent_gen.max(self.generation(repo, *parent)?);
+        }
+        self.c.execute(
+            "INSERT INTO changesets (id, gen, body) VALUES ($1, $2, $3)
+             ON CONFLICT (id) DO NOTHING",
+            &[
+                P::bytes(&id_bytes(id.as_bytes())),
+                P::i64(parent_gen + 1),
+                P::bytes(&body),
+            ],
+        )?;
+        for (n, parent) in (0_i64..).zip(&cs.parents) {
+            self.c.execute(
+                "INSERT INTO changeset_parents (cs, n, parent) VALUES ($1, $2, $3)
+                 ON CONFLICT (cs, n) DO NOTHING",
+                &[
+                    P::bytes(&id_bytes(id.as_bytes())),
+                    P::i64(n),
+                    P::bytes(&id_bytes(parent.as_bytes())),
+                ],
+            )?;
+        }
+        self.c.execute(
+            "INSERT INTO repo_changesets (repo_id, cs) VALUES ($1, $2)
+             ON CONFLICT (repo_id, cs) DO NOTHING",
+            &[P::i64(repo.0), P::bytes(&id_bytes(id.as_bytes()))],
+        )?;
+        Ok(id)
+    }
+
+    /// Adds `blob` to the blobs that `repo` may name. Returns whether it is
+    /// new.
+    fn add_repo_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool> {
+        let added = self.c.execute(
+            "INSERT INTO repo_blobs (repo_id, blob) VALUES ($1, $2)
+             ON CONFLICT (repo_id, blob) DO NOTHING",
+            &[P::i64(repo.0), P::bytes(&id_bytes(blob.as_bytes()))],
+        )?;
+        Ok(added == 1)
+    }
+
+    /// Whether `repo` may name `blob`.
+    fn repo_has_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool> {
+        Ok(self
+            .c
+            .query_opt(
+                "SELECT 1 FROM repo_blobs WHERE repo_id = $1 AND blob = $2",
+                &[P::i64(repo.0), P::bytes(&id_bytes(blob.as_bytes()))],
+            )?
+            .is_some())
+    }
+
+    /// Reads a changeset that `repo` may see and checks it against its ID.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if `repo` does not have it, [`Error::Corrupt`]
+    /// if it does not decode or match.
+    fn get_changeset(&mut self, repo: RepoId, id: ChangesetId) -> Result<Changeset> {
+        let body: Vec<u8> = self
+            .c
+            .query_opt(
+                "SELECT body FROM changesets JOIN repo_changesets ON cs = id
+                 WHERE repo_id = $1 AND id = $2",
+                &[P::i64(repo.0), P::bytes(&id_bytes(id.as_bytes()))],
+            )?
+            .ok_or_else(|| Error::NotFound(format!("changeset {id}")))?
+            .get(0);
+        let (cs, actual) = Changeset::decode_with_id(&body)
+            .map_err(|e| Error::Corrupt(format!("changeset {id}: {e}")))?;
+        if actual != id {
+            return Err(Error::Corrupt(format!(
+                "changeset {id} does not match its ID"
+            )));
+        }
+        Ok(cs)
+    }
+
+    /// Whether `repo` may see changeset `id`.
+    fn has_changeset(&mut self, repo: RepoId, id: ChangesetId) -> Result<bool> {
+        Ok(self
+            .c
+            .query_opt(
+                "SELECT 1 FROM repo_changesets WHERE repo_id = $1 AND cs = $2",
+                &[P::i64(repo.0), P::bytes(&id_bytes(id.as_bytes()))],
+            )?
+            .is_some())
+    }
+
+    /// The generation of a changeset that `repo` may see.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if `repo` does not have it.
+    fn generation(&mut self, repo: RepoId, id: ChangesetId) -> Result<i64> {
+        self.c
+            .query_opt(
+                "SELECT gen FROM changesets JOIN repo_changesets ON cs = id
+                 WHERE repo_id = $1 AND id = $2",
+                &[P::i64(repo.0), P::bytes(&id_bytes(id.as_bytes()))],
+            )?
+            .map(|row| row.get::<_, i64>(0))
+            .ok_or_else(|| Error::NotFound(format!("changeset {id}")))
+    }
+
+    /// The generation of a changeset, in any repo. For derived data.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if no changeset has this ID.
+    fn generation_of(&mut self, id: ChangesetId) -> Result<i64> {
+        self.c
+            .query_opt(
+                "SELECT gen FROM changesets WHERE id = $1",
+                &[P::bytes(&id_bytes(id.as_bytes()))],
+            )?
+            .map(|row| row.get::<_, i64>(0))
+            .ok_or_else(|| Error::NotFound(format!("changeset {id}")))
+    }
+
+    /// The first parent of a changeset, or `None` for a root.
+    fn first_parent(&mut self, id: ChangesetId) -> Result<Option<ChangesetId>> {
+        let parent = self
+            .c
+            .query_opt(
+                "SELECT parent FROM changeset_parents WHERE cs = $1 AND n = 0",
+                &[P::bytes(&id_bytes(id.as_bytes()))],
+            )?
+            .map(|row| row.get::<_, Vec<u8>>(0));
+        parent.map(|bytes| to_id(&bytes)).transpose()
+    }
+
+    /// Every parent of changeset `id`, in order, with its generation.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if a parent's generation is not below `id_gen`.
+    fn parents(&mut self, id: ChangesetId, id_gen: i64) -> Result<Vec<(ChangesetId, i64)>> {
+        let rows = self.c.query(
+            "SELECT parent, gen FROM changeset_parents JOIN changesets ON id = parent
+             WHERE cs = $1 ORDER BY n",
+            &[P::bytes(&id_bytes(id.as_bytes()))],
+        )?;
+        rows.iter()
+            .map(|row| {
+                let parent: Vec<u8> = row.get(0);
+                let parent_gen: i64 = row.get(1);
+                let parent = to_id(&parent)?;
+                if parent_gen >= id_gen {
+                    return Err(Error::Corrupt(format!(
+                        "changeset {id} has generation {id_gen}, its parent {parent} {parent_gen}"
+                    )));
+                }
+                Ok((parent, parent_gen))
+            })
+            .collect()
+    }
+
+    /// Whether `ancestor` is `descendant` or reachable from it through
+    /// parents, within a bounded walk.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if `repo` does not have either changeset.
+    /// [`Error::ResourceExhausted`] if the walk needs more than `max_visits`
+    /// changesets.
+    fn is_ancestor(
+        &mut self,
+        repo: RepoId,
+        ancestor: ChangesetId,
+        descendant: ChangesetId,
+        max_visits: usize,
+    ) -> Result<bool> {
+        let floor = self.generation(repo, ancestor)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![(descendant, self.generation(repo, descendant)?)];
+        while let Some((id, id_gen)) = stack.pop() {
+            if id == ancestor {
+                return Ok(true);
+            }
+            if id_gen <= floor || !seen.insert(id) {
+                continue;
+            }
+            if seen.len() > max_visits {
+                return Err(too_deep(max_visits));
+            }
+            stack.extend(self.parents(id, id_gen)?);
+        }
+        Ok(false)
+    }
+
+    /// Where a ref points, if it exists.
+    fn get_ref(&mut self, repo: RepoId, name: &str) -> Result<Option<RefState>> {
+        self.c
+            .query_opt(
+                "SELECT target, version FROM refs WHERE repo_id = $1 AND name = $2",
+                &[P::i64(repo.0), P::text(name)],
+            )?
+            .map(|row| -> Result<RefState> {
+                let target: Vec<u8> = row.get(0);
+                Ok(RefState {
+                    target: to_id(&target)?,
+                    version: row.get(1),
+                })
+            })
+            .transpose()
+    }
+
+    /// Moves a ref if its version is still `expected`. `None` creates the
+    /// ref and expects it not to exist. Returns whether the ref moved.
+    ///
+    /// # Errors
+    ///
+    /// Database errors, or [`Error::NotFound`] if `repo` does not have
+    /// `target`.
+    fn cas_ref(
+        &mut self,
+        repo: RepoId,
+        name: &str,
+        expected: Option<i64>,
+        target: ChangesetId,
+    ) -> Result<bool> {
+        self.generation(repo, target)?;
+        let changed = match expected {
+            None => self.c.execute(
+                "INSERT INTO refs (repo_id, name, target, version) VALUES ($1, $2, $3, 1)
+                 ON CONFLICT (repo_id, name) DO NOTHING",
+                &[
+                    P::i64(repo.0),
+                    P::text(name),
+                    P::bytes(&id_bytes(target.as_bytes())),
+                ],
+            )?,
+            Some(version) => self.c.execute(
+                "UPDATE refs SET target = $3, version = version + 1
+                 WHERE repo_id = $1 AND name = $2 AND version = $4",
+                &[
+                    P::i64(repo.0),
+                    P::text(name),
+                    P::bytes(&id_bytes(target.as_bytes())),
+                    P::i64(version),
+                ],
+            )?,
+        };
+        Ok(changed == 1)
+    }
+
+    /// The stored bytes of a derived value, if computed.
+    fn get_derived(
+        &mut self,
+        kind: &str,
+        version: u32,
+        cs: ChangesetId,
+    ) -> Result<Option<Vec<u8>>> {
+        let version = i64::from(version);
+        Ok(self
+            .c
+            .query_opt(
+                "SELECT value FROM derived WHERE kind = $1 AND version = $2 AND cs = $3",
+                &[
+                    P::text(kind),
+                    P::i64(version),
+                    P::bytes(&id_bytes(cs.as_bytes())),
+                ],
+            )?
+            .map(|row| row.get(0)))
+    }
+
+    /// Records a derived value. A second write must agree with the first:
+    /// derivation is deterministic, so a mismatch means corruption.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if a different value is already stored.
+    fn put_derived(
+        &mut self,
+        kind: &str,
+        version: u32,
+        cs: ChangesetId,
+        value: &[u8],
+    ) -> Result<()> {
+        let version64 = i64::from(version);
+        let inserted = self.c.execute(
+            "INSERT INTO derived (kind, version, cs, value) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (kind, version, cs) DO NOTHING",
+            &[
+                P::text(kind),
+                P::i64(version64),
+                P::bytes(&id_bytes(cs.as_bytes())),
+                P::bytes(value),
+            ],
+        )?;
+        if inserted == 0 && self.get_derived(kind, version, cs)?.as_deref() != Some(value) {
+            return Err(Error::Corrupt(format!(
+                "derived {kind} v{version} for {cs} differs from the stored value"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Deletes up to `limit` derived values of `kind` with a version below
+    /// `version`, and returns how many.
+    fn delete_derived_below(&mut self, kind: &str, version: u32, limit: usize) -> Result<usize> {
+        let version = i64::from(version);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let deleted = self.c.execute(
+            "DELETE FROM derived WHERE (kind, version, cs) IN (
+                 SELECT kind, version, cs FROM derived
+                 WHERE kind = $1 AND version < $2 LIMIT $3)",
+            &[P::text(kind), P::i64(version), P::i64(limit)],
+        )?;
+        Ok(usize::try_from(deleted).unwrap_or(0))
+    }
+
+    /// Stores a tree. Safe to repeat.
+    fn put_tree(&mut self, tree: &Tree) -> Result<TreeId> {
+        let (body, id) = tree.encode_with_id();
+        self.c.execute(
+            "INSERT INTO trees (id, body) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
+            &[P::bytes(&id_bytes(id.as_bytes())), P::bytes(&body)],
+        )?;
+        Ok(id)
+    }
+
+    /// Reads a tree and checks it against its ID.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if absent, [`Error::Corrupt`] if it does not
+    /// decode or match.
+    fn get_tree(&mut self, id: TreeId) -> Result<Tree> {
+        load_tree(self.c, id).map(|(tree, _)| tree)
+    }
+
+    /// Reads a tree's stored `TreeV1` bytes and checks them against its ID.
+    ///
+    /// # Errors
+    ///
+    /// As [`MetaTx::get_tree`].
+    fn get_tree_body(&mut self, id: TreeId) -> Result<Vec<u8>> {
+        load_tree(self.c, id).map(|(_, body)| body)
+    }
+
+    /// The length of a tree's stored `TreeV1` bytes, without reading them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if absent.
+    fn tree_size(&mut self, id: TreeId) -> Result<usize> {
+        let size: i64 = self
+            .c
+            .query_opt(
+                "SELECT octet_length(body) FROM trees WHERE id = $1",
+                &[P::bytes(&id_bytes(id.as_bytes()))],
+            )?
+            .ok_or_else(|| Error::NotFound(format!("tree {id}")))?
+            .get(0);
+        usize::try_from(size).map_err(|_| Error::Corrupt(format!("tree {id}: length {size}")))
+    }
+
+    /// Inserts a land, or finds the land for the same request key. A land
+    /// to a ref that does not exist is recorded as rejected at once. A new
+    /// land also expires old ones.
+    fn record_land(
+        &mut self,
+        caller: &Caller,
+        req: &LandRequest,
+        pending_limit: Option<usize>,
+    ) -> Result<(RepoId, LandOutcome)> {
+        let repo = self.repo_id(&req.repo)?;
+        self.generation(repo, req.changeset)?;
+        let existing = self
+            .c
+            .query_opt(
+                "SELECT land_id, input_cs, target_ref FROM lands
+                 WHERE repo_id = $1 AND caller = $2 AND request_key = $3",
+                &[
+                    P::i64(repo.0),
+                    P::text(&caller.0),
+                    P::text(&req.request_key),
+                ],
+            )?
+            .map(|row| {
+                (
+                    row.get::<_, i64>(0),
+                    row.get::<_, Vec<u8>>(1),
+                    row.get::<_, String>(2),
+                )
+            });
+        let land_id = if let Some((land_id, input, target)) = existing {
+            if input != req.changeset.as_bytes() || target != req.target_ref {
+                return Err(Error::InvalidArgument(format!(
+                    "request key {:?} was already used for a different land",
+                    req.request_key
+                )));
+            }
+            land_id
+        } else {
+            let (state, detail) = if self.get_ref(repo, &req.target_ref)?.is_some() {
+                (LandState::Pending, String::new())
+            } else {
+                let detail = format!("ref {:?} does not exist", req.target_ref);
+                (LandState::Rejected, detail)
+            };
+            if let Some(limit) = pending_limit {
+                // The pending-lands quota counts new pending rows. A retry
+                // of an existing key resumes its land and adds no row, so a
+                // client can always finish what it started.
+                let pending: i64 = self
+                    .c
+                    .query_opt(
+                        "SELECT count(*) FROM lands WHERE caller = $1 AND state = 'pending'",
+                        &[P::text(&caller.0)],
+                    )?
+                    .and_then(|row| row.get(0))
+                    .unwrap_or(0);
+                if pending >= i64::try_from(limit).unwrap_or(i64::MAX) {
+                    return Err(Error::ResourceExhausted(format!(
+                        "principal {:?} has its {limit} lands pending \
+                         (--max-principal-pending-lands {limit}); wait for one to finish",
+                        caller.0
+                    )));
+                }
+            }
+            let land_id: i64 = self
+                .c
+                .query_opt(
+                    "INSERT INTO lands
+                     (repo_id, caller, request_key, target_ref, input_cs, state, detail,
+                      finished_at, created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7,
+                         CASE WHEN $6 = 'pending' THEN NULL ELSE now_epoch() END,
+                         now_epoch())
+                     RETURNING land_id",
+                    &[
+                        P::i64(repo.0),
+                        P::text(&caller.0),
+                        P::text(&req.request_key),
+                        P::text(&req.target_ref),
+                        P::bytes(&id_bytes(req.changeset.as_bytes())),
+                        P::text(state.as_str()),
+                        P::text(&detail),
+                    ],
+                )?
+                .and_then(|row| row.get(0))
+                .unwrap_or(0);
+            self.expire_lands()?;
+            land_id
+        };
+        Ok((repo, self.land_outcome(repo, caller, land_id)?))
+    }
+
+    /// The pending lands that started more than `stale_secs` ago.
+    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<(RepoId, i64, String)>> {
+        let rows = self.c.query(
+            "SELECT repo_id, land_id, target_ref FROM lands
+             WHERE state = 'pending' AND created_at > 0
+                 AND created_at < now_epoch() - $1",
+            &[P::i64(stale_secs)],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| (RepoId(row.get(0)), row.get(1), row.get(2)))
+            .collect())
+    }
+
+    /// Rejects a land that is still pending; 1 if it changed, else 0.
+    fn reject_stale_land(&mut self, land_id: i64, detail: String) -> Result<u64> {
+        let changed = self.c.execute(
+            "UPDATE lands SET state = 'rejected', detail = $1, finished_at = now_epoch()
+             WHERE land_id = $2 AND state = 'pending'",
+            &[P::text(&detail), P::i64(land_id)],
+        )?;
+        Ok(changed)
+    }
+
+    /// Deletes up to [`EXPIRE_PER_LAND`] lands that finished more than
+    /// [`LAND_RETENTION_SECS`] ago, oldest first. The newest land always
+    /// stays; its ID is the largest, and the sequence never hands an ID
+    /// out twice.
+    fn expire_lands(&mut self) -> Result<()> {
+        let deleted = self.c.execute(
+            "DELETE FROM lands WHERE land_id IN (
+                 SELECT land_id FROM lands
+                 WHERE finished_at < now_epoch() - $1
+                     AND land_id < (SELECT max(land_id) FROM lands)
+                 ORDER BY finished_at LIMIT $2)",
+            &[P::i64(LAND_RETENTION_SECS), P::i64(EXPIRE_PER_LAND)],
+        )?;
+        if deleted > 0 {
+            tracing::debug!(deleted, "expired finished lands");
+        }
+        Ok(())
+    }
+
+    /// A land that `caller` started in `repo`.
+    fn land_outcome(&mut self, repo: RepoId, caller: &Caller, land_id: i64) -> Result<LandOutcome> {
+        let row = self
+            .c
+            .query_opt(
+                "SELECT state, result_cs, detail, conflict_paths FROM lands
+                 WHERE repo_id = $1 AND land_id = $2 AND caller = $3",
+                &[P::i64(repo.0), P::i64(land_id), P::text(&caller.0)],
+            )?
+            .ok_or_else(|| Error::NotFound(format!("land {land_id}")))?;
+        let state: String = row.get(0);
+        let result: Option<Vec<u8>> = row.get(1);
+        let detail: String = row.get(2);
+        let paths: Vec<u8> = row.get(3);
+        let result = result
+            .map(|bytes| ChangesetId::try_from(bytes.as_slice()))
+            .transpose()
+            .map_err(|e| Error::Corrupt(format!("land {land_id} result: {e}")))?;
+        Ok(LandOutcome {
+            land_id,
+            state: LandState::parse(&state)?,
+            result,
+            detail,
+            conflict_paths: decode_paths(&paths)
+                .ok_or_else(|| Error::Corrupt(format!("land {land_id} conflict paths")))?,
+        })
+    }
+
+    /// Moves a pending land to its final state and returns the outcome.
+    fn set_land_state(
+        &mut self,
+        repo: RepoId,
+        land_id: i64,
+        state: LandState,
+        result: Option<ChangesetId>,
+        detail: String,
+        conflict_paths: Vec<RepoPath>,
+    ) -> Result<LandOutcome> {
+        let updated = self.c.execute(
+            "UPDATE lands SET state = $3, result_cs = $4, detail = $5, conflict_paths = $6,
+                 finished_at = now_epoch()
+             WHERE repo_id = $1 AND land_id = $2 AND state = 'pending'",
+            &[
+                P::i64(repo.0),
+                P::i64(land_id),
+                P::text(state.as_str()),
+                P::opt_bytes(result.as_ref().map(|id| id_bytes(id.as_bytes()))),
+                P::text(&detail),
+                P::bytes(&encode_paths(&conflict_paths)),
+            ],
+        )?;
+        if updated != 1 {
+            return Err(Error::Corrupt(format!(
+                "land {land_id} is no longer pending"
+            )));
+        }
+        Ok(LandOutcome {
+            land_id,
+            state,
+            result,
+            detail,
+            conflict_paths,
+        })
+    }
+
+    /// Records that a git commit became the changeset. Safe to repeat.
+    fn put_git_import(&mut self, repo: RepoId, commit: ObjectId, cs: ChangesetId) -> Result<()> {
+        self.c.execute(
+            "INSERT INTO git_import (repo_id, git_algo, git_oid, cs) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (repo_id, git_algo, git_oid) DO NOTHING",
+            &[
+                P::i64(repo.0),
+                P::i64(SHA1),
+                P::bytes(commit.as_slice()),
+                P::bytes(&id_bytes(cs.as_bytes())),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every git commit already imported into `repo`.
+    fn imported_commits(
+        &mut self,
+        repo: RepoId,
+    ) -> Result<std::collections::HashMap<ObjectId, ChangesetId>> {
+        let rows = self.c.query(
+            "SELECT git_oid, cs FROM git_import WHERE repo_id = $1 AND git_algo = $2",
+            &[P::i64(repo.0), P::i64(SHA1)],
+        )?;
+        let mut out = std::collections::HashMap::new();
+        for row in &rows {
+            let oid: Vec<u8> = row.get(0);
+            let cs: Vec<u8> = row.get(1);
+            let corrupt = || Error::Corrupt("git_import row".to_owned());
+            let oid = ObjectId::try_from(oid.as_slice()).map_err(|_| corrupt())?;
+            let cs = ChangesetId::try_from(cs.as_slice()).map_err(|_| corrupt())?;
+            out.insert(oid, cs);
+        }
+        Ok(out)
+    }
+
+    /// Stores a history node under its content address. Safe to repeat.
+    /// Returns whether the row was new.
+    fn put_history_node(&mut self, id: NodeId, body: Vec<u8>) -> Result<(NodeId, bool)> {
+        let stored = self.c.execute(
+            "INSERT INTO history_nodes (id, body) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
+            &[P::bytes(&id.0), P::bytes(&body)],
+        )?;
+        Ok((id, stored == 1))
+    }
+
+    /// Reads a history node and checks it against its ID. Also returns the
+    /// length of its stored bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if absent or if it does not match its ID.
+    fn get_history_node(&mut self, id: NodeId) -> Result<(Vec<u8>, usize)> {
+        let body: Vec<u8> = self
+            .c
+            .query_opt(
+                "SELECT body FROM history_nodes WHERE id = $1",
+                &[P::bytes(&id.0)],
+            )?
+            .ok_or_else(|| Error::Corrupt(format!("history node {id} is missing")))?
+            .get(0);
+        if NodeId::of(&body) != id {
+            return Err(Error::Corrupt(format!(
+                "history node {id} does not match its ID"
+            )));
+        }
+        let len = body.len();
+        Ok((body, len))
+    }
+}
+
+impl Meta for Pg {
+    type Tx<'a>
+        = PgTx<'a>
+    where
+        Self: 'a;
+
+    fn read<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
+        // Every commit is durable when it returns, so what `f` sees is
+        // durable, and the read need not wait.
+        Pg::read(self, f)
+    }
+
+    fn read_counted<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> (Result<T>, u64) {
+        // The count is for a caller that waits before it replies; on this
+        // backend there is nothing to wait for.
+        (Pg::read(self, f), 0)
+    }
+
+    fn wait_durable(&self, _seen: u64) -> Result<()> {
+        Ok(())
+    }
+
+    fn read_unflushed<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
+        Pg::read_unflushed(self, f)
+    }
+
+    fn commit<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
+        Pg::commit(self, f)
+    }
+
+    fn write<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
+        // Durable on return, so `write` is `commit`.
+        Pg::write(self, f)
+    }
+
+    fn flush(&self) -> Result<()> {
+        // synchronous_commit is on: a commit is durable when it returns.
+        Ok(())
+    }
+}

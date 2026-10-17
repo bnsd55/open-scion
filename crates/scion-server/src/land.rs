@@ -33,13 +33,14 @@ use hashlink::LruCache;
 use scion_core::{Changeset, ChangesetId, FileState, RepoPath};
 
 use crate::auth::Caller;
+use crate::backend::Backend;
 use crate::deadline::Deadline;
 use crate::derived;
 use crate::error::{Error, Result};
 use crate::graph::{self, CommitGraph};
 use crate::history::{self, PathHistory};
+use crate::meta::Meta as _;
 use crate::meta::{MetaTx, RefState, RepoId};
-use crate::store::Store;
 use crate::tree;
 
 /// Longest accepted ref name or request key, in bytes.
@@ -214,7 +215,7 @@ impl Lands {
     /// pending under it. A row rejected here has no live call: the 600 s
     /// call limit ended long before, and a retry that had the lock would
     /// have finished the land.
-    pub fn sweep_stale(&self, store: &Store, stale_secs: i64) -> Result<u64> {
+    pub fn sweep_stale(&self, store: &Backend, stale_secs: i64) -> Result<u64> {
         let stale = store.read(|c| c.stale_lands(stale_secs))?;
         let mut rejected = 0;
         for (repo, land_id, target_ref) in stale {
@@ -248,7 +249,7 @@ impl Lands {
     /// moving the ref, and [`Error::DeadlineExceeded`] if the plan ran past
     /// the request's deadline. The land then stays pending, and a retry with
     /// the same request key resumes it. Store errors otherwise.
-    pub fn land(&self, store: &Store, caller: &Caller, req: &LandRequest) -> Result<LandOutcome> {
+    pub fn land(&self, store: &Backend, caller: &Caller, req: &LandRequest) -> Result<LandOutcome> {
         let outcome = self.land_committed(store, caller, req);
         // An index can hold up to the whole budget, and freeing it takes a
         // while, so it happens here, outside every lock.
@@ -265,7 +266,7 @@ impl Lands {
     /// not wait for a flush either: `land` flushes before it replies.
     fn land_committed(
         &self,
-        store: &Store,
+        store: &Backend,
         caller: &Caller,
         req: &LandRequest,
     ) -> Result<LandOutcome> {
@@ -432,7 +433,7 @@ impl Lands {
 ///
 /// [`Error::NotFound`] if the repo has no such land, or another caller
 /// started it.
-pub fn get_land(store: &Store, caller: &Caller, repo: &str, land_id: i64) -> Result<LandOutcome> {
+pub fn get_land(store: &Backend, caller: &Caller, repo: &str, land_id: i64) -> Result<LandOutcome> {
     store.read(|c| {
         let repo = c.repo_id(repo)?;
         c.land_outcome(repo, caller, land_id)
@@ -486,7 +487,7 @@ fn stays_pending(e: Error) -> Error {
 /// from before path history needs this once: each later changeset gets its
 /// own when it is written.
 fn derive_history(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     head: ChangesetId,
     deadline: &Deadline,
@@ -505,7 +506,7 @@ fn derive_history(
 /// plan reads the head from the database.
 fn finish(
     lands: &Lands,
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     land_id: i64,
     req: &LandRequest,
@@ -574,7 +575,7 @@ fn plan(
 /// writes nothing and returns [`Error::Aborted`].
 fn settle(
     lands: &Lands,
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     land_id: i64,
     target: &str,
@@ -1109,7 +1110,9 @@ pub(crate) fn decode_paths(bytes: &[u8]) -> Option<Vec<RepoPath>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::Backend;
     use crate::db::{self, SqliteTx};
+    use crate::store::Store;
     use rusqlite::{Connection, params};
     use std::time::Instant;
 
@@ -1123,7 +1126,7 @@ mod tests {
 
     struct Fixture {
         _dir: tempfile::TempDir,
-        store: Store,
+        store: Backend,
         repo: RepoId,
         root: ChangesetId,
         lands: Lands,
@@ -1153,7 +1156,7 @@ mod tests {
     /// A repo whose `main` points at a root with `a/x`, `b/y` and `c`.
     fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let (repo, root) = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
@@ -1235,7 +1238,7 @@ mod tests {
             self.store
                 .read(|c| {
                     let sql = "SELECT count(*) FROM lands WHERE state = 'landed'";
-                    Ok(c.query_row(sql, [], |row| row.get(0))?)
+                    Ok(c.sqlite().unwrap().query_row(sql, [], |row| row.get(0))?)
                 })
                 .unwrap()
         }
@@ -1254,7 +1257,7 @@ mod tests {
             let sql = "UPDATE lands SET finished_at = finished_at - ?2 WHERE land_id = ?1";
             let aged = self
                 .store
-                .write(|c| Ok(c.execute(sql, params![land_id, secs])?))
+                .write(|c| Ok(c.sqlite().unwrap().execute(sql, params![land_id, secs])?))
                 .unwrap();
             assert_eq!(aged, 1);
         }
@@ -1710,7 +1713,11 @@ mod tests {
             let sql = "SELECT state FROM lands WHERE request_key = ?1";
             let row: String = f
                 .store
-                .read(|c| Ok(c.query_row(sql, [key], |row| row.get(0))?))
+                .read(|c| {
+                    Ok(c.sqlite()
+                        .unwrap()
+                        .query_row(sql, [key], |row| row.get(0))?)
+                })
                 .unwrap();
             assert_eq!(row, "pending", "{key}");
             // The index stays, so a retry goes on from where the plan stopped.
@@ -1893,11 +1900,11 @@ mod tests {
             room in proptest::option::of(0..4000_usize),
         ) {
             let dir = tempfile::tempdir().unwrap();
-            let store = Store::open(dir.path()).unwrap();
+            let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
             let (repo, ids) = store
                 .write(|c| {
                     let repo = c.create_repo("r")?;
-                    Ok((repo, testing::insert_history(c, repo, &parents, &edits)?))
+                    Ok((repo, testing::insert_history(c.sqlite().unwrap(), repo, &parents, &edits)?))
                 })
                 .unwrap();
             let lands = Lands::default();
@@ -2579,9 +2586,13 @@ mod tests {
             (child, pending_cs)
         };
 
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let version: u32 = store
-            .read(|c| Ok(c.pragma_query_value(None, "user_version", |row| row.get(0))?))
+            .read(|c| {
+                Ok(c.sqlite()
+                    .unwrap()
+                    .pragma_query_value(None, "user_version", |row| row.get(0))?)
+            })
             .unwrap();
         assert_eq!(version, crate::store::SCHEMA_VERSION);
         // Finished lands start their retention at the upgrade; the pending
@@ -2590,7 +2601,7 @@ mod tests {
             .read(|c| {
                 let sql = "SELECT state, abs(finished_at - unixepoch()) < 60 FROM lands
                            ORDER BY land_id";
-                let mut stmt = c.prepare(sql)?;
+                let mut stmt = c.sqlite().unwrap().prepare(sql)?;
                 let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
                 Ok(rows.collect::<rusqlite::Result<_>>()?)
             })
@@ -2687,7 +2698,7 @@ mod tests {
         // why, and that a retry needs a new request key.
         f.store
             .write(|c| {
-                c.execute(
+                c.sqlite().unwrap().execute(
                     "UPDATE lands SET created_at = unixepoch() - 100000
                      WHERE state = 'pending'",
                     [],
@@ -2700,7 +2711,7 @@ mod tests {
         let (state, detail): (String, String) = f
             .store
             .read(|c| {
-                Ok(c.query_row(
+                Ok(c.sqlite().unwrap().query_row(
                     "SELECT state, detail FROM lands WHERE request_key = 'old'",
                     [],
                     |row| Ok((row.get(0)?, row.get(1)?)),

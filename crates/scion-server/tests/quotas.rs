@@ -8,9 +8,9 @@ use scion_proto::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{GetLandRequest, LogRequest, PutBlobRequest};
 use scion_server::access::Access;
-use scion_server::meta::{MetaTx as _, RefState};
+use scion_server::meta::{Meta as _, MetaTx as _, RefState};
 use scion_server::quotas::Quotas;
-use scion_server::{Store, service};
+use scion_server::{Backend, service};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::AsciiMetadataValue;
@@ -56,9 +56,9 @@ fn access(principals: &[&str]) -> Access {
 
 /// A store whose repo `main` has one root changeset that puts `README`,
 /// with its blob registered, as an upload through `PutBlob` would leave it.
-fn store() -> (tempfile::TempDir, Store) {
+fn store() -> (tempfile::TempDir, Backend) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Backend::open_test(dir.path()).unwrap();
     let blob = store.blobs().put(b"# hello\n").unwrap();
     store
         .write(|c| {
@@ -96,7 +96,7 @@ fn store() -> (tempfile::TempDir, Store) {
 type Stop = tokio::sync::oneshot::Sender<()>;
 
 /// Where `main` of `REPO` points.
-fn main_ref(store: &Store) -> RefState {
+fn main_ref(store: &Backend) -> RefState {
     store
         .read(|c| {
             let repo = c.repo_id(REPO)?;
@@ -108,7 +108,7 @@ fn main_ref(store: &Store) -> RefState {
 
 /// A server of `store` with `access` and `quotas`. Hold the stop signal, or
 /// the server shuts down.
-async fn server(store: &Store, access: Access, quotas: Quotas) -> (Stop, Channel) {
+async fn server(store: &Backend, access: Access, quotas: Quotas) -> (Stop, Channel) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
