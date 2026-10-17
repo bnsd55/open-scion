@@ -331,6 +331,16 @@ fn two_changesets(
     base: BTreeMap<RepoPath, Option<FileState>>,
     changes: BTreeMap<RepoPath, Option<FileState>>,
 ) -> (ChangesetId, ChangesetId) {
+    two_changesets_lens(store, base, changes, Box::new(|_| Ok(0)))
+}
+
+/// [`two_changesets`], with the lens lookup of the tree derivation.
+fn two_changesets_lens(
+    store: &Store,
+    base: BTreeMap<RepoPath, Option<FileState>>,
+    changes: BTreeMap<RepoPath, Option<FileState>>,
+    mut lens: Box<dyn FnMut(BlobId) -> Result<u64, scion_server::Error>>,
+) -> (ChangesetId, ChangesetId) {
     store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -348,11 +358,81 @@ fn two_changesets(
                     message: b"change".to_vec(),
                     changes,
                 };
-                parents.push(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0);
+                parents.push(tree::store_changeset(c, repo, &cs, &mut *lens)?.0);
             }
             Ok((parents[0], parents[1]))
         })
         .unwrap()
+}
+
+#[test]
+fn ls_shows_the_size_of_every_entry_that_carries_one() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let read = b"one two three"; // 13 bytes
+    let link = b"a.md"; // 4 bytes
+    let empty = b"";
+    let gitlink = GitOid::Sha1([0xab; 20]);
+    let sizes = |id: BlobId| {
+        Ok(if id == BlobId::of(read) {
+            read.len() as u64
+        } else if id == BlobId::of(link) {
+            link.len() as u64
+        } else {
+            0
+        })
+    };
+    let changes: BTreeMap<RepoPath, Option<FileState>> = BTreeMap::from([
+        (
+            RepoPath::new(b"read.md").unwrap(),
+            Some(FileState::Regular {
+                content: BlobId::of(read),
+                executable: false,
+            }),
+        ),
+        (
+            RepoPath::new(b"link.md").unwrap(),
+            Some(FileState::Symlink {
+                target: BlobId::of(link),
+            }),
+        ),
+        (
+            RepoPath::new(b"empty.md").unwrap(),
+            Some(FileState::Regular {
+                content: BlobId::of(empty),
+                executable: false,
+            }),
+        ),
+        (
+            RepoPath::new(b"sub").unwrap(),
+            Some(FileState::Gitlink { commit: gitlink }),
+        ),
+    ]);
+    let (_, head) = two_changesets_lens(&store, BTreeMap::new(), changes, Box::new(sizes));
+    let server = Server::start(data, store);
+
+    let ls = server.text(&["ls", &format!("{head}:")]);
+    assert!(ls.contains("100644 file            13 read.md"), "{ls:?}");
+    assert!(ls.contains("120000 symlink          4 link.md"), "{ls:?}");
+    // An empty file still shows its size: zero, not blank.
+    assert!(ls.contains("100644 file             0 empty.md"), "{ls:?}");
+    // A gitlink names a commit, not a blob, so it shows no size.
+    assert!(ls.contains("160000 gitlink            sub"), "{ls:?}");
+
+    let entries = server.json(&["ls", &format!("{head}:")]);
+    let by_name = |name: &str| {
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(by_name("read.md")["size"], 13);
+    assert_eq!(by_name("link.md")["size"], 4);
+    assert_eq!(by_name("empty.md")["size"], 0);
+    assert!(by_name("sub").get("size").is_none(), "{}", by_name("sub"));
 }
 
 #[test]
