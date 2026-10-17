@@ -44,6 +44,10 @@ docker image inspect open-scion-demo >/dev/null 2>&1 || docker compose build
 # data volume, written by the server's own user.
 PUB=$(docker compose run --rm --entrypoint scion-server server \
     --data /data ticket-key --out /data/ticket.key | tail -n 1)
+if [ -z "$PUB" ]; then
+    echo "scion-server ticket-key printed no public key" >&2
+    exit 1
+fi
 export SCION_TICKET_PUB="$PUB"
 
 echo "starting the server and the cache"

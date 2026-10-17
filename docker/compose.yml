@@ -6,7 +6,8 @@
 # or baked into the image. See docker/README.md.
 #
 # The server's ticket public key arrives as an environment variable that
-# docker/demo.sh exports; the cache refuses to start without it.
+# docker/demo.sh exports before it starts the services; without it the
+# cache refuses to serve.
 
 name: scion-demo
 
@@ -54,7 +55,7 @@ services:
       - --ca
       - /certs/ca.pem
       - --ticket-public-key
-      - ${SCION_TICKET_PUB:?run docker/demo.sh, which exports it}
+      - ${SCION_TICKET_PUB:-}
     volumes:
       - ./certs:/certs:ro
     depends_on:
