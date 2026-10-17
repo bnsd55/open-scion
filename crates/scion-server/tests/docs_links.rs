@@ -132,12 +132,12 @@ fn targets(markdown: &str) -> Vec<String> {
             rest = &rest[end + 1..];
         }
         // Reference definitions: [text]: target
-        if let Some(colon) = line.find("]:") {
-            if line.starts_with('[') {
-                let target = line[colon + 2..].trim();
-                if !target.is_empty() {
-                    found.push(target.to_owned());
-                }
+        if let Some(colon) = line.find("]:")
+            && line.starts_with('[')
+        {
+            let target = line[colon + 2..].trim();
+            if !target.is_empty() {
+                found.push(target.to_owned());
             }
         }
     }
