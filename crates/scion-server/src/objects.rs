@@ -32,7 +32,7 @@ use crate::error::{Error, Result};
 use crate::meta::MetaTx as _;
 use crate::quotas::{Call, Quotas};
 use crate::read;
-use crate::service::{Worker, check_reader, check_unary, parse_id, resolve_ref};
+use crate::service::{Worker, check_reader, parse_id, resolve_ref};
 use crate::store::{self, Store};
 use crate::tickets::Keys;
 
@@ -382,12 +382,10 @@ impl Objects for ObjectsService {
             // ticket fails every read that carries it.
             None => Vec::new(),
         };
-        let reply = GetRootTreeResponse {
+        Ok(Response::new(GetRootTreeResponse {
             tree_id: tree.as_bytes().to_vec(),
             ticket,
-        };
-        check_unary(&reply)?;
-        Ok(Response::new(reply))
+        }))
     }
 
     type GetObjectsStream = ObjectStream;

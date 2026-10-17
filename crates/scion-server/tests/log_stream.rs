@@ -1,15 +1,16 @@
 //! `Log` streams its entries in parts, as `ListDir` and `GetChangeset`
 //! stream theirs: the parts take the one counted path, so a client that
 //! stops reading is counted and cut off. The unary replies that are left
-//! carry a guard cap: a reply whose encoding is over it is refused, so the
-//! documented ceiling of the unary memory a client that never reads holds
-//! does not depend on today's RPC list.
+//! are bounded by the message limit: a reply over it is refused by the
+//! server's encoder, and a test pins that wiring, so nobody removes it by
+//! accident.
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
 use scion_core::{Changeset, FileState, RepoPath};
+use scion_proto::MAX_MESSAGE_BYTES;
 use scion_proto::auth::Bearer;
 use scion_proto::listen::Limits;
 use scion_proto::v1::LogRequest;
@@ -21,6 +22,7 @@ use scion_server::{Store, service};
 use tonic::codec::Streaming;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
+use tonic::{Request, Response, Status};
 
 const REPO: &str = "main";
 const TOKEN: &str = "secret";
@@ -156,4 +158,150 @@ async fn a_stalled_log_reply_is_counted_and_closes_the_connection() {
     // nothing was counted.
     let end = reply.message().await;
     assert!(end.is_err(), "the stalled reply was not cut off: {end:?}");
+}
+
+/// A service whose one unary reply is one byte over the largest message a
+/// client accepts, so the server's encoder refuses it.
+struct Huge;
+
+fn dead<T>() -> tokio_stream::wrappers::ReceiverStream<T> {
+    tokio_stream::wrappers::ReceiverStream::new(tokio::sync::mpsc::channel(1).1)
+}
+
+#[tonic::async_trait]
+impl scion_proto::v1::scion_server::Scion for Huge {
+    async fn put_blob(
+        &self,
+        _: Request<tonic::Streaming<scion_proto::v1::PutBlobRequest>>,
+    ) -> Result<Response<scion_proto::v1::PutBlobResponse>, Status> {
+        Err(Status::unimplemented("test stub"))
+    }
+
+    async fn create_changeset(
+        &self,
+        _: Request<scion_proto::v1::CreateChangesetRequest>,
+    ) -> Result<Response<scion_proto::v1::CreateChangesetResponse>, Status> {
+        Err(Status::unimplemented("test stub"))
+    }
+
+    async fn land(
+        &self,
+        _: Request<scion_proto::v1::LandRequest>,
+    ) -> Result<Response<scion_proto::v1::LandResponse>, Status> {
+        Err(Status::unimplemented("test stub"))
+    }
+
+    async fn get_land(
+        &self,
+        _: Request<scion_proto::v1::GetLandRequest>,
+    ) -> Result<Response<scion_proto::v1::LandResponse>, Status> {
+        Err(Status::unimplemented("test stub"))
+    }
+
+    async fn resolve_ref(
+        &self,
+        _: Request<scion_proto::v1::ResolveRefRequest>,
+    ) -> Result<Response<scion_proto::v1::ResolveRefResponse>, Status> {
+        Ok(Response::new(scion_proto::v1::ResolveRefResponse {
+            changeset_id: vec![0; MAX_MESSAGE_BYTES + 1],
+        }))
+    }
+
+    type GetChangesetStream = tokio_stream::wrappers::ReceiverStream<
+        Result<scion_proto::v1::GetChangesetResponse, Status>,
+    >;
+
+    async fn get_changeset(
+        &self,
+        _: Request<scion_proto::v1::GetChangesetRequest>,
+    ) -> Result<Response<Self::GetChangesetStream>, Status> {
+        Ok(Response::new(dead()))
+    }
+
+    type ReadFileStream =
+        tokio_stream::wrappers::ReceiverStream<Result<scion_proto::v1::ReadFileResponse, Status>>;
+
+    async fn read_file(
+        &self,
+        _: Request<scion_proto::v1::ReadFileRequest>,
+    ) -> Result<Response<Self::ReadFileStream>, Status> {
+        Ok(Response::new(dead()))
+    }
+
+    type ListDirStream =
+        tokio_stream::wrappers::ReceiverStream<Result<scion_proto::v1::ListDirResponse, Status>>;
+
+    async fn list_dir(
+        &self,
+        _: Request<scion_proto::v1::ListDirRequest>,
+    ) -> Result<Response<Self::ListDirStream>, Status> {
+        Ok(Response::new(dead()))
+    }
+
+    type LogStream =
+        tokio_stream::wrappers::ReceiverStream<Result<scion_proto::v1::LogResponse, Status>>;
+
+    async fn log(
+        &self,
+        _: Request<scion_proto::v1::LogRequest>,
+    ) -> Result<Response<Self::LogStream>, Status> {
+        Ok(Response::new(dead()))
+    }
+
+    async fn blame(
+        &self,
+        _: Request<scion_proto::v1::BlameRequest>,
+    ) -> Result<Response<scion_proto::v1::BlameResponse>, Status> {
+        Err(Status::unimplemented("test stub"))
+    }
+
+    async fn merge_base(
+        &self,
+        _: Request<scion_proto::v1::MergeBaseRequest>,
+    ) -> Result<Response<scion_proto::v1::MergeBaseResponse>, Status> {
+        Err(Status::unimplemented("test stub"))
+    }
+
+    async fn is_ancestor(
+        &self,
+        _: Request<scion_proto::v1::IsAncestorRequest>,
+    ) -> Result<Response<scion_proto::v1::IsAncestorResponse>, Status> {
+        Err(Status::unimplemented("test stub"))
+    }
+
+    async fn diff(
+        &self,
+        _: Request<scion_proto::v1::DiffRequest>,
+    ) -> Result<Response<scion_proto::v1::DiffResponse>, Status> {
+        Err(Status::unimplemented("test stub"))
+    }
+}
+
+/// A unary reply over the message limit is refused by the server's encoder,
+/// with the code `OUT_OF_RANGE`, so the ceiling of the memory a client that
+/// never reads holds for one holds by construction. The test serves the
+/// stub through the same wiring the real server uses, so removing the
+/// limits there fails here.
+#[tokio::test]
+async fn a_unary_reply_over_the_message_limit_is_refused() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(scion_proto::listen::Limits::default().serve(
+        |mut server| server.add_service(service::into_server(Huge)),
+        scion_proto::listen::tcp(listener),
+        None,
+        std::future::pending(),
+    ));
+    let channel = Channel::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = scion_proto::v1::scion_client::ScionClient::new(channel);
+    let err = client
+        .resolve_ref(scion_proto::v1::ResolveRefRequest::default())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::OutOfRange, "{err}");
+    assert!(err.to_string().contains("encoded message length"), "{err}");
 }

@@ -178,9 +178,7 @@ changeset names only blobs of its repo (section 6.2), so `ReadFile`,
 | One `Objects` reply message | 1 MiB + 1 KiB: one part of an object, of up to 1 MiB of encoded data, plus its header |
 
 A message over its limit fails the call with `OUT_OF_RANGE`, on whichever
-side finds it. A client MUST accept received messages up to these sizes. A
-server refuses a unary reply whose encoding would be over the limit with
-`RESOURCE_EXHAUSTED`, so the client sees the limit before the bytes move.
+side finds it. A client MUST accept received messages up to these sizes.
 Many gRPC libraries accept only 4 MiB by default. An object (a blob's
 content or a tree's `TreeV1` bytes) is at most 100 MiB. Streamed file content
 moves in chunks of 1 MiB, and `GetObjects` sends each object in parts of

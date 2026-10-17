@@ -41,7 +41,6 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
-prost.workspace = true
 tonic-health.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

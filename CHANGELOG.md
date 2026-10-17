@@ -180,10 +180,10 @@ until that section gets its release date.
   changeset (`#175`), so a client that stops reading is counted by the
   connection's stall cap, which then closes the connection. A client
   joins the parts' entries in order; the last part's
-  `next_changeset_id` starts the next call. The other unary replies carry
-  a guard cap: a reply over the 64 MiB a reply message may hold is
-  refused with `RESOURCE_EXHAUSTED` before it is sent, so the memory a
-  client that never reads holds for one is bounded by construction.
+  `next_changeset_id` starts the next call. A unary reply over the 64 MiB
+  a reply message may hold is refused by the server's encoder, so the
+  memory a client that never reads holds for one is bounded by
+  construction; a test pins that wiring.
 - Path history as derived data (kind `path_history`, schema version 5).
   `Log` with a path reads only the changesets that change the path, so one
   call returns up to 1,000 entries however far apart they are. A call

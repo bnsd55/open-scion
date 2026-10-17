@@ -290,9 +290,7 @@ impl ScionService {
     }
 
     fn into_server(self) -> ScionServer<Self> {
-        ScionServer::new(self)
-            .max_decoding_message_size(MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_MESSAGE_BYTES)
+        into_server(self)
     }
 
     /// Runs a `MergeBase`, `IsAncestor` or `Log` with a path: at most
@@ -303,23 +301,23 @@ impl ScionService {
         T: Send + 'static,
         F: FnOnce(&Store, &Deadline) -> Result<T> + Send + 'static,
     {
-        // The query checks it at each read: a request timeout, or a client
-        // that cancels, drops this call but not a job that is running. The
-        // guard ends the deadline when this call ends or is dropped.
-        let _call = deadline.guard();
-        // Taken before the worker permit, and held until the job ends, also
-        // when the client leaves first.
-        let slot = Arc::clone(&self.graph_queries)
-            .acquire_owned()
-            .await
-            .map_err(|_| Status::unavailable("server is shutting down"))?;
-        self.worker
-            .run(move |store| {
-                let _slot = slot;
-                query(&store, &deadline)
-            })
-            .await
+        run_graph_query(&self.worker, &self.graph_queries, deadline, query).await
     }
+}
+
+/// Wraps a service into the gRPC server, with the message limits of the
+/// protocol: a message over them fails the call on whichever side finds it
+/// first (section 2 of protocol-v1).
+///
+/// SHORTCUT: a unary reply's bytes stay in HTTP/2 uncounted until the
+/// client reads them or the connection closes; the encode limit bounds the
+/// encoded bytes of one at the message limit. Upgrade: stream Blame
+/// ([#175](https://github.com/bnsd55/open-scion/issues/175)), the one unary
+/// reply that legitimately grows toward it.
+pub fn into_server<S: Scion + Send + 'static>(service: S) -> ScionServer<S> {
+    ScionServer::new(service)
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES)
 }
 
 /// Runs synchronous store work off the async runtime. Clones share one bound
@@ -406,11 +404,9 @@ pub(crate) async fn resolve_ref(
     let id = worker
         .run(move |store| read::resolve_ref(&store, &repo, &name))
         .await?;
-    let reply = ResolveRefResponse {
+    Ok(ResolveRefResponse {
         changeset_id: id.as_bytes().to_vec(),
-    };
-    check_unary(&reply)?;
-    Ok(reply)
+    })
 }
 
 fn parse_path(bytes: Vec<u8>) -> Result<RepoPath, Status> {
@@ -469,34 +465,6 @@ type GetChangesetStream = ReceiverStream<Part<GetChangesetResponse>>;
 type ListDirStream = ReceiverStream<Part<ListDirResponse>>;
 
 type LogStream = ReceiverStream<Part<LogResponse>>;
-
-/// The largest encoded reply of a unary call: the largest message any
-/// client accepts (section 2 of protocol-v1). A streamed reply is counted
-/// on its connection when the client stops reading (see `send_parts`); a
-/// unary reply is not, so its size is capped here instead, on the encoding
-/// side of the same limit: at the defaults, the ceiling of the unary
-/// memory a client that never reads can hold is connections x streams x
-/// this. `Blame` reaches it: a file whose every line changes in every
-/// version of the walk has a range per diffed line.
-///
-/// SHORTCUT: a unary reply's bytes stay in HTTP/2 uncounted until the
-/// client reads them or the connection closes; the cap bounds the encoded
-/// bytes at the message limit. Stream a reply if a client that never
-/// reads it matters more than the protocol change.
-pub(crate) const MAX_UNARY_REPLY_BYTES: usize = scion_proto::MAX_MESSAGE_BYTES;
-
-/// Refuses a unary reply whose encoding would be over
-/// [`MAX_UNARY_REPLY_BYTES`], so the documented ceiling holds by
-/// construction and not by today's RPC list.
-pub(crate) fn check_unary<T: prost::Message>(msg: &T) -> Result<(), Status> {
-    let len = msg.encoded_len();
-    if len > MAX_UNARY_REPLY_BYTES {
-        return Err(Status::resource_exhausted(format!(
-            "the reply would hold {len} bytes, over the {MAX_UNARY_REPLY_BYTES} a reply message may hold"
-        )));
-    }
-    Ok(())
-}
 
 /// The share of `READ_BUDGET_BYTES` that a `ReadFile` reply of a `size`-byte
 /// file holds. A file of one part is read in one job, so the reply holds only
@@ -593,7 +561,12 @@ impl Parts {
 /// free for the error that ends a reply early: a store error, or the stall.
 /// A client never takes a short reply for a whole one.
 /// Runs a graph query on `permits`, the way [`ScionService::graph_query`]
-/// does, for a page of a streamed `Log` reply.
+/// does, for a page of a streamed `Log` reply. The query checks the
+/// deadline at each read: a request timeout, or a client that cancels,
+/// drops this call but not a job that is running. The guard ends the
+/// deadline when this call ends or is dropped. The slot is taken before
+/// the worker permit, and held until the job ends, also when the client
+/// leaves first.
 async fn run_graph_query<T, F>(
     worker: &Worker,
     permits: &Arc<Semaphore>,
@@ -672,6 +645,64 @@ fn log_page_parts(entries: Vec<(ChangesetId, Changeset)>, walk: &mut LogWalk) ->
     parts
 }
 
+/// What waiting for the client got the reply's producer.
+enum Taken<'a, T> {
+    /// Two free slots of the reply's channel: the client has taken the
+    /// parts before, so one slot stays free for the error that ends the
+    /// reply early.
+    Slots(tokio::sync::mpsc::PermitIterator<'a, Part<T>>),
+    /// The client has gone with the connection.
+    Gone,
+    /// The client took nothing for `stall`: the parts of the reply stay in
+    /// HTTP/2 until the stream ends or the connection closes, and the
+    /// connection counts them.
+    Stalled,
+}
+
+/// Waits `stall` for two free slots of the reply's channel, as
+/// [`send_parts`] and [`log_parts`] do.
+async fn reserve<'a, T>(
+    tx: &'a mpsc::Sender<Part<T>>,
+    stall: Duration,
+    stalled: Option<&'a scion_proto::listen::Stalled>,
+) -> Taken<'a, T> {
+    match tokio::time::timeout(stall, tx.reserve_many(2)).await {
+        Ok(Ok(slots)) => Taken::Slots(slots),
+        // The client has gone with the connection.
+        Ok(Err(_)) => Taken::Gone,
+        Err(_) => {
+            if let Some(stalled) = stalled {
+                stalled.add(scion_proto::reply::STALLED_REPLY_BYTES);
+            }
+            Taken::Stalled
+        }
+    }
+}
+
+/// Fetches one page of the log: a graph query when `path` is set, because
+/// it may derive the path history of a long history first, a plain read
+/// otherwise.
+async fn log_page(
+    worker: &Worker,
+    graph_queries: &Arc<Semaphore>,
+    repo: String,
+    path: Option<RepoPath>,
+    deadline: Deadline,
+    from: ChangesetId,
+    limit: usize,
+) -> Result<read::LogPage, Status> {
+    if let Some(path) = path {
+        run_graph_query(worker, graph_queries, deadline, move |store, deadline| {
+            read::log_page(store, &repo, from, Some(&path), limit, deadline)
+        })
+        .await
+    } else {
+        worker
+            .run(move |store| read::log_page(&store, &repo, from, None, limit, &deadline))
+            .await
+    }
+}
+
 /// Streams a `Log` reply: sends the parts of the first page, then fetches
 /// the page after it and sends that, until the history ends, the call has
 /// served `limit` entries, or the client stops taking parts. A stall counts
@@ -681,66 +712,43 @@ async fn log_parts(mut walk: LogWalk, page: read::LogPage, tx: mpsc::Sender<Part
         // Fails only if the client has gone.
         let _ = tx.try_send(Err(status));
     };
-    macro_rules! send {
-        ($part:expr) => {
-            match tokio::time::timeout(READ_STALL_TIMEOUT, tx.reserve_many(2)).await {
-                Ok(Ok(mut slots)) => {
+    let mut page = page;
+    loop {
+        for part in log_page_parts(std::mem::take(&mut page.entries), &mut walk) {
+            match reserve(&tx, READ_STALL_TIMEOUT, walk.stalled.as_ref()).await {
+                Taken::Slots(mut slots) => {
                     if let Some(slot) = slots.next() {
-                        slot.send(Ok($part));
+                        slot.send(Ok(part));
                     }
                 }
-                Ok(Err(_)) => return,
-                Err(_) => {
-                    // The parts of the reply stay in HTTP/2 until the
-                    // connection ends; the connection counts them.
-                    if let Some(stalled) = &walk.stalled {
-                        stalled.add(scion_proto::reply::STALLED_REPLY_BYTES);
-                    }
+                Taken::Gone => return,
+                Taken::Stalled => {
                     let detail = format!("the client took no data for {READ_STALL_TIMEOUT:?}");
                     return fail(Status::deadline_exceeded(detail));
                 }
             }
-        };
-    }
-    let mut page = page;
-    loop {
-        for part in log_page_parts(std::mem::take(&mut page.entries), &mut walk) {
-            send!(part);
         }
-        if walk.left == 0 {
+        if walk.left == 0 || walk.next.is_none() {
+            // Keeps the request slot until the client has taken the last
+            // part; a client that never does is counted.
+            reserve(&tx, READ_STALL_TIMEOUT, walk.stalled.as_ref()).await;
             return;
         }
-        let Some(from) = walk.next else {
-            return;
-        };
+        let from = walk.next.unwrap();
         let limit = walk.left.min(read::MAX_SCAN);
-        page = if let Some(path) = walk.path.clone() {
-            let repo = walk.repo.clone();
-            let deadline = walk.deadline.clone();
-            match run_graph_query(
-                &walk.worker,
-                &walk.graph_queries,
-                deadline,
-                move |store, deadline| {
-                    read::log_page(store, &repo, from, Some(&path), limit, deadline)
-                },
-            )
-            .await
-            {
-                Ok(page) => page,
-                Err(status) => return fail(status),
-            }
-        } else {
-            let worker = walk.worker.clone();
-            let repo = walk.repo.clone();
-            let deadline = walk.deadline.clone();
-            match worker
-                .run(move |store| read::log_page(&store, &repo, from, None, limit, &deadline))
-                .await
-            {
-                Ok(page) => page,
-                Err(status) => return fail(status),
-            }
+        page = match log_page(
+            &walk.worker,
+            &walk.graph_queries,
+            walk.repo.clone(),
+            walk.path.clone(),
+            walk.deadline.clone(),
+            from,
+            limit,
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(status) => return fail(status),
         };
     }
 }
@@ -765,35 +773,23 @@ async fn send_parts<T: Send + 'static>(
         };
         if let Some(data) = part {
             // Both slots free: the client has taken the part before.
-            match tokio::time::timeout(stall, tx.reserve_many(2)).await {
-                Ok(Ok(mut slots)) => {
+            match reserve(&tx, stall, stalled.as_ref()).await {
+                Taken::Slots(mut slots) => {
                     if let Some(slot) = slots.next() {
                         slot.send(Ok(make(data)));
                     }
                 }
-                Ok(Err(_)) => return,
-                Err(_) => {
-                    // The parts of the reply stay in HTTP/2 until the
-                    // connection ends; the connection counts them.
-                    if let Some(stalled) = &stalled {
-                        stalled.add(scion_proto::reply::STALLED_REPLY_BYTES);
-                    }
+                Taken::Gone => return,
+                Taken::Stalled => {
+                    // The client took no part: it is owed the error, so it
+                    // never takes the file for a whole one.
                     let detail = format!("the client took no data for {stall:?}");
                     return fail(Status::deadline_exceeded(detail));
                 }
             }
         } else {
             // Keeps the share until the client has taken the last part.
-            match tokio::time::timeout(stall, tx.reserve_many(2)).await {
-                // Sent, or the client has gone with it.
-                Ok(_) => {}
-                // It stopped reading: what was sent stays in HTTP/2.
-                Err(_) => {
-                    if let Some(stalled) = &stalled {
-                        stalled.add(scion_proto::reply::STALLED_REPLY_BYTES);
-                    }
-                }
-            }
+            reserve(&tx, stall, stalled.as_ref()).await;
             return;
         }
     }
@@ -879,11 +875,9 @@ impl Scion for ScionService {
             .worker
             .run(move |store| write::put_blob(&store, repo, upload))
             .await?;
-        let reply = PutBlobResponse {
+        Ok(Response::new(PutBlobResponse {
             blob_id: id.as_bytes().to_vec(),
-        };
-        check_unary(&reply)?;
-        Ok(Response::new(reply))
+        }))
     }
 
     async fn create_changeset(
@@ -906,11 +900,9 @@ impl Scion for ScionService {
                 write::create_changeset(&store, &repo, &changeset)
             })
             .await?;
-        let reply = CreateChangesetResponse {
+        Ok(Response::new(CreateChangesetResponse {
             changeset_id: id.as_bytes().to_vec(),
-        };
-        check_unary(&reply)?;
-        Ok(Response::new(reply))
+        }))
     }
 
     async fn land(
@@ -947,9 +939,7 @@ impl Scion for ScionService {
                 lands.land(&store, &caller, &req)
             })
             .await?;
-        let reply = land_response(outcome);
-        check_unary(&reply)?;
-        Ok(Response::new(reply))
+        Ok(Response::new(land_response(outcome)))
     }
 
     async fn get_land(
@@ -967,9 +957,7 @@ impl Scion for ScionService {
             .worker
             .run(move |store| land::get_land(&store, &caller, &repo, land_id))
             .await?;
-        let reply = land_response(outcome);
-        check_unary(&reply)?;
-        Ok(Response::new(reply))
+        Ok(Response::new(land_response(outcome)))
     }
 
     async fn resolve_ref(
@@ -1089,21 +1077,16 @@ impl Scion for ScionService {
         // `read::MAX_SCAN` also bounds the entries.
         let limit = (req.limit as usize).max(1);
         let path = parse_optional_path(req.path)?;
-        let repo = req.repo.clone();
-        let page = if let Some(path) = path.clone() {
-            // It may derive the path history of a long history first, so it
-            // runs as a graph query, with its slot and its deadline.
-            self.graph_query(deadline.clone(), move |store, deadline| {
-                read::log_page(store, &repo, id, Some(&path), limit, deadline)
-            })
-            .await?
-        } else {
-            let repo = req.repo.clone();
-            let deadline = deadline.clone();
-            self.worker
-                .run(move |store| read::log_page(&store, &repo, id, None, limit, &deadline))
-                .await?
-        };
+        let page = log_page(
+            &self.worker,
+            &self.graph_queries,
+            req.repo.clone(),
+            path.clone(),
+            deadline.clone(),
+            id,
+            limit,
+        )
+        .await?;
         // The first page goes out as the first parts; the rest follow,
         // page by page, until the history or `limit` ends the walk. The
         // reply's work goes on in the producer, so the request slot lives
@@ -1199,13 +1182,11 @@ impl Scion for ScionService {
             .resume
             .map(|resume| blame::encode_cursor(&resume, &req.repo, id, &path))
             .unwrap_or_default();
-        let reply = BlameResponse {
+        Ok(Response::new(BlameResponse {
             ranges,
             changesets,
             next_cursor,
-        };
-        check_unary(&reply)?;
-        Ok(Response::new(reply))
+        }))
     }
 
     async fn merge_base(
@@ -1224,11 +1205,9 @@ impl Scion for ScionService {
                 read::merge_base(store, &req.repo, a, b, deadline)
             })
             .await?;
-        let reply = MergeBaseResponse {
+        Ok(Response::new(MergeBaseResponse {
             changeset_ids: bases.iter().map(|id| id.as_bytes().to_vec()).collect(),
-        };
-        check_unary(&reply)?;
-        Ok(Response::new(reply))
+        }))
     }
 
     async fn is_ancestor(
@@ -1247,9 +1226,7 @@ impl Scion for ScionService {
                 read::is_ancestor(store, &req.repo, ancestor, descendant, deadline)
             })
             .await?;
-        let reply = IsAncestorResponse { is_ancestor };
-        check_unary(&reply)?;
-        Ok(Response::new(reply))
+        Ok(Response::new(IsAncestorResponse { is_ancestor }))
     }
 
     async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<DiffResponse>, Status> {
@@ -1296,13 +1273,11 @@ impl Scion for ScionService {
                 }
             })
             .collect();
-        let reply = DiffResponse {
+        Ok(Response::new(DiffResponse {
             entries,
             next_after: path_bytes(page.next_after),
             renames_incomplete: page.renames_incomplete,
-        };
-        check_unary(&reply)?;
-        Ok(Response::new(reply))
+        }))
     }
 }
 
@@ -1339,30 +1314,9 @@ mod tests {
     use std::time::Instant;
 
     use scion_core::{Changeset, FileState, IdentityTime};
-    use scion_proto::v1::LogResponse;
     use tonic::Code;
 
     use super::*;
-
-    /// A unary reply over the cap is refused, so the ceiling of the memory
-    /// a client that never reads holds for one holds by construction, not
-    /// by today's RPC list. No legitimate reply reaches it: the cap is the
-    /// largest message a client accepts, and no unary reply may hold more.
-    #[test]
-    fn a_unary_reply_over_the_cap_is_refused() {
-        let mut reply = LogResponse::default();
-        reply.entries.push(scion_proto::v1::LogEntry {
-            changeset_id: vec![0; 32],
-            changeset: vec![0; MAX_UNARY_REPLY_BYTES],
-        });
-        let err = check_unary(&reply).unwrap_err();
-        assert_eq!(err.code(), Code::ResourceExhausted, "{err}");
-        assert!(
-            err.to_string().contains("a reply message may hold"),
-            "{err}"
-        );
-        assert!(check_unary(&LogResponse::default()).is_ok());
-    }
 
     /// The log of the test binary, into this one buffer.
     static LOG: std::sync::LazyLock<Captured> = std::sync::LazyLock::new(Captured::default);
