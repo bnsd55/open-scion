@@ -14,6 +14,15 @@ until that section gets its release date.
 
 ### Added
 
+- A Postgres-backed store knows which database and which data directory
+  belong together: the first open mints a store UUID, keeps it in the
+  database and the data directory's `backend` marker, and an open that
+  finds the two different is refused with both UUIDs named.
+- A Postgres server that loses the one-server lock to another process is
+  fenced: every read and write fails with the loss named, the health
+  service answers `NOT_SERVING`, and the process exits after a short
+  grace, so a supervisor restart either takes the lock back or refuses.
+
 - The server counts lands whose ref moved under them and were planned
   again in `scion_land_replans_total`, next to the land outcome counters.
 
