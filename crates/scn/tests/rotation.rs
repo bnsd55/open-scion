@@ -81,6 +81,7 @@ fn start_stack(
             listener,
             TOKEN,
             service::ServeOptions {
+                data: data.path().to_path_buf(),
                 limits: Limits::default(),
                 quotas: scion_server::quotas::Quotas::off(),
                 pending_lands: None,

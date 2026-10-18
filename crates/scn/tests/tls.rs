@@ -121,6 +121,7 @@ async fn serve_tls(certs: &TestCerts) -> String {
     let tls =
         scion_proto::tls::ServerTls::load(&certs.server_cert, &certs.server_key, None).unwrap();
     let store = Backend::open_test(&certs.dir.path().join("data")).unwrap();
+    let data = certs.dir.path().join("data");
     land(&store);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -129,6 +130,7 @@ async fn serve_tls(certs: &TestCerts) -> String {
         listener,
         TOKEN,
         service::ServeOptions {
+            data: data.path().to_path_buf(),
             limits: Limits::default(),
             quotas: scion_server::quotas::Quotas::off(),
             pending_lands: None,

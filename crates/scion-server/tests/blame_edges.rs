@@ -115,7 +115,12 @@ fn whole_access() -> Access {
 
 /// Serves `store` with `access`, and returns the stop signal and a client
 /// that sends `token`.
-async fn serve(store: &Backend, dir: &std::path::Path, access: Access, token: &str) -> (Stop, Scion) {
+async fn serve(
+    store: &Backend,
+    dir: &std::path::Path,
+    access: Access,
+    token: &str,
+) -> (Stop, Scion) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();

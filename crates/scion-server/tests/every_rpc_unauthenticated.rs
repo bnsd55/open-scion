@@ -99,7 +99,11 @@ async fn store() -> (tempfile::TempDir, Backend, scion_core::ChangesetId) {
 
 /// The server of `store` behind `access`, as a `http://` URL. Hold the
 /// stop signal, or the server shuts down when it drops.
-async fn serve(store: &Backend, dir: &std::path::Path, access: Access) -> (tokio::sync::oneshot::Sender<()>, String) {
+async fn serve(
+    store: &Backend,
+    dir: &std::path::Path,
+    access: Access,
+) -> (tokio::sync::oneshot::Sender<()>, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
