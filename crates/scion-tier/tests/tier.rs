@@ -406,15 +406,13 @@ async fn serve_fake(fake: Fake) -> String {
 /// `zstd` or not: the objects it returns, unpacked, with the number of parts
 /// and the encoding of each, or the error that ends it. `Err` from the outer
 /// result is the call's status.
-/// Awaits one stream message, or panics naming `step`: a server that
-/// stalls mid-reply fails the test in seconds, not at the CI cancel.
 async fn message_of<T, E>(
     step: &str,
     stream: &mut tonic::Streaming<Result<T, E>>,
 ) -> Option<Result<T, E>>
 where
-    T: Send + Unpin,
-    E: Send + Unpin,
+    T: Unpin,
+    E: Unpin,
 {
     match tokio::time::timeout(std::time::Duration::from_secs(30), stream.message()).await {
         Ok(value) => value,
