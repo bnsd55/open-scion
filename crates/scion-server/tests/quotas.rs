@@ -126,6 +126,7 @@ async fn server_with_tickets(
         listener,
         access,
         service::ServeOptions {
+            data: dir.path().to_path_buf(),
             limits: Limits::default(),
             quotas,
             pending_lands: None,

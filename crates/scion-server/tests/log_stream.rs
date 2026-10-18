@@ -140,7 +140,7 @@ async fn a_stalled_log_reply_is_counted_and_closes_the_connection() {
         stalled_bytes: NonZeroU64::new(1 << 20).unwrap(),
         ..Limits::default()
     };
-    let url = serve(store, limits).await;
+    let url = serve(store, dir.path(), limits).await;
     let mut client = client(&url).await;
 
     let tip = ids[ids.len() - 1];
@@ -327,7 +327,7 @@ async fn a_stalled_blame_reply_is_counted_and_closes_the_connection() {
         stalled_bytes: NonZeroU64::new(1 << 20).unwrap(),
         ..Limits::default()
     };
-    let url = serve(store, limits).await;
+    let url = serve(store, dir.path(), limits).await;
     let mut client = client(&url).await;
 
     let tip = ids[ids.len() - 1];
