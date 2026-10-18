@@ -986,10 +986,9 @@ mod tests {
         // barrier: a step whose release never comes fails in seconds with
         // its name, and cannot trap its partner.
         let (in_tx, in_rx) = std::sync::mpsc::channel::<()>();
-        drop(in_rx);
         let (moved_tx, moved_rx) = std::sync::mpsc::channel::<()>();
         let land = {
-            let (server, in_tx) = (server.clone(), in_tx);
+            let (server, in_tx, moved_rx) = (server.clone(), in_tx, moved_rx);
             thread::spawn(move || {
                 server.write(|c| {
                     let moved = c.cas_ref(repo, "main", Some(1), x)?;
@@ -1002,7 +1001,7 @@ mod tests {
                 })
             })
         };
-        moved_rx
+        in_rx
             .recv_timeout(Duration::from_secs(30))
             .unwrap_or_else(|_| panic!("the land never moved the ref"));
         let moved = point_ref(&importer, repo, "main", tip);

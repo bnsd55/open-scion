@@ -125,10 +125,9 @@ async fn wait_serving(cache: &mut Cache) {
 /// Awaits `fut`, or panics naming `step`: a cache that never answers a
 /// step fails the test in seconds, not at the CI cancel.
 async fn ceiling<T>(step: &str, fut: impl std::future::Future<Output = T>) -> T {
-    match tokio::time::timeout(Duration::from_secs(30), fut).await {
-        Ok(value) => value,
-        Err(_) => panic!("the step {step} never finished within 30 s"),
-    }
+    tokio::time::timeout(Duration::from_secs(30), fut)
+        .await
+        .unwrap_or_else(|_| panic!("the step {step} never finished within 30 s"))
 }
 
 /// Sends `SIGINT`, as Ctrl-C does.

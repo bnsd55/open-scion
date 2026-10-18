@@ -406,18 +406,13 @@ async fn serve_fake(fake: Fake) -> String {
 /// `zstd` or not: the objects it returns, unpacked, with the number of parts
 /// and the encoding of each, or the error that ends it. `Err` from the outer
 /// result is the call's status.
-async fn message_of<T, E>(
-    step: &str,
-    stream: &mut tonic::Streaming<Result<T, E>>,
-) -> Option<Result<T, E>>
+async fn message_of<I>(step: &str, stream: &mut tonic::Streaming<I>) -> Option<I>
 where
-    T: Unpin,
-    E: Unpin,
+    I: Unpin,
 {
-    match tokio::time::timeout(std::time::Duration::from_secs(30), stream.message()).await {
-        Ok(value) => value,
-        Err(_) => panic!("the step {step} never finished within 30 s"),
-    }
+    tokio::time::timeout(std::time::Duration::from_secs(30), stream.message())
+        .await
+        .unwrap_or_else(|_| panic!("the step {step} never finished within 30 s"))
 }
 
 async fn get_parts(
