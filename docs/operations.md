@@ -145,7 +145,24 @@ scion-server --data /srv/scion \
 - The choice is recorded in the data directory's `backend` file: a
   `--postgres-url` open refuses a directory that holds SQLite metadata, and
   a plain open refuses a directory it names, so a second, empty store
-  cannot grow beside the database.
+  cannot grow beside the database. The first open also mints a store UUID
+  and writes it in the database and the marker's second line: an open of
+  the database against a directory that names another store is refused
+  with both UUIDs, so a restore that mixes a database with the wrong
+  directory fails at the start instead of serving metadata whose blobs
+  are not on this disk.
+- One server process serves one database, and it stays that way: if the
+  server's connection drops and the lock is lost to another process, the
+  server is fenced. Every read and write fails with the loss named, the
+  health service answers `NOT_SERVING` on the same port, and after a few
+  seconds the process exits with code 70, so a supervisor restart finds
+  the lock taken and refuses, or takes it back on an empty database. A
+  session checks itself once a minute, so a loss is seen even while no
+  client calls: the check runs on the server's own session, through the
+  same queue as every statement, never on a second connection.
+- The SQLite store has none of this: one file is opened by one process at
+  the kernel level, so there is no lock to lose and no fence. The notes
+  above that name the one-server lock and the fence are Postgres only.
 
 Backup and restore of a Postgres-backed server: `pg_dump` the database
 first, then copy the data directory. A changeset in the dump names only
