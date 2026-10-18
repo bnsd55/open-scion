@@ -1249,12 +1249,20 @@ impl<'a> PgTx<'a> {
     // measured the gain, and the split needs an audit of every walk that
     // re-reads a ref. Measure first, then split.
     fn begin_read(c: &'a mut PgClient, statement: Duration, idle: Duration) -> Result<PgTx<'a>> {
+        // Three statements, not one string: the client prepares its
+        // queries, and Postgres takes no second command in a prepared
+        // statement (E42601).
+        c.execute(
+            "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+            &[],
+        )?;
+        c.execute(
+            &format!("SET LOCAL statement_timeout = {}", statement.as_millis()),
+            &[],
+        )?;
         c.execute(
             &format!(
-                "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY; \
-                 SET LOCAL statement_timeout = {}; \
-                 SET LOCAL idle_in_transaction_session_timeout = {};",
-                statement.as_millis(),
+                "SET LOCAL idle_in_transaction_session_timeout = {}",
                 idle.as_millis()
             ),
             &[],

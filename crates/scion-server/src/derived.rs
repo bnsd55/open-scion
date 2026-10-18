@@ -926,9 +926,10 @@ mod tests {
                     })
                     .unwrap_or_else(PoisonError::into_inner);
                 gate = next;
-                if timed_out.timed_out() {
-                    panic!("the cold gate never opened within 30 s");
-                }
+                assert!(
+                    !timed_out.timed_out(),
+                    "the cold gate never opened within 30 s"
+                );
             }
             drop(gate);
             std::thread::sleep(Duration::from_millis(
