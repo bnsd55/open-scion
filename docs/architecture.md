@@ -393,6 +393,21 @@ file into a directory or back. It loads only the directories on changed paths
 and removes directories left empty. It fails on a delete of a missing path or
 of a directory, and on a put where a file or a directory is in the way.
 
+**Views.** A partial reader reads through a view the server derives from its
+read prefixes (`views.rs`). The derivation is a pure function of the rule set
+and the real trees, so its results are a rebuildable cache: one `view_trees`
+row per (repo, rule-set digest, projection version, real tree, path-context
+digest), in the same shape on both backends (SQLite migration 0009, Postgres
+0003). A derivation asks the table at every directory, so a new changeset
+re-derives only the folders on its changed paths; the rest of the view comes
+from the rows, and the changeset's root row is the row of its real root tree
+under the rule set's full context. Each derivation's write also sweeps at
+most `VIEW_EXPIRE_STEP` (256) dead rows: rows of an older projection version
+first, then rows of a digest that no read rule of the repo hashes to any
+more. `scion_view_trees_walked_total` counts the real trees a derivation
+opened; a count that stays high on every changeset of one rule set says the
+memo is not serving and every derivation re-walks.
+
 **Commit graph.** Kind `commit_graph` version 1 (`graph::CommitGraph`). The
 article says that Scion keeps skip lists for the commit graph as derived
 data. The form of the skip list here is this project's choice: the
@@ -1697,6 +1712,7 @@ into fixed buckets. The values are read on export only.
 | `scion_rpc_bytes_total{rpc,direction}` | counter | Reply bytes out; request bytes in, counted from the `content-length` header, which a gRPC client does not send. |
 | `scion_lands_total{outcome}` | counter | Lands by outcome: `landed`, `conflict`, `rejected`, `retry` (a pending land waits for its retry). |
 | `scion_land_replans_total` | counter | Lands whose ref moved under them and were planned again: a rising rate means lands that contend with imports or other writers on one ref. |
+| `scion_view_trees_walked_total` | counter | Real trees a view derivation opened for a partial reader. A count that rises on every changeset of the same rule set says the per-tree memo is not serving and every read re-walks the tree. |
 | `scion_cache_hits_total`, `scion_cache_misses_total` | counter | A tier's object reads served from its store or its snapshot, and read from upstream. A tier's scrape also shows its `Objects` calls in `scion_requests_total` and `scion_request_seconds`. |
 
 The layer sits inside the axum router, around both gRPC services and
