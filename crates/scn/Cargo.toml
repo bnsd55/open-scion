@@ -34,7 +34,8 @@ tonic.workspace = true
 rcgen.workspace = true
 # The rotation test builds the tier key sets by hand.
 ed25519-dalek.workspace = true
-open-scion-server.workspace = true
+# scn's tests drive the server's test seams, which the feature turns on.
+open-scion-server = { workspace = true, features = ["test-hooks"] }
 open-scion-tier.workspace = true
 tempfile.workspace = true
 tracing.workspace = true

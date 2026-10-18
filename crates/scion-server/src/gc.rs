@@ -1,8 +1,8 @@
 //! `scion-server gc <data>`: removes the blob files and the `repo_blobs`
-//! rows that nothing names any more, over [`Meta`](crate::meta::Meta), so
-//! one collector serves every backend. Its queries are
-//! [`MetaTx`](crate::meta::MetaTx) methods;
-//! its files are the object folder, which every backend keeps on disk.
+//! rows that nothing names any more, over the crate's internal metadata
+//! trait, so one collector serves every backend. Its queries are methods
+//! of that trait; its files are the object folder, which every backend
+//! keeps on disk.
 //!
 //! A blob file is shared by content across repos, so what is garbage is a
 //! question with two levels:
@@ -873,15 +873,13 @@ mod tests {
             eprintln!("skip on sqlite: the lock is the write lock itself");
             return;
         }
-        let url = crate::backend::test_url().unwrap();
+        // The collector side opens the way the `gc` CLI does - shared,
+        // with no one-server lock - and the writer the way a server
+        // does, with the per-schema lock. One data directory, as they
+        // share in production: the store UUID pairs it with the schema.
         let dir = TempDir::new().unwrap();
-        let schema = crate::backend::test_schema(dir.path());
-        let data = TempDir::new().unwrap();
-        let gc_store = crate::pg::Pg::open_test(&url, &schema, 2, data.path()).unwrap();
-        let writer_store =
-            crate::pg::Pg::open_test(&url, &schema, 2, data.path().join("w").as_path()).unwrap();
-        let gc_store = Backend::Postgres(gc_store);
-        let writer = Backend::Postgres(writer_store);
+        let gc_store = Backend::open_test_shared(dir.path()).unwrap();
+        let writer = Backend::open_test(dir.path()).unwrap();
         let repo = gc_store.write(|c| c.create_repo(REPO)).unwrap();
         let b = gc_store.blobs().put(b"locked\n").unwrap();
         writer.write(|c| c.add_repo_blob(repo, b)).unwrap();

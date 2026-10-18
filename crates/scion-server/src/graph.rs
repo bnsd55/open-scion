@@ -10,7 +10,7 @@
 //! the depth it starts from. So a walk down a first-parent history to a
 //! generation, or to where two such histories meet, reads O(log n) nodes.
 //!
-//! The kind reads every parent ([`Kind::ALL_PARENTS`]), so each ancestor of
+//! The kind reads every parent (all parents), so each ancestor of
 //! a changeset with a node has a node, and the queries can follow any
 //! parent:
 //!
@@ -24,9 +24,9 @@
 //!   from both changesets, highest generation first (`Paint`). It jumps
 //!   over each run of first parents that no other part of the walk reaches.
 //!
-//! Neither query has a bound on its reads. Each fails once its [`Deadline`]
+//! Neither query has a bound on its reads. Each fails once its deadline
 //! has passed, and runs in steps of about 1,000 reads (`STEPS`). A step holds
-//! one read connection ([`Store::read`](crate::store::Store::read)), so writes and other reads run
+//! one read connection, so writes and other reads run
 //! beside it.
 
 use std::cmp::Reverse;
@@ -77,6 +77,16 @@ pub struct CommitGraph;
 
 /// Bytes of a stored [`Link`]: ID, generation, depth.
 const LINK_BYTES: usize = 32 + 8 + 8;
+
+/// Derives the commit graph of `cs`, and removes the rows of older
+/// versions. Returns the kind's name for the `derive` command's report.
+///
+/// # Errors
+///
+/// Errors of the `derived` fill, and of [`Store::flush`](crate::store::Store::flush).
+pub fn backfill_commit_graph(store: &Backend, repo: &str, cs: ChangesetId) -> Result<&'static str> {
+    crate::derived::backfill::<CommitGraph>(store, repo, cs)
+}
 
 impl Kind for CommitGraph {
     const NAME: &'static str = "commit_graph";

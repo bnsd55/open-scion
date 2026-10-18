@@ -127,6 +127,16 @@ pub fn lookup(c: &mut dyn MetaTx, root: TreeId, path: &RepoPath) -> Result<Optio
 /// tree plus its changes.
 pub struct RootTree;
 
+/// Derives the root tree of `cs`, and removes the rows of older
+/// versions. Returns the kind's name for the `derive` command's report.
+///
+/// # Errors
+///
+/// Errors of the `derived` fill, and of the final flush.
+pub fn backfill_root_tree(store: &Backend, repo: &str, cs: ChangesetId) -> Result<&'static str> {
+    crate::derived::backfill::<RootTree>(store, repo, cs)
+}
+
 impl Kind for RootTree {
     const NAME: &'static str = "root_tree";
     const VERSION: u32 = 1;
@@ -164,8 +174,8 @@ pub fn root_tree(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<TreeI
     derived::get::<RootTree>(store, repo, cs)
 }
 
-/// Derives the root tree of `cs` in steps if it is missing, as
-/// [`derived::fill`] does. Returns before it is durable.
+/// Derives the root tree of `cs` in steps if it is missing, as the
+/// `derived` mechanism fills a kind. Returns before it is durable.
 ///
 /// # Errors
 ///
@@ -174,8 +184,8 @@ pub fn fill_root_tree(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<
     derived::fill::<RootTree>(store, repo, cs)
 }
 
-/// Derives the root tree of `cs` inside the caller's transaction, as
-/// [`derived::derive`] does.
+/// Derives the root tree of `cs` inside the caller's transaction, as the
+/// `derived` mechanism computes a kind's value.
 ///
 /// # Errors
 ///
@@ -200,12 +210,12 @@ pub fn derive_root_tree(
 /// on the first parent before its transaction, and so does git import, for
 /// each first parent from before its batch.
 ///
-/// Like each step of [`derived::fill`], it also removes a few root trees of
-/// older versions.
+/// Like each fill step of the `derived` mechanism, it also removes a few
+/// root trees of older versions.
 ///
 /// It also stores the changeset's node in the commit graph, if each parent
-/// has one, and its path history, if its first parent has one
-/// ([`derived::on_write`]).
+/// has one, and its path history, if its first parent has one, which the
+/// `derived` mechanism's on-write hook does for every kind.
 ///
 /// It adds each blob that the changeset names to the blobs of `repo`, so a
 /// blob that a changeset of `repo` names always belongs to `repo`, also
