@@ -665,7 +665,7 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
         // persisted, and nothing else.
         let data = lazy.backing.join("data");
         let store = Store::open_shared(&data).unwrap();
-        verify_whole(&store, &acked, &events, round, &data);
+        verify_whole(&store, &acked[..], &events, round, &data);
         drop(store);
         drop(lazy);
         total += RACERS * WAVES;
