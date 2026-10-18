@@ -9,6 +9,9 @@
 
 use gix::ObjectId;
 use scion_core::{BlobId, Changeset, ChangesetId, RepoPath, Tree, TreeId};
+use scion_proto::metrics::Metrics;
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::auth::Caller;
 use crate::db::SqliteTx;
@@ -278,6 +281,26 @@ impl Backend {
         match self {
             Self::Sqlite(store) => store.is_shared(),
             Self::Postgres(_) => false,
+        }
+    }
+
+    /// Gives the Postgres reader pool the server's metrics registry. A
+    /// no-op on the data directory backend, whose readers are threads of
+    /// one process and need no pool metrics.
+    pub fn set_pg_metrics(&self, metrics: Arc<Metrics>) {
+        if let Self::Postgres(pg) = self {
+            pg.set_metrics(metrics);
+        }
+    }
+
+    /// The age of the oldest open Postgres read transaction, for the
+    /// tx-age gauge. Zero on the data directory backend, whose reads are
+    /// immediate and whose readers are pages, not connections.
+    #[must_use]
+    pub fn pg_tx_age(&self) -> Duration {
+        match self {
+            Self::Sqlite(_) => Duration::ZERO,
+            Self::Postgres(pg) => pg.tx_age(),
         }
     }
 

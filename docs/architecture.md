@@ -1744,6 +1744,9 @@ into fixed buckets. The values are read on export only.
 | `scion_data_free_bytes` | gauge | Free bytes for this process's user on the filesystem that holds the data directory, refreshed every 30 s. This is the alarm that fires before the server fails to write. |
 | `scion_derive_walks_in_flight`, `scion_derive_walks_waiting` | gauge | Derive walks that hold a permit, and walks that wait for one. Walks waiting while the in-flight count sits at the cap mean a cold history read that waits behind the walkers. |
 | `scion_pg_collector_key_wait_seconds` | histogram | A Postgres write transaction's wait for the collector's advisory key, the one lock every writer of the schema orders on. Waits near the 60 s bound of the key mean the writer queue does not drain. Same buckets as `scion_request_seconds`. |
+| `scion_pg_pool_wait_seconds` | histogram | The time a call waited for a read connection of the Postgres reader pool. A rising tail means the readers are held by long walks; a call that waited past the pool's bound failed `unavailable`. |
+| `scion_pg_readers_busy` | gauge | Postgres read connections of the pool that are in use now, refreshed at each take and give-back. |
+| `scion_pg_tx_age_seconds` | gauge | Age of the oldest open Postgres read transaction, sampled every 5 s. Long ages hold a snapshot that keeps the database from cleaning old rows. |
 
 The layer sits inside the axum router, around both gRPC services and
 outside the access checks. A refusal (bad token, unknown repo, a budget

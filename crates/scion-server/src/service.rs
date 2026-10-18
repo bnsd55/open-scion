@@ -87,6 +87,29 @@ const READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// How often the stale-land sweep runs after the first one.
 const SWEEP_PERIOD: Duration = Duration::from_secs(60 * 60);
 
+/// How often the tx-age gauge is refreshed: a scrape reads the gauge, and
+/// an age that grows without a pool event must still show.
+const TX_AGE_PERIOD: Duration = Duration::from_secs(5);
+
+/// Keeps the `scion_pg_tx_age_seconds` gauge current: the age of the
+/// oldest open Postgres read transaction, sampled every [`TX_AGE_PERIOD`]
+/// until `stop` resolves. On SQLite the sample is always zero.
+async fn pg_tx_age_sample(store: Backend, metrics: Arc<Metrics>, mut stop: watch::Receiver<()>) {
+    let mut tick = tokio::time::interval(TX_AGE_PERIOD);
+    loop {
+        let store = store.clone();
+        let age = tokio::task::spawn_blocking(move || store.pg_tx_age()).await;
+        match age {
+            Ok(age) => metrics.pg_tx_age(age),
+            Err(e) => tracing::warn!(error = %e, "the tx-age sample failed"),
+        }
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = stop.changed() => break,
+        }
+    }
+}
+
 /// Runs the stale-land sweep at once, then once per [`SWEEP_PERIOD`], until
 /// `stop` resolves. The first sweep settles what a restart left pending
 /// before the first client asks.
@@ -166,16 +189,22 @@ pub async fn serve(
     } = options;
     let access = Arc::new(access.into());
     let auth = access.auth();
-    let worker = Worker::new(store);
+    let worker = Worker::new(store.clone());
+    // The Postgres reader pool records into the registry: the wait for a
+    // reader, the busy readers, and the tx age, which this task keeps
+    // fresh. On SQLite this is a no-op.
+    store.set_pg_metrics(Arc::clone(&metrics));
     let lands = Arc::new(Lands::new(pending_lands, Some(Arc::clone(&metrics))));
-    // The sweep stops when the server does: the shutdown future resolves,
-    // the watch says so, and the loop breaks. The same watch ends the
-    // server itself.
     let (stop_tx, stop_rx) = watch::channel(());
     tokio::spawn(async move {
         shutdown.await;
         let _ = stop_tx.send(());
     });
+    tokio::spawn(pg_tx_age_sample(
+        store,
+        Arc::clone(&metrics),
+        stop_rx.clone(),
+    ));
     let shutdown = {
         let mut stopped = stop_rx.clone();
         async move {

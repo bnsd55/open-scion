@@ -112,6 +112,13 @@ pub struct Metrics {
     /// Derive walks in flight, and walks waiting for a permit.
     derive_walks_in_flight: AtomicU64,
     derive_walks_waiting: AtomicU64,
+    /// The Postgres reader pool: the time calls waited for a reader, as
+    /// the same buckets as `latency`, with the sum and the count. The
+    /// last two fields are the gauges: readers out of the pool, and the
+    /// age of the oldest open read transaction, both in microseconds.
+    pg_pool_wait: [AtomicU64; BUCKETS.len() + 2],
+    pg_readers_busy: AtomicU64,
+    pg_tx_age: AtomicU64,
 }
 
 /// A metric name, as the index of its RPC.
@@ -260,6 +267,54 @@ impl Metrics {
         )
     }
 
+    /// Records one wait for a Postgres reader that took `waited`.
+    pub fn pg_pool_wait(&self, waited: std::time::Duration) {
+        let micros = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX);
+        for (i, bound) in BUCKETS.iter().enumerate() {
+            if micros <= *bound {
+                self.pg_pool_wait[i].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.pg_pool_wait[BUCKETS.len()].fetch_add(micros, Ordering::Relaxed);
+        self.pg_pool_wait[BUCKETS.len() + 1].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The pool-wait histogram's sum in microseconds and its count, for a
+    /// test that reads it without a scrape.
+    #[must_use]
+    pub fn pg_pool_wait_totals(&self) -> (u64, u64) {
+        (
+            self.pg_pool_wait[BUCKETS.len()].load(Ordering::Relaxed),
+            self.pg_pool_wait[BUCKETS.len() + 1].load(Ordering::Relaxed),
+        )
+    }
+
+    /// Sets the gauge of Postgres read connections that are out of the
+    /// pool.
+    pub fn pg_readers_busy(&self, busy: u64) {
+        self.pg_readers_busy.store(busy, Ordering::Relaxed);
+    }
+
+    /// The busy-readers gauge, for a test that reads it without a scrape.
+    #[must_use]
+    pub fn pg_readers_busy_gauge(&self) -> u64 {
+        self.pg_readers_busy.load(Ordering::Relaxed)
+    }
+
+    /// Sets the gauge of the age of the oldest open read transaction.
+    pub fn pg_tx_age(&self, age: std::time::Duration) {
+        self.pg_tx_age.store(
+            u64::try_from(age.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The transaction-age gauge in microseconds, for a test that reads
+    /// it without a scrape.
+    #[must_use]
+    pub fn pg_tx_age_micros(&self) -> u64 {
+        self.pg_tx_age.load(Ordering::Relaxed)
+    }
     /// The cache counters, for a test that reads them without a scrape.
     #[must_use]
     pub fn cache_counts(&self) -> (u64, u64) {
@@ -336,6 +391,47 @@ impl Metrics {
             );
         }
         self.render_derive_walks(&mut text);
+        text.push_str(
+            "# HELP scion_pg_pool_wait_seconds Time a call waited for a Postgres reader, in seconds.\n",
+        );
+        text.push_str("# TYPE scion_pg_pool_wait_seconds histogram\n");
+        let buckets = &self.pg_pool_wait;
+        if buckets[BUCKETS.len() + 1].load(Ordering::Relaxed) > 0 {
+            for (i, bound) in BUCKETS.iter().enumerate() {
+                let le = if *bound == u64::MAX {
+                    "+Inf".to_owned()
+                } else {
+                    format!("{}", seconds(*bound))
+                };
+                let _ = writeln!(
+                    text,
+                    "scion_pg_pool_wait_seconds_bucket{{le=\"{le}\"}} {}",
+                    buckets[i].load(Ordering::Relaxed)
+                );
+            }
+            let count = buckets[BUCKETS.len() + 1].load(Ordering::Relaxed);
+            let sum = buckets[BUCKETS.len()].load(Ordering::Relaxed);
+            let _ = writeln!(text, "scion_pg_pool_wait_seconds_sum {}", seconds(sum));
+            let _ = writeln!(text, "scion_pg_pool_wait_seconds_count {count}");
+        }
+        text.push_str(
+            "# HELP scion_pg_readers_busy Postgres read connections of the pool that are in use.\n",
+        );
+        text.push_str("# TYPE scion_pg_readers_busy gauge\n");
+        let _ = writeln!(
+            text,
+            "scion_pg_readers_busy {}",
+            self.pg_readers_busy.load(Ordering::Relaxed)
+        );
+        text.push_str(
+            "# HELP scion_pg_tx_age_seconds Age of the oldest open Postgres read transaction, in seconds.\n",
+        );
+        text.push_str("# TYPE scion_pg_tx_age_seconds gauge\n");
+        let _ = writeln!(
+            text,
+            "scion_pg_tx_age_seconds {}",
+            seconds(self.pg_tx_age.load(Ordering::Relaxed))
+        );
         text
     }
 
@@ -1015,5 +1111,43 @@ mod tests {
             }
         }
         assert_eq!(found, RPCS.len(), "the proto has rpcs the table misses");
+    }
+
+    /// The Postgres pool metrics render with their names, units, and the
+    /// values a caller recorded.
+    #[test]
+    fn the_pg_pool_metrics_render() {
+        let metrics = Metrics::default();
+        metrics.pg_pool_wait(std::time::Duration::from_millis(1500));
+        metrics.pg_readers_busy(8);
+        metrics.pg_tx_age(std::time::Duration::from_millis(2500));
+        let text = metrics.render();
+        assert!(
+            text.contains("# TYPE scion_pg_pool_wait_seconds histogram\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("scion_pg_pool_wait_seconds_bucket{le=\"4\"}"),
+            "{text}"
+        );
+        assert!(
+            text.contains("scion_pg_pool_wait_seconds_count 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE scion_pg_readers_busy gauge\n"),
+            "{text}"
+        );
+        assert!(text.contains("scion_pg_readers_busy 8"), "{text}");
+        assert!(
+            text.contains("# TYPE scion_pg_tx_age_seconds gauge\n"),
+            "{text}"
+        );
+        assert!(text.contains("scion_pg_tx_age_seconds 2.5"), "{text}");
+        // An age of zero still renders: a quiet pool is a real state.
+        let empty = Metrics::default();
+        let text = empty.render();
+        assert!(text.contains("scion_pg_tx_age_seconds 0"), "{text}");
+        assert!(!text.contains("scion_pg_pool_wait_seconds_count"), "{text}");
     }
 }

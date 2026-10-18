@@ -23,6 +23,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use gix::ObjectId;
 use postgres::types::ToSql;
@@ -31,6 +32,7 @@ use postgres::{Client, Config, NoTls};
 /// Shorthand for the owned query parameter.
 type P = Param;
 use scion_core::{BlobId, Changeset, ChangesetId, RepoPath, Tree, TreeId};
+use scion_proto::metrics::Metrics;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::auth::Caller;
@@ -46,6 +48,22 @@ use crate::store::Blobs;
 
 /// The schema version this build makes and reads.
 pub(crate) const PG_SCHEMA_VERSION: u32 = 3;
+
+/// How long a call may wait for a Postgres reader before the server
+/// answers [`Error::Unavailable`]. Well below the 600 s call deadline:
+/// a wait this long means the pool is stuck in long reads, and a retry
+/// after the pool drains is kinder than blocking to the deadline.
+pub(crate) const READER_WAIT: Duration = Duration::from_secs(30);
+
+/// The bound on one statement of a read transaction, below the 600 s
+/// call deadline (`scn`'s), so one stuck query cannot hold a reader to
+/// the end of a stream.
+const READ_STATEMENT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long a read transaction may sit idle between statements, so an
+/// abandoned walk (its call gone, its reply unread) gives the reader
+/// back to the pool.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The advisory lock of the one server process of a database.
 const SERVER_LOCK: i64 = 0x5343_494F_4E53_5256;
@@ -95,6 +113,14 @@ struct PgInner {
 struct Readers {
     idle: Mutex<Vec<PgClient>>,
     returned: Condvar,
+    /// The start time of every live read, so the gauges can say how old
+    /// the oldest open read transaction is.
+    open_since: Mutex<Vec<Instant>>,
+    /// How many clients the pool holds, for the busy gauge.
+    size: usize,
+    /// The registry the pool records into. Set once the server builds
+    /// its metrics; [`None`] for import, fsck, and tests that have none.
+    metrics: Mutex<Option<Arc<Metrics>>>,
 }
 
 impl Readers {
@@ -126,23 +152,102 @@ impl Readers {
         Ok(Self {
             idle: Mutex::new(idle),
             returned: Condvar::new(),
+            open_since: Mutex::new(Vec::new()),
+            size,
+            metrics: Mutex::new(None),
         })
     }
 
-    /// Takes a reader, or waits for one.
-    fn take(&self) -> ReaderGuard<'_> {
+    /// Takes a reader, or waits at most `wait` for one. A full pool means
+    /// the readers are stuck in long reads: the caller hears
+    /// [`Error::Unavailable`] and may retry, instead of waiting forever
+    /// behind a transaction that never ends.
+    fn take(&self, wait: Duration) -> Result<ReaderGuard<'_>> {
+        let started = Instant::now();
         let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
-        while idle.is_empty() {
-            idle = self
+        let client = loop {
+            if let Some(client) = idle.pop() {
+                break client;
+            }
+            let left = wait.checked_sub(started.elapsed());
+            let Some(left) = left else {
+                return Err(Error::Unavailable(format!(
+                    "no Postgres reader free after {wait:?}; the readers are stuck in long reads"
+                )));
+            };
+            let (guard, woke) = self
                 .returned
-                .wait(idle)
+                .wait_timeout(idle, left)
                 .unwrap_or_else(PoisonError::into_inner);
+            idle = guard;
+            if woke.timed_out() {
+                return Err(Error::Unavailable(format!(
+                    "no Postgres reader free after {wait:?}; the readers are stuck in long reads"
+                )));
+            }
+        };
+        let started_at = Instant::now();
+        self.open_since
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(started_at);
+        self.report_busy();
+        if let Some(metrics) = self.metrics() {
+            metrics.pg_pool_wait(started.elapsed());
         }
-        let client = idle.pop().expect("the pool is not empty");
-        ReaderGuard {
+        Ok(ReaderGuard {
             readers: self,
             client: Some(client),
+            started: started_at,
+        })
+    }
+
+    /// The start time of the oldest live read, for the tx-age gauge.
+    fn oldest_open(&self) -> Option<Instant> {
+        self.open_since
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .copied()
+            .min()
+    }
+
+    /// A read gave its reader back: forget its start time.
+    fn closed(&self, started: Instant) {
+        let mut open = self
+            .open_since
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(at) = open.iter().position(|known| *known == started) {
+            open.swap_remove(at);
         }
+        drop(open);
+        self.report_busy();
+    }
+
+    /// How many readers are out of the pool, for the busy gauge.
+    fn report_busy(&self) {
+        let idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        let busy = self.size.saturating_sub(idle.len());
+        drop(idle);
+        if let Some(metrics) = self.metrics() {
+            metrics.pg_readers_busy(u64::try_from(busy).unwrap_or(u64::MAX));
+        }
+    }
+
+    /// The metrics to record into, if the server gave the backend its
+    /// registry.
+    fn metrics(&self) -> Option<Arc<Metrics>> {
+        self.metrics
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Gives the pool the server's metrics registry.
+    fn set_metrics(&self, metrics: Arc<Metrics>) {
+        *self.metrics.lock().unwrap_or_else(PoisonError::into_inner) = Some(metrics);
+        self.report_busy();
     }
 }
 
@@ -150,6 +255,7 @@ impl Readers {
 struct ReaderGuard<'a> {
     readers: &'a Readers,
     client: Option<PgClient>,
+    started: Instant,
 }
 
 impl ReaderGuard<'_> {
@@ -161,6 +267,7 @@ impl ReaderGuard<'_> {
 impl Drop for ReaderGuard<'_> {
     fn drop(&mut self) {
         if let Some(client) = self.client.take() {
+            self.readers.closed(self.started);
             self.readers
                 .idle
                 .lock()
@@ -708,6 +815,24 @@ impl Pg {
         &self.inner.blobs
     }
 
+    /// Gives the pool the server's metrics registry. Called once by the
+    /// server before it serves; import, fsck, and gc pass none, and the
+    /// pool then records nothing.
+    pub fn set_metrics(&self, metrics: Arc<Metrics>) {
+        self.inner.readers.set_metrics(metrics);
+    }
+
+    /// The age of the oldest open read transaction, for the
+    /// `scion_pg_tx_age_seconds` gauge. Zero when no read is open.
+    #[must_use]
+    pub fn tx_age(&self) -> Duration {
+        self.inner
+            .readers
+            .oldest_open()
+            .map(|started| started.elapsed())
+            .unwrap_or_default()
+    }
+
     /// A read on the write client, so it sees the caller's own commits.
     pub fn read_unflushed<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
         let (mut writer, _waiting) = self.lock_writer();
@@ -721,13 +846,39 @@ impl Pg {
     /// A strong read on one client of the pool. The read runs in one
     /// transaction, so all its statements see one snapshot; on this backend
     /// every commit is durable when it returns, so what `f` saw is durable.
+    /// The transaction is bounded: a statement past
+    /// [`READ_STATEMENT_TIMEOUT`] or an idle past [`READ_IDLE_TIMEOUT`]
+    /// fails, so an abandoned read cannot hold a reader forever.
+    ///
+    /// # Errors
+    ///
+    /// What `f` returns, a database error from begin, or
+    /// [`Error::Unavailable`] when no reader was free in time.
     pub fn read<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
-        let mut reader = self.inner.readers.take();
-        let mut tx = PgTx::begin_read(reader.client())?;
-        let out = f(&mut tx);
-        // A read transaction: nothing to keep. The rollback's own error
-        // must not hide the error of `f`; the drop rolls back anyway.
-        let _ = tx.rollback();
+        self.read_bounded(f, READ_STATEMENT_TIMEOUT, READ_IDLE_TIMEOUT, READER_WAIT)
+    }
+
+    /// [`Pg::read`], with the bounds in the open: the per-statement
+    /// timeout, the idle-in-transaction timeout, and how long a caller
+    /// may wait for a reader. The tests use short bounds; the server
+    /// uses [`Pg::read`].
+    pub(crate) fn read_bounded<T>(
+        &self,
+        f: impl FnOnce(&mut PgTx<'_>) -> Result<T>,
+        statement: Duration,
+        idle: Duration,
+        wait: Duration,
+    ) -> Result<T> {
+        let mut reader = self.inner.readers.take(wait)?;
+        let out = {
+            let mut tx = PgTx::begin_read(reader.client(), statement, idle)?;
+            let out = f(&mut tx);
+            // A read transaction: nothing to keep. The rollback's own error
+            // must not hide the error of `f`; the drop rolls back anyway.
+            let _ = tx.rollback();
+            out
+        };
+        drop(reader);
         out
     }
 
@@ -927,10 +1078,26 @@ impl<'a> PgTx<'a> {
 
     /// Begins one read-only transaction at repeatable read: every
     /// statement of the caller's read sees one snapshot, not the newest
-    /// state of each statement.
-    fn begin_read(c: &'a mut PgClient) -> Result<PgTx<'a>> {
+    /// state of each statement. The transaction is bounded server side:
+    /// one statement may take `statement`, and the transaction may sit
+    /// idle between statements at most `idle` (the timeouts are
+    /// `SET LOCAL`, so they end with the transaction, and a stream that
+    /// stopped reading cannot hold the reader forever).
+    //
+    // SHORTCUT: every read runs at repeatable read, one snapshot per
+    // read, even though reads that touch only immutable rows would be
+    // safe at read committed with a shorter snapshot hold. Nobody has
+    // measured the gain, and the split needs an audit of every walk that
+    // re-reads a ref. Measure first, then split.
+    fn begin_read(c: &'a mut PgClient, statement: Duration, idle: Duration) -> Result<PgTx<'a>> {
         c.execute(
-            "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+            &format!(
+                "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY; \
+                 SET LOCAL statement_timeout = {}; \
+                 SET LOCAL idle_in_transaction_session_timeout = {};",
+                statement.as_millis(),
+                idle.as_millis()
+            ),
             &[],
         )?;
         Ok(Self { c, ended: false })
@@ -2572,5 +2739,192 @@ mod tests {
             text.contains("scion_pg_collector_key_wait_seconds_count 1\n"),
             "{text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use crate::store::READERS;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// A Postgres backend of a test database, or [`None`] on SQLite: the
+    /// pool is a Postgres shape, so the pool tests skip the data
+    /// directory.
+    fn pg() -> Option<Pg> {
+        if !crate::backend::Backend::test_is_postgres() {
+            eprintln!("skip on sqlite: the reader pool is Postgres");
+            return None;
+        }
+        let data = tempfile::tempdir().unwrap();
+        match crate::backend::Backend::open_test(data.path()).unwrap() {
+            crate::backend::Backend::Postgres(pg) => Some(pg),
+            crate::backend::Backend::Sqlite(_) => unreachable!("the env named postgres"),
+        }
+    }
+
+    /// One statement that runs past its bound is cancelled, and the
+    /// reader comes back to the pool.
+    #[test]
+    fn a_read_statement_past_its_bound_is_cancelled() {
+        let Some(pg) = pg() else { return };
+        let err = pg
+            .read_bounded(
+                |tx| {
+                    tx.c.query_opt("SELECT pg_sleep(2)", &[])?;
+                    Ok(())
+                },
+                Duration::from_millis(50),
+                Duration::from_secs(30),
+                READER_WAIT,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Pg(_)), "{err}");
+        // The reader returned: the next read runs at once.
+        let again = pg.read(|tx| {
+            tx.c.query_opt("SELECT 1", &[])
+                .map(|row| row.map(|row| row.get::<_, i32>(0)))
+        });
+        assert_eq!(again.unwrap(), Some(1));
+    }
+
+    /// A call whose wait for a reader passes the bound hears
+    /// `Unavailable`, instead of blocking to its deadline.
+    #[test]
+    fn a_call_that_waits_past_the_pool_bound_is_refused() {
+        let Some(pg) = pg() else { return };
+        let pg = Arc::new(pg);
+        let busy = Arc::new(AtomicUsize::new(0));
+        let holds: Vec<_> = (0..READERS)
+            .map(|_| {
+                let pg = Arc::clone(&pg);
+                let busy = Arc::clone(&busy);
+                std::thread::spawn(move || {
+                    pg.read_bounded(
+                        |_| {
+                            busy.fetch_add(1, AtomicOrdering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(600));
+                            Ok(())
+                        },
+                        Duration::from_secs(300),
+                        Duration::from_secs(30),
+                        Duration::from_secs(30),
+                    )
+                    .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        // Every reader is out of the pool.
+        let wait = std::time::Instant::now() + Duration::from_secs(10);
+        while busy.load(AtomicOrdering::SeqCst) < READERS && std::time::Instant::now() < wait {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            busy.load(AtomicOrdering::SeqCst),
+            READERS,
+            "all readers busy"
+        );
+        let refused = pg
+            .read_bounded(
+                |tx| {
+                    tx.c.query_opt("SELECT 1", &[])?;
+                    Ok(())
+                },
+                Duration::from_secs(300),
+                Duration::from_secs(30),
+                Duration::from_millis(50),
+            )
+            .unwrap_err();
+        assert!(matches!(refused, Error::Unavailable(_)), "{refused}");
+        for hold in holds {
+            hold.join().unwrap();
+        }
+    }
+
+    /// The pool wait lands in the histogram, and the busy gauge returns
+    /// to zero when the reads are done.
+    #[test]
+    fn the_pool_records_its_waits_and_its_busy_readers() {
+        let Some(pg) = pg() else { return };
+        let metrics = Arc::new(Metrics::default());
+        pg.set_metrics(Arc::clone(&metrics));
+        let pg = Arc::new(pg);
+        let busy = Arc::new(AtomicUsize::new(0));
+        let holds: Vec<_> = (0..READERS)
+            .map(|_| {
+                let pg = Arc::clone(&pg);
+                let busy = Arc::clone(&busy);
+                std::thread::spawn(move || {
+                    pg.read_bounded(
+                        |_| {
+                            busy.fetch_add(1, AtomicOrdering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(500));
+                            Ok(())
+                        },
+                        Duration::from_secs(30),
+                        Duration::from_secs(30),
+                        Duration::from_millis(400),
+                    )
+                    .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while busy.load(AtomicOrdering::SeqCst) < READERS && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // One more call waits ~400 ms for a reader, then takes one as the
+        // holders return theirs.
+        let waited = std::time::Instant::now();
+        pg.read_bounded(
+            |tx| {
+                tx.c.query_opt("SELECT 1", &[])?;
+                Ok(())
+            },
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(
+            waited.elapsed() >= Duration::from_millis(100),
+            "the wait was real"
+        );
+        for hold in holds {
+            hold.join().unwrap();
+        }
+        assert_eq!(metrics.pg_readers_busy_gauge(), 0);
+        let (sum, count) = metrics.pg_pool_wait_totals();
+        assert!(count >= 1, "the wait was recorded");
+        assert!(sum > 0, "sum {sum}");
+        assert_eq!(pg.tx_age(), Duration::ZERO);
+    }
+
+    /// The tx-age gauge says how old the oldest open read is, and goes
+    /// back to zero when it ends.
+    #[test]
+    fn the_tx_age_gauge_tracks_the_oldest_open_read() {
+        let Some(pg) = pg() else { return };
+        let pg = Arc::new(pg);
+        assert_eq!(pg.tx_age(), Duration::ZERO);
+        let hold = {
+            let pg = Arc::clone(&pg);
+            std::thread::spawn(move || {
+                pg.read_bounded(
+                    |_| {
+                        std::thread::sleep(Duration::from_millis(300));
+                        Ok(())
+                    },
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    Duration::from_secs(5),
+                )
+                .unwrap();
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(pg.tx_age() > Duration::ZERO, "{:?}", pg.tx_age());
+        hold.join().unwrap();
+        assert_eq!(pg.tx_age(), Duration::ZERO);
     }
 }
