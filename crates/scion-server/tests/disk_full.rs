@@ -128,12 +128,21 @@ fn open_store(mount: &Mount) -> Backend {
     Backend::open_test(mount.0.join("data").as_path()).unwrap()
 }
 
-/// Fills the store with blobs of `len` bytes until the disk refuses
-/// one, and returns the error and the blobs that landed.
+/// Fills the store with distinct blobs of `len` bytes until the disk
+/// refuses one, and returns the error and the blobs that landed. The
+/// blobs are distinct: a put of a blob the store already holds writes
+/// nothing, so a repeated chunk would fill nothing.
 fn fill_with_blobs(store: &Backend, len: usize) -> (Error, Vec<scion_core::BlobId>) {
-    let chunk = vec![b'x'; len];
+    let mut chunk = vec![b'x'; len.max(8)];
     let mut landed = Vec::new();
     loop {
+        // A backstop: a disk that never refuses means this fill is
+        // broken, not that the disk is endless.
+        assert!(
+            landed.len() < 200_000,
+            "the fill never hit the disk's limit"
+        );
+        chunk[..8].copy_from_slice(&landed.len().to_be_bytes());
         match store.blobs().put(&chunk) {
             Ok(id) => landed.push(id),
             Err(error) => return (error, landed),
@@ -215,11 +224,11 @@ fn a_disk_out_of_inodes_answers_out_of_space_and_needs_no_repair() {
     let store = open_store(&mount);
     // Tiny blobs eat the inode budget one file at a time, until the
     // create itself is refused.
-    let (error, landed) = fill_with_blobs(&store, 1);
+    let (error, landed) = fill_with_blobs(&store, 16);
     assert!(is_out_of_space(&error), "{error:?}");
     assert!(is_resource_exhausted(&error), "{error:?}");
     for id in &landed {
-        assert_eq!(store.blobs().get(*id).unwrap(), b"x");
+        assert_eq!(store.blobs().get(*id).unwrap().len(), 16);
     }
     // More inodes, and the next write works with no restart.
     mount.remount_bigger("64m", "4096");
