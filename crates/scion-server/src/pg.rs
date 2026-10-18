@@ -102,9 +102,10 @@ struct PgInner {
     /// The import's test hooks and busy-retry count, as the SQLite store
     /// keeps its own.
     hooks: crate::store::ImportHooks,
-    /// The operator metrics, when the process exports one: a commit's
-    /// wait for the collector's advisory key records how long it waited.
-    metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
+    /// The operator metrics, set once by the server before it serves: a
+    /// commit's wait for the collector's advisory key records how long
+    /// it waited. Empty in import, fsck and gc, which export none.
+    metrics: std::sync::OnceLock<std::sync::Arc<crate::metrics::Metrics>>,
 }
 
 /// Clients for [`Pg::read`], so at most [`READERS`](crate::store::READERS)
@@ -673,7 +674,7 @@ impl Pg {
     /// A URL that does not parse, a database that does not connect, a
     /// schema of a newer build, or a migration that fails.
     pub fn open(url: &str, ca: Option<&Path>, readers: usize, data: &Path) -> Result<Self> {
-        Self::open_in(url, ca, readers, data, None, false, None)
+        Self::open_in(url, ca, readers, data, None, false)
     }
 
     /// [`Pg::open`], as the one server process of the database: a second
@@ -689,7 +690,7 @@ impl Pg {
         readers: usize,
         data: &Path,
     ) -> Result<Self> {
-        Self::open_in(url, ca, readers, data, None, true, None)
+        Self::open_in(url, ca, readers, data, None, true)
     }
 
     /// [`Pg::open`], in `schema` instead of the database's default one, for
@@ -700,29 +701,6 @@ impl Pg {
     ///
     /// As [`Pg::open`].
     pub fn open_test(url: &str, schema: &str, readers: usize, data: &Path) -> Result<Self> {
-        Self::open_test_inner(url, schema, readers, data, None)
-    }
-
-    /// [`Pg::open_test`], with the metrics registry a test reads its
-    /// assertions from.
-    #[cfg(test)]
-    pub fn open_test_with_metrics(
-        url: &str,
-        schema: &str,
-        readers: usize,
-        data: &Path,
-        metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
-    ) -> Result<Self> {
-        Self::open_test_inner(url, schema, readers, data, metrics)
-    }
-
-    fn open_test_inner(
-        url: &str,
-        schema: &str,
-        readers: usize,
-        data: &Path,
-        metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
-    ) -> Result<Self> {
         {
             // One throwaway client makes the schema, before any connection
             // narrows its search path to it. It names itself first, so no
@@ -759,7 +737,7 @@ impl Pg {
                 }
             })?;
         }
-        Self::open_in(url, None, readers, data, Some(schema), false, metrics)
+        Self::open_in(url, None, readers, data, Some(schema), false)
     }
 
     /// [`Pg::open`], in the search path of `schema` when it is set.
@@ -771,7 +749,6 @@ impl Pg {
         data: &Path,
         schema: Option<&str>,
         exclusive: bool,
-        metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
     ) -> Result<Self> {
         let options = base_options();
         let mut writer = if exclusive {
@@ -790,7 +767,7 @@ impl Pg {
                  synchronous_commit=on"
             )));
         }
-        let blobs = Blobs::open_with(data, metrics.clone())?;
+        let blobs = Blobs::open(data)?;
         blobs.sweep_tmp(false)?;
         Ok(Self {
             inner: Arc::new(PgInner {
@@ -799,12 +776,9 @@ impl Pg {
                 blobs,
                 writers: Mutex::new(0),
                 write_woken: Condvar::new(),
-                derive: crate::derived::DeriveFlights::new_with(
-                    crate::store::DERIVE_WALKS_CAP,
-                    metrics.clone(),
-                ),
+                derive: crate::derived::DeriveFlights::new(crate::store::DERIVE_WALKS_CAP),
                 hooks: crate::store::ImportHooks::default(),
-                metrics,
+                metrics: std::sync::OnceLock::new(),
             }),
         })
     }
@@ -819,6 +793,9 @@ impl Pg {
     /// server before it serves; import, fsck, and gc pass none, and the
     /// pool then records nothing.
     pub fn set_metrics(&self, metrics: Arc<Metrics>) {
+        let _ = self.inner.metrics.set(Arc::clone(&metrics));
+        self.inner.blobs.set_metrics(Arc::clone(&metrics));
+        self.inner.derive.set_metrics(metrics.clone());
         self.inner.readers.set_metrics(metrics);
     }
 
@@ -930,7 +907,7 @@ impl Pg {
             "SELECT pg_advisory_xact_lock(hashtext(current_schema() || ':gc'))",
             &[],
         )?;
-        if let Some(metrics) = &self.inner.metrics {
+        if let Some(metrics) = self.inner.metrics.get() {
             metrics.collector_key_wait(
                 u64::try_from(key_started.elapsed().as_micros()).unwrap_or(u64::MAX),
             );
@@ -2698,16 +2675,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let schema = crate::backend::test_schema(dir.path());
         let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
-        let pg =
-            Pg::open_test_with_metrics(&url, &schema, 2, dir.path(), Some(Arc::clone(&metrics)))
-                .unwrap();
+        let pg = Pg::open_test(&url, &schema, 2, dir.path()).unwrap();
+        pg.set_metrics(Arc::clone(&metrics));
         assert!(
-            !pg.inner
-                .metrics
-                .as_ref()
-                .unwrap()
-                .render()
-                .contains("scion_pg_collector_key_wait"),
+            !metrics.render().contains("scion_pg_collector_key_wait"),
             "nothing waited yet"
         );
         // Another client holds the key, so the commit below really waits.

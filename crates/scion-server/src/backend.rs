@@ -284,12 +284,15 @@ impl Backend {
         }
     }
 
-    /// Gives the Postgres reader pool the server's metrics registry. A
-    /// no-op on the data directory backend, whose readers are threads of
-    /// one process and need no pool metrics.
-    pub fn set_pg_metrics(&self, metrics: Arc<Metrics>) {
-        if let Self::Postgres(pg) = self {
-            pg.set_metrics(metrics);
+    /// Gives the backend the server's metrics registry, once before the
+    /// server serves: the Postgres pool's pool metrics, and on both
+    /// backends the blob full flushes, the derive-walk gauges and the
+    /// collector-key wait. Without it, import, fsck and gc record
+    /// nothing.
+    pub fn set_metrics(&self, metrics: Arc<Metrics>) {
+        match self {
+            Self::Sqlite(store) => store.set_metrics(metrics),
+            Self::Postgres(pg) => pg.set_metrics(metrics),
         }
     }
 

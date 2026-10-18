@@ -327,7 +327,6 @@ async fn main() -> anyhow::Result<()> {
             let tickets = load_tickets(ticket_key.as_deref(), ticket_key_old.as_deref())?;
             serve(
                 store,
-                &cli.data,
                 listen,
                 access,
                 ServeConfig {
@@ -470,15 +469,11 @@ struct ServeConfig {
     metrics_listen: Option<SocketAddr>,
 }
 
-/// How often the free-space gauge of the data directory is refreshed.
-const FREE_SPACE_POLL: Duration = Duration::from_secs(30);
-
 /// Serves the gRPC API on `listen`, with the TLS files of the flags, until
 /// the caller stops it.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn serve(
     store: Backend,
-    data: &std::path::Path,
     listen: SocketAddr,
     access: scion_server::access::Access,
     config: ServeConfig,
@@ -501,30 +496,6 @@ async fn serve(
         scion_proto::metrics::shutdown_signal().await;
         let _ = end_tx.send(());
     });
-    // The free space of the data directory's filesystem, so the operator
-    // sees a full drive before the server hits it. The latest poll is the
-    // gauge; a failed stat keeps the last good value and logs once a poll.
-    {
-        let (metrics, data, mut stop) = (Arc::clone(&metrics), data.to_path_buf(), end_rx.clone());
-        tokio::spawn(async move {
-            loop {
-                let data = data.clone();
-                let free =
-                    tokio::task::spawn_blocking(move || scion_server::store::free_bytes(&data));
-                match free.await {
-                    Ok(Ok(bytes)) => metrics.data_free_bytes(bytes),
-                    Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "cannot stat the data directory's free space");
-                    }
-                    Err(e) => tracing::warn!(error = %e, "the free-space poll failed"),
-                }
-                tokio::select! {
-                    () = tokio::time::sleep(FREE_SPACE_POLL) => {}
-                    _ = stop.changed() => break,
-                }
-            }
-        });
-    }
     if let Some(metrics_listen) = config.metrics_listen {
         let address = metrics_listen.to_string();
         let checked = metrics::loopback_or_allow(metrics_listen, config.insecure_listen);
@@ -555,6 +526,7 @@ async fn serve(
         listener,
         access,
         service::ServeOptions {
+            data: cli.data.clone(),
             limits: Limits {
                 connections: config.max_connections,
                 streams: config.max_streams,

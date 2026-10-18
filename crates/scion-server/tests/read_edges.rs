@@ -104,6 +104,7 @@ async fn serve(store: &Backend) -> (Stop, Scion) {
         listener,
         access,
         service::ServeOptions {
+            data: dir.path().to_path_buf(),
             limits: Limits::default(),
             quotas: scion_server::quotas::Quotas::off(),
             pending_lands: None,

@@ -108,6 +108,7 @@ async fn serve(store: &Backend, access: Access) -> (tokio::sync::oneshot::Sender
         listener,
         access,
         service::ServeOptions {
+            data: dir.path().to_path_buf(),
             limits: Limits::default(),
             quotas: scion_server::quotas::Quotas::off(),
             pending_lands: None,
