@@ -208,24 +208,29 @@ impl Readers {
     /// behind a transaction that never ends.
     fn take(&self, wait: Duration) -> Result<ReaderGuard<'_>> {
         let started = Instant::now();
-        let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
-        let client = loop {
-            if let Some(client) = idle.pop() {
-                break client;
+        // The idle lock guards the pool list only: it is dropped before
+        // the tail, whose report_busy takes it again. Holding it across
+        // the tail deadlocks take against itself on the first read.
+        let client = {
+            let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+            loop {
+                if let Some(client) = idle.pop() {
+                    break client;
+                }
+                let left = wait.checked_sub(started.elapsed());
+                let Some(left) = left else {
+                    return Err(Error::Unavailable(format!(
+                        "no Postgres reader free after {wait:?}; the readers are stuck in long reads"
+                    )));
+                };
+                let (guard, _woke) = self
+                    .returned
+                    .wait_timeout(idle, left)
+                    .unwrap_or_else(PoisonError::into_inner);
+                idle = guard;
+                // A timed-out wait falls through to the top of the loop, so a
+                // reader given back in this window is taken before refusing.
             }
-            let left = wait.checked_sub(started.elapsed());
-            let Some(left) = left else {
-                return Err(Error::Unavailable(format!(
-                    "no Postgres reader free after {wait:?}; the readers are stuck in long reads"
-                )));
-            };
-            let (guard, _woke) = self
-                .returned
-                .wait_timeout(idle, left)
-                .unwrap_or_else(PoisonError::into_inner);
-            idle = guard;
-            // A timed-out wait falls through to the top of the loop, so a
-            // reader given back in this window is taken before refusing.
         };
         let started_at = Instant::now();
         self.open_since
