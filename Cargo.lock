@@ -2498,6 +2498,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "ed25519-dalek",
  "hashlink",
  "nfsserve",
  "open-scion-core",
