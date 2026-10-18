@@ -842,13 +842,29 @@ async fn import_process_races_the_server_on_the_same_blob() {
     // A git repository for the import process: one commit whose file
     // holds the same bytes the client puts.
     let git_dir = dir.path().join("git");
-    fs::create_dir_all(&git_dir).unwrap();
-    git(&git_dir, &["init", "-q"]);
-    fs::write(git_dir.join("f.bin"), &content).unwrap();
-    git(&git_dir, &["add", "."]);
-    git(&git_dir, &["commit", "-q", "-m", "the race"]);
-    // The import starts first: opening the store on FUSE and reading git
-    // take a moment, and the client's put parks the server meanwhile.
+    one_file_repo(&git_dir, &content);
+    // The put goes first: keep finds the blob missing, and the server's
+    // writer parks between keep and rename. The trace shows the park:
+    // the server stats the park file through the mount every few ms.
+    let mut put = tokio::spawn(async move { put_blob(&mut scion, &content).await });
+    let park_path = format!("hooks/park-{want}");
+    let park_until = Instant::now() + Duration::from_secs(30);
+    loop {
+        let parked = fs::read_to_string(&lazy.trace)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.contains("lfs_getattr") && line.contains(&park_path));
+        assert!(
+            parked || Instant::now() < park_until,
+            "the server never reached the park"
+        );
+        if parked {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Only now the import runs: its rename lands while the server holds
+    // the stripe and sits in the park.
     let import = common::spawn_guard::across_spawn(|| {
         Command::new(env!("CARGO_BIN_EXE_scion-server"))
             .args([
@@ -864,12 +880,9 @@ async fn import_process_races_the_server_on_the_same_blob() {
     })
     .unwrap();
     let import_handle = Mutex::new(Some(std::thread::spawn(move || import.wait_with_output())));
-    let mut put = tokio::spawn(async move { put_blob(&mut scion, &content).await });
-    // The import renames the raced blob while the server's writer sits
-    // in the park. The trace names every rename, so the wait reads it.
-    // The dest path splits the ID: its first two hex digits name the
-    // folder, the remaining sixty-two name the file, so the needle is
-    // the tail. A cold CI import renamed within seconds.
+    // The trace names every rename. The dest path splits the ID: its
+    // first two hex digits name the folder, the remaining sixty-two name
+    // the file, so the needle is the tail.
     let blob_name = want.to_string()[2..].to_owned();
     let import_from = wait_for_rename(&lazy.trace, &blob_name, 240, None);
     // The release ends the park: the server's rename lands after the
@@ -881,7 +894,7 @@ async fn import_process_races_the_server_on_the_same_blob() {
         .unwrap()
         .unwrap();
     assert_eq!(id, want);
-    wait_import(import_handle);
+    wait_import(&import_handle);
     // The order is the point: the server's rename of the raced blob
     // lands after the import's, from another tmp folder. A second rename
     // never came, and the park never held: the seam failed.
@@ -908,7 +921,7 @@ async fn import_process_races_the_server_on_the_same_blob() {
 /// Waits for the import process to finish, and fails with its stderr if
 /// it exited badly.
 fn wait_import(
-    handle: Mutex<Option<std::thread::JoinHandle<std::io::Result<std::process::Output>>>>,
+    handle: &Mutex<Option<std::thread::JoinHandle<std::io::Result<std::process::Output>>>>,
 ) -> std::process::Output {
     let import = wait_for("the import to finish", 60, || {
         let finished = handle
@@ -941,6 +954,15 @@ fn park_file(data: &Path, id: &BlobId) -> PathBuf {
     data.join("hooks").join(format!("park-{id}"))
 }
 
+/// Makes a git repository of one commit, whose file holds `content`.
+fn one_file_repo(git_dir: &Path, content: &[u8]) {
+    fs::create_dir_all(git_dir).unwrap();
+    git(git_dir, &["init", "-q"]);
+    fs::write(git_dir.join("f.bin"), content).unwrap();
+    git(git_dir, &["add", "."]);
+    git(git_dir, &["commit", "-q", "-m", "the race"]);
+}
+
 /// The from path of one `lfs_rename` ops line: the writer's temp folder
 /// names the process that ran it.
 fn from_of(line: &str) -> String {
@@ -959,7 +981,7 @@ fn wait_for_rename(trace: &Path, blob_name: &str, secs: u64, not_from: Option<&s
         let line = text.lines().find(|line| {
             line.contains("lfs_rename")
                 && line.contains(blob_name)
-                && not_from.map_or(true, |from| !line.contains(from))
+                && not_from.is_none_or(|from| !line.contains(from))
         });
         if let Some(line) = line {
             return from_of(line);
