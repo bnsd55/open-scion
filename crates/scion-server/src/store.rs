@@ -1642,15 +1642,9 @@ impl BlobBatch<'_> {
     // a bug report or a change to this rename path says a directory entry
     // was lost.
     fn flush_dirs(self) -> Result<bool> {
-        // MUTATION: the directory fsync is deleted; the rename's entry is
-        // only as durable as the next full flush of another path.
-        for dir in &self.dirs {
-<<<<<<< HEAD
-            self.blobs.log.record(DurabilityStep::DirFsync(dir.clone()));
-=======
-            fsync_dir_logged(&self.blobs.log, dir)?;
->>>>>>> origin/feat/dir-fsync-order
-        }
+        // MUTATION: the directory fsync (and its record, which is one
+        // call with it) is deleted; the rename's entry is only as durable
+        // as the next full flush of another path.
         Ok(!self.dirs.is_empty())
     }
 }
