@@ -117,6 +117,28 @@ fn count_changesets(c: &Connection) -> scion_server::Result<i64> {
     Ok(c.query_row("SELECT count(*) FROM changesets", [], |row| row.get(0))?)
 }
 
+/// The changeset rows of the store's world: the data directory's table on
+/// SQLite, the test schema's on Postgres, read through a client of the
+/// schema, as the refusal tests hold theirs.
+fn count_of(store: &Backend, dir: &std::path::Path) -> i64 {
+    if Backend::test_is_postgres() {
+        let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+        let schema = Backend::test_schema(dir).unwrap();
+        let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        client
+            .batch_execute(&format!("SET search_path TO {schema}"))
+            .unwrap();
+        client
+            .query_one("SELECT count(*) FROM changesets", &[])
+            .unwrap()
+            .get(0)
+    } else {
+        store
+            .read(|c| count_changesets(c.sqlite().unwrap()))
+            .unwrap()
+    }
+}
+
 #[test]
 fn concurrent_creates_of_one_changeset_store_it_once() {
     let f = fixture();
@@ -125,6 +147,7 @@ fn concurrent_creates_of_one_changeset_store_it_once() {
         &[("a", None), ("dir/new", Some(regular("new")))],
     )
     .encode_with_id();
+    let before = count_of(&f.store, f.dir.path());
     let ids: Vec<ChangesetId> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..100)
             .map(|_| s.spawn(|| create_changeset(&f.store, REPO, &bytes)))
@@ -136,32 +159,11 @@ fn concurrent_creates_of_one_changeset_store_it_once() {
     });
     // Every caller answers the same ID, and none of them errors: the
     // conflict of the one stored row is a no-op on every backend, not a
-    // failure. The Postgres table keeps one row per ID, so a caller that
-    // stored a second one would have errored here.
+    // failure.
     assert!(ids.iter().all(|id| *id == expected), "{ids:?}");
-    let repo_id = f.store.read(|c| c.repo_id(REPO)).unwrap();
-    assert!(
-        f.store
-            .read(|c| c.has_changeset(repo_id, expected))
-            .unwrap(),
-        "the changeset is not in the repo"
-    );
-    // The row count closes the case on the store whose rows the tests
-    // read; on Postgres the schema drift test covers the table's keys.
-    if Backend::test_is_postgres() {
-        return;
-    }
-    let before = f
-        .store
-        .read(|c| count_changesets(c.sqlite().unwrap()))
-        .unwrap();
-    create_changeset(&f.store, REPO, &bytes).unwrap();
-    assert_eq!(
-        f.store
-            .read(|c| count_changesets(c.sqlite().unwrap()))
-            .unwrap(),
-        before
-    );
+    // One create, one row, on both backends: a caller that stored a
+    // second row, or lost the race and stored none, fails here.
+    assert_eq!(count_of(&f.store, f.dir.path()), before + 1);
 }
 
 #[test]
