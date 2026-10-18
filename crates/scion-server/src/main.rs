@@ -16,12 +16,11 @@ use scion_server::derived::{self, Kind};
 use scion_server::graph::CommitGraph;
 use scion_server::history::PathHistory;
 use scion_server::import::{ImportOptions, import_git};
-use scion_server::meta::Meta as _;
-use scion_server::meta::MetaTx as _;
+
 use scion_server::metrics::{self, Metrics};
 use scion_server::quotas::Quotas;
 use scion_server::tree::RootTree;
-use scion_server::{Backend, Error, fsck, gc, read, service};
+use scion_server::{Backend, Error, fsck, gc, service};
 use tracing_subscriber::EnvFilter;
 
 /// The scion server: import, serve and derive.
@@ -382,19 +381,18 @@ async fn main() -> anyhow::Result<()> {
             target_ref,
         } => {
             let (name, tip) = tokio::task::spawn_blocking(move || {
-                let tip = read::resolve_ref(&store, &repo, &target_ref)?;
-                let repo_id = store.read(|c| c.repo_id(&repo))?;
+                let tip = store.resolve_ref(&repo, &target_ref)?;
                 let name = match kind {
                     KindName::RootTree => {
-                        derived::backfill::<RootTree>(&store, repo_id, tip)?;
+                        derived::backfill::<RootTree>(&store, &repo, tip)?;
                         RootTree::NAME
                     }
                     KindName::CommitGraph => {
-                        derived::backfill::<CommitGraph>(&store, repo_id, tip)?;
+                        derived::backfill::<CommitGraph>(&store, &repo, tip)?;
                         CommitGraph::NAME
                     }
                     KindName::PathHistory => {
-                        derived::backfill::<PathHistory>(&store, repo_id, tip)?;
+                        derived::backfill::<PathHistory>(&store, &repo, tip)?;
                         PathHistory::NAME
                     }
                 };

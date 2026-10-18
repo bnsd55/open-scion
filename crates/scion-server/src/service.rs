@@ -438,7 +438,7 @@ pub(crate) async fn resolve_ref(
     check_reader(access, &caller, &repo)?;
     check_name("ref", &name)?;
     let id = worker
-        .run(move |store| read::resolve_ref(&store, &repo, &name))
+        .run(move |store| store.resolve_ref(&repo, &name))
         .await?;
     Ok(ResolveRefResponse {
         changeset_id: id.as_bytes().to_vec(),

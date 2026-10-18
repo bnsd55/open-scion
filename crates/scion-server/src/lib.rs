@@ -54,12 +54,32 @@
 //! a build is at the user's own risk.
 
 pub mod access;
+// Internal: the binaries' implementation. Tests reach it only with the
+// test-hooks feature on, which the crate's own dev-dependency sets.
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod auth;
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod auth;
 pub mod backend;
 pub use backend::Backend;
+// Internal: the binaries' implementation. Tests reach it only with the
+// test-hooks feature on, which the crate's own dev-dependency sets.
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod blame;
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod blame;
+// Internal: the binaries' implementation. Tests reach it only with the
+// test-hooks feature on, which the crate's own dev-dependency sets.
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod db;
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod db;
+// Internal: the binaries' implementation. Tests reach it only with the
+// test-hooks feature on, which the crate's own dev-dependency sets.
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod deadline;
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod deadline;
 pub mod derived;
 pub mod error;
 pub mod fsck;
@@ -67,22 +87,67 @@ pub mod gc;
 pub mod graph;
 pub mod history;
 pub mod import;
+// Internal: the binaries' implementation. Tests reach it only with the
+// test-hooks feature on, which the crate's own dev-dependency sets.
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod land;
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod land;
+// Internal: the binaries' implementation. Tests reach it only with the
+// test-hooks feature on, which the crate's own dev-dependency sets.
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod memory;
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod memory;
+// Internal: the binaries' implementation. Tests reach it only with the
+// test-hooks feature on, which the crate's own dev-dependency sets.
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod meta;
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod meta;
 pub mod metrics;
+// Internal: the binaries' implementation. Tests reach it only with the
+// test-hooks feature on, which the crate's own dev-dependency sets.
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod names;
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod names;
+// Internal: the binaries' implementation. Tests reach it only with the
+// test-hooks feature on, which the crate's own dev-dependency sets.
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod objects;
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod objects;
 mod pg;
 pub mod quotas;
+// Internal: the binaries' implementation. Tests reach it only with the
+// test-hooks feature on, which the crate's own dev-dependency sets.
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod read;
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod read;
 pub mod service;
+// Internal: the binaries' implementation. Tests reach it only with the
+// test-hooks feature on, which the crate's own dev-dependency sets.
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod similar;
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod similar;
 pub mod store;
 pub mod tickets;
 pub mod tree;
+// Internal: the binaries' implementation. Tests reach it only with the
+// test-hooks feature on, which the crate's own dev-dependency sets.
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod views;
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod views;
+// Internal: the binaries' implementation. Tests reach it only with the
+// test-hooks feature on, which the crate's own dev-dependency sets.
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod write;
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod write;
 
 pub use store::Store;
 

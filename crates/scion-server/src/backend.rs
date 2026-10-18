@@ -118,6 +118,21 @@ pub(crate) fn test_schema(data: &Path) -> String {
 }
 
 impl Backend {
+    /// Where a ref points.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if the repo or ref does not exist.
+    pub fn resolve_ref(&self, repo: &str, name: &str) -> Result<ChangesetId> {
+        use crate::meta::Meta as _;
+        self.read(|c| {
+            let repo = c.repo_id(repo)?;
+            c.get_ref(repo, name)?
+                .map(|r| r.target)
+                .ok_or_else(|| crate::error::Error::NotFound(format!("ref {name:?}")))
+        })
+    }
+
     /// The derive walks of this backend: which are in flight, and the cap
     /// on how many may be.
     pub(crate) fn derive_flights(&self) -> &crate::derived::DeriveFlights {

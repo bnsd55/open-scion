@@ -414,7 +414,9 @@ fn fill_until<K: Kind>(
 /// # Errors
 ///
 /// As [`fill`] and [`Store::flush`](crate::store::Store::flush).
-pub fn backfill<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<()> {
+pub fn backfill<K: Kind>(store: &Backend, repo: &str, cs: ChangesetId) -> Result<()> {
+    use crate::meta::Meta as _;
+    let repo = store.read(|c| c.repo_id(repo))?;
     fill::<K>(store, repo, cs)?;
     // A short step means that no older row is left.
     while store.commit(|c| remove_old::<K>(c))? == STEP {}
@@ -1342,7 +1344,7 @@ mod tests {
     fn a_backfill_derives_a_history_and_removes_every_older_row() {
         let (_dir, store, repo, ids) = store_with(&chain(7));
         let tip = ids[6];
-        backfill::<ChangedPathsV2>(&store, repo, tip).unwrap();
+        backfill::<ChangedPathsV2>(&store, "r", tip).unwrap();
         assert_eq!(kind_rows(&store, 2).len(), 7);
         // A build with version 1 derives its own rows and keeps version 2.
         assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), 7);
@@ -1355,7 +1357,7 @@ mod tests {
         DERIVES.set(0);
         let commits = store.commits();
         let flushes = store.blobs().full_flushes();
-        backfill::<ChangedPathsV2>(&store, repo, tip).unwrap();
+        backfill::<ChangedPathsV2>(&store, "r", tip).unwrap();
         assert_eq!(DERIVES.get(), 0);
         assert!(kind_rows(&store, 1).is_empty(), "version 1 is removed");
         assert_eq!(store.commits() - commits, steps(7));
