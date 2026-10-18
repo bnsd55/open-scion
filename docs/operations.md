@@ -38,6 +38,12 @@ chmod 600 /srv/scion-keys/ticket.key
   --ticket-key /srv/scion-keys/ticket.key
 ```
 
+Size the process with the three connection caps: `--max-connections` (128)
+bounds the clients served at once, `--max-streams` (256) bounds the calls
+one client may hold open at once, and `--max-stalled-bytes` (64 MiB)
+bounds what the stalled replies of one connection may hold before the
+connection is closed. A cache and a daemon take the same three flags.
+
 Choose the tokens with care: `--token T` makes one principal, `default`, with
 every right on every repo. For several people or services, use an access
 file instead (see "Tokens: one, or an access file", below).
@@ -56,6 +62,10 @@ in front of it.
   --ticket-public-key <PUBLIC_KEY_HEX>
 ```
 
+The cache keeps its objects in memory and drops the least recently used
+first: `--max-bytes` (1 GiB) is the most object bytes it holds. A snapshot
+holds at most `--snapshot-bytes` object bytes (256 MiB).
+
 The cache needs `--ticket-public-key` (the hex that `ticket-key` printed):
 without it, it serves no objects. A `scn` user then points reads at the
 cache with `scn checkout --server http://SERVER:7878 --objects http://CACHE:7879`.
@@ -69,7 +79,10 @@ cache with `scn checkout --server http://SERVER:7878 --objects http://CACHE:7879
 ```
 
 The daemon's data directory must be private to its user (mode 0700, not a
-shared path such as `/tmp`); it serves on a 0600 Unix socket in it. Every
+shared path such as `/tmp`); it serves on a 0600 Unix socket in it
+(`--socket`, default `daemon.sock` in the data directory). Its disk store
+keeps at most `--max-bytes` object bytes (10 GiB) and drops the least
+recently used first. Every
 directory above it must be owned by root or by the user, and not writable by
 group or others unless it has the sticky bit. It refuses anything else, and
 `scn` checks the socket the same way; the error names the directory and
@@ -243,6 +256,11 @@ schema 4 walks every repo's changesets). Two rules:
 - If other processes (an `import`, a `fsck`) share the directory, a
   migration waits for them to stop: the error says `stop the other processes
   that use ...`. One process at a time migrates.
+
+An import reads git revision `--rev` (default `HEAD`) into scion repo
+`--repo` (default `main`), and points scion ref `--ref` (default `main`)
+at the imported tip. Besides every root and merge, it re-checks `--verify`
+(default 100) ordinary commits against git.
 
 So an upgrade is: stop the server (and any tiers that share the directory —
 none do by default), copy the directory as a backup (section 3), start the
