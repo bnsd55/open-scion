@@ -24,9 +24,9 @@
 //!   from both changesets, highest generation first (`Paint`). It jumps
 //!   over each run of first parents that no other part of the walk reaches.
 //!
-//! Neither query has a bound on its reads. Each fails once its [`Deadline`]
+//! Neither query has a bound on its reads. Each fails once its deadline
 //! has passed, and runs in steps of about 1,000 reads (`STEPS`). A step holds
-//! one read connection ([`Store::read`](crate::store::Store::read)), so writes and other reads run
+//! one read connection, so writes and other reads run
 //! beside it.
 
 use std::cmp::Reverse;

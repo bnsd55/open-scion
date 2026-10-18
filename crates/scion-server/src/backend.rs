@@ -1,11 +1,11 @@
 //! The metadata backend of a server: one of the supported databases,
-//! behind [`Meta`].
+//! behind the crate's internal metadata trait.
 //!
 //! [`Backend::Sqlite`] is the data directory of [`Store`].
-//! [`Backend::Postgres`] is a shared database (`Pg`). A
-//! caller holds one and calls the [`Meta`] methods; the transaction type
-//! differs per backend, so the queries of a call go through
-//! [`BackendTx`], which forwards them to the backend's own transaction.
+//! [`Backend::Postgres`] is a shared database (`Pg`). A caller holds one
+//! and reads or writes through it; the transaction type differs per
+//! backend, so the queries of a call go through `BackendTx`, which
+//! forwards them to the backend's own transaction.
 
 use gix::ObjectId;
 use scion_core::{BlobId, Changeset, ChangesetId, RepoPath, Tree, TreeId};

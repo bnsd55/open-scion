@@ -15,30 +15,33 @@
 //! [`scion-core`]: https://docs.rs/open-scion-core
 //! [`scn`]: https://docs.rs/open-scion
 //!
-//! Modules from the bottom up:
+//! The layers, bottom up. The private ones carry no links: they are not
+//! API, and their names here are orientation, not references.
 //!
-//! - [`backend`] and [`meta`]: one [`Meta`](meta::Meta) trait over two
-//!   backends: a data directory on this machine ([`store`]: SQLite for
-//!   metadata and trees), and a Postgres database (the `pg` module) for
-//!   the metadata instead. The blob files stay on local disk in both: one
-//!   blob folder per server. One server runs per database: a second one
-//!   is refused at open.
-//! - [`derived`]: one mechanism for every kind of derived data.
-//! - [`tree`]: apply changesets to trees and derive each changeset's root tree.
+//! - `backend` and `meta`: one metadata trait over two backends: a data
+//!   directory on this machine (`store`: SQLite for metadata and trees),
+//!   and a Postgres database (`pg`) for the metadata instead. The blob
+//!   files stay on local disk in both: one blob folder per server. One
+//!   server runs per database: a second one is refused at open. What a
+//!   user touches is [`Backend`].
+//! - `derived`: one mechanism for every kind of derived data, with
+//!   [`backfill`] and the [`Kind`] implementations.
+//! - [`tree`]: apply changesets to trees and derive each changeset's root
+//!   tree.
 //! - [`graph`]: the commit-graph index, and the graph queries that read it.
 //! - [`history`]: the path history of each changeset, for `Log` with a path
 //!   and for lands on old bases.
-//! - [`read`], [`blame`], the `write` module, [`land`]: the operations behind the RPCs.
-//!   A long one stops at its call's [`deadline`].
-//!   [`similar`] finds renames for `Diff` and `Blame`.
-//! - [`views`]: the view of the repo that a partial reader (folder read
+//! - `read`, `blame`, the `write` module, `land`: the operations behind the
+//!   RPCs. A long one stops at its call's deadline. `similar` finds
+//!   renames for `Diff` and `Blame`.
+//! - `views`: the view of the repo that a partial reader (folder read
 //!   rules, [`access`]) reads through.
 //! - [`quotas`]: what one principal may hold at once; [`tickets`]: the
 //!   signed read tickets of object reads.
 //! - [`fsck`]: reports the damage in a data directory. Read-only.
 //! - [`gc`]: collects the blobs that nothing names any more.
 //! - [`import`]: one-way import from a git repository.
-//! - [`service`], [`objects`] and [`auth`]: the gRPC front end. [`access`]:
+//! - [`service`], `objects` and `auth`: the gRPC front end. [`access`]:
 //!   which principal may read or write what.
 
 //! ### What the facade is
