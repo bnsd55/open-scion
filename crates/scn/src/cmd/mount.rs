@@ -39,7 +39,7 @@ pub struct UnmountArgs {
 }
 
 /// One live mount, as the session file holds it.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MountRecord {
     /// The mounted directory, absolute.
     pub dir: PathBuf,
@@ -116,8 +116,9 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
     drop(server);
     // Unmount before the overlay goes, so no file disappears mid-read.
     unmount_dir(&dir);
-    let _ = remove_session(&dir);
-    let _ = std::fs::remove_dir_all(&overlay);
+    for warning in cleanup_after_stop(&dir, &overlay) {
+        eprintln!("scn mount: {warning}");
+    }
     println!("stopped serving {}", dir.display());
     Ok(())
 }
@@ -127,12 +128,20 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
 #[allow(clippy::unused_async)]
 pub async fn unmount(_ctx: &mut Ctx, args: UnmountArgs) -> Result<()> {
     let dir = std::path::absolute(&args.dir)?;
-    let record = remove_session(&dir)
+    let file = session_file()?;
+    let record = drop_session(&file, &dir)?
         .ok_or_else(|| anyhow!("{}: no mount of scn is recorded", dir.display()))?;
     // The serving process unmounts and removes the overlay on this signal.
-    let _ = std::process::Command::new("kill")
-        .args(["-TERM", &record.pid.to_string()])
-        .status();
+    if !stop_serving(&record, &dir) {
+        // The process is alive and the signal did not go out: the mount is
+        // still up. Put the record back, so a retry can find it.
+        save_session(&record)?;
+        anyhow::bail!(
+            "{}: cannot stop the serving process (pid {}): it may still serve the mount",
+            dir.display(),
+            record.pid
+        );
+    }
     // The unmount itself may need root; say so, and let the user run it.
     if !std::process::Command::new("umount")
         .arg(&dir)
@@ -235,48 +244,75 @@ pub(crate) fn session_file() -> Result<PathBuf> {
 }
 
 /// Reads the session file.
-pub(crate) fn load_sessions() -> Vec<MountRecord> {
-    let Ok(file) = session_file() else {
-        return Vec::new();
-    };
-    read_sessions(&file)
+pub(crate) fn load_sessions() -> Result<Vec<MountRecord>> {
+    read_sessions(&session_file()?)
 }
 
-/// Reads the sessions of `file`.
-fn read_sessions(file: &Path) -> Vec<MountRecord> {
-    std::fs::read_to_string(file)
-        .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .map(|json| parse_sessions(&json))
-        .unwrap_or_default()
+/// Reads the sessions of `file`. A file that is not there holds no
+/// sessions; a file that is there but corrupt is an error, so a broken
+/// mount table cannot silently read as "no mounts".
+fn read_sessions(file: &Path) -> Result<Vec<MountRecord>> {
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(anyhow!("cannot read {}: {e}", file.display())),
+    };
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("{} is not valid JSON", file.display()))?;
+    parse_sessions(&json).with_context(|| format!("{} does not hold mount records", file.display()))
 }
 
 /// The records of a session file's JSON.
-fn parse_sessions(json: &serde_json::Value) -> Vec<MountRecord> {
-    json.as_array()
-        .map(|records| {
-            records
-                .iter()
-                .filter_map(|record| {
-                    Some(MountRecord {
-                        dir: PathBuf::from(record.get("dir")?.as_str()?),
-                        overlay: PathBuf::from(record.get("overlay")?.as_str()?),
-                        rev: record.get("rev")?.as_str()?.to_owned(),
-                        pid: u32::try_from(record.get("pid")?.as_u64()?).ok()?,
-                    })
-                })
-                .collect()
+fn parse_sessions(json: &serde_json::Value) -> Result<Vec<MountRecord>> {
+    let records = json
+        .as_array()
+        .ok_or_else(|| anyhow!("the file holds no array of records"))?;
+    records
+        .iter()
+        .enumerate()
+        .map(|(n, record)| {
+            Ok(MountRecord {
+                dir: PathBuf::from(
+                    record
+                        .get("dir")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow!("record {n} has no dir"))?,
+                ),
+                overlay: PathBuf::from(
+                    record
+                        .get("overlay")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow!("record {n} has no overlay"))?,
+                ),
+                rev: record
+                    .get("rev")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("record {n} has no rev"))?
+                    .to_owned(),
+                pid: u32::try_from(
+                    record
+                        .get("pid")
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| anyhow!("record {n} has no pid"))?,
+                )?,
+            })
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// Adds `record` to the session file, replacing the record of its dir.
 pub(crate) fn save_session(record: &MountRecord) -> Result<()> {
     let file = session_file()?;
-    let mut sessions = load_sessions();
+    add_session(&file, record)
+}
+
+/// Adds `record` to the session file `file`, replacing the record of its
+/// dir.
+fn add_session(file: &Path, record: &MountRecord) -> Result<()> {
+    let mut sessions = load_sessions_at(file)?;
     sessions.retain(|known| known.dir != record.dir);
     sessions.push(record.clone());
-    write_sessions(&file, &sessions)
+    write_sessions(file, &sessions)
 }
 
 /// Writes `records` as the session file `file`.
@@ -296,14 +332,76 @@ pub fn write_sessions(file: &Path, sessions: &[MountRecord]) -> Result<()> {
     Ok(())
 }
 
-/// Drops the session of `dir`, and returns its record.
-fn remove_session(dir: &Path) -> Option<MountRecord> {
-    let file = session_file().ok()?;
-    let sessions = load_sessions();
-    let record = sessions.iter().find(|r| r.dir == dir)?.clone();
+/// Drops the session of `dir` from `file`, and returns its record. The
+/// table is read strictly: a corrupt file is an error, not "no mount".
+fn drop_session(file: &Path, dir: &Path) -> Result<Option<MountRecord>> {
+    let sessions = load_sessions_at(file)?;
+    let Some(record) = sessions.iter().find(|r| r.dir == dir).cloned() else {
+        return Ok(None);
+    };
     let rest: Vec<MountRecord> = sessions.into_iter().filter(|r| r.dir != dir).collect();
-    write_sessions(&file, &rest).ok()?;
-    Some(record)
+    write_sessions(file, &rest)?;
+    Ok(Some(record))
+}
+
+/// Reads the sessions of `file` (the test-visible form of
+/// [`load_sessions`]).
+fn load_sessions_at(file: &Path) -> Result<Vec<MountRecord>> {
+    read_sessions(file)
+}
+
+/// The cleanup of a mount that has stopped serving: drop its session, and
+/// remove its overlay. Returns what went wrong, for the caller to report;
+/// a missing overlay is fine (it is already gone).
+fn cleanup_after_stop(dir: &Path, overlay: &Path) -> Vec<String> {
+    match session_file() {
+        Ok(file) => cleanup_at(&file, dir, overlay),
+        Err(e) => vec![format!("cannot update the mount table: {e}")],
+    }
+}
+
+/// [`cleanup_after_stop`] for the session file `file`.
+fn cleanup_at(file: &Path, dir: &Path, overlay: &Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Err(e) = drop_session(file, dir) {
+        warnings.push(format!("cannot update the mount table: {e}"));
+    }
+    if let Err(e) = std::fs::remove_dir_all(overlay) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warnings.push(format!(
+                "cannot remove the overlay {}: {e}",
+                overlay.display()
+            ));
+        }
+    }
+    warnings
+}
+
+/// Sends `pid` the `signal`, and answers whether it was delivered.
+fn kill_pid(pid: u32, signal: &str) -> bool {
+    std::process::Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Signals the serving process of `record` to stop. Answers `false` when
+/// the process is alive and the signal did not go out: the mount is still
+/// served, and the caller must keep the record.
+fn stop_serving(record: &MountRecord, dir: &Path) -> bool {
+    stop_serving_with(record, dir, kill_pid)
+}
+
+/// [`stop_serving`] with the kill injected, so a test can drive both
+/// branches without a real process.
+fn stop_serving_with(record: &MountRecord, dir: &Path, kill: impl Fn(u32, &str) -> bool) -> bool {
+    let alive = kill(record.pid, "-0");
+    let signaled = kill(record.pid, "-TERM");
+    if signaled || !alive {
+        return true;
+    }
+    let _ = dir;
+    false
 }
 
 /// Waits for a stop signal.
@@ -320,7 +418,7 @@ async fn wait_stopped() {
 /// The recorded mount of `dir`.
 pub fn session_for_dir(dir: &Path) -> Result<MountRecord> {
     let dir = std::path::absolute(dir).context("cannot resolve the mount directory")?;
-    load_sessions()
+    load_sessions()?
         .into_iter()
         .find(|record| record.dir == dir)
         .ok_or_else(|| anyhow!("{}: no mount of scn is recorded", dir.display()))
@@ -409,12 +507,9 @@ mod tests {
         };
         let sessions = vec![record.clone()];
         write_sessions(&file, &sessions).unwrap();
-        let found = read_sessions(&file);
+        let found = read_sessions(&file).unwrap();
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].dir, record.dir);
-        assert_eq!(found[0].overlay, record.overlay);
-        assert_eq!(found[0].rev, "main");
-        assert_eq!(found[0].pid, 123);
+        assert_eq!(found[0], record);
         // A second mount of the same dir replaces the record.
         let other = MountRecord {
             dir: record.dir.clone(),
@@ -422,18 +517,18 @@ mod tests {
             rev: "dev".to_owned(),
             pid: 5,
         };
-        let mut sessions = read_sessions(&file);
+        let mut sessions = read_sessions(&file).unwrap();
         sessions.retain(|known| known.dir != other.dir);
         sessions.push(other.clone());
         write_sessions(&file, &sessions).unwrap();
-        let found = read_sessions(&file);
+        let found = read_sessions(&file).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].overlay, other.overlay);
         // Removing the session returns its record.
         let gone = sessions.pop().unwrap();
         assert_eq!(gone.overlay, other.overlay);
         write_sessions(&file, &[]).unwrap();
-        assert!(read_sessions(&file).is_empty());
+        assert!(read_sessions(&file).unwrap().is_empty());
     }
 
     #[test]
@@ -492,4 +587,101 @@ mod tests {
         };
         assert!(exec);
     }
+}
+
+use super::*;
+
+fn temp_file(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("scn-mount-test-{}-{}", std::process::id(), name));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join("mounts.json")
+}
+
+fn record(dir: &str, pid: u32) -> MountRecord {
+    MountRecord {
+        dir: PathBuf::from(dir),
+        overlay: PathBuf::from(format!("{dir}/overlay")),
+        rev: "main".to_owned(),
+        pid,
+    }
+}
+
+/// A kill that cannot signal a live process keeps the record, so a
+/// retry of the unmount finds the mount again.
+#[test]
+fn a_failed_kill_keeps_the_session() {
+    let file = temp_file("failed-kill");
+    std::fs::remove_file(&file).ok();
+    let r = record("/mnt/keep", 4242);
+    add_session(&file, &r).unwrap();
+    let stop = |pid: u32, signal: &str| {
+        // Alive, but the signal does not go out.
+        assert_eq!(pid, 4242);
+        signal == "-0"
+    };
+    assert!(!stop_serving_with(&r, &r.dir.clone(), stop));
+    let sessions = load_sessions_at(&file).unwrap();
+    assert_eq!(sessions.len(), 1, "the record stays for a retry");
+    std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+}
+
+/// A process that is already gone counts as stopped: the record is
+/// dropped and the unmount goes on.
+#[test]
+fn a_dead_process_is_stopped() {
+    let file = temp_file("dead");
+    std::fs::remove_file(&file).ok();
+    let r = record("/mnt/dead", 4243);
+    add_session(&file, &r).unwrap();
+    let stop = |pid: u32, signal: &str| {
+        assert_eq!(pid, 4243);
+        false // kill -0 and kill -TERM both fail: no such process
+    };
+    assert!(stop_serving_with(&r, &r.dir.clone(), stop));
+    assert_eq!(drop_session(&file, &r.dir).unwrap(), Some(r.clone()));
+    std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+}
+
+/// A corrupt mount table is an error, not "no mounts": nothing reads
+/// it as empty, so a mount cannot quietly double-mount a directory.
+#[test]
+fn a_corrupt_table_is_an_error() {
+    let file = temp_file("corrupt");
+    std::fs::write(&file, b"{not json").unwrap();
+    assert!(read_sessions(&file).is_err());
+    let r = record("/mnt/corrupt", 4244);
+    assert!(
+        add_session(&file, &r).is_err(),
+        "a mount start must fail loudly, not read the table as empty"
+    );
+    assert!(drop_session(&file, &r.dir).is_err());
+    std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+}
+
+/// A missing file holds no sessions, and the stop cleanup of a mount
+/// whose overlay is already gone reports nothing.
+#[test]
+fn a_missing_file_is_empty_and_the_cleanup_is_quiet() {
+    let file = temp_file("missing");
+    std::fs::remove_file(&file).ok();
+    assert_eq!(read_sessions(&file).unwrap(), Vec::new());
+    let overlay = file.parent().unwrap().join("overlay-gone");
+    let warnings = cleanup_at(&file, &PathBuf::from("/mnt/none"), &overlay);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+}
+
+/// The stop cleanup reports a mount table it cannot update.
+#[test]
+fn the_cleanup_reports_a_broken_table() {
+    let file = temp_file("cleanup-broken");
+    std::fs::write(&file, b"not json").unwrap();
+    let overlay = file.parent().unwrap().join("overlay");
+    std::fs::create_dir_all(&overlay).unwrap();
+    let warnings = cleanup_at(&file, &PathBuf::from("/mnt/x"), &overlay);
+    assert!(
+        warnings.iter().any(|w| w.contains("mount table")),
+        "{warnings:?}"
+    );
+    std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
 }
