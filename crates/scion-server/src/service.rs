@@ -189,19 +189,27 @@ pub async fn serve(
     } = options;
     let access = Arc::new(access.into());
     let auth = access.auth();
-    let worker = Worker::new(store.clone());
+    let fence = store.fence_flag();
     // The Postgres reader pool records into the registry: the wait for a
     // reader, the busy readers, and the tx age, which this task keeps
     // fresh. On SQLite this is a no-op.
     store.set_metrics(Arc::clone(&metrics));
+    let worker = Worker::new(store);
     let lands = Arc::new(Lands::new(pending_lands, Some(Arc::clone(&metrics))));
     let (stop_tx, stop_rx) = watch::channel(());
+    // The fence of a Postgres server that lost its database to another
+    // process: it resolves the same shutdown the operator's signal does,
+    // so the health service answers NOT_SERVING and tonic finishes the
+    // open calls; a short grace later the process exits, and a supervisor
+    // restart either takes the lock back or is refused at open. SQLite
+    // has no fence (None), so this task never runs.
+    let fence_stop = fence.clone().map(|fence| (fence, stop_tx.clone()));
     tokio::spawn(async move {
         shutdown.await;
         let _ = stop_tx.send(());
     });
     tokio::spawn(pg_tx_age_sample(
-        store,
+        worker.store(),
         Arc::clone(&metrics),
         stop_rx.clone(),
     ));
@@ -211,6 +219,20 @@ pub async fn serve(
             let _ = stopped.changed().await;
         }
     };
+    if let Some((fence, stop_tx)) = fence_stop {
+        tokio::spawn(async move {
+            while !fence.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            tracing::error!(
+                "this server process lost the database to another server \
+                 process; it stops serving and exits"
+            );
+            let _ = stop_tx.send(());
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            std::process::exit(70);
+        });
+    }
     tokio::spawn(sweeps(
         worker.clone(),
         Arc::clone(&lands),
@@ -238,7 +260,9 @@ pub async fn serve(
         .layer(ObjectsService::new(worker, access, quotas, tickets, metrics).into_server());
     // The health service answers `grpc.health.v1.Check` and `Watch` on the
     // same port, without a token: a probe carries none. The store opens
-    // before this call, so the server starts serving.
+    // before this call, so the server starts serving. A fence trip
+    // resolves the shutdown, so the names flip to NOT_SERVING on the
+    // service's own path, and the process exits a grace later.
     let (health, shutdown) =
         listen::health(&["scion.v1.Scion", "scion.v1.Objects"], shutdown).await;
     let router = |server: Server| {
