@@ -109,16 +109,29 @@ fn the_flag_lets_a_seed_through() {
         .spawn()
         .expect("scion-daemon runs");
     // The child is stopped by its own handle only, never by a pattern.
+    // A thread reads the stderr so a daemon that never reports cannot
+    // hang the test: the wait gives up after 30 s and the test fails.
     let stderr = child.stderr.take().expect("the stderr is piped");
-    let mut lines = std::io::BufReader::new(stderr).lines();
-    let mut seeded = false;
-    for line in &mut lines {
-        if line
-            .as_deref()
-            .is_ok_and(|line| line.contains("seeded the store from a snapshot"))
+    let (sender, report) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
         {
-            seeded = true;
-            break;
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    // Earlier log lines come first; keep reading until the seed report,
+    // or until 30 s pass.
+    let started = std::time::Instant::now();
+    let limit = std::time::Duration::from_secs(30);
+    let mut seeded = false;
+    while !seeded && started.elapsed() < limit {
+        match report.recv_timeout(limit - started.elapsed()) {
+            Ok(line) => seeded = line.contains("seeded the store from a snapshot"),
+            Err(_) => break,
         }
     }
     let _ = child.kill();
