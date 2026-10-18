@@ -477,9 +477,6 @@ until that section gets its release date.
 
 ### Changed
 
-- A new metric, `scion_land_replans_total` (`#200`): a land whose ref
-  moved while it ran plans again from the new head. A rising rate means
-  lands contend with imports or other writers on one ref.
 - The server, the cache and the daemon log to stderr (`#179`): stdout
   carries the output of `ticket-key` and `hash-token`, so a redirect of
   one does not catch the other's lines.
