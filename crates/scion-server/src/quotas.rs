@@ -8,8 +8,8 @@
 //! The counts live in memory, one row per principal that a call named. A
 //! guard takes its units on entry and gives them back on every exit path,
 //! also when the client goes away or a job panics. The pending-land limit is
-//! not counted here: a pending land outlives its call, so [`crate::land`]
-//! counts its rows in the database.
+//! not counted here: a pending land outlives its call, so the crate's
+//! `land` module counts its rows in the database.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};

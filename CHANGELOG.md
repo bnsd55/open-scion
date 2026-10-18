@@ -16,6 +16,14 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Added
 
+- A Postgres-backed store knows which database and which data directory
+  belong together: the first open mints a store UUID, keeps it in the
+  database and the data directory's `backend` marker, and an open that
+  finds the two different is refused with both UUIDs named.
+- A Postgres server that loses the one-server lock to another process is
+  fenced: every read and write fails with the loss named, the health
+  service answers `NOT_SERVING`, and the process exits after a short
+  grace, so a supervisor restart either takes the lock back or refuses.
 - `scion-server`, the server: changesets, trees and blobs in a data
   directory (SQLite metadata, one zstd file per blob), one-way git import
   checked against git, `fsck`, `gc`, `derive` and `hash-token` commands.
@@ -155,6 +163,24 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Changed
 
+- `open-scion-server`'s public API is a small facade: `Backend`,
+  `service::{serve, ServeOptions}`, `access::Access`, `tickets::Keys`,
+  `quotas::Quotas`, `metrics::Metrics`,
+  `import::{import_git, ImportOptions, ImportReport}`, `store::Store`,
+  `error::{Error, Result}`, `fsck`, `gc` with `DEFAULT_GRACE_SECS`,
+  `derived::{backfill, Kind}`, `graph::CommitGraph`,
+  `history::PathHistory` and `tree::RootTree`. The modules behind it
+  exist for the two binaries and can change without a release; a ref
+  read goes through `Backend::resolve_ref`, where code that reached
+  past the facade used to go.
+- The server's test seams (`open_test`, the import's batch-boundary and
+  busy-retry hooks, the commit-failure and busy-timeout seams) sit
+  behind a `test-hooks` cargo feature, default off: a build without it
+  carries none of them, and nothing behind the feature, and nothing
+  `#[doc(hidden)]`, is API.
+- `scn mount` now works with the system's NFS client (`#238`): the
+  listener serves the export name its printed command mounts, where a
+  real kernel client was refused with `MNT3ERR_NOENT`.
 - `fsck` and `gc` run against a Postgres-backed store (`#180`), through
   the same metadata interface as on a data directory: both used to
   refuse it. The collector's batches on Postgres hold one advisory key

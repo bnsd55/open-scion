@@ -17,20 +17,6 @@ use crate::meta::{Meta as _, MetaTx, RepoId};
 use crate::similar::{self, Budget, Chunks, MAX_PAIRS, Progress};
 use crate::tree;
 
-/// Where a ref points.
-///
-/// # Errors
-///
-/// [`Error::NotFound`] if the repo or ref does not exist.
-pub fn resolve_ref(store: &Backend, repo: &str, name: &str) -> Result<ChangesetId> {
-    store.read(|c| {
-        let repo = c.repo_id(repo)?;
-        c.get_ref(repo, name)?
-            .map(|r| r.target)
-            .ok_or_else(|| Error::NotFound(format!("ref {name:?}")))
-    })
-}
-
 /// A changeset the repo may see.
 ///
 /// # Errors
