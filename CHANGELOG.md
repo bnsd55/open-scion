@@ -12,480 +12,194 @@ until that section gets its release date.
 
 ## [v0.1.0] - unreleased
 
+The first release: the server, its cache tiers, and the `scn` client.
+
 ### Added
 
-- The server counts lands whose ref moved under them and were planned
-  again in `scion_land_replans_total`, next to the land outcome counters.
-
-#### Objects and byte format
-
-- A tree entry carries its blob's byte length (`#172`): `ls -l` and a mount
-  stat read the size from the tree and fetch no blob. The change re-hashed
-  every tree; schema 7 drops stored trees and their derived rows, and they
-  rebuild from the stored changesets on demand. A tier that still holds
-  old tree bytes under old IDs never serves them again: nothing asks for
-  those IDs, and the hash check guards everything else.
-
-- Per-principal quotas (`#15`). With `--access`, `--max-principal-requests`
-  (64), `--max-principal-upload-bytes` (512 MiB) and
-  `--max-principal-pending-lands` (64) bound what one principal holds at
-  once; a call over a cap fails before any work with `RESOURCE_EXHAUSTED`,
-  naming the flag of the cap it hit. With `--token T`, one client is one
-  principal, so the caps are off unless a flag sets one. The pending-lands
-  count comes from the store, so it is right after a restart. A land that
-  stays `PENDING` for longer than `--land-stale-secs` (a day) is rejected by
-  a sweep at start and then once per hour: no caller can still be finishing
-  it, because a call runs at most 600 s, and the sweep holds the same
-  per-ref lock as the land path, so a live retry wins. A retry of a
-  rejected land needs a new request key.
-
-- `scion-core`: the object model (changesets, trees, blob IDs) and a frozen,
-  canonical v1 byte format, with golden tests, property tests and a fuzz
-  target. Blobs belong to repos (schema version 4, table `repo_blobs`): a
-  repo has the blobs uploaded to it and the blobs that its changesets name.
-  `CreateChangeset` refuses a blob of another repo with the error of
-  content that no repo stored, before it reads any file, so a changeset can
-  no longer name another repo's blob and then read it. `PutBlob` keeps a
-  stored copy only for a blob that its repo has, and else writes the
-  content again, so its time does not show that another repo has the
-  content.
-
-#### Read tickets (#13)
-
-- An object ID alone is no longer a permission. `GetRootTree` returns the
-  root tree with a signed read ticket: repo, principal, root tree and
-  expiry (15 minutes, checked against the server's clock with 60 seconds of
-  skew), signed with Ed25519 over a versioned body. `GetObjects` carries
-  the ticket, and each ref names its path from the ticket's root tree; the
-  server and every tier walk the path, and a walk that does not reach the
-  object ends it `NOT_FOUND`. The ticket is the only permission of an
-  object read: it carries no token. Every other call needs a token, as
-  before. A tier refuses `ResolveRef` and `GetRootTree` with
-  `UNIMPLEMENTED`: the ref and the ticket come from the server, so a tier
-  can never mint a permission.
-- The server signs with an Ed25519 key from `--ticket-key FILE` (make one
-  with `scion-server ticket-key --out FILE`, which prints the public key,
-  for the tiers, to stdout; rotation with `--ticket-key-old`). Only the
-  seed is a secret: the server refuses a seed file that anyone but its
-  owner can read, and a public-key file (the `--ticket-key-old` argument)
-  that group or others can write (`#168`). A `scion-cache` verifies with
-  `--ticket-public-key HEX`, at most 2 keys during a rotation. A
-  `scion-daemon` takes no key: it checks no ticket, and serves what its
-  store holds only to the one OS user that owns its private 0600 socket,
-  who can read its store files anyway. It forwards the ticket upstream,
-  whose check and walk keep unproven reads out. One daemon per OS user.
-- `scn` resolves and reads the root tree on `--server`, and sends
-  `GetObjects` to `--objects` (a `scion-cache` or `scion-daemon`) with the
-  checkout's ticket and each ref's path. Without `--objects`, object reads
-  go to `--server`. On `ticket expired`, `scn` mints a fresh ticket for the
-  same changeset, once per call, and goes on. A `scn mount` sends its
-  ticket with every read, and refreshes it through `GetRootTree` of the
-  mounted changeset — never of the ref, which may have moved — before it
-  expires, and again on `ticket expired`.
-
-#### The server
-
-- One request ID per client operation, carried through every hop
-  (`#144` follow-up). `scn` makes one 16-digit hex ID per command and
-  sends it on every call in `x-request-id`; a tier forwards the ID its
-  caller sent. Every served call records it as the `request_id` field of
-  its `call` span, so one
-  checkout can be followed across scn, daemon, cache and server logs. A
-  header over 64 bytes, or not visible ASCII, is dropped whole: nothing
-  of it is logged.
-- Prometheus metrics on `scion-server --metrics-listen ADDR` (default off)
-  and `scion-cache --metrics-listen ADDR`: request counts by RPC and code,
-  a latency histogram with factor-4 buckets (1, 4, 16, 64, 256 ms, 1, 4,
-  16, 64 s), reply bytes by RPC, lands by outcome, and the tier's cache
-  hits and misses. The registry, the counting layer and the HTTP export
-  live in `scion-proto`, shared by the server and the tier. The listener
-  is plain HTTP on a loopback address unless `--insecure-listen` allows
-  more; it serves one connection at a time with a 5 s header read timeout,
-  and ends on the process's shutdown signal (Ctrl+C or SIGTERM). The
-  registry is atomics, so a request never takes a lock or allocates
-  (#144).
-- `scion-server`: SQLite metadata and trees, a blob folder with batched,
-  verified durability, and one write path for changesets and their root
-  trees. Group commit: concurrent blob syncs and database commits share one
-  full drive flush, so a successful reply never shows state that a power
-  loss can undo. `scion-server --data <data> fsck` reports the damage in a
-  data directory: it is read-only, it can run while the server runs, and one
-  line per problem names the kind, the ID and the path; it exits 0 when it
-  saw no damage, 1 when it did, and 2 when it could not run.
-- `scion-server gc` (`--data <data>`) collects the blobs that nothing
-  names: a `repo_blobs` row whose blob no stored changeset of its repo
-  puts, and a blob file that no repo's row names, each older than a grace
-  period
-  (`--grace-secs`, seven days; `--dry-run` reports and removes nothing).
-  Rows go before files, so a crash leaves orphan files only, which the
-  next run removes. It runs beside a live server: a changeset that commits
-  while it works pins its blobs, and `PutBlob` of a stored blob touches the
-  file, so the grace counts from the last upload.
-- Server-side commits (`CreateChangeset`) and lands: path-level conflict
-  checks through a per-ref index, one transaction per land, retries by
-  request key, and a bounded retry when the ref moves. A land stops in its
-  long loops 600 s after its call started, or as soon as its call is
-  dropped, and stays pending. The path indexes of all refs share one
-  budget of 128 MiB; the indexes of idle refs go out first, least recently
-  used first, and an index that cannot fit starts over at the tip.
-- One-way git import, checked against git: a re-import never moves a ref
-  off later lands. The import can run while the server serves the same
-  data directory: it moves the ref by compare-and-swap as a land does, its
-  commits are durable before the server can see them, its write
-  transactions end after 1 s so a server write waits for at most that plus
-  one commit, a request that waits more than 5 s fails with `UNAVAILABLE`,
-  and the temp files of a crashed import are removed by the next open of
-  the directory while the server keeps running. A second server, or a
-  process of another build, is refused.
-- Derived data is derived in bounded steps, one transaction each, so other
-  requests run between steps after a new kind or a version bump, and each
-  step removes rows of older versions. One walk per kind, version and
-  repo runs at a time (`#142`): the first caller owns it, the others wait
-  for it with their own deadlines and then read the value, and the steps
-  of writers go first, so a cold read no longer queues its derivation
-  ahead of a land. `scion-server derive --kind KIND` fills a kind ahead
-  of the first query. A kind can read the value of every parent, not only
-  the first, and path history is derived parents first, in generation
-  order.
-- Reads use a pool of 8 read-only SQLite connections, so a read never
-  waits for a write, for a long read such as a graph walk, or for a server
-  write that waits for an import's write lock. Writes still take turns on
-  one write connection.
-- `scion-server serve` logs the address that it bound, so `--listen
-  127.0.0.1:0` shows the port that the OS chose. A refused call or a
-  failed one logs who made it and on which repo (`#148`), with no token
-  or path content in the line.
-
-#### Lands
-
-- `CreateChangeset` stores a changeset with one parent and moves no ref;
-  `Land` rebases it onto a ref and moves the ref by compare-and-swap.
-  Conflicts are path-level, through a per-ref index. A retry with the same
-  request key returns the stored land, so a call that was cut never lands
-  the same change twice, and a land that the ref moved under is retried a
-  bounded number of times.
-- Lands on a base more than 10,000 generations below the head check their
-  paths in the head's path history, so no base is too old to check.
-  Before, a base more than 100,000 changesets back was `REJECTED` (#38).
-- `GetLand` and request keys are scoped by caller.
-
-#### Reads, blame and queries
-
-- Reads over the API: resolve a ref, get a changeset, read a file in 1 MiB
-  parts from the zstd decoder under a 256 MiB budget for all replies,
-  list a directory, and walk first-parent history. `ReadFile` checks the
-  content against its ID before the last part, and ends a reply whose
-  client stops reading with `DEADLINE_EXCEEDED` after 120 s.
-- `GetChangeset` and `ListDir` stream their `ChangesetV1` and `TreeV1`
-  bytes in 1 MiB parts, as `ReadFile` streams a file (section 6.6 and 6.8
-  of protocol-v1), so a directory or a changeset over the 64 MiB message
-  cap still reads whole. The client puts the parts together and checks
-  the changeset bytes against the ID it asked for, and stops with an
-  error once the joined bytes pass 1 GiB, so a broken or hostile server
-  cannot stream until the client runs out of memory.
-- `Log` and `Blame` stream their replies in 1 MiB parts, as
-  `GetChangeset` streams a changeset (`#175`), so a client that stops
-  reading is counted by the connection's stall cap, which then closes the
-  connection. A client joins the parts in order; the last part's
-  `next_changeset_id` (for `Log`) or `next_cursor` (for `Blame`) starts
-  the next call. The largest unary reply left is `Diff` (at most 1,000
-  paths, about 120 KB) and the rest are KBs, so a client that never reads
-  holds at most its 128 connections x 256 streams of those, until its
-  connections close; a unary reply over the 64 MiB a reply message may
-  hold is refused by the server's encoder, and a test pins that
-  wiring.
-- Path history as derived data (kind `path_history`, schema version 5).
-  `Log` with a path reads only the changesets that change the path, so one
-  call returns up to 1,000 entries however far apart they are. A call
-  stops after about 64 MiB of path history, which a file in a large
-  directory reaches in fewer entries. A level of path history above 64 KiB
-  is cut into chunks at content-defined boundaries (a name cuts with
-  chance 1 in 128), so a change in a directory of 100,000 names stores
-  about 47 KiB of new rows, not the 6.3 MB node of every name the
-  directory ever had. `scn log --path` and `scn blame`.
-  An older server ignores the new `path` field, so `scn log --path`
-  against it prints unfiltered history.
-- `Blame`, a new RPC: which changeset last changed each line of a file, on
-  first-parent history. It walks versions through the path history, so it
-  reads one changeset and a few node rows per version, however many
-  changesets lie between two versions, and holds those node bytes of the
-  blame memory share. It follows renames as `git blame` does by
-  default: a deleted file with the same content, else a similar one (50%
-  or more). Each changeset in a reply names the path of the file there
-  (`BlameChangeset.path`). `scn blame` shows each line's path when some
-  line came from another path, as git does, and `--json` adds `path` to
-  each range.
-- `Blame` blames a binary file line by line, as `git blame` does, and
-  files of any size the shared memory budget holds: all `Blame` calls of a
-  server share 1 GiB, and a call takes the bytes of every version it reads
-  and 128 bytes per line of the file it blames. A call's first take may
-  wait for bytes; every later take fails at once if they are not free, so
-  two calls can never wait for each other. An older version that does not
-  fit counts as absent, so its lines go to the changeset that replaced it.
-  A call answers at most 1,048,576 lines of the file; a bigger one is
-  blamed over several calls.
-- A `Blame` reply that stopped at a bound carries an opaque cursor
-  (`next_cursor`): where the walk goes on, where its rename search
-  stopped, and which lines of the file the reply answered. The client MUST
-  send it back unchanged, with the same repo, changeset and path; the
-  server binds it to all three, checks every changeset it names, and
-  refuses anything else with `INVALID_ARGUMENT`. Each new window re-walks
-  the history from the requested changeset and diffs only the versions of
-  its own window. When the search has looked at every deleted file, the
-  reply says that too, and the next call takes the best file as the answer
-  at once. `scn blame` does all of this.
-- The query API: `MergeBase` (every best common ancestor, as
-  `git merge-base --all`), `IsAncestor` (exit 0 or 1), and `Diff` (the
-  paths whose file differs between two changesets, optionally below a
-  path). The graph walks use generation numbers and a commit-graph index
-  (derived data): `IsAncestor` reads a few dozen entries at any depth, and
-  three rows per merge between, and `MergeBase` jumps over runs of first
-  parents that only one part of the walk reaches. They have no step bound:
-  each stops with `DEADLINE_EXCEEDED` at 600 s or once its call is
-  dropped, and at most 4 run at once. `scn merge-base`, `scn is-ancestor`
-  and `scn diff`. Every `scn` error exits 2, so it never reads as the
-  "no" of `scn is-ancestor`.
-- `Diff` finds renames as `git diff` does by default: same content, then
-  the one file of a name on each side at 75%, then the most similar files
-  at 50%. A rename keeps its two entries: the added one has `rename_from`,
-  the deleted one `rename_to`, and both `similarity`, so a client that
-  ignores them still sees a delete and an add. Each call finds the renames
-  of the whole diff below its path, so an entry has the same rename in
-  every reply. The inexact search (same name, then similar files) has a
-  fixed budget per call. At most 4 `Diff`
-  calls run at once. `scn diff` prints a rename once, as `R`, a tab and
-  `old -> new`, and `--json` gives it `status` `R`, `old_path` and
-  `similarity`.
-
-#### Access, transport and limits
-
-- Folder read rules (`#184`). A `read` rule may name a path prefix as its
-  fourth field, by path parts: `read alice main src` lets alice read `src`
-  and below, and nothing else of the repo. A principal whose read rules
-  are all prefixes is a *partial reader*: the server derives its view of
-  the repo (the real trees with every entry outside its prefixes
-  removed), `GetRootTree` answers the view root with a read ticket bound
-  to it, `ListDir`, `ReadFile` and `GetObjects` serve from that view, a
-  path outside the prefixes answers `NOT_FOUND` as a missing one, and the
-  history and query calls answer `UNIMPLEMENTED`, one uniform answer on
-  every call. The first read of a rule set walks the real tree; later
-  reads of the same rule set and changeset find the derived view. A repo
-  holds at most 32 distinct rule sets, a set at most 256 prefixes, and an
-  access file over either cap is refused at load.
-- Principals and access rules (#13, part 2). `scion-server serve --access
-  FILE` reads an access file that maps the BLAKE3 digest of each token to
-  a principal, and says which repos each principal may read and which
-  paths it may write: a path prefix by path parts (`src` covers `src/a`,
-  not `srcx`), no prefix meaning the whole repo. A write rule needs a
-  whole-repo read rule — no blind writes, and no silent non-writer
-  (`access.rs`, `check_write_needs_read`) — and a file that gives a
-  partial reader a write rule is refused at load, with the line to fix.
-  A principal with no rule for a repo cannot see the repo: every call
-  answers `NOT_FOUND`, as for a repo that does not exist. A change to a
-  path outside the principal's write prefixes answers `PERMISSION_DENIED`
-  and names the first denied path; `PutBlob` needs a write rule, and
-  `Land` is checked for the principal that lands it.
-  `scion-server hash-token` prints the digest that a `token` line wants,
-  so the file never holds a token. `--token T` stays: one principal,
-  `default`, which may read and write every repo.
-- Bearer-token auth, loopback-only listening by default, request limits
-  and name validation at the RPC boundary.
-- The gRPC health service (`grpc.health.v1`) on the same port as the other
-  services, without a token, so a probe needs none: `scion-server` and
-  `scion-cache` (and `scion-daemon`, which shares the tier's server)
-  answer `Check` and `Watch` with `SERVING` once the store and the
-  upstream channel are open, and with `NOT_SERVING` while a shutdown
-  drains.
-- TLS and mTLS: the server and `scion-cache` serve TLS with `--tls-cert`
-  and `--tls-key` (a non-loopback address then needs no
-  `--insecure-listen`), and require a client certificate with
-  `--tls-client-ca`. The cache and `scion-daemon` trust `--tls-ca` for
-  their https upstream and present `--tls-client-cert` and
-  `--tls-client-key` for mTLS. `scn` trusts `--tls-ca` for an https
-  server. The TLS handshake of a connection ends within 20 s, and the
-  HTTP/2 preface is still awaited within 20 s of the place, so a peer that
-  stops before or after the handshake holds no connection place. The
-  cryptography is ring (the `tls-ring` feature of tonic: 8 new crates,
-  fewer than the 12 of `tls-aws-lc`, one of which needs cmake).
-- `GetObjects` streams objects in parts of 1 MiB (`ObjectPart`): the first
-  part names the object, its encoding and its sizes, so every receiver
-  reserves memory before the bytes arrive and unpacks within that size. A
-  blob travels in its stored zstd file, as it is, to a client that lists
-  `ZSTD` in the `accept` field: the tiers keep and pass on that frame, and
-  `scn checkout` unpacks it, so a blob is packed once and unpacked once. A
-  tier fetches up to 64 objects at once from upstream, within the same
-  400 MiB. A `GetObjects` reply never ends `OK` with no object, and one
-  with no memory for the first object within 30 s fails with
+- `scion-server`, the server: changesets, trees and blobs in a data
+  directory (SQLite metadata, one zstd file per blob), one-way git import
+  checked against git, `fsck`, `gc`, `derive` and `hash-token` commands.
+  The metadata may live in Postgres instead (`--postgres-url`); the blob
+  files stay on disk in both backends (`#178`).
+- Server-side writes: `PutBlob`, `CreateChangeset` (at most 100,000
+  changes, one parent, no committer) and `Land`, which rebases onto a ref
+  and moves it by compare-and-swap. Conflicts are path-level; there is no
+  text merge. A retry with the same request key returns the stored
+  outcome, so a cut-off call never lands the same change twice; a land
+  whose ref moved is planned again, up to 3 times. A finished land is
+  kept 7 days; one left `PENDING` longer than `--land-stale-secs` (a day)
+  is rejected by a sweep at start and then hourly.
+- Server-side commits and lands never show state that a power loss can
+  undo: concurrent blob syncs and commits share one full drive flush, so
+  a successful reply rests on a flushed drive (`#3`).
+- One-way git import that can run beside a live server: it moves the ref
+  by compare-and-swap, its commits are durable before the server sees
+  them, and a re-import never moves a ref off later lands.
+- `fsck` checks a data directory and reports one line per problem,
+  read-only, safe beside a live server (exit 0 clean, 1 damage, 2 could
+  not run). `gc` collects blobs and rows nothing names any more, past a
+  grace period of `--grace-secs` (a week), rows before files, safe to
+  repeat; `--dry-run` removes nothing. `derive --kind KIND --ref R`
+  backfills derived data before the first query.
+- The read API: `ResolveRef`, `GetChangeset`, `ReadFile`, `ListDir`,
+  `Log` (with a path), `Blame`, `MergeBase`, `IsAncestor` and `Diff`.
+  Streamed replies move in 1 MiB parts; a client that stops reading is
+  cut off after 120 s.
+- Path history is derived data: `Log` with a path returns the changesets
+  that changed it, however far apart, and a level above 64 KiB is cut
+  into chunks, so a directory that churns through names stays cheap
+  (`#159`). `scn log --path` reads it.
+- `Blame`: which changeset last changed each line, on first-parent
+  history, across renames, on binary files too. All blame calls share a
+  1 GiB budget; a file of more than 1,048,576 lines is blamed over
+  several calls with a cursor.
+- `Diff` finds renames as `git diff` does (same content, then same name
+  at 75%, then the most similar at 50%), and names each rename's old
+  path, new path and similarity.
+- The query API runs on a derived commit-graph index, so `IsAncestor`
+  reads a few dozen entries at any depth and `MergeBase` answers in a
+  few dozen steps when the histories meet low. They are bounded only by
+  the 600 s call limit, and at most 4 run at once.
+- Read tickets (`#13`): an object ID alone is no permission. `GetRootTree`
+  signs a 15-minute ticket for the repo, principal and root tree;
+  `GetObjects` carries the ticket and each object's path, and the server
+  and every tier walk the path, so nothing outside it is served. A tier
+  refuses `ResolveRef` and `GetRootTree`: the server alone mints
+  permissions.
+- The metrics of the server and a cache on `--metrics-listen` (off by
+  default, loopback only): request counts by RPC and code, a latency
+  histogram, reply bytes by RPC, lands by outcome, land replans, view
+  derivations, and a tier's cache hits and misses.
+- The gRPC health service (`grpc.health.v1.Check` and `Watch`) on the
+  serving port, without a token.
+- Transport limits: at most 128 connections (`--max-connections`) of 256
+  streams (`--max-streams`) per process, a stalled connection capped at
+  64 MiB (`--max-stalled-bytes`), a connection closed after 30 min of age
+  with a 10 min grace, and Nagle off.
+- A caller's deadline passes down through the tiers with `grpc-timeout`,
+  each hop keeping a margin, so a busy server's own status reaches the
+  caller for any deadline (`#98`).
+- Folder read rules (`#184`): a `read` rule may name path prefixes. A
+  principal whose read rules are all prefixes reads the derived view of
+  its prefixes, a hidden path answers like a missing one, and a partial
+  reader cannot write.
+- Principals and access rules (`#13`): `--access FILE` maps the BLAKE3
+  digest of each token to a principal and its per-repo read and write
+  rules; `scion-server hash-token` prints the digest an access file
+  wants, so the file never holds a token.
+- Per-principal quotas (`#15`): with `--access`, 64 requests in flight,
+  512 MiB of upload bytes and 64 pending lands per principal by default,
+  each overridable, a call over a cap failing with `RESOURCE_EXHAUSTED`.
+- Read keys (`#13`, `#168`): `scion-server ticket-key --out FILE` makes
+  the Ed25519 key that signs read tickets, and prints the public key for
+  the tiers (`--ticket-public-key`, at most 2 during a rotation;
+  `--ticket-key-old` moves the server to a new key).
+- Bearer-token auth on every call, loopback-only listening by default,
+  request limits and name validation at the RPC boundary.
+- `scn`, the client: `cat`, `ls`, `log`, `blame`, `show`, `diff`,
+  `merge-base`, `is-ancestor`, `commit`, `land`, `bench`, `checkout`,
+  `mount` and `unmount`, with `--json` output. Every `scn` error exits 2,
+  and `is-ancestor` answers with exit 0 or 1, so one never reads as the
+  other.
+- `scn checkout`, into a new or an existing empty directory: every entry
+  is checked against its ID, a failure or signal removes what was
+  written, and the checkout dies by the signal it caught (130 for
+  Ctrl-C).
+- `scn mount` and `scn unmount` (`#11`): one ref served as an NFSv3
+  filesystem from `scn` itself, so a file loads when it is first read;
+  `scn commit --from-mount DIR` commits exactly what the overlay holds.
+  For single-user machines only: any local user who can read the mount
+  table can reach the mount through the NFS port.
+- `scn` reaches a `scion-daemon` over `unix:///PATH`, and checks the
+  socket and every directory above it, as the daemon checks its own.
+- `scion-tier`, the cache tiers: `scion-cache` keeps objects in memory
+  and `scion-daemon` keeps them on disk, each least-recently-used out
+  first under `--max-bytes` (1 GiB in memory, 10 GiB on disk). A cache
+  listens on TCP, a daemon on a private Unix socket, one daemon per OS
+  user. A tier answers only `GetObjects` and checks every object from
+  upstream against its ID.
+- Snapshots: `scion-cache --snapshot DIR --snapshot-repo R` writes
+  `DIR/R.scnsnap` every `--snapshot-every` seconds, and a cold
+  `scion-daemon --seed FILE` imports it, each object checked against its
+  ID (`#59`).
+- The daemon keeps its recency in `<data>/index.db`, so a clean stop
+  reopens without reading every stored object, and a crash loses only
+  the recency of the last batch, never an object.
+- The gRPC health service (`grpc.health.v1`) on every process's serving
+  port, without a token, so a probe needs none.
+- Prometheus metrics on the server and the cache
+  (`--metrics-listen`, off by default, loopback only): request counts by
+  RPC and code, a latency histogram, reply bytes, lands by outcome, land
+  replans, view derivations, and a tier's cache hits and misses (`#144`).
+- One request ID per command, carried in `x-request-id` through every
+  hop and logged as `request_id`, so one operation can be followed
+  across scn, daemon, cache and server (`#144`).
+- TLS and mTLS: the server and a cache serve TLS (`--tls-cert`,
+  `--tls-key`) and can require a client certificate
+  (`--tls-client-ca`); the tiers trust `--tls-ca` and can present a
+  client certificate; `scn` trusts `--tls-ca`.
+- `GetObjects` streams objects in parts of 1 MiB, the first part naming
+  the object, its encoding and its sizes; a blob travels as its stored
+  zstd frame, so it is packed once and unpacked once. A reply that has
+  no memory for its first object within 30 s fails with
   `RESOURCE_EXHAUSTED`.
-- Receivers accept only plain Zstandard frames, with no dictionary and a
-  window of at most 8 MiB; the zstd library is built without its legacy
-  decoders.
-- The server, `scion-cache` and `scion-daemon` serve at most 128
-  connections at once (`--max-connections`), each with at most 256 open
-  streams (`--max-streams`). A client beyond either cap waits, and a
-  connection that waits logs a warning. Every connection closes in time:
-  20 s after it gets its place if no HTTP/2 preface came; after the
-  preface, 20 s after an unanswered ping, which goes out after 60 s
-  without a frame; and 10 min after a `GOAWAY` at 30 min of age, so a
-  daemon's lifelong connection to its cache gives its place up. So the
-  number of stalled replies has a bound, and a connection beyond the cap
-  waits at most 40 min. Size `--max-connections` on a cache for the
-  daemons behind it, and on the server for the caches and direct clients.
-- A reply whose client stops reading adds what it leaves in HTTP/2 (under
-  4 MiB) to a count of its connection, and a connection whose stalled
-  replies hold more than 64 MiB together (`--max-stalled-bytes`) is closed
-  with them. Other connections are not touched. hyper cannot reset one
-  stalled stream, so the connection is the unit of accounting (#113).
-- The server and `scion-cache` turn off Nagle's algorithm on each TCP
-  connection. It was on: tonic ignores its `tcp_nodelay` setting for a
-  listener that it does not open itself. So a small reply, such as a unary
-  answer or a status, could wait for the client's ACK, up to about 40 ms
-  where the client delays its ACKs.
-- A caller's deadline passes down through the tiers with `grpc-timeout`.
-  Each tier ends every wait at the caller's deadline, less a margin (a
-  tenth, at most 1 s), and sends what is left upstream, so the status of
-  the deepest process reaches the caller for any deadline: a call through
-  a daemon, a cache and a busy server fails with the server's
-  `RESOURCE_EXHAUSTED`, never with a timeout of a tier in the middle. The
-  server also ends its waits before the caller's deadline. With no
-  deadline, the fixed limits per step still apply and nothing goes
-  upstream. A caller whose deadline passes stops waiting; a fetch goes on
-  for the callers that still wait, and a caller with a later deadline asks
-  again with its own if the fetch failed on a shorter one (#98).
-- `scion-tier`: the cache tiers. `scion-cache` keeps objects in memory and
-  `scion-daemon` keeps them on disk, each under a byte limit, least
-  recently used out first. The daemon listens on a Unix socket with mode
-  0600. Each tier answers the `Objects` calls, checks every object from
-  upstream against its ID before it stores or sends it, forwards
-  `ResolveRef`, keeps `GetRootTree` answers, fetches a shared miss once,
-  and needs a token.
-- A `scion-cache --snapshot DIR --snapshot-repo R` writes `DIR/R.scnsnap`
-  every `--snapshot-every` seconds: the most recently used objects of that
-  repo, up to `--snapshot-bytes`. A cold `scion-daemon --seed FILE`
-  imports them before it serves, each checked against its ID; a warm one
-  ignores the file (#59).
-- `scion-daemon` keeps its recency index in `<data>/index.db`, a SQLite
-  database read and changed in place. The index is not held in memory: a
-  `size` is one point lookup, and the daemon keeps only the last batch of
-  row changes, at most 1,024 (or 64 MiB of new bytes), committed in one
-  transaction, plus the database's own page cache of 8 MiB. After a clean
-  stop (Ctrl-C, or SIGTERM, which it handles too), a start reads the rows
-  and opens no object directory, and the order of use survives the
-  restart; the stop commits, checkpoints the write-ahead log, and flushes
-  it past the drive's cache. After a crash, a start still opens at once,
-  at most one batch behind: every change carries a sequence number, and
-  the start reads only the changes past the newest one committed. Files
-  that a crash left before their batch are adopted by one low-priority
-  walk of the object directories after the start: each file with no row
-  comes back as the least recently used, and its bytes count against
-  `--max-bytes`, so the limit holds again; the walk stops at a clean stop
-  and logs what it adopted. A crash loses only what was used last, never
-  an object. A store from a build before the index db has `<data>/index`
-  (the append-only index of that format): the first start imports its
-  records in file order and removes it.
-
-#### scn
-
-- `scn`, the command-line client: `cat`, `ls`, `log`, `show`, `commit`,
-  `land` and `bench`, with `--json` output. `scn merge-base`, `scn
-  is-ancestor` (exit 0 or 1) and `scn diff` for the query API, and
-  `scn blame`. Every `scn` error exits 2, so it never reads as the "no" of
-  `scn is-ancestor`.
-- `scn ls` shows each entry's size: `scion-server` 0.1 trees carry the
-  byte length of every file and symlink, so the listing knows it with no
-  extra call; directories and gitlinks show none. `--json` adds `size` to
-  the entries that carry one.
-- `scn mount` and `scn unmount` (`#11`): a virtual checkout. `scn mount
-  DIR [REV]` serves one ref as an NFSv3 filesystem from `scn` itself, on a
-  free port of 127.0.0.1, so a directory's tree loads when it is first
-  listed or looked up in, and a file's blob when it is first read or
-  sized. Until `#172` adds `GetSizes`, a file's size comes from its
-  blob, so a first stat of an unread file fetches the blob. Writes land
-  in a private overlay directory (mode 0700 under the system's temporary
-  directory), and `scn commit --from-mount DIR` commits exactly what the
-  overlay holds, with no scan of the tree. `scn unmount DIR` stops the
-  mount and removes the overlay. For single-user machines only: the NFS
-  server sees neither the caller's user ID nor its source port, and the
-  mount path with its random secret is in the mount table that every
-  local user can read, so any local user who can read the mount table can
-  reach the mounted content, and root always can. The secret stops stray
-  and accidental callers only; it is not a protection.
-- `scn checkout`, into a new directory or an existing empty one. An
-  existing directory is kept, with its mode and owner, and its parent need
-  not be writable. It must not be writable by all users unless it has the
-  sticky bit. Writes go through directory handles and never follow a
-  symlink, and each directory is opened about once. On failure, or on
-  SIGINT, SIGTERM or SIGHUP, what was written is removed, and then `scn`
-  dies by the signal, so a shell reports 128 plus its number (130 for
-  Ctrl-C) and a shell loop stops too. A second signal stops the removal at
-  once, and names the temp directory that it leaves.
-  Where the filesystem has no rename that never replaces (NFS on Linux),
-  a checkout into an existing directory still works: each top-level file
-  or symlink moves up by a hard link, and each top-level directory by a
-  rename onto a new empty directory that claims its name. Where it has no
-  hard links either (some FUSE filesystems), each top-level file is copied
-  to a new name made with `O_EXCL`, and each symlink is made again. On NFS
-  version 3, a lost reply does not fail the checkout, from the temp
-  directory it is written into to the move into place (#106). A name that
-  the filesystem folds into one already written still fails it, also when
-  both hold an empty file or a symlink to one target. This is tested by
-  forcing it, not on a real NFS mount.
-- `scn` reaches a daemon with `--server unix:///PATH`. It first refuses a
-  path that is not a socket owned by its user or by root. `scn` and the
-  daemon also refuse a socket or data directory under a directory that
-  another user can change: each directory up to `/` must be owned by root
-  or by their user, and not writable by group or others unless it has the
-  sticky bit.
-- `scn` sends a 600 s deadline (the server's own limit) and a 10 s connect
-  timeout on every call, so a waiting `scn` never hangs silently (#98).
-
-#### Docs and scripts
-
-- `docs/protocol-v1.md`: the contract of the `Scion` and `Objects`
-  services, for independent clients, tiers and servers.
-- `scripts/demo.sh`, a demo that anyone can rerun on a fixed public
-  repository, and `scripts/bench-checkout.sh`, a checkout benchmark
-  against git. `docs/benchmarks.md` gives the method.
-- `scripts/grpc-conformance.sh` (`#163`): a conformance check that
-  speaks the API with grpcurl, so a client that is not the Rust one is
-  covered by CI.
-- An operations guide, `docs/operations.md` (`#169`): deploy, keys,
-  backup, upgrade, routines, and what to watch.
-- A container image and a compose example (`#164`): a server and a cache
-  with TLS, and a checkout through the cache.
+- One-way git import, safe to repeat and safe beside a live server: a
+  re-import never moves a ref off later lands, and every root and merge
+  commit is checked against git, plus `--verify` (100) others.
+- Docs and scripts: the protocol contract (`docs/protocol-v1.md`), the
+  operations guide (`docs/operations.md`), the CLI reference
+  (`docs/cli.md`), the benchmark method (`docs/benchmarks.md`),
+  `scripts/demo.sh`, `scripts/bench-checkout.sh`, a grpcurl conformance
+  check (`#163`), and a compose example with a server and a cache with
+  TLS (`#164`).
 
 ### Changed
 
+- `fsck` and `gc` run against a Postgres-backed store (`#180`), through
+  the same metadata interface as on a data directory: both used to
+  refuse it. The collector's batches on Postgres hold one advisory key
+  per schema and at most 256 rows each, so a writer waits at most one
+  batch behind the collector.
+- `scn` errors say what to check next: one `check:` line under the error,
+  keyed to the failure — a refused address, a certificate the client
+  does not trust, a wrong token — and `scn mount` refuses a missing or
+  non-directory mount point before it serves anything (#246).
+- A partial reader's view is memoized per tree (`#121`): a new changeset
+  re-derives only the folders on its changed paths, and rows of older
+  projection versions or dead rule sets are swept in bounded steps.
 - The server, the cache and the daemon log to stderr (`#179`): stdout
-  carries the output of `ticket-key` and `hash-token`, so a redirect of
-  one does not catch the other's lines.
-- `Diff` finds renames as git does over diffs of 1,000,000 entries
-  (`#107`). Exact renames (same content, by blob ID) run at any size in
-  that range, where a diff of more than 10,000 entries before had none; a
-  larger diff has no renames, and costs the call no more than about 150 MB
-  of memory. The inexact search (same name, then similar files) keeps git's
-  limit of 1,000 x 1,000 file pairs and its per-call work budget. When it
-  did not run or stopped at the budget, or the diff is over the entry
-  bound, the reply sets `renames_incomplete`, and `scn diff` prints git's
-  warning about skipped inexact rename detection; the exact renames in the
-  reply are still whole. Every call of the same diff reports the flag the
-  same way.
-
+  carries only the output of `ticket-key` and `hash-token`.
+- `Diff` finds renames over diffs of up to 1,000,000 entries (`#107`):
+  exact renames run at any size in that range, where a diff of more than
+  10,000 entries before had none. When the inexact search did not run or
+  stopped at its budget, the reply says `renames_incomplete`, and `scn
+  diff` prints git's warning about skipped inexact rename detection.
 ### Fixed
+
+- `Log` no longer repeats a page past the first scan (`#203`): a call
+  whose `limit` crossed one internal page of 1,000 entries got those
+  entries twice.
+- A `Blame` cursor whose run length overflows the line count is refused
+  with `INVALID_ARGUMENT` (`#201`), where a release build wrapped the
+  count and answered a wrong window.
+- `scn` prints each part of an error once, where the printed chain said
+  the transport error twice.
+- `scion-server hash-token --token` has a help text.
+- The mount table does not fail silently (`#240`): an unmount whose kill
+  fails keeps the record for a retry; a corrupt `mounts.json` is an
+  error, not an empty table, so `scn mount` cannot double-mount a
+  directory; the stop path reports on stderr what it could not clean; a
+  tier sweep logs a removal it cannot make.
+
+### Security
 
 - The server refuses a data directory that group or others can write, or
   that sits under a directory another user can change: the blobs and the
-  metadata inside are only as private as the directory.
-- `scn` prints each part of an error once: tonic's transport error Display
-  already ends with its source's text, and the printed chain said `tcp
-  connect error` and `invalid URL, scheme is missing` twice.
-- `scion-server hash-token --token` has a help text.
-- A `Blame` cursor whose run length overflows the line count is refused
-  with `INVALID_ARGUMENT` (`#201`): the fuzz target found that a release
-  build wrapped the total silently and answered a wrong window.
-- `Log` no longer repeats a page past the first scan (`#203`): a call
-  whose `limit` is larger than one internal page (1,000 entries) fetched
-  its second page and then started again from the second page's first
-  entry, so the reply held a thousand entries twice. The walk now takes
-  each page's own continuation; the new paging tests fail on either a
-  skipped or a repeated entry.
+  metadata are only as private as their directory (`#197`).
+- The ticket-key seed must be readable by its owner alone, a public-key
+  file must not be group-writable, both refuse a symlink, and a second
+  `ticket-key` run refuses, so a key cannot change under the tiers
+  (`#168`).
+- `scion-daemon --seed` refuses a snapshot unless `--seed-full-repo` says
+  every user of the node may read the repo whole (`#241`): a snapshot is
+  a full-repo credential.

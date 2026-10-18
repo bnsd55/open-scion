@@ -1,6 +1,8 @@
 //! `scion-server gc <data>`: removes the blob files and the `repo_blobs`
-//! rows that nothing names any more. It belongs to the SQLite backend: its
-//! SQL lives in `db.rs`, and another backend brings its own collector.
+//! rows that nothing names any more, over [`Meta`](crate::meta::Meta), so
+//! one collector serves every backend. Its queries are
+//! [`MetaTx`](crate::meta::MetaTx) methods;
+//! its files are the object folder, which every backend keeps on disk.
 //!
 //! A blob file is shared by content across repos, so what is garbage is a
 //! question with two levels:
@@ -51,8 +53,9 @@ use std::time::{Duration, SystemTime};
 
 use scion_core::{BlobId, Changeset, ChangesetId};
 
+use crate::backend::Backend;
 use crate::db;
-use crate::store::Store;
+use crate::meta::{Meta as _, MetaTx as _, RepoChangeset, RepoId};
 use std::str::FromStr as _;
 
 /// Rows to read per batch, as `fsck` reads.
@@ -62,10 +65,20 @@ pub const BATCH: usize = 4096;
 /// writer waits milliseconds, not the whole sweep.
 pub const SWEEP_BATCH: usize = 1000;
 
+/// The dead-row candidates one prune transaction deletes, at most: one
+/// transaction holds the collector's key, so its length bounds how long
+/// every writer waits behind it.
+const PRUNE_BATCH: usize = 256;
+
+/// The time one prune transaction or sweep batch may hold the collector's
+/// key before the run says so in the log. The row cap bounds the hold;
+/// this clock only reports the batches that ran past it.
+const BATCH_BUDGET: Duration = Duration::from_millis(100);
+
 /// The grace period, when `--grace-secs` is not given: seven days.
 pub const DEFAULT_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
 
-/// A stage of the collection, reported between two batches or repos.
+/// A stage of the collection, reported between two batches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     /// The live-set walk over the stored changesets.
@@ -112,7 +125,7 @@ impl Report {
 ///
 /// Errors of the database or the file system.
 pub fn run(
-    store: &Store,
+    store: &Backend,
     grace: Duration,
     dry_run: bool,
     between: &mut dyn FnMut(Stage),
@@ -129,15 +142,15 @@ pub fn run(
 /// A batch runs in one short read transaction, so a live server keeps
 /// writing; changesets that commit later are picked up when their repo's
 /// rows are pruned.
-fn live_set(store: &Store, between: &mut dyn FnMut(Stage)) -> crate::error::Result<LiveSet> {
+fn live_set(store: &Backend, between: &mut dyn FnMut(Stage)) -> crate::error::Result<LiveSet> {
     let mut live = LiveSet::default();
-    let mut last: Option<(i64, Vec<u8>)> = None;
+    let mut last: Option<(RepoId, Vec<u8>)> = None;
     loop {
-        let (from_repo, from_cs) = last.clone().unwrap_or((0, Vec::new()));
-        let rows = store.read(|c| db::gc_changesets(c, from_repo, from_cs.as_slice(), BATCH))?;
+        let (from_repo, from_cs) = last.clone().unwrap_or((RepoId(0), Vec::new()));
+        let rows = store.read(|c| c.repo_changesets_after(from_repo, from_cs.as_slice(), BATCH))?;
         let count = rows.len();
-        let next = rows.last().map(|(repo, cs, _)| (*repo, cs.clone()));
-        for (repo, cs, body) in rows {
+        let next = rows.last().map(|row| (row.0, row.1.clone()));
+        for RepoChangeset(repo, cs, body) in rows {
             let (cs, _) = Changeset::decode_with_id(&body)
                 .map_err(|e| crate::Error::Corrupt(format!("changeset {}: {e}", cs_string(&cs))))?;
             live.note(repo, &cs);
@@ -155,15 +168,15 @@ fn live_set(store: &Store, between: &mut dyn FnMut(Stage)) -> crate::error::Resu
 #[derive(Default)]
 struct LiveSet {
     /// The blobs that each repo's stored changesets put.
-    live: BTreeMap<i64, BTreeSet<BlobId>>,
+    live: BTreeMap<RepoId, BTreeSet<BlobId>>,
     /// The changesets that the snapshot walk read, per repo. The prune of a
     /// repo re-reads its changesets and decodes only the new ones.
-    seen: HashMap<i64, BTreeSet<ChangesetId>>,
+    seen: HashMap<RepoId, BTreeSet<ChangesetId>>,
 }
 
 impl LiveSet {
     /// Records the puts of `cs` as live for its repo.
-    fn note(&mut self, repo: i64, cs: &Changeset) {
+    fn note(&mut self, repo: RepoId, cs: &Changeset) {
         let blobs = self.live.entry(repo).or_default();
         for (_, blob) in db::puts(cs) {
             blobs.insert(blob);
@@ -172,9 +185,10 @@ impl LiveSet {
     }
 }
 
-/// Prunes the dead `repo_blobs` rows of each repo, one transaction per repo.
+/// Prunes the dead `repo_blobs` rows of each repo, in chunks of at most
+/// `PRUNE_BATCH` rows, one transaction per chunk.
 fn prune_rows(
-    store: &Store,
+    store: &Backend,
     live: &LiveSet,
     grace: Duration,
     dry_run: bool,
@@ -183,65 +197,99 @@ fn prune_rows(
 ) -> crate::error::Result<()> {
     // Every repo, not only the ones with changesets: a repo whose rows all
     // came from uploads gets its prune too.
-    let repos = store.read(db::gc_repos)?;
+    let repos = store.read(|c| c.repos())?;
     report.repos = u64::try_from(repos.len()).unwrap_or(u64::MAX);
     for repo in repos {
-        store.write(|c| {
-            // A changeset that committed after the snapshot walk pins the
-            // blobs that it puts, whatever their age. The transaction sees
-            // every commit before it, and the one writer of the server
-            // commits nothing while it runs.
+        // The candidate scan reads rows and files: it runs in a read
+        // transaction, so it does not hold the collector's key while it
+        // stats the files.
+        let dead = store.read(|c| {
             let live_of_repo = live.live.get(&repo);
-            let mut seen = live.seen.get(&repo).cloned().unwrap_or_default();
-            let mut fresh = BTreeSet::new();
-            for cs in db::gc_repo_changesets(c, repo)? {
-                let Ok(cs) = ChangesetId::try_from(cs.as_slice()) else {
-                    continue; // fsck reports the bad ID
-                };
-                if seen.insert(cs) {
-                    let Some(body) = db::gc_changeset_body(c, cs.as_bytes())? else {
-                        continue;
-                    };
-                    let (cs, _) = Changeset::decode_with_id(&body)
-                        .map_err(|e| crate::Error::Corrupt(format!("changeset {cs}: {e}")))?;
-                    for (_, blob) in db::puts(&cs) {
-                        fresh.insert(blob);
-                    }
-                }
-            }
-            for blob in db::gc_repo_blobs(c, repo)? {
+            // The rows dead per the snapshot, and old enough. The row's age
+            // is its file's: every writer makes the file durable first, and
+            // names it right after. A row whose file is gone is dead at any
+            // age: it grants nothing, and a later upload makes it again.
+            let mut dead = Vec::new();
+            for blob in c.repo_blob_ids(repo)? {
                 let Ok(blob) = BlobId::try_from(blob.as_slice()) else {
                     continue; // fsck reports the bad ID
                 };
-                if live_of_repo.is_some_and(|live| live.contains(&blob)) || fresh.contains(&blob) {
+                if live_of_repo.is_some_and(|live| live.contains(&blob)) {
                     continue;
                 }
-                // The row's age is its file's: every writer makes the file
-                // durable first, and names it right after. A row whose file
-                // is gone is dead at any age: it grants nothing, and a
-                // later upload makes it again.
                 match file_age(store, blob)? {
                     Some(age) if age < grace => {
                         report.rows_young += 1;
                     }
-                    _ => {
-                        if !dry_run {
-                            db::gc_delete_repo_blob(c, repo, blob.as_bytes())?;
-                        }
-                        report.rows_pruned += 1;
-                    }
+                    _ => dead.push(blob),
                 }
             }
-            Ok(())
+            Ok(dead)
         })?;
-        between(Stage::RepoRows);
+        // The collector's key (Postgres) and the one write connection
+        // (SQLite) already order the collector's delete transactions
+        // against every changeset transaction: a writer that began first
+        // commits before a delete chunk begins, and a writer that begins
+        // after the chunk waits for it.
+        // One transaction per chunk of at most PRUNE_BATCH rows: a
+        // transaction holds the collector's key from its begin to its
+        // commit, so its length is how long every writer waits. A
+        // changeset that committed after the snapshot walk pins the blobs
+        // that it puts: the re-read inside each chunk runs after the key
+        // was taken, so it sees every changeset that committed while this
+        // transaction waited for one.
+        // SHORTCUT: the re-read loads every changeset ID of the repo once
+        // per chunk, so a repo with many changesets pays that walk per
+        // chunk. Fine at 256 rows a chunk; if a chunk ever runs past its
+        // budget in the log, load the IDs once per repo per sweep and
+        // share them across chunks, at the cost of a wider pin window.
+        let mut seen = live.seen.get(&repo).cloned().unwrap_or_default();
+        for chunk in dead.chunks(PRUNE_BATCH) {
+            let started = std::time::Instant::now();
+            store.write(|c| {
+                let mut fresh = BTreeSet::new();
+                for cs in c.repo_changeset_ids(repo)? {
+                    let Ok(cs) = ChangesetId::try_from(cs.as_slice()) else {
+                        continue; // fsck reports the bad ID
+                    };
+                    if seen.insert(cs) {
+                        let Some(body) = c.stored_changeset_body(cs.as_bytes())? else {
+                            continue;
+                        };
+                        let (cs, _) = Changeset::decode_with_id(&body)
+                            .map_err(|e| crate::Error::Corrupt(format!("changeset {cs}: {e}")))?;
+                        for (_, blob) in db::puts(&cs) {
+                            fresh.insert(blob);
+                        }
+                    }
+                }
+                for blob in chunk {
+                    if fresh.contains(blob) {
+                        continue;
+                    }
+                    if !dry_run {
+                        c.delete_repo_blob(repo, blob.as_bytes())?;
+                    }
+                    report.rows_pruned += 1;
+                }
+                Ok(())
+            })?;
+            if started.elapsed() > BATCH_BUDGET {
+                tracing::warn!(
+                    rows = chunk.len(),
+                    elapsed_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                    "the collector's prune batch ran past its budget"
+                );
+            }
+            between(Stage::RepoRows);
+        }
     }
     Ok(())
 }
 
 /// Unlinks the blob files that no row names, oldest first.
 fn sweep_files(
-    store: &Store,
+    store: &Backend,
     grace: Duration,
     dry_run: bool,
     between: &mut dyn FnMut(Stage),
@@ -263,15 +311,19 @@ fn sweep_files(
     }
     // The listing is done; a test writes between it and the sweep.
     between(Stage::BlobFiles);
-    // The unlink runs inside a write transaction with the row check, so no
-    // writer can add a row between the two: the server has one writer, and
-    // it waits for the transaction. The mtime re-stat stays as a second
+    // The sweep's row check and unlink run inside a write transaction, so
+    // no writer can add a row between the two: on the data directory the
+    // one write connection orders the sweep against the changeset, and on
+    // a shared database every write transaction holds the collector's key
+    // from its begin (`Pg::commit`), the way the SQLite one-write-
+    // connection store serializes. The mtime re-stat stays as a second
     // guard. An unlink is not rolled back by the transaction, and a crash
     // after it and before the commit is fine: the file had no row.
+    candidates.sort_by(|a, b| a.2.as_bytes().cmp(b.2.as_bytes()));
     for batch in candidates.chunks(SWEEP_BATCH) {
         store.write(|c| {
             for (path, listed, id) in batch {
-                if db::gc_any_repo_blob(c, id.as_bytes())? {
+                if c.any_repo_names(id.as_bytes())? {
                     continue;
                 }
                 if file_mtime(path)? != Some(*listed) {
@@ -289,7 +341,7 @@ fn sweep_files(
 }
 
 /// Every file under the blob root, with the mtime that the listing saw.
-fn blob_files(store: &Store) -> crate::error::Result<Vec<(PathBuf, SystemTime)>> {
+fn blob_files(store: &Backend) -> crate::error::Result<Vec<(PathBuf, SystemTime)>> {
     let root = store.blobs().root().to_path_buf();
     let mut files = Vec::new();
     let dirs = match std::fs::read_dir(&root) {
@@ -322,7 +374,7 @@ fn blob_id_of(path: &Path) -> Option<BlobId> {
 }
 
 /// The age of a blob file, or `None` when it is not there.
-fn file_age(store: &Store, id: BlobId) -> crate::error::Result<Option<Duration>> {
+fn file_age(store: &Backend, id: BlobId) -> crate::error::Result<Option<Duration>> {
     let (_, path) = store.blobs().location(id);
     Ok(file_mtime(&path)?.map(|mtime| {
         SystemTime::now()
@@ -353,7 +405,7 @@ mod tests {
     use crate::db::SqliteTx;
     use crate::deadline::Deadline;
     use crate::land::{LandRequest, Lands};
-    use crate::meta::MetaTx as _;
+    use crate::store::Store;
     use scion_core::{FileState, IdentityTime, RepoPath};
     use std::time::Instant;
     use tempfile::TempDir;
@@ -437,7 +489,7 @@ mod tests {
     }
 
     /// Makes the blob file of `id` look `age` old.
-    fn age_file(store: &Store, id: BlobId, age: Duration) {
+    fn age_file(store: &Backend, id: BlobId, age: Duration) {
         let (_, path) = store.blobs().location(id);
         let file = std::fs::File::options().write(true).open(&path).unwrap();
         file.set_modified(SystemTime::now() - age).unwrap();
@@ -451,13 +503,11 @@ mod tests {
 
     /// Whether `repo` names `blob`.
     fn named(store: &Store, blob: BlobId) -> bool {
-        store
-            .read(|c| db::gc_any_repo_blob(c, blob.as_bytes()))
-            .unwrap()
+        store.read(|c| c.any_repo_names(blob.as_bytes())).unwrap()
     }
 
     /// One run with the default grace, through the stages.
-    fn collect(store: &Store, grace: Duration, between: &mut dyn FnMut(Stage)) -> Report {
+    fn collect(store: &Backend, grace: Duration, between: &mut dyn FnMut(Stage)) -> Report {
         run(store, grace, false, between).unwrap()
     }
 
@@ -465,8 +515,12 @@ mod tests {
     fn gc_removes_what_nothing_names() {
         let (_dir, store) = store();
         let x = uploaded(&store, b"orphan\n");
-        age_file(&store, x, OLD);
-        let report = collect(&store, Duration::from_secs(DEFAULT_GRACE_SECS), &mut |_| {});
+        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        let report = collect(
+            &Backend::Sqlite(store.clone()),
+            Duration::from_secs(DEFAULT_GRACE_SECS),
+            &mut |_| {},
+        );
         assert_eq!(report.rows_pruned, 1, "{report:?}");
         assert_eq!(report.files_removed, 1, "{report:?}");
         assert!(!named(&store, x));
@@ -481,8 +535,12 @@ mod tests {
         let (_dir, store) = store();
         let x = store.blobs().put(b"kept\n").unwrap();
         land(&store, &cs(None, &[("a.txt", file_of(&store, b"kept\n"))]));
-        age_file(&store, x, OLD);
-        let report = collect(&store, Duration::from_secs(DEFAULT_GRACE_SECS), &mut |_| {});
+        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        let report = collect(
+            &Backend::Sqlite(store.clone()),
+            Duration::from_secs(DEFAULT_GRACE_SECS),
+            &mut |_| {},
+        );
         assert_eq!(report.rows_pruned, 0, "{report:?}");
         assert_eq!(report.files_removed, 0, "{report:?}");
         assert!(named(&store, x));
@@ -492,7 +550,11 @@ mod tests {
     fn gc_keeps_a_fresh_upload() {
         let (_dir, store) = store();
         let x = uploaded(&store, b"fresh\n");
-        let report = collect(&store, Duration::from_secs(DEFAULT_GRACE_SECS), &mut |_| {});
+        let report = collect(
+            &Backend::Sqlite(store.clone()),
+            Duration::from_secs(DEFAULT_GRACE_SECS),
+            &mut |_| {},
+        );
         assert_eq!(report.rows_young, 1, "{report:?}");
         assert_eq!(report.files_removed, 0, "{report:?}");
         assert!(named(&store, x));
@@ -515,8 +577,12 @@ mod tests {
             &store,
             &cs(None, &[("a.txt", file_of(&store, b"shared\n"))]),
         );
-        age_file(&store, x, OLD);
-        let report = collect(&store, Duration::from_secs(DEFAULT_GRACE_SECS), &mut |_| {});
+        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        let report = collect(
+            &Backend::Sqlite(store.clone()),
+            Duration::from_secs(DEFAULT_GRACE_SECS),
+            &mut |_| {},
+        );
         assert_eq!(report.rows_pruned, 1, "{report:?}");
         assert_eq!(report.files_removed, 0, "{report:?}");
         assert!(named(&store, x));
@@ -526,7 +592,7 @@ mod tests {
     fn a_changeset_after_the_snapshot_pins_its_blobs() {
         let (_dir, store) = store();
         let x = uploaded(&store, b"pinned\n");
-        age_file(&store, x, OLD);
+        age_file(&Backend::Sqlite(store.clone()), x, OLD);
         let mut injected = false;
         let report = {
             let store = &store;
@@ -544,7 +610,11 @@ mod tests {
                     land(store, &cs(None, &[("x.txt", state)]));
                 }
             };
-            collect(store, Duration::from_secs(DEFAULT_GRACE_SECS), &mut between)
+            collect(
+                &Backend::Sqlite(store.clone()),
+                Duration::from_secs(DEFAULT_GRACE_SECS),
+                &mut between,
+            )
         };
         assert!(injected);
         assert_eq!(report.rows_pruned, 0, "{report:?}");
@@ -557,7 +627,7 @@ mod tests {
         let (_dir, store) = store();
         let text = b"again\n";
         let x = uploaded(&store, text);
-        age_file(&store, x, OLD);
+        age_file(&Backend::Sqlite(store.clone()), x, OLD);
         let before = mtime_of(&store, x);
         std::thread::sleep(Duration::from_millis(20));
         // The second upload of the same content keeps the stored copy.
@@ -565,7 +635,11 @@ mod tests {
         let after = mtime_of(&store, x);
         assert!(after > before, "the keep must touch the file: {before:?}");
         // The touched file is younger than the grace, so the run keeps it.
-        let report = collect(&store, Duration::from_secs(DEFAULT_GRACE_SECS), &mut |_| {});
+        let report = collect(
+            &Backend::Sqlite(store.clone()),
+            Duration::from_secs(DEFAULT_GRACE_SECS),
+            &mut |_| {},
+        );
         assert_eq!(report.rows_pruned, 0, "{report:?}");
         assert_eq!(report.files_removed, 0, "{report:?}");
         assert!(named(&store, x));
@@ -594,7 +668,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, crate::Error::DeadlineExceeded(_)), "{err:?}");
         // Every stored blob is old, and nothing new is orphaned.
-        let report = collect(&store, Duration::ZERO, &mut |_| {});
+        let report = collect(&Backend::Sqlite(store.clone()), Duration::ZERO, &mut |_| {});
         assert_eq!(report.rows_pruned, 0, "{report:?}");
         assert_eq!(report.files_removed, 0, "{report:?}");
     }
@@ -603,31 +677,29 @@ mod tests {
     fn rows_go_before_files_so_a_crash_leaves_no_missing_file() {
         let (_dir, store) = store();
         let x = uploaded(&store, b"crash\n");
-        age_file(&store, x, OLD);
+        age_file(&Backend::Sqlite(store.clone()), x, OLD);
         // What a crash between the two stages leaves: the rows are gone,
         // the file is an orphan.
         store
             .write(|c| {
-                let mut tx = SqliteTx(c);
-                let repo = tx.repo_id(REPO)?;
-                db::gc_delete_repo_blob(&mut tx, repo.0, x.as_bytes())
+                let repo = c.repo_id(REPO)?;
+                c.delete_repo_blob(repo, x.as_bytes())
             })
             .unwrap();
         assert!(!named(&store, x));
         // No row names a missing file: the fsck invariant holds.
         store
             .read(|c| {
-                let mut tx = SqliteTx(c);
-                for (repo, blob) in db::fsck_repo_blobs(&mut tx, 0, &[], usize::MAX)? {
+                for (repo, blob) in c.repo_blob_rows_after(RepoId(0), &[], usize::MAX)? {
                     let id = BlobId::try_from(blob.as_slice()).unwrap();
                     let (_, path) = store.blobs().location(id);
-                    assert!(path.exists(), "row (repo {repo}) names a missing file");
+                    assert!(path.exists(), "row (repo {}) names a missing file", repo.0);
                 }
                 Ok(())
             })
             .unwrap();
         // The next run removes the orphan file.
-        let report = collect(&store, Duration::ZERO, &mut |_| {});
+        let report = collect(&Backend::Sqlite(store.clone()), Duration::ZERO, &mut |_| {});
         assert_eq!(report.files_removed, 1, "{report:?}");
     }
 
@@ -635,12 +707,20 @@ mod tests {
     fn a_fresh_orphan_file_survives_one_gc() {
         let (_dir, store) = store();
         let x = store.blobs().put(b"later\n").unwrap();
-        let report = collect(&store, Duration::from_secs(DEFAULT_GRACE_SECS), &mut |_| {});
+        let report = collect(
+            &Backend::Sqlite(store.clone()),
+            Duration::from_secs(DEFAULT_GRACE_SECS),
+            &mut |_| {},
+        );
         assert_eq!(report.files_young, 1, "{report:?}");
         assert_eq!(report.files_removed, 0, "{report:?}");
         // Once it is old, the next run removes it.
-        age_file(&store, x, OLD);
-        let report = collect(&store, Duration::from_secs(DEFAULT_GRACE_SECS), &mut |_| {});
+        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        let report = collect(
+            &Backend::Sqlite(store.clone()),
+            Duration::from_secs(DEFAULT_GRACE_SECS),
+            &mut |_| {},
+        );
         assert_eq!(report.files_removed, 1, "{report:?}");
     }
 
@@ -648,7 +728,7 @@ mod tests {
     fn a_row_added_between_the_listing_and_the_sweep_keeps_its_file() {
         let (_dir, store) = store();
         let x = store.blobs().put(b"listed\n").unwrap();
-        age_file(&store, x, OLD);
+        age_file(&Backend::Sqlite(store.clone()), x, OLD);
         let mut injected = false;
         let report = {
             let mut between = |stage: Stage| {
@@ -665,7 +745,7 @@ mod tests {
                 }
             };
             collect(
-                &store,
+                &Backend::Sqlite(store.clone()),
                 Duration::from_secs(DEFAULT_GRACE_SECS),
                 &mut between,
             )
@@ -677,7 +757,7 @@ mod tests {
             store.blobs().verify(x).unwrap(),
             crate::store::BlobStatus::Valid
         );
-        let check = crate::fsck::run(&store, 1, &mut |_| {}).unwrap();
+        let check = crate::fsck::run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(check.is_clean(), "{check:?}");
     }
 
@@ -685,7 +765,7 @@ mod tests {
     fn a_dry_run_removes_nothing() {
         let (_dir, store) = store();
         let x = uploaded(&store, b"dry\n");
-        age_file(&store, x, OLD);
+        age_file(&Backend::Sqlite(store.clone()), x, OLD);
         let mut removed = 0;
         let mut between = |stage: Stage| {
             if stage == Stage::BlobFiles {
@@ -693,7 +773,7 @@ mod tests {
             }
         };
         let report = run(
-            &store,
+            &Backend::Sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             true,
             &mut between,
@@ -711,7 +791,11 @@ mod tests {
             crate::store::BlobStatus::Valid
         );
         // The real run after it collects both.
-        let real = collect(&store, Duration::from_secs(DEFAULT_GRACE_SECS), &mut |_| {});
+        let real = collect(
+            &Backend::Sqlite(store.clone()),
+            Duration::from_secs(DEFAULT_GRACE_SECS),
+            &mut |_| {},
+        );
         assert_eq!(real.rows_pruned, 1, "{real:?}");
         assert_eq!(real.files_removed, 1, "{real:?}");
     }
@@ -719,11 +803,170 @@ mod tests {
     #[test]
     fn a_store_that_never_holds_blobs_collects_nothing() {
         let (_dir, store) = store();
-        let report = collect(&store, Duration::from_secs(DEFAULT_GRACE_SECS), &mut |_| {});
+        let report = collect(
+            &Backend::Sqlite(store.clone()),
+            Duration::from_secs(DEFAULT_GRACE_SECS),
+            &mut |_| {},
+        );
         assert_eq!(report.repos, 1, "{report:?}");
         assert_eq!(report.rows_pruned, 0, "{report:?}");
         assert_eq!(report.rows_young, 0, "{report:?}");
         assert_eq!(report.files_removed, 0, "{report:?}");
         assert_eq!(report.files_young, 0, "{report:?}");
+    }
+
+    /// A changeset on no parent that puts `blob`.
+    fn cs_put(blob: BlobId) -> Changeset {
+        cs(
+            None,
+            &[(
+                "pinned.txt",
+                FileState::Regular {
+                    content: blob,
+                    executable: false,
+                },
+            )],
+        )
+    }
+
+    /// A changeset that names the blob commits between the collector's
+    /// snapshot and its prune: the re-read inside the prune sees it, and
+    /// the blob's row and file survive.
+    #[test]
+    fn a_changeset_that_commits_while_gc_runs_keeps_its_blob() {
+        let dir = TempDir::new().unwrap();
+        let store = Backend::open_test_shared(dir.path()).unwrap();
+        let repo = store.write(|c| c.create_repo(REPO)).unwrap();
+        let b = store.blobs().put(b"pinned\n").unwrap();
+        store.write(|c| c.add_repo_blob(repo, b)).unwrap();
+        age_file(&store, b, OLD);
+        let committed = std::sync::atomic::AtomicBool::new(false);
+        let report = collect(&store, Duration::from_secs(1), &mut |stage| {
+            if stage == Stage::LiveSet && !committed.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                // The changeset commits after the snapshot and before
+                // the prune, the way a client that lands mid-gc does.
+                store
+                    .write(|c| {
+                        c.insert_changeset(repo, &cs_put(b))?;
+                        c.add_repo_blob(repo, b)
+                    })
+                    .unwrap();
+            }
+        });
+        assert_eq!(report.rows_pruned, 0, "{report:?}");
+        assert_eq!(report.files_removed, 0, "{report:?}");
+        assert!(
+            store.read(|c| c.any_repo_names(b.as_bytes())).unwrap(),
+            "the row vanished"
+        );
+        let (_, path) = store.blobs().location(b);
+        assert!(path.exists(), "the file vanished");
+    }
+
+    /// The interleaving the lock exists for: a changeset transaction holds
+    /// the blob's lock while the collector prunes; the collector waits, its
+    /// re-read then sees the changeset, and the file survives.
+    #[test]
+    fn the_collector_waits_for_a_changeset_that_holds_the_blob_lock() {
+        if !Backend::test_is_postgres() {
+            eprintln!("skip on sqlite: the lock is the write lock itself");
+            return;
+        }
+        let url = crate::backend::test_url().unwrap();
+        let dir = TempDir::new().unwrap();
+        let schema = crate::backend::test_schema(dir.path());
+        let data = TempDir::new().unwrap();
+        let gc_store = crate::pg::Pg::open_test(&url, &schema, 2, data.path()).unwrap();
+        let writer_store =
+            crate::pg::Pg::open_test(&url, &schema, 2, data.path().join("w").as_path()).unwrap();
+        let gc_store = Backend::Postgres(gc_store);
+        let writer = Backend::Postgres(writer_store);
+        let repo = gc_store.write(|c| c.create_repo(REPO)).unwrap();
+        let b = gc_store.blobs().put(b"locked\n").unwrap();
+        writer.write(|c| c.add_repo_blob(repo, b)).unwrap();
+        age_file(&gc_store, b, OLD);
+        let cs = cs_put(b);
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let writer_thread = std::thread::spawn(move || {
+            writer
+                .write(|c| {
+                    // The transaction took the collector's key at its
+                    // begin (`Pg::commit`): the collector's batches wait
+                    // for it from here to its commit.
+                    started_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    c.insert_changeset(repo, &cs)?;
+                    c.add_repo_blob(repo, b)?;
+                    Ok(())
+                })
+                .unwrap();
+        });
+        started_rx
+            .recv()
+            .expect("the changeset transaction took the key");
+        // The snapshot runs; the prune then waits for the changeset.
+        let (live_tx, live_rx) = std::sync::mpsc::channel();
+        let gc_thread = {
+            let gc_store = gc_store.clone();
+            std::thread::spawn(move || {
+                run(&gc_store, Duration::ZERO, false, &mut |stage| {
+                    if stage == Stage::LiveSet {
+                        let _ = live_tx.send(());
+                    }
+                })
+                .unwrap()
+            })
+        };
+        live_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the collector did not reach its snapshot");
+        go_tx.send(()).expect("the changeset transaction is alive");
+        writer_thread.join().unwrap();
+        let report = gc_thread.join().unwrap();
+        assert_eq!(report.rows_pruned, 0, "{report:?}");
+        assert_eq!(report.files_removed, 0, "{report:?}");
+        assert!(
+            gc_store.read(|c| c.any_repo_names(b.as_bytes())).unwrap(),
+            "the row vanished"
+        );
+        let (_, path) = gc_store.blobs().location(b);
+        assert!(path.exists(), "the file was removed");
+    }
+
+    /// A prune bigger than one chunk yields the collector's key between
+    /// chunks: the hook fires once per chunk, so a run over more than
+    /// `PRUNE_BATCH` dead rows holds the key twice, never once for all of
+    /// them. The count, not a clock, is the proof: each transaction
+    /// deletes at most `PRUNE_BATCH` rows.
+    #[test]
+    fn a_prune_bigger_than_a_chunk_yields_the_key_between_chunks() {
+        let dir = TempDir::new().unwrap();
+        let store = Backend::open_test_shared(dir.path()).unwrap();
+        let repo = store.write(|c| c.create_repo(REPO)).unwrap();
+        let blobs: Vec<BlobId> = (0..PRUNE_BATCH + 2)
+            .map(|n| {
+                let blob = store
+                    .blobs()
+                    .put(format!("chunk {n}\n").as_bytes())
+                    .unwrap();
+                store.write(|c| c.add_repo_blob(repo, blob)).unwrap();
+                blob
+            })
+            .collect();
+        for blob in &blobs {
+            age_file(&store, *blob, OLD);
+        }
+        let chunks = std::cell::Cell::new(0u32);
+        let report = collect(&store, Duration::from_secs(1), &mut |stage| {
+            if stage == Stage::RepoRows {
+                chunks.set(chunks.get() + 1);
+            }
+        });
+        assert_eq!(report.rows_pruned, blobs.len() as u64, "{report:?}");
+        assert_eq!(report.files_removed, blobs.len() as u64, "{report:?}");
+        assert_eq!(chunks.get(), 2, "the prune held the key once for every row");
     }
 }

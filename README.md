@@ -134,6 +134,7 @@ export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
 ./target/release/scn blame main:README.md         # last changeset of each line
 ./target/release/scn cat main:README.md
 ./target/release/scn checkout main --into /tmp/work   # --sparse DIR for part of it
+mkdir -p /tmp/view
 ./target/release/scn mount /tmp/view main             # files load when first read
 ./target/release/scn commit -m "from the mount" --from-mount /tmp/view
 ./target/release/scn unmount /tmp/view
@@ -273,7 +274,9 @@ not start empty: give `scion-cache --snapshot DIR --snapshot-repo R` and it
 writes `DIR/R.scnsnap` every `--snapshot-every` seconds, with the most
 recently used objects of that repo, up to `--snapshot-bytes`. Copy the file
 to the node (any copy tool or shared mount) and start the daemon with
-`--seed FILE`: it imports the objects, each checked against its ID, before
+`--seed FILE --seed-full-repo` (the snapshot is a full-repo credential, so
+the daemon refuses the seed without the say-so): it imports the objects,
+each checked against its ID, before
 it serves, and only if its store is empty. A warm daemon ignores the file.
 A snapshot holds every object of the repo, so give a node only repos that
 all its users may read whole: a folder rule hides parts of a repo from a
@@ -342,7 +345,9 @@ A bearer token over plain TCP to a non-loopback address stays refused.
 | [`docs/format-v1.md`](docs/format-v1.md) | The v1 byte format. Object IDs are hashes of these bytes. |
 | [`docs/protocol-v1.md`](docs/protocol-v1.md) | The v1 API contract: calls, limits, status codes, retries, durability and what a client checks |
 | [`docs/cli.md`](docs/cli.md) | Every `scn` command: what it does, its flags, the global flags and env vars, and the exit codes |
+| [`docs/operations.md`](docs/operations.md) | How to run a server: deploy, keys, the access file, Postgres, backups, and what each failure means |
 | [`docs/benchmarks.md`](docs/benchmarks.md) | How the demo and the benchmarks run, what each number means, and how to rerun them |
+| [`docs/RELEASING.md`](docs/RELEASING.md) | For maintainers: how a release is cut and published |
 | [`docs/design/scalable-backend.md`](docs/design/scalable-backend.md) | A design proposal, not built: stateless servers on a shared metadata store and object store |
 
 ## Design notes
@@ -376,8 +381,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 CI also runs `cargo deny check` (license and advisory checks on every
-crate) and the test that follows every relative link in the repo's
-markdown.
+crate), a rustdoc build whose warnings fail the build, and the test that
+follows every relative link in the repo's markdown.
 
 Fuzz the decoders (needs nightly and `cargo-fuzz`):
 

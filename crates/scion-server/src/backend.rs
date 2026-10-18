@@ -1,8 +1,8 @@
 //! The metadata backend of a server: one of the supported databases,
-//! behind [`Meta`](crate::meta::Meta).
+//! behind [`Meta`].
 //!
-//! [`Backend::Sqlite`] is the data directory of [`Store`](crate::store::Store).
-//! [`Backend::Postgres`] is a shared database ([`Pg`](crate::pg::Pg)). A
+//! [`Backend::Sqlite`] is the data directory of [`Store`].
+//! [`Backend::Postgres`] is a shared database (`Pg`). A
 //! caller holds one and calls the [`Meta`] methods; the transaction type
 //! differs per backend, so the queries of a call go through
 //! [`BackendTx`], which forwards them to the backend's own transaction.
@@ -15,7 +15,7 @@ use crate::db::SqliteTx;
 use crate::error::Result;
 use crate::history::NodeId;
 use crate::land::{LandOutcome, LandRequest, LandState};
-use crate::meta::{Meta, MetaTx, RefState, RepoId};
+use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId};
 use crate::pg::{Pg, PgTx};
 use std::path::Path;
 
@@ -99,7 +99,7 @@ fn refuse_postgres_marker(data: &Path) -> Result<()> {
 }
 
 /// The URL of the test database.
-fn test_url() -> Result<String> {
+pub(crate) fn test_url() -> Result<String> {
     std::env::var("SCION_TEST_POSTGRES_URL").map_err(|_| {
         crate::error::Error::InvalidArgument(
             "SCION_TEST_POSTGRES_URL must name the test database".into(),
@@ -109,7 +109,7 @@ fn test_url() -> Result<String> {
 
 /// A database schema name that belongs to `data`, so the tests of one
 /// directory share it and no others see it.
-fn test_schema(data: &Path) -> String {
+pub(crate) fn test_schema(data: &Path) -> String {
     let path = data.canonicalize().unwrap_or_else(|_| data.to_path_buf());
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&path, &mut hasher);
@@ -234,6 +234,10 @@ impl Backend {
         std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres")
     }
 
+    /// The schema that [`Backend::open_test`] gave this data directory on
+    /// Postgres: a test that counts rows through its own Postgres client
+    /// names it the same way. A result, so the callers unwrap one shape.
+    ///
     /// The schema a test backend of this directory uses, when the tests
     /// run on Postgres. Hidden: a test holds a lock in it from a
     /// connection of its own.
@@ -307,6 +311,43 @@ impl Backend {
         if let Self::Sqlite(store) = self {
             store.set_busy_timeout(timeout);
         }
+    }
+
+    /// The import's test hooks and busy-retry count, the same state on
+    /// both backends.
+    #[doc(hidden)]
+    #[must_use]
+    fn hooks(&self) -> &crate::store::ImportHooks {
+        match self {
+            Self::Sqlite(store) => store.hooks(),
+            Self::Postgres(pg) => pg.hooks(),
+        }
+    }
+
+    /// Sets the step the tests run after each batch of the import commits.
+    #[doc(hidden)]
+    pub fn set_after_batch(&self, step: Option<crate::store::AfterBatch>) {
+        self.hooks().set_after_batch(step);
+    }
+
+    /// How many busy retries of the import's batches ran so far.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn busy_retries(&self) -> u64 {
+        self.hooks().busy_retries()
+    }
+
+    /// Runs the test step of a batch boundary, with the count of batches
+    /// done so far.
+    #[doc(hidden)]
+    pub fn run_after_batch(&self, batches: usize) {
+        self.hooks().run_after_batch(batches);
+    }
+
+    /// Counts one busy retry of the import's batch.
+    #[doc(hidden)]
+    pub fn note_busy_retry(&self) {
+        self.hooks().note_busy_retry();
     }
 }
 
@@ -453,28 +494,45 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
-    fn get_view_root(
+    fn get_view_tree(
         &mut self,
         repo: RepoId,
         digest: &[u8; 32],
-        cs: ChangesetId,
+        version: u32,
+        tree: TreeId,
+        ctx: [u8; 32],
     ) -> Result<Option<TreeId>> {
         match self {
-            Self::Sqlite(tx) => tx.get_view_root(repo, digest, cs),
-            Self::Postgres(pg) => pg.get_view_root(repo, digest, cs),
+            Self::Sqlite(tx) => tx.get_view_tree(repo, digest, version, tree, ctx),
+            Self::Postgres(pg) => pg.get_view_tree(repo, digest, version, tree, ctx),
         }
     }
 
-    fn put_view_root(
+    fn put_view_tree(
         &mut self,
         repo: RepoId,
         digest: &[u8; 32],
-        cs: ChangesetId,
-        root: TreeId,
+        version: u32,
+        tree: TreeId,
+        ctx: [u8; 32],
+        view: TreeId,
     ) -> Result<()> {
         match self {
-            Self::Sqlite(tx) => tx.put_view_root(repo, digest, cs, root),
-            Self::Postgres(pg) => pg.put_view_root(repo, digest, cs, root),
+            Self::Sqlite(tx) => tx.put_view_tree(repo, digest, version, tree, ctx, view),
+            Self::Postgres(pg) => pg.put_view_tree(repo, digest, version, tree, ctx, view),
+        }
+    }
+
+    fn delete_stale_view_trees(
+        &mut self,
+        repo: RepoId,
+        live: &[[u8; 32]],
+        version: u32,
+        limit: usize,
+    ) -> Result<usize> {
+        match self {
+            Self::Sqlite(tx) => tx.delete_stale_view_trees(repo, live, version, limit),
+            Self::Postgres(pg) => pg.delete_stale_view_trees(repo, live, version, limit),
         }
     }
 
@@ -545,6 +603,128 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.get_history_node(id),
             Self::Postgres(pg) => pg.get_history_node(id),
+        }
+    }
+
+    fn repos(&mut self) -> Result<Vec<RepoId>> {
+        match self {
+            Self::Sqlite(tx) => tx.repos(),
+            Self::Postgres(pg) => pg.repos(),
+        }
+    }
+
+    fn repo_changesets_after(
+        &mut self,
+        from_repo: RepoId,
+        from_cs: &[u8],
+        limit: usize,
+    ) -> Result<Vec<RepoChangeset>> {
+        match self {
+            Self::Sqlite(tx) => tx.repo_changesets_after(from_repo, from_cs, limit),
+            Self::Postgres(pg) => pg.repo_changesets_after(from_repo, from_cs, limit),
+        }
+    }
+
+    fn repo_changeset_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>> {
+        match self {
+            Self::Sqlite(tx) => tx.repo_changeset_ids(repo),
+            Self::Postgres(pg) => pg.repo_changeset_ids(repo),
+        }
+    }
+
+    fn stored_changeset_body(&mut self, cs: &[u8]) -> Result<Option<Vec<u8>>> {
+        match self {
+            Self::Sqlite(tx) => tx.stored_changeset_body(cs),
+            Self::Postgres(pg) => pg.stored_changeset_body(cs),
+        }
+    }
+
+    fn repo_blob_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>> {
+        match self {
+            Self::Sqlite(tx) => tx.repo_blob_ids(repo),
+            Self::Postgres(pg) => pg.repo_blob_ids(repo),
+        }
+    }
+
+    fn delete_repo_blob(&mut self, repo: RepoId, blob: &[u8]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.delete_repo_blob(repo, blob),
+            Self::Postgres(pg) => pg.delete_repo_blob(repo, blob),
+        }
+    }
+
+    fn any_repo_names(&mut self, blob: &[u8]) -> Result<bool> {
+        match self {
+            Self::Sqlite(tx) => tx.any_repo_names(blob),
+            Self::Postgres(pg) => pg.any_repo_names(blob),
+        }
+    }
+
+    fn changeset_bodies_after(
+        &mut self,
+        from: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.changeset_bodies_after(from, limit),
+            Self::Postgres(pg) => pg.changeset_bodies_after(from, limit),
+        }
+    }
+
+    fn tree_bodies_after(&mut self, from: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.tree_bodies_after(from, limit),
+            Self::Postgres(pg) => pg.tree_bodies_after(from, limit),
+        }
+    }
+
+    fn history_node_bodies_after(
+        &mut self,
+        from: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.history_node_bodies_after(from, limit),
+            Self::Postgres(pg) => pg.history_node_bodies_after(from, limit),
+        }
+    }
+
+    fn repo_blob_rows_after(
+        &mut self,
+        from_repo: RepoId,
+        from_blob: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(RepoId, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.repo_blob_rows_after(from_repo, from_blob, limit),
+            Self::Postgres(pg) => pg.repo_blob_rows_after(from_repo, from_blob, limit),
+        }
+    }
+
+    fn dangling_refs(&mut self) -> Result<Vec<(RepoId, String, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.dangling_refs(),
+            Self::Postgres(pg) => pg.dangling_refs(),
+        }
+    }
+
+    fn lands_with_missing_changesets(&mut self) -> Result<Vec<(i64, Vec<u8>, &'static str)>> {
+        match self {
+            Self::Sqlite(tx) => tx.lands_with_missing_changesets(),
+            Self::Postgres(pg) => pg.lands_with_missing_changesets(),
+        }
+    }
+
+    fn derived_rows_after(
+        &mut self,
+        kind: &str,
+        version: u32,
+        cs: &[u8],
+        limit: usize,
+    ) -> Result<Vec<FsckDerivedRow>> {
+        match self {
+            Self::Sqlite(tx) => tx.derived_rows_after(kind, version, cs, limit),
+            Self::Postgres(pg) => pg.derived_rows_after(kind, version, cs, limit),
         }
     }
 

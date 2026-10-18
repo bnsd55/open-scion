@@ -62,8 +62,8 @@ fn a_gc_of_a_postgres_backed_directory_removes_no_blob_file() {
     );
     assert_eq!(blob_files(dir.path()), before);
 
-    // With --postgres-url the gc runs, and refuses on Postgres with one
-    // line saying why. Still no file touched.
+    // With --postgres-url the gc runs: the collector serves every
+    // backend. The blob is still in use, so no file is removed.
     let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_scion-server"))
         .arg("--data")
@@ -75,10 +75,7 @@ fn a_gc_of_a_postgres_backed_directory_removes_no_blob_file() {
         .env_remove("SCION_TEST_POSTGRES_URL")
         .output()
         .unwrap();
-    assert!(
-        !out.status.success(),
-        "gc on Postgres must be refused: {out:?}"
-    );
+    assert!(out.status.success(), "gc on Postgres must run: {out:?}");
     assert_eq!(blob_files(dir.path()), before);
 }
 
@@ -152,5 +149,37 @@ fn a_write_blocked_by_another_writer_answers_busy_in_seconds() {
     assert!(
         waited < std::time::Duration::from_secs(20),
         "answered after {waited:?}"
+    );
+}
+
+/// `fsck` runs on a Postgres-backed store: a clean store reports nothing,
+/// and a missing blob file is found, through the same metadata interface.
+#[test]
+fn a_fsck_of_a_postgres_backed_store_finds_missing_blob_files() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(dir.path()).unwrap();
+    let repo = store.write(|c| c.create_repo("fsck-pg")).unwrap();
+    let blob = store.blobs().put(b"fsck me\n").unwrap();
+    store.write(|c| c.add_repo_blob(repo, blob)).unwrap();
+    let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
+    assert!(
+        report.problems.is_empty(),
+        "a clean store is clean: {:?}",
+        report.problems
+    );
+
+    // The damage of the guide's example: a file that a row names is gone.
+    std::fs::remove_file(store.blobs().location(blob).1).unwrap();
+    let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.to_string().starts_with(&format!("blob-missing {blob}"))),
+        "{:?}",
+        report.problems
     );
 }
