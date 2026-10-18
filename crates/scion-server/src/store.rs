@@ -1537,11 +1537,6 @@ impl Blobs {
     pub(crate) fn file_exists(&self, id: BlobId) -> bool {
         self.location(id).1.exists()
     }
-        let hex = id.to_string();
-        let dir = self.root.join(&hex[..2]);
-        let path = dir.join(&hex[2..]);
-        (dir, path)
-    }
 
     #[cfg(test)]
     pub(crate) fn full_flushes(&self) -> u64 {
