@@ -200,7 +200,7 @@ impl Readers {
             returned: Condvar::new(),
             open_since: Mutex::new(Vec::new()),
             size,
-            metrics: Mutex::new(None),
+            metrics: std::sync::OnceLock::new(),
         })
     }
 
