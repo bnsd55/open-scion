@@ -89,6 +89,19 @@ jobs:
           PROPTEST_CASES: "64"
           SCION_TEST_BACKEND: postgres
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+      # The takeover test stops the database and restarts it. The service
+      # container of this job is the only postgres:17 on the runner, and
+      # it belongs to this job alone, so it may go down and come back.
+      # It must run after the tests above: it takes the database down
+      # while it runs.
+      - name: the database may go down, and the store recovers
+        run: |
+          container=$(docker ps --filter ancestor=postgres:17 --format '{{.Names}}' | head -1)
+          test -n "$container"
+          SCION_TEST_PG_CONTAINER="$container" \
+          SCION_TEST_BACKEND=postgres \
+          SCION_TEST_POSTGRES_URL=postgres://postgres:scion@localhost:5432/scion \
+          cargo test -p open-scion-server --test backend_refusals -- --ignored
 
   test-macos:
     name: test (macOS)
