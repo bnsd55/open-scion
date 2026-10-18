@@ -74,15 +74,16 @@ fn owner() -> String {
 }
 
 /// One recording: the dm-log-writes pair, its mount, and the marks the
-/// story wrote. The `Drop` takes it all down, best effort.
+/// story wrote. The `Drop` takes it all down, best effort - and only
+/// the loop devices this test attached: a developer's machine may have
+/// mounts of its own that a `losetup -D` would break.
 struct Recording {
-    /// The scratch directory of the images.
     /// The mount of the `ext4` the story was recorded on.
     mount: PathBuf,
     /// The loop device that holds the log, attached for good.
     log_dev: String,
-    /// The loop device that holds the data image, replaced per replay.
-    data_loop: RefCell<String>,
+    /// The loop devices this test attached, detached on the drop.
+    loops: RefCell<Vec<String>>,
     disk: PathBuf,
     /// The mkfs'd data image, restored before every replay.
     pristine: PathBuf,
@@ -126,7 +127,7 @@ impl Recording {
         Self {
             mount: work.join("mnt"),
             log_dev,
-            data_loop: RefCell::new(data_loop),
+            loops: RefCell::new(vec![data_loop.clone(), log_dev.clone()]),
             disk,
             pristine: work.join("disk.pristine.img"),
         }
