@@ -872,6 +872,9 @@ pub struct Blobs {
     /// The test hook that fails an fsync of this backend with EIO: the
     /// file fsync before the rename, and the directory fsync after it.
     fail_fsyncs: std::sync::atomic::AtomicUsize,
+    /// How many fsyncs passed through [`Blobs::fsync_gate`], pass or
+    /// fail: a test reads it to see that a kept file was fsynced.
+    fsync_count: std::sync::atomic::AtomicU64,
 }
 
 impl Blobs {
@@ -928,6 +931,7 @@ impl Blobs {
             fail_writes_errno: std::sync::atomic::AtomicU8::new(28),
             fail_reads: std::sync::atomic::AtomicUsize::new(UNARMED),
             fail_fsyncs: std::sync::atomic::AtomicUsize::new(UNARMED),
+            fsync_count: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1042,7 +1046,6 @@ impl Blobs {
         BlobBatch {
             blobs: self,
             dirs: BTreeSet::new(),
-            written: Vec::new(),
         }
     }
 
@@ -1184,6 +1187,15 @@ impl Blobs {
         }
     }
 
+    /// How many fsyncs passed the gate so far: a test reads it to see
+    /// that a kept file was fsynced, file and directory both.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fsync_count(&self) -> u64 {
+        self.fsync_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Arms the hook that fails an fsync of this backend: it lets the
     /// next `n` fsyncs through, fails the one after with EIO, and lets
     /// the rest through. Zero arms it for the very next fsync. The count
@@ -1201,6 +1213,8 @@ impl Blobs {
     /// fsync leaves the data only in the page cache: the caller must not
     /// answer as if it reached the drive.
     fn fsync_gate(&self, name: &str, operation: &str) -> Result<()> {
+        self.fsync_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         loop {
             let left = self.fail_fsyncs.load(std::sync::atomic::Ordering::SeqCst);
             let pass = match left {
@@ -1584,9 +1598,6 @@ fn too_large() -> Error {
 pub struct BlobBatch<'a> {
     blobs: &'a Blobs,
     dirs: BTreeSet<PathBuf>,
-    /// The final paths this batch renamed into place, so a failed
-    /// directory fsync can take them back.
-    written: Vec<PathBuf>,
 }
 
 impl BlobBatch<'_> {
@@ -1617,6 +1628,22 @@ impl BlobBatch<'_> {
                 // not the first, so a client that uploaded again does not
                 // lose the blob before it names it.
                 self.touch(id)?;
+                // The stored copy may not be durable: another writer's
+                // batch may not have synced yet, and a failed directory
+                // fsync somewhere else may have left it only in the page
+                // cache. This caller makes it durable instead of trusting
+                // the file's presence: fsync the file and the directory,
+                // every time, so a retry after a failed fsync ends with
+                // the blob on the drive and no name is ever removed.
+                let (dir, path) = self.blobs.location(id);
+                let file = fs::File::open(&path)?;
+                self.blobs
+                    .fsync_gate("the stored blob file", "fsync stored blob")?;
+                fsync(&file)?;
+                let name = dir.display().to_string();
+                self.blobs
+                    .fsync_gate(&name, "fsync blob directory")?;
+                fsync_dir(&dir)?;
                 return Ok(());
             }
             // The rename below replaces it in one step. No repo on this
@@ -1656,7 +1683,6 @@ impl BlobBatch<'_> {
         fsync(tmp.as_file())?;
         fs::create_dir_all(&dir)?;
         tmp.persist(&path).map_err(|e| e.error)?;
-        self.written.push(path);
         self.dirs.insert(dir);
         Ok(())
     }
@@ -1718,25 +1744,9 @@ impl BlobBatch<'_> {
     // a bug report or a change to this rename path says a directory entry
     // was lost.
     fn flush_dirs(self) -> Result<bool> {
-        let written = self.written;
         for dir in &self.dirs {
             let name = dir.display().to_string();
-            if self.blobs.fsync_gate(&name, "fsync blob directory").is_err() {
-                // The renames of this batch may not have reached the
-                // drive, and the page cache may still hold their data:
-                // take the files back, so a retry rewrites them instead
-                // of keeping a copy that only looks intact.
-                for path in written.iter().filter(|p| p.parent() == Some(dir)) {
-                    if let Err(error) = fs::remove_file(path) {
-                        tracing::error!(
-                            path = %path.display(),
-                            error = %error,
-                            "cannot take back a blob file whose fsync failed"
-                        );
-                    }
-                }
-                return Err(Error::Io(std::io::Error::from_raw_os_error(5)));
-            }
+            self.blobs.fsync_gate(&name, "fsync blob directory")?;
             fsync_dir(dir)?;
         }
         Ok(!self.dirs.is_empty())

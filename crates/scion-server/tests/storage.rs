@@ -295,7 +295,7 @@ fn a_file_fsync_the_disk_refuses_answers_internal_and_leaves_no_torn_file() {
 }
 
 #[test]
-fn a_dir_fsync_failure_takes_the_renamed_file_back_so_a_retry_rewrites_it() {
+fn a_retry_after_a_failed_dir_fsync_makes_the_kept_file_durable() {
     let (dir, store) = store();
     let kept = store.blobs().put(b"kept\n").unwrap();
     // The next fsync is the temp file's; the one after is the blob
@@ -308,19 +308,23 @@ fn a_dir_fsync_failure_takes_the_renamed_file_back_so_a_retry_rewrites_it() {
         "{error:?}"
     );
     drop(error);
-    // No ack, and the renamed file is taken back: a copy whose data may
-    // be only in the page cache must not stay where a retry would keep
-    // it and skip the write. Nothing is left in tmp either.
+    // No ack. The file stays where the rename put it: a writer never
+    // removes a name, because the same name may already hold a blob that
+    // another writer acknowledged.
     let id = scion_core::BlobId::of(b"later\n");
-    assert!(!blob_path(dir.path(), id).exists());
-    assert!(blob_dirs_are_clean(dir.path()));
-    // The store keeps serving, and the retry rewrites the blob: the
-    // write happens again, because no file holds the name any more.
+    assert!(blob_path(dir.path(), id).exists());
+    // The store keeps serving.
     assert_eq!(store.blobs().get(kept).unwrap(), b"kept\n");
-    let again = store.blobs().put(b"again\n").unwrap();
-    assert_eq!(store.blobs().get(again).unwrap(), b"again\n");
-    // And the blob whose directory fsync failed, put again, lands.
+    // The retry finds the file intact and makes it durable before it
+    // answers: the counter shows the file fsync and the directory fsync
+    // of the keep path, and the directory fsync of the batch's sync.
+    let before = store.blobs().fsync_count();
     let id = store.blobs().put(b"later\n").unwrap();
+    assert_eq!(
+        store.blobs().fsync_count() - before,
+        3,
+        "the kept file was fsynced, file and directory both"
+    );
     assert_eq!(store.blobs().get(id).unwrap(), b"later\n");
 }
 
