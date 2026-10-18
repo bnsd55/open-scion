@@ -2134,19 +2134,16 @@ mod tests {
         assert!(read_all(second).await == data, "the second reply");
     }
 
+    type Blocker = (
+        std::thread::JoinHandle<Result<(), crate::error::Error>>,
+        std::sync::mpsc::Sender<()>,
+    );
+
     /// Holds every read connection of `store`: one thread per reader,
     /// each parked in a read until its own release, announcing itself on
     /// the returned channel. A blocker that dies before its release fails
     /// its step in seconds, and cannot trap its siblings in a barrier.
-    fn hold_read_connections(
-        store: &Backend,
-    ) -> (
-        Vec<(
-            std::thread::JoinHandle<Result<(), crate::error::Error>>,
-            std::sync::mpsc::Sender<()>,
-        )>,
-        std::sync::mpsc::Receiver<()>,
-    ) {
+    fn hold_read_connections(store: &Backend) -> (Vec<Blocker>, std::sync::mpsc::Receiver<()>) {
         let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
         let blockers = (0..crate::store::READERS)
             .map(|i| {

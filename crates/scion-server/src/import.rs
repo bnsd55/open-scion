@@ -1003,8 +1003,11 @@ mod tests {
         in_rx
             .recv_timeout(Duration::from_secs(30))
             .unwrap_or_else(|_| panic!("the land never moved the ref"));
-        let moved = point_ref(&importer, repo, "main", tip);
+        // The import starts its check while the land's transaction still
+        // holds the write lock: it reads `root`, then waits to write, like
+        // it would against a live land.
         moved_tx.send(()).unwrap();
+        let moved = point_ref(&importer, repo, "main", tip);
         assert!(land.join().unwrap().unwrap());
         // The swap lost, and the check again sees that main has diverged.
         assert!(
