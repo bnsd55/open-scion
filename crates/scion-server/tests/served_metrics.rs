@@ -16,7 +16,6 @@ use scion_server::{Backend, service};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tonic::service::interceptor::{InterceptedService, Interceptor};
-use tonic::transport::Channel;
 use tonic::{Request, Status};
 
 const REPO: &str = "main";
