@@ -3231,7 +3231,7 @@ mod tests {
                 "a kept blob was written again"
             );
             assert!(
-                log.iter().any(|s| *s == S::StoredFileFsync(*id)),
+                log.contains(&S::StoredFileFsync(*id)),
                 "no stored-file fsync before the answer"
             );
             let (dir, _) = store.blobs().location(*id);
