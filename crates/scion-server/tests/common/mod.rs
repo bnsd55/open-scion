@@ -133,6 +133,9 @@ impl Server {
                 // Plain log lines, so the address parses without escape
                 // codes.
                 .env("NO_COLOR", "1")
+                // The write park of the two-process race test: inert
+                // unless a test creates a park file for a blob.
+                .env("SCION_TEST_PARK_WRITES", "1")
                 .env("RUST_LOG", "info")
                 .stdout(log_file.try_clone().unwrap())
                 .stderr(log_file)

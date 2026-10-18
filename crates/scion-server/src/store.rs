@@ -128,6 +128,51 @@ impl ImportHooks {
     }
 }
 
+/// The write park of the test that races two processes onto one blob
+/// ([#268]). With `SCION_TEST_PARK_WRITES` in the environment, a writer
+/// whose `keep` found the blob missing parks while the park file of that
+/// blob's ID exists next to the data directory. The spawned server picks
+/// the variable up at start, so a test parks the writer of a real
+/// process; the park file is the release.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Default)]
+pub struct WritePark {
+    enabled: bool,
+    root: PathBuf,
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+impl WritePark {
+    /// Arms the park from the environment, over the data root.
+    pub(crate) fn from_env(root: &Path) -> Self {
+        Self {
+            enabled: std::env::var_os("SCION_TEST_PARK_WRITES").is_some(),
+            root: root.to_owned(),
+        }
+    }
+
+    /// Parks the caller while the park file of `id` exists. The writer
+    /// holds its stripe all the while, so no same-blob write of this
+    /// process moves either. The ceiling bounds the park of the good
+    /// code: a park nobody lifts fails the holder, not the whole store.
+    pub fn park(&self, id: &BlobId) {
+        if !self.enabled {
+            return;
+        }
+        let file = self.root.join("hooks").join(format!("park-{id}"));
+        let give_up = Instant::now() + Duration::from_secs(60);
+        while file.exists() {
+            assert!(
+                Instant::now() < give_up,
+                "the park of {id} was never lifted"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
 /// Handle to one data directory. Cheap to clone.
 #[derive(Clone)]
 pub struct Store {
@@ -856,7 +901,6 @@ pub enum BlobStatus {
 }
 
 /// Immutable file contents, one zstd-compressed file per [`BlobId`].
-/// Immutable file contents, one zstd-compressed file per [`BlobId`].
 pub struct Blobs {
     root: PathBuf,
     /// The staging folder for temp files of every process.
@@ -871,6 +915,9 @@ pub struct Blobs {
     /// in this process, so two puts of the same bytes never race their
     /// renames onto one path ([#185]).
     write_locks: Vec<Mutex<()>>,
+    /// The test park of the write path, armed by the environment.
+    #[cfg(any(test, feature = "test-hooks"))]
+    park: WritePark,
     group_flush: GroupFlush,
     /// Calls to [`Blobs::verify`] so far.
     #[cfg(test)]
@@ -946,6 +993,8 @@ impl Blobs {
             mine,
             _mine_lock: mine_lock,
             write_locks: (0..WRITE_STRIPES).map(|_| Mutex::new(())).collect(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            park: WritePark::from_env(&root),
             group_flush: GroupFlush::default(),
             #[cfg(test)]
             verifies: std::sync::atomic::AtomicU64::default(),
@@ -1684,6 +1733,11 @@ impl BlobBatch<'_> {
             BlobStatus::Corrupt => tracing::warn!(blob = %id, "rewriting a corrupt blob file"),
             BlobStatus::Missing => {}
         }
+        // The test seam of [#268]: the writer has passed keep and holds
+        // its stripe, and parks here while the park file exists, so the
+        // rename lands after another process's rename of the same path.
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.blobs.park.park(&id);
         self.replace(id, len, raw)
     }
 

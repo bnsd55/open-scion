@@ -806,76 +806,13 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
     }
 }
 
-/// Prepares the race's git repository: one commit of `files` files, each
-/// holding fresh bytes the test also puts through the server. Returns the
-/// bytes, newest file last, so the puts run against the import's writes.
-fn prepare_race_repo(git_dir: &Path, rng: &mut Rng, files: usize) -> Vec<Vec<u8>> {
-    fs::create_dir_all(git_dir).unwrap();
-    git(git_dir, &["init", "-q"]);
-    let mut contents = Vec::new();
-    for i in 0..files {
-        let content = rng.bytes(2 << 10);
-        fs::write(git_dir.join(format!("f{i:04}.bin")), &content).unwrap();
-        contents.push(content);
-    }
-    git(git_dir, &["add", "."]);
-    git(git_dir, &["commit", "-q", "-m", "the race"]);
-    contents
-}
-
-/// Splits a trace line's `lfs_rename(from=...,to=...)` into its two paths.
-fn parse_rename(line: &str) -> Option<(&str, &str)> {
-    let rest = line.split("lfs_rename(from=").nth(1)?;
-    let (from, to) = rest.split_once(",to=")?;
-    Some((from, to.trim_end_matches(')')))
-}
-
-/// Counts the blob paths of a `LazyFS` ops trace that the import renamed
-/// after the server did: `from`'s tmp folder starts with the writer's
-/// process id, so each rename has an owner, and a rename of the import
-/// that follows one of the server on the same path is the overlap the
-/// per-process lock cannot see.
-fn import_renamed_after_the_server(trace: &str, server_tmp: &str, import_tmp: &str) -> usize {
-    // For every blob path: when each process last renamed onto it.
-    let mut server_at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    let mut import_at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for (seq, line) in trace
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| line.contains("lfs_rename"))
-    {
-        let Some((from, to)) = parse_rename(line) else {
-            continue;
-        };
-        if !to.contains("/objects/") {
-            continue;
-        }
-        if from.contains(server_tmp) {
-            server_at.insert(to, seq);
-        } else if from.contains(import_tmp) {
-            import_at.insert(to, seq);
-        }
-    }
-    import_at
-        .iter()
-        .filter(|(dest, import_seq)| {
-            server_at
-                .get(*dest)
-                .is_some_and(|server_seq| server_seq < import_seq)
-        })
-        .count()
-}
-
-/// Two processes rename onto the same blob paths under `LazyFS`: the
-/// server, from client puts, and a second `scion-server` process, from an
-/// import of ~200 git files whose bytes the client also puts, in reverse
-/// order, while the import runs. The stripe lock is per-`Blobs`, that is
-/// per process, so this race is exactly the one it cannot see. The test
-/// fails unless the processes truly overlapped: the import must have
-/// written a file whose bytes a put put during the import's run. The run
-/// of 2026-10-18 that found ESTALE in wave 0 was one process; this test
-/// is the two-process form. If it fails, the lock must be shared across
-/// processes (a lock file per stripe).
+/// Two processes rename onto the same blob path, deterministically: the
+/// server's writer parks on the test seam after its keep found the blob
+/// missing, the import writes and renames the same bytes, and the
+/// release lets the server's rename land after the import's. The ops
+/// trace names every rename, so the test asserts the order itself, then
+/// freezes, cuts, kills and reopens from the backing: the raced blob
+/// verifies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn import_process_races_the_server_on_the_same_blob() {
     if !may_run() {
@@ -884,23 +821,34 @@ async fn import_process_races_the_server_on_the_same_blob() {
     let lazyfs = lazyfs_dir().unwrap();
     let seed = seed();
     let mut rng = Rng::new(seed);
-    let files = usize::try_from(env("SCION_IMPORT_RACE_FILES", 200)).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("import-race-server.log");
     let mut lazy = Lazyfs::start(dir.path(), &lazyfs, 300);
     let data = lazy.mount.join("data");
     create_repo(&data);
     let mut server = Server::start(&data, &log);
-    let (mut scion, _objects) = connect(&server.url).await.unwrap();
-    let mut acked = Vec::new();
-    // A git repository for the import process: one commit whose files
-    // hold the same bytes the client puts, so the import writes the blobs
-    // the server writes.
+    let (mut scion, _objects) = tokio::time::timeout(Duration::from_secs(30), connect(&server.url))
+        .await
+        .unwrap_or_else(|_| panic!("the client never connected"))
+        .unwrap();
+    // One blob both processes write: the import commits it, the client
+    // puts it, and the park holds the server's writer between keep and
+    // rename while the import renames the same path.
+    let content = rng.bytes(2 << 10);
+    let want = BlobId::of(&content);
+    let park = park_file(&data, &want);
+    fs::create_dir_all(data.join("hooks")).unwrap();
+    fs::write(&park, b"").unwrap();
+    // A git repository for the import process: one commit whose file
+    // holds the same bytes the client puts.
     let git_dir = dir.path().join("git");
-    let contents = prepare_race_repo(&git_dir, &mut rng, files);
+    fs::create_dir_all(&git_dir).unwrap();
+    git(&git_dir, &["init", "-q"]);
+    fs::write(git_dir.join("f.bin"), &content).unwrap();
+    git(&git_dir, &["add", "."]);
+    git(&git_dir, &["commit", "-q", "-m", "the race"]);
     // The import starts first: opening the store on FUSE and reading git
-    // takes long enough that the client's puts land inside its run, and
-    // both processes rename onto the same blob paths at once.
+    // take a moment, and the client's put parks the server meanwhile.
     let import = common::spawn_guard::across_spawn(|| {
         Command::new(env!("CARGO_BIN_EXE_scion-server"))
             .args([
@@ -915,81 +863,71 @@ async fn import_process_races_the_server_on_the_same_blob() {
             .spawn()
     })
     .unwrap();
-    let started = Instant::now();
-    // The client puts the same bytes, newest file first: the import
-    // commits them oldest first, so the puts of the later files race the
-    // import's writes of the earlier ones.
-    for content in contents.iter().rev() {
-        let id = put_blob(&mut scion, content).await.unwrap();
-        acked.push((id, content.clone()));
-    }
-    eprintln!(
-        "the import and {} puts overlapped for {} ms",
-        acked.len(),
-        started.elapsed().as_millis()
-    );
-    // The import runs behind a ceiling that kills it: a stuck child dies
-    // at the ceiling, the wait returns, and the assert names the step.
-    let import_pid = import.id();
-    let killer = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(120));
-        let _ = rustix::process::kill_process(
-            rustix::process::Pid::from_raw(import_pid.cast_signed()).unwrap(),
-            rustix::process::Signal::KILL,
+    let import_handle = Mutex::new(Some(std::thread::spawn(move || import.wait_with_output())));
+    let mut put = tokio::spawn(async move { put_blob(&mut scion, &content).await });
+    // The import renames the raced blob while the server's writer sits
+    // in the park. The trace names every rename, so the wait reads it.
+    let blob_name = format!("blob/{want}");
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
+        let renamed = trace
+            .lines()
+            .any(|line| line.contains("lfs_rename") && line.contains(&blob_name));
+        assert!(
+            renamed || Instant::now() < until,
+            "the import never renamed the raced blob"
         );
-    });
-    let import = std::thread::spawn(move || import.wait_with_output());
-    let mut import = Some(import);
-    let out = wait_for("the import to finish", 130, || {
-        let finished = import.as_ref().unwrap().is_finished();
+        if renamed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The release ends the park: the server's rename lands after the
+    // import's, on the same path.
+    fs::remove_file(&park).unwrap();
+    let id = tokio::time::timeout(Duration::from_secs(30), &mut put)
+        .await
+        .unwrap_or_else(|_| panic!("the parked put never finished"))
+        .unwrap();
+    assert_eq!(id, want);
+    let import = wait_for("the import to finish", 60, || {
+        let finished = import_handle
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|h| h.is_finished());
         finished.then(|| {
-            import
+            import_handle
+                .lock()
+                .unwrap()
                 .take()
                 .unwrap()
                 .join()
                 .unwrap()
-                .unwrap_or_else(|error| panic!("waiting for the import failed: {error}"))
         })
     });
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let stderr = String::from_utf8_lossy(&import.stderr).into_owned();
     assert!(
-        out.status.success(),
+        import.status.success(),
         "the import failed: {:?}: {stderr}",
-        out.status
-    );
-    drop(killer);
-    // The race test fails when the processes did not overlap: the ops
-    // trace must show a blob path the import renamed AFTER the server
-    // renamed it. The from= folder names the writer's tmp folder, whose
-    // name starts with its process id, so each rename has an owner.
-    let server_tmp = format!("/tmp/{:x}-", server.pid());
-    let import_tmp = format!("/tmp/{import_pid:x}-");
-    let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
-    let raced = import_renamed_after_the_server(&trace, &server_tmp, &import_tmp);
-    eprintln!("{raced} blob paths were renamed by the import after the server");
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert!(
-        out.status.success(),
-        "the import failed: {:?}: {stderr}",
-        out.status
-    );
-    assert!(
-        raced > 0,
-        "the import never renamed after the server: the puts and the import did not overlap"
+        import.status
     );
     server.freeze();
     lazy.cut();
     drop(scion);
     drop(server);
     // What both processes acknowledged survives: the blob verifies from
-    // the backing, where only synced writes live. The mount goes down
-    // after the backing path is taken, and its exit changes nothing.
+    // the backing, where only synced writes live.
     let backing = lazy.backing.join("data");
     drop(lazy);
     let store = Store::open_shared(&backing).unwrap();
-    for (id, _) in &acked {
-        let status = store.blobs().verify(*id).unwrap();
-        assert_eq!(status, BlobStatus::Valid, "raced blob {id}");
-    }
+    let status = store.blobs().verify(id).unwrap();
+    assert_eq!(status, BlobStatus::Valid, "raced blob {id}");
     drop(store);
+}
+
+/// The park file of one blob, under the data directory's hooks folder.
+fn park_file(data: &Path, id: &BlobId) -> PathBuf {
+    data.join("hooks").join(format!("park-{id}"))
 }
