@@ -291,28 +291,6 @@ impl Readers {
         self.metrics.get().cloned()
     }
 
-    /// Gives the pool the server's metrics registry.
-    fn set_metrics(&self, metrics: Arc<Metrics>) {
-        let _ = self.metrics.set(metrics);
-        self.report_busy();
-    }
-
-    /// How many readers are out of the pool, for the busy gauge.
-    fn report_busy(&self) {
-        let idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
-        let busy = self.size.saturating_sub(idle.len());
-        drop(idle);
-        if let Some(metrics) = self.metrics() {
-            metrics.pg_readers_busy(u64::try_from(busy).unwrap_or(u64::MAX));
-        }
-    }
-
-    /// The metrics to record into, if the server gave the backend its
-    /// registry.
-    fn metrics(&self) -> Option<Arc<Metrics>> {
-        self.metrics.get().cloned()
-    }
-
     /// Gives the pool the server's metrics registry. Set once: a second
     /// set is a no-op, and says so in the debug log.
     fn set_metrics(&self, metrics: Arc<Metrics>) {
