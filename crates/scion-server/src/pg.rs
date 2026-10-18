@@ -3101,7 +3101,13 @@ mod pool_tests {
                 READER_WAIT,
             )
             .unwrap_err();
-        assert!(matches!(err, Error::Pg(_)), "{err}");
+        // SQLSTATE 57014 is the statement clock, and map_pg_error gives
+        // it the deadline answer, as for a SQLite write past its busy
+        // timeout.
+        assert!(
+            matches!(err, Error::DeadlineExceeded(_)),
+            "the cancelled read came back as {err}"
+        );
         // The reader returned: the next read runs at once.
         let again = pg.read(|tx| {
             tx.c.query_opt("SELECT 1", &[])
@@ -3279,9 +3285,9 @@ mod pool_tests {
             .lines()
             .find(|line| line.starts_with("scion_pg_pool_wait_seconds_sum "))
             .and_then(|line| line.rsplit(' ').next())
-            .and_then(|n| n.parse::<u64>().ok())
-            .unwrap_or(0);
-        assert!(sum > 0, "sum {sum}");
+            .and_then(|n| n.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        assert!(sum > 0.0, "sum {sum}");
         assert_eq!(pg.tx_age(), Duration::ZERO);
     }
 
