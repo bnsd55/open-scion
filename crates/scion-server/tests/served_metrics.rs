@@ -10,6 +10,8 @@ use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest};
 
 use scion_server::access::Access;
+use std::collections::BTreeMap;
+
 use scion_server::meta::{Meta as _, MetaTx as _};
 use scion_server::metrics::Metrics;
 use scion_server::tickets::Keys;
@@ -70,7 +72,7 @@ async fn served() -> (
                     },
                     committer: None,
                     message: b"root\n".to_vec(),
-                    changes: Default::default(),
+                    changes: BTreeMap::new(),
                 },
             )?;
             c.cas_ref(repo, "main", None, root)?;
