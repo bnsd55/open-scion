@@ -41,9 +41,32 @@ fn a_gc_of_a_postgres_backed_directory_removes_no_blob_file() {
     }
     let dir = tempfile::tempdir().unwrap();
     let store = Backend::open_test(dir.path()).unwrap();
-    store.blobs().put(b"kept").unwrap();
+    let repo = store.write(|c| c.create_repo("kept")).unwrap();
+    let blob = store.blobs().put(b"kept").unwrap();
+    store.write(|c| c.add_repo_blob(repo, blob)).unwrap();
     let before = blob_files(dir.path());
     assert!(!before.is_empty(), "the blob made one file");
+
+    // The collector serves every backend, in the process of this test:
+    // a subprocess would open the whole database, whose one-server lock
+    // and store UUID belong to no test schema. A long grace keeps
+    // everything: the collector sees the row and the file, and keeps
+    // both.
+    let report = scion_server::gc::run(
+        &store,
+        std::time::Duration::from_secs(3600),
+        false,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(
+        report.rows_young, 1,
+        "the collector saw the blob: {report:?}"
+    );
+    assert_eq!(report.files_young, 1, "{report:?}");
+    assert_eq!(report.rows_pruned, 0, "{report:?}");
+    assert_eq!(report.files_removed, 0, "{report:?}");
+    assert_eq!(blob_files(dir.path()), before);
     drop(store);
 
     // Without --postgres-url the open is refused: the directory says its
@@ -60,22 +83,6 @@ fn a_gc_of_a_postgres_backed_directory_removes_no_blob_file() {
         !out.status.success(),
         "gc without --postgres-url must be refused: {out:?}"
     );
-    assert_eq!(blob_files(dir.path()), before);
-
-    // With --postgres-url the gc runs: the collector serves every
-    // backend. The blob is still in use, so no file is removed.
-    let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_scion-server"))
-        .arg("--data")
-        .arg(dir.path())
-        .arg("--postgres-url")
-        .arg(&url)
-        .arg("gc")
-        .env_remove("SCION_TEST_BACKEND")
-        .env_remove("SCION_TEST_POSTGRES_URL")
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "gc on Postgres must run: {out:?}");
     assert_eq!(blob_files(dir.path()), before);
 }
 

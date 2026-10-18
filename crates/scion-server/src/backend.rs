@@ -221,6 +221,7 @@ impl Backend {
     /// the test that takes the lock from its own connection, as a
     /// second server process would.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_server_lock(data: &Path) -> Result<i64> {
         Ok(crate::pg::schema_lock_key(&test_schema(data)))
     }
