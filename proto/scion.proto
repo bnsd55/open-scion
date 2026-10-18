@@ -30,8 +30,9 @@ service Scion {
 
   // Read path.
 
-  // Deprecated: use Objects.ResolveRef, which a cache tier forwards. Kept so
-  // existing clients still work; both share one implementation.
+  // Deprecated: use Objects.ResolveRef. Kept so existing clients still
+  // work; both share one implementation. A tier serves GetObjects only and
+  // refuses both with UNIMPLEMENTED: the client asks the server for both.
   rpc ResolveRef(ResolveRefRequest) returns (ResolveRefResponse);
   // Streams the ChangesetV1 bytes in parts, as ReadFile streams a file.
   rpc GetChangeset(GetChangesetRequest) returns (stream GetChangesetResponse);
@@ -79,7 +80,8 @@ service Scion {
 // asks only for the objects it wants, starting at the root tree, and checks
 // each object against its ID on arrival.
 service Objects {
-  // Where a ref points. Mutable: a tier forwards it and never caches it.
+  // Where a ref points. Mutable. A client resolves it on the server: a
+  // tier serves GetObjects only, and refuses this call.
   rpc ResolveRef(ResolveRefRequest) returns (ResolveRefResponse);
   // The root tree of a changeset.
   rpc GetRootTree(GetRootTreeRequest) returns (GetRootTreeResponse);

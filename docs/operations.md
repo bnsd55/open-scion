@@ -12,7 +12,8 @@ The pieces:
   zstd file per blob), `tmp/` (staging), and three lock files. A second
   server on the same directory refuses to start.
 - `scion-cache` — a regional tier in front of the server. Keeps objects in
-  memory, answers object reads, forwards everything else.
+  memory and answers object reads only: a client resolves refs and gets its
+  read tickets from the server, which the tier refuses to serve itself.
 - `scion-daemon` — one per machine user, in front of a cache. Keeps objects
   on disk, serves on a private Unix socket. One daemon serves one OS user.
 
@@ -50,8 +51,9 @@ file instead (see "Tokens: one, or an access file", below).
 
 ### Server and a regional cache
 
-A cache serves object reads to a region and forwards everything else. Each
-hop has its own token pair: what the tier requires from its clients
+A cache serves object reads to a region and refuses every other call
+(`UNIMPLEMENTED`): the client resolves refs and reads paths on the server,
+and asks the cache only for objects. Each hop has its own token pair:
 (`--token`), and what it sends upstream (`--upstream-token`). A `scn`
 client's `--token` is what it sends, the other side of the pair of the tier
 in front of it.
@@ -95,10 +97,12 @@ daemon. With the chain above, the daemon of a user runs
 `--token <USER_TOKEN>`, where `<USER_TOKEN>` is that user's token at the
 server too. A new node can start warm: copy a snapshot file from the cache
 (`--snapshot DIR --snapshot-repo R`, refreshed every `--snapshot-every`
-seconds) and start the daemon with `--seed FILE`. A snapshot holds every
-object of its repo by ID, so snapshot only repos that ALL the node's users
-may read WHOLE: a seeded daemon serves paths that folder read rules hide,
-because it checks objects, not rules.
+seconds) and start the daemon with `--seed FILE --seed-full-repo`. A snapshot
+holds every object of its repo by ID, so it is a full-repo credential: anyone
+who has the file can read what a folder read rule would hide from a partial
+reader, and a seeded daemon serves those paths, because it checks objects, not
+rules. The daemon refuses a seed without `--seed-full-repo`, which says that
+every user of this node may read the repo whole; snapshot only such repos.
 
 ### The metadata in Postgres
 
@@ -212,8 +216,13 @@ reach either way.
 
 Snapshots interact with the rules: a snapshot holds every object of its
 repo by ID, so a daemon seeded from one serves paths that folder read
-rules hide. Snapshot only repos that all of a node's users may read whole
-(see "Server, cache, and a daemon per user").
+rules hide. Snapshot only repos that all of a node's users may read whole,
+and say so with `--seed-full-repo` (see "Server, cache, and a daemon per
+user"). Two side channels stay even without a seed: a partial reader sees
+the real changeset IDs of its view, so a new ID under a view root whose
+objects it cannot fetch shows that a hidden-only change landed; and the
+cache's walk metrics count objects a partial reader asked for that the
+walk refused. Metrics are for the operator, not for the readers.
 
 ### Network and TLS
 
@@ -383,7 +392,8 @@ the process, scraped from there. The names:
 
 **Health.** The server, cache and daemon answer standard gRPC health checks
 (`grpc.health.v1.Check` and `Watch`) on their serving port, without a
- token, for the services `scion.v1.Scion` and `scion.v1.Objects`. The server
+token: the server's health covers the services `scion.v1.Scion` and
+`scion.v1.Objects`, a tier's covers `scion.v1.Objects`. The server
 serves no gRPC reflection, so a probe tool must know the health protocol
 itself (`grpc_health_probe` does).
 
