@@ -14,7 +14,7 @@
 //! the `replay-log` tool (the CI step builds it and names it with
 //! `SCION_DMW_REPLAY`). Plain `cargo test` skips it, like the disk-full
 //! suite skips without its variable.
-use scion_server::Store as _;
+use scion_server::{Backend, Store as _};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
