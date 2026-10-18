@@ -10,8 +10,8 @@ use scion_proto::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{BlameChangeset, BlameRange, BlameRequest};
 use scion_server::access::Access;
-use scion_server::meta::MetaTx as _;
-use scion_server::{Store, service};
+use scion_server::meta::{Meta as _, MetaTx as _};
+use scion_server::{Backend, Store, service};
 use tokio::net::TcpListener;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -75,9 +75,9 @@ fn commit(
 
 /// A store whose repo has one root changeset that puts `file.txt` with
 /// `root_body`, written by a 4-byte author.
-fn store(root_body: &[u8]) -> (tempfile::TempDir, Store, ChangesetId) {
+fn store(root_body: &[u8]) -> (tempfile::TempDir, Backend, ChangesetId) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
     let blob = store.blobs().put(root_body).unwrap();
     let root = store
         .write(|c| {
@@ -92,7 +92,7 @@ fn store(root_body: &[u8]) -> (tempfile::TempDir, Store, ChangesetId) {
 }
 
 /// Stores `content` as a blob, as an upload would.
-fn put(store: &Store, content: &[u8]) -> BlobId {
+fn put(store: &Backend, content: &[u8]) -> BlobId {
     let blob = store.blobs().put(content).unwrap();
     store
         .write(|c| {
@@ -115,7 +115,7 @@ fn whole_access() -> Access {
 
 /// Serves `store` with `access`, and returns the stop signal and a client
 /// that sends `token`.
-async fn serve(store: &Store, access: Access, token: &str) -> (Stop, Scion) {
+async fn serve(store: &Backend, access: Access, token: &str) -> (Stop, Scion) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -265,7 +265,7 @@ async fn a_line_longer_than_a_stream_part_is_blamed_whole() {
 /// and `count` children, the `i`-th rewriting line `i + 1` with
 /// `gen {i}`, with `name_len`-byte author names. The blame of the tip
 /// names every child, one per line.
-fn seam_store(name_len: usize, count: usize) -> (tempfile::TempDir, Store, Vec<ChangesetId>) {
+fn seam_store(name_len: usize, count: usize) -> (tempfile::TempDir, Backend, Vec<ChangesetId>) {
     let seed: Vec<u8> = (1..=count)
         .map(|line| format!("line {line}\n"))
         .collect::<Vec<_>>()

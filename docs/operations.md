@@ -100,6 +100,52 @@ object of its repo by ID, so snapshot only repos that ALL the node's users
 may read WHOLE: a seeded daemon serves paths that folder read rules hide,
 because it checks objects, not rules.
 
+### The metadata in Postgres
+
+By default the data directory keeps its metadata in its own SQLite file. With
+`--postgres-url`, the server keeps it in a Postgres database instead, so it
+can be administered and replicated with the Postgres tooling you already
+run, and outlives one machine. The blob files stay in the data directory in
+every backend: they are the big majority of the bytes, and the database
+never stores them.
+
+```sh
+scion-server --data /srv/scion \
+  --postgres-url postgres://user@dbhost/scion \
+  --postgres-ca /srv/scion/db-ca.pem serve --access /srv/scion/access.txt
+```
+
+- `--postgres-url` names the database. `--postgres-ca` (a PEM file) is
+  required when that host is not this machine: the database must present a
+  certificate it signed, and there is no mode that accepts any certificate.
+  A host on this machine (`localhost`, a loopback address) may go without
+  it.
+- The open checks the database runs `synchronous_commit=on`: a returned
+  commit must be durable. A database that answers otherwise is refused.
+- The open migrates the database's schema to this build's version, one
+  transaction per migration, under a database lock, so a server and an
+  import started together take turns. A database of a newer build is
+  refused: run that build's server.
+- One server process serves one database: a second `serve` on the same
+  `--postgres-url` fails at its open with "another server holds this
+  database". An import does not take that lock and runs beside a server.
+- A write that waits for another writer's lock gives up after 5 s and
+  answers unavailable, like the SQLite store past its busy timeout; the
+  client retries.
+- `fsck` and `gc` read the data directory's own database, so on a
+  Postgres-backed server both refuse to run with exit 2.
+- The choice is recorded in the data directory's `backend` file: a
+  `--postgres-url` open refuses a directory that holds SQLite metadata, and
+  a plain open refuses a directory it names, so a second, empty store
+  cannot grow beside the database.
+
+Backup and restore of a Postgres-backed server: `pg_dump` the database
+first, then copy the data directory. A changeset in the dump names only
+blob files that existed when the dump was taken, and a blob file is written
+before its database row commits, so the later copy holds every file the
+dump names. Restore into a fresh database, copy the data directory back,
+start the server with the same `--postgres-url`.
+
 ### Tokens: one, or an access file
 
 `--token` and `--access` are exclusive. An access file names tokens by their
