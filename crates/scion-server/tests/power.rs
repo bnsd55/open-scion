@@ -917,7 +917,7 @@ async fn import_process_races_the_server_on_the_same_blob() {
     );
     server.freeze();
     lazy.cut();
-    drop(scion);
+    // The client moved into the parked put's task: it ends with it.
     drop(server);
     // What both processes acknowledged survives: the blob verifies from
     // the backing, where only synced writes live.
