@@ -56,9 +56,15 @@ struct Cli {
     max_streams: NonZeroU32,
     /// A snapshot from scion-cache (`--snapshot`) to start from. Read only
     /// if the store holds no object: each object is checked against its ID
-    /// and stored before the daemon serves. Repeat for more.
+    /// and stored before the daemon serves. Repeat for more. Seeding one is
+    /// refused without `--seed-full-repo`.
     #[arg(long, value_name = "FILE")]
     seed: Vec<PathBuf>,
+    /// Say that every `--seed` snapshot is a full-repo credential: whoever
+    /// has the file can read its whole repo, so every user of this daemon
+    /// may read that repo whole. A snapshot without this say-so is refused.
+    #[arg(long, requires = "seed")]
+    seed_full_repo: bool,
     /// Most bytes that the stalled replies of one connection may hold. A
     /// connection over it is closed with them.
     #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
@@ -75,6 +81,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let cli = Cli::parse();
     anyhow::ensure!(!cli.token.is_empty(), "--token must not be empty");
+    anyhow::ensure!(
+        cli.seed.is_empty() || cli.seed_full_repo,
+        "refusing to seed without --seed-full-repo: a snapshot is a \
+         full-repo credential, it holds every object of its repo, so whoever \
+         has the file can read what a folder rule would hide from a partial \
+         reader; pass --seed-full-repo when every user of this daemon may \
+         read the repo whole"
+    );
     let store = DiskStore::open(&cli.data, cli.max_bytes)
         .with_context(|| format!("cannot open data directory {}", cli.data.display()))?;
     let client_tls = ClientTls::load(

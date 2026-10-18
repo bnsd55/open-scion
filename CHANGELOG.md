@@ -477,6 +477,12 @@ until that section gets its release date.
 
 ### Changed
 
+- `scion-daemon --seed` refuses a snapshot unless the operator passes
+  `--seed-full-repo`, which says every user of the node may read the
+  seeded repo whole: a snapshot holds every object of its repo, so the
+  file is a full-repo credential, and a seeded daemon serves paths that
+  folder read rules hide.
+
 - A partial reader's view is memoized per tree (`#121`): a derivation asks
   the `view_trees` table at every directory, so a new changeset re-derives
   only the folders on its changed paths, and the rest of the view comes

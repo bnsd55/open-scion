@@ -95,10 +95,12 @@ daemon. With the chain above, the daemon of a user runs
 `--token <USER_TOKEN>`, where `<USER_TOKEN>` is that user's token at the
 server too. A new node can start warm: copy a snapshot file from the cache
 (`--snapshot DIR --snapshot-repo R`, refreshed every `--snapshot-every`
-seconds) and start the daemon with `--seed FILE`. A snapshot holds every
-object of its repo by ID, so snapshot only repos that ALL the node's users
-may read WHOLE: a seeded daemon serves paths that folder read rules hide,
-because it checks objects, not rules.
+seconds) and start the daemon with `--seed FILE --seed-full-repo`. A snapshot
+holds every object of its repo by ID, so it is a full-repo credential: anyone
+who has the file can read what a folder read rule would hide from a partial
+reader, and a seeded daemon serves those paths, because it checks objects, not
+rules. The daemon refuses a seed without `--seed-full-repo`, which says that
+every user of this node may read the repo whole; snapshot only such repos.
 
 ### The metadata in Postgres
 
@@ -210,8 +212,13 @@ reach either way.
 
 Snapshots interact with the rules: a snapshot holds every object of its
 repo by ID, so a daemon seeded from one serves paths that folder read
-rules hide. Snapshot only repos that all of a node's users may read whole
-(see "Server, cache, and a daemon per user").
+rules hide. Snapshot only repos that all of a node's users may read whole,
+and say so with `--seed-full-repo` (see "Server, cache, and a daemon per
+user"). Two side channels stay even without a seed: a partial reader sees
+the real changeset IDs of its view, so a new ID under a view root whose
+objects it cannot fetch shows that a hidden-only change landed; and the
+cache's walk metrics count objects a partial reader asked for that the
+walk refused. Metrics are for the operator, not for the readers.
 
 ### Network and TLS
 
