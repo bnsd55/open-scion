@@ -867,7 +867,9 @@ async fn import_process_races_the_server_on_the_same_blob() {
     let mut put = tokio::spawn(async move { put_blob(&mut scion, &content).await });
     // The import renames the raced blob while the server's writer sits
     // in the park. The trace names every rename, so the wait reads it.
-    let blob_name = format!("blob/{want}");
+    // The dest path holds the full ID as its last segment: the two-hex
+    // folder between is not part of the name.
+    let blob_name = want.to_string();
     let until = Instant::now() + Duration::from_secs(30);
     loop {
         let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
@@ -897,7 +899,7 @@ async fn import_process_races_the_server_on_the_same_blob() {
             .lock()
             .unwrap()
             .as_ref()
-            .is_some_and(|h| h.is_finished());
+            .is_some_and(std::thread::JoinHandle::is_finished);
         finished.then(|| {
             import_handle
                 .lock()
