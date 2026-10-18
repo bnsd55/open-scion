@@ -275,6 +275,11 @@ async fn every_reply_survives_a_power_cut() {
         // and the checks start over with it.
         let mut ledger = Ledger::default();
         let mut checked = Checked::default();
+        // A reaped child's flock can outlive the waitpid by one tick; the
+        // next server must not race it.
+        common::spawn_guard::across_release(|| {
+            common::wait_for_lock_release(&dir.path().join("backing/data"));
+        });
         let mut lazy = Lazyfs::start(dir.path(), &lazyfs, round);
         let data = lazy.mount.join("data");
         eprintln!("round {round}: mounted");
@@ -594,6 +599,9 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
     // named after it, and must not collide with the other tests' rounds.
     for round in 100..100 + rounds {
         events.line(&format!("round {round}: mounts"));
+        common::spawn_guard::across_release(|| {
+            common::wait_for_lock_release(&dir.path().join("backing/data"));
+        });
         let mut lazy = Lazyfs::start(dir.path(), &lazyfs, round);
         let data = lazy.mount.join("data");
         create_repo(&data);
