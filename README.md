@@ -380,8 +380,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 CI also runs `cargo deny check` (license and advisory checks on every
-crate) and the test that follows every relative link in the repo's
-markdown.
+crate), a rustdoc build whose warnings fail the build, and the test that
+follows every relative link in the repo's markdown.
 
 Fuzz the decoders (needs nightly and `cargo-fuzz`):
 

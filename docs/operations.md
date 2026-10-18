@@ -12,7 +12,8 @@ The pieces:
   zstd file per blob), `tmp/` (staging), and three lock files. A second
   server on the same directory refuses to start.
 - `scion-cache` — a regional tier in front of the server. Keeps objects in
-  memory, answers object reads, forwards everything else.
+  memory and answers object reads only: a client resolves refs and gets its
+  read tickets from the server, which the tier refuses to serve itself.
 - `scion-daemon` — one per machine user, in front of a cache. Keeps objects
   on disk, serves on a private Unix socket. One daemon serves one OS user.
 
@@ -50,8 +51,9 @@ file instead (see "Tokens: one, or an access file", below).
 
 ### Server and a regional cache
 
-A cache serves object reads to a region and forwards everything else. Each
-hop has its own token pair: what the tier requires from its clients
+A cache serves object reads to a region and refuses every other call
+(`UNIMPLEMENTED`): the client resolves refs and reads paths on the server,
+and asks the cache only for objects. Each hop has its own token pair:
 (`--token`), and what it sends upstream (`--upstream-token`). A `scn`
 client's `--token` is what it sends, the other side of the pair of the tier
 in front of it.
@@ -388,7 +390,8 @@ the process, scraped from there. The names:
 
 **Health.** The server, cache and daemon answer standard gRPC health checks
 (`grpc.health.v1.Check` and `Watch`) on their serving port, without a
- token, for the services `scion.v1.Scion` and `scion.v1.Objects`. The server
+token: the server's health covers the services `scion.v1.Scion` and
+`scion.v1.Objects`, a tier's covers `scion.v1.Objects`. The server
 serves no gRPC reflection, so a probe tool must know the health protocol
 itself (`grpc_health_probe` does).
 
