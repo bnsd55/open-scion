@@ -90,6 +90,8 @@ timeout 120 "$BIN/scion-server" --data "$WORK/server" import \
 # and keeps serving; the script runs that printed command under sudo, and
 # polls until the mount answers.
 note "mounting main on $VIEW"
+# mount(2) needs an existing mount point; scn mount does not make one.
+mkdir -p "$VIEW"
 "$BIN/scn" --server "$SERVER" mount "$VIEW" main \
   > "$WORK/mount.log" 2>&1 &
 MOUNT_PID=$!
