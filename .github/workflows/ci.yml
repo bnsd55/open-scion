@@ -22,6 +22,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
+      - name: every doc(hidden) item is behind test-hooks
+        run: |
+          scripts/check-test-seams.sh --self-test
+          scripts/check-test-seams.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

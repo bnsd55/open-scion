@@ -1,9 +1,9 @@
 //! Derived data: values computed from changesets, not part of them.
 //!
-//! One mechanism for every kind. A [`Kind`] has a name, a version, and a
+//! One mechanism for every kind. A kind has a name, a version, and a
 //! function from a changeset and its parents' values to a value. A kind reads
 //! the value of its first parent only, or of every parent
-//! ([`Kind::ALL_PARENTS`]). A value is computed when it is first needed and
+//! (`ALL_PARENTS`). A value is computed when it is first needed and
 //! stored by (kind, version, changeset). A kind that must always be ready,
 //! such as the root tree, also stores its value when the changeset is written.
 //!
@@ -44,7 +44,7 @@ pub(crate) fn steps(changesets: usize) -> u64 {
 }
 
 /// One kind of derived data.
-pub trait Kind {
+pub(crate) trait Kind {
     /// The kind's name in the `derived` table.
     const NAME: &'static str;
     /// Bump it when [`Kind::derive`] gives a different answer. Rows of other
@@ -96,7 +96,7 @@ pub trait Kind {
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`], or of [`Store::flush`](crate::store::Store::flush).
-pub fn get<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
+pub(crate) fn get<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
     get_until::<K>(store, repo, cs, None)
 }
 
@@ -106,7 +106,7 @@ pub fn get<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<K:
 /// # Errors
 ///
 /// As [`get`], and [`Error::DeadlineExceeded`].
-pub fn get_by<K: Kind>(
+pub(crate) fn get_by<K: Kind>(
     store: &Backend,
     repo: RepoId,
     cs: ChangesetId,
@@ -401,7 +401,7 @@ fn in_one_walk<K: Kind>(
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`].
-pub fn fill<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
+pub(crate) fn fill<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
     fill_until::<K>(store, repo, cs, None)
 }
 
@@ -411,7 +411,7 @@ pub fn fill<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<K
 /// # Errors
 ///
 /// As [`fill`], and [`Error::DeadlineExceeded`].
-pub fn fill_by<K: Kind>(
+pub(crate) fn fill_by<K: Kind>(
     store: &Backend,
     repo: RepoId,
     cs: ChangesetId,
@@ -435,18 +435,29 @@ fn fill_until<K: Kind>(
         .ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
 }
 
-/// Fills `K` for `cs` and its history as [`fill`] does, then removes every
+/// Fills `K` for `cs` and its history, then removes every
 /// row of an older version of `K`, at most [`STEP`] rows per transaction.
 /// Returns once all of it is durable.
 ///
 /// # Errors
 ///
-/// As [`fill`] and [`Store::flush`](crate::store::Store::flush).
-pub fn backfill<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<()> {
+/// Errors as for the fill, and of [`Store::flush`](crate::store::Store::flush).
+/// Derives the kind of `cs`, and removes the rows of older versions.
+/// Returns the kind's name, which the `derive` command reports. The kinds
+/// a user derives are the ones the server ships, each with its own `pub`
+/// fn below, so the crate-private trait never shows in a signature.
+pub(crate) fn backfill<K: Kind>(
+    store: &Backend,
+    repo: &str,
+    cs: ChangesetId,
+) -> Result<&'static str> {
+    use crate::meta::Meta as _;
+    let repo = store.read(|c| c.repo_id(repo))?;
     fill::<K>(store, repo, cs)?;
     // A short step means that no older row is left.
     while store.commit(|c| remove_old::<K>(c))? == STEP {}
-    store.flush()
+    store.flush()?;
+    Ok(K::NAME)
 }
 
 /// Derives the value of `K` for `cs` inside the caller's transaction, and
@@ -457,7 +468,7 @@ pub fn backfill<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Resu
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`].
-pub fn derive<K: Kind>(
+pub(crate) fn derive<K: Kind>(
     c: &mut dyn MetaTx,
     repo: RepoId,
     cs: ChangesetId,
@@ -478,7 +489,7 @@ pub fn derive<K: Kind>(
 /// # Errors
 ///
 /// [`Error::Corrupt`] if a different value is already stored.
-pub fn put<K: Kind>(c: &mut dyn MetaTx, cs: ChangesetId, value: &K::Value) -> Result<()> {
+pub(crate) fn put<K: Kind>(c: &mut dyn MetaTx, cs: ChangesetId, value: &K::Value) -> Result<()> {
     c.put_derived(K::NAME, K::VERSION, cs, &K::encode(value))
 }
 
@@ -492,7 +503,7 @@ pub fn put<K: Kind>(c: &mut dyn MetaTx, cs: ChangesetId, value: &K::Value) -> Re
 /// # Errors
 ///
 /// Errors of [`Kind::derive`].
-pub fn on_write<K: Kind>(
+pub(crate) fn on_write<K: Kind>(
     c: &mut dyn MetaTx,
     id: ChangesetId,
     changeset: &Changeset,
@@ -688,7 +699,7 @@ fn parent_values<K: Kind>(
 /// # Errors
 ///
 /// Database errors.
-pub fn remove_old<K: Kind>(c: &mut dyn MetaTx) -> Result<usize> {
+pub(crate) fn remove_old<K: Kind>(c: &mut dyn MetaTx) -> Result<usize> {
     let removed = c.delete_derived_below(K::NAME, K::VERSION, STEP)?;
     if removed > 0 {
         tracing::debug!(
@@ -1370,7 +1381,7 @@ mod tests {
     fn a_backfill_derives_a_history_and_removes_every_older_row() {
         let (_dir, store, repo, ids) = store_with(&chain(7));
         let tip = ids[6];
-        backfill::<ChangedPathsV2>(&store, repo, tip).unwrap();
+        backfill::<ChangedPathsV2>(&store, "r", tip).unwrap();
         assert_eq!(kind_rows(&store, 2).len(), 7);
         // A build with version 1 derives its own rows and keeps version 2.
         assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), 7);
@@ -1383,7 +1394,7 @@ mod tests {
         DERIVES.set(0);
         let commits = store.commits();
         let flushes = store.blobs().full_flushes();
-        backfill::<ChangedPathsV2>(&store, repo, tip).unwrap();
+        backfill::<ChangedPathsV2>(&store, "r", tip).unwrap();
         assert_eq!(DERIVES.get(), 0);
         assert!(kind_rows(&store, 1).is_empty(), "version 1 is removed");
         assert_eq!(store.commits() - commits, steps(7));

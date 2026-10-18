@@ -1,8 +1,8 @@
 //! `scion-server gc <data>`: removes the blob files and the `repo_blobs`
-//! rows that nothing names any more, over [`Meta`](crate::meta::Meta), so
-//! one collector serves every backend. Its queries are
-//! [`MetaTx`](crate::meta::MetaTx) methods;
-//! its files are the object folder, which every backend keeps on disk.
+//! rows that nothing names any more, over the crate's internal metadata
+//! trait, so one collector serves every backend. Its queries are methods
+//! of that trait; its files are the object folder, which every backend
+//! keeps on disk.
 //!
 //! A blob file is shared by content across repos, so what is garbage is a
 //! question with two levels:

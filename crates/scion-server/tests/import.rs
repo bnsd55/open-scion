@@ -337,7 +337,7 @@ fn import_matches_git_and_repeats_as_a_no_op() {
         "every commit is a root, a merge or sampled, so every one is verified"
     );
     assert_eq!(report.tip, changeset_of(&store, &h.submodule));
-    assert_eq!(read::resolve_ref(&store, "r", "main").unwrap(), report.tip);
+    assert_eq!(store.resolve_ref("r", "main").unwrap(), report.tip);
 
     let before = store.read(|c| Ok(row_counts(c.sqlite().unwrap()))).unwrap();
     let again = import(&store, &git, "HEAD");
@@ -505,7 +505,7 @@ fn incremental_import_adds_only_new_commits() {
 
     let rest = import(&store, &git, "HEAD");
     assert_eq!((rest.commits, rest.imported, rest.verified), (7, 5, 5));
-    assert_eq!(read::resolve_ref(&store, "r", "main").unwrap(), rest.tip);
+    assert_eq!(store.resolve_ref("r", "main").unwrap(), rest.tip);
 
     let (_fresh_dir, fresh) = open_store();
     assert_eq!(
@@ -597,7 +597,7 @@ fn verification_catches_a_tree_that_differs_from_git() {
         other => panic!("expected a verification error, got {other:?}"),
     }
     assert_eq!(
-        read::resolve_ref(&store, "r", "main").unwrap(),
+        store.resolve_ref("r", "main").unwrap(),
         first.tip,
         "a failed import does not move the ref"
     );
@@ -707,10 +707,7 @@ fn import_never_moves_a_ref_off_a_land() {
     common::spawn_guard::prime_gix_lookup();
     let report = import_git(&store, "r", git.path(), &other).unwrap();
     assert_eq!(report.imported, 0);
-    assert_eq!(
-        read::resolve_ref(&store, "r", "git/main").unwrap(),
-        report.tip
-    );
+    assert_eq!(store.resolve_ref("r", "git/main").unwrap(), report.tip);
 }
 
 #[test]
@@ -957,7 +954,7 @@ fn an_import_process_shares_the_data_directory_with_lands() {
         .unwrap();
     assert_eq!(rows, 400);
     assert_eq!(
-        read::resolve_ref(&store, "r", "git/main").unwrap(),
+        store.resolve_ref("r", "git/main").unwrap(),
         changeset_of(&store, &more)
     );
     // Main's first-parent history above `mine` is the lands, each once. A
@@ -1075,7 +1072,7 @@ fn an_import_process_shares_the_postgres_database_with_lands() {
         .unwrap();
     assert_eq!(imported_count, 400);
     assert_eq!(
-        read::resolve_ref(&store, "r", "git/main").unwrap(),
+        store.resolve_ref("r", "git/main").unwrap(),
         changeset_of(&store, &more)
     );
     // Main's first-parent history above `mine` is the lands, each once. A
@@ -1355,11 +1352,8 @@ fn an_import_batch_waits_out_a_busy_write_lock_on_postgres() {
 
 #[test]
 fn an_import_that_loses_disk_space_fails_and_is_not_retried() {
-    if Backend::test_is_postgres() {
-        // The blob files are local in every backend, so the hook below
-        // works on Postgres too; the run here is the data-directory one.
-        // (Both jobs run this test.)
-    }
+    // The blob files are local in every backend, so the hook below works
+    // on Postgres too; both jobs run this test.
     let git = Git::init();
     let rev = git.fast_commits(0, 60);
     let (_dir, store) = open_store();
@@ -1426,4 +1420,44 @@ fn a_rolled_back_import_batch_verifies_again_when_it_reruns() {
         2 * one_pass,
         "the checks of the rolled-back batch ran again"
     );
+}
+
+#[test]
+fn an_import_on_a_read_only_disk_fails_and_lands_after_the_remount() {
+    // The blob files are local in every backend, so the hook below works
+    // on Postgres too; both jobs run this test.
+    let git = Git::init();
+    let rev = git.fast_commits(0, 60);
+    let (_dir, store) = open_store();
+    let before = store.busy_retries();
+    // The import's first blob write is the one the read-only disk
+    // refuses: 30 is EROFS, what a read-only remount answers.
+    store.blobs().fail_writes_after_errno(0, 30);
+    assert!(store.read(|c| c.repo_id("r")).is_err());
+    let error = try_import(&store, &git, &rev).unwrap_err();
+    // The import did not answer busy: a read-only disk is not a lock the
+    // database holds, and the batch's retry loop does not run.
+    assert!(
+        matches!(
+            &error,
+            Error::Io(e) if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        store.busy_retries(),
+        before,
+        "the import retried a read-only disk"
+    );
+    // Nothing was written: the ref is not there, and a read works right
+    // after the failure.
+    let repo_id = store.read(|c| c.repo_id("r")).unwrap();
+    assert!(
+        store
+            .read(|c| c.get_ref(repo_id, "main"))
+            .unwrap()
+            .is_none()
+    );
+    // The remount is back: the same import, again from the top, works.
+    try_import(&store, &git, &rev).unwrap();
 }

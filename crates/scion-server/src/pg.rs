@@ -145,6 +145,7 @@ struct PgInner {
     derive: crate::derived::DeriveFlights,
     /// The import's test hooks and busy-retry count, as the SQLite store
     /// keeps its own.
+    #[cfg(any(test, feature = "test-hooks"))]
     hooks: crate::store::ImportHooks,
     /// The operator metrics, set once by the server before it serves: a
     /// commit's wait for the collector's advisory key records how long
@@ -909,6 +910,7 @@ impl Pg {
             writers: Mutex::new(0),
             write_woken: Condvar::new(),
             derive: crate::derived::DeriveFlights::new(crate::store::DERIVE_WALKS_CAP),
+            #[cfg(any(test, feature = "test-hooks"))]
             hooks: crate::store::ImportHooks::default(),
             metrics: std::sync::OnceLock::new(),
         });
@@ -1152,6 +1154,7 @@ impl Pg {
     }
 
     /// The import's test hooks and busy-retry count.
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn hooks(&self) -> &crate::store::ImportHooks {
         &self.inner.hooks

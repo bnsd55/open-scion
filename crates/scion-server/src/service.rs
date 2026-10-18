@@ -58,7 +58,7 @@ const MAX_UPLOADS: usize = 16;
 /// beyond this waits here, in async code, for a slot to free.
 const MAX_BLAMES: usize = 4;
 /// The bytes of memory that all `Blame` calls share: a call takes the bytes
-/// of every version it reads, and [`memory::BYTES_PER_LINE`] per line of the
+/// of every version it reads, and `memory::BYTES_PER_LINE` per line of the
 /// blamed file, so together they hold no more than this.
 const BLAME_MEMORY_BUDGET: usize = 1 << 30;
 /// Most `MergeBase`, `IsAncestor` and `Log` calls with a path running at
@@ -531,7 +531,7 @@ pub(crate) async fn resolve_ref(
     check_reader(access, &caller, &repo)?;
     check_name("ref", &name)?;
     let id = worker
-        .run(move |store| read::resolve_ref(&store, &repo, &name))
+        .run(move |store| store.resolve_ref(&repo, &name))
         .await?;
     Ok(ResolveRefResponse {
         changeset_id: id.as_bytes().to_vec(),

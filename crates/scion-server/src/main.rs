@@ -12,16 +12,11 @@ use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use scion_proto::listen::{self, Limits};
 use scion_proto::tls::ServerTls;
-use scion_server::derived::{self, Kind};
-use scion_server::graph::CommitGraph;
-use scion_server::history::PathHistory;
 use scion_server::import::{ImportOptions, import_git};
-use scion_server::meta::Meta as _;
-use scion_server::meta::MetaTx as _;
+
 use scion_server::metrics::{self, Metrics};
 use scion_server::quotas::Quotas;
-use scion_server::tree::RootTree;
-use scion_server::{Backend, Error, fsck, gc, read, service};
+use scion_server::{Backend, Error, fsck, gc, service};
 use tracing_subscriber::EnvFilter;
 
 /// The scion server: import, serve and derive.
@@ -383,20 +378,16 @@ async fn main() -> anyhow::Result<()> {
             target_ref,
         } => {
             let (name, tip) = tokio::task::spawn_blocking(move || {
-                let tip = read::resolve_ref(&store, &repo, &target_ref)?;
-                let repo_id = store.read(|c| c.repo_id(&repo))?;
+                let tip = store.resolve_ref(&repo, &target_ref)?;
                 let name = match kind {
                     KindName::RootTree => {
-                        derived::backfill::<RootTree>(&store, repo_id, tip)?;
-                        RootTree::NAME
+                        scion_server::tree::backfill_root_tree(&store, &repo, tip)?
                     }
                     KindName::CommitGraph => {
-                        derived::backfill::<CommitGraph>(&store, repo_id, tip)?;
-                        CommitGraph::NAME
+                        scion_server::graph::backfill_commit_graph(&store, &repo, tip)?
                     }
                     KindName::PathHistory => {
-                        derived::backfill::<PathHistory>(&store, repo_id, tip)?;
-                        PathHistory::NAME
+                        scion_server::history::backfill_path_history(&store, &repo, tip)?
                     }
                 };
                 Ok::<_, Error>((name, tip))

@@ -54,6 +54,8 @@ tokio-postgres-rustls = "0.14"
 # The test seams (`#[doc(hidden)]` items gated on this) that an
 # integration test needs: the crate enables the feature on itself as its
 # own dev-dependency, and a default build does not compile the seams.
+# Path only: a version would make `cargo package` resolve it from the
+# registry.
 test-hooks = []
 
 [dev-dependencies]
