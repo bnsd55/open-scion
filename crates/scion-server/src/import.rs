@@ -987,9 +987,9 @@ mod tests {
         // its name, and cannot trap its partner.
         let (in_tx, in_rx) = std::sync::mpsc::channel::<()>();
         let (moved_tx, moved_rx) = std::sync::mpsc::channel::<()>();
+        let in_release = in_tx.clone();
         let land = {
-            let (server, in_tx, moved_rx, in_release) =
-                (server.clone(), in_tx, moved_rx, in_tx.clone());
+            let (server, in_tx, moved_rx) = (server.clone(), in_tx, moved_rx);
             thread::spawn(move || {
                 server.write(|c| {
                     let moved = c.cas_ref(repo, "main", Some(1), x)?;

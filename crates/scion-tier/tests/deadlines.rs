@@ -232,11 +232,13 @@ async fn get(client: &mut Client, id: BlobId, deadline: Option<Duration>, ticket
     // A ceiling per message: a server that stalls mid-drain fails the
     // test in seconds, not at the CI cancel.
     loop {
-        match tokio::time::timeout(Duration::from_secs(30), stream.message()).await {
-            Ok(Ok(Some(_))) => {}
-            Ok(Ok(None)) => return Code::Ok,
-            Ok(Err(status)) => return status.code(),
-            Err(_) => panic!("the drain never finished within 30 s"),
+        let message = tokio::time::timeout(Duration::from_secs(30), stream.message())
+            .await
+            .unwrap_or_else(|_| panic!("the drain never finished within 30 s"));
+        match message {
+            Ok(Some(_)) => {}
+            Ok(None) => return Code::Ok,
+            Err(status) => return status.code(),
         }
     }
 }
