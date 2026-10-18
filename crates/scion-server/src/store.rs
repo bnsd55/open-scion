@@ -551,6 +551,7 @@ impl Store {
     /// the out-of-space tests: the next write that must grow the file
     /// fails with the real disk-full.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn cap_database_pages(&self, extra: i64) {
         let db = self.lock();
         let pages: i64 = db
@@ -562,6 +563,7 @@ impl Store {
 
     /// Lifts the page cap again, back to the largest file SQLite allows.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn release_database_pages(&self) {
         let db = self.lock();
         db.pragma_update(None, "max_page_count", 0x7FFF_FFFFi64)
@@ -1184,6 +1186,7 @@ impl Blobs {
     /// arms it for the very next write. Calling it again rearms it; the
     /// start ([`UNARMED`]) never arms it.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_writes_after(&self, n: usize) {
         self.fail_writes
             .store(n, std::sync::atomic::Ordering::SeqCst);
