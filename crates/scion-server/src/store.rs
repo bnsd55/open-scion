@@ -922,6 +922,10 @@ pub enum DurabilityStep {
     FullFlush,
     /// A batch's `sync` answered its caller.
     Answer,
+    /// Kept for the doc test of the enum below; never recorded.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    Unused,
 }
 
 /// The ordered log of [`DurabilityStep`]s behind the test-hooks seam.
