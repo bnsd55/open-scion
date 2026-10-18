@@ -1,9 +1,10 @@
 //! The durability of an acknowledged blob at the block level: the store
 //! runs on an `ext4` over a dm-log-writes target, the story is recorded
 //! with a named mark at every put, and each replay stops at the last
-//! flush entry before a mark - a power cut that lost everything the
-//! drive was never told to flush. What survives each cut is checked by
-//! mounting the file system, reopening the store, and running fsck.
+//! barrier before a mark - a flush, or a FUA write - so it is a power
+//! cut that lost everything the drive was never told to flush. What
+//! survives each cut is checked by mounting the file system, reopening
+//! the store, and running fsck.
 //!
 //! This is the cut the `LazyFS` suite cannot make: `LazyFS` persists a
 //! rename at rename time, so a lost directory fsync is invisible to it.
@@ -134,11 +135,23 @@ impl Recording {
     /// The data image, restored to its mkfs'd bytes on a fresh loop, so
     /// a replay never sees a previous cut. The log loop stays.
     fn fresh_disk(&self) -> String {
-        sudo(&["losetup", "-d", &self.data_loop.borrow()]);
+        let old = self.data_loop_name();
+        sudo(&["losetup", "-d", &old]);
+        self.loops.borrow_mut().retain(|l| *l != old);
         std::fs::copy(&self.pristine, &self.disk).unwrap();
         let fresh = sudo(&["losetup", "--find", "--show", self.disk.to_str().unwrap()]);
-        self.data_loop.borrow_mut().clone_from(&fresh);
+        self.loops.borrow_mut().push(fresh.clone());
         fresh
+    }
+
+    /// The loop device that currently holds the data image.
+    fn data_loop_name(&self) -> String {
+        self.loops
+            .borrow()
+            .iter()
+            .find(|dev| **dev != self.log_dev)
+            .cloned()
+            .expect("the data loop is attached")
     }
 }
 
@@ -152,7 +165,9 @@ impl Drop for Recording {
     fn drop(&mut self) {
         sudo_soft(&["umount", self.mount.to_str().unwrap()]);
         sudo_soft(&["dmsetup", "remove", "logdisk"]);
-        sudo_soft(&["losetup", "-D"]);
+        for dev in self.loops.borrow().iter() {
+            sudo_soft(&["losetup", "-d", dev]);
+        }
     }
 }
 
@@ -194,7 +209,7 @@ fn find_flagged(
 }
 
 #[test]
-fn an_acknowledged_blob_survives_a_cut_at_the_last_flush_before_its_reply() {
+fn an_acknowledged_blob_survives_a_cut_at_the_last_barrier_before_its_reply() {
     if !required() {
         return;
     }
