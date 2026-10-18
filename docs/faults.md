@@ -24,7 +24,7 @@ The matrix:
 | Serve through a real kernel NFS mount | reads, writes, a rename and a delete through the mount work; a commit from the mount diffs; a tampered mount path is refused | the CI job `mount (NFS)` runs the whole flow under `timeout` | yes | CI job `mount (NFS)`, `scripts/mount-nfs.sh` (#243) |
 | Power cut while clients write | every reply lands or fails; the server restarts clean | the cut is a real lazyfs cache drop; runs in the CI job `power-loss` (needs `SCION_LAZYFS`) | yes | `power.rs::every_reply_survives_a_power_cut`; the durability-order refinements are open: #225, #261 |
 | A disk that fails mid-write or went read-only (`EIO`, `EROFS`) | open - #262 | | | #262 |
-| The whole server on a real full disk (tmpfs, not injected faults) | open - #263 | | | #263 |
+| The whole server on a real full disk (tmpfs, not injected faults) | `ResourceExhausted`, same fixed reply, for the blob path and for the metadata path; a disk out of inodes is the same refusal at file create | reads keep working; a write lands again after a remount with more space or inodes; a reopen plus `fsck` is clean | yes | `disk_full.rs::a_full_disk_answers_out_of_space_and_needs_no_repair`, `disk_full.rs::a_full_metadata_disk_answers_out_of_space_and_needs_no_repair`, `disk_full.rs::a_disk_out_of_inodes_answers_out_of_space_and_needs_no_repair` (CI job `test`, `SCION_DISK_REQUIRE=1`) |
 
 Notes:
 
