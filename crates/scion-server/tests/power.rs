@@ -754,7 +754,7 @@ async fn import_process_races_the_server_on_the_same_blob() {
         git(&git_dir, &["add", "."]);
         git(&git_dir, &["commit", "-q", "-m", &format!("round {round}")]);
         // The import process and the client's put race on the same blob.
-        let mut import = Command::new(env!("CARGO_BIN_EXE_scion-server"))
+        let import = Command::new(env!("CARGO_BIN_EXE_scion-server"))
             .args([
                 "--data",
                 data.to_str().unwrap(),
@@ -781,10 +781,11 @@ async fn import_process_races_the_server_on_the_same_blob() {
     lazy.cut();
     drop(scion);
     drop(server);
-    drop(lazy);
     // What both processes acknowledged survives: the blob verifies from
-    // the backing, where only synced writes live.
+    // the backing, where only synced writes live. The mount goes down
+    // after the backing path is taken, and its exit changes nothing.
     let backing = lazy.backing.join("data");
+    drop(lazy);
     let store = Store::open_shared(&backing).unwrap();
     for (id, _) in &acked {
         let status = store.blobs().verify(*id).unwrap();
