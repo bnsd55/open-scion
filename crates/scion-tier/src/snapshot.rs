@@ -255,12 +255,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (objects, path, _) = snapshot_in(dir.path());
         let size = |i: usize| objects[i].1.len();
-        // Room for the last two only: the least recently used drops first.
+        // Room for the last two only: the tree (the first object) is over
+        // this store's limit on its own, so its put stores nothing and it
+        // counts as skipped; the two blobs take the room.
         let limit = size(1) + size(2);
         let store = DiskStore::open(&dir.path().join("data"), limit).unwrap();
         let seeded = seed(&store, &path).unwrap().unwrap();
         assert_eq!(seeded.repo, "r");
-        assert_eq!((seeded.stored, seeded.skipped), (3, 0));
+        assert_eq!((seeded.stored, seeded.skipped), (2, 1));
+        assert_eq!(seeded.bytes, size(1) + size(2));
         assert!(!seeded.damaged);
         assert_eq!(store.size(objects[0].0).unwrap(), None);
         for (key, data) in &objects[1..] {
