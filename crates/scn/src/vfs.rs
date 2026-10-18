@@ -916,27 +916,32 @@ impl NFSFileSystem for Vfs {
             if to_path.as_bytes().starts_with(&under) {
                 return Err(nfsstat3::NFS3ERR_INVAL);
             }
-            if let Some(to_id) =
-                Self::id_of(&nodes, Some(&to_path)).filter(|_| !nodes.deleted.contains(&to_path))
-            {
+            // The target of a directory rename must be a directory, and
+            // empty at most. The check runs before anything moves.
+            let target =
+                Self::id_of(&nodes, Some(&to_path)).filter(|_| !nodes.deleted.contains(&to_path));
+            if let Some(to_id) = target {
                 if !nodes.by_id[&to_id].kind.is_dir() {
                     return Err(nfsstat3::NFS3ERR_NOTDIR);
                 }
                 if !self.dir_is_empty(&mut nodes, to_id, &to_path).await? {
                     return Err(nfsstat3::NFS3ERR_NOTEMPTY);
                 }
-                // An empty target goes away: an empty directory holds no
-                // tree entry (trees keep only dirs with children), so a
-                // target of the ref needs no deletion note.
-                drop_listed(&mut nodes, to_dirid, to_filename.as_ref());
-                nodes.drop_node(to_id);
-                std::fs::remove_dir(self.overlay_file(&to_path)).ok();
             }
             // A directory moves with everything under it: each file and
             // symlink of the ref is materialized at the new path, and its old
             // path is a deletion.
             self.move_dir(&mut nodes, from_id, &from_path, &to_path)
                 .await?;
+            // The move landed; an empty target goes away now, so a failed
+            // move leaves both directories as they were. Its directory on
+            // disk stays: the moved children land in it, and an empty
+            // directory holds no tree entry (trees keep only dirs with
+            // children), so a target of the ref needs no deletion note.
+            if let Some(to_id) = Self::id_of(&nodes, Some(&to_path)).filter(|id| *id != from_id) {
+                drop_listed(&mut nodes, to_dirid, to_filename.as_ref());
+                nodes.drop_node(to_id);
+            }
             drop_listed(&mut nodes, from_dirid, from_filename.as_ref());
             nodes.drop_node(from_id);
             // The new directory is of the overlay; its children are its
@@ -1252,7 +1257,7 @@ const DELETES_VERSION_1: u8 = 1;
 fn write_deletes(overlay: &Path, deleted: &HashSet<RepoPath>) -> std::io::Result<()> {
     use std::io::Write as _;
     let mut bytes = Vec::with_capacity(1 + 4 + deleted.len() * 8);
-    bytes.push(1u8);
+    bytes.push(DELETES_VERSION_1);
     bytes.extend_from_slice(
         &u32::try_from(deleted.len())
             .map_err(|_| {
@@ -1272,7 +1277,11 @@ fn write_deletes(overlay: &Path, deleted: &HashSet<RepoPath>) -> std::io::Result
     let mut file = std::fs::File::create(&tmp)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
-    std::fs::rename(&tmp, overlay.join(DELETES))
+    std::fs::rename(&tmp, overlay.join(DELETES))?;
+    // The rename's directory entry is as durable as the note: a crash
+    // that loses it brings back the old note, and with it every
+    // deletion the mount made.
+    std::fs::File::open(overlay)?.sync_all()
 }
 
 /// Reads the note of deletions back, for `scn commit --from-mount`. A
@@ -1285,10 +1294,9 @@ pub fn read_deletes(overlay: &Path) -> anyhow::Result<Vec<RepoPath>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => {
             return Err(anyhow::anyhow!(
-                "cannot read the note of deletions ({}): re-make the \
+                "cannot read the note of deletions ({e}): re-make the \
                  deletions on the mount, or run `scn unmount DIR` and \
-                 mount again",
-                e
+                 mount again"
             ));
         }
     };
@@ -1304,7 +1312,7 @@ pub fn read_deletes(overlay: &Path) -> anyhow::Result<Vec<RepoPath>> {
             })
             .collect();
     }
-    if bytes.first() != Some(&1u8) {
+    if bytes.first() != Some(&DELETES_VERSION_1) {
         return Err(broken_note(anyhow!(
             "the note holds no deletions format this build reads"
         )));
@@ -1318,13 +1326,27 @@ pub fn read_deletes(overlay: &Path) -> anyhow::Result<Vec<RepoPath>> {
         at += want;
         Ok(head)
     };
+    // The count is not trusted for the size of the vector: a damaged
+    // note can name millions of entries. Each entry costs at least four
+    // bytes, so a count the note cannot pay for is a damaged note, and
+    // a count the bytes outlive is one too.
     let count = u32::from_le_bytes(take(4)?.try_into().expect("four bytes")) as usize;
+    if count > (bytes.len() - 1) / 4 {
+        return Err(broken_note(anyhow!(
+            "the note names more deletions than it holds"
+        )));
+    }
     let mut deleted = Vec::with_capacity(count);
     for _ in 0..count {
         let len = u32::from_le_bytes(take(4)?.try_into().expect("four bytes")) as usize;
         let path = RepoPath::new(take(len)?)
-            .map_err(|_| broken_note(anyhow!("the note holds a name that is not a path")))?;
-        deleted.push(path);
+            .map_err(|_| broken_note(anyhow!("the note holds a name that is not a path")));
+        deleted.push(path?);
+    }
+    if at != bytes.len() {
+        return Err(broken_note(anyhow!(
+            "the note holds bytes past its last deletion"
+        )));
     }
     Ok(deleted)
 }
@@ -1879,13 +1901,12 @@ mod tests {
         assert!(find(&test.vfs, "y/b").await.is_ok());
         // The shape of the refusal: the same rename answers NOTEMPTY.
         let from = filename3::from(b"x".to_vec());
-        assert_eq!(
-            test.vfs
-                .rename(root, &from, root, &filename3::from(b"y".to_vec()))
-                .await
-                .unwrap_err(),
-            nfsstat3::NFS3ERR_NOTEMPTY
-        );
+        let refused = test
+            .vfs
+            .rename(root, &from, root, &filename3::from(b"y".to_vec()))
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, nfsstat3::NFS3ERR_NOTEMPTY));
     }
 
     /// A rename of a directory over an existing file is not a directory
@@ -1894,18 +1915,17 @@ mod tests {
     async fn a_rename_of_a_dir_over_a_file_is_refused() {
         let test = start(&[("d/f", b"df\n", Some(false)), ("f", b"fx\n", Some(false))]).await;
         let root = NFSFileSystem::root_dir(&test.vfs);
-        assert_eq!(
-            test.vfs
-                .rename(
-                    root,
-                    &filename3::from(b"d".to_vec()),
-                    root,
-                    &filename3::from(b"f".to_vec())
-                )
-                .await
-                .unwrap_err(),
-            nfsstat3::NFS3ERR_NOTDIR
-        );
+        let refused = test
+            .vfs
+            .rename(
+                root,
+                &filename3::from(b"d".to_vec()),
+                root,
+                &filename3::from(b"f".to_vec()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, nfsstat3::NFS3ERR_NOTDIR));
     }
 
     /// A rename of a directory into its own subtree is invalid ([F2]).
@@ -1916,19 +1936,17 @@ mod tests {
         let test = start(&[("a/b", b"b\n", Some(false)), ("a/c", b"c\n", Some(false))]).await;
         let root = NFSFileSystem::root_dir(&test.vfs);
         let a = find(&test.vfs, "a").await.unwrap();
-        let inner = filename3::from(b"b".to_vec());
-        assert_eq!(
-            test.vfs
-                .rename(
-                    NFSFileSystem::root_dir(&test.vfs),
-                    &filename3::from(b"a".to_vec()),
-                    a,
-                    &filename3::from(b"b".to_vec())
-                )
-                .await
-                .unwrap_err(),
-            nfsstat3::NFS3ERR_INVAL
-        );
+        let refused = test
+            .vfs
+            .rename(
+                NFSFileSystem::root_dir(&test.vfs),
+                &filename3::from(b"a".to_vec()),
+                a,
+                &filename3::from(b"b".to_vec()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, nfsstat3::NFS3ERR_INVAL));
     }
 
     /// A rename over an empty directory replaces it, as POSIX allows.
