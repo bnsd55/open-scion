@@ -126,8 +126,8 @@ impl Recording {
         std::fs::copy(&disk, work.join("disk.pristine.img")).unwrap();
         Self {
             mount: work.join("mnt"),
+            loops: RefCell::new(vec![data_loop, log_dev.clone()]),
             log_dev,
-            loops: RefCell::new(vec![data_loop.clone(), log_dev.clone()]),
             disk,
             pristine: work.join("disk.pristine.img"),
         }
