@@ -1328,9 +1328,12 @@ impl<S: Store> Objects for Tier<S> {
         check::object_count(refs.len())?;
         // The ticket is the only permission of an object read here too:
         // on a cache it is verified against the keys of the upstream
-        // server; on a daemon, which only forwards tickets, it is read
-        // without its signature, and the walk from its root tree still
-        // gates what leaves.
+        // server, and the walk from its root tree proves every object
+        // before it leaves. On a daemon, which only forwards tickets, the
+        // ticket is read without its signature, and the proof is skipped:
+        // a daemon with no ticket keys serves what its store holds, to the
+        // one OS user that owns its private socket (see the SHORTCUT at
+        // `produce`).
         let ticket = if self.inner.ticket_keys.is_empty() {
             scion_proto::ticket::parse_unverified(&ticket, scion_proto::ticket::now())
         } else {
