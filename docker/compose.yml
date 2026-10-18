@@ -2,7 +2,7 @@
 # checks a repo out through the cache. One image carries all three binaries;
 # each service picks its own entrypoint.
 #
-# Secrets are made at compose time by docker/demo.sh and are never committed
+# Secrets are made by docker/demo.sh and are never committed
 # or baked into the image. See docker/README.md.
 #
 # The server's ticket public key arrives as an environment variable that

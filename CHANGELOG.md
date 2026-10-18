@@ -183,6 +183,10 @@ The first release: the server, its cache tiers, and the `scn` client.
   server log carries the path and the operation. A cut-off write leaves
   no torn blob file, and an import that ran out of space is not retried
   while the disk is full.
+- The container demo's output folders are git-ignored again (`#164`):
+  `.gitignore` named `docker/demo/certs` and `docker/demo/work`, while
+  `docker/demo.sh` writes `docker/certs` and `docker/work`, so a demo run
+  left the demo CA's private key untracked instead of ignored.
 - `Log` no longer repeats a page past the first scan (`#203`): a call
   whose `limit` crossed one internal page of 1,000 entries got those
   entries twice.
