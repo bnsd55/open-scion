@@ -1524,14 +1524,19 @@ impl Blobs {
     }
 
     /// The fan-out directory and the file path of a blob.
+    pub fn location(&self, id: BlobId) -> (PathBuf, PathBuf) {
+        let hex = id.to_string();
+        let dir = self.root.join(&hex[..2]);
+        let path = dir.join(&hex[2..]);
+        (dir, path)
+    }
+
     /// Whether the blob's file is on disk. A cheap stat, no read: the
     /// importer's skip checks it, so a blob whose row survives but whose
     /// file was deleted under the server still refuses the import.
     pub(crate) fn file_exists(&self, id: BlobId) -> bool {
         self.location(id).1.exists()
     }
-
-    pub fn location(&self, id: BlobId) -> (PathBuf, PathBuf) {
         let hex = id.to_string();
         let dir = self.root.join(&hex[..2]);
         let path = dir.join(&hex[2..]);

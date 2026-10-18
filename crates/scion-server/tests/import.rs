@@ -1469,6 +1469,7 @@ fn a_reimport_of_blobs_with_no_rows_still_verifies_and_fsyncs_them() {
     let git = Git::init();
     git.write("g/a", "alpha\n");
     git.write("g/b", "beta\n");
+    git.write("g/c", "gamma\n");
     let rev = git.commit("three files");
     let (_dir, store) = open_store();
     store.blobs().fail_writes_after(2);
@@ -1509,12 +1510,13 @@ fn a_second_import_of_row_named_blobs_neither_verifies_nor_fsyncs() {
     let rev = git.commit("first");
     let (_dir, store) = open_store();
     import(&store, &git, &rev);
-    // A new commit that names the same blobs: the file is written again
-    // with the same bytes, so git keeps the blob and only the commit is
-    // new. Its rows are committed, so the stored copies are durable and
-    // the import skips their puts: no read-back, no fsync.
-    git.run(&["commit", "-q", "--allow-empty", "-m", "the same blobs, a new commit"]);
-    let next = git.head();
+    // A later commit takes the file away, and the commit after that puts
+    // the same bytes back: the re-added blob is named by a committed row,
+    // so the import skips its put: no read-back, no fsync.
+    git.remove("g/b");
+    let _middle = git.commit("take beta away");
+    git.write("g/b", "beta\n");
+    let next = git.commit("put beta back");
     let verifies = store.blobs().verifies();
     let fsyncs = store.blobs().fsync_count();
     import(&store, &git, &next);
