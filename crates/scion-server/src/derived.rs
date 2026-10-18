@@ -1675,26 +1675,41 @@ mod tests {
         let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
         let flights = DeriveFlights::new(1);
         flights.set_metrics(Arc::clone(&metrics));
+        // The gauges read from a scrape: a line's number, 0 when the
+        // gauge renders nothing.
+        let gauge = |name: &str| {
+            metrics
+                .render()
+                .lines()
+                .find(|line| line.starts_with(&format!("{name} ")))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
         let first = take_walk_permit(&flights, None).unwrap();
-        assert_eq!(metrics.derive_walks(), (1, 0));
+        assert_eq!(gauge("scion_derive_walks_in_flight"), 1);
+        assert_eq!(gauge("scion_derive_walks_waiting"), 0);
         // A second caller waits: the gauge says it is in the wait, without
         // a clock, because the drop of `first` is what ends it.
         let holder = std::thread::scope(|scope| {
             let waiter = scope.spawn(|| take_walk_permit(&flights, None).unwrap());
             let mut spins = 0;
-            while metrics.derive_walks().1 == 0 {
+            while gauge("scion_derive_walks_waiting") == 0 {
                 spins += 1;
                 assert!(spins < 1_000_000, "the waiter never entered the wait");
                 std::thread::yield_now();
             }
-            assert_eq!(metrics.derive_walks(), (1, 1));
+            assert_eq!(gauge("scion_derive_walks_in_flight"), 1);
+            assert_eq!(gauge("scion_derive_walks_waiting"), 1);
             drop(first);
             let permit = waiter.join().unwrap();
-            assert_eq!(metrics.derive_walks(), (1, 0));
+            assert_eq!(gauge("scion_derive_walks_in_flight"), 1);
+            assert_eq!(gauge("scion_derive_walks_waiting"), 0);
             permit
         });
         drop(holder);
-        assert_eq!(metrics.derive_walks(), (0, 0));
+        assert_eq!(gauge("scion_derive_walks_in_flight"), 0);
+        assert_eq!(gauge("scion_derive_walks_waiting"), 0);
         assert!(
             !metrics.render().contains("scion_derive_walks"),
             "zero gauges do not render: {}",

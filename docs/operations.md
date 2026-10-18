@@ -407,9 +407,6 @@ the process, scraped from there. The names:
 - `scion_view_trees_walked_total` — real trees a view derivation opened for
   a partial reader; a rate that stays high across changesets of one rule
   set means the per-tree memo is not serving and every derivation re-walks.
-- `scion_view_trees_walked_total` — real trees a view derivation opened for
-  a partial reader; a rate that stays high across changesets of one rule
-  set means the per-tree memo is not serving and every derivation re-walks.
 - `scion_cache_hits_total` / `scion_cache_misses_total` — what a tier
   served from its store against what it fetched upstream.
 - `scion_blob_sync_seconds` — one fsync on the blob write path (temp file, stored file, blob directory, or the drive-cache flush)

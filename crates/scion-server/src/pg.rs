@@ -165,8 +165,8 @@ struct Readers {
     /// How many clients the pool holds, for the busy gauge.
     size: usize,
     /// The registry the pool records into. Set once the server builds
-    /// its metrics; [`None`] for import, fsck, and tests that have none.
-    metrics: Mutex<Option<Arc<Metrics>>>,
+    /// its metrics; empty for import, fsck, and tests that have none.
+    metrics: std::sync::OnceLock<Arc<Metrics>>,
 }
 
 impl Readers {
@@ -284,15 +284,12 @@ impl Readers {
     /// The metrics to record into, if the server gave the backend its
     /// registry.
     fn metrics(&self) -> Option<Arc<Metrics>> {
-        self.metrics
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.metrics.get().cloned()
     }
 
     /// Gives the pool the server's metrics registry.
     fn set_metrics(&self, metrics: Arc<Metrics>) {
-        *self.metrics.lock().unwrap_or_else(PoisonError::into_inner) = Some(metrics);
+        let _ = self.metrics.set(metrics);
         self.report_busy();
     }
 }

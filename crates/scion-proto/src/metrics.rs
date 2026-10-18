@@ -258,15 +258,6 @@ impl Metrics {
         self.view_trees_walked.load(Ordering::Relaxed)
     }
 
-    /// The derive-walk gauges, for a test that reads them without a scrape.
-    #[must_use]
-    pub fn derive_walks(&self) -> (u64, u64) {
-        (
-            self.derive_walks_in_flight.load(Ordering::Relaxed),
-            self.derive_walks_waiting.load(Ordering::Relaxed),
-        )
-    }
-
     /// Records one wait for a Postgres reader that took `waited`.
     pub fn pg_pool_wait(&self, waited: std::time::Duration) {
         let micros = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX);

@@ -133,13 +133,16 @@ pub fn run(
     let started = std::time::Instant::now();
     let mut report = Report::default();
     let live = live_set(store, between)?;
+    // One read names the repos for the start line and the prune; prune
+    // rows walks them right after.
+    let repos = store.read(|c| c.repos())?;
     tracing::info!(
-        repos = report_repos(store)?,
+        repos = u64::try_from(repos.len()).unwrap_or(u64::MAX),
         grace_secs = grace.as_secs(),
         dry_run,
         "the collector walks the live set"
     );
-    prune_rows(store, &live, grace, dry_run, between, &mut report)?;
+    prune_rows(store, &live, repos, grace, dry_run, between, &mut report)?;
     sweep_files(store, grace, dry_run, between, &mut report)?;
     tracing::info!(
         repos = report.repos,
@@ -151,13 +154,6 @@ pub fn run(
         "the collector ended"
     );
     Ok(report)
-}
-
-/// The repos the collector found, for the start line that runs before
-/// `report.repos` is set.
-fn report_repos(store: &Backend) -> crate::error::Result<u64> {
-    let repos = store.read(|c| c.repos())?;
-    Ok(u64::try_from(repos.len()).unwrap_or(u64::MAX))
 }
 
 /// The blobs that each repo's stored changesets put, read in batches.
@@ -213,6 +209,7 @@ impl LiveSet {
 fn prune_rows(
     store: &Backend,
     live: &LiveSet,
+    repos: Vec<(RepoId, String)>,
     grace: Duration,
     dry_run: bool,
     between: &mut dyn FnMut(Stage),
@@ -220,7 +217,6 @@ fn prune_rows(
 ) -> crate::error::Result<()> {
     // Every repo, not only the ones with changesets: a repo whose rows all
     // came from uploads gets its prune too.
-    let repos = store.read(|c| c.repos())?;
     report.repos = u64::try_from(repos.len()).unwrap_or(u64::MAX);
     for (repo, name) in repos {
         // The candidate scan reads rows and files: it runs in a read

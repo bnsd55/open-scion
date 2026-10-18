@@ -2373,23 +2373,31 @@ mod tests {
     }
 
     #[test]
-    fn a_blob_batch_records_its_full_flush_in_the_metrics() {
+    fn a_put_records_one_observation_per_fsync_of_the_blob_path() {
         let dir = tempfile::tempdir().unwrap();
         let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
         let store = Store::open(dir.path()).unwrap();
         store.set_metrics(Arc::clone(&metrics));
         assert!(
             !metrics.render().contains("scion_blob_sync_seconds"),
-            "nothing flushed yet: {}",
+            "nothing synced yet: {}",
             metrics.render()
         );
         store.blobs().put(b"recorded").unwrap();
         let text = metrics.render();
-        assert!(text.contains("scion_blob_sync_seconds_count 1\n"), "{text}");
-        // The flush of this store ran; its duration landed in the +Inf
-        // bucket exactly once.
+        // One put fsyncs the temp file and the blob directory, and, where
+        // fsync leaves the drive cache, makes one full flush: three
+        // observations on macOS, two on Linux.
+        let full_flushes = usize::from(FSYNC_LEAVES_DRIVE_CACHE);
+        let want = 2 + full_flushes;
         assert!(
-            text.contains("scion_blob_sync_seconds_bucket{le=\"+Inf\"} 1\n"),
+            text.contains(&format!("scion_blob_sync_seconds_count {want}\n")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "scion_blob_sync_seconds_bucket{{le=\"+Inf\"}} {want}\n"
+            )),
             "{text}"
         );
     }
