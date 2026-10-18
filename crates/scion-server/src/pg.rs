@@ -1042,15 +1042,20 @@ impl Pg {
         wait: Duration,
     ) -> Result<T> {
         self.check_fenced()?;
+        probe("pg.read_bounded", "past the fence, taking a reader");
         let mut reader = self.inner.readers.take(wait)?;
+        probe("pg.read_bounded", "beginning the read tx");
         let out = {
             let mut tx = PgTx::begin_read(reader.client(), statement, idle)?;
+            probe("pg.read_bounded", "read tx begun");
             let out = f(&mut tx);
+            probe("pg.read_bounded", "the read body returned");
             // A read transaction: nothing to keep. The rollback's own error
             // must not hide the error of `f`; the drop rolls back anyway.
             let _ = tx.rollback();
             out
         };
+        probe("pg.read_bounded", "rolled back, giving back");
         drop(reader);
         out
     }

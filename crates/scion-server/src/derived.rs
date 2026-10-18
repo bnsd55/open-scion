@@ -130,10 +130,12 @@ fn get_until<K: Kind>(
     cs: ChangesetId,
     deadline: Option<&Deadline>,
 ) -> Result<K::Value> {
+    probe("derive.get", "first read");
     let known = store.read(|c| {
         require(c, repo, cs)?;
         load::<K>(c, cs)
     })?;
+    probe("derive.get", "first read done");
     if let Some(value) = known {
         return Ok(value);
     }
