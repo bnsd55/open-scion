@@ -867,9 +867,10 @@ mod tests {
         let writer_thread = std::thread::spawn(move || {
             writer
                 .write(|c| {
-                    c.lock_blob(b)?;
+                    // The transaction took the collector's key at its
+                    // begin (`Pg::commit`): the collector's batches wait
+                    // for it from here to its commit.
                     started_tx.send(()).unwrap();
-                    // The collector now blocks on the same lock.
                     go_rx.recv().unwrap();
                     c.insert_changeset(repo, &cs)?;
                     c.add_repo_blob(repo, b)?;
@@ -879,7 +880,7 @@ mod tests {
         });
         started_rx
             .recv()
-            .expect("the changeset transaction took the lock");
+            .expect("the changeset transaction took the key");
         // The snapshot runs; the prune then waits for the changeset.
         let (live_tx, live_rx) = std::sync::mpsc::channel();
         let gc_thread = {
