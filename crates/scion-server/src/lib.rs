@@ -1,8 +1,28 @@
 //! Scion server: durable storage, server-side commits and lands, and reads.
 //!
+//! This is the storage and serving crate of [open-scion]: the bottom of the
+//! system above the object model ([`scion-core`]), holding the metadata and
+//! blobs, doing commits, lands and reads, and serving the API of
+//! [`scion-proto`](https://docs.rs/open-scion-proto) to the client
+//! ([`scn`]) and the cache tiers
+//! ([`scion-tier`](https://docs.rs/open-scion-tier)). One server runs per
+//! data directory or per Postgres database — a second server on the same
+//! database fails at open (see [`Backend`]) — and the metadata may live in
+//! Postgres instead of the data directory; the blobs stay on local disk in
+//! both. The operations guide, `docs/operations.md`, covers both shapes.
+//!
+//! [open-scion]: https://github.com/bnsd55/open-scion
+//! [`scion-core`]: https://docs.rs/open-scion-core
+//! [`scn`]: https://docs.rs/open-scion
+//!
 //! Modules from the bottom up:
 //!
-//! - [`store`] and [`db`]: `SQLite` for metadata and trees, a folder for blobs.
+//! - [`backend`] and [`meta`]: one [`Meta`](meta::Meta) trait over two
+//!   backends: a data directory on this machine ([`store`]: SQLite for
+//!   metadata and trees), and a Postgres database (the `pg` module) for
+//!   the metadata instead. The blob files stay on local disk in both: one
+//!   blob folder per server. One server runs per database: a second one
+//!   is refused at open.
 //! - [`derived`]: one mechanism for every kind of derived data.
 //! - [`tree`]: apply changesets to trees and derive each changeset's root tree.
 //! - [`graph`]: the commit-graph index, and the graph queries that read it.
@@ -11,7 +31,12 @@
 //! - [`read`], [`blame`], the `write` module, [`land`]: the operations behind the RPCs.
 //!   A long one stops at its call's [`deadline`].
 //!   [`similar`] finds renames for `Diff` and `Blame`.
+//! - [`views`]: the view of the repo that a partial reader (folder read
+//!   rules, [`access`]) reads through.
+//! - [`quotas`]: what one principal may hold at once; [`tickets`]: the
+//!   signed read tickets of object reads.
 //! - [`fsck`]: reports the damage in a data directory. Read-only.
+//! - [`gc`]: collects the blobs that nothing names any more.
 //! - [`import`]: one-way import from a git repository.
 //! - [`service`], [`objects`] and [`auth`]: the gRPC front end. [`access`]:
 //!   which principal may read or write what.
