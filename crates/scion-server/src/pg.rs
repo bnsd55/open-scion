@@ -1045,8 +1045,6 @@ impl Pg {
         drop(reader);
         out
     }
-        out
-    }
 
     /// Runs `f` in one write transaction. It commits when `f` returns `Ok`
     /// and rolls back otherwise. A commit is durable when it returns, so
