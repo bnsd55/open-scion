@@ -78,6 +78,14 @@ jobs:
         run: cargo test -p open-scion-server --test disk_full
         env:
           SCION_DISK_REQUIRE: "1"
+      - name: block-level power cuts (dm-log-writes)
+        run: |
+          git clone --depth 1 https://github.com/josefbacik/log-writes "$RUNNER_TEMP/dlw"
+          gcc -O2 -o "$RUNNER_TEMP/replay-log" "$RUNNER_TEMP/dlw/replay-log.c" "$RUNNER_TEMP/dlw/log-writes.c"
+          cargo test -p open-scion-server --test dm_log_writes
+        env:
+          SCION_DMW_REQUIRE: "1"
+          SCION_DMW_REPLAY: ${{ runner.temp }}/replay-log
 
   test-postgres:
     name: test (postgres)

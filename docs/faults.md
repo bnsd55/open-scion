@@ -22,7 +22,8 @@ The matrix:
 | One file write of a batch fails | the refused blob answers the error | the earlier files of the batch stay intact (no row names them yet, so gc may reclaim them later) | yes | `storage.rs::a_batch_that_loses_a_file_keeps_its_earlier_files` |
 | A blob file was deleted under the server (corruption) | reads of it fail | `fsck` finds the missing files and lists them | yes, after repair | `backend_refusals.rs::a_fsck_of_a_postgres_backed_store_finds_missing_blob_files` |
 | Serve through a real kernel NFS mount | reads, writes, a rename and a delete through the mount work; a commit from the mount diffs; a tampered mount path is refused | the CI job `mount (NFS)` runs the whole flow under `timeout` | yes | CI job `mount (NFS)`, `scripts/mount-nfs.sh` (#243) |
-| Power cut while clients write | every reply lands or fails; the server restarts clean | the cut is a real lazyfs cache drop; runs in the CI job `power-loss` (needs `SCION_LAZYFS`) | yes | `power.rs::every_reply_survives_a_power_cut`; the durability-order refinements are open: #225, #261 |
+| Power cut while clients write | every reply lands or fails; the server restarts clean | the cut is a real lazyfs cache drop: a sync-before-reply test; it persists a rename at rename time, so a lost directory fsync is invisible to it | yes | `power.rs::every_reply_survives_a_power_cut`; the durability-order refinements are open: #225, #261 |
+| A power cut between the file flush and the directory flush (block-level replay) | a blob whose put was answered before the cut reads back with its name after every cut; the reopened store's `fsck` is clean | the cut is a real dm-log-writes replay to the last flush before each reply, so unflushed writes are lost; a mutation that deletes the blob-directory fsync turns it red | yes, after the reopen | `dm_log_writes.rs::an_acknowledged_blob_survives_a_cut_at_the_last_flush_before_its_reply` (CI job `test`, `SCION_DMW_REQUIRE=1`) |
 | A disk that fails mid-write or went read-only (`EIO`, `EROFS`) | a write on a read-only disk answers `Unavailable`, "the disk is read-only; retry later"; a read or fsync that the device refuses (`EIO`) answers `Internal` | no torn blob file and no temp file left; the log line carries the path and the operation; a retry that finds the stored file intact fsyncs it, file and directory, before it answers | yes | `storage.rs::a_write_on_a_read_only_disk_answers_unavailable_and_leaves_no_torn_file`, `storage.rs::a_read_on_a_failing_disk_answers_internal_and_keeps_serving_the_rest`, `storage.rs::a_file_fsync_the_disk_refuses_answers_internal_and_leaves_no_torn_file`, `storage.rs::a_retry_after_a_failed_dir_fsync_makes_the_kept_file_durable` |
 | The whole server on a real full disk (tmpfs, not injected faults) | `ResourceExhausted`, same fixed reply, for the blob path and for the metadata path; a disk out of inodes is the same refusal | reads keep working; a write lands again after a remount with more space or inodes; a reopen plus `fsck` is clean | yes | `disk_full.rs::a_full_disk_answers_out_of_space_and_needs_no_repair`, `disk_full.rs::a_full_metadata_disk_answers_out_of_space_and_needs_no_repair`, `disk_full.rs::a_disk_out_of_inodes_answers_out_of_space_and_needs_no_repair` (CI job `test`, `SCION_DISK_REQUIRE=1`) |
 
@@ -35,4 +36,7 @@ Notes:
   test beside them; the injected tests stay. #262 adds the faults a
   disk fails with that are not "no space".
 - The power-cut row needs LazyFS, so it skips where `SCION_LAZYFS` is
-  unset; the CI job sets it.
+  unset; the CI job sets it. The block-level row needs `dmsetup` and
+  `replay-log` (built by its CI step from
+  github.com/josefbacik/log-writes), so it skips where
+  `SCION_DMW_REQUIRE` is unset; the CI job sets it.
