@@ -926,10 +926,6 @@ pub enum DurabilityStep {
     FullFlush,
     /// A batch's `sync` answered its caller.
     Answer,
-    /// Kept for the doc test of the enum below; never recorded.
-    #[doc(hidden)]
-    #[allow(dead_code)]
-    Unused,
 }
 
 /// The ordered log of [`DurabilityStep`]s behind the test-hooks seam.
@@ -960,7 +956,6 @@ impl DurabilityLog {
     }
 
     /// The steps recorded so far, oldest first.
-    #[doc(hidden)]
     #[must_use]
     pub fn steps(&self) -> Vec<DurabilityStep> {
         self.steps
@@ -1800,6 +1795,8 @@ impl BlobBatch<'_> {
         self.blobs.write_gate(&path, "write blob file")?;
         let mut tmp = tempfile::NamedTempFile::new_in(&self.blobs.mine)?;
         zstd::stream::compress_sized_into(raw, &mut tmp, 3, len as u64)?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.blobs.log.record(DurabilityStep::TmpWrite(id));
         self.blobs
             .fsync_gate("the blob's temp file", "fsync blob file")?;
         #[cfg(any(test, feature = "test-hooks"))]
