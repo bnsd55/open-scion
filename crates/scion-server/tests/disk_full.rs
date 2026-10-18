@@ -104,32 +104,6 @@ fn is_out_of_space(e: &Error) -> bool {
     }
 }
 
-/// The client's view of the error: one fixed out-of-space reply. The
-/// status is built from an error of the same kind - the mapping is a
-/// pure function of the error's code.
-fn is_resource_exhausted(e: &Error) -> bool {
-    let error = match e {
-        Error::Io(io) => {
-            // An io error may carry no errno (a library's own error of
-            // that kind): the mirror keeps the kind, which is all the
-            // mapping reads.
-            let kind = io.kind();
-            Error::Io(match io.raw_os_error() {
-                Some(code) => std::io::Error::from_raw_os_error(code),
-                None => std::io::Error::from(kind),
-            })
-        }
-        Error::Db(_) => Error::Db(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
-            None,
-        )),
-        _ => return false,
-    };
-    let status = tonic::Status::from(error);
-    status.code() == tonic::Code::ResourceExhausted
-        && status.message() == "the server is out of disk space; retry later"
-}
-
 /// A store on the mount, like a server opens its data directory.
 fn open_store(mount: &Mount) -> Backend {
     Backend::open_test(mount.0.join("data").as_path()).unwrap()
@@ -171,7 +145,13 @@ fn a_full_disk_answers_out_of_space_and_needs_no_repair() {
     // or fsync.
     let (error, landed) = fill_with_blobs(&store, 64 * 1024);
     assert!(is_out_of_space(&error), "{error:?}");
-    assert!(is_resource_exhausted(&error), "{error:?}");
+    // The client's view: the real error, one fixed out-of-space reply.
+    let status = tonic::Status::from(error);
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted, "{status:?}");
+    assert_eq!(
+        status.message(),
+        "the server is out of disk space; retry later"
+    );
     // Every blob the disk accepted is still there: reads work.
     for id in &landed {
         assert_eq!(store.blobs().get(*id).unwrap().len(), 64 * 1024);
@@ -185,7 +165,8 @@ fn a_full_disk_answers_out_of_space_and_needs_no_repair() {
     // clean.
     let store = open_store(&mount);
     assert_eq!(store.blobs().get(kept).unwrap(), b"kept\n");
-    scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
+    let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
+    assert!(report.is_clean(), "{:?}", report.problems);
 }
 
 #[test]
@@ -210,7 +191,13 @@ fn a_full_metadata_disk_answers_out_of_space_and_needs_no_repair() {
         }
     };
     assert!(is_out_of_space(&error), "{error:?}");
-    assert!(is_resource_exhausted(&error), "{error:?}");
+    // The client's view: the real error, one fixed out-of-space reply.
+    let status = tonic::Status::from(error);
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted, "{status:?}");
+    assert_eq!(
+        status.message(),
+        "the server is out of disk space; retry later"
+    );
     // Reads work: every repo row that landed is still there.
     assert_eq!(store.read(|c| c.repos()).unwrap().len(), names.len());
     // The disk comes back, and the next row works with no restart.
@@ -219,7 +206,8 @@ fn a_full_metadata_disk_answers_out_of_space_and_needs_no_repair() {
     drop(store);
     // A restart needs no repair, and fsck is clean.
     let store = open_store(&mount);
-    scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
+    let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
+    assert!(report.is_clean(), "{:?}", report.problems);
 }
 
 #[test]
@@ -233,7 +221,13 @@ fn a_disk_out_of_inodes_answers_out_of_space_and_needs_no_repair() {
     // create itself is refused.
     let (error, landed) = fill_with_blobs(&store, 16);
     assert!(is_out_of_space(&error), "{error:?}");
-    assert!(is_resource_exhausted(&error), "{error:?}");
+    // The client's view: the real error, one fixed out-of-space reply.
+    let status = tonic::Status::from(error);
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted, "{status:?}");
+    assert_eq!(
+        status.message(),
+        "the server is out of disk space; retry later"
+    );
     for id in &landed {
         assert_eq!(store.blobs().get(*id).unwrap().len(), 16);
     }
@@ -242,5 +236,6 @@ fn a_disk_out_of_inodes_answers_out_of_space_and_needs_no_repair() {
     store.blobs().put(b"after\n").unwrap();
     drop(store);
     let store = open_store(&mount);
-    scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
+    let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
+    assert!(report.is_clean(), "{:?}", report.problems);
 }
