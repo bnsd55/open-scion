@@ -1352,11 +1352,8 @@ fn an_import_batch_waits_out_a_busy_write_lock_on_postgres() {
 
 #[test]
 fn an_import_that_loses_disk_space_fails_and_is_not_retried() {
-    if Backend::test_is_postgres() {
-        // The blob files are local in every backend, so the hook below
-        // works on Postgres too; the run here is the data-directory one.
-        // (Both jobs run this test.)
-    }
+    // The blob files are local in every backend, so the hook below works
+    // on Postgres too; both jobs run this test.
     let git = Git::init();
     let rev = git.fast_commits(0, 60);
     let (_dir, store) = open_store();
@@ -1427,11 +1424,8 @@ fn a_rolled_back_import_batch_verifies_again_when_it_reruns() {
 
 #[test]
 fn an_import_on_a_read_only_disk_fails_and_lands_after_the_remount() {
-    if Backend::test_is_postgres() {
-        // The blob files are local in every backend, so the hook below
-        // works on Postgres too; the run here is the data-directory one.
-        // (Both jobs run this test.)
-    }
+    // The blob files are local in every backend, so the hook below works
+    // on Postgres too; both jobs run this test.
     let git = Git::init();
     let rev = git.fast_commits(0, 60);
     let (_dir, store) = open_store();
