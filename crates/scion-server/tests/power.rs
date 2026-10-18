@@ -255,7 +255,7 @@ async fn every_reply_survives_a_power_cut() {
         eprintln!("round {round}: mounted");
         create_repo(&data);
         eprintln!("round {round}: repo created");
-        let server = Server::start(&data, &log);
+        let mut server = Server::start(&data, &log);
         eprintln!("round {round}: server up");
         check(&server.url, &data, &mut ledger, &mut checked, &mut rng).await;
         eprintln!("round {round}: check 1 done");
@@ -303,7 +303,7 @@ async fn every_reply_survives_a_power_cut() {
         // The store reopens from the backing directory: what `LazyFS`
         // persisted, and nothing else.
         let data = lazy.backing.join("data");
-        let server = Server::start(&data, &log);
+        let mut server = Server::start(&data, &log);
         eprintln!("round {round}: restart up");
         check(&server.url, &data, &mut ledger, &mut checked, &mut rng).await;
         eprintln!("round {round}: check 2 done");
@@ -458,7 +458,7 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
         let mut lazy = Lazyfs::start(dir.path(), &lazyfs, round);
         let data = lazy.mount.join("data");
         create_repo(&data);
-        let server = Server::start(&data, &server_log);
+        let mut server = Server::start(&data, &server_log);
         events.line(&format!("round {round}: server up"));
         // Acked waves: every put is answered before the cut, so every one
         // of them must survive it.
@@ -576,7 +576,7 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
         let mut lazy = Lazyfs::start(dir.path(), &lazyfs, round);
         let data = lazy.mount.join("data");
         create_repo(&data);
-        let server = Server::start(&data, &log);
+        let mut server = Server::start(&data, &log);
         // The server writes through the mount: blobs, acknowledged.
         let (mut scion, _objects) = connect(&server.url).await.unwrap();
         let mut acked = Vec::new();
