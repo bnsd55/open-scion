@@ -3358,7 +3358,7 @@ mod pool_tests {
                 Ok(cs)
             })
             .unwrap();
-        let req = |key: &str| LandRequest {
+        let req = move |key: &str| LandRequest {
             repo: "r".into(),
             changeset: cs,
             target_ref: "main".into(),

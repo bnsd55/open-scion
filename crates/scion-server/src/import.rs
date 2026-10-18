@@ -1067,7 +1067,7 @@ mod tests {
             message: message.into(),
             changes: BTreeMap::new(),
         };
-        let (repo, tip, links) = server
+        let (repo, tip, links): (RepoId, ChangesetId, Arc<[ChangesetId]>) = server
             .write(|c| {
                 let repo = c.create_repo("r")?;
                 let mut parent = c.insert_changeset(repo, &changeset(vec![], "root"))?;
