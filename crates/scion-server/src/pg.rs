@@ -1190,7 +1190,7 @@ impl Pg {
             .writers
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        probe("pg.wait_for_writers", format!("enter waiting={waiting}"));
+        probe("pg.wait_for_writers", format!("enter waiting={}", *waiting));
         while *waiting > 0 {
             let Some(deadline) = deadline else {
                 waiting = self
@@ -1198,7 +1198,7 @@ impl Pg {
                     .write_woken
                     .wait(waiting)
                     .unwrap_or_else(PoisonError::into_inner);
-                probe("pg.wait_for_writers", format!("woken waiting={waiting}"));
+                probe("pg.wait_for_writers", format!("woken waiting={}", *waiting));
                 continue;
             };
             let budget = deadline

@@ -299,7 +299,7 @@ fn waited(flight: &Arc<Flight>, before: u64, deadline: Option<&Deadline>) -> boo
     probe("derive.waited", format!("enter before={before}"));
     loop {
         if *walks > before {
-            probe("derive.waited", format!("exit true walks={walks}"));
+            probe("derive.waited", format!("exit true walks={}", *walks));
             return true;
         }
         match deadline {
@@ -308,7 +308,7 @@ fn waited(flight: &Arc<Flight>, before: u64, deadline: Option<&Deadline>) -> boo
                     .woken
                     .wait(walks)
                     .unwrap_or_else(PoisonError::into_inner);
-                probe("derive.waited", format!("woken walks={walks}"));
+                probe("derive.waited", format!("woken walks={}", *walks));
             }
             Some(deadline) => {
                 let budget = deadline.at().saturating_duration_since(Instant::now());
