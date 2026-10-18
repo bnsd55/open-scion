@@ -4,8 +4,8 @@
 //! transaction open leaves the reader pool healthy.
 
 use scion_core::{Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
-use scion_server::Store;
 use scion_server::meta::MetaTx as _;
+use scion_server::{Backend, Store, meta::Meta as _};
 use std::collections::BTreeMap;
 
 const REPO: &str = "r";
@@ -21,7 +21,7 @@ fn author() -> IdentityTime {
 
 /// A change whose blob is stored in the store, so the land's lens reads
 /// its length.
-fn put(store: &Store, path: &str, content: &str) -> (RepoPath, Option<FileState>) {
+fn put(store: &Backend, path: &str, content: &str) -> (RepoPath, Option<FileState>) {
     let content = store.blobs().put(content.as_bytes()).unwrap();
     let state = Some(FileState::Regular {
         content,
@@ -33,7 +33,7 @@ fn put(store: &Store, path: &str, content: &str) -> (RepoPath, Option<FileState>
 /// A repo whose `main` points at a root with `a/b/c`, `a/f` and `b/y`.
 struct Fixture {
     _dir: tempfile::TempDir,
-    store: Store,
+    store: Backend,
     root: ChangesetId,
 }
 
@@ -66,7 +66,7 @@ impl Fixture {
 
 fn setup() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
     let blob = |content: &str| store.blobs().put(content.as_bytes()).unwrap();
     let state = |blob| {
         Some(FileState::Regular {
@@ -106,6 +106,11 @@ fn setup() -> Fixture {
 /// writes that happened after the panicked read.
 #[test]
 fn a_read_that_leaves_a_transaction_open_is_replaced() {
+    // The poison reaches into the SQLite pool through rusqlite itself;
+    // the Postgres pool has its own recovery, exercised by its own jobs.
+    if Backend::test_is_postgres() {
+        return;
+    }
     let f = setup();
     // The reader pool has 8 connections. Poison each of them once, so
     // every pooled connection would be stale without the replacement.
@@ -114,7 +119,9 @@ fn a_read_that_leaves_a_transaction_open_is_replaced() {
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _ = store.read(|c| {
                 use rusqlite::params;
-                c.execute("BEGIN", params![])?;
+                c.sqlite()
+                    .expect("a SQLite backend")
+                    .execute("BEGIN", params![])?;
                 panic!("the read dies with its transaction open");
                 #[allow(unreachable_code)]
                 Ok::<(), scion_server::error::Error>(())

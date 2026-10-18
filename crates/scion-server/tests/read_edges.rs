@@ -12,7 +12,7 @@ use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{ListDirRequest, ReadFileRequest};
 use scion_server::access::Access;
 use scion_server::meta::MetaTx as _;
-use scion_server::{Store, service};
+use scion_server::{Backend, Store, meta::Meta as _, service};
 use tokio::net::TcpListener;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -62,9 +62,9 @@ fn author() -> IdentityTime {
 
 /// A store whose repo has one root changeset that puts `files` at the repo
 /// root. An empty `files` makes an empty directory.
-fn store(files: &[(Vec<u8>, &[u8])]) -> (tempfile::TempDir, Store, ChangesetId) {
+fn store(files: &[(Vec<u8>, &[u8])]) -> (tempfile::TempDir, Backend, ChangesetId) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
     let root = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -90,7 +90,7 @@ fn store(files: &[(Vec<u8>, &[u8])]) -> (tempfile::TempDir, Store, ChangesetId) 
 }
 
 /// Serves `store`, and returns the stop signal and a client as `TOKEN`.
-async fn serve(store: &Store) -> (Stop, Scion) {
+async fn serve(store: &Backend) -> (Stop, Scion) {
     let access = Access::parse(&format!(
         "token\t{TOKEN}\t{}\nread\t{TOKEN}\t{REPO}\n",
         hex(TOKEN)
