@@ -31,6 +31,10 @@ struct Pool {
     cap: usize,
     free: Mutex<usize>,
     woke: Condvar,
+    /// How many takes wait for bytes right now. Tests use it to see that a
+    /// waiter is really blocked before they free bytes for it.
+    #[cfg(test)]
+    waiting: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Debug for Bytes {
@@ -50,6 +54,8 @@ impl Bytes {
             cap,
             free: Mutex::new(cap),
             woke: Condvar::new(),
+            #[cfg(test)]
+            waiting: std::sync::atomic::AtomicUsize::new(0),
         }))
     }
 
@@ -82,6 +88,15 @@ impl Bytes {
             )));
         }
         let mut free = self.0.free.lock().expect("the budget lock is not poisoned");
+        #[cfg(test)]
+        let _waiting = if *free < n {
+            self.0
+                .waiting
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(WaitingGuard(&self.0.waiting))
+        } else {
+            None
+        };
         while *free < n {
             let Some(wait) = until.map(|at| at.saturating_duration_since(Instant::now())) else {
                 free = self
@@ -119,6 +134,17 @@ impl Bytes {
     /// than the whole pool; the error names the budget.
     pub fn try_take(&self, n: usize) -> Result<Held> {
         self.take(n, Some(Instant::now()))
+    }
+}
+
+/// Counts one take that waits for bytes, for as long as it waits.
+#[cfg(test)]
+struct WaitingGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+#[cfg(test)]
+impl Drop for WaitingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -217,6 +243,45 @@ mod tests {
         assert!(matches!(err, Error::ResourceExhausted(_)), "{err:?}");
         assert!(started.elapsed() >= Duration::from_millis(10));
         drop(held);
+    }
+
+    #[test]
+    fn keep_gives_the_rest_back_at_once() {
+        let bytes = Bytes::new(100);
+        let mut held = bytes.take(60, None).expect("fits");
+        held.keep(10);
+        assert_eq!(held.n, 10, "keep holds the kept part");
+        // The other 50 are free again: a take of them succeeds at once.
+        let rest = bytes.try_take(50).expect("keep freed the rest");
+        drop((held, rest));
+        assert!(bytes.try_take(100).is_ok(), "the whole pool came back");
+    }
+
+    #[test]
+    fn keep_wakes_a_waiter_for_the_bytes_it_gives_back() {
+        let bytes = Arc::new(Bytes::new(100));
+        let mut held = bytes.take(60, None).expect("fits");
+        let waiter = {
+            let bytes = Arc::clone(&bytes);
+            std::thread::spawn(move || {
+                let until = Instant::now() + Duration::from_millis(500);
+                bytes.take(50, Some(until))
+            })
+        };
+        // The order must be certain: a keep that runs before the waiter
+        // blocks would hand the bytes over without waking anything, and a
+        // lost notify would go unseen.
+        let blocked = (0..2000).any(|_| {
+            if bytes.0.waiting.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            false
+        });
+        assert!(blocked, "the waiter never blocked on the empty budget");
+        held.keep(10);
+        let got = waiter.join().unwrap().expect("keep woke the waiter");
+        drop((held, got));
     }
 
     #[test]

@@ -175,6 +175,11 @@ pub struct Lands {
     /// The metrics that count lands by outcome, when the process exports
     /// any.
     metrics: Option<Arc<crate::metrics::Metrics>>,
+    /// A step the tests run between a plan and its settle, once: a test
+    /// that moves the ref at exactly that moment makes the land replan
+    /// for certain, where a timed race depends on the machine.
+    #[cfg(test)]
+    before_settle: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Default for Lands {
@@ -198,7 +203,18 @@ impl Lands {
             used: Arc::default(),
             evicted: Mutex::default(),
             metrics,
+            #[cfg(test)]
+            before_settle: Mutex::new(None),
         }
+    }
+
+    /// Sets the step the next plan runs before its settle, once.
+    #[cfg(test)]
+    fn set_before_settle(&self, step: Box<dyn FnOnce() + Send>) {
+        *self
+            .before_settle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(step);
     }
 
     /// Rejects every land that has been pending for more than `stale_secs`,
@@ -532,9 +548,21 @@ fn finish(
     let mut attempt = 1;
     loop {
         let plan = store.read_unflushed(|c| plan(lands, c, repo, req, index))?;
+        #[cfg(test)]
+        if let Some(step) = lands
+            .before_settle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            step();
+        }
         match settle(lands, store, repo, land_id, &req.target_ref, plan, index) {
             Err(Error::Aborted(detail)) if attempt < MAX_ATTEMPTS => {
                 tracing::info!(land_id, attempt, %detail, "planning the land again");
+                if let Some(metrics) = &lands.metrics {
+                    metrics.land_replan();
+                }
                 attempt += 1;
             }
             outcome => return outcome,
@@ -1483,6 +1511,52 @@ mod tests {
         AfterPlan,
         /// An import moved the ref between the plan and the transaction.
         RefMoved,
+    }
+
+    /// A ref that moves between the land's plan and its settle makes the
+    /// land plan again from the new head, and the replan counts once. The
+    /// hook fires at exactly that moment, so the race does not depend on
+    /// the machine.
+    #[test]
+    fn a_land_whose_ref_moves_between_plan_and_settle_replans() {
+        let f = fixture();
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        let lands = Lands::new(None, Some(Arc::clone(&metrics)));
+        // Main moves past the base, so the land must rebase.
+        f.move_main(f.commit(f.root, &[put("b/y", "first")]));
+        let cs = f.commit(f.root, &[put("a/x", "new")]);
+        // The import commits its changeset but holds its ref move for the
+        // moment between the land's plan and its settle.
+        let import = f.commit(f.main().target, &[put("c", "import")]);
+        let hook_store = f.store.clone();
+        let hook_repo = f.repo;
+        lands.set_before_settle(Box::new(move || {
+            let head = hook_store
+                .read(|c| {
+                    let head = c.get_ref(hook_repo, "main")?.unwrap();
+                    Ok(head)
+                })
+                .unwrap();
+            let moved = hook_store
+                .write(|c| c.cas_ref(hook_repo, "main", Some(head.version), import))
+                .unwrap();
+            assert!(moved, "the import's move lost a race it cannot lose");
+        }));
+
+        let out = lands.land(&f.store, &caller(), &req(cs, "hook")).unwrap();
+        assert_eq!(out.state, LandState::Landed, "{}", out.detail);
+        let landed = out.result.expect("landed");
+        // The landed changeset sits on top of the import: the land
+        // replanned onto the head the import made.
+        let parents = f
+            .store
+            .read(|c| Ok(c.get_changeset(f.repo, landed)?.parents))
+            .unwrap();
+        assert_eq!(parents, vec![import], "the land rebased onto the import");
+        assert_eq!(metrics.land_replans(), 1, "the replan counted once");
+        // A retry with the same key returns the same outcome.
+        let again = lands.land(&f.store, &caller(), &req(cs, "hook")).unwrap();
+        assert_eq!(again, out);
     }
 
     #[test]
