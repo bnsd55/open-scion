@@ -37,6 +37,7 @@ fn required() -> bool {
     true
 }
 
+// A second test here must wrap its spawns in spawn_guard::across_spawn, as disk_full.rs does.
 /// Runs `args` as root, and fails the test when the command fails.
 fn sudo(args: &[&str]) -> String {
     let out = std::process::Command::new("sudo")

@@ -10,7 +10,7 @@
 //! variable. Every mount is one test's own: `sudo` is only used on the
 //! `mount`, `remount`, and `umount` commands themselves.
 use scion_server::meta::{Meta as _, MetaTx as _};
-use scion_server::{Backend, Error};
+use scion_server::{Backend, Error, spawn_guard};
 
 fn required() -> bool {
     if !cfg!(target_os = "linux") {
@@ -26,10 +26,14 @@ fn required() -> bool {
 
 /// Runs `args` as root, and fails the test when the command fails.
 fn sudo(args: &[&str]) {
-    let out = std::process::Command::new("sudo")
-        .args(args)
-        .output()
-        .expect("sudo runs");
+    // A child shares a flock until it execs (see `spawn_guard`): the read
+    // side keeps this spawn out of a lock-release window of another test.
+    let out = spawn_guard::across_spawn(|| {
+        std::process::Command::new("sudo")
+            .args(args)
+            .output()
+            .expect("sudo runs")
+    });
     assert!(
         out.status.success(),
         "sudo {args:?} failed: {}",
