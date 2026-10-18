@@ -984,7 +984,7 @@ mod silent_failures {
     /// Waits until `cond` holds, with a ceiling: macOS may keep a reaped
     /// child's flock for one tick, so a lock test polls the real
     /// condition instead of assuming the first read.
-    fn wait_for(ceiling_secs: u64, cond: impl Fn() -> bool) -> bool {
+    fn wait_for(ceiling_secs: u64, mut cond: impl FnMut() -> bool) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ceiling_secs);
         loop {
             if cond() {
