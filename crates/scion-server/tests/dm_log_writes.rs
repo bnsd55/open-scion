@@ -231,6 +231,9 @@ fn an_acknowledged_blob_survives_a_cut_at_the_last_flush_before_its_reply() {
     )
     .collect();
     assert!(!flushes.is_empty(), "the log carries flush entries");
+    let total = find_entry(&replay, &recording.log_dev, 0, false, None);
+    eprintln!("log: marks at {marks:?}, flushes at {flushes:?} (find at 0 answered {total:?})");
+    let _ = marks;
 
     for (i, mark) in marks.iter().enumerate() {
         let n = i as u64 + 1;
@@ -254,6 +257,17 @@ fn an_acknowledged_blob_survives_a_cut_at_the_last_flush_before_its_reply() {
         ]);
         // Mounting replays the journal; the store reopens on the cut.
         sudo(&["mount", disk.as_str(), mount.to_str().unwrap()]);
+        for dir in ["data/objects/blob", "data/objects/blob/tmp"] {
+            let out = std::process::Command::new("sudo")
+                .args(["find", mount.join(dir).to_str().unwrap(), "-type", "f"])
+                .output()
+                .unwrap();
+            eprintln!(
+                "cut {cut} for reply-{n}: {} files under {dir}: {}",
+                String::from_utf8_lossy(&out.stdout).lines().count(),
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
         let store = Backend::open_test(mount.join("data").as_path()).unwrap();
         for (k, id) in ids.iter().take(n.try_into().unwrap()).enumerate() {
             let k = k + 1;
