@@ -431,6 +431,7 @@ impl Store {
     /// The durability steps this store's blob path ran, oldest first,
     /// for the order test under the test-hooks seam.
     #[doc(hidden)]
+    #[must_use]
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn durability_steps(&self) -> Vec<DurabilityStep> {
         self.inner.blobs.log.steps()
@@ -937,6 +938,7 @@ impl DurabilityLog {
 
     /// The steps recorded so far, oldest first.
     #[doc(hidden)]
+    #[must_use]
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn steps(&self) -> Vec<DurabilityStep> {
         self.steps
