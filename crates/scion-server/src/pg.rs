@@ -22,7 +22,7 @@
 //!   twice, and the newest land holds the largest one.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use gix::ObjectId;
@@ -115,9 +115,11 @@ struct Readers {
     open_since: Mutex<Vec<Instant>>,
     /// How many clients the pool holds, for the busy gauge.
     size: usize,
-    /// The registry the pool records into. Set once the server builds
-    /// its metrics; [`None`] for import, fsck, and tests that have none.
-    metrics: Mutex<Option<Arc<Metrics>>>,
+    /// The registry the pool records into. Set once, by the server,
+    /// through [`Backend::set_metrics`](crate::backend::Backend::set_metrics);
+    /// a second set is a no-op. [`None`] until then: import, fsck, gc,
+    /// and tests without a registry record nothing.
+    metrics: OnceLock<Arc<Metrics>>,
 }
 
 impl Readers {
@@ -151,7 +153,7 @@ impl Readers {
             returned: Condvar::new(),
             open_since: Mutex::new(Vec::new()),
             size,
-            metrics: Mutex::new(None),
+            metrics: OnceLock::new(),
         })
     }
 
@@ -178,9 +180,9 @@ impl Readers {
                 .unwrap_or_else(PoisonError::into_inner);
             idle = guard;
             if woke.timed_out() {
-                return Err(Error::Unavailable(format!(
-                    "no Postgres reader free after {wait:?}; the readers are stuck in long reads"
-                )));
+                // The wait is over, but a reader given back in this window
+                // is idle now: look once more before refusing.
+                continue;
             }
         };
         let started_at = Instant::now();
@@ -235,15 +237,15 @@ impl Readers {
     /// The metrics to record into, if the server gave the backend its
     /// registry.
     fn metrics(&self) -> Option<Arc<Metrics>> {
-        self.metrics
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.metrics.get().cloned()
     }
 
-    /// Gives the pool the server's metrics registry.
+    /// Gives the pool the server's metrics registry. Set once: a second
+    /// set is a no-op, and says so in the debug log.
     fn set_metrics(&self, metrics: Arc<Metrics>) {
-        *self.metrics.lock().unwrap_or_else(PoisonError::into_inner) = Some(metrics);
+        if self.metrics.set(metrics).is_err() {
+            tracing::debug!("the metrics registry was already set");
+        }
         self.report_busy();
     }
 }
@@ -802,7 +804,7 @@ impl Pg {
     /// Gives the pool the server's metrics registry. Called once by the
     /// server before it serves; import, fsck, and gc pass none, and the
     /// pool then records nothing.
-    pub fn set_metrics(&self, metrics: Arc<Metrics>) {
+    pub(crate) fn set_metrics(&self, metrics: Arc<Metrics>) {
         self.inner.readers.set_metrics(metrics);
     }
 

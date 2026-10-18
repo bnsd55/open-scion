@@ -387,15 +387,13 @@ the process, scraped from there. The names:
 - `scion_view_trees_walked_total` — real trees a view derivation opened for
   a partial reader; a rate that stays high across changesets of one rule
   set means the per-tree memo is not serving and every derivation re-walks.
-- `scion_view_trees_walked_total` — real trees a view derivation opened for
-  a partial reader; a rate that stays high across changesets of one rule
-  set means the per-tree memo is not serving and every derivation re-walks.
 - `scion_cache_hits_total` / `scion_cache_misses_total` — what a tier
   served from its store against what it fetched upstream.
 - `scion_pg_pool_wait_seconds` — (Postgres only) how long calls waited for
-  a read connection. A rising tail means the 8 readers are held by long
-  walks; the calls that waited past the pool's bound failed
-  `unavailable`.
+  a read connection. A read transaction is bounded at 300 s per statement
+  and 30 s idle between statements, and a call waits at most 30 s for a
+  reader before it fails `unavailable`. A rising tail means the 8 readers
+  are held by long walks.
 - `scion_pg_readers_busy` — (Postgres only) how many of the pool's read
   connections are in use now. Pinned at 8 means every read walks a big
   history; pair it with `scion_pg_tx_age_seconds`.

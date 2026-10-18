@@ -193,7 +193,7 @@ pub async fn serve(
     // The Postgres reader pool records into the registry: the wait for a
     // reader, the busy readers, and the tx age, which this task keeps
     // fresh. On SQLite this is a no-op.
-    store.set_pg_metrics(Arc::clone(&metrics));
+    store.set_metrics(Arc::clone(&metrics));
     let lands = Arc::new(Lands::new(pending_lands, Some(Arc::clone(&metrics))));
     let (stop_tx, stop_rx) = watch::channel(());
     tokio::spawn(async move {
