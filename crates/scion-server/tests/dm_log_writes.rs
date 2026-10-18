@@ -5,7 +5,7 @@
 //! drive was never told to flush. What survives each cut is checked by
 //! mounting the file system, reopening the store, and running fsck.
 //!
-//! This is the cut the LazyFS suite cannot make: LazyFS persists a
+//! This is the cut the `LazyFS` suite cannot make: LazyFS persists a
 //! rename at rename time, so a lost directory fsync is invisible to it.
 //! Here a cut between the file flush and the directory flush takes the
 //! name away, and the test goes red.
@@ -127,21 +127,21 @@ impl Recording {
         }
     }
 
-    /// A mark in the log: the story reached this point, so every put
-    /// before it was answered.
-    fn mark(&self, name: &str) {
-        sudo(&["dmsetup", "message", "logdisk", "0", "mark", name]);
-    }
-
     /// The data image, restored to its mkfs'd bytes on a fresh loop, so
     /// a replay never sees a previous cut. The log loop stays.
     fn fresh_disk(&self) -> String {
         sudo(&["losetup", "-d", &self.data_loop.borrow()]);
         std::fs::copy(&self.pristine, &self.disk).unwrap();
         let fresh = sudo(&["losetup", "--find", "--show", self.disk.to_str().unwrap()]);
-        *self.data_loop.borrow_mut() = fresh.clone();
+        self.data_loop.borrow_mut().clone_from(&fresh);
         fresh
     }
+}
+
+/// A mark in the log: the story reached this point, so every put
+/// before it was answered.
+fn mark(name: &str) {
+    sudo(&["dmsetup", "message", "logdisk", "0", "mark", name]);
 }
 
 impl Drop for Recording {
@@ -198,7 +198,7 @@ fn an_acknowledged_blob_survives_a_cut_at_the_last_flush_before_its_reply() {
         std::env::var("SCION_DMW_REPLAY").expect("the CI step builds replay-log and names it");
     let work = tempfile::tempdir().unwrap();
     let recording = Recording::new(work.path());
-    let mount = recording.mount.to_path_buf();
+    let mount = recording.mount.clone();
 
     // The story: three puts, each acknowledged at its mark. The store
     // synced the file, the rename, the fan-out directory, and the drive
@@ -208,7 +208,7 @@ fn an_acknowledged_blob_survives_a_cut_at_the_last_flush_before_its_reply() {
     for k in 1..=3u64 {
         let raw = format!("acknowledged {k}\n");
         ids.push(store.blobs().put(raw.as_bytes()).unwrap());
-        recording.mark(&format!("reply-{k}"));
+        mark(&format!("reply-{k}"));
     }
     drop(store);
     sudo(&["umount", mount.to_str().unwrap()]);
@@ -240,8 +240,8 @@ fn an_acknowledged_blob_survives_a_cut_at_the_last_flush_before_its_reply() {
         // or before the mark. The drive lost the entries after it.
         let cut = *flushes
             .iter()
-            .filter(|f| **f <= *mark)
-            .next_back()
+            .rev()
+            .find(|f| **f <= *mark)
             .unwrap_or_else(|| panic!("a flush precedes the mark reply-{n}"));
         // A fresh disk, and the log up to the cut, replayed onto it.
         let disk = recording.fresh_disk();
@@ -257,9 +257,10 @@ fn an_acknowledged_blob_survives_a_cut_at_the_last_flush_before_its_reply() {
         // Mounting replays the journal; the store reopens on the cut.
         sudo(&["mount", disk.as_str(), mount.to_str().unwrap()]);
         let store = Backend::open_test(mount.join("data").as_path()).unwrap();
-        for k in 1..=n {
+        for (k, id) in ids.iter().take(n as usize).enumerate() {
+            let k = k + 1;
             assert_eq!(
-                store.blobs().get(ids[k as usize - 1]).unwrap(),
+                store.blobs().get(*id).unwrap(),
                 format!("acknowledged {k}\n").into_bytes(),
                 "blob {k}, acknowledged before the cut at entry {cut}, lost its bytes or its name"
             );
