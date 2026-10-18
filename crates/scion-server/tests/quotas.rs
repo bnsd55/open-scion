@@ -11,6 +11,7 @@ use scion_server::access::Access;
 use scion_server::meta::{Meta as _, MetaTx as _, RefState};
 use scion_server::quotas::Quotas;
 use scion_server::{Backend, service};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::ReceiverStream;
@@ -46,11 +47,8 @@ fn access(principals: &[&str]) -> Access {
     for name in principals {
         let line = format!("token\t{name}\t{}\n", hex(name));
         text.push_str(&line);
-        text.push_str("write\t");
-        text.push_str(name);
-        text.push('\t');
-        text.push_str(REPO);
-        text.push('\n');
+        let _ = writeln!(text, "read\t{name}\t{REPO}");
+        let _ = writeln!(text, "write\t{name}\t{REPO}");
     }
     Access::parse(&text).unwrap()
 }
@@ -275,7 +273,7 @@ async fn a_principal_at_its_cap_is_refused_while_another_goes_on() {
     assert!(denied.to_string().contains("--max-principal-requests 1"));
 
     // Bob is under his own cap: while alice is held, his calls complete.
-    client(channel.clone(), "bob")
+    let mut pages = client(channel.clone(), "bob")
         .log(LogRequest {
             repo: REPO.to_string(),
             changeset_id: main_ref(&store).target.as_bytes().to_vec(),
@@ -283,7 +281,9 @@ async fn a_principal_at_its_cap_is_refused_while_another_goes_on() {
             path: Vec::new(),
         })
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner();
+    while pages.message().await.unwrap().is_some() {}
     let _ = probe(&client(channel.clone(), "bob")).await;
 
     // Alice ends her upload, so her slot comes back and her next request

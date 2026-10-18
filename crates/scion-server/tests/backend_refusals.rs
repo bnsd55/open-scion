@@ -7,6 +7,7 @@ use std::path::Path;
 use std::process::Command;
 
 use scion_server::Backend;
+use scion_server::meta::{Meta as _, MetaTx as _};
 
 /// The refusal needs a directory whose marker names Postgres, which only
 /// a Postgres-backed open writes.
@@ -114,4 +115,42 @@ fn a_postgres_open_makes_the_data_directory_it_names() {
         .err()
         .expect("the marker refuses the SQLite backend");
     assert!(error.to_string().contains("--postgres-url"), "{error}");
+}
+
+/// A write that another writer blocks answers busy in seconds, not past
+/// the minute-long statement clock: the open sets a lock timeout like the
+/// SQLite busy timeout, and a lock the database cannot give in it maps to
+/// busy, so the client retries.
+#[test]
+fn a_write_blocked_by_another_writer_answers_busy_in_seconds() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(dir.path()).unwrap();
+    // A connection of the test holds the name in an open transaction: it
+    // inserted the row and never ended the transaction, so every writer
+    // of the same name waits for it.
+    let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+    let schema = Backend::test_schema(dir.path()).unwrap();
+    let mut held = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    held.batch_execute(&format!("SET search_path TO {schema}"))
+        .unwrap();
+    held.batch_execute("BEGIN; INSERT INTO repos (name) VALUES ('held');")
+        .unwrap();
+    let started = std::time::Instant::now();
+    let error = store
+        .write(|c| c.create_repo("held").map(|_| ()))
+        .expect_err("the held name refuses the write");
+    let waited = started.elapsed();
+    let _ = held.batch_execute("ROLLBACK");
+    assert!(matches!(error, scion_server::Error::Busy), "{error:?}");
+    assert!(
+        waited >= std::time::Duration::from_secs(4),
+        "answered after {waited:?}"
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(20),
+        "answered after {waited:?}"
+    );
 }

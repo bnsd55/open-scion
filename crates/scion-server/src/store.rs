@@ -24,11 +24,12 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, ErrorKind, Read, Seek, Write};
 use std::ops::Deref;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use rustix::fs::FlockOperation;
@@ -36,10 +37,12 @@ use rustix::io::Errno;
 use scion_core::{BlobHasher, BlobId};
 
 use crate::db::SqliteTx;
+use crate::deadline::Deadline;
+use crate::derived::DeriveFlights;
 use crate::error::{Error, Result};
 
 /// The schema version this build makes and reads.
-pub(crate) const SCHEMA_VERSION: u32 = 7;
+pub(crate) const SCHEMA_VERSION: u32 = 8;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database from
 /// version `n - 1` to version `n`. A released migration never changes.
@@ -51,6 +54,7 @@ const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [
     include_str!("../migrations/0005_path_history.sql"),
     include_str!("../migrations/0006_land_created_at.sql"),
     include_str!("../migrations/0007_tree_sizes.sql"),
+    include_str!("../migrations/0008_view_roots.sql"),
 ];
 
 /// Largest object accepted or read back, uncompressed: 100 MiB, the hard
@@ -76,6 +80,24 @@ pub struct Store {
 /// once. Each has its own page cache, so they are few. They are more than
 /// the graph queries that can run at once, so those never take every one.
 pub(crate) const READERS: usize = 8;
+
+/// The cap on derive walks in flight, across all kinds and repos of one
+/// [`Store`]. Each walk holds the write connection in turns, so walks
+/// beyond the cap only repeat work and starve writes ([#142]).
+pub(crate) const DERIVE_WALKS_CAP: usize = 8;
+
+/// Counts one writer that is waiting for the write connection, and
+/// subtracts it again, with a wake, when the writer gets in or gives up.
+/// A derive walk between steps waits while the count is above zero.
+struct WriteWaiter<'a>(&'a Mutex<usize>, &'a Condvar);
+
+impl Drop for WriteWaiter<'_> {
+    fn drop(&mut self) {
+        let mut waiting = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        *waiting -= 1;
+        self.1.notify_all();
+    }
+}
 
 struct Inner {
     /// Read-only connections for [`Store::read`]. They come before `db`, so
@@ -107,6 +129,16 @@ struct Inner {
     /// the import's busy retry: the transaction ran and rolled back, so
     /// nothing was written, exactly as a real busy commit ends.
     fail_commits: AtomicU64,
+    /// The derive walks of this store: which are in flight, and the cap
+    /// on how many may be.
+    derive: DeriveFlights,
+    /// Writers that are waiting for the write connection, with the condvar
+    /// woken when one gets in or gives up. A derive walk between steps
+    /// waits while the count is above zero, so writers have strict
+    /// priority over walk steps: a steady stream of writers delays a cold
+    /// read up to its deadline, never a land ([#142]).
+    writers: Mutex<usize>,
+    write_woken: Condvar,
 }
 
 impl Store {
@@ -125,7 +157,14 @@ impl Store {
     /// database cannot be created, or if the schema is newer than this build,
     /// or older while another `Store` uses the directory.
     pub fn open(dir: &Path) -> Result<Self> {
-        Self::open_as(dir, true, &build())
+        Self::open_as(dir, true, &build(), DERIVE_WALKS_CAP)
+    }
+
+    /// Opens or creates a data directory as its server, with a cap of
+    /// `walks` derive walks in flight. For tests of the cap.
+    #[cfg(test)]
+    pub(crate) fn open_with_walks(dir: &Path, walks: usize) -> Result<Self> {
+        Self::open_as(dir, true, &build(), walks)
     }
 
     /// Opens or creates a data directory for a process that does not land,
@@ -144,17 +183,35 @@ impl Store {
     ///
     /// As [`Store::open`], except that a server `Store` is no conflict.
     pub fn open_shared(dir: &Path) -> Result<Self> {
-        Self::open_as(dir, false, &build())
+        Self::open_as(dir, false, &build(), DERIVE_WALKS_CAP)
     }
 
     /// Opens a data directory for a process of build `build` ([`build`]).
-    fn open_as(dir: &Path, server: bool, build: &str) -> Result<Self> {
+    fn open_as(dir: &Path, server: bool, build: &str, walks_cap: usize) -> Result<Self> {
         fs::create_dir_all(dir)?;
+        // The blobs and the metadata are only as private as the directory:
+        // a group- or others-writable directory lets another user read or
+        // replace them, and so does one under a directory another user can
+        // change.
+        let me = rustix::process::geteuid().as_raw();
+        let meta = fs::symlink_metadata(dir)?;
+        if meta.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "{} can be written by group or others (fix: chmod go-w {})",
+                    dir.display(),
+                    dir.display()
+                ),
+            )
+            .into());
+        }
+        let dir = scion_proto::auth::check_ancestors(dir, me)?;
         // A second server fails here, before it waits for anything.
         let server_lock = if server {
-            let file = lock_file(dir, "server.lock")?;
+            let file = lock_file(&dir, "server.lock")?;
             if !flock(&file, FlockOperation::NonBlockingLockExclusive)? {
-                return Err(in_use(dir, "server.lock", "another server"));
+                return Err(in_use(&dir, "server.lock", "another server"));
             }
             Some(file)
         } else {
@@ -164,12 +221,12 @@ impl Store {
         // one ends. If `lock` can be taken exclusive, no other process uses
         // the directory. Shared from then on, it keeps out a process of an
         // older build, which holds it exclusive for its whole life.
-        let opening = lock_file(dir, "open.lock")?;
+        let opening = lock_file(&dir, "open.lock")?;
         flock(&opening, FlockOperation::LockExclusive)?;
-        let lock = lock_file(dir, "lock")?;
+        let lock = lock_file(&dir, "lock")?;
         let alone = flock(&lock, FlockOperation::NonBlockingLockExclusive)?;
         if !flock(&lock, FlockOperation::NonBlockingLockShared)? {
-            return Err(in_use(dir, "lock", "a process that holds it alone"));
+            return Err(in_use(&dir, "lock", "a process that holds it alone"));
         }
         // The first process writes its build into `lock`, and every other
         // one must have the same build.
@@ -187,7 +244,7 @@ impl Store {
                 )));
             }
         }
-        let blobs = Blobs::open(dir)?;
+        let blobs = Blobs::open(&dir)?;
         // Every open removes the folders of dead processes; only an open
         // that is alone also removes files, which a build older than the
         // folders may have left.
@@ -237,8 +294,68 @@ impl Store {
                 _server_lock: server_lock,
                 txes: AtomicU64::new(0),
                 fail_commits: AtomicU64::new(0),
+                derive: DeriveFlights::new(walks_cap),
+                writers: Mutex::new(0),
+                write_woken: Condvar::new(),
             }),
         })
+    }
+
+    /// How many writers are waiting for the write connection.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn writers_waiting(&self) -> usize {
+        *self
+            .inner
+            .writers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits while writers are waiting for the write connection, until the
+    /// deadline. Writers have strict priority over walk steps: a steady
+    /// stream of writers delays a cold read up to its deadline, never a
+    /// land ([#142]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::DeadlineExceeded`] once the deadline has passed.
+    pub(crate) fn wait_for_writers(&self, deadline: Option<&Deadline>) -> Result<()> {
+        let mut waiting = self
+            .inner
+            .writers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while *waiting > 0 {
+            let Some(deadline) = deadline else {
+                waiting = self
+                    .inner
+                    .write_woken
+                    .wait(waiting)
+                    .unwrap_or_else(PoisonError::into_inner);
+                continue;
+            };
+            let budget = deadline.at().saturating_duration_since(Instant::now());
+            let (guard, timed_out) = self
+                .inner
+                .write_woken
+                .wait_timeout_while(waiting, budget, |waiting| *waiting > 0)
+                .unwrap_or_else(PoisonError::into_inner);
+            waiting = guard;
+            if timed_out.timed_out() {
+                return Err(Error::DeadlineExceeded(
+                    "the call ran past its deadline".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The derive walks of this store: which are in flight, and the cap on
+    /// how many may be.
+    #[must_use]
+    pub(crate) fn derive_flights(&self) -> &DeriveFlights {
+        &self.inner.derive
     }
 
     /// The blob folder.
@@ -385,6 +502,12 @@ impl Store {
         &self,
         f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>,
     ) -> Result<T> {
+        *self
+            .inner
+            .writers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += 1;
+        let _waiting = WriteWaiter(&self.inner.writers, &self.inner.write_woken);
         let mut db = self.lock();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = f(&mut SqliteTx(&tx))?;
@@ -1456,6 +1579,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_open_refuses_a_data_directory_that_group_or_others_can_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let writable = |path: &Path| {
+            let mut mode = fs::metadata(path).unwrap().permissions();
+            mode.set_mode(0o777);
+            fs::set_permissions(path, mode).unwrap();
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        fs::create_dir(&path).unwrap();
+        writable(&path);
+        let Err(err) = Store::open(&path) else {
+            panic!("the open of a writable data directory must fail");
+        };
+        assert!(
+            err.to_string()
+                .contains("can be written by group or others"),
+            "{err}"
+        );
+        // The same through a parent that another user can change: a
+        // group-writable directory without the sticky bit above the data.
+        let parent = dir.path().join("shared");
+        fs::create_dir(&parent).unwrap();
+        writable(&parent);
+        let path = parent.join("data");
+        fs::create_dir(&path).unwrap();
+        let Err(err) = Store::open(&path) else {
+            panic!("the open under a swappable parent must fail");
+        };
+        assert!(
+            err.to_string().contains("could swap")
+                || err.to_string().contains("not private")
+                || err.to_string().contains("owned by another user"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn a_blob_size_comes_from_its_frame_header() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
@@ -1706,11 +1867,11 @@ mod tests {
                 other => panic!("expected the open to fail, got {:?}", other.err()),
             };
             let server = Store::open(dir.path()).unwrap();
-            refused(Store::open_as(dir.path(), false, &other));
+            refused(Store::open_as(dir.path(), false, &other, DERIVE_WALKS_CAP));
             Store::open_shared(dir.path()).unwrap();
             drop(server);
             // The import of the other build opened alone, so its build counts.
-            let import = Store::open_as(dir.path(), false, &other).unwrap();
+            let import = Store::open_as(dir.path(), false, &other, DERIVE_WALKS_CAP).unwrap();
             refused(Store::open(dir.path()));
             refused(Store::open_shared(dir.path()));
             drop(import);

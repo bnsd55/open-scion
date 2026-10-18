@@ -21,7 +21,10 @@ otherwise.
 ## Scope
 
 Known limits of the current design are documented in the code as `SHORTCUT:`
-comments and in the README. For example: there is one shared token and no TLS,
-and the server refuses non-loopback addresses unless `--insecure-listen` is
-given. A report about a documented limit is still welcome if it shows an impact
-the documentation does not mention.
+comments, in the README, and in
+[`docs/operations.md`](docs/operations.md). For example: an access file maps
+one token to one principal with per-path rules, and the network is closed by
+default — the server refuses a non-loopback address unless it serves TLS
+(`--tls-cert` and `--tls-key`) or gets `--insecure-listen`. A report about a
+documented limit is still welcome if it shows an impact the documentation
+does not mention.

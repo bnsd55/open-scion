@@ -1586,6 +1586,49 @@ fn a_cursor_with_huge_line_numbers_decodes_without_overflow() {
     assert_eq!(decoded.window, Vec::new());
 }
 
+/// A cursor whose run claims more lines than a word holds is refused: the
+/// window bound, not a wrapped total, decides. Found by the `blame-cursor`
+/// fuzz target: `total += len` overflowed, and the fuzz build died on the
+/// check while a release build silently took the wrapped total.
+#[test]
+fn a_cursor_with_a_run_longer_than_the_word_is_refused() {
+    let (_data, store) = open_store();
+    let put = |data: &[u8]| regular(store.blobs().put(data).unwrap());
+    let ids = chain(&store, vec![vec![("f", put(b"a\n")), ("f", put(b"b\n"))]]);
+    let mut bytes = cursor_bytes(
+        &Resume {
+            next: None,
+            search: RenameSearch::default(),
+            after_line: 0,
+            counted: 8,
+            window: vec![Line::Unnamed(0), Line::Unnamed(1)],
+        },
+        ids[0],
+        "f",
+    );
+    // The runs start after the fixed header: the version, the digest, the
+    // walk flag, the search, the window bounds. Replace the run counts and
+    // the runs: a table of none, then one line, then a run of the biggest
+    // count a word holds.
+    bytes.truncate(1 + 16 + 1 + 8 + 1 + 8 + 8);
+    bytes.extend_from_slice(&0u32.to_be_bytes());
+    bytes.extend_from_slice(&2u32.to_be_bytes());
+    bytes.extend_from_slice(&[0x01, 0x00, 0x00]);
+    bytes.extend_from_slice(&[0xff; 9]);
+    bytes.extend_from_slice(&[0x01, 0x00]);
+    let err = blame::decode_cursor(
+        &store,
+        REPO,
+        &bytes,
+        ids[0],
+        &path("f"),
+        &Bytes::new(1 << 30),
+        None,
+    )
+    .expect_err("a cursor with a run longer than the word is refused");
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+}
+
 #[test]
 fn a_cursor_names_only_changesets_of_its_repo() {
     let (_data, store) = open_store();

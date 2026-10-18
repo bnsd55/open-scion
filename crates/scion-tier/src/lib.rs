@@ -1,5 +1,13 @@
 //! Cache tiers for the `Objects` service: `scion-cache` and `scion-daemon`.
 //!
+//! A tier sits between clients and the server: a `scion-cache` holds the
+//! hot objects of many users near them, and a `scion-daemon` is a
+//! single-user cache on the client machine, serving `scn` over a private
+//! Unix socket. Both are built on this crate; the server itself is the
+//! [`open-scion-server`](https://docs.rs/open-scion-server) crate, and
+//! the calls they forward and answer are defined in
+//! [`scion-proto`](https://docs.rs/open-scion-proto).
+//!
 //! A [`Tier`] answers the same `Objects` calls as the server. It serves trees
 //! and blobs from its own [`Store`] and sends each miss to its one upstream:
 //! the next tier, or the server. It never trusts that upstream:

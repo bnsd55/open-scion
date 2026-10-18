@@ -29,6 +29,7 @@ use tracing::Instrument as _;
 
 use crate::access::Access;
 use crate::backend::Backend;
+use crate::deadline::Deadline;
 use crate::error::{Error, Result};
 use crate::meta::Meta as _;
 use crate::meta::MetaTx as _;
@@ -37,6 +38,7 @@ use crate::read;
 use crate::service::{Worker, check_reader, parse_id, resolve_ref};
 use crate::store::{self};
 use crate::tickets::Keys;
+use crate::views;
 
 // The store keeps exactly the objects that the API promises to send.
 const _: () = assert!(store::MAX_OBJECT_BYTES == scion_proto::MAX_OBJECT_BYTES);
@@ -366,13 +368,33 @@ impl Objects for ObjectsService {
     ) -> Result<Response<GetRootTreeResponse>, Status> {
         let caller = self.auth.caller_of(&request)?;
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
+        // The derivation of a first view walks the real tree, under the
+        // call's deadline.
+        let deadline = Deadline::of_call(&request, crate::deadline::CALL_LIMIT);
         let GetRootTreeRequest { repo, changeset_id } = request.into_inner();
         check_reader(&self.access, &caller, &repo)?;
         let cs = parse_id(&changeset_id, "changeset_id")?;
+        // A partial reader gets the root of its view: the real trees with
+        // everything its read rules do not cover removed ([#121]). The view
+        // is derived on the first read of its rule set, then cached.
+        let rule_set = self.access.read_digest(&caller, &repo).map(|digest| {
+            (
+                digest,
+                self.access
+                    .read_rule_set(&caller, &repo)
+                    .unwrap_or_default(),
+            )
+        });
         let (tree, repo) = self
             .worker
             .run(move |store| {
-                let tree = read::root_tree(&store, &repo, cs)?;
+                let tree = match &rule_set {
+                    Some((digest, prefixes)) => {
+                        let repo_id = store.read(|c| c.repo_id(&repo))?;
+                        views::view_root(&store, repo_id, digest, cs, prefixes, &deadline)?
+                    }
+                    None => read::root_tree(&store, &repo, cs)?,
+                };
                 Ok((tree, repo))
             })
             .await?;

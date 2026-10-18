@@ -1126,7 +1126,7 @@ fn reconcile(index: Lru<()>, mut files: HashMap<Key, (SystemTime, usize)>) -> Lr
 /// them, with the counters and `mark` set past them: a put renames its file
 /// before the flush that commits its row, so every row at or below `mark`
 /// has its file. A batch is due at 1,024 versions or 64 MiB of new bytes
-/// ([`FLUSH_RECORDS`], [`FLUSH_NEW_BYTES`]); a put commits at once, at the
+/// (`FLUSH_RECORDS`, `FLUSH_NEW_BYTES`); a put commits at once, at the
 /// eviction that follows it. With SQLite's WAL and `synchronous = NORMAL`,
 /// a committed batch survives a crash of the process, and a crash of the
 /// machine loses at most the last batches, as the old index file did. A
@@ -1139,7 +1139,7 @@ fn reconcile(index: Lru<()>, mut files: HashMap<Key, (SystemTime, usize)>) -> Lr
 /// from then on a crash may strand files. A crash strands a file when its
 /// row did not reach a committed batch: the file is there, the index does
 /// not name it, and the limit does not count it. The walk of a start that
-/// is owed one (see [`walk_objects`]) finds them: it hands every file that
+/// is owed one (see `walk_objects`) finds them: it hands every file that
 /// has no row to the store, which adopts it as the least recently used, so
 /// the limit counts it again. The walk runs on its own thread, at the pace
 /// that the store drains, and a stop of the store stops it. A start that

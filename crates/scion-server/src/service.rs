@@ -2,11 +2,13 @@
 //! (`SQLite` and the object folder are synchronous), and maps errors to status
 //! codes.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use scion_core::{BlobId, ChangesetId, FileState, RepoPath};
+use prost::Message as _;
+use scion_core::{BlobId, Changeset, ChangesetId, FileState, RepoPath};
 use scion_proto::listen::{self, Limits};
 use scion_proto::tls::ServerTls;
 use scion_proto::v1::scion_server::{Scion, ScionServer};
@@ -41,10 +43,9 @@ use crate::objects::ObjectsService;
 use crate::quotas::{Call, Quotas};
 use crate::store::{MAX_OBJECT_BYTES, READER_BYTES};
 use crate::tickets::Keys;
-use crate::{blame, names, read, write};
+use crate::{blame, names, read, views, write};
 
 /// Most changeset bytes in one `Log` reply; the client pages for more.
-const LOG_BUDGET_BYTES: usize = MAX_MESSAGE_BYTES / 2;
 /// Most store operations running at once.
 const MAX_BLOCKING: usize = 256;
 /// Most uploads read at once. Each holds one request message in memory, of up
@@ -292,9 +293,7 @@ impl ScionService {
     }
 
     fn into_server(self) -> ScionServer<Self> {
-        ScionServer::new(self)
-            .max_decoding_message_size(MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_MESSAGE_BYTES)
+        into_server(self)
     }
 
     /// Runs a `MergeBase`, `IsAncestor` or `Log` with a path: at most
@@ -305,23 +304,24 @@ impl ScionService {
         T: Send + 'static,
         F: FnOnce(&Backend, &Deadline) -> Result<T> + Send + 'static,
     {
-        // The query checks it at each read: a request timeout, or a client
-        // that cancels, drops this call but not a job that is running. The
-        // guard ends the deadline when this call ends or is dropped.
-        let _call = deadline.guard();
-        // Taken before the worker permit, and held until the job ends, also
-        // when the client leaves first.
-        let slot = Arc::clone(&self.graph_queries)
-            .acquire_owned()
-            .await
-            .map_err(|_| Status::unavailable("server is shutting down"))?;
-        self.worker
-            .run(move |store| {
-                let _slot = slot;
-                query(&store, &deadline)
-            })
-            .await
+        run_graph_query(&self.worker, &self.graph_queries, deadline, query).await
     }
+}
+
+/// Wraps a service into the gRPC server, with the message limits of the
+/// protocol: a message over them fails the call on whichever side finds it
+/// first (section 2 of protocol-v1).
+///
+/// SHORTCUT: a unary reply's bytes stay in HTTP/2 uncounted until the
+/// client reads them or the connection closes; the largest one left is
+/// `Diff` (about 120 KB), so a client that never reads holds at most its
+/// connections x streams of those. Every reply that can grow with its
+/// input streams; a new unary RPC must stream, or bound its reply, before
+/// it ships.
+pub fn into_server<S: Scion + Send + 'static>(service: S) -> ScionServer<S> {
+    ScionServer::new(service)
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES)
 }
 
 /// Runs synchronous store work off the async runtime. Clones share one bound
@@ -391,6 +391,24 @@ pub(crate) fn check_reader(access: &Access, caller: &Caller, repo: &str) -> Resu
     access.check_read(caller, repo).map_err(Status::from)
 }
 
+/// The refusal of every RPC that a partial reader may not use, uniform for
+/// every principal with folder read rules: the feature is off for such a
+/// caller, with no per-object difference. `check_reader` first, so a repo
+/// that the caller may not see answers as a missing one.
+pub(crate) fn check_whole_reader(
+    access: &Access,
+    caller: &Caller,
+    repo: &str,
+) -> Result<(), Status> {
+    check_reader(access, caller, repo)?;
+    if access.partial(caller, repo) {
+        return Err(Status::unimplemented(
+            "not available to a principal with folder read rules",
+        ));
+    }
+    Ok(())
+}
+
 /// `ResolveRef`, served by both services.
 pub(crate) async fn resolve_ref(
     worker: &Worker,
@@ -401,8 +419,6 @@ pub(crate) async fn resolve_ref(
     let caller = caller(&request)?;
     let _call = quotas.enter(&caller).map_err(Status::from)?;
     let ResolveRefRequest { repo, name } = request.into_inner();
-    check_reader(access, &caller, &repo)?;
-    check_name("ref", &name)?;
     check_reader(access, &caller, &repo)?;
     check_name("ref", &name)?;
     let id = worker
@@ -467,6 +483,10 @@ type ReadFileStream = ReceiverStream<Part<ReadFileResponse>>;
 type GetChangesetStream = ReceiverStream<Part<GetChangesetResponse>>;
 
 type ListDirStream = ReceiverStream<Part<ListDirResponse>>;
+
+type LogStream = ReceiverStream<Part<LogResponse>>;
+
+type BlameStream = ReceiverStream<Part<BlameResponse>>;
 
 /// The share of `READ_BUDGET_BYTES` that a `ReadFile` reply of a `size`-byte
 /// file holds. A file of one part is read in one job, so the reply holds only
@@ -562,6 +582,289 @@ impl Parts {
 /// the channel only when the channel is empty, so its second slot is always
 /// free for the error that ends a reply early: a store error, or the stall.
 /// A client never takes a short reply for a whole one.
+/// Runs a graph query on `permits`, the way [`ScionService::graph_query`]
+/// does, for a page of a streamed `Log` reply. The query checks the
+/// deadline at each read: a request timeout, or a client that cancels,
+/// drops this call but not a job that is running. The guard ends the
+/// deadline when this call ends or is dropped. The slot is taken before
+/// the worker permit, and held until the job ends, also when the client
+/// leaves first.
+async fn run_graph_query<T, F>(
+    worker: &Worker,
+    permits: &Arc<Semaphore>,
+    deadline: Deadline,
+    query: F,
+) -> Result<T, Status>
+where
+    T: Send + 'static,
+    F: FnOnce(&Backend, &Deadline) -> Result<T> + Send + 'static,
+{
+    // The query checks it at each read: a request timeout, or a client
+    // that cancels, drops this call but not a job that is running. The
+    // guard ends the deadline when this call ends or is dropped.
+    let _call = deadline.guard();
+    let slot = Arc::clone(permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| Status::unavailable("server is shutting down"))?;
+    worker
+        .run(move |store| {
+            let _slot = slot;
+            query(&store, &deadline)
+        })
+        .await
+}
+
+/// What a streamed `Log` reply still has to walk: where the last page
+/// stopped, how many entries the call still owes, and the bounds of the
+/// next page.
+struct LogWalk {
+    worker: Worker,
+    repo: String,
+    graph_queries: Arc<Semaphore>,
+    /// The request slot, held until the reply ends.
+    _call: Call,
+    next: Option<ChangesetId>,
+    left: usize,
+    path: Option<RepoPath>,
+    deadline: Deadline,
+    stalled: Option<scion_proto::listen::Stalled>,
+}
+
+/// Splits a fetched page into parts: groups of entries whose encoded bytes
+/// stay within [`CHUNK_BYTES`], one part each. The last part carries where
+/// the walk continues; the walk stops, with the rest of the page unsent, at
+/// the `limit` of the call.
+fn log_page_parts(entries: Vec<(ChangesetId, Changeset)>, walk: &mut LogWalk) -> Vec<LogResponse> {
+    let mut parts = Vec::new();
+    let mut group: Vec<LogEntry> = Vec::new();
+    let mut bytes = 0usize;
+    for (id, changeset) in entries {
+        if walk.left == 0 {
+            // Unreachable while `log_parts` fetches every page with
+            // `limit = walk.left.min(MAX_SCAN)`: a page then never holds
+            // more entries than the call still owes, so the page ends
+            // before the call's credit does. If a page ever did hold more,
+            // this entry is the first uncovered one, and the next call
+            // starts here.
+            debug_assert!(false, "a page held more than the call still owes");
+            break;
+        }
+        let body = changeset.encode();
+        if !group.is_empty() && bytes + body.len() > CHUNK_BYTES {
+            bytes = 0;
+            parts.push(LogResponse {
+                entries: std::mem::take(&mut group),
+                next_changeset_id: Vec::new(),
+            });
+        }
+        bytes += body.len();
+        walk.left -= 1;
+        group.push(LogEntry {
+            changeset_id: id.as_bytes().to_vec(),
+            changeset: body,
+        });
+    }
+    parts.push(LogResponse {
+        entries: group,
+        next_changeset_id: id_bytes(walk.next),
+    });
+    parts
+}
+
+/// What waiting for the client got the reply's producer.
+enum Taken<'a, T> {
+    /// Two free slots of the reply's channel: the client has taken the
+    /// parts before, so one slot stays free for the error that ends the
+    /// reply early.
+    Slots(tokio::sync::mpsc::PermitIterator<'a, Part<T>>),
+    /// The client has gone with the connection.
+    Gone,
+    /// The client took nothing for `stall`: the parts of the reply stay in
+    /// HTTP/2 until the stream ends or the connection closes, and the
+    /// connection counts them.
+    Stalled,
+}
+
+/// Waits `stall` for two free slots of the reply's channel, as
+/// [`send_parts`] and [`log_parts`] do.
+async fn reserve<'a, T>(
+    tx: &'a mpsc::Sender<Part<T>>,
+    stall: Duration,
+    stalled: Option<&'a scion_proto::listen::Stalled>,
+) -> Taken<'a, T> {
+    match tokio::time::timeout(stall, tx.reserve_many(2)).await {
+        Ok(Ok(slots)) => Taken::Slots(slots),
+        // The client has gone with the connection.
+        Ok(Err(_)) => Taken::Gone,
+        Err(_) => {
+            if let Some(stalled) = stalled {
+                stalled.add(scion_proto::reply::STALLED_REPLY_BYTES);
+            }
+            Taken::Stalled
+        }
+    }
+}
+
+/// What a streamed `Blame` reply sends: the ranges of the walk and the
+/// changesets they name, where the walk continues, and the state the reply
+/// holds until its client takes it.
+struct BlameSend {
+    ranges: Vec<BlameRange>,
+    changesets: Vec<BlameChangeset>,
+    cursor: Vec<u8>,
+    /// The request slot, held until the reply ends.
+    _call: Call,
+    stalled: Option<scion_proto::listen::Stalled>,
+}
+
+/// Splits a computed blame into parts: groups of ranges whose encoded
+/// bytes, with the changesets they name that no earlier part carried, stay
+/// within [`CHUNK_BYTES`]. The last part carries where the walk continues.
+fn blame_page_parts(send: &mut BlameSend) -> Vec<BlameResponse> {
+    // Where each named changeset sits, so a range names its changeset's
+    // part: the first part that names it carries it.
+    let mut at: HashMap<Vec<u8>, usize> = HashMap::with_capacity(send.changesets.len());
+    for (i, changeset) in send.changesets.iter().enumerate() {
+        at.insert(changeset.changeset_id.clone(), i);
+    }
+    let mut carried = vec![false; send.changesets.len()];
+    let mut parts = Vec::new();
+    let mut ranges: Vec<BlameRange> = Vec::new();
+    let mut changesets: Vec<BlameChangeset> = Vec::new();
+    let mut bytes = 0usize;
+    for range in std::mem::take(&mut send.ranges) {
+        let range_bytes = range.encoded_len();
+        let named = at.get(&range.changeset_id).copied();
+        let mut new_bytes = 0usize;
+        if let Some(i) = named.filter(|i| !carried[*i]) {
+            new_bytes = send.changesets[i].encoded_len();
+        }
+        if !ranges.is_empty() && bytes + range_bytes + new_bytes > CHUNK_BYTES {
+            bytes = 0;
+            parts.push(BlameResponse {
+                ranges: std::mem::take(&mut ranges),
+                changesets: std::mem::take(&mut changesets),
+                next_cursor: Vec::new(),
+            });
+        }
+        bytes += range_bytes + new_bytes;
+        if let Some(i) = named.filter(|i| !carried[*i]) {
+            changesets.push(std::mem::take(&mut send.changesets[i]));
+            carried[i] = true;
+        }
+        ranges.push(range);
+    }
+    parts.push(BlameResponse {
+        ranges,
+        changesets,
+        next_cursor: std::mem::take(&mut send.cursor),
+    });
+    parts
+}
+
+/// Streams a `Blame` reply: sends the parts of the computed blame, until
+/// the client has them all or stops taking parts. A stall counts
+/// [`STALLED_REPLY_BYTES`] on the connection, as any streamed reply does.
+async fn blame_parts(mut send: BlameSend, tx: mpsc::Sender<Part<BlameResponse>>) {
+    for part in blame_page_parts(&mut send) {
+        match reserve(&tx, READ_STALL_TIMEOUT, send.stalled.as_ref()).await {
+            Taken::Slots(mut slots) => {
+                if let Some(slot) = slots.next() {
+                    slot.send(Ok(part));
+                }
+            }
+            Taken::Gone => return,
+            Taken::Stalled => {
+                let detail = format!("the client took no data for {READ_STALL_TIMEOUT:?}");
+                let _ = tx.try_send(Err(Status::deadline_exceeded(detail)));
+                return;
+            }
+        }
+    }
+    // Keeps the request slot until the client has taken the last part; a
+    // client that never does is counted.
+    reserve(&tx, READ_STALL_TIMEOUT, send.stalled.as_ref()).await;
+}
+
+/// Fetches one page of the log: a graph query when `path` is set, because
+/// it may derive the path history of a long history first, a plain read
+/// otherwise.
+async fn log_page(
+    worker: &Worker,
+    graph_queries: &Arc<Semaphore>,
+    repo: String,
+    path: Option<RepoPath>,
+    deadline: Deadline,
+    from: ChangesetId,
+    limit: usize,
+) -> Result<read::LogPage, Status> {
+    if let Some(path) = path {
+        run_graph_query(worker, graph_queries, deadline, move |store, deadline| {
+            read::log_page(store, &repo, from, Some(&path), limit, deadline)
+        })
+        .await
+    } else {
+        worker
+            .run(move |store| read::log_page(&store, &repo, from, None, limit, &deadline))
+            .await
+    }
+}
+
+/// Streams a `Log` reply: sends the parts of the first page, then fetches
+/// the page after it and sends that, until the history ends, the call has
+/// served `limit` entries, or the client stops taking parts. A stall counts
+/// [`STALLED_REPLY_BYTES`] on the connection, as any streamed reply does.
+async fn log_parts(mut walk: LogWalk, page: read::LogPage, tx: mpsc::Sender<Part<LogResponse>>) {
+    let fail = |status: Status| {
+        // Fails only if the client has gone.
+        let _ = tx.try_send(Err(status));
+    };
+    let mut page = page;
+    loop {
+        for part in log_page_parts(std::mem::take(&mut page.entries), &mut walk) {
+            match reserve(&tx, READ_STALL_TIMEOUT, walk.stalled.as_ref()).await {
+                Taken::Slots(mut slots) => {
+                    if let Some(slot) = slots.next() {
+                        slot.send(Ok(part));
+                    }
+                }
+                Taken::Gone => return,
+                Taken::Stalled => {
+                    let detail = format!("the client took no data for {READ_STALL_TIMEOUT:?}");
+                    return fail(Status::deadline_exceeded(detail));
+                }
+            }
+        }
+        if walk.left == 0 || walk.next.is_none() {
+            // Keeps the request slot until the client has taken the last
+            // part; a client that never does is counted.
+            reserve(&tx, READ_STALL_TIMEOUT, walk.stalled.as_ref()).await;
+            return;
+        }
+        let from = walk.next.unwrap();
+        let limit = walk.left.min(read::MAX_SCAN);
+        page = match log_page(
+            &walk.worker,
+            &walk.graph_queries,
+            walk.repo.clone(),
+            walk.path.clone(),
+            walk.deadline.clone(),
+            from,
+            limit,
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(status) => return fail(status),
+        };
+        // The next page's continuation is the walk's: without this, the
+        // page after the second one starts at the second page's start, and
+        // the reply repeats it.
+        walk.next = page.next;
+    }
+}
+
 async fn send_parts<T: Send + 'static>(
     mut parts: Parts,
     _share: OwnedSemaphorePermit,
@@ -582,35 +885,23 @@ async fn send_parts<T: Send + 'static>(
         };
         if let Some(data) = part {
             // Both slots free: the client has taken the part before.
-            match tokio::time::timeout(stall, tx.reserve_many(2)).await {
-                Ok(Ok(mut slots)) => {
+            match reserve(&tx, stall, stalled.as_ref()).await {
+                Taken::Slots(mut slots) => {
                     if let Some(slot) = slots.next() {
                         slot.send(Ok(make(data)));
                     }
                 }
-                Ok(Err(_)) => return,
-                Err(_) => {
-                    // The parts of the reply stay in HTTP/2 until the
-                    // connection ends; the connection counts them.
-                    if let Some(stalled) = &stalled {
-                        stalled.add(scion_proto::reply::STALLED_REPLY_BYTES);
-                    }
+                Taken::Gone => return,
+                Taken::Stalled => {
+                    // The client took no part: it is owed the error, so it
+                    // never takes the file for a whole one.
                     let detail = format!("the client took no data for {stall:?}");
                     return fail(Status::deadline_exceeded(detail));
                 }
             }
         } else {
             // Keeps the share until the client has taken the last part.
-            match tokio::time::timeout(stall, tx.reserve_many(2)).await {
-                // Sent, or the client has gone with it.
-                Ok(_) => {}
-                // It stopped reading: what was sent stays in HTTP/2.
-                Err(_) => {
-                    if let Some(stalled) = &stalled {
-                        stalled.add(scion_proto::reply::STALLED_REPLY_BYTES);
-                    }
-                }
-            }
+            reserve(&tx, stall, stalled.as_ref()).await;
             return;
         }
     }
@@ -663,7 +954,13 @@ impl Scion for ScionService {
             .ok_or_else(|| Status::invalid_argument("empty upload"))??;
         check_name("repo", &first.repo)?;
         // An upload names no path, so a caller that may change some path of
-        // the repo may upload.
+        // the repo may upload. A partial reader uploads nothing in v0.1 of
+        // the folder rules ([#121]).
+        if self.access.partial(&caller, &first.repo) {
+            return Err(Status::unimplemented(
+                "not available to a principal with folder read rules",
+            ));
+        }
         self.access.check_writer(&caller, &first.repo)?;
         // The first message's bytes, and the budget that the later messages
         // of this upload take from. Held until the reply, on every path.
@@ -708,7 +1005,7 @@ impl Scion for ScionService {
         let caller = caller(&request)?;
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let CreateChangesetRequest { repo, changeset } = request.into_inner();
-        check_reader(&self.access, &caller, &repo)?;
+        check_whole_reader(&self.access, &caller, &repo)?;
         let access = Arc::clone(&self.access);
         let id = self
             .worker
@@ -738,7 +1035,7 @@ impl Scion for ScionService {
         let caller = caller(&request)?;
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let req = request.into_inner();
-        check_reader(&self.access, &caller, &req.repo)?;
+        check_whole_reader(&self.access, &caller, &req.repo)?;
         check_name("target_ref", &req.target_ref)?;
         check_name("request_key", &req.request_key)?;
         let req = land::LandRequest {
@@ -770,7 +1067,7 @@ impl Scion for ScionService {
         let caller = caller(&request)?;
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let GetLandRequest { repo, land_id } = request.into_inner();
-        check_reader(&self.access, &caller, &repo)?;
+        check_whole_reader(&self.access, &caller, &repo)?;
         let land_id = land_id
             .parse()
             .map_err(|_| Status::invalid_argument("land_id must be a number"))?;
@@ -800,7 +1097,7 @@ impl Scion for ScionService {
         // apart: the reply counts what it leaves in HTTP/2 on it.
         let stalled = scion_proto::listen::Stalled::of(&request);
         let req = request.into_inner();
-        check_reader(&self.access, &caller, &req.repo)?;
+        check_whole_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let data = self
             .worker
@@ -818,6 +1115,10 @@ impl Scion for ScionService {
 
     type ListDirStream = ListDirStream;
 
+    type LogStream = LogStream;
+
+    type BlameStream = BlameStream;
+
     async fn read_file(
         &self,
         request: Request<ReadFileRequest>,
@@ -827,14 +1128,38 @@ impl Scion for ScionService {
         // The handle of the caller's connection, before the request is taken
         // apart: the reply counts what it leaves in HTTP/2 on it.
         let stalled = scion_proto::listen::Stalled::of(&request);
+        // The derivation of a first view walks the real tree, under the
+        // call's deadline.
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_path(req.path)?;
+        // A partial reader reads its view: the paths that its read rules
+        // cover, through trees the server derived for it ([#121]). A hidden
+        // path is not in the view, so it answers as a missing one.
+        let view = match self.access.read_digest(&caller, &req.repo) {
+            Some(digest) => {
+                let prefixes = self
+                    .access
+                    .read_rule_set(&caller, &req.repo)
+                    .unwrap_or_default();
+                Some((digest, prefixes))
+            }
+            None => None,
+        };
         let (blob, size) = self
             .worker
             .run(move |store| {
-                let blob = read::file_blob(&store, &req.repo, id, &path)?;
+                let blob = match &view {
+                    Some((digest, prefixes)) => {
+                        let repo_id = store.read(|c| c.repo_id(&req.repo))?;
+                        let root =
+                            views::view_root(&store, repo_id, digest, id, prefixes, &deadline)?;
+                        read::file_blob_at(&store, root, &path)?
+                    }
+                    None => read::file_blob(&store, &req.repo, id, &path)?,
+                };
                 Ok((blob, store.blobs().size(blob)?))
             })
             .await?;
@@ -871,72 +1196,96 @@ impl Scion for ScionService {
         // The handle of the caller's connection, before the request is taken
         // apart: the reply counts what it leaves in HTTP/2 on it.
         let stalled = scion_proto::listen::Stalled::of(&request);
+        // The derivation of a first view walks the real tree, under the
+        // call's deadline.
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_optional_path(req.path)?;
+        // A partial reader lists its view: only the entries its read rules
+        // cover, and a hidden path answers as a missing one ([#121]).
+        let view = match self.access.read_digest(&caller, &req.repo) {
+            Some(digest) => {
+                let prefixes = self
+                    .access
+                    .read_rule_set(&caller, &req.repo)
+                    .unwrap_or_default();
+                Some((digest, prefixes))
+            }
+            None => None,
+        };
         let data = self
             .worker
-            .run(move |store| Ok(read::list_dir(&store, &req.repo, id, path.as_ref())?.encode()))
+            .run(move |store| {
+                let tree = match &view {
+                    Some((digest, prefixes)) => {
+                        let repo_id = store.read(|c| c.repo_id(&req.repo))?;
+                        let root =
+                            views::view_root(&store, repo_id, digest, id, prefixes, &deadline)?;
+                        read::list_dir_at(&store, root, path.as_ref())?
+                    }
+                    None => read::list_dir(&store, &req.repo, id, path.as_ref())?,
+                };
+                Ok(tree.encode())
+            })
             .await?;
         self.stream_whole(call, data, stalled, |data| ListDirResponse { tree: data })
             .await
     }
 
-    async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogResponse>, Status> {
+    async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogStream>, Status> {
         let caller = caller(&request)?;
-        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
+        let call = self.quotas.enter(&caller).map_err(Status::from)?;
+        // The handle of the caller's connection, before the request is taken
+        // apart: the reply counts what it leaves in HTTP/2 on it.
+        let stalled = scion_proto::listen::Stalled::of(&request);
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
-        check_reader(&self.access, &caller, &req.repo)?;
+        check_whole_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         // `read::MAX_SCAN` also bounds the entries.
         let limit = (req.limit as usize).max(1);
         let path = parse_optional_path(req.path)?;
-        let page = if let Some(path) = path {
-            // It may derive the path history of a long history first, so it
-            // runs as a graph query, with its slot and its deadline.
-            self.graph_query(deadline, move |store, deadline| {
-                read::log_page(store, &req.repo, id, Some(&path), limit, deadline)
-            })
-            .await?
-        } else {
-            self.worker
-                .run(move |store| read::log_page(&store, &req.repo, id, None, limit, &deadline))
-                .await?
+        let page = log_page(
+            &self.worker,
+            &self.graph_queries,
+            req.repo.clone(),
+            path.clone(),
+            deadline.clone(),
+            id,
+            limit,
+        )
+        .await?;
+        // The first page goes out as the first parts; the rest follow,
+        // page by page, until the history or `limit` ends the walk. The
+        // reply's work goes on in the producer, so the request slot lives
+        // until the reply ends.
+        let walk = LogWalk {
+            worker: self.worker.clone(),
+            repo: req.repo.clone(),
+            graph_queries: Arc::clone(&self.graph_queries),
+            _call: call,
+            next: page.next,
+            left: limit,
+            path,
+            deadline,
+            stalled,
         };
-        // Always send the first entry; stop before the reply gets too big.
-        let mut next = page.next;
-        let mut budget = LOG_BUDGET_BYTES;
-        let mut entries = Vec::new();
-        for (id, changeset) in page.entries {
-            let body = changeset.encode();
-            if !entries.is_empty() && body.len() > budget {
-                // Not sent, so the next call starts here.
-                next = Some(id);
-                break;
-            }
-            budget = budget.saturating_sub(body.len());
-            entries.push(LogEntry {
-                changeset_id: id.as_bytes().to_vec(),
-                changeset: body,
-            });
-        }
-        Ok(Response::new(LogResponse {
-            entries,
-            next_changeset_id: id_bytes(next),
-        }))
+        let (tx, rx) = mpsc::channel(2);
+        tokio::spawn(log_parts(walk, page, tx).instrument(tracing::Span::current()));
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    async fn blame(
-        &self,
-        request: Request<BlameRequest>,
-    ) -> Result<Response<BlameResponse>, Status> {
+    async fn blame(&self, request: Request<BlameRequest>) -> Result<Response<BlameStream>, Status> {
         let caller = caller(&request)?;
-        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
+        let call = self.quotas.enter(&caller).map_err(Status::from)?;
+        // The handle of the caller's connection, before the request is
+        // taken apart: the reply counts what it leaves in HTTP/2 on it.
+        let stalled = scion_proto::listen::Stalled::of(&request);
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
-        check_reader(&self.access, &caller, &req.repo)?;
+        check_whole_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_path(req.path.clone())?;
         // Taken before the worker permit, and held until the job ends, also
@@ -1003,11 +1352,18 @@ impl Scion for ScionService {
             .resume
             .map(|resume| blame::encode_cursor(&resume, &req.repo, id, &path))
             .unwrap_or_default();
-        Ok(Response::new(BlameResponse {
+        // The blame is computed; the reply goes on in the producer, so the
+        // request slot lives until the reply ends.
+        let send = BlameSend {
             ranges,
             changesets,
-            next_cursor,
-        }))
+            cursor: next_cursor,
+            _call: call,
+            stalled,
+        };
+        let (tx, rx) = mpsc::channel(2);
+        tokio::spawn(blame_parts(send, tx).instrument(tracing::Span::current()));
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn merge_base(
@@ -1018,7 +1374,7 @@ impl Scion for ScionService {
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
-        check_reader(&self.access, &caller, &req.repo)?;
+        check_whole_reader(&self.access, &caller, &req.repo)?;
         let a = parse_id(&req.a_changeset_id, "a_changeset_id")?;
         let b = parse_id(&req.b_changeset_id, "b_changeset_id")?;
         let bases = self
@@ -1039,7 +1395,7 @@ impl Scion for ScionService {
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
-        check_reader(&self.access, &caller, &req.repo)?;
+        check_whole_reader(&self.access, &caller, &req.repo)?;
         let ancestor = parse_id(&req.ancestor_id, "ancestor_id")?;
         let descendant = parse_id(&req.descendant_id, "descendant_id")?;
         let is_ancestor = self
@@ -1054,7 +1410,7 @@ impl Scion for ScionService {
         let caller = caller(&request)?;
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let req = request.into_inner();
-        check_reader(&self.access, &caller, &req.repo)?;
+        check_whole_reader(&self.access, &caller, &req.repo)?;
         let old = parse_id(&req.old_changeset_id, "old_changeset_id")?;
         let new = parse_id(&req.new_changeset_id, "new_changeset_id")?;
         let path = parse_optional_path(req.path)?;
@@ -1764,7 +2120,17 @@ mod tests {
                         });
                         let reply = service.log(request).await.unwrap().into_inner();
                         let ids: Vec<Vec<u8>> =
-                            reply.entries.into_iter().map(|e| e.changeset_id).collect();
+                            tokio_stream::StreamExt::collect::<Vec<_>>(reply.map(|page| {
+                                page.unwrap()
+                                    .entries
+                                    .into_iter()
+                                    .map(|e| e.changeset_id)
+                                    .collect::<Vec<_>>()
+                            }))
+                            .await
+                            .into_iter()
+                            .flatten()
+                            .collect();
                         ids == [a]
                     } else if i % 3 == 0 {
                         let request = as_default(MergeBaseRequest {

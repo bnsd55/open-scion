@@ -8,7 +8,7 @@
 //! - [`graph`]: the commit-graph index, and the graph queries that read it.
 //! - [`history`]: the path history of each changeset, for `Log` with a path
 //!   and for lands on old bases.
-//! - [`read`], [`blame`], [`write`], [`land`]: the operations behind the RPCs.
+//! - [`read`], [`blame`], the `write` module, [`land`]: the operations behind the RPCs.
 //!   A long one stops at its call's [`deadline`].
 //!   [`similar`] finds renames for `Diff` and `Blame`.
 //! - [`fsck`]: reports the damage in a data directory. Read-only.
@@ -44,6 +44,7 @@ pub mod similar;
 pub mod store;
 pub mod tickets;
 pub mod tree;
+pub mod views;
 pub mod write;
 
 pub use error::{Error, Result};

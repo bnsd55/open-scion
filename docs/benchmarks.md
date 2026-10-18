@@ -33,6 +33,8 @@ change the dataset.
 - Rust 1.88 or newer and `protoc`, as for the build.
 - Git 2.28 or newer, with `git daemon`.
 - `/usr/bin/time` (on Debian and Ubuntu: `apt install time`).
+- `curl` and `pkill` (on Debian and Ubuntu: `apt install curl procps`):
+  the scripts check for both and stop without them.
 - About 2 GiB of free disk for `bench-checkout.sh` with 50 jobs: each of
   the 50 plain git clones holds the whole history.
 
@@ -56,6 +58,7 @@ JOBS=10 SPARSE_DIR=tokio-util scripts/bench-checkout.sh
 | `REPO_URL`, `REPO_COMMIT` | the dataset above | both | The repository and the commit to import |
 | `SERVER_PORT`, `CACHE_PORT` | 17878, 17879 | both | Loopback ports of the server and the cache |
 | `GIT_PORT` | 19418 | bench | Loopback port of `git daemon` |
+| `SERVER_METRICS_PORT`, `CACHE_METRICS_PORT` | 17880, 17881 | bench | Loopback ports of the server's and the cache's metrics exports |
 
 Progress goes to stderr, and the results table to stdout. The output names
 no machine details, so a table can be shared as it is.

@@ -51,7 +51,7 @@ fn parse_dir(dir: &str) -> Result<RepoPath> {
 type Files = BTreeMap<RepoPath, FileEntry>;
 
 /// Writes the files of a changeset into a new or empty directory, and prints
-/// how many it wrote. On failure, or on a signal in [`STOP_SIGNALS`], the
+/// how many it wrote. On failure, or on a signal in `STOP_SIGNALS`, the
 /// destination is left as it was.
 pub async fn checkout(ctx: &mut Ctx, args: CheckoutArgs) -> Result<()> {
     // Listening replaces the default exit, so start it first. On a signal

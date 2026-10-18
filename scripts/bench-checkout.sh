@@ -33,6 +33,7 @@ GIT_URL=git://127.0.0.1:$GIT_PORT/src.git
 MIRROR=$WORK/mirror.git
 export GIT_URL MIRROR
 
+
 # record LABEL RUN BYTES SERVER_LOG [LOG...]: checks that the first job of
 # RUN wrote the same files as the first scion job, adds a line to the
 # results, and removes the output of RUN. CPU time adds up the jobs, the
@@ -58,13 +59,28 @@ record() {
 scion_run() {
   local run=scion-$1-$2 before after bytes
   note "scion, $1 daemon (rep $2)"
+  if [ "$1" = cold ]; then
+    # A cold rep starts from an empty daemon. The disk store of the last
+    # warm rep would serve every object from disk, and the cold rep of
+    # rep 2 on would read warm.
+    rm -rf "${WORK:?}/daemon"
+  fi
   start_scion
   before=$(scrape_metrics "http://127.0.0.1:$SERVER_METRICS_PORT")
+  gbefore=$(getobjects "http://127.0.0.1:$SERVER_METRICS_PORT")
   batch "$run" "$JOBS" "$CHECKOUT"
   after=$(scrape_metrics "http://127.0.0.1:$SERVER_METRICS_PORT")
+  gafter=$(getobjects "http://127.0.0.1:$SERVER_METRICS_PORT")
   bytes=$((after - before))
   stop_scion
-  [ "$1" = warm ] || [ "$bytes" -gt 0 ] || die "the server sent no bytes in a cold run"
+  # A cold rep fetches its objects from the server: its daemon starts
+  # with an empty store, so the server answers at least one GetObjects.
+  # (The server's bytes are stored zstd frames, so they run well under
+  # the checkout's uncompressed size, and no byte floor tells cold from
+  # warm. The GetObjects counter can.) A daemon that still holds the
+  # objects fetches none, which this fails on.
+  [ "$1" = warm ] || [ "$((gafter - gbefore))" -gt 0 ] || \
+    die "a cold run fetched no object from the server: the daemon was not cold"
   record "scion, $1 daemon" "$run" "$bytes" \
     "$WORK/server.log" "$WORK/cache.log" "$WORK/daemon.log"
 }
