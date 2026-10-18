@@ -52,6 +52,7 @@ use common::*;
 use scion_core::BlobId;
 use scion_server::Store;
 use scion_server::store::BlobStatus;
+use tonic::Status;
 
 /// The `LazyFS` checkout the suite runs against: it must hold
 /// `lazyfs/build/lazyfs` and `libs/libpcache/build`.
@@ -417,9 +418,9 @@ async fn race_wave(
                         barrier.wait().await;
                         put_blob(&mut scion, &content).await
                     }
-                    Ok(Err(status)) => {
+                    Ok(Err(error)) => {
                         barrier.wait().await;
-                        Err(status)
+                        Err(Status::unknown(format!("connect failed: {error}")))
                     }
                     Err(_) => {
                         barrier.wait().await;
