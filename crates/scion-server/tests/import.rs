@@ -9,7 +9,9 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -988,41 +990,37 @@ fn open_shared_store() -> (tempfile::TempDir, Backend) {
     (dir, store)
 }
 
-/// Waits until the store has `n` changesets, so a test can hold the write
-/// lock while the import's next batch runs.
-fn wait_for_writes(dir: &Path, n: i64) {
-    let watcher = Connection::open(dir.join("scion.db")).unwrap();
-    let mut enough = false;
-    for _ in 0..10000 {
-        let cs: i64 = watcher
-            .query_row("SELECT count(*) FROM changesets", [], |row| row.get(0))
-            .unwrap_or(0);
-        if cs >= n {
-            enough = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(2));
-    }
-    assert!(enough, "the import never stored {n} changesets");
-}
-
-/// Holds the store's write lock from another connection for `hold_ms`. The
-/// thread ends on its own; it commits when the hold is over. The hold takes
-/// the lock the moment a batch's commit ends, so it must outlast the flush
-/// that follows the commit plus the yield before the next batch begins.
-fn hold_for(dir: &Path, hold_ms: u64) {
+/// Takes the store's write lock with another connection and keeps it until
+/// the import's batch has hit the busy database once: the hold starts at a
+/// counted batch boundary, and releases only when a batch retried, so the
+/// batch that began inside the hold provably waited out the lock. Its
+/// writes are idempotent, so the retry is safe. The thread ends on its own;
+/// it commits when the hold is over.
+fn hold_until_a_retry(store: &Backend, dir: &Path, before: u64) {
+    let (held_tx, held_rx) = mpsc::channel();
     let db = Connection::open(dir.join("scion.db")).unwrap();
+    let watcher = store.clone();
     thread::spawn(move || {
         // The lock may be held by a batch of the import; wait for it, then
-        // hold past the writer's busy timeout.
+        // hold it.
         db.busy_timeout(Duration::from_secs(30)).unwrap();
         db.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let deadline = Instant::now() + Duration::from_millis(hold_ms);
-        while Instant::now() < deadline {
+        held_tx.send(()).unwrap();
+        // The import's first write under this hold fails as busy and the
+        // batch retries; the hold ends when that retry is counted.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while watcher.busy_retries() <= before {
+            assert!(
+                Instant::now() < deadline,
+                "the import never hit the busy lock"
+            );
             thread::sleep(Duration::from_millis(5));
         }
         db.execute_batch("COMMIT").unwrap();
     });
+    held_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the hold never took the write lock");
 }
 
 #[test]
@@ -1034,18 +1032,30 @@ fn an_import_batch_waits_out_a_busy_write_lock() {
     let rev = git.fast_commits(0, 3000);
     let (dir, store) = open_shared_store();
     // A busy lock fails fast, so the retry is deterministic: the holder
-    // keeps the lock far longer than the store waits for it.
+    // keeps the lock until a batch retried, and the batch runs again whole.
     store.set_busy_timeout(Duration::from_millis(100));
-    let report = thread::scope(|s| {
-        let importer = s.spawn(|| try_import(&store, &git, &rev).unwrap());
-        // Once changesets are stored, a batch is running or just ended: the
-        // hold takes the lock the moment that batch ends, so the next batch
-        // begins inside the hold. A batch is safe to run again whole.
-        wait_for_writes(dir.path(), 50);
-        hold_for(dir.path(), 1500);
-        importer.join().unwrap()
-    });
+    let store = Arc::new(store);
+    let before = store.busy_retries();
+    // The hold starts at a counted batch boundary: the hook runs after the
+    // first batch's commit has ended and returns only once the hold has the
+    // write lock, so the next batch begins inside the hold. A batch is safe
+    // to run again whole.
+    let holds = dir.path().to_path_buf();
+    let hooked = Arc::clone(&store);
+    store.set_after_batch(Some(Box::new(move |batch_no| {
+        if batch_no == 0 {
+            hold_until_a_retry(&hooked, &holds, before);
+        }
+    })));
+    let report = try_import(&store, &git, &rev).unwrap();
+    store.set_after_batch(None);
     assert_eq!((report.commits, report.imported), (3000, 3000));
+    // The batch that began inside the hold waited out the lock: its try hit
+    // the busy database, and a retry ran it again whole.
+    assert!(
+        store.busy_retries() > before,
+        "no batch ever hit the busy lock"
+    );
 }
 
 #[test]
