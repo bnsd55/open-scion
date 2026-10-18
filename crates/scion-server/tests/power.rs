@@ -601,7 +601,7 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
         events.line(&format!("round {round}: server up"));
         // Acked waves: every put is answered before the cut, so every one
         // of them must survive it.
-        let acked = run_acked_waves(&events, round, &server.url, &mut rng).await;
+        let mut acked = run_acked_waves(&events, round, &server.url, &mut rng).await;
         // Cut one: after the acked waves. The server freezes, is cut, and
         // dies; a new one opens on the same mount, which is what a restart
         // after a real cut does.
