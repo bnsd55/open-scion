@@ -1645,7 +1645,11 @@ impl BlobBatch<'_> {
         // MUTATION: the directory fsync is deleted; the rename's entry is
         // only as durable as the next full flush of another path.
         for dir in &self.dirs {
+<<<<<<< HEAD
             self.blobs.log.record(DurabilityStep::DirFsync(dir.clone()));
+=======
+            fsync_dir_logged(&self.blobs.log, dir)?;
+>>>>>>> origin/feat/dir-fsync-order
         }
         Ok(!self.dirs.is_empty())
     }
@@ -1741,6 +1745,14 @@ fn fsync(file: &fs::File) -> io::Result<()> {
 
 pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
     fsync(&fs::File::open(path)?)
+}
+
+/// Flushes a directory and records the step together: whoever deletes the
+/// fsync deletes the record with it, and the order test fails.
+fn fsync_dir_logged(log: &DurabilityLog, path: &Path) -> Result<()> {
+    fsync_dir(path)?;
+    log.record(DurabilityStep::DirFsync(path.to_path_buf()));
+    Ok(())
 }
 
 /// Keeps child processes out of the window where a test drops a store and
