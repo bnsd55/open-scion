@@ -18,12 +18,6 @@ name = "scion_server"
 name = "scion-server"
 path = "src/main.rs"
 
-# The seam that lets integration tests see inside the server: the
-# durability log of the blob path (store.rs). Off in every production
-# build; `cargo test` turns it on with the crate's own cfg(test).
-[features]
-test-hooks = []
-
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
