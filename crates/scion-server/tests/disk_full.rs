@@ -118,8 +118,8 @@ fn is_resource_exhausted(e: &Error) -> bool {
 }
 
 /// A store on the mount, like a server opens its data directory.
-fn store(mount: &Mount) -> Backend {
-    Backend::open_test(mount.0.join("data")).unwrap()
+fn open_store(mount: &Mount) -> Backend {
+    Backend::open_test(mount.0.join("data").as_path()).unwrap()
 }
 
 /// Fills the store with blobs of `len` bytes until the disk refuses
@@ -141,7 +141,7 @@ fn a_full_disk_answers_out_of_space_and_needs_no_repair() {
         return;
     }
     let mount = Mount::new("space", "8m", "4096");
-    let store = store(&mount);
+    let store = open_store(&mount);
     // The first blob lands, so a read has something to keep serving.
     let kept = store.blobs().put(b"kept\n").unwrap();
     assert_eq!(store.blobs().get(kept).unwrap(), b"kept\n");
@@ -161,7 +161,7 @@ fn a_full_disk_answers_out_of_space_and_needs_no_repair() {
     drop(store);
     // A restart needs no repair: the store opens again, and fsck is
     // clean.
-    let store = store(&mount);
+    let store = open_store(&mount);
     assert_eq!(store.blobs().get(kept).unwrap(), b"kept\n");
     scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
 }
@@ -177,7 +177,7 @@ fn a_full_metadata_disk_answers_out_of_space_and_needs_no_repair() {
         return;
     }
     let mount = Mount::new("meta", "1m", "4096");
-    let store = store(&mount);
+    let store = open_store(&mount);
     // Repos fill the metadata database until its file cannot grow.
     let mut names = Vec::new();
     let error = loop {
@@ -196,7 +196,7 @@ fn a_full_metadata_disk_answers_out_of_space_and_needs_no_repair() {
     store.write(|c| c.create_repo("after")).unwrap();
     drop(store);
     // A restart needs no repair, and fsck is clean.
-    let store = store(&mount);
+    let store = open_store(&mount);
     scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
 }
 
@@ -206,7 +206,7 @@ fn a_disk_out_of_inodes_answers_out_of_space_and_needs_no_repair() {
         return;
     }
     let mount = Mount::new("inodes", "64m", "128");
-    let store = store(&mount);
+    let store = open_store(&mount);
     // Tiny blobs eat the inode budget one file at a time, until the
     // create itself is refused.
     let (error, landed) = fill_with_blobs(&store, 1);
@@ -219,6 +219,6 @@ fn a_disk_out_of_inodes_answers_out_of_space_and_needs_no_repair() {
     mount.remount_bigger("64m", "4096");
     store.blobs().put(b"after\n").unwrap();
     drop(store);
-    let store = store(&mount);
+    let store = open_store(&mount);
     scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
 }
