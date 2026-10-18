@@ -12,6 +12,7 @@ set -eu
 cd "$(dirname "$0")"
 
 BACKEND=${1:-sqlite}
+COMPOSE_FILES=""
 case "$BACKEND" in
     sqlite) ;;
     postgres) COMPOSE_FILES="-f compose.yml -f compose.postgres.yml" ;;
