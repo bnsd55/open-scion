@@ -215,33 +215,43 @@ fn an_acknowledged_blob_survives_a_cut_at_the_last_flush_before_its_reply() {
     // The reply marks and the flush entries, by number.
     let marks: Vec<u64> = (1..=3)
         .map(|k| {
-            find_entry(
+            find_flagged(
                 &replay,
                 &recording.log_dev,
                 0,
-                false,
+                "",
                 Some(&format!("reply-{k}")),
             )
             .unwrap_or_else(|| panic!("the mark reply-{k} is in the log"))
         })
         .collect();
-    let flushes: Vec<u64> = std::iter::successors(
-        find_entry(&replay, &recording.log_dev, 0, true, None),
-        |f| find_entry(&replay, &recording.log_dev, f + 1, true, None),
+    // The barriers of the log: a flush, or a write that carried FUA.
+    // jbd2 commits its journal with FUA writes when the device offers
+    // them, so a cut at the flush entries alone can fall inside a
+    // commit and lose metadata that was already durable.
+    let mut barriers: Vec<u64> = std::iter::successors(
+        find_flagged(&replay, &recording.log_dev, 0, "--next-flush", None),
+        |f| find_flagged(&replay, &recording.log_dev, f + 1, "--next-flush", None),
     )
+    .chain(std::iter::successors(
+        find_flagged(&replay, &recording.log_dev, 0, "--next-fua", None),
+        |f| find_flagged(&replay, &recording.log_dev, f + 1, "--next-fua", None),
+    ))
     .collect();
-    assert!(!flushes.is_empty(), "the log carries flush entries");
-    eprintln!("log: marks at {marks:?}, flushes at {flushes:?}");
+    barriers.sort_unstable();
+    barriers.dedup();
+    assert!(!barriers.is_empty(), "the log carries barrier entries");
+    eprintln!("log: marks at {marks:?}, barriers at {barriers:?}");
 
     for (i, mark) in marks.iter().enumerate() {
         let n = i as u64 + 1;
         // The cut: everything logged up to and with the last flush at
         // or before the mark. The drive lost the entries after it.
-        let cut = *flushes
+        let cut = *barriers
             .iter()
             .rev()
             .find(|f| **f <= *mark)
-            .unwrap_or_else(|| panic!("a flush precedes the mark reply-{n}"));
+            .unwrap_or_else(|| panic!("a barrier precedes the mark reply-{n}"));
         // A fresh disk, and the log up to the cut, replayed onto it.
         let disk = recording.fresh_disk();
         sudo(&[
