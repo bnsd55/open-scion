@@ -10,7 +10,7 @@
 //! the depth it starts from. So a walk down a first-parent history to a
 //! generation, or to where two such histories meet, reads O(log n) nodes.
 //!
-//! The kind reads every parent ([`Kind::ALL_PARENTS`]), so each ancestor of
+//! The kind reads every parent (all parents), so each ancestor of
 //! a changeset with a node has a node, and the queries can follow any
 //! parent:
 //!
@@ -77,6 +77,16 @@ pub struct CommitGraph;
 
 /// Bytes of a stored [`Link`]: ID, generation, depth.
 const LINK_BYTES: usize = 32 + 8 + 8;
+
+/// Derives the commit graph of `cs`, and removes the rows of older
+/// versions. Returns the kind's name for the `derive` command's report.
+///
+/// # Errors
+///
+/// Errors of the `derived` fill, and of [`Store::flush`](crate::store::Store::flush).
+pub fn backfill_commit_graph(store: &Backend, repo: &str, cs: ChangesetId) -> Result<&'static str> {
+    crate::derived::backfill::<CommitGraph>(store, repo, cs)
+}
 
 impl Kind for CommitGraph {
     const NAME: &'static str = "commit_graph";

@@ -12,14 +12,10 @@ use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use scion_proto::listen::{self, Limits};
 use scion_proto::tls::ServerTls;
-use scion_server::derived::{self, Kind};
-use scion_server::graph::CommitGraph;
-use scion_server::history::PathHistory;
 use scion_server::import::{ImportOptions, import_git};
 
 use scion_server::metrics::{self, Metrics};
 use scion_server::quotas::Quotas;
-use scion_server::tree::RootTree;
 use scion_server::{Backend, Error, fsck, gc, service};
 use tracing_subscriber::EnvFilter;
 
@@ -384,16 +380,13 @@ async fn main() -> anyhow::Result<()> {
                 let tip = store.resolve_ref(&repo, &target_ref)?;
                 let name = match kind {
                     KindName::RootTree => {
-                        derived::backfill::<RootTree>(&store, &repo, tip)?;
-                        RootTree::NAME
+                        scion_server::tree::backfill_root_tree(&store, &repo, tip)?
                     }
                     KindName::CommitGraph => {
-                        derived::backfill::<CommitGraph>(&store, &repo, tip)?;
-                        CommitGraph::NAME
+                        scion_server::graph::backfill_commit_graph(&store, &repo, tip)?
                     }
                     KindName::PathHistory => {
-                        derived::backfill::<PathHistory>(&store, &repo, tip)?;
-                        PathHistory::NAME
+                        scion_server::history::backfill_path_history(&store, &repo, tip)?
                     }
                 };
                 Ok::<_, Error>((name, tip))

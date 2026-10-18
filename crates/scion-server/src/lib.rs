@@ -24,8 +24,8 @@
 //!   files stay on local disk in both: one blob folder per server. One
 //!   server runs per database: a second one is refused at open. What a
 //!   user touches is [`Backend`].
-//! - `derived`: one mechanism for every kind of derived data, with
-//!   [`backfill`] and the [`Kind`] implementations.
+//! - `derived`: one mechanism for every kind of derived data, which
+//!   `backfill_root_tree` and its two sibling functions drive.
 //! - [`tree`]: apply changesets to trees and derive each changeset's root
 //!   tree.
 //! - [`graph`]: the commit-graph index, and the graph queries that read it.
@@ -152,22 +152,20 @@ pub mod write;
 #[cfg(not(any(test, feature = "test-hooks")))]
 pub(crate) mod write;
 
-pub use store::Store;
-
 // The facade: the API of this crate, one list, kept here so it is one
 // thing to read and one thing to keep honest. Every other name in the
 // modules is an implementation detail of the two binaries, however
 // public the module it sits in looks. The doc(hidden) items are not
 // here, and never were.
 pub use access::Access;
-pub use derived::{Kind, backfill};
 pub use error::{Error, Result};
 pub use gc::DEFAULT_GRACE_SECS;
-pub use graph::CommitGraph;
-pub use history::PathHistory;
+pub use graph::{CommitGraph, backfill_commit_graph};
+pub use history::{PathHistory, backfill_path_history};
 pub use import::{ImportOptions, ImportReport, import_git};
 pub use metrics::Metrics;
 pub use quotas::Quotas;
 pub use service::{ServeOptions, serve};
+pub use store::Store;
 pub use tickets::Keys;
-pub use tree::RootTree;
+pub use tree::{RootTree, backfill_root_tree};

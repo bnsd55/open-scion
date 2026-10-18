@@ -1388,7 +1388,6 @@ fn id_bytes(id: &[u8; 32]) -> Vec<u8> {
     id.to_vec()
 }
 
-/// The advisory lock key that orders a changeset or land transaction
 impl MetaTx for PgTx<'_> {
     /// Creates a repository, or returns the existing one with that name.
     fn create_repo(&mut self, name: &str) -> Result<RepoId> {
