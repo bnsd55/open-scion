@@ -130,11 +130,34 @@ pub fn run(
     dry_run: bool,
     between: &mut dyn FnMut(Stage),
 ) -> crate::error::Result<Report> {
+    let started = std::time::Instant::now();
     let mut report = Report::default();
     let live = live_set(store, between)?;
+    tracing::info!(
+        repos = report_repos(store)?,
+        grace_secs = grace.as_secs(),
+        dry_run,
+        "the collector walks the live set"
+    );
     prune_rows(store, &live, grace, dry_run, between, &mut report)?;
     sweep_files(store, grace, dry_run, between, &mut report)?;
+    tracing::info!(
+        repos = report.repos,
+        rows_pruned = report.rows_pruned,
+        files_removed = report.files_removed,
+        rows_young = report.rows_young,
+        files_young = report.files_young,
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "the collector ended"
+    );
     Ok(report)
+}
+
+/// The repos the collector found, for the start line that runs before
+/// `report.repos` is set.
+fn report_repos(store: &Backend) -> crate::error::Result<u64> {
+    let repos = store.read(|c| c.repos())?;
+    Ok(u64::try_from(repos.len()).unwrap_or(u64::MAX))
 }
 
 /// The blobs that each repo's stored changesets put, read in batches.
@@ -199,7 +222,7 @@ fn prune_rows(
     // came from uploads gets its prune too.
     let repos = store.read(|c| c.repos())?;
     report.repos = u64::try_from(repos.len()).unwrap_or(u64::MAX);
-    for repo in repos {
+    for (repo, name) in repos {
         // The candidate scan reads rows and files: it runs in a read
         // transaction, so it does not hold the collector's key while it
         // stats the files.
@@ -274,6 +297,12 @@ fn prune_rows(
                 }
                 Ok(())
             })?;
+            tracing::info!(
+                repo = %name,
+                rows = chunk.len(),
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "the collector pruned a batch of rows"
+            );
             if started.elapsed() > BATCH_BUDGET {
                 tracing::warn!(
                     rows = chunk.len(),
@@ -321,6 +350,7 @@ fn sweep_files(
     // after it and before the commit is fine: the file had no row.
     candidates.sort_by(|a, b| a.2.as_bytes().cmp(b.2.as_bytes()));
     for batch in candidates.chunks(SWEEP_BATCH) {
+        let started = std::time::Instant::now();
         store.write(|c| {
             for (path, listed, id) in batch {
                 if c.any_repo_names(id.as_bytes())? {
@@ -336,6 +366,12 @@ fn sweep_files(
             }
             Ok(())
         })?;
+        tracing::info!(
+            files = batch.len(),
+            removed = report.files_removed,
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "the collector swept a batch of files"
+        );
     }
     Ok(())
 }

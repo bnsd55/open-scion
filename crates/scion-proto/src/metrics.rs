@@ -99,6 +99,19 @@ pub struct Metrics {
     /// Real trees a view derivation fetched, folders of a partial
     /// reader's view (folder read rules).
     view_trees_walked: AtomicU64,
+    /// Durations of a blob batch's full flush of the drive cache, in
+    /// microseconds, as [`scion_blob_sync_seconds`].
+    blob_sync: [AtomicU64; BUCKETS.len() + 2],
+    /// Waits for the collector's advisory key before a Postgres write
+    /// transaction, in microseconds.
+    collector_key_wait: [AtomicU64; BUCKETS.len() + 2],
+    /// Free bytes of the filesystem that holds the data directory, as the
+    /// latest poll saw them (`data_free_set` says whether any poll ran).
+    data_free_bytes: AtomicU64,
+    data_free_set: std::sync::atomic::AtomicBool,
+    /// Derive walks in flight, and walks waiting for a permit.
+    derive_walks_in_flight: AtomicU64,
+    derive_walks_waiting: AtomicU64,
 }
 
 /// A metric name, as the index of its RPC.
@@ -186,6 +199,47 @@ impl Metrics {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Adds one full flush of the drive cache for a blob batch, `micros`
+    /// long. Callers that batch at the same time share one flush, so each
+    /// caller's duration includes the wait for the flush in progress.
+    pub fn blob_sync(&self, micros: u64) {
+        add_hist(&self.blob_sync, micros);
+    }
+
+    /// Adds one wait for the collector's advisory key, which every
+    /// Postgres write transaction takes before it writes.
+    pub fn collector_key_wait(&self, micros: u64) {
+        add_hist(&self.collector_key_wait, micros);
+    }
+
+    /// Sets the free bytes of the filesystem that holds the data
+    /// directory, from the latest poll.
+    pub fn data_free_bytes(&self, bytes: u64) {
+        self.data_free_bytes.store(bytes, Ordering::Relaxed);
+        self.data_free_set.store(true, Ordering::Relaxed);
+    }
+
+    /// Counts one derive walk that took its permit.
+    pub fn derive_walk_started(&self) {
+        self.derive_walks_in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one derive walk that gave its permit back.
+    pub fn derive_walk_ended(&self) {
+        self.derive_walks_in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Counts one walk that waits for a permit; the pair brackets each
+    /// wait, so the gauge is the walks in the wait, not ever waited.
+    pub fn derive_walk_wait_started(&self) {
+        self.derive_walks_waiting.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one walk that got a permit or gave up waiting.
+    pub fn derive_walk_wait_ended(&self) {
+        self.derive_walks_waiting.fetch_sub(1, Ordering::Relaxed);
+    }
+
     /// Counts `n` real trees a view derivation fetched.
     pub fn view_tree_walked(&self, n: u64) {
         self.view_trees_walked.fetch_add(n, Ordering::Relaxed);
@@ -195,6 +249,15 @@ impl Metrics {
     #[must_use]
     pub fn view_trees_walked(&self) -> u64 {
         self.view_trees_walked.load(Ordering::Relaxed)
+    }
+
+    /// The derive-walk gauges, for a test that reads them without a scrape.
+    #[must_use]
+    pub fn derive_walks(&self) -> (u64, u64) {
+        (
+            self.derive_walks_in_flight.load(Ordering::Relaxed),
+            self.derive_walks_waiting.load(Ordering::Relaxed),
+        )
     }
 
     /// The cache counters, for a test that reads them without a scrape.
@@ -224,55 +287,8 @@ impl Metrics {
                 }
             }
         }
-        text.push_str("# HELP scion_request_seconds A request's duration by RPC, in seconds.\n");
-        text.push_str("# TYPE scion_request_seconds histogram\n");
-        for (rpc, known) in RPCS.iter().enumerate() {
-            let buckets = &self.latency[rpc];
-            if buckets[BUCKETS.len() + 1].load(Ordering::Relaxed) == 0 {
-                continue;
-            }
-            for (i, bound) in BUCKETS.iter().enumerate() {
-                let le = if *bound == u64::MAX {
-                    "+Inf".to_owned()
-                } else {
-                    format!("{}", seconds(*bound))
-                };
-                let _ = writeln!(
-                    text,
-                    "scion_request_seconds_bucket{{rpc=\"{known}\",le=\"{le}\"}} {}",
-                    buckets[i].load(Ordering::Relaxed)
-                );
-            }
-            let count = buckets[BUCKETS.len() + 1].load(Ordering::Relaxed);
-            let sum = buckets[BUCKETS.len()].load(Ordering::Relaxed);
-            let _ = writeln!(
-                text,
-                "scion_request_seconds_sum{{rpc=\"{known}\"}} {}",
-                seconds(sum)
-            );
-            let _ = writeln!(
-                text,
-                "scion_request_seconds_count{{rpc=\"{known}\"}} {count}"
-            );
-        }
-        text.push_str("# HELP scion_rpc_bytes_total Request and reply bytes by RPC.\n");
-        text.push_str("# TYPE scion_rpc_bytes_total counter\n");
-        for (rpc, known) in RPCS.iter().enumerate() {
-            let bytes_in = self.bytes_in[rpc].load(Ordering::Relaxed);
-            let bytes_out = self.bytes_out[rpc].load(Ordering::Relaxed);
-            if bytes_in > 0 {
-                let _ = writeln!(
-                    text,
-                    "scion_rpc_bytes_total{{rpc=\"{known}\",direction=\"in\"}} {bytes_in}"
-                );
-            }
-            if bytes_out > 0 {
-                let _ = writeln!(
-                    text,
-                    "scion_rpc_bytes_total{{rpc=\"{known}\",direction=\"out\"}} {bytes_out}"
-                );
-            }
-        }
+        self.render_latency(&mut text);
+        self.render_bytes(&mut text);
         text.push_str("# HELP scion_lands_total Lands by outcome.\n");
         text.push_str("# TYPE scion_lands_total counter\n");
         for (outcome, name) in LANDS.iter().enumerate() {
@@ -308,8 +324,163 @@ impl Metrics {
                 let _ = writeln!(text, "scion_cache_{name}_total {value}");
             }
         }
+        self.render_blob_sync(&mut text);
+        self.render_collector_key_wait(&mut text);
+        if self.data_free_set.load(Ordering::Relaxed) {
+            let _ = writeln!(
+                text,
+                "# HELP scion_data_free_bytes Free bytes of the filesystem that holds the data directory.\n\
+                 # TYPE scion_data_free_bytes gauge\n\
+                 scion_data_free_bytes {}",
+                self.data_free_bytes.load(Ordering::Relaxed)
+            );
+        }
+        self.render_derive_walks(&mut text);
         text
     }
+
+    /// The per-RPC latency histograms, one series per RPC that counted.
+    fn render_latency(&self, text: &mut String) {
+        use std::fmt::Write as _;
+        text.push_str("# HELP scion_request_seconds A request's duration by RPC, in seconds.\n");
+        text.push_str("# TYPE scion_request_seconds histogram\n");
+        for (rpc, known) in RPCS.iter().enumerate() {
+            let buckets = &self.latency[rpc];
+            if buckets[BUCKETS.len() + 1].load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            for (i, bound) in BUCKETS.iter().enumerate() {
+                let le = if *bound == u64::MAX {
+                    "+Inf".to_owned()
+                } else {
+                    format!("{}", seconds(*bound))
+                };
+                let _ = writeln!(
+                    text,
+                    "scion_request_seconds_bucket{{rpc=\"{known}\",le=\"{le}\"}} {}",
+                    buckets[i].load(Ordering::Relaxed)
+                );
+            }
+            let count = buckets[BUCKETS.len() + 1].load(Ordering::Relaxed);
+            let sum = buckets[BUCKETS.len()].load(Ordering::Relaxed);
+            let _ = writeln!(
+                text,
+                "scion_request_seconds_sum{{rpc=\"{known}\"}} {}",
+                seconds(sum)
+            );
+            let _ = writeln!(
+                text,
+                "scion_request_seconds_count{{rpc=\"{known}\"}} {count}"
+            );
+        }
+    }
+
+    /// The per-RPC byte counters, for the RPCs that counted any.
+    fn render_bytes(&self, text: &mut String) {
+        use std::fmt::Write as _;
+        text.push_str("# HELP scion_rpc_bytes_total Request and reply bytes by RPC.\n");
+        text.push_str("# TYPE scion_rpc_bytes_total counter\n");
+        for (rpc, known) in RPCS.iter().enumerate() {
+            let bytes_in = self.bytes_in[rpc].load(Ordering::Relaxed);
+            let bytes_out = self.bytes_out[rpc].load(Ordering::Relaxed);
+            if bytes_in > 0 {
+                let _ = writeln!(
+                    text,
+                    "scion_rpc_bytes_total{{rpc=\"{known}\",direction=\"in\"}} {bytes_in}"
+                );
+            }
+            if bytes_out > 0 {
+                let _ = writeln!(
+                    text,
+                    "scion_rpc_bytes_total{{rpc=\"{known}\",direction=\"out\"}} {bytes_out}"
+                );
+            }
+        }
+    }
+
+    /// The blob-sync histogram, when a flush ran.
+    fn render_blob_sync(&self, text: &mut String) {
+        let help = "A blob batch's full flush of the drive cache, which callers \
+                    that batch at the same time share.";
+        render_hist(text, "scion_blob_sync_seconds", help, &self.blob_sync);
+    }
+
+    /// The collector-key-wait histogram, when a Postgres write waited.
+    fn render_collector_key_wait(&self, text: &mut String) {
+        let help = "A write transaction's wait for the collector's advisory key \
+                    (Postgres).";
+        render_hist(
+            text,
+            "scion_pg_collector_key_wait_seconds",
+            help,
+            &self.collector_key_wait,
+        );
+    }
+
+    /// The derive-walk gauges, while walks hold or wait for permits.
+    fn render_derive_walks(&self, text: &mut String) {
+        use std::fmt::Write as _;
+        for (name, help, gauge) in [
+            (
+                "scion_derive_walks_in_flight",
+                "Derive walks holding a permit now.",
+                &self.derive_walks_in_flight,
+            ),
+            (
+                "scion_derive_walks_waiting",
+                "Derive walks waiting for a permit.",
+                &self.derive_walks_waiting,
+            ),
+        ] {
+            let value = gauge.load(Ordering::Relaxed);
+            if value > 0 {
+                let _ = writeln!(
+                    text,
+                    "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}"
+                );
+            }
+        }
+    }
+}
+
+/// One histogram series without labels, in the Prometheus text shape:
+/// every bucket, then the sum and the count. Nothing renders while the
+/// series counted nothing.
+fn render_hist(text: &mut String, name: &str, help: &str, hist: &[AtomicU64]) {
+    use std::fmt::Write as _;
+    if hist[BUCKETS.len() + 1].load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let _ = writeln!(text, "# HELP {name} {help}\n# TYPE {name} histogram");
+    for (i, bound) in BUCKETS.iter().enumerate() {
+        let le = if *bound == u64::MAX {
+            "+Inf".to_owned()
+        } else {
+            format!("{}", seconds(*bound))
+        };
+        let _ = writeln!(
+            text,
+            "{name}_bucket{{le=\"{le}\"}} {}",
+            hist[i].load(Ordering::Relaxed)
+        );
+    }
+    let count = hist[BUCKETS.len() + 1].load(Ordering::Relaxed);
+    let sum = hist[BUCKETS.len()].load(Ordering::Relaxed);
+    let _ = writeln!(text, "{name}_sum {}", seconds(sum));
+    let _ = writeln!(text, "{name}_count {count}");
+}
+
+/// Adds `micros` to every bucket of `hist` whose bound covers it, to the
+/// sum, and to the count: the shape of the per-RPC latency code, without
+/// the RPC label.
+fn add_hist(hist: &[AtomicU64], micros: u64) {
+    for (i, bound) in BUCKETS.iter().enumerate() {
+        if micros <= *bound {
+            hist[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    hist[BUCKETS.len()].fetch_add(micros, Ordering::Relaxed);
+    hist[BUCKETS.len() + 1].fetch_add(1, Ordering::Relaxed);
 }
 
 /// A call's duration in microseconds, saturated at `u64::MAX`.
@@ -774,6 +945,50 @@ mod tests {
             text.contains("scion_requests_total{rpc=\"Scion/Blame\",code=\"cancelled\"} 1\n"),
             "{text}"
         );
+    }
+
+    /// The operator gauges and histograms render only when they counted
+    /// something, and in the Prometheus shape the scrapers expect.
+    #[test]
+    fn the_operating_metrics_render_their_shape() {
+        let metrics = Metrics::default();
+        let text = metrics.render();
+        assert!(!text.contains("scion_blob_sync_seconds"), "{text}");
+        assert!(!text.contains("scion_data_free_bytes"), "{text}");
+        assert!(!text.contains("scion_derive_walks"), "{text}");
+        assert!(!text.contains("scion_pg_collector_key_wait"), "{text}");
+
+        metrics.blob_sync(4_000);
+        metrics.collector_key_wait(70_000);
+        metrics.data_free_bytes(4_096);
+        metrics.derive_walk_started();
+        metrics.derive_walk_wait_started();
+        let text = metrics.render();
+        assert!(
+            text.contains("scion_blob_sync_seconds_bucket{le=\"0.004\"} 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("scion_blob_sync_seconds_bucket{le=\"+Inf\"} 1\n"),
+            "{text}"
+        );
+        assert!(text.contains("scion_blob_sync_seconds_count 1\n"), "{text}");
+        assert!(
+            !text.contains("scion_blob_sync_seconds_bucket{le=\"0.001\"} 1\n"),
+            "4 ms is not in the 1 ms bucket: {text}"
+        );
+        assert!(
+            text.contains("scion_pg_collector_key_wait_seconds_bucket{le=\"0.256\"} 1\n"),
+            "{text}"
+        );
+        assert!(text.contains("scion_data_free_bytes 4096\n"), "{text}");
+        assert!(text.contains("scion_derive_walks_in_flight 1\n"), "{text}");
+        assert!(text.contains("scion_derive_walks_waiting 1\n"), "{text}");
+
+        metrics.derive_walk_ended();
+        metrics.derive_walk_wait_ended();
+        let text = metrics.render();
+        assert!(!text.contains("scion_derive_walks"), "{text}");
     }
 
     /// Every rpc of the proto file has a slot: the table cannot drift from

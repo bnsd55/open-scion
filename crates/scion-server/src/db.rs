@@ -912,14 +912,15 @@ impl MetaTx for SqliteTx<'_> {
         Ok((body, len))
     }
 
-    /// Every repo, in ID order.
-    fn repos(&mut self) -> Result<Vec<RepoId>> {
+    /// Every repo with its name, in ID order.
+    fn repos(&mut self) -> Result<Vec<(RepoId, String)>> {
         let mut stmt = self
             .0
-            .prepare_cached("SELECT repo_id FROM repos ORDER BY repo_id")?;
-        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            .prepare_cached("SELECT repo_id, name FROM repos ORDER BY repo_id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((RepoId(row.get::<_, i64>(0)?), row.get::<_, String>(1)?))
+        })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map(|ids| ids.into_iter().map(RepoId).collect())
             .map_err(Into::into)
     }
 

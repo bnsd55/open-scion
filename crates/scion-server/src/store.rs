@@ -215,14 +215,28 @@ impl Store {
     /// database cannot be created, or if the schema is newer than this build,
     /// or older while another `Store` uses the directory.
     pub fn open(dir: &Path) -> Result<Self> {
-        Self::open_as(dir, true, &build(), DERIVE_WALKS_CAP)
+        Self::open_as(dir, true, &build(), DERIVE_WALKS_CAP, None)
+    }
+
+    /// [`Store::open`], with the metrics registry of a process that
+    /// exports one: blob full flushes and derive-walk waits record into
+    /// it. The serve path wires this when the metrics plumbing of the
+    /// backend lands; tests use it to read the gauges.
+    // SHORTCUT: test-only until the Backend::open metrics handle lands
+    // (#239 part 3); then the serve path passes the registry here.
+    #[cfg(test)]
+    pub(crate) fn open_with_metrics(
+        dir: &Path,
+        metrics: Option<&std::sync::Arc<crate::metrics::Metrics>>,
+    ) -> Result<Self> {
+        Self::open_as(dir, true, &build(), DERIVE_WALKS_CAP, metrics)
     }
 
     /// Opens or creates a data directory as its server, with a cap of
     /// `walks` derive walks in flight. For tests of the cap.
     #[cfg(test)]
     pub(crate) fn open_with_walks(dir: &Path, walks: usize) -> Result<Self> {
-        Self::open_as(dir, true, &build(), walks)
+        Self::open_as(dir, true, &build(), walks, None)
     }
 
     /// Opens or creates a data directory for a process that does not land,
@@ -241,11 +255,17 @@ impl Store {
     ///
     /// As [`Store::open`], except that a server `Store` is no conflict.
     pub fn open_shared(dir: &Path) -> Result<Self> {
-        Self::open_as(dir, false, &build(), DERIVE_WALKS_CAP)
+        Self::open_as(dir, false, &build(), DERIVE_WALKS_CAP, None)
     }
 
     /// Opens a data directory for a process of build `build` ([`build`]).
-    fn open_as(dir: &Path, server: bool, build: &str, walks_cap: usize) -> Result<Self> {
+    fn open_as(
+        dir: &Path,
+        server: bool,
+        build: &str,
+        walks_cap: usize,
+        metrics: Option<&std::sync::Arc<crate::metrics::Metrics>>,
+    ) -> Result<Self> {
         fs::create_dir_all(dir)?;
         // The blobs and the metadata are only as private as the directory:
         // a group- or others-writable directory lets another user read or
@@ -302,7 +322,7 @@ impl Store {
                 )));
             }
         }
-        let blobs = Blobs::open(&dir)?;
+        let blobs = Blobs::open_with(&dir, metrics.cloned())?;
         // Every open removes the folders of dead processes; only an open
         // that is alone also removes files, which a build older than the
         // folders may have left.
@@ -353,7 +373,7 @@ impl Store {
                 txes: AtomicU64::new(0),
                 fail_commits: AtomicU64::new(0),
                 hooks: ImportHooks::default(),
-                derive: DeriveFlights::new(walks_cap),
+                derive: DeriveFlights::new_with(walks_cap, metrics.cloned()),
                 writers: Mutex::new(0),
                 write_woken: Condvar::new(),
             }),
@@ -835,13 +855,26 @@ pub struct Blobs {
     /// Never read: its life is the point.
     _mine_lock: fs::File,
     group_flush: GroupFlush,
+    /// The operator metrics, when the process exports them: the full
+    /// flush records its duration there.
+    metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
     /// Calls to [`Blobs::verify`] so far.
     #[cfg(test)]
     verifies: std::sync::atomic::AtomicU64,
 }
 
 impl Blobs {
+    #[cfg(test)]
     pub(crate) fn open(dir: &Path) -> Result<Self> {
+        Self::open_with(dir, None)
+    }
+
+    /// [`Blobs::open`], with the metrics registry of a process that
+    /// exports one: every full flush records how long it took.
+    pub(crate) fn open_with(
+        dir: &Path,
+        metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
+    ) -> Result<Self> {
         // Folders of `tmp/` made in this process, so each `Blobs` gets its own.
         static FOLDERS: AtomicU64 = AtomicU64::new(0);
         let objects = dir.join("objects");
@@ -888,6 +921,7 @@ impl Blobs {
             mine,
             _mine_lock: mine_lock,
             group_flush: GroupFlush::default(),
+            metrics,
             #[cfg(test)]
             verifies: std::sync::atomic::AtomicU64::default(),
         })
@@ -931,8 +965,14 @@ impl Blobs {
     /// directory, then the drive cache. That covers everything that reached
     /// the drive before it, the database too, which lives on the same drive.
     pub(crate) fn full_flush(&self) -> io::Result<()> {
-        self.group_flush
-            .run(|| fs::File::open(&self.root)?.sync_all())
+        let started = std::time::Instant::now();
+        let result = self
+            .group_flush
+            .run(|| fs::File::open(&self.root)?.sync_all());
+        if let Some(metrics) = &self.metrics {
+            metrics.blob_sync(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+        }
+        result
     }
 
     /// Stores one file's content durably. Safe to repeat.
@@ -1315,6 +1355,18 @@ impl Upload {
 
 fn too_large() -> Error {
     Error::InvalidArgument(format!("blob is larger than {MAX_OBJECT_BYTES} bytes"))
+}
+
+/// The bytes free for this user on the filesystem that holds `dir`, as
+/// the operator's free-space gauge reads them. `f_bavail`, not `f_bfree`:
+/// the blocks a non-root process can really get.
+///
+/// # Errors
+///
+/// The `statvfs` of `dir` failed (a directory that is gone).
+pub fn free_bytes(dir: &Path) -> std::io::Result<u64> {
+    let stats = rustix::fs::statvfs(dir)?;
+    Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
 }
 
 /// Blobs written but not yet durable. Call [`BlobBatch::sync`] before
@@ -1933,11 +1985,17 @@ mod tests {
                 other => panic!("expected the open to fail, got {:?}", other.err()),
             };
             let server = Store::open(dir.path()).unwrap();
-            refused(Store::open_as(dir.path(), false, &other, DERIVE_WALKS_CAP));
+            refused(Store::open_as(
+                dir.path(),
+                false,
+                &other,
+                DERIVE_WALKS_CAP,
+                None,
+            ));
             Store::open_shared(dir.path()).unwrap();
             drop(server);
             // The import of the other build opened alone, so its build counts.
-            let import = Store::open_as(dir.path(), false, &other, DERIVE_WALKS_CAP).unwrap();
+            let import = Store::open_as(dir.path(), false, &other, DERIVE_WALKS_CAP, None).unwrap();
             refused(Store::open(dir.path()));
             refused(Store::open_shared(dir.path()));
             drop(import);
@@ -2008,6 +2066,34 @@ mod tests {
         };
         assert!(!fullfsync(&Store::open(dir.path()).unwrap()));
         assert!(fullfsync(&Store::open_shared(dir.path()).unwrap()));
+    }
+
+    #[test]
+    fn a_blob_batch_records_its_full_flush_in_the_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
+        let store = Store::open_with_metrics(dir.path(), Some(&metrics)).unwrap();
+        assert!(
+            !metrics.render().contains("scion_blob_sync_seconds"),
+            "nothing flushed yet: {}",
+            metrics.render()
+        );
+        store.blobs().put(b"recorded").unwrap();
+        let text = metrics.render();
+        assert!(text.contains("scion_blob_sync_seconds_count 1\n"), "{text}");
+        // The flush of this store ran; its duration landed in the +Inf
+        // bucket exactly once.
+        assert!(
+            text.contains("scion_blob_sync_seconds_bucket{le=\"+Inf\"} 1\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn free_bytes_of_a_tempdir_is_positive() {
+        let dir = tempfile::tempdir().unwrap();
+        let free = free_bytes(dir.path()).unwrap();
+        assert!(free > 0, "{free}");
     }
 
     #[test]

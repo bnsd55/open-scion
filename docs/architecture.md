@@ -1740,6 +1740,10 @@ into fixed buckets. The values are read on export only.
 | `scion_land_replans_total` | counter | Lands whose ref moved under them and were planned again: a rising rate means lands that contend with imports or other writers on one ref. |
 | `scion_view_trees_walked_total` | counter | Real trees a view derivation opened for a partial reader. A count that rises on every changeset of the same rule set says the per-tree memo is not serving and every read re-walks the tree. |
 | `scion_cache_hits_total`, `scion_cache_misses_total` | counter | A tier's object reads served from its store or its snapshot, and read from upstream. A tier's scrape also shows its `Objects` calls in `scion_requests_total` and `scion_request_seconds`. |
+| `scion_blob_sync_seconds` | histogram | A blob batch's full flush of the drive cache, which batches that sync at the same time share; one caller's duration includes the wait for the flush in progress. A sum that outruns the counts says a drive that cannot keep up with the imports. Same buckets as `scion_request_seconds`. |
+| `scion_data_free_bytes` | gauge | Free bytes for this process's user on the filesystem that holds the data directory, refreshed every 30 s. This is the alarm that fires before the server fails to write. |
+| `scion_derive_walks_in_flight`, `scion_derive_walks_waiting` | gauge | Derive walks that hold a permit, and walks that wait for one. Walks waiting while the in-flight count sits at the cap mean a cold history read that waits behind the walkers. |
+| `scion_pg_collector_key_wait_seconds` | histogram | A Postgres write transaction's wait for the collector's advisory key, the one lock every writer of the schema orders on. Waits near the 60 s bound of the key mean the writer queue does not drain. Same buckets as `scion_request_seconds`. |
 
 The layer sits inside the axum router, around both gRPC services and
 outside the access checks. A refusal (bad token, unknown repo, a budget

@@ -606,7 +606,7 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
-    fn repos(&mut self) -> Result<Vec<RepoId>> {
+    fn repos(&mut self) -> Result<Vec<(RepoId, String)>> {
         match self {
             Self::Sqlite(tx) => tx.repos(),
             Self::Postgres(pg) => pg.repos(),

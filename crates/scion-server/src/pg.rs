@@ -84,6 +84,9 @@ struct PgInner {
     /// The import's test hooks and busy-retry count, as the SQLite store
     /// keeps its own.
     hooks: crate::store::ImportHooks,
+    /// The operator metrics, when the process exports one: a commit's
+    /// wait for the collector's advisory key records how long it waited.
+    metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
 }
 
 /// Clients for [`Pg::read`], so at most [`READERS`](crate::store::READERS)
@@ -563,7 +566,7 @@ impl Pg {
     /// A URL that does not parse, a database that does not connect, a
     /// schema of a newer build, or a migration that fails.
     pub fn open(url: &str, ca: Option<&Path>, readers: usize, data: &Path) -> Result<Self> {
-        Self::open_in(url, ca, readers, data, None, false)
+        Self::open_in(url, ca, readers, data, None, false, None)
     }
 
     /// [`Pg::open`], as the one server process of the database: a second
@@ -579,7 +582,7 @@ impl Pg {
         readers: usize,
         data: &Path,
     ) -> Result<Self> {
-        Self::open_in(url, ca, readers, data, None, true)
+        Self::open_in(url, ca, readers, data, None, true, None)
     }
 
     /// [`Pg::open`], in `schema` instead of the database's default one, for
@@ -590,6 +593,29 @@ impl Pg {
     ///
     /// As [`Pg::open`].
     pub fn open_test(url: &str, schema: &str, readers: usize, data: &Path) -> Result<Self> {
+        Self::open_test_inner(url, schema, readers, data, None)
+    }
+
+    /// [`Pg::open_test`], with the metrics registry a test reads its
+    /// assertions from.
+    #[cfg(test)]
+    pub fn open_test_with_metrics(
+        url: &str,
+        schema: &str,
+        readers: usize,
+        data: &Path,
+        metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
+    ) -> Result<Self> {
+        Self::open_test_inner(url, schema, readers, data, metrics)
+    }
+
+    fn open_test_inner(
+        url: &str,
+        schema: &str,
+        readers: usize,
+        data: &Path,
+        metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
+    ) -> Result<Self> {
         {
             // One throwaway client makes the schema, before any connection
             // narrows its search path to it. It names itself first, so no
@@ -626,7 +652,7 @@ impl Pg {
                 }
             })?;
         }
-        Self::open_in(url, None, readers, data, Some(schema), false)
+        Self::open_in(url, None, readers, data, Some(schema), false, metrics)
     }
 
     /// [`Pg::open`], in the search path of `schema` when it is set.
@@ -638,6 +664,7 @@ impl Pg {
         data: &Path,
         schema: Option<&str>,
         exclusive: bool,
+        metrics: Option<std::sync::Arc<crate::metrics::Metrics>>,
     ) -> Result<Self> {
         let options = base_options();
         let mut writer = if exclusive {
@@ -656,7 +683,7 @@ impl Pg {
                  synchronous_commit=on"
             )));
         }
-        let blobs = Blobs::open(data)?;
+        let blobs = Blobs::open_with(data, metrics.clone())?;
         blobs.sweep_tmp(false)?;
         Ok(Self {
             inner: Arc::new(PgInner {
@@ -665,8 +692,12 @@ impl Pg {
                 blobs,
                 writers: Mutex::new(0),
                 write_woken: Condvar::new(),
-                derive: crate::derived::DeriveFlights::new(crate::store::DERIVE_WALKS_CAP),
+                derive: crate::derived::DeriveFlights::new_with(
+                    crate::store::DERIVE_WALKS_CAP,
+                    metrics.clone(),
+                ),
                 hooks: crate::store::ImportHooks::default(),
+                metrics,
             }),
         })
     }
@@ -743,10 +774,16 @@ impl Pg {
             &format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT_FOR_KEY}'"),
             &[],
         )?;
+        let key_started = std::time::Instant::now();
         tx.c.query_opt(
             "SELECT pg_advisory_xact_lock(hashtext(current_schema() || ':gc'))",
             &[],
         )?;
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.collector_key_wait(
+                u64::try_from(key_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
+        }
         tx.c.query(
             &format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT_FOR_WRITERS}'"),
             &[],
@@ -2184,12 +2221,15 @@ impl MetaTx for PgTx<'_> {
         let len = body.len();
         Ok((body, len))
     }
-    /// Every repo, in ID order.
-    fn repos(&mut self) -> Result<Vec<RepoId>> {
+    /// Every repo with its name, in ID order.
+    fn repos(&mut self) -> Result<Vec<(RepoId, String)>> {
         let rows = self
             .c
-            .query("SELECT repo_id FROM repos ORDER BY repo_id", &[])?;
-        Ok(rows.iter().map(|row| RepoId(row.get(0))).collect())
+            .query("SELECT repo_id, name FROM repos ORDER BY repo_id", &[])?;
+        Ok(rows
+            .iter()
+            .map(|row| (RepoId(row.get(0)), row.get(1)))
+            .collect())
     }
 
     /// The `(repo, changeset ID, body)` of the stored changesets after
@@ -2452,7 +2492,9 @@ impl Meta for Pg {
 
 #[cfg(test)]
 mod tests {
-    use super::merged_options;
+    use super::{Client, NoTls, merged_options};
+    use crate::pg::Pg;
+    use std::sync::Arc;
 
     const OWN: &str = "-csynchronous_commit=on -cstatement_timeout=600000 -clock_timeout=5000";
 
@@ -2476,5 +2518,59 @@ mod tests {
     fn a_url_without_options_gets_the_backends_only() {
         assert_eq!(merged_options(None, OWN), OWN);
         assert_eq!(merged_options(Some(""), OWN), OWN);
+    }
+
+    /// A write that waits for the collector's key records the wait in the
+    /// metrics: the gauge an operator watches for a busy database.
+    #[test]
+    fn a_commit_records_its_wait_for_the_collectors_key() {
+        if !crate::Backend::test_is_postgres() {
+            return;
+        }
+        let url = crate::backend::test_url().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = crate::backend::test_schema(dir.path());
+        let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
+        let pg =
+            Pg::open_test_with_metrics(&url, &schema, 2, dir.path(), Some(Arc::clone(&metrics)))
+                .unwrap();
+        assert!(
+            !pg.inner
+                .metrics
+                .as_ref()
+                .unwrap()
+                .render()
+                .contains("scion_pg_collector_key_wait"),
+            "nothing waited yet"
+        );
+        // Another client holds the key, so the commit below really waits.
+        let mut holder = Client::connect(&url, NoTls).unwrap();
+        holder
+            .batch_execute(&format!(
+                "SET search_path TO {schema};
+                 BEGIN;
+                 SELECT pg_advisory_xact_lock(hashtext(current_schema() || ':gc'));"
+            ))
+            .unwrap();
+        let writer = std::thread::spawn(move || {
+            pg.commit(|_tx| Ok(())).unwrap();
+        });
+        // Give the writer time to reach the key, then let it in.
+        for _ in 0..2_000 {
+            std::thread::yield_now();
+        }
+        holder.batch_execute("COMMIT").unwrap();
+        let mut spins = 0;
+        while !writer.is_finished() {
+            spins += 1;
+            assert!(spins < 1_000_000, "the writer never finished");
+            std::thread::yield_now();
+        }
+        writer.join().unwrap();
+        let text = metrics.render();
+        assert!(
+            text.contains("scion_pg_collector_key_wait_seconds_count 1\n"),
+            "{text}"
+        );
     }
 }
