@@ -32,7 +32,7 @@ use postgres::{Client, Config, NoTls};
 
 /// Shorthand for the owned query parameter.
 type P = Param;
-use scion_core::{BlobId, Changeset, ChangesetId, IdentityTime, RepoPath, Tree, TreeId};
+use scion_core::{BlobId, Changeset, ChangesetId, RepoPath, Tree, TreeId};
 use scion_proto::metrics::Metrics;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
@@ -3343,7 +3343,7 @@ mod pool_tests {
                     repo,
                     &Changeset {
                         parents: vec![],
-                        author: IdentityTime {
+                        author: scion_core::IdentityTime {
                             name: b"Ada".to_vec(),
                             email: b"ada@example.com".to_vec(),
                             unix_secs: 0,

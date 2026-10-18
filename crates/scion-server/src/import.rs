@@ -11,6 +11,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
+#[cfg(test)]
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
