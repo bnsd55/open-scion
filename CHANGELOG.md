@@ -215,6 +215,12 @@ The first release: the server, its cache tiers, and the `scn` client.
   few nodes and stops at a deadline, instead of walking parents
   without one.
 
+- A disk cache whose index row names more bytes than any object holds
+  answers that row as corrupt, naming the object, instead of sizing
+  its read buffer for the row.
+- A snapshot seeded into a daemon counts an object that the store's
+  byte limit refuses as skipped, so the seeded log line says what the
+  store really holds.
 - Two reads of a Postgres-backed store no longer panic on a column's
   type (`#252`): `GetObjects`' tree-size read and `fsck`'s
   derived-row version read wanted a width Postgres does not give, and
