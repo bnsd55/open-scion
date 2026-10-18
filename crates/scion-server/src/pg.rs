@@ -711,6 +711,19 @@ impl Pg {
         Self::open_in(url, None, readers, data, Some(schema), true, marker)
     }
 
+    /// [`Pg::open_test`], as a process that does not land: it takes no
+    /// one-server lock, and its loss fences nothing, like a `gc`, `fsck`
+    /// or `import` beside a live server.
+    pub(crate) fn open_test_shared(
+        url: &str,
+        schema: &str,
+        readers: usize,
+        data: &Path,
+        marker: Marker,
+    ) -> Result<Self> {
+        Self::open_in(url, None, readers, data, Some(schema), false, marker)
+    }
+
     /// [`Pg::open`], in the search path of `schema` when it is set.
     #[allow(clippy::unused_self)]
     fn open_in(

@@ -877,8 +877,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let schema = crate::backend::test_schema(dir.path());
         let data = TempDir::new().unwrap();
+        // The collector side opens the way the `gc` CLI does - shared,
+        // with no one-server lock - and the writer the way a server
+        // does, with the per-schema lock.
         let gc_store =
-            crate::pg::Pg::open_test(&url, &schema, 2, data.path(), Marker::default()).unwrap();
+            crate::pg::Pg::open_test_shared(&url, &schema, 2, data.path(), Marker::default())
+                .unwrap();
         let writer_store = crate::pg::Pg::open_test(
             &url,
             &schema,

@@ -312,7 +312,8 @@ impl Backend {
         if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
             let marker = Marker::read(data);
             refuse_sqlite_dir(data)?;
-            let pg = Pg::open_test(&test_url()?, &test_schema(data), PG_READERS, data, marker)?;
+            let pg =
+                Pg::open_test_shared(&test_url()?, &test_schema(data), PG_READERS, data, marker)?;
             marker_agrees(data, !marker.present, pg.store_uuid())?;
             return Ok(Self::Postgres(pg));
         }
