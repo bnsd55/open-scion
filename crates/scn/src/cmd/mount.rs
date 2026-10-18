@@ -952,7 +952,7 @@ mod silent_failures {
         drop(_lock);
         assert!(wait_for(2, || live_record_for(
             Path::new("/mnt/view"),
-            &[known],
+            std::slice::from_ref(&known),
             &serving
         )
         .is_none()));
