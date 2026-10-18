@@ -310,12 +310,11 @@ impl Backend {
     }
 
     /// Sets the step the tests run after each batch of the import commits.
-    /// A Postgres database has no shared data directory, so this only
-    /// reaches SQLite.
     #[doc(hidden)]
     pub fn set_after_batch(&self, step: Option<crate::store::AfterBatch>) {
-        if let Self::Sqlite(store) = self {
-            store.set_after_batch(step);
+        match self {
+            Self::Sqlite(store) => store.set_after_batch(step),
+            Self::Postgres(pg) => pg.set_after_batch(step),
         }
     }
 
@@ -325,7 +324,7 @@ impl Backend {
     pub fn busy_retries(&self) -> u64 {
         match self {
             Self::Sqlite(store) => store.busy_retries(),
-            Self::Postgres(_) => 0,
+            Self::Postgres(pg) => pg.busy_retries(),
         }
     }
 
@@ -333,16 +332,18 @@ impl Backend {
     /// done so far.
     #[doc(hidden)]
     pub fn run_after_batch(&self, batches: usize) {
-        if let Self::Sqlite(store) = self {
-            store.run_after_batch(batches);
+        match self {
+            Self::Sqlite(store) => store.run_after_batch(batches),
+            Self::Postgres(pg) => pg.run_after_batch(batches),
         }
     }
 
     /// Counts one busy retry of the import's batch.
     #[doc(hidden)]
     pub fn note_busy_retry(&self) {
-        if let Self::Sqlite(store) = self {
-            store.note_busy_retry();
+        match self {
+            Self::Sqlite(store) => store.note_busy_retry(),
+            Self::Postgres(pg) => pg.note_busy_retry(),
         }
     }
 }

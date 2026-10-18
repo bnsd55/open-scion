@@ -80,6 +80,12 @@ struct PgInner {
     write_woken: Condvar,
     /// The walks in flight of this backend's derivations.
     derive: crate::derived::DeriveFlights,
+    /// How many times an import batch waited out a busy database and ran
+    /// again, counted like the SQLite store counts its own.
+    busy_retries: std::sync::atomic::AtomicU64,
+    /// The test step a batch boundary runs, as the SQLite store runs its
+    /// own: the busy-lock tests hold the database at a counted boundary.
+    after_batch: Mutex<Option<crate::store::AfterBatch>>,
 }
 
 /// Clients for [`Pg::read`], so at most [`READERS`](crate::store::READERS)
@@ -639,6 +645,8 @@ impl Pg {
                 writers: Mutex::new(0),
                 write_woken: Condvar::new(),
                 derive: crate::derived::DeriveFlights::new(crate::store::DERIVE_WALKS_CAP),
+                busy_retries: std::sync::atomic::AtomicU64::new(0),
+                after_batch: Mutex::new(None),
             }),
         })
     }
@@ -731,6 +739,43 @@ impl Pg {
     /// The walks in flight of this backend's derivations.
     pub(crate) fn derive_flights(&self) -> &crate::derived::DeriveFlights {
         &self.inner.derive
+    }
+
+    /// Counts one busy retry of the import's batch.
+    pub fn note_busy_retry(&self) {
+        self.inner
+            .busy_retries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many busy retries of the import's batches ran so far.
+    #[must_use]
+    pub fn busy_retries(&self) -> u64 {
+        self.inner
+            .busy_retries
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Sets the step the tests run after each batch of the import commits.
+    pub fn set_after_batch(&self, step: Option<crate::store::AfterBatch>) {
+        *self
+            .inner
+            .after_batch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = step;
+    }
+
+    /// Runs the test step of a batch boundary, with the count of batches
+    /// done so far.
+    pub fn run_after_batch(&self, batches: usize) {
+        if let Some(step) = &mut *self
+            .inner
+            .after_batch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            step(batches);
+        }
     }
 
     /// How many writers wait for the write client right now.

@@ -1093,6 +1093,78 @@ fn an_import_that_stays_busy_fails_with_the_busy_error() {
     assert_eq!(cs, 0);
 }
 
+/// The Postgres hold of a batch boundary: a client of the test schema
+/// takes the changesets table and keeps it until the import's batch has
+/// hit the busy database once, as `hold_until_a_retry` holds the data
+/// directory's write lock on SQLite. The hold starts at a counted batch
+/// boundary, and releases only when a batch retried, so the batch that
+/// began inside the hold provably waited out the lock. Its writes are
+/// idempotent, so the retry is safe. The thread ends on its own; it
+/// commits when the hold is over.
+fn hold_until_a_retry_pg(store: &Arc<Backend>, dir: &Path, before: u64) {
+    let (held_tx, held_rx) = mpsc::channel();
+    let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+    let schema = Backend::test_schema(dir).unwrap();
+    let watcher = Arc::clone(store);
+    thread::spawn(move || {
+        let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        db.batch_execute(&format!("SET search_path TO {schema}"))
+            .unwrap();
+        // The batch's writes are inserts into `changesets`; the lock holds
+        // them while reads go past.
+        db.batch_execute("BEGIN; LOCK TABLE changesets IN EXCLUSIVE MODE;")
+            .unwrap();
+        held_tx.send(()).unwrap();
+        // The import's first write under this hold waits out the 5 s lock
+        // clock, answers busy, and the batch retries; the hold ends when
+        // that retry is counted.
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while watcher.busy_retries() <= before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the import never hit the busy lock"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let _ = db.batch_execute("COMMIT");
+    });
+    held_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the hold never took the write lock");
+}
+
+#[test]
+fn an_import_batch_waits_out_a_busy_write_lock_on_postgres() {
+    if !Backend::test_is_postgres() {
+        return;
+    }
+    let git = Git::init();
+    let rev = git.fast_commits(0, 3000);
+    let (dir, store) = open_store();
+    let store = Arc::new(store);
+    let before = store.busy_retries();
+    // The hold starts at a counted batch boundary: the hook runs after the
+    // first batch's commit has ended and returns only once the hold has
+    // the table, so the next batch begins inside the hold. A batch is safe
+    // to run again whole.
+    let holds = dir.path().to_path_buf();
+    let hooked = Arc::clone(&store);
+    store.set_after_batch(Some(Box::new(move |batch_no| {
+        if batch_no == 0 {
+            hold_until_a_retry_pg(&hooked, &holds, before);
+        }
+    })));
+    let report = try_import(&store, &git, &rev).unwrap();
+    store.set_after_batch(None);
+    assert_eq!((report.commits, report.imported), (3000, 3000));
+    // The batch that began inside the hold waited out the lock: its try
+    // hit the 5 s lock clock, and a retry ran it again whole.
+    assert!(
+        store.busy_retries() > before,
+        "no batch ever hit the busy lock"
+    );
+}
+
 #[test]
 fn a_rolled_back_import_batch_verifies_again_when_it_reruns() {
     if skip_on_postgres("counts the import's verification passes, a SQLite test hook") {
