@@ -109,7 +109,10 @@ impl ImportHooks {
     }
 
     /// Runs the test step of a batch boundary, with the count of batches
-    /// done so far.
+    /// done so far. The mutex is held across the step: a test step may
+    /// block for as long as it likes (the busy tests hold the database for
+    /// seconds), but nothing else can set or clear the step meanwhile, and
+    /// a step that calls back into `set_after_batch` deadlocks.
     pub fn run_after_batch(&self, batches: usize) {
         if let Some(step) = &mut *self
             .after_batch
