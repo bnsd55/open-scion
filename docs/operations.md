@@ -259,6 +259,29 @@ through the cache. It is the quickest end-to-end look at a two-tier
 deployment, and a template for the real files (the secrets are made at
 compose time, the server's data lives in a volume).
 
+### Environment variables
+
+Several flags can be set with an environment variable instead: the
+variable holds the same value the flag would. These are the ones the
+binaries read (each names the flag it stands for, and which binary reads
+it):
+
+| Variable | Flag | Read by | Notes |
+| --- | --- | --- | --- |
+| `SCION_DATA` | `--data` | `scion-server` | Data directory, default `scion-data`. |
+| `SCION_POSTGRES_URL` | `--postgres-url` | `scion-server` | The URL holds the database credentials; the environment keeps them out of the process list (`ps`). |
+| `SCION_TOKEN` | `--token` | `scion-server` (`serve`, `hash-token`), `scion-cache`, `scion-daemon`, `scn` | A secret; the environment keeps it out of the process list. |
+| `SCION_UPSTREAM_TOKEN` | `--upstream-token` | `scion-cache`, `scion-daemon` | A secret, as `SCION_TOKEN`. |
+| `SCION_DAEMON_DATA` | `--data` | `scion-daemon` | Data directory, default `scion-daemon-data`. |
+| `SCION_AUTHOR` | `--author` | `scn commit` | Default `scn <scn@localhost>`. |
+| `SCION_SERVER` | `--server` | `scn` | Default `http://127.0.0.1:7878`. |
+| `SCION_OBJECTS` | `--objects` | `scn` | Address of a cache or daemon for object reads. |
+| `SCION_TLS_CA` | `--tls-ca` | `scn` | PEM file of a private CA. |
+| `SCION_REPO` | `--repo` | `scn` | Default `main`. |
+
+Two more names exist for the test suite only, never for an operator:
+`SCION_TEST_BACKEND` and `SCION_TEST_POSTGRES_URL`.
+
 ## 2. Ticket keys
 
 An object read carries a ticket that the server signs with an Ed25519 key.
@@ -406,6 +429,20 @@ the process, scraped from there. The names:
   set means the per-tree memo is not serving and every derivation re-walks.
 - `scion_cache_hits_total` / `scion_cache_misses_total` — what a tier
   served from its store against what it fetched upstream.
+- `scion_pg_pool_wait_seconds` — (Postgres only) how long calls waited for
+  a read connection. A read transaction is bounded at 300 s per statement
+  and 30 s idle between statements, and a call waits at most 30 s for a
+  reader before it fails `unavailable`. A rising tail means the 8 readers
+  are held by long walks.
+- `scion_pg_readers_busy` — (Postgres only) how many of the pool's read
+  connections are in use now. Pinned at 8 means every read walks a big
+  history; pair it with `scion_pg_tx_age_seconds`.
+- `scion_pg_tx_age_seconds` — (Postgres only) the age of the oldest open
+  read transaction, sampled every 5 s. A transaction that grows past a few
+  seconds holds one of the pool's connections and a repeatable-read
+  snapshot, which keeps the database from cleaning old rows; find the
+  client behind it (`pg_stat_activity`), and if walks like that are
+  common, raise the pool size.
 
 **Health.** The server, cache and daemon answer standard gRPC health checks
 (`grpc.health.v1.Check` and `Watch`) on their serving port, without a

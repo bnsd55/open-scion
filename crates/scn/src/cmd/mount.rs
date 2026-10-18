@@ -477,10 +477,8 @@ pub fn overlay_changes(record: &MountRecord) -> Result<Vec<(RepoPath, Change)>> 
     let tree = record.overlay.join(CHANGES);
     walk_changes(&tree, "", &mut changes)?;
     // The recorded deletions, but not of a path that the overlay holds.
-    for name in crate::vfs::read_deletes(&tree) {
-        if let Ok(path) = RepoPath::new(name.as_bytes())
-            && !changes.iter().any(|(known, _)| known == &path)
-        {
+    for path in crate::vfs::read_deletes(&tree)? {
+        if !changes.iter().any(|(known, _)| known == &path) {
             changes.push((path, Change::Delete));
         }
     }
