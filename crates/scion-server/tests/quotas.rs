@@ -107,13 +107,19 @@ fn main_ref(store: &Backend) -> RefState {
 
 /// A server of `store` with `access` and `quotas`. Hold the stop signal, or
 /// the server shuts down.
-async fn server(store: &Backend, access: Access, quotas: Quotas) -> (Stop, Channel) {
-    server_with_tickets(store, access, quotas, None).await
+async fn server(
+    store: &Backend,
+    dir: &std::path::Path,
+    access: Access,
+    quotas: Quotas,
+) -> (Stop, Channel) {
+    server_with_tickets(store, dir.path(), access, quotas, None).await
 }
 
 /// The same, with the ticket keys of `GetRootTree` and the object reads.
 async fn server_with_tickets(
     store: &Backend,
+    dir: &std::path::Path,
     access: Access,
     quotas: Quotas,
     tickets: Option<scion_server::tickets::Keys>,
@@ -126,7 +132,7 @@ async fn server_with_tickets(
         listener,
         access,
         service::ServeOptions {
-            data: dir.path().to_path_buf(),
+            data: dir.to_path_buf(),
             limits: Limits::default(),
             quotas,
             pending_lands: None,
@@ -253,7 +259,7 @@ async fn a_principal_at_its_cap_is_refused_while_another_goes_on() {
     let (dir, store) = store();
     let access = access(&["alice", "bob"]);
     // One request in flight per principal.
-    let (stop, channel) = server(&store, access, Quotas::new(Some(1), None)).await;
+    let (stop, channel) = server(&store, dir.path(), access, Quotas::new(Some(1), None)).await;
 
     // Alice's upload sends its first message and stays open, so the server
     // holds her only request slot. A probe that reaches the server before
@@ -299,7 +305,7 @@ async fn a_principal_at_its_cap_is_refused_while_another_goes_on() {
 async fn an_upload_over_the_byte_cap_is_refused_and_frees_on_exit() {
     let (dir, store) = store();
     let access = access(&["alice", "bob"]);
-    let (stop, channel) = server(&store, access, Quotas::new(None, Some(10))).await;
+    let (stop, channel) = server(&store, dir.path(), access, Quotas::new(None, Some(10))).await;
 
     // The first message alone is over alice's byte cap.
     let over = client(channel.clone(), "alice")
@@ -367,7 +373,7 @@ async fn a_stream_holds_its_slot_until_the_stream_ends() {
     // nothing about the quota.
     let quotas = Quotas::new(Some(1), None);
     let observed = quotas.clone();
-    let (stop, channel) = server(&store, access, quotas).await;
+    let (stop, channel) = server(&store, dir.path(), access, quotas).await;
     // A file of several parts, so its reply has a producer that stays alive
     // after the handler has returned, and that waits on a client which
     // takes no message.
