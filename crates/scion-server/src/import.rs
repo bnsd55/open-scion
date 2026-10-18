@@ -982,21 +982,31 @@ mod tests {
             .unwrap();
 
         // The land's transaction has moved main but not committed, so the
-        // import still reads root, then waits to write.
-        let started = Arc::new(Barrier::new(2));
+        // import still reads root, then waits to write. Channels, not a
+        // barrier: a step whose release never comes fails in seconds with
+        // its name, and cannot trap its partner.
+        let (in_tx, in_rx) = std::sync::mpsc::channel::<()>();
+        drop(in_rx);
+        let (moved_tx, moved_rx) = std::sync::mpsc::channel::<()>();
         let land = {
-            let (server, started) = (server.clone(), Arc::clone(&started));
+            let (server, in_tx) = (server.clone(), in_tx);
             thread::spawn(move || {
                 server.write(|c| {
                     let moved = c.cas_ref(repo, "main", Some(1), x)?;
-                    started.wait();
+                    in_tx.send(()).unwrap();
+                    moved_rx
+                        .recv_timeout(Duration::from_secs(30))
+                        .unwrap_or_else(|_| panic!("the import never looked again"));
                     thread::sleep(Duration::from_millis(300));
                     Ok(moved)
                 })
             })
         };
-        started.wait();
+        moved_rx
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("the land never moved the ref"));
         let moved = point_ref(&importer, repo, "main", tip);
+        in_tx.send(()).unwrap();
         assert!(land.join().unwrap().unwrap());
         // The swap lost, and the check again sees that main has diverged.
         assert!(

@@ -1543,6 +1543,21 @@ mod tests {
 
     use super::*;
 
+    /// Receives one step's go signal, or panics naming the step: a
+    /// release that never comes fails the test in seconds, not the
+    /// 30-minute CI cancel a stuck barrier costs.
+    pub(crate) fn expect_step(rx: &std::sync::mpsc::Receiver<()>, step: &str) {
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("the test never released {step}"));
+    }
+
+    /// Lets one step go, or panics naming the step when its receiver is
+    /// gone.
+    pub(crate) fn release_step(tx: &std::sync::mpsc::Sender<()>, step: &str) {
+        tx.send(())
+            .unwrap_or_else(|_| panic!("the step {step} is gone"));
+    }
+
     /// The log of the test binary, into this one buffer.
     static LOG: std::sync::LazyLock<Captured> = std::sync::LazyLock::new(Captured::default);
 
@@ -2135,23 +2150,38 @@ mod tests {
         let busy = || MAX_BLOCKING - service.worker.permits.available_permits();
 
         // Hold every read connection, so each job waits at its first read.
-        let (held_tx, held_rx) = std::sync::mpsc::channel();
-        let go = Arc::new(std::sync::Barrier::new(crate::store::READERS + 1));
-        let blockers: Vec<_> = (0..crate::store::READERS)
-            .map(|_| {
-                let (store, held_tx, go) = (store.clone(), held_tx.clone(), Arc::clone(&go));
-                std::thread::spawn(move || {
+        // One channel per blocker: a blocker that dies before its release
+        // fails its step in seconds, and cannot trap its siblings in a
+        // barrier.
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let blockers: Vec<(std::thread::JoinHandle<_>, std::sync::mpsc::Sender<()>)> = (0
+            ..crate::store::READERS)
+            .map(|i| {
+                let store = store.clone();
+                let arrived_tx = arrived_tx.clone();
+                let (go_tx, go_rx) = std::sync::mpsc::channel();
+                let handle = std::thread::spawn(move || {
                     store.read(|_| {
-                        held_tx.send(()).unwrap();
-                        go.wait();
+                        arrived_tx.send(()).unwrap();
+                        go_rx
+                            .recv_timeout(std::time::Duration::from_secs(30))
+                            .unwrap_or_else(|_| {
+                                panic!("the test never released read connection {i}")
+                            });
                         Ok(())
                     })
-                })
+                });
+                (handle, go_tx)
             })
             .collect();
-        for _ in &blockers {
-            held_rx.recv().unwrap();
+        for _ in 0..crate::store::READERS {
+            expect_step(&arrived_rx, "a read connection took its seat");
         }
+        for (handle, go_tx) in &blockers {
+            assert!(!handle.is_finished(), "a blocker died before it held");
+            release_step(go_tx, "the held read connections");
+        }
+        let blockers: Vec<_> = blockers.into_iter().map(|(handle, _)| handle).collect();
         // One call more than the limit, of each kind.
         let calls: Vec<_> = (0..=MAX_GRAPH_QUERIES)
             .map(|i| {
@@ -2208,7 +2238,6 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(busy(), MAX_GRAPH_QUERIES, "the last call waits for a slot");
 
-        go.wait();
         for blocker in blockers {
             blocker.join().unwrap().unwrap();
         }

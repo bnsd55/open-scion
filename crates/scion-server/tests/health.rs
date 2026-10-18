@@ -3,6 +3,8 @@
 //! when shutdown starts, while the server still answers on the open watch.
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -119,7 +121,10 @@ async fn wait_serving(server: &mut Server, log: &Path) {
         .expect("the named service answers")
         .into_inner();
     let mut named = named;
-    let first = named.message().await.unwrap().expect("a status");
+    let first = common::ceiling("the first named status", named.message())
+        .await
+        .unwrap()
+        .expect("a status");
     assert_eq!(first.status(), ServingStatus::Serving);
     server.watcher = Some(watcher);
     server.named = Some(named);
@@ -141,21 +146,22 @@ async fn the_server_serves_until_shutdown_starts() {
     let mut watcher = server.watcher.take().unwrap();
 
     // The first status is `SERVING`: the store is open.
-    let first = watcher.message().await.unwrap().expect("a status");
+    let first = common::ceiling("the first overall status", watcher.message())
+        .await
+        .unwrap()
+        .expect("a status");
     assert_eq!(first.status(), ServingStatus::Serving);
 
     // Shutdown starts: the watcher sees `NOT_SERVING` on its open stream,
     // while the server still answers. A named service flips too.
     interrupt(&server.child);
-    let update = watcher
-        .message()
+    let update = common::ceiling("the NOT_SERVING update", watcher.message())
         .await
         .expect("the watcher stays open through the drain")
         .expect("a status update");
     assert_eq!(update.status(), ServingStatus::NotServing);
     let mut named = server.named.take().unwrap();
-    let update = named
-        .message()
+    let update = common::ceiling("the named NOT_SERVING update", named.message())
         .await
         .expect("the named watch stays open through the drain")
         .expect("a status update");
