@@ -1801,6 +1801,10 @@ impl BlobBatch<'_> {
         // this blob, so it waits for the same stripe.
         let _write = self.blobs.write_lock(id);
         self.blobs.full_flush()?;
+        // The same test seam as `write`: a put of a blob the repo does
+        // not have yet takes this path, and the race test parks it here.
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.blobs.park.park(&id);
         self.replace(id, len, raw)
     }
 
