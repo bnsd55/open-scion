@@ -32,6 +32,19 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@v2
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
   supply-chain:
     name: cargo-deny
     runs-on: ubuntu-latest

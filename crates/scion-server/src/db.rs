@@ -1,6 +1,6 @@
 //! The SQLite queries on the shared tables: repos, changesets, the blobs
 //! of each repo, refs, trees and derived data. They are the methods of
-//! [`MetaTx`](crate::meta::MetaTx) that this module implements for
+//! [`MetaTx`] that this module implements for
 //! [`SqliteTx`]. Tables owned by one module (lands, git import) keep their
 //! SQL there, in impls of the same trait.
 //!
@@ -314,7 +314,7 @@ impl MetaTx for SqliteTx<'_> {
 
     /// Every parent of changeset `id`, whose generation is `id_gen`, in order,
     /// with its generation. The parents of a changeset in a repo are in that
-    /// repo too ([`insert_changeset`]). The graph walks rely on each parent's
+    /// repo too ([`MetaTx::insert_changeset`]). The graph walks rely on each parent's
     /// generation being below its child's, so this checks it.
     ///
     /// # Errors
@@ -560,7 +560,7 @@ impl MetaTx for SqliteTx<'_> {
     ///
     /// # Errors
     ///
-    /// As [`get_tree`].
+    /// As [`MetaTx::get_tree`].
     fn get_tree_body(&mut self, id: TreeId) -> Result<Vec<u8>> {
         load_tree(self.0, id).map(|(_, body)| body)
     }
@@ -582,7 +582,7 @@ impl MetaTx for SqliteTx<'_> {
 
     /// Inserts a land, or finds the land for the same request key. A land to a
     /// ref that does not exist is recorded as rejected at once, so only real
-    /// refs ever get a lock slot in [`Lands`]. A new land also expires old
+    /// refs ever get a lock slot in [`Lands`](crate::land::Lands). A new land also expires old
     /// ones.
     fn record_land(
         &mut self,
@@ -694,8 +694,8 @@ impl MetaTx for SqliteTx<'_> {
         Ok(u64::try_from(changed).unwrap_or(0))
     }
 
-    /// Deletes up to [`EXPIRE_PER_LAND`] lands that finished more than
-    /// [`LAND_RETENTION_SECS`] ago, oldest first. A pending land has no
+    /// Deletes up to `EXPIRE_PER_LAND` lands that finished more than
+    /// `LAND_RETENTION_SECS` ago, oldest first. A pending land has no
     /// `finished_at`, so it never expires. It runs in the transaction that
     /// records a new land, so the flush before that land's reply covers it.
     ///
