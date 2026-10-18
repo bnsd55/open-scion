@@ -2069,17 +2069,11 @@ mod tests {
                 other => panic!("expected the open to fail, got {:?}", other.err()),
             };
             let server = Store::open(dir.path()).unwrap();
-            refused(Store::open_as(
-                dir.path(),
-                false,
-                &other,
-                DERIVE_WALKS_CAP,
-                None,
-            ));
+            refused(Store::open_as(dir.path(), false, &other, DERIVE_WALKS_CAP));
             Store::open_shared(dir.path()).unwrap();
             drop(server);
             // The import of the other build opened alone, so its build counts.
-            let import = Store::open_as(dir.path(), false, &other, DERIVE_WALKS_CAP, None).unwrap();
+            let import = Store::open_as(dir.path(), false, &other, DERIVE_WALKS_CAP).unwrap();
             refused(Store::open(dir.path()));
             refused(Store::open_shared(dir.path()));
             drop(import);

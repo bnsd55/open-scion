@@ -3076,7 +3076,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let schema = crate::backend::test_schema(dir.path());
         let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
-        let pg = Pg::open_test(&url, &schema, 2, dir.path()).unwrap();
+        let pg = Pg::open_test(&url, &schema, 2, dir.path(), Marker::read(dir.path())).unwrap();
         pg.set_metrics(Arc::clone(&metrics));
         assert!(
             !metrics.render().contains("scion_pg_collector_key_wait"),

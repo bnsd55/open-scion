@@ -74,6 +74,9 @@ fn start_stack(
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut dirs: Vec<TempDir> = Vec::new();
 
+    let data_dir = tempfile::tempdir().unwrap();
+    let data = data_dir.path().to_path_buf();
+    dirs.push(data_dir);
     let (listener, server) = tcp();
     tasks.push(runtime.spawn(async move {
         let _ = service::serve(
@@ -81,7 +84,7 @@ fn start_stack(
             listener,
             TOKEN,
             service::ServeOptions {
-                data: data.path().to_path_buf(),
+                data,
                 limits: Limits::default(),
                 quotas: scion_server::quotas::Quotas::off(),
                 pending_lands: None,

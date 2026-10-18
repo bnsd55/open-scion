@@ -73,7 +73,7 @@ async fn serve(store: Backend, dir: &std::path::Path) -> String {
         listener,
         TOKEN,
         service::ServeOptions {
-            data: dir.path().to_path_buf(),
+            data: dir.to_path_buf(),
             limits: Limits::default(),
             quotas: scion_server::quotas::Quotas::off(),
             pending_lands: None,
@@ -179,7 +179,7 @@ async fn paged(
 
 #[tokio::test]
 async fn log_paging_matches_one_full_walk() {
-    let (_data, store, ids) = chain(HISTORY);
+    let (dir, store, ids) = chain(HISTORY);
     let tip = *ids.last().unwrap();
     let url = serve(store, dir.path()).await;
     let mut client = client(&url).await;
@@ -220,7 +220,7 @@ async fn log_paging_matches_one_full_walk() {
 
 #[tokio::test]
 async fn log_paging_with_a_path_matches_one_full_walk() {
-    let (_data, store, ids) = chain(HISTORY);
+    let (dir, store, ids) = chain(HISTORY);
     let tip = *ids.last().unwrap();
     let url = serve(store, dir.path()).await;
     let mut client = client(&url).await;

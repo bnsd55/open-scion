@@ -73,7 +73,7 @@ fn chain(
 }
 
 /// Serves `store` with `limits`.
-async fn serve(store: Backend, limits: Limits) -> String {
+async fn serve(store: Backend, dir: &std::path::Path, limits: Limits) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(service::serve(
@@ -81,6 +81,7 @@ async fn serve(store: Backend, limits: Limits) -> String {
         listener,
         TOKEN,
         service::ServeOptions {
+            data: dir.to_path_buf(),
             limits,
             quotas: scion_server::quotas::Quotas::off(),
             pending_lands: None,
@@ -134,7 +135,7 @@ async fn a_stalled_log_reply_is_counted_and_closes_the_connection() {
     // Twenty changesets with 300 KB messages each: the tip's page is about
     // six parts, and the client's connection takes under two, so a client
     // that never reads stalls the producer inside the reply.
-    let (_data, store, ids) = chain(20, 300_000);
+    let (dir, store, ids) = chain(20, 300_000);
     // The cap of the test connection: one stalled reply of 4 MiB is over it.
     let limits = Limits {
         stalled_bytes: NonZeroU64::new(1 << 20).unwrap(),
@@ -321,7 +322,7 @@ async fn a_stalled_blame_reply_is_counted_and_closes_the_connection() {
     // Twenty changesets with 300 KB messages each: a blame of the file
     // names each author, so its reply is about six parts, and the client's
     // connection takes under two.
-    let (_data, store, ids) = chain(20, 300_000);
+    let (dir, store, ids) = chain(20, 300_000);
     // The cap of the test connection: one stalled reply of 4 MiB is over it.
     let limits = Limits {
         stalled_bytes: NonZeroU64::new(1 << 20).unwrap(),
