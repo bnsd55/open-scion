@@ -137,9 +137,11 @@ scion-server --data /srv/scion \
 - A write that waits for another writer's lock gives up after 5 s and
   answers unavailable, like the SQLite store past its busy timeout; the
   client retries.
-- `fsck` and `gc` read the data directory's own database. On a
-  Postgres-backed server they refuse: with `--postgres-url` they exit 2;
-  without it the directory's own marker refuses them with exit 1.
+- `fsck` and `gc` serve every backend: on a Postgres-backed server they
+  run against the database through the same metadata interface, and the
+  blob files stay in the data directory either way. The directory's own
+  marker still refuses an open whose `--postgres-url` names another
+  backend.
 - The choice is recorded in the data directory's `backend` file: a
   `--postgres-url` open refuses a directory that holds SQLite metadata, and
   a plain open refuses a directory it names, so a second, empty store
