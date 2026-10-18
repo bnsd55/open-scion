@@ -805,13 +805,3 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
         drop(store);
     }
 }
-
-/// Issue #185, window W1. Many clients put the SAME blob at once, wave
-/// after wave: both racers of a blob ID see it missing, both write and
-/// fsync a temp file, and both rename onto the same path (`Store::replace`).
-/// Under `LazyFS` the loser's rename may free the winner's cached item, and
-/// a later cut loses the winner's acknowledged write. The test makes the
-/// race certain, cuts once after the acked waves and once while a wave is
-/// in flight, and then reopens the store from the backing directory: every
-/// acknowledged blob must be there and intact, and no blob file may be
-/// corrupt.
