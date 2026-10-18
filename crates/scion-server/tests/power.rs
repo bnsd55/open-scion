@@ -843,10 +843,11 @@ async fn import_process_races_the_server_on_the_same_blob() {
     let git_dir = dir.path().join("git");
     one_file_repo(&git_dir, &content);
     // The put goes first: keep finds the blob missing, and the server's
-    // writer parks between keep and rename. The trace shows the park:
-    // the server stats the park file through the mount every few ms.
+    // writer parks between keep and rename. The seam's marker file says
+    // the writer is inside: a stat of the park file can come from the
+    // kernel's cache, so the trace cannot show the park itself.
     let mut put = tokio::spawn(async move { put_blob(&mut scion, &content).await });
-    wait_parked(&lazy.trace, &want);
+    wait_parked(&data.join("hooks"), &want);
     // Only now the import runs: its rename lands while the server holds
     // the stripe and sits in the park.
     let import = common::spawn_guard::across_spawn(|| {
@@ -950,26 +951,12 @@ fn release_park(data: &Path, id: &BlobId) {
     fs::remove_file(park_file(data, id)).unwrap();
 }
 
-/// Waits until the server's writer is inside the park. The trace shows
-/// the arm as the create of the park file; the park as repeated stats of
-/// it, one every few ms. The test's own ops add at most one stat, so
-/// three stats after the create mean the server polls.
-fn wait_parked(trace: &Path, id: &BlobId) {
-    let park_path = format!("hooks/park-{id}");
-    let mut armed = false;
-    let mut polls = 0;
+/// Waits until the server's writer is inside the park: the seam leaves
+/// a marker file next to the park file for exactly that.
+fn wait_parked(hooks: &Path, id: &BlobId) {
+    let marker = hooks.join(format!("parked-{id}"));
     let until = Instant::now() + Duration::from_secs(30);
-    loop {
-        for line in fs::read_to_string(trace).unwrap_or_default().lines() {
-            if line.contains("lfs_create") && line.contains(&park_path) {
-                armed = true;
-            } else if armed && line.contains("lfs_getattr") && line.contains(&park_path) {
-                polls += 1;
-            }
-        }
-        if polls >= 3 {
-            return;
-        }
+    while !marker.exists() {
         assert!(Instant::now() < until, "the server never reached the park");
         std::thread::sleep(Duration::from_millis(5));
     }
