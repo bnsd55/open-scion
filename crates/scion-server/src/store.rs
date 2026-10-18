@@ -162,7 +162,9 @@ impl WritePark {
             return;
         }
         let file = self.root.join("hooks").join(format!("park-{id}"));
-        let give_up = Instant::now() + Duration::from_secs(60);
+        // A cold CI import of one commit took about 30 s; the ceiling
+        // sits well above it, and the test lifts the park long before.
+        let give_up = Instant::now() + Duration::from_secs(180);
         while file.exists() {
             assert!(
                 Instant::now() < give_up,

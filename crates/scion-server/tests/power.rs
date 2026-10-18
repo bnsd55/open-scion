@@ -868,25 +868,26 @@ async fn import_process_races_the_server_on_the_same_blob() {
     // The import renames the raced blob while the server's writer sits
     // in the park. The trace names every rename, so the wait reads it.
     // The dest path holds the full ID as its last segment: the two-hex
-    // folder between is not part of the name.
+    // folder between is not part of the name. The ceiling only bounds a
+    // good run: a cold CI import of one commit took about 30 s.
     let blob_name = want.to_string();
-    let until = Instant::now() + Duration::from_secs(30);
-    loop {
-        let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
-        let renamed = trace
+    let until = Instant::now() + Duration::from_secs(120);
+    let import_from = loop {
+        let line = fs::read_to_string(&lazy.trace)
+            .unwrap_or_default()
             .lines()
-            .any(|line| line.contains("lfs_rename") && line.contains(&blob_name));
+            .find(|line| line.contains("lfs_rename") && line.contains(&blob_name));
+        if let Some(line) = line {
+            break from_of(line);
+        }
         assert!(
-            renamed || Instant::now() < until,
+            Instant::now() < until,
             "the import never renamed the raced blob"
         );
-        if renamed {
-            break;
-        }
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    };
     // The release ends the park: the server's rename lands after the
-    // import's, on the same path.
+    // import's, on the same path, from its own tmp folder.
     fs::remove_file(&park).unwrap();
     let id = tokio::time::timeout(Duration::from_secs(30), &mut put)
         .await
@@ -917,6 +918,27 @@ async fn import_process_races_the_server_on_the_same_blob() {
         "the import failed: {:?}: {stderr}",
         import.status
     );
+    // The order is the point: the server's rename of the raced blob
+    // lands after the import's, from another tmp folder. A second rename
+    // never came, and the park never held: the seam failed.
+    let server_from = wait_for("the server's rename of the raced blob", 60, || {
+        let lines: Vec<&str> = fs::read_to_string(&lazy.trace)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("lfs_rename") && line.contains(&blob_name))
+            .collect();
+        lines
+            .last()
+            .map(|line| from_of(line))
+            .filter(|from| *from != import_from)
+    });
+    let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
+    let import_at = trace.find(&import_from).unwrap_or(usize::MAX);
+    let server_at = trace.find(&server_from).unwrap_or(0);
+    assert!(
+        server_at > import_at,
+        "the server's rename did not land after the import's"
+    );
     server.freeze();
     lazy.cut();
     // The client moved into the parked put's task: it ends with it.
@@ -934,4 +956,12 @@ async fn import_process_races_the_server_on_the_same_blob() {
 /// The park file of one blob, under the data directory's hooks folder.
 fn park_file(data: &Path, id: &BlobId) -> PathBuf {
     data.join("hooks").join(format!("park-{id}"))
+}
+
+/// The from path of one `lfs_rename` ops line: the writer's temp folder
+/// names the process that ran it.
+fn from_of(line: &str) -> String {
+    let body = line.split("lfs_rename(from=").nth(1).unwrap_or(line);
+    let to = body.find(",to=").unwrap_or(body.len());
+    body[..to].to_owned()
 }
