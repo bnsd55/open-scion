@@ -70,18 +70,20 @@ echo $! > "$WORK/server.pid"
 timeout 30 bash -c 'until grep -q serving '"$WORK"'/server.log 2> /dev/null; do sleep 0.2; done' \
   || die "the server did not start"
 
-# A known changeset: one file of known bytes, landed on main.
-printf 'hello from the mount test\n' > "$WORK/hello.txt"
-timeout 60 "$BIN/scn" --server "$SERVER" commit \
-  --put "README.md=$WORK/hello.txt" -m "seed the repo" \
-  > "$WORK/commit.out" 2> "$WORK/commit.log" || {
-  tail -n 20 "$WORK/commit.log" >&2
-  die "the first commit failed"
+# A known changeset with known bytes on main: a one-file git repository,
+# imported (import creates the repo, a commit cannot, so this goes before
+# any scn call).
+git init -q --initial-branch=main "$WORK/src"
+printf 'hello from the mount test\n' > "$WORK/src/README.md"
+git -C "$WORK/src" add README.md
+git -C "$WORK/src" -c user.name=mount-nfs -c user.email=mount-nfs@localhost \
+  commit -qm "seed the repo"
+timeout 120 "$BIN/scion-server" --data "$WORK/server" import \
+  --repo main --rev main "$WORK/src" \
+  > "$WORK/import.out" 2> "$WORK/import.log" || {
+  tail -n 20 "$WORK/import.log" >&2
+  die "the import failed"
 }
-CS=$(grep -Eo '[0-9a-f]{64}' "$WORK/commit.out" | tail -n 1)
-[ -n "$CS" ] || die "no changeset id from the first commit"
-timeout 60 "$BIN/scn" --server "$SERVER" land "$CS" > "$WORK/land.log" 2>&1 \
-  || die "the land failed"
 
 # The mount, as the README says: `scn mount DIR main` as the user. Its own
 # mount attempt fails (only root may mount), so it prints the sudo command
