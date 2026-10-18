@@ -226,20 +226,21 @@ fn serving(record: &MountRecord) -> bool {
     };
     // The probe takes the lock to test it and releases it by dropping
     // the file: held means a live server, free means the record is
-    // stale.
-    !lock_is_free(&file)
+    // stale. An error says nothing about a live holder: answer "not
+    // serving", so a probe never signals on a guess.
+    matches!(try_lock(&file), Ok(false))
 }
 
-/// Locks `file` without waiting, and answers whether the lock was free
-/// (and is now held by `file`). Locks on two opens of a file conflict,
-/// even in one process.
-fn lock_is_free(file: &std::fs::File) -> bool {
-    // A lock that cannot even be tested says nothing about a live
-    // holder: treat the record as stale, never signal on a guess.
-    !matches!(
-        rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive),
-        Err(rustix::io::Errno::WOULDBLOCK)
-    )
+/// Locks `file` without waiting. `Ok(true)` when the lock was free and
+/// is now held by `file`, `Ok(false)` when another holder keeps it, and
+/// an error when the lock cannot be tested. Locks on two opens of a
+/// file conflict, even in one process.
+fn try_lock(file: &std::fs::File) -> Result<bool, rustix::io::Errno> {
+    match rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::WOULDBLOCK) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Opens and exclusively locks `<overlay>/serve.lock` for the calling
@@ -253,13 +254,18 @@ fn hold_serve_lock(overlay: &Path) -> Result<std::fs::File> {
         .write(true)
         .open(overlay.join("serve.lock"))
         .context("cannot open the serve lock of the overlay")?;
-    if !lock_is_free(&file) {
-        bail!(
+    // Only a free lock is good news: a held lock means another server
+    // serves, and any other error means the filesystem misbehaves. Both
+    // refuse the start, so no server can serve without its lock, and no
+    // second mount can read a broken lock as a free one.
+    match try_lock(&file) {
+        Ok(true) => Ok(file),
+        Ok(false) => bail!(
             "{}: another scn process serves this overlay",
             overlay.display()
-        );
+        ),
+        Err(e) => bail!("cannot test the serve lock of {}: {e}", overlay.display()),
     }
-    Ok(file)
 }
 
 /// The `sudo` mount command, for the user to run when the plain mount is
@@ -713,6 +719,7 @@ mod tests {
 #[cfg(test)]
 mod silent_failures {
     use super::*;
+    use std::fs;
 
     fn temp_file(name: &str) -> PathBuf {
         let dir =
@@ -736,8 +743,18 @@ mod silent_failures {
     fn a_failed_kill_keeps_the_session() {
         let file = temp_file("failed-kill");
         std::fs::remove_file(&file).ok();
-        let r = record("/mnt/keep", 4242);
+        let home = tempfile::tempdir().unwrap();
+        let overlay = home.path().join("overlay");
+        fs::create_dir_all(&overlay).unwrap();
+        let r = MountRecord {
+            dir: PathBuf::from("/mnt/keep"),
+            overlay: overlay.clone(),
+            rev: "main".to_owned(),
+            pid: 4242,
+        };
         add_session(&file, &r).unwrap();
+        // The recorded server is live: this process holds its serve lock.
+        let _lock = hold_serve_lock(&overlay).unwrap();
         let stop = |pid: u32, signal: &str| {
             // Alive, but the signal does not go out.
             assert_eq!(pid, 4242);
@@ -755,8 +772,19 @@ mod silent_failures {
     fn a_dead_process_is_stopped() {
         let file = temp_file("dead");
         std::fs::remove_file(&file).ok();
-        let r = record("/mnt/dead", 4243);
+        let home = tempfile::tempdir().unwrap();
+        let overlay = home.path().join("overlay");
+        fs::create_dir_all(&overlay).unwrap();
+        let r = MountRecord {
+            dir: PathBuf::from("/mnt/dead"),
+            overlay: overlay.clone(),
+            rev: "main".to_owned(),
+            pid: 4243,
+        };
         add_session(&file, &r).unwrap();
+        // The serve lock is held, like a live server holds it, and the
+        // process behind the pid answers nothing: no such process.
+        let _lock = hold_serve_lock(&overlay).unwrap();
         let stop = |pid: u32, _signal: &str| {
             assert_eq!(pid, 4243);
             false // kill -0 and kill -TERM both fail: no such process
