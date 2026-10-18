@@ -778,6 +778,23 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
     }
 }
 
+/// Prepares the race's git repository: one commit of `files` files, each
+/// holding fresh bytes the test also puts through the server. Returns the
+/// bytes, newest file last, so the puts run against the import's writes.
+fn prepare_race_repo(git_dir: &Path, rng: &mut Rng, files: usize) -> Vec<Vec<u8>> {
+    fs::create_dir_all(git_dir).unwrap();
+    git(git_dir, &["init", "-q"]);
+    let mut contents = Vec::new();
+    for i in 0..files {
+        let content = rng.bytes(2 << 10);
+        fs::write(git_dir.join(format!("f{i:04}.bin")), &content).unwrap();
+        contents.push(content);
+    }
+    git(git_dir, &["add", "."]);
+    git(git_dir, &["commit", "-q", "-m", "the race"]);
+    contents
+}
+
 /// Counts the blob paths of a `LazyFS` ops trace that the import renamed
 /// after the server did: `from`'s tmp folder starts with the writer's
 /// process id, so each rename has an owner, and a rename of the import
@@ -850,16 +867,7 @@ async fn import_process_races_the_server_on_the_same_blob() {
     // hold the same bytes the client puts, so the import writes the blobs
     // the server writes.
     let git_dir = dir.path().join("git");
-    fs::create_dir_all(&git_dir).unwrap();
-    git(&git_dir, &["init", "-q"]);
-    let mut contents = Vec::new();
-    for i in 0..files {
-        let content = rng.bytes(2 << 10);
-        fs::write(git_dir.join(format!("f{i:04}.bin")), &content).unwrap();
-        contents.push(content);
-    }
-    git(&git_dir, &["add", "."]);
-    git(&git_dir, &["commit", "-q", "-m", "the race"]);
+    let contents = prepare_race_repo(&git_dir, &mut rng, files);
     // The import starts first: opening the store on FUSE and reading git
     // takes long enough that the client's puts land inside its run, and
     // both processes rename onto the same blob paths at once.
@@ -913,11 +921,11 @@ async fn import_process_races_the_server_on_the_same_blob() {
                 .unwrap_or_else(|error| panic!("waiting for the import failed: {error}"))
         })
     });
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
         out.status.success(),
-        "the import failed: {:?}: {:?}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
+        "the import failed: {:?}: {stderr}",
+        out.status
     );
     drop(killer);
     // The race test fails when the processes did not overlap: the ops
@@ -929,11 +937,11 @@ async fn import_process_races_the_server_on_the_same_blob() {
     let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
     let raced = import_renamed_after_the_server(&trace, &server_tmp, &import_tmp);
     eprintln!("{raced} blob paths were renamed by the import after the server");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
         out.status.success(),
-        "the import failed: {:?}: {:?}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
+        "the import failed: {:?}: {stderr}",
+        out.status
     );
     assert!(
         raced > 0,
