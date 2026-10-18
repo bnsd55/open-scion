@@ -423,6 +423,13 @@ impl Store {
         &self.inner.blobs
     }
 
+    /// The durability steps this store's blob path ran, oldest first,
+    /// for the order test under the test-hooks seam.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn durability_steps(&self) -> Vec<DurabilityStep> {
+        self.inner.blobs.log.steps()
+    }
+
     /// Commits made so far.
     #[doc(hidden)]
     #[must_use]
@@ -863,6 +870,58 @@ pub struct Blobs {
     /// disk's answer: `n` lets `n` writes through and fails the one
     /// after, once; [`UNARMED`] lets every write through.
     fail_writes: std::sync::atomic::AtomicUsize,
+    /// The durability steps this `Blobs` ran, in order, for the order
+    /// test: a test-hooks build records them, a production build stores
+    /// nothing.
+    log: DurabilityLog,
+}
+
+/// One durability step of the blob path, recorded for the order test
+/// under `cfg(any(test, feature = "test-hooks"))` and never in a
+/// production build.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DurabilityStep {
+    /// A temp file for a blob was written.
+    TmpWrite(BlobId),
+    /// The temp file's bytes were flushed to the drive.
+    FileFsync(BlobId),
+    /// The temp file took the blob's name.
+    Rename(BlobId),
+    /// A directory that changed was flushed.
+    DirFsync(PathBuf),
+    /// A batch's `sync` answered its caller.
+    Answer,
+}
+
+/// The ordered log of [`DurabilityStep`]s behind the test-hooks seam.
+#[derive(Default)]
+pub(crate) struct DurabilityLog {
+    #[cfg(any(test, feature = "test-hooks"))]
+    steps: std::sync::Mutex<Vec<DurabilityStep>>,
+}
+
+impl DurabilityLog {
+    /// Records one step, when this build keeps a log.
+    fn record(&self, step: DurabilityStep) {
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.steps
+            .lock()
+            .expect("the durability log's lock")
+            .push(step);
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        {
+            let _ = step;
+        }
+    }
+
+    /// The steps recorded so far, oldest first.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn steps(&self) -> Vec<DurabilityStep> {
+        self.steps
+            .lock()
+            .expect("the durability log's lock")
+            .clone()
+    }
 }
 
 impl Blobs {
@@ -916,6 +975,7 @@ impl Blobs {
             #[cfg(test)]
             verifies: std::sync::atomic::AtomicU64::default(),
             fail_writes: std::sync::atomic::AtomicUsize::new(UNARMED),
+            log: DurabilityLog::default(),
         })
     }
 
@@ -1489,9 +1549,12 @@ impl BlobBatch<'_> {
         self.blobs.write_gate(&path, "write blob file")?;
         let mut tmp = tempfile::NamedTempFile::new_in(&self.blobs.mine)?;
         zstd::stream::compress_sized_into(raw, &mut tmp, 3, len as u64)?;
+        self.blobs.log.record(DurabilityStep::TmpWrite(id));
         fsync(tmp.as_file())?;
+        self.blobs.log.record(DurabilityStep::FileFsync(id));
         fs::create_dir_all(&dir)?;
         tmp.persist(&path).map_err(|e| e.error)?;
+        self.blobs.log.record(DurabilityStep::Rename(id));
         self.dirs.insert(dir);
         Ok(())
     }
@@ -1540,6 +1603,7 @@ impl BlobBatch<'_> {
         if self.flush_dirs()? {
             blobs.full_flush()?;
         }
+        blobs.log.record(DurabilityStep::Answer);
         Ok(())
     }
 
@@ -1555,6 +1619,7 @@ impl BlobBatch<'_> {
     fn flush_dirs(self) -> Result<bool> {
         for dir in &self.dirs {
             fsync_dir(dir)?;
+            self.blobs.log.record(DurabilityStep::DirFsync(dir.clone()));
         }
         Ok(!self.dirs.is_empty())
     }
@@ -2722,5 +2787,55 @@ mod tests {
         // its snapshot would show one repo.
         assert_eq!(store.read(repos).unwrap(), 2);
         assert_eq!(store.inner.readers.idle().len(), READERS);
+    }
+
+    /// A blob a batch acks is durable before the ack, by construction:
+    /// the recorded steps of every blob it wrote read, in order, tmp
+    /// write, file fsync, rename, dir fsync of the blob's fan-out
+    /// directory, and the batch's answer. If the directory fsync is
+    /// deleted from `flush_dirs`, the dir step disappears and this test
+    /// fails.
+    #[test]
+    fn a_batch_answers_after_its_blobs_dir_fsyncs() {
+        use DurabilityStep as S;
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let raws: Vec<&[u8]> = vec![b"one", b"two", b"three"];
+        let ids: Vec<BlobId> = {
+            let mut batch = store.blobs().batch();
+            let ids = raws.iter().map(|raw| batch.put(raw).unwrap()).collect();
+            batch.sync().unwrap();
+            ids
+        };
+        let steps = store.durability_steps();
+        let answer = steps
+            .iter()
+            .position(|step| *step == S::Answer)
+            .expect("the batch answered");
+        for id in &ids {
+            // The step of `id` before `answer`, in this order.
+            let steps_of = |step: &DurabilityStep| {
+                steps
+                    .iter()
+                    .take(answer)
+                    .position(|s| s == step)
+                    .unwrap_or_else(|| panic!("no {step:?} before the answer"))
+            };
+            let (dir, _) = store.blobs().location(*id);
+            let (a, b, c, d) = (
+                steps_of(&S::TmpWrite(*id)),
+                steps_of(&S::FileFsync(*id)),
+                steps_of(&S::Rename(*id)),
+                steps.iter().take(answer).position(|s| match s {
+                    S::DirFsync(path) => path == &dir,
+                    _ => false,
+                }).unwrap_or_else(|| panic!("no dir fsync of {} before the answer", dir.display())),
+            );
+            assert!(
+                a < b && b < c && c < d,
+                "the durability steps of {id} are out of order: \
+                 tmp write {a}, file fsync {b}, rename {c}, dir fsync {d}"
+            );
+        }
     }
 }
