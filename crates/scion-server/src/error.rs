@@ -182,9 +182,8 @@ mod tests {
 
     #[test]
     fn an_out_of_space_write_is_resource_exhausted_with_a_fixed_reply() {
-        // A file write that the disk refused (ENOSPC): the reply names no
-        // path. The raw numbers are ENOSPC on Linux and macOS both, and
-        // `kind` reads them back as StorageFull and QuotaExceeded.
+        // A file write that the disk refused (ENOSPC, errno 28 on Linux
+        // and macOS both): the reply names no path.
         let io = std::io::Error::from_raw_os_error(28);
         assert_eq!(io.kind(), std::io::ErrorKind::StorageFull);
         let status = Status::from(Error::Io(io));
@@ -193,9 +192,9 @@ mod tests {
             status.message(),
             "the server is out of disk space; retry later"
         );
-        // A quota refusal (EDQUOT) maps the same.
-        let io = std::io::Error::from_raw_os_error(69);
-        assert_eq!(io.kind(), std::io::ErrorKind::QuotaExceeded);
+        // A quota refusal maps the same; the kind is built, because the
+        // EDQUOT number differs between the platforms.
+        let io = std::io::Error::from(std::io::ErrorKind::QuotaExceeded);
         assert_eq!(Status::from(Error::Io(io)).code(), Code::ResourceExhausted);
         // The metadata database out of space, on either backend.
         let db = |code| Error::Db(rusqlite::Error::SqliteFailure(ffi::Error::new(code), None));

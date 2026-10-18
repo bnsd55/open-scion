@@ -1205,10 +1205,22 @@ impl Blobs {
                     }
                     false
                 }
-                // A write the hook lets through.
-                _ => {
-                    self.fail_writes
-                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                // A write the hook lets through: count it down, without
+                // the two-writers race where a plain subtract wraps past
+                // zero and re-arms the hook silently.
+                left => {
+                    if self
+                        .fail_writes
+                        .compare_exchange(
+                            left,
+                            left - 1,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
                     true
                 }
             };
