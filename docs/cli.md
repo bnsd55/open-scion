@@ -65,9 +65,10 @@ Every command takes these flags, before or after the subcommand:
   safe.
 - `scn bench` — many agents commit and land at the same time and print
   throughput: `--agents` (default 200), `--lands` (default 10000),
-  `--base main|fresh` (default `shared`: each agent re-reads `main`
-  before every change only in `fresh`). It fails unless `main` gained
-  each landed change exactly once.
+  `--base shared|fresh` (default `shared`): `shared` keeps the base each
+  agent started from, so every land rebases; `fresh` re-reads `main`
+  before each change. It fails unless `main` gained each landed change
+  exactly once.
 
 ### Queries
 
