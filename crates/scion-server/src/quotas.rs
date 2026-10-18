@@ -130,6 +130,17 @@ impl Quotas {
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Usage>> {
         self.usage.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// The requests in flight of one principal, as the tests read them.
+    /// The tests of the caps wait on this, on the server's own state,
+    /// instead of polling through the network: a probe's reply rides the
+    /// same connection whose flow control a stalled stream holds, and
+    /// under load its arrival says nothing about the quota.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn in_flight(&self, principal: &str) -> usize {
+        self.lock().get(principal).map_or(0, |entry| entry.requests)
+    }
 }
 
 /// What one principal holds at the moment.

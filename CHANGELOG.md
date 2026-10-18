@@ -16,6 +16,14 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Added
 
+- A Postgres-backed store knows which database and which data directory
+  belong together: the first open mints a store UUID, keeps it in the
+  database and the data directory's `backend` marker, and an open that
+  finds the two different is refused with both UUIDs named.
+- A Postgres server that loses the one-server lock to another process is
+  fenced: every read and write fails with the loss named, the health
+  service answers `NOT_SERVING`, and the process exits after a short
+  grace, so a supervisor restart either takes the lock back or refuses.
 - `scion-server`, the server: changesets, trees and blobs in a data
   directory (SQLite metadata, one zstd file per blob), one-way git import
   checked against git, `fsck`, `gc`, `derive` and `hash-token` commands.
