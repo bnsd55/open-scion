@@ -1903,7 +1903,8 @@ impl MetaTx for PgTx<'_> {
         let size: i64 = self
             .c
             .query_opt(
-                "SELECT octet_length(body) FROM trees WHERE id = $1",
+                // octet_length of a bytea is int4; the read wants int8.
+                "SELECT octet_length(body)::bigint FROM trees WHERE id = $1",
                 &[P::bytes(&id_bytes(id.as_bytes()))],
             )?
             .ok_or_else(|| Error::NotFound(format!("tree {id}")))?
