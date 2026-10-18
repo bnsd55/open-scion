@@ -669,51 +669,17 @@ impl Pg {
         data: &Path,
         marker: Marker,
     ) -> Result<Self> {
-        {
-            // One throwaway client makes the schema, before any connection
-            // narrows its search path to it. It names itself first, so no
-            // parallel cleanup mistakes a live schema for a stale one.
-            let preparer = connect(url, None)?;
-            preparer.as_raw({
-                let name = schema.to_owned();
-                move |client| {
-                    client
-                        .batch_execute(&format!("SET application_name TO '{name}'"))
-                        .map_err(map_pg_error)
-                }
-            })?;
-            drop_stale_schemas(&preparer);
-            // One maker at a time: two concurrent `CREATE TABLE IF NOT
-            // EXISTS` of the registry race on the type catalog, and the
-            // loser dies. The lock lives for this one transaction only.
-            preparer.as_raw({
-                let name = schema.to_owned();
-                move |client| {
-                    client
-                        .batch_execute(&format!(
-                            "SELECT pg_advisory_xact_lock({CLEAN_LOCK});
-                                 CREATE SCHEMA IF NOT EXISTS {name};
-                                 CREATE TABLE IF NOT EXISTS public.scion_test_schemas (
-                                     schema  TEXT PRIMARY KEY,
-                                     started BIGINT NOT NULL
-                                 );
-                                 INSERT INTO public.scion_test_schemas (schema, started)
-                                 VALUES ('{name}', extract(epoch from now())::bigint)
-                                 ON CONFLICT (schema) DO UPDATE SET started = excluded.started"
-                        ))
-                        .map_err(map_pg_error)
-                }
-            })?;
-        }
+        prepare_test_schema(url, schema)?;
         // The test store is the one server of its schema: it takes the
         // per-schema one-server lock, and its loss fences the process,
         // exactly as a serve does on the database key.
         Self::open_in(url, None, readers, data, Some(schema), true, marker)
     }
 
-    /// [`Pg::open_test`], as a process that does not land: it takes no
-    /// one-server lock, and its loss fences nothing, like a `gc`, `fsck`
-    /// or `import` beside a live server.
+    /// [`Pg::open_test`], as a process that does not land: it makes the
+    /// schema the same way and takes no one-server lock, and its loss
+    /// fences nothing, like a `gc`, `fsck` or `import` beside a live
+    /// server.
     pub(crate) fn open_test_shared(
         url: &str,
         schema: &str,
@@ -721,6 +687,7 @@ impl Pg {
         data: &Path,
         marker: Marker,
     ) -> Result<Self> {
+        prepare_test_schema(url, schema)?;
         Self::open_in(url, None, readers, data, Some(schema), false, marker)
     }
 
@@ -2846,6 +2813,42 @@ impl Meta for Pg {
         }
         Ok(())
     }
+}
+
+/// Makes the test schema, and registers it, before any connection
+/// narrows its search path to it. One maker at a time: two concurrent
+/// `CREATE TABLE IF NOT EXISTS` of the registry race on the type
+/// catalog, and the loser dies.
+fn prepare_test_schema(url: &str, schema: &str) -> Result<()> {
+    let preparer = connect(url, None)?;
+    preparer.as_raw({
+        let name = schema.to_owned();
+        move |client| {
+            client
+                .batch_execute(&format!("SET application_name TO '{name}'"))
+                .map_err(map_pg_error)
+        }
+    })?;
+    drop_stale_schemas(&preparer);
+    preparer.as_raw({
+        let name = schema.to_owned();
+        move |client| {
+            client
+                .batch_execute(&format!(
+                    "SELECT pg_advisory_xact_lock({CLEAN_LOCK});
+                         CREATE SCHEMA IF NOT EXISTS {name};
+                         CREATE TABLE IF NOT EXISTS public.scion_test_schemas (
+                             schema  TEXT PRIMARY KEY,
+                             started BIGINT NOT NULL
+                         );
+                         INSERT INTO public.scion_test_schemas (schema, started)
+                         VALUES ('{name}', extract(epoch from now())::bigint)
+                         ON CONFLICT (schema) DO UPDATE SET started = excluded.started"
+                ))
+                .map_err(map_pg_error)
+        }
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
