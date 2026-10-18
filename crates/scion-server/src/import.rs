@@ -624,10 +624,7 @@ impl Importer<'_> {
             // through put with its read-back and fsyncs. Upgrade: an index
             // on repo_blobs (blob), then any_repo_names, when a cross-repo
             // import is measured slow.
-            if self
-                .store
-                .read(|c| c.repo_has_blob(self.repo_id, id))?
-            {
+            if self.store.read(|c| c.repo_has_blob(self.repo_id, id))? {
                 self.put.push(id);
                 return Ok(id);
             }

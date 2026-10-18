@@ -1023,7 +1023,7 @@ impl Blobs {
             _mine_lock: mine_lock,
             write_locks: (0..WRITE_STRIPES).map(|_| Mutex::new(())).collect(),
             group_flush: GroupFlush::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             verifies: std::sync::atomic::AtomicU64::default(),
             fail_writes: std::sync::atomic::AtomicUsize::new(UNARMED),
             fail_writes_errno: std::sync::atomic::AtomicU8::new(28),

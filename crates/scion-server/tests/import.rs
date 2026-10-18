@@ -1478,7 +1478,12 @@ fn a_reimport_of_blobs_with_no_rows_still_verifies_and_fsyncs_them() {
     // there: nothing was acknowledged.
     assert!(store.read(|c| c.repo_id("r")).is_ok());
     let repo_id = store.read(|c| c.repo_id("r")).unwrap();
-    assert!(store.read(|c| c.get_ref(repo_id, "main")).unwrap().is_none());
+    assert!(
+        store
+            .read(|c| c.get_ref(repo_id, "main"))
+            .unwrap()
+            .is_none()
+    );
     // The re-import must not trust the files: without rows they may be
     // the leftovers of a write whose fsync never succeeded, so each goes
     // through put's keep path, which verifies and fsyncs before it
