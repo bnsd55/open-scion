@@ -164,6 +164,27 @@ jobs:
           path: ${{ runner.temp }}/lazyfs-trace/lazyfs-r*.log
           if-no-files-found: ignore
 
+  nfs-mount:
+    name: mount (NFS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@v2
+      - name: the kernel NFS client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nfs-common
+      # The script wraps every external command in `timeout`, and its trap
+      # force-unmounts and kills the server and the mount on any exit, so
+      # a failed step cannot hang the runner until this cap.
+      - name: run the mount script
+        run: timeout 600 scripts/mount-nfs.sh
+
   publish-check:
     name: publish check
     runs-on: ubuntu-latest

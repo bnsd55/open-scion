@@ -24,7 +24,7 @@
 //! walks only the folders its changes moved.
 //!
 //! Rows die when their principal does: each derivation's write sweeps up
-//! to [`VIEW_EXPIRE_STEP`] rows of older projection versions and of
+//! to `VIEW_EXPIRE_STEP` rows of older projection versions and of
 //! digests that no grant of the repo hashes to any more, as far as this
 //! server's access file knows. A row a second server still needs is
 //! re-derived, at that server's next read.
