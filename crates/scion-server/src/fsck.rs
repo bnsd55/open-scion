@@ -25,11 +25,13 @@ use std::str::FromStr as _;
 
 use scion_core::{BlobId, Changeset, ChangesetId, Tree, TreeId};
 
+use crate::backend::Backend;
 use crate::db;
 use crate::derived::Kind as _;
 use crate::graph::CommitGraph;
 use crate::history::{self, NodeId, PathHistory};
-use crate::store::{BlobStatus, Store};
+use crate::meta::{FsckDerivedRow, Meta as _, MetaTx as _, RepoId};
+use crate::store::BlobStatus;
 use crate::tree::RootTree;
 
 /// Rows to read per batch.
@@ -126,7 +128,7 @@ impl Report {
 /// Errors of the database or the file system: the check itself could not
 /// run, which is not damage in the store.
 pub fn run(
-    store: &Store,
+    store: &Backend,
     batch: usize,
     between: &mut dyn FnMut(Stage),
 ) -> crate::error::Result<Report> {
@@ -147,7 +149,7 @@ pub fn run(
 
 /// Checks every file under `objects/blob`: its name parses to a blob ID,
 /// and the file unpacks to content with that ID.
-fn check_blob_files(store: &Store, report: &mut Report) -> crate::error::Result<()> {
+fn check_blob_files(store: &Backend, report: &mut Report) -> crate::error::Result<()> {
     let root = store.blobs().root().to_path_buf();
     let dirs = match std::fs::read_dir(&root) {
         Ok(dirs) => dirs,
@@ -219,7 +221,7 @@ fn check_blob_files(store: &Store, report: &mut Report) -> crate::error::Result<
 /// Checks every changeset: it decodes and matches its ID, and every blob of
 /// its puts exists when the row is read.
 fn check_changesets(
-    store: &Store,
+    store: &Backend,
     batch: usize,
     between: &mut dyn FnMut(Stage),
     report: &mut Report,
@@ -228,17 +230,18 @@ fn check_changesets(
     loop {
         let from = last.clone().unwrap_or_default();
         let rows = store.read(|c| {
-            db::fsck_changesets(c, from.as_slice(), batch).map(|rows| {
-                rows.into_iter()
-                    .map(|(id, body)| {
-                        let decoded = ChangesetId::try_from(id.as_slice())
-                            .ok()
-                            .zip(Changeset::decode_with_id(&body).ok())
-                            .map(|(id, (cs, actual))| (id, actual, cs));
-                        (id, decoded)
-                    })
-                    .collect::<Vec<_>>()
-            })
+            c.changeset_bodies_after(from.as_slice(), batch)
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|(id, body)| {
+                            let decoded = ChangesetId::try_from(id.as_slice())
+                                .ok()
+                                .zip(Changeset::decode_with_id(&body).ok())
+                                .map(|(id, (cs, actual))| (id, actual, cs));
+                            (id, decoded)
+                        })
+                        .collect::<Vec<_>>()
+                })
         })?;
         let count = rows.len();
         let next = rows.last().map(|(id, _)| id.clone());
@@ -278,7 +281,7 @@ fn check_changesets(
 /// Checks every tree: it decodes and matches its ID, and every blob of its
 /// file entries exists when the row is read.
 fn check_trees(
-    store: &Store,
+    store: &Backend,
     batch: usize,
     between: &mut dyn FnMut(Stage),
     report: &mut Report,
@@ -286,7 +289,7 @@ fn check_trees(
     let mut last: Option<Vec<u8>> = None;
     loop {
         let from = last.clone().unwrap_or_default();
-        let rows = store.read(|c| db::fsck_trees(c, from.as_slice(), batch))?;
+        let rows = store.read(|c| c.tree_bodies_after(from.as_slice(), batch))?;
         let count = rows.len();
         let next = rows.last().map(|(id, _)| id.clone());
         for (id, body) in rows {
@@ -358,7 +361,7 @@ fn check_trees(
 /// Checks every history node: its body decodes, and its ID is the hash of
 /// its bytes.
 fn check_history_nodes(
-    store: &Store,
+    store: &Backend,
     batch: usize,
     between: &mut dyn FnMut(Stage),
     report: &mut Report,
@@ -366,7 +369,7 @@ fn check_history_nodes(
     let mut last: Option<Vec<u8>> = None;
     loop {
         let from = last.clone().unwrap_or_default();
-        let rows = store.read(|c| db::fsck_history_nodes(c, from.as_slice(), batch))?;
+        let rows = store.read(|c| c.history_node_bodies_after(from.as_slice(), batch))?;
         let count = rows.len();
         let next = rows.last().map(|(id, _)| id.clone());
         for (id, body) in rows {
@@ -400,16 +403,16 @@ fn check_history_nodes(
 
 /// Checks every row of `repo_blobs`: its file exists when the row is read.
 fn check_repo_blobs(
-    store: &Store,
+    store: &Backend,
     batch: usize,
     between: &mut dyn FnMut(Stage),
     report: &mut Report,
 ) -> crate::error::Result<()> {
-    let mut last: Option<(i64, Vec<u8>)> = None;
+    let mut last: Option<(RepoId, Vec<u8>)> = None;
     loop {
-        let (from_repo, from_blob) = last.clone().unwrap_or((0, Vec::new()));
+        let (from_repo, from_blob) = last.clone().unwrap_or((RepoId(0), Vec::new()));
         let rows =
-            store.read(|c| db::fsck_repo_blobs(c, from_repo, from_blob.as_slice(), batch))?;
+            store.read(|c| c.repo_blob_rows_after(from_repo, from_blob.as_slice(), batch))?;
         let count = rows.len();
         let next = rows.last().cloned();
         for (repo, blob) in rows {
@@ -418,7 +421,10 @@ fn check_repo_blobs(
                     "blob-corrupt",
                     id_string(&blob),
                     None,
-                    format!("repo_blobs names it for repo {repo}, and it is no blob ID"),
+                    format!(
+                        "repo_blobs names it for repo {}, and it is no blob ID",
+                        repo.0
+                    ),
                 ));
                 continue;
             };
@@ -426,7 +432,7 @@ fn check_repo_blobs(
                 store,
                 id,
                 report,
-                &format!("named by repo_blobs (repo {repo})"),
+                &format!("named by repo_blobs (repo {})", repo.0),
             );
         }
         last = next;
@@ -439,7 +445,7 @@ fn check_repo_blobs(
 }
 
 /// Whether the file of `blob` exists at the moment of the check.
-fn named_blob_exists(store: &Store, blob: BlobId, report: &mut Report, why: &str) {
+fn named_blob_exists(store: &Backend, blob: BlobId, report: &mut Report, why: &str) {
     match store.blobs().open_file(blob) {
         Ok(_) => {}
         Err(crate::error::Error::NotFound(_)) => report.problem(Problem::new(
@@ -458,12 +464,12 @@ fn named_blob_exists(store: &Store, blob: BlobId, report: &mut Report, why: &str
 }
 
 /// Checks every ref: its target is a changeset of its repo.
-fn check_refs(store: &Store, report: &mut Report) -> crate::error::Result<()> {
-    let rows = store.read(db::fsck_dangling_refs)?;
+fn check_refs(store: &Backend, report: &mut Report) -> crate::error::Result<()> {
+    let rows = store.read(|c| c.dangling_refs())?;
     for (repo, name, target) in rows {
         report.problem(Problem::new(
             "ref-dangling",
-            format!("{repo}/{name}"),
+            format!("{}/{name}", repo.0),
             None,
             format!("points at {}", id_string(&target)),
         ));
@@ -472,8 +478,8 @@ fn check_refs(store: &Store, report: &mut Report) -> crate::error::Result<()> {
 }
 
 /// Checks every land: its changesets are stored.
-fn check_lands(store: &Store, report: &mut Report) -> crate::error::Result<()> {
-    let rows = store.read(db::fsck_lands_missing)?;
+fn check_lands(store: &Backend, report: &mut Report) -> crate::error::Result<()> {
+    let rows = store.read(|c| c.lands_with_missing_changesets())?;
     for (land, cs, column) in rows {
         report.problem(Problem::new(
             "changeset-missing",
@@ -489,7 +495,7 @@ fn check_lands(store: &Store, report: &mut Report) -> crate::error::Result<()> {
 /// with its kind's decoder for its version. A row of a version this build
 /// does not know is old, not damage.
 fn check_derived(
-    store: &Store,
+    store: &Backend,
     batch: usize,
     between: &mut dyn FnMut(Stage),
     report: &mut Report,
@@ -499,19 +505,11 @@ fn check_derived(
         let (from_kind, from_version, from_cs) =
             last.clone().unwrap_or((String::new(), 0, Vec::new()));
         let rows = store.read(|c| {
-            db::fsck_derived(
-                c,
-                from_kind.as_str(),
-                from_version,
-                from_cs.as_slice(),
-                batch,
-            )
+            c.derived_rows_after(from_kind.as_str(), from_version, from_cs.as_slice(), batch)
         })?;
         let count = rows.len();
-        let next = rows
-            .last()
-            .map(|(kind, version, cs, _, _)| (kind.clone(), *version, cs.clone()));
-        for (kind, version, cs, value, stored) in rows {
+        let next = rows.last().map(|row| (row.0.clone(), row.1, row.2.clone()));
+        for FsckDerivedRow(kind, version, cs, value, stored) in rows {
             let shown = format!("{kind}/{version}/{}", id_string(&cs));
             if !stored {
                 report.problem(Problem::new(
@@ -565,7 +563,7 @@ mod tests {
     use super::*;
     use crate::backend::Backend;
     use crate::db::SqliteTx;
-    use crate::meta::MetaTx as _;
+    use crate::store::Store;
     use scion_core::{FileState, IdentityTime, RepoPath};
     use std::time::Duration;
     use tempfile::TempDir;
@@ -593,7 +591,6 @@ mod tests {
 
     /// Stores `cs` in the repo and moves `main` to it, as a land does.
     fn land(store: &Store, cs: &Changeset) -> ChangesetId {
-        use crate::meta::MetaTx as _;
         store
             .write(|c| {
                 let mut tx = SqliteTx(c);
@@ -654,7 +651,7 @@ mod tests {
     #[test]
     fn a_clean_store_reports_nothing() {
         let (_dir, store, _) = store();
-        let report = run(&store, 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(report.is_clean(), "{:?}", kinds(&report));
         assert!(report.old.is_empty());
     }
@@ -677,7 +674,7 @@ mod tests {
         let path = store.blobs().location(blob).1;
         let bytes = std::fs::read(&path).unwrap();
         std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
-        let report = run(&store, 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(
             has(&report, "blob-corrupt", &blob.to_string()),
             "{:?}",
@@ -690,7 +687,7 @@ mod tests {
         let (_dir, store, id) = store();
         let blob = first_put(&store, id);
         std::fs::remove_file(store.blobs().location(blob).1).unwrap();
-        let report = run(&store, 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(
             has(&report, "blob-missing", &blob.to_string()),
             "{:?}",
@@ -718,7 +715,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let report = run(&store, 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(
             has(&report, "changeset-bad", &id.to_string()),
             "{:?}",
@@ -749,7 +746,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let report = run(&store, 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(
             has(&report, "tree-bad", &tree.to_string()),
             "{:?}",
@@ -767,7 +764,7 @@ mod tests {
         raw.execute("DELETE FROM repo_changesets WHERE cs = ?1", [id.as_bytes()])
             .unwrap();
         drop(raw);
-        let report = run(&store, 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(has(&report, "ref-dangling", "main"), "{:?}", kinds(&report));
     }
 
@@ -789,7 +786,7 @@ mod tests {
         )
         .unwrap();
         drop(raw);
-        let report = run(&store, 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(
             has(&report, "history-node-bad", "does not decode"),
             "{:?}",
@@ -811,7 +808,7 @@ mod tests {
         )
         .unwrap();
         drop(raw);
-        let report = run(&store, 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(
             has(&report, "changeset-missing", "named by derived"),
             "{:?}",
@@ -831,7 +828,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let report = run(&store, 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(
             has(&report, "derived-bad", "commit_graph"),
             "{:?}",
@@ -851,7 +848,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let report = run(&store, 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(report.is_clean(), "{:?}", kinds(&report));
         assert_eq!(report.old, BTreeSet::from([("root_tree".to_owned(), 9)]));
     }
@@ -876,7 +873,7 @@ mod tests {
         // One row per batch, and a land between two of them: the writes of
         // a live server must not look like damage.
         let mut landed = false;
-        let report = run(&store, 1, &mut |stage| {
+        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |stage| {
             if stage == Stage::RepoBlobs && !landed {
                 landed = true;
                 land(
