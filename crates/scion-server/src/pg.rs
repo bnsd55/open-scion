@@ -218,16 +218,13 @@ impl Readers {
                     "no Postgres reader free after {wait:?}; the readers are stuck in long reads"
                 )));
             };
-            let (guard, woke) = self
+            let (guard, _woke) = self
                 .returned
                 .wait_timeout(idle, left)
                 .unwrap_or_else(PoisonError::into_inner);
             idle = guard;
-            if woke.timed_out() {
-                // The wait is over, but a reader given back in this window
-                // is idle now: look once more before refusing.
-                continue;
-            }
+            // A timed-out wait falls through to the top of the loop, so a
+            // reader given back in this window is taken before refusing.
         };
         let started_at = Instant::now();
         self.open_since
