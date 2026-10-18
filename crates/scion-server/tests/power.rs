@@ -889,6 +889,7 @@ async fn import_process_races_the_server_on_the_same_blob() {
     let id = tokio::time::timeout(Duration::from_secs(30), &mut put)
         .await
         .unwrap_or_else(|_| panic!("the parked put never finished"))
+        .unwrap()
         .unwrap();
     assert_eq!(id, want);
     let import = wait_for("the import to finish", 60, || {
@@ -905,6 +906,7 @@ async fn import_process_races_the_server_on_the_same_blob() {
                 .unwrap()
                 .join()
                 .unwrap()
+                .unwrap_or_else(|error| panic!("waiting for the import failed: {error}"))
         })
     });
     let stderr = String::from_utf8_lossy(&import.stderr).into_owned();
