@@ -158,7 +158,7 @@ fn find_flagged(
     replay: &str,
     log_dev: &str,
     start: u64,
-    next_flush: bool,
+    stop: &str,
     mark: Option<&str>,
 ) -> Option<u64> {
     let mut args = vec![
@@ -169,8 +169,8 @@ fn find_flagged(
         "--start-entry".to_owned(),
         start.to_string(),
     ];
-    if next_flush {
-        args.push("--next-flush".to_owned());
+    if !stop.is_empty() {
+        args.push(stop.to_owned());
     }
     if let Some(mark) = mark {
         args.push("--end-mark".to_owned());
