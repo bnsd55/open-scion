@@ -1772,7 +1772,7 @@ impl BlobBatch<'_> {
         fsync(tmp.as_file())?;
         fs::create_dir_all(&dir)?;
         #[cfg(any(test, feature = "test-hooks"))]
-        persist_logged(&self.blobs.log, id, &tmp, &path)?;
+        persist_logged(&self.blobs.log, id, tmp, &path)?;
         #[cfg(not(any(test, feature = "test-hooks")))]
         tmp.persist(&path).map_err(|e| e.error)?;
         self.dirs.insert(dir);
@@ -1965,7 +1965,7 @@ fn fsync_logged(log: &DurabilityLog, id: BlobId, file: &fs::File) -> Result<()> 
 fn persist_logged(
     log: &DurabilityLog,
     id: BlobId,
-    tmp: &tempfile::NamedTempFile,
+    tmp: tempfile::NamedTempFile,
     path: &Path,
 ) -> Result<()> {
     tmp.persist(path).map_err(|e| e.error)?;
