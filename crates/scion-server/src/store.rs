@@ -155,13 +155,19 @@ impl WritePark {
 
     /// Parks the caller while the park file of `id` exists. The writer
     /// holds its stripe all the while, so no same-blob write of this
-    /// process moves either. The ceiling bounds the park of the good
-    /// code: a park nobody lifts fails the holder, not the whole store.
+    /// process moves either. A marker file says the writer is inside the
+    /// park: a stat of the park file can come from the kernel's cache,
+    /// so the test cannot see the park in the ops trace. The ceiling
+    /// bounds the park of the good code: a park nobody lifts fails the
+    /// holder, not the whole store.
     pub fn park(&self, id: &BlobId) {
         if !self.enabled {
             return;
         }
-        let file = self.root.join("hooks").join(format!("park-{id}"));
+        let hooks = self.root.join("hooks");
+        let file = hooks.join(format!("park-{id}"));
+        let marker = hooks.join(format!("parked-{id}"));
+        let _ = fs::write(&marker, b"");
         // A cold CI import of one commit took about 30 s; the ceiling
         // sits well above it, and the test lifts the park long before.
         let give_up = Instant::now() + Duration::from_secs(180);
@@ -172,6 +178,7 @@ impl WritePark {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+        let _ = fs::remove_file(&marker);
     }
 }
 
