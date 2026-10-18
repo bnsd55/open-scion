@@ -393,12 +393,12 @@ impl PgClient {
                         // across a wedge of dead transactions still fences
                         // the process.
                         if !setup.ok() {
-                            if ever_held {
+                            if ever_held && matches!(setup.outcome, SetupOutcome::LockRefused) {
                                 trip_fence(fence.as_ref());
                             }
-                            let _ = job.reply.send(Err(Error::FailedPrecondition(
-                                lost_message(ever_held).into(),
-                            )));
+                            // A database that cannot be reached is no
+                            // proof of a takeover: the caller retries.
+                            let _ = job.reply.send(Err(setup_error(&setup, ever_held)));
                             continue;
                         }
                     }
@@ -411,12 +411,10 @@ impl PgClient {
                         setup = Setup::new(conn.schema.as_deref(), conn.lock_key, &mut client);
                     }
                     if !setup.ok() {
-                        if ever_held {
+                        if ever_held && matches!(setup.outcome, SetupOutcome::LockRefused) {
                             trip_fence(fence.as_ref());
                         }
-                        let _ = job.reply.send(Err(Error::FailedPrecondition(
-                            lost_message(ever_held).into(),
-                        )));
+                        let _ = job.reply.send(Err(setup_error(&setup, ever_held)));
                         continue;
                     }
                     ever_held = true;
@@ -732,18 +730,34 @@ impl Pg {
         // on a directory of another store would name blobs of another disk.
         let first = writer.query("SELECT uuid FROM store_uuid WHERE one = 1", &[])?;
         let store_uuid = if let Some(row) = first.first() {
-            // The database already names its store: a directory that
-            // names no store was never served by it, and would collect
-            // blobs of another disk. Refuse before anything is written.
+            // The database already names its store, and the comparison
+            // runs before anything is written: no marker, or the marker
+            // of another store, both refuse here. A database restored on
+            // the directory of another store would serve metadata whose
+            // blobs are not on this disk.
             let uuid = uuid_of(row.get::<_, Vec<u8>>("uuid"));
-            if !marker.present {
-                return Err(Error::FailedPrecondition(format!(
-                    "this database names the store {}, but the data \
-                     directory carries no marker of it: give the \
-                     directory the database was served with, or a \
-                     directory it has never served",
-                    hex16(&uuid)
-                )));
+            match marker.uuid {
+                None => {
+                    return Err(Error::FailedPrecondition(format!(
+                        "this database names the store {}, but the data \
+                         directory carries no marker of it: give the \
+                         directory the database was served with, or a \
+                         directory it has never served",
+                        hex16(&uuid)
+                    )));
+                }
+                Some(held) if held != uuid => {
+                    return Err(Error::FailedPrecondition(format!(
+                        "this data directory belongs to the store whose \
+                         UUID is {}, but the database names the store {}: \
+                         one was restored over the other; give the \
+                         directory of the database's own store, or a \
+                         directory the database has never served",
+                        hex16(&held),
+                        hex16(&uuid)
+                    )));
+                }
+                Some(_) => {}
             }
             uuid
         } else {
@@ -1097,17 +1111,24 @@ impl Drop for PgTx<'_> {
 /// The session setup a worker applies to its client: the schema it runs
 /// in, and, for the one server process of a database, the advisory lock
 /// that refuses a second one.
+enum SetupOutcome {
+    /// The schema was set, and the lock, if one was asked for, was given.
+    Applied,
+    /// The database answered and refused the one-server lock: another
+    /// session holds it.
+    LockRefused,
+    /// The database could not be reached, or refused the schema
+    /// statements: nothing is known about the lock.
+    Unreachable,
+}
+
 struct Setup {
     schema: Option<String>,
     /// The advisory lock this session takes, if any: the one-server lock
     /// of a database, or of one test schema. None for a client that
     /// takes no lock (a reader, an import).
     lock_key: Option<i64>,
-    /// The setup ran to the end: the schema was set, and the lock, if
-    /// one was asked for, was given. A client whose setup failed serves
-    /// nothing, whatever it holds a lock with.
-    applied: bool,
-    locked: bool,
+    outcome: SetupOutcome,
 }
 
 impl Setup {
@@ -1117,30 +1138,21 @@ impl Setup {
         let mut setup = Self {
             schema: schema.map(str::to_owned),
             lock_key,
-            applied: false,
-            locked: lock_key.is_none(),
+            outcome: SetupOutcome::Unreachable,
         };
-        if setup.apply(client) {
-            setup
-        } else {
-            // A failed setup leaves the statements failed until a
-            // reconnect applies it again.
-            Self {
-                schema: setup.schema,
-                lock_key: setup.lock_key,
-                applied: false,
-                locked: false,
-            }
-        }
+        setup.outcome = setup.apply(client);
+        setup
     }
 
     /// Whether the setup holds: it ran to the end, and a one-server
     /// lock, if one was asked for, is held.
     fn ok(&self) -> bool {
-        self.applied && (self.lock_key.is_none() || self.locked)
+        matches!(self.outcome, SetupOutcome::Applied)
     }
+}
 
-    fn apply(&mut self, client: &mut Client) -> bool {
+impl Setup {
+    fn apply(&mut self, client: &mut Client) -> SetupOutcome {
         if let Some(schema) = &self.schema {
             // Every statement that follows resolves its unqualified names
             // inside the schema, and the cleanup of stale test schemas
@@ -1151,17 +1163,16 @@ impl Setup {
                 ))
                 .is_err()
             {
-                return false;
+                return SetupOutcome::Unreachable;
             }
         }
         if let Some(key) = self.lock_key
             && !server_lock_raw(client, key)
         {
-            return false;
+            // The database answered: another session holds the lock.
+            return SetupOutcome::LockRefused;
         }
-        self.locked = self.lock_key.is_some();
-        self.applied = true;
-        true
+        SetupOutcome::Applied
     }
 }
 
@@ -1220,10 +1231,10 @@ fn run_with_retry(
     };
     *setup = fresh;
     if !setup.ok() {
-        if ever_held {
+        if ever_held && matches!(setup.outcome, SetupOutcome::LockRefused) {
             trip_fence(fence);
         }
-        return Err(Error::FailedPrecondition(lost_message(ever_held).into()));
+        return Err(setup_error(setup, ever_held));
     }
     // The fresh session holds no transaction: one that was in progress
     // was dropped with the old session, and nothing of it runs here.
@@ -1244,6 +1255,15 @@ fn run_statement(client: &mut Client, job: &Job) -> Result<Reply> {
         Kind::Raw => unreachable!("a raw job ran in its own branch"),
     }
     .map_err(map_pg_error)
+}
+
+/// The reply of a failed setup: a takeover names the loss; an
+/// unreachable database answers what a client retries against.
+fn setup_error(setup: &Setup, ever_held: bool) -> Error {
+    if matches!(setup.outcome, SetupOutcome::Unreachable) {
+        return Error::Busy;
+    }
+    Error::FailedPrecondition(lost_message(ever_held).into())
 }
 
 /// The reply of a statement a reconnect robbed of its transaction.
@@ -1520,6 +1540,13 @@ fn map_pg_error(e: postgres::Error) -> Error {
         Some(code) if code.code().starts_with("23") => {
             tracing::debug!("the database refused a statement: {e}");
             Error::Pg(e)
+        }
+        // A statement the database never saw: the connection could not
+        // be made or was cut on the way. No SQLSTATE names it, and a
+        // client retries it as it retries a busy one.
+        None => {
+            tracing::warn!("the database is unreachable: {e}");
+            Error::Busy
         }
         // The rest keep their database error, and reach the log in full:
         // a bug of this backend, such as a bad parameter, must not look

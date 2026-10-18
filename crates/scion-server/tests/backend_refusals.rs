@@ -183,7 +183,7 @@ fn a_database_refuses_the_directory_of_another_store() {
     assert!(message.contains("UUID"), "{message}");
     assert!(message.contains(&"0".repeat(32)), "{message}");
     // The real marker still opens: nothing was written by the refusal.
-    drop(std::fs::write(&marker, text));
+    std::fs::write(&marker, text).expect("the marker restores");
     assert!(Backend::open_test(dir.path()).is_ok());
 }
 
@@ -296,4 +296,68 @@ fn a_reconnect_ends_the_dead_transaction_and_a_new_begin_passes() {
     store
         .read(|c| c.repo_id("after").map(|_| ()))
         .expect("the repo the new transaction made is there");
+}
+
+/// An unreachable database is not a takeover: writes answer what a
+/// client retries against, the fence stays down, and the store recovers
+/// when the database comes back. Needs a database this test may stop and
+/// start again: name its Docker container in `SCION_TEST_PG_CONTAINER`.
+// It stops the database every test of this binary shares, so it runs
+// alone: `cargo test --test backend_refusals -- --ignored`.
+#[test]
+#[ignore = "stops the test database every test of this binary shares"]
+fn an_unreachable_database_is_not_a_takeover() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let Ok(container) = std::env::var("SCION_TEST_PG_CONTAINER") else {
+        eprintln!(
+            "skip: stopping the database needs SCION_TEST_PG_CONTAINER, \\
+             the name of a Docker container this test may stop"
+        );
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(dir.path()).unwrap();
+    store
+        .write(|c| c.create_repo("before").map(|_| ()))
+        .unwrap();
+    let stop = Command::new("docker")
+        .args(["stop", "-t", "1", &container])
+        .status()
+        .expect("docker runs");
+    assert!(stop.success(), "docker stop failed");
+    // Two writes in a row fail, and neither fences: the database is
+    // unreachable, which is no proof that another process holds it.
+    for _ in 0..2 {
+        let error = store
+            .write(|c| c.create_repo("down").map(|_| ()))
+            .expect_err("a write against a database that is down fails");
+        assert!(matches!(error, scion_server::Error::Busy), "{error:?}");
+        assert!(
+            !Backend::fenced(&store),
+            "an unreachable database must not fence the backend"
+        );
+    }
+    // The database comes back: the next write reconnects, takes the lock
+    // again, and runs. No process restart was needed.
+    let start = Command::new("docker")
+        .args(["start", &container])
+        .status()
+        .expect("docker runs");
+    assert!(start.success(), "docker start failed");
+    for _ in 0..60 {
+        if Command::new("docker")
+            .args(["exec", &container, "pg_isready", "-U", "postgres"])
+            .status()
+            .is_ok_and(|out| out.success())
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    store
+        .write(|c| c.create_repo("after").map(|_| ()))
+        .expect("the store recovers with the database");
+    assert!(!Backend::fenced(&store));
 }
