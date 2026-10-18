@@ -1,6 +1,7 @@
 //! `mount` and `unmount`: the virtual checkout
 //! ([#11](https://github.com/bnsd55/open-scion/issues/11)).
 
+use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
@@ -61,7 +62,7 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
     // mount time anyway, and a second mount of a live dir would start a
     // second NFS server that no one can use.
     check_mount_point(&dir)?;
-    if let Some(known) = live_record_for(&dir, &load_sessions()?, &pid_alive) {
+    if let Some(known) = live_record_for(&dir, &load_sessions()?, &serving) {
         bail!(
             "{}: scn already serves this directory (pid {}); stop it first: scn unmount {}",
             dir.display(),
@@ -100,9 +101,32 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
     );
     let secret = vfs.secret_name();
 
-    let mut listener = NFSTcpListener::bind("127.0.0.1:0", vfs)
-        .await
-        .context("cannot listen for NFS")?;
+    // The identity of the serving process: an exclusive lock on the
+    // overlay's serve file, held for as long as this process lives. A
+    // record is only alive while its holder's lock is held, so a reused
+    // pid can neither block a mount nor take an unrelated signal. The
+    // file opens with close-on-exec, as Rust opens files, so a child of
+    // the server never inherits the lock.
+    let _serve_lock = hold_serve_lock(&overlay)?;
+    // The record exists before anything serves: a kill or a save error
+    // in the serving window leaves a table that names the server, so
+    // the next `scn mount` refuses and `scn unmount` finds it.
+    save_session(&MountRecord {
+        dir: dir.clone(),
+        overlay: overlay.clone(),
+        rev: args.rev.clone(),
+        pid: std::process::id(),
+    })?;
+    // The bind is the one step that can still fail before serving: on
+    // its failure, remove the record, so the next mount takes over.
+    let mut listener = match NFSTcpListener::bind("127.0.0.1:0", vfs).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            let file = session_file()?;
+            let _ = drop_session(&file, &dir);
+            return Err(anyhow::Error::new(e).context("cannot listen for NFS"));
+        }
+    };
     // The printed mount target is /scion/{secret}; without this, the
     // default export is /, the mountd keeps the whole /scion/{secret}
     // path, and the VFS reads "scion" as the secret and refuses the mount.
@@ -122,12 +146,6 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
         try_mount(port, &secret, &dir);
     }
 
-    save_session(&MountRecord {
-        dir: dir.clone(),
-        overlay: overlay.clone(),
-        rev: args.rev.clone(),
-        pid: std::process::id(),
-    })?;
     wait_stopped().await;
     drop(server);
     // Unmount before the overlay goes, so no file disappears mid-read.
@@ -184,22 +202,65 @@ fn check_mount_point(dir: &Path) -> Result<()> {
     );
 }
 
-/// The live record of `dir`, if the mount table holds one for a process
-/// that still runs. A record whose pid is gone is stale: the caller
-/// takes the directory over, and saving the session replaces the record.
+/// The live record of `dir`, if the mount table holds one for a server
+/// that still runs: a record is alive while its holder's serve lock is
+/// held. A record whose lock is free is stale: the caller takes the
+/// directory over, and saving the session replaces the record.
 fn live_record_for<'a>(
     dir: &Path,
     sessions: &'a [MountRecord],
-    alive: &impl Fn(u32) -> bool,
+    alive: &impl Fn(&MountRecord) -> bool,
 ) -> Option<&'a MountRecord> {
     sessions
         .iter()
-        .find(|record| record.dir == dir && alive(record.pid))
+        .find(|record| record.dir == dir && alive(record))
 }
 
-/// Answers whether the process `pid` is running.
-fn pid_alive(pid: u32) -> bool {
-    kill_pid(pid, "-0")
+/// Answers whether a live server holds `record`'s serve lock. The lock,
+/// not the pid, is the identity: a pid can be reused after a crash, but
+/// a lock dies with the process that holds it. A missing lock file or
+/// overlay says the mount ended.
+fn serving(record: &MountRecord) -> bool {
+    let Ok(file) = std::fs::File::open(record.overlay.join("serve.lock")) else {
+        return false;
+    };
+    // The probe takes the lock to test it and releases it by dropping
+    // the file: held means a live server, free means the record is
+    // stale.
+    !lock_is_free(&file)
+}
+
+/// Locks `file` without waiting, and answers whether the lock was free
+/// (and is now held by `file`). Locks on two opens of a file conflict,
+/// even in one process.
+fn lock_is_free(file: &std::fs::File) -> bool {
+    match rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => true,
+        Err(rustix::io::Errno::WOULDBLOCK) => false,
+        // A lock that cannot even be tested says nothing about a live
+        // holder: treat the record as stale, never signal on a guess.
+        Err(_) => true,
+    }
+}
+
+/// Opens and exclusively locks `<overlay>/serve.lock` for the calling
+/// process, which holds it for as long as it serves. The file opens with
+/// close-on-exec, as Rust opens files, so a child of the server never
+/// inherits the lock.
+fn hold_serve_lock(overlay: &Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(overlay.join("serve.lock"))
+        .context("cannot open the serve lock of the overlay")?;
+    if !lock_is_free(&file) {
+        bail!(
+            "{}: another scn process serves this overlay",
+            overlay.display()
+        );
+    }
+    Ok(file)
 }
 
 /// The `sudo` mount command, for the user to run when the plain mount is
@@ -361,7 +422,10 @@ fn add_session(file: &Path, record: &MountRecord) -> Result<()> {
     write_sessions(file, &sessions)
 }
 
-/// Writes `records` as the session file `file`.
+/// Writes `records` as the session file `file`. The write is atomic: a
+/// sibling temp file, made durable, renamed over the table. A crash mid
+/// write leaves the old table, not a torn one; a concurrent scn writes
+/// its own temp file, so a clobber is impossible.
 pub fn write_sessions(file: &Path, sessions: &[MountRecord]) -> Result<()> {
     let records: Vec<serde_json::Value> = sessions
         .iter()
@@ -374,7 +438,14 @@ pub fn write_sessions(file: &Path, sessions: &[MountRecord]) -> Result<()> {
             })
         })
         .collect();
-    std::fs::write(file, serde_json::to_vec(&records)?)?;
+    let temp = file.with_extension(format!("json.{}.tmp", std::process::id()));
+    let mut out = std::fs::File::create(&temp)?;
+    out.write_all(&serde_json::to_vec(&records)?)?;
+    out.sync_all()?;
+    std::fs::rename(&temp, file)?;
+    if let Ok(dir) = std::fs::File::open(file.parent().unwrap_or(Path::new("."))) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
@@ -441,8 +512,13 @@ fn stop_serving(record: &MountRecord, dir: &Path) -> bool {
 /// [`stop_serving`] with the kill injected, so a test can drive both
 /// branches without a real process.
 fn stop_serving_with(record: &MountRecord, dir: &Path, kill: impl Fn(u32, &str) -> bool) -> bool {
-    let alive = kill(record.pid, "-0");
+    // A signal goes out only while the recorded server's lock is held:
+    // a stale record's pid may be anyone by now.
+    if !serving(record) {
+        return true;
+    }
     let signaled = kill(record.pid, "-TERM");
+    let alive = kill(record.pid, "-0");
     if signaled || !alive {
         return true;
     }
@@ -760,18 +836,137 @@ mod silent_failures {
     fn a_live_mount_of_the_same_dir_is_refused_with_its_pid() {
         let dir = PathBuf::from("/mnt/view");
         let sessions = vec![record("/mnt/view", 4245)];
-        let live = |pid: u32| pid == 4245;
+        let live = |known: &MountRecord| known.pid == 4245;
         let err = match live_record_for(&dir, &sessions, &live) {
             Some(known) => format!("pid {}", known.pid),
             None => String::new(),
         };
         assert_eq!(err, "pid 4245");
         // The pid is gone: the record is stale, the mount may start.
-        let dead = |_: u32| false;
+        let dead = |_: &MountRecord| false;
         assert!(live_record_for(&dir, &sessions, &dead).is_none());
         assert!(live_record_for(&dir, &[], &live).is_none());
         // A record of another directory does not block this one.
         let other = vec![record("/mnt/other", 4245)];
         assert!(live_record_for(&dir, &other, &live).is_none());
+    }
+
+    /// The identity of a server is its serve lock, not its pid: a record
+    /// whose lock is free is stale, so an unmount must not signal the
+    /// process its pid now points at - after a crash that can be anyone.
+    #[test]
+    #[cfg(unix)]
+    fn an_unmount_does_not_signal_an_unrelated_process() {
+        let home = tempfile::tempdir().unwrap();
+        let overlay = home.path().join("overlay");
+        fs::create_dir_all(&overlay).unwrap();
+        // The lock file exists, and no one holds it: no server lives.
+        std::fs::File::create(overlay.join("serve.lock")).unwrap();
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let known = MountRecord {
+            dir: PathBuf::from("/mnt/view"),
+            overlay: overlay.clone(),
+            rev: "main".to_owned(),
+            pid: sleeper.id(),
+        };
+        // The stale record is taken over, and the sleeper lives on.
+        assert!(stop_serving(&known, &known.dir));
+        assert!(!serving(&known));
+        assert!(
+            sleeper.try_wait().unwrap().is_none(),
+            "an unrelated process was signalled"
+        );
+        let _ = sleeper.kill();
+        sleeper.wait().unwrap();
+    }
+
+    /// A record whose serve lock is held is live: the unmount signals the
+    /// recorded pid, and the process goes away.
+    #[test]
+    fn an_unmount_signals_the_live_server() {
+        let home = tempfile::tempdir().unwrap();
+        let overlay = home.path().join("overlay");
+        fs::create_dir_all(&overlay).unwrap();
+        let mut server = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let known = MountRecord {
+            dir: PathBuf::from("/mnt/view"),
+            overlay: overlay.clone(),
+            rev: "main".to_owned(),
+            pid: server.id(),
+        };
+        // This test process holds the serve lock, like the serving
+        // process would; the pid it recorded points at the child.
+        let _lock = hold_serve_lock(&overlay).unwrap();
+        assert!(serving(&known));
+        assert!(stop_serving(&known, &known.dir));
+        assert!(wait_for(2, || server.try_wait().unwrap().is_some()));
+    }
+
+    /// A dead server's record never refuses a mount: the lock dies with
+    /// the holder, and the takeover polls the real condition, because
+    /// macOS may tear a reaped child's lock down one tick late.
+    #[test]
+    fn a_dead_server_record_is_taken_over() {
+        let home = tempfile::tempdir().unwrap();
+        let overlay = home.path().join("overlay");
+        fs::create_dir_all(&overlay).unwrap();
+        let known = MountRecord {
+            dir: PathBuf::from("/mnt/view"),
+            overlay: overlay.clone(),
+            rev: "main".to_owned(),
+            pid: std::process::id(),
+        };
+        let _lock = hold_serve_lock(&overlay).unwrap();
+        assert!(live_record_for(Path::new("/mnt/view"), &[known.clone()], &serving).is_some());
+        drop(_lock);
+        assert!(wait_for(2, || live_record_for(
+            Path::new("/mnt/view"),
+            &[known],
+            &serving
+        )
+        .is_none()));
+    }
+
+    /// A save that cannot write its temp file errs, and the old table is
+    /// still there whole: the rename never happened.
+    #[test]
+    fn a_failed_save_keeps_the_old_table() {
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("mounts.json");
+        let first = record("/mnt/view", 11);
+        write_sessions(&file, &[first]).unwrap();
+        // The temp path is taken, so the save cannot complete.
+        let blocked = file.with_extension(format!("json.{}.tmp", std::process::id()));
+        fs::create_dir(&blocked).unwrap();
+        assert!(add_session(&file, &record("/mnt/other", 12)).is_err());
+        assert_eq!(read_sessions(&file).unwrap().len(), 1);
+        // With the path free, the save goes through.
+        fs::remove_dir(&blocked).unwrap();
+        add_session(&file, &record("/mnt/other", 12)).unwrap();
+        let found = read_sessions(&file).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].dir, PathBuf::from("/mnt/view"));
+    }
+
+    /// Waits until `cond` holds, with a ceiling: macOS may keep a reaped
+    /// child's flock for one tick, so a lock test polls the real
+    /// condition instead of assuming the first read.
+    fn wait_for(ceiling_secs: u64, cond: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ceiling_secs);
+        loop {
+            if cond() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
