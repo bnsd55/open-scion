@@ -11,6 +11,28 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 ed25519-dalek = { version = "3.0", default-features = false, features = ["fast", "rand_core"] }
 open-scion-proto = { path = ".." }
+prost = "0.14"
+
+[[bin]]
+name = "object"
+path = "fuzz_targets/object.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "request-id"
+path = "fuzz_targets/request-id.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "check-name"
+path = "fuzz_targets/check-name.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "ticket"

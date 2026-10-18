@@ -169,7 +169,7 @@ async fn a_blame_counts_a_request_with_its_latency_and_bytes() {
         text(&metrics)
     );
 
-    let reply = client
+    let mut pages = client
         .blame(BlameRequest {
             repo: REPO.into(),
             changeset_id: root.as_bytes().to_vec(),
@@ -179,7 +179,11 @@ async fn a_blame_counts_a_request_with_its_latency_and_bytes() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(reply.ranges.len(), 1, "{}", reply.ranges.len());
+    let mut ranges = 0usize;
+    while let Some(page) = pages.message().await.unwrap() {
+        ranges += page.ranges.len();
+    }
+    assert_eq!(ranges, 1, "{ranges}");
 
     let text = text(&metrics);
     assert!(

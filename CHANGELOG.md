@@ -14,6 +14,9 @@ until that section gets its release date.
 
 ### Added
 
+- The server counts lands whose ref moved under them and were planned
+  again in `scion_land_replans_total`, next to the land outcome counters.
+
 #### Objects and byte format
 
 - A tree entry carries its blob's byte length (`#172`): `ls -l` and a mount
@@ -136,10 +139,14 @@ until that section gets its release date.
   process of another build, is refused.
 - Derived data is derived in bounded steps, one transaction each, so other
   requests run between steps after a new kind or a version bump, and each
-  step removes rows of older versions. `scion-server derive --kind KIND`
-  fills a kind ahead of the first query. A kind can read the value of
-  every parent, not only the first, and path history is derived parents
-  first, in generation order.
+  step removes rows of older versions. One walk per kind, version and
+  repo runs at a time (`#142`): the first caller owns it, the others wait
+  for it with their own deadlines and then read the value, and the steps
+  of writers go first, so a cold read no longer queues its derivation
+  ahead of a land. `scion-server derive --kind KIND` fills a kind ahead
+  of the first query. A kind can read the value of every parent, not only
+  the first, and path history is derived parents first, in generation
+  order.
 - Reads use a pool of 8 read-only SQLite connections, so a read never
   waits for a write, for a long read such as a graph walk, or for a server
   write that waits for an import's write lock. Writes still take turns on
@@ -176,6 +183,17 @@ until that section gets its release date.
   the changeset bytes against the ID it asked for, and stops with an
   error once the joined bytes pass 1 GiB, so a broken or hostile server
   cannot stream until the client runs out of memory.
+- `Log` and `Blame` stream their replies in 1 MiB parts, as
+  `GetChangeset` streams a changeset (`#175`), so a client that stops
+  reading is counted by the connection's stall cap, which then closes the
+  connection. A client joins the parts in order; the last part's
+  `next_changeset_id` (for `Log`) or `next_cursor` (for `Blame`) starts
+  the next call. The largest unary reply left is `Diff` (at most 1,000
+  paths, about 120 KB) and the rest are KBs, so a client that never reads
+  holds at most its 128 connections x 256 streams of those, until its
+  connections close; a unary reply over the 64 MiB a reply message may
+  hold is refused by the server's encoder, and a test pins that
+  wiring.
 - Path history as derived data (kind `path_history`, schema version 5).
   `Log` with a path reads only the changesets that change the path, so one
   call returns up to 1,000 entries however far apart they are. A call
@@ -241,11 +259,27 @@ until that section gets its release date.
 
 #### Access, transport and limits
 
+- Folder read rules (`#184`). A `read` rule may name a path prefix as its
+  fourth field, by path parts: `read alice main src` lets alice read `src`
+  and below, and nothing else of the repo. A principal whose read rules
+  are all prefixes is a *partial reader*: the server derives its view of
+  the repo (the real trees with every entry outside its prefixes
+  removed), `GetRootTree` answers the view root with a read ticket bound
+  to it, `ListDir`, `ReadFile` and `GetObjects` serve from that view, a
+  path outside the prefixes answers `NOT_FOUND` as a missing one, and the
+  history and query calls answer `UNIMPLEMENTED`, one uniform answer on
+  every call. The first read of a rule set walks the real tree; later
+  reads of the same rule set and changeset find the derived view. A repo
+  holds at most 32 distinct rule sets, a set at most 256 prefixes, and an
+  access file over either cap is refused at load.
 - Principals and access rules (#13, part 2). `scion-server serve --access
   FILE` reads an access file that maps the BLAKE3 digest of each token to
   a principal, and says which repos each principal may read and which
   paths it may write: a path prefix by path parts (`src` covers `src/a`,
-  not `srcx`), no prefix meaning the whole repo, and write implying read.
+  not `srcx`), no prefix meaning the whole repo. A write rule needs a
+  whole-repo read rule — no blind writes, and no silent non-writer
+  (`access.rs`, `check_write_needs_read`) — and a file that gives a
+  partial reader a write rule is refused at load, with the line to fix.
   A principal with no rule for a repo cannot see the repo: every call
   answers `NOT_FOUND`, as for a repo that does not exist. A change to a
   path outside the principal's write prefixes answers `PERMISSION_DENIED`
@@ -357,6 +391,10 @@ until that section gets its release date.
   is-ancestor` (exit 0 or 1) and `scn diff` for the query API, and
   `scn blame`. Every `scn` error exits 2, so it never reads as the "no" of
   `scn is-ancestor`.
+- `scn ls` shows each entry's size: `scion-server` 0.1 trees carry the
+  byte length of every file and symlink, so the listing knows it with no
+  extra call; directories and gitlinks show none. `--json` adds `size` to
+  the entries that carry one.
 - `scn mount` and `scn unmount` (`#11`): a virtual checkout. `scn mount
   DIR [REV]` serves one ref as an NFSv3 filesystem from `scn` itself, on a
   free port of 127.0.0.1, so a directory's tree loads when it is first
@@ -418,6 +456,9 @@ until that section gets its release date.
 
 ### Changed
 
+- The server, the cache and the daemon log to stderr (`#179`): stdout
+  carries the output of `ticket-key` and `hash-token`, so a redirect of
+  one does not catch the other's lines.
 - `Diff` finds renames as git does over diffs of 1,000,000 entries
   (`#107`). Exact renames (same content, by blob ID) run at any size in
   that range, where a diff of more than 10,000 entries before had none; a
@@ -429,3 +470,22 @@ until that section gets its release date.
   warning about skipped inexact rename detection; the exact renames in the
   reply are still whole. Every call of the same diff reports the flag the
   same way.
+
+### Fixed
+
+- The server refuses a data directory that group or others can write, or
+  that sits under a directory another user can change: the blobs and the
+  metadata inside are only as private as the directory.
+- `scn` prints each part of an error once: tonic's transport error Display
+  already ends with its source's text, and the printed chain said `tcp
+  connect error` and `invalid URL, scheme is missing` twice.
+- `scion-server hash-token --token` has a help text.
+- A `Blame` cursor whose run length overflows the line count is refused
+  with `INVALID_ARGUMENT` (`#201`): the fuzz target found that a release
+  build wrapped the total silently and answered a wrong window.
+- `Log` no longer repeats a page past the first scan (`#203`): a call
+  whose `limit` is larger than one internal page (1,000 entries) fetched
+  its second page and then started again from the second page's first
+  entry, so the reply held a thousand entries twice. The walk now takes
+  each page's own continuation; the new paging tests fail on either a
+  skipped or a repeated entry.

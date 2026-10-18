@@ -2576,6 +2576,7 @@ dependencies = [
  "open-scion-tier",
  "postgres",
  "proptest",
+ "prost",
  "rusqlite",
  "rustix",
  "tempfile",

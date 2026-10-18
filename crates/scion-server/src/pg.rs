@@ -45,7 +45,7 @@ use crate::meta::{Meta, MetaTx, RefState, RepoId};
 use crate::store::Blobs;
 
 /// The schema version this build makes and reads.
-pub(crate) const PG_SCHEMA_VERSION: u32 = 1;
+pub(crate) const PG_SCHEMA_VERSION: u32 = 2;
 
 /// The advisory lock of the one server process of a database.
 const SERVER_LOCK: i64 = 0x5343_494F_4E53_5256;
@@ -54,8 +54,10 @@ const SCHEMA_LOCK: i64 = 0x5343_494F_4E53_4348;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database
 /// from version `n - 1` to version `n`. A released migration never changes.
-const PG_MIGRATIONS: [&str; PG_SCHEMA_VERSION as usize] =
-    [include_str!("../migrations/postgres/0001_init.sql")];
+const PG_MIGRATIONS: [&str; PG_SCHEMA_VERSION as usize] = [
+    include_str!("../migrations/postgres/0001_init.sql"),
+    include_str!("../migrations/postgres/0002_view_roots.sql"),
+];
 
 /// Handle to one Postgres database. Cheap to clone.
 #[derive(Clone)]
@@ -71,6 +73,13 @@ struct PgInner {
     readers: Readers,
     /// The blob folder: blob files stay on local disk in every backend.
     blobs: Blobs,
+    /// Writers that wait for the write client: the derivation walk waits
+    /// while they wait, so a steady stream of writers delays a cold read
+    /// up to its deadline, never a land ([#142]).
+    writers: Mutex<usize>,
+    write_woken: Condvar,
+    /// The walks in flight of this backend's derivations.
+    derive: crate::derived::DeriveFlights,
 }
 
 /// Clients for [`Pg::read`], so at most [`READERS`](crate::store::READERS)
@@ -305,6 +314,7 @@ impl PgClient {
                     // most, not one until the process restarts. A reconnect
                     // inside a transaction loses the transaction.
                     let lost_tx = tx.in_progress();
+                    let mut reconnected = false;
                     if client.is_closed() {
                         match connect_on(&url, ca.as_deref(), &options) {
                             Ok(fresh) => {
@@ -322,6 +332,30 @@ impl PgClient {
                                 continue;
                             }
                         }
+                        reconnected = true;
+                    }
+                    // A transaction the reconnect dropped refuses this job
+                    // too: it was asked while the old connection held the
+                    // transaction, and the new one holds none (its COMMIT
+                    // would answer Ok about a transaction that is gone).
+                    if reconnected && lost_tx && !job.sql.starts_with("ROLLBACK") {
+                        let _ = job.reply.send(Err(Error::Corrupt(
+                            "the transaction was lost with the connection; \
+                             roll it back and run it again"
+                                .into(),
+                        )));
+                        continue;
+                    }
+                    if !setup.ok() {
+                        // The setup failed on a client that still lives: a
+                        // network break left the old session of this very
+                        // connection holding the lock, and the session dies
+                        // some while after the connection did. One retry a
+                        // job, so the recovery needs no restart of the
+                        // process; until it comes, the caller sees the same
+                        // answer as before.
+                        setup = Setup::new(schema.as_deref(), exclusive, &mut client);
+                        setup_held = setup_held || setup.ok();
                     }
                     if !setup.ok() {
                         let message = if setup_held {
@@ -484,7 +518,10 @@ const CLEAN_LOCK: i64 = 0x5343_494F_4E53_5445;
 /// here: it is a statement on the live connection, which the server
 /// cannot lose between connections.
 fn base_options() -> String {
-    String::from("-csynchronous_commit=on -cstatement_timeout=600000")
+    // A lock a writer waits for is a busy database: 5 s, like the busy
+    // timeout of the SQLite store. A statement itself may walk the graph
+    // for minutes, so only the lock is under the short clock.
+    String::from("-csynchronous_commit=on -cstatement_timeout=600000 -clock_timeout=5000")
 }
 
 impl Pg {
@@ -599,6 +636,9 @@ impl Pg {
                 writer: Mutex::new(writer),
                 readers: Readers::new_with(readers, url, ca, &options, schema)?,
                 blobs,
+                writers: Mutex::new(0),
+                write_woken: Condvar::new(),
+                derive: crate::derived::DeriveFlights::new(crate::store::DERIVE_WALKS_CAP),
             }),
         })
     }
@@ -611,7 +651,7 @@ impl Pg {
 
     /// A read on the write client, so it sees the caller's own commits.
     pub fn read_unflushed<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
-        let mut writer = self.lock_writer();
+        let (mut writer, _waiting) = self.lock_writer();
         let mut pg = PgTx {
             c: &mut writer,
             ended: true,
@@ -640,7 +680,7 @@ impl Pg {
     ///
     /// What `f` returns, or a database error from begin or commit.
     pub fn commit<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
-        let mut writer = self.lock_writer();
+        let (mut writer, _waiting) = self.lock_writer();
         // A write transaction runs at READ COMMITTED, the Postgres
         // default: every change of the caller checks the newest state of
         // the row it touches (the CAS predicates).
@@ -668,11 +708,93 @@ impl Pg {
         self.commit(f)
     }
 
-    fn lock_writer(&self) -> MutexGuard<'_, PgClient> {
-        self.inner
-            .writer
+    /// Takes the write client, counted as a writer that waits: the
+    /// derivation walk waits while writers wait, so a steady stream of
+    /// writers delays a cold read up to its deadline, never a land
+    /// ([#142]). The count falls when the client is back, so a walk step
+    /// that ends hands the client to a writer, not to its own next step.
+    fn lock_writer(&self) -> (MutexGuard<'_, PgClient>, PgWriteWaiter<'_>) {
+        *self
+            .inner
+            .writers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += 1;
+        (
+            self.inner
+                .writer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            PgWriteWaiter(&self.inner.writers, &self.inner.write_woken),
+        )
+    }
+
+    /// The walks in flight of this backend's derivations.
+    pub(crate) fn derive_flights(&self) -> &crate::derived::DeriveFlights {
+        &self.inner.derive
+    }
+
+    /// How many writers wait for the write client right now.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn writers_waiting(&self) -> usize {
+        *self
+            .inner
+            .writers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits while writers wait for the write client, until the deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::DeadlineExceeded`] once the deadline has passed.
+    pub(crate) fn wait_for_writers(
+        &self,
+        deadline: Option<&crate::deadline::Deadline>,
+    ) -> Result<()> {
+        let mut waiting = self
+            .inner
+            .writers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while *waiting > 0 {
+            let Some(deadline) = deadline else {
+                waiting = self
+                    .inner
+                    .write_woken
+                    .wait(waiting)
+                    .unwrap_or_else(PoisonError::into_inner);
+                continue;
+            };
+            let budget = deadline
+                .at()
+                .saturating_duration_since(std::time::Instant::now());
+            let (guard, timed_out) = self
+                .inner
+                .write_woken
+                .wait_timeout_while(waiting, budget, |waiting| *waiting > 0)
+                .unwrap_or_else(PoisonError::into_inner);
+            waiting = guard;
+            if timed_out.timed_out() {
+                return Err(Error::DeadlineExceeded(
+                    "the call ran past its deadline".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The count of a taken write client, while it is taken: it falls, and
+/// wakes the waiters, when the client is back.
+struct PgWriteWaiter<'a>(&'a Mutex<usize>, &'a Condvar);
+
+impl Drop for PgWriteWaiter<'_> {
+    fn drop(&mut self) {
+        let mut waiting = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        *waiting -= 1;
+        self.1.notify_all();
     }
 }
 
@@ -941,14 +1063,20 @@ fn connect_exclusive(
         std::thread::scope(|scope| scope.spawn(|| connect_on(url, ca, options)).join().unwrap())?;
     // The lock is taken on the worker thread, like every statement: the
     // caller may be a tokio one, which must never block on this client.
-    Ok(PgClient::spawn(ClientConfig {
+    let client = PgClient::spawn(ClientConfig {
         client,
         url: url.to_owned(),
         ca: ca.map(Path::to_path_buf),
         options: options.to_owned(),
         schema: schema.map(str::to_owned),
         exclusive: true,
-    }))
+    });
+    // Whether the lock was given is decided at the spawn: one probe job
+    // brings a refusal here, to the open, so an operator whose second
+    // server starts against a taken database sees it now, and not in the
+    // errors of the first call a client makes.
+    client.query_opt("SELECT 1", &[])?;
+    Ok(client)
 }
 
 /// [`connect_with`]'s work: parse, then connect.
@@ -990,11 +1118,14 @@ fn connect_on(url: &str, ca: Option<&Path>, options: &str) -> Result<Client> {
                 .to_owned(),
         ));
     }
+    // A connect that fails is a database the caller may wait for: the
+    // same states a statement answers, mapped the same way, so a caller
+    // that retries a busy database retries a starting one too.
     let client = match (local, ca) {
         // The connector upgrades every connection, and checks the
         // certificate the server presents against `ca`.
-        (_, Some(ca)) => config.connect(make_tls(ca)?)?,
-        (true, None) => config.connect(NoTls)?,
+        (_, Some(ca)) => config.connect(make_tls(ca)?).map_err(map_pg_error)?,
+        (true, None) => config.connect(NoTls).map_err(map_pg_error)?,
         (false, None) => {
             return Err(Error::InvalidArgument(
                 "the database host is off this machine: give --postgres-ca, \
@@ -1010,26 +1141,41 @@ fn connect_on(url: &str, ca: Option<&Path>, options: &str) -> Result<Client> {
 /// importer retries a batch on it, and the gRPC status becomes
 /// UNAVAILABLE. The rest keep their database error.
 fn map_pg_error(e: postgres::Error) -> Error {
-    // The error reaches the log in full, whatever it maps to: a caller
-    // that only sees Busy reads "database is busy" and no more.
-    tracing::warn!("the database refused a statement: {e}");
     // A connection the database dropped is as retryable as a busy one.
     if e.is_closed() {
         return Error::Busy;
     }
     match e.code() {
         // Deadlock, serialization failure, an administrative shutdown, a
-        // database that starts up.
+        // database that starts up, a lock another writer holds.
         Some(code)
-            if matches!(code.code(), "40P01" | "40001" | "57P01" | "57P03")
+            if matches!(code.code(), "40P01" | "40001" | "57P01" | "57P03" | "55P03")
                 || code.code().starts_with("08") =>
         {
+            tracing::warn!("the database is busy: {e}");
             Error::Busy
         }
-        // The rest keep their database error: a bug of this backend, such
-        // as a bad parameter, must not look busy, or the importer retries
-        // it and the log says nothing but "busy".
-        _ => Error::Pg(e),
+        // The lock or the statement waited past its clock, as a SQLite
+        // write does past its busy timeout: the caller has been at it
+        // too long, and the client retries past its own deadline.
+        Some(code) if code.code() == "57014" => {
+            tracing::warn!("the database gave the statement up: {e}");
+            Error::DeadlineExceeded("the database kept the caller waiting".to_owned())
+        }
+        // A violation the code handles (a duplicate key, a check, a
+        // foreign key) is one answer among many: it logs quietly.
+        Some(code) if code.code().starts_with("23") => {
+            tracing::debug!("the database refused a statement: {e}");
+            Error::Pg(e)
+        }
+        // The rest keep their database error, and reach the log in full:
+        // a bug of this backend, such as a bad parameter, must not look
+        // busy, or the importer retries it and the log says nothing but
+        // "busy".
+        _ => {
+            tracing::warn!("the database refused a statement: {e}");
+            Error::Pg(e)
+        }
     }
 }
 
@@ -1064,22 +1210,36 @@ fn make_tls(ca: &Path) -> Result<MakeRustlsConnect> {
 /// not run yet, in one transaction each, and refuses a schema of a newer
 /// build.
 fn migrate(client: &mut PgClient) -> Result<()> {
-    // One transaction holds the schema lock, so a server and an import
-    // started together migrate one after the other, and the version the
-    // loser reads is the one the winner left.
-    let mut tx = PgTx::begin(client)?;
-    tx.c.execute("SELECT pg_advisory_xact_lock($1)", &[P::i64(SCHEMA_LOCK)])?;
-    tx.c.batch(
+    // One process at a time migrates: a lock of the session, held across
+    // the migrations, so a server and an import started together take
+    // turns while the migrations are quick, and the version the loser
+    // reads is the one the winner left. A lock past its 5 s clock leaves
+    // the taker busy: an open that hits one waits and tries again.
+    client.query_opt("SELECT pg_advisory_lock($1)", &[P::i64(SCHEMA_LOCK)])?;
+    let outcome = migrate_under_lock(client);
+    // The lock lives on the client's session: it goes back whatever the
+    // migrations did. A client that died mid-migration lost the lock with
+    // its connection, and the unlock names a lock the new connection
+    // never held, which answers false and costs nothing.
+    let _ = client.query_opt("SELECT pg_advisory_unlock($1)", &[P::i64(SCHEMA_LOCK)]);
+    outcome
+}
+
+/// The migrations themselves, under the session's schema lock.
+fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
+    // The ledger of the versions, made first, in its own transaction: a
+    // migration that fails leaves the ledger and every version before it.
+    client.batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
              version BIGINT PRIMARY KEY,
              name    TEXT NOT NULL
          )",
     )?;
-    let version: i64 =
-        tx.c.query("SELECT max(version) FROM schema_migrations", &[])?
-            .first()
-            .and_then(|row| row.get::<_, Option<i64>>(0))
-            .unwrap_or(0);
+    let version: i64 = client
+        .query("SELECT max(version) FROM schema_migrations", &[])?
+        .first()
+        .and_then(|row| row.get::<_, Option<i64>>(0))
+        .unwrap_or(0);
     let version = u32::try_from(version).map_err(|_| {
         Error::FailedPrecondition(format!(
             "database schema version {version} is not a version"
@@ -1096,13 +1256,18 @@ fn migrate(client: &mut PgClient) -> Result<()> {
         if n <= version {
             continue;
         }
+        // One transaction per migration, with its version bump: a
+        // migration that fails rolls its own statements back, and the
+        // versions before it stand.
+        let mut tx = PgTx::begin(client)?;
         tx.c.batch(&format!(
             "{sql}\nINSERT INTO schema_migrations (version, name) \
              VALUES ({}, 'postgres schema')",
             i64::from(n)
         ))?;
+        tx.commit()?;
     }
-    tx.commit()
+    Ok(())
 }
 
 /// Reads a tree's rows and checks them against its ID.
@@ -1486,6 +1651,68 @@ impl MetaTx for PgTx<'_> {
             &[P::text(kind), P::i64(version), P::i64(limit)],
         )?;
         Ok(usize::try_from(deleted).unwrap_or(0))
+    }
+
+    /// The view root that a rule-set digest derives for a changeset, if
+    /// derived already.
+    ///
+    /// # Errors
+    ///
+    /// Database errors, or a stored root that is not a tree ID.
+    fn get_view_root(
+        &mut self,
+        repo: RepoId,
+        digest: &[u8; 32],
+        cs: ChangesetId,
+    ) -> Result<Option<TreeId>> {
+        let bytes: Option<Vec<u8>> = self
+            .c
+            .query_opt(
+                "SELECT root FROM view_roots WHERE repo_id = $1 AND digest = $2 AND cs = $3",
+                &[
+                    P::i64(repo.0),
+                    P::bytes(digest),
+                    P::bytes(&id_bytes(cs.as_bytes())),
+                ],
+            )?
+            .map(|row| row.get(0));
+        bytes
+            .map(|b| {
+                TreeId::try_from(b.as_slice()).map_err(|_| Error::Corrupt("bad view root".into()))
+            })
+            .transpose()
+    }
+
+    /// Records the view root of a rule-set digest for a changeset. A second
+    /// write must agree with the first: derivation is deterministic, so a
+    /// mismatch means corruption.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if a different root is already stored.
+    fn put_view_root(
+        &mut self,
+        repo: RepoId,
+        digest: &[u8; 32],
+        cs: ChangesetId,
+        root: TreeId,
+    ) -> Result<()> {
+        let inserted = self.c.execute(
+            "INSERT INTO view_roots (repo_id, digest, cs, root) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (repo_id, digest, cs) DO NOTHING",
+            &[
+                P::i64(repo.0),
+                P::bytes(digest),
+                P::bytes(&id_bytes(cs.as_bytes())),
+                P::bytes(&id_bytes(root.as_bytes())),
+            ],
+        )?;
+        if inserted == 0 && self.get_view_root(repo, digest, cs)? != Some(root) {
+            return Err(Error::Corrupt(format!(
+                "the view root of {cs} for the rule set differs from the stored value"
+            )));
+        }
+        Ok(())
     }
 
     /// Stores a tree. Safe to repeat.

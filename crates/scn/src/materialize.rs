@@ -18,7 +18,7 @@
 //!   The destination itself stays, with its mode, owner and extended
 //!   attributes. Where the filesystem has no such rename (NFS), each entry
 //!   moves up in another way that never replaces: see
-//!   [`Checkout::move_up_without_rename`].
+//!   `Checkout::move_up_without_rename`.
 //!
 //! On any failure, every path the checkout made is removed, deepest first,
 //! through the same bounded directory handles as the writes, and then the
@@ -32,7 +32,7 @@
 //! starts empty, only this checkout writes it, and the checkout records every
 //! path it makes. So a path that already exists is the call's own, sent again
 //! by NFS after a lost reply, or the filesystem folded two names into one, by
-//! case or by Unicode form: see [`Checkout::is_lost_reply`].
+//! case or by Unicode form: see `Checkout::is_lost_reply`.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, OsStr};
@@ -132,7 +132,7 @@ pub fn check_name(name: &[u8]) -> Result<(), &'static str> {
 /// Fails if `dest` is a symlink, a file, or a directory that is not empty,
 /// that another user owns, or that all users can write without the sticky
 /// bit.
-pub fn check_dest(dest: &Path) -> Result<()> {
+pub(crate) fn check_dest(dest: &Path) -> Result<()> {
     open_dest(dest).map(drop)
 }
 
@@ -999,7 +999,7 @@ fn entries(dir: &OwnedFd) -> io::Result<Vec<Vec<u8>>> {
 }
 
 /// Whether `path` is `dir` or below it.
-pub fn is_within(path: &[u8], dir: &[u8]) -> bool {
+pub(crate) fn is_within(path: &[u8], dir: &[u8]) -> bool {
     path.strip_prefix(dir)
         .is_some_and(|rest| rest.first().is_none_or(|&b| b == b'/'))
 }

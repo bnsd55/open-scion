@@ -82,7 +82,8 @@ rules and must not contain `/`.
 The decoder accepts exactly one encoding per object. It rejects:
 
 - trailing bytes after the object
-- a version byte other than 1, an unknown tag, a flag byte other than 0 or 1
+- a version byte other than 1, an unknown tag, a flag byte other than 0 or 1,
+  a gitlink algorithm byte other than 1 (sha1) or 2 (sha256)
 - paths or names that are unsorted, duplicated, or break the path rules
 - any length or count larger than the bytes that remain
 

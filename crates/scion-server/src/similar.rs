@@ -45,8 +45,8 @@ const PART_BYTES: usize = 1 << 20;
 /// newline or after 64 bytes. In text (no NUL byte in the first 8,000 bytes,
 /// git's test for binary), a CR before a newline does not count, so a line
 /// scores the same with either line end. Each chunk is hashed to one of
-/// [`HASHBASE`] values, as in git, so two different chunks can count as the
-/// same. So a table has at most [`HASHBASE`] rows, whatever the file size.
+/// `HASHBASE` values, as in git, so two different chunks can count as the
+/// same. So a table has at most `HASHBASE` rows, whatever the file size.
 pub struct Chunks {
     /// For each hash, the bytes of the chunks with that hash, by hash.
     table: Vec<(u32, u32)>,

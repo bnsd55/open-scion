@@ -35,13 +35,13 @@ pub const MAX_BLAME_VERSIONS: usize = 100;
 
 /// Most lines one call diffs, counting both sides of each diff. A diff of
 /// many repeated lines can take seconds, so this bounds the time of a call.
-/// A line counts once per 64 bytes ([`diff_cost`]), a rename search counts
+/// A line counts once per 64 bytes (`diff_cost`), a rename search counts
 /// the chunks it reads, the rows it indexes and compares, and the file
 /// sizes it reads ([`similar::Budget`]), and a file read and refused counts
 /// once per 64 bytes, so every byte read counts. The first step of a call
 /// always runs, so a call always makes progress. A rename search uses only
 /// the budget left; where it stops, the next call goes on with it
-/// ([`Blame::next_search`]). So a call reads about 64 MiB in steps that
+/// (`Blame::next_search`). So a call reads about 64 MiB in steps that
 /// fit, plus a few files of at most [`crate::memory::Bytes::cap`] past it:
 /// the first
 /// step can pass it by one file of a rename search, and the step that stops
@@ -61,10 +61,10 @@ pub struct BlameRange {
     /// How many lines.
     pub line_count: u32,
     /// The changeset that last changed these lines. `None` when the call
-    /// stopped first: see [`Blame::next`].
+    /// stopped first: see `Blame::next`.
     pub changeset: Option<ChangesetId>,
     /// The first line, counting from 1, in the file at `changeset`, or at
-    /// [`Blame::next`] when `changeset` is `None`.
+    /// `Blame::next` when `changeset` is `None`.
     pub origin_line: u32,
 }
 
@@ -160,11 +160,11 @@ enum Older {
 /// Blames the file at `path` in `cs`. Diffs at most [`MAX_BLAME_VERSIONS`]
 /// versions and about [`MAX_BLAME_DIFF_LINES`] lines, and reads at most
 /// the call's share of path history nodes: the versions come from the path
-/// history ([`history::newest_change`]), so a call reads one changeset and
+/// history (`history::newest_change`), so a call reads one changeset and
 /// a few node rows per version, however many changesets lie between two
 /// versions. A binary file is blamed line by line too, as
 /// `git blame` does. `from` goes on with a rename search that an earlier
-/// call stopped ([`Blame::next_search`]); its default starts none. A call
+/// call stopped (`Blame::next_search`); its default starts none. A call
 /// that cannot take the nodes' share before it explains a version is
 /// `ResourceExhausted`, retryable; past the first version it stops with a
 /// cursor.
@@ -172,7 +172,7 @@ enum Older {
 /// Every version read takes its bytes from `memory`, and the lines of the
 /// blamed file take [`BYTES_PER_LINE`] each; the takes wait for the budget
 /// to free up, until `until`. A file whose share is more than the whole
-/// budget is refused: see [`memory`].
+/// budget is refused: see [`memory`](crate::memory).
 ///
 /// # Errors
 ///
@@ -1172,14 +1172,42 @@ pub fn decode_cursor(
         until,
     )?;
     let mut table = Vec::with_capacity(table_count as usize);
-    for _ in 0..table_count {
-        let id = ChangesetId::from_bytes(r.array::<32>()?);
-        let known = store.read(|c| c.has_changeset(repo_id, id))?;
-        if !known {
-            return Err(bad(&format!("it names {id} which {repo} does not have")));
+    // The table's names are checked in one read transaction: a blame
+    // resume decodes on every call, so a table of a hundred names costs
+    // one read, not a hundred.
+    store.read(|c| {
+        for _ in 0..table_count {
+            let id = ChangesetId::from_bytes(r.array::<32>()?);
+            if !c.has_changeset(repo_id, id)? {
+                return Err(bad(&format!("it names {id} which {repo} does not have")));
+            }
+            table.push(id);
         }
-        table.push(id);
-    }
+        Ok(())
+    })?;
+    let window = decode_window(&mut r, &table, run_count, open)?;
+    r.finish()?;
+    let resume = Resume {
+        next,
+        search: RenameSearch { searched, best },
+        after_line,
+        counted,
+        window,
+    };
+    Ok((resume, hold))
+}
+
+/// The window's lines from the `run_count` runs that follow the table:
+/// a run of unnamed lines, each with its place in the version at `next`,
+/// or one named by its place in the table. The runs must fill the window
+/// exactly, and claim no more lines than a word holds.
+fn decode_window(
+    r: &mut CursorReader<'_>,
+    table: &[ChangesetId],
+    run_count: u32,
+    open: usize,
+) -> Result<Vec<Line>> {
+    let bad = |why: &str| Error::InvalidArgument(format!("bad blame cursor: {why}"));
     let mut window = Vec::with_capacity(open);
     let mut total = 0usize;
     for _ in 0..run_count {
@@ -1189,7 +1217,11 @@ pub fn decode_cursor(
             return Err(bad("bad line kind"));
         }
         let len = usize::try_from(len).map_err(|_| bad("a run is too long"))?;
-        total += len;
+        // A run may claim more lines than a word holds: the window bound,
+        // not a wrapped total, must decide what the cursor names.
+        total = total
+            .checked_add(len)
+            .ok_or_else(|| bad("the cursor's lines fill more than its window"))?;
         if total > open {
             return Err(bad("the cursor's lines fill more than its window"));
         }
@@ -1212,15 +1244,7 @@ pub fn decode_cursor(
     if total != open {
         return Err(bad("the cursor's lines do not fill its window"));
     }
-    r.finish()?;
-    let resume = Resume {
-        next,
-        search: RenameSearch { searched, best },
-        after_line,
-        counted,
-        window,
-    };
-    Ok((resume, hold))
+    Ok(window)
 }
 
 /// Reads a cursor from the front of its bytes.

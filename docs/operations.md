@@ -25,7 +25,10 @@ The pieces:
 ```
 
 That is the whole deployment: clients talk to `127.0.0.1:7878` (or `--listen`
-HOST:PORT). Without `--ticket-key` no object is readable, so a real server
+HOST:PORT). The data directory holds every blob and every row, so keep it
+mode 0700 and owned by the user the server runs as: the server refuses one
+that group or others can write, or that sits under a directory another user
+can change. Without `--ticket-key` no object is readable, so a real server
 adds a ticket key (section 2):
 
 ```sh
@@ -35,6 +38,12 @@ chmod 600 /srv/scion-keys/ticket.key
   --ticket-key /srv/scion-keys/ticket.key
 ```
 
+Size the process with the three connection caps: `--max-connections` (128)
+bounds the clients served at once, `--max-streams` (256) bounds the calls
+one client may hold open at once, and `--max-stalled-bytes` (64 MiB)
+bounds what the stalled replies of one connection may hold before the
+connection is closed. A cache and a daemon take the same three flags.
+
 Choose the tokens with care: `--token T` makes one principal, `default`, with
 every right on every repo. For several people or services, use an access
 file instead (see "Tokens: one, or an access file", below).
@@ -43,13 +52,19 @@ file instead (see "Tokens: one, or an access file", below).
 
 A cache serves object reads to a region and forwards everything else. Each
 hop has its own token pair: what the tier requires from its clients
-(`--token`), and what it sends upstream (`--upstream-token`).
+(`--token`), and what it sends upstream (`--upstream-token`). A `scn`
+client's `--token` is what it sends, the other side of the pair of the tier
+in front of it.
 
 ```sh
 ./scion-cache --token <CACHE_TOKEN> --upstream-token <SERVER_TOKEN> \
   --upstream http://SERVER:7878 \
   --ticket-public-key <PUBLIC_KEY_HEX>
 ```
+
+The cache keeps its objects in memory and drops the least recently used
+first: `--max-bytes` (1 GiB) is the most object bytes it holds. A snapshot
+holds at most `--snapshot-bytes` object bytes (256 MiB).
 
 The cache needs `--ticket-public-key` (the hex that `ticket-key` printed):
 without it, it serves no objects. A `scn` user then points reads at the
@@ -64,7 +79,10 @@ cache with `scn checkout --server http://SERVER:7878 --objects http://CACHE:7879
 ```
 
 The daemon's data directory must be private to its user (mode 0700, not a
-shared path such as `/tmp`); it serves on a 0600 Unix socket in it. Every
+shared path such as `/tmp`); it serves on a 0600 Unix socket in it
+(`--socket`, default `daemon.sock` in the data directory). Its disk store
+keeps at most `--max-bytes` object bytes (10 GiB) and drops the least
+recently used first. Every
 directory above it must be owned by root or by the user, and not writable by
 group or others unless it has the sticky bit. It refuses anything else, and
 `scn` checks the socket the same way; the error names the directory and
@@ -77,7 +95,58 @@ daemon. With the chain above, the daemon of a user runs
 `--token <USER_TOKEN>`, where `<USER_TOKEN>` is that user's token at the
 server too. A new node can start warm: copy a snapshot file from the cache
 (`--snapshot DIR --snapshot-repo R`, refreshed every `--snapshot-every`
-seconds) and start the daemon with `--seed FILE`.
+seconds) and start the daemon with `--seed FILE`. A snapshot holds every
+object of its repo by ID, so snapshot only repos that ALL the node's users
+may read WHOLE: a seeded daemon serves paths that folder read rules hide,
+because it checks objects, not rules.
+
+### The metadata in Postgres
+
+By default the data directory keeps its metadata in its own SQLite file. With
+`--postgres-url`, the server keeps it in a Postgres database instead, so it
+can be administered and replicated with the Postgres tooling you already
+run, and outlives one machine. The blob files stay in the data directory in
+every backend: they are the big majority of the bytes, and the database
+never stores them.
+
+```sh
+scion-server --data /srv/scion \
+  --postgres-url postgres://user@dbhost/scion?sslmode=require \
+  --postgres-ca /srv/scion/db-ca.pem serve --access /srv/scion/access.txt
+```
+
+- `--postgres-url` names the database. Off this machine the URL must ask
+  for TLS (`sslmode=require`): the open refuses a remote URL that does not.
+- `--postgres-ca` (a PEM file) is required with a remote host too: the
+  database must present a certificate it signed, and there is no mode that
+  accepts any certificate. A host on this machine (`localhost`, a loopback
+  address) may go without either.
+- The open checks the database runs `synchronous_commit=on`: a returned
+  commit must be durable. A database that answers otherwise is refused.
+- The open migrates the database's schema to this build's version, one
+  transaction per migration, under a database lock with the same 5 s clock:
+  an open that waits longer answers busy, and the caller retries. A
+  database of a newer build is refused: run that build's server.
+- One server process serves one database: a second `serve` on the same
+  `--postgres-url` fails at its open with "another server holds this
+  database". An import does not take that lock and runs beside a server.
+- A write that waits for another writer's lock gives up after 5 s and
+  answers unavailable, like the SQLite store past its busy timeout; the
+  client retries.
+- `fsck` and `gc` read the data directory's own database. On a
+  Postgres-backed server they refuse: with `--postgres-url` they exit 2;
+  without it the directory's own marker refuses them with exit 1.
+- The choice is recorded in the data directory's `backend` file: a
+  `--postgres-url` open refuses a directory that holds SQLite metadata, and
+  a plain open refuses a directory it names, so a second, empty store
+  cannot grow beside the database.
+
+Backup and restore of a Postgres-backed server: `pg_dump` the database
+first, then copy the data directory. A changeset in the dump names only
+blob files that existed when the dump was taken, and a blob file is written
+before its database row commits, so the later copy holds every file the
+dump names. Restore into a fresh database, copy the data directory back,
+start the server with the same `--postgres-url`.
 
 ### Tokens: one, or an access file
 
@@ -87,7 +156,7 @@ per-repo read and write rules:
 
 ```sh
 TOK=$(./scion-server hash-token --token <SECRET>)
-printf 'token\tops\t%s\nwrite\tops\tr\n' "$TOK" > /srv/scion/access.txt
+printf 'token\tops\t%s\nread\tops\tr\nwrite\tops\tr\n' "$TOK" > /srv/scion/access.txt
 chmod 600 /srv/scion/access.txt
 ./scion-server --data /srv/scion serve --access /srv/scion/access.txt \
   --ticket-key /srv/scion-keys/ticket.key
@@ -98,6 +167,51 @@ MiB upload bytes, 64 pending lands per principal); raise or lower them with
 `--max-principal-requests`, `--max-principal-upload-bytes`,
 `--max-principal-pending-lands`. With `--token`, every caller is the same
 principal, so the caps are off unless a flag sets one.
+
+Rewriting the access file takes effect at the next start (or restart): the
+server reads it once. A ticket keeps working for its whole life after a
+reload that narrows its principal, up to 15 minutes from signing, on this
+server and on any cache that holds the repo's objects. To revoke reads:
+rewrite the file and restart, and either wait out the tickets (15 minutes)
+or rotate the ticket key (`--ticket-key`) to cut them off at once. Objects
+already on a user's daemon are out of reach of both; give a daemon only
+repos all its users may read whole.
+
+### Folder read rules
+
+A `read` or `write` rule may name a path prefix as its fourth field, by
+path parts: `read alice main src` lets alice read `src` and below
+(`src/a` yes, `srcx` no), and nothing else of that repo. No prefix means
+the whole repo. A write rule needs a whole-repo read rule — no blind
+writes — and a file that gives a partial reader (one whose read rules are
+all prefixes) a write rule is refused at load. The server derives each
+principal's canonical prefixes into a rule-set digest, which keys the
+derived view data; a repo holds at most 32 distinct rule sets, a set at
+most 256 prefixes, and an access file over either cap is refused at load.
+
+A partial reader reads the repo through its *view*: the real trees with
+every entry outside its prefixes removed. `ResolveRef` answers the ref's
+real changeset; `GetRootTree` answers the view root, with a read ticket
+bound to it; `ListDir`, `ReadFile` and `GetObjects` serve from that view,
+and a path outside the prefixes answers `NOT_FOUND`, the same as a
+missing one, with no hint that it is hidden. The history and query calls
+(`GetChangeset`, `Log`, `Blame`, `MergeBase`, `IsAncestor`, `Diff`) answer
+`UNIMPLEMENTED` for a partial reader, one uniform answer on every call.
+The first read of a rule set walks the real tree to derive the view, so
+its latency varies with the repo; later reads of the same rule set and
+changeset find the derived view.
+
+Narrowing a principal's rules takes the same path as any access-file
+change: rewrite the file and restart. A ticket signed under the wider
+rules keeps working for its whole life, up to 15 minutes — wait it out,
+or rotate the ticket key (section 2) to cut the old tickets off at once.
+Objects a user already pulled to their daemon are outside the server's
+reach either way.
+
+Snapshots interact with the rules: a snapshot holds every object of its
+repo by ID, so a daemon seeded from one serves paths that folder read
+rules hide. Snapshot only repos that all of a node's users may read whole
+(see "Server, cache, and a daemon per user").
 
 ### Network and TLS
 
@@ -191,6 +305,11 @@ schema 4 walks every repo's changesets). Two rules:
   migration waits for them to stop: the error says `stop the other processes
   that use ...`. One process at a time migrates.
 
+An import reads git revision `--rev` (default `HEAD`) into scion repo
+`--repo` (default `main`), and points scion ref `--ref` (default `main`)
+at the imported tip. Besides every root and merge, it re-checks `--verify`
+(default 100) ordinary commits against git.
+
 So an upgrade is: stop the server (and any tiers that share the directory —
 none do by default), copy the directory as a backup (section 3), start the
 new binary, watch the log for the migration, run `fsck`. Schema 7 (tree
@@ -249,6 +368,9 @@ the process, scraped from there. The names:
 - `scion_request_seconds` — one latency histogram per RPC.
 - `scion_rpc_bytes_total` — request and reply bytes by RPC.
 - `scion_lands_total` — lands by outcome.
+- `scion_land_replans_total` — lands that planned again because their ref
+  moved under them; a rising rate means lands contending with imports or
+  other writers on one ref.
 - `scion_cache_hits_total` / `scion_cache_misses_total` — what a tier
   served from its store against what it fetched upstream.
 

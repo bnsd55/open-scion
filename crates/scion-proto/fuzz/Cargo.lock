@@ -908,6 +908,7 @@ dependencies = [
  "ed25519-dalek",
  "libfuzzer-sys",
  "open-scion-proto",
+ "prost",
 ]
 
 [[package]]

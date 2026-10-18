@@ -42,8 +42,8 @@ Here, all data is in one SQLite file and one blob folder on one machine, all
 writes go through one database connection, and lands to a ref are serialized
 by a lock in the server's memory. So a second server process cannot share the
 data. A backend that scales out is not built
-([#47](https://github.com/bnsd55/open-scion/issues/47)). The cache tiers are
-in review ([#64](https://github.com/bnsd55/open-scion/pull/64)).
+([#47](https://github.com/bnsd55/open-scion/issues/47)); the cache tiers are
+built and run in front of the server (below).
 
 ## Why
 
@@ -105,6 +105,13 @@ scn land "$cs"                                               # rebase onto main 
 re-read them, redo the change, and try again. A retry of the same land is safe:
 the server returns the first result.
 
+Every call carries a request ID (16 hex characters, one per command), which
+the server and each tier log, so one command can be followed through every
+hop's log
+([docs/operations.md](docs/operations.md), section 6). A partial reader - a
+principal whose read rules name folder prefixes - reads the paths its rules
+cover and cannot write; the server derives a view of the repo for it.
+
 ## Try it
 
 `scripts/demo.sh` does all of the steps below on a fixed public repository,
@@ -121,6 +128,7 @@ export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
 ./target/release/scion-server --data /tmp/scion fsck              # check the data directory; safe while the server runs
 ./target/release/scion-server --data /tmp/scion gc --dry-run      # what a collection would remove; safe while the server runs
 
+./target/release/scn ls main:src    # mode, kind, size, name per entry
 ./target/release/scn log -n 5
 ./target/release/scn log --path src -n 5          # changesets that changed src/
 ./target/release/scn blame main:README.md         # last changeset of each line
@@ -186,15 +194,30 @@ with `#` are skipped:
 
 ```text
 # token <principal> <the BLAKE3 digest of the token>
-token	alice	d4289b3345cfbdfb36fb37ee89e85bd74447f837b04c18aee6233c731b1419a7
+token	alice	<64 hex digits>
+token	pat	<64 hex digits>
 token	ci	<64 hex digits>
-# read <principal> <repo>: every RPC on that repo
+# read <principal> <repo> [prefix]: reads at or below the prefix, by
+# path parts. No prefix means the whole repo.
 read	ci	main
 # write <principal> <repo> [prefix]: changes at or below the prefix, by
-# path parts. No prefix means the whole repo. Write implies read.
+# path parts. No prefix means the whole repo. A write rule needs a
+# whole-repo read rule: a partial reader cannot write in v0.1 (#183).
+read	alice	main
 write	alice	main	src
 write	ci	main
 ```
+
+A principal whose read rules are all prefixes is a *partial reader*: it
+reads only what they cover, through the view of the repo that the server
+derives for it. `ResolveRef` and `GetRootTree` answer the real changeset
+ID and the view root; `ReadFile` and `ListDir` read through the view, and
+a path outside the prefixes is answered exactly like a missing one. The
+history RPCs (`GetChangeset`, `Log`, `Blame`, `MergeBase`, `IsAncestor`,
+`Diff`), every write, and `GetObjects` without a view-root ticket answer
+`UNIMPLEMENTED` with the same text for every such principal. A file that
+gives a partial reader a write rule is refused at load. The file holds at
+most 32 distinct read rule sets per repo, and a set at most 256 prefixes.
 
 The file holds digests, never tokens. Print the digest of a token with
 `scion-server hash-token`:
@@ -252,6 +275,9 @@ recently used objects of that repo, up to `--snapshot-bytes`. Copy the file
 to the node (any copy tool or shared mount) and start the daemon with
 `--seed FILE`: it imports the objects, each checked against its ID, before
 it serves, and only if its store is empty. A warm daemon ignores the file.
+A snapshot holds every object of the repo, so give a node only repos that
+all its users may read whole: a folder rule hides parts of a repo from a
+partial reader, but not from the snapshot file.
 
 A read needs a ticket: `scn checkout` asks the server for one (`--server`,
 where it also resolves the ref), and fetches the objects through a tier
@@ -315,6 +341,7 @@ A bearer token over plain TCP to a non-loopback address stays refused.
 | [`docs/architecture.md`](docs/architecture.md) | How the parts fit together: storage, lands, reads, and the cache tiers |
 | [`docs/format-v1.md`](docs/format-v1.md) | The v1 byte format. Object IDs are hashes of these bytes. |
 | [`docs/protocol-v1.md`](docs/protocol-v1.md) | The v1 API contract: calls, limits, status codes, retries, durability and what a client checks |
+| [`docs/cli.md`](docs/cli.md) | Every `scn` command: what it does, its flags, the global flags and env vars, and the exit codes |
 | [`docs/benchmarks.md`](docs/benchmarks.md) | How the demo and the benchmarks run, what each number means, and how to rerun them |
 | [`docs/design/scalable-backend.md`](docs/design/scalable-backend.md) | A design proposal, not built: stateless servers on a shared metadata store and object store |
 
@@ -326,7 +353,7 @@ These are this project's choices where the article does not give details.
 |---|---|
 | Hash and format | BLAKE3 with a different prefix per object kind, over a written, frozen byte format |
 | Storage | SQLite for metadata and trees, one compressed file per blob. Anthropic uses Spanner and cloud storage; this is the single-machine stand-in. |
-| Blobs per repo | One file per content, shared by all repos. A repo may name only its own blobs: those uploaded to it, and those that its changesets name. No answer of `PutBlob` or `CreateChangeset` shows whether another repo has a blob. `GetObjects` does not check this yet ([#13](https://github.com/bnsd55/open-scion/issues/13)). |
+| Blobs per repo | One file per content, shared by all repos. A repo may name only its own blobs: those uploaded to it, and those that its changesets name. No answer of `PutBlob` or `CreateChangeset` shows whether another repo has a blob. `GetObjects` serves only what a read ticket's walk reaches, and the ticket is minted on a root the repo's own changesets reach. |
 | Conflicts | Path-level only: the same path, or a directory above or below it. No text merge. |
 | Landing | One land at a time per ref, inside one process. A changeset can be created in parallel without any lock. |
 | Retries | Each land has a caller-chosen request key, so a retry returns the first result |
@@ -347,6 +374,10 @@ example `brew install protobuf` or `apt install protobuf-compiler`).
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+CI also runs `cargo deny check` (license and advisory checks on every
+crate) and the test that follows every relative link in the repo's
+markdown.
 
 Fuzz the decoders (needs nightly and `cargo-fuzz`):
 
