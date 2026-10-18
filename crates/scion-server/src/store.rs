@@ -988,13 +988,13 @@ impl Blobs {
             fsync_dir(path)?;
         }
         Ok(Self {
+            #[cfg(any(test, feature = "test-hooks"))]
+            park: WritePark::from_env(&root),
             root,
             tmp,
             mine,
             _mine_lock: mine_lock,
             write_locks: (0..WRITE_STRIPES).map(|_| Mutex::new(())).collect(),
-            #[cfg(any(test, feature = "test-hooks"))]
-            park: WritePark::from_env(&root),
             group_flush: GroupFlush::default(),
             #[cfg(test)]
             verifies: std::sync::atomic::AtomicU64::default(),
