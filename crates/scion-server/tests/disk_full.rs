@@ -109,9 +109,16 @@ fn is_out_of_space(e: &Error) -> bool {
 /// pure function of the error's code.
 fn is_resource_exhausted(e: &Error) -> bool {
     let error = match e {
-        Error::Io(io) => Error::Io(std::io::Error::from_raw_os_error(
-            io.raw_os_error().unwrap(),
-        )),
+        Error::Io(io) => {
+            // An io error may carry no errno (a library's own error of
+            // that kind): the mirror keeps the kind, which is all the
+            // mapping reads.
+            let kind = io.kind();
+            Error::Io(match io.raw_os_error() {
+                Some(code) => std::io::Error::from_raw_os_error(code),
+                None => std::io::Error::from(kind),
+            })
+        }
         Error::Db(_) => Error::Db(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
             None,
