@@ -9,9 +9,9 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1237,6 +1237,163 @@ fn an_import_that_stays_busy_fails_with_the_busy_error() {
         })
         .unwrap();
     assert_eq!(cs, 0);
+}
+
+/// The Postgres hold of a batch boundary: a client of the test schema
+/// takes the changesets table and keeps it until the import's batch has
+/// hit the busy database once, as `hold_until_a_retry` holds the data
+/// directory's write lock on SQLite. The hold starts at a counted batch
+/// boundary, and releases only when a batch retried, so the batch that
+/// began inside the hold provably waited out the lock. Its writes are
+/// idempotent, so the retry is safe. The thread ends on its own; it
+/// commits when the hold is over.
+fn hold_until_a_retry_pg(
+    store: &Arc<Backend>,
+    dir: &Path,
+    before: u64,
+    failures: &Arc<Mutex<Vec<String>>>,
+) {
+    let (held_tx, held_rx) = mpsc::channel();
+    let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+    let Some(schema) = Backend::test_schema(dir) else {
+        failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push("no test schema for the hold".to_owned());
+        return;
+    };
+    let watcher = Arc::clone(store);
+    let failures = Arc::clone(failures);
+    thread::spawn(move || {
+        // A failure is reported, not panicked: a panic in this detached
+        // thread would be lost, and the test would fail much later with a
+        // message that says nothing.
+        let fail = |why: String| {
+            failures
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(why);
+        };
+        let mut db = match postgres::Client::connect(&url, postgres::NoTls) {
+            Ok(db) => db,
+            Err(e) => return fail(format!("the hold never connected: {e}")),
+        };
+        if let Err(e) = db.batch_execute(&format!("SET search_path TO {schema}")) {
+            return fail(format!("the hold never reached the schema: {e}"));
+        }
+        // The batch's writes are inserts into `changesets`; the lock holds
+        // them while reads go past.
+        if let Err(e) = db.batch_execute("BEGIN; LOCK TABLE changesets IN EXCLUSIVE MODE;") {
+            return fail(format!("the hold never took the table: {e}"));
+        }
+        if held_tx.send(()).is_err() {
+            return; // the test gave up waiting for the hold
+        }
+        // The import's first write under this hold waits out the 5 s lock
+        // clock, answers busy, and the batch retries; the hold ends when
+        // that retry is counted.
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while watcher.busy_retries() <= before {
+            if std::time::Instant::now() >= deadline {
+                return fail("the import never hit the busy lock".to_owned());
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        if let Err(e) = db.batch_execute("COMMIT") {
+            fail(format!("the hold never let go: {e}"));
+        }
+    });
+    held_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the hold never took the write lock");
+}
+
+#[test]
+fn an_import_batch_waits_out_a_busy_write_lock_on_postgres() {
+    if !Backend::test_is_postgres() {
+        return;
+    }
+    let git = Git::init();
+    let rev = git.fast_commits(0, 3000);
+    let (dir, store) = open_store();
+    let store = Arc::new(store);
+    let before = store.busy_retries();
+    // The hold starts at a counted batch boundary: the hook runs after the
+    // first batch's commit has ended and returns only once the hold has
+    // the table, so the next batch begins inside the hold. A batch is safe
+    // to run again whole.
+    let holds = dir.path().to_path_buf();
+    let hooked = Arc::clone(&store);
+    // The hold reports what went wrong here, and the test reads the log
+    // as soon as the import is over, before the busy assert, whose
+    // failure would only say the import answered busy.
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let logged = Arc::clone(&failures);
+    store.set_after_batch(Some(Box::new(move |batch_no| {
+        if batch_no == 0 {
+            hold_until_a_retry_pg(&hooked, &holds, before, &logged);
+        }
+    })));
+    let report = try_import(&store, &git, &rev);
+    store.set_after_batch(None);
+    if let Some(why) = failures
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .first()
+    {
+        panic!("{why}");
+    }
+    let report = report.unwrap();
+    assert_eq!((report.commits, report.imported), (3000, 3000));
+    // The batch that began inside the hold waited out the lock: its try
+    // hit the 5 s lock clock, and a retry ran it again whole.
+    assert!(
+        store.busy_retries() > before,
+        "no batch ever hit the busy lock"
+    );
+}
+
+#[test]
+fn an_import_that_loses_disk_space_fails_and_is_not_retried() {
+    if Backend::test_is_postgres() {
+        // The blob files are local in every backend, so the hook below
+        // works on Postgres too; the run here is the data-directory one.
+        // (Both jobs run this test.)
+    }
+    let git = Git::init();
+    let rev = git.fast_commits(0, 60);
+    let (_dir, store) = open_store();
+    let before = store.busy_retries();
+    // The import's first blob write is the one the disk refuses.
+    store.blobs().fail_writes_after(0);
+    // A read works before the import starts.
+    assert!(store.read(|c| c.repo_id("r")).is_err());
+    let error = try_import(&store, &git, &rev).unwrap_err();
+    // The import did not answer busy: the out-of-space answer is not a
+    // lock the database holds, and the batch's retry loop does not run.
+    assert!(
+        matches!(
+            &error,
+            Error::Io(e) if e.kind() == std::io::ErrorKind::StorageFull
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        store.busy_retries(),
+        before,
+        "the import retried a full disk"
+    );
+    // Nothing was written: the ref is not there, and a read works right
+    // after the failure.
+    let repo_id = store.read(|c| c.repo_id("r")).unwrap();
+    assert!(
+        store
+            .read(|c| c.get_ref(repo_id, "main"))
+            .unwrap()
+            .is_none()
+    );
+    // The space is back: the same import, again from the top, works.
+    try_import(&store, &git, &rev).unwrap();
 }
 
 #[test]

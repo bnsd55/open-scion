@@ -43,7 +43,7 @@ use crate::land::{
     EXPIRE_PER_LAND, LAND_RETENTION_SECS, LandOutcome, LandRequest, LandState, decode_paths,
     encode_paths,
 };
-use crate::meta::{Meta, MetaTx, RefState, RepoId};
+use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId};
 use crate::store::Blobs;
 
 /// The schema version this build makes and reads.
@@ -125,6 +125,9 @@ struct PgInner {
     write_woken: Condvar,
     /// The walks in flight of this backend's derivations.
     derive: crate::derived::DeriveFlights,
+    /// The import's test hooks and busy-retry count, as the SQLite store
+    /// keeps its own.
+    hooks: crate::store::ImportHooks,
 }
 
 /// Clients for [`Pg::read`], so at most [`READERS`](crate::store::READERS)
@@ -363,6 +366,9 @@ impl PgClient {
                         && !job.sql.starts_with("ROLLBACK")
                         && !job.sql.starts_with("BEGIN")
                     {
+                        // The caller may be gone, which is fine: the reply
+                        // fails, and the job's outcome is the caller's
+                        // business. The worker goes on to the next job.
                         let _ = job.reply.send(Err(Error::Corrupt(TX_LOST.into())));
                         continue;
                     }
@@ -424,6 +430,7 @@ impl PgClient {
                     // would answer Ok about a transaction that is gone).
                     // A new BEGIN passes: the reconnect ended the old tx,
                     // so the BEGIN opens a fresh one on the fresh session.
+                    // As above: a gone caller is fine, the worker goes on.
                     if reconnected
                         && lost_tx
                         && !job.sql.starts_with("ROLLBACK")
@@ -536,7 +543,10 @@ impl PgClient {
 /// `application_name`, and registered with its start time, so the
 /// schema of a test that just began is never dropped.
 fn drop_stale_schemas(maker: &PgClient) {
-    let Ok(got) = maker.query_opt("SELECT pg_try_advisory_lock($1)", &[P::i64(CLEAN_LOCK)]) else {
+    let got = maker.query_opt("SELECT pg_try_advisory_lock($1)", &[P::i64(CLEAN_LOCK)]);
+    let Ok(got) = got else {
+        // This connection cannot even ask: another open's cleanup runs, or
+        // the database is in trouble. The next open tries again.
         return;
     };
     // The answer is a row that holds the verdict: a `false` row means
@@ -563,13 +573,19 @@ fn drop_stale_schemas(maker: &PgClient) {
             if !name.starts_with("scion_test_") {
                 continue;
             }
-            let _ = maker.batch(&format!(
+            if let Err(why) = maker.batch(&format!(
                 "DROP SCHEMA IF EXISTS {name} CASCADE;
                  DELETE FROM public.scion_test_schemas WHERE schema = '{name}'"
-            ));
+            )) {
+                tracing::warn!(schema = %name, error = %why, "cannot drop a stale test schema");
+            }
         }
     }
-    let _ = maker.query_opt("SELECT pg_advisory_unlock($1)", &[P::i64(CLEAN_LOCK)]);
+    // The lock frees when this connection closes: a failed unlock needs
+    // nothing but the drop of the maker.
+    if let Err(why) = maker.query_opt("SELECT pg_advisory_unlock($1)", &[P::i64(CLEAN_LOCK)]) {
+        tracing::warn!(error = %why, "cannot unlock the test-schema cleanup");
+    }
 }
 
 /// The advisory lock of the test-schema cleanup.
@@ -584,8 +600,22 @@ fn base_options() -> String {
     // A lock a writer waits for is a busy database: 5 s, like the busy
     // timeout of the SQLite store. A statement itself may walk the graph
     // for minutes, so only the lock is under the short clock.
-    String::from("-csynchronous_commit=on -cstatement_timeout=600000 -clock_timeout=5000")
+    format!(
+        "-csynchronous_commit=on -cstatement_timeout=600000 -clock_timeout={LOCK_TIMEOUT_FOR_WRITERS}"
+    )
 }
+
+/// The lock clock every writer runs under: a lock a writer waits for is a
+/// busy database, answered Busy so the client retries. The one exception
+/// is the collector's key, whose wait has its own bound (the commit's
+/// `LOCK_TIMEOUT_FOR_KEY`); everything after it is back on this clock.
+/// The value is bare: the base options take it as `-clock_timeout=<v>`,
+/// and the SQL `SET LOCAL` in `Pg::commit` quotes it.
+const LOCK_TIMEOUT_FOR_WRITERS: &str = "5s";
+
+/// How long the collector's key wait may run, in `Pg::commit` below: the
+/// queue drains as fast as the writers commit.
+const LOCK_TIMEOUT_FOR_KEY: &str = "60s";
 
 impl Pg {
     /// Opens the database at `url`, and the blob folder under `data`, as
@@ -788,6 +818,7 @@ impl Pg {
             writers: Mutex::new(0),
             write_woken: Condvar::new(),
             derive: crate::derived::DeriveFlights::new(crate::store::DERIVE_WALKS_CAP),
+            hooks: crate::store::ImportHooks::default(),
         });
         // The probe of a server that lost its lock: once a minute the
         // session checks itself, through the job queue like every
@@ -889,6 +920,44 @@ impl Pg {
         // default: every change of the caller checks the newest state of
         // the row it touches (the CAS predicates).
         let mut tx = PgTx::begin(&mut writer)?;
+        // Every writer and the collector's batches of one schema order on
+        // one advisory key, held to the end of the transaction: what a
+        // SQLite write transaction gets from the data directory's one
+        // write connection (store.rs `commit`,
+        // `TransactionBehavior::Immediate`).
+        //
+        // SHORTCUT: one key per schema orders every writer of the schema
+        // against one collector, which is right for one server per schema
+        // (#178): a test database hosts one store per schema, so tests of
+        // different stores do not serialize against each other. Many
+        // servers (#47) need a finer design: per-repo keys, or the
+        // collector's batches reading a snapshot instead of holding a
+        // lock. One key, not one per blob: a transaction that puts
+        // thousands of blobs would hold thousands of entries in Postgres's
+        // shared lock table and run it out (E53200,
+        // `max_locks_per_transaction`). A changeset that names a blob the
+        // collector is about to remove
+        // commits first, and the collector's re-read pins the blob; a
+        // batch of the collector waits for every writer that has begun.
+        // The wait ignores the writer's 5 s lock clock: the queue drains
+        // as fast as the writers commit, and a writer that gave up would
+        // turn healthy contention into Busy for every parallel caller.
+        // The 60 s covers only this key: right after the statement, the
+        // transaction is back on the writer's clock, so the row locks it
+        // meets later still answer Busy at 5 s (SET LOCAL lasts to the
+        // end of the transaction).
+        tx.c.query(
+            &format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT_FOR_KEY}'"),
+            &[],
+        )?;
+        tx.c.query_opt(
+            "SELECT pg_advisory_xact_lock(hashtext(current_schema() || ':gc'))",
+            &[],
+        )?;
+        tx.c.query(
+            &format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT_FOR_WRITERS}'"),
+            &[],
+        )?;
         match f(&mut tx) {
             Ok(value) => {
                 tx.commit()?;
@@ -935,6 +1004,12 @@ impl Pg {
     /// The walks in flight of this backend's derivations.
     pub(crate) fn derive_flights(&self) -> &crate::derived::DeriveFlights {
         &self.inner.derive
+    }
+
+    /// The import's test hooks and busy-retry count.
+    #[must_use]
+    pub fn hooks(&self) -> &crate::store::ImportHooks {
+        &self.inner.hooks
     }
 
     /// How many writers wait for the write client right now.
@@ -1716,6 +1791,12 @@ impl MetaTx for PgTx<'_> {
     ///
     /// [`Error::NotFound`] if a parent is not in `repo`.
     fn insert_changeset(&mut self, repo: RepoId, cs: &Changeset) -> Result<ChangesetId> {
+        // This transaction holds the collector's key from its begin, so
+        // the collector's check waits for it, and its re-read pins every
+        // blob this changeset puts. The files themselves the lens of
+        // `store_changeset` has already read inside this transaction: a
+        // blob whose file the collector removed fails there, before any
+        // write, on both backends.
         let (body, id) = cs.encode_with_id();
         let mut parent_gen = 0;
         for parent in &cs.parents {
@@ -2195,7 +2276,8 @@ impl MetaTx for PgTx<'_> {
         let size: i64 = self
             .c
             .query_opt(
-                "SELECT octet_length(body) FROM trees WHERE id = $1",
+                // octet_length of a bytea is int4; the read wants int8.
+                "SELECT octet_length(body)::bigint FROM trees WHERE id = $1",
                 &[P::bytes(&id_bytes(id.as_bytes()))],
             )?
             .ok_or_else(|| Error::NotFound(format!("tree {id}")))?
@@ -2475,6 +2557,234 @@ impl MetaTx for PgTx<'_> {
         }
         let len = body.len();
         Ok((body, len))
+    }
+    /// Every repo, in ID order.
+    fn repos(&mut self) -> Result<Vec<RepoId>> {
+        let rows = self
+            .c
+            .query("SELECT repo_id FROM repos ORDER BY repo_id", &[])?;
+        Ok(rows.iter().map(|row| RepoId(row.get(0))).collect())
+    }
+
+    /// The `(repo, changeset ID, body)` of the stored changesets after
+    /// `(repo, cs)`, in that order, at most `limit`.
+    fn repo_changesets_after(
+        &mut self,
+        from_repo: RepoId,
+        from_cs: &[u8],
+        limit: usize,
+    ) -> Result<Vec<RepoChangeset>> {
+        let rows = self.c.query(
+            "SELECT rc.repo_id, rc.cs, ch.body
+             FROM repo_changesets rc JOIN changesets ch ON ch.id = rc.cs
+             WHERE (rc.repo_id, rc.cs) > ($1, $2)
+             ORDER BY rc.repo_id, rc.cs LIMIT $3",
+            &[
+                P::i64(from_repo.0),
+                P::bytes(from_cs),
+                P::i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+            ],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| RepoChangeset(RepoId(row.get(0)), row.get(1), row.get(2)))
+            .collect())
+    }
+
+    /// The changeset IDs that `repo` holds, all of them.
+    fn repo_changeset_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>> {
+        let rows = self.c.query(
+            "SELECT cs FROM repo_changesets WHERE repo_id = $1 ORDER BY cs",
+            &[P::i64(repo.0)],
+        )?;
+        Ok(rows.iter().map(|row| row.get(0)).collect())
+    }
+
+    /// The body of changeset `cs`, or `None` when it is not stored.
+    fn stored_changeset_body(&mut self, cs: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .c
+            .query_opt("SELECT body FROM changesets WHERE id = $1", &[P::bytes(cs)])?
+            .map(|row| row.get(0)))
+    }
+
+    /// The blobs that `repo` may name, all of them.
+    fn repo_blob_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>> {
+        let rows = self.c.query(
+            "SELECT blob FROM repo_blobs WHERE repo_id = $1 ORDER BY blob",
+            &[P::i64(repo.0)],
+        )?;
+        Ok(rows.iter().map(|row| row.get(0)).collect())
+    }
+
+    /// Removes the row that names `blob` for `repo`.
+    fn delete_repo_blob(&mut self, repo: RepoId, blob: &[u8]) -> Result<()> {
+        self.c.execute(
+            "DELETE FROM repo_blobs WHERE repo_id = $1 AND blob = $2",
+            &[P::i64(repo.0), P::bytes(blob)],
+        )?;
+        Ok(())
+    }
+
+    /// Whether any repo names `blob`. Driven from `repos`, as the SQLite
+    /// one is: `repo_blobs` has no index on `blob` alone.
+    fn any_repo_names(&mut self, blob: &[u8]) -> Result<bool> {
+        Ok(self
+            .c
+            .query_opt(
+                "SELECT 1 FROM repos r
+                 WHERE EXISTS (SELECT 1 FROM repo_blobs rb
+                               WHERE rb.repo_id = r.repo_id AND rb.blob = $1)
+                 LIMIT 1",
+                &[P::bytes(blob)],
+            )?
+            .is_some())
+    }
+
+    /// The `(changeset ID, body)` of the changesets after `from`, in ID
+    /// order, at most `limit`.
+    fn changeset_bodies_after(
+        &mut self,
+        from: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let rows = self.c.query(
+            "SELECT id, body FROM changesets WHERE id > $1 ORDER BY id LIMIT $2",
+            &[
+                P::bytes(from),
+                P::i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+            ],
+        )?;
+        Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+    }
+
+    /// The `(tree ID, body)` of the trees after `from`, in ID order, at
+    /// most `limit`.
+    fn tree_bodies_after(&mut self, from: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let rows = self.c.query(
+            "SELECT id, body FROM trees WHERE id > $1 ORDER BY id LIMIT $2",
+            &[
+                P::bytes(from),
+                P::i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+            ],
+        )?;
+        Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+    }
+
+    /// The `(node ID, body)` of the history nodes after `from`, in ID
+    /// order, at most `limit`.
+    fn history_node_bodies_after(
+        &mut self,
+        from: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let rows = self.c.query(
+            "SELECT id, body FROM history_nodes WHERE id > $1 ORDER BY id LIMIT $2",
+            &[
+                P::bytes(from),
+                P::i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+            ],
+        )?;
+        Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+    }
+
+    /// The `repo_blobs` rows after `(repo, blob)`, at most `limit`.
+    fn repo_blob_rows_after(
+        &mut self,
+        from_repo: RepoId,
+        from_blob: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(RepoId, Vec<u8>)>> {
+        let rows = self.c.query(
+            "SELECT repo_id, blob FROM repo_blobs
+             WHERE (repo_id, blob) > ($1, $2) ORDER BY repo_id, blob LIMIT $3",
+            &[
+                P::i64(from_repo.0),
+                P::bytes(from_blob),
+                P::i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+            ],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| (RepoId(row.get(0)), row.get(1)))
+            .collect())
+    }
+
+    /// The refs whose target no `repo_changesets` row of their repo holds.
+    fn dangling_refs(&mut self) -> Result<Vec<(RepoId, String, Vec<u8>)>> {
+        let rows = self.c.query(
+            "SELECT repo_id, name, target FROM refs r
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM repo_changesets rc
+                 WHERE rc.repo_id = r.repo_id AND rc.cs = r.target
+             )",
+            &[],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| (RepoId(row.get(0)), row.get(1), row.get(2)))
+            .collect())
+    }
+
+    /// Every land whose input or result changeset is not stored, as
+    /// `(land, changeset, which column)`.
+    fn lands_with_missing_changesets(&mut self) -> Result<Vec<(i64, Vec<u8>, &'static str)>> {
+        let mut out = Vec::new();
+        for (column, when) in [
+            ("input_cs", "1 = 1"),
+            ("result_cs", "result_cs IS NOT NULL"),
+        ] {
+            let sql = format!(
+                "SELECT land_id, {column} FROM lands l
+                 WHERE {when} AND NOT EXISTS (
+                     SELECT 1 FROM changesets c WHERE c.id = l.{column}
+                 )"
+            );
+            let rows = self.c.query(&sql, &[])?;
+            for row in rows {
+                out.push((row.get(0), row.get(1), column));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The derived rows after `(kind, version, cs)`, at most `limit`, with
+    /// whether their changeset is stored.
+    fn derived_rows_after(
+        &mut self,
+        kind: &str,
+        version: u32,
+        cs: &[u8],
+        limit: usize,
+    ) -> Result<Vec<FsckDerivedRow>> {
+        let rows = self.c.query(
+            "SELECT d.kind, d.version, d.cs, d.value,
+                    EXISTS (SELECT 1 FROM changesets c WHERE c.id = d.cs)
+             FROM derived d
+             WHERE (d.kind, d.version, d.cs) > ($1, $2, $3)
+             ORDER BY d.kind, d.version, d.cs LIMIT $4",
+            &[
+                P::text(kind),
+                P::i64(i64::from(version)),
+                P::bytes(cs),
+                P::i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+            ],
+        )?;
+        rows.iter()
+            .map(|row| -> Result<FsckDerivedRow> {
+                // d.version is BIGINT here and u32 in the row: read the
+                // int8 first, like every numeric expression here.
+                let version: i64 = row.get(1);
+                Ok(FsckDerivedRow(
+                    row.get(0),
+                    u32::try_from(version)
+                        .map_err(|_| Error::Corrupt(format!("derived version {version}")))?,
+                    row.get(2),
+                    row.get(3),
+                    row.get(4),
+                ))
+            })
+            .collect()
     }
 }
 

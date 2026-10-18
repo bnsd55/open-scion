@@ -1,0 +1,44 @@
+name: soak
+on:
+  schedule:
+    # Once a day, at 02:30 UTC.
+    - cron: "30 2 * * *"
+  pull_request:
+    # A change to the soak is tested by a short soak on its own PR.
+    paths:
+      - scripts/soak.sh
+      - .github/workflows/soak.yml
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: run length in minutes
+        default: "10"
+
+jobs:
+  soak:
+    name: soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@v2
+      - name: run the soak
+        env:
+          # The dispatch input sets the length; a pull_request run gets 3
+          # minutes. The input goes through env:, not through the run:
+          # string, so no shell sees it unquoted.
+          RUN_MINUTES: ${{ github.event_name == 'pull_request' && '3' || (github.event.inputs.minutes || '10') }}
+        run: timeout 2400 scripts/soak.sh
+      # The bounds live in the script; a failed bound fails the step and
+      # keeps the CSVs and logs.
+      - name: upload the samples and the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-artifacts
+          path: ${{ runner.temp }}/soak-artifacts/
+          if-no-files-found: ignore
