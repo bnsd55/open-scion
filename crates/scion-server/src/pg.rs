@@ -534,16 +534,22 @@ fn base_options() -> String {
     // A lock a writer waits for is a busy database: 5 s, like the busy
     // timeout of the SQLite store. A statement itself may walk the graph
     // for minutes, so only the lock is under the short clock.
-    String::from(&format!(
+    format!(
         "-csynchronous_commit=on -cstatement_timeout=600000 -clock_timeout={LOCK_TIMEOUT_FOR_WRITERS}"
-    ))
+    )
 }
 
 /// The lock clock every writer runs under: a lock a writer waits for is a
 /// busy database, answered Busy so the client retries. The one exception
 /// is the collector's key, whose wait has its own bound (the commit's
 /// `LOCK_TIMEOUT_FOR_KEY`); everything after it is back on this clock.
-const LOCK_TIMEOUT_FOR_WRITERS: &str = "'5s'";
+/// The value is bare: the base options take it as `-clock_timeout=<v>`,
+/// and the SQL `SET LOCAL` in `Pg::commit` quotes it.
+const LOCK_TIMEOUT_FOR_WRITERS: &str = "5s";
+
+/// How long the collector's key wait may run, in `Pg::commit` below: the
+/// queue drains as fast as the writers commit.
+const LOCK_TIMEOUT_FOR_KEY: &str = "60s";
 
 impl Pg {
     /// Opens the database at `url`, and the blob folder under `data`, as
@@ -721,10 +727,13 @@ impl Pg {
         // transaction is back on the writer's clock, so the row locks it
         // meets later still answer Busy at 5 s (SET LOCAL lasts to the
         // end of the transaction).
-        tx.c.query("SET LOCAL lock_timeout = '60s'", &[])?;
+        tx.c.query(
+            &format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT_FOR_KEY}'"),
+            &[],
+        )?;
         tx.c.query_opt("SELECT pg_advisory_xact_lock($1)", &[P::i64(PG_GC_LOCK)])?;
         tx.c.query(
-            &format!("SET LOCAL lock_timeout = {LOCK_TIMEOUT_FOR_WRITERS}"),
+            &format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT_FOR_WRITERS}'"),
             &[],
         )?;
         match f(&mut tx) {
