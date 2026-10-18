@@ -1934,7 +1934,6 @@ mod tests {
     #[tokio::test]
     async fn a_rename_of_a_dir_into_itself_is_refused() {
         let test = start(&[("a/b", b"b\n", Some(false)), ("a/c", b"c\n", Some(false))]).await;
-        let root = NFSFileSystem::root_dir(&test.vfs);
         let a = find(&test.vfs, "a").await.unwrap();
         let refused = test
             .vfs
