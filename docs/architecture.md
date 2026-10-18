@@ -449,7 +449,7 @@ any parent (section 7). The node is stored when a changeset is written, if
 each parent has one. In a database from before the commit graph, the first
 query derives it in steps.
 
-**Path history.** Kind `path_history` version 1 (`history::PathHistory`).
+**Path history.** Kind `path_history` version 2 (`history::PathHistory`).
 The article says that Scion builds dedicated structures for file blame and
 path history from the changesets, through the same mechanism. The form here
 is this project's choice. The value of a changeset is the root of its
@@ -465,29 +465,33 @@ entry holds:
 
 A changeset's tree is its first parent's tree, with the entries of its
 changed paths, and of the directories above them, set to the changeset. So
-a changeset stores one node per directory on its changed paths, as for its
-root tree, and shares the other nodes with its first parent. A node is one
-directory level, stored in `history_nodes` by the hash of its bytes. As
-with trees, no node is ever deleted: not after a version bump, not for a
-draft that never lands, and not for a changeset that a land stored again
-on a new head. The value is stored when a changeset is written, if its
-first parent has one.
+a changeset stores the nodes of the directories on its changed paths, as
+for its root tree, and shares the other nodes with its first parent. A
+node is one directory level, stored in `history_nodes` by the hash of its
+bytes. A level above 64 KiB is cut into chunks at content-defined
+boundaries (`history::Cut`): the mean chunk holds 128 entries, and a chunk
+that reaches 64 KiB is cut anyway. So a change in a directory of 100,000
+names stores about 47 KiB of new rows, not the 6.3 MB node of every name
+the directory ever had, and a change rewrites only the chunks its names
+land in. As with trees, no node is ever deleted for a draft that never
+lands, or for a changeset that a land stored again on a new head — but a
+version bump may drop the old-format rows, as migration 0007 did for
+trees, and the new version derives them again. The value is stored when a
+changeset is written, if its first parent has one.
 In a database from before path history, the first query that needs it
 derives it in steps. A golden test pins the root nodes of a fixed history.
 
 A deleted path keeps its entry, so a land on a base from before the delete
-still sees the change. The cost: a node holds every name that its directory
-ever had on the first-parent history, and never shrinks. A change rewrites
-each node on its paths whole, as it rewrites each tree on its paths, but a
-tree holds only the live names. With names of 12 bytes, a write in a
-directory of 10,000 names stores a history node of 630 KB and a tree of
-500 KB. With 100,000 names: 6.3 MB and 5.0 MB. A directory that churns
-through new names makes each later write in it larger
-([#114](https://github.com/bnsd55/open-scion/issues/114)).
+still sees the change. The cost: the rows of a level hold every name that
+its directory ever had on the first-parent history, and no row is ever
+deleted ([#114](https://github.com/bnsd55/open-scion/issues/114)). A
+change rewrites only the chunks its names land in, but the chunks it
+touches are rewritten whole, while a tree holds only the live names. A
+directory that churns through new names spreads its level over more
+chunks, and each later write in it reads and writes more of them.
 
-`Log` with a path (section 7) and the land check of an old base (section 5)
-read it. **Planned:** blame from the same structure
-([#61](https://github.com/bnsd55/open-scion/issues/61)). A unit test of
+`Log` with a path and blame (section 7) and the land check of an old base
+(section 5) read it. A unit test of
 `derived.rs` shows that a kind with another value type, which is derived only
 on demand, works the same way.
 
@@ -809,7 +813,7 @@ takes a revision, and resolves refs through `Objects`.
 | `GetChangeset` | `ChangesetV1` bytes. |
 | `ReadFile` | A regular file's content, or a symlink's target, in 1 MiB chunks. |
 | `ListDir` | One directory level as `TreeV1` bytes. |
-| `Log` | First-parent history, newest first. With a path, only the changesets that change it, however far apart. A reply holds at most 1,000 entries and about 32 MiB, in parts of up to 1 MiB of encoded entries, like `ReadFile`'s chunks; the last part's `next_changeset_id` says where to continue. `scn log` asks again until it has `-n` entries. |
+| `Log` | First-parent history, newest first. With a path, only the changesets that change it, however far apart. A reply streams in parts of up to 1 MiB of encoded entries, like `ReadFile`'s chunks; a part holds at most one page of 1,000 entries, and the last part's `next_changeset_id` says where to continue. `scn log` asks again until it has `-n` entries. |
 | `Blame` | For each range of lines in a file, the changeset that last changed it on first-parent history, across renames, and that changeset's author, time and path of the file. A reply streams in parts of up to 1 MiB of encoded ranges, like `Log`'s; the last part's `next_cursor` says where to continue. |
 | `MergeBase` | The best common ancestors of two changesets, over all parents. |
 | `IsAncestor` | Whether one changeset is an ancestor of another, over all parents. |
@@ -821,12 +825,13 @@ that changes the path: the file itself, or anything below it if it is a
 directory. It reads the path history (section 4). The path's entry in the
 given changeset's history tree names the newest such changeset, and its
 entry in the tree of that changeset's first parent names the one before it.
-So each entry reads one changeset and one node per path part, however many
-changesets lie between two entries. A node is a whole directory level, so a
-file in a large directory costs a lot per entry: about 630 KB at 10,000
-names ([#114](https://github.com/bnsd55/open-scion/issues/114)). So a call
-stops once it has read 64 MiB of nodes (`read::MAX_LOG_NODE_BYTES`), after
-its first entry, and `next_changeset_id` says where to continue. A call
+So each entry reads one changeset and the node rows of each path part,
+however many changesets lie between two entries. A level above 64 KiB is
+cut into chunks (section 4), but a name can land anywhere in its level, so
+a file in a directory that churns through names reads more rows per entry
+([#114](https://github.com/bnsd55/open-scion/issues/114)). So a call stops
+once it has read 64 MiB of nodes (`read::MAX_LOG_NODE_BYTES`), after its
+first entry, and `next_changeset_id` says where to continue. A call
 keeps the nodes it read, so it reads each node once. A `Log` with a path
 runs as a graph query (below): at most 4 at once, each until its 600 s
 deadline. On a database from before path history, its first call derives
@@ -1213,9 +1218,10 @@ starting at the root tree, and never says what it already has.
 checked against its ID on arrival, so no tier can change an object. Two
 answers cannot be checked that way: the changeset a ref points at
 (`ResolveRef`) and the root tree of a changeset (`GetRootTree`). The client
-trusts the server for both, and in v0.1 it trusts the tiers to pass them on
-unchanged. A tier forwards `ResolveRef`, and keeps only the `GetRootTree`
-answers that upstream gave. It never computes or invents either answer.
+trusts the server for both, and always asks the server for them: a tier
+serves `GetObjects` only, and answers `ResolveRef` and `GetRootTree` with
+`UNIMPLEMENTED` (`scion-tier/src/lib.rs`), so it cannot pass on, compute
+or invent either answer.
 
 **`scn checkout REV [--sparse DIR]... --into PATH`** (`scn/src/cmd/checkout.rs`)
 uses only `Objects`:
@@ -1540,8 +1546,7 @@ an untrusted network.
 |---|---|---|
 | Authentication | The server knows the principal of each of its tokens: `--token T` makes one principal, `default`, which may read and write every repo, and `--access FILE` maps the BLAKE3 digest of each token to a principal, with which repos it may read and which paths of a repo it may write (a write rule needs a read rule without a prefix, refused at load otherwise: a partial reader cannot write in v0.1). A read rule MAY name a path prefix: a principal whose read rules are all prefixes is a *partial reader* and reads through the view the server derives for it (the `Repo isolation` row). A principal with no rule for a repo cannot see it, so every call answers `NOT_FOUND`, as for a repo that does not exist. The server and each tier compare BLAKE3 digests of the tokens in constant time, and `scion-server hash-token` prints the digest that an access file wants, so the file never holds a token. A tier sends its own token upstream. | A tier knows one token, so one principal upstream. `GetObjects` carries no token: its permission is the read ticket, which the walk of every serving tier checks (see "Read tickets" below). Per-principal caps are on with `--access` (section 2 of protocol-v1); the request and upload-byte counts live in memory. A ticket is not checked against the rules in force: after a reload that narrows its principal, the old ticket works for at most 15 minutes from signing, on the server and the caches; to cut it at once, rotate the ticket key. |
 | Network | The server listens on `127.0.0.1:7878` and `scion-cache` on `127.0.0.1:7879` by default. A non-loopback address is refused unless `--insecure-listen` is given, or the process serves TLS (`--tls-cert` and `--tls-key`; a private CA is trusted by `scn` with `--tls-ca`). With `--tls-client-ca`, a tier must present a client certificate that CA signed. `scion-daemon` listens only on a Unix socket with mode 0600, in a directory that only its user can reach; it refuses any other. `scn` refuses a socket that another user owns. Both refuse a socket or data directory under a directory that another user can change: one that another user owns, or that group or others can write and has no sticky bit. | With TLS, the process trusts the server's certificate only if a CA is given; there are no public roots. Without TLS, the token and all data travel unencrypted: a bearer token over plain TCP to a non-loopback address stays refused. TLS certificates are not checked against hostnames beyond what the CA signs, and there is no revocation ([#14](https://github.com/bnsd55/open-scion/issues/14) tracks TLS; revocation has no issue). By choice, as OpenSSH's `StrictModes`, the directory checks refuse a group-writable directory (`chmod go-w` fixes it; with umask 002, new directories are group-writable), and read only the owner and the mode bits, not ACLs: an ACL that lets other users write a directory gets past them. |
-| Data directory | The server's `--data` directory holds the SQLite metadata, the blob files and the ticket key. The blobs are content-addressed files, and the metadata answers who may read what only through the server. The ticket key is wherever `--ticket-key` points, made mode 0600, and its directory chain is checked (`check_ancestors`, as for a socket). | The server checks no permissions of the data directory itself: keep it mode 0700 and owned by the user the server runs as. Whoever can read it has every blob and every row, and a copied data directory is a full copy of every repo. The same holds for a daemon's store (see "Read tickets"). The machine must be trusted, as the intro says. |
-| Postgres backend | With `--postgres-url`, the metadata lives in a Postgres database and the blob files stay in the data directory. A host off this machine must ask for TLS in the URL (`sslmode=require` or stronger) and present a certificate that `--postgres-ca` signed: `prefer`, which falls back to plaintext, is refused, and a `hostaddr` makes a URL non-local. A host on this machine may go without TLS. The URL (its password included) is never logged, and `SCION_POSTGRES_URL` takes it from the environment, not argv. The open checks `synchronous_commit=on`, migrates under a database lock, and one server process serves one database (an advisory lock; `fsck` and `gc` refuse a Postgres-backed directory). The data directory's `backend` marker refuses a mixed open. | Whoever administers the database reads every row of the metadata: the DBA is trusted as the machine is. A URL with a password in argv is readable through `ps` (the Client machine row), so pass it in the environment. The blob files outside the database keep every rule of the Data directory row. |
+| Data directory | The server's `--data` directory holds the blob files and the ticket key, and the SQLite metadata, unless the metadata is in Postgres (`--postgres-url`; then the directory holds only the blobs and the ticket key). The blobs are content-addressed files, and the metadata answers who may read what only through the server. Every open of a data directory (serve, import, fsck, gc, derive) refuses one that group or others can write, and one under a directory that another user can change (`check_ancestors`, as for a socket). The ticket key is wherever `--ticket-key` points, made mode 0600, with the same chain check. | The server does not demand mode 0700: a directory that only group or others can write is refused, the rest is the operator's choice. Whoever can read the directory has every blob and every row, and a copied data directory is a full copy of every repo. The same holds for a daemon's store (see "Read tickets"). The machine must be trusted, as the intro says. |
 | Repo isolation | Every call first checks the caller's read rule for the repo, and a repo it may not read answers `NOT_FOUND`. A principal whose read rules name prefixes (a *partial reader*) reads `ReadFile` and `ListDir` through the view the server derives from its prefixes, and a path outside them answers exactly as a missing one: the same code and the same text as the same path in a repo where it does not exist. `ResolveRef` resolves as for any caller, and `GetRootTree` mints the read ticket on the view root, so the walk behind the ticket cannot reach a hidden entry. Its history reads (`GetChangeset`, `Log`, `Blame`, `MergeBase`, `IsAncestor`, `Diff`) and every write answer `UNIMPLEMENTED` with one text, before any data is read. For a whole-repo reader, changesets and derived root trees are reached only through `repo_changesets`. A changeset names only blobs of its own repo (`repo_blobs`, section 5), so the path reads reach only the repo's own content. Path history nodes are reached only through the derived value of a changeset that the repo has, and name only changesets on its first-parent history. No answer of the write calls shows whether another repo has a blob: `CreateChangeset` gives the error of content that no repo stored, before any file is read, and `PutBlob` of such content takes the same write path as for new content. Two leaks stay: the rename frees the old file, and the page cache makes a shared blob fast. | `GetObjects` reads only what a read ticket's walk reaches; see "Read tickets" below. |
 | Lands | `GetLand` and request keys are scoped by the caller's principal: two tokens of one principal share a scope, and the retry of a land finds the outcome of its request key. | With `--token`, every caller is the same principal, `default`, so all callers share one scope. |
 | Checkout | `scn checkout` writes into a private temp directory with a random name. It renames it onto a new destination, or moves its entries up into an existing empty directory that the user owns, never over an entry already there. It never follows a symlink while writing or removing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure, or on SIGINT, SIGTERM or SIGHUP, the destination stays as it was. | The directory that gets the checkout (an existing destination, or a new one's parent) must not be writable by all users, unless it has the sticky bit: they could swap parts of the checkout. An existing destination that breaks this is refused. Members of a group that can write it are trusted. Where the filesystem has no rename that never replaces (NFS), any empty mode 0700 directory of the user at a top-level directory name counts as the checkout's claim after `mkdirat` fails with `EEXIST`, and is replaced. Where it has no hard links either (some FUSE filesystems), any symlink of the user with the same target at a top-level symlink name counts as made after `symlinkat` fails with `EEXIST`, and is kept. This is for a lost NFS version 3 reply, but a trusted user (the owner, a group member, root) can also put such an entry there: it is taken, and no data is lost. A filesystem that shows one owner for every entry (a FUSE or SMB mount with `-o uid=`) passes every ownership check. In the temp directory, an entry found after `EEXIST` that is what the call makes counts as made, unless a recorded path in the same directory has its inode. A filesystem that folds names but shows another inode number under each name (CIFS with `noserverino`, FUSE without `use_ino`) would let such a fold through only for two empty files or two symlinks with one target: the two paths then share one entry, with the same content. A folded directory always fails: each directory that the checkout made already holds an entry. The check reads only the mode bits, not ACLs: an ACL that lets other users add or delete entries gets past it. No Windows rules: Windows is unsupported, so device names and names that end
