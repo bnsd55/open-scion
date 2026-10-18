@@ -883,14 +883,10 @@ mod tests {
         let gc_store =
             crate::pg::Pg::open_test_shared(&url, &schema, 2, data.path(), Marker::default())
                 .unwrap();
-        let writer_store = crate::pg::Pg::open_test(
-            &url,
-            &schema,
-            2,
-            data.path().join("w").as_path(),
-            Marker::default(),
-        )
-        .unwrap();
+        // One data directory, as the gc CLI and the server share in
+        // production: the store UUID pairs it with the schema.
+        let writer_store =
+            crate::pg::Pg::open_test(&url, &schema, 2, data.path(), Marker::default()).unwrap();
         let gc_store = Backend::Postgres(gc_store);
         let writer = Backend::Postgres(writer_store);
         let repo = gc_store.write(|c| c.create_repo(REPO)).unwrap();
