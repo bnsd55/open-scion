@@ -873,8 +873,8 @@ async fn import_process_races_the_server_on_the_same_blob() {
     let blob_name = want.to_string();
     let until = Instant::now() + Duration::from_secs(120);
     let import_from = loop {
-        let line = fs::read_to_string(&lazy.trace)
-            .unwrap_or_default()
+        let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
+        let line = trace
             .lines()
             .find(|line| line.contains("lfs_rename") && line.contains(&blob_name));
         if let Some(line) = line {
@@ -922,8 +922,8 @@ async fn import_process_races_the_server_on_the_same_blob() {
     // lands after the import's, from another tmp folder. A second rename
     // never came, and the park never held: the seam failed.
     let server_from = wait_for("the server's rename of the raced blob", 60, || {
-        let lines: Vec<&str> = fs::read_to_string(&lazy.trace)
-            .unwrap_or_default()
+        let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
+        let lines: Vec<&str> = trace
             .lines()
             .filter(|line| line.contains("lfs_rename") && line.contains(&blob_name))
             .collect();
