@@ -309,42 +309,41 @@ impl Backend {
         }
     }
 
+    /// The import's test hooks and busy-retry count, the same state on
+    /// both backends.
+    #[doc(hidden)]
+    #[must_use]
+    fn hooks(&self) -> &crate::store::ImportHooks {
+        match self {
+            Self::Sqlite(store) => store.hooks(),
+            Self::Postgres(pg) => pg.hooks(),
+        }
+    }
+
     /// Sets the step the tests run after each batch of the import commits.
     #[doc(hidden)]
     pub fn set_after_batch(&self, step: Option<crate::store::AfterBatch>) {
-        match self {
-            Self::Sqlite(store) => store.set_after_batch(step),
-            Self::Postgres(pg) => pg.set_after_batch(step),
-        }
+        self.hooks().set_after_batch(step);
     }
 
     /// How many busy retries of the import's batches ran so far.
     #[doc(hidden)]
     #[must_use]
     pub fn busy_retries(&self) -> u64 {
-        match self {
-            Self::Sqlite(store) => store.busy_retries(),
-            Self::Postgres(pg) => pg.busy_retries(),
-        }
+        self.hooks().busy_retries()
     }
 
     /// Runs the test step of a batch boundary, with the count of batches
     /// done so far.
     #[doc(hidden)]
     pub fn run_after_batch(&self, batches: usize) {
-        match self {
-            Self::Sqlite(store) => store.run_after_batch(batches),
-            Self::Postgres(pg) => pg.run_after_batch(batches),
-        }
+        self.hooks().run_after_batch(batches);
     }
 
     /// Counts one busy retry of the import's batch.
     #[doc(hidden)]
     pub fn note_busy_retry(&self) {
-        match self {
-            Self::Sqlite(store) => store.note_busy_retry(),
-            Self::Postgres(pg) => pg.note_busy_retry(),
-        }
+        self.hooks().note_busy_retry();
     }
 }
 
