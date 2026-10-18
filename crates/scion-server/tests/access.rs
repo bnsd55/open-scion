@@ -218,7 +218,7 @@ async fn server(
     access: Access,
     token: &str,
 ) -> (Stop, Scion, Objects) {
-    let (stop, url) = serve(store, dir.path(), access).await;
+    let (stop, url) = serve(store, dir, access).await;
     (
         stop,
         scion(&url, Some(token)).await,
@@ -1198,8 +1198,8 @@ async fn the_authz_matrix_answers_as_documented() {
 
     // Two servers: one with the rules of `access`, one whose only
     // principal has no rule for any repo. Every column calls its own.
-    let (_rules_stop, rules_url) = serve(&store, access()).await;
-    let (_no_rules_stop, no_rules_url) = serve(&store, no_rules()).await;
+    let (_rules_stop, rules_url) = serve(&store, dir.path(), access()).await;
+    let (_no_rules_stop, no_rules_url) = serve(&store, dir.path(), no_rules()).await;
     let mut clients = Vec::new();
     for who in &CALLERS {
         let url = if who.rules { &rules_url } else { &no_rules_url };

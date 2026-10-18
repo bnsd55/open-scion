@@ -34,7 +34,7 @@ impl Interceptor for Bearer {
 }
 
 fn access() -> Access {
-    let digest = scion_proto::auth::token_digest("ci");
+    let digest = token_digest("ci");
     let digest = blake3::Hash::from(digest).to_hex().to_string();
     let text = format!("token\tci\t{digest}\nread\tci\t{REPO}\nwrite\tci\t{REPO}\n");
     Access::parse(&text).expect("the access file parses")
