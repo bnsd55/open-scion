@@ -879,4 +879,65 @@ mod tests {
         assert_eq!(data, content);
         assert_eq!(in_flight.available_permits(), IN_FLIGHT_BYTES);
     }
+
+    /// `tree_size` reads the byte length of a stored tree on every
+    /// backend. On Postgres the length expression is `octet_length(body)`,
+    /// whose type is int4, so the read must cast it to the int8 it reads
+    /// into: without the cast this panics with 'error deserializing
+    /// column 0', which the demo's `GetObjects` died of.
+    #[test]
+    fn a_tree_size_reads_the_octets_of_a_stored_tree() {
+        use scion_core::Tree;
+        use std::collections::BTreeMap;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::open_test(dir.path()).unwrap();
+        let tree = Tree {
+            entries: BTreeMap::new(),
+        };
+        let id = store.write(|c| c.put_tree(&tree)).unwrap();
+        let size = store.read(|c| c.tree_size(id)).unwrap();
+        let (body, _) = tree.encode_with_id();
+        assert_eq!(size, body.len(), "the length of the tree's bytes");
+    }
+
+    /// `fsck`'s derived-row walk reads each row's version (BIGINT on
+    /// Postgres) into a u32: the read converts the int8 first. A row
+    /// whose version overflows u32 is corruption, not a panic.
+    #[test]
+    fn a_fsck_derived_row_reads_its_version() {
+        use crate::meta::MetaTx as _;
+        use scion_core::{Changeset, IdentityTime};
+        use std::collections::BTreeMap;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::open_test(dir.path()).unwrap();
+        let repo = store.write(|c| c.create_repo("fsck-rows")).unwrap();
+        // The derived table's foreign key names a stored changeset.
+        let cs = store
+            .write(|c| {
+                c.insert_changeset(
+                    repo,
+                    &Changeset {
+                        parents: Vec::new(),
+                        author: IdentityTime {
+                            name: b"A".to_vec(),
+                            email: b"a@example.com".to_vec(),
+                            unix_secs: 1,
+                            tz_offset_minutes: 0,
+                        },
+                        committer: None,
+                        message: b"probe\n".to_vec(),
+                        changes: BTreeMap::new(),
+                    },
+                )
+            })
+            .unwrap();
+        store
+            .write(|c| c.put_derived("probe", 3, cs, &[1, 2, 3]))
+            .unwrap();
+        let rows = store
+            .read(|c| c.derived_rows_after("probe", 0, cs.as_bytes(), 10))
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the probe row");
+        assert_eq!(rows[0].1, 3, "the row's version");
+    }
 }

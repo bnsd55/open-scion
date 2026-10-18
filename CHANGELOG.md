@@ -176,6 +176,13 @@ The first release: the server, its cache tiers, and the `scn` client.
   diff` prints git's warning about skipped inexact rename detection.
 ### Fixed
 
+- A write that the disk refused no longer looks like a server bug
+  (#247): an out-of-space file write, SQLite metadata database or
+  Postgres metadata database answers `RESOURCE_EXHAUSTED`, "the server
+  is out of disk space; retry later", with no path in the reply; the
+  server log carries the path and the operation. A cut-off write leaves
+  no torn blob file, and an import that ran out of space is not retried
+  while the disk is full.
 - `Log` no longer repeats a page past the first scan (`#203`): a call
   whose `limit` crossed one internal page of 1,000 entries got those
   entries twice.
