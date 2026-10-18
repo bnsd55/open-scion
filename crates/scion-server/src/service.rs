@@ -94,6 +94,35 @@ const TX_AGE_PERIOD: Duration = Duration::from_secs(5);
 /// Keeps the `scion_pg_tx_age_seconds` gauge current: the age of the
 /// oldest open Postgres read transaction, sampled every [`TX_AGE_PERIOD`]
 /// until `stop` resolves. On SQLite the sample is always zero.
+/// Polls the free space of the data directory's filesystem into the
+/// gauge. The latest poll is the value; a failed stat keeps the last
+/// good value and logs once a poll. The poll stops when the server
+/// does.
+fn spawn_free_space_poll(
+    data: std::path::PathBuf,
+    metrics: Arc<Metrics>,
+    stop: tokio::sync::watch::Receiver<()>,
+) {
+    tokio::spawn(async move {
+        let mut stop = stop;
+        loop {
+            let data = data.clone();
+            let free = tokio::task::spawn_blocking(move || crate::store::free_bytes(&data));
+            match free.await {
+                Ok(Ok(bytes)) => metrics.data_free_bytes(bytes),
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "cannot stat the data directory's free space");
+                }
+                Err(e) => tracing::warn!(error = %e, "the free-space poll failed"),
+            }
+            tokio::select! {
+                () = tokio::time::sleep(FREE_SPACE_POLL) => {}
+                _ = stop.changed() => break,
+            }
+        }
+    });
+}
+
 async fn pg_tx_age_sample(store: Backend, metrics: Arc<Metrics>, mut stop: watch::Receiver<()>) {
     let mut tick = tokio::time::interval(TX_AGE_PERIOD);
     loop {
@@ -217,29 +246,8 @@ pub async fn serve(
         let _ = stop_tx.send(());
     });
     // The free space of the data directory's filesystem, so the operator
-    // sees a full drive before the server hits it. The latest poll is
-    // the gauge; a failed stat keeps the last good value and logs once
-    // a poll.
-    {
-        let (metrics, data, mut stop) = (Arc::clone(&metrics), data, stop_rx.clone());
-        tokio::spawn(async move {
-            loop {
-                let data = data.clone();
-                let free = tokio::task::spawn_blocking(move || crate::store::free_bytes(&data));
-                match free.await {
-                    Ok(Ok(bytes)) => metrics.data_free_bytes(bytes),
-                    Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "cannot stat the data directory's free space");
-                    }
-                    Err(e) => tracing::warn!(error = %e, "the free-space poll failed"),
-                }
-                tokio::select! {
-                    () = tokio::time::sleep(FREE_SPACE_POLL) => {}
-                    _ = stop.changed() => break,
-                }
-            }
-        });
-    }
+    // sees a full drive before the server hits it.
+    spawn_free_space_poll(data, Arc::clone(&metrics), stop_rx.clone());
     tokio::spawn(pg_tx_age_sample(
         store,
         Arc::clone(&metrics),
