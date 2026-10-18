@@ -314,6 +314,7 @@ impl PgClient {
                     // most, not one until the process restarts. A reconnect
                     // inside a transaction loses the transaction.
                     let lost_tx = tx.in_progress();
+                    let mut reconnected = false;
                     if client.is_closed() {
                         match connect_on(&url, ca.as_deref(), &options) {
                             Ok(fresh) => {
@@ -331,6 +332,30 @@ impl PgClient {
                                 continue;
                             }
                         }
+                        reconnected = true;
+                    }
+                    // A transaction the reconnect dropped refuses this job
+                    // too: it was asked while the old connection held the
+                    // transaction, and the new one holds none (its COMMIT
+                    // would answer Ok about a transaction that is gone).
+                    if reconnected && lost_tx && !job.sql.starts_with("ROLLBACK") {
+                        let _ = job.reply.send(Err(Error::Corrupt(
+                            "the transaction was lost with the connection; \
+                             roll it back and run it again"
+                                .into(),
+                        )));
+                        continue;
+                    }
+                    if !setup.ok() {
+                        // The setup failed on a client that still lives: a
+                        // network break left the old session of this very
+                        // connection holding the lock, and the session dies
+                        // some while after the connection did. One retry a
+                        // job, so the recovery needs no restart of the
+                        // process; until it comes, the caller sees the same
+                        // answer as before.
+                        setup = Setup::new(schema.as_deref(), exclusive, &mut client);
+                        setup_held = setup_held || setup.ok();
                     }
                     if !setup.ok() {
                         let message = if setup_held {
@@ -1093,11 +1118,14 @@ fn connect_on(url: &str, ca: Option<&Path>, options: &str) -> Result<Client> {
                 .to_owned(),
         ));
     }
+    // A connect that fails is a database the caller may wait for: the
+    // same states a statement answers, mapped the same way, so a caller
+    // that retries a busy database retries a starting one too.
     let client = match (local, ca) {
         // The connector upgrades every connection, and checks the
         // certificate the server presents against `ca`.
-        (_, Some(ca)) => config.connect(make_tls(ca)?)?,
-        (true, None) => config.connect(NoTls)?,
+        (_, Some(ca)) => config.connect(make_tls(ca)?).map_err(map_pg_error)?,
+        (true, None) => config.connect(NoTls).map_err(map_pg_error)?,
         (false, None) => {
             return Err(Error::InvalidArgument(
                 "the database host is off this machine: give --postgres-ca, \
@@ -1184,9 +1212,9 @@ fn make_tls(ca: &Path) -> Result<MakeRustlsConnect> {
 fn migrate(client: &mut PgClient) -> Result<()> {
     // One process at a time migrates: a lock of the session, held across
     // the migrations, so a server and an import started together take
-    // turns, and the version the loser reads is the one the winner left.
-    // A lock past its 5 s clock leaves the taker busy, and the importer
-    // retries.
+    // turns while the migrations are quick, and the version the loser
+    // reads is the one the winner left. A lock past its 5 s clock leaves
+    // the taker busy: an open that hits one waits and tries again.
     client.query_opt("SELECT pg_advisory_lock($1)", &[P::i64(SCHEMA_LOCK)])?;
     let outcome = migrate_under_lock(client);
     // The lock lives on the client's session: it goes back whatever the

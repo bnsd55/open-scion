@@ -952,17 +952,26 @@ fn a_second_server_process_is_refused() {
         return;
     }
     let (dir, _server) = open_store();
-    let out = common::spawn_guard::across_spawn(|| {
-        server_process(
-            dir.path(),
-            &["serve", "--token", "t", "--listen", "127.0.0.1:0"],
-        )
-        .output()
-    })
-    .unwrap();
+    // On Postgres the second server carries the URL itself: the database
+    // is what is taken, and the refusal comes at its open.
+    let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap_or_default();
+    let extra: &[&str] = if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
+        &["--postgres-url", url.as_str()]
+    } else {
+        &[]
+    };
+    let mut args = vec!["serve", "--token", "t", "--listen", "127.0.0.1:0"];
+    args.extend_from_slice(extra);
+    let out =
+        common::spawn_guard::across_spawn(|| server_process(dir.path(), &args).output()).unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("in use by another server"), "{stderr}");
+    let said = if extra.is_empty() {
+        stderr.contains("in use by another server")
+    } else {
+        stderr.contains("another server holds this database")
+    };
+    assert!(said, "{stderr}");
 }
 
 /// Creates the import's repo up front, so the import's first write is a

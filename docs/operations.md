@@ -111,29 +111,31 @@ never stores them.
 
 ```sh
 scion-server --data /srv/scion \
-  --postgres-url postgres://user@dbhost/scion \
+  --postgres-url postgres://user@dbhost/scion?sslmode=require \
   --postgres-ca /srv/scion/db-ca.pem serve --access /srv/scion/access.txt
 ```
 
-- `--postgres-url` names the database. `--postgres-ca` (a PEM file) is
-  required when that host is not this machine: the database must present a
-  certificate it signed, and there is no mode that accepts any certificate.
-  A host on this machine (`localhost`, a loopback address) may go without
-  it.
+- `--postgres-url` names the database. Off this machine the URL must ask
+  for TLS (`sslmode=require`): the open refuses a remote URL that does not.
+- `--postgres-ca` (a PEM file) is required with a remote host too: the
+  database must present a certificate it signed, and there is no mode that
+  accepts any certificate. A host on this machine (`localhost`, a loopback
+  address) may go without either.
 - The open checks the database runs `synchronous_commit=on`: a returned
   commit must be durable. A database that answers otherwise is refused.
 - The open migrates the database's schema to this build's version, one
-  transaction per migration, under a database lock, so a server and an
-  import started together take turns. A database of a newer build is
-  refused: run that build's server.
+  transaction per migration, under a database lock with the same 5 s clock:
+  an open that waits longer answers busy, and the caller retries. A
+  database of a newer build is refused: run that build's server.
 - One server process serves one database: a second `serve` on the same
   `--postgres-url` fails at its open with "another server holds this
   database". An import does not take that lock and runs beside a server.
 - A write that waits for another writer's lock gives up after 5 s and
   answers unavailable, like the SQLite store past its busy timeout; the
   client retries.
-- `fsck` and `gc` read the data directory's own database, so on a
-  Postgres-backed server both refuse to run with exit 2.
+- `fsck` and `gc` read the data directory's own database. On a
+  Postgres-backed server they refuse: with `--postgres-url` they exit 2;
+  without it the directory's own marker refuses them with exit 1.
 - The choice is recorded in the data directory's `backend` file: a
   `--postgres-url` open refuses a directory that holds SQLite metadata, and
   a plain open refuses a directory it names, so a second, empty store
