@@ -3155,6 +3155,49 @@ mod pool_tests {
         }
     }
 
+    /// A reader that goes back to the pool is taken again. The take's
+    /// tail reports the busy gauge, and the report takes the idle lock
+    /// that the take itself still held: the first read of a store then
+    /// hung forever, with no panic and nothing on the database. A 10 s
+    /// ceiling keeps this a fast failure that names the step.
+    #[test]
+    fn a_reader_taken_and_given_back_is_taken_again() {
+        let Some(pg) = pg() else { return };
+        let pg = Arc::new(pg);
+        let done = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            {
+                let pg = Arc::clone(&pg);
+                let done = Arc::clone(&done);
+                scope.spawn(move || {
+                    for round in 1..=2 {
+                        pg.read_bounded(
+                            |tx| {
+                                tx.c.query_opt("SELECT 1", &[])?;
+                                Ok(())
+                            },
+                            Duration::from_secs(30),
+                            Duration::from_secs(30),
+                            Duration::from_secs(5),
+                        )
+                        .unwrap();
+                        done.store(round, AtomicOrdering::SeqCst);
+                    }
+                });
+            }
+            let wait = std::time::Instant::now() + Duration::from_secs(10);
+            while done.load(AtomicOrdering::SeqCst) < 2 && std::time::Instant::now() < wait {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert_eq!(
+                done.load(AtomicOrdering::SeqCst),
+                2,
+                "the pool take deadlocked at step {}",
+                done.load(AtomicOrdering::SeqCst) + 1
+            );
+        });
+    }
+
     /// The pool wait lands in the histogram, and the busy gauge returns
     /// to zero when the reads are done.
     #[test]
