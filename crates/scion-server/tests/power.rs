@@ -170,13 +170,20 @@ impl Lazyfs {
 
     /// The cut: drops every cached write that was not fsynced. The command
     /// runs through the faults fifo, and the completed fifo answers when the
-    /// cache is cleared.
+    /// cache is cleared. The answer is waited for behind a ceiling, so a cut
+    /// that never completes fails in seconds and names its step.
     fn cut(&mut self) {
         let mut fifo = fs::OpenOptions::new().write(true).open(&self.fifo).unwrap();
         fifo.write_all(b"lazyfs::clear-cache\n").unwrap();
-        let mut done = [0u8; 64];
-        let n = self.completed.read(&mut done).unwrap();
-        let done = String::from_utf8_lossy(&done[..n]).into_owned();
+        let completed = self.completed.try_clone().unwrap();
+        let done = std::thread::spawn(move || {
+            let mut done = [0u8; 64];
+            let n = completed.read(&mut done).unwrap();
+            String::from_utf8_lossy(&done[..n]).into_owned()
+        });
+        let done = wait_for("clear-cache to finish", 15, move || {
+            done.is_finished().then(|| done.join().unwrap())
+        });
         assert!(done.contains("finished::clear-cache"), "{done:?}");
     }
 }
@@ -294,7 +301,10 @@ async fn every_reply_survives_a_power_cut() {
         eprintln!("round {round}: cut done");
         drop(server);
         for client in clients {
-            let mut got = client.await.unwrap();
+            let mut got = tokio::time::timeout(Duration::from_secs(60), client)
+                .await
+                .unwrap_or_else(|_| panic!("a client never finished after the kill"))
+                .unwrap();
             ledger.blobs.append(&mut got.blobs);
             cut_lands += got.lands.iter().filter(|sent| sent.reply.is_none()).count();
             ledger.lands.append(&mut got.lands);
@@ -314,8 +324,23 @@ async fn every_reply_survives_a_power_cut() {
     assert!(total > 0, "the clients did little work");
 }
 
-/// How many clients put the same blob at once in one wave of the W1 test.
 const RACERS: usize = 16;
+
+/// Waits for one step of the cut sequence to finish, for at most `secs`
+/// seconds, and fails naming the step: a hang must say where it hangs.
+fn wait_for<T>(step: &str, secs: u64, mut ready: impl FnMut() -> Option<T>) -> T {
+    let give_up = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(done) = ready() {
+            return done;
+        }
+        assert!(
+            Instant::now() < give_up,
+            "the cut sequence hung at {step} for over {secs} s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
 /// How many waves of racing puts one round of the W1 test runs.
 const WAVES: usize = 4;
@@ -497,13 +522,17 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
         ));
         server.freeze();
         lazy.cut();
-        let (ids, cut) = flight.await;
+        // The kill comes before the join: the racers of the wave hang on
+        // the frozen server, and only the kill lets their calls fail.
+        drop(server);
+        let (ids, cut) = tokio::time::timeout(Duration::from_secs(30), flight)
+            .await
+            .unwrap_or_else(|_| panic!("the cut wave's racers never finished"));
         events.line(&format!(
             "round {round} wave {wave}: {} acked before the freeze, {cut} cut",
             ids.len()
         ));
         acked.extend(ids);
-        drop(server);
         // The store reopens from the backing directory: what `LazyFS`
         // persisted, and nothing else.
         let data = lazy.backing.join("data");
@@ -605,7 +634,9 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
         let backing = lazy.backing.join("data");
         let store = Store::open_shared(&backing).unwrap();
         for (id, _) in &acked {
-            let status = store.blobs().verify(*id).unwrap();
+            let status = wait_for("the checker's verify", 30, || {
+                Some(store.blobs().verify(*id).unwrap())
+            });
             assert_eq!(status, BlobStatus::Valid, "acknowledged blob {id}");
         }
         drop(store);
