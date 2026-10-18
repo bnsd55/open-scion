@@ -401,7 +401,7 @@ fn cs_string(cs: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::auth::Caller;
-    use crate::backend::{Backend, Marker};
+    use crate::backend::Backend;
     use crate::db::SqliteTx;
     use crate::deadline::Deadline;
     use crate::land::{LandRequest, Lands};
@@ -873,22 +873,13 @@ mod tests {
             eprintln!("skip on sqlite: the lock is the write lock itself");
             return;
         }
-        let url = crate::backend::test_url().unwrap();
-        let dir = TempDir::new().unwrap();
-        let schema = crate::backend::test_schema(dir.path());
-        let data = TempDir::new().unwrap();
         // The collector side opens the way the `gc` CLI does - shared,
         // with no one-server lock - and the writer the way a server
-        // does, with the per-schema lock.
-        let gc_store =
-            crate::pg::Pg::open_test_shared(&url, &schema, 2, data.path(), Marker::default())
-                .unwrap();
-        // One data directory, as the gc CLI and the server share in
-        // production: the store UUID pairs it with the schema.
-        let writer_store =
-            crate::pg::Pg::open_test(&url, &schema, 2, data.path(), Marker::default()).unwrap();
-        let gc_store = Backend::Postgres(gc_store);
-        let writer = Backend::Postgres(writer_store);
+        // does, with the per-schema lock. One data directory, as they
+        // share in production: the store UUID pairs it with the schema.
+        let dir = TempDir::new().unwrap();
+        let gc_store = Backend::open_test_shared(dir.path()).unwrap();
+        let writer = Backend::open_test(dir.path()).unwrap();
         let repo = gc_store.write(|c| c.create_repo(REPO)).unwrap();
         let b = gc_store.blobs().put(b"locked\n").unwrap();
         writer.write(|c| c.add_repo_blob(repo, b)).unwrap();
