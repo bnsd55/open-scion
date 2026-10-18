@@ -104,15 +104,21 @@ fn is_out_of_space(e: &Error) -> bool {
     }
 }
 
-/// The client's view of the error: one fixed out-of-space reply.
+/// The client's view of the error: one fixed out-of-space reply. The
+/// status is built from an error of the same kind - the mapping is a
+/// pure function of the error's code.
 fn is_resource_exhausted(e: &Error) -> bool {
-    let status = tonic::Status::from(match e {
+    let error = match e {
         Error::Io(io) => Error::Io(std::io::Error::from_raw_os_error(
             io.raw_os_error().unwrap(),
         )),
-        Error::Db(db) => Error::Db(rusqlite::Error::from_errno(db.sqlite_error_code().unwrap())),
+        Error::Db(_) => Error::Db(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            None,
+        )),
         _ => return false,
-    });
+    };
+    let status = tonic::Status::from(error);
     status.code() == tonic::Code::ResourceExhausted
         && status.message() == "the server is out of disk space; retry later"
 }
