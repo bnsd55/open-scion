@@ -344,7 +344,7 @@ impl EventLog {
     }
 
     /// One event, now to stderr and now to the file.
-    fn line(&self, line: String) {
+    fn line(&self, line: &str) {
         eprintln!("{line}");
         if let Ok(mut slot) = self.file.lock() {
             if let Some(file) = slot.as_mut() {
@@ -379,11 +379,11 @@ async fn race_wave(
                 barrier.wait().await;
                 match put_blob(&mut scion, &content).await {
                     Ok(id) => {
-                        log.line(format!("round {round} wave {wave} racer {i}: acked {id}"));
+                        log.line(&format!("round {round} wave {wave} racer {i}: acked {id}"));
                         (id, content)
                     }
                     Err(status) => {
-                        log.line(format!(
+                        log.line(&format!(
                             "round {round} wave {wave} racer {i}: put failed {status:?}"
                         ));
                         panic!("racer {i}: put failed: {status:?}");
@@ -395,7 +395,7 @@ async fn race_wave(
     let mut ids = Vec::new();
     for racer in racers {
         let (id, content) = racer.await.unwrap();
-        log.line(format!(
+        log.line(&format!(
             "round {round} wave {wave}: collected {id}, want {}",
             BlobId::of(&content)
         ));
@@ -426,38 +426,39 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
     let dir = tempfile::tempdir().unwrap();
     // The server's log goes where CI can upload it: next to the LazyFS
     // trace, when the run named that directory.
-    let server_log = std::env::var_os("SCION_LAZYFS_TRACE_DIR")
-        .map(|dir| {
+    let server_log = std::env::var_os("SCION_LAZYFS_TRACE_DIR").map_or_else(
+        || dir.path().join("race-server.log"),
+        |dir| {
             let dir = PathBuf::from(dir);
             fs::create_dir_all(&dir).unwrap();
             dir.join("race-server.log")
-        })
-        .unwrap_or_else(|| dir.path().join("race-server.log"));
+        },
+    );
     let events = EventLog::new("race-w1");
     let mut total = 0;
     // Rounds from 100 up: the trace file and the mount log of a round are
     // named after it, and must not collide with the other tests' rounds.
     for round in 100..100 + rounds {
-        events.line(format!("round {round}: mounts"));
+        events.line(&format!("round {round}: mounts"));
         let mut lazy = Lazyfs::start(dir.path(), &lazyfs, round);
         let data = lazy.mount.join("data");
         create_repo(&data);
         let server = Server::start(&data, &server_log);
-        events.line(format!("round {round}: server up"));
+        events.line(&format!("round {round}: server up"));
         // Acked waves: every put is answered before the cut, so every one
         // of them must survive it.
         let mut acked = Vec::new();
         for wave in 0..WAVES - 1 {
             let content = rng.bytes(3 << 10);
             let want = BlobId::of(&content);
-            events.line(format!(
+            events.line(&format!(
                 "round {round} wave {wave}: starts, one blob {want}"
             ));
             let ids = race_wave(&events, round, wave, server.url.clone(), content).await;
             assert!(ids.windows(2).all(|w| w[0] == w[1]), "one blob ID");
             acked.extend(ids);
         }
-        events.line(format!("round {round}: cut after the acked waves"));
+        events.line(&format!("round {round}: cut after the acked waves"));
         lazy.cut();
         // A wave cut in flight: a put whose sync the cut caught may lose
         // its file, but a reply still binds the server, and whatever
@@ -465,14 +466,14 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
         let wave = WAVES - 1;
         let content = rng.bytes(3 << 10);
         let want = BlobId::of(&content);
-        events.line(format!(
+        events.line(&format!(
             "round {round} wave {wave}: starts in flight, one blob {want}"
         ));
         let started = Instant::now();
         let flight = race_wave(&events, round, wave, server.url.clone(), content);
         let delay = u64::try_from(rng.below(40)).unwrap() + 4;
         tokio::time::sleep(Duration::from_millis(delay)).await;
-        events.line(format!(
+        events.line(&format!(
             "round {round}: cut mid-wave at {} ms",
             started.elapsed().as_millis()
         ));
@@ -483,15 +484,15 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
         // persisted, and nothing else.
         let data = lazy.backing.join("data");
         let store = Store::open_shared(&data).unwrap();
-        events.line(format!("round {round}: reopens, {} acked", acked.len()));
+        events.line(&format!("round {round}: reopens, {} acked", acked.len()));
         for id in &acked {
             let status = store.blobs().verify(*id).unwrap();
-            events.line(format!("round {round}: verify acked {id}: {status:?}"));
+            events.line(&format!("round {round}: verify acked {id}: {status:?}"));
             assert_eq!(status, BlobStatus::Valid, "acknowledged blob {id}");
         }
         for id in blob_files(&data) {
             let status = store.blobs().verify(id).unwrap();
-            events.line(format!("round {round}: verify file {id}: {status:?}"));
+            events.line(&format!("round {round}: verify file {id}: {status:?}"));
             assert_eq!(status, BlobStatus::Valid, "stored blob file {id}");
         }
         drop(store);
