@@ -250,7 +250,7 @@ async fn hold_slot(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_principal_at_its_cap_is_refused_while_another_goes_on() {
-    let (_dir, store) = store();
+    let (dir, store) = store();
     let access = access(&["alice", "bob"]);
     // One request in flight per principal.
     let (stop, channel) = server(&store, access, Quotas::new(Some(1), None)).await;
@@ -297,7 +297,7 @@ async fn a_principal_at_its_cap_is_refused_while_another_goes_on() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_upload_over_the_byte_cap_is_refused_and_frees_on_exit() {
-    let (_dir, store) = store();
+    let (dir, store) = store();
     let access = access(&["alice", "bob"]);
     let (stop, channel) = server(&store, access, Quotas::new(None, Some(10))).await;
 
@@ -358,7 +358,7 @@ async fn an_upload_over_the_byte_cap_is_refused_and_frees_on_exit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stream_holds_its_slot_until_the_stream_ends() {
-    let (_dir, store) = store();
+    let (dir, store) = store();
     let access = access(&["alice", "bob"]);
     // One request in flight per principal. A clone of the caps shares the
     // server's counts, so the test reads its own state instead of polling
@@ -477,7 +477,7 @@ async fn hold_objects(
 /// more read, while another principal's read goes through.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_get_objects_stream_holds_its_principals_slot() {
-    let (_dir, store) = store();
+    let (dir, store) = store();
     let access = access(&["alice", "bob"]);
     let keys = scion_server::tickets::Keys::generate();
     // One request in flight per principal.

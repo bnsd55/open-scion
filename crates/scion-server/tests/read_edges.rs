@@ -177,7 +177,7 @@ async fn read_file(
 /// for a broken one would never see the empty tree.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_empty_directory_lists_as_one_part_of_no_entries() {
-    let (_dir, store, root) = store(&[]);
+    let (dir, store, root) = store(&[]);
     let (_stop, mut client) = serve(&store, dir.path()).await;
     let (parts, bytes) = list_dir(&mut client, &root, b"").await;
     assert_eq!(parts, 1, "the empty tree is its header only");
@@ -200,8 +200,8 @@ async fn the_part_seam_of_a_directory_loses_no_entry() {
         .map(|i| (format!("e{i:05}").into_bytes(), &b"x\n"[..]))
         .collect();
     files.push((vec![b'z'; pad_len], b"x\n"));
-    let (_dir_a, store_a, root) = store(&files);
-    let (_stop, mut client) = serve(&store_a, dir.path()).await;
+    let (dir_a, store_a, root) = store(&files);
+    let (_stop, mut client) = serve(&store_a, dir_a.path()).await;
 
     // Exactly one part, byte for byte as the format says.
     let (parts, bytes) = list_dir(&mut client, &root, b"").await;
@@ -216,8 +216,8 @@ async fn the_part_seam_of_a_directory_loses_no_entry() {
         .collect();
     files.push((vec![b'z'; pad_len], b"x\n"));
     files.push((b"zz".to_vec(), b"x\n"));
-    let (_dir_b, store_b, root) = store(&files);
-    let (_stop, mut client) = serve(&store_b, dir.path()).await;
+    let (dir_b, store_b, root) = store(&files);
+    let (_stop, mut client) = serve(&store_b, dir_b.path()).await;
     let (parts, bytes) = list_dir(&mut client, &root, b"").await;
     assert_eq!(parts, 2, "one entry over the part size");
     assert_eq!(
@@ -235,7 +235,7 @@ async fn the_part_seam_of_a_directory_loses_no_entry() {
 async fn a_name_at_the_cap_lists_and_reads_back() {
     let name = vec![b'f'; 4096];
     let body = b"cap\n".to_vec();
-    let (_dir, store, root) = store(&[(name.clone(), &body)]);
+    let (dir, store, root) = store(&[(name.clone(), &body)]);
     let (_stop, mut client) = serve(&store, dir.path()).await;
 
     let (parts, bytes) = list_dir(&mut client, &root, b"").await;
@@ -254,7 +254,7 @@ async fn a_name_at_the_cap_lists_and_reads_back() {
 /// answer `INVALID_ARGUMENT`, not `INTERNAL`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_path_over_the_cap_is_refused_as_invalid_argument() {
-    let (_dir, store, root) = store(&[(b"file.txt".to_vec(), b"body\n")]);
+    let (dir, store, root) = store(&[(b"file.txt".to_vec(), b"body\n")]);
     let (_stop, mut client) = serve(&store, dir.path()).await;
     let over = vec![b'g'; 4097];
     for note in ["list", "read"] {
@@ -290,7 +290,7 @@ async fn a_file_of_zero_one_part_and_one_part_plus_one_byte() {
     let one: Vec<u8> = vec![b'a'; CHUNK_BYTES];
     let mut over = one.clone();
     over.push(b'b');
-    let (_dir, store, root) = store(&[
+    let (dir, store, root) = store(&[
         (b"empty.txt".to_vec(), empty),
         (b"one.bin".to_vec(), &one),
         (b"over.bin".to_vec(), &over),

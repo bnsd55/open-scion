@@ -231,7 +231,7 @@ async fn server(
 /// rules, so its one answer is the uniform `UNIMPLEMENTED`.
 #[tokio::test(flavor = "multi_thread")]
 async fn writes_outside_a_prefix_are_denied_with_the_path() {
-    let (_dir, store, root, _blob) = store();
+    let (dir, store, root, _blob) = store();
     let access = access();
 
     // ci may write every path: a change outside `docs` is fine.
@@ -286,7 +286,7 @@ async fn writes_outside_a_prefix_are_denied_with_the_path() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn put_upload_create_and_land_need_write_rules() {
-    let (_dir, store, root, _blob) = store();
+    let (dir, store, root, _blob) = store();
     let access = access();
     let (_bob_stop, mut bob, _) = server(&store, dir.path(), access, "bob").await;
 
@@ -328,7 +328,7 @@ async fn put_upload_create_and_land_need_write_rules() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_lander_of_another_principals_changeset_needs_write() {
-    let (_dir, store, root, _blob) = store();
+    let (dir, store, root, _blob) = store();
     let access = access();
 
     // ci, who may write every path, creates a changeset.
@@ -506,7 +506,7 @@ mod req {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_principal_without_a_read_rule_sees_no_repo_on_any_rpc() {
-    let (_dir, store, root, blob) = store();
+    let (dir, store, root, blob) = store();
     let access = access();
 
     // Control: with a rule, the repo is there.
@@ -633,7 +633,7 @@ fn root_tree_id(store: &Backend, tip: ChangesetId) -> TreeId {
 /// answers exactly like a missing one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_partial_reader_reads_only_its_view() {
-    let (_dir, store, tip, _docs, _secret) = repo_with_docs_and_secret();
+    let (dir, store, tip, _docs, _secret) = repo_with_docs_and_secret();
     let (_stop, mut scion, mut objects) = server(&store, dir.path(), partial_access(), "pat").await;
     // The missing world: a second repo whose tree has `docs` only, served
     // to a whole reader, for the same-path comparison below.
@@ -727,7 +727,7 @@ async fn a_partial_reader_reads_only_its_view() {
 /// with the same uniform refusal.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_partial_reader_gets_no_history() {
-    let (_dir, store, tip, _docs, _secret) = repo_with_docs_and_secret();
+    let (dir, store, tip, _docs, _secret) = repo_with_docs_and_secret();
     let (_stop, mut scion, _) = server(&store, dir.path(), partial_access(), "pat").await;
     unimplemented(
         "GetChangeset",
@@ -756,7 +756,7 @@ async fn a_partial_reader_gets_no_history() {
 /// with the same prefixes deriving the same view.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_partial_readers_ticket_reaches_only_its_view() {
-    let (_dir, store, tip, docs, secret) = repo_with_docs_and_secret();
+    let (dir, store, tip, docs, secret) = repo_with_docs_and_secret();
     let (_stop, _scion, mut objects) = server(&store, dir.path(), partial_access(), "pat").await;
     // A whole-repo reader, for the real root it still gets.
     let whole_text = format!("token\tbob\t{}\nread\tbob\t{REPO}\n", hex("bob"));
@@ -864,7 +864,7 @@ async fn a_partial_readers_ticket_reaches_only_its_view() {
 /// uniform `UNIMPLEMENTED`, with no per-object difference.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_partial_reader_writes_nothing() {
-    let (_dir, store, root, _blob) = store();
+    let (dir, store, root, _blob) = store();
     let (_stop, mut scion, _) = server(&store, dir.path(), partial_access(), "pat").await;
     unimplemented(
         "PutBlob",
@@ -1173,7 +1173,7 @@ fn get_objects(clients: &Clients, prep: &Prep, _col: usize) -> Fut {
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_authz_matrix_answers_as_documented() {
-    let (_dir, store, root, blob) = store();
+    let (dir, store, root, blob) = store();
 
     // A changeset inside alice's prefix, stored as if she had created it.
     let guide_blob = put(&store, b"guide");
@@ -1309,7 +1309,7 @@ async fn the_authz_matrix_answers_as_documented() {
 /// must still run at once: the slots bound how many permits blame can hold.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_file_runs_while_the_blame_slots_are_full() {
-    let (_dir, store, root, _blob) = store();
+    let (dir, store, root, _blob) = store();
     // Five versions of a 1,048,576-line file: one blame call diffs at
     // least one version pair, which takes seconds, and stops at its diff
     // budget with a cursor.
