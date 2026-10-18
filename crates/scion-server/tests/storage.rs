@@ -228,7 +228,7 @@ fn a_write_on_a_read_only_disk_answers_unavailable_and_leaves_no_torn_file() {
 }
 
 #[test]
-fn a_read_on_a_failing_disk_answers_unavailable_and_keeps_serving_the_rest() {
+fn a_read_on_a_failing_disk_answers_internal_and_keeps_serving_the_rest() {
     let (_dir, store) = store();
     let one = store.blobs().put(b"one\n").unwrap();
     let two = store.blobs().put(b"two\n").unwrap();
