@@ -217,26 +217,10 @@ impl Metrics {
         self.pg_pool_wait[BUCKETS.len() + 1].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The pool-wait histogram's sum in microseconds and its count, for a
-    /// test that reads it without a scrape.
-    #[must_use]
-    pub fn pg_pool_wait_totals(&self) -> (u64, u64) {
-        (
-            self.pg_pool_wait[BUCKETS.len()].load(Ordering::Relaxed),
-            self.pg_pool_wait[BUCKETS.len() + 1].load(Ordering::Relaxed),
-        )
-    }
-
     /// Sets the gauge of Postgres read connections that are out of the
     /// pool.
     pub fn pg_readers_busy(&self, busy: u64) {
         self.pg_readers_busy.store(busy, Ordering::Relaxed);
-    }
-
-    /// The busy-readers gauge, for a test that reads it without a scrape.
-    #[must_use]
-    pub fn pg_readers_busy_gauge(&self) -> u64 {
-        self.pg_readers_busy.load(Ordering::Relaxed)
     }
 
     /// Sets the gauge of the age of the oldest open read transaction.
@@ -245,13 +229,6 @@ impl Metrics {
             u64::try_from(age.as_micros()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
-    }
-
-    /// The transaction-age gauge in microseconds, for a test that reads
-    /// it without a scrape.
-    #[must_use]
-    pub fn pg_tx_age_micros(&self) -> u64 {
-        self.pg_tx_age.load(Ordering::Relaxed)
     }
 
     /// The cache counters, for a test that reads them without a scrape.

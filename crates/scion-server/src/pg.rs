@@ -262,8 +262,6 @@ impl Readers {
         if let Some(at) = open.iter().position(|known| *known == started) {
             open.swap_remove(at);
         }
-        drop(open);
-        self.report_busy();
     }
 
     /// How many readers are out of the pool, for the busy gauge.
@@ -314,6 +312,10 @@ impl Drop for ReaderGuard<'_> {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(client);
+            // The gauge reads the pool after the client is back in it: a
+            // report before the push would leave one reader counted busy
+            // until the next take.
+            self.readers.report_busy();
             self.readers.returned.notify_one();
         }
     }
@@ -3200,9 +3202,29 @@ mod pool_tests {
         for hold in holds {
             hold.join().unwrap();
         }
-        assert_eq!(metrics.pg_readers_busy_gauge(), 0);
-        let (sum, count) = metrics.pg_pool_wait_totals();
-        assert!(count >= 1, "the wait was recorded");
+        // The gauges read the rendered text, as a scraper would: the
+        // busy gauge is back to zero, and the wait is in the histogram.
+        let text = metrics.render();
+        let gauge = text
+            .lines()
+            .find(|line| line.starts_with("scion_pg_readers_busy "))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
+        assert_eq!(gauge, 0, "{text}");
+        let count = text
+            .lines()
+            .find(|line| line.starts_with("scion_pg_pool_wait_seconds_count "))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+        assert!(count >= 1, "the wait was recorded: {text}");
+        let sum = text
+            .lines()
+            .find(|line| line.starts_with("scion_pg_pool_wait_seconds_sum "))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
         assert!(sum > 0, "sum {sum}");
         assert_eq!(pg.tx_age(), Duration::ZERO);
     }
