@@ -1079,20 +1079,23 @@ fn connect_exclusive(
     Ok(client)
 }
 
+/// The libpq `options` a connection starts with: the ones the URL carries
+/// first, then the backend's own, which win on a clash. The backend checks
+/// `synchronous_commit` itself after the connect, so an operator's
+/// `search_path` in the URL survives, and its clashes do not matter.
+fn merged_options(from_url: Option<&str>, own: &str) -> String {
+    match from_url {
+        Some(from_url) if !from_url.is_empty() => format!("{from_url} {own}"),
+        _ => own.to_owned(),
+    }
+}
+
 /// [`connect_with`]'s work: parse, then connect.
 fn connect_on(url: &str, ca: Option<&Path>, options: &str) -> Result<Client> {
     let mut config: Config = url
         .parse()
         .map_err(|e| Error::InvalidArgument(format!("cannot parse the database URL: {e}")))?;
-    // Options the URL carries go first, so the ones this backend sets last
-    // win: it checks `synchronous_commit` itself after the connect. An
-    // operator's `search_path` in the URL survives.
-    let from_url = config.get_options().unwrap_or_default();
-    let options = if from_url.is_empty() {
-        options.to_owned()
-    } else {
-        format!("{from_url} {options}")
-    };
+    let options = merged_options(config.get_options(), options);
     config.options(&options);
     // A dead connection is noticed in seconds, not held open forever.
     config.connect_timeout(std::time::Duration::from_secs(10));
@@ -2087,5 +2090,34 @@ impl Meta for Pg {
             self.inner.blobs.full_flush()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merged_options;
+
+    const OWN: &str = "-csynchronous_commit=on -cstatement_timeout=600000 -clock_timeout=5000";
+
+    #[test]
+    fn the_urls_options_survive_the_backends_own() {
+        assert_eq!(
+            merged_options(Some("--search_path=scion_test_1"), OWN),
+            format!("--search_path=scion_test_1 {OWN}")
+        );
+    }
+
+    #[test]
+    fn on_a_clash_the_backend_options_win() {
+        // The backend's option comes last, and a `-c` of the startup
+        // options overrides one before it.
+        let merged = merged_options(Some("-cstatement_timeout=1"), OWN);
+        assert!(merged.ends_with(OWN), "{merged}");
+    }
+
+    #[test]
+    fn a_url_without_options_gets_the_backends_only() {
+        assert_eq!(merged_options(None, OWN), OWN);
+        assert_eq!(merged_options(Some(""), OWN), OWN);
     }
 }
