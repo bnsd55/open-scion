@@ -286,6 +286,9 @@ async fn every_reply_survives_a_power_cut() {
         }
         eprintln!("round {round}: clients spawning");
         signals.killed.store(true, Ordering::SeqCst);
+        // The freeze: no reply can follow it, so no reply can follow the
+        // cut either ([#185]).
+        server.freeze();
         eprintln!("round {round}: cutting");
         lazy.cut();
         eprintln!("round {round}: cut done");
@@ -364,7 +367,7 @@ async fn race_wave(
     wave: usize,
     url: String,
     content: Vec<u8>,
-) -> Vec<BlobId> {
+) -> (Vec<BlobId>, usize) {
     let barrier = Arc::new(tokio::sync::Barrier::new(RACERS));
     let racers: Vec<_> = (0..RACERS)
         .map(|i| {
@@ -380,21 +383,33 @@ async fn race_wave(
                 match put_blob(&mut scion, &content).await {
                     Ok(id) => {
                         log.line(&format!("round {round} wave {wave} racer {i}: acked {id}"));
-                        (id, content)
+                        Ok((id, content))
                     }
                     Err(status) => {
+                        // The freeze ends the wave, so a racer still in
+                        // flight loses its call. No reply, no guarantee.
                         log.line(&format!(
                             "round {round} wave {wave} racer {i}: put failed {status:?}"
                         ));
-                        panic!("racer {i}: put failed: {status:?}");
+                        Err(status)
                     }
                 }
             })
         })
         .collect();
     let mut ids = Vec::new();
+    let mut failed = 0;
     for racer in racers {
-        let (id, content) = racer.await.unwrap();
+        let (id, content) = match racer.await.unwrap() {
+            Ok(put) => put,
+            Err(status) => {
+                failed += 1;
+                log.line(&format!(
+                    "round {round} wave {wave}: no reply, {failed} racers cut: {status:?}"
+                ));
+                continue;
+            }
+        };
         log.line(&format!(
             "round {round} wave {wave}: collected {id}, want {}",
             BlobId::of(&content)
@@ -402,7 +417,7 @@ async fn race_wave(
         assert_eq!(id, BlobId::of(&content));
         ids.push(id);
     }
-    ids
+    (ids, failed)
 }
 
 /// Issue #185, window W1. Many clients put the SAME blob at once, wave
@@ -454,15 +469,18 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
             events.line(&format!(
                 "round {round} wave {wave}: starts, one blob {want}"
             ));
-            let ids = race_wave(&events, round, wave, server.url.clone(), content).await;
+            let (ids, failed) = race_wave(&events, round, wave, server.url.clone(), content).await;
+            assert_eq!(failed, 0, "a put failed before the freeze");
             assert!(ids.windows(2).all(|w| w[0] == w[1]), "one blob ID");
             acked.extend(ids);
         }
         events.line(&format!("round {round}: cut after the acked waves"));
+        server.freeze();
         lazy.cut();
-        // A wave cut in flight: a put whose sync the cut caught may lose
-        // its file, but a reply still binds the server, and whatever
-        // reached the backing must be whole.
+        server.resume();
+        // A wave cut in flight: the freeze ends it, so no racer of the
+        // wave gets a reply past the cut. Whatever the acked waves put
+        // must be whole, and so must every file of the store.
         let wave = WAVES - 1;
         let content = rng.bytes(3 << 10);
         let want = BlobId::of(&content);
@@ -477,8 +495,14 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
             "round {round}: cut mid-wave at {} ms",
             started.elapsed().as_millis()
         ));
+        server.freeze();
         lazy.cut();
-        acked.extend(flight.await);
+        let (ids, cut) = flight.await;
+        events.line(&format!(
+            "round {round} wave {wave}: {} acked before the freeze, {cut} cut",
+            ids.len()
+        ));
+        acked.extend(ids);
         drop(server);
         // The store reopens from the backing directory: what `LazyFS`
         // persisted, and nothing else.
@@ -563,7 +587,9 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
         }
         // The cut, and writes the server fsyncs after it: their pages sit
         // in the daemon's cache, clean, when the server dies.
+        server.freeze();
         lazy.cut();
+        server.resume();
         for _ in 0..3 {
             let content = rng.bytes(1 << 10);
             let id = put_blob(&mut scion, &content).await.unwrap();

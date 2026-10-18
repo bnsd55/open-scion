@@ -154,6 +154,23 @@ impl Drop for Server {
     }
 }
 
+impl Server {
+    /// Freezes the server: SIGSTOP. Every reply a client got was sent
+    /// before the freeze, so a cut that follows can lose nothing that a
+    /// reply depends on ([#185]): on real hardware, nothing of the server
+    /// runs after a power cut, so no ack can follow one either.
+    pub fn freeze(&mut self) {
+        let pid = rustix::process::Pid::from_raw(self.child.id().cast_signed()).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::STOP).unwrap();
+    }
+
+    /// Resumes a frozen server: SIGCONT.
+    pub fn resume(&mut self) {
+        let pid = rustix::process::Pid::from_raw(self.child.id().cast_signed()).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::CONT).unwrap();
+    }
+}
+
 pub type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
 pub type Objects = ObjectsClient<InterceptedService<Channel, Bearer>>;
 
