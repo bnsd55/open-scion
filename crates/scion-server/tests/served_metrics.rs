@@ -104,16 +104,20 @@ async fn a_served_server_renders_the_operating_metrics() {
         }))
         .await
         .expect("the token may upload");
-    // The free-space poll runs before its first sleep.
-    let mut spins = 0;
-    while !metrics
-        .render()
-        .contains("scion_blob_sync_seconds_count 1\n")
-    {
-        spins += 1;
-        assert!(spins < 1_000_000, "the blob sync never rendered the flush");
-        tokio::task::yield_now().await;
+    // A full flush of the drive cache rides a PutBlob only where fsync
+    // leaves the drive cache (macOS); elsewhere the upload still landed.
+    if cfg!(target_vendor = "apple") {
+        let mut spins = 0;
+        while !metrics
+            .render()
+            .contains("scion_blob_sync_seconds_count 1\n")
+        {
+            spins += 1;
+            assert!(spins < 1_000_000, "the blob sync never rendered the flush");
+            tokio::task::yield_now().await;
+        }
     }
+    // The free-space poll runs before its first sleep.
     let text = metrics.render();
     assert!(text.contains("scion_data_free_bytes "), "{text}");
     // On Postgres, the changeset's write transaction waited for the
