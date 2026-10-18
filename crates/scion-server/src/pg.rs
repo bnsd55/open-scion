@@ -2398,8 +2398,20 @@ impl MetaTx for PgTx<'_> {
         )?;
         Ok(rows
             .iter()
-            .map(|row| FsckDerivedRow(row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
-            .collect())
+            .map(|row| -> Result<FsckDerivedRow> {
+                // d.version is BIGINT here and u32 in the row: read the
+                // int8 first, like every numeric expression here.
+                let version: i64 = row.get(1);
+                Ok(FsckDerivedRow(
+                    row.get(0),
+                    u32::try_from(version)
+                        .map_err(|_| Error::Corrupt(format!("derived version {version}")))?,
+                    row.get(2),
+                    row.get(3),
+                    row.get(4),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?)
     }
 }
 
