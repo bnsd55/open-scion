@@ -1085,8 +1085,9 @@ version, a server stops serving its package; its clients then get
 - Client changesets with no parent, several parents or a committer. Only git
   import makes them.
 - Text merge. Conflicts are path-level.
-- `Diff` renames in a diff of more than 10,000 entries or past the search
-  budget ([#107](https://github.com/bnsd55/open-scion/issues/107)).
+- Diff renames past the entry bound of the rename pass (1,000,000
+  entries), or past the inexact search's pair limit or budget
+  ([#107](https://github.com/bnsd55/open-scion/issues/107)).
 - `Blame` without per-call bounds
   ([#61](https://github.com/bnsd55/open-scion/issues/61)), and `Log` that
   follows renames.

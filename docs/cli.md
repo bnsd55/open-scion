@@ -47,10 +47,11 @@ Every command takes these flags, before or after the subcommand:
   directory and everything below it; repeat for more. An existing empty
   directory is kept; a signal removes what was written and then dies by
   the signal, so a shell reports 130 for Ctrl-C.
-- `scn mount DIR [REV]` (default `main`) — serve the ref as an NFSv3
-  filesystem that reads files on demand. `--no-mount` serves NFS but does
-  not try to mount: it prints the mount command instead. `scn unmount
-  DIR` stops the mount.
+- `scn mount DIR [REV]` (default `main`) — create `DIR` first (`mkdir
+  -p DIR`; `scn` refuses a missing mount point), then serve the ref as
+  an NFSv3 filesystem that reads files on demand. `--no-mount` serves
+  NFS but does not try to mount: it prints the mount command instead.
+  `scn unmount DIR` stops the mount.
 - `scn commit --message MESSAGE` (`-m`) — create a changeset on the server. It moves no
   ref; use `scn land` next. `--base REV` is the base (default `main`);
   `--put PATH=FILE` puts the content of local `FILE` at `PATH`
