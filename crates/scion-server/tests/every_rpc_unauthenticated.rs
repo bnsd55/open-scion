@@ -57,9 +57,14 @@ fn access() -> Access {
 
 /// A store whose repo `main` has one root changeset that puts `README`,
 /// and its blob.
-fn store() -> (tempfile::TempDir, Backend, scion_core::ChangesetId) {
+async fn store() -> (tempfile::TempDir, Backend, scion_core::ChangesetId) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Backend::open_test(dir.path()).unwrap();
+    let store = {
+        let path = dir.path().to_path_buf();
+        tokio::task::spawn_blocking(move || Backend::open_test(&path).unwrap())
+            .await
+            .unwrap()
+    };
     let blob = store.blobs().put(b"# hello\n").unwrap();
     let cs = scion_core::Changeset {
         parents: vec![],
@@ -359,8 +364,17 @@ fn declared() -> (Vec<(String, String)>, Vec<String>) {
 /// `main`, and the row count of every metadata table. The tables come
 /// from the store's own catalog, so a new table joins the check on its
 /// own. On Postgres the rows are counted through a client of the test
-/// database, in the schema of this data directory.
-fn state_of(store: &Backend, dir: &Path) -> (i64, Vec<i64>) {
+/// database, in the schema of this data directory. The reads block, so
+/// they run on a thread outside the runtime.
+async fn state_of(store: &Backend, dir: &Path) -> (i64, Vec<i64>) {
+    let store = store.clone();
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || state_of_blocking(&store, &dir))
+        .await
+        .unwrap()
+}
+
+fn state_of_blocking(store: &Backend, dir: &Path) -> (i64, Vec<i64>) {
     if Backend::test_is_postgres() {
         let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
         let schema = Backend::test_schema(dir).expect("the tests run on Postgres");
@@ -490,7 +504,7 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
         );
     }
 
-    let (dir, store, root) = store();
+    let (dir, store, root) = store().await;
     let (stop, url) = serve(&store, access()).await;
 
     let channel = Channel::from_shared(url.clone())
@@ -543,7 +557,7 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
         .expect("the right token may create the changeset the land names");
     // The baseline: everything the setup stored, nothing more. The
     // refused calls and the controls are compared against it.
-    let before = state_of(&store, dir.path());
+    let before = state_of(&store, dir.path()).await;
 
     for row in &rows {
         for (who, pair) in [("no token", &none), ("wrong token", &wrong)] {
@@ -568,7 +582,7 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
         }
     }
     // No refused call moved a ref, stored a blob, or landed anything.
-    let after = state_of(&store, dir.path());
+    let after = state_of(&store, dir.path()).await;
     assert_eq!(before, after, "a refused call changed the repo");
 
     // The positive control: the same requests, sent with the right
@@ -579,7 +593,7 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
         .await
         .expect("the upload the refused calls carried is a valid one");
     assert_ne!(
-        state_of(&store, dir.path()),
+        state_of(&store, dir.path()).await,
         after,
         "the control upload changed nothing"
     );
@@ -588,7 +602,7 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
         .await
         .expect("the changeset the refused calls carried is a valid one");
     assert_ne!(
-        state_of(&store, dir.path()),
+        state_of(&store, dir.path()).await,
         after,
         "the control changeset changed nothing"
     );
@@ -602,7 +616,7 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
         .await
         .expect("the land the refused calls carried is a valid one");
     assert_ne!(
-        state_of(&store, dir.path()),
+        state_of(&store, dir.path()).await,
         after,
         "the control land changed nothing"
     );
