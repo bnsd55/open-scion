@@ -94,6 +94,22 @@ const TX_AGE_PERIOD: Duration = Duration::from_secs(5);
 /// Keeps the `scion_pg_tx_age_seconds` gauge current: the age of the
 /// oldest open Postgres read transaction, sampled every [`TX_AGE_PERIOD`]
 /// until `stop` resolves. On SQLite the sample is always zero.
+async fn pg_tx_age_sample(store: Backend, metrics: Arc<Metrics>, mut stop: watch::Receiver<()>) {
+    let mut tick = tokio::time::interval(TX_AGE_PERIOD);
+    loop {
+        let store = store.clone();
+        let age = tokio::task::spawn_blocking(move || store.pg_tx_age()).await;
+        match age {
+            Ok(age) => metrics.pg_tx_age(age),
+            Err(e) => tracing::warn!(error = %e, "the tx-age sample failed"),
+        }
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = stop.changed() => break,
+        }
+    }
+}
+
 /// Polls the free space of the data directory's filesystem into the
 /// gauge. The latest poll is the value; a failed stat keeps the last
 /// good value and logs once a poll. The poll stops when the server
@@ -121,22 +137,6 @@ fn spawn_free_space_poll(
             }
         }
     });
-}
-
-async fn pg_tx_age_sample(store: Backend, metrics: Arc<Metrics>, mut stop: watch::Receiver<()>) {
-    let mut tick = tokio::time::interval(TX_AGE_PERIOD);
-    loop {
-        let store = store.clone();
-        let age = tokio::task::spawn_blocking(move || store.pg_tx_age()).await;
-        match age {
-            Ok(age) => metrics.pg_tx_age(age),
-            Err(e) => tracing::warn!(error = %e, "the tx-age sample failed"),
-        }
-        tokio::select! {
-            _ = tick.tick() => {}
-            _ = stop.changed() => break,
-        }
-    }
 }
 
 /// Runs the stale-land sweep at once, then once per [`SWEEP_PERIOD`], until
@@ -226,12 +226,12 @@ pub async fn serve(
     let access = Arc::new(access.into());
     let auth = access.auth();
     let fence = store.fence_flag();
-    let worker = Worker::new(store.clone());
     // The backend records into the registry: the Postgres pool's wait,
     // busy readers and tx age (which this task keeps fresh), and on both
     // backends the blob full flushes, the derive-walk gauges and the
     // collector-key wait.
     store.set_metrics(Arc::clone(&metrics));
+    let worker = Worker::new(store);
     let lands = Arc::new(Lands::new(pending_lands, Some(Arc::clone(&metrics))));
     let (stop_tx, stop_rx) = watch::channel(());
     // The fence of a Postgres server that lost its database to another
@@ -249,7 +249,7 @@ pub async fn serve(
     // sees a full drive before the server hits it.
     spawn_free_space_poll(data, Arc::clone(&metrics), stop_rx.clone());
     tokio::spawn(pg_tx_age_sample(
-        store,
+        worker.store(),
         Arc::clone(&metrics),
         stop_rx.clone(),
     ));

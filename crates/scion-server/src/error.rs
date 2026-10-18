@@ -207,6 +207,12 @@ mod tests {
     }
 
     #[test]
+    fn a_drained_reader_pool_is_unavailable() {
+        let err = Error::Unavailable("no Postgres reader free".to_owned());
+        assert_eq!(Status::from(err).code(), Code::Unavailable);
+    }
+
+    #[test]
     fn an_out_of_space_write_is_resource_exhausted_with_a_fixed_reply() {
         // A file write that the disk refused (ENOSPC, errno 28 on Linux
         // and macOS both): the reply names no path.

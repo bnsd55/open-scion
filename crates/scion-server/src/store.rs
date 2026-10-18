@@ -436,6 +436,15 @@ impl Store {
         &self.inner.blobs
     }
 
+    /// The durability steps this store's blob path ran, oldest first,
+    /// for the order test under the test-hooks seam.
+    #[doc(hidden)]
+    #[must_use]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn durability_steps(&self) -> Vec<DurabilityStep> {
+        self.inner.blobs.log.steps()
+    }
+
     /// Commits made so far.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
@@ -875,6 +884,10 @@ pub struct Blobs {
     /// The lock file of `mine`, held for as long as this `Blobs` lives.
     /// Never read: its life is the point.
     _mine_lock: fs::File,
+    /// One lock per stripe of blob IDs: the write of one blob runs alone
+    /// in this process, so two puts of the same bytes never race their
+    /// renames onto one path ([#185]).
+    write_locks: Vec<Mutex<()>>,
     group_flush: GroupFlush,
     /// The operator metrics, set once by the server before it serves:
     /// every full flush records how long it took. Empty in import, fsck
@@ -899,7 +912,86 @@ pub struct Blobs {
     /// How many fsyncs passed through [`Blobs::fsync_gate`], pass or
     /// fail: a test reads it to see that a kept file was fsynced.
     fsync_count: std::sync::atomic::AtomicU64,
+    /// The durability steps this `Blobs` ran, in order, for the order
+    /// test: a test-hooks build records them, a production build stores
+    /// nothing.
+    #[cfg(any(test, feature = "test-hooks"))]
+    log: DurabilityLog,
 }
+
+/// Which entry the order test records for one gated fsync. Production
+/// code names the step; only a test-hooks build records anything.
+#[derive(Clone)]
+enum SyncStep {
+    /// The temp file of a blob, before its rename.
+    TempFile(BlobId),
+    /// A stored blob file, on the keep path.
+    StoredFile(BlobId),
+    /// A blob directory.
+    Dir(std::path::PathBuf),
+    /// The full flush: the blob root, then the drive cache.
+    FullFlush,
+    /// An fsync the order test does not name (the blob root of an upload).
+    Unnamed,
+}
+
+/// One durability step of the blob path, recorded for the order test.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DurabilityStep {
+    /// A temp file for a blob was written.
+    TmpWrite(BlobId),
+    /// The temp file's bytes were flushed to the drive.
+    FileFsync(BlobId),
+    /// The temp file took the blob's name.
+    Rename(BlobId),
+    /// A stored file was flushed to the drive, on the keep path.
+    StoredFileFsync(BlobId),
+    /// A directory that changed was flushed.
+    DirFsync(PathBuf),
+    /// A full flush of the drive cache ran for a batch.
+    FullFlush,
+    /// A batch's `sync` answered its caller.
+    Answer,
+}
+
+/// The ordered log of [`DurabilityStep`]s behind the test-hooks seam.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Default)]
+pub struct DurabilityLog {
+    steps: std::sync::Mutex<Vec<DurabilityStep>>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl DurabilityLog {
+    /// Records one step.
+    fn record(&self, step: DurabilityStep) {
+        self.steps
+            .lock()
+            .expect("the durability log's lock")
+            .push(step);
+    }
+
+    /// The steps recorded so far, oldest first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the log's lock is poisoned.
+    #[must_use]
+    pub fn steps(&self) -> Vec<DurabilityStep> {
+        self.steps
+            .lock()
+            .expect("the durability log's lock")
+            .clone()
+    }
+}
+
+/// How many stripes the per-blob write locks have: 256 on the first byte
+/// of the blob's ID. Puts of different blobs wait on each other only when
+/// their IDs share a stripe, and one ID is always the same stripe.
+const WRITE_STRIPES: usize = 256;
 
 impl Blobs {
     pub(crate) fn open(dir: &Path) -> Result<Self> {
@@ -948,6 +1040,7 @@ impl Blobs {
             tmp,
             mine,
             _mine_lock: mine_lock,
+            write_locks: (0..WRITE_STRIPES).map(|_| Mutex::new(())).collect(),
             group_flush: GroupFlush::default(),
             metrics: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -957,6 +1050,8 @@ impl Blobs {
             fail_reads: std::sync::atomic::AtomicUsize::new(UNARMED),
             fail_fsyncs: std::sync::atomic::AtomicUsize::new(UNARMED),
             fsync_count: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            log: DurabilityLog::default(),
         })
     }
 
@@ -964,6 +1059,15 @@ impl Blobs {
     /// full flush then records how long it took.
     pub(crate) fn set_metrics(&self, metrics: std::sync::Arc<crate::metrics::Metrics>) {
         let _ = self.metrics.set(metrics);
+    }
+
+    fn write_lock(&self, id: BlobId) -> MutexGuard<'_, ()> {
+        // One stripe per value of the first ID byte: the index needs no
+        // modulo, and two writes race only when their IDs share it.
+        let stripe = usize::from(id.as_bytes()[0]);
+        self.write_locks[stripe]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Removes what crashes left in `tmp/`: the folders of processes that no
@@ -1008,6 +1112,10 @@ impl Blobs {
         let result = self
             .group_flush
             .run(|| fs::File::open(&self.root)?.sync_all());
+        #[cfg(any(test, feature = "test-hooks"))]
+        if result.is_ok() {
+            self.log.record(DurabilityStep::FullFlush);
+        }
         self.record_sync(started);
         result
     }
@@ -1071,7 +1179,12 @@ impl Blobs {
         if batch.flush_dirs()? {
             // A new fan-out directory is an entry in the root. The full flush
             // of `sync` would cover it.
-            self.gated_fsync("the blob root", "fsync blob root", || fsync_dir(&self.root))?;
+            self.gated_fsync(
+                "the blob root",
+                "fsync blob root",
+                SyncStep::Unnamed,
+                || fsync_dir(&self.root),
+            )?;
         }
         Ok(id)
     }
@@ -1305,19 +1418,32 @@ impl Blobs {
         }
     }
 
-    /// Runs the real fsync of `f` through the gate, and records how long
-    /// the fsync took: one observation of `scion_blob_sync_seconds` per
-    /// fsync of the blob path (a temp file, a stored file, a blob
-    /// directory, or the drive cache).
+    /// Runs the real fsync of `f` through the gate, records `step` for
+    /// the order test, and records how long the fsync took: the gate,
+    /// the fsync, the record, and the timer in one place. One observation
+    /// of `scion_blob_sync_seconds` per fsync of the blob path (a temp
+    /// file, a stored file, a blob directory, or the drive cache).
     fn gated_fsync(
         &self,
         name: &str,
         operation: &str,
+        step: SyncStep,
         f: impl FnOnce() -> io::Result<()>,
     ) -> Result<()> {
         self.fsync_gate(name, operation)?;
         let started = std::time::Instant::now();
         let out = f();
+        #[cfg(any(test, feature = "test-hooks"))]
+        if out.is_ok() {
+            match step {
+                SyncStep::TempFile(id) => self.log.record(DurabilityStep::FileFsync(id)),
+                SyncStep::StoredFile(id) => self.log.record(DurabilityStep::StoredFileFsync(id)),
+                SyncStep::Dir(path) => self.log.record(DurabilityStep::DirFsync(path)),
+                SyncStep::FullFlush | SyncStep::Unnamed => {}
+            }
+        }
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        drop(step);
         self.record_sync(started);
         out.map_err(Error::Io)
     }
@@ -1690,6 +1816,10 @@ impl BlobBatch<'_> {
     /// Writes blob `id`, whose `len` bytes `raw` gives, unless the stored file
     /// is intact. A file that is not intact is replaced.
     fn write(&mut self, id: BlobId, len: usize, raw: impl Read) -> Result<()> {
+        // One blob, one writer: the lock spans the check of the stored
+        // file, the touch of a kept one, and the rename that replaces it
+        // (see `Blobs::write_lock`).
+        let _write = self.blobs.write_lock(id);
         match self.keep(id)? {
             BlobStatus::Valid => {
                 // A put that keeps the stored copy writes nothing, so the
@@ -1707,11 +1837,19 @@ impl BlobBatch<'_> {
                 // the blob on the drive and no name is ever removed.
                 let (dir, path) = self.blobs.location(id);
                 let file = fs::File::open(&path)?;
-                self.blobs
-                    .gated_fsync("the stored blob file", "fsync stored blob", || fsync(&file))?;
+                self.blobs.gated_fsync(
+                    "the stored blob file",
+                    "fsync stored blob",
+                    SyncStep::StoredFile(id),
+                    || fsync(&file),
+                )?;
                 let name = dir.display().to_string();
-                self.blobs
-                    .gated_fsync(&name, "fsync blob directory", || fsync_dir(&dir))?;
+                self.blobs.gated_fsync(
+                    &name,
+                    "fsync blob directory",
+                    SyncStep::Dir(dir.clone()),
+                    || fsync_dir(&dir),
+                )?;
                 return Ok(());
             }
             // The rename below replaces it in one step. No repo on this
@@ -1747,12 +1885,23 @@ impl BlobBatch<'_> {
         self.blobs.write_gate(&path, "write blob file")?;
         let mut tmp = tempfile::NamedTempFile::new_in(&self.blobs.mine)?;
         zstd::stream::compress_sized_into(raw, &mut tmp, 3, len as u64)?;
-        self.blobs
-            .gated_fsync("the blob's temp file", "fsync blob file", || {
-                fsync(tmp.as_file())
-            })?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.blobs.log.record(DurabilityStep::TmpWrite(id));
+        self.blobs.gated_fsync(
+            "the blob's temp file",
+            "fsync blob file",
+            SyncStep::TempFile(id),
+            || fsync(tmp.as_file()),
+        )?;
         fs::create_dir_all(&dir)?;
-        tmp.persist(&path).map_err(|e| e.error)?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        persist_logged(&self.blobs.log, id, tmp, &path)?;
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        tmp.persist(&path).map_err(|e| {
+            tracing::warn!(blob = %id, path = %path.display(), error = %e.error,
+                "the rename of the blob's temp file failed");
+            e.error
+        })?;
         self.dirs.insert(dir);
         Ok(())
     }
@@ -1766,6 +1915,9 @@ impl BlobBatch<'_> {
     /// corrupt replaces no intact file, and its batch `sync` covers the
     /// rename.
     fn replace_stored(&mut self, id: BlobId, len: usize, raw: impl Read) -> Result<()> {
+        // The rename below lands on the same path as any other write of
+        // this blob, so it waits for the same stripe.
+        let _write = self.blobs.write_lock(id);
         self.blobs.full_flush()?;
         self.replace(id, len, raw)
     }
@@ -1801,6 +1953,8 @@ impl BlobBatch<'_> {
         if self.flush_dirs()? {
             blobs.full_flush()?;
         }
+        #[cfg(any(test, feature = "test-hooks"))]
+        blobs.log.record(DurabilityStep::Answer);
         Ok(())
     }
 
@@ -1816,8 +1970,12 @@ impl BlobBatch<'_> {
     fn flush_dirs(self) -> Result<bool> {
         for dir in &self.dirs {
             let name = dir.display().to_string();
-            self.blobs
-                .gated_fsync(&name, "fsync blob directory", || fsync_dir(dir))?;
+            self.blobs.gated_fsync(
+                &name,
+                "fsync blob directory",
+                SyncStep::Dir(dir.clone()),
+                || fsync_dir(dir),
+            )?;
         }
         Ok(!self.dirs.is_empty())
     }
@@ -1915,6 +2073,20 @@ pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
     fsync(&fs::File::open(path)?)
 }
 
+/// The rename of a temp file onto the blob's name, with its step recorded
+/// in one call.
+#[cfg(any(test, feature = "test-hooks"))]
+fn persist_logged(
+    log: &DurabilityLog,
+    id: BlobId,
+    tmp: tempfile::NamedTempFile,
+    path: &Path,
+) -> Result<()> {
+    tmp.persist(path).map_err(|e| e.error)?;
+    log.record(DurabilityStep::Rename(id));
+    Ok(())
+}
+
 /// Keeps child processes out of the window where a test drops a store and
 /// asserts its lock released. A forked child shares the flock of every open
 /// file description until it execs, so a child spawned while another test
@@ -2005,6 +2177,72 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    /// A write of one blob waits for the stripe of a write that is held:
+    /// while the stripe is held by hand, the blob's file stays absent,
+    /// and a write released, the file is there ([#185]). Without the
+    /// striped lock the write renames at once, and the absence assert
+    /// fails. The replacing upload takes the same lock, so the second
+    /// test repeats the shape on the `replace_stored` path, which the
+    /// gRPC race of an upload with a copy stored reaches.
+    #[test]
+    fn a_write_of_one_blob_waits_for_the_stripe() {
+        held_stripe_waits(|store, id, content| {
+            let mut batch = store.blobs().batch();
+            batch.put(content).unwrap();
+            let _ = id;
+        });
+    }
+
+    #[test]
+    fn a_replacing_upload_of_one_blob_waits_for_the_stripe() {
+        held_stripe_waits(|store, id, content| {
+            let mut batch = store.blobs().batch();
+            batch.replace_stored(id, content.len(), content).unwrap();
+            batch.flush_dirs().unwrap();
+        });
+    }
+
+    /// Holds the stripe of one blob by hand, runs `write` on a thread,
+    /// and says the blob stays absent while the stripe is held and is
+    /// whole once the stripe is free. The lease drops the stripe
+    /// however the test ends, so a panicking assert cannot wedge the
+    /// writer ([#142]).
+    fn held_stripe_waits(write: impl Fn(&Store, BlobId, &'static [u8]) + Send + Sync) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let content = b"the same bytes for both writes";
+        let id = BlobId::of(content);
+        // The stripe is held by hand, and drops however the test ends: a
+        // panicking assert frees the writer at the scope's join ([#142]).
+        let stripe = Mutex::new(store.blobs().write_lock(id));
+        thread::scope(|scope| {
+            let writer = scope.spawn(|| write(&store, id, content));
+            // A ceiling only bounds the wait of the good code: the write
+            // of the broken code renames at once, and the absence assert
+            // fails.
+            let until = Instant::now() + Duration::from_millis(200);
+            let mut landed = false;
+            while Instant::now() < until {
+                if store.blobs().verify(id).unwrap() == BlobStatus::Valid {
+                    landed = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                !landed,
+                "the write renamed while another write held the stripe"
+            );
+            drop(stripe);
+            writer.join().unwrap();
+        });
+        assert_eq!(
+            store.blobs().verify(id).unwrap(),
+            BlobStatus::Valid,
+            "the blob of the held stripe"
+        );
+    }
 
     #[test]
     fn an_open_refuses_a_data_directory_that_group_or_others_can_write() {
@@ -3021,5 +3259,98 @@ mod tests {
         // its snapshot would show one repo.
         assert_eq!(store.read(repos).unwrap(), 2);
         assert_eq!(store.inner.readers.idle().len(), READERS);
+    }
+
+    /// A blob a batch acks is durable before the ack, by construction:
+    /// the recorded steps of every blob it wrote read, in order, tmp
+    /// write, file fsync, rename, dir fsync of the blob's fan-out
+    /// directory, a full flush, and the batch's answer. A blob a batch
+    /// kept reads its stored-file fsync and dir fsync before the answer.
+    /// If the directory fsync is deleted from `flush_dirs`, the dir step
+    /// disappears and this test fails.
+    #[test]
+    fn a_batch_answers_after_its_blobs_dir_fsyncs() {
+        use tempfile::TempDir;
+
+        use DurabilityStep as S;
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let raws: Vec<&[u8]> = vec![b"one", b"two", b"three"];
+        let ids: Vec<BlobId> = {
+            let mut batch = store.blobs().batch();
+            let ids = raws.iter().map(|raw| batch.put(raw).unwrap()).collect();
+            batch.sync().unwrap();
+            ids
+        };
+        // The keep path: the same bytes again. Nothing is written, and
+        // the stored file is fsynced with its directory before the
+        // answer.
+        let kept: Vec<BlobId> = {
+            let mut batch = store.blobs().batch();
+            let ids = raws.iter().map(|raw| batch.put(raw).unwrap()).collect();
+            batch.sync().unwrap();
+            ids
+        };
+        let steps = store.durability_steps();
+        let answers: Vec<usize> = steps
+            .iter()
+            .enumerate()
+            .filter_map(|(i, step)| (*step == S::Answer).then_some(i))
+            .collect();
+        assert_eq!(answers.len(), 2, "two batches answered");
+
+        let steps_of = |log: &[DurabilityStep], step: &DurabilityStep| {
+            log.iter()
+                .position(|s| s == step)
+                .unwrap_or_else(|| panic!("no {step:?} in the batch's steps"))
+        };
+        let batch1 = &steps[..answers[0]];
+        for id in &ids {
+            let (dir, _) = store.blobs().location(*id);
+            let tmp_write = steps_of(batch1, &S::TmpWrite(*id));
+            let file_fsync = steps_of(batch1, &S::FileFsync(*id));
+            let rename = steps_of(batch1, &S::Rename(*id));
+            let dir_fsync = batch1
+                .iter()
+                .position(|s| matches!(s, S::DirFsync(path) if *path == dir))
+                .unwrap_or_else(|| panic!("no dir fsync of {} before the answer", dir.display()));
+            let full_flush = batch1
+                .iter()
+                .position(|s| *s == S::FullFlush)
+                .expect("no full flush before the answer");
+            assert!(
+                tmp_write < file_fsync
+                    && file_fsync < rename
+                    && rename < dir_fsync
+                    && dir_fsync < full_flush
+                    && full_flush < answers[0],
+                "the durability steps of {id} are out of order: \
+                 tmp write {tmp_write}, file fsync {file_fsync}, rename {rename}, \
+                 dir fsync {dir_fsync}, full flush {full_flush}, answer {}",
+                answers[0]
+            );
+        }
+        // The keep path: no tmp write of the kept blobs in the second
+        // batch, but a stored-file fsync and a dir fsync before the
+        // answer.
+        let batch2 = &steps[answers[0] + 1..answers[1]];
+        for id in &kept {
+            let log = batch2;
+            assert!(
+                log.iter().all(|s| *s != S::TmpWrite(*id)),
+                "a kept blob was written again"
+            );
+            assert!(
+                log.contains(&S::StoredFileFsync(*id)),
+                "no stored-file fsync before the answer"
+            );
+            let (dir, _) = store.blobs().location(*id);
+            assert!(
+                log.iter()
+                    .any(|s| matches!(s, S::DirFsync(path) if *path == dir)),
+                "no dir fsync of {} before the answer",
+                dir.display()
+            );
+        }
     }
 }

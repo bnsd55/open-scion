@@ -23,7 +23,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use gix::ObjectId;
@@ -164,9 +164,11 @@ struct Readers {
     open_since: Mutex<Vec<Instant>>,
     /// How many clients the pool holds, for the busy gauge.
     size: usize,
-    /// The registry the pool records into. Set once the server builds
-    /// its metrics; empty for import, fsck, and tests that have none.
-    metrics: std::sync::OnceLock<Arc<Metrics>>,
+    /// The registry the pool records into. Set once, by the server,
+    /// through [`Backend::set_metrics`](crate::backend::Backend::set_metrics);
+    /// a second set is a no-op. [`None`] until then: import, fsck, gc,
+    /// and tests without a registry record nothing.
+    metrics: OnceLock<Arc<Metrics>>,
 }
 
 impl Readers {
@@ -200,7 +202,7 @@ impl Readers {
             returned: Condvar::new(),
             open_since: Mutex::new(Vec::new()),
             size,
-            metrics: std::sync::OnceLock::new(),
+            metrics: OnceLock::new(),
         })
     }
 
@@ -210,26 +212,28 @@ impl Readers {
     /// behind a transaction that never ends.
     fn take(&self, wait: Duration) -> Result<ReaderGuard<'_>> {
         let started = Instant::now();
-        let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
-        let client = loop {
-            if let Some(client) = idle.pop() {
-                break client;
-            }
-            let left = wait.checked_sub(started.elapsed());
-            let Some(left) = left else {
-                return Err(Error::Unavailable(format!(
-                    "no Postgres reader free after {wait:?}; the readers are stuck in long reads"
-                )));
-            };
-            let (guard, woke) = self
-                .returned
-                .wait_timeout(idle, left)
-                .unwrap_or_else(PoisonError::into_inner);
-            idle = guard;
-            if woke.timed_out() {
-                return Err(Error::Unavailable(format!(
-                    "no Postgres reader free after {wait:?}; the readers are stuck in long reads"
-                )));
+        // The idle lock guards the pool list only: it is dropped before
+        // the tail, whose report_busy takes it again. Holding it across
+        // the tail deadlocks take against itself on the first read.
+        let client = {
+            let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+            loop {
+                if let Some(client) = idle.pop() {
+                    break client;
+                }
+                let left = wait.checked_sub(started.elapsed());
+                let Some(left) = left else {
+                    return Err(Error::Unavailable(format!(
+                        "no Postgres reader free after {wait:?}; the readers are stuck in long reads"
+                    )));
+                };
+                let (guard, _woke) = self
+                    .returned
+                    .wait_timeout(idle, left)
+                    .unwrap_or_else(PoisonError::into_inner);
+                idle = guard;
+                // A timed-out wait falls through to the top of the loop, so a
+                // reader given back in this window is taken before refusing.
             }
         };
         let started_at = Instant::now();
@@ -292,6 +296,31 @@ impl Readers {
         let _ = self.metrics.set(metrics);
         self.report_busy();
     }
+
+    /// How many readers are out of the pool, for the busy gauge.
+    fn report_busy(&self) {
+        let idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        let busy = self.size.saturating_sub(idle.len());
+        drop(idle);
+        if let Some(metrics) = self.metrics() {
+            metrics.pg_readers_busy(u64::try_from(busy).unwrap_or(u64::MAX));
+        }
+    }
+
+    /// The metrics to record into, if the server gave the backend its
+    /// registry.
+    fn metrics(&self) -> Option<Arc<Metrics>> {
+        self.metrics.get().cloned()
+    }
+
+    /// Gives the pool the server's metrics registry. Set once: a second
+    /// set is a no-op, and says so in the debug log.
+    fn set_metrics(&self, metrics: Arc<Metrics>) {
+        if self.metrics.set(metrics).is_err() {
+            tracing::debug!("the metrics registry was already set");
+        }
+        self.report_busy();
+    }
 }
 
 /// A reader that is out of the pool. Returns it when it drops.
@@ -316,6 +345,10 @@ impl Drop for ReaderGuard<'_> {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(client);
+            // The gauge reads the pool after the client is back in it: a
+            // report before the push would leave one reader counted busy
+            // until the next take.
+            self.readers.report_busy();
             self.readers.returned.notify_one();
         }
     }
@@ -975,10 +1008,10 @@ impl Pg {
     /// Gives the pool the server's metrics registry. Called once by the
     /// server before it serves; import, fsck, and gc pass none, and the
     /// pool then records nothing.
-    pub fn set_metrics(&self, metrics: Arc<Metrics>) {
+    pub(crate) fn set_metrics(&self, metrics: Arc<Metrics>) {
         let _ = self.inner.metrics.set(Arc::clone(&metrics));
         self.inner.blobs.set_metrics(Arc::clone(&metrics));
-        self.inner.derive.set_metrics(metrics.clone());
+        self.inner.derive.set_metrics(Arc::clone(&metrics));
         self.inner.readers.set_metrics(metrics);
     }
 
@@ -1254,12 +1287,20 @@ impl<'a> PgTx<'a> {
     // measured the gain, and the split needs an audit of every walk that
     // re-reads a ref. Measure first, then split.
     fn begin_read(c: &'a mut PgClient, statement: Duration, idle: Duration) -> Result<PgTx<'a>> {
+        // Three statements, not one string: the client prepares its
+        // queries, and Postgres takes no second command in a prepared
+        // statement (E42601).
+        c.execute(
+            "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+            &[],
+        )?;
+        c.execute(
+            &format!("SET LOCAL statement_timeout = {}", statement.as_millis()),
+            &[],
+        )?;
         c.execute(
             &format!(
-                "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY; \
-                 SET LOCAL statement_timeout = {}; \
-                 SET LOCAL idle_in_transaction_session_timeout = {};",
-                statement.as_millis(),
+                "SET LOCAL idle_in_transaction_session_timeout = {}",
                 idle.as_millis()
             ),
             &[],
@@ -3272,10 +3313,284 @@ mod pool_tests {
         for hold in holds {
             hold.join().unwrap();
         }
-        assert_eq!(metrics.pg_readers_busy_gauge(), 0);
-        let (sum, count) = metrics.pg_pool_wait_totals();
-        assert!(count >= 1, "the wait was recorded");
-        assert!(sum > 0, "sum {sum}");
+        let text = metrics.render();
+        let gauge = text
+            .lines()
+            .find(|line| line.starts_with("scion_pg_readers_busy "))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
+        assert_eq!(gauge, 0, "{text}");
+        let count = text
+            .lines()
+            .find(|line| line.starts_with("scion_pg_pool_wait_seconds_count "))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+        assert!(count >= 1, "the wait was recorded: {text}");
+        let sum = text
+            .lines()
+            .find(|line| line.starts_with("scion_pg_pool_wait_seconds_sum "))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|n| n.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        assert!(sum > 0.0, "sum {sum}");
+        assert_eq!(pg.tx_age(), Duration::ZERO);
+    }
+
+    /// The tx-age gauge says how old the oldest open read is, and goes
+    /// back to zero when it ends.
+    #[test]
+    fn the_tx_age_gauge_tracks_the_oldest_open_read() {
+        let Some(pg) = pg() else { return };
+        let pg = Arc::new(pg);
+        assert_eq!(pg.tx_age(), Duration::ZERO);
+        let hold = {
+            let pg = Arc::clone(&pg);
+            std::thread::spawn(move || {
+                pg.read_bounded(
+                    |_| {
+                        std::thread::sleep(Duration::from_millis(300));
+                        Ok(())
+                    },
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    Duration::from_secs(5),
+                )
+                .unwrap();
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(pg.tx_age() > Duration::ZERO, "{:?}", pg.tx_age());
+        hold.join().unwrap();
+        assert_eq!(pg.tx_age(), Duration::ZERO);
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use crate::store::READERS;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// A Postgres backend of a test database, or [`None`] on SQLite: the
+    /// pool is a Postgres shape, so the pool tests skip the data
+    /// directory.
+    fn pg() -> Option<Pg> {
+        if !crate::backend::Backend::test_is_postgres() {
+            eprintln!("skip on sqlite: the reader pool is Postgres");
+            return None;
+        }
+        let data = tempfile::tempdir().unwrap();
+        match crate::backend::Backend::open_test(data.path()).unwrap() {
+            crate::backend::Backend::Postgres(pg) => Some(pg),
+            crate::backend::Backend::Sqlite(_) => unreachable!("the env named postgres"),
+        }
+    }
+
+    /// One statement that runs past its bound is cancelled, and the
+    /// reader comes back to the pool.
+    #[test]
+    fn a_read_statement_past_its_bound_is_cancelled() {
+        let Some(pg) = pg() else { return };
+        let err = pg
+            .read_bounded(
+                |tx| {
+                    tx.c.query_opt("SELECT pg_sleep(2)", &[])?;
+                    Ok(())
+                },
+                Duration::from_millis(50),
+                Duration::from_secs(30),
+                READER_WAIT,
+            )
+            .unwrap_err();
+        // SQLSTATE 57014 is the statement clock, and map_pg_error gives
+        // it the deadline answer, as for a SQLite write past its busy
+        // timeout.
+        assert!(
+            matches!(err, Error::DeadlineExceeded(_)),
+            "the cancelled read came back as {err}"
+        );
+        // The reader returned: the next read runs at once.
+        let again = pg.read(|tx| {
+            tx.c.query_opt("SELECT 1", &[])
+                .map(|row| row.map(|row| row.get::<_, i32>(0)))
+        });
+        assert_eq!(again.unwrap(), Some(1));
+    }
+
+    /// A call whose wait for a reader passes the bound hears
+    /// `Unavailable`, instead of blocking to its deadline.
+    #[test]
+    fn a_call_that_waits_past_the_pool_bound_is_refused() {
+        let Some(pg) = pg() else { return };
+        let pg = Arc::new(pg);
+        let busy = Arc::new(AtomicUsize::new(0));
+        let holds: Vec<_> = (0..READERS)
+            .map(|_| {
+                let pg = Arc::clone(&pg);
+                let busy = Arc::clone(&busy);
+                std::thread::spawn(move || {
+                    pg.read_bounded(
+                        |_| {
+                            busy.fetch_add(1, AtomicOrdering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(600));
+                            Ok(())
+                        },
+                        Duration::from_secs(300),
+                        Duration::from_secs(30),
+                        Duration::from_secs(30),
+                    )
+                    .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        // Every reader is out of the pool.
+        let wait = std::time::Instant::now() + Duration::from_secs(10);
+        while busy.load(AtomicOrdering::SeqCst) < READERS && std::time::Instant::now() < wait {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            busy.load(AtomicOrdering::SeqCst),
+            READERS,
+            "all readers busy"
+        );
+        let refused = pg
+            .read_bounded(
+                |tx| {
+                    tx.c.query_opt("SELECT 1", &[])?;
+                    Ok(())
+                },
+                Duration::from_secs(300),
+                Duration::from_secs(30),
+                Duration::from_millis(50),
+            )
+            .unwrap_err();
+        assert!(matches!(refused, Error::Unavailable(_)), "{refused}");
+        for hold in holds {
+            hold.join().unwrap();
+        }
+    }
+
+    /// A reader that goes back to the pool is taken again. The take's
+    /// tail reports the busy gauge, and the report takes the idle lock
+    /// that the take itself still held: the first read of a store then
+    /// hung forever, with no panic and nothing on the database. A 10 s
+    /// ceiling keeps this a fast failure that names the step.
+    #[test]
+    fn a_reader_taken_and_given_back_is_taken_again() {
+        let Some(pg) = pg() else { return };
+        let pg = Arc::new(pg);
+        let done = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            {
+                let pg = Arc::clone(&pg);
+                let done = Arc::clone(&done);
+                scope.spawn(move || {
+                    for round in 1..=2 {
+                        pg.read_bounded(
+                            |tx| {
+                                tx.c.query_opt("SELECT 1", &[])?;
+                                Ok(())
+                            },
+                            Duration::from_secs(30),
+                            Duration::from_secs(30),
+                            Duration::from_secs(5),
+                        )
+                        .unwrap();
+                        done.store(round, AtomicOrdering::SeqCst);
+                    }
+                });
+            }
+            let wait = std::time::Instant::now() + Duration::from_secs(10);
+            while done.load(AtomicOrdering::SeqCst) < 2 && std::time::Instant::now() < wait {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert_eq!(
+                done.load(AtomicOrdering::SeqCst),
+                2,
+                "the pool take deadlocked at step {}",
+                done.load(AtomicOrdering::SeqCst) + 1
+            );
+        });
+    }
+
+    /// The pool wait lands in the histogram, and the busy gauge returns
+    /// to zero when the reads are done.
+    #[test]
+    fn the_pool_records_its_waits_and_its_busy_readers() {
+        let Some(pg) = pg() else { return };
+        let metrics = Arc::new(Metrics::default());
+        pg.set_metrics(Arc::clone(&metrics));
+        let pg = Arc::new(pg);
+        let busy = Arc::new(AtomicUsize::new(0));
+        let holds: Vec<_> = (0..READERS)
+            .map(|_| {
+                let pg = Arc::clone(&pg);
+                let busy = Arc::clone(&busy);
+                std::thread::spawn(move || {
+                    pg.read_bounded(
+                        |_| {
+                            busy.fetch_add(1, AtomicOrdering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(500));
+                            Ok(())
+                        },
+                        Duration::from_secs(30),
+                        Duration::from_secs(30),
+                        Duration::from_millis(400),
+                    )
+                    .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while busy.load(AtomicOrdering::SeqCst) < READERS && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // One more call waits ~400 ms for a reader, then takes one as the
+        // holders return theirs.
+        let waited = std::time::Instant::now();
+        pg.read_bounded(
+            |tx| {
+                tx.c.query_opt("SELECT 1", &[])?;
+                Ok(())
+            },
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(
+            waited.elapsed() >= Duration::from_millis(100),
+            "the wait was real"
+        );
+        for hold in holds {
+            hold.join().unwrap();
+        }
+        // The gauges read the rendered text, as a scraper would: the
+        // busy gauge is back to zero, and the wait is in the histogram.
+        let text = metrics.render();
+        let gauge = text
+            .lines()
+            .find(|line| line.starts_with("scion_pg_readers_busy "))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
+        assert_eq!(gauge, 0, "{text}");
+        let count = text
+            .lines()
+            .find(|line| line.starts_with("scion_pg_pool_wait_seconds_count "))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+        assert!(count >= 1, "the wait was recorded: {text}");
+        let sum = text
+            .lines()
+            .find(|line| line.starts_with("scion_pg_pool_wait_seconds_sum "))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|n| n.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        assert!(sum > 0.0, "sum {sum}");
         assert_eq!(pg.tx_age(), Duration::ZERO);
     }
 

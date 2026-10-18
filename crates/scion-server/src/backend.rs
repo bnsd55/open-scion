@@ -447,10 +447,11 @@ impl Backend {
     }
 
     /// Gives the backend the server's metrics registry, once before the
-    /// server serves: the Postgres pool's pool metrics, and on both
-    /// backends the blob full flushes, the derive-walk gauges and the
-    /// collector-key wait. Without it, import, fsck and gc record
-    /// nothing.
+    /// server serves: the Postgres pool's reader metrics (a no-op on the
+    /// data-directory backend, whose readers are threads of one process),
+    /// and on the data directory the blob full flushes, the derive-walk
+    /// gauges and the collector-key wait. Without it, import, fsck and
+    /// gc record nothing.
     pub fn set_metrics(&self, metrics: Arc<Metrics>) {
         match self {
             Self::Sqlite(store) => store.set_metrics(metrics),

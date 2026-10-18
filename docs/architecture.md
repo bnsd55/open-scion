@@ -244,6 +244,15 @@ upload or a crash leaves nothing behind. Each process stages its temp files
 in its own folder of `tmp/`, held with a lock, and an open removes the
 folders of processes that no longer hold theirs (see below).
 
+**One writer per blob.** The final step of a blob write is a rename onto the
+blob's path, and two writers of the same content rename onto the same path.
+Within a process, every write of a blob takes the stripe of its ID's first
+byte (256 stripes, one per byte value), so two writes of one blob run one
+after the other, and no rename of a write races the rename of another. The
+lock is per process: an import shares the data directory with a server, and
+its writes go through their own stripes. `fsync_dir` covers the rename's
+directory entry.
+
 **Durability rules** (the SQLite backend; on Postgres a returned commit
 is durable: `synchronous_commit=on` is checked at open, so
 `Store::write` returning is the durability point, and the full-flush
@@ -1607,7 +1616,7 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/main.rs` (`Command`) | The `Serve` subcommand holds its flags by value: 309 bytes against `Import`'s 109, 20 bytes over `clippy::large_enum_variant`, so the lint is off for the enum. | Box the TLS and ticket paths of `Serve` if a variant grows further. | |
 | `scion-server/src/import.rs` (`TX_BUDGET`) | A transaction of an import ends at 1 s, but one commit's record and check can run longer, and a server write then waits for it. Ceiling: the changes and trees of the biggest commit. | A separate write connection for the import, or per-statement yields. | [#100](https://github.com/bnsd55/open-scion/issues/100) |
 | `scion-server/src/pg.rs` (the collector's key in `Pg::commit`) | One advisory key per schema orders every writer of the schema against one collector, so the stores of a test database (one schema each) do not serialize against each other; a slow batch of the collector is bounded by its `PRUNE_BATCH` rows and its 100 ms budget warn. | Per-repo keys, or the collector's batches reading a snapshot instead of holding a lock. | [#47](https://github.com/bnsd55/open-scion/issues/47) |
-| `scion-server/src/pg.rs` (`PgTx::begin_read`) | Every read runs at repeatable read, one snapshot per read, even though reads that touch only immutable rows would be safe at read committed with a shorter snapshot hold. Nobody has measured the gain, and the split needs an audit of every walk that re-reads a ref. | Measure first, then split the reads that can drop a level. | |
+| `scion-server/src/pg.rs` (`begin_read`) | Every read runs at repeatable read for one snapshot per read, even reads that touch only immutable rows, which would be safe at read committed with a shorter snapshot hold. Nobody has measured the gain, and the split needs an audit of every walk that re-reads a ref. | Measure the snapshot hold first; then split the reads by the rows they touch, keeping repeatable read where a walk re-reads a ref. | |
 | `scion-server/src/gc.rs` (`prune_rows`) | A prune chunk re-loads every changeset ID of its repo to pin what committed while it waited for the collector's key, so a repo with many changesets pays that walk per chunk. | Load the IDs once per repo per sweep and share them across chunks, at the cost of a wider pin window. | |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | Per-ref serialization in a shared database ([design](design/scalable-backend.md)). | [#47](https://github.com/bnsd55/open-scion/issues/47) |
 | `scion-server/src/service.rs` (`into_server`) | A unary reply's bytes stay in HTTP/2 uncounted until the client reads them or the connection closes. Every reply that can grow with its input streams (`ReadFile`, `GetChangeset`, `ListDir`, `Log`, `Blame`, `GetObjects`) and takes the counted stall path instead, so the largest unary reply left is `Diff` (at most 1,000 paths, about 120 KB) and the rest are KBs: at the defaults, a client that never reads holds at most 128 connections x 256 streams x about 120 KB of unary replies, until its connections close. The encoder's message limit (64 MiB) refuses anything over it. | A new unary RPC streams, or bounds its reply, before it ships. | |

@@ -946,9 +946,18 @@ mod tests {
                     gate.1 -= 1;
                     break;
                 }
-                gate = COLD_GATE_WOKEN
-                    .wait(gate)
+                // A ceiling, so a walk that never gets through fails the
+                // test in seconds instead of hanging the job.
+                let (next, timed_out) = COLD_GATE_WOKEN
+                    .wait_timeout_while(gate, Duration::from_secs(30), |gate: &mut (bool, u64)| {
+                        !gate.0 && gate.1 == 0
+                    })
                     .unwrap_or_else(PoisonError::into_inner);
+                gate = next;
+                assert!(
+                    !timed_out.timed_out(),
+                    "the cold gate never opened within 30 s"
+                );
             }
             drop(gate);
             std::thread::sleep(Duration::from_millis(
@@ -1027,7 +1036,10 @@ mod tests {
             for _ in 0..8 {
                 scope.spawn(|| {
                     at_the_gate.wait();
-                    assert_eq!(get::<Cold<1>>(store, repo, tip).unwrap(), 12);
+                    let deadline = crate::deadline::Deadline::new(
+                        std::time::Instant::now() + Duration::from_secs(60),
+                    );
+                    assert_eq!(get_by::<Cold<1>>(store, repo, tip, &deadline).unwrap(), 12);
                 });
             }
             wait_entered(1);
@@ -1624,7 +1636,10 @@ mod tests {
             for _ in 0..8 {
                 scope.spawn(|| {
                     at_the_gate.wait();
-                    assert_eq!(get::<Cold<1>>(&store, repo, tip).unwrap(), 12);
+                    let deadline = crate::deadline::Deadline::new(
+                        std::time::Instant::now() + Duration::from_secs(60),
+                    );
+                    assert_eq!(get_by::<Cold<1>>(&store, repo, tip, &deadline).unwrap(), 12);
                 });
             }
             // All eight are inside the round: the owner holds the walk at
@@ -1735,7 +1750,12 @@ mod tests {
         let (repo_b, ids_b) = another_chain(&store2, "r", &chain(3));
         let (owner, beside) = std::thread::scope(|scope| {
             let _gate = gate_closed();
-            let owner = scope.spawn(|| get::<Cold<1>>(&store, repo1, ids1[2]).unwrap());
+            let owner = scope.spawn(|| {
+                let deadline = crate::deadline::Deadline::new(
+                    std::time::Instant::now() + Duration::from_secs(60),
+                );
+                get_by::<Cold<1>>(&store, repo1, ids1[2], &deadline).unwrap()
+            });
             // The owner is provably inside its walk: its first derive ran,
             // and it holds the one permit with the gate closed. Until the
             // test opens the gate, no other walk can start, whatever the
@@ -1747,10 +1767,20 @@ mod tests {
             // holds its permit. Flights shared across stores would make it
             // wait for the first store's permit, and it would never reach
             // the gate.
-            let beside = scope.spawn(|| get::<Cold<1>>(&store2, repo_b, ids_b[2]).unwrap());
+            let beside = scope.spawn(|| {
+                let deadline = crate::deadline::Deadline::new(
+                    std::time::Instant::now() + Duration::from_secs(60),
+                );
+                get_by::<Cold<1>>(&store2, repo_b, ids_b[2], &deadline).unwrap()
+            });
             wait_entered(2);
             // A caller of repo two waits for the permit, then walks.
-            let waited = scope.spawn(|| get::<Cold<1>>(&store, repo2, ids2[2]).unwrap());
+            let waited = scope.spawn(|| {
+                let deadline = crate::deadline::Deadline::new(
+                    std::time::Instant::now() + Duration::from_secs(60),
+                );
+                get_by::<Cold<1>>(&store, repo2, ids2[2], &deadline).unwrap()
+            });
             // A caller of repo three with a deadline gives up: the one
             // walk is taken, and the test holds it there.
             let short = scope.spawn(|| {
@@ -1923,7 +1953,12 @@ mod tests {
                 .iter()
                 .map(|&(repo, tip)| {
                     let store = store.clone();
-                    scope.spawn(move || get::<Cold<1>>(&store, repo, tip).unwrap())
+                    scope.spawn(move || {
+                        let deadline = crate::deadline::Deadline::new(
+                            std::time::Instant::now() + Duration::from_secs(60),
+                        );
+                        get_by::<Cold<1>>(&store, repo, tip, &deadline).unwrap()
+                    })
                 })
                 .collect();
             // The storm is provably deep: twenty walkers have entered
@@ -1965,7 +2000,12 @@ mod tests {
         // whole walk.
         std::thread::scope(|scope| {
             let _gate = gate_closed();
-            let walker = scope.spawn(|| get::<Cold<1>>(&store, repo, tip).unwrap());
+            let walker = scope.spawn(|| {
+                let deadline = crate::deadline::Deadline::new(
+                    std::time::Instant::now() + Duration::from_secs(60),
+                );
+                get_by::<Cold<1>>(&store, repo, tip, &deadline).unwrap()
+            });
             wait_entered(1);
             // The writer reads the walk's derive count inside its own
             // transaction, right after it got the connection: that is the
@@ -2024,7 +2064,12 @@ mod tests {
         // and the writer's write runs before the walk's next derive.
         std::thread::scope(|scope| {
             let _gate = gate_closed();
-            let walker = scope.spawn(|| get::<Cold<1>>(&store, repo, tip).unwrap());
+            let walker = scope.spawn(|| {
+                let deadline = crate::deadline::Deadline::new(
+                    std::time::Instant::now() + Duration::from_secs(60),
+                );
+                get_by::<Cold<1>>(&store, repo, tip, &deadline).unwrap()
+            });
             wait_entered(1);
             let writer = scope.spawn(|| {
                 store

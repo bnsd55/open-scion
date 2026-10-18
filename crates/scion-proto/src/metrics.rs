@@ -8,6 +8,7 @@
 //! tier counts the `Objects` calls in the same registry and adds its two
 //! cache counters.
 
+use std::fmt::Write as _;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -270,26 +271,10 @@ impl Metrics {
         self.pg_pool_wait[BUCKETS.len() + 1].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The pool-wait histogram's sum in microseconds and its count, for a
-    /// test that reads it without a scrape.
-    #[must_use]
-    pub fn pg_pool_wait_totals(&self) -> (u64, u64) {
-        (
-            self.pg_pool_wait[BUCKETS.len()].load(Ordering::Relaxed),
-            self.pg_pool_wait[BUCKETS.len() + 1].load(Ordering::Relaxed),
-        )
-    }
-
     /// Sets the gauge of Postgres read connections that are out of the
     /// pool.
     pub fn pg_readers_busy(&self, busy: u64) {
         self.pg_readers_busy.store(busy, Ordering::Relaxed);
-    }
-
-    /// The busy-readers gauge, for a test that reads it without a scrape.
-    #[must_use]
-    pub fn pg_readers_busy_gauge(&self) -> u64 {
-        self.pg_readers_busy.load(Ordering::Relaxed)
     }
 
     /// Sets the gauge of the age of the oldest open read transaction.
@@ -300,12 +285,6 @@ impl Metrics {
         );
     }
 
-    /// The transaction-age gauge in microseconds, for a test that reads
-    /// it without a scrape.
-    #[must_use]
-    pub fn pg_tx_age_micros(&self) -> u64 {
-        self.pg_tx_age.load(Ordering::Relaxed)
-    }
     /// The cache counters, for a test that reads them without a scrape.
     #[must_use]
     pub fn cache_counts(&self) -> (u64, u64) {
@@ -318,7 +297,6 @@ impl Metrics {
     /// Renders the registry as the Prometheus text format.
     #[must_use]
     pub fn render(&self) -> String {
-        use std::fmt::Write as _;
         let mut text = String::new();
         self.render_requests(&mut text);
         self.render_latency(&mut text);
@@ -339,47 +317,7 @@ impl Metrics {
             );
         }
         self.render_derive_walks(&mut text);
-        text.push_str(
-            "# HELP scion_pg_pool_wait_seconds Time a call waited for a Postgres reader, in seconds.\n",
-        );
-        text.push_str("# TYPE scion_pg_pool_wait_seconds histogram\n");
-        let buckets = &self.pg_pool_wait;
-        if buckets[BUCKETS.len() + 1].load(Ordering::Relaxed) > 0 {
-            for (i, bound) in BUCKETS.iter().enumerate() {
-                let le = if *bound == u64::MAX {
-                    "+Inf".to_owned()
-                } else {
-                    format!("{}", seconds(*bound))
-                };
-                let _ = writeln!(
-                    text,
-                    "scion_pg_pool_wait_seconds_bucket{{le=\"{le}\"}} {}",
-                    buckets[i].load(Ordering::Relaxed)
-                );
-            }
-            let count = buckets[BUCKETS.len() + 1].load(Ordering::Relaxed);
-            let sum = buckets[BUCKETS.len()].load(Ordering::Relaxed);
-            let _ = writeln!(text, "scion_pg_pool_wait_seconds_sum {}", seconds(sum));
-            let _ = writeln!(text, "scion_pg_pool_wait_seconds_count {count}");
-        }
-        text.push_str(
-            "# HELP scion_pg_readers_busy Postgres read connections of the pool that are in use.\n",
-        );
-        text.push_str("# TYPE scion_pg_readers_busy gauge\n");
-        let _ = writeln!(
-            text,
-            "scion_pg_readers_busy {}",
-            self.pg_readers_busy.load(Ordering::Relaxed)
-        );
-        text.push_str(
-            "# HELP scion_pg_tx_age_seconds Age of the oldest open Postgres read transaction, in seconds.\n",
-        );
-        text.push_str("# TYPE scion_pg_tx_age_seconds gauge\n");
-        let _ = writeln!(
-            text,
-            "scion_pg_tx_age_seconds {}",
-            seconds(self.pg_tx_age.load(Ordering::Relaxed))
-        );
+        self.render_pg(&mut text);
         text
     }
 
@@ -557,6 +495,52 @@ impl Metrics {
                 );
             }
         }
+    }
+
+    /// The Postgres reader-pool metrics: the wait histogram and the two
+    /// gauges. [`Metrics::render`] hands the text over.
+    fn render_pg(&self, text: &mut String) {
+        text.push_str(
+            "# HELP scion_pg_pool_wait_seconds Time a call waited for a Postgres reader, in seconds.\n",
+        );
+        text.push_str("# TYPE scion_pg_pool_wait_seconds histogram\n");
+        let buckets = &self.pg_pool_wait;
+        if buckets[BUCKETS.len() + 1].load(Ordering::Relaxed) > 0 {
+            for (i, bound) in BUCKETS.iter().enumerate() {
+                let le = if *bound == u64::MAX {
+                    "+Inf".to_owned()
+                } else {
+                    format!("{}", seconds(*bound))
+                };
+                let _ = writeln!(
+                    text,
+                    "scion_pg_pool_wait_seconds_bucket{{le=\"{le}\"}} {}",
+                    buckets[i].load(Ordering::Relaxed)
+                );
+            }
+            let count = buckets[BUCKETS.len() + 1].load(Ordering::Relaxed);
+            let sum = buckets[BUCKETS.len()].load(Ordering::Relaxed);
+            let _ = writeln!(text, "scion_pg_pool_wait_seconds_sum {}", seconds(sum));
+            let _ = writeln!(text, "scion_pg_pool_wait_seconds_count {count}");
+        }
+        text.push_str(
+            "# HELP scion_pg_readers_busy Postgres read connections of the pool that are in use.\n",
+        );
+        text.push_str("# TYPE scion_pg_readers_busy gauge\n");
+        let _ = writeln!(
+            text,
+            "scion_pg_readers_busy {}",
+            self.pg_readers_busy.load(Ordering::Relaxed)
+        );
+        text.push_str(
+            "# HELP scion_pg_tx_age_seconds Age of the oldest open Postgres read transaction, in seconds.\n",
+        );
+        text.push_str("# TYPE scion_pg_tx_age_seconds gauge\n");
+        let _ = writeln!(
+            text,
+            "scion_pg_tx_age_seconds {}",
+            seconds(self.pg_tx_age.load(Ordering::Relaxed))
+        );
     }
 }
 
