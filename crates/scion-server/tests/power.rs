@@ -187,7 +187,7 @@ impl Lazyfs {
             Ok::<_, std::io::Error>(fifo)
         });
         let mut opening = Some(opening);
-        let mut fifo = wait_for("the faults fifo to open", 15, || {
+        let _fifo = wait_for("the faults fifo to open", 15, || {
             let finished = opening.as_ref().unwrap().is_finished();
             finished.then(|| opening.take().unwrap().join().unwrap())
         });
@@ -619,7 +619,7 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
             .unwrap_or_else(|_| panic!("the cut wave's racers never finished"))
             .unwrap();
         events.line(&format!(
-            "round {round} wave {wave}: {} acked before the freeze, {cut} cut",
+            "round {round} wave {wave}: {} acked before the freeze",
             ids.len()
         ));
         acked.extend(ids);
@@ -837,6 +837,7 @@ async fn import_process_races_the_server_on_the_same_blob() {
             rustix::process::Signal::KILL,
         );
     });
+    let import = std::thread::spawn(move || import.wait_with_output());
     let mut import = Some(import);
     let out = wait_for("the import to finish", 130, || {
         let finished = import.as_ref().unwrap().is_finished();
