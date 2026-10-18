@@ -16,7 +16,7 @@
 //! suite skips without its variable.
 use scion_server::Store as _;
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn required() -> bool {
     if !cfg!(target_os = "linux") {
