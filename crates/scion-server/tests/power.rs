@@ -278,7 +278,7 @@ async fn every_reply_survives_a_power_cut() {
         // A reaped child's flock can outlive the waitpid by one tick; the
         // next server must not race it.
         common::spawn_guard::across_release(|| {
-            common::wait_for_lock_release(&dir.path().join("backing/data"));
+            common::spawn_guard::wait_for_lock_release(&dir.path().join("backing/data"));
         });
         let mut lazy = Lazyfs::start(dir.path(), &lazyfs, round);
         let data = lazy.mount.join("data");
@@ -600,7 +600,7 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
     for round in 100..100 + rounds {
         events.line(&format!("round {round}: mounts"));
         common::spawn_guard::across_release(|| {
-            common::wait_for_lock_release(&dir.path().join("backing/data"));
+            common::spawn_guard::wait_for_lock_release(&dir.path().join("backing/data"));
         });
         let mut lazy = Lazyfs::start(dir.path(), &lazyfs, round);
         let data = lazy.mount.join("data");
