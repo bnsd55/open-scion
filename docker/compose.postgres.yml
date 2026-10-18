@@ -11,7 +11,7 @@
 # encrypted and checked: the URL names sslmode=require, and the server
 # checks the database's certificate against the demo CA with
 # --postgres-ca (what #178 requires of a host that is not local). The
-# demo CA signs the postgres certificate at compose time, like the
+# demo script signs the postgres certificate with the demo CA, like the
 # server's and the cache's.
 
 services:

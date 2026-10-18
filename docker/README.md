@@ -50,8 +50,9 @@ server's data directory keeps only the marker file and the ticket key.
 
 The database's traffic leaves the machine, so #178's rule applies: the
 URL names `sslmode=require`, and `--postgres-ca` checks the database's
-certificate. The demo CA signs a certificate for the `postgres` service
-at compose time, the way it signs the server's and the cache's. The
+certificate. The demo script signs a certificate for the `postgres`
+service with the demo CA, the way it signs the server's and the
+cache's. The
 database's key lands in a volume owned by the postgres user, because
 Postgres refuses to start with a key it cannot read.
 

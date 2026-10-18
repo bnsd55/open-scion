@@ -6,7 +6,7 @@
 #   sh docker/demo.sh postgres  the server keeps its metadata in Postgres
 #                               (compose.postgres.yml adds the database)
 #
-# Every secret here is made at compose time and stays in docker/certs:
+# Every secret here is made by this script and stays in docker/certs:
 # nothing is committed, and nothing is baked into the image.
 set -eu
 cd "$(dirname "$0")"
@@ -26,9 +26,11 @@ compose() {
     docker compose $COMPOSE_FILES "$@"
 }
 
-# A failure after the services started is diagnosed from their logs: the
-# script exits, and the trap says what each container saw.
-trap 'compose logs --tail 200' EXIT
+# A failure after the services started is diagnosed from their logs, and
+# nothing is left running: the trap says what each container saw, then
+# takes the project down with its volumes, as the success path does. The
+# down runs through compose(), so it is scoped to this project's files.
+trap 'compose logs --tail 200; compose down --volumes' EXIT
 
 if ! command -v openssl >/dev/null 2>&1; then
     echo "openssl is needed to make the demo certificates" >&2
