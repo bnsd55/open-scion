@@ -513,6 +513,37 @@ async fn race_wave(
     ids
 }
 
+/// Runs the waves whose every put must be acknowledged, and returns their
+/// ids: each wave races `RACERS` clients on one fresh blob, and every
+/// racer gets a reply before the next wave starts.
+async fn run_acked_waves(events: &EventLog, round: usize, url: &str, rng: &mut Rng) -> Vec<BlobId> {
+    let mut acked = Vec::new();
+    for wave in 0..WAVES - 1 {
+        let content = rng.bytes(3 << 10);
+        let want = BlobId::of(&content);
+        events.line(&format!(
+            "round {round} wave {wave}: starts, one blob {want}"
+        ));
+        let ids = tokio::time::timeout(
+            Duration::from_secs(60),
+            race_wave(
+                events.clone(),
+                round,
+                wave,
+                url.to_owned(),
+                content,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the acked wave never finished"));
+        assert!(ids.windows(2).all(|w| w[0] == w[1]), "one blob ID");
+        acked.extend(ids);
+    }
+    acked
+}
+
 /// Says every acknowledged blob and every blob file of the store verifies.
 fn verify_whole(store: &Store, acked: &[BlobId], events: &EventLog, round: usize, data: &Path) {
     events.line(&format!("round {round}: reopens, {} acked", acked.len()));
@@ -570,30 +601,7 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
         events.line(&format!("round {round}: server up"));
         // Acked waves: every put is answered before the cut, so every one
         // of them must survive it.
-        let mut acked = Vec::new();
-        for wave in 0..WAVES - 1 {
-            let content = rng.bytes(3 << 10);
-            let want = BlobId::of(&content);
-            events.line(&format!(
-                "round {round} wave {wave}: starts, one blob {want}"
-            ));
-            let ids = tokio::time::timeout(
-                Duration::from_secs(60),
-                race_wave(
-                    events.clone(),
-                    round,
-                    wave,
-                    server.url.clone(),
-                    content,
-                    Arc::new(AtomicUsize::new(0)),
-                    Arc::new(AtomicUsize::new(0)),
-                ),
-            )
-            .await
-            .unwrap_or_else(|_| panic!("the acked wave never finished"));
-            assert!(ids.windows(2).all(|w| w[0] == w[1]), "one blob ID");
-            acked.extend(ids);
-        }
+        let acked = run_acked_waves(&events, round, &server.url, &mut rng).await;
         // Cut one: after the acked waves. The server freezes, is cut, and
         // dies; a new one opens on the same mount, which is what a restart
         // after a real cut does.
@@ -933,7 +941,7 @@ async fn import_process_races_the_server_on_the_same_blob() {
     // renamed it. The from= folder names the writer's tmp folder, whose
     // name starts with its process id, so each rename has an owner.
     let server_tmp = format!("/tmp/{}-", server.pid());
-    let import_tmp = format!("/tmp/{}-", import_pid);
+    let import_tmp = format!("/tmp/{import_pid}-");
     let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
     let raced = import_renamed_after_the_server(&trace, &server_tmp, &import_tmp);
     eprintln!("{raced} blob paths were renamed by the import after the server");
