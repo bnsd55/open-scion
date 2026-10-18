@@ -761,10 +761,9 @@ async fn import_process_races_the_server_on_the_same_blob() {
                 "import",
                 "--repo",
                 "race",
-                "--git-dir",
                 git_dir.to_str().unwrap(),
             ])
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let id = put_blob(&mut scion, &content).await.unwrap();
@@ -772,8 +771,9 @@ async fn import_process_races_the_server_on_the_same_blob() {
         let out = import.wait_with_output().unwrap();
         assert!(
             out.status.success(),
-            "the import of round {round} failed: {:?}",
-            String::from_utf8_lossy(&out.stdout)
+            "the import of round {round} failed: {:?}: {:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
         );
         acked.push((id, content));
     }
