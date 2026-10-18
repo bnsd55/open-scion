@@ -27,8 +27,6 @@ use std::ops::Deref;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
@@ -774,10 +772,6 @@ pub struct Blobs {
     /// in this process, so two puts of the same bytes never race their
     /// renames onto one path ([#185]).
     write_locks: Vec<Mutex<()>>,
-    /// The rename gate of the test that checks that lock. Disarmed, it
-    /// stops nothing.
-    #[cfg(test)]
-    rename_gate: RenameGate,
     group_flush: GroupFlush,
     /// Calls to [`Blobs::verify`] so far.
     #[cfg(test)]
@@ -837,8 +831,6 @@ impl Blobs {
             mine,
             _mine_lock: mine_lock,
             write_locks: (0..WRITE_STRIPES).map(|_| Mutex::new(())).collect(),
-            #[cfg(test)]
-            rename_gate: RenameGate::new(),
             group_flush: GroupFlush::default(),
             #[cfg(test)]
             verifies: std::sync::atomic::AtomicU64::default(),
@@ -846,8 +838,10 @@ impl Blobs {
     }
 
     fn write_lock(&self, id: BlobId) -> MutexGuard<'_, ()> {
+        // One stripe per value of the first ID byte: the index needs no
+        // modulo, and two writes race only when their IDs share it.
         let stripe = usize::from(id.as_bytes()[0]);
-        self.write_locks[stripe % WRITE_STRIPES]
+        self.write_locks[stripe]
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
@@ -1358,9 +1352,11 @@ impl BlobBatch<'_> {
         zstd::stream::compress_sized_into(raw, &mut tmp, 3, len as u64)?;
         fsync(tmp.as_file())?;
         fs::create_dir_all(&dir)?;
-        #[cfg(test)]
-        let _rename = self.blobs.rename_gate.enter();
-        tmp.persist(&path).map_err(|e| e.error)?;
+        tmp.persist(&path).map_err(|e| {
+            tracing::warn!(blob = %id, path = %path.display(), error = %e.error,
+                "the rename of the blob's temp file failed");
+            e.error
+        })?;
         self.dirs.insert(dir);
         Ok(())
     }
@@ -1599,115 +1595,6 @@ pub(crate) mod spawn_guard {
     }
 }
 
-/// The rename gate of one `Blobs`, for the test that says two writes of
-/// one blob never rename at once ([#185]). Disarmed, a rename counts
-/// nothing and stops for nothing, so no writer but the test's own ever
-/// pays for the gate; and the gate of one `Blobs` never stops the writers
-/// of another.
-#[cfg(test)]
-struct RenameGate {
-    armed: Mutex<bool>,
-    closed: Mutex<bool>,
-    in_flight: AtomicUsize,
-    most: AtomicUsize,
-    woken: Condvar,
-}
-
-#[cfg(test)]
-impl RenameGate {
-    fn new() -> Self {
-        Self {
-            armed: Mutex::new(false),
-            closed: Mutex::new(false),
-            in_flight: AtomicUsize::new(0),
-            most: AtomicUsize::new(0),
-            woken: Condvar::new(),
-        }
-    }
-
-    /// Arms the gate and closes it: every rename of this `Blobs` stops
-    /// until the lease drops. The lease opens and disarms on drop, so a
-    /// test that panics cannot leave the gate shut.
-    fn close(&self) -> Lease<'_> {
-        *self.armed.lock().unwrap_or_else(PoisonError::into_inner) = true;
-        *self.closed.lock().unwrap_or_else(PoisonError::into_inner) = true;
-        Lease { gate: self }
-    }
-
-    /// How many renames are in the gate phase right now.
-    fn in_flight(&self) -> usize {
-        self.in_flight.load(Ordering::SeqCst)
-    }
-
-    /// How many renames were in the gate phase at once, at most.
-    fn most(&self) -> usize {
-        self.most.load(Ordering::SeqCst)
-    }
-
-    /// Enters the gate phase of one rename: counted, and stopped while
-    /// the gate is closed. The guard leaves the count; a rename that ran
-    /// while the gate was disarmed holds no count.
-    fn enter(&self) -> GateGuard<'_> {
-        let armed = *self.armed.lock().unwrap_or_else(PoisonError::into_inner);
-        if !armed {
-            return GateGuard {
-                gate: self,
-                counted: false,
-            };
-        }
-        let mut closed = self.closed.lock().unwrap_or_else(PoisonError::into_inner);
-        self.in_flight.fetch_add(1, Ordering::SeqCst);
-        self.most
-            .fetch_max(self.in_flight.load(Ordering::SeqCst), Ordering::SeqCst);
-        while *closed {
-            closed = self
-                .woken
-                .wait(closed)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-        GateGuard {
-            gate: self,
-            counted: true,
-        }
-    }
-
-    fn open(&self) {
-        *self.armed.lock().unwrap_or_else(PoisonError::into_inner) = false;
-        *self.closed.lock().unwrap_or_else(PoisonError::into_inner) = false;
-        self.woken.notify_all();
-    }
-}
-
-/// Holds the gate shut, and opens it however its test ends.
-#[cfg(test)]
-struct Lease<'a> {
-    gate: &'a RenameGate,
-}
-
-#[cfg(test)]
-impl Drop for Lease<'_> {
-    fn drop(&mut self) {
-        self.gate.open();
-    }
-}
-
-/// Holds one rename's count in the gate.
-#[cfg(test)]
-struct GateGuard<'a> {
-    gate: &'a RenameGate,
-    counted: bool,
-}
-
-#[cfg(test)]
-impl Drop for GateGuard<'_> {
-    fn drop(&mut self) {
-        if self.counted {
-            self.gate.in_flight.fetch_sub(1, Ordering::SeqCst);
-            self.gate.woken.notify_all();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::db::SqliteTx;
@@ -1721,72 +1608,69 @@ mod tests {
 
     use super::*;
 
-    /// Two puts of one blob never rename at once: the second write waits
-    /// at the striped write lock while the first holds it, so it never
-    /// reaches its own rename ([#185]). The gate makes the wait
-    /// observable: the first write stops in the rename phase, and the
-    /// test says the second never joins it there. Without the lock the
-    /// second write reaches the gate too, and the count says two.
+    /// A write of one blob waits for the stripe of a write that is held:
+    /// while the stripe is held by hand, the blob's file stays absent,
+    /// and a write released, the file is there ([#185]). Without the
+    /// striped lock the write renames at once, and the absence assert
+    /// fails. The replacing upload takes the same lock, so the second
+    /// test repeats the shape on the `replace_stored` path, which the
+    /// gRPC race of an upload with a copy stored reaches.
     #[test]
-    fn two_writes_of_one_blob_never_rename_at_once() {
+    fn a_write_of_one_blob_waits_for_the_stripe() {
+        held_stripe_waits(|store, id, content| {
+            let mut batch = store.blobs().batch();
+            batch.put(content).unwrap();
+            let _ = id;
+        });
+    }
+
+    #[test]
+    fn a_replacing_upload_of_one_blob_waits_for_the_stripe() {
+        held_stripe_waits(|store, id, content| {
+            let mut batch = store.blobs().batch();
+            batch.replace_stored(id, content.len(), content).unwrap();
+            batch.flush_dirs().unwrap();
+        });
+    }
+
+    /// Holds the stripe of one blob by hand, runs `write` on a thread,
+    /// and says the blob stays absent while the stripe is held and is
+    /// whole once the stripe is free. The lease drops the stripe
+    /// however the test ends, so a panicking assert cannot wedge the
+    /// writer ([#142]).
+    fn held_stripe_waits(write: impl Fn(&Store, BlobId, &'static [u8]) + Send + Sync) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let content = b"the same bytes for both writes";
-        // Both writes put the same bytes, so both work on one blob ID and
-        // one stripe of the write lock.
-        let put = |store: &Store| {
-            let mut batch = store.blobs().batch();
-            batch.put(content).map(|_| store.blobs().rename_gate.most())
-        };
-        let (tx, rx) = mpsc::channel();
+        let id = BlobId::of(content);
+        // The stripe is held by hand, and drops however the test ends: a
+        // panicking assert frees the writer at the scope's join ([#142]).
+        let stripe = Mutex::new(store.blobs().write_lock(id));
         thread::scope(|scope| {
-            // The gate closes for this test's `Blobs` alone, and the
-            // lease lives inside the scope: if an assertion here panics,
-            // the lease opens the gate before the scope joins the writes
-            // that wait at it ([#142]).
-            let lease = store.blobs().rename_gate.close();
-            let first = scope.spawn(|| tx.send(put(&store)));
-            // The first write stops at the gate, inside the rename, with
-            // the stripe of this blob held.
-            let until = Instant::now() + Duration::from_secs(5);
-            while store.blobs().rename_gate.in_flight() < 1 && Instant::now() < until {
-                thread::sleep(Duration::from_millis(1));
+            let writer = scope.spawn(|| write(&store, id, content));
+            // A ceiling only bounds the wait of the good code: the write
+            // of the broken code renames at once, and the absence assert
+            // fails.
+            let until = Instant::now() + Duration::from_millis(200);
+            let mut landed = false;
+            while Instant::now() < until {
+                if store.blobs().verify(id).unwrap() == BlobStatus::Valid {
+                    landed = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
             }
-            assert_eq!(
-                store.blobs().rename_gate.in_flight(),
-                1,
-                "the first write never renamed"
+            assert!(
+                !landed,
+                "the write renamed while another write held the stripe"
             );
-            let second = scope.spawn(|| tx.send(put(&store)));
-            // The second write waits at the stripe, so it can never join
-            // the first in the rename phase. A ceiling only bounds the
-            // wait of the good code; the broken code joins at once.
-            let until = Instant::now() + Duration::from_secs(5);
-            while store.blobs().rename_gate.in_flight() < 2 && Instant::now() < until {
-                thread::sleep(Duration::from_millis(1));
-            }
-            assert_eq!(
-                store.blobs().rename_gate.in_flight(),
-                1,
-                "two writes of one blob renamed at once"
-            );
-            lease.gate.open();
-            first.join().unwrap().unwrap();
-            second.join().unwrap().unwrap();
-            drop(lease);
+            drop(stripe);
+            writer.join().unwrap();
         });
         assert_eq!(
-            store.blobs().rename_gate.most(),
-            1,
-            "two renames overlapped"
-        );
-        drop(rx);
-        // Both writes end with the blob stored and intact: the second
-        // found the file of the first and kept it.
-        assert_eq!(
-            store.blobs().verify(BlobId::of(content)).unwrap(),
+            store.blobs().verify(id).unwrap(),
             BlobStatus::Valid,
-            "the blob of two racing writes"
+            "the blob of the held stripe"
         );
     }
 

@@ -171,21 +171,28 @@ impl Server {
             rustix::process::Signal::STOP,
         )
         .unwrap();
-        // The process state sits in field 3 of /proc/<pid>/stat, after the
-        // command in parens. `T` is stopped; a missing entry means the
-        // process is gone, which is frozen enough for a cut.
-        let stat = format!("/proc/{pid}/stat");
+        // /proc/<pid>/stat is the main thread only: a tokio worker inside
+        // a FUSE call can stay unstopped while the main thread is `T`, and
+        // LazyFS would run it after the cut. Every task's stat must read
+        // `T` (stopped) or `Z` (gone, so reaped or waiting to be reaped:
+        // either way nothing of it can write past the cut). A vanished
+        // /proc entry means the process is gone too.
+        let tasks = format!("/proc/{pid}/task");
         let give_up = Instant::now() + Duration::from_secs(5);
         loop {
-            match fs::read_to_string(&stat) {
-                Ok(text) => {
-                    let after = &text[text.rfind(')').unwrap() + 1..];
-                    let state = after.split_whitespace().next().unwrap_or("");
-                    if state == "T" {
-                        return;
-                    }
-                }
-                Err(_) => return,
+            let all_stopped = match fs::read_dir(&tasks) {
+                Err(_) => true,
+                Ok(tasks) => tasks
+                    .filter_map(|task| {
+                        let stat = fs::read_to_string(task.ok()?.path().join("stat")).ok()?;
+                        let after = &stat[stat.rfind(')').unwrap() + 1..];
+                        let state = after.split_whitespace().next().unwrap_or("");
+                        Some(state == "T" || state == "Z")
+                    })
+                    .all(|stopped| stopped),
+            };
+            if all_stopped {
+                return;
             }
             assert!(
                 Instant::now() < give_up,
@@ -860,4 +867,40 @@ pub mod spawn_guard {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+}
+
+/// Runs git in `dir` with fixed identities and no user or system config,
+/// and reports whether it succeeded with its stdout. The child shares a
+/// flock until it execs (see `spawn_guard`), so the read side of one test
+/// cannot land inside another test's lock-release window.
+pub fn git_status(dir: &Path, args: &[&str]) -> (bool, String) {
+    let out = spawn_guard::across_spawn(|| {
+        Command::new("git")
+            // No auto gc or maintenance: they pack loose objects in the
+            // background and delete the loose files, also while an import
+            // of the same repository still reads them.
+            .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Ada")
+            .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+            .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+            .env("GIT_COMMITTER_NAME", "Ada")
+            .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+            .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+            .output()
+    })
+    .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap().trim_end().to_owned();
+    (out.status.success(), stdout)
+}
+
+/// Runs git in `dir` and returns its stdout. Fails the test unless git
+/// succeeds.
+pub fn git(dir: &Path, args: &[&str]) -> String {
+    let (ok, stdout) = git_status(dir, args);
+    assert!(ok, "git {args:?} failed");
+    stdout
 }
