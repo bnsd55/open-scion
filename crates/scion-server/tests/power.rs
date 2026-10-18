@@ -954,19 +954,17 @@ fn release_park(data: &Path, id: &BlobId) {
 /// file through the mount, and the ops trace shows every stat.
 fn wait_parked(trace: &Path, id: &BlobId) {
     let park_path = format!("hooks/park-{id}");
+    let mut armed = false;
     let until = Instant::now() + Duration::from_secs(30);
     loop {
-        let parked = fs::read_to_string(trace)
-            .unwrap_or_default()
-            .lines()
-            .any(|line| line.contains("lfs_getattr") && line.contains(&park_path));
-        assert!(
-            parked || Instant::now() < until,
-            "the server never reached the park"
-        );
-        if parked {
-            return;
+        for line in fs::read_to_string(trace).unwrap_or_default().lines() {
+            if line.contains("lfs_create") && line.contains(&park_path) {
+                armed = true;
+            } else if armed && line.contains("lfs_getattr") && line.contains(&park_path) {
+                return;
+            }
         }
+        assert!(Instant::now() < until, "the server never reached the park");
         std::thread::sleep(Duration::from_millis(5));
     }
 }
