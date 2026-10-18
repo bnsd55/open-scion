@@ -713,11 +713,23 @@ impl Pg {
         // default: every change of the caller checks the newest state of
         // the row it touches (the CAS predicates).
         let mut tx = PgTx::begin(&mut writer)?;
-        // Every writer and the collector's batches order on one advisory
-        // key, held to the end of the transaction: what a SQLite write
-        // transaction gets from the data directory's one write connection
-        // (store.rs `commit`, `TransactionBehavior::Immediate`). A
-        // changeset that names a blob the collector is about to remove
+        // Every writer and the collector's batches of one schema order on
+        // one advisory key, held to the end of the transaction: what a
+        // SQLite write transaction gets from the data directory's one
+        // write connection (store.rs `commit`,
+        // `TransactionBehavior::Immediate`).
+        //
+        // SHORTCUT: one key per schema orders every writer of the schema
+        // against one collector, which is right for one server per schema
+        // (#178): a test database hosts one store per schema, so tests of
+        // different stores do not serialize against each other. Many
+        // servers (#47) need a finer design: per-repo keys, or the
+        // collector's batches reading a snapshot instead of holding a
+        // lock. One key, not one per blob: a transaction that puts
+        // thousands of blobs would hold thousands of entries in Postgres's
+        // shared lock table and run it out (E53200,
+        // `max_locks_per_transaction`). A changeset that names a blob the
+        // collector is about to remove
         // commits first, and the collector's re-read pins the blob; a
         // batch of the collector waits for every writer that has begun.
         // The wait ignores the writer's 5 s lock clock: the queue drains
@@ -731,7 +743,10 @@ impl Pg {
             &format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT_FOR_KEY}'"),
             &[],
         )?;
-        tx.c.query_opt("SELECT pg_advisory_xact_lock($1)", &[P::i64(PG_GC_LOCK)])?;
+        tx.c.query_opt(
+            "SELECT pg_advisory_xact_lock(hashtext(current_schema() || ':gc'))",
+            &[],
+        )?;
         tx.c.query(
             &format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT_FOR_WRITERS}'"),
             &[],
@@ -1369,17 +1384,6 @@ fn to_id(bytes: &[u8]) -> Result<ChangesetId> {
 fn id_bytes(id: &[u8; 32]) -> Vec<u8> {
     id.to_vec()
 }
-
-/// The advisory lock key that orders a changeset or land transaction
-/// against the collector's row check, delete, and unlink. One key, not
-/// one per blob: a transaction that puts thousands of blobs would
-/// otherwise hold thousands of entries in Postgres's shared lock table
-/// and run it out (E53200, `max_locks_per_transaction`).
-// SHORTCUT: one key orders every writer of the database against one
-// collector, which is right for one server per database (#178). Many
-// servers (#47) need a finer design: per-repo keys, or the collector's
-// batches reading a snapshot instead of holding a lock.
-const PG_GC_LOCK: i64 = 0x5343_494F_4E47_4331;
 
 impl MetaTx for PgTx<'_> {
     /// Creates a repository, or returns the existing one with that name.
