@@ -332,41 +332,10 @@ impl Metrics {
         self.render_requests(&mut text);
         self.render_latency(&mut text);
         self.render_bytes(&mut text);
-        self.render_blob_sync(&mut text);
-        text.push_str("# TYPE scion_lands_total counter\n");
-        for (outcome, name) in LANDS.iter().enumerate() {
-            let value = self.lands[outcome].load(Ordering::Relaxed);
-            if value > 0 {
-                let _ = writeln!(text, "scion_lands_total{{outcome=\"{name}\"}} {value}");
-            }
-        }
-        text.push_str(
-            "# HELP scion_view_trees_walked_total Real trees a view derivation fetched.\n",
-        );
-        text.push_str("# TYPE scion_view_trees_walked_total counter\n");
-        let _ = writeln!(
-            text,
-            "scion_view_trees_walked_total {}",
-            self.view_trees_walked.load(Ordering::Relaxed)
-        );
-        text.push_str(
-            "# HELP scion_land_replans_total Lands whose ref moved under them, planned again.\n",
-        );
-        text.push_str("# TYPE scion_land_replans_total counter\n");
-        let replans = self.land_replans.load(Ordering::Relaxed);
-        if replans > 0 {
-            let _ = writeln!(text, "scion_land_replans_total {replans}");
-        }
-        text.push_str("# HELP scion_cache_hits_total Objects a tier served from its store.\n");
-        text.push_str("# TYPE scion_cache_hits_total counter\n");
-        text.push_str("# HELP scion_cache_misses_total Objects a tier fetched from upstream.\n");
-        text.push_str("# TYPE scion_cache_misses_total counter\n");
-        for (name, counter) in [("hits", &self.cache_hits), ("misses", &self.cache_misses)] {
-            let value = counter.load(Ordering::Relaxed);
-            if value > 0 {
-                let _ = writeln!(text, "scion_cache_{name}_total {value}");
-            }
-        }
+        self.render_lands(&mut text);
+        self.render_view_walks(&mut text);
+        self.render_land_replans(&mut text);
+        self.render_cache(&mut text);
         self.render_blob_sync(&mut text);
         self.render_collector_key_wait(&mut text);
         if self.data_free_set.load(Ordering::Relaxed) {
