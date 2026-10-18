@@ -430,8 +430,9 @@ impl Store {
 
     /// The durability steps this store's blob path ran, oldest first,
     /// for the order test under the test-hooks seam.
+    #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn durability_steps(&self) -> Vec<DurabilityStep> {
+    pub fn durability_steps(&self) -> Vec<DurabilityStep> {
         self.inner.blobs.log.steps()
     }
 
@@ -889,10 +890,11 @@ pub struct Blobs {
 }
 
 /// One durability step of the blob path, recorded for the order test
-/// under `cfg(any(test, feature = "test-hooks"))` and never in a
-/// production build.
+/// under the test-hooks seam. A production build names the steps at the
+/// call sites and stores nothing.
+#[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DurabilityStep {
+pub enum DurabilityStep {
     /// A temp file for a blob was written.
     TmpWrite(BlobId),
     /// The temp file's bytes were flushed to the drive.
@@ -906,8 +908,9 @@ pub(crate) enum DurabilityStep {
 }
 
 /// The ordered log of [`DurabilityStep`]s behind the test-hooks seam.
+#[doc(hidden)]
 #[derive(Default)]
-pub(crate) struct DurabilityLog {
+pub struct DurabilityLog {
     #[cfg(any(test, feature = "test-hooks"))]
     steps: std::sync::Mutex<Vec<DurabilityStep>>,
 }
@@ -933,8 +936,9 @@ impl DurabilityLog {
     }
 
     /// The steps recorded so far, oldest first.
+    #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn steps(&self) -> Vec<DurabilityStep> {
+    pub fn steps(&self) -> Vec<DurabilityStep> {
         self.steps
             .lock()
             .expect("the durability log's lock")
