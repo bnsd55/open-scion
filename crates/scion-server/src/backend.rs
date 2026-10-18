@@ -234,6 +234,10 @@ impl Backend {
         std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres")
     }
 
+    /// The schema that [`Backend::open_test`] gave this data directory on
+    /// Postgres: a test that counts rows through its own Postgres client
+    /// names it the same way. A result, so the callers unwrap one shape.
+    ///
     /// The schema a test backend of this directory uses, when the tests
     /// run on Postgres. Hidden: a test holds a lock in it from a
     /// connection of its own.
@@ -309,41 +313,41 @@ impl Backend {
         }
     }
 
+    /// The import's test hooks and busy-retry count, the same state on
+    /// both backends.
+    #[doc(hidden)]
+    #[must_use]
+    fn hooks(&self) -> &crate::store::ImportHooks {
+        match self {
+            Self::Sqlite(store) => store.hooks(),
+            Self::Postgres(pg) => pg.hooks(),
+        }
+    }
+
     /// Sets the step the tests run after each batch of the import commits.
-    /// A Postgres database has no shared data directory, so this only
-    /// reaches SQLite.
     #[doc(hidden)]
     pub fn set_after_batch(&self, step: Option<crate::store::AfterBatch>) {
-        if let Self::Sqlite(store) = self {
-            store.set_after_batch(step);
-        }
+        self.hooks().set_after_batch(step);
     }
 
     /// How many busy retries of the import's batches ran so far.
     #[doc(hidden)]
     #[must_use]
     pub fn busy_retries(&self) -> u64 {
-        match self {
-            Self::Sqlite(store) => store.busy_retries(),
-            Self::Postgres(_) => 0,
-        }
+        self.hooks().busy_retries()
     }
 
     /// Runs the test step of a batch boundary, with the count of batches
     /// done so far.
     #[doc(hidden)]
     pub fn run_after_batch(&self, batches: usize) {
-        if let Self::Sqlite(store) = self {
-            store.run_after_batch(batches);
-        }
+        self.hooks().run_after_batch(batches);
     }
 
     /// Counts one busy retry of the import's batch.
     #[doc(hidden)]
     pub fn note_busy_retry(&self) {
-        if let Self::Sqlite(store) = self {
-            store.note_busy_retry();
-        }
+        self.hooks().note_busy_retry();
     }
 }
 

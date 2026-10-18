@@ -39,7 +39,7 @@ use std::io::Read as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use std::{fmt, fs, io, iter};
 
@@ -762,7 +762,7 @@ impl<S: Store> Tier<S> {
             let learned_now = learned.clone();
             let verdict = self
                 .blocking(&ask.repo, move |store: &S| {
-                    let mut walk = walk.lock().unwrap();
+                    let mut walk = walk.lock().unwrap_or_else(PoisonError::into_inner);
                     let mut reader = |tree_id: [u8; 32]| {
                         if let Some(bytes) = learned_now.get(&tree_id) {
                             return Ok(Some(bytes.clone()));
