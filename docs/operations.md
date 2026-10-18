@@ -320,6 +320,9 @@ the process, scraped from there. The names:
 - `scion_request_seconds` — one latency histogram per RPC.
 - `scion_rpc_bytes_total` — request and reply bytes by RPC.
 - `scion_lands_total` — lands by outcome.
+- `scion_land_replans_total` — lands that planned again because their ref
+  moved under them; a rising rate means lands contending with imports or
+  other writers on one ref.
 - `scion_cache_hits_total` / `scion_cache_misses_total` — what a tier
   served from its store against what it fetched upstream.
 
