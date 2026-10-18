@@ -276,8 +276,10 @@ jobs:
           tags: open-scion-demo
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: run the demo
+      - name: run the demo (SQLite)
         run: sh docker/demo.sh
+      - name: run the demo (Postgres)
+        run: sh docker/demo.sh postgres
 
   fuzz:
     name: fuzz smoke (60 s)

@@ -5,12 +5,13 @@ up a server and a cache, both with TLS, seeds a repo with one commit, and
 checks it out through the cache.
 
 ```sh
-sh docker/demo.sh
+sh docker/demo.sh           # the server keeps its metadata in SQLite
+sh docker/demo.sh postgres  # the server keeps its metadata in Postgres
 ```
 
 What it does:
 
-1. Makes the demo secrets at compose time: one CA, a certificate for each
+1. Makes the demo secrets at script time: one CA, a certificate for each
    of `server` and `cache`, and the server's ticket key (made by
    `scion-server ticket-key`, written 0600 into the server's data volume).
 2. Builds the image and starts the two services.
@@ -37,6 +38,23 @@ certificates and a real token for anything that matters.
   owns.
 - `docker/compose.yml`: the `server`, `cache`, and a one-shot `scn` runner.
 - `docker/demo.sh`: the script the steps above describe.
+- `docker/compose.postgres.yml`: the Postgres variant's additions, loaded
+  on top of `docker/compose.yml` by `docker/demo.sh postgres`.
+
+## The Postgres variant
+
+`sh docker/demo.sh postgres` runs the same checkout with the server's
+metadata in a `postgres:17` container. `docker/compose.postgres.yml` adds
+the database and re-points the server at it with `--postgres-url`; the
+server's data directory keeps only the marker file and the ticket key.
+
+The database's traffic leaves the machine, so #178's rule applies: the
+URL names `sslmode=require`, and `--postgres-ca` checks the database's
+certificate. The demo script signs a certificate for the `postgres`
+service with the demo CA, the way it signs the server's and the
+cache's. The
+database's key lands in a volume owned by the postgres user, because
+Postgres refuses to start with a key it cannot read.
 
 ## CI
 
