@@ -3105,7 +3105,7 @@ mod tests {
             let c = steps_of(log, &S::Rename(*id));
             let d = log
                 .iter()
-                .position(|s| matches!(s, S::DirFsync(path) if path == dir))
+                .position(|s| matches!(s, S::DirFsync(path) if *path == dir))
                 .unwrap_or_else(|| panic!("no dir fsync of {} before the answer", dir.display()));
             let f = log
                 .iter()
@@ -3134,7 +3134,7 @@ mod tests {
             let (dir, _) = store.blobs().location(*id);
             assert!(
                 log.iter()
-                    .any(|s| matches!(s, S::DirFsync(path) if path == dir)),
+                    .any(|s| matches!(s, S::DirFsync(path) if *path == dir)),
                 "no dir fsync of {} before the answer",
                 dir.display()
             );
