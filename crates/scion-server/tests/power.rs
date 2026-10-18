@@ -404,6 +404,59 @@ impl EventLog {
 /// One wave of the W1 test: `RACERS` clients put the same bytes at once,
 /// started together by a barrier, so two of them always race one blob ID.
 /// Every reply must name that blob.
+/// One racer of a wave: bounded connect, the barrier whatever the
+/// connect did, and one put whose counters the wave's test reads.
+#[allow(clippy::too_many_arguments)]
+async fn racer(
+    log: EventLog,
+    round: usize,
+    wave: usize,
+    i: usize,
+    url: String,
+    content: Vec<u8>,
+    barrier: Arc<tokio::sync::Barrier>,
+    crossed: Arc<AtomicUsize>,
+    replied: Arc<AtomicUsize>,
+) -> Result<(BlobId, Vec<u8>), Status> {
+    // The connect is bounded, and every racer reaches the barrier
+    // whatever it did: one failed connect must not hold the other
+    // fifteen at the barrier to the ceiling.
+    let connected = tokio::time::timeout(Duration::from_secs(30), connect(&url)).await;
+    let put = match connected {
+        Ok(Ok((mut scion, _objects))) => {
+            barrier.wait().await;
+            crossed.fetch_add(1, Ordering::SeqCst);
+            let put = put_blob(&mut scion, &content).await;
+            if put.is_ok() {
+                replied.fetch_add(1, Ordering::SeqCst);
+            }
+            put
+        }
+        Ok(Err(error)) => {
+            barrier.wait().await;
+            Err(Status::unknown(format!("connect failed: {error}")))
+        }
+        Err(_) => {
+            barrier.wait().await;
+            Err(Status::deadline_exceeded("the connect hung"))
+        }
+    };
+    match put {
+        Ok(id) => {
+            log.line(&format!("round {round} wave {wave} racer {i}: acked {id}"));
+            Ok((id, content))
+        }
+        Err(status) => {
+            // The freeze ends the wave, so a racer still in flight loses
+            // its call. No reply, no guarantee.
+            log.line(&format!(
+                "round {round} wave {wave} racer {i}: put failed {status:?}"
+            ));
+            Err(status)
+        }
+    }
+}
+
 async fn race_wave(
     log: EventLog,
     round: usize,
@@ -420,53 +473,17 @@ async fn race_wave(
     let barrier = Arc::new(tokio::sync::Barrier::new(RACERS));
     let racers: Vec<_> = (0..RACERS)
         .map(|i| {
-            let (log, url, content, barrier, crossed, replied) = (
+            tokio::spawn(racer(
                 log.clone(),
+                round,
+                wave,
+                i,
                 url.clone(),
                 content.clone(),
                 Arc::clone(&barrier),
                 Arc::clone(&crossed),
                 Arc::clone(&replied),
-            );
-            tokio::spawn(async move {
-                // The connect is bounded, and every racer reaches the
-                // barrier whatever it did: one failed connect must not
-                // hold the other fifteen at the barrier to the ceiling.
-                let connected = tokio::time::timeout(Duration::from_secs(30), connect(&url)).await;
-                let put = match connected {
-                    Ok(Ok((mut scion, _objects))) => {
-                        barrier.wait().await;
-                        crossed.fetch_add(1, Ordering::SeqCst);
-                        let put = put_blob(&mut scion, &content).await;
-                        if put.is_ok() {
-                            replied.fetch_add(1, Ordering::SeqCst);
-                        }
-                        put
-                    }
-                    Ok(Err(error)) => {
-                        barrier.wait().await;
-                        Err(Status::unknown(format!("connect failed: {error}")))
-                    }
-                    Err(_) => {
-                        barrier.wait().await;
-                        Err(Status::deadline_exceeded("the connect hung"))
-                    }
-                };
-                match put {
-                    Ok(id) => {
-                        log.line(&format!("round {round} wave {wave} racer {i}: acked {id}"));
-                        Ok((id, content))
-                    }
-                    Err(status) => {
-                        // The freeze ends the wave, so a racer still in
-                        // flight loses its call. No reply, no guarantee.
-                        log.line(&format!(
-                            "round {round} wave {wave} racer {i}: put failed {status:?}"
-                        ));
-                        Err(status)
-                    }
-                }
-            })
+            ))
         })
         .collect();
     let mut ids = Vec::new();
@@ -756,6 +773,47 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
     }
 }
 
+/// Counts the blob paths of a `LazyFS` ops trace that the import renamed
+/// after the server did: `from`'s tmp folder starts with the writer's
+/// process id, so each rename has an owner, and a rename of the import
+/// that follows one of the server on the same path is the overlap the
+/// per-process lock cannot see.
+fn import_renamed_after_the_server(trace: &str, server_tmp: &str, import_tmp: &str) -> usize {
+    // For every blob path: when each process last renamed onto it.
+    let mut server_at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut import_at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (seq, line) in trace
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("lfs_rename"))
+    {
+        let paths: Vec<&str> = line
+            .split_whitespace()
+            .filter(|token| token.contains('/'))
+            .collect();
+        let (from, to) = match paths.as_slice() {
+            [from, to] => (*from, *to),
+            _ => continue,
+        };
+        if !to.contains("/objects/") {
+            continue;
+        }
+        if from.contains(server_tmp) {
+            server_at.insert(to, seq);
+        } else if from.contains(import_tmp) {
+            import_at.insert(to, seq);
+        }
+    }
+    import_at
+        .iter()
+        .filter(|(dest, import_seq)| {
+            server_at
+                .get(*dest)
+                .is_some_and(|server_seq| server_seq < import_seq)
+        })
+        .count()
+}
+
 /// Two processes rename onto the same blob paths under `LazyFS`: the
 /// server, from client puts, and a second `scion-server` process, from an
 /// import of ~200 git files whose bytes the client also puts, in reverse
@@ -864,39 +922,7 @@ async fn import_process_races_the_server_on_the_same_blob() {
     let server_tmp = format!("/tmp/{}-", server.pid());
     let import_tmp = format!("/tmp/{}-", import_pid);
     let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
-    // For every blob path: when each process last renamed onto it.
-    let mut server_at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    let mut import_at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for (seq, line) in trace
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| line.contains("lfs_rename"))
-    {
-        let (from, to) = line
-            .split_whitespace()
-            .filter(|token| token.contains('/'))
-            .collect::<Vec<_>>()
-            .as_slice()
-            .split_first_chunk::<2>()
-            .map(|(pair, _)| (pair[0], pair[1]))
-            .unwrap_or(("", ""));
-        if !to.contains("/objects/") {
-            continue;
-        }
-        if from.contains(&server_tmp) {
-            server_at.insert(to, seq);
-        } else if from.contains(&import_tmp) {
-            import_at.insert(to, seq);
-        }
-    }
-    let raced = import_at
-        .iter()
-        .filter(|(dest, import_seq)| {
-            server_at
-                .get(*dest)
-                .is_some_and(|server_seq| server_seq < import_seq)
-        })
-        .count();
+    let raced = import_renamed_after_the_server(&trace, &server_tmp, &import_tmp);
     eprintln!("{raced} blob paths were renamed by the import after the server");
     assert!(
         out.status.success(),
