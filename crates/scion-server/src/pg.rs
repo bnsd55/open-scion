@@ -3351,7 +3351,7 @@ mod pool_tests {
                         },
                         committer: None,
                         message: b"root".to_vec(),
-                        changes: BTreeMap::new(),
+                        changes: std::collections::BTreeMap::new(),
                     },
                 )?;
                 assert!(c.cas_ref(repo, "main", None, cs)?);
