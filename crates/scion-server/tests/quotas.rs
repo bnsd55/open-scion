@@ -359,8 +359,14 @@ async fn an_upload_over_the_byte_cap_is_refused_and_frees_on_exit() {
 async fn a_stream_holds_its_slot_until_the_stream_ends() {
     let (_dir, store) = store();
     let access = access(&["alice", "bob"]);
-    // One request in flight per principal.
-    let (stop, channel) = server(&store, access, Quotas::new(Some(1), None)).await;
+    // One request in flight per principal. A clone of the caps shares the
+    // server's counts, so the test reads its own state instead of polling
+    // through the network: the prober rides the same connection whose
+    // flow control the unread reply holds, and under load its reply says
+    // nothing about the quota.
+    let quotas = Quotas::new(Some(1), None);
+    let observed = quotas.clone();
+    let (stop, channel) = server(&store, access, quotas).await;
     // A file of several parts, so its reply has a producer that stays alive
     // after the handler has returned, and that waits on a client which
     // takes no message.
@@ -410,7 +416,8 @@ async fn a_stream_holds_its_slot_until_the_stream_ends() {
         .await
         .unwrap()
         .into_inner();
-    until(|| async { probe(&prober).await == Code::ResourceExhausted }).await;
+    until(|| async { observed.in_flight("alice") == 1 }).await;
+    assert_eq!(probe(&prober).await, Code::ResourceExhausted);
 
     // Bob is under his own cap: his calls complete while alice holds hers.
     let _ = probe(&client(channel.clone(), "bob")).await;
@@ -418,7 +425,8 @@ async fn a_stream_holds_its_slot_until_the_stream_ends() {
     // Alice drops her reply, so the stream ends and her slot comes back.
     drop(stream);
     drop(alice);
-    until(|| async { probe(&prober).await == Code::NotFound }).await;
+    until(|| async { observed.in_flight("alice") == 0 }).await;
+    assert_eq!(probe(&prober).await, Code::NotFound);
     stop.send(()).ok();
 }
 

@@ -637,18 +637,30 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
             Arc::clone(&crossed),
             Arc::clone(&replied),
         ));
-        let delay = u64::try_from(rng.below(40)).unwrap() + 4;
-        tokio::time::sleep(Duration::from_millis(delay)).await;
+        // The wave runs until a put is really in flight: a racer past
+        // the barrier whose put has not replied yet is work the cut
+        // interrupts. The ceiling only bounds the wait of the good code;
+        // if no put ever goes in flight, the test says so instead of
+        // cutting nothing.
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let crossed_now = crossed.load(Ordering::SeqCst);
+            let replied_now = replied.load(Ordering::SeqCst);
+            if crossed_now > replied_now {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "no put ever went in flight: {crossed_now} crossed, {replied_now} replied"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         events.line(&format!(
-            "round {round}: cut mid-wave at {} ms",
-            started.elapsed().as_millis()
+            "round {round}: cut mid-wave at {} ms, {} crossed, {} replied",
+            started.elapsed().as_millis(),
+            crossed.load(Ordering::SeqCst),
+            replied.load(Ordering::SeqCst)
         ));
-        let crossings_at_cut = crossed.load(Ordering::SeqCst);
-        let replies_before_cut = replied.load(Ordering::SeqCst);
-        assert!(
-            crossings_at_cut > replies_before_cut,
-            "no put was in flight at the freeze: {crossings_at_cut} crossed, {replies_before_cut} replied"
-        );
         server.freeze();
         lazy.cut();
         // The kill comes before the join: the racers of the wave hang on
@@ -726,12 +738,20 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
         let data = lazy.mount.join("data");
         create_repo(&data);
         let mut server = Server::start(&data, &log);
-        // The server writes through the mount: blobs, acknowledged.
-        let (mut scion, _objects) = connect(&server.url).await.unwrap();
+        // The server writes through the mount: blobs, acknowledged. The
+        // waits run behind ceilings, so a hang names its step.
+        let (mut scion, _objects) =
+            tokio::time::timeout(Duration::from_secs(30), connect(&server.url))
+                .await
+                .unwrap_or_else(|_| panic!("the checker test's client never connected"))
+                .unwrap();
         let mut acked = Vec::new();
         for _ in 0..4 {
             let content = rng.bytes(1 << 10);
-            let id = put_blob(&mut scion, &content).await.unwrap();
+            let id = tokio::time::timeout(Duration::from_secs(30), put_blob(&mut scion, &content))
+                .await
+                .unwrap_or_else(|_| panic!("a put of the checker test never finished"))
+                .unwrap();
             acked.push((id, content));
         }
         // The cut ends the server: on real hardware, nothing of it runs

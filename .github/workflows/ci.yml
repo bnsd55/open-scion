@@ -22,6 +22,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
+      - name: every doc(hidden) item is behind test-hooks
+        run: |
+          scripts/check-test-seams.sh --self-test
+          scripts/check-test-seams.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -70,6 +74,10 @@ jobs:
       - run: cargo test --workspace
         env:
           PROPTEST_CASES: "2000"
+      - name: a real disk full (tmpfs)
+        run: cargo test -p open-scion-server --test disk_full
+        env:
+          SCION_DISK_REQUIRE: "1"
 
   test-postgres:
     name: test (postgres)
@@ -102,6 +110,19 @@ jobs:
           PROPTEST_CASES: "64"
           SCION_TEST_BACKEND: postgres
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+      # The takeover test stops the database and restarts it. The service
+      # container of this job is the only postgres:17 on the runner, and
+      # it belongs to this job alone, so it may go down and come back.
+      # It must run after the tests above: it takes the database down
+      # while it runs.
+      - name: the database may go down, and the store recovers
+        run: |
+          container=$(docker ps --filter ancestor=postgres:17 --format '{{.Names}}' | head -1)
+          test -n "$container"
+          SCION_TEST_PG_CONTAINER="$container" \
+          SCION_TEST_BACKEND=postgres \
+          SCION_TEST_POSTGRES_URL=postgres://postgres:scion@localhost:5432/scion \
+          cargo test -p open-scion-server --test backend_refusals -- --ignored
 
   test-macos:
     name: test (macOS)
