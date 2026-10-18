@@ -1192,8 +1192,7 @@ impl Blobs {
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn fsync_count(&self) -> u64 {
-        self.fsync_count
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.fsync_count.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Arms the hook that fails an fsync of this backend: it lets the
@@ -1641,8 +1640,7 @@ impl BlobBatch<'_> {
                     .fsync_gate("the stored blob file", "fsync stored blob")?;
                 fsync(&file)?;
                 let name = dir.display().to_string();
-                self.blobs
-                    .fsync_gate(&name, "fsync blob directory")?;
+                self.blobs.fsync_gate(&name, "fsync blob directory")?;
                 fsync_dir(&dir)?;
                 return Ok(());
             }
@@ -1679,7 +1677,8 @@ impl BlobBatch<'_> {
         self.blobs.write_gate(&path, "write blob file")?;
         let mut tmp = tempfile::NamedTempFile::new_in(&self.blobs.mine)?;
         zstd::stream::compress_sized_into(raw, &mut tmp, 3, len as u64)?;
-        self.blobs.fsync_gate("the blob's temp file", "fsync blob file")?;
+        self.blobs
+            .fsync_gate("the blob's temp file", "fsync blob file")?;
         fsync(tmp.as_file())?;
         fs::create_dir_all(&dir)?;
         tmp.persist(&path).map_err(|e| e.error)?;
