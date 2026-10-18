@@ -929,8 +929,6 @@ enum SyncStep {
     StoredFile(BlobId),
     /// A blob directory.
     Dir(std::path::PathBuf),
-    /// The full flush: the blob root, then the drive cache.
-    FullFlush,
     /// An fsync the order test does not name (the blob root of an upload).
     Unnamed,
 }
@@ -1439,7 +1437,7 @@ impl Blobs {
                 SyncStep::TempFile(id) => self.log.record(DurabilityStep::FileFsync(id)),
                 SyncStep::StoredFile(id) => self.log.record(DurabilityStep::StoredFileFsync(id)),
                 SyncStep::Dir(path) => self.log.record(DurabilityStep::DirFsync(path)),
-                SyncStep::FullFlush | SyncStep::Unnamed => {}
+                SyncStep::Unnamed => {}
             }
         }
         #[cfg(not(any(test, feature = "test-hooks")))]
