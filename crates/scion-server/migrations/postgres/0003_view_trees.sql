@@ -1,0 +1,18 @@
+-- The per-tree view memo (#184): one row per (repo, rule-set digest,
+-- projection version, real tree, path-context digest). A derivation asks
+-- this table at every directory, so a new changeset re-derives only the
+-- folders on its changed paths. The changeset's root row is the row of
+-- its real root tree under the rule set's full context. Rebuildable: a
+-- cache of a pure function of the rule set and the real trees, so it
+-- holds no truth; rows of old versions or digests no principal uses are
+-- swept in bounded steps.
+DROP TABLE view_roots;
+CREATE TABLE view_trees (
+    repo_id BIGINT NOT NULL REFERENCES repos (repo_id),
+    digest  BYTEA NOT NULL CHECK (octet_length(digest) = 32),
+    version BIGINT NOT NULL,
+    tree    BYTEA NOT NULL CHECK (octet_length(tree) = 32),
+    ctx     BYTEA NOT NULL CHECK (octet_length(ctx) = 32),
+    view    BYTEA NOT NULL CHECK (octet_length(view) = 32),
+    PRIMARY KEY (repo_id, digest, version, tree, ctx)
+);
