@@ -126,6 +126,19 @@ impl From<Error> for Status {
                 tracing::error!(error = %e, "the server is out of disk space");
                 Status::resource_exhausted("the server is out of disk space; retry later")
             }
+            // The disk failed, or the remount left it read-only: the
+            // server's own storage again. The reply is fixed, so it names
+            // no server path; the path and the operation are in the log
+            // line of the read or write that failed.
+            Error::Io(e) if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem => {
+                tracing::error!(error = %e, "the disk is read-only");
+                Status::unavailable("the disk is read-only; retry later")
+            }
+            Error::Io(e) if e.raw_os_error() == Some(5) => {
+                // 5 is EIO on Linux and macOS both: a failing device.
+                tracing::error!(error = %e, "the disk failed");
+                Status::unavailable("the disk failed; retry later")
+            }
             Error::Corrupt(_) | Error::Git(_) => {
                 // Details stay in the server log, not in the reply.
                 tracing::error!(error = %e, "internal error");

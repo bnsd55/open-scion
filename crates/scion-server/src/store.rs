@@ -863,6 +863,12 @@ pub struct Blobs {
     /// disk's answer: `n` lets `n` writes through and fails the one
     /// after, once; [`UNARMED`] lets every write through.
     fail_writes: std::sync::atomic::AtomicUsize,
+    /// The errno the write hook raises: 28 (ENOSPC) unless set otherwise,
+    /// so [`Blobs::fail_writes_after`] keeps its meaning.
+    fail_writes_errno: std::sync::atomic::AtomicU8,
+    /// The test hook that fails a file read of this backend with the
+    /// disk's answer, the same shape as [`Blobs::fail_writes_after`].
+    fail_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl Blobs {
@@ -916,6 +922,8 @@ impl Blobs {
             #[cfg(test)]
             verifies: std::sync::atomic::AtomicU64::default(),
             fail_writes: std::sync::atomic::AtomicUsize::new(UNARMED),
+            fail_writes_errno: std::sync::atomic::AtomicU8::new(28),
+            fail_reads: std::sync::atomic::AtomicUsize::new(UNARMED),
         })
     }
 
@@ -1111,7 +1119,9 @@ impl Blobs {
     /// Opens a blob's file: one zstd frame, which nothing here unpacks or
     /// checks.
     pub(crate) fn open_file(&self, id: BlobId) -> Result<fs::File> {
-        fs::File::open(self.location(id).1).map_err(|e| match e.kind() {
+        let (_, path) = self.location(id);
+        self.read_gate(&path, "read blob file")?;
+        fs::File::open(&path).map_err(|e| match e.kind() {
             ErrorKind::NotFound => Error::NotFound(format!("blob {id}")),
             _ => e.into(),
         })
@@ -1169,12 +1179,83 @@ impl Blobs {
         }
     }
 
+    /// Arms the hook: it lets the next `n` file reads through, fails the
+    /// one after with EIO, the disk's answer for a failing device, and
+    /// lets the rest through. Zero arms it for the very next read.
+    #[doc(hidden)]
+    pub fn fail_reads_after(&self, n: usize) {
+        self.fail_reads
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The gate the file reads of this process pass: the same countdown
+    /// as [`Blobs::write_gate`], with EIO as the disk's answer.
+    fn read_gate(&self, path: &Path, operation: &str) -> Result<()> {
+        loop {
+            let left = self.fail_reads.load(std::sync::atomic::Ordering::SeqCst);
+            let pass = match left {
+                UNARMED => true,
+                0 => {
+                    if self
+                        .fail_reads
+                        .compare_exchange(
+                            0,
+                            UNARMED,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    false
+                }
+                left => {
+                    if self
+                        .fail_reads
+                        .compare_exchange(
+                            left,
+                            left - 1,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    true
+                }
+            };
+            if pass {
+                return Ok(());
+            }
+            let error = std::io::Error::from_raw_os_error(5); // EIO
+            tracing::error!(
+                path = %path.display(),
+                operation,
+                error = %error,
+                "a blob read failed: the disk refused it"
+            );
+            return Err(error.into());
+        }
+    }
+
     /// Arms the hook: it lets the next `n` file writes through, fails the
     /// one after with the disk's answer, and lets the rest through. Zero
     /// arms it for the very next write. Calling it again rearms it; the
     /// start ([`UNARMED`]) never arms it.
     #[doc(hidden)]
     pub fn fail_writes_after(&self, n: usize) {
+        self.fail_writes_after_errno(n, 28);
+    }
+
+    /// Arms the write hook with a chosen errno instead of ENOSPC: 5 is
+    /// EIO, 30 is EROFS (a read-only mount). The same one-shot shape as
+    /// [`Blobs::fail_writes_after`].
+    #[doc(hidden)]
+    pub fn fail_writes_after_errno(&self, n: usize, errno: u8) {
+        self.fail_writes_errno
+            .store(errno, std::sync::atomic::Ordering::SeqCst);
         self.fail_writes
             .store(n, std::sync::atomic::Ordering::SeqCst);
     }
@@ -1227,12 +1308,17 @@ impl Blobs {
             if pass {
                 return Ok(());
             }
-            let error = std::io::Error::from_raw_os_error(28); // ENOSPC
+            // 28 is ENOSPC; the hook may name another disk answer instead
+            // (5 is EIO, 30 is EROFS: the same on Linux and macOS).
+            let errno = self
+                .fail_writes_errno
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let error = std::io::Error::from_raw_os_error(i32::from(errno));
             tracing::error!(
                 path = %path.display(),
                 operation,
                 error = %error,
-                "a blob write failed: the disk is full"
+                "a blob write failed: the disk refused it"
             );
             return Err(error.into());
         }

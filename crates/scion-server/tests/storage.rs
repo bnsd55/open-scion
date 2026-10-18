@@ -191,3 +191,79 @@ fn the_blob_hook_refuses_exactly_one_write_per_count() {
         b"a\n"
     );
 }
+
+#[test]
+fn a_write_on_a_read_only_disk_answers_unavailable_and_leaves_no_torn_file() {
+    let (dir, store) = store();
+    let kept = store.blobs().put(b"kept\n").unwrap();
+    assert_eq!(store.blobs().get(kept).unwrap(), b"kept\n");
+    // The next file write is the one the read-only disk refuses: 30 is
+    // EROFS, the same on Linux and macOS.
+    store.blobs().fail_writes_after_errno(0, 30);
+    let error = store.blobs().put(b"refused\n").unwrap_err();
+    let read_only = matches!(
+        &error,
+        Error::Io(io) if io.kind() == std::io::ErrorKind::ReadOnlyFilesystem
+    );
+    assert!(read_only, "{error:?}");
+    let reply = tonic::Status::from(match &error {
+        Error::Io(io) => Error::Io(std::io::Error::from_raw_os_error(
+            io.raw_os_error().unwrap(),
+        )),
+        _ => unreachable!(),
+    });
+    assert_eq!(reply.code(), tonic::Code::Unavailable);
+    assert_eq!(reply.message(), "the disk is read-only; retry later");
+    drop(error);
+    // No torn file: the refused blob's name never appeared, and no temp
+    // file of the failed write is left behind.
+    let id = scion_core::BlobId::of(b"refused\n");
+    assert!(!blob_path(dir.path(), id).exists());
+    assert!(blob_dirs_are_clean(dir.path()));
+    // The rest of the store keeps serving, and once the disk is
+    // writable again the same write lands.
+    assert_eq!(store.blobs().get(kept).unwrap(), b"kept\n");
+    let after = store.blobs().put(b"after\n").unwrap();
+    assert_eq!(store.blobs().get(after).unwrap(), b"after\n");
+}
+
+#[test]
+fn a_read_on_a_failing_disk_answers_unavailable_and_keeps_serving_the_rest() {
+    let (_dir, store) = store();
+    let one = store.blobs().put(b"one\n").unwrap();
+    let two = store.blobs().put(b"two\n").unwrap();
+    assert_eq!(store.blobs().get(one).unwrap(), b"one\n");
+    // The next file read is the one the failing disk refuses: 5 is EIO.
+    store.blobs().fail_reads_after(0);
+    let error = store.blobs().get(one).unwrap_err();
+    let io_failure = matches!(&error, Error::Io(io) if io.raw_os_error() == Some(5));
+    assert!(io_failure, "{error:?}");
+    let reply = tonic::Status::from(match &error {
+        // The same error the gate raised, rebuilt: the reply is fixed.
+        Error::Io(_io) => Error::Io(std::io::Error::from_raw_os_error(5)),
+        _ => unreachable!(),
+    });
+    assert_eq!(reply.code(), tonic::Code::Unavailable);
+    assert_eq!(reply.message(), "the disk failed; retry later");
+    drop(error);
+    // The hook is spent: the rest of the store keeps serving.
+    assert_eq!(store.blobs().get(two).unwrap(), b"two\n");
+    // And the failed read works once the disk recovers.
+    assert_eq!(store.blobs().get(one).unwrap(), b"one\n");
+}
+
+#[test]
+fn a_read_hook_refuses_exactly_one_read_per_count() {
+    let (_dir, store) = store();
+    let one = store.blobs().put(b"a\n").unwrap();
+    // Two reads go through, the third fails, the fourth goes.
+    store.blobs().fail_reads_after(2);
+    assert_eq!(store.blobs().get(one).unwrap(), b"a\n");
+    assert_eq!(store.blobs().get(one).unwrap(), b"a\n");
+    let error = store.blobs().get(one).unwrap_err();
+    assert!(
+        matches!(&error, Error::Io(io) if io.raw_os_error() == Some(5)),
+        "{error:?}"
+    );
+    assert_eq!(store.blobs().get(one).unwrap(), b"a\n");
+}

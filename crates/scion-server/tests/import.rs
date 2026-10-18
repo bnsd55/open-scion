@@ -1427,3 +1427,46 @@ fn a_rolled_back_import_batch_verifies_again_when_it_reruns() {
         "the checks of the rolled-back batch ran again"
     );
 }
+
+#[test]
+fn an_import_on_a_read_only_disk_fails_and_lands_after_the_remount() {
+    if Backend::test_is_postgres() {
+        // The blob files are local in every backend, so the hook below
+        // works on Postgres too; the run here is the data-directory one.
+        // (Both jobs run this test.)
+    }
+    let git = Git::init();
+    let rev = git.fast_commits(0, 60);
+    let (_dir, store) = open_store();
+    let before = store.busy_retries();
+    // The import's first blob write is the one the read-only disk
+    // refuses: 30 is EROFS, what a read-only remount answers.
+    store.blobs().fail_writes_after_errno(0, 30);
+    assert!(store.read(|c| c.repo_id("r")).is_err());
+    let error = try_import(&store, &git, &rev).unwrap_err();
+    // The import did not answer busy: a read-only disk is not a lock the
+    // database holds, and the batch's retry loop does not run.
+    assert!(
+        matches!(
+            &error,
+            Error::Io(e) if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        store.busy_retries(),
+        before,
+        "the import retried a read-only disk"
+    );
+    // Nothing was written: the ref is not there, and a read works right
+    // after the failure.
+    let repo_id = store.read(|c| c.repo_id("r")).unwrap();
+    assert!(
+        store
+            .read(|c| c.get_ref(repo_id, "main"))
+            .unwrap()
+            .is_none()
+    );
+    // The remount is back: the same import, again from the top, works.
+    try_import(&store, &git, &rev).unwrap();
+}
