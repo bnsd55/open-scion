@@ -792,16 +792,18 @@ fn import_process_on_postgres(data: &Path, git: &Git, rev: &str, name: &str) -> 
     let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
     let schema = Backend::test_schema(data).unwrap();
     let sep = if url.contains('?') { '&' } else { '?' };
+    // `--postgres-url` is a flag of the root command, so it goes before
+    // the subcommand.
     let mut command = server_process(
         data,
         &[
+            "--postgres-url",
+            &format!("{url}{sep}options=--search_path%3D{schema}"),
             "import",
             "--repo",
             "r",
             "--rev",
             rev,
-            "--postgres-url",
-            &format!("{url}{sep}options=--search_path%3D{schema}"),
         ],
     );
     command
