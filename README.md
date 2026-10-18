@@ -346,6 +346,7 @@ A bearer token over plain TCP to a non-loopback address stays refused.
 | [`docs/protocol-v1.md`](https://github.com/bnsd55/open-scion/blob/main/docs/protocol-v1.md) | The v1 API contract: calls, limits, status codes, retries, durability and what a client checks |
 | [`docs/cli.md`](https://github.com/bnsd55/open-scion/blob/main/docs/cli.md) | Every `scn` command: what it does, its flags, the global flags and env vars, and the exit codes |
 | [`docs/operations.md`](https://github.com/bnsd55/open-scion/blob/main/docs/operations.md) | How to run a server: deploy, keys, the access file, Postgres, backups, and what each failure means |
+| [`docs/faults.md`](https://github.com/bnsd55/open-scion/blob/main/docs/faults.md) | One row per fault: what the client sees, what the operator sees, what survives a restart, and the test that proves it |
 | [`docs/benchmarks.md`](https://github.com/bnsd55/open-scion/blob/main/docs/benchmarks.md) | How the demo and the benchmarks run, what each number means, and how to rerun them |
 | [`docs/RELEASING.md`](https://github.com/bnsd55/open-scion/blob/main/docs/RELEASING.md) | For maintainers: how a release is cut and published |
 | [`docs/design/scalable-backend.md`](https://github.com/bnsd55/open-scion/blob/main/docs/design/scalable-backend.md) | A design proposal, not built: stateless servers on a shared metadata store and object store |

@@ -156,10 +156,12 @@ The first release: the server, its cache tiers, and the `scn` client.
   commit is checked against git, plus `--verify` (100) others.
 - Docs and scripts: the protocol contract (`docs/protocol-v1.md`), the
   operations guide (`docs/operations.md`), the CLI reference
-  (`docs/cli.md`), the benchmark method (`docs/benchmarks.md`),
-  `scripts/demo.sh`, `scripts/bench-checkout.sh`, a grpcurl conformance
-  check (`#163`), and a compose example with a server and a cache with
-  TLS (`#164`).
+  (`docs/cli.md`), the benchmark method (`docs/benchmarks.md`), the
+  fault matrix (`docs/faults.md`, `#264`), `scripts/demo.sh`,
+  `scripts/bench-checkout.sh`, a grpcurl conformance
+  check (`#163`), a compose example with a server and a cache with TLS
+  (`#164`), and a demo of the server on Postgres, with TLS to the
+  database (`#195`).
 
 ### Changed
 
@@ -168,8 +170,9 @@ The first release: the server, its cache tiers, and the `scn` client.
   `quotas::Quotas`, `metrics::Metrics`,
   `import::{import_git, ImportOptions, ImportReport}`, `store::Store`,
   `error::{Error, Result}`, `fsck`, `gc` with `DEFAULT_GRACE_SECS`,
-  `derived::{backfill, Kind}`, `graph::CommitGraph`,
-  `history::PathHistory` and `tree::RootTree`. The modules behind it
+  `graph::{backfill_commit_graph, CommitGraph}`,
+  `history::{backfill_path_history, PathHistory}` and
+  `tree::{backfill_root_tree, RootTree}`. The modules behind it
   exist for the two binaries and can change without a release; a ref
   read goes through `Backend::resolve_ref`, where code that reached
   past the facade used to go.
@@ -200,8 +203,15 @@ The first release: the server, its cache tiers, and the `scn` client.
   10,000 entries before had none. When the inexact search did not run or
   stopped at its budget, the reply says `renames_incomplete`, and `scn
   diff` prints git's warning about skipped inexact rename detection.
+
 ### Fixed
 
+- Two reads of a Postgres-backed store no longer panic on a column's
+  type (`#252`): `GetObjects`' tree-size read and `fsck`'s
+  derived-row version read wanted a width Postgres does not give, and
+  the database driver panics on that. Both read what the column is
+  now, and a derived-row version that overflows answers as corruption,
+  not a crash.
 - A write that the disk refused no longer looks like a server bug
   (#247): an out-of-space file write, SQLite metadata database or
   Postgres metadata database answers `RESOURCE_EXHAUSTED`, "the server

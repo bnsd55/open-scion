@@ -428,15 +428,6 @@ impl Store {
         &self.inner.blobs
     }
 
-    /// The durability steps this store's blob path ran, oldest first,
-    /// for the order test under the test-hooks seam.
-    #[doc(hidden)]
-    #[must_use]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn durability_steps(&self) -> Vec<DurabilityStep> {
-        self.inner.blobs.log.steps()
-    }
-
     /// Commits made so far.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
@@ -884,6 +875,18 @@ pub struct Blobs {
     /// disk's answer: `n` lets `n` writes through and fails the one
     /// after, once; [`UNARMED`] lets every write through.
     fail_writes: std::sync::atomic::AtomicUsize,
+    /// The errno the write hook raises: 28 (ENOSPC) unless set otherwise,
+    /// so [`Blobs::fail_writes_after`] keeps its meaning.
+    fail_writes_errno: std::sync::atomic::AtomicU8,
+    /// The test hook that fails a file read of this backend with the
+    /// disk's answer, the same shape as [`Blobs::fail_writes_after`].
+    fail_reads: std::sync::atomic::AtomicUsize,
+    /// The test hook that fails an fsync of this backend with EIO: the
+    /// file fsync before the rename, and the directory fsync after it.
+    fail_fsyncs: std::sync::atomic::AtomicUsize,
+    /// How many fsyncs passed through [`Blobs::fsync_gate`], pass or
+    /// fail: a test reads it to see that a kept file was fsynced.
+    fsync_count: std::sync::atomic::AtomicU64,
     /// The durability steps this `Blobs` ran, in order, for the order
     /// test: a test-hooks build records them, a production build stores
     /// nothing.
@@ -902,8 +905,12 @@ pub enum DurabilityStep {
     FileFsync(BlobId),
     /// The temp file took the blob's name.
     Rename(BlobId),
+    /// A stored file was flushed to the drive, on the keep path.
+    StoredFileFsync(BlobId),
     /// A directory that changed was flushed.
     DirFsync(PathBuf),
+    /// A full flush of the drive cache ran for a batch.
+    FullFlush,
     /// A batch's `sync` answered its caller.
     Answer,
 }
@@ -913,34 +920,31 @@ pub enum DurabilityStep {
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Default)]
 pub struct DurabilityLog {
-    #[cfg(any(test, feature = "test-hooks"))]
     steps: std::sync::Mutex<Vec<DurabilityStep>>,
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 impl DurabilityLog {
-    /// Records one step, when this build keeps a log. A build without the
-    /// seam keeps no field, so the lints that a never-read `self` and an
-    /// unconsumed argument would raise are off here.
-    #[cfg_attr(
-        not(any(test, feature = "test-hooks")),
-        allow(clippy::unused_self, clippy::needless_pass_by_value)
-    )]
+    /// Records one step.
     fn record(&self, step: DurabilityStep) {
-        #[cfg(any(test, feature = "test-hooks"))]
         self.steps
             .lock()
             .expect("the durability log's lock")
             .push(step);
-        #[cfg(not(any(test, feature = "test-hooks")))]
-        {
-            let _ = step;
-        }
+    }
+
+    /// Flushes a stored file and records the step together: whoever
+    /// deletes the fsync deletes the record with it, and the order test
+    /// fails.
+    fn record_stored_fsync(&self, id: BlobId, file: &fs::File) -> Result<()> {
+        fsync(file)?;
+        self.record(DurabilityStep::StoredFileFsync(id));
+        Ok(())
     }
 
     /// The steps recorded so far, oldest first.
     #[doc(hidden)]
     #[must_use]
-    #[cfg(any(test, feature = "test-hooks"))]
     pub fn steps(&self) -> Vec<DurabilityStep> {
         self.steps
             .lock()
@@ -1000,6 +1004,12 @@ impl Blobs {
             #[cfg(test)]
             verifies: std::sync::atomic::AtomicU64::default(),
             fail_writes: std::sync::atomic::AtomicUsize::new(UNARMED),
+            fail_writes_errno: std::sync::atomic::AtomicU8::new(28),
+            fail_reads: std::sync::atomic::AtomicUsize::new(UNARMED),
+            fail_fsyncs: std::sync::atomic::AtomicUsize::new(UNARMED),
+            fsync_count: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            log: DurabilityLog::default(),
         })
     }
 
@@ -1042,7 +1052,10 @@ impl Blobs {
     /// the drive before it, the database too, which lives on the same drive.
     pub(crate) fn full_flush(&self) -> io::Result<()> {
         self.group_flush
-            .run(|| fs::File::open(&self.root)?.sync_all())
+            .run(|| fs::File::open(&self.root)?.sync_all())?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.log.record(DurabilityStep::FullFlush);
+        Ok(())
     }
 
     /// Stores one file's content durably. Safe to repeat.
@@ -1195,7 +1208,9 @@ impl Blobs {
     /// Opens a blob's file: one zstd frame, which nothing here unpacks or
     /// checks.
     pub(crate) fn open_file(&self, id: BlobId) -> Result<fs::File> {
-        fs::File::open(self.location(id).1).map_err(|e| match e.kind() {
+        let (_, path) = self.location(id);
+        self.read_gate(&path, "read blob file")?;
+        fs::File::open(&path).map_err(|e| match e.kind() {
             ErrorKind::NotFound => Error::NotFound(format!("blob {id}")),
             _ => e.into(),
         })
@@ -1253,6 +1268,144 @@ impl Blobs {
         }
     }
 
+    /// How many fsyncs passed the gate so far: a test reads it to see
+    /// that a kept file was fsynced, file and directory both.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fsync_count(&self) -> u64 {
+        self.fsync_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Arms the hook that fails an fsync of this backend: it lets the
+    /// next `n` fsyncs through, fails the one after with EIO, and lets
+    /// the rest through. Zero arms it for the very next fsync. The count
+    /// runs over the file fsyncs and the directory fsyncs both, in the
+    /// order the writes make them.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_fsyncs_after(&self, n: usize) {
+        self.fail_fsyncs
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The gate the fsyncs of this process pass: the same countdown as
+    /// [`Blobs::write_gate`], with EIO as the disk's answer. A failed
+    /// fsync leaves the data only in the page cache: the caller must not
+    /// answer as if it reached the drive.
+    fn fsync_gate(&self, name: &str, operation: &str) -> Result<()> {
+        self.fsync_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        loop {
+            let left = self.fail_fsyncs.load(std::sync::atomic::Ordering::SeqCst);
+            let pass = match left {
+                UNARMED => true,
+                0 => {
+                    if self
+                        .fail_fsyncs
+                        .compare_exchange(
+                            0,
+                            UNARMED,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    false
+                }
+                left => {
+                    if self
+                        .fail_fsyncs
+                        .compare_exchange(
+                            left,
+                            left - 1,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    true
+                }
+            };
+            if pass {
+                return Ok(());
+            }
+            let error = std::io::Error::from_raw_os_error(5); // EIO
+            tracing::error!(
+                file = name,
+                operation,
+                error = %error,
+                "an fsync failed: the drive did not take the data"
+            );
+            return Err(error.into());
+        }
+    }
+
+    /// Arms the hook: it lets the next `n` file reads through, fails the
+    /// one after with EIO, the disk's answer for a failing device, and
+    /// lets the rest through. Zero arms it for the very next read.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_reads_after(&self, n: usize) {
+        self.fail_reads
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The gate the file reads of this process pass: the same countdown
+    /// as [`Blobs::write_gate`], with EIO as the disk's answer.
+    fn read_gate(&self, path: &Path, operation: &str) -> Result<()> {
+        loop {
+            let left = self.fail_reads.load(std::sync::atomic::Ordering::SeqCst);
+            let pass = match left {
+                UNARMED => true,
+                0 => {
+                    if self
+                        .fail_reads
+                        .compare_exchange(
+                            0,
+                            UNARMED,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    false
+                }
+                left => {
+                    if self
+                        .fail_reads
+                        .compare_exchange(
+                            left,
+                            left - 1,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    true
+                }
+            };
+            if pass {
+                return Ok(());
+            }
+            let error = std::io::Error::from_raw_os_error(5); // EIO
+            tracing::error!(
+                path = %path.display(),
+                operation,
+                error = %error,
+                "a blob read failed: the disk refused it"
+            );
+            return Err(error.into());
+        }
+    }
+
     /// Arms the hook: it lets the next `n` file writes through, fails the
     /// one after with the disk's answer, and lets the rest through. Zero
     /// arms it for the very next write. Calling it again rearms it; the
@@ -1260,6 +1413,17 @@ impl Blobs {
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_writes_after(&self, n: usize) {
+        self.fail_writes_after_errno(n, 28);
+    }
+
+    /// Arms the write hook with a chosen errno instead of ENOSPC: 5 is
+    /// EIO, 30 is EROFS (a read-only mount). The same one-shot shape as
+    /// [`Blobs::fail_writes_after`].
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_writes_after_errno(&self, n: usize, errno: u8) {
+        self.fail_writes_errno
+            .store(errno, std::sync::atomic::Ordering::SeqCst);
         self.fail_writes
             .store(n, std::sync::atomic::Ordering::SeqCst);
     }
@@ -1312,12 +1476,17 @@ impl Blobs {
             if pass {
                 return Ok(());
             }
-            let error = std::io::Error::from_raw_os_error(28); // ENOSPC
+            // 28 is ENOSPC; the hook may name another disk answer instead
+            // (5 is EIO, 30 is EROFS: the same on Linux and macOS).
+            let errno = self
+                .fail_writes_errno
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let error = std::io::Error::from_raw_os_error(i32::from(errno));
             tracing::error!(
                 path = %path.display(),
                 operation,
                 error = %error,
-                "a blob write failed: the disk is full"
+                "a blob write failed: the disk refused it"
             );
             return Err(error.into());
         }
@@ -1539,6 +1708,27 @@ impl BlobBatch<'_> {
                 // not the first, so a client that uploaded again does not
                 // lose the blob before it names it.
                 self.touch(id)?;
+                // The stored copy may not be durable: another writer's
+                // batch may not have synced yet, and a failed directory
+                // fsync somewhere else may have left it only in the page
+                // cache. This caller makes it durable instead of trusting
+                // the file's presence: fsync the file and the directory,
+                // every time, so a retry after a failed fsync ends with
+                // the blob on the drive and no name is ever removed.
+                let (dir, path) = self.blobs.location(id);
+                let file = fs::File::open(&path)?;
+                self.blobs
+                    .fsync_gate("the stored blob file", "fsync stored blob")?;
+                #[cfg(any(test, feature = "test-hooks"))]
+                self.blobs.log.record_stored_fsync(id, &file)?;
+                #[cfg(not(any(test, feature = "test-hooks")))]
+                fsync(&file)?;
+                let name = dir.display().to_string();
+                self.blobs.fsync_gate(&name, "fsync blob directory")?;
+                #[cfg(any(test, feature = "test-hooks"))]
+                fsync_dir_logged(&self.blobs.log, &dir)?;
+                #[cfg(not(any(test, feature = "test-hooks")))]
+                fsync_dir(&dir)?;
                 return Ok(());
             }
             // The rename below replaces it in one step. No repo on this
@@ -1574,15 +1764,17 @@ impl BlobBatch<'_> {
         self.blobs.write_gate(&path, "write blob file")?;
         let mut tmp = tempfile::NamedTempFile::new_in(&self.blobs.mine)?;
         zstd::stream::compress_sized_into(raw, &mut tmp, 3, len as u64)?;
+        self.blobs
+            .fsync_gate("the blob's temp file", "fsync blob file")?;
         #[cfg(any(test, feature = "test-hooks"))]
-        self.blobs.log.record(DurabilityStep::TmpWrite(id));
+        fsync_logged(&self.blobs.log, id, tmp.as_file())?;
+        #[cfg(not(any(test, feature = "test-hooks")))]
         fsync(tmp.as_file())?;
-        #[cfg(any(test, feature = "test-hooks"))]
-        self.blobs.log.record(DurabilityStep::FileFsync(id));
         fs::create_dir_all(&dir)?;
-        tmp.persist(&path).map_err(|e| e.error)?;
         #[cfg(any(test, feature = "test-hooks"))]
-        self.blobs.log.record(DurabilityStep::Rename(id));
+        persist_logged(&self.blobs.log, id, &tmp, &path)?;
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        tmp.persist(&path).map_err(|e| e.error)?;
         self.dirs.insert(dir);
         Ok(())
     }
@@ -1647,6 +1839,8 @@ impl BlobBatch<'_> {
     // was lost.
     fn flush_dirs(self) -> Result<bool> {
         for dir in &self.dirs {
+            let name = dir.display().to_string();
+            self.blobs.fsync_gate(&name, "fsync blob directory")?;
             #[cfg(any(test, feature = "test-hooks"))]
             fsync_dir_logged(&self.blobs.log, dir)?;
             #[cfg(not(any(test, feature = "test-hooks")))]
@@ -1754,6 +1948,28 @@ pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
 fn fsync_dir_logged(log: &DurabilityLog, path: &Path) -> Result<()> {
     fsync_dir(path)?;
     log.record(DurabilityStep::DirFsync(path.to_path_buf()));
+    Ok(())
+}
+
+/// The fsync of a temp file, with its step recorded in one call.
+#[cfg(any(test, feature = "test-hooks"))]
+fn fsync_logged(log: &DurabilityLog, id: BlobId, file: &fs::File) -> Result<()> {
+    fsync(file)?;
+    log.record(DurabilityStep::FileFsync(id));
+    Ok(())
+}
+
+/// The rename of a temp file onto the blob's name, with its step recorded
+/// in one call.
+#[cfg(any(test, feature = "test-hooks"))]
+fn persist_logged(
+    log: &DurabilityLog,
+    id: BlobId,
+    tmp: &tempfile::NamedTempFile,
+    path: &Path,
+) -> Result<()> {
+    tmp.persist(path).map_err(|e| e.error)?;
+    log.record(DurabilityStep::Rename(id));
     Ok(())
 }
 
@@ -2832,9 +3048,10 @@ mod tests {
     /// A blob a batch acks is durable before the ack, by construction:
     /// the recorded steps of every blob it wrote read, in order, tmp
     /// write, file fsync, rename, dir fsync of the blob's fan-out
-    /// directory, and the batch's answer. If the directory fsync is
-    /// deleted from `flush_dirs`, the dir step disappears and this test
-    /// fails.
+    /// directory, a full flush, and the batch's answer. A blob a batch
+    /// kept reads its stored-file fsync and dir fsync before the answer.
+    /// If the directory fsync is deleted from `flush_dirs`, the dir step
+    /// disappears and this test fails.
     #[test]
     fn a_batch_answers_after_its_blobs_dir_fsyncs() {
         use tempfile::TempDir;
@@ -2849,40 +3066,68 @@ mod tests {
             batch.sync().unwrap();
             ids
         };
+        // The keep path: the same bytes again. Nothing is written, and
+        // the stored file is fsynced with its directory before the
+        // answer.
+        let kept: Vec<BlobId> = {
+            let mut batch = store.blobs().batch();
+            let ids = raws.iter().map(|raw| batch.put(raw).unwrap()).collect();
+            batch.sync().unwrap();
+            ids
+        };
         let steps = store.durability_steps();
-        let answer = steps
+        let answers: Vec<usize> = steps
             .iter()
-            .position(|step| *step == S::Answer)
-            .expect("the batch answered");
-        for id in &ids {
-            // The step of `id` before `answer`, in this order.
-            let steps_of = |step: &DurabilityStep| {
-                steps
-                    .iter()
-                    .take(answer)
-                    .position(|s| s == step)
-                    .unwrap_or_else(|| panic!("no {step:?} before the answer"))
-            };
+            .enumerate()
+            .filter_map(|(i, step)| (*step == S::Answer).then_some(i))
+            .collect();
+        assert_eq!(answers.len(), 2, "two batches answered");
+
+        let steps_of = |log: &[DurabilityStep], step: &DurabilityStep| {
+            log.iter()
+                .position(|s| s == step)
+                .unwrap_or_else(|| panic!("no {step:?} in the batch's steps"))
+        };
+        for (id, answer) in ids.iter().zip(&answers) {
+            let log = &steps[..*answer];
             let (dir, _) = store.blobs().location(*id);
-            let (a, b, c, d) = (
-                steps_of(&S::TmpWrite(*id)),
-                steps_of(&S::FileFsync(*id)),
-                steps_of(&S::Rename(*id)),
-                steps
-                    .iter()
-                    .take(answer)
-                    .position(|s| match s {
-                        S::DirFsync(path) => path == &dir,
-                        _ => false,
-                    })
-                    .unwrap_or_else(|| {
-                        panic!("no dir fsync of {} before the answer", dir.display())
-                    }),
+            let a = steps_of(log, &S::TmpWrite(*id));
+            let b = steps_of(log, &S::FileFsync(*id));
+            let c = steps_of(log, &S::Rename(*id));
+            let d = log
+                .iter()
+                .position(|s| matches!(s, S::DirFsync(path) if path == &dir))
+                .unwrap_or_else(|| panic!("no dir fsync of {} before the answer", dir.display()));
+            let f = log
+                .iter()
+                .position(|s| *s == S::FullFlush)
+                .expect("no full flush before the answer");
+            assert!(
+                a < b && b < c && c < d && d < f && f < *answer,
+                "the durability steps of {id} are out of order: \
+                 tmp write {a}, file fsync {b}, rename {c}, dir fsync {d}, \
+                 full flush {f}, answer {answer}"
+            );
+        }
+        // The keep path: no tmp write of the kept blobs in the second
+        // batch, but a stored-file fsync and a dir fsync before the
+        // answer.
+        for (id, answer) in kept.iter().zip(&answers[1..]) {
+            let log = &steps[answers[0] + 1..*answer];
+            assert!(
+                log.iter().all(|s| *s != S::TmpWrite(*id)),
+                "a kept blob was written again"
             );
             assert!(
-                a < b && b < c && c < d,
-                "the durability steps of {id} are out of order: \
-                 tmp write {a}, file fsync {b}, rename {c}, dir fsync {d}"
+                log.iter().any(|s| *s == S::StoredFileFsync(*id)),
+                "no stored-file fsync before the answer"
+            );
+            let (dir, _) = store.blobs().location(*id);
+            assert!(
+                log.iter()
+                    .any(|s| matches!(s, S::DirFsync(path) if path == &dir)),
+                "no dir fsync of {} before the answer",
+                dir.display()
             );
         }
     }

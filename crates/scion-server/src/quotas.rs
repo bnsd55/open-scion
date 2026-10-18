@@ -137,6 +137,7 @@ impl Quotas {
     /// same connection whose flow control a stalled stream holds, and
     /// under load its arrival says nothing about the quota.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn in_flight(&self, principal: &str) -> usize {
         self.lock().get(principal).map_or(0, |entry| entry.requests)

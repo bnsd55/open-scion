@@ -385,8 +385,9 @@ impl Backend {
 
     /// The flag of [`Backend::fenced`], for the health service of a
     /// serving process: it flips to `NOT_SERVING` when the fence trips.
-    /// None on SQLite, which has no lock to lose.
-    #[doc(hidden)]
+    /// None on SQLite, which has no lock to lose. The server sets it on
+    /// the health service before it serves; it is wiring, not a test
+    /// seam, so it is public and documented instead of doc(hidden).
     #[must_use]
     pub fn fence_flag(&self) -> Option<Arc<AtomicBool>> {
         match self {
