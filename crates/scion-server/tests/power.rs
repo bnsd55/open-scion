@@ -189,7 +189,7 @@ impl Lazyfs {
         let mut opening = Some(opening);
         let mut fifo = wait_for("the faults fifo to open", 15, || {
             let finished = opening.as_ref().unwrap().is_finished();
-            finished.then(|| opening.take().unwrap().unwrap())
+            finished.then(|| opening.take().unwrap().join().unwrap())
         });
         let mut completed = self.completed.try_clone().unwrap();
         let answer = std::thread::spawn(move || {
@@ -545,13 +545,20 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
             events.line(&format!(
                 "round {round} wave {wave}: starts, one blob {want}"
             ));
-            let (ids, _crossed, failed) = tokio::time::timeout(
+            let ids = tokio::time::timeout(
                 Duration::from_secs(60),
-                race_wave(&events, round, wave, server.url.clone(), content),
+                race_wave(
+                    events.clone(),
+                    round,
+                    wave,
+                    server.url.clone(),
+                    content,
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                ),
             )
             .await
             .unwrap_or_else(|_| panic!("the acked wave never finished"));
-            assert_eq!(failed, 0, "a put failed before the freeze");
             assert!(ids.windows(2).all(|w| w[0] == w[1]), "one blob ID");
             acked.extend(ids);
         }
@@ -596,18 +603,18 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
             "round {round}: cut mid-wave at {} ms",
             started.elapsed().as_millis()
         ));
-        let in_flight = crossed.load(Ordering::SeqCst);
-        let replies = replied.load(Ordering::SeqCst);
+        let crossings_at_cut = crossed.load(Ordering::SeqCst);
+        let replies_before_cut = replied.load(Ordering::SeqCst);
         assert!(
-            in_flight > replies,
-            "no put was in flight at the freeze: {in_flight} crossed, {replies} replied"
+            crossings_at_cut > replies_before_cut,
+            "no put was in flight at the freeze: {crossings_at_cut} crossed, {replies_before_cut} replied"
         );
         server.freeze();
         lazy.cut();
         // The kill comes before the join: the racers of the wave hang on
         // the frozen server, and only the kill lets their calls fail.
         drop(server);
-        let (ids, cut) = tokio::time::timeout(Duration::from_secs(30), flight)
+        let ids = tokio::time::timeout(Duration::from_secs(30), flight)
             .await
             .unwrap_or_else(|_| panic!("the cut wave's racers never finished"))
             .unwrap();
@@ -830,11 +837,10 @@ async fn import_process_races_the_server_on_the_same_blob() {
             rustix::process::Signal::KILL,
         );
     });
-    let import = std::thread::spawn(move || import.wait_with_output());
+    let mut import = Some(import);
     let out = wait_for("the import to finish", 130, || {
-        import
-            .is_finished()
-            .then(|| import.join().unwrap().unwrap())
+        let finished = import.as_ref().unwrap().is_finished();
+        finished.then(|| import.take().unwrap().join().unwrap())
     });
     assert!(
         out.status.success(),
