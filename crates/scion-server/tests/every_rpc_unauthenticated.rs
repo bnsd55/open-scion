@@ -17,10 +17,10 @@ use scion_proto::v1::{
 };
 
 use scion_server::access::Access;
-use scion_server::meta::MetaTx as _;
+use scion_server::meta::{Meta as _, MetaTx as _};
 use scion_server::metrics::Metrics;
 use scion_server::tickets::Keys;
-use scion_server::{Store, service};
+use scion_server::{Backend, Store, service};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -57,9 +57,9 @@ fn access() -> Access {
 
 /// A store whose repo `main` has one root changeset that puts `README`,
 /// and its blob.
-fn store() -> (tempfile::TempDir, Store, scion_core::ChangesetId) {
+fn store() -> (tempfile::TempDir, Backend, scion_core::ChangesetId) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
     let blob = store.blobs().put(b"# hello\n").unwrap();
     let cs = scion_core::Changeset {
         parents: vec![],
@@ -94,7 +94,7 @@ fn store() -> (tempfile::TempDir, Store, scion_core::ChangesetId) {
 
 /// The server of `store` behind `access`, as a `http://` URL. Hold the
 /// stop signal, or the server shuts down when it drops.
-async fn serve(store: &Store, access: Access) -> (tokio::sync::oneshot::Sender<()>, String) {
+async fn serve(store: &Backend, access: Access) -> (tokio::sync::oneshot::Sender<()>, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -357,8 +357,14 @@ fn declared() -> (Vec<(String, String)>, Vec<String>) {
 
 /// The repo's state that the calls must not change: the version of
 /// `main`, and the row count of every metadata table. The tables come
-/// from `sqlite_master`, so a new table joins the check on its own.
-fn state_of(store: &Store) -> (i64, Vec<i64>) {
+/// from the store's own catalog, so a new table joins the check on its
+/// own. The Postgres backend keeps no catalog of this shape, so it
+/// answers none: the calls themselves still compare, on SQLite alone.
+fn state_of(store: &Backend) -> Option<(i64, Vec<i64>)> {
+    let Backend::Sqlite(store) = store else {
+        eprintln!("skip on postgres: the state reads the store's catalog");
+        return None;
+    };
     let counts = store
         .read(|c| {
             let mut names = c
@@ -390,7 +396,7 @@ fn state_of(store: &Store) -> (i64, Vec<i64>) {
             Ok(c.get_ref(repo, "main")?.expect("main exists").version)
         })
         .expect("main reads");
-    (version, counts)
+    Some((version, counts))
 }
 
 /// The changeset bytes of a new child of `root` that sets `path` to the

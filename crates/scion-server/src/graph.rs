@@ -34,11 +34,12 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use scion_core::{Changeset, ChangesetId};
 
+use crate::backend::Backend;
 use crate::deadline::Deadline;
 use crate::derived::{self, Kind};
 use crate::error::{Error, Result};
+use crate::meta::Meta as _;
 use crate::meta::{MetaTx, RepoId};
-use crate::store::Store;
 
 /// A changeset that a [`Node`] points to, with what a query needs to decide
 /// whether to go there.
@@ -195,7 +196,7 @@ impl Kind for CommitGraph {
 /// [`Error::NotFound`] if `repo` does not have either changeset.
 /// [`Error::DeadlineExceeded`] once `deadline` has passed.
 pub fn is_ancestor(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     ancestor: ChangesetId,
     descendant: ChangesetId,
@@ -219,7 +220,7 @@ pub fn is_ancestor(
 /// [`Error::NotFound`] if `repo` does not have either changeset.
 /// [`Error::DeadlineExceeded`] once `deadline` has passed.
 pub fn merge_bases(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     a: ChangesetId,
     b: ChangesetId,
@@ -284,7 +285,7 @@ const STEPS: Steps = Steps { reads: 1000 };
 /// between steps. A changeset's parents and node never change, so a walk
 /// goes on in the next step from where it stopped.
 fn in_steps<T>(
-    store: &Store,
+    store: &Backend,
     deadline: &Deadline,
     steps: Steps,
     mut next: impl FnMut(&mut Index) -> Result<Option<T>>,
@@ -531,7 +532,7 @@ struct At {
 impl At {
     /// A changeset of `repo` and its node. Derives the commit graph first if
     /// it has no node.
-    fn get(store: &Store, repo: RepoId, id: ChangesetId) -> Result<Self> {
+    fn get(store: &Backend, repo: RepoId, id: ChangesetId) -> Result<Self> {
         let node = derived::get::<CommitGraph>(store, repo, id)?;
         Ok(Self { id, node })
     }
@@ -629,6 +630,8 @@ fn node(c: &mut dyn MetaTx, id: ChangesetId) -> Result<Node> {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::Backend;
+    use crate::store::Store;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -650,13 +653,18 @@ mod tests {
 
     /// A new store with the graph `parents` in repo `r`, with no derived
     /// rows, as in a database from before the commit graph.
-    fn store_graph(parents: &[Vec<usize>]) -> (tempfile::TempDir, Store, RepoId, Vec<ChangesetId>) {
+    fn store_graph(
+        parents: &[Vec<usize>],
+    ) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let (repo, ids) = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
-                Ok((repo, testing::insert_graph(c, repo, parents)?))
+                Ok((
+                    repo,
+                    testing::insert_graph(c.sqlite().unwrap(), repo, parents)?,
+                ))
             })
             .unwrap();
         (dir, store, repo, ids)
@@ -665,7 +673,7 @@ mod tests {
     /// As [`store_graph`], then stores each node as a write does.
     fn store_graph_with_nodes(
         parents: &[Vec<usize>],
-    ) -> (tempfile::TempDir, Store, RepoId, Vec<ChangesetId>) {
+    ) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
         let (dir, store, repo, ids) = store_graph(parents);
         store
             .write(|c| {
@@ -862,7 +870,7 @@ mod tests {
     /// A first-parent chain of `n` changesets, each node stored as it is
     /// written, and `side`, whose parent is changeset `n / 2`. Returns the
     /// chain and `side`.
-    fn deep_chain(store: &Store, n: usize) -> (RepoId, Vec<ChangesetId>, ChangesetId) {
+    fn deep_chain(store: &Backend, n: usize) -> (RepoId, Vec<ChangesetId>, ChangesetId) {
         store
             .write(|c| {
                 let repo = c.create_repo("r")?;
@@ -909,7 +917,7 @@ mod tests {
         // busy the machine is.
         const N: usize = 4_096;
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let (repo, ids, side) = deep_chain(&store, N);
         let tip = ids[N - 1];
         // Myers bounds a walk down to a depth by about 3 log2 n moves.
@@ -1054,7 +1062,7 @@ mod tests {
     /// Makes the moves of a walk with `next`, and lets its call go after
     /// `stop` moves. Returns the answer, and the moves made.
     fn walk_until<T>(
-        store: &Store,
+        store: &Backend,
         stop: usize,
         mut next: impl FnMut(&mut Index) -> Result<Option<T>>,
     ) -> (Result<T>, usize) {

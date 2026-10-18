@@ -19,8 +19,9 @@ use scion_proto::object::{self, Assembler, Header};
 use scion_proto::v1::{
     Encoding, GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef, ResolveRefRequest,
 };
+use scion_server::meta::Meta as _;
 use scion_server::meta::MetaTx as _;
-use scion_server::{Store, tree};
+use scion_server::{Backend, tree};
 use tonic::Code;
 
 mod common;
@@ -273,7 +274,7 @@ fn damage(path: &Path) -> Vec<u8> {
 /// changesets.
 fn fixture() -> (Tiers, ChangesetId) {
     let data = tempfile::tempdir().unwrap();
-    let store = Store::open(data.path()).unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
     let first = land(&store, &changeset(None, &common::files(&store).0));
     let other = FileState::Regular {
         content: store.blobs().put(b"other\n").unwrap(),

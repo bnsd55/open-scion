@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 use scion_core::FileState;
 use scion_proto::v1::GetObjectsRequest;
 use scion_proto::v1::objects_client::ObjectsClient;
-use scion_server::Store;
+use scion_server::Backend;
 use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
@@ -97,7 +97,7 @@ fn a_checkout_shows_one_id_at_every_hop() {
     // it logged itself.
     let mark = log_text().len();
     let data = tempfile::tempdir().unwrap();
-    let store = Store::open(&data.path().join("scion")).unwrap();
+    let store = Backend::open_test(&data.path().join("scion")).unwrap();
     let content = store.blobs().put(b"the demo file\n").unwrap();
     let files = vec![(
         "f.txt",
@@ -133,7 +133,7 @@ fn a_tier_forwards_the_id_its_caller_sent() {
     // that it logged itself.
     let mark = log_text().len();
     let data = tempfile::tempdir().unwrap();
-    let store = Store::open(&data.path().join("scion")).unwrap();
+    let store = Backend::open_test(&data.path().join("scion")).unwrap();
     let content = store.blobs().put(b"the demo file\n").unwrap();
     let files = vec![(
         "f.txt",

@@ -14,9 +14,9 @@ use scion_proto::auth::Bearer;
 use scion_proto::listen::Limits;
 use scion_proto::v1::LogRequest;
 use scion_proto::v1::scion_client::ScionClient;
-use scion_server::meta::MetaTx as _;
+use scion_server::meta::{Meta as _, MetaTx as _};
 use scion_server::metrics::Metrics;
-use scion_server::{Store, service, tree};
+use scion_server::{Backend, Store, service, tree};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
@@ -31,9 +31,9 @@ type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
 /// A repo whose chain of `count` changesets alternates the path it
 /// changes: even i changes `d/f.txt`, odd i changes `other.txt`. The
 /// message names i, so a test can tell which changeset an entry holds.
-fn chain(count: usize) -> (tempfile::TempDir, Store, Vec<scion_core::ChangesetId>) {
+fn chain(count: usize) -> (tempfile::TempDir, Backend, Vec<scion_core::ChangesetId>) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
     let ids = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -65,7 +65,7 @@ fn chain(count: usize) -> (tempfile::TempDir, Store, Vec<scion_core::ChangesetId
     (dir, store, ids)
 }
 
-async fn serve(store: Store) -> String {
+async fn serve(store: Backend) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(service::serve(

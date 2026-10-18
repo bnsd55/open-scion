@@ -87,14 +87,14 @@ pub trait Meta: Send + Sync + 'static {
     /// # Errors
     ///
     /// What `f` returns, or a database error from begin or commit.
-    fn commit<T>(&self, f: impl FnMut(&mut Self::Tx<'_>) -> Result<T>) -> Result<T>;
+    fn commit<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T>;
 
     /// [`Meta::commit`], and then [`Meta::flush`]: durable on return.
     ///
     /// # Errors
     ///
     /// As [`Meta::commit`] and [`Meta::flush`].
-    fn write<T>(&self, f: impl FnMut(&mut Self::Tx<'_>) -> Result<T>) -> Result<T>;
+    fn write<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T>;
 
     /// Returns once every commit made before this call is durable. No
     /// reply shows a commit that is not durable.
@@ -305,11 +305,11 @@ impl Meta for Store {
         Store::read_unflushed(self, |c| f(&mut SqliteTx(c)))
     }
 
-    fn commit<T>(&self, mut f: impl FnMut(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
+    fn commit<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
         Store::commit(self, |c| f(&mut SqliteTx(c)))
     }
 
-    fn write<T>(&self, mut f: impl FnMut(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
+    fn write<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
         Store::write(self, |c| f(&mut SqliteTx(c)))
     }
 

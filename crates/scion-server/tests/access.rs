@@ -16,14 +16,16 @@ use scion_proto::v1::{
 };
 use std::sync::Arc;
 
+use scion_server::Store;
 use scion_server::access::Access;
+use scion_server::meta::Meta as _;
 
 /// The second repo of the two-world comparisons: its tree holds `docs`
 /// only, so the same path is genuinely missing there.
 const OTHER: &str = "other";
 use scion_server::meta::MetaTx as _;
 use scion_server::metrics::Metrics;
-use scion_server::{Store, service};
+use scion_server::{Backend, service};
 use std::future::Future;
 use std::pin::Pin;
 use tokio::net::TcpListener;
@@ -114,9 +116,9 @@ fn regular(content: BlobId) -> FileState {
 
 /// A store whose repo `main` has one root changeset that puts `README`,
 /// and its blob. Returns the store, root changeset, and blob id.
-fn store() -> (tempfile::TempDir, Store, ChangesetId, BlobId) {
+fn store() -> (tempfile::TempDir, Backend, ChangesetId, BlobId) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Backend::open_test(dir.path()).unwrap();
     let blob = store.blobs().put(b"# hello\n").unwrap();
     let root = store
         .write(|c| {
@@ -134,7 +136,7 @@ fn store() -> (tempfile::TempDir, Store, ChangesetId, BlobId) {
 
 /// Stores `content` as a blob of `REPO`, as an upload through `PutBlob`
 /// would.
-fn put(store: &Store, content: &[u8]) -> BlobId {
+fn put(store: &Backend, content: &[u8]) -> BlobId {
     let blob = store.blobs().put(content).unwrap();
     store
         .write(|c| {
@@ -150,7 +152,7 @@ fn put(store: &Store, content: &[u8]) -> BlobId {
 /// signal: hold it, or the server shuts down when the caller drops it. The
 /// second is its `http://` URL.
 type Stop = tokio::sync::oneshot::Sender<()>;
-async fn serve(store: &Store, access: Access) -> (Stop, String) {
+async fn serve(store: &Backend, access: Access) -> (Stop, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -209,7 +211,7 @@ async fn objects(url: &str, token: Option<&str>) -> Objects {
 /// A server of `store` with `access`, and a client of each service as
 /// `token`. The first reply is the server's stop signal: hold it, or the
 /// server shuts down when the caller drops it.
-async fn server(store: &Store, access: Access, token: &str) -> (Stop, Scion, Objects) {
+async fn server(store: &Backend, access: Access, token: &str) -> (Stop, Scion, Objects) {
     let (stop, url) = serve(store, access).await;
     (
         stop,
@@ -588,7 +590,7 @@ fn partial_access() -> Access {
 
 /// The repo of the other tests: a root changeset with `README`, and a child
 /// with `docs/a` and `secret/b`. The tip's ID, and the two blobs'.
-fn repo_with_docs_and_secret() -> (tempfile::TempDir, Store, ChangesetId, BlobId, BlobId) {
+fn repo_with_docs_and_secret() -> (tempfile::TempDir, Backend, ChangesetId, BlobId, BlobId) {
     let (dir, store, root, _blob) = store();
     let (docs_blob, secret_blob) = (put(&store, b"a\n"), put(&store, b"b\n"));
     let tip = store
@@ -606,7 +608,7 @@ fn repo_with_docs_and_secret() -> (tempfile::TempDir, Store, ChangesetId, BlobId
 }
 
 /// The tree ID of `secret` under the real root of `tip`.
-fn root_tree_id(store: &Store, tip: ChangesetId) -> TreeId {
+fn root_tree_id(store: &Backend, tip: ChangesetId) -> TreeId {
     let repo_id = store.read(|c| c.repo_id(REPO)).unwrap();
     let root = scion_server::tree::root_tree(store, repo_id, tip).unwrap();
     let tree = store.read(|c| c.get_tree(root)).unwrap();
@@ -1493,7 +1495,7 @@ fn a_partial_reader_case(paths: &[String], rule_seeds: &[u16]) -> Result<(), Tes
     // The store: a chain of changesets whose tip tree holds every path,
     // and each file's blob, as an upload would leave them.
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
     let tip = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -1526,7 +1528,7 @@ fn a_partial_reader_case(paths: &[String], rule_seeds: &[u16]) -> Result<(), Tes
         .cloned()
         .collect();
     let dir_b = tempfile::tempdir().unwrap();
-    let store_b = Store::open(dir_b.path()).unwrap();
+    let store_b = Backend::Sqlite(Store::open(dir_b.path()).unwrap());
     let tip_b = store_b
         .write(|c| {
             let repo = c.create_repo(REPO)?;
