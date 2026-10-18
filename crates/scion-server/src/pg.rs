@@ -686,6 +686,14 @@ impl Pg {
         // default: every change of the caller checks the newest state of
         // the row it touches (the CAS predicates).
         let mut tx = PgTx::begin(&mut writer, &self.inner.blobs)?;
+        // Every writer and the collector's batches order on one advisory
+        // key, held to the end of the transaction: what a SQLite write
+        // transaction gets from the data directory's one write connection
+        // (store.rs `commit`, `TransactionBehavior::Immediate`). A
+        // changeset that names a blob the collector is about to remove
+        // commits first, and the collector's re-read pins the blob; a
+        // batch of the collector waits for every writer that has begun.
+        tx.c.query_opt("SELECT pg_advisory_xact_lock($1)", &[P::i64(PG_GC_LOCK)])?;
         match f(&mut tx) {
             Ok(value) => {
                 tx.commit()?;
@@ -1369,21 +1377,20 @@ impl MetaTx for PgTx<'_> {
     ///
     /// [`Error::NotFound`] if a parent is not in `repo`.
     fn insert_changeset(&mut self, repo: RepoId, cs: &Changeset) -> Result<ChangesetId> {
-        // The collector takes the same lock around its row check and
-        // delete, so a changeset that names a blob it is about to remove
-        // commits first, and the collector's re-read pins the blob.
+        // This transaction already holds the collector's key from its
+        // begin, so its re-read pins every blob this changeset puts. What
+        // the lock cannot order is a commit that starts after the
+        // collector's sweep of a blob that no row named: such a commit
+        // would re-add a row whose file is gone. So every named blob must
+        // still have its file. Busy, so the client retries: the retry puts
+        // the blob again, with a fresh file, and lands.
         let mut puts: Vec<BlobId> = crate::db::puts(cs).map(|(_, blob)| blob).collect();
         puts.sort();
         puts.dedup();
+        let blobs = self
+            .blobs
+            .expect("a migration transaction stores no changeset");
         for blob in &puts {
-            self.lock_blob(*blob)?;
-            // A blob whose file the collector removed between the upload
-            // and this commit cannot be stored: the row would name bytes
-            // no reader can reach. Busy, so the client retries: the retry
-            // puts the blob again, with a fresh file, and lands.
-            let blobs = self
-                .blobs
-                .expect("a migration transaction stores no changeset");
             if !blobs.location(*blob).1.exists() {
                 return Err(Error::Busy);
             }
@@ -2173,17 +2180,12 @@ impl MetaTx for PgTx<'_> {
     /// lock of one blob, held to the end of this transaction. Every
     /// changeset and land transaction takes it for each blob it puts, and
     /// the collector around its row check, delete and unlink.
-    /// Orders this transaction against the collector's row check, delete,
-    /// and unlink: one advisory lock key, held to the end of the
-    /// transaction, for every blob. The collector takes it for each batch,
-    /// so a changeset commit either lands before the collector's re-read,
-    /// or waits for the collector's removal. One key, not one per blob: a
-    /// transaction that puts thousands of blobs would otherwise hold
-    /// thousands of entries in Postgres's shared lock table and run it out
-    /// (E53200, `max_locks_per_transaction`).
+    /// A no-op on this backend: every write transaction already holds the
+    /// collector's key from the moment it begins (`Pg::commit`), the way a
+    /// SQLite write transaction holds the data directory's one write
+    /// connection. The call stays for the collector's code to say what it
+    /// means, and for a backend whose writers do not already serialize.
     fn lock_blob(&mut self, _blob: BlobId) -> Result<()> {
-        self.c
-            .query_opt("SELECT pg_advisory_xact_lock($1)", &[P::i64(PG_GC_LOCK)])?;
         Ok(())
     }
 
