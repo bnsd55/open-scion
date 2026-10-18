@@ -259,6 +259,29 @@ through the cache. It is the quickest end-to-end look at a two-tier
 deployment, and a template for the real files (the secrets are made at
 compose time, the server's data lives in a volume).
 
+### Environment variables
+
+Several flags can be set with an environment variable instead: the
+variable holds the same value the flag would. These are the ones the
+binaries read (each names the flag it stands for, and which binary reads
+it):
+
+| Variable | Flag | Read by | Notes |
+| --- | --- | --- | --- |
+| `SCION_DATA` | `--data` | `scion-server` | Data directory, default `scion-data`. |
+| `SCION_POSTGRES_URL` | `--postgres-url` | `scion-server` | The URL holds the database credentials; the environment keeps them out of the process list (`ps`). |
+| `SCION_TOKEN` | `--token` | `scion-server` (`serve`, `hash-token`), `scion-cache`, `scion-daemon`, `scn` | A secret; the environment keeps it out of the process list. |
+| `SCION_UPSTREAM_TOKEN` | `--upstream-token` | `scion-cache`, `scion-daemon` | A secret, as `SCION_TOKEN`. |
+| `SCION_DAEMON_DATA` | `--data` | `scion-daemon` | Data directory, default `scion-daemon-data`. |
+| `SCION_AUTHOR` | `--author` | `scn commit` | Default `scn <scn@localhost>`. |
+| `SCION_SERVER` | `--server` | `scn` | Default `http://127.0.0.1:7878`. |
+| `SCION_OBJECTS` | `--objects` | `scn` | Address of a cache or daemon for object reads. |
+| `SCION_TLS_CA` | `--tls-ca` | `scn` | PEM file of a private CA. |
+| `SCION_REPO` | `--repo` | `scn` | Default `main`. |
+
+Two more names exist for the test suite only, never for an operator:
+`SCION_TEST_BACKEND` and `SCION_TEST_POSTGRES_URL`.
+
 ## 2. Ticket keys
 
 An object read carries a ticket that the server signs with an Ed25519 key.

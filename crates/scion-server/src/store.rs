@@ -867,6 +867,10 @@ pub struct Blobs {
     /// The lock file of `mine`, held for as long as this `Blobs` lives.
     /// Never read: its life is the point.
     _mine_lock: fs::File,
+    /// One lock per stripe of blob IDs: the write of one blob runs alone
+    /// in this process, so two puts of the same bytes never race their
+    /// renames onto one path ([#185]).
+    write_locks: Vec<Mutex<()>>,
     group_flush: GroupFlush,
     /// Calls to [`Blobs::verify`] so far.
     #[cfg(test)]
@@ -888,6 +892,11 @@ pub struct Blobs {
     /// fail: a test reads it to see that a kept file was fsynced.
     fsync_count: std::sync::atomic::AtomicU64,
 }
+
+/// How many stripes the per-blob write locks have: 256 on the first byte
+/// of the blob's ID. Puts of different blobs wait on each other only when
+/// their IDs share a stripe, and one ID is always the same stripe.
+const WRITE_STRIPES: usize = 256;
 
 impl Blobs {
     pub(crate) fn open(dir: &Path) -> Result<Self> {
@@ -936,6 +945,7 @@ impl Blobs {
             tmp,
             mine,
             _mine_lock: mine_lock,
+            write_locks: (0..WRITE_STRIPES).map(|_| Mutex::new(())).collect(),
             group_flush: GroupFlush::default(),
             #[cfg(test)]
             verifies: std::sync::atomic::AtomicU64::default(),
@@ -945,6 +955,15 @@ impl Blobs {
             fail_fsyncs: std::sync::atomic::AtomicUsize::new(UNARMED),
             fsync_count: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    fn write_lock(&self, id: BlobId) -> MutexGuard<'_, ()> {
+        // One stripe per value of the first ID byte: the index needs no
+        // modulo, and two writes race only when their IDs share it.
+        let stripe = usize::from(id.as_bytes()[0]);
+        self.write_locks[stripe]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Removes what crashes left in `tmp/`: the folders of processes that no
@@ -1631,6 +1650,10 @@ impl BlobBatch<'_> {
     /// Writes blob `id`, whose `len` bytes `raw` gives, unless the stored file
     /// is intact. A file that is not intact is replaced.
     fn write(&mut self, id: BlobId, len: usize, raw: impl Read) -> Result<()> {
+        // One blob, one writer: the lock spans the check of the stored
+        // file, the touch of a kept one, and the rename that replaces it
+        // (see `Blobs::write_lock`).
+        let _write = self.blobs.write_lock(id);
         match self.keep(id)? {
             BlobStatus::Valid => {
                 // A put that keeps the stored copy writes nothing, so the
@@ -1693,7 +1716,11 @@ impl BlobBatch<'_> {
             .fsync_gate("the blob's temp file", "fsync blob file")?;
         fsync(tmp.as_file())?;
         fs::create_dir_all(&dir)?;
-        tmp.persist(&path).map_err(|e| e.error)?;
+        tmp.persist(&path).map_err(|e| {
+            tracing::warn!(blob = %id, path = %path.display(), error = %e.error,
+                "the rename of the blob's temp file failed");
+            e.error
+        })?;
         self.dirs.insert(dir);
         Ok(())
     }
@@ -1707,6 +1734,9 @@ impl BlobBatch<'_> {
     /// corrupt replaces no intact file, and its batch `sync` covers the
     /// rename.
     fn replace_stored(&mut self, id: BlobId, len: usize, raw: impl Read) -> Result<()> {
+        // The rename below lands on the same path as any other write of
+        // this blob, so it waits for the same stripe.
+        let _write = self.blobs.write_lock(id);
         self.blobs.full_flush()?;
         self.replace(id, len, raw)
     }
@@ -1946,6 +1976,72 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    /// A write of one blob waits for the stripe of a write that is held:
+    /// while the stripe is held by hand, the blob's file stays absent,
+    /// and a write released, the file is there ([#185]). Without the
+    /// striped lock the write renames at once, and the absence assert
+    /// fails. The replacing upload takes the same lock, so the second
+    /// test repeats the shape on the `replace_stored` path, which the
+    /// gRPC race of an upload with a copy stored reaches.
+    #[test]
+    fn a_write_of_one_blob_waits_for_the_stripe() {
+        held_stripe_waits(|store, id, content| {
+            let mut batch = store.blobs().batch();
+            batch.put(content).unwrap();
+            let _ = id;
+        });
+    }
+
+    #[test]
+    fn a_replacing_upload_of_one_blob_waits_for_the_stripe() {
+        held_stripe_waits(|store, id, content| {
+            let mut batch = store.blobs().batch();
+            batch.replace_stored(id, content.len(), content).unwrap();
+            batch.flush_dirs().unwrap();
+        });
+    }
+
+    /// Holds the stripe of one blob by hand, runs `write` on a thread,
+    /// and says the blob stays absent while the stripe is held and is
+    /// whole once the stripe is free. The lease drops the stripe
+    /// however the test ends, so a panicking assert cannot wedge the
+    /// writer ([#142]).
+    fn held_stripe_waits(write: impl Fn(&Store, BlobId, &'static [u8]) + Send + Sync) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let content = b"the same bytes for both writes";
+        let id = BlobId::of(content);
+        // The stripe is held by hand, and drops however the test ends: a
+        // panicking assert frees the writer at the scope's join ([#142]).
+        let stripe = Mutex::new(store.blobs().write_lock(id));
+        thread::scope(|scope| {
+            let writer = scope.spawn(|| write(&store, id, content));
+            // A ceiling only bounds the wait of the good code: the write
+            // of the broken code renames at once, and the absence assert
+            // fails.
+            let until = Instant::now() + Duration::from_millis(200);
+            let mut landed = false;
+            while Instant::now() < until {
+                if store.blobs().verify(id).unwrap() == BlobStatus::Valid {
+                    landed = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                !landed,
+                "the write renamed while another write held the stripe"
+            );
+            drop(stripe);
+            writer.join().unwrap();
+        });
+        assert_eq!(
+            store.blobs().verify(id).unwrap(),
+            BlobStatus::Valid,
+            "the blob of the held stripe"
+        );
+    }
 
     #[test]
     fn an_open_refuses_a_data_directory_that_group_or_others_can_write() {

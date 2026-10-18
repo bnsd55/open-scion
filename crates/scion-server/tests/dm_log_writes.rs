@@ -10,6 +10,12 @@
 //! Here a cut between the file flush and the directory flush takes the
 //! name away, and the test goes red.
 //!
+//! One model note, proven by the mutation runs: on ext4 the directory
+//! fsync and the full flush back each other up - either one forces a
+//! journal commit that carries the rename - so this suite proves the
+//! pair, and the mutation deleting both goes red; a single deletion
+//! needs a file system without one global journal to show.
+//!
 //! The suite needs Linux, the rights to mount and to run `dmsetup`, and
 //! the `replay-log` tool (the CI step builds it and names it with
 //! `SCION_DMW_REPLAY`). Plain `cargo test` skips it, like the disk-full
