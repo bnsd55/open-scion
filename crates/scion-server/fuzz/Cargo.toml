@@ -10,7 +10,9 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 open-scion-core = { path = "../../scion-core" }
-open-scion-server = { path = ".." }
+# The fuzz targets drive the server's internals (blame, memory, write,
+# meta), which only the test-hooks feature makes reachable.
+open-scion-server = { path = "..", features = ["test-hooks"] }
 tempfile = "3"
 
 [[bin]]
