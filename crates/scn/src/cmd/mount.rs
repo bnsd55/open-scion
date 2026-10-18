@@ -234,13 +234,12 @@ fn serving(record: &MountRecord) -> bool {
 /// (and is now held by `file`). Locks on two opens of a file conflict,
 /// even in one process.
 fn lock_is_free(file: &std::fs::File) -> bool {
-    match rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => true,
-        Err(rustix::io::Errno::WOULDBLOCK) => false,
-        // A lock that cannot even be tested says nothing about a live
-        // holder: treat the record as stale, never signal on a guess.
-        Err(_) => true,
-    }
+    // A lock that cannot even be tested says nothing about a live
+    // holder: treat the record as stale, never signal on a guess.
+    !matches!(
+        rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive),
+        Err(rustix::io::Errno::WOULDBLOCK)
+    )
 }
 
 /// Opens and exclusively locks `<overlay>/serve.lock` for the calling
