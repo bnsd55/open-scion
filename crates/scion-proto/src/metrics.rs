@@ -8,6 +8,7 @@
 //! tier counts the `Objects` calls in the same registry and adds its two
 //! cache counters.
 
+use std::fmt::Write as _;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -265,7 +266,6 @@ impl Metrics {
     /// Renders the registry as the Prometheus text format.
     #[must_use]
     pub fn render(&self) -> String {
-        use std::fmt::Write as _;
         let mut text = String::new();
         text.push_str("# HELP scion_requests_total Requests by RPC and code.\n");
         text.push_str("# TYPE scion_requests_total counter\n");
@@ -371,7 +371,6 @@ impl Metrics {
     /// The Postgres reader-pool metrics: the wait histogram and the two
     /// gauges. [`Metrics::render`] hands the text over.
     fn render_pg(&self, text: &mut String) {
-        use std::fmt::Write as _;
         text.push_str(
             "# HELP scion_pg_pool_wait_seconds Time a call waited for a Postgres reader, in seconds.\n",
         );
