@@ -136,7 +136,7 @@ fn a_write_blocked_by_another_writer_answers_busy_in_seconds() {
     let mut held = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     held.batch_execute(&format!("SET search_path TO {schema}"))
         .unwrap();
-    held.batch_execute("BEGIN; INSERT INTO repos (name) VALUES (held);")
+    held.batch_execute("BEGIN; INSERT INTO repos (name) VALUES ('held');")
         .unwrap();
     let started = std::time::Instant::now();
     let error = store
