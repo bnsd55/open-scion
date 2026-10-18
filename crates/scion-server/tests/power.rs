@@ -867,25 +867,10 @@ async fn import_process_races_the_server_on_the_same_blob() {
     let mut put = tokio::spawn(async move { put_blob(&mut scion, &content).await });
     // The import renames the raced blob while the server's writer sits
     // in the park. The trace names every rename, so the wait reads it.
-    // The dest path holds the full ID as its last segment: the two-hex
-    // folder between is not part of the name. The ceiling only bounds a
-    // good run: a cold CI import of one commit took about 30 s.
+    // The ceiling only bounds a good run: a cold CI import of one commit
+    // has taken from 30 s to over 120 s.
     let blob_name = want.to_string();
-    let until = Instant::now() + Duration::from_secs(120);
-    let import_from = loop {
-        let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
-        let line = trace
-            .lines()
-            .find(|line| line.contains("lfs_rename") && line.contains(&blob_name));
-        if let Some(line) = line {
-            break from_of(line);
-        }
-        assert!(
-            Instant::now() < until,
-            "the import never renamed the raced blob"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let import_from = wait_for_rename(&lazy.trace, &blob_name, 240, None);
     // The release ends the park: the server's rename lands after the
     // import's, on the same path, from its own tmp folder.
     fs::remove_file(&park).unwrap();
@@ -895,48 +880,14 @@ async fn import_process_races_the_server_on_the_same_blob() {
         .unwrap()
         .unwrap();
     assert_eq!(id, want);
-    let import = wait_for("the import to finish", 60, || {
-        let finished = import_handle
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(std::thread::JoinHandle::is_finished);
-        finished.then(|| {
-            import_handle
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap()
-                .join()
-                .unwrap()
-                .unwrap_or_else(|error| panic!("waiting for the import failed: {error}"))
-        })
-    });
-    let stderr = String::from_utf8_lossy(&import.stderr).into_owned();
-    assert!(
-        import.status.success(),
-        "the import failed: {:?}: {stderr}",
-        import.status
-    );
+    let import = wait_import(import_handle);
     // The order is the point: the server's rename of the raced blob
     // lands after the import's, from another tmp folder. A second rename
     // never came, and the park never held: the seam failed.
-    let server_from = wait_for("the server's rename of the raced blob", 60, || {
-        let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
-        let lines: Vec<&str> = trace
-            .lines()
-            .filter(|line| line.contains("lfs_rename") && line.contains(&blob_name))
-            .collect();
-        lines
-            .last()
-            .map(|line| from_of(line))
-            .filter(|from| *from != import_from)
-    });
+    let server_from = wait_for_rename(&lazy.trace, &blob_name, 60, Some(&import_from));
     let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
-    let import_at = trace.find(&import_from).unwrap_or(usize::MAX);
-    let server_at = trace.find(&server_from).unwrap_or(0);
     assert!(
-        server_at > import_at,
+        trace.find(&server_from).unwrap_or(0) > trace.find(&import_from).unwrap_or(usize::MAX),
         "the server's rename did not land after the import's"
     );
     server.freeze();
@@ -953,6 +904,37 @@ async fn import_process_races_the_server_on_the_same_blob() {
     drop(store);
 }
 
+/// Waits for the import process to finish, and fails with its stderr if
+/// it exited badly.
+fn wait_import(
+    handle: Mutex<Option<std::thread::JoinHandle<std::io::Result<std::process::Output>>>>,
+) -> std::process::Output {
+    let import = wait_for("the import to finish", 60, || {
+        let finished = handle
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished);
+        finished.then(|| {
+            handle
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .join()
+                .unwrap()
+                .unwrap_or_else(|error| panic!("waiting for the import failed: {error}"))
+        })
+    });
+    let stderr = String::from_utf8_lossy(&import.stderr).into_owned();
+    assert!(
+        import.status.success(),
+        "the import failed: {:?}: {stderr}",
+        import.status
+    );
+    import
+}
+
 /// The park file of one blob, under the data directory's hooks folder.
 fn park_file(data: &Path, id: &BlobId) -> PathBuf {
     data.join("hooks").join(format!("park-{id}"))
@@ -964,4 +946,27 @@ fn from_of(line: &str) -> String {
     let body = line.split("lfs_rename(from=").nth(1).unwrap_or(line);
     let to = body.find(",to=").unwrap_or(body.len());
     body[..to].to_owned()
+}
+
+/// Waits for a rename of the named blob in the ops trace, and returns
+/// the from path of the first line that matches. `not_from` skips one
+/// writer's temp folder, so the second wait sees only the other one.
+fn wait_for_rename(trace: &Path, blob_name: &str, secs: u64, not_from: Option<&str>) -> String {
+    let until = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let text = fs::read_to_string(trace).unwrap_or_default();
+        let line = text.lines().find(|line| {
+            line.contains("lfs_rename")
+                && line.contains(blob_name)
+                && not_from.map_or(true, |from| !line.contains(from))
+        });
+        if let Some(line) = line {
+            return from_of(line);
+        }
+        assert!(
+            Instant::now() < until,
+            "no rename of {blob_name} landed within {secs} s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
