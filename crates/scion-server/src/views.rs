@@ -514,7 +514,7 @@ mod tests {
         PathElem::new(raw.to_vec()).unwrap()
     }
 
-    fn file_entry(store: &Store, content: &[u8]) -> Entry {
+    fn file_entry(store: &Backend, content: &[u8]) -> Entry {
         let blob = store.blobs().put(content).unwrap();
         let len = u64::try_from(content.len()).unwrap();
         Entry::File(FileEntry::new(
@@ -530,7 +530,7 @@ mod tests {
     /// directory exists, files carry their deterministic content. Returns
     /// the non-root trees by path and the stored root's ID.
     fn build_trees(
-        store: &Store,
+        store: &Backend,
         paths: &[String],
     ) -> (std::collections::BTreeMap<String, Tree>, TreeId) {
         let mut all: Vec<String> = vec![String::new()];
@@ -799,7 +799,7 @@ mod tests {
     /// What the view walk carries: the store, the real trees by path, the
     /// rule set, and what the view has shown so far.
     struct Walk<'a> {
-        store: &'a Store,
+        store: &'a Backend,
         dirs: &'a std::collections::BTreeMap<String, Tree>,
         paths: &'a [String],
         rules: &'a [String],

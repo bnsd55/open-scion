@@ -16,6 +16,7 @@ use scion_proto::v1::{
 };
 use std::sync::Arc;
 
+use scion_server::Store;
 use scion_server::access::Access;
 use scion_server::meta::Meta as _;
 
@@ -1494,7 +1495,7 @@ fn a_partial_reader_case(paths: &[String], rule_seeds: &[u16]) -> Result<(), Tes
     // The store: a chain of changesets whose tip tree holds every path,
     // and each file's blob, as an upload would leave them.
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
     let tip = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -1527,7 +1528,7 @@ fn a_partial_reader_case(paths: &[String], rule_seeds: &[u16]) -> Result<(), Tes
         .cloned()
         .collect();
     let dir_b = tempfile::tempdir().unwrap();
-    let store_b = Store::open(dir_b.path()).unwrap();
+    let store_b = Backend::Sqlite(Store::open(dir_b.path()).unwrap());
     let tip_b = store_b
         .write(|c| {
             let repo = c.create_repo(REPO)?;
