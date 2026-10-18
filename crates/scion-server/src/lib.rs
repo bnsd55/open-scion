@@ -5,10 +5,11 @@
 //! blobs, doing commits, lands and reads, and serving the API of
 //! [`scion-proto`](https://docs.rs/open-scion-proto) to the client
 //! ([`scn`]) and the cache tiers
-//! ([`scion-tier`](https://docs.rs/open-scion-tier)). Deploy one server for
-//! one machine's data directory, or a fleet of servers over one shared
-//! Postgres (see [`Backend`]); the operations guide, `docs/operations.md`,
-//! covers both shapes.
+//! ([`scion-tier`](https://docs.rs/open-scion-tier)). One server runs per
+//! data directory or per Postgres database — a second server on the same
+//! database fails at open (see [`Backend`]) — and the metadata may live in
+//! Postgres instead of the data directory; the blobs stay on local disk in
+//! both. The operations guide, `docs/operations.md`, covers both shapes.
 //!
 //! [open-scion]: https://github.com/bnsd55/open-scion
 //! [`scion-core`]: https://docs.rs/open-scion-core
@@ -18,8 +19,10 @@
 //!
 //! - [`backend`] and [`meta`]: one [`Meta`](meta::Meta) trait over two
 //!   backends: a data directory on this machine ([`store`]: SQLite for
-//!   metadata and trees, a folder for blobs), and a Postgres database (the
-//!   `pg` module) that a fleet of servers can share.
+//!   metadata and trees), and a Postgres database (the `pg` module) for
+//!   the metadata instead. The blob files stay on local disk in both: one
+//!   blob folder per server. One server runs per database: a second one
+//!   is refused at open.
 //! - [`derived`]: one mechanism for every kind of derived data.
 //! - [`tree`]: apply changesets to trees and derive each changeset's root tree.
 //! - [`graph`]: the commit-graph index, and the graph queries that read it.
