@@ -113,7 +113,7 @@ async fn server(
     access: Access,
     quotas: Quotas,
 ) -> (Stop, Channel) {
-    server_with_tickets(store, dir.path(), access, quotas, None).await
+    server_with_tickets(store, dir, access, quotas, None).await
 }
 
 /// The same, with the ticket keys of `GetRootTree` and the object reads.
@@ -489,6 +489,7 @@ async fn a_get_objects_stream_holds_its_principals_slot() {
     // One request in flight per principal.
     let (stop, channel) = server_with_tickets(
         &store,
+        dir.path(),
         access,
         Quotas::new(Some(1), None),
         Some(keys.clone()),
