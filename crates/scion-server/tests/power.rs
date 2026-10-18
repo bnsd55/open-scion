@@ -43,9 +43,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use common::*;
 use scion_core::BlobId;
@@ -317,24 +317,88 @@ const RACERS: usize = 16;
 /// How many waves of racing puts one round of the W1 test runs.
 const WAVES: usize = 4;
 
+/// The W1 test's evidence: one line per event, to stderr and to a file in
+/// the trace directory (which CI uploads on a failure), flushed per line,
+/// so a panic cannot lose what came before it.
+#[derive(Clone)]
+struct EventLog {
+    file: Arc<Mutex<Option<fs::File>>>,
+}
+
+impl EventLog {
+    /// Opens `name.log` in the trace directory, if the run named one.
+    fn new(name: &str) -> Self {
+        let file = std::env::var_os("SCION_LAZYFS_TRACE_DIR").map(|dir| {
+            let dir = PathBuf::from(dir);
+            fs::create_dir_all(&dir).unwrap();
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(format!("{name}.log")))
+                .unwrap();
+            Mutex::new(Some(file))
+        });
+        Self {
+            file: Arc::new(file.unwrap_or_else(|| Mutex::new(None))),
+        }
+    }
+
+    /// One event, now to stderr and now to the file.
+    fn line(&self, line: String) {
+        eprintln!("{line}");
+        if let Ok(mut slot) = self.file.lock() {
+            if let Some(file) = slot.as_mut() {
+                let _ = writeln!(file, "{line}");
+                let _ = file.flush();
+            }
+        }
+    }
+}
+
 /// One wave of the W1 test: `RACERS` clients put the same bytes at once,
 /// started together by a barrier, so two of them always race one blob ID.
 /// Every reply must name that blob.
-async fn race_wave(url: String, content: Vec<u8>) -> Vec<BlobId> {
+async fn race_wave(
+    log: &EventLog,
+    round: usize,
+    wave: usize,
+    url: String,
+    content: Vec<u8>,
+) -> Vec<BlobId> {
     let barrier = Arc::new(tokio::sync::Barrier::new(RACERS));
     let racers: Vec<_> = (0..RACERS)
-        .map(|_| {
-            let (url, content, barrier) = (url.clone(), content.clone(), Arc::clone(&barrier));
+        .map(|i| {
+            let (log, url, content, barrier) = (
+                log.clone(),
+                url.clone(),
+                content.clone(),
+                Arc::clone(&barrier),
+            );
             tokio::spawn(async move {
                 let (mut scion, _objects) = connect(&url).await.unwrap();
                 barrier.wait().await;
-                (put_blob(&mut scion, &content).await.unwrap(), content)
+                match put_blob(&mut scion, &content).await {
+                    Ok(id) => {
+                        log.line(format!("round {round} wave {wave} racer {i}: acked {id}"));
+                        (id, content)
+                    }
+                    Err(status) => {
+                        log.line(format!(
+                            "round {round} wave {wave} racer {i}: put failed {status:?}"
+                        ));
+                        panic!("racer {i}: put failed: {status:?}");
+                    }
+                }
             })
         })
         .collect();
     let mut ids = Vec::new();
     for racer in racers {
         let (id, content) = racer.await.unwrap();
+        log.line(format!(
+            "round {round} wave {wave}: collected {id}, want {}",
+            BlobId::of(&content)
+        ));
         assert_eq!(id, BlobId::of(&content));
         ids.push(id);
     }
@@ -360,32 +424,58 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
     let mut rng = Rng::new(seed);
     let rounds = usize::try_from(env("SCION_RACE_ROUNDS", 8)).unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let log = dir.path().join("race.log");
+    // The server's log goes where CI can upload it: next to the LazyFS
+    // trace, when the run named that directory.
+    let server_log = std::env::var_os("SCION_LAZYFS_TRACE_DIR")
+        .map(|dir| {
+            let dir = PathBuf::from(dir);
+            fs::create_dir_all(&dir).unwrap();
+            dir.join("race-server.log")
+        })
+        .unwrap_or_else(|| dir.path().join("race-server.log"));
+    let events = EventLog::new("race-w1");
     let mut total = 0;
     // Rounds from 100 up: the trace file and the mount log of a round are
     // named after it, and must not collide with the other tests' rounds.
     for round in 100..100 + rounds {
+        events.line(format!("round {round}: mounts"));
         let mut lazy = Lazyfs::start(dir.path(), &lazyfs, round);
         let data = lazy.mount.join("data");
         create_repo(&data);
-        let server = Server::start(&data, &log);
+        let server = Server::start(&data, &server_log);
+        events.line(format!("round {round}: server up"));
         // Acked waves: every put is answered before the cut, so every one
         // of them must survive it.
         let mut acked = Vec::new();
-        for _ in 0..WAVES - 1 {
+        for wave in 0..WAVES - 1 {
             let content = rng.bytes(3 << 10);
-            let ids = race_wave(server.url.clone(), content).await;
+            let want = BlobId::of(&content);
+            events.line(format!(
+                "round {round} wave {wave}: starts, one blob {want}"
+            ));
+            let ids = race_wave(&events, round, wave, server.url.clone(), content).await;
             assert!(ids.windows(2).all(|w| w[0] == w[1]), "one blob ID");
             acked.extend(ids);
         }
+        events.line(format!("round {round}: cut after the acked waves"));
         lazy.cut();
         // A wave cut in flight: a put whose sync the cut caught may lose
         // its file, but a reply still binds the server, and whatever
         // reached the backing must be whole.
+        let wave = WAVES - 1;
         let content = rng.bytes(3 << 10);
-        let flight = race_wave(server.url.clone(), content);
+        let want = BlobId::of(&content);
+        events.line(format!(
+            "round {round} wave {wave}: starts in flight, one blob {want}"
+        ));
+        let started = Instant::now();
+        let flight = race_wave(&events, round, wave, server.url.clone(), content);
         let delay = u64::try_from(rng.below(40)).unwrap() + 4;
         tokio::time::sleep(Duration::from_millis(delay)).await;
+        events.line(format!(
+            "round {round}: cut mid-wave at {} ms",
+            started.elapsed().as_millis()
+        ));
         lazy.cut();
         acked.extend(flight.await);
         drop(server);
@@ -393,12 +483,15 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
         // persisted, and nothing else.
         let data = lazy.backing.join("data");
         let store = Store::open_shared(&data).unwrap();
+        events.line(format!("round {round}: reopens, {} acked", acked.len()));
         for id in &acked {
             let status = store.blobs().verify(*id).unwrap();
+            events.line(format!("round {round}: verify acked {id}: {status:?}"));
             assert_eq!(status, BlobStatus::Valid, "acknowledged blob {id}");
         }
         for id in blob_files(&data) {
             let status = store.blobs().verify(id).unwrap();
+            events.line(format!("round {round}: verify file {id}: {status:?}"));
             assert_eq!(status, BlobStatus::Valid, "stored blob file {id}");
         }
         drop(store);

@@ -74,9 +74,15 @@ jobs:
           PROPTEST_CASES: "2000"
 
   power-loss:
-    name: power-loss
+    # DRAFT #214: ten copies of the job hunt the W1 race of #185 at once;
+    # back to one copy once the window is found or ruled out.
+    name: power-loss (${{ matrix.attempts }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        attempts: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     env:
       SCION_POWER_REQUIRE: "1"
     steps:
@@ -123,13 +129,17 @@ jobs:
         run: cargo test -p open-scion-server --test power
       # The suite writes the LazyFS ops trace to
       # $SCION_LAZYFS_TRACE_DIR/lazyfs-r<N>.log; on a failure the trace
-      # says what the cut actually persisted.
+      # says what the cut actually persisted. The W1 race test logs every
+      # put and every verify to race-w1.log, and its server log lands in
+      # the same folder.
       - name: upload the LazyFS trace
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: lazyfs-trace
-          path: ${{ runner.temp }}/lazyfs-trace/lazyfs-r*.log
+          name: lazyfs-trace-${{ matrix.attempts }}
+          path: |
+            ${{ runner.temp }}/lazyfs-trace/lazyfs-r*.log
+            ${{ runner.temp }}/lazyfs-trace/race-*.log
           if-no-files-found: ignore
 
   publish-check:
