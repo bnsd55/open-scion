@@ -513,6 +513,27 @@ async fn race_wave(
     ids
 }
 
+/// Says every acknowledged blob and every blob file of the store verifies.
+fn verify_whole(
+    store: &Store,
+    acked: &[(BlobId, Vec<u8>)],
+    events: &EventLog,
+    round: usize,
+    data: &Path,
+) {
+    events.line(&format!("round {round}: reopens, {} acked", acked.len()));
+    for (id, _) in acked {
+        let status = store.blobs().verify(*id).unwrap();
+        events.line(&format!("round {round}: verify acked {id}: {status:?}"));
+        assert_eq!(status, BlobStatus::Valid, "acknowledged blob {id}");
+    }
+    for id in blob_files(data) {
+        let status = store.blobs().verify(id).unwrap();
+        events.line(&format!("round {round}: verify file {id}: {status:?}"));
+        assert_eq!(status, BlobStatus::Valid, "stored blob file {id}");
+    }
+}
+
 /// Issue #185, window W1. Many clients put the SAME blob at once, wave
 /// after wave: both racers of a blob ID see it missing, both write and
 /// fsync a temp file, and both rename onto the same path (`Store::replace`).
@@ -644,17 +665,7 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
         // persisted, and nothing else.
         let data = lazy.backing.join("data");
         let store = Store::open_shared(&data).unwrap();
-        events.line(&format!("round {round}: reopens, {} acked", acked.len()));
-        for id in &acked {
-            let status = store.blobs().verify(*id).unwrap();
-            events.line(&format!("round {round}: verify acked {id}: {status:?}"));
-            assert_eq!(status, BlobStatus::Valid, "acknowledged blob {id}");
-        }
-        for id in blob_files(&data) {
-            let status = store.blobs().verify(id).unwrap();
-            events.line(&format!("round {round}: verify file {id}: {status:?}"));
-            assert_eq!(status, BlobStatus::Valid, "stored blob file {id}");
-        }
+        verify_whole(&store, &acked, &events, round, &data);
         drop(store);
         drop(lazy);
         total += RACERS * WAVES;
