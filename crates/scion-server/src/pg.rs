@@ -2218,19 +2218,6 @@ impl MetaTx for PgTx<'_> {
             .is_some())
     }
 
-    /// The order the collector and the changeset transactions keep: the
-    /// lock of one blob, held to the end of this transaction. Every
-    /// changeset and land transaction takes it for each blob it puts, and
-    /// the collector around its row check, delete and unlink.
-    /// A no-op on this backend: every write transaction already holds the
-    /// collector's key from the moment it begins (`Pg::commit`), the way a
-    /// SQLite write transaction holds the data directory's one write
-    /// connection. The call stays for the collector's code to say what it
-    /// means, and for a backend whose writers do not already serialize.
-    fn lock_blob(&mut self, _blob: BlobId) -> Result<()> {
-        Ok(())
-    }
-
     /// The `(changeset ID, body)` of the changesets after `from`, in ID
     /// order, at most `limit`.
     fn changeset_bodies_after(

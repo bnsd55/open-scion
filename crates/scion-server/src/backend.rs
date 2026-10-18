@@ -656,13 +656,6 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
-    fn lock_blob(&mut self, blob: BlobId) -> Result<()> {
-        match self {
-            Self::Sqlite(tx) => tx.lock_blob(blob),
-            Self::Postgres(pg) => pg.lock_blob(blob),
-        }
-    }
-
     fn changeset_bodies_after(
         &mut self,
         from: &[u8],

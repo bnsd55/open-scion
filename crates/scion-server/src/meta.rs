@@ -314,16 +314,6 @@ pub trait MetaTx {
     /// Whether any repo names `blob`.
     fn any_repo_names(&mut self, blob: &[u8]) -> Result<bool>;
 
-    /// Orders this transaction against `gc`'s row check and delete for
-    /// `blob`: after it returns, either every changeset this transaction
-    /// later stores is seen by the collector's re-read, or the collector's
-    /// removal is done before this transaction's row check. On the data
-    /// directory it is free: the one write connection orders the two
-    /// already. A shared database needs the lock, so its changeset and land
-    /// transactions take it for every blob they put, and the collector
-    /// takes it around its row check, delete and unlink.
-    fn lock_blob(&mut self, blob: BlobId) -> Result<()>;
-
     /// The `(changeset ID, body)` of the changesets after `from`, in ID
     /// order, at most `limit`. `fsck`'s walk over every stored changeset.
     fn changeset_bodies_after(

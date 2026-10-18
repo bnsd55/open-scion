@@ -77,7 +77,7 @@ const BATCH_BUDGET: Duration = Duration::from_millis(100);
 /// The grace period, when `--grace-secs` is not given: seven days.
 pub const DEFAULT_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
 
-/// A stage of the collection, reported between two batches or repos.
+/// A stage of the collection, reported between two batches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     /// The live-set walk over the stored changesets.
@@ -184,7 +184,8 @@ impl LiveSet {
     }
 }
 
-/// Prunes the dead `repo_blobs` rows of each repo, one transaction per repo.
+/// Prunes the dead `repo_blobs` rows of each repo, in chunks of at most
+/// `PRUNE_BATCH` rows, one transaction per chunk.
 fn prune_rows(
     store: &Backend,
     live: &LiveSet,
@@ -224,13 +225,11 @@ fn prune_rows(
             }
             Ok(dead)
         })?;
-        // The lock orders a delete transaction against a changeset
-        // transaction that names the same blob: the collector's row check
-        // and delete wait for the changeset, or the changeset's row check
-        // waits for the collector. Sorted, so both sides take their locks
-        // in one order and none wait in a circle.
-        let mut dead = dead;
-        dead.sort();
+        // The collector's key (Postgres) and the one write connection
+        // (SQLite) already order the collector's delete transactions
+        // against every changeset transaction: a writer that began first
+        // commits before a delete chunk begins, and a writer that begins
+        // after the chunk waits for it.
         // One transaction per chunk of at most PRUNE_BATCH rows: a
         // transaction holds the collector's key from its begin to its
         // commit, so its length is how long every writer waits. A
@@ -311,18 +310,18 @@ fn sweep_files(
     }
     // The listing is done; a test writes between it and the sweep.
     between(Stage::BlobFiles);
-    // The unlink runs inside a write transaction with the row check, so no
-    // writer can add a row between the two: on the data directory the one
-    // writer waits for the transaction, and on a shared database the lock
-    // orders the sweep against the changeset transaction. The mtime
-    // re-stat stays as a second guard. An unlink is not rolled back by the
-    // transaction, and a crash after it and before the commit is fine: the
-    // file had no row.
+    // The sweep's row check and unlink run inside a write transaction, so
+    // no writer can add a row between the two: on the data directory the
+    // one write connection orders the sweep against the changeset, and on
+    // a shared database every write transaction holds the collector's key
+    // from its begin (`Pg::commit`), the way the SQLite one-write-
+    // connection store serializes. The mtime re-stat stays as a second
+    // guard. An unlink is not rolled back by the transaction, and a crash
+    // after it and before the commit is fine: the file had no row.
     candidates.sort_by(|a, b| a.2.as_bytes().cmp(b.2.as_bytes()));
     for batch in candidates.chunks(SWEEP_BATCH) {
         store.write(|c| {
             for (path, listed, id) in batch {
-                c.lock_blob(*id)?;
                 if c.any_repo_names(id.as_bytes())? {
                     continue;
                 }

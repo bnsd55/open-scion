@@ -1002,12 +1002,6 @@ impl MetaTx for SqliteTx<'_> {
             .exists(params![blob])?)
     }
 
-    /// Free on the data directory: its one write connection orders a
-    /// changeset transaction and the collector already.
-    fn lock_blob(&mut self, _blob: BlobId) -> Result<()> {
-        Ok(())
-    }
-
     /// The `(changeset ID, body)` of the changesets after `from`, in ID
     /// order, at most `limit`.
     fn changeset_bodies_after(
