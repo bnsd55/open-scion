@@ -100,9 +100,13 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
     );
     let secret = vfs.secret_name();
 
-    let listener = NFSTcpListener::bind("127.0.0.1:0", vfs)
+    let mut listener = NFSTcpListener::bind("127.0.0.1:0", vfs)
         .await
         .context("cannot listen for NFS")?;
+    // The printed mount target is /scion/{secret}; without this, the
+    // default export is /, the mountd keeps the whole /scion/{secret}
+    // path, and the VFS reads "scion" as the secret and refuses the mount.
+    listener.with_export_name(EXPORT);
     let port = listener.get_listen_port();
     let server = tokio::spawn(async move {
         if let Err(e) = listener.handle_forever().await {
