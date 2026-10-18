@@ -122,7 +122,8 @@ impl Backend {
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`] if the repo or ref does not exist.
+    /// [`crate::error::Error::NotFound`] if the repo or ref does not
+    /// exist.
     pub fn resolve_ref(&self, repo: &str, name: &str) -> Result<ChangesetId> {
         use crate::meta::Meta as _;
         self.read(|c| {
