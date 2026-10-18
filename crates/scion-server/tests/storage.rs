@@ -238,13 +238,14 @@ fn a_read_on_a_failing_disk_answers_unavailable_and_keeps_serving_the_rest() {
     let error = store.blobs().get(one).unwrap_err();
     let io_failure = matches!(&error, Error::Io(io) if io.raw_os_error() == Some(5));
     assert!(io_failure, "{error:?}");
+    // EIO is a failing device, not a busy one: the reply is an internal
+    // error, not an invitation to retry.
     let reply = tonic::Status::from(match &error {
-        // The same error the gate raised, rebuilt: the reply is fixed.
         Error::Io(_io) => Error::Io(std::io::Error::from_raw_os_error(5)),
         _ => unreachable!(),
     });
-    assert_eq!(reply.code(), tonic::Code::Unavailable);
-    assert_eq!(reply.message(), "the disk failed; retry later");
+    assert_eq!(reply.code(), tonic::Code::Internal);
+    assert_eq!(reply.message(), "internal error");
     drop(error);
     // The hook is spent: the rest of the store keeps serving.
     assert_eq!(store.blobs().get(two).unwrap(), b"two\n");
@@ -265,5 +266,77 @@ fn a_read_hook_refuses_exactly_one_read_per_count() {
         matches!(&error, Error::Io(io) if io.raw_os_error() == Some(5)),
         "{error:?}"
     );
+    assert_eq!(store.blobs().get(one).unwrap(), b"a\n");
+}
+
+#[test]
+fn a_file_fsync_the_disk_refuses_answers_internal_and_leaves_no_torn_file() {
+    let (dir, store) = store();
+    let kept = store.blobs().put(b"kept\n").unwrap();
+    // The next fsync is the temp file's: the write reached the page
+    // cache, but the drive did not take it.
+    store.blobs().fail_fsyncs_after(0);
+    let error = store.blobs().put(b"refused\n").unwrap_err();
+    assert!(
+        matches!(&error, Error::Io(io) if io.raw_os_error() == Some(5)),
+        "{error:?}"
+    );
+    drop(error);
+    // No ack, and no torn file: the refused blob's name never appeared,
+    // and the temp file of the failed write is gone with it.
+    let id = scion_core::BlobId::of(b"refused\n");
+    assert!(!blob_path(dir.path(), id).exists());
+    assert!(blob_dirs_are_clean(dir.path()));
+    // The rest of the store keeps serving.
+    assert_eq!(store.blobs().get(kept).unwrap(), b"kept\n");
+    // The drive took the data after all: the retry rewrites the blob.
+    let id = store.blobs().put(b"refused\n").unwrap();
+    assert_eq!(store.blobs().get(id).unwrap(), b"refused\n");
+}
+
+#[test]
+fn a_dir_fsync_failure_takes_the_renamed_file_back_so_a_retry_rewrites_it() {
+    let (dir, store) = store();
+    let kept = store.blobs().put(b"kept\n").unwrap();
+    // The next fsync is the temp file's; the one after is the blob
+    // directory's, after the rename. The drive takes the file's data but
+    // refuses the directory entry's.
+    store.blobs().fail_fsyncs_after(1);
+    let error = store.blobs().put(b"later\n").unwrap_err();
+    assert!(
+        matches!(&error, Error::Io(io) if io.raw_os_error() == Some(5)),
+        "{error:?}"
+    );
+    drop(error);
+    // No ack, and the renamed file is taken back: a copy whose data may
+    // be only in the page cache must not stay where a retry would keep
+    // it and skip the write. Nothing is left in tmp either.
+    let id = scion_core::BlobId::of(b"later\n");
+    assert!(!blob_path(dir.path(), id).exists());
+    assert!(blob_dirs_are_clean(dir.path()));
+    // The store keeps serving, and the retry rewrites the blob: the
+    // write happens again, because no file holds the name any more.
+    assert_eq!(store.blobs().get(kept).unwrap(), b"kept\n");
+    let again = store.blobs().put(b"again\n").unwrap();
+    assert_eq!(store.blobs().get(again).unwrap(), b"again\n");
+    // And the blob whose directory fsync failed, put again, lands.
+    let id = store.blobs().put(b"later\n").unwrap();
+    assert_eq!(store.blobs().get(id).unwrap(), b"later\n");
+}
+
+#[test]
+fn a_fsync_hook_refuses_exactly_one_fsync_per_count() {
+    let (_dir, store) = store();
+    let one = store.blobs().put(b"a\n").unwrap();
+    // One fsync goes through (the temp file's), the next fails (the
+    // directory's, after the rename), and the one after goes: the count
+    // runs over the file fsyncs and the directory fsyncs in order.
+    store.blobs().fail_fsyncs_after(1);
+    let error = store.blobs().put(b"b\n").unwrap_err();
+    assert!(
+        matches!(&error, Error::Io(io) if io.raw_os_error() == Some(5)),
+        "{error:?}"
+    );
+    store.blobs().put(b"c\n").unwrap();
     assert_eq!(store.blobs().get(one).unwrap(), b"a\n");
 }

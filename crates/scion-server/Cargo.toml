@@ -50,7 +50,14 @@ zstd.workspace = true
 postgres = "0.19"
 tokio-postgres-rustls = "0.14"
 
+[features]
+test-hooks = []
+
 [dev-dependencies]
+# The crate's own tests reach the doc(hidden) test hooks through the
+# test-hooks feature, which #251 makes the rule for every test seam.
+open-scion-server = { path = ".", features = ["test-hooks"] }
+
 proptest.workspace = true
 tempfile.workspace = true
 tonic-health.workspace = true

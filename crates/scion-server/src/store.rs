@@ -869,6 +869,9 @@ pub struct Blobs {
     /// The test hook that fails a file read of this backend with the
     /// disk's answer, the same shape as [`Blobs::fail_writes_after`].
     fail_reads: std::sync::atomic::AtomicUsize,
+    /// The test hook that fails an fsync of this backend with EIO: the
+    /// file fsync before the rename, and the directory fsync after it.
+    fail_fsyncs: std::sync::atomic::AtomicUsize,
 }
 
 impl Blobs {
@@ -924,6 +927,7 @@ impl Blobs {
             fail_writes: std::sync::atomic::AtomicUsize::new(UNARMED),
             fail_writes_errno: std::sync::atomic::AtomicU8::new(28),
             fail_reads: std::sync::atomic::AtomicUsize::new(UNARMED),
+            fail_fsyncs: std::sync::atomic::AtomicUsize::new(UNARMED),
         })
     }
 
@@ -1038,6 +1042,7 @@ impl Blobs {
         BlobBatch {
             blobs: self,
             dirs: BTreeSet::new(),
+            written: Vec::new(),
         }
     }
 
@@ -1179,10 +1184,77 @@ impl Blobs {
         }
     }
 
+    /// Arms the hook that fails an fsync of this backend: it lets the
+    /// next `n` fsyncs through, fails the one after with EIO, and lets
+    /// the rest through. Zero arms it for the very next fsync. The count
+    /// runs over the file fsyncs and the directory fsyncs both, in the
+    /// order the writes make them.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_fsyncs_after(&self, n: usize) {
+        self.fail_fsyncs
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The gate the fsyncs of this process pass: the same countdown as
+    /// [`Blobs::write_gate`], with EIO as the disk's answer. A failed
+    /// fsync leaves the data only in the page cache: the caller must not
+    /// answer as if it reached the drive.
+    fn fsync_gate(&self, name: &str, operation: &str) -> Result<()> {
+        loop {
+            let left = self.fail_fsyncs.load(std::sync::atomic::Ordering::SeqCst);
+            let pass = match left {
+                UNARMED => true,
+                0 => {
+                    if self
+                        .fail_fsyncs
+                        .compare_exchange(
+                            0,
+                            UNARMED,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    false
+                }
+                left => {
+                    if self
+                        .fail_fsyncs
+                        .compare_exchange(
+                            left,
+                            left - 1,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    true
+                }
+            };
+            if pass {
+                return Ok(());
+            }
+            let error = std::io::Error::from_raw_os_error(5); // EIO
+            tracing::error!(
+                file = name,
+                operation,
+                error = %error,
+                "an fsync failed: the drive did not take the data"
+            );
+            return Err(error.into());
+        }
+    }
+
     /// Arms the hook: it lets the next `n` file reads through, fails the
     /// one after with EIO, the disk's answer for a failing device, and
     /// lets the rest through. Zero arms it for the very next read.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_reads_after(&self, n: usize) {
         self.fail_reads
             .store(n, std::sync::atomic::Ordering::SeqCst);
@@ -1245,6 +1317,7 @@ impl Blobs {
     /// arms it for the very next write. Calling it again rearms it; the
     /// start ([`UNARMED`]) never arms it.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_writes_after(&self, n: usize) {
         self.fail_writes_after_errno(n, 28);
     }
@@ -1253,6 +1326,7 @@ impl Blobs {
     /// EIO, 30 is EROFS (a read-only mount). The same one-shot shape as
     /// [`Blobs::fail_writes_after`].
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_writes_after_errno(&self, n: usize, errno: u8) {
         self.fail_writes_errno
             .store(errno, std::sync::atomic::Ordering::SeqCst);
@@ -1510,6 +1584,9 @@ fn too_large() -> Error {
 pub struct BlobBatch<'a> {
     blobs: &'a Blobs,
     dirs: BTreeSet<PathBuf>,
+    /// The final paths this batch renamed into place, so a failed
+    /// directory fsync can take them back.
+    written: Vec<PathBuf>,
 }
 
 impl BlobBatch<'_> {
@@ -1575,9 +1652,11 @@ impl BlobBatch<'_> {
         self.blobs.write_gate(&path, "write blob file")?;
         let mut tmp = tempfile::NamedTempFile::new_in(&self.blobs.mine)?;
         zstd::stream::compress_sized_into(raw, &mut tmp, 3, len as u64)?;
+        self.blobs.fsync_gate("the blob's temp file", "fsync blob file")?;
         fsync(tmp.as_file())?;
         fs::create_dir_all(&dir)?;
         tmp.persist(&path).map_err(|e| e.error)?;
+        self.written.push(path);
         self.dirs.insert(dir);
         Ok(())
     }
@@ -1639,7 +1718,25 @@ impl BlobBatch<'_> {
     // a bug report or a change to this rename path says a directory entry
     // was lost.
     fn flush_dirs(self) -> Result<bool> {
+        let written = self.written;
         for dir in &self.dirs {
+            let name = dir.display().to_string();
+            if self.blobs.fsync_gate(&name, "fsync blob directory").is_err() {
+                // The renames of this batch may not have reached the
+                // drive, and the page cache may still hold their data:
+                // take the files back, so a retry rewrites them instead
+                // of keeping a copy that only looks intact.
+                for path in written.iter().filter(|p| p.parent() == Some(dir)) {
+                    if let Err(error) = fs::remove_file(path) {
+                        tracing::error!(
+                            path = %path.display(),
+                            error = %error,
+                            "cannot take back a blob file whose fsync failed"
+                        );
+                    }
+                }
+                return Err(Error::Io(std::io::Error::from_raw_os_error(5)));
+            }
             fsync_dir(dir)?;
         }
         Ok(!self.dirs.is_empty())
