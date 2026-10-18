@@ -245,12 +245,21 @@ async fn get(client: &mut Client, id: BlobId, deadline: Option<Duration>, ticket
 #[tokio::test(flavor = "multi_thread")]
 async fn the_caller_gets_the_status_of_the_deepest_tier_for_any_deadline() {
     // It never finds room. Its own limit, 2 s, is below the cache's limit
-    // per step, 3 s, which is below the daemon's, 6 s.
+    // per step, 60 s, which is below the daemon's, 120 s. Only their order
+    // matters: each outer limit must be longer than the inner's own, so
+    // the inner's `RESOURCE_EXHAUSTED` wins. They are far longer than the
+    // 2 s the deepest waits, so a loaded machine never flips the outcome
+    // into an outer tier's `UNAVAILABLE`.
     let deepest = Deepest::new(Duration::MAX, Duration::from_secs(2));
     let id = deepest.id();
     let (ticket, keys) = (deepest.ticket(), vec![deepest.key.verifying_key()]);
-    let cache = serve_tier(&serve_deepest(deepest).await, Duration::from_secs(3), &keys).await;
-    let daemon = serve_tier(&cache, Duration::from_secs(6), &keys).await;
+    let cache = serve_tier(
+        &serve_deepest(deepest).await,
+        Duration::from_secs(60),
+        &keys,
+    )
+    .await;
+    let daemon = serve_tier(&cache, Duration::from_secs(120), &keys).await;
     let mut client = connect(&daemon).await;
     for deadline in [
         Some(Duration::from_millis(200)),
