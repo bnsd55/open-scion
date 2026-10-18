@@ -1084,9 +1084,16 @@ fn connect_on(url: &str, ca: Option<&Path>, options: &str) -> Result<Client> {
     let mut config: Config = url
         .parse()
         .map_err(|e| Error::InvalidArgument(format!("cannot parse the database URL: {e}")))?;
-    if !options.is_empty() {
-        config.options(options);
-    }
+    // Options the URL carries go first, so the ones this backend sets last
+    // win: it checks `synchronous_commit` itself after the connect. An
+    // operator's `search_path` in the URL survives.
+    let from_url = config.get_options().unwrap_or_default();
+    let options = if from_url.is_empty() {
+        options.to_owned()
+    } else {
+        format!("{from_url} {options}")
+    };
+    config.options(&options);
     // A dead connection is noticed in seconds, not held open forever.
     config.connect_timeout(std::time::Duration::from_secs(10));
     config.keepalives(true);
