@@ -42,7 +42,7 @@ use crate::derived::DeriveFlights;
 use crate::error::{Error, Result};
 
 /// The schema version this build makes and reads.
-pub(crate) const SCHEMA_VERSION: u32 = 8;
+pub(crate) const SCHEMA_VERSION: u32 = 9;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database from
 /// version `n - 1` to version `n`. A released migration never changes.
@@ -55,6 +55,7 @@ const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [
     include_str!("../migrations/0006_land_created_at.sql"),
     include_str!("../migrations/0007_tree_sizes.sql"),
     include_str!("../migrations/0008_view_roots.sql"),
+    include_str!("../migrations/0009_view_trees.sql"),
 ];
 
 /// Largest object accepted or read back, uncompressed: 100 MiB, the hard
@@ -69,6 +70,11 @@ const READER_WINDOW_LOG: u32 = 21;
 /// Most memory that a [`BlobReader`] holds between parts: its zstd window and
 /// the decoder's buffers and tables, which take less than 1 MiB.
 pub const READER_BYTES: usize = (1 << READER_WINDOW_LOG) + (1 << 20);
+
+/// A step the tests run at a counted batch boundary of the import, with
+/// the count of batches done so far.
+#[doc(hidden)]
+pub type AfterBatch = Box<dyn FnMut(usize) + Send>;
 
 /// Handle to one data directory. Cheap to clone.
 #[derive(Clone)]
@@ -129,6 +135,13 @@ struct Inner {
     /// the import's busy retry: the transaction ran and rolled back, so
     /// nothing was written, exactly as a real busy commit ends.
     fail_commits: AtomicU64,
+    /// The step the tests run after each batch of the import commits, with
+    /// the count of batches done so far: a test that must act at a counted
+    /// batch boundary runs there, instead of racing the batch's end.
+    after_batch: Mutex<Option<AfterBatch>>,
+    /// Busy retries of the import's batches, so a test proves the retry
+    /// ran instead of only that the import survived.
+    busy_retries: AtomicU64,
     /// The derive walks of this store: which are in flight, and the cap
     /// on how many may be.
     derive: DeriveFlights,
@@ -294,6 +307,8 @@ impl Store {
                 _server_lock: server_lock,
                 txes: AtomicU64::new(0),
                 fail_commits: AtomicU64::new(0),
+                after_batch: Mutex::new(None),
+                busy_retries: AtomicU64::new(0),
                 derive: DeriveFlights::new(walks_cap),
                 writers: Mutex::new(0),
                 write_woken: Condvar::new(),
@@ -470,6 +485,43 @@ impl Store {
     #[doc(hidden)]
     pub fn set_busy_timeout(&self, timeout: Duration) {
         let _ = self.lock().busy_timeout(timeout);
+    }
+
+    /// Sets the step the tests run after each batch of the import commits.
+    #[doc(hidden)]
+    pub fn set_after_batch(&self, step: Option<AfterBatch>) {
+        *self
+            .inner
+            .after_batch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = step;
+    }
+
+    /// Runs the test step of a batch boundary, with the count of batches
+    /// done so far.
+    #[doc(hidden)]
+    pub fn run_after_batch(&self, batches: usize) {
+        if let Some(step) = &mut *self
+            .inner
+            .after_batch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            step(batches);
+        }
+    }
+
+    /// How many busy retries of the import's batches ran so far.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn busy_retries(&self) -> u64 {
+        self.inner.busy_retries.load(Ordering::Relaxed)
+    }
+
+    /// Counts one busy retry of the import's batch.
+    #[doc(hidden)]
+    pub fn note_busy_retry(&self) {
+        self.inner.busy_retries.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Write transactions run so far.

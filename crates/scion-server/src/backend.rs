@@ -308,6 +308,43 @@ impl Backend {
             store.set_busy_timeout(timeout);
         }
     }
+
+    /// Sets the step the tests run after each batch of the import commits.
+    /// A Postgres database has no shared data directory, so this only
+    /// reaches SQLite.
+    #[doc(hidden)]
+    pub fn set_after_batch(&self, step: Option<crate::store::AfterBatch>) {
+        if let Self::Sqlite(store) = self {
+            store.set_after_batch(step);
+        }
+    }
+
+    /// How many busy retries of the import's batches ran so far.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn busy_retries(&self) -> u64 {
+        match self {
+            Self::Sqlite(store) => store.busy_retries(),
+            Self::Postgres(_) => 0,
+        }
+    }
+
+    /// Runs the test step of a batch boundary, with the count of batches
+    /// done so far.
+    #[doc(hidden)]
+    pub fn run_after_batch(&self, batches: usize) {
+        if let Self::Sqlite(store) = self {
+            store.run_after_batch(batches);
+        }
+    }
+
+    /// Counts one busy retry of the import's batch.
+    #[doc(hidden)]
+    pub fn note_busy_retry(&self) {
+        if let Self::Sqlite(store) = self {
+            store.note_busy_retry();
+        }
+    }
 }
 
 impl Meta for Backend {
@@ -376,30 +413,6 @@ impl Meta for Backend {
 }
 
 impl MetaTx for BackendTx<'_> {
-    fn get_view_root(
-        &mut self,
-        repo: RepoId,
-        digest: &[u8; 32],
-        cs: ChangesetId,
-    ) -> Result<Option<TreeId>> {
-        match self {
-            Self::Sqlite(tx) => tx.get_view_root(repo, digest, cs),
-            Self::Postgres(pg) => pg.get_view_root(repo, digest, cs),
-        }
-    }
-
-    fn put_view_root(
-        &mut self,
-        repo: RepoId,
-        digest: &[u8; 32],
-        cs: ChangesetId,
-        root: TreeId,
-    ) -> Result<()> {
-        match self {
-            Self::Sqlite(tx) => tx.put_view_root(repo, digest, cs, root),
-            Self::Postgres(pg) => pg.put_view_root(repo, digest, cs, root),
-        }
-    }
     fn create_repo(&mut self, name: &str) -> Result<RepoId> {
         match self {
             Self::Sqlite(tx) => tx.create_repo(name),
@@ -474,6 +487,48 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.delete_derived_below(kind, version, limit),
             Self::Postgres(pg) => pg.delete_derived_below(kind, version, limit),
+        }
+    }
+
+    fn get_view_tree(
+        &mut self,
+        repo: RepoId,
+        digest: &[u8; 32],
+        version: u32,
+        tree: TreeId,
+        ctx: [u8; 32],
+    ) -> Result<Option<TreeId>> {
+        match self {
+            Self::Sqlite(tx) => tx.get_view_tree(repo, digest, version, tree, ctx),
+            Self::Postgres(pg) => pg.get_view_tree(repo, digest, version, tree, ctx),
+        }
+    }
+
+    fn put_view_tree(
+        &mut self,
+        repo: RepoId,
+        digest: &[u8; 32],
+        version: u32,
+        tree: TreeId,
+        ctx: [u8; 32],
+        view: TreeId,
+    ) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.put_view_tree(repo, digest, version, tree, ctx, view),
+            Self::Postgres(pg) => pg.put_view_tree(repo, digest, version, tree, ctx, view),
+        }
+    }
+
+    fn delete_stale_view_trees(
+        &mut self,
+        repo: RepoId,
+        live: &[[u8; 32]],
+        version: u32,
+        limit: usize,
+    ) -> Result<usize> {
+        match self {
+            Self::Sqlite(tx) => tx.delete_stale_view_trees(repo, live, version, limit),
+            Self::Postgres(pg) => pg.delete_stale_view_trees(repo, live, version, limit),
         }
     }
 

@@ -191,15 +191,22 @@ pub async fn serve(
     // Outside the access rules, so a refused call counts too. The layer
     // only wraps replies in a counting body; the handlers stay as they are.
     let scion = MetricsLayer::new(Arc::clone(&metrics)).layer(InterceptedService::new(
-        ScionService::new(worker.clone(), Arc::clone(&access), lands, quotas.clone()).into_server(),
+        ScionService::new(
+            worker.clone(),
+            Arc::clone(&access),
+            lands,
+            quotas.clone(),
+            Arc::clone(&metrics),
+        )
+        .into_server(),
         auth.clone(),
     ));
     // No token interceptor on `objects`: `GetObjects` authenticates by
     // ticket alone, and the service's other calls check the token
     // themselves. So a tier needs no token of the server to fetch objects.
     // The counting layer wraps it all the same, outside the ticket checks.
-    let objects = MetricsLayer::new(metrics)
-        .layer(ObjectsService::new(worker, access, quotas, tickets).into_server());
+    let objects = MetricsLayer::new(Arc::clone(&metrics))
+        .layer(ObjectsService::new(worker, access, quotas, tickets, metrics).into_server());
     // The health service answers `grpc.health.v1.Check` and `Watch` on the
     // same port, without a token: a probe carries none. The store opens
     // before this call, so the server starts serving.
@@ -229,6 +236,8 @@ pub struct ScionService {
     lands: Arc<Lands>,
     /// What one principal may hold at once.
     quotas: Quotas,
+    /// The registry that counts the view derivations.
+    metrics: Arc<Metrics>,
     /// Bounds uploads read at once (`MAX_UPLOADS`): their messages in memory
     /// and their spool files in `tmp/`.
     uploads: Arc<Semaphore>,
@@ -277,12 +286,19 @@ impl ScionService {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    fn new(worker: Worker, access: Arc<Access>, lands: Arc<Lands>, quotas: Quotas) -> Self {
+    fn new(
+        worker: Worker,
+        access: Arc<Access>,
+        lands: Arc<Lands>,
+        quotas: Quotas,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         Self {
             worker,
             access,
             lands,
             quotas,
+            metrics,
             uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
             blames: Arc::new(Semaphore::new(MAX_BLAMES)),
             blame_memory: crate::memory::Bytes::new(BLAME_MEMORY_BUDGET),
@@ -1131,6 +1147,7 @@ impl Scion for ScionService {
         // The derivation of a first view walks the real tree, under the
         // call's deadline.
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
+        let metrics = Arc::clone(&self.metrics);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
@@ -1144,7 +1161,8 @@ impl Scion for ScionService {
                     .access
                     .read_rule_set(&caller, &req.repo)
                     .unwrap_or_default();
-                Some((digest, prefixes))
+                let live = self.access.view_digests(&req.repo);
+                Some((digest, prefixes, live))
             }
             None => None,
         };
@@ -1152,10 +1170,11 @@ impl Scion for ScionService {
             .worker
             .run(move |store| {
                 let blob = match &view {
-                    Some((digest, prefixes)) => {
+                    Some((digest, prefixes, live)) => {
                         let repo_id = store.read(|c| c.repo_id(&req.repo))?;
-                        let root =
-                            views::view_root(&store, repo_id, digest, id, prefixes, &deadline)?;
+                        let root = views::view_root(
+                            &store, repo_id, digest, id, prefixes, live, &metrics, &deadline,
+                        )?;
                         read::file_blob_at(&store, root, &path)?
                     }
                     None => read::file_blob(&store, &req.repo, id, &path)?,
@@ -1199,6 +1218,7 @@ impl Scion for ScionService {
         // The derivation of a first view walks the real tree, under the
         // call's deadline.
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
+        let metrics = Arc::clone(&self.metrics);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
@@ -1211,7 +1231,8 @@ impl Scion for ScionService {
                     .access
                     .read_rule_set(&caller, &req.repo)
                     .unwrap_or_default();
-                Some((digest, prefixes))
+                let live = self.access.view_digests(&req.repo);
+                Some((digest, prefixes, live))
             }
             None => None,
         };
@@ -1219,10 +1240,11 @@ impl Scion for ScionService {
             .worker
             .run(move |store| {
                 let tree = match &view {
-                    Some((digest, prefixes)) => {
+                    Some((digest, prefixes, live)) => {
                         let repo_id = store.read(|c| c.repo_id(&req.repo))?;
-                        let root =
-                            views::view_root(&store, repo_id, digest, id, prefixes, &deadline)?;
+                        let root = views::view_root(
+                            &store, repo_id, digest, id, prefixes, live, &metrics, &deadline,
+                        )?;
                         read::list_dir_at(&store, root, path.as_ref())?
                     }
                     None => read::list_dir(&store, &req.repo, id, path.as_ref())?,
@@ -1523,6 +1545,7 @@ mod tests {
             Arc::new(Access::single("t")),
             Arc::default(),
             Quotas::off(),
+            Arc::default(),
         )
     }
 
@@ -1739,6 +1762,7 @@ mod tests {
             Arc::new(read_only_access()),
             Arc::default(),
             Quotas::off(),
+            Arc::default(),
         );
         // A valid changeset, which puts `f`: decode succeeds, the rules
         // deny the write. The check runs in the job, so this also shows

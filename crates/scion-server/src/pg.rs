@@ -45,7 +45,7 @@ use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId}
 use crate::store::Blobs;
 
 /// The schema version this build makes and reads.
-pub(crate) const PG_SCHEMA_VERSION: u32 = 2;
+pub(crate) const PG_SCHEMA_VERSION: u32 = 3;
 
 /// The advisory lock of the one server process of a database.
 const SERVER_LOCK: i64 = 0x5343_494F_4E53_5256;
@@ -57,6 +57,7 @@ const SCHEMA_LOCK: i64 = 0x5343_494F_4E53_4348;
 const PG_MIGRATIONS: [&str; PG_SCHEMA_VERSION as usize] = [
     include_str!("../migrations/postgres/0001_init.sql"),
     include_str!("../migrations/postgres/0002_view_roots.sql"),
+    include_str!("../migrations/postgres/0003_view_trees.sql"),
 ];
 
 /// Handle to one Postgres database. Cheap to clone.
@@ -172,6 +173,8 @@ enum Param {
     Text(String),
     Bytes(Vec<u8>),
     OptBytes(Option<Vec<u8>>),
+    /// A list of byte strings, for a `= ANY($n)` over `bytea[]`.
+    ByteaArray(Vec<Vec<u8>>),
 }
 
 impl Param {
@@ -194,6 +197,11 @@ impl Param {
     fn opt_bytes(v: Option<Vec<u8>>) -> Param {
         Param::OptBytes(v)
     }
+
+    /// A list of byte strings, as one `bytea[]` parameter.
+    fn bytea_array(v: Vec<Vec<u8>>) -> Param {
+        Param::ByteaArray(v)
+    }
 }
 
 impl ToSql for Param {
@@ -208,6 +216,7 @@ impl ToSql for Param {
             Self::Text(v) => v.to_sql(t, out),
             Self::Bytes(v) => v.to_sql(t, out),
             Self::OptBytes(v) => v.to_sql(t, out),
+            Self::ByteaArray(v) => v.to_sql(t, out),
         }
     }
 
@@ -226,6 +235,7 @@ impl ToSql for Param {
             Self::Text(v) => v.to_sql(t, out),
             Self::Bytes(v) => v.to_sql(t, out),
             Self::OptBytes(v) => v.to_sql(t, out),
+            Self::ByteaArray(v) => v.to_sql(t, out),
         }
     }
 }
@@ -1674,66 +1684,128 @@ impl MetaTx for PgTx<'_> {
         Ok(usize::try_from(deleted).unwrap_or(0))
     }
 
-    /// The view root that a rule-set digest derives for a changeset, if
-    /// derived already.
+    /// The view that the per-tree memo holds for a (rule set, version,
+    /// real tree, context), if derived.
     ///
     /// # Errors
     ///
-    /// Database errors, or a stored root that is not a tree ID.
-    fn get_view_root(
+    /// Database errors, or a stored view that is not a tree ID.
+    fn get_view_tree(
         &mut self,
         repo: RepoId,
         digest: &[u8; 32],
-        cs: ChangesetId,
+        version: u32,
+        tree: TreeId,
+        ctx: [u8; 32],
     ) -> Result<Option<TreeId>> {
         let bytes: Option<Vec<u8>> = self
             .c
             .query_opt(
-                "SELECT root FROM view_roots WHERE repo_id = $1 AND digest = $2 AND cs = $3",
+                "SELECT view FROM view_trees \
+                 WHERE repo_id = $1 AND digest = $2 AND version = $3 AND tree = $4 AND ctx = $5",
                 &[
                     P::i64(repo.0),
                     P::bytes(digest),
-                    P::bytes(&id_bytes(cs.as_bytes())),
+                    P::i64(i64::from(version)),
+                    P::bytes(&id_bytes(tree.as_bytes())),
+                    P::bytes(&ctx),
                 ],
             )?
             .map(|row| row.get(0));
         bytes
-            .map(|b| {
-                TreeId::try_from(b.as_slice()).map_err(|_| Error::Corrupt("bad view root".into()))
-            })
+            .map(|b| TreeId::try_from(b.as_slice()).map_err(|_| Error::Corrupt("bad view".into())))
             .transpose()
     }
 
-    /// Records the view root of a rule-set digest for a changeset. A second
-    /// write must agree with the first: derivation is deterministic, so a
-    /// mismatch means corruption.
+    /// Records one row of the per-tree memo. A second write must agree
+    /// with the first: derivation is deterministic, so a mismatch means
+    /// corruption.
     ///
     /// # Errors
     ///
-    /// [`Error::Corrupt`] if a different root is already stored.
-    fn put_view_root(
+    /// [`Error::Corrupt`] if a different view is already stored.
+    fn put_view_tree(
         &mut self,
         repo: RepoId,
         digest: &[u8; 32],
-        cs: ChangesetId,
-        root: TreeId,
+        version: u32,
+        tree: TreeId,
+        ctx: [u8; 32],
+        view: TreeId,
     ) -> Result<()> {
         let inserted = self.c.execute(
-            "INSERT INTO view_roots (repo_id, digest, cs, root) VALUES ($1, $2, $3, $4)
-             ON CONFLICT (repo_id, digest, cs) DO NOTHING",
+            "INSERT INTO view_trees (repo_id, digest, version, tree, ctx, view) \
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (repo_id, digest, version, tree, ctx) DO NOTHING",
             &[
                 P::i64(repo.0),
                 P::bytes(digest),
-                P::bytes(&id_bytes(cs.as_bytes())),
-                P::bytes(&id_bytes(root.as_bytes())),
+                P::i64(i64::from(version)),
+                P::bytes(&id_bytes(tree.as_bytes())),
+                P::bytes(&ctx),
+                P::bytes(&id_bytes(view.as_bytes())),
             ],
         )?;
-        if inserted == 0 && self.get_view_root(repo, digest, cs)? != Some(root) {
+        if inserted == 0 && self.get_view_tree(repo, digest, version, tree, ctx)? != Some(view) {
             return Err(Error::Corrupt(format!(
-                "the view root of {cs} for the rule set differs from the stored value"
+                "the view of tree {tree} under its context differs from the stored value"
             )));
         }
         Ok(())
+    }
+
+    /// Deletes at most `limit` dead rows of the per-tree memo: rows of an
+    /// older projection version, then rows of a digest that no grant of
+    /// this repo hashes to any more, as far as this server's access file
+    /// knows. The LIMIT lives in the subquery over the primary key, as the
+    /// derived-row expiry does. A digest that another server still needs
+    /// is re-derived, at that server's next read.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn delete_stale_view_trees(
+        &mut self,
+        repo: RepoId,
+        live: &[[u8; 32]],
+        version: u32,
+        limit: usize,
+    ) -> Result<usize> {
+        let limit = u64::try_from(limit).map_err(|_| Error::InvalidArgument("limit".into()))?;
+        let version = i64::from(version);
+        // Rows of an older projection version are dead, whoever used them.
+        let mut removed = self.c.execute(
+            "DELETE FROM view_trees WHERE (repo_id, digest, version, tree, ctx) IN (
+                 SELECT repo_id, digest, version, tree, ctx FROM view_trees
+                 WHERE repo_id = $1 AND version < $2 LIMIT $3)",
+            &[
+                P::i64(repo.0),
+                P::i64(version),
+                P::i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+            ],
+        )?;
+        // Rows of a digest that no grant of this repo hashes to any more.
+        // `live` is never empty here: the deriving caller's digest is among
+        // the digests of its access snapshot (the assert in `view_root`),
+        // and a caller that cannot prove that has no business sweeping.
+        if removed < limit && !live.is_empty() {
+            let live: Vec<Vec<u8>> = live.iter().map(|d| d.to_vec()).collect();
+            let left = limit - removed;
+            removed += self.c.execute(
+                "DELETE FROM view_trees WHERE (repo_id, digest, version, tree, ctx) IN (
+                     SELECT repo_id, digest, version, tree, ctx FROM view_trees
+                     WHERE repo_id = $1 AND version = $2
+                       AND NOT (digest = ANY($3))
+                     LIMIT $4)",
+                &[
+                    P::i64(repo.0),
+                    P::i64(version),
+                    P::bytea_array(live),
+                    P::i64(i64::try_from(left).unwrap_or(i64::MAX)),
+                ],
+            )?;
+        }
+        Ok(usize::try_from(removed).unwrap_or(0))
     }
 
     /// Stores a tree. Safe to repeat.
