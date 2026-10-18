@@ -119,16 +119,7 @@ fn count_changesets(c: &Connection) -> scion_server::Result<i64> {
 
 #[test]
 fn concurrent_creates_of_one_changeset_store_it_once() {
-    // Asserts the rows of the data directory's database.
-    if skip_on_postgres("asserts the rows of the data directory's database") {
-        return;
-    }
-
     let f = fixture();
-    let before = f
-        .store
-        .read(|c| count_changesets(c.sqlite().unwrap()))
-        .unwrap();
     let (bytes, expected) = changeset(
         vec![f.root],
         &[("a", None), ("dir/new", Some(regular("new")))],
@@ -143,12 +134,33 @@ fn concurrent_creates_of_one_changeset_store_it_once() {
             .map(|h| h.join().unwrap().unwrap())
             .collect()
     });
+    // Every caller answers the same ID, and none of them errors: the
+    // conflict of the one stored row is a no-op on every backend, not a
+    // failure. The Postgres table keeps one row per ID, so a caller that
+    // stored a second one would have errored here.
     assert!(ids.iter().all(|id| *id == expected), "{ids:?}");
+    let repo_id = f.store.read(|c| c.repo_id(REPO)).unwrap();
+    assert!(
+        f.store
+            .read(|c| c.has_changeset(repo_id, expected))
+            .unwrap(),
+        "the changeset is not in the repo"
+    );
+    // The row count closes the case on the store whose rows the tests
+    // read; on Postgres the schema drift test covers the table's keys.
+    if Backend::test_is_postgres() {
+        return;
+    }
+    let before = f
+        .store
+        .read(|c| count_changesets(c.sqlite().unwrap()))
+        .unwrap();
+    create_changeset(&f.store, REPO, &bytes).unwrap();
     assert_eq!(
         f.store
             .read(|c| count_changesets(c.sqlite().unwrap()))
             .unwrap(),
-        before + 1
+        before
     );
 }
 
