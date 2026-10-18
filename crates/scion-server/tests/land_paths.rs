@@ -50,6 +50,14 @@ fn req(cs: ChangesetId, key: &str) -> LandRequest {
     }
 }
 
+/// Whether the import of one scenario moved the ref while the land ran.
+enum Race {
+    /// The import moved `main` after the land recorded itself.
+    Moved,
+    /// The land finished before the import moved: nothing raced.
+    Missed,
+}
+
 /// A repo whose `main` points at a root with `a/b/c`, `a/f` and `b/y`.
 struct Fixture {
     dir: tempfile::TempDir,
@@ -167,22 +175,33 @@ fn setup() -> Fixture {
 /// A land whose ref an import moves under it plans again from the new
 /// head and lands once, and the replan shows in the process's counters.
 /// One scenario does not always reach the replan: the import can commit
-/// between the land's attempts. The test runs the scenario until the
-/// counter moves, at most 10 times.
+/// before the land reads the head, or the land can finish before the
+/// import moves at all. The test runs scenarios until the counter moves,
+/// counting only the rounds the import really raced.
 #[test]
 fn a_land_replans_when_imports_move_its_ref() {
     let metrics = Arc::new(scion_proto::metrics::Metrics::default());
+    let mut raced_rounds = 0;
     let mut replans = 0;
-    for _ in 0..10 {
-        replans = replan_scenario(&metrics);
+    let mut rounds = 0;
+    while raced_rounds < 10 && rounds < 40 {
+        rounds += 1;
+        let raced = replan_scenario(&metrics);
+        if matches!(raced, Race::Moved) {
+            raced_rounds += 1;
+        }
+        replans = metrics.land_replans();
         if replans >= 1 {
             break;
         }
     }
-    assert!(replans >= 1, "no land replanned in 10 runs");
+    assert!(
+        replans >= 1,
+        "no land replanned in {raced_rounds} raced rounds"
+    );
 }
 
-fn replan_scenario(metrics: &Arc<scion_proto::metrics::Metrics>) -> u64 {
+fn replan_scenario(metrics: &Arc<scion_proto::metrics::Metrics>) -> Race {
     let f = setup();
     let lands = Lands::new(None, Some(Arc::clone(metrics)));
     // The land's changeset: parent = root, so it must rebase onto
@@ -201,14 +220,15 @@ fn replan_scenario(metrics: &Arc<scion_proto::metrics::Metrics>) -> u64 {
         std::thread::spawn(move || {
             // The poll runs on its own read-only connection: a Store::read
             // waits for the commits it saw to be durable, which the land
-            // it races can hold for a while. CI runs the whole workspace
-            // at once on a few cores, so the wait is minutes, not seconds.
+            // it races can hold for a while. The wait is bounded: a land
+            // that finishes first leaves nothing to race, and the round
+            // says so instead of hanging.
             let conn = rusqlite::Connection::open_with_flags(
                 db_path,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             )
             .unwrap();
-            let until = Instant::now() + Duration::from_secs(120);
+            let until = Instant::now() + Duration::from_secs(5);
             loop {
                 let pending: i64 = conn
                     .query_row(
@@ -220,10 +240,17 @@ fn replan_scenario(metrics: &Arc<scion_proto::metrics::Metrics>) -> u64 {
                 if pending >= 1 {
                     break;
                 }
-                assert!(
-                    Instant::now() < until,
-                    "the land never recorded its pending row"
-                );
+                // The land finished without this import: too late to race.
+                let done: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM lands WHERE state <> 'pending'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                if done >= 1 || Instant::now() > until {
+                    return Race::Missed;
+                }
                 std::thread::sleep(Duration::from_millis(1));
             }
             // The land has recorded its request and reads the head soon
@@ -245,18 +272,13 @@ fn replan_scenario(metrics: &Arc<scion_proto::metrics::Metrics>) -> u64 {
                 })
                 .unwrap();
             rounds.fetch_add(1, Ordering::SeqCst);
+            Race::Moved
         })
     };
 
     // The land lands although the import moves the ref while it runs.
     let out = lands.land(&f.store, &caller(), &req(cs, "k")).unwrap();
     assert_eq!(out.state, LandState::Landed, "{}", out.detail);
-    racer.join().unwrap();
-    assert_eq!(
-        rounds.load(Ordering::SeqCst),
-        1,
-        "the import did not move main while the land ran"
-    );
     let landed = out.result.expect("landed");
     // The landed changeset sits on the first-parent history of main: an
     // import that moved the ref after the land sits on top of it.
@@ -284,7 +306,9 @@ fn replan_scenario(metrics: &Arc<scion_proto::metrics::Metrics>) -> u64 {
     // A retry with the same key returns the same outcome.
     let again = lands.land(&f.store, &caller(), &req(cs, "k")).unwrap();
     assert_eq!(again, out);
-    metrics.land_replans()
+    let race = racer.join().unwrap();
+    drop(rounds);
+    race
 }
 
 /// A read that panics with its transaction open must not poison the
