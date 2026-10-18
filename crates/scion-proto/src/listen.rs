@@ -44,7 +44,7 @@ use std::io;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -185,7 +185,13 @@ impl Stalled {
                 limit = self.0.limit,
                 "closing a connection: its stalled replies hold too much"
             );
-            if let Some(waker) = self.0.waker.lock().unwrap().take() {
+            if let Some(waker) = self
+                .0
+                .waker
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
                 waker.wake();
             }
         }
@@ -198,7 +204,7 @@ impl Stalled {
 
     /// Registers the read waker, so a crossing of the limit is seen at once.
     fn register(&self, read: &Waker) {
-        let mut waker = self.0.waker.lock().unwrap();
+        let mut waker = self.0.waker.lock().unwrap_or_else(PoisonError::into_inner);
         *waker = Some(read.clone());
     }
 
