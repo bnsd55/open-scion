@@ -3201,22 +3201,26 @@ mod tests {
         let batch1 = &steps[..answers[0]];
         for id in &ids {
             let (dir, _) = store.blobs().location(*id);
-            let a = steps_of(batch1, &S::TmpWrite(*id));
-            let b = steps_of(batch1, &S::FileFsync(*id));
-            let c = steps_of(batch1, &S::Rename(*id));
-            let d = batch1
+            let tmp_write = steps_of(batch1, &S::TmpWrite(*id));
+            let file_fsync = steps_of(batch1, &S::FileFsync(*id));
+            let rename = steps_of(batch1, &S::Rename(*id));
+            let dir_fsync = batch1
                 .iter()
                 .position(|s| matches!(s, S::DirFsync(path) if *path == dir))
                 .unwrap_or_else(|| panic!("no dir fsync of {} before the answer", dir.display()));
-            let f = batch1
+            let full_flush = batch1
                 .iter()
                 .position(|s| *s == S::FullFlush)
                 .expect("no full flush before the answer");
             assert!(
-                a < b && b < c && c < d && d < f && f < answers[0],
+                tmp_write < file_fsync
+                    && file_fsync < rename
+                    && rename < dir_fsync
+                    && dir_fsync < full_flush
+                    && full_flush < answers[0],
                 "the durability steps of {id} are out of order: \
-                 tmp write {a}, file fsync {b}, rename {c}, dir fsync {d}, \
-                 full flush {f}, answer {}",
+                 tmp write {tmp_write}, file fsync {file_fsync}, rename {rename}, \
+                 dir fsync {dir_fsync}, full flush {full_flush}, answer {}",
                 answers[0]
             );
         }
