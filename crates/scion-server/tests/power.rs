@@ -92,7 +92,6 @@ struct Lazyfs {
     completed: fs::File,
     mount: PathBuf,
     backing: PathBuf,
-    trace: PathBuf,
 }
 
 impl Lazyfs {
@@ -168,7 +167,6 @@ impl Lazyfs {
             completed,
             mount,
             backing,
-            trace,
         }
     }
 
