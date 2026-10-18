@@ -44,7 +44,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -188,12 +188,9 @@ impl Lazyfs {
         });
         let mut opening = Some(opening);
         let mut fifo = wait_for("the faults fifo to open", 15, || {
-            let opening = opening.as_mut()?;
-            opening
-                .is_finished()
-                .then(|| opening.take().unwrap().unwrap())
+            let finished = opening.as_ref().unwrap().is_finished();
+            finished.then(|| opening.take().unwrap().unwrap())
         });
-        fifo.write_all(b"lazyfs::clear-cache\n").unwrap();
         let mut completed = self.completed.try_clone().unwrap();
         let answer = std::thread::spawn(move || {
             let mut done = [0u8; 64];
@@ -408,25 +405,28 @@ impl EventLog {
 /// started together by a barrier, so two of them always race one blob ID.
 /// Every reply must name that blob.
 async fn race_wave(
-    log: &EventLog,
+    log: EventLog,
     round: usize,
     wave: usize,
     url: String,
     content: Vec<u8>,
-) -> (Vec<BlobId>, usize, usize) {
+    // Counters the test reads while the wave runs: `crossed` rises when a
+    // racer passed the barrier, `replied` when a racer's put came back.
+    // At the freeze, crossed > replied means a put was really in flight,
+    // and the cut interrupts it.
+    crossed: Arc<AtomicUsize>,
+    replied: Arc<AtomicUsize>,
+) -> Vec<BlobId> {
     let barrier = Arc::new(tokio::sync::Barrier::new(RACERS));
-    // How many racers crossed the barrier: a crossing is work the server
-    // had accepted before the freeze, and the wave's cut must interrupt
-    // at least one real in-flight put, not racers of a dead server.
-    let passed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let racers: Vec<_> = (0..RACERS)
         .map(|i| {
-            let (log, url, content, barrier, passed) = (
+            let (log, url, content, barrier, crossed, replied) = (
                 log.clone(),
                 url.clone(),
                 content.clone(),
                 Arc::clone(&barrier),
-                Arc::clone(&passed),
+                Arc::clone(&crossed),
+                Arc::clone(&replied),
             );
             tokio::spawn(async move {
                 // The connect is bounded, and every racer reaches the
@@ -436,8 +436,12 @@ async fn race_wave(
                 let put = match connected {
                     Ok(Ok((mut scion, _objects))) => {
                         barrier.wait().await;
-                        passed.fetch_add(1, Ordering::SeqCst);
-                        put_blob(&mut scion, &content).await
+                        crossed.fetch_add(1, Ordering::SeqCst);
+                        let put = put_blob(&mut scion, &content).await;
+                        if put.is_ok() {
+                            replied.fetch_add(1, Ordering::SeqCst);
+                        }
+                        put
                     }
                     Ok(Err(error)) => {
                         barrier.wait().await;
@@ -485,11 +489,11 @@ async fn race_wave(
         assert_eq!(id, BlobId::of(&content));
         ids.push(id);
     }
-    let passed = passed.load(Ordering::SeqCst);
     log.line(&format!(
-        "round {round} wave {wave}: {passed} racers crossed the barrier"
+        "round {round} wave {wave}: {failed} racers cut, {} crossed",
+        crossed.load(Ordering::SeqCst)
     ));
-    (ids, failed, passed)
+    ids
 }
 
 /// Issue #185, window W1. Many clients put the SAME blob at once, wave
@@ -572,26 +576,41 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
         let started = Instant::now();
         // The wave is spawned, not built and awaited later: the racers
         // run while the server lives, and the cut lands in their flight.
-        let flight = tokio::spawn(race_wave(&events, round, wave, server.url.clone(), content));
+        // The counters are shared, so the test reads them at the freeze:
+        // a racer past the barrier whose put has not replied yet is work
+        // the cut really interrupts.
+        let crossed = Arc::new(AtomicUsize::new(0));
+        let replied = Arc::new(AtomicUsize::new(0));
+        let flight = tokio::spawn(race_wave(
+            events.clone(),
+            round,
+            wave,
+            server.url.clone(),
+            content,
+            Arc::clone(&crossed),
+            Arc::clone(&replied),
+        ));
         let delay = u64::try_from(rng.below(40)).unwrap() + 4;
         tokio::time::sleep(Duration::from_millis(delay)).await;
         events.line(&format!(
             "round {round}: cut mid-wave at {} ms",
             started.elapsed().as_millis()
         ));
+        let in_flight = crossed.load(Ordering::SeqCst);
+        let replies = replied.load(Ordering::SeqCst);
+        assert!(
+            in_flight > replies,
+            "no put was in flight at the freeze: {in_flight} crossed, {replies} replied"
+        );
         server.freeze();
         lazy.cut();
         // The kill comes before the join: the racers of the wave hang on
         // the frozen server, and only the kill lets their calls fail.
         drop(server);
-        let (ids, cut, crossed) = tokio::time::timeout(Duration::from_secs(30), flight)
+        let (ids, cut) = tokio::time::timeout(Duration::from_secs(30), flight)
             .await
             .unwrap_or_else(|_| panic!("the cut wave's racers never finished"))
             .unwrap();
-        assert!(
-            crossed > 0,
-            "no racer crossed the barrier before the freeze: the wave cut nothing"
-        );
         events.line(&format!(
             "round {round} wave {wave}: {} acked before the freeze, {cut} cut",
             ids.len()
@@ -801,28 +820,18 @@ async fn import_process_races_the_server_on_the_same_blob() {
         acked.len(),
         started.elapsed().as_millis()
     );
-    // The race test fails when the processes did not overlap: the ops
-    // trace must show at least one blob path that BOTH processes renamed,
-    // which is the rename race the lock cannot see across processes.
-    let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
-    let mut renames: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for line in trace.lines().filter(|line| line.contains("lfs_rename")) {
-        if let Some(dest) = line.split_whitespace().next_back() {
-            if dest.contains("/objects/") {
-                *renames.entry(dest).or_default() += 1;
-            }
-        }
-    }
-    let raced = renames.values().filter(|count| **count > 1).count();
-    eprintln!("{raced} blob paths were renamed by both processes");
-    assert!(
-        raced > 0,
-        "no blob path was renamed twice: the import and the puts did not overlap"
-    );
-    // The import runs behind a ceiling: a stuck child is killed, and
-    // the test names the step instead of hanging to the job timeout.
+    // The import runs behind a ceiling that kills it: a stuck child dies
+    // at the ceiling, the wait returns, and the assert names the step.
+    let import_pid = import.id();
+    let killer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(120));
+        let _ = rustix::process::kill_process(
+            rustix::process::Pid::from_raw(import_pid.cast_signed()).unwrap(),
+            rustix::process::Signal::KILL,
+        );
+    });
     let import = std::thread::spawn(move || import.wait_with_output());
-    let out = wait_for("the import to finish", 120, || {
+    let out = wait_for("the import to finish", 130, || {
         import
             .is_finished()
             .then(|| import.join().unwrap().unwrap())
@@ -832,6 +841,58 @@ async fn import_process_races_the_server_on_the_same_blob() {
         "the import failed: {:?}: {:?}",
         out.status,
         String::from_utf8_lossy(&out.stderr)
+    );
+    drop(killer);
+    // The race test fails when the processes did not overlap: the ops
+    // trace must show a blob path the import renamed AFTER the server
+    // renamed it. The from= folder names the writer's tmp folder, whose
+    // name starts with its process id, so each rename has an owner.
+    let server_tmp = format!("/tmp/{}-", server.pid());
+    let import_tmp = format!("/tmp/{}-", import_pid);
+    let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
+    // For every blob path: when each process last renamed onto it.
+    let mut server_at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut import_at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (seq, line) in trace
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("lfs_rename"))
+    {
+        let (from, to) = line
+            .split_whitespace()
+            .filter(|token| token.contains('/'))
+            .collect::<Vec<_>>()
+            .as_slice()
+            .split_first_chunk::<2>()
+            .map(|(pair, _)| (pair[0], pair[1]))
+            .unwrap_or(("", ""));
+        if !to.contains("/objects/") {
+            continue;
+        }
+        if from.contains(&server_tmp) {
+            server_at.insert(to, seq);
+        } else if from.contains(&import_tmp) {
+            import_at.insert(to, seq);
+        }
+    }
+    let raced = import_at
+        .iter()
+        .filter(|(dest, import_seq)| {
+            server_at
+                .get(*dest)
+                .is_some_and(|server_seq| server_seq < import_seq)
+        })
+        .count();
+    eprintln!("{raced} blob paths were renamed by the import after the server");
+    assert!(
+        out.status.success(),
+        "the import failed: {:?}: {:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        raced > 0,
+        "the import never renamed after the server: the puts and the import did not overlap"
     );
     server.freeze();
     lazy.cut();

@@ -77,6 +77,14 @@ pub struct Server {
 }
 
 impl Server {
+    /// The server process's id, for a test that must tell the server's
+    /// files from another process's.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Server {
     /// Starts a server on `data` and waits until it listens. It appends its
     /// log to `log`.
     pub fn start(data: &Path, log: &Path) -> Self {
