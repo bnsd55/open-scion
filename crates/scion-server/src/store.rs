@@ -2828,10 +2828,16 @@ mod tests {
                 steps_of(&S::TmpWrite(*id)),
                 steps_of(&S::FileFsync(*id)),
                 steps_of(&S::Rename(*id)),
-                steps.iter().take(answer).position(|s| match s {
-                    S::DirFsync(path) => path == &dir,
-                    _ => false,
-                }).unwrap_or_else(|| panic!("no dir fsync of {} before the answer", dir.display())),
+                steps
+                    .iter()
+                    .take(answer)
+                    .position(|s| match s {
+                        S::DirFsync(path) => path == &dir,
+                        _ => false,
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("no dir fsync of {} before the answer", dir.display())
+                    }),
             );
             assert!(
                 a < b && b < c && c < d,
