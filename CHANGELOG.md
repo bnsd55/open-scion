@@ -155,6 +155,20 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Changed
 
+- `open-scion-server`'s public API is a small facade: `Backend`,
+  `service::{serve, ServeOptions}`, `access::Access`, `tickets::Keys`,
+  `quotas::Quotas`, `metrics::Metrics`,
+  `import::{import_git, ImportOptions, ImportReport}`, `store::Store`,
+  `error::{Error, Result}`, `fsck`, `gc` with `DEFAULT_GRACE_SECS`,
+  `derived::{backfill, Kind}`, `graph::CommitGraph`,
+  `history::PathHistory` and `tree::RootTree`. Everything else in the
+  crate is private now, and a ref read goes through
+  `Backend::resolve_ref`; code that reached past the facade moves to it.
+- The server's test seams (`open_test`, the import's batch-boundary and
+  busy-retry hooks, the commit-failure and busy-timeout seams) sit
+  behind a `test-hooks` cargo feature, default off: a build without it
+  carries none of them, and nothing behind the feature, and nothing
+  `#[doc(hidden)]`, is API.
 - `scn mount` now works with the system's NFS client (`#238`): the
   listener serves the export name its printed command mounts, where a
   real kernel client was refused with `MNT3ERR_NOENT`.
