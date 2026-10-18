@@ -371,6 +371,9 @@ the process, scraped from there. The names:
 - `scion_land_replans_total` — lands that planned again because their ref
   moved under them; a rising rate means lands contending with imports or
   other writers on one ref.
+- `scion_view_trees_walked_total` — real trees a view derivation opened for
+  a partial reader; a rate that stays high across changesets of one rule
+  set means the per-tree memo is not serving and every derivation re-walks.
 - `scion_cache_hits_total` / `scion_cache_misses_total` — what a tier
   served from its store against what it fetched upstream.
 

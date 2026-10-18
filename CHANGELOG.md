@@ -477,6 +477,14 @@ until that section gets its release date.
 
 ### Changed
 
+- A partial reader's view is memoized per tree (`#121`): a derivation asks
+  the `view_trees` table at every directory, so a new changeset re-derives
+  only the folders on its changed paths, and the rest of the view comes
+  from the rows; rows of an older projection version or of a rule set no
+  principal holds any more are swept in bounded steps. The metric
+  `scion_view_trees_walked_total` counts the real trees a derivation
+  opened. Both backends hold the table (SQLite migration 0009, Postgres
+  0003).
 - The server, the cache and the daemon log to stderr (`#179`): stdout
   carries the output of `ticket-key` and `hash-token`, so a redirect of
   one does not catch the other's lines.

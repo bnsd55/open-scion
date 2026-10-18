@@ -42,7 +42,7 @@ use crate::derived::DeriveFlights;
 use crate::error::{Error, Result};
 
 /// The schema version this build makes and reads.
-pub(crate) const SCHEMA_VERSION: u32 = 8;
+pub(crate) const SCHEMA_VERSION: u32 = 9;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database from
 /// version `n - 1` to version `n`. A released migration never changes.
@@ -55,6 +55,7 @@ const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [
     include_str!("../migrations/0006_land_created_at.sql"),
     include_str!("../migrations/0007_tree_sizes.sql"),
     include_str!("../migrations/0008_view_roots.sql"),
+    include_str!("../migrations/0009_view_trees.sql"),
 ];
 
 /// Largest object accepted or read back, uncompressed: 100 MiB, the hard

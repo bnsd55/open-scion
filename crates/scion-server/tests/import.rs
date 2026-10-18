@@ -786,6 +786,34 @@ fn import_process(data: &Path, git: &Git, rev: &str, name: &str) -> Command {
     command
 }
 
+/// `scion-server import` that opens the test's Postgres schema: the test
+/// URL plus a `search_path` startup option, since the binary names no
+/// schema and the tests of one data directory share one. The data
+/// directory still holds the blobs and the backend marker.
+fn import_process_on_postgres(data: &Path, git: &Git, rev: &str, name: &str) -> Command {
+    let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+    let schema = Backend::test_schema(data).unwrap();
+    let sep = if url.contains('?') { '&' } else { '?' };
+    // `--postgres-url` is a flag of the root command, so it goes before
+    // the subcommand.
+    let mut command = server_process(
+        data,
+        &[
+            "--postgres-url",
+            &format!("{url}{sep}options=--search_path%3D{schema}"),
+            "import",
+            "--repo",
+            "r",
+            "--rev",
+            rev,
+        ],
+    );
+    command
+        .args(["--ref", name, "--verify", "10"])
+        .arg(git.path());
+    command
+}
+
 fn assert_success(out: &Output) {
     assert!(
         out.status.success(),
@@ -928,6 +956,124 @@ fn an_import_process_shares_the_data_directory_with_lands() {
         })
         .unwrap();
     assert_eq!(rows, 400);
+    assert_eq!(
+        read::resolve_ref(&store, "r", "git/main").unwrap(),
+        changeset_of(&store, &more)
+    );
+    // Main's first-parent history above `mine` is the lands, each once. A
+    // fast machine lands more than one log page (`read::MAX_SCAN`), so walk
+    // the parents.
+    let mut history = Vec::new();
+    let mut at = main_ref(&store).target;
+    while at != mine {
+        assert!(history.len() < landed.len(), "main does not reach {mine}");
+        history.push(at);
+        at = read::get_changeset(&store, "r", at).unwrap().parents[0];
+    }
+    let mut want = landed;
+    want.sort();
+    history.sort();
+    assert_eq!(history, want);
+}
+
+#[test]
+fn an_import_process_shares_the_postgres_database_with_lands() {
+    // The SQLite twin above asserts the data directory's own mechanics, so
+    // it skips here. This one runs only on Postgres, where the database
+    // sorts its writers out and an import takes no server lock: another
+    // process imports while this test's lands write the same schema.
+    if !Backend::test_is_postgres() {
+        return;
+    }
+    let git = Git::init();
+    let first = git.fast_commits(0, 1);
+    let tip = git.fast_commits(1, 60);
+    // The server's store and lands; the imports run as other processes.
+    let (dir, store) = open_store();
+    let lands = Lands::default();
+    let data = dir.path();
+    let import = |rev: &str, name: &str| {
+        assert_success(
+            &import_process_on_postgres(data, &git, rev, name)
+                .output()
+                .unwrap(),
+        );
+    };
+    import(&first, "main");
+    let start = main_ref(&store).target;
+
+    // A land whose base is not on main builds main's path index at the
+    // start, and leaves main alone.
+    let repo = store.read(|c| c.repo_id("r")).unwrap();
+    let side = Changeset {
+        parents: vec![],
+        author: identity(),
+        committer: None,
+        message: b"side".to_vec(),
+        changes: BTreeMap::new(),
+    };
+    let side = store.write(|c| c.insert_changeset(repo, &side)).unwrap();
+    let out = land(&store, &lands, create(&store, side, "s.txt"));
+    assert_eq!(out.state, LandState::Rejected, "{}", out.detail);
+    assert_eq!(main_ref(&store).target, start);
+
+    // The other process moves main forward. The next plan reads the new
+    // head, so the index sees the imported changes.
+    import(&tip, "main");
+    let imported = changeset_of(&store, &tip);
+    assert_eq!(main_ref(&store).target, imported);
+    let out = land(&store, &lands, create(&store, start, "g/f5"));
+    assert_eq!(out.state, LandState::Conflict, "{}", out.detail);
+    assert_eq!(out.conflict_paths, [path("g/f5")]);
+    let out = land(&store, &lands, create(&store, start, "mine.txt"));
+    assert_eq!(out.state, LandState::Landed, "{}", out.detail);
+    let mine = out.result.unwrap();
+    let parents = read::get_changeset(&store, "r", mine).unwrap().parents;
+    assert_eq!(parents, [imported]);
+
+    // Agents land on main while another process imports more commits into
+    // another ref.
+    let more = git.fast_commits(60, 400);
+    let import = common::spawn_guard::across_spawn(|| {
+        import_process_on_postgres(data, &git, &more, "git/main")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+    })
+    .unwrap();
+    let done = AtomicBool::new(false);
+    let landed: Vec<ChangesetId> = thread::scope(|scope| {
+        let agents: Vec<_> = (0..4)
+            .map(|agent| {
+                let (store, lands, done) = (&store, &lands, &done);
+                scope.spawn(move || {
+                    let mut landed = Vec::new();
+                    while !done.load(Ordering::Relaxed) || landed.is_empty() {
+                        let head = main_ref(store).target;
+                        let cs = create(store, head, &format!("agent{agent}/{}", landed.len()));
+                        let out = land(store, lands, cs);
+                        assert_eq!(out.state, LandState::Landed, "{}", out.detail);
+                        landed.push(out.result.unwrap());
+                    }
+                    landed
+                })
+            })
+            .collect();
+        let out = import.wait_with_output().unwrap();
+        done.store(true, Ordering::Relaxed);
+        assert_success(&out);
+        agents.into_iter().flat_map(|a| a.join().unwrap()).collect()
+    });
+
+    // Every commit is imported, and the other ref points at the tip. The
+    // imported commits come from the store, not from the database's rows.
+    let imported_count = store
+        .read(|c| {
+            let repo = c.repo_id("r")?;
+            Ok(c.imported_commits(repo)?.len())
+        })
+        .unwrap();
+    assert_eq!(imported_count, 400);
     assert_eq!(
         read::resolve_ref(&store, "r", "git/main").unwrap(),
         changeset_of(&store, &more)

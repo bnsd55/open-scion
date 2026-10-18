@@ -234,6 +234,10 @@ impl Backend {
         std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres")
     }
 
+    /// The schema that [`Backend::open_test`] gave this data directory on
+    /// Postgres: a test that counts rows through its own Postgres client
+    /// names it the same way. A result, so the callers unwrap one shape.
+    ///
     /// The schema a test backend of this directory uses, when the tests
     /// run on Postgres. Hidden: a test holds a lock in it from a
     /// connection of its own.
@@ -490,28 +494,45 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
-    fn get_view_root(
+    fn get_view_tree(
         &mut self,
         repo: RepoId,
         digest: &[u8; 32],
-        cs: ChangesetId,
+        version: u32,
+        tree: TreeId,
+        ctx: [u8; 32],
     ) -> Result<Option<TreeId>> {
         match self {
-            Self::Sqlite(tx) => tx.get_view_root(repo, digest, cs),
-            Self::Postgres(pg) => pg.get_view_root(repo, digest, cs),
+            Self::Sqlite(tx) => tx.get_view_tree(repo, digest, version, tree, ctx),
+            Self::Postgres(pg) => pg.get_view_tree(repo, digest, version, tree, ctx),
         }
     }
 
-    fn put_view_root(
+    fn put_view_tree(
         &mut self,
         repo: RepoId,
         digest: &[u8; 32],
-        cs: ChangesetId,
-        root: TreeId,
+        version: u32,
+        tree: TreeId,
+        ctx: [u8; 32],
+        view: TreeId,
     ) -> Result<()> {
         match self {
-            Self::Sqlite(tx) => tx.put_view_root(repo, digest, cs, root),
-            Self::Postgres(pg) => pg.put_view_root(repo, digest, cs, root),
+            Self::Sqlite(tx) => tx.put_view_tree(repo, digest, version, tree, ctx, view),
+            Self::Postgres(pg) => pg.put_view_tree(repo, digest, version, tree, ctx, view),
+        }
+    }
+
+    fn delete_stale_view_trees(
+        &mut self,
+        repo: RepoId,
+        live: &[[u8; 32]],
+        version: u32,
+        limit: usize,
+    ) -> Result<usize> {
+        match self {
+            Self::Sqlite(tx) => tx.delete_stale_view_trees(repo, live, version, limit),
+            Self::Postgres(pg) => pg.delete_stale_view_trees(repo, live, version, limit),
         }
     }
 
