@@ -244,7 +244,13 @@ Rotation, step by step:
 
 1. Make the new key: `scion-server ticket-key --out NEW.key` — it prints the
    new public key as 64 hex characters.
-2. Restart the server with both keys: `--ticket-key NEW.key
+2. Give the tiers both public keys, new first, **before** the server moves
+   to the new key — a cache that verifies only the old key refuses every
+   ticket the new server mints:
+   `--ticket-public-key <NEW_HEX> --ticket-public-key <OLD_HEX>` (repeat the
+   flag; two are the most). Restart the caches; a cache that verifies
+   against both serves tickets of either key.
+3. Restart the server with both keys: `--ticket-key NEW.key
    --ticket-key-old OLD-PUBLIC`. The old argument is a file holding the
    **public** key of the previous key (the hex that the old run printed),
    not its seed. A public key is not a secret: anyone may read the file,
@@ -253,10 +259,6 @@ Rotation, step by step:
    symlink, and the directories above it must be private to its owner or
    root. `chmod go-w OLD-PUBLIC` fixes a copy tool's 0666. Tickets of
    either key verify while both are given.
-3. Give the tiers both public keys, new first:
-   `--ticket-public-key <NEW_HEX> --ticket-public-key <OLD_HEX>` (repeat the
-   flag; two are the most). Restart the caches; a cache that verifies
-   against both serves tickets of either key.
 4. When no client can hold a ticket of the old key any more (tickets live 15
    minutes), restart the server without `--ticket-key-old` and the caches
    with only the new public key.
