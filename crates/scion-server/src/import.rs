@@ -612,19 +612,23 @@ impl Importer<'_> {
             }
             let id = BlobId::of(&blob.data);
             // A committed row of this repo names this blob only after the
-            // file's and its directory's fsyncs succeeded (import.rs: the
-            // batch syncs before the batch's rows commit; PutBlob commits
-            // its row after put_upload). The stored copy is durable, so
-            // the put, its read-back check, and the keep fsyncs are not
-            // needed. A blob without a row may be the file of a failed
-            // write whose fsync never succeeded: it goes through put, and
-            // the keep path fsyncs it before it answers.
+            // file's and its directory's fsyncs succeeded (the batch syncs
+            // before the batch's rows commit; PutBlob commits its row
+            // after put_upload). The stored copy is durable, so the put,
+            // its read-back check, and the keep fsyncs are not needed. A
+            // blob without a row may be the file of a failed write whose
+            // fsync never succeeded: it goes through put, and the keep
+            // path fsyncs it before it answers.
             // SHORTCUT: the skip sees only this repo's rows, one probe per
-            // distinct blob. A blob that another repo names still goes
-            // through put with its read-back and fsyncs. Upgrade: an index
-            // on repo_blobs (blob), then any_repo_names, when a cross-repo
-            // import is measured slow.
-            if self.store.read(|c| c.repo_has_blob(self.repo_id, id))? {
+            // distinct blob, and checks the file is there: a row whose
+            // file someone deleted under the server still refuses the
+            // import through put's read-back (fsck lists it too). A blob
+            // that another repo names still goes through put. Upgrade:
+            // an index on repo_blobs (blob), then any_repo_names, when a
+            // cross-repo import is measured slow.
+            if self.store.read(|c| c.repo_has_blob(self.repo_id, id))?
+                && self.store.blobs().file_exists(id)
+            {
                 self.put.push(id);
                 return Ok(id);
             }
