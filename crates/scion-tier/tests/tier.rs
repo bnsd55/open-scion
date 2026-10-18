@@ -201,6 +201,19 @@ impl Fake {
         }
     }
 
+    /// Serves `object`'s parts too, without giving it a path: a tree that
+    /// another ticket's walk needs, which `path` must not name.
+    fn with_object(self, object: &Object) -> Self {
+        let mut objects_map = (*self.objects).clone();
+        objects_map
+            .entry(object.id.clone())
+            .or_insert_with(|| object.raw());
+        Self {
+            objects: Arc::new(objects_map),
+            ..self
+        }
+    }
+
     /// The signed ticket for the root tree, in repo `r`, verified for its
     /// shape so the bytes ride on as they would from the server.
     fn ticket(&self) -> Vec<u8> {
@@ -454,6 +467,44 @@ async fn get_in(
 ) -> Result<Result<Vec<Object>, Status>, Status> {
     let got = get_parts(client, fake, objects, false).await?;
     Ok(got.map(|got| got.into_iter().map(|(object, ..)| object).collect()))
+}
+
+/// The reply to a `GetObjects` call with the given refs and ticket: the
+/// objects it returns, unpacked, or the error that ends it.
+async fn get_with(
+    client: &mut Client,
+    refs: Vec<ObjectRef>,
+    ticket: Vec<u8>,
+) -> Result<Result<Vec<Object>, Status>, Status> {
+    let request = GetObjectsRequest {
+        refs,
+        accept: Vec::new(),
+        ticket,
+    };
+    let mut stream = client.get_objects(request).await?.into_inner();
+    let mut got = Vec::new();
+    loop {
+        let first = match stream.message().await {
+            Ok(Some(part)) => part,
+            Ok(None) => return Ok(Ok(got)),
+            Err(status) => return Ok(Err(status)),
+        };
+        let mut object = Assembler::new(Header::of(&first, false).unwrap(), first);
+        while !object.is_done() {
+            match stream.message().await {
+                Ok(Some(part)) => object.push(&part).unwrap(),
+                Ok(None) => panic!("the reply ended in the middle of an object"),
+                Err(status) => return Ok(Err(status)),
+            }
+        }
+        let (header, data) = object.finish();
+        let data = object::decode(&header, data).unwrap();
+        got.push(Object {
+            kind: header.kind.into(),
+            id: header.id.to_vec(),
+            data,
+        });
+    }
 }
 
 /// A cache that waits at most `timeout` for `upstream`, and its address.
@@ -1314,5 +1365,170 @@ async fn a_daemon_miss_fetches_the_object_only() {
     let status = get(&mut client, &fake, &[&stranger]).await.unwrap_err();
     assert_eq!(status.code(), Code::NotFound, "{status:?}");
     assert_eq!(fake.calls(), 2, "the cache fetched nothing for it");
+    let _ = cache;
+}
+
+/// A partial reader's view ticket cannot reach a blob that the cache
+/// holds for a whole-repo reader: the walk from the ticket's root tree
+/// refuses it as missing, and the answer is byte for byte the answer a
+/// truly missing path gets. Through a daemon, which runs no walk of its
+/// own, the cache behind it refuses too.
+#[tokio::test]
+async fn a_view_ticket_cannot_reach_a_warm_blob_outside_its_view() {
+    let secret = blob(b"docs/secret, outside the view\n");
+    // The fake's whole-repo tree reaches the blob at its index path; its
+    // tickets name that root, so alice's fetch proves and warms it.
+    let fake = Fake::new(&[&secret], Duration::ZERO);
+    // bob's view: a root tree that lists `src` only, signed by the same
+    // key and served, so the walk of his ticket can read it.
+    let (view_bytes, view_root) = Tree {
+        entries: [(
+            PathElem::new(b"src".to_vec()).unwrap(),
+            Entry::Dir(Tree::default().encode_with_id().1),
+        )]
+        .into(),
+    }
+    .encode_with_id();
+    let view_tree = Object {
+        kind: ObjectKind::Tree.into(),
+        id: view_root.as_bytes().to_vec(),
+        data: view_bytes,
+    };
+    let fake = fake.with_object(&view_tree);
+    let upstream = serve_fake(fake.clone()).await;
+    let (_cache, url) = serve_cache(&upstream, CACHE_UPSTREAM_TIMEOUT, &fake.keys()).await;
+    let bob_ticket = scion_proto::ticket::sign(
+        &fake.key,
+        "r",
+        "bob",
+        *view_root.as_bytes(),
+        scion_proto::ticket::now(),
+    )
+    .unwrap();
+
+    // alice (whole repo) warms the cache; her second call is a hit.
+    let mut alice = connect(&url, Some(TOKEN)).await;
+    get(&mut alice, &fake, &[&secret]).await.unwrap();
+    get(&mut alice, &fake, &[&secret]).await.unwrap();
+    assert_eq!(fake.calls(), 2, "the second call stayed in the cache");
+
+    // bob asks for the warm blob over its true path, with his view
+    // ticket: refused, though the blob sits in the cache.
+    let mut bob = connect(&url, Some(TOKEN)).await;
+    let refs = |path: Vec<u8>| {
+        vec![ObjectRef {
+            kind: secret.kind,
+            id: secret.id.clone(),
+            path,
+        }]
+    };
+    let hidden = get_with(&mut bob, refs(fake.path(&secret)), bob_ticket.clone())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(hidden.code(), Code::NotFound, "{hidden:?}");
+    assert!(hidden.message().contains("is not in the ticket"));
+
+    // The same call for a path that nothing reaches: the same answer,
+    // byte for byte. Hidden equals missing at the tier.
+    let missing = get_with(&mut bob, refs(b"nowhere".to_vec()), bob_ticket.clone())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(missing.code(), Code::NotFound, "{missing:?}");
+    assert_eq!(
+        hidden.message(),
+        missing.message(),
+        "hidden must equal missing"
+    );
+
+    // The walk fetched only the trees on the way, never the blob.
+    assert_eq!(fake.calls(), 3, "the blob was never fetched for bob");
+
+    // And a second ask stays refused: nothing was learned or stored for
+    // bob's ticket.
+    let again = get_with(&mut bob, refs(fake.path(&secret)), bob_ticket)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(again.code(), Code::NotFound, "{again:?}");
+}
+
+/// The same refusal through a daemon: the daemon runs no walk, so the
+/// cache behind it is the check. It refuses with the blob unfetched.
+#[tokio::test]
+async fn a_daemons_cache_still_refuses_a_view_ticket_outside_its_view() {
+    let secret = blob(b"docs/secret, outside the view\n");
+    let fake = Fake::new(&[&secret], Duration::ZERO);
+    let (view_bytes, view_root) = Tree {
+        entries: [(
+            PathElem::new(b"src".to_vec()).unwrap(),
+            Entry::Dir(Tree::default().encode_with_id().1),
+        )]
+        .into(),
+    }
+    .encode_with_id();
+    let view_tree = Object {
+        kind: ObjectKind::Tree.into(),
+        id: view_root.as_bytes().to_vec(),
+        data: view_bytes,
+    };
+    let fake = fake.with_object(&view_tree);
+    let upstream = serve_fake(fake.clone()).await;
+    let (cache, cache_url) = serve_cache(&upstream, CACHE_UPSTREAM_TIMEOUT, &fake.keys()).await;
+    let bob_ticket = scion_proto::ticket::sign(
+        &fake.key,
+        "r",
+        "bob",
+        *view_root.as_bytes(),
+        scion_proto::ticket::now(),
+    )
+    .unwrap();
+
+    // alice warms the cache through her own client.
+    let mut alice = connect(&cache_url, Some(TOKEN)).await;
+    get(&mut alice, &fake, &[&secret]).await.unwrap();
+    let warmed = fake.calls();
+
+    // bob's daemon: no ticket keys, so no walk of its own.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
+    let daemon = Tier::new(
+        store,
+        &cache_url,
+        TOKEN,
+        CACHE_UPSTREAM_TIMEOUT,
+        None,
+        Vec::new(),
+    )
+    .unwrap();
+    let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
+    tokio::spawn(daemon.clone().serve(
+        TOKEN,
+        incoming,
+        Limits::default(),
+        None,
+        std::future::pending(),
+    ));
+    let mut bob = connect(&format!("unix://{}", socket.display()), Some(TOKEN)).await;
+    let refs = vec![ObjectRef {
+        kind: secret.kind,
+        id: secret.id.clone(),
+        path: fake.path(&secret),
+    }];
+    let hidden = get_with(&mut bob, refs, bob_ticket)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(hidden.code(), Code::NotFound, "{hidden:?}");
+    assert!(hidden.message().contains("is not in the ticket"));
+    // The cache walked bob's ticket: only the view tree was fetched.
+    assert_eq!(
+        fake.calls(),
+        warmed + 1,
+        "the cache fetched the view tree, never the blob"
+    );
     let _ = cache;
 }

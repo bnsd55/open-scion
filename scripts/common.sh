@@ -54,6 +54,7 @@ need() {
 make_work() {
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/scion-$1.XXXXXX")
   trap cleanup EXIT
+  trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
   # Resolve symlinks (macOS: /var is /private/var), as git daemon does.
@@ -156,6 +157,15 @@ start_scion() {
 scrape_metrics() {
   command curl -fsS "$1/metrics" | awk '
     /^scion_rpc_bytes_total\{.*direction="out"/ { s += $NF }
+    END { print s + 0 }'
+}
+
+# getobjects URL: the total of the GetObjects request counters at URL,
+# over every code. A counter that never incremented does not render,
+# hence the +0.
+getobjects() {
+  command curl -fsS "$1/metrics" | awk '
+    /scion_requests_total\{rpc="Objects\/GetObjects"/ { s += $NF }
     END { print s + 0 }'
 }
 
