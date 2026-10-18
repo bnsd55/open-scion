@@ -887,13 +887,13 @@ pub struct Blobs {
     /// The durability steps this `Blobs` ran, in order, for the order
     /// test: a test-hooks build records them, a production build stores
     /// nothing.
+    #[cfg(any(test, feature = "test-hooks"))]
     log: DurabilityLog,
 }
 
-/// One durability step of the blob path, recorded for the order test
-/// under the test-hooks seam. A production build names the steps at the
-/// call sites and stores nothing.
+/// One durability step of the blob path, recorded for the order test.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DurabilityStep {
     /// A temp file for a blob was written.
@@ -910,6 +910,7 @@ pub enum DurabilityStep {
 
 /// The ordered log of [`DurabilityStep`]s behind the test-hooks seam.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Default)]
 pub struct DurabilityLog {
     #[cfg(any(test, feature = "test-hooks"))]
@@ -999,7 +1000,6 @@ impl Blobs {
             #[cfg(test)]
             verifies: std::sync::atomic::AtomicU64::default(),
             fail_writes: std::sync::atomic::AtomicUsize::new(UNARMED),
-            log: DurabilityLog::default(),
         })
     }
 
@@ -1574,11 +1574,14 @@ impl BlobBatch<'_> {
         self.blobs.write_gate(&path, "write blob file")?;
         let mut tmp = tempfile::NamedTempFile::new_in(&self.blobs.mine)?;
         zstd::stream::compress_sized_into(raw, &mut tmp, 3, len as u64)?;
+        #[cfg(any(test, feature = "test-hooks"))]
         self.blobs.log.record(DurabilityStep::TmpWrite(id));
         fsync(tmp.as_file())?;
+        #[cfg(any(test, feature = "test-hooks"))]
         self.blobs.log.record(DurabilityStep::FileFsync(id));
         fs::create_dir_all(&dir)?;
         tmp.persist(&path).map_err(|e| e.error)?;
+        #[cfg(any(test, feature = "test-hooks"))]
         self.blobs.log.record(DurabilityStep::Rename(id));
         self.dirs.insert(dir);
         Ok(())
@@ -1628,6 +1631,7 @@ impl BlobBatch<'_> {
         if self.flush_dirs()? {
             blobs.full_flush()?;
         }
+        #[cfg(any(test, feature = "test-hooks"))]
         blobs.log.record(DurabilityStep::Answer);
         Ok(())
     }
@@ -1642,9 +1646,13 @@ impl BlobBatch<'_> {
     // a bug report or a change to this rename path says a directory entry
     // was lost.
     fn flush_dirs(self) -> Result<bool> {
-        // MUTATION: the directory fsync (and its record, which is one
-        // call with it) is deleted; the rename's entry is only as durable
-        // as the next full flush of another path.
+        // MUTATION: the directory fsync (and its record, one call with
+        // it) is deleted; the rename's entry is only as durable as the
+        // next full flush of another path.
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        for dir in &self.dirs {
+            fsync_dir(dir)?;
+        }
         Ok(!self.dirs.is_empty())
     }
 }
@@ -1743,6 +1751,7 @@ pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
 
 /// Flushes a directory and records the step together: whoever deletes the
 /// fsync deletes the record with it, and the order test fails.
+#[cfg(any(test, feature = "test-hooks"))]
 fn fsync_dir_logged(log: &DurabilityLog, path: &Path) -> Result<()> {
     fsync_dir(path)?;
     log.record(DurabilityStep::DirFsync(path.to_path_buf()));
