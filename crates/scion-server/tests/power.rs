@@ -43,7 +43,7 @@ mod common;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -637,18 +637,30 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
             Arc::clone(&crossed),
             Arc::clone(&replied),
         ));
-        let delay = u64::try_from(rng.below(40)).unwrap() + 4;
-        tokio::time::sleep(Duration::from_millis(delay)).await;
+        // The wave runs until a put is really in flight: a racer past
+        // the barrier whose put has not replied yet is work the cut
+        // interrupts. The ceiling only bounds the wait of the good code;
+        // if no put ever goes in flight, the test says so instead of
+        // cutting nothing.
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let crossed_now = crossed.load(Ordering::SeqCst);
+            let replied_now = replied.load(Ordering::SeqCst);
+            if crossed_now > replied_now {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "no put ever went in flight: {crossed_now} crossed, {replied_now} replied"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         events.line(&format!(
-            "round {round}: cut mid-wave at {} ms",
-            started.elapsed().as_millis()
+            "round {round}: cut mid-wave at {} ms, {} crossed, {} replied",
+            started.elapsed().as_millis(),
+            crossed.load(Ordering::SeqCst),
+            replied.load(Ordering::SeqCst)
         ));
-        let crossings_at_cut = crossed.load(Ordering::SeqCst);
-        let replies_before_cut = replied.load(Ordering::SeqCst);
-        assert!(
-            crossings_at_cut > replies_before_cut,
-            "no put was in flight at the freeze: {crossings_at_cut} crossed, {replies_before_cut} replied"
-        );
         server.freeze();
         lazy.cut();
         // The kill comes before the join: the racers of the wave hang on
@@ -726,12 +738,20 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
         let data = lazy.mount.join("data");
         create_repo(&data);
         let mut server = Server::start(&data, &log);
-        // The server writes through the mount: blobs, acknowledged.
-        let (mut scion, _objects) = connect(&server.url).await.unwrap();
+        // The server writes through the mount: blobs, acknowledged. The
+        // waits run behind ceilings, so a hang names its step.
+        let (mut scion, _objects) =
+            tokio::time::timeout(Duration::from_secs(30), connect(&server.url))
+                .await
+                .unwrap_or_else(|_| panic!("the checker test's client never connected"))
+                .unwrap();
         let mut acked = Vec::new();
         for _ in 0..4 {
             let content = rng.bytes(1 << 10);
-            let id = put_blob(&mut scion, &content).await.unwrap();
+            let id = tokio::time::timeout(Duration::from_secs(30), put_blob(&mut scion, &content))
+                .await
+                .unwrap_or_else(|_| panic!("a put of the checker test never finished"))
+                .unwrap();
             acked.push((id, content));
         }
         // The cut ends the server: on real hardware, nothing of it runs
@@ -786,190 +806,249 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
     }
 }
 
-/// Prepares the race's git repository: one commit of `files` files, each
-/// holding fresh bytes the test also puts through the server. Returns the
-/// bytes, newest file last, so the puts run against the import's writes.
-fn prepare_race_repo(git_dir: &Path, rng: &mut Rng, files: usize) -> Vec<Vec<u8>> {
-    fs::create_dir_all(git_dir).unwrap();
-    git(git_dir, &["init", "-q"]);
-    let mut contents = Vec::new();
-    for i in 0..files {
-        let content = rng.bytes(2 << 10);
-        fs::write(git_dir.join(format!("f{i:04}.bin")), &content).unwrap();
-        contents.push(content);
-    }
-    git(git_dir, &["add", "."]);
-    git(git_dir, &["commit", "-q", "-m", "the race"]);
-    contents
-}
-
-/// Splits a trace line's `lfs_rename(from=...,to=...)` into its two paths.
-fn parse_rename(line: &str) -> Option<(&str, &str)> {
-    let rest = line.split("lfs_rename(from=").nth(1)?;
-    let (from, to) = rest.split_once(",to=")?;
-    Some((from, to.trim_end_matches(')')))
-}
-
-/// Counts the blob paths of a `LazyFS` ops trace that the import renamed
-/// after the server did: `from`'s tmp folder starts with the writer's
-/// process id, so each rename has an owner, and a rename of the import
-/// that follows one of the server on the same path is the overlap the
-/// per-process lock cannot see.
-fn import_renamed_after_the_server(trace: &str, server_tmp: &str, import_tmp: &str) -> usize {
-    // For every blob path: when each process last renamed onto it.
-    let mut server_at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    let mut import_at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for (seq, line) in trace
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| line.contains("lfs_rename"))
-    {
-        let Some((from, to)) = parse_rename(line) else {
-            continue;
-        };
-        if !to.contains("/objects/") {
-            continue;
-        }
-        if from.contains(server_tmp) {
-            server_at.insert(to, seq);
-        } else if from.contains(import_tmp) {
-            import_at.insert(to, seq);
-        }
-    }
-    import_at
-        .iter()
-        .filter(|(dest, import_seq)| {
-            server_at
-                .get(*dest)
-                .is_some_and(|server_seq| server_seq < import_seq)
-        })
-        .count()
-}
-
-/// Two processes rename onto the same blob paths under `LazyFS`: the
-/// server, from client puts, and a second `scion-server` process, from an
-/// import of ~200 git files whose bytes the client also puts, in reverse
-/// order, while the import runs. The stripe lock is per-`Blobs`, that is
-/// per process, so this race is exactly the one it cannot see. The test
-/// fails unless the processes truly overlapped: the import must have
-/// written a file whose bytes a put put during the import's run. The run
-/// of 2026-10-18 that found ESTALE in wave 0 was one process; this test
-/// is the two-process form. If it fails, the lock must be shared across
-/// processes (a lock file per stripe).
+/// Issue #185, window W1. Many clients put the SAME blob at once, wave
+/// after wave: both racers of a blob ID see it missing, both write and
+/// fsync a temp file, and both rename onto the same path (`Store::replace`).
+/// Under `LazyFS` the loser's rename may free the winner's cached item, and
+/// a later cut loses the winner's acknowledged write. The test makes the
+/// race certain, cuts once after the acked waves and once while a wave is
+/// in flight, and then reopens the store from the backing directory: every
+/// acknowledged blob must be there and intact, and no blob file may be
+/// corrupt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn import_process_races_the_server_on_the_same_blob() {
+async fn racing_puts_of_one_blob_survive_a_cut() {
     if !may_run() {
         return;
     }
     let lazyfs = lazyfs_dir().unwrap();
     let seed = seed();
     let mut rng = Rng::new(seed);
-    let files = usize::try_from(env("SCION_IMPORT_RACE_FILES", 200)).unwrap();
+    let rounds = usize::try_from(env("SCION_RACE_ROUNDS", 8)).unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let log = dir.path().join("import-race-server.log");
-    let mut lazy = Lazyfs::start(dir.path(), &lazyfs, 300);
-    let data = lazy.mount.join("data");
-    create_repo(&data);
-    let mut server = Server::start(&data, &log);
-    let (mut scion, _objects) = connect(&server.url).await.unwrap();
-    let mut acked = Vec::new();
-    // A git repository for the import process: one commit whose files
-    // hold the same bytes the client puts, so the import writes the blobs
-    // the server writes.
-    let git_dir = dir.path().join("git");
-    let contents = prepare_race_repo(&git_dir, &mut rng, files);
-    // The import starts first: opening the store on FUSE and reading git
-    // takes long enough that the client's puts land inside its run, and
-    // both processes rename onto the same blob paths at once.
-    let import = common::spawn_guard::across_spawn(|| {
-        Command::new(env!("CARGO_BIN_EXE_scion-server"))
-            .args([
-                "--data",
-                data.to_str().unwrap(),
-                "import",
-                "--repo",
-                "race",
-                git_dir.to_str().unwrap(),
-            ])
-            .stderr(Stdio::piped())
-            .spawn()
-    })
-    .unwrap();
-    let started = Instant::now();
-    // The client puts the same bytes, newest file first: the import
-    // commits them oldest first, so the puts of the later files race the
-    // import's writes of the earlier ones.
-    for content in contents.iter().rev() {
-        let id = put_blob(&mut scion, content).await.unwrap();
-        acked.push((id, content.clone()));
-    }
-    eprintln!(
-        "the import and {} puts overlapped for {} ms",
-        acked.len(),
-        started.elapsed().as_millis()
+    // The server's log goes where CI can upload it: next to the LazyFS
+    // trace, when the run named that directory.
+    let server_log = std::env::var_os("SCION_LAZYFS_TRACE_DIR").map_or_else(
+        || dir.path().join("race-server.log"),
+        |dir| {
+            let dir = PathBuf::from(dir);
+            fs::create_dir_all(&dir).unwrap();
+            dir.join("race-server.log")
+        },
     );
-    // The import runs behind a ceiling that kills it: a stuck child dies
-    // at the ceiling, the wait returns, and the assert names the step.
-    let import_pid = import.id();
-    let killer = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(120));
-        let _ = rustix::process::kill_process(
-            rustix::process::Pid::from_raw(import_pid.cast_signed()).unwrap(),
-            rustix::process::Signal::KILL,
-        );
-    });
-    let import = std::thread::spawn(move || import.wait_with_output());
-    let mut import = Some(import);
-    let out = wait_for("the import to finish", 130, || {
-        let finished = import.as_ref().unwrap().is_finished();
-        finished.then(|| {
-            import
-                .take()
-                .unwrap()
-                .join()
-                .unwrap()
-                .unwrap_or_else(|error| panic!("waiting for the import failed: {error}"))
+    let events = EventLog::new("race-w1");
+    let mut total = 0;
+    // Rounds from 100 up: the trace file and the mount log of a round are
+    // named after it, and must not collide with the other tests' rounds.
+    for round in 100..100 + rounds {
+        events.line(&format!("round {round}: mounts"));
+        let mut lazy = Lazyfs::start(dir.path(), &lazyfs, round);
+        let data = lazy.mount.join("data");
+        create_repo(&data);
+        let mut server = Server::start(&data, &server_log);
+        events.line(&format!("round {round}: server up"));
+        // Acked waves: every put is answered before the cut, so every one
+        // of them must survive it.
+        let mut acked = run_acked_waves(&events, round, &server.url, &mut rng).await;
+        // Cut one: after the acked waves. The server freezes, is cut, and
+        // dies; a new one opens on the same mount, which is what a restart
+        // after a real cut does.
+        events.line(&format!("round {round}: cut after the acked waves"));
+        server.freeze();
+        lazy.cut();
+        drop(server);
+        let mut server = Server::start(&data, &server_log);
+        events.line(&format!("round {round}: server up after the cut"));
+        // A wave cut in flight: the freeze ends it, so no racer of the
+        // wave gets a reply past the cut. Whatever the acked waves put
+        // must be whole, and so must every file of the store.
+        let wave = WAVES - 1;
+        let content = rng.bytes(3 << 10);
+        let want = BlobId::of(&content);
+        events.line(&format!(
+            "round {round} wave {wave}: starts in flight, one blob {want}"
+        ));
+        let started = Instant::now();
+        // The wave is spawned, not built and awaited later: the racers
+        // run while the server lives, and the cut lands in their flight.
+        // The counters are shared, so the test reads them at the freeze:
+        // a racer past the barrier whose put has not replied yet is work
+        // the cut really interrupts.
+        let crossed = Arc::new(AtomicUsize::new(0));
+        let replied = Arc::new(AtomicUsize::new(0));
+        let flight = tokio::spawn(race_wave(
+            events.clone(),
+            round,
+            wave,
+            server.url.clone(),
+            content,
+            Arc::clone(&crossed),
+            Arc::clone(&replied),
+        ));
+        // The wave runs until a put is really in flight: a racer past
+        // the barrier whose put has not replied yet is work the cut
+        // interrupts. The ceiling only bounds the wait of the good code;
+        // if no put ever goes in flight, the test says so instead of
+        // cutting nothing.
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let crossed_now = crossed.load(Ordering::SeqCst);
+            let replied_now = replied.load(Ordering::SeqCst);
+            if crossed_now > replied_now {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "no put ever went in flight: {crossed_now} crossed, {replied_now} replied"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        events.line(&format!(
+            "round {round}: cut mid-wave at {} ms, {} crossed, {} replied",
+            started.elapsed().as_millis(),
+            crossed.load(Ordering::SeqCst),
+            replied.load(Ordering::SeqCst)
+        ));
+        server.freeze();
+        lazy.cut();
+        // The kill comes before the join: the racers of the wave hang on
+        // the frozen server, and only the kill lets their calls fail.
+        drop(server);
+        let ids = tokio::time::timeout(Duration::from_secs(30), flight)
+            .await
+            .unwrap_or_else(|_| panic!("the cut wave's racers never finished"))
+            .unwrap();
+        events.line(&format!(
+            "round {round} wave {wave}: {} acked before the freeze",
+            ids.len()
+        ));
+        acked.extend(ids);
+        // The store reopens from the backing directory: what `LazyFS`
+        // persisted, and nothing else.
+        let data = lazy.backing.join("data");
+        let store = Store::open_shared(&data).unwrap();
+        verify_whole(&store, &acked[..], &events, round, &data);
+        drop(store);
+        drop(lazy);
+        total += RACERS * WAVES;
+    }
+    println!("{total} racing puts across {rounds} rounds");
+}
+
+/// Every file under `dir`, with its bytes: what the W2 test compares the
+/// backing store against.
+fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files: Vec<_> = walk(dir)
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
         })
-    });
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert!(
-        out.status.success(),
-        "the import failed: {:?}: {stderr}",
-        out.status
-    );
-    drop(killer);
-    // The race test fails when the processes did not overlap: the ops
-    // trace must show a blob path the import renamed AFTER the server
-    // renamed it. The from= folder names the writer's tmp folder, whose
-    // name starts with its process id, so each rename has an owner.
-    let server_tmp = format!("/tmp/{:x}-", server.pid());
-    let import_tmp = format!("/tmp/{import_pid:x}-");
-    let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
-    let raced = import_renamed_after_the_server(&trace, &server_tmp, &import_tmp);
-    eprintln!("{raced} blob paths were renamed by the import after the server");
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert!(
-        out.status.success(),
-        "the import failed: {:?}: {stderr}",
-        out.status
-    );
-    assert!(
-        raced > 0,
-        "the import never renamed after the server: the puts and the import did not overlap"
-    );
-    server.freeze();
-    lazy.cut();
-    drop(scion);
-    drop(server);
-    // What both processes acknowledged survives: the blob verifies from
-    // the backing, where only synced writes live. The mount goes down
-    // after the backing path is taken, and its exit changes nothing.
-    let backing = lazy.backing.join("data");
-    drop(lazy);
-    let store = Store::open_shared(&backing).unwrap();
-    for (id, _) in &acked {
-        let status = store.blobs().verify(*id).unwrap();
-        assert_eq!(status, BlobStatus::Valid, "raced blob {id}");
+        .collect();
+    files.sort();
+    files
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
     }
-    drop(store);
+    out
+}
+
+/// Issue #185, window W2. The checker writes directly into the backing
+/// directory while the `LazyFS` daemon still runs, as `check` does. If the
+/// daemon's exit writes its cache back over those direct writes, the
+/// checker's own view of the store is not what the drive holds. The test
+/// forces the order: the server writes through the mount and is killed,
+/// the checker opens the store directly on the backing and snapshots every
+/// byte, the mount goes away, and every byte must still be what the
+/// checker saw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checker_writes_outlive_the_lazyfs_exit() {
+    if !may_run() {
+        return;
+    }
+    let lazyfs = lazyfs_dir().unwrap();
+    let seed = seed();
+    let mut rng = Rng::new(seed);
+    let rounds = usize::try_from(env("SCION_CHECKER_ROUNDS", 4)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("checker.log");
+    for round in 200..200 + rounds {
+        let mut lazy = Lazyfs::start(dir.path(), &lazyfs, round);
+        let data = lazy.mount.join("data");
+        create_repo(&data);
+        let mut server = Server::start(&data, &log);
+        // The server writes through the mount: blobs, acknowledged. The
+        // waits run behind ceilings, so a hang names its step.
+        let (mut scion, _objects) =
+            tokio::time::timeout(Duration::from_secs(30), connect(&server.url))
+                .await
+                .unwrap_or_else(|_| panic!("the checker test's client never connected"))
+                .unwrap();
+        let mut acked = Vec::new();
+        for _ in 0..4 {
+            let content = rng.bytes(1 << 10);
+            let id = tokio::time::timeout(Duration::from_secs(30), put_blob(&mut scion, &content))
+                .await
+                .unwrap_or_else(|_| panic!("a put of the checker test never finished"))
+                .unwrap();
+            acked.push((id, content));
+        }
+        // The cut ends the server: on real hardware, nothing of it runs
+        // past the cut. The pages of its synced writes sit in the daemon's
+        // cache, clean, when the process dies.
+        server.freeze();
+        lazy.cut();
+        drop(scion);
+        drop(server);
+        // The checker writes directly into the backing, as `check` does: it
+        // opens the store, reads the metadata, and verifies every blob. Its
+        // close checkpoints the WAL, so the snapshot of what it wrote comes
+        // after the close: from there on, only the daemon's exit can change
+        // a byte.
+        let backing = lazy.backing.join("data");
+        let store = Store::open_shared(&backing).unwrap();
+        for (id, _) in &acked {
+            let status = store.blobs().verify(*id).unwrap();
+            assert_eq!(status, BlobStatus::Valid, "acknowledged blob {id}");
+        }
+        drop(store);
+        let before = snapshot(&backing);
+        // The mount goes away: the daemon's exit. Its cache must not
+        // rewrite what the checker wrote and saw.
+        drop(lazy);
+        let after = snapshot(&backing);
+        if before != after {
+            // Name the files that changed, with their sizes: the trace
+            // says what the daemon wrote and when.
+            let changed: Vec<String> = before
+                .iter()
+                .zip(&after)
+                .filter(|(b, a)| b != a)
+                .map(|((path, before), (_, after))| {
+                    format!(
+                        "{}: {} bytes before, {} after",
+                        path.display(),
+                        before.len(),
+                        after.len()
+                    )
+                })
+                .collect();
+            panic!("the backing changed while the mount went away: {changed:?}");
+        }
+        // What the checker verified still verifies.
+        let store = Store::open_shared(&backing).unwrap();
+        for (id, _) in &acked {
+            let status = store.blobs().verify(*id).unwrap();
+            assert_eq!(status, BlobStatus::Valid, "blob {id} after the exit");
+        }
+        drop(store);
+    }
 }
