@@ -965,7 +965,6 @@ impl Pg {
     /// The fence flag, for the health service of a serving process.
     pub(crate) fn fence_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.inner.fence.tripped)
->>>>>>> origin/main
     }
 
     /// The blob folder.

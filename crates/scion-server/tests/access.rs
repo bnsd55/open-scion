@@ -212,7 +212,12 @@ async fn objects(url: &str, token: Option<&str>) -> Objects {
 /// A server of `store` with `access`, and a client of each service as
 /// `token`. The first reply is the server's stop signal: hold it, or the
 /// server shuts down when the caller drops it.
-async fn server(store: &Backend, dir: &std::path::Path, access: Access, token: &str) -> (Stop, Scion, Objects) {
+async fn server(
+    store: &Backend,
+    dir: &std::path::Path,
+    access: Access,
+    token: &str,
+) -> (Stop, Scion, Objects) {
     let (stop, url) = serve(store, dir.path(), access).await;
     (
         stop,
@@ -511,7 +516,8 @@ async fn a_principal_without_a_read_rule_sees_no_repo_on_any_rpc() {
 
     // mallory has a token, but no rule for any repo. Every RPC answers as
     // for a repo that does not exist.
-    let (_mallory_stop, mut mallory, mut objects) = server(&store, dir.path(), no_rules(), "mallory").await;
+    let (_mallory_stop, mut mallory, mut objects) =
+        server(&store, dir.path(), no_rules(), "mallory").await;
     let (root, blob) = (root.as_bytes(), blob.as_bytes());
 
     denied(
@@ -639,8 +645,13 @@ async fn a_partial_reader_reads_only_its_view() {
         })
         .unwrap();
     let whole_text = format!("token\tbob\t{}\nread\tbob\t{OTHER}\n", hex("bob"));
-    let (_whole_stop, mut whole_scion, _whole_objects) =
-        server(&store, dir.path(), Access::parse(&whole_text).unwrap(), "bob").await;
+    let (_whole_stop, mut whole_scion, _whole_objects) = server(
+        &store,
+        dir.path(),
+        Access::parse(&whole_text).unwrap(),
+        "bob",
+    )
+    .await;
 
     // ResolveRef answers as today: the ref's real changeset.
     let seen = scion.resolve_ref(req::resolve_ref()).await.unwrap();
@@ -749,8 +760,13 @@ async fn a_partial_readers_ticket_reaches_only_its_view() {
     let (_stop, _scion, mut objects) = server(&store, dir.path(), partial_access(), "pat").await;
     // A whole-repo reader, for the real root it still gets.
     let whole_text = format!("token\tbob\t{}\nread\tbob\t{REPO}\n", hex("bob"));
-    let (_whole_stop, _whole_scion, mut whole) =
-        server(&store, dir.path(), Access::parse(&whole_text).unwrap(), "bob").await;
+    let (_whole_stop, _whole_scion, mut whole) = server(
+        &store,
+        dir.path(),
+        Access::parse(&whole_text).unwrap(),
+        "bob",
+    )
+    .await;
     let view = objects
         .get_root_tree(req::get_root_tree(tip.as_bytes()))
         .await
