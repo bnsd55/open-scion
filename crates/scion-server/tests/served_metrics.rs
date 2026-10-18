@@ -10,6 +10,7 @@ use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest};
 
 use scion_server::access::Access;
+use scion_server::meta::Meta as _;
 use scion_server::metrics::Metrics;
 use scion_server::tickets::Keys;
 use scion_server::{Backend, service};
