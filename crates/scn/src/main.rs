@@ -133,9 +133,29 @@ async fn main() -> ExitCode {
         Ok(code) => code,
         Err(e) => {
             let err: &(dyn std::error::Error + 'static) = e.as_ref();
-            eprintln!("scn: {}", chain_text(err));
+            let text = chain_text(err);
+            eprintln!("scn: {text}");
+            if let Some(hint) = hint(&text) {
+                eprintln!("check: {hint}");
+            }
             ExitCode::from(ERROR_EXIT)
         }
+    }
+}
+
+/// One advice line for the failures a first-time user hits: what the
+/// error names, and what to check next. The order matters: a TLS
+/// failure is also a transport error, so the certificate check comes
+/// first.
+fn hint(text: &str) -> Option<&'static str> {
+    if text.contains("invalid peer certificate") {
+        Some("--tls-ca must hold the CA (PEM) that signed the certificate of the server you trust")
+    } else if text.contains("valid authentication credentials") || text.contains("wrong token") {
+        Some("compare --token (or SCION_TOKEN) with the token the server was given")
+    } else if text.contains("cannot connect") {
+        Some("is a scion server running at --server?")
+    } else {
+        None
     }
 }
 
@@ -218,7 +238,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 
 #[cfg(test)]
 mod tests {
-    use super::chain_text;
+    use super::{chain_text, hint};
 
     /// A cause whose Display ends with its source's text, as tonic's
     /// transport errors have.
@@ -257,6 +277,43 @@ mod tests {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             Some(&self.0)
         }
+    }
+
+    #[test]
+    fn a_tls_failure_hints_at_the_ca() {
+        let text = "cannot connect to https://127.0.0.1:7932: transport error: invalid peer certificate: UnknownIssuer";
+        let got = hint(text).unwrap();
+        assert!(got.contains("--tls-ca"), "{got}");
+    }
+
+    #[test]
+    fn a_wrong_token_hints_at_the_token() {
+        let text = "cannot resolve \"main\": code: 'The request does not have valid authentication credentials', message: \"missing or wrong token\"";
+        let got = hint(text).unwrap();
+        assert!(got.contains("--token"), "{got}");
+    }
+
+    #[test]
+    fn a_down_server_hints_at_the_server() {
+        let text = "cannot connect to http://127.0.0.1:7878: transport error: tcp connect error: Connection refused (os error 61)";
+        let got = hint(text).unwrap();
+        assert!(got.contains("--server"), "{got}");
+        // A TLS failure is also a connect failure; the certificate hint
+        // must win.
+        let text = text.replace(
+            "Connection refused (os error 61)",
+            "invalid peer certificate: UnknownIssuer",
+        );
+        assert!(hint(&text).unwrap().contains("--tls-ca"));
+    }
+
+    #[test]
+    fn other_errors_carry_no_hint() {
+        assert_eq!(
+            hint("cannot read main:nope.txt: path \"nope.txt\" not found"),
+            None
+        );
+        assert_eq!(hint("land conflicted"), None);
     }
 
     #[test]

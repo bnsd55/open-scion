@@ -1,6 +1,6 @@
 //! `land`.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow};
 use scion_core::ChangesetId;
 use scion_proto::v1::{LandRequest, LandResponse, LandState};
 use serde_json::json;
@@ -45,11 +45,21 @@ pub async fn land(ctx: &mut Ctx, args: LandArgs) -> Result<()> {
     print_outcome(ctx.json, &reply)?;
     match state {
         LandState::Landed => Ok(()),
-        LandState::Conflict => bail!("land conflicted: {}", reply.detail),
-        LandState::Rejected => bail!("land rejected: {}", reply.detail),
+        // print_outcome already named the detail, so the error carries
+        // the state alone: the text prints once.
+        state => Err(land_error(state, &reply)),
+    }
+}
+
+/// The error for a land that did not land.
+fn land_error(state: LandState, reply: &LandResponse) -> anyhow::Error {
+    match state {
+        LandState::Conflict => anyhow!("land conflicted"),
+        LandState::Rejected => anyhow!("land rejected"),
         LandState::Pending | LandState::Unspecified => {
-            bail!("land {} did not finish", reply.land_id)
+            anyhow!("land {} did not finish", reply.land_id)
         }
+        LandState::Landed => anyhow!("land landed but was not accepted"),
     }
 }
 
@@ -87,4 +97,38 @@ fn print_outcome(json: bool, reply: &LandResponse) -> Result<()> {
         (state, _) => println!("{}: {}", state.as_str_name(), reply.detail),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conflict_reply() -> LandResponse {
+        LandResponse {
+            land_id: String::from("l1"),
+            state: LandState::Conflict as i32,
+            result_changeset_id: Vec::new(),
+            detail: String::from("1 path(s) changed on \"main\" after the base"),
+            conflict_paths: vec![b"same.txt".to_vec()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_error_of_a_conflict_names_the_state_once() {
+        let reply = conflict_reply();
+        let text = land_error(LandState::Conflict, &reply).to_string();
+        assert_eq!(text, "land conflicted");
+        assert!(!text.contains("same.txt"), "{text}");
+        assert!(!text.contains("path(s)"), "{text}");
+    }
+
+    #[test]
+    fn the_error_of_a_rejection_names_the_state_once() {
+        let mut reply = conflict_reply();
+        reply.state = LandState::Rejected as i32;
+        let text = land_error(LandState::Rejected, &reply).to_string();
+        assert_eq!(text, "land rejected");
+        assert!(!text.contains("path(s)"), "{text}");
+    }
 }

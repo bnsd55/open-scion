@@ -4,7 +4,7 @@
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use scion_core::RepoPath;
 use scion_proto::v1::GetRootTreeRequest;
@@ -56,6 +56,19 @@ pub struct MountRecord {
 /// waits for a signal. The changes go to an overlay directory, which
 /// `scn commit --from-mount DIR` commits.
 pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
+    let dir = std::path::absolute(&args.dir)?;
+    // Refuse before anything is served: a missing mount point fails at
+    // mount time anyway, and a second mount of a live dir would start a
+    // second NFS server that no one can use.
+    check_mount_point(&dir)?;
+    if let Some(known) = live_record_for(&dir, &load_sessions()?, &pid_alive) {
+        bail!(
+            "{}: scn already serves this directory (pid {}); stop it first: scn unmount {}",
+            dir.display(),
+            known.pid,
+            dir.display()
+        );
+    }
     let base = ctx.resolve(&args.rev).await?;
     // The server mints the mount's ticket: the read permission of the
     // whole walk below the root tree of the mounted changeset. It goes to
@@ -97,7 +110,6 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
         }
     });
 
-    let dir = std::path::absolute(&args.dir)?;
     println!(
         "single-user machines only: any local user who can read the mount table can reach this mount"
     );
@@ -155,8 +167,38 @@ pub async fn unmount(_ctx: &mut Ctx, args: UnmountArgs) -> Result<()> {
     Ok(())
 }
 
+/// Refuses a mount point that is not a directory: the plain mount would
+/// fail there anyway, after `scn` had started to serve.
+fn check_mount_point(dir: &Path) -> Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    bail!(
+        "{}: the mount point does not exist or is not a directory; create it first: mkdir -p {}",
+        dir.display(),
+        dir.display()
+    );
+}
+
+/// The live record of `dir`, if the mount table holds one for a process
+/// that still runs. A record whose pid is gone is stale: the caller
+/// takes the directory over, and saving the session replaces the record.
+fn live_record_for<'a>(
+    dir: &Path,
+    sessions: &'a [MountRecord],
+    alive: &impl Fn(u32) -> bool,
+) -> Option<&'a MountRecord> {
+    sessions
+        .iter()
+        .find(|record| record.dir == dir && alive(record.pid))
+}
+
+/// Answers whether the process `pid` is running.
+fn pid_alive(pid: u32) -> bool {
+    kill_pid(pid, "-0")
+}
+
 /// The `sudo` mount command, for the user to run when the plain mount is
-/// refused: only root may use a port under 1024, and root may read any
 /// mounted content ([#11], section 8 of the docs).
 fn mount_command(port: u16, secret: &str, dir: &Path) -> String {
     let target = format!("127.0.0.1:/{EXPORT}/{secret}");
@@ -687,5 +729,45 @@ mod silent_failures {
             "{warnings:?}"
         );
         std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    /// A mount point that is not a directory is refused before anything
+    /// is served; an existing directory passes.
+    #[test]
+    fn a_missing_mount_point_is_refused_before_serving() {
+        let base = std::env::temp_dir().join(format!("scn-mount-point-{}", std::process::id()));
+        let gone = base.join("gone");
+        let err = check_mount_point(&gone).unwrap_err().to_string();
+        assert!(err.contains("mkdir -p"), "{err}");
+        // A file at the path is refused too: it cannot take a mount.
+        let file = base.join("file");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(&file, b"").unwrap();
+        assert!(check_mount_point(&file).is_err());
+        let dir = base.join("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(check_mount_point(&dir).is_ok());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A live record for the same directory is refused with the owning
+    /// pid; a stale record (the pid is gone) and no record pass.
+    #[test]
+    fn a_live_mount_of_the_same_dir_is_refused_with_its_pid() {
+        let dir = PathBuf::from("/mnt/view");
+        let sessions = vec![record("/mnt/view", 4245)];
+        let live = |pid: u32| pid == 4245;
+        let err = match live_record_for(&dir, &sessions, &live) {
+            Some(known) => format!("pid {}", known.pid),
+            None => String::new(),
+        };
+        assert_eq!(err, "pid 4245");
+        // The pid is gone: the record is stale, the mount may start.
+        let dead = |_: u32| false;
+        assert!(live_record_for(&dir, &sessions, &dead).is_none());
+        assert!(live_record_for(&dir, &[], &live).is_none());
+        // A record of another directory does not block this one.
+        let other = vec![record("/mnt/other", 4245)];
+        assert!(live_record_for(&dir, &other, &live).is_none());
     }
 }
