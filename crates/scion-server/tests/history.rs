@@ -3,11 +3,13 @@
 
 mod common;
 
+use common::git;
+use scion_server::import::{ImportOptions, import_git};
+
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
@@ -15,7 +17,6 @@ use scion_server::blame::{
     self, Blame, BlameRange, Line, MAX_BLAME_DIFF_LINES, MAX_BLAME_VERSIONS, RenameSearch, Resume,
 };
 use scion_server::deadline::Deadline;
-use scion_server::import::{ImportOptions, import_git};
 use scion_server::memory::Bytes;
 use scion_server::meta::{Meta as _, MetaTx as _};
 use scion_server::read::{self, MAX_SCAN};
@@ -36,34 +37,6 @@ fn path(p: &str) -> RepoPath {
 
 fn later() -> Deadline {
     Deadline::new(Instant::now() + Duration::from_secs(600))
-}
-
-/// Runs git in `dir` with fixed identities and dates and no user or system
-/// config, and returns stdout. Fails the test unless git succeeds.
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        // No auto gc or maintenance: they pack loose objects in the
-        // background and delete the loose files, also while `import_git` of
-        // the same repository still reads them.
-        .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_AUTHOR_NAME", "Ada")
-        .env("GIT_AUTHOR_EMAIL", "ada@example.com")
-        .env("GIT_AUTHOR_DATE", "1700000000 +0000")
-        .env("GIT_COMMITTER_NAME", "Ada")
-        .env("GIT_COMMITTER_EMAIL", "ada@example.com")
-        .env("GIT_COMMITTER_DATE", "1700000000 +0000")
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).unwrap().trim_end().to_owned()
 }
 
 /// Writes the files in order (`None` deletes a file or a directory),

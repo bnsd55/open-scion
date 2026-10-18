@@ -145,6 +145,7 @@ struct PgInner {
     derive: crate::derived::DeriveFlights,
     /// The import's test hooks and busy-retry count, as the SQLite store
     /// keeps its own.
+    #[cfg(any(test, feature = "test-hooks"))]
     hooks: crate::store::ImportHooks,
 }
 
@@ -904,6 +905,7 @@ impl Pg {
             writers: Mutex::new(0),
             write_woken: Condvar::new(),
             derive: crate::derived::DeriveFlights::new(crate::store::DERIVE_WALKS_CAP),
+            #[cfg(any(test, feature = "test-hooks"))]
             hooks: crate::store::ImportHooks::default(),
         });
         // The probe of a server that lost its lock: once a minute the
@@ -1137,6 +1139,7 @@ impl Pg {
     }
 
     /// The import's test hooks and busy-retry count.
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn hooks(&self) -> &crate::store::ImportHooks {
         &self.inner.hooks

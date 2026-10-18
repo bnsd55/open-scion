@@ -244,6 +244,15 @@ upload or a crash leaves nothing behind. Each process stages its temp files
 in its own folder of `tmp/`, held with a lock, and an open removes the
 folders of processes that no longer hold theirs (see below).
 
+**One writer per blob.** The final step of a blob write is a rename onto the
+blob's path, and two writers of the same content rename onto the same path.
+Within a process, every write of a blob takes the stripe of its ID's first
+byte (256 stripes, one per byte value), so two writes of one blob run one
+after the other, and no rename of a write races the rename of another. The
+lock is per process: an import shares the data directory with a server, and
+its writes go through their own stripes. `fsync_dir` covers the rename's
+directory entry.
+
 **Durability rules** (the SQLite backend; on Postgres a returned commit
 is durable: `synchronous_commit=on` is checked at open, so
 `Store::write` returning is the durability point, and the full-flush

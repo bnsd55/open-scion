@@ -134,6 +134,17 @@ impl From<Error> for Status {
                 tracing::error!(error = %e, "the server is out of disk space");
                 Status::resource_exhausted("the server is out of disk space; retry later")
             }
+            // A remount left the disk read-only: the server's own
+            // storage, not the caller's request. The reply is fixed, so
+            // it names no server path; the path and the operation are in
+            // the log line of the write that failed. An EIO (a failing
+            // device) stays on the internal arm below: a bad sector does
+            // not heal on retry, and an error to the caller keeps the
+            // server's own log loud.
+            Error::Io(e) if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem => {
+                tracing::error!(error = %e, "the disk is read-only");
+                Status::unavailable("the disk is read-only; retry later")
+            }
             Error::Corrupt(_) | Error::Git(_) => {
                 // Details stay in the server log, not in the reply.
                 tracing::error!(error = %e, "internal error");

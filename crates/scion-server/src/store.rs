@@ -74,6 +74,7 @@ pub const READER_BYTES: usize = (1 << READER_WINDOW_LOG) + (1 << 20);
 /// A step the tests run at a counted batch boundary of the import, with
 /// the count of batches done so far.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
 pub type AfterBatch = Box<dyn FnMut(usize) + Send>;
 
 /// The import's test hooks, the same state on both backends: the count of
@@ -82,6 +83,7 @@ pub type AfterBatch = Box<dyn FnMut(usize) + Send>;
 /// so a test that must act at a counted batch boundary runs there,
 /// instead of racing the batch's end.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Default)]
 pub struct ImportHooks {
     busy_retries: AtomicU64,
@@ -89,6 +91,7 @@ pub struct ImportHooks {
 }
 
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
 impl ImportHooks {
     /// Counts one busy retry of the import's batch.
     pub fn note_busy_retry(&self) {
@@ -186,6 +189,7 @@ struct Inner {
     fail_commits: AtomicU64,
     /// The import's test hooks and busy-retry count, as Postgres keeps
     /// its own.
+    #[cfg(any(test, feature = "test-hooks"))]
     hooks: ImportHooks,
     /// The derive walks of this store: which are in flight, and the cap
     /// on how many may be.
@@ -352,6 +356,7 @@ impl Store {
                 _server_lock: server_lock,
                 txes: AtomicU64::new(0),
                 fail_commits: AtomicU64::new(0),
+                #[cfg(any(test, feature = "test-hooks"))]
                 hooks: ImportHooks::default(),
                 derive: DeriveFlights::new(walks_cap),
                 writers: Mutex::new(0),
@@ -425,6 +430,7 @@ impl Store {
 
     /// Commits made so far.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn commits(&self) -> u64 {
         self.inner.committed.load(Ordering::Acquire)
@@ -518,6 +524,7 @@ impl Store {
     /// the import's busy retry use it: the failing transaction ran and
     /// rolled back, so the retry re-runs it whole.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_next_commits(&self, n: u32) {
         self.inner
             .fail_commits
@@ -527,12 +534,14 @@ impl Store {
     /// Sets how long the write connection waits for a busy database. Tests
     /// use it to make a busy lock fail fast, so a retry is deterministic.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_busy_timeout(&self, timeout: Duration) {
         let _ = self.lock().busy_timeout(timeout);
     }
 
     /// The import's test hooks and busy-retry count.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn hooks(&self) -> &ImportHooks {
         &self.inner.hooks
@@ -542,6 +551,7 @@ impl Store {
     /// the out-of-space tests: the next write that must grow the file
     /// fails with the real disk-full.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn cap_database_pages(&self, extra: i64) {
         let db = self.lock();
         let pages: i64 = db
@@ -553,6 +563,7 @@ impl Store {
 
     /// Lifts the page cap again, back to the largest file SQLite allows.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn release_database_pages(&self) {
         let db = self.lock();
         db.pragma_update(None, "max_page_count", 0x7FFF_FFFFi64)
@@ -561,6 +572,7 @@ impl Store {
 
     /// Write transactions run so far.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn txes(&self) -> u64 {
         self.inner.txes.load(Ordering::Relaxed)
@@ -855,6 +867,10 @@ pub struct Blobs {
     /// The lock file of `mine`, held for as long as this `Blobs` lives.
     /// Never read: its life is the point.
     _mine_lock: fs::File,
+    /// One lock per stripe of blob IDs: the write of one blob runs alone
+    /// in this process, so two puts of the same bytes never race their
+    /// renames onto one path ([#185]).
+    write_locks: Vec<Mutex<()>>,
     group_flush: GroupFlush,
     /// Calls to [`Blobs::verify`] so far.
     #[cfg(test)]
@@ -863,7 +879,24 @@ pub struct Blobs {
     /// disk's answer: `n` lets `n` writes through and fails the one
     /// after, once; [`UNARMED`] lets every write through.
     fail_writes: std::sync::atomic::AtomicUsize,
+    /// The errno the write hook raises: 28 (ENOSPC) unless set otherwise,
+    /// so [`Blobs::fail_writes_after`] keeps its meaning.
+    fail_writes_errno: std::sync::atomic::AtomicU8,
+    /// The test hook that fails a file read of this backend with the
+    /// disk's answer, the same shape as [`Blobs::fail_writes_after`].
+    fail_reads: std::sync::atomic::AtomicUsize,
+    /// The test hook that fails an fsync of this backend with EIO: the
+    /// file fsync before the rename, and the directory fsync after it.
+    fail_fsyncs: std::sync::atomic::AtomicUsize,
+    /// How many fsyncs passed through [`Blobs::fsync_gate`], pass or
+    /// fail: a test reads it to see that a kept file was fsynced.
+    fsync_count: std::sync::atomic::AtomicU64,
 }
+
+/// How many stripes the per-blob write locks have: 256 on the first byte
+/// of the blob's ID. Puts of different blobs wait on each other only when
+/// their IDs share a stripe, and one ID is always the same stripe.
+const WRITE_STRIPES: usize = 256;
 
 impl Blobs {
     pub(crate) fn open(dir: &Path) -> Result<Self> {
@@ -912,11 +945,25 @@ impl Blobs {
             tmp,
             mine,
             _mine_lock: mine_lock,
+            write_locks: (0..WRITE_STRIPES).map(|_| Mutex::new(())).collect(),
             group_flush: GroupFlush::default(),
             #[cfg(test)]
             verifies: std::sync::atomic::AtomicU64::default(),
             fail_writes: std::sync::atomic::AtomicUsize::new(UNARMED),
+            fail_writes_errno: std::sync::atomic::AtomicU8::new(28),
+            fail_reads: std::sync::atomic::AtomicUsize::new(UNARMED),
+            fail_fsyncs: std::sync::atomic::AtomicUsize::new(UNARMED),
+            fsync_count: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    fn write_lock(&self, id: BlobId) -> MutexGuard<'_, ()> {
+        // One stripe per value of the first ID byte: the index needs no
+        // modulo, and two writes race only when their IDs share it.
+        let stripe = usize::from(id.as_bytes()[0]);
+        self.write_locks[stripe]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Removes what crashes left in `tmp/`: the folders of processes that no
@@ -1111,7 +1158,9 @@ impl Blobs {
     /// Opens a blob's file: one zstd frame, which nothing here unpacks or
     /// checks.
     pub(crate) fn open_file(&self, id: BlobId) -> Result<fs::File> {
-        fs::File::open(self.location(id).1).map_err(|e| match e.kind() {
+        let (_, path) = self.location(id);
+        self.read_gate(&path, "read blob file")?;
+        fs::File::open(&path).map_err(|e| match e.kind() {
             ErrorKind::NotFound => Error::NotFound(format!("blob {id}")),
             _ => e.into(),
         })
@@ -1169,12 +1218,162 @@ impl Blobs {
         }
     }
 
+    /// How many fsyncs passed the gate so far: a test reads it to see
+    /// that a kept file was fsynced, file and directory both.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fsync_count(&self) -> u64 {
+        self.fsync_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Arms the hook that fails an fsync of this backend: it lets the
+    /// next `n` fsyncs through, fails the one after with EIO, and lets
+    /// the rest through. Zero arms it for the very next fsync. The count
+    /// runs over the file fsyncs and the directory fsyncs both, in the
+    /// order the writes make them.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_fsyncs_after(&self, n: usize) {
+        self.fail_fsyncs
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The gate the fsyncs of this process pass: the same countdown as
+    /// [`Blobs::write_gate`], with EIO as the disk's answer. A failed
+    /// fsync leaves the data only in the page cache: the caller must not
+    /// answer as if it reached the drive.
+    fn fsync_gate(&self, name: &str, operation: &str) -> Result<()> {
+        self.fsync_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        loop {
+            let left = self.fail_fsyncs.load(std::sync::atomic::Ordering::SeqCst);
+            let pass = match left {
+                UNARMED => true,
+                0 => {
+                    if self
+                        .fail_fsyncs
+                        .compare_exchange(
+                            0,
+                            UNARMED,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    false
+                }
+                left => {
+                    if self
+                        .fail_fsyncs
+                        .compare_exchange(
+                            left,
+                            left - 1,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    true
+                }
+            };
+            if pass {
+                return Ok(());
+            }
+            let error = std::io::Error::from_raw_os_error(5); // EIO
+            tracing::error!(
+                file = name,
+                operation,
+                error = %error,
+                "an fsync failed: the drive did not take the data"
+            );
+            return Err(error.into());
+        }
+    }
+
+    /// Arms the hook: it lets the next `n` file reads through, fails the
+    /// one after with EIO, the disk's answer for a failing device, and
+    /// lets the rest through. Zero arms it for the very next read.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_reads_after(&self, n: usize) {
+        self.fail_reads
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The gate the file reads of this process pass: the same countdown
+    /// as [`Blobs::write_gate`], with EIO as the disk's answer.
+    fn read_gate(&self, path: &Path, operation: &str) -> Result<()> {
+        loop {
+            let left = self.fail_reads.load(std::sync::atomic::Ordering::SeqCst);
+            let pass = match left {
+                UNARMED => true,
+                0 => {
+                    if self
+                        .fail_reads
+                        .compare_exchange(
+                            0,
+                            UNARMED,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    false
+                }
+                left => {
+                    if self
+                        .fail_reads
+                        .compare_exchange(
+                            left,
+                            left - 1,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    true
+                }
+            };
+            if pass {
+                return Ok(());
+            }
+            let error = std::io::Error::from_raw_os_error(5); // EIO
+            tracing::error!(
+                path = %path.display(),
+                operation,
+                error = %error,
+                "a blob read failed: the disk refused it"
+            );
+            return Err(error.into());
+        }
+    }
+
     /// Arms the hook: it lets the next `n` file writes through, fails the
     /// one after with the disk's answer, and lets the rest through. Zero
     /// arms it for the very next write. Calling it again rearms it; the
     /// start ([`UNARMED`]) never arms it.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_writes_after(&self, n: usize) {
+        self.fail_writes_after_errno(n, 28);
+    }
+
+    /// Arms the write hook with a chosen errno instead of ENOSPC: 5 is
+    /// EIO, 30 is EROFS (a read-only mount). The same one-shot shape as
+    /// [`Blobs::fail_writes_after`].
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_writes_after_errno(&self, n: usize, errno: u8) {
+        self.fail_writes_errno
+            .store(errno, std::sync::atomic::Ordering::SeqCst);
         self.fail_writes
             .store(n, std::sync::atomic::Ordering::SeqCst);
     }
@@ -1227,12 +1426,17 @@ impl Blobs {
             if pass {
                 return Ok(());
             }
-            let error = std::io::Error::from_raw_os_error(28); // ENOSPC
+            // 28 is ENOSPC; the hook may name another disk answer instead
+            // (5 is EIO, 30 is EROFS: the same on Linux and macOS).
+            let errno = self
+                .fail_writes_errno
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let error = std::io::Error::from_raw_os_error(i32::from(errno));
             tracing::error!(
                 path = %path.display(),
                 operation,
                 error = %error,
-                "a blob write failed: the disk is full"
+                "a blob write failed: the disk refused it"
             );
             return Err(error.into());
         }
@@ -1446,6 +1650,10 @@ impl BlobBatch<'_> {
     /// Writes blob `id`, whose `len` bytes `raw` gives, unless the stored file
     /// is intact. A file that is not intact is replaced.
     fn write(&mut self, id: BlobId, len: usize, raw: impl Read) -> Result<()> {
+        // One blob, one writer: the lock spans the check of the stored
+        // file, the touch of a kept one, and the rename that replaces it
+        // (see `Blobs::write_lock`).
+        let _write = self.blobs.write_lock(id);
         match self.keep(id)? {
             BlobStatus::Valid => {
                 // A put that keeps the stored copy writes nothing, so the
@@ -1454,6 +1662,21 @@ impl BlobBatch<'_> {
                 // not the first, so a client that uploaded again does not
                 // lose the blob before it names it.
                 self.touch(id)?;
+                // The stored copy may not be durable: another writer's
+                // batch may not have synced yet, and a failed directory
+                // fsync somewhere else may have left it only in the page
+                // cache. This caller makes it durable instead of trusting
+                // the file's presence: fsync the file and the directory,
+                // every time, so a retry after a failed fsync ends with
+                // the blob on the drive and no name is ever removed.
+                let (dir, path) = self.blobs.location(id);
+                let file = fs::File::open(&path)?;
+                self.blobs
+                    .fsync_gate("the stored blob file", "fsync stored blob")?;
+                fsync(&file)?;
+                let name = dir.display().to_string();
+                self.blobs.fsync_gate(&name, "fsync blob directory")?;
+                fsync_dir(&dir)?;
                 return Ok(());
             }
             // The rename below replaces it in one step. No repo on this
@@ -1489,9 +1712,15 @@ impl BlobBatch<'_> {
         self.blobs.write_gate(&path, "write blob file")?;
         let mut tmp = tempfile::NamedTempFile::new_in(&self.blobs.mine)?;
         zstd::stream::compress_sized_into(raw, &mut tmp, 3, len as u64)?;
+        self.blobs
+            .fsync_gate("the blob's temp file", "fsync blob file")?;
         fsync(tmp.as_file())?;
         fs::create_dir_all(&dir)?;
-        tmp.persist(&path).map_err(|e| e.error)?;
+        tmp.persist(&path).map_err(|e| {
+            tracing::warn!(blob = %id, path = %path.display(), error = %e.error,
+                "the rename of the blob's temp file failed");
+            e.error
+        })?;
         self.dirs.insert(dir);
         Ok(())
     }
@@ -1505,6 +1734,9 @@ impl BlobBatch<'_> {
     /// corrupt replaces no intact file, and its batch `sync` covers the
     /// rename.
     fn replace_stored(&mut self, id: BlobId, len: usize, raw: impl Read) -> Result<()> {
+        // The rename below lands on the same path as any other write of
+        // this blob, so it waits for the same stripe.
+        let _write = self.blobs.write_lock(id);
         self.blobs.full_flush()?;
         self.replace(id, len, raw)
     }
@@ -1554,6 +1786,8 @@ impl BlobBatch<'_> {
     // was lost.
     fn flush_dirs(self) -> Result<bool> {
         for dir in &self.dirs {
+            let name = dir.display().to_string();
+            self.blobs.fsync_gate(&name, "fsync blob directory")?;
             fsync_dir(dir)?;
         }
         Ok(!self.dirs.is_empty())
@@ -1742,6 +1976,72 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    /// A write of one blob waits for the stripe of a write that is held:
+    /// while the stripe is held by hand, the blob's file stays absent,
+    /// and a write released, the file is there ([#185]). Without the
+    /// striped lock the write renames at once, and the absence assert
+    /// fails. The replacing upload takes the same lock, so the second
+    /// test repeats the shape on the `replace_stored` path, which the
+    /// gRPC race of an upload with a copy stored reaches.
+    #[test]
+    fn a_write_of_one_blob_waits_for_the_stripe() {
+        held_stripe_waits(|store, id, content| {
+            let mut batch = store.blobs().batch();
+            batch.put(content).unwrap();
+            let _ = id;
+        });
+    }
+
+    #[test]
+    fn a_replacing_upload_of_one_blob_waits_for_the_stripe() {
+        held_stripe_waits(|store, id, content| {
+            let mut batch = store.blobs().batch();
+            batch.replace_stored(id, content.len(), content).unwrap();
+            batch.flush_dirs().unwrap();
+        });
+    }
+
+    /// Holds the stripe of one blob by hand, runs `write` on a thread,
+    /// and says the blob stays absent while the stripe is held and is
+    /// whole once the stripe is free. The lease drops the stripe
+    /// however the test ends, so a panicking assert cannot wedge the
+    /// writer ([#142]).
+    fn held_stripe_waits(write: impl Fn(&Store, BlobId, &'static [u8]) + Send + Sync) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let content = b"the same bytes for both writes";
+        let id = BlobId::of(content);
+        // The stripe is held by hand, and drops however the test ends: a
+        // panicking assert frees the writer at the scope's join ([#142]).
+        let stripe = Mutex::new(store.blobs().write_lock(id));
+        thread::scope(|scope| {
+            let writer = scope.spawn(|| write(&store, id, content));
+            // A ceiling only bounds the wait of the good code: the write
+            // of the broken code renames at once, and the absence assert
+            // fails.
+            let until = Instant::now() + Duration::from_millis(200);
+            let mut landed = false;
+            while Instant::now() < until {
+                if store.blobs().verify(id).unwrap() == BlobStatus::Valid {
+                    landed = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                !landed,
+                "the write renamed while another write held the stripe"
+            );
+            drop(stripe);
+            writer.join().unwrap();
+        });
+        assert_eq!(
+            store.blobs().verify(id).unwrap(),
+            BlobStatus::Valid,
+            "the blob of the held stripe"
+        );
+    }
 
     #[test]
     fn an_open_refuses_a_data_directory_that_group_or_others_can_write() {

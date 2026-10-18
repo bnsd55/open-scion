@@ -4,16 +4,17 @@
 
 mod common;
 
+use common::{git, git_status};
+use scion_server::import::{ImportOptions, import_git};
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_server::deadline::Deadline;
-use scion_server::import::{ImportOptions, import_git};
 use scion_server::meta::{Meta as _, MetaTx as _};
 use scion_server::read::{self, DiffEntry, MAX_DIFF_ENTRIES, MAX_RENAME_CHUNKS, Rename};
 use scion_server::{Backend, Error, tree};
@@ -45,42 +46,6 @@ fn later() -> Deadline {
 
 fn path(p: &str) -> RepoPath {
     RepoPath::new(p).unwrap()
-}
-
-/// Runs git in `dir` with fixed identities and dates and no user or system
-/// config. Returns whether it succeeded, and stdout.
-fn git_status(dir: &Path, args: &[&str]) -> (bool, String) {
-    // The child shares a flock until it execs (see `common::spawn_guard`):
-    // the read side keeps this spawn out of a lock-release window of
-    // another test.
-    let out = common::spawn_guard::across_spawn(|| {
-        Command::new("git")
-            // No auto gc or maintenance: they pack loose objects in the
-            // background and delete the loose files, also while `import_git`
-            // of the same repository still reads them.
-            .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_AUTHOR_NAME", "Ada")
-            .env("GIT_AUTHOR_EMAIL", "ada@example.com")
-            .env("GIT_AUTHOR_DATE", "1700000000 +0000")
-            .env("GIT_COMMITTER_NAME", "Ada")
-            .env("GIT_COMMITTER_EMAIL", "ada@example.com")
-            .env("GIT_COMMITTER_DATE", "1700000000 +0000")
-            .output()
-    })
-    .unwrap();
-    let stdout = String::from_utf8(out.stdout).unwrap().trim_end().to_owned();
-    (out.status.success(), stdout)
-}
-
-/// Runs git and returns stdout. Fails the test unless git succeeds.
-fn git(dir: &Path, args: &[&str]) -> String {
-    let (ok, stdout) = git_status(dir, args);
-    assert!(ok, "git {args:?} failed");
-    stdout
 }
 
 /// Writes one file named after the commit, commits everything, and returns

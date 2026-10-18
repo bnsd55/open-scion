@@ -77,6 +77,14 @@ pub struct Server {
 }
 
 impl Server {
+    /// The server process's id, for a test that must tell the server's
+    /// files from another process's.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Server {
     /// Starts a server on `data` and waits until it listens. It appends its
     /// log to `log`.
     pub fn start(data: &Path, log: &Path) -> Self {
@@ -151,6 +159,55 @@ impl Drop for Server {
         // `Child::kill` sends SIGKILL.
         self.child.kill().ok();
         self.child.wait().ok();
+    }
+}
+
+impl Server {
+    /// Freezes the server, and waits until the kernel says it stopped:
+    /// SIGSTOP takes effect on the child's own schedule, and a cut that
+    /// lands before the stop finds the server still writing. Every reply
+    /// a client got was sent before the freeze, so a cut that follows can
+    /// lose nothing that a reply depends on ([#185]): on real hardware,
+    /// nothing of the server runs after a power cut, so no ack can follow
+    /// one either. The caller kills the frozen server; nothing of it runs
+    /// past the cut.
+    pub fn freeze(&mut self) {
+        let pid = self.child.id();
+        let pid_i32 = pid.cast_signed();
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(pid_i32).unwrap(),
+            rustix::process::Signal::STOP,
+        )
+        .unwrap();
+        // /proc/<pid>/stat is the main thread only: a tokio worker inside
+        // a FUSE call can stay unstopped while the main thread is `T`, and
+        // LazyFS would run it after the cut. Every task's stat must read
+        // `T` (stopped) or `Z` (gone, so reaped or waiting to be reaped:
+        // either way nothing of it can write past the cut). A vanished
+        // /proc entry means the process is gone too.
+        let tasks = format!("/proc/{pid}/task");
+        let give_up = Instant::now() + Duration::from_secs(5);
+        loop {
+            let all_stopped = match fs::read_dir(&tasks) {
+                Err(_) => true,
+                Ok(tasks) => tasks
+                    .filter_map(|task| {
+                        let stat = fs::read_to_string(task.ok()?.path().join("stat")).ok()?;
+                        let after = &stat[stat.rfind(')').unwrap() + 1..];
+                        let state = after.split_whitespace().next().unwrap_or("");
+                        Some(state == "T" || state == "Z")
+                    })
+                    .all(|stopped| stopped),
+            };
+            if all_stopped {
+                return;
+            }
+            assert!(
+                Instant::now() < give_up,
+                "the server never stopped for the cut"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -818,4 +875,40 @@ pub mod spawn_guard {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+}
+
+/// Runs git in `dir` with fixed identities and no user or system config,
+/// and reports whether it succeeded with its stdout. The child shares a
+/// flock until it execs (see `spawn_guard`), so the read side of one test
+/// cannot land inside another test's lock-release window.
+pub fn git_status(dir: &Path, args: &[&str]) -> (bool, String) {
+    let out = spawn_guard::across_spawn(|| {
+        Command::new("git")
+            // No auto gc or maintenance: they pack loose objects in the
+            // background and delete the loose files, also while an import
+            // of the same repository still reads them.
+            .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Ada")
+            .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+            .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+            .env("GIT_COMMITTER_NAME", "Ada")
+            .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+            .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+            .output()
+    })
+    .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap().trim_end().to_owned();
+    (out.status.success(), stdout)
+}
+
+/// Runs git in `dir` and returns its stdout. Fails the test unless git
+/// succeeds.
+pub fn git(dir: &Path, args: &[&str]) -> String {
+    let (ok, stdout) = git_status(dir, args);
+    assert!(ok, "git {args:?} failed");
+    stdout
 }
