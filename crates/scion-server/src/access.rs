@@ -794,4 +794,148 @@ mod tests {
             }
         }
     }
+
+    // ---- The canonicalization properties: random rule shapes against a
+    // ---- naive model of what canonical means.
+
+    use proptest::prelude::*;
+
+    /// Random read and write prefixes: short names from a small alphabet,
+    /// so prefixes overlap, nest and repeat.
+    fn prefixes() -> impl proptest::strategy::Strategy<Value = Vec<String>> {
+        // "-" sorts before "/", so names that change the prefix boundary
+        // ("a" covering "a-b") are tried.
+        proptest::collection::vec(proptest::collection::vec("[ab-]{1,3}", 1..3), 0..10).prop_map(
+            |parts| {
+                parts
+                    .into_iter()
+                    .map(|names| names.join("/"))
+                    .collect::<Vec<_>>()
+            },
+        )
+    }
+
+    /// The grant of a rules file with `read` and `write` prefix rules.
+    fn grant(read: &[String], write: &[String]) -> Grant {
+        let as_paths = |list: &[String]| {
+            list.iter()
+                .map(|p| RepoPath::new(p.clone()).unwrap())
+                .collect()
+        };
+        Grant {
+            read_all: false,
+            read: as_paths(read),
+            write_all: false,
+            write: as_paths(write),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(128))]
+
+        /// The canonical set equals a naive minimal covering set computed
+        /// with plain string parts, canonicalizing twice gives the same
+        /// set, and the write prefixes land in the canonical read set.
+        #[test]
+        fn canon_equals_the_naive_minimal_set(read in prefixes(), write in prefixes()) {
+            let g = grant(&read, &write);
+            let canon = g.canonical_read();
+            let canon = canon
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|p| std::str::from_utf8(p.as_bytes()).unwrap().to_owned())
+                .collect::<Vec<_>>();
+            // The naive model: a prefix is kept iff no other prefix covers
+            // it. The boundary is checked on the string, so a bug that lets
+            // "a" cover "ab" fails here.
+            let mut pool: Vec<String> = read.iter().chain(write.iter()).cloned().collect();
+            pool.sort();
+            pool.dedup();
+            let naive: Vec<String> = pool
+                .iter()
+                .filter(|p| !pool.iter().any(|q| q != *p && p.starts_with(&format!("{q}/"))))
+                .cloned()
+                .collect();
+            prop_assert_eq!(&canon, &naive, "the canonical set differs from the naive model");
+            // The canonical set, fed back as read prefixes: canon of canon.
+            let again = grant(&canon, &[]);
+            prop_assert_eq!(
+                again
+                    .canonical_read()
+                    .unwrap()
+                    .iter()
+                    .map(|p| std::str::from_utf8(p.as_bytes()).unwrap().to_owned())
+                    .collect::<Vec<_>>(),
+                canon.clone()
+            );
+            // A write rule lets its principal read what it writes: every
+            // write prefix is covered by a kept read prefix.
+            for w in &write {
+                prop_assert!(
+                    canon.iter().any(|k| w == k || w.starts_with(&format!("{k}/"))),
+                    "the write prefix {w} is not covered by the canonical set"
+                );
+            }
+        }
+
+        /// Two grants that cover the same paths canonicalize to one set
+        /// and one digest: reordering, duplicates and covered sub-prefixes
+        /// change nothing, while dropping or adding coverage changes the
+        /// digest.
+        #[test]
+        fn same_coverage_one_digest(set in prefixes()) {
+            prop_assume!(!set.is_empty());
+            let g = grant(&set, &[]);
+            let canon = g.canonical_read().unwrap();
+            prop_assume!(!canon.is_empty());
+            let digest = rule_set_digest(Some(&canon));
+            let canon_len = canon.len();
+            let canon = canon
+                .iter()
+                .map(|p| std::str::from_utf8(p.as_bytes()).unwrap().to_owned())
+                .collect::<Vec<_>>();
+
+            // Reordered and duplicated: same coverage.
+            let mut shuffled: Vec<String> = canon.clone();
+            shuffled.reverse();
+            shuffled.extend(shuffled.clone());
+            prop_assert_eq!(
+                grant(&shuffled, &[])
+                    .canonical_read()
+                    .map(|c| c.iter().map(|p| std::str::from_utf8(p.as_bytes()).unwrap().to_owned()).collect::<Vec<_>>()),
+                Some(canon.clone())
+            );
+            prop_assert_eq!(rule_set_digest(Some(&grant(&shuffled, &[]).canonical_read().unwrap())), digest);
+
+            // Covered sub-prefixes of every prefix: same coverage. Each
+            // sub-prefix is below its parent, so the parent covers it.
+            let mut padded: Vec<String> = shuffled.clone();
+            for p in &shuffled {
+                padded.push(format!("{p}/a"));
+                padded.push(format!("{p}/a/b"));
+            }
+            prop_assert_eq!(
+                grant(&padded, &[])
+                    .canonical_read()
+                    .map(|c| c.iter().map(|p| std::str::from_utf8(p.as_bytes()).unwrap().to_owned()).collect::<Vec<_>>()),
+                Some(canon.clone())
+            );
+
+            // A prefix of a disjoint namespace adds coverage: different
+            // digest. The alphabet of `prefixes` has no `c`.
+            let mut more = padded.clone();
+            more.push("c".into());
+            let other = grant(&more, &[]).canonical_read().unwrap();
+            prop_assert_ne!(rule_set_digest(Some(&other)), digest);
+
+            // One prefix fewer: less coverage, different digest.
+            if canon_len > 1 {
+                let fewer: Vec<String> = canon[..canon_len - 1].to_vec();
+                let less = grant(&fewer, &[]).canonical_read().unwrap();
+                prop_assert_ne!(rule_set_digest(Some(&less)), digest);
+            }
+        }
+
+    }
 }
