@@ -9,12 +9,12 @@ use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileEntry, FileState, IdentityTime, RepoPath,
 };
 use scion_server::error::ApplyError;
-use scion_server::meta::MetaTx as _;
+use scion_server::meta::{Meta as _, MetaTx as _};
 use scion_server::store::BlobStatus;
 use scion_server::write::{
     MAX_CHANGES, MAX_COMMIT_MESSAGE_BYTES, MAX_IDENTITY_BYTES, create_changeset,
 };
-use scion_server::{Error, Store, tree};
+use scion_server::{Backend, Error, tree};
 use tempfile::TempDir;
 
 const REPO: &str = "main";
@@ -23,14 +23,25 @@ const REPO: &str = "main";
 /// `main` ref) and repo `other` (its own root).
 struct Fixture {
     dir: TempDir,
-    store: Store,
+    store: Backend,
     root: ChangesetId,
     other_root: ChangesetId,
 }
 
+/// Ends the test with one printed line when it runs on Postgres: it
+/// asserts the data directory's own mechanics, which the Postgres backend
+/// does not have. The PR body lists these tests.
+fn skip_on_postgres(why: &str) -> bool {
+    if Backend::test_is_postgres() {
+        eprintln!("skip on postgres: {why}");
+        return true;
+    }
+    false
+}
+
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Backend::open_test(dir.path()).unwrap();
     for content in ["a", "b", "c", "new"] {
         store.blobs().put(content.as_bytes()).unwrap();
     }
@@ -106,15 +117,37 @@ fn count_changesets(c: &Connection) -> scion_server::Result<i64> {
     Ok(c.query_row("SELECT count(*) FROM changesets", [], |row| row.get(0))?)
 }
 
+/// The changeset rows of the store's world: the data directory's table on
+/// SQLite, the test schema's on Postgres, read through a client of the
+/// schema, as the refusal tests hold theirs.
+fn count_of(store: &Backend, dir: &std::path::Path) -> i64 {
+    if Backend::test_is_postgres() {
+        let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+        let schema = Backend::test_schema(dir).unwrap();
+        let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        client
+            .batch_execute(&format!("SET search_path TO {schema}"))
+            .unwrap();
+        client
+            .query_one("SELECT count(*) FROM changesets", &[])
+            .unwrap()
+            .get(0)
+    } else {
+        store
+            .read(|c| count_changesets(c.sqlite().unwrap()))
+            .unwrap()
+    }
+}
+
 #[test]
 fn concurrent_creates_of_one_changeset_store_it_once() {
     let f = fixture();
-    let before = f.store.read(|c| count_changesets(c)).unwrap();
     let (bytes, expected) = changeset(
         vec![f.root],
         &[("a", None), ("dir/new", Some(regular("new")))],
     )
     .encode_with_id();
+    let before = count_of(&f.store, f.dir.path());
     let ids: Vec<ChangesetId> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..100)
             .map(|_| s.spawn(|| create_changeset(&f.store, REPO, &bytes)))
@@ -124,14 +157,27 @@ fn concurrent_creates_of_one_changeset_store_it_once() {
             .map(|h| h.join().unwrap().unwrap())
             .collect()
     });
+    // Every caller answers the same ID, and none of them errors: the
+    // conflict of the one stored row is a no-op on every backend, not a
+    // failure.
     assert!(ids.iter().all(|id| *id == expected), "{ids:?}");
-    assert_eq!(f.store.read(|c| count_changesets(c)).unwrap(), before + 1);
+    // One create, one row, on both backends: a caller that stored a
+    // second row, or lost the race and stored none, fails here.
+    assert_eq!(count_of(&f.store, f.dir.path()), before + 1);
 }
 
 #[test]
 fn bad_requests_are_rejected_and_store_nothing() {
+    // Asserts the rows of the data directory's database.
+    if skip_on_postgres("asserts the rows of the data directory's database") {
+        return;
+    }
+
     let f = fixture();
-    let before = f.store.read(|c| count_changesets(c)).unwrap();
+    let before = f
+        .store
+        .read(|c| count_changesets(c.sqlite().unwrap()))
+        .unwrap();
     let ok = |edit: fn(&mut Changeset)| {
         let mut cs = changeset(vec![f.root], &[("dir/new", Some(regular("new")))]);
         edit(&mut cs);
@@ -222,7 +268,12 @@ fn bad_requests_are_rejected_and_store_nothing() {
         create_changeset(&f.store, "nope", &valid),
         Err(Error::NotFound(_))
     ));
-    assert_eq!(f.store.read(|c| count_changesets(c)).unwrap(), before);
+    assert_eq!(
+        f.store
+            .read(|c| count_changesets(c.sqlite().unwrap()))
+            .unwrap(),
+        before
+    );
 }
 
 #[test]
@@ -369,13 +420,18 @@ fn concurrent_puts_of_one_blob_leave_it_intact() {
 
 #[test]
 fn a_changeset_that_does_not_match_its_id_reads_as_corrupt() {
+    // Asserts the rows of the data directory's database.
+    if skip_on_postgres("asserts the rows of the data directory's database") {
+        return;
+    }
+
     let f = fixture();
     // A valid encoding, but of another changeset.
     let other = changeset(vec![], &[("a", Some(regular("b")))]).encode();
     let repo = f
         .store
         .write(|c| {
-            c.execute(
+            c.sqlite().unwrap().execute(
                 "UPDATE changesets SET body = ?1 WHERE id = ?2",
                 params![other, f.root.as_bytes()],
             )?;

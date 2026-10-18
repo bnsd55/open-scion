@@ -34,13 +34,14 @@ use tracing::Instrument as _;
 
 use crate::access::Access;
 use crate::auth::Caller;
+use crate::backend::Backend;
 use crate::deadline::Deadline;
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
-use crate::meta::MetaTx as _;
+use crate::meta::{Meta as _, MetaTx as _};
 use crate::objects::ObjectsService;
 use crate::quotas::{Call, Quotas};
-use crate::store::{MAX_OBJECT_BYTES, READER_BYTES, Store};
+use crate::store::{MAX_OBJECT_BYTES, READER_BYTES};
 use crate::tickets::Keys;
 use crate::{blame, names, read, views, write};
 
@@ -148,7 +149,7 @@ pub struct ServeOptions {
 ///
 /// Transport errors.
 pub async fn serve(
-    store: Store,
+    store: Backend,
     listener: TcpListener,
     access: impl Into<Access>,
     options: ServeOptions,
@@ -190,15 +191,22 @@ pub async fn serve(
     // Outside the access rules, so a refused call counts too. The layer
     // only wraps replies in a counting body; the handlers stay as they are.
     let scion = MetricsLayer::new(Arc::clone(&metrics)).layer(InterceptedService::new(
-        ScionService::new(worker.clone(), Arc::clone(&access), lands, quotas.clone()).into_server(),
+        ScionService::new(
+            worker.clone(),
+            Arc::clone(&access),
+            lands,
+            quotas.clone(),
+            Arc::clone(&metrics),
+        )
+        .into_server(),
         auth.clone(),
     ));
     // No token interceptor on `objects`: `GetObjects` authenticates by
     // ticket alone, and the service's other calls check the token
     // themselves. So a tier needs no token of the server to fetch objects.
     // The counting layer wraps it all the same, outside the ticket checks.
-    let objects = MetricsLayer::new(metrics)
-        .layer(ObjectsService::new(worker, access, quotas, tickets).into_server());
+    let objects = MetricsLayer::new(Arc::clone(&metrics))
+        .layer(ObjectsService::new(worker, access, quotas, tickets, metrics).into_server());
     // The health service answers `grpc.health.v1.Check` and `Watch` on the
     // same port, without a token: a probe carries none. The store opens
     // before this call, so the server starts serving.
@@ -228,6 +236,8 @@ pub struct ScionService {
     lands: Arc<Lands>,
     /// What one principal may hold at once.
     quotas: Quotas,
+    /// The registry that counts the view derivations.
+    metrics: Arc<Metrics>,
     /// Bounds uploads read at once (`MAX_UPLOADS`): their messages in memory
     /// and their spool files in `tmp/`.
     uploads: Arc<Semaphore>,
@@ -276,12 +286,19 @@ impl ScionService {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    fn new(worker: Worker, access: Arc<Access>, lands: Arc<Lands>, quotas: Quotas) -> Self {
+    fn new(
+        worker: Worker,
+        access: Arc<Access>,
+        lands: Arc<Lands>,
+        quotas: Quotas,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         Self {
             worker,
             access,
             lands,
             quotas,
+            metrics,
             uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
             blames: Arc::new(Semaphore::new(MAX_BLAMES)),
             blame_memory: crate::memory::Bytes::new(BLAME_MEMORY_BUDGET),
@@ -301,7 +318,7 @@ impl ScionService {
     async fn graph_query<T, F>(&self, deadline: Deadline, query: F) -> Result<T, Status>
     where
         T: Send + 'static,
-        F: FnOnce(&Store, &Deadline) -> Result<T> + Send + 'static,
+        F: FnOnce(&Backend, &Deadline) -> Result<T> + Send + 'static,
     {
         run_graph_query(&self.worker, &self.graph_queries, deadline, query).await
     }
@@ -327,14 +344,14 @@ pub fn into_server<S: Scion + Send + 'static>(service: S) -> ScionServer<S> {
 /// on the work in flight, so both services queue behind the same limit.
 #[derive(Clone)]
 pub(crate) struct Worker {
-    store: Store,
+    store: Backend,
     /// Bounds blocking work, so a flood of requests queues instead of
     /// spawning unbounded threads.
     permits: Arc<Semaphore>,
 }
 
 impl Worker {
-    pub(crate) fn new(store: Store) -> Self {
+    pub(crate) fn new(store: Backend) -> Self {
         Self {
             store,
             permits: Arc::new(Semaphore::new(MAX_BLOCKING)),
@@ -343,7 +360,7 @@ impl Worker {
 
     /// A handle to the store, for work outside the permit queue, such as the
     /// stale-land sweep.
-    pub(crate) fn store(&self) -> Store {
+    pub(crate) fn store(&self) -> Backend {
         self.store.clone()
     }
 
@@ -351,7 +368,7 @@ impl Worker {
     pub(crate) async fn run<T, F>(&self, f: F) -> Result<T, Status>
     where
         T: Send + 'static,
-        F: FnOnce(Store) -> Result<T> + Send + 'static,
+        F: FnOnce(Backend) -> Result<T> + Send + 'static,
     {
         let permit = Arc::clone(&self.permits)
             .acquire_owned()
@@ -596,7 +613,7 @@ async fn run_graph_query<T, F>(
 ) -> Result<T, Status>
 where
     T: Send + 'static,
-    F: FnOnce(&Store, &Deadline) -> Result<T> + Send + 'static,
+    F: FnOnce(&Backend, &Deadline) -> Result<T> + Send + 'static,
 {
     // The query checks it at each read: a request timeout, or a client
     // that cancels, drops this call but not a job that is running. The
@@ -1130,6 +1147,7 @@ impl Scion for ScionService {
         // The derivation of a first view walks the real tree, under the
         // call's deadline.
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
+        let metrics = Arc::clone(&self.metrics);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
@@ -1143,7 +1161,8 @@ impl Scion for ScionService {
                     .access
                     .read_rule_set(&caller, &req.repo)
                     .unwrap_or_default();
-                Some((digest, prefixes))
+                let live = self.access.view_digests(&req.repo);
+                Some((digest, prefixes, live))
             }
             None => None,
         };
@@ -1151,10 +1170,11 @@ impl Scion for ScionService {
             .worker
             .run(move |store| {
                 let blob = match &view {
-                    Some((digest, prefixes)) => {
+                    Some((digest, prefixes, live)) => {
                         let repo_id = store.read(|c| c.repo_id(&req.repo))?;
-                        let root =
-                            views::view_root(&store, repo_id, digest, id, prefixes, &deadline)?;
+                        let root = views::view_root(
+                            &store, repo_id, digest, id, prefixes, live, &metrics, &deadline,
+                        )?;
                         read::file_blob_at(&store, root, &path)?
                     }
                     None => read::file_blob(&store, &req.repo, id, &path)?,
@@ -1198,6 +1218,7 @@ impl Scion for ScionService {
         // The derivation of a first view walks the real tree, under the
         // call's deadline.
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
+        let metrics = Arc::clone(&self.metrics);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
@@ -1210,7 +1231,8 @@ impl Scion for ScionService {
                     .access
                     .read_rule_set(&caller, &req.repo)
                     .unwrap_or_default();
-                Some((digest, prefixes))
+                let live = self.access.view_digests(&req.repo);
+                Some((digest, prefixes, live))
             }
             None => None,
         };
@@ -1218,10 +1240,11 @@ impl Scion for ScionService {
             .worker
             .run(move |store| {
                 let tree = match &view {
-                    Some((digest, prefixes)) => {
+                    Some((digest, prefixes, live)) => {
                         let repo_id = store.read(|c| c.repo_id(&req.repo))?;
-                        let root =
-                            views::view_root(&store, repo_id, digest, id, prefixes, &deadline)?;
+                        let root = views::view_root(
+                            &store, repo_id, digest, id, prefixes, live, &metrics, &deadline,
+                        )?;
                         read::list_dir_at(&store, root, path.as_ref())?
                     }
                     None => read::list_dir(&store, &req.repo, id, path.as_ref())?,
@@ -1486,7 +1509,9 @@ fn file_state(state: FileState) -> v1::FileState {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::Backend;
     use crate::db;
+    use crate::store::Store;
     use std::time::Instant;
 
     use scion_core::{Changeset, FileState, IdentityTime};
@@ -1514,12 +1539,13 @@ mod tests {
     }
 
     /// A service whose one principal may do everything.
-    fn test_service(store: Store) -> ScionService {
+    fn test_service(store: Backend) -> ScionService {
         ScionService::new(
             Worker::new(store),
             Arc::new(Access::single("t")),
             Arc::default(),
             Quotas::off(),
+            Arc::default(),
         )
     }
 
@@ -1577,9 +1603,9 @@ mod tests {
         )
     }
 
-    fn file_store(content: &[u8]) -> (tempfile::TempDir, Store, ChangesetId, BlobId) {
+    fn file_store(content: &[u8]) -> (tempfile::TempDir, Backend, ChangesetId, BlobId) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let blob = store.blobs().put(content).unwrap();
         let state = FileState::Regular {
             content: blob,
@@ -1614,7 +1640,7 @@ mod tests {
     /// Starts [`send_file`] for `blob` with all of a budget of `budget`.
     /// Returns the task, the reply and the budget.
     async fn reply(
-        store: Store,
+        store: Backend,
         blob: BlobId,
         budget: usize,
         stall: Duration,
@@ -1736,6 +1762,7 @@ mod tests {
             Arc::new(read_only_access()),
             Arc::default(),
             Quotas::off(),
+            Arc::default(),
         );
         // A valid changeset, which puts `f`: decode succeeds, the rules
         // deny the write. The check runs in the job, so this also shows
@@ -1944,7 +1971,7 @@ mod tests {
         // main goes root ─ B. The land's base is root, below the floor of a
         // new path index at B, so its plan walks back.
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let blob = store.blobs().put(b"x").unwrap();
         let put = |parents, path: &str| Changeset {
             parents,
@@ -2019,7 +2046,7 @@ mod tests {
         }
         let sql = "SELECT state FROM lands WHERE request_key = 'k'";
         let state: String = store
-            .read(|c| Ok(c.query_row(sql, [], |row| row.get(0))?))
+            .read(|c| Ok(c.sqlite().unwrap().query_row(sql, [], |row| row.get(0))?))
             .unwrap();
         assert_eq!(state, "pending");
         let main = store.read(|c| {
@@ -2072,11 +2099,11 @@ mod tests {
     async fn at_most_max_graph_queries_run_at_once() {
         // root ─ a, and root ─ b.
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let ids = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
-                db::testing::insert_graph(c, repo, &[vec![], vec![0], vec![0]])
+                db::testing::insert_graph(c.sqlite().unwrap(), repo, &[vec![], vec![0], vec![0]])
             })
             .unwrap();
         let bytes = |i: usize| ids[i].as_bytes().to_vec();
@@ -2173,7 +2200,7 @@ mod tests {
     #[tokio::test]
     async fn a_worker_panic_does_not_reach_the_client() {
         let dir = tempfile::tempdir().unwrap();
-        let worker = Worker::new(Store::open(dir.path()).unwrap());
+        let worker = Worker::new(Backend::Sqlite(Store::open(dir.path()).unwrap()));
         let status = worker
             .run(|_| -> Result<()> { panic!("secret detail") })
             .await

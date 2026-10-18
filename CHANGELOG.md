@@ -14,6 +14,9 @@ until that section gets its release date.
 
 ### Added
 
+- The server counts lands whose ref moved under them and were planned
+  again in `scion_land_replans_total`, next to the land outcome counters.
+
 #### Objects and byte format
 
 - A tree entry carries its blob's byte length (`#172`): `ls -l` and a mount
@@ -82,6 +85,27 @@ until that section gets its release date.
 
 #### The server
 
+- The metadata may live in Postgres instead of the data directory
+  (`#178`, part 2 of `#47`): `scion-server serve --postgres-url URL`
+  (env `SCION_POSTGRES_URL`). The same `Meta` queries run over either
+  backend, so lands, reads, derived data, views, `Blame` and `Log`
+  streaming all serve unchanged. Blob files stay on local disk in both:
+  one blob folder per server. One server runs per database: a second one
+  fails at open (`another server holds this database`). A data directory
+  records its backend in a marker file and the other backend refuses it,
+  so a `gc` that saw an empty store cannot sweep the blobs of a
+  Postgres-backed directory; `fsck` and `gc` refuse a Postgres-backed
+  directory for now (`#180`). A host off this machine needs
+  `sslmode=require` or stronger and a `--postgres-ca` that signed the
+  server's certificate (`prefer`, which falls back to plaintext, is
+  refused); the URL is never logged. `synchronous_commit=on` on every
+  connection, checked at open, so a flush returns after the commit. One
+  writer, many readers, CAS predicates on refs; a lock wait ends after
+  5 s with `UNAVAILABLE`, a statement past its deadline answers
+  `DEADLINE_EXCEEDED`, and a closed client reconnects. Each migration
+  runs in its own transaction under a session advisory lock, and a
+  newer schema is refused. The operations guide gains a Postgres
+  section (deploy, TLS, backup, what to watch).
 - One request ID per client operation, carried through every hop
   (`#144` follow-up). `scn` makes one 16-digit hex ID per command and
   sends it on every call in `x-request-id`; a tier forwards the ID its
@@ -453,6 +477,14 @@ until that section gets its release date.
 
 ### Changed
 
+- A partial reader's view is memoized per tree (`#121`): a derivation asks
+  the `view_trees` table at every directory, so a new changeset re-derives
+  only the folders on its changed paths, and the rest of the view comes
+  from the rows; rows of an older projection version or of a rule set no
+  principal holds any more are swept in bounded steps. The metric
+  `scion_view_trees_walked_total` counts the real trees a derivation
+  opened. Both backends hold the table (SQLite migration 0009, Postgres
+  0003).
 - The server, the cache and the daemon log to stderr (`#179`): stdout
   carries the output of `ticket-key` and `hash-token`, so a redirect of
   one does not catch the other's lines.

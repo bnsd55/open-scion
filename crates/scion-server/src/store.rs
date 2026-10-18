@@ -42,7 +42,7 @@ use crate::derived::DeriveFlights;
 use crate::error::{Error, Result};
 
 /// The schema version this build makes and reads.
-pub(crate) const SCHEMA_VERSION: u32 = 8;
+pub(crate) const SCHEMA_VERSION: u32 = 9;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database from
 /// version `n - 1` to version `n`. A released migration never changes.
@@ -55,6 +55,7 @@ const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [
     include_str!("../migrations/0006_land_created_at.sql"),
     include_str!("../migrations/0007_tree_sizes.sql"),
     include_str!("../migrations/0008_view_roots.sql"),
+    include_str!("../migrations/0009_view_trees.sql"),
 ];
 
 /// Largest object accepted or read back, uncompressed: 100 MiB, the hard
@@ -69,6 +70,11 @@ const READER_WINDOW_LOG: u32 = 21;
 /// Most memory that a [`BlobReader`] holds between parts: its zstd window and
 /// the decoder's buffers and tables, which take less than 1 MiB.
 pub const READER_BYTES: usize = (1 << READER_WINDOW_LOG) + (1 << 20);
+
+/// A step the tests run at a counted batch boundary of the import, with
+/// the count of batches done so far.
+#[doc(hidden)]
+pub type AfterBatch = Box<dyn FnMut(usize) + Send>;
 
 /// Handle to one data directory. Cheap to clone.
 #[derive(Clone)]
@@ -124,12 +130,18 @@ struct Inner {
     _server_lock: Option<fs::File>,
     /// Write transactions run so far, for tests of how imports share the
     /// write lock.
-    #[cfg(test)]
     txes: AtomicU64,
     /// How many of the next commits fail as a busy database, for tests of
     /// the import's busy retry: the transaction ran and rolled back, so
     /// nothing was written, exactly as a real busy commit ends.
     fail_commits: AtomicU64,
+    /// The step the tests run after each batch of the import commits, with
+    /// the count of batches done so far: a test that must act at a counted
+    /// batch boundary runs there, instead of racing the batch's end.
+    after_batch: Mutex<Option<AfterBatch>>,
+    /// Busy retries of the import's batches, so a test proves the retry
+    /// ran instead of only that the import survived.
+    busy_retries: AtomicU64,
     /// The derive walks of this store: which are in flight, and the cap
     /// on how many may be.
     derive: DeriveFlights,
@@ -293,9 +305,10 @@ impl Store {
                 alone,
                 _lock: lock,
                 _server_lock: server_lock,
-                #[cfg(test)]
                 txes: AtomicU64::new(0),
                 fail_commits: AtomicU64::new(0),
+                after_batch: Mutex::new(None),
+                busy_retries: AtomicU64::new(0),
                 derive: DeriveFlights::new(walks_cap),
                 writers: Mutex::new(0),
                 write_woken: Condvar::new(),
@@ -367,8 +380,9 @@ impl Store {
     }
 
     /// Commits made so far.
-    #[cfg(test)]
-    pub(crate) fn commits(&self) -> u64 {
+    #[doc(hidden)]
+    #[must_use]
+    pub fn commits(&self) -> u64 {
         self.inner.committed.load(Ordering::Acquire)
     }
 
@@ -385,7 +399,7 @@ impl Store {
     /// # Errors
     ///
     /// Returns what `f` returns, or an error from [`Store::flush`].
-    pub fn read<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
+    pub fn read<T>(&self, f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>) -> Result<T> {
         let (result, seen) = self.read_counted(f);
         // An error is an answer too.
         self.wait_durable(seen)?;
@@ -398,7 +412,7 @@ impl Store {
     /// replies.
     pub(crate) fn read_counted<T>(
         &self,
-        f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>,
+        f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>,
     ) -> (Result<T>, u64) {
         let reader = self.inner.readers.take();
         let result = f(&mut SqliteTx(&reader));
@@ -441,7 +455,10 @@ impl Store {
     /// # Errors
     ///
     /// Returns what `f` returns.
-    pub fn read_unflushed<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
+    pub fn read_unflushed<T>(
+        &self,
+        f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>,
+    ) -> Result<T> {
         let db = self.lock();
         f(&mut SqliteTx(&db))
     }
@@ -470,9 +487,47 @@ impl Store {
         let _ = self.lock().busy_timeout(timeout);
     }
 
+    /// Sets the step the tests run after each batch of the import commits.
+    #[doc(hidden)]
+    pub fn set_after_batch(&self, step: Option<AfterBatch>) {
+        *self
+            .inner
+            .after_batch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = step;
+    }
+
+    /// Runs the test step of a batch boundary, with the count of batches
+    /// done so far.
+    #[doc(hidden)]
+    pub fn run_after_batch(&self, batches: usize) {
+        if let Some(step) = &mut *self
+            .inner
+            .after_batch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            step(batches);
+        }
+    }
+
+    /// How many busy retries of the import's batches ran so far.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn busy_retries(&self) -> u64 {
+        self.inner.busy_retries.load(Ordering::Relaxed)
+    }
+
+    /// Counts one busy retry of the import's batch.
+    #[doc(hidden)]
+    pub fn note_busy_retry(&self) {
+        self.inner.busy_retries.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Write transactions run so far.
-    #[cfg(test)]
-    pub(crate) fn txes(&self) -> u64 {
+    #[doc(hidden)]
+    #[must_use]
+    pub fn txes(&self) -> u64 {
         self.inner.txes.load(Ordering::Relaxed)
     }
 
@@ -483,7 +538,7 @@ impl Store {
     /// # Errors
     ///
     /// As [`Store::commit`] and [`Store::flush`].
-    pub fn write<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
+    pub fn write<T>(&self, f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>) -> Result<T> {
         let value = self.commit(f)?;
         self.flush()?;
         Ok(value)
@@ -495,7 +550,10 @@ impl Store {
     /// # Errors
     ///
     /// Returns what `f` returns, or a database error from begin or commit.
-    pub fn commit<T>(&self, f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> Result<T> {
+    pub fn commit<T>(
+        &self,
+        f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>,
+    ) -> Result<T> {
         *self
             .inner
             .writers
@@ -769,7 +827,7 @@ pub struct Blobs {
 }
 
 impl Blobs {
-    fn open(dir: &Path) -> Result<Self> {
+    pub(crate) fn open(dir: &Path) -> Result<Self> {
         // Folders of `tmp/` made in this process, so each `Blobs` gets its own.
         static FOLDERS: AtomicU64 = AtomicU64::new(0);
         let objects = dir.join("objects");
@@ -826,7 +884,7 @@ impl Blobs {
     /// when this open is alone, files of a build older than the folders. No
     /// blob name points at any of them. The folders of live processes are
     /// held, and this process's own folder is held too.
-    fn sweep_tmp(&self, alone: bool) -> io::Result<()> {
+    pub(crate) fn sweep_tmp(&self, alone: bool) -> io::Result<()> {
         let mut removed = 0;
         for entry in fs::read_dir(&self.tmp)? {
             let path = entry?.path();
@@ -858,7 +916,7 @@ impl Blobs {
     /// Waits for a full flush that starts after this call: the blob root
     /// directory, then the drive cache. That covers everything that reached
     /// the drive before it, the database too, which lives on the same drive.
-    fn full_flush(&self) -> io::Result<()> {
+    pub(crate) fn full_flush(&self) -> io::Result<()> {
         self.group_flush
             .run(|| fs::File::open(&self.root)?.sync_all())
     }

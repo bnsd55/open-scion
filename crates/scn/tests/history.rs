@@ -12,9 +12,10 @@ use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPa
 use scion_proto::listen::Limits;
 use scion_server::blame::MAX_BLAME_VERSIONS;
 use scion_server::import::{ImportOptions, import_git};
+use scion_server::meta::Meta as _;
 use scion_server::meta::MetaTx as _;
 use scion_server::read::MAX_SCAN;
-use scion_server::{Store, service, tree};
+use scion_server::{Backend, service, tree};
 use serde_json::Value;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -74,7 +75,7 @@ struct Server {
 }
 
 impl Server {
-    fn start(data: TempDir, store: Store) -> Self {
+    fn start(data: TempDir, store: Backend) -> Self {
         let runtime = Runtime::new().unwrap();
         let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -142,14 +143,14 @@ fn blame_lines(server: &Server, spec: &str) -> Vec<(String, u64, String)> {
 }
 
 /// The changeset that a git commit was imported as, in hex.
-fn changeset_of(store: &Store, commit: &str) -> String {
+fn changeset_of(store: &Backend, commit: &str) -> String {
     let oid: Vec<u8> = (0..commit.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&commit[i..i + 2], 16).unwrap())
         .collect();
     store
         .read(|c| {
-            let cs: Vec<u8> = c.query_row(
+            let cs: Vec<u8> = c.sqlite().unwrap().query_row(
                 "SELECT cs FROM git_import WHERE git_oid = ?1",
                 [oid],
                 |row| row.get(0),
@@ -161,7 +162,7 @@ fn changeset_of(store: &Store, commit: &str) -> String {
 
 /// `git blame --first-parent --line-porcelain` as one `(changeset, origin
 /// line, path there)` per line, with each commit mapped to its changeset.
-fn git_blame_lines(store: &Store, dir: &Path, file: &str) -> Vec<(String, u64, String)> {
+fn git_blame_lines(store: &Backend, dir: &Path, file: &str) -> Vec<(String, u64, String)> {
     let mut lines = Vec::new();
     // Each line starts with "<commit> <origin line> <line> [<count>]".
     let mut header = None;
@@ -308,7 +309,7 @@ fn blame_matches_git_blame_first_parent() {
         ],
     );
     let data = tempfile::tempdir().unwrap();
-    let store = Store::open(data.path()).unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
     let opts = ImportOptions {
         rev: "HEAD".into(),
         target_ref: "main".into(),
@@ -354,7 +355,7 @@ type Puts<'a, S> = (Vec<u8>, Vec<(&'a str, S)>);
 /// Stores a first-parent chain in a new repo, one changeset per entry.
 /// Returns the IDs, oldest first.
 fn chain<S: Into<Option<FileState>>>(
-    store: &Store,
+    store: &Backend,
     changesets: Vec<Puts<'_, S>>,
 ) -> Vec<ChangesetId> {
     store
@@ -400,7 +401,7 @@ fn log_ids(server: &Server, args: &[&str]) -> Vec<String> {
 #[test]
 fn log_path_and_blame_continue_past_the_server_bounds() {
     let data = tempfile::tempdir().unwrap();
-    let store = Store::open(data.path()).unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
     // The root adds `f` with two lines. Then 2 * MAX_SCAN changesets change
     // only `g`, more than one `Blame` call walks. Then MAX_BLAME_VERSIONS
     // changesets each add one line at the top of `f`, one more than one
@@ -455,7 +456,7 @@ fn log_path_and_blame_continue_past_the_server_bounds() {
 #[test]
 fn blame_continues_at_the_old_path_after_a_rename() {
     let data = tempfile::tempdir().unwrap();
-    let store = Store::open(data.path()).unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
     // Each changeset adds one line at the top. The one at `before` also
     // renames `a` to `f`. One `Blame` call diffs MAX_BLAME_VERSIONS
     // versions, so it passes the rename and stops on the history of `a`.
@@ -490,7 +491,7 @@ fn blame_continues_at_the_old_path_after_a_rename() {
 #[test]
 fn blame_goes_on_with_a_rename_search_across_replies() {
     let data = tempfile::tempdir().unwrap();
-    let store = Store::open(data.path()).unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
     // `new` replaces 24 deleted files of 65,536 lines, one chunk each, so
     // one call's budget reads about 15 of them, and the search goes on in a
     // second reply. All are 99% like `new`, so the first by path wins.
@@ -521,7 +522,7 @@ fn blame_goes_on_with_a_rename_search_across_replies() {
 #[test]
 fn log_continues_after_a_reply_cut_by_its_byte_budget() {
     let data = tempfile::tempdir().unwrap();
-    let store = Store::open(data.path()).unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
     // A reply holds about 32 MiB of changesets, so it stops after three of
     // these and must say where to continue.
     let ids = chain(

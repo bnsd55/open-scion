@@ -11,8 +11,8 @@ use libfuzzer_sys::fuzz_target;
 use scion_core::{Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_server::blame::{self, Resume};
 use scion_server::memory::Bytes;
-use scion_server::meta::MetaTx as _;
-use scion_server::{Store, tree};
+use scion_server::meta::{Meta as _, MetaTx as _};
+use scion_server::{Backend, Store, tree};
 use std::sync::OnceLock;
 use tempfile::TempDir;
 
@@ -25,11 +25,11 @@ const PATH: &str = "f";
 /// The directory stays in the static for the life of the process: keeping
 /// it reachable keeps LeakSanitizer quiet and its cleanup never runs
 /// while the fuzzer runs.
-fn fixture() -> &'static (TempDir, Store, ChangesetId) {
-    static FIXTURE: OnceLock<(TempDir, Store, ChangesetId)> = OnceLock::new();
+fn fixture() -> &'static (TempDir, Backend, ChangesetId) {
+    static FIXTURE: OnceLock<(TempDir, Backend, ChangesetId)> = OnceLock::new();
     FIXTURE.get_or_init(|| {
         let dir = tempfile::tempdir().expect("temp dir");
-        let store = Store::open(dir.path()).expect("store");
+        let store = Backend::Sqlite(Store::open(dir.path()).expect("store"));
         let tip = store
             .write(|c| {
                 let repo = c.create_repo(REPO)?;

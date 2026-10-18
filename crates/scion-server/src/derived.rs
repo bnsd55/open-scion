@@ -25,10 +25,11 @@ use std::time::Instant;
 
 use scion_core::{Changeset, ChangesetId};
 
+use crate::backend::Backend;
 use crate::deadline::Deadline;
 use crate::error::{Error, Result};
+use crate::meta::Meta as _;
 use crate::meta::{MetaTx, RepoId};
-use crate::store::Store;
 
 /// Most changesets that one step walks or derives, and most rows of older
 /// versions that one step removes. A step holds the write connection, so
@@ -95,7 +96,7 @@ pub trait Kind {
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`], or of [`Store::flush`].
-pub fn get<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
+pub fn get<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
     get_until::<K>(store, repo, cs, None)
 }
 
@@ -106,7 +107,7 @@ pub fn get<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::V
 ///
 /// As [`get`], and [`Error::DeadlineExceeded`].
 pub fn get_by<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     cs: ChangesetId,
     deadline: &Deadline,
@@ -115,7 +116,7 @@ pub fn get_by<K: Kind>(
 }
 
 fn get_until<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     cs: ChangesetId,
     deadline: Option<&Deadline>,
@@ -317,7 +318,7 @@ fn waited(flight: &Arc<Flight>, before: u64, deadline: Option<&Deadline>) -> boo
 /// step boundary once its deadline has passed; the rows it stored stay, and
 /// a waiter that finds no value takes over the next walk.
 fn in_one_walk<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     cs: ChangesetId,
     deadline: Option<&Deadline>,
@@ -372,7 +373,7 @@ fn in_one_walk<K: Kind>(
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`].
-pub fn fill<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
+pub fn fill<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
     fill_until::<K>(store, repo, cs, None)
 }
 
@@ -383,7 +384,7 @@ pub fn fill<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::
 ///
 /// As [`fill`], and [`Error::DeadlineExceeded`].
 pub fn fill_by<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     cs: ChangesetId,
     deadline: &Deadline,
@@ -392,7 +393,7 @@ pub fn fill_by<K: Kind>(
 }
 
 fn fill_until<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     cs: ChangesetId,
     deadline: Option<&Deadline>,
@@ -413,7 +414,7 @@ fn fill_until<K: Kind>(
 /// # Errors
 ///
 /// As [`fill`] and [`Store::flush`].
-pub fn backfill<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<()> {
+pub fn backfill<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<()> {
     fill::<K>(store, repo, cs)?;
     // A short step means that no older row is left.
     while store.commit(|c| remove_old::<K>(c))? == STEP {}
@@ -482,7 +483,7 @@ pub fn on_write<K: Kind>(
 /// The walk of [`fill`]: the stored value for `cs`, or else the changesets
 /// to derive, parents first. Runs `check` before each step after the first.
 fn walk_all<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     cs: ChangesetId,
     check: impl Fn() -> Result<()>,
@@ -578,7 +579,7 @@ impl Walk {
 /// [`STEP`] changesets per transaction. Returns the value for the last one.
 /// Runs `check` before each step.
 fn derive_steps<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     pending: &[ChangesetId],
     deadline: Option<&Deadline>,
@@ -697,7 +698,9 @@ fn require(c: &mut dyn MetaTx, repo: RepoId, cs: ChangesetId) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::Backend;
     use crate::db::SqliteTx;
+    use crate::store::Store;
     use rusqlite::Connection;
     use std::cell::Cell;
     use std::collections::HashMap;
@@ -956,14 +959,61 @@ mod tests {
     }
 
     /// A new store with `history` in repo `r`, as [`store_chain`] stores it.
-    fn store_with(history: &[Edits]) -> (tempfile::TempDir, Store, RepoId, Vec<ChangesetId>) {
+    fn store_with(history: &[Edits]) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let (repo, ids) = store.write(|c| store_chain(c, history)).unwrap();
         (dir, store, repo, ids)
     }
 
-    /// Stores `history` in a new repo `r` through the one write path, which
+    /// [`store_with`] on the backend the tests run on: the Postgres test
+    /// schemas on the Postgres job, the data directory's store otherwise.
+    fn store_with_here(
+        history: &[Edits],
+    ) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::open_test(dir.path()).unwrap();
+        let (repo, ids) = store.write(|c| store_chain(c, history)).unwrap();
+        (dir, store, repo, ids)
+    }
+
+    /// The body of [`n_cold_reads_derive_once`], on the store given: the
+    /// Postgres variant runs it against the database, the SQLite one
+    /// against the data directory, and both read the same in-memory
+    /// flights.
+    fn n_cold_reads_derive_once_on(store: &Backend, repo: RepoId, tip: ChangesetId) {
+        let at_the_gate = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            let _gate = gate_closed();
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    at_the_gate.wait();
+                    assert_eq!(get::<Cold<1>>(store, repo, tip).unwrap(), 12);
+                });
+            }
+            wait_entered(1);
+            for _ in 0..2_000 {
+                if joined_on(store, repo) >= 9 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(joined_on(store, repo), 9, "the seven callers never joined");
+            let walks = store.derive_flights();
+            assert_eq!(
+                *walks
+                    .in_flight
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+                1,
+                "a caller that only waits holds a walk permit"
+            );
+            gate_open();
+        });
+        assert_eq!(COLD_DERIVES.load(Ordering::Relaxed), 12);
+    }
+
+    /// Backends `history` in a new repo `r` through the one write path, which
     /// stores root trees and the commit graph, and nothing else. Returns the
     /// IDs, oldest first.
     fn store_chain(c: &mut dyn MetaTx, history: &[Edits]) -> Result<(RepoId, Vec<ChangesetId>)> {
@@ -974,7 +1024,7 @@ mod tests {
         })
     }
 
-    /// Stores `history` in a new repo `r` with `store`. Returns the IDs,
+    /// Backends `history` in a new repo `r` with `store`. Returns the IDs,
     /// oldest first.
     fn chain_with(
         c: &mut dyn MetaTx,
@@ -1025,8 +1075,8 @@ mod tests {
     }
 
     /// The rows of kind `name` at `version`, as (changeset, value).
-    fn rows_of(store: &Store, name: &str, version: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let all = store.read(|c| Ok(rows(c))).unwrap();
+    fn rows_of(store: &Backend, name: &str, version: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let all = store.read(|c| Ok(rows(c.sqlite().unwrap()))).unwrap();
         all.into_iter()
             .filter(|(kind, v, ..)| kind == name && *v == version)
             .map(|(_, _, cs, value)| (cs, value))
@@ -1034,7 +1084,7 @@ mod tests {
     }
 
     /// The rows of the test kind at `version`, as (changeset, value).
-    fn kind_rows(store: &Store, version: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn kind_rows(store: &Backend, version: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
         rows_of(store, ChangedPathsV1::NAME, version)
     }
 
@@ -1115,14 +1165,21 @@ mod tests {
                 .all(|(kind, v, ..)| kind == RootTree::NAME && *v == RootTree::VERSION)
         );
 
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let version: u32 = store
-            .read(|c| Ok(c.pragma_query_value(None, "user_version", |row| row.get(0))?))
+            .read(|c| {
+                Ok(c.sqlite()
+                    .unwrap()
+                    .pragma_query_value(None, "user_version", |row| row.get(0))?)
+            })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         // Migration 7 drops the old root trees: they predate the entry
         // lengths, so they are re-derived from the blob store.
-        assert_eq!(store.read(|c| Ok(rows(c))).unwrap(), vec![]);
+        assert_eq!(
+            store.read(|c| Ok(rows(c.sqlite().unwrap()))).unwrap(),
+            vec![]
+        );
         // The blobs the chain names, by the chain's own convention.
         for path in ["a", "b", "c", "d"] {
             store.blobs().put(path.as_bytes()).unwrap();
@@ -1137,15 +1194,15 @@ mod tests {
                 tree.as_bytes().to_vec(),
             ));
         }
-        let mut got = store.read(|c| Ok(rows(c))).unwrap();
+        let mut got = store.read(|c| Ok(rows(c.sqlite().unwrap()))).unwrap();
         got.sort();
         after.sort();
         assert_eq!(got, after);
     }
 
     /// How many root tree rows the store holds.
-    fn root_trees(store: &Store) -> usize {
-        let all = store.read(|c| Ok(rows(c))).unwrap();
+    fn root_trees(store: &Backend) -> usize {
+        let all = store.read(|c| Ok(rows(c.sqlite().unwrap()))).unwrap();
         all.iter()
             .filter(|(kind, ..)| kind == RootTree::NAME)
             .count()
@@ -1315,7 +1372,7 @@ mod tests {
         let older = "INSERT INTO derived (kind, version, cs, value)
                      SELECT kind, 0, cs, value FROM derived WHERE kind = ?1";
         let added = store
-            .write(|c| Ok(c.execute(older, [RootTree::NAME])?))
+            .write(|c| Ok(c.sqlite().unwrap().execute(older, [RootTree::NAME])?))
             .unwrap();
         assert_eq!(added, 7);
 
@@ -1335,13 +1392,18 @@ mod tests {
 
     /// A new store with the graph `parents` in repo `r`, with no derived
     /// rows. Each changeset puts one file.
-    fn store_graph(parents: &[Vec<usize>]) -> (tempfile::TempDir, Store, RepoId, Vec<ChangesetId>) {
+    fn store_graph(
+        parents: &[Vec<usize>],
+    ) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let (repo, ids) = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
-                Ok((repo, testing::insert_graph(c, repo, parents)?))
+                Ok((
+                    repo,
+                    testing::insert_graph(c.sqlite().unwrap(), repo, parents)?,
+                ))
             })
             .unwrap();
         (dir, store, repo, ids)
@@ -1470,7 +1532,7 @@ mod tests {
     /// Its author differs, so its changeset IDs differ from the first repo's:
     /// a changeset ID is the hash of its content, and equal content would
     /// make the two repos share their derived rows.
-    fn another_chain(store: &Store, name: &str, history: &[Edits]) -> (RepoId, Vec<ChangesetId>) {
+    fn another_chain(store: &Backend, name: &str, history: &[Edits]) -> (RepoId, Vec<ChangesetId>) {
         store
             .write(|c| {
                 let repo = c.create_repo(name)?;
@@ -1555,6 +1617,21 @@ mod tests {
     }
 
     #[test]
+    fn n_cold_reads_derive_once_on_postgres() {
+        if !Backend::test_is_postgres() {
+            return;
+        }
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        COLD_DERIVES.store(0, Ordering::Relaxed);
+        let (_dir, store, repo, ids) = store_with_here(&chain(12));
+        let tip = *ids.last().unwrap();
+        // The same flight, held in the Postgres backend's own walks: eight
+        // cold readers of one repo join one walk, and the walk derives
+        // each changeset once.
+        n_cold_reads_derive_once_on(&store, repo, tip);
+    }
+
+    #[test]
     fn a_caller_over_the_cap_waits_then_succeeds() {
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         COLD_DERIVES.store(0, Ordering::Relaxed);
@@ -1563,12 +1640,12 @@ mod tests {
         // its permit taken. The gate, not a clock, holds it there: the
         // walk's permit stays taken for as long as the test wants.
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open_with_walks(dir.path(), 1).unwrap();
+        let store = Backend::Sqlite(Store::open_with_walks(dir.path(), 1).unwrap());
         let (repo1, ids1) = another_chain(&store, "one", &chain(3));
         let (repo2, ids2) = another_chain(&store, "two", &chain(3));
         let (repo3, ids3) = another_chain(&store, "three", &chain(3));
         let dir2 = tempfile::tempdir().unwrap();
-        let store2 = Store::open(dir2.path()).unwrap();
+        let store2 = Backend::Sqlite(Store::open(dir2.path()).unwrap());
         let (repo_b, ids_b) = another_chain(&store2, "r", &chain(3));
         let (owner, beside) = std::thread::scope(|scope| {
             let _gate = gate_closed();
@@ -1615,7 +1692,7 @@ mod tests {
     /// the walking owner's, and one per caller that joined the flight and
     /// still waits on it. A test that must have a waiter on the flight
     /// before the walk ends polls this count.
-    fn joined_on(store: &Store, repo: RepoId) -> usize {
+    fn joined_on(store: &Backend, repo: RepoId) -> usize {
         store
             .derive_flights()
             .flights
@@ -1748,7 +1825,7 @@ mod tests {
         // transactions on the write connection, and the land would wait
         // behind all of them.
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open_with_walks(dir.path(), 2).unwrap();
+        let store = Backend::Sqlite(Store::open_with_walks(dir.path(), 2).unwrap());
         let mut repos: Vec<(RepoId, ChangesetId)> = Vec::new();
         for i in 0..40 {
             let (repo, ids) = another_chain(&store, &format!("r{i}"), &chain(4));
@@ -1841,6 +1918,51 @@ mod tests {
                 "the walk derived while a writer waited"
             );
             // The writer is done: the walk goes on, and the gate lets it.
+            gate_open();
+            assert_eq!(walker.join().unwrap(), 12);
+        });
+        assert_eq!(COLD_DERIVES.load(Ordering::Relaxed), 12);
+    }
+
+    #[test]
+    fn a_walk_waits_while_a_writer_waits_on_postgres() {
+        if !Backend::test_is_postgres() {
+            return;
+        }
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        COLD_DERIVES.store(0, Ordering::Relaxed);
+        let (_dir, store, repo, ids) = store_with_here(&chain(12));
+        let tip = *ids.last().unwrap();
+        // The same writer priority, over the Postgres writer mutex: the
+        // walk's step ends, it sees a writer waiting for the connection,
+        // and the writer's write runs before the walk's next derive.
+        std::thread::scope(|scope| {
+            let _gate = gate_closed();
+            let walker = scope.spawn(|| get::<Cold<1>>(&store, repo, tip).unwrap());
+            wait_entered(1);
+            let writer = scope.spawn(|| {
+                store
+                    .write(|_| {
+                        DERIVES_AT_WRITE
+                            .store(COLD_ENTERED.load(Ordering::SeqCst), Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+            for _ in 0..2_000 {
+                if store.writers_waiting() > 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(store.writers_waiting() > 0, "the writer never waited");
+            gate_release(12);
+            writer.join().unwrap();
+            assert_eq!(
+                DERIVES_AT_WRITE.load(Ordering::SeqCst),
+                2,
+                "the walk derived while a writer waited"
+            );
             gate_open();
             assert_eq!(walker.join().unwrap(), 12);
         });

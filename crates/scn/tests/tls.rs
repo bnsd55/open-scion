@@ -6,8 +6,9 @@ use std::process::Command;
 
 use scion_core::{Changeset, IdentityTime};
 use scion_proto::listen::Limits;
+use scion_server::meta::Meta as _;
 use scion_server::meta::MetaTx as _;
-use scion_server::{Store, service, tree};
+use scion_server::{Backend, service, tree};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -91,7 +92,7 @@ fn write_pem(dir: &TempDir, name: &str, cert: &str, key: &str) -> (PathBuf, Path
 
 /// Stores a first changeset in the repo, and points `main` at it, so `scn
 /// log main` has something to show.
-fn land(store: &Store) {
+fn land(store: &Backend) {
     let cs = Changeset {
         parents: Vec::new(),
         author: IdentityTime {
@@ -119,7 +120,7 @@ fn land(store: &Store) {
 async fn serve_tls(certs: &TestCerts) -> String {
     let tls =
         scion_proto::tls::ServerTls::load(&certs.server_cert, &certs.server_key, None).unwrap();
-    let store = Store::open(&certs.dir.path().join("data")).unwrap();
+    let store = Backend::open_test(&certs.dir.path().join("data")).unwrap();
     land(&store);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

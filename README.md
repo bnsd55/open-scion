@@ -341,7 +341,10 @@ A bearer token over plain TCP to a non-loopback address stays refused.
 | [`docs/architecture.md`](docs/architecture.md) | How the parts fit together: storage, lands, reads, and the cache tiers |
 | [`docs/format-v1.md`](docs/format-v1.md) | The v1 byte format. Object IDs are hashes of these bytes. |
 | [`docs/protocol-v1.md`](docs/protocol-v1.md) | The v1 API contract: calls, limits, status codes, retries, durability and what a client checks |
+| [`docs/cli.md`](docs/cli.md) | Every `scn` command: what it does, its flags, the global flags and env vars, and the exit codes |
+| [`docs/operations.md`](docs/operations.md) | How to run a server: deploy, keys, the access file, Postgres, backups, and what each failure means |
 | [`docs/benchmarks.md`](docs/benchmarks.md) | How the demo and the benchmarks run, what each number means, and how to rerun them |
+| [`docs/RELEASING.md`](docs/RELEASING.md) | For maintainers: how a release is cut and published |
 | [`docs/design/scalable-backend.md`](docs/design/scalable-backend.md) | A design proposal, not built: stateless servers on a shared metadata store and object store |
 
 ## Design notes

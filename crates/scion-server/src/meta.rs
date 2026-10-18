@@ -87,14 +87,14 @@ pub trait Meta: Send + Sync + 'static {
     /// # Errors
     ///
     /// What `f` returns, or a database error from begin or commit.
-    fn commit<T>(&self, f: impl FnMut(&mut Self::Tx<'_>) -> Result<T>) -> Result<T>;
+    fn commit<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T>;
 
     /// [`Meta::commit`], and then [`Meta::flush`]: durable on return.
     ///
     /// # Errors
     ///
     /// As [`Meta::commit`] and [`Meta::flush`].
-    fn write<T>(&self, f: impl FnMut(&mut Self::Tx<'_>) -> Result<T>) -> Result<T>;
+    fn write<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T>;
 
     /// Returns once every commit made before this call is durable. No
     /// reply shows a commit that is not durable.
@@ -176,25 +176,41 @@ pub trait MetaTx {
     /// Deletes up to `limit` derived values of `kind` below `version`.
     fn delete_derived_below(&mut self, kind: &str, version: u32, limit: usize) -> Result<usize>;
 
-    /// The view root that a rule-set digest derives for a changeset, if
-    /// derived already.
-    fn get_view_root(
+    /// The view that a rule-set digest of `version` derives for the real
+    /// tree `tree` under the path-context digest `ctx`, if derived already.
+    /// The changeset's root view is the row of its real root tree under the
+    /// rule set's full context.
+    fn get_view_tree(
         &mut self,
         repo: RepoId,
         digest: &[u8; 32],
-        cs: ChangesetId,
+        version: u32,
+        tree: TreeId,
+        ctx: [u8; 32],
     ) -> Result<Option<TreeId>>;
 
-    /// Records the view root of a rule-set digest for a changeset. A second
-    /// write must agree with the first: derivation is deterministic, so a
-    /// mismatch means corruption.
-    fn put_view_root(
+    /// Records a derived view tree. A second write must agree with the
+    /// first: derivation is deterministic, so a mismatch means corruption.
+    fn put_view_tree(
         &mut self,
         repo: RepoId,
         digest: &[u8; 32],
-        cs: ChangesetId,
-        root: TreeId,
+        version: u32,
+        tree: TreeId,
+        ctx: [u8; 32],
+        view: TreeId,
     ) -> Result<()>;
+
+    /// Deletes up to `limit` view rows of `repo` that no live rule-set
+    /// digest can serve any more: rows of older projection versions, and
+    /// rows of digests outside `live`. Returns how many went.
+    fn delete_stale_view_trees(
+        &mut self,
+        repo: RepoId,
+        live: &[[u8; 32]],
+        version: u32,
+        limit: usize,
+    ) -> Result<usize>;
 
     /// Stores a tree. Safe to repeat.
     fn put_tree(&mut self, tree: &Tree) -> Result<TreeId>;
@@ -305,11 +321,11 @@ impl Meta for Store {
         Store::read_unflushed(self, |c| f(&mut SqliteTx(c)))
     }
 
-    fn commit<T>(&self, mut f: impl FnMut(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
+    fn commit<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
         Store::commit(self, |c| f(&mut SqliteTx(c)))
     }
 
-    fn write<T>(&self, mut f: impl FnMut(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
+    fn write<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
         Store::write(self, |c| f(&mut SqliteTx(c)))
     }
 

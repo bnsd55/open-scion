@@ -43,9 +43,12 @@ tokio-stream.workspace = true
 prost.workspace = true
 tonic.workspace = true
 tonic-health.workspace = true
+tokio-rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zstd.workspace = true
+postgres = "0.19"
+tokio-postgres-rustls = "0.14"
 
 [dev-dependencies]
 proptest.workspace = true

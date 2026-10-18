@@ -563,6 +563,7 @@ fn id_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::Backend;
     use crate::db::SqliteTx;
     use crate::meta::MetaTx as _;
     use scion_core::{FileState, IdentityTime, RepoPath};
@@ -601,7 +602,7 @@ mod tests {
                     &mut tx,
                     repo,
                     cs,
-                    &mut crate::tree::lens_of(store),
+                    &mut crate::tree::lens_of(&Backend::Sqlite(store.clone())),
                 )?;
                 let version = tx.get_ref(repo, "main")?.map(|r| r.version);
                 assert!(tx.cas_ref(repo, "main", version, id)?);
@@ -728,12 +729,10 @@ mod tests {
     #[test]
     fn a_broken_tree_body_is_bad() {
         let (_dir, store, id) = store();
-        let tree = store
-            .read(|c| {
-                let repo = SqliteTx(c).repo_id(REPO)?;
-                Ok(crate::tree::root_tree(&store, repo, id).unwrap())
-            })
-            .unwrap();
+        let repo = store.write(|c| c.repo_id(REPO)).unwrap();
+        let tree =
+            crate::tree::root_tree(&crate::backend::Backend::Sqlite(store.clone()), repo, id)
+                .unwrap();
         store
             .write(|c| {
                 let mut body: Vec<u8> = c.query_row(

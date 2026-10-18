@@ -9,7 +9,9 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,8 +25,8 @@ use scion_server::auth::Caller;
 use scion_server::deadline::Deadline;
 use scion_server::import::{BUSY_TRIES, CHECKS, ImportOptions, ImportReport, import_git};
 use scion_server::land::{LandRequest, LandState, Lands};
-use scion_server::meta::{MetaTx as _, RefState};
-use scion_server::{Error, Store, read, tree, write};
+use scion_server::meta::{Meta as _, MetaTx as _, RefState};
+use scion_server::{Backend, Error, read, tree, write};
 use tempfile::TempDir;
 
 const SUBMODULE: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -161,6 +163,17 @@ struct History {
 
 /// Builds a history that covers every entry kind, file and directory swaps,
 /// deletes, a merge, a submodule and a non-UTF-8 message.
+/// Ends the test with one printed line when it runs on Postgres: it
+/// asserts the data directory's own mechanics, which the Postgres backend
+/// does not have. The PR body lists these tests.
+fn skip_on_postgres(why: &str) -> bool {
+    if Backend::test_is_postgres() {
+        eprintln!("skip on postgres: {why}");
+        return true;
+    }
+    false
+}
+
 fn fixture() -> (Git, History) {
     let git = Git::init();
     git.write("README.md", "hello\n");
@@ -242,31 +255,31 @@ fn opts(rev: &str) -> ImportOptions {
     }
 }
 
-fn open_store() -> (TempDir, Store) {
+fn open_store() -> (TempDir, Backend) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Backend::open_test(dir.path()).unwrap();
     (dir, store)
 }
 
-fn try_import(store: &Store, git: &Git, rev: &str) -> Result<ImportReport, Error> {
+fn try_import(store: &Backend, git: &Git, rev: &str) -> Result<ImportReport, Error> {
     common::spawn_guard::prime_gix_lookup();
     import_git(store, "r", git.path(), &opts(rev))
 }
 
-fn import(store: &Store, git: &Git, rev: &str) -> ImportReport {
+fn import(store: &Backend, git: &Git, rev: &str) -> ImportReport {
     try_import(store, git, rev).unwrap()
 }
 
 /// The changeset that a git commit was imported as.
-fn changeset_of(store: &Store, commit: &str) -> ChangesetId {
+fn changeset_of(store: &Backend, commit: &str) -> ChangesetId {
+    let oid = gix::ObjectId::from_hex(commit.as_bytes()).unwrap();
     store
         .read(|c| {
-            let cs: Vec<u8> = c.query_row(
-                "SELECT cs FROM git_import WHERE git_oid = ?1",
-                [oid(commit).as_slice()],
-                |row| row.get(0),
-            )?;
-            Ok(ChangesetId::try_from(cs.as_slice()).unwrap())
+            let repo = c.repo_id("r")?;
+            Ok(c.imported_commits(repo)?
+                .get(&oid)
+                .copied()
+                .unwrap_or_else(|| panic!("{commit} is not imported")))
         })
         .unwrap()
 }
@@ -300,7 +313,7 @@ fn path(p: &str) -> RepoPath {
 }
 
 /// The root directory entry at `name`.
-fn root_entry(store: &Store, cs: ChangesetId, name: &str) -> Option<Entry> {
+fn root_entry(store: &Backend, cs: ChangesetId, name: &str) -> Option<Entry> {
     read::list_dir(store, "r", cs, None)
         .unwrap()
         .entries
@@ -309,6 +322,11 @@ fn root_entry(store: &Store, cs: ChangesetId, name: &str) -> Option<Entry> {
 
 #[test]
 fn import_matches_git_and_repeats_as_a_no_op() {
+    // Asserts the rows of the data directory's database.
+    if skip_on_postgres("asserts the data directory's mechanics") {
+        return;
+    }
+
     let (git, h) = fixture();
     let (_dir, store) = open_store();
 
@@ -321,11 +339,14 @@ fn import_matches_git_and_repeats_as_a_no_op() {
     assert_eq!(report.tip, changeset_of(&store, &h.submodule));
     assert_eq!(read::resolve_ref(&store, "r", "main").unwrap(), report.tip);
 
-    let before = store.read(|c| Ok(row_counts(&*c))).unwrap();
+    let before = store.read(|c| Ok(row_counts(c.sqlite().unwrap()))).unwrap();
     let again = import(&store, &git, "HEAD");
     assert_eq!((again.commits, again.imported, again.verified), (7, 0, 0));
     assert_eq!(again.tip, report.tip);
-    assert_eq!(store.read(|c| Ok(row_counts(&*c))).unwrap(), before);
+    assert_eq!(
+        store.read(|c| Ok(row_counts(c.sqlite().unwrap()))).unwrap(),
+        before
+    );
     let main = store
         .read(|c| {
             let repo = c.repo_id("r")?;
@@ -538,6 +559,11 @@ fn a_path_scion_cannot_store_fails_the_import() {
 
 #[test]
 fn verification_catches_a_tree_that_differs_from_git() {
+    // Asserts the rows of the data directory's database.
+    if skip_on_postgres("asserts the data directory's mechanics") {
+        return;
+    }
+
     let (git, h) = fixture();
     let (_dir, store) = open_store();
     let first = import(&store, &git, &h.root);
@@ -556,7 +582,7 @@ fn verification_catches_a_tree_that_differs_from_git() {
                 }),
             )]);
             let bad = tree::apply(c, Some(root), &extra, &mut |_| Ok(0))?;
-            c.execute(
+            c.sqlite().unwrap().execute(
                 "UPDATE derived SET value = ?1 WHERE kind = 'root_tree' AND cs = ?2",
                 params![bad.as_bytes(), first.tip.as_bytes()],
             )?;
@@ -576,7 +602,11 @@ fn verification_catches_a_tree_that_differs_from_git() {
         "a failed import does not move the ref"
     );
     let rows: i64 = store
-        .read(|c| Ok(c.query_row("SELECT count(*) FROM git_import", [], |r| r.get(0))?))
+        .read(|c| {
+            Ok(c.sqlite()
+                .unwrap()
+                .query_row("SELECT count(*) FROM git_import", [], |r| r.get(0))?)
+        })
         .unwrap();
     assert_eq!(rows, 1, "the failed batch rolled back");
 }
@@ -619,7 +649,7 @@ fn verification_catches_a_corrupt_blob() {
     }
 }
 
-fn main_ref(store: &Store) -> RefState {
+fn main_ref(store: &Backend) -> RefState {
     store
         .read(|c| {
             let repo = c.repo_id("r")?;
@@ -774,7 +804,7 @@ fn identity() -> IdentityTime {
 }
 
 /// Creates a changeset on `base` that puts `path`, through the write path.
-fn create(store: &Store, base: ChangesetId, path: &str) -> ChangesetId {
+fn create(store: &Backend, base: ChangesetId, path: &str) -> ChangesetId {
     let repo = store.read(|c| c.repo_id("r")).unwrap();
     let upload = store.blobs().upload().unwrap();
     let upload = upload.append(path.as_bytes()).unwrap();
@@ -793,7 +823,7 @@ fn create(store: &Store, base: ChangesetId, path: &str) -> ChangesetId {
 }
 
 /// Lands `cs` on `main`, and retries with the same key while the ref moves.
-fn land(store: &Store, lands: &Lands, cs: ChangesetId) -> scion_server::land::LandOutcome {
+fn land(store: &Backend, lands: &Lands, cs: ChangesetId) -> scion_server::land::LandOutcome {
     let request = LandRequest {
         repo: "r".into(),
         changeset: cs,
@@ -811,6 +841,11 @@ fn land(store: &Store, lands: &Lands, cs: ChangesetId) -> scion_server::land::La
 
 #[test]
 fn an_import_process_shares_the_data_directory_with_lands() {
+    // Asserts the rows of the data directory's database.
+    if skip_on_postgres("asserts the data directory's mechanics") {
+        return;
+    }
+
     let git = Git::init();
     let first = git.fast_commits(0, 1);
     let tip = git.fast_commits(1, 60);
@@ -886,7 +921,11 @@ fn an_import_process_shares_the_data_directory_with_lands() {
 
     // Every commit is imported, and the other ref points at the tip.
     let rows: i64 = store
-        .read(|c| Ok(c.query_row("SELECT count(*) FROM git_import", [], |row| row.get(0))?))
+        .read(|c| {
+            Ok(c.sqlite()
+                .unwrap()
+                .query_row("SELECT count(*) FROM git_import", [], |row| row.get(0))?)
+        })
         .unwrap();
     assert_eq!(rows, 400);
     assert_eq!(
@@ -911,93 +950,121 @@ fn an_import_process_shares_the_data_directory_with_lands() {
 
 #[test]
 fn a_second_server_process_is_refused() {
+    if skip_on_postgres("runs the data directory's server, which locks its database") {
+        return;
+    }
     let (dir, _server) = open_store();
-    let out = common::spawn_guard::across_spawn(|| {
-        server_process(
-            dir.path(),
-            &["serve", "--token", "t", "--listen", "127.0.0.1:0"],
-        )
-        .output()
-    })
-    .unwrap();
+    // On Postgres the second server carries the URL itself: the database
+    // is what is taken, and the refusal comes at its open.
+    let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap_or_default();
+    let extra: &[&str] = if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
+        &["--postgres-url", url.as_str()]
+    } else {
+        &[]
+    };
+    let mut args = vec!["serve", "--token", "t", "--listen", "127.0.0.1:0"];
+    args.extend_from_slice(extra);
+    let out =
+        common::spawn_guard::across_spawn(|| server_process(dir.path(), &args).output()).unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("in use by another server"), "{stderr}");
+    let said = if extra.is_empty() {
+        stderr.contains("in use by another server")
+    } else {
+        stderr.contains("another server holds this database")
+    };
+    assert!(said, "{stderr}");
 }
 
 /// Creates the import's repo up front, so the import's first write is a
 /// batch, not the repo's create.
-fn make_repo(store: &Store) {
+fn make_repo(store: &Backend) {
     store.write(|c| c.create_repo("r")).unwrap();
 }
 
 /// A store that shares its data directory, so an import keeps its write
 /// transactions short and yields between them.
-fn open_shared_store() -> (tempfile::TempDir, Store) {
+fn open_shared_store() -> (tempfile::TempDir, Backend) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open_shared(dir.path()).unwrap();
+    let store = Backend::open_test_shared(dir.path()).unwrap();
     (dir, store)
 }
 
-/// Waits until the store has `n` changesets, so a test can hold the write
-/// lock while the import's next batch runs.
-fn wait_for_writes(dir: &Path, n: i64) {
-    let watcher = Connection::open(dir.join("scion.db")).unwrap();
-    let mut enough = false;
-    for _ in 0..10000 {
-        let cs: i64 = watcher
-            .query_row("SELECT count(*) FROM changesets", [], |row| row.get(0))
-            .unwrap_or(0);
-        if cs >= n {
-            enough = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(2));
-    }
-    assert!(enough, "the import never stored {n} changesets");
-}
-
-/// Holds the store's write lock from another connection for `hold_ms`. The
-/// thread ends on its own; it commits when the hold is over. The hold takes
-/// the lock the moment a batch's commit ends, so it must outlast the flush
-/// that follows the commit plus the yield before the next batch begins.
-fn hold_for(dir: &Path, hold_ms: u64) {
+/// Takes the store's write lock with another connection and keeps it until
+/// the import's batch has hit the busy database once: the hold starts at a
+/// counted batch boundary, and releases only when a batch retried, so the
+/// batch that began inside the hold provably waited out the lock. Its
+/// writes are idempotent, so the retry is safe. The thread ends on its own;
+/// it commits when the hold is over.
+fn hold_until_a_retry(store: &Backend, dir: &Path, before: u64) {
+    let (held_tx, held_rx) = mpsc::channel();
     let db = Connection::open(dir.join("scion.db")).unwrap();
+    let watcher = store.clone();
     thread::spawn(move || {
         // The lock may be held by a batch of the import; wait for it, then
-        // hold past the writer's busy timeout.
+        // hold it.
         db.busy_timeout(Duration::from_secs(30)).unwrap();
         db.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let deadline = Instant::now() + Duration::from_millis(hold_ms);
-        while Instant::now() < deadline {
+        held_tx.send(()).unwrap();
+        // The import's first write under this hold fails as busy and the
+        // batch retries; the hold ends when that retry is counted.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while watcher.busy_retries() <= before {
+            assert!(
+                Instant::now() < deadline,
+                "the import never hit the busy lock"
+            );
             thread::sleep(Duration::from_millis(5));
         }
         db.execute_batch("COMMIT").unwrap();
     });
+    held_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the hold never took the write lock");
 }
 
 #[test]
 fn an_import_batch_waits_out_a_busy_write_lock() {
+    if skip_on_postgres("simulates the data directory's busy write lock") {
+        return;
+    }
     let git = Git::init();
     let rev = git.fast_commits(0, 3000);
     let (dir, store) = open_shared_store();
     // A busy lock fails fast, so the retry is deterministic: the holder
-    // keeps the lock far longer than the store waits for it.
+    // keeps the lock until a batch retried, and the batch runs again whole.
     store.set_busy_timeout(Duration::from_millis(100));
-    let report = thread::scope(|s| {
-        let importer = s.spawn(|| try_import(&store, &git, &rev).unwrap());
-        // Once changesets are stored, a batch is running or just ended: the
-        // hold takes the lock the moment that batch ends, so the next batch
-        // begins inside the hold. A batch is safe to run again whole.
-        wait_for_writes(dir.path(), 50);
-        hold_for(dir.path(), 1500);
-        importer.join().unwrap()
-    });
+    let store = Arc::new(store);
+    let before = store.busy_retries();
+    // The hold starts at a counted batch boundary: the hook runs after the
+    // first batch's commit has ended and returns only once the hold has the
+    // write lock, so the next batch begins inside the hold. A batch is safe
+    // to run again whole.
+    let holds = dir.path().to_path_buf();
+    let hooked = Arc::clone(&store);
+    store.set_after_batch(Some(Box::new(move |batch_no| {
+        if batch_no == 0 {
+            hold_until_a_retry(&hooked, &holds, before);
+        }
+    })));
+    let report = try_import(&store, &git, &rev).unwrap();
+    store.set_after_batch(None);
     assert_eq!((report.commits, report.imported), (3000, 3000));
+    // The batch that began inside the hold waited out the lock: its try hit
+    // the busy database, and a retry ran it again whole.
+    assert!(
+        store.busy_retries() > before,
+        "no batch ever hit the busy lock"
+    );
 }
 
 #[test]
 fn an_import_that_stays_busy_fails_with_the_busy_error() {
+    // Asserts the rows of the data directory's database.
+    if skip_on_postgres("simulates the data directory's busy write lock") {
+        return;
+    }
+
     let git = Git::init();
     let rev = git.fast_commits(0, 60);
     let (_dir, store) = open_store();
@@ -1009,17 +1076,28 @@ fn an_import_that_stays_busy_fails_with_the_busy_error() {
     assert!(matches!(error, Error::Busy), "{error:?}");
     // Nothing was written: the ref is not there, and no changeset is.
     let refs: i64 = store
-        .read(|c| Ok(c.query_row("SELECT count(*) FROM refs", [], |row| row.get(0))?))
+        .read(|c| {
+            Ok(c.sqlite()
+                .unwrap()
+                .query_row("SELECT count(*) FROM refs", [], |row| row.get(0))?)
+        })
         .unwrap();
     assert_eq!(refs, 0);
     let cs: i64 = store
-        .read(|c| Ok(c.query_row("SELECT count(*) FROM changesets", [], |row| row.get(0))?))
+        .read(|c| {
+            Ok(c.sqlite()
+                .unwrap()
+                .query_row("SELECT count(*) FROM changesets", [], |row| row.get(0))?)
+        })
         .unwrap();
     assert_eq!(cs, 0);
 }
 
 #[test]
 fn a_rolled_back_import_batch_verifies_again_when_it_reruns() {
+    if skip_on_postgres("counts the import's verification passes, a SQLite test hook") {
+        return;
+    }
     let git = Git::init();
     let rev = git.fast_commits(0, 40);
     // A clean import of the same history checks every commit once; its walk
