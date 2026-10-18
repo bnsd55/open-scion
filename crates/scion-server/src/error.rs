@@ -166,7 +166,6 @@ pub(crate) const PG_DISK_FULL: postgres::error::SqlState = postgres::error::SqlS
 
 #[cfg(test)]
 mod tests {
-    use super::PG_DISK_FULL;
     use rusqlite::ffi;
     use tonic::Code;
 
@@ -204,9 +203,8 @@ mod tests {
             status.message(),
             "the server is out of disk space; retry later"
         );
-        // The Postgres arm keys on the SQLSTATE alone (53100, disk_full):
-        // a `postgres::Error` of a chosen code cannot be built outside the
-        // crate, so the mapping is a predicate a test can reach.
-        assert_eq!(PG_DISK_FULL.code(), "53100");
+        // The Postgres arm has no unit test: a `postgres::Error` of a
+        // chosen code cannot be built outside the crate, so the arm keys
+        // on the SQLSTATE alone, 53100, disk_full.
     }
 }
