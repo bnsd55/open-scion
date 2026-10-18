@@ -867,9 +867,10 @@ async fn import_process_races_the_server_on_the_same_blob() {
     let mut put = tokio::spawn(async move { put_blob(&mut scion, &content).await });
     // The import renames the raced blob while the server's writer sits
     // in the park. The trace names every rename, so the wait reads it.
-    // The ceiling only bounds a good run: a cold CI import of one commit
-    // has taken from 30 s to over 120 s.
-    let blob_name = want.to_string();
+    // The dest path splits the ID: its first two hex digits name the
+    // folder, the remaining sixty-two name the file, so the needle is
+    // the tail. A cold CI import renamed within seconds.
+    let blob_name = want.to_string()[2..].to_owned();
     let import_from = wait_for_rename(&lazy.trace, &blob_name, 240, None);
     // The release ends the park: the server's rename lands after the
     // import's, on the same path, from its own tmp folder.
@@ -880,7 +881,7 @@ async fn import_process_races_the_server_on_the_same_blob() {
         .unwrap()
         .unwrap();
     assert_eq!(id, want);
-    let import = wait_import(import_handle);
+    wait_import(import_handle);
     // The order is the point: the server's rename of the raced blob
     // lands after the import's, from another tmp folder. A second rename
     // never came, and the park never held: the seam failed.
