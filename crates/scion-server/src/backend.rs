@@ -18,7 +18,7 @@ use crate::db::SqliteTx;
 use crate::error::Result;
 use crate::history::NodeId;
 use crate::land::{LandOutcome, LandRequest, LandState};
-use crate::meta::{Meta, MetaTx, RefState, RepoId};
+use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId};
 use crate::pg::{Pg, PgTx};
 use std::path::Path;
 
@@ -102,7 +102,7 @@ fn refuse_postgres_marker(data: &Path) -> Result<()> {
 }
 
 /// The URL of the test database.
-fn test_url() -> Result<String> {
+pub(crate) fn test_url() -> Result<String> {
     std::env::var("SCION_TEST_POSTGRES_URL").map_err(|_| {
         crate::error::Error::InvalidArgument(
             "SCION_TEST_POSTGRES_URL must name the test database".into(),
@@ -112,7 +112,7 @@ fn test_url() -> Result<String> {
 
 /// A database schema name that belongs to `data`, so the tests of one
 /// directory share it and no others see it.
-fn test_schema(data: &Path) -> String {
+pub(crate) fn test_schema(data: &Path) -> String {
     let path = data.canonicalize().unwrap_or_else(|_| data.to_path_buf());
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&path, &mut hasher);
@@ -626,6 +626,128 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.get_history_node(id),
             Self::Postgres(pg) => pg.get_history_node(id),
+        }
+    }
+
+    fn repos(&mut self) -> Result<Vec<RepoId>> {
+        match self {
+            Self::Sqlite(tx) => tx.repos(),
+            Self::Postgres(pg) => pg.repos(),
+        }
+    }
+
+    fn repo_changesets_after(
+        &mut self,
+        from_repo: RepoId,
+        from_cs: &[u8],
+        limit: usize,
+    ) -> Result<Vec<RepoChangeset>> {
+        match self {
+            Self::Sqlite(tx) => tx.repo_changesets_after(from_repo, from_cs, limit),
+            Self::Postgres(pg) => pg.repo_changesets_after(from_repo, from_cs, limit),
+        }
+    }
+
+    fn repo_changeset_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>> {
+        match self {
+            Self::Sqlite(tx) => tx.repo_changeset_ids(repo),
+            Self::Postgres(pg) => pg.repo_changeset_ids(repo),
+        }
+    }
+
+    fn stored_changeset_body(&mut self, cs: &[u8]) -> Result<Option<Vec<u8>>> {
+        match self {
+            Self::Sqlite(tx) => tx.stored_changeset_body(cs),
+            Self::Postgres(pg) => pg.stored_changeset_body(cs),
+        }
+    }
+
+    fn repo_blob_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>> {
+        match self {
+            Self::Sqlite(tx) => tx.repo_blob_ids(repo),
+            Self::Postgres(pg) => pg.repo_blob_ids(repo),
+        }
+    }
+
+    fn delete_repo_blob(&mut self, repo: RepoId, blob: &[u8]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.delete_repo_blob(repo, blob),
+            Self::Postgres(pg) => pg.delete_repo_blob(repo, blob),
+        }
+    }
+
+    fn any_repo_names(&mut self, blob: &[u8]) -> Result<bool> {
+        match self {
+            Self::Sqlite(tx) => tx.any_repo_names(blob),
+            Self::Postgres(pg) => pg.any_repo_names(blob),
+        }
+    }
+
+    fn changeset_bodies_after(
+        &mut self,
+        from: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.changeset_bodies_after(from, limit),
+            Self::Postgres(pg) => pg.changeset_bodies_after(from, limit),
+        }
+    }
+
+    fn tree_bodies_after(&mut self, from: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.tree_bodies_after(from, limit),
+            Self::Postgres(pg) => pg.tree_bodies_after(from, limit),
+        }
+    }
+
+    fn history_node_bodies_after(
+        &mut self,
+        from: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.history_node_bodies_after(from, limit),
+            Self::Postgres(pg) => pg.history_node_bodies_after(from, limit),
+        }
+    }
+
+    fn repo_blob_rows_after(
+        &mut self,
+        from_repo: RepoId,
+        from_blob: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(RepoId, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.repo_blob_rows_after(from_repo, from_blob, limit),
+            Self::Postgres(pg) => pg.repo_blob_rows_after(from_repo, from_blob, limit),
+        }
+    }
+
+    fn dangling_refs(&mut self) -> Result<Vec<(RepoId, String, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.dangling_refs(),
+            Self::Postgres(pg) => pg.dangling_refs(),
+        }
+    }
+
+    fn lands_with_missing_changesets(&mut self) -> Result<Vec<(i64, Vec<u8>, &'static str)>> {
+        match self {
+            Self::Sqlite(tx) => tx.lands_with_missing_changesets(),
+            Self::Postgres(pg) => pg.lands_with_missing_changesets(),
+        }
+    }
+
+    fn derived_rows_after(
+        &mut self,
+        kind: &str,
+        version: u32,
+        cs: &[u8],
+        limit: usize,
+    ) -> Result<Vec<FsckDerivedRow>> {
+        match self {
+            Self::Sqlite(tx) => tx.derived_rows_after(kind, version, cs, limit),
+            Self::Postgres(pg) => pg.derived_rows_after(kind, version, cs, limit),
         }
     }
 
