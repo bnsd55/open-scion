@@ -329,22 +329,10 @@ impl Metrics {
     pub fn render(&self) -> String {
         use std::fmt::Write as _;
         let mut text = String::new();
-        text.push_str("# HELP scion_requests_total Requests by RPC and code.\n");
-        text.push_str("# TYPE scion_requests_total counter\n");
-        for (rpc, known) in RPCS.iter().enumerate() {
-            for (code, name) in CODES.iter().enumerate() {
-                let value = self.requests[rpc][code].load(Ordering::Relaxed);
-                if value > 0 {
-                    let _ = writeln!(
-                        text,
-                        "scion_requests_total{{rpc=\"{known}\",code=\"{name}\"}} {value}"
-                    );
-                }
-            }
-        }
+        self.render_requests(&mut text);
         self.render_latency(&mut text);
         self.render_bytes(&mut text);
-        text.push_str("# HELP scion_lands_total Lands by outcome.\n");
+        self.render_blob_sync(&mut text);
         text.push_str("# TYPE scion_lands_total counter\n");
         for (outcome, name) in LANDS.iter().enumerate() {
             let value = self.lands[outcome].load(Ordering::Relaxed);
@@ -490,6 +478,78 @@ impl Metrics {
                     text,
                     "scion_rpc_bytes_total{{rpc=\"{known}\",direction=\"out\"}} {bytes_out}"
                 );
+            }
+        }
+    }
+
+    /// The request counter, by RPC and code, for the counted calls.
+    fn render_requests(&self, text: &mut String) {
+        use std::fmt::Write as _;
+        text.push_str("# HELP scion_requests_total Requests by RPC and code.\n");
+        text.push_str("# TYPE scion_requests_total counter\n");
+        for (rpc, known) in RPCS.iter().enumerate() {
+            for (code, name) in CODES.iter().enumerate() {
+                let value = self.requests[rpc][code].load(Ordering::Relaxed);
+                if value > 0 {
+                    let _ = writeln!(
+                        text,
+                        "scion_requests_total{{rpc=\"{known}\",code=\"{name}\"}} {value}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The land, view-walk, replan and cache series.
+    fn render_lands(&self, text: &mut String) {
+        use std::fmt::Write as _;
+        text.push_str("# HELP scion_lands_total Lands by outcome.\n");
+        text.push_str("# TYPE scion_lands_total counter\n");
+        for (outcome, name) in LANDS.iter().enumerate() {
+            let value = self.lands[outcome].load(Ordering::Relaxed);
+            if value > 0 {
+                let _ = writeln!(text, "scion_lands_total{{outcome=\"{name}\"}} {value}");
+            }
+        }
+    }
+
+    /// The view-walk counter.
+    fn render_view_walks(&self, text: &mut String) {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            text,
+            "# HELP scion_view_trees_walked_total Real trees a view derivation fetched.\n\
+             # TYPE scion_view_trees_walked_total counter\n\
+             scion_view_trees_walked_total {}",
+            self.view_trees_walked.load(Ordering::Relaxed)
+        );
+    }
+
+    /// The replan counter, when any land planned again.
+    fn render_land_replans(&self, text: &mut String) {
+        use std::fmt::Write as _;
+        let replans = self.land_replans.load(Ordering::Relaxed);
+        if replans > 0 {
+            let _ = writeln!(
+                text,
+                "# HELP scion_land_replans_total Lands whose ref moved under them, planned again.\n\
+                 # TYPE scion_land_replans_total counter\n\
+                 scion_land_replans_total {replans}"
+            );
+        }
+    }
+
+    /// The cache counters, while a tier served or fetched anything.
+    fn render_cache(&self, text: &mut String) {
+        use std::fmt::Write as _;
+        text.push_str("# HELP scion_cache_hits_total Objects a tier served from its store.\n");
+        text.push_str("# TYPE scion_cache_hits_total counter\n");
+        text.push_str("# HELP scion_cache_misses_total Objects a tier fetched from upstream.\n");
+        text.push_str("# TYPE scion_cache_misses_total counter\n");
+        for (name, counter) in [("hits", &self.cache_hits), ("misses", &self.cache_misses)] {
+            let value = counter.load(Ordering::Relaxed);
+            if value > 0 {
+                let _ = writeln!(text, "scion_cache_{name}_total {value}");
             }
         }
     }
