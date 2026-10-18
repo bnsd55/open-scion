@@ -30,7 +30,7 @@ use gix::ObjectId;
 use postgres::types::ToSql;
 
 /// PROBE BRANCH ONLY: a breadcrumb for the hang hunt. Prints one line per
-/// call when SCION_PROBE is set; silent otherwise.
+/// call when `SCION_PROBE` is set; silent otherwise.
 fn probe(site: &str, msg: impl std::fmt::Display) {
     if std::env::var_os("SCION_PROBE").is_some() {
         let t = std::thread::current();

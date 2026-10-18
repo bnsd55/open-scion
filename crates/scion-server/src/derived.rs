@@ -97,7 +97,7 @@ pub(crate) trait Kind {
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`], or of [`Store::flush`](crate::store::Store::flush).
 /// PROBE BRANCH ONLY: a breadcrumb for the hang hunt. Prints one line per
-/// call when SCION_PROBE is set; silent otherwise.
+/// call when `SCION_PROBE` is set; silent otherwise.
 fn probe(site: &str, msg: impl std::fmt::Display) {
     if std::env::var_os("SCION_PROBE").is_some() {
         let t = std::thread::current();
