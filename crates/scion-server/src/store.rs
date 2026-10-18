@@ -2385,11 +2385,11 @@ mod tests {
         );
         store.blobs().put(b"recorded").unwrap();
         let text = metrics.render();
-        // One put fsyncs the temp file and the blob directory, and, where
-        // fsync leaves the drive cache, makes one full flush: three
-        // observations on macOS, two on Linux.
+        // One put fsyncs the temp file, the fan-out directory, and the
+        // root (a first put makes the fan-out dir); where fsync leaves
+        // the drive cache, `sync` adds one full flush.
         let full_flushes = usize::from(FSYNC_LEAVES_DRIVE_CACHE);
-        let want = 2 + full_flushes;
+        let want = 3 + full_flushes;
         assert!(
             text.contains(&format!("scion_blob_sync_seconds_count {want}\n")),
             "{text}"
