@@ -364,6 +364,14 @@ impl Metrics {
                 let _ = writeln!(text, "scion_cache_{name}_total {value}");
             }
         }
+        self.render_pg(&mut text);
+        text
+    }
+
+    /// The Postgres reader-pool metrics: the wait histogram and the two
+    /// gauges. [`Metrics::render`] hands the text over.
+    fn render_pg(&self, text: &mut String) {
+        use std::fmt::Write as _;
         text.push_str(
             "# HELP scion_pg_pool_wait_seconds Time a call waited for a Postgres reader, in seconds.\n",
         );
@@ -405,7 +413,6 @@ impl Metrics {
             "scion_pg_tx_age_seconds {}",
             seconds(self.pg_tx_age.load(Ordering::Relaxed))
         );
-        text
     }
 }
 
