@@ -53,7 +53,18 @@ fi
 fetch_dataset
 import_dataset
 start_scion
-SERVER_PID=$(cat "$WORK/server.pid")
+# common.sh's start(1) runs the server under /usr/bin/time, so the PID
+# file names time(1), not the server — and time(1) may exec or fork
+# depending on the system. The process that has the server's port is the
+# server, on every system. Measure it, and only if it really is the
+# server.
+SERVER_PID=$(lsof -t -iTCP:"$SERVER_PORT" -sTCP:LISTEN 2> /dev/null | head -n 1)
+[ -n "$SERVER_PID" ] || die "no process listens on the server port"
+# macOS ps prints the full path as the command name; take the last part.
+case $(ps -o comm= -p "$SERVER_PID") in
+  */scion-server | scion-server) ;;
+  *) die "the server port is held by $(ps -o comm= -p "$SERVER_PID"), not scion-server" ;;
+esac
 CACHE_URL="http://127.0.0.1:$CACHE_PORT"
 
 # The loaders, in background with PID files, so cleanup stops them. END is
