@@ -8,8 +8,9 @@
 //! reopens from the backing directory, where [`check`] (shared with the
 //! crash suite) checks the same invariants as after a SIGKILL.
 //!
-//! The model: the cut loses the writes that the application had not fsynced
-//! when the cut came, so the suite tests sync-before-reply. It does not
+//! What the suite proves is sync-before-reply: a reply's data was fsynced
+//! before the reply went out, so a cut can lose nothing that a reply
+//! promised. It is not a full proof of power-loss survival: it does not
 //! model a drive's volatile cache, which can also lose writes that reached
 //! the drive but were never flushed, and it does not reorder writes.
 //!
@@ -42,7 +43,7 @@ mod common;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -519,10 +520,15 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
             assert!(ids.windows(2).all(|w| w[0] == w[1]), "one blob ID");
             acked.extend(ids);
         }
+        // Cut one: after the acked waves. The server freezes, is cut, and
+        // dies; a new one opens on the same mount, which is what a restart
+        // after a real cut does.
         events.line(&format!("round {round}: cut after the acked waves"));
         server.freeze();
         lazy.cut();
-        server.resume();
+        drop(server);
+        let server = Server::start(&data, &server_log);
+        events.line(&format!("round {round}: server up after the cut"));
         // A wave cut in flight: the freeze ends it, so no racer of the
         // wave gets a reply past the cut. Whatever the acked waves put
         // must be whole, and so must every file of the store.
@@ -634,16 +640,11 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
             let id = put_blob(&mut scion, &content).await.unwrap();
             acked.push((id, content));
         }
-        // The cut, and writes the server fsyncs after it: their pages sit
-        // in the daemon's cache, clean, when the server dies.
+        // The cut ends the server: on real hardware, nothing of it runs
+        // past the cut. The pages of its synced writes sit in the daemon's
+        // cache, clean, when the process dies.
         server.freeze();
         lazy.cut();
-        server.resume();
-        for _ in 0..3 {
-            let content = rng.bytes(1 << 10);
-            let id = put_blob(&mut scion, &content).await.unwrap();
-            acked.push((id, content));
-        }
         drop(scion);
         drop(server);
         // The checker writes directly into the backing, as `check` does: it
@@ -691,4 +692,104 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
         }
         drop(store);
     }
+}
+
+/// Runs git in `dir` with fixed identities and no user or system config,
+/// and returns stdout. Fails the test unless git succeeds.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = common::spawn_guard::across_spawn(|| {
+        Command::new("git")
+            .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Ada")
+            .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+            .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+            .env("GIT_COMMITTER_NAME", "Ada")
+            .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+            .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+            .output()
+    })
+    .unwrap();
+    assert!(out.status.success(), "git {args:?} failed");
+    String::from_utf8(out.stdout).unwrap().trim_end().to_owned()
+}
+
+/// Two processes write the same blob under `LazyFS`: the server, from a
+/// client's put, and a second `scion-server` process, from an import whose
+/// git commit holds the same bytes, so both persist a file of the same ID
+/// and race their rename onto the same path. The stripe lock is
+/// per-process, so this race is exactly the one it cannot see; the run of
+/// 2026-10-18 that found ESTALE in wave 0 was one process, this test is
+/// the two-process form. If it fails, the lock must be shared across
+/// processes (a lock file per stripe).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn import_process_races_the_server_on_the_same_blob() {
+    if !may_run() {
+        return;
+    }
+    let lazyfs = lazyfs_dir().unwrap();
+    let seed = seed();
+    let mut rng = Rng::new(seed);
+    let rounds = usize::try_from(env("SCION_IMPORT_RACE_ROUNDS", 6)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("import-race-server.log");
+    let mut lazy = Lazyfs::start(dir.path(), &lazyfs, 300);
+    let data = lazy.mount.join("data");
+    create_repo(&data);
+    let mut server = Server::start(&data, &log);
+    let (mut scion, _objects) = connect(&server.url).await.unwrap();
+    let mut acked = Vec::new();
+    // A git repository for the import process: one commit per round whose
+    // file holds the same bytes the client puts, so the import writes the
+    // blob the server writes.
+    let git_dir = dir.path().join("git");
+    fs::create_dir_all(&git_dir).unwrap();
+    git(&git_dir, &["init", "-q"]);
+    for round in 0..rounds {
+        let content = rng.bytes(2 << 10);
+        let want = BlobId::of(&content);
+        fs::write(git_dir.join("f.bin"), &content).unwrap();
+        git(&git_dir, &["add", "."]);
+        git(&git_dir, &["commit", "-q", "-m", &format!("round {round}")]);
+        // The import process and the client's put race on the same blob.
+        let mut import = Command::new(env!("CARGO_BIN_EXE_scion-server"))
+            .args([
+                "--data",
+                data.to_str().unwrap(),
+                "import",
+                "--repo",
+                "race",
+                "--git-dir",
+                git_dir.to_str().unwrap(),
+            ])
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let id = put_blob(&mut scion, &content).await.unwrap();
+        assert_eq!(id, want);
+        let out = import.wait().unwrap();
+        assert!(
+            out.status.success(),
+            "the import of round {round} failed: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        acked.push((id, content));
+    }
+    server.freeze();
+    lazy.cut();
+    drop(scion);
+    drop(server);
+    drop(lazy);
+    // What both processes acknowledged survives: the blob verifies from
+    // the backing, where only synced writes live.
+    let backing = lazy.backing.join("data");
+    let store = Store::open_shared(&backing).unwrap();
+    for (id, _) in &acked {
+        let status = store.blobs().verify(*id).unwrap();
+        assert_eq!(status, BlobStatus::Valid, "raced blob {id}");
+    }
+    drop(store);
 }

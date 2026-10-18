@@ -155,19 +155,44 @@ impl Drop for Server {
 }
 
 impl Server {
-    /// Freezes the server: SIGSTOP. Every reply a client got was sent
-    /// before the freeze, so a cut that follows can lose nothing that a
-    /// reply depends on ([#185]): on real hardware, nothing of the server
-    /// runs after a power cut, so no ack can follow one either.
+    /// Freezes the server, and waits until the kernel says it stopped:
+    /// SIGSTOP takes effect on the child's own schedule, and a cut that
+    /// lands before the stop finds the server still writing. Every reply
+    /// a client got was sent before the freeze, so a cut that follows can
+    /// lose nothing that a reply depends on ([#185]): on real hardware,
+    /// nothing of the server runs after a power cut, so no ack can follow
+    /// one either. The caller kills the frozen server; nothing of it runs
+    /// past the cut.
     pub fn freeze(&mut self) {
-        let pid = rustix::process::Pid::from_raw(self.child.id().cast_signed()).unwrap();
-        rustix::process::kill_process(pid, rustix::process::Signal::STOP).unwrap();
-    }
-
-    /// Resumes a frozen server: SIGCONT.
-    pub fn resume(&mut self) {
-        let pid = rustix::process::Pid::from_raw(self.child.id().cast_signed()).unwrap();
-        rustix::process::kill_process(pid, rustix::process::Signal::CONT).unwrap();
+        let pid = self.child.id();
+        let pid_i32 = pid.cast_signed();
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(pid_i32).unwrap(),
+            rustix::process::Signal::STOP,
+        )
+        .unwrap();
+        // The process state sits in field 3 of /proc/<pid>/stat, after the
+        // command in parens. `T` is stopped; a missing entry means the
+        // process is gone, which is frozen enough for a cut.
+        let stat = format!("/proc/{pid}/stat");
+        let give_up = Instant::now() + Duration::from_secs(5);
+        loop {
+            match fs::read_to_string(&stat) {
+                Ok(text) => {
+                    let after = &text[text.rfind(')').unwrap() + 1..];
+                    let state = after.split_whitespace().next().unwrap_or("");
+                    if state == "T" {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+            assert!(
+                Instant::now() < give_up,
+                "the server never stopped for the cut"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
