@@ -55,7 +55,7 @@ async fn served() -> (
             .await
             .unwrap()
     };
-    store
+    let root = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
             let root = c.insert_changeset(
