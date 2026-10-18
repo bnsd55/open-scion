@@ -841,7 +841,14 @@ async fn import_process_races_the_server_on_the_same_blob() {
     let mut import = Some(import);
     let out = wait_for("the import to finish", 130, || {
         let finished = import.as_ref().unwrap().is_finished();
-        finished.then(|| import.take().unwrap().join().unwrap())
+        finished.then(|| {
+            import
+                .take()
+                .unwrap()
+                .join()
+                .unwrap()
+                .unwrap_or_else(|error| panic!("waiting for the import failed: {error}"))
+        })
     });
     assert!(
         out.status.success(),
