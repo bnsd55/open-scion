@@ -1880,7 +1880,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
         let (key, frame) = blob(b"aaaa");
-        let n = frame.len();
         let store = DiskStore::open(&data, 1 << 20).unwrap();
         store.put(key, &frame).unwrap();
         let (other, other_frame) = blob(b"bbbb");
