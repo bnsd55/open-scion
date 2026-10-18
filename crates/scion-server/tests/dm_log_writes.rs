@@ -231,9 +231,7 @@ fn an_acknowledged_blob_survives_a_cut_at_the_last_flush_before_its_reply() {
     )
     .collect();
     assert!(!flushes.is_empty(), "the log carries flush entries");
-    let total = find_entry(&replay, &recording.log_dev, 0, false, None);
-    eprintln!("log: marks at {marks:?}, flushes at {flushes:?} (find at 0 answered {total:?})");
-    let _ = marks;
+    eprintln!("log: marks at {marks:?}, flushes at {flushes:?}");
 
     for (i, mark) in marks.iter().enumerate() {
         let n = i as u64 + 1;
