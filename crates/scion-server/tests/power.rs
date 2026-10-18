@@ -803,6 +803,13 @@ fn prepare_race_repo(git_dir: &Path, rng: &mut Rng, files: usize) -> Vec<Vec<u8>
     contents
 }
 
+/// Splits a trace line's `lfs_rename(from=...,to=...)` into its two paths.
+fn parse_rename(line: &str) -> Option<(&str, &str)> {
+    let rest = line.split("lfs_rename(from=").nth(1)?;
+    let (from, to) = rest.split_once(",to=")?;
+    Some((from, to.trim_end_matches(')')))
+}
+
 /// Counts the blob paths of a `LazyFS` ops trace that the import renamed
 /// after the server did: `from`'s tmp folder starts with the writer's
 /// process id, so each rename has an owner, and a rename of the import
@@ -817,13 +824,8 @@ fn import_renamed_after_the_server(trace: &str, server_tmp: &str, import_tmp: &s
         .enumerate()
         .filter(|(_, line)| line.contains("lfs_rename"))
     {
-        let paths: Vec<&str> = line
-            .split_whitespace()
-            .filter(|token| token.contains('/'))
-            .collect();
-        let (from, to) = match paths.as_slice() {
-            [from, to] => (*from, *to),
-            _ => continue,
+        let Some((from, to)) = parse_rename(line) else {
+            continue;
         };
         if !to.contains("/objects/") {
             continue;
@@ -940,8 +942,8 @@ async fn import_process_races_the_server_on_the_same_blob() {
     // trace must show a blob path the import renamed AFTER the server
     // renamed it. The from= folder names the writer's tmp folder, whose
     // name starts with its process id, so each rename has an owner.
-    let server_tmp = format!("/tmp/{}-", server.pid());
-    let import_tmp = format!("/tmp/{import_pid}-");
+    let server_tmp = format!("/tmp/{:x}-", server.pid());
+    let import_tmp = format!("/tmp/{import_pid:x}-");
     let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
     let raced = import_renamed_after_the_server(&trace, &server_tmp, &import_tmp);
     eprintln!("{raced} blob paths were renamed by the import after the server");
