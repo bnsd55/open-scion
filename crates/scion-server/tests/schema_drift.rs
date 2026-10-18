@@ -39,11 +39,13 @@ struct Table {
 type Schema = BTreeMap<String, Table>;
 
 /// One index: its name, the table it orders, the columns it orders by,
-/// and its partial filter, which the two dialects spell the same way.
+/// whether it is UNIQUE, and its partial filter, which the two dialects
+/// spell the same way.
 #[derive(Debug, PartialEq, Eq)]
 struct Index {
     table: String,
     columns: Vec<String>,
+    unique: bool,
     filter: String,
 }
 
@@ -124,6 +126,7 @@ fn apply(
         .strip_prefix("CREATE INDEX ")
         .or_else(|| statement.strip_prefix("CREATE UNIQUE INDEX "))
     {
+        let unique = statement.starts_with("CREATE UNIQUE INDEX");
         let rest = rest.trim_start();
         let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
         let mut words = rest.split_whitespace();
@@ -149,6 +152,7 @@ fn apply(
             Index {
                 table,
                 columns,
+                unique,
                 filter,
             },
         );

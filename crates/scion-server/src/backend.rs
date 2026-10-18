@@ -234,6 +234,10 @@ impl Backend {
         std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres")
     }
 
+    /// The schema that [`Backend::open_test`] gave this data directory on
+    /// Postgres: a test that counts rows through its own Postgres client
+    /// names it the same way. A result, so the callers unwrap one shape.
+    ///
     /// The schema a test backend of this directory uses, when the tests
     /// run on Postgres. Hidden: a test holds a lock in it from a
     /// connection of its own.

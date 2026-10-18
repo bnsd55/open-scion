@@ -20,7 +20,7 @@ use scion_server::access::Access;
 use scion_server::meta::{Meta as _, MetaTx as _};
 use scion_server::metrics::Metrics;
 use scion_server::tickets::Keys;
-use scion_server::{Backend, Store, service};
+use scion_server::{Backend, service};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -59,7 +59,7 @@ fn access() -> Access {
 /// and its blob.
 fn store() -> (tempfile::TempDir, Backend, scion_core::ChangesetId) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+    let store = Backend::open_test(dir.path()).unwrap();
     let blob = store.blobs().put(b"# hello\n").unwrap();
     let cs = scion_core::Changeset {
         parents: vec![],
@@ -358,12 +358,42 @@ fn declared() -> (Vec<(String, String)>, Vec<String>) {
 /// The repo's state that the calls must not change: the version of
 /// `main`, and the row count of every metadata table. The tables come
 /// from the store's own catalog, so a new table joins the check on its
-/// own. The Postgres backend keeps no catalog of this shape, so it
-/// answers none: the calls themselves still compare, on SQLite alone.
-fn state_of(store: &Backend) -> Option<(i64, Vec<i64>)> {
+/// own. On Postgres the rows are counted through a client of the test
+/// database, in the schema of this data directory.
+fn state_of(store: &Backend, dir: &Path) -> (i64, Vec<i64>) {
+    if Backend::test_is_postgres() {
+        let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+        let schema = Backend::test_schema(dir).expect("the tests run on Postgres");
+        let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        client
+            .batch_execute(&format!("SET search_path TO {schema}"))
+            .unwrap();
+        let tables = client
+            .query(
+                "SELECT tablename FROM pg_tables
+                 WHERE schemaname = current_schema()
+                 ORDER BY tablename",
+                &[],
+            )
+            .unwrap();
+        let counts = tables
+            .iter()
+            .map(|row| {
+                let table: String = row.get(0);
+                client
+                    .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+                    .unwrap()
+                    .get(0)
+            })
+            .collect();
+        let version = client
+            .query_one("SELECT version FROM refs WHERE name = 'main'", &[])
+            .unwrap()
+            .get(0);
+        return (version, counts);
+    }
     let Backend::Sqlite(store) = store else {
-        eprintln!("skip on postgres: the state reads the store's catalog");
-        return None;
+        unreachable!("the test backend is SQLite or Postgres")
     };
     let counts = store
         .read(|c| {
@@ -396,7 +426,7 @@ fn state_of(store: &Backend) -> Option<(i64, Vec<i64>)> {
             Ok(c.get_ref(repo, "main")?.expect("main exists").version)
         })
         .expect("main reads");
-    Some((version, counts))
+    (version, counts)
 }
 
 /// The changeset bytes of a new child of `root` that sets `path` to the
@@ -460,7 +490,7 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
         );
     }
 
-    let (_dir, store, root) = store();
+    let (dir, store, root) = store();
     let (stop, url) = serve(&store, access()).await;
 
     let channel = Channel::from_shared(url.clone())
@@ -513,7 +543,7 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
         .expect("the right token may create the changeset the land names");
     // The baseline: everything the setup stored, nothing more. The
     // refused calls and the controls are compared against it.
-    let before = state_of(&store);
+    let before = state_of(&store, dir.path());
 
     for row in &rows {
         for (who, pair) in [("no token", &none), ("wrong token", &wrong)] {
@@ -538,7 +568,7 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
         }
     }
     // No refused call moved a ref, stored a blob, or landed anything.
-    let after = state_of(&store);
+    let after = state_of(&store, dir.path());
     assert_eq!(before, after, "a refused call changed the repo");
 
     // The positive control: the same requests, sent with the right
@@ -549,7 +579,7 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
         .await
         .expect("the upload the refused calls carried is a valid one");
     assert_ne!(
-        state_of(&store),
+        state_of(&store, dir.path()),
         after,
         "the control upload changed nothing"
     );
@@ -558,7 +588,7 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
         .await
         .expect("the changeset the refused calls carried is a valid one");
     assert_ne!(
-        state_of(&store),
+        state_of(&store, dir.path()),
         after,
         "the control changeset changed nothing"
     );
@@ -571,7 +601,11 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
         })
         .await
         .expect("the land the refused calls carried is a valid one");
-    assert_ne!(state_of(&store), after, "the control land changed nothing");
+    assert_ne!(
+        state_of(&store, dir.path()),
+        after,
+        "the control land changed nothing"
+    );
 
     // And with the right token, no row answers UNAUTHENTICATED: the
     // refusal of the calls above is about the token, nothing else.
