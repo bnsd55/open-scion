@@ -28,6 +28,15 @@ use std::time::{Duration, Instant};
 
 use gix::ObjectId;
 use postgres::types::ToSql;
+
+/// PROBE BRANCH ONLY: a breadcrumb for the hang hunt. Prints one line per
+/// call when SCION_PROBE is set; silent otherwise.
+fn probe(site: &str, msg: impl std::fmt::Display) {
+    if std::env::var_os("SCION_PROBE").is_some() {
+        let t = std::thread::current();
+        eprintln!("[probe] {site} tid={:?} name={:?} {msg}", t.id(), t.name());
+    }
+}
 use postgres::{Client, Config, NoTls};
 
 /// Shorthand for the owned query parameter.
@@ -209,12 +218,17 @@ impl Readers {
     fn take(&self, wait: Duration) -> Result<ReaderGuard<'_>> {
         let started = Instant::now();
         let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        probe(
+            "pg.take",
+            format!("enter idle={} wait={wait:?}", idle.len()),
+        );
         let client = loop {
             if let Some(client) = idle.pop() {
                 break client;
             }
             let left = wait.checked_sub(started.elapsed());
             let Some(left) = left else {
+                probe("pg.take", "TIMEOUT -> Unavailable");
                 return Err(Error::Unavailable(format!(
                     "no Postgres reader free after {wait:?}; the readers are stuck in long reads"
                 )));
@@ -227,6 +241,7 @@ impl Readers {
             // A timed-out wait falls through to the top of the loop, so a
             // reader given back in this window is taken before refusing.
         };
+        probe("pg.take", "got a reader");
         let started_at = Instant::now();
         self.open_since
             .lock()
@@ -1126,13 +1141,16 @@ impl Pg {
             .writers
             .lock()
             .unwrap_or_else(PoisonError::into_inner) += 1;
-        (
+        probe("pg.lock_writer", "waiting for the writer mutex");
+        let taken = (
             self.inner
                 .writer
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
             PgWriteWaiter(&self.inner.writers, &self.inner.write_woken),
-        )
+        );
+        probe("pg.lock_writer", "writer mutex held");
+        taken
     }
 
     /// The walks in flight of this backend's derivations.
@@ -1172,6 +1190,7 @@ impl Pg {
             .writers
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        probe("pg.wait_for_writers", format!("enter waiting={waiting}"));
         while *waiting > 0 {
             let Some(deadline) = deadline else {
                 waiting = self
@@ -1179,6 +1198,7 @@ impl Pg {
                     .write_woken
                     .wait(waiting)
                     .unwrap_or_else(PoisonError::into_inner);
+                probe("pg.wait_for_writers", format!("woken waiting={waiting}"));
                 continue;
             };
             let budget = deadline
@@ -1196,6 +1216,7 @@ impl Pg {
                 ));
             }
         }
+        probe("pg.wait_for_writers", "exit");
         Ok(())
     }
 }

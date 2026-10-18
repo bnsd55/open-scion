@@ -124,6 +124,51 @@ jobs:
           SCION_TEST_POSTGRES_URL=postgres://postgres:scion@localhost:5432/scion \
           cargo test -p open-scion-server --test backend_refusals -- --ignored
 
+  # PROBE BRANCH ONLY: hunts the #258 Postgres hang. Two runs with
+  # breadcrumbs (SCION_PROBE=1): the one test alone, then the four
+  # suspects together. Each has a hard timeout, so a hang shows as a
+  # killed step with its breadcrumbs in the log, not a 30-min cancel.
+  probe-pg-hang:
+    name: probe (pg hang)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@v2
+      - name: one hung test alone
+        continue-on-error: true
+        run: |
+          SCION_PROBE=1 RUST_BACKTRACE=1 \
+          SCION_TEST_BACKEND=postgres \
+          SCION_TEST_POSTGRES_URL=postgres://postgres:scion@localhost:5432/scion \
+          timeout 240 cargo test -p open-scion-server --lib -- \
+            --test-threads=1 --nocapture a_walk_waits_while_a_writer_waits_on_postgres
+      - name: the four suspects together
+        continue-on-error: true
+        run: |
+          SCION_PROBE=1 RUST_BACKTRACE=1 \
+          SCION_TEST_BACKEND=postgres \
+          SCION_TEST_POSTGRES_URL=postgres://postgres:scion@localhost:5432/scion \
+          timeout 240 cargo test -p open-scion-server --lib -- \
+            --test-threads=4 --nocapture a_walk_waits n_cold_reads_derive_once a_changeset_that_commits_while_gc_runs
+
   test-macos:
     name: test (macOS)
     runs-on: macos-latest

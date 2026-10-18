@@ -96,6 +96,15 @@ pub(crate) trait Kind {
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`], or of [`Store::flush`](crate::store::Store::flush).
+/// PROBE BRANCH ONLY: a breadcrumb for the hang hunt. Prints one line per
+/// call when SCION_PROBE is set; silent otherwise.
+fn probe(site: &str, msg: impl std::fmt::Display) {
+    if std::env::var_os("SCION_PROBE").is_some() {
+        let t = std::thread::current();
+        eprintln!("[probe] {site} tid={:?} name={:?} {msg}", t.id(), t.name());
+    }
+}
+
 pub(crate) fn get<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
     get_until::<K>(store, repo, cs, None)
 }
@@ -196,6 +205,7 @@ fn take_walk_permit<'a>(
     walks: &'a DeriveFlights,
     deadline: Option<&Deadline>,
 ) -> Result<Permit<'a>> {
+    probe("derive.permit", "enter");
     let mut in_flight = walks
         .in_flight
         .lock()
@@ -286,8 +296,10 @@ fn retire(walks: &DeriveFlights, flight: &Arc<Flight>) {
 /// the deadline passed first.
 fn waited(flight: &Arc<Flight>, before: u64, deadline: Option<&Deadline>) -> bool {
     let mut walks = flight.walks.lock().unwrap_or_else(PoisonError::into_inner);
+    probe("derive.waited", format!("enter before={before}"));
     loop {
         if *walks > before {
+            probe("derive.waited", format!("exit true walks={walks}"));
             return true;
         }
         match deadline {
@@ -296,6 +308,7 @@ fn waited(flight: &Arc<Flight>, before: u64, deadline: Option<&Deadline>) -> boo
                     .woken
                     .wait(walks)
                     .unwrap_or_else(PoisonError::into_inner);
+                probe("derive.waited", format!("woken walks={walks}"));
             }
             Some(deadline) => {
                 let budget = deadline.at().saturating_duration_since(Instant::now());
@@ -305,6 +318,7 @@ fn waited(flight: &Arc<Flight>, before: u64, deadline: Option<&Deadline>) -> boo
                     .unwrap_or_else(PoisonError::into_inner);
                 walks = guard;
                 if result.timed_out() {
+                    probe("derive.waited", "exit false (timeout)");
                     return false;
                 }
             }
@@ -329,17 +343,21 @@ fn in_one_walk<K: Kind>(
         // while this caller waited stored it, or it was never missing.
         let known = store.read(|c| load::<K>(c, cs))?;
         if let Some(value) = known {
+            probe("derive.walk", "value known");
             return Ok(value);
         }
         // Join first: a waiter holds no walk permit, so callers that wait
         // for a running walk never take a permit from a walk of another
         // repo or kind ([#142]).
         let (flight, owner) = join::<K>(walks, repo);
+        probe("derive.walk", format!("joined owner={owner}"));
         if owner {
             // The walk's permit: walks beyond the cap only repeat work,
             // and starve the writes. Wait for one until the deadline.
             let _permit = take_walk_permit(walks, deadline)?;
+            probe("derive.walk", "permit taken, walking");
             let value = fill_until::<K>(store, repo, cs, deadline);
+            probe("derive.walk", "walk done, retiring");
             retire(walks, &flight);
             return value;
         }
@@ -909,6 +927,7 @@ mod tests {
             _: crate::tree::BlobLens<'_>,
         ) -> Result<u64> {
             COLD_ENTERED.fetch_add(1, Ordering::SeqCst);
+            probe("derive.gate", "entered the gate");
             let mut gate = COLD_GATE.lock().unwrap_or_else(PoisonError::into_inner);
             loop {
                 if gate.0 {
@@ -921,8 +940,10 @@ mod tests {
                 gate = COLD_GATE_WOKEN
                     .wait(gate)
                     .unwrap_or_else(PoisonError::into_inner);
+                probe("derive.gate", "woken at the gate");
             }
             drop(gate);
+            probe("derive.gate", "through the gate");
             std::thread::sleep(Duration::from_millis(
                 COLD_SLEEP.load(Ordering::Relaxed) as u64
             ));
