@@ -173,6 +173,13 @@ pub async fn serve(
     // the watch says so, and the loop breaks. The same watch ends the
     // server itself.
     let (stop_tx, stop_rx) = watch::channel(());
+    // The fence of a Postgres server that lost its database to another
+    // process: it resolves the same shutdown the operator's signal does,
+    // so the health service answers NOT_SERVING and tonic finishes the
+    // open calls; a short grace later the process exits, and a supervisor
+    // restart either takes the lock back or is refused at open. SQLite
+    // has no fence (None), so this task never runs.
+    let fence_stop = fence.clone().map(|fence| (fence, stop_tx.clone()));
     tokio::spawn(async move {
         shutdown.await;
         let _ = stop_tx.send(());
@@ -183,6 +190,20 @@ pub async fn serve(
             let _ = stopped.changed().await;
         }
     };
+    if let Some((fence, stop_tx)) = fence_stop {
+        tokio::spawn(async move {
+            while !fence.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            tracing::error!(
+                "this server process lost the database to another server \
+                 process; it stops serving and exits"
+            );
+            let _ = stop_tx.send(());
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            std::process::exit(70);
+        });
+    }
     tokio::spawn(sweeps(
         worker.clone(),
         Arc::clone(&lands),
@@ -210,11 +231,11 @@ pub async fn serve(
         .layer(ObjectsService::new(worker, access, quotas, tickets, metrics).into_server());
     // The health service answers `grpc.health.v1.Check` and `Watch` on the
     // same port, without a token: a probe carries none. The store opens
-    // before this call, so the server starts serving. On Postgres the
-    // fence rides along: a process that lost its database flips every
-    // name to NOT_SERVING and exits.
+    // before this call, so the server starts serving. A fence trip
+    // resolves the shutdown, so the names flip to NOT_SERVING on the
+    // service's own path, and the process exits a grace later.
     let (health, shutdown) =
-        listen::health_fenced(&["scion.v1.Scion", "scion.v1.Objects"], shutdown, fence).await;
+        listen::health(&["scion.v1.Scion", "scion.v1.Objects"], shutdown).await;
     let router = |server: Server| {
         server
             .timeout(REQUEST_TIMEOUT)

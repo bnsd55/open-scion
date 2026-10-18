@@ -1535,7 +1535,7 @@ fn fsync(file: &fs::File) -> io::Result<()> {
     rustix::fs::fsync(file).map_err(Into::into)
 }
 
-fn fsync_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
     fsync(&fs::File::open(path)?)
 }
 

@@ -22,7 +22,7 @@
 //!   twice, and the newest land holds the largest one.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use gix::ObjectId;
@@ -35,6 +35,7 @@ use scion_core::{BlobId, Changeset, ChangesetId, RepoPath, Tree, TreeId};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::auth::Caller;
+use crate::backend::Marker;
 use crate::error::{Error, Result};
 use crate::history::NodeId;
 use crate::import::SHA1;
@@ -109,10 +110,6 @@ struct PgInner {
     /// write of this backend fails from then on, and the server that
     /// holds the backend exits (the [`Fence`]).
     fence: Arc<Fence>,
-    /// The test hook of [`Fence`]: pulses left. While it is above
-    /// zero, the next exclusive setups drop the lock and fail, as if
-    /// another process had taken it.
-    test_drop_lock: Arc<AtomicUsize>,
     /// The UUID of this database, written at the first open and carried
     /// by the marker file of the data directory.
     store_uuid: [u8; 16],
@@ -336,39 +333,39 @@ impl PgClient {
             .spawn(move || {
                 let ClientConfig {
                     mut client,
-                    url,
-                    ca,
-                    options,
-                    schema,
-                    exclusive,
+                    conn,
                     fence,
-                    test_drop_lock,
                 } = cfg;
                 // The schema of the connection, named again after every
                 // reconnect; the one-server lock, taken again after every
                 // reconnect. A lock the database does not give back fails
                 // every statement that follows: another server process may
                 // hold it, and this one must not land beside it.
-                let mut setup = Setup::new(
-                    schema.as_deref(),
-                    exclusive,
-                    &mut client,
-                    test_drop_lock.clone(),
-                );
+                let mut setup = Setup::new(conn.schema.as_deref(), conn.lock_key, &mut client);
                 // BEGIN opens one; COMMIT and ROLLBACK end it. A
                 // transaction a reconnect lost fails every statement until
                 // its rollback: on the new connection, autocommit would
                 // answer COMMIT with Ok.
                 let mut tx = TxState::Idle;
+                // Whether a setup of this worker ever held the lock: the
+                // fence trips on a lock that was held and is gone, never
+                // on a first setup that never got one. The flag lives for
+                // the worker's life, so a wedge of dead transactions
+                // cannot hide a takeover from the fence.
+                let mut ever_held = setup.ok();
                 for job in rx {
-                    if tx.lost() && !job.sql.starts_with("ROLLBACK") {
+                    // A transaction the reconnect dropped fails every
+                    // statement until its caller ends it. A new BEGIN may
+                    // pass: the reconnect ended the old tx, so a BEGIN
+                    // starts a fresh one on the fresh session, and nothing
+                    // of the old tx ever runs outside a tx.
+                    if tx.lost()
+                        && !job.sql.starts_with("ROLLBACK")
+                        && !job.sql.starts_with("BEGIN")
+                    {
                         let _ = job.reply.send(Err(Error::Corrupt(TX_LOST.into())));
                         continue;
                     }
-                    // Whether any setup ever held: a lock a client never
-                    // got at all is another server's, not a lost one, and
-                    // the message says so.
-                    let mut setup_held = setup.ok();
                     // A client the server closed, as after a restart of
                     // the database, connects again: the caller sees one
                     // error at most. A reconnect inside a transaction
@@ -376,18 +373,9 @@ impl PgClient {
                     let lost_tx = tx.in_progress();
                     let mut reconnected = false;
                     if client.is_closed() {
-                        match reconnect(
-                            &mut client,
-                            &url,
-                            ca.as_deref(),
-                            &options,
-                            schema.as_deref(),
-                            exclusive,
-                            test_drop_lock.as_ref(),
-                        ) {
+                        match reconnect(&mut client, &conn) {
                             Ok(fresh) => {
                                 setup = fresh;
-                                setup_held = setup_held || setup.ok();
                                 if lost_tx {
                                     tx = TxState::Lost;
                                 }
@@ -400,36 +388,50 @@ impl PgClient {
                             }
                         }
                         reconnected = true;
+                        // The lock state of the fresh session is checked
+                        // here, before any lost-tx reply: a lock lost
+                        // across a wedge of dead transactions still fences
+                        // the process.
+                        if !setup.ok() {
+                            if ever_held {
+                                trip_fence(fence.as_ref());
+                            }
+                            let _ = job.reply.send(Err(Error::FailedPrecondition(
+                                lost_message(ever_held).into(),
+                            )));
+                            continue;
+                        }
                     }
+                    // The setup failed on a client that still lives: a
+                    // network break left the old session of this very
+                    // connection holding the lock, and the session dies
+                    // some while after the connection did. One retry a
+                    // job, so the recovery needs no process restart.
+                    if !setup.ok() {
+                        setup = Setup::new(conn.schema.as_deref(), conn.lock_key, &mut client);
+                    }
+                    if !setup.ok() {
+                        if ever_held {
+                            trip_fence(fence.as_ref());
+                        }
+                        let _ = job.reply.send(Err(Error::FailedPrecondition(
+                            lost_message(ever_held).into(),
+                        )));
+                        continue;
+                    }
+                    ever_held = true;
                     // A transaction the reconnect dropped refuses this job
                     // too: it was asked while the old connection held the
                     // transaction, and the new one holds none (its COMMIT
                     // would answer Ok about a transaction that is gone).
-                    if reconnected && lost_tx && !job.sql.starts_with("ROLLBACK") {
+                    // A new BEGIN passes: the reconnect ended the old tx,
+                    // so the BEGIN opens a fresh one on the fresh session.
+                    if reconnected
+                        && lost_tx
+                        && !job.sql.starts_with("ROLLBACK")
+                        && !job.sql.starts_with("BEGIN")
+                    {
                         let _ = job.reply.send(Err(Error::Corrupt(TX_LOST.into())));
-                        continue;
-                    }
-                    if !setup.ok() {
-                        // The setup failed on a client that still lives: a
-                        // network break left the old session of this very
-                        // connection holding the lock, and the session dies
-                        // some while after the connection did. One retry a
-                        // job, so the recovery needs no process restart.
-                        setup = Setup::new(
-                            schema.as_deref(),
-                            exclusive,
-                            &mut client,
-                            test_drop_lock.clone(),
-                        );
-                        setup_held = setup_held || setup.ok();
-                    }
-                    if !setup.ok() {
-                        if setup_held {
-                            trip_fence(fence.as_ref());
-                        }
-                        let _ = job.reply.send(Err(Error::FailedPrecondition(
-                            lost_message(setup_held).into(),
-                        )));
                         continue;
                     }
                     if job.kind == Kind::Raw {
@@ -438,14 +440,18 @@ impl PgClient {
                         let _ = job.reply.send(f(&mut client).map(|(): ()| Reply::Count(0)));
                         continue;
                     }
-                    let refs = as_refs(&job.params);
-                    let out = match job.kind {
-                        Kind::Batch => client.batch_execute(&job.sql).map(|(): ()| Reply::Count(0)),
-                        Kind::Count => client.execute(&job.sql, &refs).map(Reply::Count),
-                        Kind::Rows => client.query(&job.sql, &refs).map(Reply::Rows),
-                        Kind::Raw => unreachable!("a raw job ran above"),
+                    let out = run_with_retry(
+                        &mut client,
+                        &mut setup,
+                        &conn,
+                        &job,
+                        &mut tx,
+                        ever_held,
+                        fence.as_ref(),
+                    );
+                    if setup.ok() {
+                        ever_held = true;
                     }
-                    .map_err(map_pg_error);
                     tx = tx.after(&job.sql, out.is_ok());
                     if job.reply.send(out).is_err() {
                         break;
@@ -594,8 +600,14 @@ impl Pg {
     ///
     /// A URL that does not parse, a database that does not connect, a
     /// schema of a newer build, or a migration that fails.
-    pub fn open(url: &str, ca: Option<&Path>, readers: usize, data: &Path) -> Result<Self> {
-        Self::open_in(url, ca, readers, data, None, false)
+    pub(crate) fn open(
+        url: &str,
+        ca: Option<&Path>,
+        readers: usize,
+        data: &Path,
+        marker: Marker,
+    ) -> Result<Self> {
+        Self::open_in(url, ca, readers, data, None, false, marker)
     }
 
     /// [`Pg::open`], as the one server process of the database: a second
@@ -605,13 +617,14 @@ impl Pg {
     /// # Errors
     ///
     /// As [`Pg::open`], and another process holds the one-server lock.
-    pub fn open_exclusive(
+    pub(crate) fn open_exclusive(
         url: &str,
         ca: Option<&Path>,
         readers: usize,
         data: &Path,
+        marker: Marker,
     ) -> Result<Self> {
-        Self::open_in(url, ca, readers, data, None, true)
+        Self::open_in(url, ca, readers, data, None, true, marker)
     }
 
     /// [`Pg::open`], in `schema` instead of the database's default one, for
@@ -621,13 +634,19 @@ impl Pg {
     /// # Errors
     ///
     /// As [`Pg::open`].
-    pub fn open_test(url: &str, schema: &str, readers: usize, data: &Path) -> Result<Self> {
+    pub(crate) fn open_test(
+        url: &str,
+        schema: &str,
+        readers: usize,
+        data: &Path,
+        marker: Marker,
+    ) -> Result<Self> {
         {
             // One throwaway client makes the schema, before any connection
             // narrows its search path to it. It names itself first, so no
             // parallel cleanup mistakes a live schema for a stale one.
-            let maker = connect(url, None)?;
-            maker.as_raw({
+            let preparer = connect(url, None)?;
+            preparer.as_raw({
                 let name = schema.to_owned();
                 move |client| {
                     client
@@ -635,11 +654,11 @@ impl Pg {
                         .map_err(map_pg_error)
                 }
             })?;
-            drop_stale_schemas(&maker);
+            drop_stale_schemas(&preparer);
             // One maker at a time: two concurrent `CREATE TABLE IF NOT
             // EXISTS` of the registry race on the type catalog, and the
             // loser dies. The lock lives for this one transaction only.
-            maker.as_raw({
+            preparer.as_raw({
                 let name = schema.to_owned();
                 move |client| {
                     client
@@ -658,7 +677,10 @@ impl Pg {
                 }
             })?;
         }
-        Self::open_in(url, None, readers, data, Some(schema), false)
+        // The test store is the one server of its schema: it takes the
+        // per-schema one-server lock, and its loss fences the process,
+        // exactly as a serve does on the database key.
+        Self::open_in(url, None, readers, data, Some(schema), true, marker)
     }
 
     /// [`Pg::open`], in the search path of `schema` when it is set.
@@ -670,18 +692,25 @@ impl Pg {
         data: &Path,
         schema: Option<&str>,
         exclusive: bool,
+        marker: Marker,
     ) -> Result<Self> {
         let options = base_options();
         let fence = Arc::new(Fence::new());
-        let test_drop_lock = Arc::new(AtomicUsize::new(0));
+        // The one-server lock of the database, or of one test schema: a
+        // key per schema, so parallel tests do not block each other.
+        let lock_key = if exclusive {
+            Some(schema.map_or(SERVER_LOCK, schema_lock_key))
+        } else {
+            None
+        };
         let mut writer = if exclusive {
             connect_exclusive(
                 url,
                 ca,
                 &options,
                 schema,
+                lock_key.expect("an exclusive open names a lock"),
                 Arc::clone(&fence),
-                Arc::clone(&test_drop_lock),
             )?
         } else {
             connect_with(url, ca, &options, schema)?
@@ -703,9 +732,25 @@ impl Pg {
         // on a directory of another store would name blobs of another disk.
         let first = writer.query("SELECT uuid FROM store_uuid WHERE one = 1", &[])?;
         let store_uuid = if let Some(row) = first.first() {
-            uuid_of(row.get::<_, Vec<u8>>("uuid"))
+            // The database already names its store: a directory that
+            // names no store was never served by it, and would collect
+            // blobs of another disk. Refuse before anything is written.
+            let uuid = uuid_of(row.get::<_, Vec<u8>>("uuid"));
+            if !marker.present {
+                return Err(Error::FailedPrecondition(format!(
+                    "this database names the store {}, but the data \
+                     directory carries no marker of it: give the \
+                     directory the database was served with, or a \
+                     directory it has never served",
+                    hex16(&uuid)
+                )));
+            }
+            uuid
         } else {
-            let fresh = uuid_new();
+            // A marker that names a store is the identity to adopt: a
+            // dump taken before the UUID existed restores next to its
+            // own directory, and they agree. A fresh database mints.
+            let fresh = marker.uuid.unwrap_or_else(uuid_new);
             writer.query(
                 "INSERT INTO store_uuid (one, uuid) VALUES (1, $1) \
                  ON CONFLICT (one) DO NOTHING",
@@ -720,19 +765,40 @@ impl Pg {
         };
         let blobs = Blobs::open(data)?;
         blobs.sweep_tmp(false)?;
-        Ok(Self {
-            inner: Arc::new(PgInner {
-                writer: Mutex::new(writer),
-                fence,
-                test_drop_lock,
-                store_uuid,
-                readers: Readers::new_with(readers, url, ca, &options, schema)?,
-                blobs,
-                writers: Mutex::new(0),
-                write_woken: Condvar::new(),
-                derive: crate::derived::DeriveFlights::new(crate::store::DERIVE_WALKS_CAP),
-            }),
-        })
+        let inner = Arc::new(PgInner {
+            writer: Mutex::new(writer),
+            fence,
+            store_uuid,
+            readers: Readers::new_with(readers, url, ca, &options, schema)?,
+            blobs,
+            writers: Mutex::new(0),
+            write_woken: Condvar::new(),
+            derive: crate::derived::DeriveFlights::new(crate::store::DERIVE_WALKS_CAP),
+        });
+        // The probe of a server that lost its lock: once a minute the
+        // session checks itself, through the job queue like every
+        // statement, so the lock and the fence are checked on the way.
+        // It rides a weak handle: the probe dies with the backend, and
+        // holds nothing open.
+        if exclusive {
+            let probe = Arc::downgrade(&inner);
+            std::thread::Builder::new()
+                .name("pg-probe".into())
+                .spawn(move || {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(60));
+                        let Some(inner) = probe.upgrade() else {
+                            return;
+                        };
+                        // A dead connection or a fenced store both fail
+                        // here and are seen on the next real call; the
+                        // probe exists to trip the fence on time.
+                        let _ = inner.writer.lock().unwrap().query_opt("SELECT 1", &[]);
+                    }
+                })
+                .map_err(crate::error::Error::Io)?;
+        }
+        Ok(Self { inner })
     }
 
     /// The UUID of this database, which the marker file of the data
@@ -762,13 +828,6 @@ impl Pg {
     /// The fence flag, for the health service of a serving process.
     pub(crate) fn fence_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.inner.fence.tripped)
-    }
-
-    /// The test hook of a lost one-server lock: the next exclusive setups
-    /// drop the lock and fail, so a test can force the fence without a
-    /// second process.
-    pub(crate) fn arm_lock_loss(&self) {
-        self.inner.test_drop_lock.store(2, Ordering::SeqCst);
     }
 
     /// The blob folder.
@@ -1040,31 +1099,26 @@ impl Drop for PgTx<'_> {
 /// that refuses a second one.
 struct Setup {
     schema: Option<String>,
-    exclusive: bool,
+    /// The advisory lock this session takes, if any: the one-server lock
+    /// of a database, or of one test schema. None for a client that
+    /// takes no lock (a reader, an import).
+    lock_key: Option<i64>,
     /// The setup ran to the end: the schema was set, and the lock, if
     /// one was asked for, was given. A client whose setup failed serves
     /// nothing, whatever it holds a lock with.
     applied: bool,
     locked: bool,
-    /// The test hook that makes this setup lose the lock: while it
-    /// carries pulses, the one-server lock is unlocked and not taken,
-    /// as if another process held it ([`Backend::arm_lock_loss`]).
-    test_drop_lock: Option<Arc<AtomicUsize>>,
 }
 
 impl Setup {
-    fn new(
-        schema: Option<&str>,
-        exclusive: bool,
-        client: &mut Client,
-        test_drop_lock: Option<Arc<AtomicUsize>>,
-    ) -> Self {
+    /// Applies the setup to a fresh client. A failed setup leaves the
+    /// statements failed until a reconnect applies it again.
+    fn new(schema: Option<&str>, lock_key: Option<i64>, client: &mut Client) -> Self {
         let mut setup = Self {
             schema: schema.map(str::to_owned),
-            exclusive,
+            lock_key,
             applied: false,
-            locked: !exclusive,
-            test_drop_lock,
+            locked: lock_key.is_none(),
         };
         if setup.apply(client) {
             setup
@@ -1073,10 +1127,9 @@ impl Setup {
             // reconnect applies it again.
             Self {
                 schema: setup.schema,
-                exclusive: setup.exclusive,
+                lock_key: setup.lock_key,
                 applied: false,
                 locked: false,
-                test_drop_lock: None,
             }
         }
     }
@@ -1084,7 +1137,7 @@ impl Setup {
     /// Whether the setup holds: it ran to the end, and a one-server
     /// lock, if one was asked for, is held.
     fn ok(&self) -> bool {
-        self.applied && (!self.exclusive || self.locked)
+        self.applied && (self.lock_key.is_none() || self.locked)
     }
 
     fn apply(&mut self, client: &mut Client) -> bool {
@@ -1101,20 +1154,12 @@ impl Setup {
                 return false;
             }
         }
-        if self.exclusive {
-            // The test hook: lose the lock the way a takeover loses it,
-            // unlocked and held by another process, for the next setups.
-            if let Some(pulses) = self.test_drop_lock.as_ref()
-                && drop_pulse(pulses)
-            {
-                let _ = client.query_opt("SELECT pg_advisory_unlock($1)", &[&SERVER_LOCK]);
-                return false;
-            }
-            if !server_lock_raw(client) {
-                return false;
-            }
+        if let Some(key) = self.lock_key
+            && !server_lock_raw(client, key)
+        {
+            return false;
         }
-        self.locked = self.exclusive;
+        self.locked = self.lock_key.is_some();
         self.applied = true;
         true
     }
@@ -1149,6 +1194,58 @@ fn trip_fence(fence: Option<&Arc<Fence>>) {
     }
 }
 
+/// Runs one statement, and once more on a fresh session when the
+/// connection died under it: the first statement after a loss goes
+/// through the reconnect and the lock check, and answers what the fresh
+/// session holds, not the death of the old one. Only a job outside a
+/// transaction retries: a transaction was dropped with the connection,
+/// and its caller must see that.
+fn run_with_retry(
+    client: &mut Client,
+    setup: &mut Setup,
+    conn: &Conn,
+    job: &Job,
+    tx: &mut TxState,
+    ever_held: bool,
+    fence: Option<&Arc<Fence>>,
+) -> Result<Reply> {
+    let out = run_statement(client, job);
+    if out.is_ok() || !client.is_closed() {
+        return out;
+    }
+    let Ok(fresh) = reconnect(client, conn) else {
+        // The connection stays dead; the original error stands, and the
+        // next job reconnects.
+        return out;
+    };
+    *setup = fresh;
+    if !setup.ok() {
+        if ever_held {
+            trip_fence(fence);
+        }
+        return Err(Error::FailedPrecondition(lost_message(ever_held).into()));
+    }
+    // The fresh session holds no transaction: one that was in progress
+    // was dropped with the old session, and nothing of it runs here.
+    if tx.in_progress() {
+        *tx = TxState::Lost;
+        return Err(Error::Corrupt(TX_LOST.into()));
+    }
+    run_statement(client, job)
+}
+
+/// Runs one statement of a job on the client.
+fn run_statement(client: &mut Client, job: &Job) -> Result<Reply> {
+    let refs = as_refs(&job.params);
+    match job.kind {
+        Kind::Batch => client.batch_execute(&job.sql).map(|(): ()| Reply::Count(0)),
+        Kind::Count => client.execute(&job.sql, &refs).map(Reply::Count),
+        Kind::Rows => client.query(&job.sql, &refs).map(Reply::Rows),
+        Kind::Raw => unreachable!("a raw job ran in its own branch"),
+    }
+    .map_err(map_pg_error)
+}
+
 /// The reply of a statement a reconnect robbed of its transaction.
 const TX_LOST: &str = "the transaction was lost with the connection; \
      roll it back and run it again";
@@ -1168,23 +1265,10 @@ fn lost_message(setup_held: bool) -> &'static str {
 /// Reconnects a dead client, applies the setup again, and hands the new
 /// setup back: the caller folds it into `setup_held` and the lost
 /// transaction state.
-fn reconnect(
-    client: &mut Client,
-    url: &str,
-    ca: Option<&Path>,
-    options: &str,
-    schema: Option<&str>,
-    exclusive: bool,
-    test_drop_lock: Option<&Arc<AtomicUsize>>,
-) -> Result<Setup> {
-    let fresh = connect_on(url, ca, options)?;
+fn reconnect(client: &mut Client, conn: &Conn) -> Result<Setup> {
+    let fresh = connect_on(&conn.url, conn.ca.as_deref(), &conn.options)?;
     *client = fresh;
-    Ok(Setup::new(
-        schema,
-        exclusive,
-        client,
-        test_drop_lock.cloned(),
-    ))
+    Ok(Setup::new(conn.schema.as_deref(), conn.lock_key, client))
 }
 
 /// Whether the worker's client is inside the transaction a `BEGIN`
@@ -1223,44 +1307,54 @@ impl TxState {
     }
 }
 
-/// What a worker needs to run, and to connect again when its client dies.
-struct ClientConfig {
-    client: Client,
+/// How a worker reconnects: where to connect, and what setup to apply
+/// again. One per [`ClientConfig`].
+struct Conn {
     url: String,
     ca: Option<PathBuf>,
     options: String,
     /// The schema a reconnect narrows itself to again.
     schema: Option<String>,
-    /// Re-take the one-server lock after every reconnect.
-    exclusive: bool,
+    /// The advisory lock this session re-takes after every reconnect,
+    /// if any.
+    lock_key: Option<i64>,
+}
+
+/// What a worker needs to run, and to connect again when its client dies.
+struct ClientConfig {
+    client: Client,
+    conn: Conn,
     /// The process fence of the exclusive client: tripped when a setup
-    /// that once held the one-server lock no longer does.
+    /// that once held the lock no longer does.
     fence: Option<Arc<Fence>>,
-    /// The test hook that makes the next setups lose the lock (see
-    /// [`Backend::arm_lock_loss`]). None, and always empty, in production.
-    test_drop_lock: Option<Arc<AtomicUsize>>,
 }
 
-/// Consumes one pulse of the test hook: true while pulses are left.
-fn drop_pulse(pulses: &AtomicUsize) -> bool {
-    let mut now = pulses.load(Ordering::SeqCst);
-    loop {
-        if now == 0 {
-            return false;
-        }
-        match pulses.compare_exchange(now, now - 1, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => return true,
-            Err(got) => now = got,
-        }
-    }
+/// The advisory-lock key of one test schema, so parallel tests of
+/// different schemas do not block each other on the one lock.
+pub(crate) fn schema_lock_key(schema: &str) -> i64 {
+    let hash = blake3::hash(schema.as_bytes());
+    SERVER_LOCK.wrapping_add(i64::from_be_bytes(
+        hash.as_bytes()[..8].try_into().expect("8 of 32 bytes"),
+    ))
 }
 
-/// The advisory lock of the one server process of a database: a second
-/// `serve` or `derive` on the same URL is refused. Runs on the worker
-/// thread, like every statement.
-fn server_lock_raw(client: &mut Client) -> bool {
+/// 16 bytes as 32 lowercase hex digits.
+fn hex16(bytes: &[u8; 16]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(32), |mut hex, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
+
+/// The advisory lock of the one server process of a database, or of one
+/// test schema: a second `serve` or `derive` on the same target is
+/// refused. Runs on the worker thread, like every statement.
+fn server_lock_raw(client: &mut Client, key: i64) -> bool {
     client
-        .query_opt("SELECT pg_try_advisory_lock($1)", &[&SERVER_LOCK])
+        .query_opt("SELECT pg_try_advisory_lock($1)", &[&key])
         .is_ok_and(|row| row.is_some_and(|row| row.get::<_, bool>(0)))
 }
 
@@ -1277,48 +1371,39 @@ fn connect_with(
     options: &str,
     schema: Option<&str>,
 ) -> Result<PgClient> {
-    spawn_client(url, ca, options, schema, false, None, None)
+    spawn_client(url, ca, options, schema, None, None)
 }
 
 /// [`connect_with`], as the one server process of the database: the
 /// advisory lock it takes survives as long as the client, and a
-/// reconnecting client takes it again. The process fence and the test
-/// hook ride along: a lost lock trips the fence ([`Fence`]).
+/// reconnecting client takes it again. A lost lock trips the fence
+/// ([`Fence`]).
 fn connect_exclusive(
     url: &str,
     ca: Option<&Path>,
     options: &str,
     schema: Option<&str>,
+    lock_key: i64,
     fence: Arc<Fence>,
-    test_drop_lock: Arc<AtomicUsize>,
 ) -> Result<PgClient> {
     // Whether the lock was given is decided at the spawn: one probe job
     // brings a refusal here, to the open, so an operator whose second
     // server starts against a taken database sees it now, and not in the
     // errors of the first call a client makes.
-    let client = spawn_client(
-        url,
-        ca,
-        options,
-        schema,
-        true,
-        Some(fence),
-        Some(test_drop_lock),
-    )?;
+    let client = spawn_client(url, ca, options, schema, Some(lock_key), Some(fence))?;
     client.query_opt("SELECT 1", &[])?;
     Ok(client)
 }
 
-/// Puts one client on its worker thread. `exclusive` re-takes the
-/// one-server lock after every reconnect.
+/// Puts one client on its worker thread. A `lock_key` is re-taken after
+/// every reconnect, and its loss trips the fence.
 fn spawn_client(
     url: &str,
     ca: Option<&Path>,
     options: &str,
     schema: Option<&str>,
-    exclusive: bool,
+    lock_key: Option<i64>,
     fence: Option<Arc<Fence>>,
-    test_drop_lock: Option<Arc<AtomicUsize>>,
 ) -> Result<PgClient> {
     let client =
         std::thread::scope(|scope| scope.spawn(|| connect_on(url, ca, options)).join().unwrap())?;
@@ -1326,13 +1411,14 @@ fn spawn_client(
     // caller may be a tokio one, which must never block on this client.
     Ok(PgClient::spawn(ClientConfig {
         client,
-        url: url.to_owned(),
-        ca: ca.map(Path::to_path_buf),
-        options: options.to_owned(),
-        schema: schema.map(str::to_owned),
-        exclusive,
+        conn: Conn {
+            url: url.to_owned(),
+            ca: ca.map(Path::to_path_buf),
+            options: options.to_owned(),
+            schema: schema.map(str::to_owned),
+            lock_key,
+        },
         fence,
-        test_drop_lock,
     }))
 }
 

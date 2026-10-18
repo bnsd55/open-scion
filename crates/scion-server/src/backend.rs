@@ -69,11 +69,28 @@ const _: () = assert!(PG_READERS == crate::store::READERS);
 /// directory is a SQLite one: directories of older builds have no file.
 const MARKER: &str = "backend";
 
-/// Marks `data` as Postgres-backed, and refuses to open Postgres on a
-/// directory whose metadata a SQLite store already holds. The marker's
-/// second line, the store UUID, is written once the database is open
-/// and names its identity.
-fn postgres_marker(data: &Path) -> Result<()> {
+/// What the data directory's marker held when an open began.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Marker {
+    pub(crate) uuid: Option<[u8; 16]>,
+    pub(crate) present: bool,
+}
+
+impl Marker {
+    /// Reads the marker of `data`, if any.
+    pub(crate) fn read(data: &Path) -> Self {
+        let present = data.join(MARKER).exists();
+        Self {
+            uuid: marker_uuid(data),
+            present,
+        }
+    }
+}
+
+/// Refuses to open Postgres on a directory whose metadata a SQLite
+/// store already holds: its rows live in that database, and a second,
+/// empty store here would look like a server with no data at all.
+fn refuse_sqlite_dir(data: &Path) -> Result<()> {
     let db = data.join("scion.db");
     if db.metadata().is_ok_and(|m| m.len() > 0) {
         return Err(crate::error::Error::InvalidArgument(
@@ -82,14 +99,9 @@ fn postgres_marker(data: &Path) -> Result<()> {
                 .into(),
         ));
     }
-    // The open may name a directory that does not exist yet: the marker
-    // is its first file. Written once: an open of an existing store must
-    // not drop the UUID a previous open recorded.
+    // The open may name a directory that does not exist yet: the blobs
+    // of a fresh store go here.
     std::fs::create_dir_all(data).map_err(crate::error::Error::Io)?;
-    let marker = data.join(MARKER);
-    if !marker.exists() {
-        std::fs::write(&marker, "postgres\n").map_err(crate::error::Error::Io)?;
-    }
     Ok(())
 }
 
@@ -130,8 +142,10 @@ fn marker_uuid(data: &Path) -> Option<[u8; 16]> {
 
 /// Puts the database's UUID in the marker, and refuses when the marker
 /// names another store: a database restored on the directory of another
-/// store would serve metadata whose blobs are not on this disk.
-fn marker_agrees(data: &Path, uuid: [u8; 16]) -> Result<()> {
+/// store would serve metadata whose blobs are not on this disk. A
+/// refusal writes nothing: the UUID was compared in the database open,
+/// before any blob of this directory was named.
+fn marker_agrees(data: &Path, marker_was_absent: bool, uuid: [u8; 16]) -> Result<()> {
     let marker = data.join(MARKER);
     match marker_uuid(data) {
         Some(held) if held != uuid => {
@@ -147,11 +161,35 @@ fn marker_agrees(data: &Path, uuid: [u8; 16]) -> Result<()> {
         }
         Some(_) => {}
         None => {
-            std::fs::write(&marker, format!("postgres\n{}\n", hex16(&uuid)))
-                .map_err(crate::error::Error::Io)?;
+            // A fresh pair, or a marker that predates the UUID: the
+            // database's identity is the one this directory takes.
+            if marker_was_absent {
+                // The claim of a fresh directory is its first file.
+                std::fs::write(&marker, "postgres\n").map_err(crate::error::Error::Io)?;
+            }
+            write_marker(&marker, uuid)?;
         }
     }
     Ok(())
+}
+
+/// Writes the marker with `uuid` on its second line, durable: a marker
+/// half-written would name no store and refuse the next open.
+fn write_marker(marker: &Path, uuid: [u8; 16]) -> Result<()> {
+    let tmp = tempfile::NamedTempFile::new_in(marker.parent().unwrap_or_else(|| Path::new(".")))
+        .map_err(crate::error::Error::Io)?;
+    (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        tmp.as_file()
+            .write_all(format!("postgres\n{}\n", hex16(&uuid)).as_bytes())?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(marker).map_err(|e| e.error)?;
+        if let Some(dir) = marker.parent() {
+            let _ = crate::store::fsync_dir(dir);
+        }
+        Ok(())
+    })()
+    .map_err(crate::error::Error::Io)
 }
 
 /// 16 bytes as 32 lowercase hex digits.
@@ -182,6 +220,14 @@ fn test_schema(data: &Path) -> String {
 }
 
 impl Backend {
+    /// The advisory-lock key of the test schema's one-server lock, for
+    /// the test that takes the lock from its own connection, as a
+    /// second server process would.
+    #[doc(hidden)]
+    pub fn test_server_lock(data: &Path) -> Result<i64> {
+        Ok(crate::pg::schema_lock_key(&test_schema(data)))
+    }
+
     /// The derive walks of this backend: which are in flight, and the cap
     /// on how many may be.
     pub(crate) fn derive_flights(&self) -> &crate::derived::DeriveFlights {
@@ -226,9 +272,10 @@ impl Backend {
     /// What the store or the database returns.
     pub fn open(data: &Path, postgres_url: Option<&str>, ca: Option<&Path>) -> Result<Self> {
         if let Some(url) = postgres_url {
-            postgres_marker(data)?;
-            let pg = Pg::open_exclusive(url, ca, PG_READERS, data)?;
-            marker_agrees(data, pg.store_uuid())?;
+            let marker = Marker::read(data);
+            refuse_sqlite_dir(data)?;
+            let pg = Pg::open_exclusive(url, ca, PG_READERS, data, marker)?;
+            marker_agrees(data, !marker.present, pg.store_uuid())?;
             Ok(Self::Postgres(pg))
         } else {
             refuse_postgres_marker(data)?;
@@ -245,9 +292,10 @@ impl Backend {
     /// What the store or the database returns.
     pub fn open_shared(data: &Path, postgres_url: Option<&str>, ca: Option<&Path>) -> Result<Self> {
         if let Some(url) = postgres_url {
-            postgres_marker(data)?;
-            let pg = Pg::open(url, ca, PG_READERS, data)?;
-            marker_agrees(data, pg.store_uuid())?;
+            let marker = Marker::read(data);
+            refuse_sqlite_dir(data)?;
+            let pg = Pg::open(url, ca, PG_READERS, data, marker)?;
+            marker_agrees(data, !marker.present, pg.store_uuid())?;
             Ok(Self::Postgres(pg))
         } else {
             refuse_postgres_marker(data)?;
@@ -264,9 +312,10 @@ impl Backend {
     #[doc(hidden)]
     pub fn open_test_shared(data: &Path) -> Result<Self> {
         if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
-            postgres_marker(data)?;
-            let pg = Pg::open_test(&test_url()?, &test_schema(data), PG_READERS, data)?;
-            marker_agrees(data, pg.store_uuid())?;
+            let marker = Marker::read(data);
+            refuse_sqlite_dir(data)?;
+            let pg = Pg::open_test(&test_url()?, &test_schema(data), PG_READERS, data, marker)?;
+            marker_agrees(data, !marker.present, pg.store_uuid())?;
             return Ok(Self::Postgres(pg));
         }
         refuse_postgres_marker(data)?;
@@ -284,9 +333,10 @@ impl Backend {
     #[doc(hidden)]
     pub fn open_test(data: &Path) -> Result<Self> {
         if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
-            postgres_marker(data)?;
-            let pg = Pg::open_test(&test_url()?, &test_schema(data), PG_READERS, data)?;
-            marker_agrees(data, pg.store_uuid())?;
+            let marker = Marker::read(data);
+            refuse_sqlite_dir(data)?;
+            let pg = Pg::open_test(&test_url()?, &test_schema(data), PG_READERS, data, marker)?;
+            marker_agrees(data, !marker.present, pg.store_uuid())?;
             return Ok(Self::Postgres(pg));
         }
         refuse_postgres_marker(data)?;
@@ -323,16 +373,6 @@ impl Backend {
         match self {
             Self::Sqlite(_) => None,
             Self::Postgres(pg) => Some(pg.fence_flag()),
-        }
-    }
-
-    /// The test hook of a lost one-server lock: the next exclusive setups
-    /// of the database drop the lock and fail, so a test can force the
-    /// fence without a second process. A no-op on SQLite.
-    #[doc(hidden)]
-    pub fn arm_lock_loss(&self) {
-        if let Self::Postgres(pg) = self {
-            pg.arm_lock_loss();
         }
     }
 

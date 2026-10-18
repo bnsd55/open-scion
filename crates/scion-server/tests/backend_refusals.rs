@@ -188,9 +188,9 @@ fn a_database_refuses_the_directory_of_another_store() {
 }
 
 /// A process that loses the one-server lock is fenced: another process
-/// may hold the database now, so every read and write fails, and the
-/// server exits (`health_fenced`). The hook makes the writer's next
-/// setups lose the lock the way a takeover does.
+/// holds the database now, so every read and write fails, and the server
+/// exits. The takeover is real: the test kills the store's session and
+/// takes the lock from its own connection, as a second server would.
 #[test]
 fn a_lost_server_lock_fences_the_backend() {
     if skip_on_sqlite() {
@@ -202,22 +202,25 @@ fn a_lost_server_lock_fences_the_backend() {
         .write(|c| c.create_repo("before").map(|_| ()))
         .unwrap();
     assert!(!Backend::fenced(&store));
-    store.arm_lock_loss();
-    // The server's own sessions die: the next statement reconnects, and
-    // the hook drops the lock on it, as a takeover would.
+    // The takeover: kill the store's session, then take the lock before
+    // the store's next statement can.
     let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
     let schema = Backend::test_schema(dir.path()).unwrap();
-    let mut killer = postgres::Client::connect(&url, postgres::NoTls).unwrap();
-    killer
+    let key = Backend::test_server_lock(dir.path()).unwrap();
+    let mut taker = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    taker
         .batch_execute(&format!(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
              WHERE application_name = '{schema}' AND pid <> pg_backend_pid()"
         ))
         .unwrap();
-    // A write reconnects, loses the lock, and the fence trips.
+    taker.query("SELECT pg_advisory_lock($1)", &[&key]).unwrap();
+    // The first write goes through the reconnect and the lock check: it
+    // answers that the lock is gone, not the connection error of the old
+    // session, and the fence trips.
     let error = store
         .write(|c| c.create_repo("after").map(|_| ()))
-        .expect_err("a fenced backend fails writes");
+        .expect_err("a backend that lost its lock fails writes");
     assert!(
         matches!(error, scion_server::Error::FailedPrecondition(_)),
         "{error:?}"
@@ -232,4 +235,65 @@ fn a_lost_server_lock_fences_the_backend() {
         matches!(error, scion_server::Error::FailedPrecondition(_)),
         "{error:?}"
     );
+    drop(taker);
+}
+
+/// A reconnect ends the transaction of the dead session, and nothing of
+/// the old transaction runs on the new session: every statement of the
+/// dead transaction fails until its caller ends it, a new BEGIN opens a
+/// fresh one, and the store recovers without a restart.
+#[test]
+fn a_reconnect_ends_the_dead_transaction_and_a_new_begin_passes() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(dir.path()).unwrap();
+    store
+        .write(|c| c.create_repo("before").map(|_| ()))
+        .unwrap();
+    let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+    let schema = Backend::test_schema(dir.path()).unwrap();
+    let mut killer = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    // The transaction dies mid-flight: the kill lands between its BEGIN
+    // and its next statement. The lock is left alone, so the reconnect
+    // recovers the store instead of fencing it.
+    let error = store
+        .commit(|c| -> Result<(), scion_server::Error> {
+            killer
+                .batch_execute(&format!(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                     WHERE application_name = '{schema}' AND pid <> pg_backend_pid()"
+                ))
+                .unwrap();
+            // The first statement of the dead transaction: the reconnect
+            // dropped the transaction, so the statement is refused.
+            let first = c.repo_id("before");
+            assert!(
+                matches!(&first, Err(scion_server::Error::Corrupt(message))
+                    if message.contains("lost with the connection")),
+                "the first statement answers that the transaction was lost: {first:?}"
+            );
+            // Every later statement of it too, until the caller ends it.
+            let second = c.repo_id("before");
+            assert!(
+                matches!(&second, Err(scion_server::Error::Corrupt(message))
+                    if message.contains("lost with the connection")),
+                "the next statement of the dead transaction fails too: {second:?}"
+            );
+            Err(scion_server::Error::NotFound("ends the transaction".into()))
+        })
+        .expect_err("the transaction was lost");
+    assert!(
+        matches!(error, scion_server::Error::NotFound(_)),
+        "{error:?}"
+    );
+    // A new transaction passes: the BEGIN starts a fresh one on the
+    // fresh session, and the store recovers without a restart.
+    store
+        .commit(|c| c.create_repo("after").map(|_| ()))
+        .expect("a new transaction runs after the dead one was ended");
+    store
+        .read(|c| c.repo_id("after").map(|_| ()))
+        .expect("the repo the new transaction made is there");
 }
