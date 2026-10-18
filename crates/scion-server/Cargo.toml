@@ -50,7 +50,17 @@ zstd.workspace = true
 postgres = "0.19"
 tokio-postgres-rustls = "0.14"
 
+[features]
+# Moves the doc(hidden) test seams of `Backend` and `Store` behind a
+# switch, so a release build carries none of them. Default off, and not
+# API: anything behind it can change or vanish without a release.
+test-hooks = []
+
 [dev-dependencies]
+# The integration tests compile this crate without cfg(test); the self
+# dependency turns the test hooks on for them. Path only: a version
+# would make `cargo package` resolve it from the registry.
+open-scion-server = { path = ".", features = ["test-hooks"] }
 proptest.workspace = true
 tempfile.workspace = true
 tonic-health.workspace = true

@@ -74,6 +74,7 @@ pub const READER_BYTES: usize = (1 << READER_WINDOW_LOG) + (1 << 20);
 /// A step the tests run at a counted batch boundary of the import, with
 /// the count of batches done so far.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
 pub type AfterBatch = Box<dyn FnMut(usize) + Send>;
 
 /// The import's test hooks, the same state on both backends: the count of
@@ -82,6 +83,7 @@ pub type AfterBatch = Box<dyn FnMut(usize) + Send>;
 /// so a test that must act at a counted batch boundary runs there,
 /// instead of racing the batch's end.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Default)]
 pub struct ImportHooks {
     busy_retries: AtomicU64,
@@ -89,6 +91,7 @@ pub struct ImportHooks {
 }
 
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
 impl ImportHooks {
     /// Counts one busy retry of the import's batch.
     pub fn note_busy_retry(&self) {
@@ -186,6 +189,7 @@ struct Inner {
     fail_commits: AtomicU64,
     /// The import's test hooks and busy-retry count, as Postgres keeps
     /// its own.
+    #[cfg(any(test, feature = "test-hooks"))]
     hooks: ImportHooks,
     /// The derive walks of this store: which are in flight, and the cap
     /// on how many may be.
@@ -352,6 +356,7 @@ impl Store {
                 _server_lock: server_lock,
                 txes: AtomicU64::new(0),
                 fail_commits: AtomicU64::new(0),
+                #[cfg(any(test, feature = "test-hooks"))]
                 hooks: ImportHooks::default(),
                 derive: DeriveFlights::new(walks_cap),
                 writers: Mutex::new(0),
@@ -425,6 +430,7 @@ impl Store {
 
     /// Commits made so far.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn commits(&self) -> u64 {
         self.inner.committed.load(Ordering::Acquire)
@@ -518,6 +524,7 @@ impl Store {
     /// the import's busy retry use it: the failing transaction ran and
     /// rolled back, so the retry re-runs it whole.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_next_commits(&self, n: u32) {
         self.inner
             .fail_commits
@@ -527,12 +534,14 @@ impl Store {
     /// Sets how long the write connection waits for a busy database. Tests
     /// use it to make a busy lock fail fast, so a retry is deterministic.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_busy_timeout(&self, timeout: Duration) {
         let _ = self.lock().busy_timeout(timeout);
     }
 
     /// The import's test hooks and busy-retry count.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn hooks(&self) -> &ImportHooks {
         &self.inner.hooks
@@ -540,6 +549,7 @@ impl Store {
 
     /// Write transactions run so far.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn txes(&self) -> u64 {
         self.inner.txes.load(Ordering::Relaxed)

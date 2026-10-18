@@ -45,6 +45,7 @@ impl BackendTx<'_> {
     /// rows. [`None`] on Postgres, whose rows a test reads through the
     /// [`MetaTx`] queries.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn sqlite(&self) -> Option<&rusqlite::Connection> {
         match self {
@@ -195,6 +196,7 @@ impl Backend {
     ///
     /// What the store or the database returns, and a missing test URL.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn open_test_shared(data: &Path) -> Result<Self> {
         if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
             postgres_marker(data)?;
@@ -214,6 +216,7 @@ impl Backend {
     ///
     /// What the store or the database returns, and a missing test URL.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn open_test(data: &Path) -> Result<Self> {
         if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
             postgres_marker(data)?;
@@ -229,6 +232,7 @@ impl Backend {
     /// assertions are about the SQLite schema, which the schema drift test
     /// covers for Postgres.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn test_is_postgres() -> bool {
         std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres")
@@ -242,6 +246,7 @@ impl Backend {
     /// run on Postgres. Hidden: a test holds a lock in it from a
     /// connection of its own.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn test_schema(data: &Path) -> Option<String> {
         if Self::test_is_postgres() {
@@ -253,6 +258,7 @@ impl Backend {
 
     /// Write transactions run so far. SQLite only.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn txes(&self) -> u64 {
         match self {
@@ -284,6 +290,7 @@ impl Backend {
     /// Commits made so far. SQLite only: it counts the transactions of the
     /// write connection, which is what the tests of the batching watch.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn commits(&self) -> u64 {
         match self {
@@ -298,6 +305,7 @@ impl Backend {
     /// busy database. A Postgres database has no busy error, so this only
     /// reaches SQLite.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_next_commits(&self, n: u32) {
         if let Self::Sqlite(store) = self {
             store.fail_next_commits(n);
@@ -307,6 +315,7 @@ impl Backend {
     /// Sets how long the write connection of the data directory waits for
     /// a busy database.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_busy_timeout(&self, timeout: std::time::Duration) {
         if let Self::Sqlite(store) = self {
             store.set_busy_timeout(timeout);
@@ -316,6 +325,7 @@ impl Backend {
     /// The import's test hooks and busy-retry count, the same state on
     /// both backends.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     fn hooks(&self) -> &crate::store::ImportHooks {
         match self {
@@ -326,12 +336,14 @@ impl Backend {
 
     /// Sets the step the tests run after each batch of the import commits.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_after_batch(&self, step: Option<crate::store::AfterBatch>) {
         self.hooks().set_after_batch(step);
     }
 
     /// How many busy retries of the import's batches ran so far.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn busy_retries(&self) -> u64 {
         self.hooks().busy_retries()
@@ -340,12 +352,14 @@ impl Backend {
     /// Runs the test step of a batch boundary, with the count of batches
     /// done so far.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn run_after_batch(&self, batches: usize) {
         self.hooks().run_after_batch(batches);
     }
 
     /// Counts one busy retry of the import's batch.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn note_busy_retry(&self) {
         self.hooks().note_busy_retry();
     }
