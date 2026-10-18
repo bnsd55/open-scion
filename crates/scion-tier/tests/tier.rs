@@ -20,7 +20,7 @@ use scion_proto::v1::{
     Encoding, GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, ObjectKind, ObjectPart,
     ObjectRef, ResolveRefRequest, ResolveRefResponse,
 };
-use scion_tier::{CACHE_UPSTREAM_TIMEOUT, DiskStore, MemoryStore, Tier, bind_unix};
+use scion_tier::{CACHE_UPSTREAM_TIMEOUT, DiskStore, Key, MemoryStore, Store, Tier, bind_unix};
 use tokio::net::TcpListener;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::{TcpListenerStream, UnixListenerStream};
@@ -1531,4 +1531,263 @@ async fn a_daemons_cache_still_refuses_a_view_ticket_outside_its_view() {
         "the cache fetched the view tree, never the blob"
     );
     let _ = cache;
+}
+
+/// Starts the real daemon on `data`, and returns it with the URL of its
+/// socket, which it opens within 10 s.
+async fn start_daemon(
+    data: &std::path::Path,
+    socket: &std::path::Path,
+    upstream: &str,
+    limit: usize,
+) -> (Kill, String) {
+    use std::time::Instant;
+
+    use std::process::Command;
+    let child = Command::new(env!("CARGO_BIN_EXE_scion-daemon"))
+        .arg("--data")
+        .arg(data)
+        .arg("--socket")
+        .arg(socket)
+        .arg("--upstream")
+        .arg(upstream)
+        .arg("--max-bytes")
+        .arg(limit.to_string())
+        .arg("--token")
+        .arg(TOKEN)
+        .arg("--upstream-token")
+        .arg(TOKEN)
+        .spawn()
+        .map(Kill)
+        .unwrap();
+    // The child is up when its socket file is there (10 s ceiling).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !socket.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never opened its socket"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    (child, format!("unix://{}", socket.display()))
+}
+
+/// Kills the daemon when the test ends, however it ends: a leftover child
+/// holds the captured output open and the harness hangs.
+struct Kill(std::process::Child);
+impl Drop for Kill {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A daemon killed with SIGKILL while it fills its store, and restarted:
+/// no torn object is ever served, the index and the files agree after the
+/// restart, the byte limit still holds, and reads go on
+/// (docs/architecture.md, Cache tiers: after a crash the tier opens and
+/// checks).
+///
+/// The cut falls between file writes, and the test says where plainly: a
+/// stored file reaches its final name only when a durable temp file is
+/// renamed, so the objects that the store misses at the kill are the cut.
+/// The kill lands when three files are on disk of two hundred that the
+/// fill is still writing; the test asserts the store missed many, so a
+/// clean stop cannot pass unseen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_killed_mid_fill_serves_no_torn_object_after_its_restart() {
+    use std::time::Instant;
+
+    // Two hundred blobs of about 64 KiB each: a fill whose file writes
+    // take many polls, in a store that must evict to hold its limit.
+    let fill: Vec<Object> = (0..200).map(|i| blob(&noise(64 * 1024 + i))).collect();
+    let limit = 8 << 20;
+    let fake = Fake::new(&fill.iter().collect::<Vec<_>>(), Duration::ZERO);
+    let upstream = serve_fake(fake.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let data = dir.path().join("data");
+
+    let (mut child, url) = start_daemon(&data, &socket, &upstream, limit).await;
+    let fill_task = spawn_get(&url, &fake, &fill).await;
+
+    // The kill lands while the fill writes: the store's object tree holds
+    // three files of the two hundred still coming.
+    let objects = data.join("objects");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if count_files(&objects) >= 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the store never wrote a file during the fill"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _ = fill_task.await;
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+
+    // The cut is real: files landed, and the fill had far more to write.
+    let files = stored_files(&objects);
+    let landed = files.iter().filter(|(kind, ..)| kind == "blob").count();
+    assert!(landed >= 3, "the kill landed before the fill wrote");
+    assert!(
+        landed < fill.len(),
+        "the kill landed after the whole fill: {landed} files"
+    );
+
+    // Restarted on the same directory, the tier serves every object with
+    // its own bytes: the copies that the kill cut arrive from upstream
+    // again, and no torn file is served on the way (reads go on).
+    let store = DiskStore::open(&data, limit).unwrap();
+    let restarted = Tier::new(
+        store,
+        &upstream,
+        TOKEN,
+        CACHE_UPSTREAM_TIMEOUT,
+        None,
+        Vec::new(),
+    )
+    .unwrap();
+    let socket = dir.path().join("daemon-restarted.sock");
+    let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
+    let serve_task = tokio::spawn(restarted.clone().serve(
+        TOKEN,
+        incoming,
+        Limits::default(),
+        None,
+        std::future::pending(),
+    ));
+    let mut client = connect(&format!("unix://{}", socket.display()), Some(TOKEN)).await;
+    let got = get(&mut client, &fake, &fill.iter().collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert_eq!(got, fill, "every object answers, byte for byte");
+
+    // The restart's store lets go of the directory before the check opens
+    // it again: the abort drops the serving tier, and the open waits for
+    // the lock (10 s ceiling).
+    serve_task.abort();
+    drop(restarted);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let store = loop {
+        match DiskStore::open(&data, limit) {
+            Ok(store) => break store,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the restarted store never let go of the directory"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(error) => panic!("the reopened store never opened: {error}"),
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if files.iter().all(|file| agrees(&store, file)) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the walk never adopted the files that the kill stranded"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // No stored file is torn: each unpacks to bytes that hash to the ID
+    // in its name. The tier's serve-time check would drop a bad one and
+    // fetch it again; this asserts none is bad in the first place.
+    for (kind, id, path, _) in &files {
+        let body = std::fs::read(path).unwrap();
+        if kind == "blob" {
+            unpacks_to_its_id(&body, id);
+        }
+    }
+
+    // The byte limit still holds, after the walk and the fills.
+    let kept: u64 = files.iter().map(|(.., len)| *len).sum();
+    assert!(
+        kept <= limit as u64,
+        "the store holds {kept} bytes over its limit"
+    );
+}
+
+/// A stored blob unpacks, to bytes that hash to the ID in its name.
+fn unpacks_to_its_id(body: &[u8], id: &[u8]) {
+    use std::io::Read as _;
+    let mut data = Vec::new();
+    object::unpacker(body)
+        .expect("a stored blob unpacks")
+        .read_to_end(&mut data)
+        .expect("the stored blob is whole");
+    assert_eq!(&BlobId::of(&data).as_bytes()[..], id, "the ID matches");
+}
+
+/// The files of a store's object tree, as `(kind, id, path, len)`.
+fn stored_files(objects: &std::path::Path) -> Vec<(String, Vec<u8>, std::path::PathBuf, u64)> {
+    let mut files = Vec::new();
+    for kind in ["tree", "blob"] {
+        let Ok(firsts) = std::fs::read_dir(objects.join(kind)) else {
+            continue;
+        };
+        for first in firsts.flatten() {
+            let Ok(seconds) = std::fs::read_dir(first.path()) else {
+                continue;
+            };
+            for second in seconds.flatten() {
+                let Ok(meta) = second.metadata() else {
+                    continue;
+                };
+                if !meta.is_file() {
+                    continue;
+                }
+                let Some(id) = id_of(&first.file_name(), &second.file_name()) else {
+                    continue;
+                };
+                files.push((kind.to_owned(), id, second.path(), meta.len()));
+            }
+        }
+    }
+    files
+}
+
+/// How many files a store's object tree holds.
+fn count_files(objects: &std::path::Path) -> usize {
+    stored_files(objects).len()
+}
+
+/// Joins the two parts of a stored file's name into its 32-byte ID.
+fn id_of(first: &std::ffi::OsStr, second: &std::ffi::OsStr) -> Option<Vec<u8>> {
+    let mut hex = first.to_str()?.to_owned();
+    hex.push_str(second.to_str()?);
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// One file agrees with the index: the store knows its key at the file's
+/// size.
+fn agrees(store: &DiskStore, file: &(String, Vec<u8>, std::path::PathBuf, u64)) -> bool {
+    let (kind, id, _, len) = file;
+    let key = if kind == "blob" {
+        BlobId::try_from(id.as_slice()).map(Key::Blob)
+    } else {
+        scion_core::TreeId::try_from(id.as_slice()).map(Key::Tree)
+    };
+    match key {
+        Ok(key) => store
+            .size(key)
+            .ok()
+            .flatten()
+            .is_some_and(|size| size as u64 == *len),
+        Err(_) => false,
+    }
 }

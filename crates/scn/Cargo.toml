@@ -32,6 +32,8 @@ tonic.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
+# The rotation test builds the tier key sets by hand.
+ed25519-dalek.workspace = true
 open-scion-server.workspace = true
 open-scion-tier.workspace = true
 tempfile.workspace = true

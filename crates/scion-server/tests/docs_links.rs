@@ -11,6 +11,11 @@ use std::path::{Path, PathBuf};
 
 const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
+/// The two repo-absolute link shapes the README uses: a file at main
+/// (`/blob/`) and a raw file at main (`/raw/`), both of this repository.
+const REPO_BLOB: &str = "https://github.com/bnsd55/open-scion/blob/main/";
+const REPO_RAW: &str = "https://github.com/bnsd55/open-scion/raw/main/";
+
 /// The markdown files whose links the test checks.
 fn documents() -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = ["README.md", "CHANGELOG.md"]
@@ -158,11 +163,28 @@ fn broken_links(documents: &[PathBuf], root: &Path) -> (Vec<String>, usize) {
         for target in targets(&markdown) {
             // Strip an optional URL title: [text](file "title").
             let target = target.split_whitespace().next().unwrap_or("");
-            if target.is_empty()
-                || target.starts_with("http://")
-                || target.starts_with("https://")
-                || target.starts_with("mailto:")
-            {
+            if target.is_empty() || target.starts_with("http://") || target.starts_with("mailto:") {
+                continue;
+            }
+            // A link to this repository at main must name a file or a
+            // directory that exists: the README's links are of this form
+            // so that they render on crates.io, and a doc move can rot
+            // them silently otherwise.
+            let in_repo = target
+                .strip_prefix(REPO_BLOB)
+                .or_else(|| target.strip_prefix(REPO_RAW));
+            if let Some(in_repo) = in_repo {
+                checked += 1;
+                let in_repo = in_repo.split('#').next().unwrap_or(in_repo);
+                if !root.join(in_repo).exists() {
+                    broken.push(format!(
+                        "{} -> {target} (not in the repo)",
+                        document.strip_prefix(root).unwrap().display()
+                    ));
+                }
+                continue;
+            }
+            if target.starts_with("https://") || target.starts_with("http://") {
                 continue;
             }
             checked += 1;
@@ -259,21 +281,39 @@ fn the_protocol_doc_has_a_section_for_every_rpc() {
 
 #[test]
 fn a_broken_link_is_reported() {
-    // One tree: `a.md` links to a file that is not there, and to a heading
-    // that `b.md` does not have. The checker must name both.
+    // One tree: `a.md` links to a file that is not there, to a heading
+    // that `b.md` does not have, and to a repo-absolute link of this
+    // repository whose path is not in the repo. The checker must name all
+    // three.
     let root = tempfile::tempdir().expect("a temp tree");
     fs::write(
         root.path().join("a.md"),
-        "[file](missing.md)\n[anchor](b.md#no)\n",
+        "[file](missing.md)\n[anchor](b.md#no)\n[repo](https://github.com/bnsd55/open-scion/blob/main/docs/no-such-doc.md)\n",
     )
     .unwrap();
     fs::write(root.path().join("b.md"), "# Real\n").unwrap();
     let documents = vec![root.path().join("a.md"), root.path().join("b.md")];
     let (broken, checked) = broken_links(&documents, root.path());
-    assert_eq!(checked, 2);
-    assert_eq!(broken.len(), 2, "{}", broken.join("\n"));
+    assert_eq!(checked, 3);
+    assert_eq!(broken.len(), 3, "{}", broken.join("\n"));
     assert!(broken[0].contains("a.md -> missing.md (no file)"));
     assert!(broken[1].contains("b.md#no"));
+    assert!(broken[2].contains("docs/no-such-doc.md (not in the repo)"));
+}
+
+#[test]
+fn a_repo_link_to_a_real_file_resolves() {
+    // The positive case of the repo-absolute check: the links the README
+    // now holds point at files that exist, and an existing repo link is
+    // not reported.
+    let root = Path::new(ROOT);
+    let readme = root.join("README.md");
+    let (broken, _) = broken_links(&[readme], root);
+    assert!(
+        broken.iter().all(|b| !b.contains("README.md ->")),
+        "{}",
+        broken.join("\n")
+    );
 }
 
 #[cfg(test)]

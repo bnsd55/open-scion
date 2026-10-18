@@ -42,7 +42,7 @@ use crate::derived::DeriveFlights;
 use crate::error::{Error, Result};
 
 /// The schema version this build makes and reads.
-pub(crate) const SCHEMA_VERSION: u32 = 8;
+pub(crate) const SCHEMA_VERSION: u32 = 9;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database from
 /// version `n - 1` to version `n`. A released migration never changes.
@@ -55,6 +55,7 @@ const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [
     include_str!("../migrations/0006_land_created_at.sql"),
     include_str!("../migrations/0007_tree_sizes.sql"),
     include_str!("../migrations/0008_view_roots.sql"),
+    include_str!("../migrations/0009_view_trees.sql"),
 ];
 
 /// Largest object accepted or read back, uncompressed: 100 MiB, the hard
@@ -69,6 +70,60 @@ const READER_WINDOW_LOG: u32 = 21;
 /// Most memory that a [`BlobReader`] holds between parts: its zstd window and
 /// the decoder's buffers and tables, which take less than 1 MiB.
 pub const READER_BYTES: usize = (1 << READER_WINDOW_LOG) + (1 << 20);
+
+/// A step the tests run at a counted batch boundary of the import, with
+/// the count of batches done so far.
+#[doc(hidden)]
+pub type AfterBatch = Box<dyn FnMut(usize) + Send>;
+
+/// The import's test hooks, the same state on both backends: the count of
+/// busy retries, so a test proves the retry ran instead of only that the
+/// import survived, and the step the tests run after each batch commits,
+/// so a test that must act at a counted batch boundary runs there,
+/// instead of racing the batch's end.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct ImportHooks {
+    busy_retries: AtomicU64,
+    after_batch: Mutex<Option<AfterBatch>>,
+}
+
+#[doc(hidden)]
+impl ImportHooks {
+    /// Counts one busy retry of the import's batch.
+    pub fn note_busy_retry(&self) {
+        self.busy_retries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many busy retries of the import's batches ran so far.
+    #[must_use]
+    pub fn busy_retries(&self) -> u64 {
+        self.busy_retries.load(Ordering::Relaxed)
+    }
+
+    /// Sets the step the tests run after each batch of the import commits.
+    pub fn set_after_batch(&self, step: Option<AfterBatch>) {
+        *self
+            .after_batch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = step;
+    }
+
+    /// Runs the test step of a batch boundary, with the count of batches
+    /// done so far. The mutex is held across the step: a test step may
+    /// block for as long as it likes (the busy tests hold the database for
+    /// seconds), but nothing else can set or clear the step meanwhile, and
+    /// a step that calls back into `set_after_batch` deadlocks.
+    pub fn run_after_batch(&self, batches: usize) {
+        if let Some(step) = &mut *self
+            .after_batch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            step(batches);
+        }
+    }
+}
 
 /// Handle to one data directory. Cheap to clone.
 #[derive(Clone)]
@@ -129,6 +184,9 @@ struct Inner {
     /// the import's busy retry: the transaction ran and rolled back, so
     /// nothing was written, exactly as a real busy commit ends.
     fail_commits: AtomicU64,
+    /// The import's test hooks and busy-retry count, as Postgres keeps
+    /// its own.
+    hooks: ImportHooks,
     /// The derive walks of this store: which are in flight, and the cap
     /// on how many may be.
     derive: DeriveFlights,
@@ -294,6 +352,7 @@ impl Store {
                 _server_lock: server_lock,
                 txes: AtomicU64::new(0),
                 fail_commits: AtomicU64::new(0),
+                hooks: ImportHooks::default(),
                 derive: DeriveFlights::new(walks_cap),
                 writers: Mutex::new(0),
                 write_woken: Condvar::new(),
@@ -470,6 +529,34 @@ impl Store {
     #[doc(hidden)]
     pub fn set_busy_timeout(&self, timeout: Duration) {
         let _ = self.lock().busy_timeout(timeout);
+    }
+
+    /// The import's test hooks and busy-retry count.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn hooks(&self) -> &ImportHooks {
+        &self.inner.hooks
+    }
+
+    /// Caps the database file at its current size plus `extra` pages, for
+    /// the out-of-space tests: the next write that must grow the file
+    /// fails with the real disk-full.
+    #[doc(hidden)]
+    pub fn cap_database_pages(&self, extra: i64) {
+        let db = self.lock();
+        let pages: i64 = db
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap_or(0);
+        db.pragma_update(None, "max_page_count", pages + extra)
+            .unwrap();
+    }
+
+    /// Lifts the page cap again, back to the largest file SQLite allows.
+    #[doc(hidden)]
+    pub fn release_database_pages(&self) {
+        let db = self.lock();
+        db.pragma_update(None, "max_page_count", 0x7FFF_FFFFi64)
+            .unwrap();
     }
 
     /// Write transactions run so far.
@@ -776,6 +863,10 @@ pub struct Blobs {
     /// Calls to [`Blobs::verify`] so far.
     #[cfg(test)]
     verifies: std::sync::atomic::AtomicU64,
+    /// The test hook that fails a file write of this backend with the
+    /// disk's answer: `n` lets `n` writes through and fails the one
+    /// after, once; [`UNARMED`] lets every write through.
+    fail_writes: std::sync::atomic::AtomicUsize,
 }
 
 /// How many stripes the per-blob write locks have: 256 on the first byte
@@ -834,6 +925,7 @@ impl Blobs {
             group_flush: GroupFlush::default(),
             #[cfg(test)]
             verifies: std::sync::atomic::AtomicU64::default(),
+            fail_writes: std::sync::atomic::AtomicUsize::new(UNARMED),
         })
     }
 
@@ -1096,15 +1188,83 @@ impl Blobs {
         }
     }
 
+    /// Arms the hook: it lets the next `n` file writes through, fails the
+    /// one after with the disk's answer, and lets the rest through. Zero
+    /// arms it for the very next write. Calling it again rearms it; the
+    /// start ([`UNARMED`]) never arms it.
+    #[doc(hidden)]
+    pub fn fail_writes_after(&self, n: usize) {
+        self.fail_writes
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The gate the file writes of this process pass: it lets the next
+    /// `n` writes through, fails the one after with the disk's answer,
+    /// and lets the rest through. One error line per failure, with the
+    /// file and the operation.
+    fn write_gate(&self, path: &Path, operation: &str) -> Result<()> {
+        loop {
+            let left = self.fail_writes.load(std::sync::atomic::Ordering::SeqCst);
+            let pass = match left {
+                // The hook is not armed.
+                UNARMED => true,
+                // This is the write the hook fails; the hook is spent.
+                0 => {
+                    if self
+                        .fail_writes
+                        .compare_exchange(
+                            0,
+                            UNARMED,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    false
+                }
+                // A write the hook lets through: count it down, without
+                // the two-writers race where a plain subtract wraps past
+                // zero and re-arms the hook silently.
+                left => {
+                    if self
+                        .fail_writes
+                        .compare_exchange(
+                            left,
+                            left - 1,
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    true
+                }
+            };
+            if pass {
+                return Ok(());
+            }
+            let error = std::io::Error::from_raw_os_error(28); // ENOSPC
+            tracing::error!(
+                path = %path.display(),
+                operation,
+                error = %error,
+                "a blob write failed: the disk is full"
+            );
+            return Err(error.into());
+        }
+    }
+
     /// The fan-out directory and the file path of a blob.
-    pub(crate) fn location(&self, id: BlobId) -> (PathBuf, PathBuf) {
+    pub fn location(&self, id: BlobId) -> (PathBuf, PathBuf) {
         let hex = id.to_string();
         let dir = self.root.join(&hex[..2]);
         let path = dir.join(&hex[2..]);
         (dir, path)
     }
 
-    /// Full flushes finished so far.
     #[cfg(test)]
     pub(crate) fn full_flushes(&self) -> u64 {
         self.group_flush.lock().finished
@@ -1334,6 +1494,7 @@ impl BlobBatch<'_> {
     /// [`Error::Io`] if the file cannot be opened or its time not set.
     fn touch(&self, id: BlobId) -> Result<()> {
         let (_, path) = self.blobs.location(id);
+        self.blobs.write_gate(&path, "touch blob file")?;
         let file = fs::File::options().write(true).open(&path)?;
         file.set_modified(SystemTime::now())?;
         Ok(())
@@ -1348,6 +1509,7 @@ impl BlobBatch<'_> {
         // points at data that is not on the drive. The frame header holds the
         // size, for `Blobs::size`. Compression fails if `raw` does not give
         // exactly `len` bytes.
+        self.blobs.write_gate(&path, "write blob file")?;
         let mut tmp = tempfile::NamedTempFile::new_in(&self.blobs.mine)?;
         zstd::stream::compress_sized_into(raw, &mut tmp, 3, len as u64)?;
         fsync(tmp.as_file())?;
@@ -1427,6 +1589,9 @@ impl BlobBatch<'_> {
         Ok(!self.dirs.is_empty())
     }
 }
+
+/// The test hook is not armed: every file write goes.
+const UNARMED: usize = usize::MAX;
 
 /// Group commit: concurrent callers share one full flush of the drive cache.
 ///
