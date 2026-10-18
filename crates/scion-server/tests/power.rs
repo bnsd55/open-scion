@@ -303,7 +303,7 @@ async fn every_reply_survives_a_power_cut() {
         // The store reopens from the backing directory: what `LazyFS`
         // persisted, and nothing else.
         let data = lazy.backing.join("data");
-        let mut server = Server::start(&data, &log);
+        let server = Server::start(&data, &log);
         eprintln!("round {round}: restart up");
         check(&server.url, &data, &mut ledger, &mut checked, &mut rng).await;
         eprintln!("round {round}: check 2 done");
