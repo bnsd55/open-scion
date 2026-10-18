@@ -988,7 +988,8 @@ mod tests {
         let (in_tx, in_rx) = std::sync::mpsc::channel::<()>();
         let (moved_tx, moved_rx) = std::sync::mpsc::channel::<()>();
         let land = {
-            let (server, in_tx, moved_rx) = (server.clone(), in_tx, moved_rx);
+            let (server, in_tx, moved_rx, in_release) =
+                (server.clone(), in_tx, moved_rx, in_tx.clone());
             thread::spawn(move || {
                 server.write(|c| {
                     let moved = c.cas_ref(repo, "main", Some(1), x)?;
@@ -1005,7 +1006,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(30))
             .unwrap_or_else(|_| panic!("the land never moved the ref"));
         let moved = point_ref(&importer, repo, "main", tip);
-        in_tx.send(()).unwrap();
+        in_release.send(()).unwrap();
         assert!(land.join().unwrap().unwrap());
         // The swap lost, and the check again sees that main has diverged.
         assert!(

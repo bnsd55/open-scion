@@ -406,7 +406,7 @@ async fn serve_fake(fake: Fake) -> String {
 /// `zstd` or not: the objects it returns, unpacked, with the number of parts
 /// and the encoding of each, or the error that ends it. `Err` from the outer
 /// result is the call's status.
-async fn message_of<I>(step: &str, stream: &mut tonic::Streaming<I>) -> Option<I>
+async fn message_of<I>(step: &str, stream: &mut tonic::Streaming<I>) -> Result<Option<I>, Status>
 where
     I: Unpin,
 {
