@@ -2574,6 +2574,7 @@ dependencies = [
  "hyper",
  "open-scion-core",
  "open-scion-proto",
+ "open-scion-server",
  "open-scion-tier",
  "postgres",
  "proptest",

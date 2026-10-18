@@ -1,11 +1,11 @@
 //! The metadata backend of a server: one of the supported databases,
-//! behind [`Meta`].
+//! behind the crate's internal metadata trait.
 //!
 //! [`Backend::Sqlite`] is the data directory of [`Store`].
-//! [`Backend::Postgres`] is a shared database (`Pg`). A
-//! caller holds one and calls the [`Meta`] methods; the transaction type
-//! differs per backend, so the queries of a call go through
-//! [`BackendTx`], which forwards them to the backend's own transaction.
+//! [`Backend::Postgres`] is a shared database (`Pg`). A caller holds one
+//! and reads or writes through it; the transaction type differs per
+//! backend, so the queries of a call go through `BackendTx`, which
+//! forwards them to the backend's own transaction.
 
 use gix::ObjectId;
 use scion_core::{BlobId, Changeset, ChangesetId, RepoPath, Tree, TreeId};
@@ -17,7 +17,10 @@ use crate::history::NodeId;
 use crate::land::{LandOutcome, LandRequest, LandState};
 use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId};
 use crate::pg::{Pg, PgTx};
+use std::fmt::Write as _;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::store::{Blobs, Store};
 
@@ -45,6 +48,7 @@ impl BackendTx<'_> {
     /// rows. [`None`] on Postgres, whose rows a test reads through the
     /// [`MetaTx`] queries.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn sqlite(&self) -> Option<&rusqlite::Connection> {
         match self {
@@ -66,9 +70,28 @@ const _: () = assert!(PG_READERS == crate::store::READERS);
 /// directory is a SQLite one: directories of older builds have no file.
 const MARKER: &str = "backend";
 
-/// Marks `data` as Postgres-backed, and refuses to open Postgres on a
-/// directory whose metadata a SQLite store already holds.
-fn postgres_marker(data: &Path) -> Result<()> {
+/// What the data directory's marker held when an open began.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Marker {
+    pub(crate) uuid: Option<[u8; 16]>,
+    pub(crate) present: bool,
+}
+
+impl Marker {
+    /// Reads the marker of `data`, if any.
+    pub(crate) fn read(data: &Path) -> Self {
+        let present = data.join(MARKER).exists();
+        Self {
+            uuid: marker_uuid(data),
+            present,
+        }
+    }
+}
+
+/// Refuses to open Postgres on a directory whose metadata a SQLite
+/// store already holds: its rows live in that database, and a second,
+/// empty store here would look like a server with no data at all.
+fn refuse_sqlite_dir(data: &Path) -> Result<()> {
     let db = data.join("scion.db");
     if db.metadata().is_ok_and(|m| m.len() > 0) {
         return Err(crate::error::Error::InvalidArgument(
@@ -77,10 +100,6 @@ fn postgres_marker(data: &Path) -> Result<()> {
                 .into(),
         ));
     }
-    // The open may name a directory that does not exist yet: the marker
-    // is its first file.
-    std::fs::create_dir_all(data).map_err(crate::error::Error::Io)?;
-    std::fs::write(data.join(MARKER), "postgres\n").map_err(crate::error::Error::Io)?;
     Ok(())
 }
 
@@ -88,7 +107,7 @@ fn postgres_marker(data: &Path) -> Result<()> {
 /// Postgres: its rows live in the database, and a second, empty store
 /// here would look like a server with no data at all.
 fn refuse_postgres_marker(data: &Path) -> Result<()> {
-    if std::fs::read_to_string(data.join(MARKER)).is_ok_and(|s| s.trim() == "postgres") {
+    if marker_names_postgres(&std::fs::read_to_string(data.join(MARKER)).unwrap_or_default()) {
         return Err(crate::error::Error::InvalidArgument(
             "this data directory keeps its metadata in Postgres: \
              give --postgres-url"
@@ -96,6 +115,88 @@ fn refuse_postgres_marker(data: &Path) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Whether a marker file's text names the Postgres backend: its first
+/// line does. The second, when present, is the store UUID.
+fn marker_names_postgres(text: &str) -> bool {
+    text.lines().next().map(str::trim) == Some("postgres")
+}
+
+/// The store UUID a marker carries, if it names one: 32 hex digits on
+/// its second line.
+fn marker_uuid(data: &Path) -> Option<[u8; 16]> {
+    let text = std::fs::read_to_string(data.join(MARKER)).ok()?;
+    let line = text.lines().nth(1)?.trim();
+    if line.len() != 32 || !line.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&line[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
+}
+
+/// Puts the database's UUID in the marker, and refuses when the marker
+/// names another store: a database restored on the directory of another
+/// store would serve metadata whose blobs are not on this disk. A
+/// refusal writes nothing: the UUID was compared in the database open,
+/// before any blob of this directory was named.
+fn marker_agrees(data: &Path, marker_was_absent: bool, uuid: [u8; 16]) -> Result<()> {
+    let marker = data.join(MARKER);
+    match marker_uuid(data) {
+        Some(held) if held != uuid => {
+            return Err(crate::error::Error::FailedPrecondition(format!(
+                "this data directory belongs to the store whose UUID is \
+                 {}, but the database names the store {}: one was \
+                 restored over the other; give the directory of the \
+                 database's own store, or a directory the database has \
+                 never served",
+                hex16(&held),
+                hex16(&uuid)
+            )));
+        }
+        Some(_) => {}
+        None => {
+            // A fresh pair, or a marker that predates the UUID: the
+            // database's identity is the one this directory takes.
+            if marker_was_absent {
+                // The claim of a fresh directory is its first file.
+                std::fs::write(&marker, "postgres\n").map_err(crate::error::Error::Io)?;
+            }
+            write_marker(&marker, uuid)?;
+        }
+    }
+    Ok(())
+}
+
+/// Writes the marker with `uuid` on its second line, durable: a marker
+/// half-written would name no store and refuse the next open.
+fn write_marker(marker: &Path, uuid: [u8; 16]) -> Result<()> {
+    let tmp = tempfile::NamedTempFile::new_in(marker.parent().unwrap_or_else(|| Path::new(".")))
+        .map_err(crate::error::Error::Io)?;
+    (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        tmp.as_file()
+            .write_all(format!("postgres\n{}\n", hex16(&uuid)).as_bytes())?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(marker).map_err(|e| e.error)?;
+        if let Some(dir) = marker.parent() {
+            let _ = crate::store::fsync_dir(dir);
+        }
+        Ok(())
+    })()
+    .map_err(crate::error::Error::Io)
+}
+
+/// 16 bytes as 32 lowercase hex digits.
+fn hex16(bytes: &[u8; 16]) -> String {
+    let mut hex = String::with_capacity(32);
+    for byte in bytes {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// The URL of the test database.
@@ -117,6 +218,31 @@ pub(crate) fn test_schema(data: &Path) -> String {
 }
 
 impl Backend {
+    /// Where a ref points.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::Error::NotFound`] if the repo or ref does not
+    /// exist.
+    pub fn resolve_ref(&self, repo: &str, name: &str) -> Result<ChangesetId> {
+        use crate::meta::Meta as _;
+        self.read(|c| {
+            let repo = c.repo_id(repo)?;
+            c.get_ref(repo, name)?
+                .map(|r| r.target)
+                .ok_or_else(|| crate::error::Error::NotFound(format!("ref {name:?}")))
+        })
+    }
+
+    /// The advisory-lock key of the test schema's one-server lock, for
+    /// the test that takes the lock from its own connection, as a
+    /// second server process would.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_server_lock(data: &Path) -> Result<i64> {
+        Ok(crate::pg::schema_lock_key(&test_schema(data)))
+    }
+
     /// The derive walks of this backend: which are in flight, and the cap
     /// on how many may be.
     pub(crate) fn derive_flights(&self) -> &crate::derived::DeriveFlights {
@@ -161,10 +287,11 @@ impl Backend {
     /// What the store or the database returns.
     pub fn open(data: &Path, postgres_url: Option<&str>, ca: Option<&Path>) -> Result<Self> {
         if let Some(url) = postgres_url {
-            postgres_marker(data)?;
-            Ok(Self::Postgres(Pg::open_exclusive(
-                url, ca, PG_READERS, data,
-            )?))
+            let marker = Marker::read(data);
+            refuse_sqlite_dir(data)?;
+            let pg = Pg::open_exclusive(url, ca, PG_READERS, data, marker)?;
+            marker_agrees(data, !marker.present, pg.store_uuid())?;
+            Ok(Self::Postgres(pg))
         } else {
             refuse_postgres_marker(data)?;
             Ok(Self::Sqlite(Store::open(data)?))
@@ -180,8 +307,11 @@ impl Backend {
     /// What the store or the database returns.
     pub fn open_shared(data: &Path, postgres_url: Option<&str>, ca: Option<&Path>) -> Result<Self> {
         if let Some(url) = postgres_url {
-            postgres_marker(data)?;
-            Ok(Self::Postgres(Pg::open(url, ca, PG_READERS, data)?))
+            let marker = Marker::read(data);
+            refuse_sqlite_dir(data)?;
+            let pg = Pg::open(url, ca, PG_READERS, data, marker)?;
+            marker_agrees(data, !marker.present, pg.store_uuid())?;
+            Ok(Self::Postgres(pg))
         } else {
             refuse_postgres_marker(data)?;
             Ok(Self::Sqlite(Store::open_shared(data)?))
@@ -195,10 +325,14 @@ impl Backend {
     ///
     /// What the store or the database returns, and a missing test URL.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn open_test_shared(data: &Path) -> Result<Self> {
         if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
-            postgres_marker(data)?;
-            let pg = Pg::open_test(&test_url()?, &test_schema(data), PG_READERS, data)?;
+            let marker = Marker::read(data);
+            refuse_sqlite_dir(data)?;
+            let pg =
+                Pg::open_test_shared(&test_url()?, &test_schema(data), PG_READERS, data, marker)?;
+            marker_agrees(data, !marker.present, pg.store_uuid())?;
             return Ok(Self::Postgres(pg));
         }
         refuse_postgres_marker(data)?;
@@ -214,10 +348,13 @@ impl Backend {
     ///
     /// What the store or the database returns, and a missing test URL.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn open_test(data: &Path) -> Result<Self> {
         if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
-            postgres_marker(data)?;
-            let pg = Pg::open_test(&test_url()?, &test_schema(data), PG_READERS, data)?;
+            let marker = Marker::read(data);
+            refuse_sqlite_dir(data)?;
+            let pg = Pg::open_test(&test_url()?, &test_schema(data), PG_READERS, data, marker)?;
+            marker_agrees(data, !marker.present, pg.store_uuid())?;
             return Ok(Self::Postgres(pg));
         }
         refuse_postgres_marker(data)?;
@@ -229,19 +366,44 @@ impl Backend {
     /// assertions are about the SQLite schema, which the schema drift test
     /// covers for Postgres.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn test_is_postgres() -> bool {
         std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres")
     }
 
+    /// Whether this backend lost its database to another process: every
+    /// read and write fails from then on. SQLite has no lock to lose, so
+    /// it is never fenced.
+    #[must_use]
+    pub fn fenced(&self) -> bool {
+        match self {
+            Self::Sqlite(_) => false,
+            Self::Postgres(pg) => pg.fenced(),
+        }
+    }
+
+    /// The flag of [`Backend::fenced`], for the health service of a
+    /// serving process: it flips to `NOT_SERVING` when the fence trips.
+    /// None on SQLite, which has no lock to lose. The server sets it on
+    /// the health service before it serves; it is wiring, not a test
+    /// seam, so it is public and documented instead of doc(hidden).
+    #[must_use]
+    pub fn fence_flag(&self) -> Option<Arc<AtomicBool>> {
+        match self {
+            Self::Sqlite(_) => None,
+            Self::Postgres(pg) => Some(pg.fence_flag()),
+        }
+    }
+
     /// The schema that [`Backend::open_test`] gave this data directory on
     /// Postgres: a test that counts rows through its own Postgres client
     /// names it the same way. A result, so the callers unwrap one shape.
-    ///
     /// The schema a test backend of this directory uses, when the tests
     /// run on Postgres. Hidden: a test holds a lock in it from a
     /// connection of its own.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn test_schema(data: &Path) -> Option<String> {
         if Self::test_is_postgres() {
@@ -253,6 +415,7 @@ impl Backend {
 
     /// Write transactions run so far. SQLite only.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn txes(&self) -> u64 {
         match self {
@@ -284,6 +447,7 @@ impl Backend {
     /// Commits made so far. SQLite only: it counts the transactions of the
     /// write connection, which is what the tests of the batching watch.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn commits(&self) -> u64 {
         match self {
@@ -298,6 +462,7 @@ impl Backend {
     /// busy database. A Postgres database has no busy error, so this only
     /// reaches SQLite.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_next_commits(&self, n: u32) {
         if let Self::Sqlite(store) = self {
             store.fail_next_commits(n);
@@ -307,6 +472,7 @@ impl Backend {
     /// Sets how long the write connection of the data directory waits for
     /// a busy database.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_busy_timeout(&self, timeout: std::time::Duration) {
         if let Self::Sqlite(store) = self {
             store.set_busy_timeout(timeout);
@@ -316,6 +482,7 @@ impl Backend {
     /// The import's test hooks and busy-retry count, the same state on
     /// both backends.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     fn hooks(&self) -> &crate::store::ImportHooks {
         match self {
@@ -326,12 +493,14 @@ impl Backend {
 
     /// Sets the step the tests run after each batch of the import commits.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_after_batch(&self, step: Option<crate::store::AfterBatch>) {
         self.hooks().set_after_batch(step);
     }
 
     /// How many busy retries of the import's batches ran so far.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn busy_retries(&self) -> u64 {
         self.hooks().busy_retries()
@@ -340,12 +509,14 @@ impl Backend {
     /// Runs the test step of a batch boundary, with the count of batches
     /// done so far.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn run_after_batch(&self, batches: usize) {
         self.hooks().run_after_batch(batches);
     }
 
     /// Counts one busy retry of the import's batch.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn note_busy_retry(&self) {
         self.hooks().note_busy_retry();
     }

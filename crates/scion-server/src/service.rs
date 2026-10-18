@@ -58,7 +58,7 @@ const MAX_UPLOADS: usize = 16;
 /// beyond this waits here, in async code, for a slot to free.
 const MAX_BLAMES: usize = 4;
 /// The bytes of memory that all `Blame` calls share: a call takes the bytes
-/// of every version it reads, and [`memory::BYTES_PER_LINE`] per line of the
+/// of every version it reads, and `memory::BYTES_PER_LINE` per line of the
 /// blamed file, so together they hold no more than this.
 const BLAME_MEMORY_BUDGET: usize = 1 << 30;
 /// Most `MergeBase`, `IsAncestor` and `Log` calls with a path running at
@@ -166,12 +166,20 @@ pub async fn serve(
     } = options;
     let access = Arc::new(access.into());
     let auth = access.auth();
+    let fence = store.fence_flag();
     let worker = Worker::new(store);
     let lands = Arc::new(Lands::new(pending_lands, Some(Arc::clone(&metrics))));
     // The sweep stops when the server does: the shutdown future resolves,
     // the watch says so, and the loop breaks. The same watch ends the
     // server itself.
     let (stop_tx, stop_rx) = watch::channel(());
+    // The fence of a Postgres server that lost its database to another
+    // process: it resolves the same shutdown the operator's signal does,
+    // so the health service answers NOT_SERVING and tonic finishes the
+    // open calls; a short grace later the process exits, and a supervisor
+    // restart either takes the lock back or is refused at open. SQLite
+    // has no fence (None), so this task never runs.
+    let fence_stop = fence.clone().map(|fence| (fence, stop_tx.clone()));
     tokio::spawn(async move {
         shutdown.await;
         let _ = stop_tx.send(());
@@ -182,6 +190,20 @@ pub async fn serve(
             let _ = stopped.changed().await;
         }
     };
+    if let Some((fence, stop_tx)) = fence_stop {
+        tokio::spawn(async move {
+            while !fence.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            tracing::error!(
+                "this server process lost the database to another server \
+                 process; it stops serving and exits"
+            );
+            let _ = stop_tx.send(());
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            std::process::exit(70);
+        });
+    }
     tokio::spawn(sweeps(
         worker.clone(),
         Arc::clone(&lands),
@@ -209,7 +231,9 @@ pub async fn serve(
         .layer(ObjectsService::new(worker, access, quotas, tickets, metrics).into_server());
     // The health service answers `grpc.health.v1.Check` and `Watch` on the
     // same port, without a token: a probe carries none. The store opens
-    // before this call, so the server starts serving.
+    // before this call, so the server starts serving. A fence trip
+    // resolves the shutdown, so the names flip to NOT_SERVING on the
+    // service's own path, and the process exits a grace later.
     let (health, shutdown) =
         listen::health(&["scion.v1.Scion", "scion.v1.Objects"], shutdown).await;
     let router = |server: Server| {
@@ -438,7 +462,7 @@ pub(crate) async fn resolve_ref(
     check_reader(access, &caller, &repo)?;
     check_name("ref", &name)?;
     let id = worker
-        .run(move |store| read::resolve_ref(&store, &repo, &name))
+        .run(move |store| store.resolve_ref(&repo, &name))
         .await?;
     Ok(ResolveRefResponse {
         changeset_id: id.as_bytes().to_vec(),
