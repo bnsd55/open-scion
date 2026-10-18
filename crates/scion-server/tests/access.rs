@@ -242,7 +242,7 @@ async fn writes_outside_a_prefix_are_denied_with_the_path() {
 
     // alice may write `docs` only: inside the prefix is accepted, and a
     // path outside it is named by the denial.
-    let (_alice_stop, mut alice, _) = server(&store, dir.path(), access, \"alice").await;
+    let (_alice_stop, mut alice, _) = server(&store, dir.path(), access, "alice").await;
     let source = put(&store, b"source");
     let (bytes, _) = changeset(vec![root], "docs/guide", Some(regular(source))).encode_with_id();
     alice
@@ -283,7 +283,7 @@ async fn writes_outside_a_prefix_are_denied_with_the_path() {
 async fn put_upload_create_and_land_need_write_rules() {
     let (_dir, store, root, _blob) = store();
     let access = access();
-    let (_bob_stop, mut bob, _) = server(&store, dir.path(), access, \"bob").await;
+    let (_bob_stop, mut bob, _) = server(&store, dir.path(), access, "bob").await;
 
     // A blob upload names no path, so a read-only principal is denied.
     let status = bob
@@ -338,7 +338,7 @@ async fn the_lander_of_another_principals_changeset_needs_write() {
     .unwrap();
 
     // bob, read-only, cannot land it.
-    let (_bob_stop, mut bob, _) = server(&store, dir.path(), access, \"bob").await;
+    let (_bob_stop, mut bob, _) = server(&store, dir.path(), access, "bob").await;
     let status = bob
         .land(LandRequest {
             repo: REPO.into(),
@@ -505,7 +505,7 @@ async fn a_principal_without_a_read_rule_sees_no_repo_on_any_rpc() {
     let access = access();
 
     // Control: with a rule, the repo is there.
-    let (_ci_stop, _, mut objects) = server(&store, dir.path(), access, \"ci").await;
+    let (_ci_stop, _, mut objects) = server(&store, dir.path(), access, "ci").await;
     let seen = objects.resolve_ref(req::resolve_ref()).await;
     assert!(seen.is_ok(), "{seen:?}");
 
