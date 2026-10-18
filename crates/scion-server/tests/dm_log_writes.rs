@@ -154,7 +154,7 @@ impl Drop for Recording {
 /// carries the flag, or of the named mark; `None` when the scan walks
 /// past the log's end. replay-log.c prints `cur_entry - 1`, the index
 /// of the entry it stopped on.
-fn find_entry(
+fn find_flagged(
     replay: &str,
     log_dev: &str,
     start: u64,
