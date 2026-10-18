@@ -66,8 +66,9 @@ const REF_TRIES: u32 = 3;
 /// compare-and-swap, so the swap loses as if another server had moved the
 /// ref. Tests set it and drop it back to `None`.
 #[cfg(test)]
-static REF_MOVER: Mutex<Option<Box<dyn Fn(&Backend, RepoId, &str) -> Result<()> + Send>>> =
-    Mutex::new(None);
+type RefMover = Box<dyn Fn(&Backend, RepoId, &str) -> Result<()> + Send>;
+#[cfg(test)]
+static REF_MOVER: Mutex<Option<RefMover>> = Mutex::new(None);
 
 // How long the write transaction sleeps per commit of a batch, for the
 // tests of a slow batch. It models a batch whose records are slow.
@@ -1043,6 +1044,16 @@ mod tests {
         assert_eq!(main.unwrap().target, x);
     }
 
+    /// Takes a test's ref mover back when the test ends, an assert's panic
+    /// included: a mover left set would move other tests' refs.
+    struct MoverGuard;
+
+    impl Drop for MoverGuard {
+        fn drop(&mut self) {
+            *REF_MOVER.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+    }
+
     /// A ref that moves before every swap stops the import after `REF_TRIES`
     /// swaps, with a busy answer, instead of walking the history again
     /// without end. Each move lands main forward on the chain below the
@@ -1085,22 +1096,16 @@ mod tests {
         // The mover points main at the next link of the chain before every
         // swap, so the swap's version is always stale. Dropping the guard
         // takes the mover back, also when an assert fails.
-        struct DropMover;
-        impl Drop for DropMover {
-            fn drop(&mut self) {
-                *REF_MOVER.lock().unwrap_or_else(PoisonError::into_inner) = None;
-            }
-        }
-        let _guard = DropMover;
+        let _guard = MoverGuard;
         let swaps = Arc::new(AtomicUsize::new(0));
         // Only this test's importer handle moves: other tests' point_ref
         // calls run in the same process, and the mover must stay inert for
         // them.
-        let mine = &importer as *const Backend as usize;
+        let mine = std::ptr::from_ref(&importer) as usize;
         *REF_MOVER.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new({
             let (links, swaps) = (Arc::clone(&links), Arc::clone(&swaps));
             move |store: &Backend, repo: RepoId, name: &str| {
-                if store as *const Backend as usize != mine {
+                if std::ptr::from_ref(store) as usize != mine {
                     return Ok(());
                 }
                 let at = swaps
