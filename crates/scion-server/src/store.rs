@@ -997,8 +997,10 @@ impl Blobs {
             fsync_dir(path)?;
         }
         Ok(Self {
+            // The park files live under the data dir, not under
+            // `objects/blob`: the test writes them next to the data root.
             #[cfg(any(test, feature = "test-hooks"))]
-            park: WritePark::from_env(&root),
+            park: WritePark::from_env(dir),
             root,
             tmp,
             mine,
