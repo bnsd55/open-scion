@@ -273,7 +273,9 @@ not start empty: give `scion-cache --snapshot DIR --snapshot-repo R` and it
 writes `DIR/R.scnsnap` every `--snapshot-every` seconds, with the most
 recently used objects of that repo, up to `--snapshot-bytes`. Copy the file
 to the node (any copy tool or shared mount) and start the daemon with
-`--seed FILE`: it imports the objects, each checked against its ID, before
+`--seed FILE --seed-full-repo` (the snapshot is a full-repo credential, so
+the daemon refuses the seed without the say-so): it imports the objects,
+each checked against its ID, before
 it serves, and only if its store is empty. A warm daemon ignores the file.
 A snapshot holds every object of the repo, so give a node only repos that
 all its users may read whole: a folder rule hides parts of a repo from a

@@ -1473,7 +1473,9 @@ used first. An entry is a record (an op `T` or `B`, the ID, the size as a
 ASCII letter, a digit, `-`, `_` or a `.` after the first byte as `%XX`, so
 any repo name gives one plain file name.
 
-The daemon takes `--seed FILE`, repeatable. Before it serves, and only if
+The daemon takes `--seed FILE`, repeatable, and refuses it without
+`--seed-full-repo`, which says every user of the node may read the repo
+whole. Before it serves, and only if
 its store holds no object, it reads each file: it checks every object
 against its ID, as a fetch from upstream does, and stores it through the
 normal put, so `--max-bytes` holds. A bad object is skipped and counted,
