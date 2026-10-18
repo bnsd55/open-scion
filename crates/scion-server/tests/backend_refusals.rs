@@ -151,3 +151,35 @@ fn a_write_blocked_by_another_writer_answers_busy_in_seconds() {
         "answered after {waited:?}"
     );
 }
+
+/// `fsck` runs on a Postgres-backed store: a clean store reports nothing,
+/// and a missing blob file is found, through the same metadata interface.
+#[test]
+fn a_fsck_of_a_postgres_backed_store_finds_missing_blob_files() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(dir.path()).unwrap();
+    let repo = store.write(|c| c.create_repo("fsck-pg")).unwrap();
+    let blob = store.blobs().put(b"fsck me\n").unwrap();
+    store.write(|c| c.add_repo_blob(repo, blob)).unwrap();
+    let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
+    assert!(
+        report.problems.is_empty(),
+        "a clean store is clean: {:?}",
+        report.problems
+    );
+
+    // The damage of the guide's example: a file that a row names is gone.
+    std::fs::remove_file(store.blobs().location(blob).1).unwrap();
+    let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.to_string().starts_with(&format!("blob-missing {blob}"))),
+        "{:?}",
+        report.problems
+    );
+}

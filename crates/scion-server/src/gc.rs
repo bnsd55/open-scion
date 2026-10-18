@@ -64,6 +64,16 @@ pub const BATCH: usize = 4096;
 /// writer waits milliseconds, not the whole sweep.
 pub const SWEEP_BATCH: usize = 1000;
 
+/// The dead-row candidates one prune transaction deletes, at most: one
+/// transaction holds the collector's key, so its length bounds how long
+/// every writer waits behind it.
+const PRUNE_BATCH: usize = 256;
+
+/// The time one prune transaction or sweep batch may hold the collector's
+/// key before the run says so in the log. The row cap bounds the hold;
+/// this clock only reports the batches that ran past it.
+const BATCH_BUDGET: Duration = Duration::from_millis(100);
+
 /// The grace period, when `--grace-secs` is not given: seven days.
 pub const DEFAULT_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
 
@@ -188,9 +198,11 @@ fn prune_rows(
     let repos = store.read(|c| c.repos())?;
     report.repos = u64::try_from(repos.len()).unwrap_or(u64::MAX);
     for repo in repos {
-        store.write(|c| {
+        // The candidate scan reads rows and files: it runs in a read
+        // transaction, so it does not hold the collector's key while it
+        // stats the files.
+        let dead = store.read(|c| {
             let live_of_repo = live.live.get(&repo);
-            let seen = live.seen.get(&repo).cloned().unwrap_or_default();
             // The rows dead per the snapshot, and old enough. The row's age
             // is its file's: every writer makes the file durable first, and
             // names it right after. A row whose file is gone is dead at any
@@ -210,48 +222,67 @@ fn prune_rows(
                     _ => dead.push(blob),
                 }
             }
-            // The lock orders this transaction against a changeset
-            // transaction that names the same blob: the collector's row
-            // check and delete wait for the changeset, or the changeset's
-            // row check waits for the collector. Sorted, so both sides
-            // take their locks in one order and none wait in a circle.
-            dead.sort();
-            for blob in &dead {
-                c.lock_blob(*blob)?;
-            }
-            // A changeset that committed after the snapshot walk pins the
-            // blobs that it puts, whatever their age. The re-read runs
-            // after the locks, so it sees every changeset that committed
-            // while this transaction waited for one.
-            let mut seen = seen;
-            let mut fresh = BTreeSet::new();
-            for cs in c.repo_changeset_ids(repo)? {
-                let Ok(cs) = ChangesetId::try_from(cs.as_slice()) else {
-                    continue; // fsck reports the bad ID
-                };
-                if seen.insert(cs) {
-                    let Some(body) = c.stored_changeset_body(cs.as_bytes())? else {
-                        continue;
+            Ok(dead)
+        })?;
+        // The lock orders a delete transaction against a changeset
+        // transaction that names the same blob: the collector's row check
+        // and delete wait for the changeset, or the changeset's row check
+        // waits for the collector. Sorted, so both sides take their locks
+        // in one order and none wait in a circle.
+        let mut dead = dead;
+        dead.sort();
+        // One transaction per chunk of at most PRUNE_BATCH rows: a
+        // transaction holds the collector's key from its begin to its
+        // commit, so its length is how long every writer waits. A
+        // changeset that committed after the snapshot walk pins the blobs
+        // that it puts: the re-read inside each chunk runs after the key
+        // was taken, so it sees every changeset that committed while this
+        // transaction waited for one.
+        // SHORTCUT: the re-read loads every changeset ID of the repo once
+        // per chunk, so a repo with many changesets pays that walk per
+        // chunk. Fine at 256 rows a chunk; if a chunk ever runs past its
+        // budget in the log, load the IDs once per repo per sweep and
+        // share them across chunks, at the cost of a wider pin window.
+        let mut seen = live.seen.get(&repo).cloned().unwrap_or_default();
+        for chunk in dead.chunks(PRUNE_BATCH) {
+            let started = std::time::Instant::now();
+            store.write(|c| {
+                let mut fresh = BTreeSet::new();
+                for cs in c.repo_changeset_ids(repo)? {
+                    let Ok(cs) = ChangesetId::try_from(cs.as_slice()) else {
+                        continue; // fsck reports the bad ID
                     };
-                    let (cs, _) = Changeset::decode_with_id(&body)
-                        .map_err(|e| crate::Error::Corrupt(format!("changeset {cs}: {e}")))?;
-                    for (_, blob) in db::puts(&cs) {
-                        fresh.insert(blob);
+                    if seen.insert(cs) {
+                        let Some(body) = c.stored_changeset_body(cs.as_bytes())? else {
+                            continue;
+                        };
+                        let (cs, _) = Changeset::decode_with_id(&body)
+                            .map_err(|e| crate::Error::Corrupt(format!("changeset {cs}: {e}")))?;
+                        for (_, blob) in db::puts(&cs) {
+                            fresh.insert(blob);
+                        }
                     }
                 }
-            }
-            for blob in dead {
-                if fresh.contains(&blob) {
-                    continue;
+                for blob in chunk {
+                    if fresh.contains(blob) {
+                        continue;
+                    }
+                    if !dry_run {
+                        c.delete_repo_blob(repo, blob.as_bytes())?;
+                    }
+                    report.rows_pruned += 1;
                 }
-                if !dry_run {
-                    c.delete_repo_blob(repo, blob.as_bytes())?;
-                }
-                report.rows_pruned += 1;
+                Ok(())
+            })?;
+            if started.elapsed() > BATCH_BUDGET {
+                tracing::warn!(
+                    rows = chunk.len(),
+                    elapsed_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                    "the collector's prune batch ran past its budget"
+                );
             }
-            Ok(())
-        })?;
-        between(Stage::RepoRows);
+            between(Stage::RepoRows);
+        }
     }
     Ok(())
 }
@@ -803,11 +834,6 @@ mod tests {
     /// the blob's row and file survive.
     #[test]
     fn a_changeset_that_commits_while_gc_runs_keeps_its_blob() {
-        if Backend::test_is_postgres() {
-            // The threaded run below covers Postgres, where the lock is a
-            // database lock. This run would age the file of a schema that
-            // another test's data directory owns.
-        }
         let dir = TempDir::new().unwrap();
         let store = Backend::open_test_shared(dir.path()).unwrap();
         let repo = store.write(|c| c.create_repo(REPO)).unwrap();
@@ -908,5 +934,39 @@ mod tests {
         );
         let (_, path) = gc_store.blobs().location(b);
         assert!(path.exists(), "the file was removed");
+    }
+
+    /// A prune bigger than one chunk yields the collector's key between
+    /// chunks: the hook fires once per chunk, so a run over more than
+    /// `PRUNE_BATCH` dead rows holds the key twice, never once for all of
+    /// them. The count, not a clock, is the proof: each transaction
+    /// deletes at most `PRUNE_BATCH` rows.
+    #[test]
+    fn a_prune_bigger_than_a_chunk_yields_the_key_between_chunks() {
+        let dir = TempDir::new().unwrap();
+        let store = Backend::open_test_shared(dir.path()).unwrap();
+        let repo = store.write(|c| c.create_repo(REPO)).unwrap();
+        let blobs: Vec<BlobId> = (0..PRUNE_BATCH + 2)
+            .map(|n| {
+                let blob = store
+                    .blobs()
+                    .put(format!("chunk {n}\n").as_bytes())
+                    .unwrap();
+                store.write(|c| c.add_repo_blob(repo, blob)).unwrap();
+                blob
+            })
+            .collect();
+        for blob in &blobs {
+            age_file(&store, *blob, OLD);
+        }
+        let chunks = std::cell::Cell::new(0u32);
+        let report = collect(&store, Duration::from_secs(1), &mut |stage| {
+            if stage == Stage::RepoRows {
+                chunks.set(chunks.get() + 1);
+            }
+        });
+        assert_eq!(report.rows_pruned, blobs.len() as u64, "{report:?}");
+        assert_eq!(report.files_removed, blobs.len() as u64, "{report:?}");
+        assert_eq!(chunks.get(), 2, "the prune held the key once for every row");
     }
 }

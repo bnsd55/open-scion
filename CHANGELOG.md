@@ -92,10 +92,11 @@ until that section gets its release date.
   streaming all serve unchanged. Blob files stay on local disk in both:
   one blob folder per server. One server runs per database: a second one
   fails at open (`another server holds this database`). A data directory
-  records its backend in a marker file and the other backend refuses it,
-  so a `gc` that saw an empty store cannot sweep the blobs of a
-  Postgres-backed directory; `fsck` and `gc` refuse a Postgres-backed
-  directory for now (`#180`). A host off this machine needs
+  records its backend in a marker file and the other backend refuses it.
+  `fsck` and `gc` serve both backends through the metadata interface
+  (`#180`); on Postgres the collector's batches and every changeset
+  transaction order on one database lock, so a changeset that lands while
+  `gc` runs keeps its blobs. A host off this machine needs
   `sslmode=require` or stronger and a `--postgres-ca` that signed the
   server's certificate (`prefer`, which falls back to plaintext, is
   refused); the URL is never logged. `synchronous_commit=on` on every

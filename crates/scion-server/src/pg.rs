@@ -702,6 +702,10 @@ impl Pg {
         // changeset that names a blob the collector is about to remove
         // commits first, and the collector's re-read pins the blob; a
         // batch of the collector waits for every writer that has begun.
+        // The wait ignores the session's 5 s lock clock: the queue drains
+        // as fast as the writers commit, and a writer that gave up would
+        // turn healthy contention into Busy for every parallel caller.
+        tx.c.query("SET LOCAL lock_timeout = '60s'", &[])?;
         tx.c.query_opt("SELECT pg_advisory_xact_lock($1)", &[P::i64(PG_GC_LOCK)])?;
         match f(&mut tx) {
             Ok(value) => {
@@ -1326,6 +1330,10 @@ fn id_bytes(id: &[u8; 32]) -> Vec<u8> {
 /// one per blob: a transaction that puts thousands of blobs would
 /// otherwise hold thousands of entries in Postgres's shared lock table
 /// and run it out (E53200, `max_locks_per_transaction`).
+// SHORTCUT: one key orders every writer of the database against one
+// collector, which is right for one server per database (#178). Many
+// servers (#47) need a finer design: per-repo keys, or the collector's
+// batches reading a snapshot instead of holding a lock.
 const PG_GC_LOCK: i64 = 0x5343_494F_4E47_4331;
 
 impl MetaTx for PgTx<'_> {
