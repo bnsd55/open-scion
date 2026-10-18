@@ -376,7 +376,6 @@ impl Meta for Backend {
 }
 
 impl MetaTx for BackendTx<'_> {
-
     fn get_view_root(
         &mut self,
         repo: RepoId,
