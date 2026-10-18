@@ -21,6 +21,9 @@ services:
       POSTGRES_USER: scion
       POSTGRES_PASSWORD: dev
       POSTGRES_DB: scion
+      # One panic in the demo's server died without a place: name the
+      # frames while the demo is new.
+      RUST_BACKTRACE: full
     command:
       - -c
       - ssl=on

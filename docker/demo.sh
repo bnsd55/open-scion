@@ -28,7 +28,7 @@ compose() {
 
 # A failure after the services started is diagnosed from their logs: the
 # script exits, and the trap says what each container saw.
-trap 'compose logs --tail 40' EXIT
+trap 'compose logs --tail 200' EXIT
 
 if ! command -v openssl >/dev/null 2>&1; then
     echo "openssl is needed to make the demo certificates" >&2
