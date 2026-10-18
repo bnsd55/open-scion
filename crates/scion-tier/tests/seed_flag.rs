@@ -128,9 +128,10 @@ fn the_flag_lets_a_seed_through() {
     let started = std::time::Instant::now();
     let limit = std::time::Duration::from_secs(30);
     let mut seeded = false;
-    while !seeded && started.elapsed() < limit {
-        match report.recv_timeout(limit - started.elapsed()) {
+    while !seeded {
+        match report.recv_timeout(limit.saturating_sub(started.elapsed())) {
             Ok(line) => seeded = line.contains("seeded the store from a snapshot"),
+            // The wait is over, or the reader thread is gone.
             Err(_) => break,
         }
     }
