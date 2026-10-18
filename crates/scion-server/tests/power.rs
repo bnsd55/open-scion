@@ -836,9 +836,8 @@ async fn import_process_races_the_server_on_the_same_blob() {
     // rename while the import renames the same path.
     let content = rng.bytes(2 << 10);
     let want = BlobId::of(&content);
-    let park = park_file(&data, &want);
-    fs::create_dir_all(data.join("hooks")).unwrap();
-    fs::write(&park, b"").unwrap();
+    arm_park(&data, &want);
+
     // A git repository for the import process: one commit whose file
     // holds the same bytes the client puts.
     let git_dir = dir.path().join("git");
@@ -847,22 +846,7 @@ async fn import_process_races_the_server_on_the_same_blob() {
     // writer parks between keep and rename. The trace shows the park:
     // the server stats the park file through the mount every few ms.
     let mut put = tokio::spawn(async move { put_blob(&mut scion, &content).await });
-    let park_path = format!("hooks/park-{want}");
-    let park_until = Instant::now() + Duration::from_secs(30);
-    loop {
-        let parked = fs::read_to_string(&lazy.trace)
-            .unwrap_or_default()
-            .lines()
-            .any(|line| line.contains("lfs_getattr") && line.contains(&park_path));
-        assert!(
-            parked || Instant::now() < park_until,
-            "the server never reached the park"
-        );
-        if parked {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_parked(&lazy.trace, &want);
     // Only now the import runs: its rename lands while the server holds
     // the stripe and sits in the park.
     let import = common::spawn_guard::across_spawn(|| {
@@ -887,7 +871,7 @@ async fn import_process_races_the_server_on_the_same_blob() {
     let import_from = wait_for_rename(&lazy.trace, &blob_name, 240, None);
     // The release ends the park: the server's rename lands after the
     // import's, on the same path, from its own tmp folder.
-    fs::remove_file(&park).unwrap();
+    release_park(&lazy.mount.join("data"), &want);
     let id = tokio::time::timeout(Duration::from_secs(30), &mut put)
         .await
         .unwrap_or_else(|_| panic!("the parked put never finished"))
@@ -952,6 +936,39 @@ fn wait_import(
 /// The park file of one blob, under the data directory's hooks folder.
 fn park_file(data: &Path, id: &BlobId) -> PathBuf {
     data.join("hooks").join(format!("park-{id}"))
+}
+
+/// Arms the park of one blob: the hooks folder with the park file, so
+/// the server's writer parks when its keep finds the blob missing.
+fn arm_park(data: &Path, id: &BlobId) {
+    fs::create_dir_all(data.join("hooks")).unwrap();
+    fs::write(park_file(data, id), b"").unwrap();
+}
+
+/// Lifts the park of one blob.
+fn release_park(data: &Path, id: &BlobId) {
+    fs::remove_file(park_file(data, id)).unwrap();
+}
+
+/// Waits until the server's writer is inside the park: it stats the park
+/// file through the mount, and the ops trace shows every stat.
+fn wait_parked(trace: &Path, id: &BlobId) {
+    let park_path = format!("hooks/park-{id}");
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        let parked = fs::read_to_string(trace)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.contains("lfs_getattr") && line.contains(&park_path));
+        assert!(
+            parked || Instant::now() < until,
+            "the server never reached the park"
+        );
+        if parked {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Makes a git repository of one commit, whose file holds `content`.
