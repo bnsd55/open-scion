@@ -654,6 +654,7 @@ impl Pg {
         let (mut writer, _waiting) = self.lock_writer();
         let mut pg = PgTx {
             c: &mut writer,
+            blobs: Some(&self.inner.blobs),
             ended: true,
         };
         f(&mut pg)
@@ -664,7 +665,7 @@ impl Pg {
     /// every commit is durable when it returns, so what `f` saw is durable.
     pub fn read<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
         let mut reader = self.inner.readers.take();
-        let mut tx = PgTx::begin_read(reader.client())?;
+        let mut tx = PgTx::begin_read(reader.client(), &self.inner.blobs)?;
         let out = f(&mut tx);
         // A read transaction: nothing to keep. The rollback's own error
         // must not hide the error of `f`; the drop rolls back anyway.
@@ -684,7 +685,7 @@ impl Pg {
         // A write transaction runs at READ COMMITTED, the Postgres
         // default: every change of the caller checks the newest state of
         // the row it touches (the CAS predicates).
-        let mut tx = PgTx::begin(&mut writer)?;
+        let mut tx = PgTx::begin(&mut writer, &self.inner.blobs)?;
         match f(&mut tx) {
             Ok(value) => {
                 tx.commit()?;
@@ -804,6 +805,11 @@ impl Drop for PgWriteWaiter<'_> {
 /// in its lifetime, which the backend enum's transaction needs.
 pub struct PgTx<'a> {
     c: &'a mut PgClient,
+    /// The blob folder: a changeset transaction checks that every blob it
+    /// names is still on disk, for the collector may have removed the file
+    /// of a blob that no row named while the transaction was in flight.
+    /// `None` on a migration transaction, which stores no blobs.
+    blobs: Option<&'a Blobs>,
     /// The transaction was ended by `commit` or `rollback`; a drop then
     /// leaves the client alone.
     ended: bool,
@@ -811,20 +817,39 @@ pub struct PgTx<'a> {
 
 impl<'a> PgTx<'a> {
     /// Begins one transaction on the client.
-    fn begin(c: &'a mut PgClient) -> Result<PgTx<'a>> {
+    fn begin(c: &'a mut PgClient, blobs: &'a Blobs) -> Result<PgTx<'a>> {
         c.execute("BEGIN", &[])?;
-        Ok(Self { c, ended: false })
+        Ok(Self {
+            c,
+            blobs: Some(blobs),
+            ended: false,
+        })
+    }
+
+    /// A transaction of the migrations: it stores no blobs, so it carries
+    /// no blob folder to check.
+    fn begin_migration(c: &'a mut PgClient) -> Result<PgTx<'a>> {
+        c.execute("BEGIN", &[])?;
+        Ok(Self {
+            c,
+            blobs: None,
+            ended: false,
+        })
     }
 
     /// Begins one read-only transaction at repeatable read: every
     /// statement of the caller's read sees one snapshot, not the newest
     /// state of each statement.
-    fn begin_read(c: &'a mut PgClient) -> Result<PgTx<'a>> {
+    fn begin_read(c: &'a mut PgClient, blobs: &'a Blobs) -> Result<PgTx<'a>> {
         c.execute(
             "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
             &[],
         )?;
-        Ok(Self { c, ended: false })
+        Ok(Self {
+            c,
+            blobs: Some(blobs),
+            ended: false,
+        })
     }
 
     /// One transaction over the same client, for a caller that wraps this
@@ -832,6 +857,7 @@ impl<'a> PgTx<'a> {
     pub(crate) fn reborrow(&mut self) -> PgTx<'_> {
         PgTx {
             c: self.c,
+            blobs: self.blobs,
             ended: true,
         }
     }
@@ -1259,7 +1285,7 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<()> {
         // One transaction per migration, with its version bump: a
         // migration that fails rolls its own statements back, and the
         // versions before it stand.
-        let mut tx = PgTx::begin(client)?;
+        let mut tx = PgTx::begin_migration(client)?;
         tx.c.batch(&format!(
             "{sql}\nINSERT INTO schema_migrations (version, name) \
              VALUES ({}, 'postgres schema')",
@@ -1303,14 +1329,12 @@ fn id_bytes(id: &[u8; 32]) -> Vec<u8> {
     id.to_vec()
 }
 
-/// The 63-bit key of the advisory lock for `blob`: the first 8 bytes of its
-/// ID, masked to the positive range, so both sides key one blob alike.
-fn blob_lock_key(blob: &BlobId) -> i64 {
-    let bytes = blob.as_bytes();
-    let mut key = [0_u8; 8];
-    key.copy_from_slice(&bytes[..8]);
-    (i64::from_be_bytes(key) >> 1) & i64::MAX
-}
+/// The advisory lock key that orders a changeset or land transaction
+/// against the collector's row check, delete, and unlink. One key, not
+/// one per blob: a transaction that puts thousands of blobs would
+/// otherwise hold thousands of entries in Postgres's shared lock table
+/// and run it out (E53200, `max_locks_per_transaction`).
+const PG_GC_LOCK: i64 = 0x5343_494F_4E47_4331;
 
 impl MetaTx for PgTx<'_> {
     /// Creates a repository, or returns the existing one with that name.
@@ -1345,15 +1369,24 @@ impl MetaTx for PgTx<'_> {
     ///
     /// [`Error::NotFound`] if a parent is not in `repo`.
     fn insert_changeset(&mut self, repo: RepoId, cs: &Changeset) -> Result<ChangesetId> {
-        // The collector takes the same locks around its row check and
+        // The collector takes the same lock around its row check and
         // delete, so a changeset that names a blob it is about to remove
-        // commits first, and the collector's re-read pins the blob. Sorted,
-        // so both sides take their locks in one order.
+        // commits first, and the collector's re-read pins the blob.
         let mut puts: Vec<BlobId> = crate::db::puts(cs).map(|(_, blob)| blob).collect();
         puts.sort();
         puts.dedup();
         for blob in &puts {
             self.lock_blob(*blob)?;
+            // A blob whose file the collector removed between the upload
+            // and this commit cannot be stored: the row would name bytes
+            // no reader can reach. Busy, so the client retries: the retry
+            // puts the blob again, with a fresh file, and lands.
+            let blobs = self
+                .blobs
+                .expect("a migration transaction stores no changeset");
+            if !blobs.location(*blob).1.exists() {
+                return Err(Error::Busy);
+            }
         }
         let (body, id) = cs.encode_with_id();
         let mut parent_gen = 0;
@@ -2140,11 +2173,17 @@ impl MetaTx for PgTx<'_> {
     /// lock of one blob, held to the end of this transaction. Every
     /// changeset and land transaction takes it for each blob it puts, and
     /// the collector around its row check, delete and unlink.
-    fn lock_blob(&mut self, blob: BlobId) -> Result<()> {
-        self.c.execute(
-            "SELECT pg_advisory_xact_lock($1)",
-            &[P::i64(blob_lock_key(&blob))],
-        )?;
+    /// Orders this transaction against the collector's row check, delete,
+    /// and unlink: one advisory lock key, held to the end of the
+    /// transaction, for every blob. The collector takes it for each batch,
+    /// so a changeset commit either lands before the collector's re-read,
+    /// or waits for the collector's removal. One key, not one per blob: a
+    /// transaction that puts thousands of blobs would otherwise hold
+    /// thousands of entries in Postgres's shared lock table and run it out
+    /// (E53200, `max_locks_per_transaction`).
+    fn lock_blob(&mut self, _blob: BlobId) -> Result<()> {
+        self.c
+            .query_opt("SELECT pg_advisory_xact_lock($1)", &[P::i64(PG_GC_LOCK)])?;
         Ok(())
     }
 
