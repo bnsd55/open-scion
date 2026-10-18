@@ -901,7 +901,13 @@ pub(crate) struct DurabilityLog {
 }
 
 impl DurabilityLog {
-    /// Records one step, when this build keeps a log.
+    /// Records one step, when this build keeps a log. A build without the
+    /// seam keeps no field, so the lints that a never-read `self` and an
+    /// unconsumed argument would raise are off here.
+    #[cfg_attr(
+        not(any(test, feature = "test-hooks")),
+        allow(clippy::unused_self, clippy::needless_pass_by_value)
+    )]
     fn record(&self, step: DurabilityStep) {
         #[cfg(any(test, feature = "test-hooks"))]
         self.steps
