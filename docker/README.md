@@ -11,7 +11,7 @@ sh docker/demo.sh postgres  # the server keeps its metadata in Postgres
 
 What it does:
 
-1. Makes the demo secrets at compose time: one CA, a certificate for each
+1. Makes the demo secrets at script time: one CA, a certificate for each
    of `server` and `cache`, and the server's ticket key (made by
    `scion-server ticket-key`, written 0600 into the server's data volume).
 2. Builds the image and starts the two services.
