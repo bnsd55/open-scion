@@ -62,8 +62,8 @@ fn a_gc_of_a_postgres_backed_directory_removes_no_blob_file() {
     );
     assert_eq!(blob_files(dir.path()), before);
 
-    // With --postgres-url the gc runs, and refuses on Postgres with one
-    // line saying why. Still no file touched.
+    // With --postgres-url the gc runs: the collector serves every
+    // backend. The blob is still in use, so no file is removed.
     let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_scion-server"))
         .arg("--data")
@@ -75,10 +75,7 @@ fn a_gc_of_a_postgres_backed_directory_removes_no_blob_file() {
         .env_remove("SCION_TEST_POSTGRES_URL")
         .output()
         .unwrap();
-    assert!(
-        !out.status.success(),
-        "gc on Postgres must be refused: {out:?}"
-    );
+    assert!(out.status.success(), "gc on Postgres must run: {out:?}");
     assert_eq!(blob_files(dir.path()), before);
 }
 
