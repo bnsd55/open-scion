@@ -1572,6 +1572,14 @@ impl Store for DiskStore {
     }
 
     fn get(&self, key: Key, size: usize) -> io::Result<Option<Bytes>> {
+        // A row that names more than any object holds is a corrupt index,
+        // not a size to size the buffer for: refuse it, naming the object.
+        if size > MAX_ENCODED_BYTES {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("{key} names {size} bytes, over the {MAX_ENCODED_BYTES} an object holds"),
+            ));
+        }
         self.flush();
         let path = self.path(key);
         let mut data = Vec::with_capacity(size + 1);
@@ -1865,6 +1873,42 @@ mod tests {
         // A file longer than its recorded size is not read past it.
         fs::write(store.path(blob_key), [&frame[..], b" and more"].concat()).unwrap();
         assert_eq!(store.get(blob_key, n).unwrap(), None);
+    }
+
+    #[test]
+    fn a_row_that_names_more_than_an_object_holds_is_refused_not_sized() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let (key, frame) = blob(b"aaaa");
+        let n = frame.len();
+        let store = DiskStore::open(&data, 1 << 20).unwrap();
+        store.put(key, &frame).unwrap();
+        let (other, other_frame) = blob(b"bbbb");
+        store.put(other, &other_frame).unwrap();
+        drop(store);
+
+        // A corrupt row names more than any object holds.
+        let db = rusqlite::Connection::open(data.join(INDEX)).unwrap();
+        let huge = i64::try_from(MAX_ENCODED_BYTES + 1).unwrap();
+        db.execute(
+            "UPDATE objects SET size = ?1 WHERE kind = ?2",
+            rusqlite::params![huge, kind_of(key)],
+        )
+        .unwrap();
+        drop(db);
+
+        let store = DiskStore::open(&data, 1 << 20).unwrap();
+        assert_eq!(store.size(key).unwrap(), Some(MAX_ENCODED_BYTES + 1));
+        let err = store.get(key, MAX_ENCODED_BYTES + 1).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("over the"), "{err}");
+        // The copy stays: the corrupt row is an index fault, not a bad file.
+        assert!(store.path(key).exists());
+        // The store still serves the others.
+        assert_eq!(
+            store.get(other, other_frame.len()).unwrap(),
+            Some(other_frame)
+        );
     }
 
     #[test]

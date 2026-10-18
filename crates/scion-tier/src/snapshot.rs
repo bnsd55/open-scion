@@ -88,8 +88,8 @@ pub struct Seeded {
     pub stored: usize,
     /// Their bytes, in stored form.
     pub bytes: usize,
-    /// Objects whose bytes are not the object that their ID names. Not
-    /// stored.
+    /// Objects not stored: their bytes are not the object that their ID
+    /// names, or the store's limit cannot keep them.
     pub skipped: usize,
     /// The file ended in the middle of an entry, or held something that is
     /// not one. The objects before it count.
@@ -163,9 +163,15 @@ pub fn seed(store: &DiskStore, path: &Path) -> io::Result<Option<Seeded>> {
             seeded.skipped += 1;
             continue;
         }
+        // A put that the store's limit refused leaves nothing: it counts
+        // as skipped, so the log line says what the store really holds.
         store.put(key, &Bytes::from(data))?;
-        seeded.stored += 1;
-        seeded.bytes += size;
+        if store.size(key)?.is_some() {
+            seeded.stored += 1;
+            seeded.bytes += size;
+        } else {
+            seeded.skipped += 1;
+        }
     }
     Ok(Some(seeded))
 }
@@ -300,6 +306,25 @@ mod tests {
         let store = DiskStore::open(&dir.path().join("three"), 1 << 20).unwrap();
         let err = seed(&store, &path).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData, "{err}");
+    }
+
+    #[test]
+    fn an_object_over_the_store_limit_is_skipped_not_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = blob(b"aa");
+        let big = blob(&vec![b'x'; 4096]);
+        assert!(big.1.len() > small.1.len());
+        let path = dir.path().join("r.scnsnap");
+        write(&path, "r", &[small.clone(), big.clone()]).unwrap();
+        // Room for the small object only: the big one is over the limit,
+        // and the log line says it was not stored.
+        let store = DiskStore::open(&dir.path().join("data"), small.1.len()).unwrap();
+        let seeded = seed(&store, &path).unwrap().unwrap();
+        assert_eq!((seeded.stored, seeded.skipped), (1, 1));
+        assert_eq!(seeded.bytes, small.1.len());
+        assert!(!seeded.damaged);
+        assert_eq!(store.get(small.0, small.1.len()).unwrap(), Some(small.1));
+        assert_eq!(store.size(big.0).unwrap(), None);
     }
 
     #[tokio::test]
