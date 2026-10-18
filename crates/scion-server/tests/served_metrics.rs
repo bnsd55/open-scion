@@ -53,6 +53,9 @@ async fn served() -> (
             .await
             .unwrap()
     };
+    store
+        .write(|c| c.create_repo(REPO).map(|_| ()))
+        .expect("the test store opens a write");
     let metrics = Arc::new(Metrics::default());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
