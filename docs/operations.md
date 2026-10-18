@@ -412,7 +412,7 @@ the process, scraped from there. The names:
   set means the per-tree memo is not serving and every derivation re-walks.
 - `scion_cache_hits_total` / `scion_cache_misses_total` — what a tier
   served from its store against what it fetched upstream.
-- `scion_blob_sync_seconds` — a blob batch's full flush of the drive cache
+- `scion_blob_sync_seconds` — one fsync on the blob write path (temp file, stored file, blob directory, or the drive-cache flush)
   (batches that sync at once share one flush, so one caller's duration
   includes the wait for the flush in progress); a sum that outruns the
   counts says a drive that cannot keep up with the imports.

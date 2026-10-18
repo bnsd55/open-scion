@@ -104,18 +104,23 @@ async fn a_served_server_renders_the_operating_metrics() {
         }))
         .await
         .expect("the token may upload");
-    // A full flush of the drive cache rides a PutBlob only where fsync
-    // leaves the drive cache (macOS); elsewhere the upload still landed.
-    if cfg!(target_vendor = "apple") {
-        let mut spins = 0;
-        while !metrics
+    // The upload fsynced its temp file and the blob directories, on
+    // every platform, and each fsync is one observation.
+    let mut spins = 0;
+    loop {
+        let count = metrics
             .render()
-            .contains("scion_blob_sync_seconds_count 1\n")
-        {
-            spins += 1;
-            assert!(spins < 1_000_000, "the blob sync never rendered the flush");
-            tokio::task::yield_now().await;
+            .lines()
+            .find(|line| line.starts_with("scion_blob_sync_seconds_count "))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+        if count >= 1 {
+            break;
         }
+        spins += 1;
+        assert!(spins < 1_000_000, "the blob sync never rendered a fsync");
+        tokio::task::yield_now().await;
     }
     // The free-space poll runs before its first sleep.
     let text = metrics.render();

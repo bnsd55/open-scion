@@ -1008,9 +1008,7 @@ impl Blobs {
         let result = self
             .group_flush
             .run(|| fs::File::open(&self.root)?.sync_all());
-        if let Some(metrics) = self.metrics.get() {
-            metrics.blob_sync(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
-        }
+        self.record_sync(started);
         result
     }
 
@@ -1073,7 +1071,7 @@ impl Blobs {
         if batch.flush_dirs()? {
             // A new fan-out directory is an entry in the root. The full flush
             // of `sync` would cover it.
-            fsync_dir(&self.root)?;
+            self.gated_fsync("the blob root", "fsync blob root", || fsync_dir(&self.root))?;
         }
         Ok(id)
     }
@@ -1298,6 +1296,30 @@ impl Blobs {
             );
             return Err(error.into());
         }
+    }
+
+    /// Records how long one fsync of the blob path took.
+    fn record_sync(&self, started: std::time::Instant) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics.blob_sync(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+        }
+    }
+
+    /// Runs the real fsync of `f` through the gate, and records how long
+    /// the fsync took: one observation of `scion_blob_sync_seconds` per
+    /// fsync of the blob path (a temp file, a stored file, a blob
+    /// directory, or the drive cache).
+    fn gated_fsync(
+        &self,
+        name: &str,
+        operation: &str,
+        f: impl FnOnce() -> io::Result<()>,
+    ) -> Result<()> {
+        self.fsync_gate(name, operation)?;
+        let started = std::time::Instant::now();
+        let out = f();
+        self.record_sync(started);
+        out.map_err(Error::Io)
     }
 
     /// Arms the hook: it lets the next `n` file reads through, fails the
@@ -1686,11 +1708,10 @@ impl BlobBatch<'_> {
                 let (dir, path) = self.blobs.location(id);
                 let file = fs::File::open(&path)?;
                 self.blobs
-                    .fsync_gate("the stored blob file", "fsync stored blob")?;
-                fsync(&file)?;
+                    .gated_fsync("the stored blob file", "fsync stored blob", || fsync(&file))?;
                 let name = dir.display().to_string();
-                self.blobs.fsync_gate(&name, "fsync blob directory")?;
-                fsync_dir(&dir)?;
+                self.blobs
+                    .gated_fsync(&name, "fsync blob directory", || fsync_dir(&dir))?;
                 return Ok(());
             }
             // The rename below replaces it in one step. No repo on this
@@ -1727,8 +1748,9 @@ impl BlobBatch<'_> {
         let mut tmp = tempfile::NamedTempFile::new_in(&self.blobs.mine)?;
         zstd::stream::compress_sized_into(raw, &mut tmp, 3, len as u64)?;
         self.blobs
-            .fsync_gate("the blob's temp file", "fsync blob file")?;
-        fsync(tmp.as_file())?;
+            .gated_fsync("the blob's temp file", "fsync blob file", || {
+                fsync(tmp.as_file())
+            })?;
         fs::create_dir_all(&dir)?;
         tmp.persist(&path).map_err(|e| e.error)?;
         self.dirs.insert(dir);
@@ -1794,8 +1816,8 @@ impl BlobBatch<'_> {
     fn flush_dirs(self) -> Result<bool> {
         for dir in &self.dirs {
             let name = dir.display().to_string();
-            self.blobs.fsync_gate(&name, "fsync blob directory")?;
-            fsync_dir(dir)?;
+            self.blobs
+                .gated_fsync(&name, "fsync blob directory", || fsync_dir(dir))?;
         }
         Ok(!self.dirs.is_empty())
     }

@@ -525,8 +525,9 @@ impl Metrics {
 
     /// The blob-sync histogram, when a flush ran.
     fn render_blob_sync(&self, text: &mut String) {
-        let help = "A blob batch's full flush of the drive cache, which callers \
-                    that batch at the same time share.";
+        let help = "One fsync on the blob write path: a temp file, a stored \
+                    file, a blob directory, or the drive-cache flush that \
+                    concurrent callers share.";
         render_hist(text, "scion_blob_sync_seconds", help, &self.blob_sync);
     }
 
