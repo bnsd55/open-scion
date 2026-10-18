@@ -110,7 +110,6 @@ mod tests {
             result_changeset_id: Vec::new(),
             detail: String::from("1 path(s) changed on \"main\" after the base"),
             conflict_paths: vec![b"same.txt".to_vec()],
-            ..Default::default()
         }
     }
 

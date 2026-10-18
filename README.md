@@ -134,6 +134,7 @@ export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
 ./target/release/scn blame main:README.md         # last changeset of each line
 ./target/release/scn cat main:README.md
 ./target/release/scn checkout main --into /tmp/work   # --sparse DIR for part of it
+mkdir -p /tmp/view
 ./target/release/scn mount /tmp/view main             # files load when first read
 ./target/release/scn commit -m "from the mount" --from-mount /tmp/view
 ./target/release/scn unmount /tmp/view
