@@ -6,7 +6,10 @@ not exist yet are marked **planned**, with the issue that tracks them.
 The design follows Anthropic's article
 [Redesigning source control](https://www.anthropic.com/engineering/redesigning-source-control).
 The README lists where this project makes its own choices.
-[`design/scalable-backend.md`](design/scalable-backend.md) proposes a backend that scales out to many servers (not built).
+The metadata may live in Postgres instead of the data directory (#178,
+part 2 of [#47](https://github.com/bnsd55/open-scion/issues/47)); a
+backend that scales out to *many servers* on one database is still a
+proposal ([`design/scalable-backend.md`](design/scalable-backend.md)).
 
 ## 1. Overview
 
@@ -14,7 +17,7 @@ The README lists where this project makes its own choices.
 |---|---|
 | [`scion-core`](../crates/scion-core) | Object model (`Changeset`, `Tree`, IDs, `RepoPath`) and the v1 encoder and strict decoder. No I/O. |
 | [`scion-proto`](../crates/scion-proto) | gRPC types generated from [`proto/scion.proto`](../proto/scion.proto): the `Scion` and `Objects` services, whose contract is [`protocol-v1.md`](protocol-v1.md). Largest message 64 MiB, stream chunk 1 MiB; a `GetObjects` reply message holds one part of an object, at most 1 MiB plus its header. Also the code that the server and the tiers share: the bearer-token check (`auth.rs`), how an object travels in parts and encodings (`object.rs`), and the `GetObjects` reply rules (`reply.rs`). |
-| [`scion-server`](../crates/scion-server) | One binary with two commands: `serve` (the API) and `import` (git import). |
+| [`scion-server`](../crates/scion-server) | One binary: `serve` (the API), `import` (git import), `fsck`, `gc`, `derive`, `hash-token`, `ticket-key`. |
 | [`scion-tier`](../crates/scion-tier) | The cache tiers (section 7): a `Tier` library and two binaries, `scion-cache` (memory) and `scion-daemon` (disk, Unix socket). |
 | [`scn`](../crates/scn) | Command-line client: `cat`, `ls`, `log`, `blame`, `show`, `merge-base`, `is-ancestor`, `diff`, `checkout`, `commit`, `land`, `bench`. |
 
@@ -26,7 +29,7 @@ flowchart LR
         ops --> tree["tree.rs: apply, root trees<br/>graph.rs: commit graph<br/>history.rs: path history<br/>derived.rs: derived data"]
         ops --> db["db.rs, store.rs"]
         tree --> db
-        db --> sqlite[("scion.db: SQLite")]
+        db --> sqlite[("metadata: SQLite, or Postgres")]
         ops --> blobs[("objects/blob: zstd files")]
     end
     git[("git repository")] --> imp["scion-server import"]
@@ -138,7 +141,14 @@ and the decoder rules.
 
 ## 3. Storage
 
-One data directory holds everything (`store.rs`):
+This section describes the SQLite backend: the metadata lives in
+`scion.db` inside one data directory. With `--postgres-url` the server
+keeps the same metadata in a Postgres database instead (same tables, one
+server per database; the Postgres schema is checked against these tables
+by a test), and its rules are in the operations guide
+([`operations.md`](operations.md), "The metadata in Postgres"). The blob
+files stay in the data directory in every backend. What follows is the
+SQLite backend:
 
 ```text
 <data>/lock                    shared by every process that uses <data>
@@ -234,7 +244,10 @@ upload or a crash leaves nothing behind. Each process stages its temp files
 in its own folder of `tmp/`, held with a lock, and an open removes the
 folders of processes that no longer hold theirs (see below).
 
-**Durability rules.**
+**Durability rules** (the SQLite backend; on Postgres a returned commit
+is durable: `synchronous_commit=on` is checked at open, so
+`Store::write` returning is the durability point, and the full-flush
+machinery below does not apply).
 
 - Group commit: concurrent callers share one full drive flush (`F_FULLFSYNC`
   on macOS). Each caller first makes its writes reach the drive with a plain
@@ -283,7 +296,9 @@ folders of processes that no longer hold theirs (see below).
 Unit tests check where each flush comes. No test cuts the power: the crash
 suite kills the process, and the kernel keeps what it wrote (section 10).
 
-**Processes that share a data directory.** `scion-server import` can run
+**Processes that share a data directory** (SQLite backend only: on
+Postgres, one `serve` runs per database — a second fails at open — and an
+import runs beside it without taking that lock). `scion-server import` can run
 while the server runs. The server opens the directory with `Store::open`, an
 import with `Store::open_shared`. Each holds its `flock`s until the last
 `Store` clone is dropped:
@@ -529,7 +544,7 @@ sequenceDiagram
     autonumber
     participant A as scn
     participant L as land.rs
-    participant DB as SQLite
+    participant DB as backend (SQLite, or Postgres)
     A->>L: Land(changeset, ref, request key)
     L->>DB: transaction: insert a pending row and expire old lands, or find the row for this key
     alt row is not pending
@@ -724,7 +739,8 @@ with `INTERNAL`.
 the ref once ([#18](https://github.com/bnsd55/open-scion/issues/18), closed: one
 machine already gives about 200 durable lands/s). The
 [scalable backend design](design/scalable-backend.md) says when it would be
-needed.
+needed: many servers on one database, which the Postgres backend does not
+give yet (one server runs per database).
 
 ## 6. Git import
 
