@@ -956,6 +956,10 @@ impl DurabilityLog {
     }
 
     /// The steps recorded so far, oldest first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the log's lock is poisoned.
     #[must_use]
     pub fn steps(&self) -> Vec<DurabilityStep> {
         self.steps
