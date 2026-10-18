@@ -22,6 +22,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
+      - name: every doc(hidden) item is behind test-hooks
+        run: scripts/check-test-seams.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -31,8 +33,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-
-  docs:
     name: rustdoc
     runs-on: ubuntu-latest
     timeout-minutes: 10
