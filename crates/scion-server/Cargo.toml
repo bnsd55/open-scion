@@ -51,9 +51,6 @@ postgres = "0.19"
 tokio-postgres-rustls = "0.14"
 
 [dev-dependencies]
-# Two tests hold a connection of their own: one a row lock the server's
-# write waits for, one a row count of the test schema.
-postgres = "0.19"
 proptest.workspace = true
 tempfile.workspace = true
 tonic-health.workspace = true
