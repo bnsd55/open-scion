@@ -831,7 +831,7 @@ async fn a_partial_readers_ticket_reaches_only_its_view() {
     // shared view root.
     let text = format!("token\tpat2\t{}\nread\tpat2\t{REPO}\tdocs\n", hex("pat2"));
     let shared = Access::parse(&text).unwrap();
-    let (_stop2, _scion2, mut objects2) = server(&store, dir.path(), shared, \"pat2").await;
+    let (_stop2, _scion2, mut objects2) = server(&store, dir.path(), shared, "pat2").await;
     let again = objects2
         .get_root_tree(req::get_root_tree(tip.as_bytes()))
         .await
