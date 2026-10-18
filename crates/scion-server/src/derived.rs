@@ -67,7 +67,7 @@ pub trait Kind {
     /// Writes that it makes, such as trees, go in the caller's transaction.
     ///
     /// It may also read the stored value of an older changeset that it
-    /// reaches through those parents ([`load`]). Each one has a value.
+    /// reaches through those parents (`load`). Each one has a value.
     ///
     /// # Errors
     ///
@@ -95,7 +95,7 @@ pub trait Kind {
 /// # Errors
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
-/// [`Kind::derive`], or of [`Store::flush`].
+/// [`Kind::derive`], or of [`Store::flush`](crate::store::Store::flush).
 pub fn get<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
     get_until::<K>(store, repo, cs, None)
 }
@@ -354,7 +354,7 @@ fn in_one_walk<K: Kind>(
 
 /// Derives every missing value of `K` that the value for `cs` needs, in
 /// steps, and returns the value for `cs`. Returns before the values are
-/// durable: call [`Store::flush`] before replying with anything they name.
+/// durable: call [`Store::flush`](crate::store::Store::flush) before replying with anything they name.
 ///
 /// First it walks from `cs` through the parents that `K` reads, and stops at
 /// each changeset with a stored value. It visits at most [`STEP`] changesets
@@ -413,7 +413,7 @@ fn fill_until<K: Kind>(
 ///
 /// # Errors
 ///
-/// As [`fill`] and [`Store::flush`].
+/// As [`fill`] and [`Store::flush`](crate::store::Store::flush).
 pub fn backfill<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<()> {
     fill::<K>(store, repo, cs)?;
     // A short step means that no older row is left.
@@ -964,6 +964,53 @@ mod tests {
         let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let (repo, ids) = store.write(|c| store_chain(c, history)).unwrap();
         (dir, store, repo, ids)
+    }
+
+    /// [`store_with`] on the backend the tests run on: the Postgres test
+    /// schemas on the Postgres job, the data directory's store otherwise.
+    fn store_with_here(
+        history: &[Edits],
+    ) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::open_test(dir.path()).unwrap();
+        let (repo, ids) = store.write(|c| store_chain(c, history)).unwrap();
+        (dir, store, repo, ids)
+    }
+
+    /// The body of [`n_cold_reads_derive_once`], on the store given: the
+    /// Postgres variant runs it against the database, the SQLite one
+    /// against the data directory, and both read the same in-memory
+    /// flights.
+    fn n_cold_reads_derive_once_on(store: &Backend, repo: RepoId, tip: ChangesetId) {
+        let at_the_gate = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            let _gate = gate_closed();
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    at_the_gate.wait();
+                    assert_eq!(get::<Cold<1>>(store, repo, tip).unwrap(), 12);
+                });
+            }
+            wait_entered(1);
+            for _ in 0..2_000 {
+                if joined_on(store, repo) >= 9 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(joined_on(store, repo), 9, "the seven callers never joined");
+            let walks = store.derive_flights();
+            assert_eq!(
+                *walks
+                    .in_flight
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+                1,
+                "a caller that only waits holds a walk permit"
+            );
+            gate_open();
+        });
+        assert_eq!(COLD_DERIVES.load(Ordering::Relaxed), 12);
     }
 
     /// Backends `history` in a new repo `r` through the one write path, which
@@ -1570,6 +1617,21 @@ mod tests {
     }
 
     #[test]
+    fn n_cold_reads_derive_once_on_postgres() {
+        if !Backend::test_is_postgres() {
+            return;
+        }
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        COLD_DERIVES.store(0, Ordering::Relaxed);
+        let (_dir, store, repo, ids) = store_with_here(&chain(12));
+        let tip = *ids.last().unwrap();
+        // The same flight, held in the Postgres backend's own walks: eight
+        // cold readers of one repo join one walk, and the walk derives
+        // each changeset once.
+        n_cold_reads_derive_once_on(&store, repo, tip);
+    }
+
+    #[test]
     fn a_caller_over_the_cap_waits_then_succeeds() {
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         COLD_DERIVES.store(0, Ordering::Relaxed);
@@ -1856,6 +1918,51 @@ mod tests {
                 "the walk derived while a writer waited"
             );
             // The writer is done: the walk goes on, and the gate lets it.
+            gate_open();
+            assert_eq!(walker.join().unwrap(), 12);
+        });
+        assert_eq!(COLD_DERIVES.load(Ordering::Relaxed), 12);
+    }
+
+    #[test]
+    fn a_walk_waits_while_a_writer_waits_on_postgres() {
+        if !Backend::test_is_postgres() {
+            return;
+        }
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        COLD_DERIVES.store(0, Ordering::Relaxed);
+        let (_dir, store, repo, ids) = store_with_here(&chain(12));
+        let tip = *ids.last().unwrap();
+        // The same writer priority, over the Postgres writer mutex: the
+        // walk's step ends, it sees a writer waiting for the connection,
+        // and the writer's write runs before the walk's next derive.
+        std::thread::scope(|scope| {
+            let _gate = gate_closed();
+            let walker = scope.spawn(|| get::<Cold<1>>(&store, repo, tip).unwrap());
+            wait_entered(1);
+            let writer = scope.spawn(|| {
+                store
+                    .write(|_| {
+                        DERIVES_AT_WRITE
+                            .store(COLD_ENTERED.load(Ordering::SeqCst), Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+            for _ in 0..2_000 {
+                if store.writers_waiting() > 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(store.writers_waiting() > 0, "the writer never waited");
+            gate_release(12);
+            writer.join().unwrap();
+            assert_eq!(
+                DERIVES_AT_WRITE.load(Ordering::SeqCst),
+                2,
+                "the walk derived while a writer waited"
+            );
             gate_open();
             assert_eq!(walker.join().unwrap(), 12);
         });

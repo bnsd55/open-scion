@@ -42,7 +42,7 @@ use crate::derived::DeriveFlights;
 use crate::error::{Error, Result};
 
 /// The schema version this build makes and reads.
-pub(crate) const SCHEMA_VERSION: u32 = 8;
+pub(crate) const SCHEMA_VERSION: u32 = 9;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database from
 /// version `n - 1` to version `n`. A released migration never changes.
@@ -55,6 +55,7 @@ const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [
     include_str!("../migrations/0006_land_created_at.sql"),
     include_str!("../migrations/0007_tree_sizes.sql"),
     include_str!("../migrations/0008_view_roots.sql"),
+    include_str!("../migrations/0009_view_trees.sql"),
 ];
 
 /// Largest object accepted or read back, uncompressed: 100 MiB, the hard
@@ -69,6 +70,60 @@ const READER_WINDOW_LOG: u32 = 21;
 /// Most memory that a [`BlobReader`] holds between parts: its zstd window and
 /// the decoder's buffers and tables, which take less than 1 MiB.
 pub const READER_BYTES: usize = (1 << READER_WINDOW_LOG) + (1 << 20);
+
+/// A step the tests run at a counted batch boundary of the import, with
+/// the count of batches done so far.
+#[doc(hidden)]
+pub type AfterBatch = Box<dyn FnMut(usize) + Send>;
+
+/// The import's test hooks, the same state on both backends: the count of
+/// busy retries, so a test proves the retry ran instead of only that the
+/// import survived, and the step the tests run after each batch commits,
+/// so a test that must act at a counted batch boundary runs there,
+/// instead of racing the batch's end.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct ImportHooks {
+    busy_retries: AtomicU64,
+    after_batch: Mutex<Option<AfterBatch>>,
+}
+
+#[doc(hidden)]
+impl ImportHooks {
+    /// Counts one busy retry of the import's batch.
+    pub fn note_busy_retry(&self) {
+        self.busy_retries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many busy retries of the import's batches ran so far.
+    #[must_use]
+    pub fn busy_retries(&self) -> u64 {
+        self.busy_retries.load(Ordering::Relaxed)
+    }
+
+    /// Sets the step the tests run after each batch of the import commits.
+    pub fn set_after_batch(&self, step: Option<AfterBatch>) {
+        *self
+            .after_batch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = step;
+    }
+
+    /// Runs the test step of a batch boundary, with the count of batches
+    /// done so far. The mutex is held across the step: a test step may
+    /// block for as long as it likes (the busy tests hold the database for
+    /// seconds), but nothing else can set or clear the step meanwhile, and
+    /// a step that calls back into `set_after_batch` deadlocks.
+    pub fn run_after_batch(&self, batches: usize) {
+        if let Some(step) = &mut *self
+            .after_batch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            step(batches);
+        }
+    }
+}
 
 /// Handle to one data directory. Cheap to clone.
 #[derive(Clone)]
@@ -129,6 +184,9 @@ struct Inner {
     /// the import's busy retry: the transaction ran and rolled back, so
     /// nothing was written, exactly as a real busy commit ends.
     fail_commits: AtomicU64,
+    /// The import's test hooks and busy-retry count, as Postgres keeps
+    /// its own.
+    hooks: ImportHooks,
     /// The derive walks of this store: which are in flight, and the cap
     /// on how many may be.
     derive: DeriveFlights,
@@ -294,6 +352,7 @@ impl Store {
                 _server_lock: server_lock,
                 txes: AtomicU64::new(0),
                 fail_commits: AtomicU64::new(0),
+                hooks: ImportHooks::default(),
                 derive: DeriveFlights::new(walks_cap),
                 writers: Mutex::new(0),
                 write_woken: Condvar::new(),
@@ -470,6 +529,13 @@ impl Store {
     #[doc(hidden)]
     pub fn set_busy_timeout(&self, timeout: Duration) {
         let _ = self.lock().busy_timeout(timeout);
+    }
+
+    /// The import's test hooks and busy-retry count.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn hooks(&self) -> &ImportHooks {
+        &self.inner.hooks
     }
 
     /// Write transactions run so far.

@@ -10,6 +10,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -784,6 +786,34 @@ fn import_process(data: &Path, git: &Git, rev: &str, name: &str) -> Command {
     command
 }
 
+/// `scion-server import` that opens the test's Postgres schema: the test
+/// URL plus a `search_path` startup option, since the binary names no
+/// schema and the tests of one data directory share one. The data
+/// directory still holds the blobs and the backend marker.
+fn import_process_on_postgres(data: &Path, git: &Git, rev: &str, name: &str) -> Command {
+    let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+    let schema = Backend::test_schema(data).unwrap();
+    let sep = if url.contains('?') { '&' } else { '?' };
+    // `--postgres-url` is a flag of the root command, so it goes before
+    // the subcommand.
+    let mut command = server_process(
+        data,
+        &[
+            "--postgres-url",
+            &format!("{url}{sep}options=--search_path%3D{schema}"),
+            "import",
+            "--repo",
+            "r",
+            "--rev",
+            rev,
+        ],
+    );
+    command
+        .args(["--ref", name, "--verify", "10"])
+        .arg(git.path());
+    command
+}
+
 fn assert_success(out: &Output) {
     assert!(
         out.status.success(),
@@ -947,6 +977,124 @@ fn an_import_process_shares_the_data_directory_with_lands() {
 }
 
 #[test]
+fn an_import_process_shares_the_postgres_database_with_lands() {
+    // The SQLite twin above asserts the data directory's own mechanics, so
+    // it skips here. This one runs only on Postgres, where the database
+    // sorts its writers out and an import takes no server lock: another
+    // process imports while this test's lands write the same schema.
+    if !Backend::test_is_postgres() {
+        return;
+    }
+    let git = Git::init();
+    let first = git.fast_commits(0, 1);
+    let tip = git.fast_commits(1, 60);
+    // The server's store and lands; the imports run as other processes.
+    let (dir, store) = open_store();
+    let lands = Lands::default();
+    let data = dir.path();
+    let import = |rev: &str, name: &str| {
+        assert_success(
+            &import_process_on_postgres(data, &git, rev, name)
+                .output()
+                .unwrap(),
+        );
+    };
+    import(&first, "main");
+    let start = main_ref(&store).target;
+
+    // A land whose base is not on main builds main's path index at the
+    // start, and leaves main alone.
+    let repo = store.read(|c| c.repo_id("r")).unwrap();
+    let side = Changeset {
+        parents: vec![],
+        author: identity(),
+        committer: None,
+        message: b"side".to_vec(),
+        changes: BTreeMap::new(),
+    };
+    let side = store.write(|c| c.insert_changeset(repo, &side)).unwrap();
+    let out = land(&store, &lands, create(&store, side, "s.txt"));
+    assert_eq!(out.state, LandState::Rejected, "{}", out.detail);
+    assert_eq!(main_ref(&store).target, start);
+
+    // The other process moves main forward. The next plan reads the new
+    // head, so the index sees the imported changes.
+    import(&tip, "main");
+    let imported = changeset_of(&store, &tip);
+    assert_eq!(main_ref(&store).target, imported);
+    let out = land(&store, &lands, create(&store, start, "g/f5"));
+    assert_eq!(out.state, LandState::Conflict, "{}", out.detail);
+    assert_eq!(out.conflict_paths, [path("g/f5")]);
+    let out = land(&store, &lands, create(&store, start, "mine.txt"));
+    assert_eq!(out.state, LandState::Landed, "{}", out.detail);
+    let mine = out.result.unwrap();
+    let parents = read::get_changeset(&store, "r", mine).unwrap().parents;
+    assert_eq!(parents, [imported]);
+
+    // Agents land on main while another process imports more commits into
+    // another ref.
+    let more = git.fast_commits(60, 400);
+    let import = common::spawn_guard::across_spawn(|| {
+        import_process_on_postgres(data, &git, &more, "git/main")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+    })
+    .unwrap();
+    let done = AtomicBool::new(false);
+    let landed: Vec<ChangesetId> = thread::scope(|scope| {
+        let agents: Vec<_> = (0..4)
+            .map(|agent| {
+                let (store, lands, done) = (&store, &lands, &done);
+                scope.spawn(move || {
+                    let mut landed = Vec::new();
+                    while !done.load(Ordering::Relaxed) || landed.is_empty() {
+                        let head = main_ref(store).target;
+                        let cs = create(store, head, &format!("agent{agent}/{}", landed.len()));
+                        let out = land(store, lands, cs);
+                        assert_eq!(out.state, LandState::Landed, "{}", out.detail);
+                        landed.push(out.result.unwrap());
+                    }
+                    landed
+                })
+            })
+            .collect();
+        let out = import.wait_with_output().unwrap();
+        done.store(true, Ordering::Relaxed);
+        assert_success(&out);
+        agents.into_iter().flat_map(|a| a.join().unwrap()).collect()
+    });
+
+    // Every commit is imported, and the other ref points at the tip. The
+    // imported commits come from the store, not from the database's rows.
+    let imported_count = store
+        .read(|c| {
+            let repo = c.repo_id("r")?;
+            Ok(c.imported_commits(repo)?.len())
+        })
+        .unwrap();
+    assert_eq!(imported_count, 400);
+    assert_eq!(
+        read::resolve_ref(&store, "r", "git/main").unwrap(),
+        changeset_of(&store, &more)
+    );
+    // Main's first-parent history above `mine` is the lands, each once. A
+    // fast machine lands more than one log page (`read::MAX_SCAN`), so walk
+    // the parents.
+    let mut history = Vec::new();
+    let mut at = main_ref(&store).target;
+    while at != mine {
+        assert!(history.len() < landed.len(), "main does not reach {mine}");
+        history.push(at);
+        at = read::get_changeset(&store, "r", at).unwrap().parents[0];
+    }
+    let mut want = landed;
+    want.sort();
+    history.sort();
+    assert_eq!(history, want);
+}
+
+#[test]
 fn a_second_server_process_is_refused() {
     if skip_on_postgres("runs the data directory's server, which locks its database") {
         return;
@@ -988,41 +1136,37 @@ fn open_shared_store() -> (tempfile::TempDir, Backend) {
     (dir, store)
 }
 
-/// Waits until the store has `n` changesets, so a test can hold the write
-/// lock while the import's next batch runs.
-fn wait_for_writes(dir: &Path, n: i64) {
-    let watcher = Connection::open(dir.join("scion.db")).unwrap();
-    let mut enough = false;
-    for _ in 0..10000 {
-        let cs: i64 = watcher
-            .query_row("SELECT count(*) FROM changesets", [], |row| row.get(0))
-            .unwrap_or(0);
-        if cs >= n {
-            enough = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(2));
-    }
-    assert!(enough, "the import never stored {n} changesets");
-}
-
-/// Holds the store's write lock from another connection for `hold_ms`. The
-/// thread ends on its own; it commits when the hold is over. The hold takes
-/// the lock the moment a batch's commit ends, so it must outlast the flush
-/// that follows the commit plus the yield before the next batch begins.
-fn hold_for(dir: &Path, hold_ms: u64) {
+/// Takes the store's write lock with another connection and keeps it until
+/// the import's batch has hit the busy database once: the hold starts at a
+/// counted batch boundary, and releases only when a batch retried, so the
+/// batch that began inside the hold provably waited out the lock. Its
+/// writes are idempotent, so the retry is safe. The thread ends on its own;
+/// it commits when the hold is over.
+fn hold_until_a_retry(store: &Backend, dir: &Path, before: u64) {
+    let (held_tx, held_rx) = mpsc::channel();
     let db = Connection::open(dir.join("scion.db")).unwrap();
+    let watcher = store.clone();
     thread::spawn(move || {
         // The lock may be held by a batch of the import; wait for it, then
-        // hold past the writer's busy timeout.
+        // hold it.
         db.busy_timeout(Duration::from_secs(30)).unwrap();
         db.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let deadline = Instant::now() + Duration::from_millis(hold_ms);
-        while Instant::now() < deadline {
+        held_tx.send(()).unwrap();
+        // The import's first write under this hold fails as busy and the
+        // batch retries; the hold ends when that retry is counted.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while watcher.busy_retries() <= before {
+            assert!(
+                Instant::now() < deadline,
+                "the import never hit the busy lock"
+            );
             thread::sleep(Duration::from_millis(5));
         }
         db.execute_batch("COMMIT").unwrap();
     });
+    held_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the hold never took the write lock");
 }
 
 #[test]
@@ -1034,18 +1178,30 @@ fn an_import_batch_waits_out_a_busy_write_lock() {
     let rev = git.fast_commits(0, 3000);
     let (dir, store) = open_shared_store();
     // A busy lock fails fast, so the retry is deterministic: the holder
-    // keeps the lock far longer than the store waits for it.
+    // keeps the lock until a batch retried, and the batch runs again whole.
     store.set_busy_timeout(Duration::from_millis(100));
-    let report = thread::scope(|s| {
-        let importer = s.spawn(|| try_import(&store, &git, &rev).unwrap());
-        // Once changesets are stored, a batch is running or just ended: the
-        // hold takes the lock the moment that batch ends, so the next batch
-        // begins inside the hold. A batch is safe to run again whole.
-        wait_for_writes(dir.path(), 50);
-        hold_for(dir.path(), 1500);
-        importer.join().unwrap()
-    });
+    let store = Arc::new(store);
+    let before = store.busy_retries();
+    // The hold starts at a counted batch boundary: the hook runs after the
+    // first batch's commit has ended and returns only once the hold has the
+    // write lock, so the next batch begins inside the hold. A batch is safe
+    // to run again whole.
+    let holds = dir.path().to_path_buf();
+    let hooked = Arc::clone(&store);
+    store.set_after_batch(Some(Box::new(move |batch_no| {
+        if batch_no == 0 {
+            hold_until_a_retry(&hooked, &holds, before);
+        }
+    })));
+    let report = try_import(&store, &git, &rev).unwrap();
+    store.set_after_batch(None);
     assert_eq!((report.commits, report.imported), (3000, 3000));
+    // The batch that began inside the hold waited out the lock: its try hit
+    // the busy database, and a retry ran it again whole.
+    assert!(
+        store.busy_retries() > before,
+        "no batch ever hit the busy lock"
+    );
 }
 
 #[test]
@@ -1081,6 +1237,120 @@ fn an_import_that_stays_busy_fails_with_the_busy_error() {
         })
         .unwrap();
     assert_eq!(cs, 0);
+}
+
+/// The Postgres hold of a batch boundary: a client of the test schema
+/// takes the changesets table and keeps it until the import's batch has
+/// hit the busy database once, as `hold_until_a_retry` holds the data
+/// directory's write lock on SQLite. The hold starts at a counted batch
+/// boundary, and releases only when a batch retried, so the batch that
+/// began inside the hold provably waited out the lock. Its writes are
+/// idempotent, so the retry is safe. The thread ends on its own; it
+/// commits when the hold is over.
+fn hold_until_a_retry_pg(
+    store: &Arc<Backend>,
+    dir: &Path,
+    before: u64,
+    failures: &Arc<Mutex<Vec<String>>>,
+) {
+    let (held_tx, held_rx) = mpsc::channel();
+    let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+    let Some(schema) = Backend::test_schema(dir) else {
+        failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push("no test schema for the hold".to_owned());
+        return;
+    };
+    let watcher = Arc::clone(store);
+    let failures = Arc::clone(failures);
+    thread::spawn(move || {
+        // A failure is reported, not panicked: a panic in this detached
+        // thread would be lost, and the test would fail much later with a
+        // message that says nothing.
+        let fail = |why: String| {
+            failures
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(why);
+        };
+        let mut db = match postgres::Client::connect(&url, postgres::NoTls) {
+            Ok(db) => db,
+            Err(e) => return fail(format!("the hold never connected: {e}")),
+        };
+        if let Err(e) = db.batch_execute(&format!("SET search_path TO {schema}")) {
+            return fail(format!("the hold never reached the schema: {e}"));
+        }
+        // The batch's writes are inserts into `changesets`; the lock holds
+        // them while reads go past.
+        if let Err(e) = db.batch_execute("BEGIN; LOCK TABLE changesets IN EXCLUSIVE MODE;") {
+            return fail(format!("the hold never took the table: {e}"));
+        }
+        if held_tx.send(()).is_err() {
+            return; // the test gave up waiting for the hold
+        }
+        // The import's first write under this hold waits out the 5 s lock
+        // clock, answers busy, and the batch retries; the hold ends when
+        // that retry is counted.
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while watcher.busy_retries() <= before {
+            if std::time::Instant::now() >= deadline {
+                return fail("the import never hit the busy lock".to_owned());
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        if let Err(e) = db.batch_execute("COMMIT") {
+            fail(format!("the hold never let go: {e}"));
+        }
+    });
+    held_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the hold never took the write lock");
+}
+
+#[test]
+fn an_import_batch_waits_out_a_busy_write_lock_on_postgres() {
+    if !Backend::test_is_postgres() {
+        return;
+    }
+    let git = Git::init();
+    let rev = git.fast_commits(0, 3000);
+    let (dir, store) = open_store();
+    let store = Arc::new(store);
+    let before = store.busy_retries();
+    // The hold starts at a counted batch boundary: the hook runs after the
+    // first batch's commit has ended and returns only once the hold has
+    // the table, so the next batch begins inside the hold. A batch is safe
+    // to run again whole.
+    let holds = dir.path().to_path_buf();
+    let hooked = Arc::clone(&store);
+    // The hold reports what went wrong here, and the test reads the log
+    // as soon as the import is over, before the busy assert, whose
+    // failure would only say the import answered busy.
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let logged = Arc::clone(&failures);
+    store.set_after_batch(Some(Box::new(move |batch_no| {
+        if batch_no == 0 {
+            hold_until_a_retry_pg(&hooked, &holds, before, &logged);
+        }
+    })));
+    let report = try_import(&store, &git, &rev);
+    store.set_after_batch(None);
+    if let Some(why) = failures
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .first()
+    {
+        panic!("{why}");
+    }
+    let report = report.unwrap();
+    assert_eq!((report.commits, report.imported), (3000, 3000));
+    // The batch that began inside the hold waited out the lock: its try
+    // hit the 5 s lock clock, and a retry ran it again whole.
+    assert!(
+        store.busy_retries() > before,
+        "no batch ever hit the busy lock"
+    );
 }
 
 #[test]

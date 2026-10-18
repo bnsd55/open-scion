@@ -11,8 +11,7 @@
 //!   the whole repo. A principal whose read rules are all prefixes is a
 //!   *partial reader*: it reads what they cover through the view that
 //!   [`crate::views`] derives for it, and a path outside them answers as a
-//!   missing one. Its history reads answer
-//!   [`UNIMPLEMENTED`](crate::error::Error::Unimplemented), uniformly, and
+//!   missing one. Its history reads answer `UNIMPLEMENTED`, uniformly, and
 //!   so would its writes; a file that gives a partial reader a write rule
 //!   is refused at load.
 //! - A write rule names a path prefix of a repo. A principal may change a
@@ -138,7 +137,7 @@ const RULE_SET_DIGEST_VERSION: u8 = 1;
 /// The digest of a canonical read rule set. The whole repo (`None`) and
 /// every set of canonical prefixes hash to distinct digests, and two sets
 /// with the same canonical prefixes hash to one digest.
-fn rule_set_digest(canonical: Option<&[RepoPath]>) -> [u8; 32] {
+pub(crate) fn rule_set_digest(canonical: Option<&[RepoPath]>) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&[RULE_SET_DIGEST_VERSION]);
     match canonical {
@@ -356,6 +355,25 @@ impl Access {
                 .map(|prefixes| rule_set_digest(Some(prefixes))),
             _ => None,
         }
+    }
+
+    /// Every canonical read rule-set digest of `repo` that some principal
+    /// holds: the live keys of the view rows. The sweep of a derivation
+    /// removes view rows of digests outside this set, so a digest whose
+    /// last principal went away dies at the next derivation.
+    #[must_use]
+    pub fn view_digests(&self, repo: &str) -> Vec<[u8; 32]> {
+        let mut digests: std::collections::BTreeSet<[u8; 32]> = std::collections::BTreeSet::new();
+        for ((principal, grant_repo), grant) in &self.grants {
+            let _ = principal;
+            if grant_repo != repo {
+                continue;
+            }
+            if let Some(prefixes) = grant.canonical_read() {
+                digests.insert(rule_set_digest(Some(&prefixes)));
+            }
+        }
+        digests.into_iter().collect()
     }
 
     /// The grant of `principal` in `repo`, made if missing.

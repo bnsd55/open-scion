@@ -177,7 +177,7 @@ fn import_with_cache(
         intact: LruCache::new(cache_entries),
     };
     let mut done = 0;
-    for batch in plan.todo.chunks(BATCH) {
+    for (batch_no, batch) in plan.todo.chunks(BATCH).enumerate() {
         // Blobs are made durable first, so no stored metadata points at a
         // blob that a crash could lose.
         let mut blobs = store.blobs().batch();
@@ -214,6 +214,9 @@ fn import_with_cache(
             &mut done,
             started,
         )?;
+        // A batch's commit has ended and the write lock is free: this is
+        // the counted boundary a test holds the lock at.
+        store.run_after_batch(batch_no);
     }
 
     // The tip was imported before, or planned and imported above.
@@ -312,6 +315,7 @@ fn store_batch(
                     tries += 1;
                     taken = 0;
                     checker.reset_for_retry();
+                    store.note_busy_retry();
                     tracing::warn!(tries, "the database stayed busy; the batch retries");
                     std::thread::sleep(TX_YIELD);
                 }

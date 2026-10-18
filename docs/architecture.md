@@ -6,7 +6,10 @@ not exist yet are marked **planned**, with the issue that tracks them.
 The design follows Anthropic's article
 [Redesigning source control](https://www.anthropic.com/engineering/redesigning-source-control).
 The README lists where this project makes its own choices.
-[`design/scalable-backend.md`](design/scalable-backend.md) proposes a backend that scales out to many servers (not built).
+The metadata may live in Postgres instead of the data directory (#178,
+part 2 of [#47](https://github.com/bnsd55/open-scion/issues/47)); a
+backend that scales out to *many servers* on one database is still a
+proposal ([`design/scalable-backend.md`](design/scalable-backend.md)).
 
 ## 1. Overview
 
@@ -14,7 +17,7 @@ The README lists where this project makes its own choices.
 |---|---|
 | [`scion-core`](../crates/scion-core) | Object model (`Changeset`, `Tree`, IDs, `RepoPath`) and the v1 encoder and strict decoder. No I/O. |
 | [`scion-proto`](../crates/scion-proto) | gRPC types generated from [`proto/scion.proto`](../proto/scion.proto): the `Scion` and `Objects` services, whose contract is [`protocol-v1.md`](protocol-v1.md). Largest message 64 MiB, stream chunk 1 MiB; a `GetObjects` reply message holds one part of an object, at most 1 MiB plus its header. Also the code that the server and the tiers share: the bearer-token check (`auth.rs`), how an object travels in parts and encodings (`object.rs`), and the `GetObjects` reply rules (`reply.rs`). |
-| [`scion-server`](../crates/scion-server) | One binary with two commands: `serve` (the API) and `import` (git import). |
+| [`scion-server`](../crates/scion-server) | One binary: `serve` (the API), `import` (git import), `fsck`, `gc`, `derive`, `hash-token`, `ticket-key`. |
 | [`scion-tier`](../crates/scion-tier) | The cache tiers (section 7): a `Tier` library and two binaries, `scion-cache` (memory) and `scion-daemon` (disk, Unix socket). |
 | [`scn`](../crates/scn) | Command-line client: `cat`, `ls`, `log`, `blame`, `show`, `merge-base`, `is-ancestor`, `diff`, `checkout`, `commit`, `land`, `bench`. |
 
@@ -26,7 +29,7 @@ flowchart LR
         ops --> tree["tree.rs: apply, root trees<br/>graph.rs: commit graph<br/>history.rs: path history<br/>derived.rs: derived data"]
         ops --> db["db.rs, store.rs"]
         tree --> db
-        db --> sqlite[("scion.db: SQLite")]
+        db --> sqlite[("metadata: SQLite, or Postgres")]
         ops --> blobs[("objects/blob: zstd files")]
     end
     git[("git repository")] --> imp["scion-server import"]
@@ -138,7 +141,14 @@ and the decoder rules.
 
 ## 3. Storage
 
-One data directory holds everything (`store.rs`):
+This section describes the SQLite backend: the metadata lives in
+`scion.db` inside one data directory. With `--postgres-url` the server
+keeps the same metadata in a Postgres database instead (same tables, one
+server per database; the Postgres schema is checked against these tables
+by a test), and its rules are in the operations guide
+([`operations.md`](operations.md), "The metadata in Postgres"). The blob
+files stay in the data directory in every backend. What follows is the
+SQLite backend:
 
 ```text
 <data>/lock                    shared by every process that uses <data>
@@ -234,7 +244,10 @@ upload or a crash leaves nothing behind. Each process stages its temp files
 in its own folder of `tmp/`, held with a lock, and an open removes the
 folders of processes that no longer hold theirs (see below).
 
-**Durability rules.**
+**Durability rules** (the SQLite backend; on Postgres a returned commit
+is durable: `synchronous_commit=on` is checked at open, so
+`Store::write` returning is the durability point, and the full-flush
+machinery below does not apply).
 
 - Group commit: concurrent callers share one full drive flush (`F_FULLFSYNC`
   on macOS). Each caller first makes its writes reach the drive with a plain
@@ -283,7 +296,9 @@ folders of processes that no longer hold theirs (see below).
 Unit tests check where each flush comes. No test cuts the power: the crash
 suite kills the process, and the kernel keeps what it wrote (section 10).
 
-**Processes that share a data directory.** `scion-server import` can run
+**Processes that share a data directory** (SQLite backend only: on
+Postgres, one `serve` runs per database — a second fails at open — and an
+import runs beside it without taking that lock). `scion-server import` can run
 while the server runs. The server opens the directory with `Store::open`, an
 import with `Store::open_shared`. Each holds its `flock`s until the last
 `Store` clone is dropped:
@@ -392,6 +407,21 @@ waits for the batch's transaction (section 3).
 file into a directory or back. It loads only the directories on changed paths
 and removes directories left empty. It fails on a delete of a missing path or
 of a directory, and on a put where a file or a directory is in the way.
+
+**Views.** A partial reader reads through a view the server derives from its
+read prefixes (`views.rs`). The derivation is a pure function of the rule set
+and the real trees, so its results are a rebuildable cache: one `view_trees`
+row per (repo, rule-set digest, projection version, real tree, path-context
+digest), in the same shape on both backends (SQLite migration 0009, Postgres
+0003). A derivation asks the table at every directory, so a new changeset
+re-derives only the folders on its changed paths; the rest of the view comes
+from the rows, and the changeset's root row is the row of its real root tree
+under the rule set's full context. Each derivation's write also sweeps at
+most `VIEW_EXPIRE_STEP` (256) dead rows: rows of an older projection version
+first, then rows of a digest that no read rule of the repo hashes to any
+more. `scion_view_trees_walked_total` counts the real trees a derivation
+opened; a count that stays high on every changeset of one rule set says the
+memo is not serving and every derivation re-walks.
 
 **Commit graph.** Kind `commit_graph` version 1 (`graph::CommitGraph`). The
 article says that Scion keeps skip lists for the commit graph as derived
@@ -514,7 +544,7 @@ sequenceDiagram
     autonumber
     participant A as scn
     participant L as land.rs
-    participant DB as SQLite
+    participant DB as backend (SQLite, or Postgres)
     A->>L: Land(changeset, ref, request key)
     L->>DB: transaction: insert a pending row and expire old lands, or find the row for this key
     alt row is not pending
@@ -709,7 +739,8 @@ with `INTERNAL`.
 the ref once ([#18](https://github.com/bnsd55/open-scion/issues/18), closed: one
 machine already gives about 200 durable lands/s). The
 [scalable backend design](design/scalable-backend.md) says when it would be
-needed.
+needed: many servers on one database, which the Postgres backend does not
+give yet (one server runs per database).
 
 ## 6. Git import
 
@@ -1584,8 +1615,6 @@ limit and its upgrade path. This is the list on `main` today.
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each symlink target whole, so memory caps the target length. | Stream chunks from the file. | |
 | `scn/src/cmd/commit.rs` (`parse_author`) | The author time zone is always UTC, since `std` cannot read the local time zone. | A time zone crate. | |
 | `scn/src/vfs.rs` (`io_err`) | Takes the error by value so `.map_err(io_err)` reads clean. | Take it by reference if the lint allows it one day. | |
-| `scion-server/src/views.rs` | The store caches the view root only, not each derived tree: a cache miss re-walks the whole tree. Ceiling: file-granular rules over a large flat tree pay the walk once per changeset. | One row per (key, tree, context) in `view_roots`, looked up as the walk descends. | [#121](https://github.com/bnsd55/open-scion/issues/121) |
-| `scion-server/src/views.rs` | Rows of old view keys (a changed rule set, a bumped projection version) are never removed. | A sweep like the derived table's, or a delete of a repo's rows when its rule sets change. | [#183](https://github.com/bnsd55/open-scion/issues/183) |
 
 ## 10. Testing
 
@@ -1700,6 +1729,7 @@ into fixed buckets. The values are read on export only.
 | `scion_rpc_bytes_total{rpc,direction}` | counter | Reply bytes out; request bytes in, counted from the `content-length` header, which a gRPC client does not send. |
 | `scion_lands_total{outcome}` | counter | Lands by outcome: `landed`, `conflict`, `rejected`, `retry` (a pending land waits for its retry). |
 | `scion_land_replans_total` | counter | Lands whose ref moved under them and were planned again: a rising rate means lands that contend with imports or other writers on one ref. |
+| `scion_view_trees_walked_total` | counter | Real trees a view derivation opened for a partial reader. A count that rises on every changeset of the same rule set says the per-tree memo is not serving and every read re-walks the tree. |
 | `scion_cache_hits_total`, `scion_cache_misses_total` | counter | A tier's object reads served from its store or its snapshot, and read from upstream. A tier's scrape also shows its `Objects` calls in `scion_requests_total` and `scion_request_seconds`. |
 
 The layer sits inside the axum router, around both gRPC services and
