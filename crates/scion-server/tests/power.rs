@@ -514,15 +514,9 @@ async fn race_wave(
 }
 
 /// Says every acknowledged blob and every blob file of the store verifies.
-fn verify_whole(
-    store: &Store,
-    acked: &[(BlobId, Vec<u8>)],
-    events: &EventLog,
-    round: usize,
-    data: &Path,
-) {
+fn verify_whole(store: &Store, acked: &[BlobId], events: &EventLog, round: usize, data: &Path) {
     events.line(&format!("round {round}: reopens, {} acked", acked.len()));
-    for (id, _) in acked {
+    for id in acked {
         let status = store.blobs().verify(*id).unwrap();
         events.line(&format!("round {round}: verify acked {id}: {status:?}"));
         assert_eq!(status, BlobStatus::Valid, "acknowledged blob {id}");
