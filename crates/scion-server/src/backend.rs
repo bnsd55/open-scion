@@ -22,7 +22,6 @@ use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId}
 use crate::pg::{Pg, PgTx};
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::store::{Blobs, Store};
