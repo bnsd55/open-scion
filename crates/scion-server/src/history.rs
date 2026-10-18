@@ -34,6 +34,7 @@ use std::ops::Bound::{self, Unbounded};
 
 use scion_core::{Changeset, ChangesetId, FileState, PathElem, RepoPath};
 
+use crate::backend::Backend;
 use crate::deadline::Deadline;
 use crate::derived::{self, Kind};
 use crate::error::{Error, Result};
@@ -158,6 +159,16 @@ type Node = BTreeMap<PathElem, Entry>;
 
 /// The history tree of a changeset, as the ID of its root node.
 pub struct PathHistory;
+
+/// Derives the path history of `cs`, and removes the rows of older
+/// versions. Returns the kind's name for the `derive` command's report.
+///
+/// # Errors
+///
+/// Errors of the `derived` fill, and of the final flush.
+pub fn backfill_path_history(store: &Backend, repo: &str, cs: ChangesetId) -> Result<&'static str> {
+    crate::derived::backfill::<PathHistory>(store, repo, cs)
+}
 
 impl Kind for PathHistory {
     const NAME: &'static str = "path_history";

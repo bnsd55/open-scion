@@ -482,7 +482,11 @@ fn the_postgres_schema_holds_the_tables_and_columns_of_the_sqlite_schema() {
         }
     }
     for name in postgres.keys() {
-        if !sqlite.contains_key(name) {
+        // The store UUID is Postgres-only by design: only there can a
+        // database and a data directory part ways, so only there does an
+        // identity row earn its keep. SQLite's identity is its own
+        // scion.db, whose name is the identity.
+        if !sqlite.contains_key(name) && name != "store_uuid" {
             say(
                 format!("table {name} is missing from the SQLite schema"),
                 &mut ok,

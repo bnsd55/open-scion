@@ -9,8 +9,9 @@
 //!   prefixes. A read prefix names a path of the repo, by path parts: `src`
 //!   covers `src` and `src/a`, not `srcx`. A read rule with no prefix covers
 //!   the whole repo. A principal whose read rules are all prefixes is a
-//!   *partial reader*: it reads what they cover through the view that
-//!   [`crate::views`] derives for it, and a path outside them answers as a
+//!   *partial reader*: it reads what they cover through the view that the
+//!   crate's `views` module derives for it, and a path outside them
+//!   answers as a
 //!   missing one. Its history reads answer `UNIMPLEMENTED`, uniformly, and
 //!   so would its writes; a file that gives a partial reader a write rule
 //!   is refused at load.
