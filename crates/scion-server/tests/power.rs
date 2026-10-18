@@ -950,8 +950,10 @@ fn release_park(data: &Path, id: &BlobId) {
     fs::remove_file(park_file(data, id)).unwrap();
 }
 
-/// Waits until the server's writer is inside the park: it stats the park
-/// file through the mount, and the ops trace shows every stat.
+/// Waits until the server's writer is inside the park. The trace shows
+/// the arm as the create of the park file; the park as repeated stats of
+/// it, one every few ms. The test's own ops add at most one stat, so
+/// three stats after the create mean the server polls.
 fn wait_parked(trace: &Path, id: &BlobId) {
     let park_path = format!("hooks/park-{id}");
     let mut armed = false;
