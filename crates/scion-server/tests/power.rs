@@ -185,10 +185,8 @@ impl Lazyfs {
         });
         let mut answer = Some(answer);
         let done = wait_for("clear-cache to finish", 15, || {
-            let answer = answer.as_mut()?;
-            answer
-                .is_finished()
-                .then(|| answer.take().unwrap().join().unwrap())
+            let finished = answer.as_ref().unwrap().is_finished();
+            finished.then(|| answer.take().unwrap().join().unwrap())
         });
         assert!(done.contains("finished::clear-cache"), "{done:?}");
     }
@@ -528,7 +526,7 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
         server.freeze();
         lazy.cut();
         drop(server);
-        let server = Server::start(&data, &server_log);
+        let mut server = Server::start(&data, &server_log);
         events.line(&format!("round {round}: server up after the cut"));
         // A wave cut in flight: the freeze ends it, so no racer of the
         // wave gets a reply past the cut. Whatever the acked waves put
@@ -771,7 +769,7 @@ async fn import_process_races_the_server_on_the_same_blob() {
             .unwrap();
         let id = put_blob(&mut scion, &content).await.unwrap();
         assert_eq!(id, want);
-        let out = import.wait().unwrap();
+        let out = import.wait_with_output().unwrap();
         assert!(
             out.status.success(),
             "the import of round {round} failed: {:?}",
