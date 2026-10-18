@@ -46,6 +46,7 @@ async fn served() -> (
     String,
     Arc<Metrics>,
     ScionClient<InterceptedService<tonic::transport::Channel, Bearer>>,
+    scion_core::ChangesetId,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let store = {
@@ -55,7 +56,26 @@ async fn served() -> (
             .unwrap()
     };
     store
-        .write(|c| c.create_repo(REPO).map(|_| ()))
+        .write(|c| {
+            let repo = c.create_repo(REPO)?;
+            let root = c.insert_changeset(
+                repo,
+                &scion_core::Changeset {
+                    parents: vec![],
+                    author: scion_core::IdentityTime {
+                        name: b"Ada".to_vec(),
+                        email: b"ada@example.com".to_vec(),
+                        unix_secs: 1_700_000_000,
+                        tz_offset_minutes: 0,
+                    },
+                    committer: None,
+                    message: b"root\n".to_vec(),
+                    changes: Default::default(),
+                },
+            )?;
+            c.cas_ref(repo, "main", None, root)?;
+            Ok(root)
+        })
         .expect("the test store opens a write");
     let metrics = Arc::new(Metrics::default());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -90,12 +110,12 @@ async fn served() -> (
             .expect("the header value is visible ASCII"),
     );
     let scion = ScionClient::with_interceptor(channel, bearer);
-    (dir, stop, format!("http://{addr}"), metrics, scion)
+    (dir, stop, format!("http://{addr}"), metrics, scion, root)
 }
 
 #[tokio::test]
 async fn a_served_server_renders_the_operating_metrics() {
-    let (_dir, _stop, _url, metrics, mut scion) = served().await;
+    let (_dir, _stop, _url, metrics, mut scion, root) = served().await;
     // A real upload ends in a full flush of the drive cache.
     scion
         .put_blob(tokio_stream::once(PutBlobRequest {
@@ -131,7 +151,7 @@ async fn a_served_server_renders_the_operating_metrics() {
     // and the wait is in the histogram. The changeset names the blob the
     // upload above stored.
     let cs = scion_core::Changeset {
-        parents: vec![],
+        parents: vec![root],
         author: scion_core::IdentityTime {
             name: b"Ada".to_vec(),
             email: b"ada@example.com".to_vec(),
