@@ -493,45 +493,108 @@ impl MetaTx for SqliteTx<'_> {
 
     /// Stores a tree. Safe to repeat.
     ///
-    fn get_view_root(
+    fn get_view_tree(
         &mut self,
         repo: RepoId,
         digest: &[u8; 32],
-        cs: ChangesetId,
+        version: u32,
+        tree: TreeId,
+        ctx: [u8; 32],
     ) -> Result<Option<TreeId>> {
         let bytes: Option<Vec<u8>> = self
             .0
             .prepare_cached(
-                "SELECT root FROM view_roots WHERE repo_id = ?1 AND digest = ?2 AND cs = ?3",
+                "SELECT view FROM view_trees \
+                 WHERE repo_id = ?1 AND digest = ?2 AND version = ?3 AND tree = ?4 AND ctx = ?5",
             )?
-            .query_row(params![repo.0, digest, cs.as_bytes()], |row| row.get(0))
+            .query_row(
+                params![repo.0, digest, version, tree.as_bytes(), ctx],
+                |row| row.get(0),
+            )
             .optional()?;
         bytes
-            .map(|b| {
-                TreeId::try_from(b.as_slice()).map_err(|_| Error::Corrupt("bad view root".into()))
-            })
+            .map(|b| TreeId::try_from(b.as_slice()).map_err(|_| Error::Corrupt("bad view".into())))
             .transpose()
     }
 
-    fn put_view_root(
+    fn put_view_tree(
         &mut self,
         repo: RepoId,
         digest: &[u8; 32],
-        cs: ChangesetId,
-        root: TreeId,
+        version: u32,
+        tree: TreeId,
+        ctx: [u8; 32],
+        view: TreeId,
     ) -> Result<()> {
         let inserted = self
             .0
             .prepare_cached(
-                "INSERT OR IGNORE INTO view_roots (repo_id, digest, cs, root) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR IGNORE INTO view_trees \
+                 (repo_id, digest, version, tree, ctx, view) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?
-            .execute(params![repo.0, digest, cs.as_bytes(), root.as_bytes()])?;
-        if inserted == 0 && self.get_view_root(repo, digest, cs)? != Some(root) {
+            .execute(params![
+                repo.0,
+                digest,
+                version,
+                tree.as_bytes(),
+                ctx,
+                view.as_bytes()
+            ])?;
+        if inserted == 0 && self.get_view_tree(repo, digest, version, tree, ctx)? != Some(view) {
             return Err(Error::Corrupt(format!(
-                "the view root of {cs} for the rule set differs from the stored value"
+                "the view of tree {tree} under its context differs from the stored value"
             )));
         }
         Ok(())
+    }
+
+    fn delete_stale_view_trees(
+        &mut self,
+        repo: RepoId,
+        live: &[[u8; 32]],
+        version: u32,
+        limit: usize,
+    ) -> Result<usize> {
+        // Rows of an older projection version are dead, whoever used them.
+        // The LIMIT lives in the subquery: this SQLite build has no
+        // UPDATE_DELETE_LIMIT, as the derived-row expiry shows.
+        let bound = i64::try_from(limit).map_err(|_| Error::InvalidArgument("limit".into()))?;
+        let mut removed = self
+            .0
+            .prepare_cached(
+                "DELETE FROM view_trees WHERE (repo_id, digest, version, tree, ctx) IN (
+                 SELECT repo_id, digest, version, tree, ctx FROM view_trees
+                 WHERE repo_id = ?1 AND version < ?2 LIMIT ?3)",
+            )?
+            .execute(params![repo.0, version, bound])?;
+        // Rows of a digest that no grant of this repo hashes to any more,
+        // as far as this server's access file knows. All binds positional:
+        // a numbered list would share its indexes with the columns. `live`
+        // is never empty here: the deriving caller's digest is among the
+        // digests of its access snapshot (the assert in `view_root`), and
+        // a caller that cannot prove that has no business sweeping.
+        if removed < limit && !live.is_empty() {
+            let marks = std::iter::repeat_n("?", live.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "DELETE FROM view_trees WHERE (repo_id, digest, version, tree, ctx) IN (
+                 SELECT repo_id, digest, version, tree, ctx FROM view_trees
+                 WHERE repo_id = ? AND version = ? AND digest NOT IN ({marks})
+                 LIMIT ?)"
+            );
+            let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+                vec![Box::new(repo.0), Box::new(version)];
+            params.extend(
+                live.iter()
+                    .map(|d| Box::new(*d) as Box<dyn rusqlite::ToSql>),
+            );
+            params.push(Box::new(bound - i64::try_from(removed).unwrap_or(bound)));
+            let refs: Vec<&dyn rusqlite::ToSql> =
+                params.iter().map(std::convert::AsRef::as_ref).collect();
+            removed += self.prepare_cached(&sql)?.execute(refs.as_slice())?;
+        }
+        Ok(removed)
     }
 
     /// # Errors
