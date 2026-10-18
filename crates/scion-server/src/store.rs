@@ -3197,32 +3197,34 @@ mod tests {
                 .position(|s| s == step)
                 .unwrap_or_else(|| panic!("no {step:?} in the batch's steps"))
         };
-        for (id, answer) in ids.iter().zip(&answers) {
-            let log = &steps[..*answer];
+        let batch1 = &steps[..answers[0]];
+        for id in &ids {
             let (dir, _) = store.blobs().location(*id);
-            let a = steps_of(log, &S::TmpWrite(*id));
-            let b = steps_of(log, &S::FileFsync(*id));
-            let c = steps_of(log, &S::Rename(*id));
-            let d = log
+            let a = steps_of(batch1, &S::TmpWrite(*id));
+            let b = steps_of(batch1, &S::FileFsync(*id));
+            let c = steps_of(batch1, &S::Rename(*id));
+            let d = batch1
                 .iter()
                 .position(|s| matches!(s, S::DirFsync(path) if *path == dir))
                 .unwrap_or_else(|| panic!("no dir fsync of {} before the answer", dir.display()));
-            let f = log
+            let f = batch1
                 .iter()
                 .position(|s| *s == S::FullFlush)
                 .expect("no full flush before the answer");
             assert!(
-                a < b && b < c && c < d && d < f && f < *answer,
+                a < b && b < c && c < d && d < f && f < answers[0],
                 "the durability steps of {id} are out of order: \
                  tmp write {a}, file fsync {b}, rename {c}, dir fsync {d}, \
-                 full flush {f}, answer {answer}"
+                 full flush {f}, answer {}",
+                answers[0]
             );
         }
         // The keep path: no tmp write of the kept blobs in the second
         // batch, but a stored-file fsync and a dir fsync before the
         // answer.
-        for (id, answer) in kept.iter().zip(&answers[1..]) {
-            let log = &steps[answers[0] + 1..*answer];
+        let batch2 = &steps[answers[0] + 1..answers[1]];
+        for id in &kept {
+            let log = batch2;
             assert!(
                 log.iter().all(|s| *s != S::TmpWrite(*id)),
                 "a kept blob was written again"
