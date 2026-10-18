@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/banner.jpg" alt="open-scion logo: a young scion grafted onto a rootstock whose roots are circuit traces" width="720">
+  <img src="https://github.com/bnsd55/open-scion/raw/main/docs/assets/banner.jpg" alt="open-scion logo: a young scion grafted onto a rootstock whose roots are circuit traces" width="720">
 </p>
 
 # open-scion
@@ -108,7 +108,7 @@ the server returns the first result.
 Every call carries a request ID (16 hex characters, one per command), which
 the server and each tier log, so one command can be followed through every
 hop's log
-([docs/operations.md](docs/operations.md), section 6). A partial reader - a
+([docs/operations.md](https://github.com/bnsd55/open-scion/blob/main/docs/operations.md), section 6). A partial reader - a
 principal whose read rules name folder prefixes - reads the paths its rules
 cover and cannot write; the server derives a view of the repo for it.
 
@@ -116,7 +116,7 @@ cover and cannot write; the server derives a view of the repo for it.
 
 `scripts/demo.sh` does all of the steps below on a fixed public repository,
 prints the numbers, and removes what it made. The method and the checkout
-benchmark against git are in [docs/benchmarks.md](docs/benchmarks.md).
+benchmark against git are in [docs/benchmarks.md](https://github.com/bnsd55/open-scion/blob/main/docs/benchmarks.md).
 
 ```sh
 cargo build --release
@@ -170,7 +170,7 @@ The server and a cache can also export Prometheus metrics: start them with
 on a non-loopback address unless `--insecure-listen` is given. The
 registry counts requests by RPC and code, a latency histogram, reply
 bytes, lands by outcome, and a tier's cache hits and misses; the details
-are in [docs/architecture.md](docs/architecture.md), section 11.
+are in [docs/architecture.md](https://github.com/bnsd55/open-scion/blob/main/docs/architecture.md), section 11.
 
 ### Garbage collection
 
@@ -335,20 +335,20 @@ A bearer token over plain TCP to a non-loopback address stays refused.
 
 | Path | Contents |
 |---|---|
-| [`crates/scion-core`](crates/scion-core) | Object model and canonical byte format |
-| [`crates/scion-proto`](crates/scion-proto) | gRPC API ([`proto/scion.proto`](proto/scion.proto)) |
-| [`crates/scion-server`](crates/scion-server) | Storage, commits, lands, reads, git import |
-| [`crates/scion-tier`](crates/scion-tier) | Cache tiers: `scion-cache` and `scion-daemon` |
-| [`crates/scn`](crates/scn) | Command-line client |
-| [`scripts`](scripts) | The demo and the checkout benchmark against git |
-| [`docs/architecture.md`](docs/architecture.md) | How the parts fit together: storage, lands, reads, and the cache tiers |
-| [`docs/format-v1.md`](docs/format-v1.md) | The v1 byte format. Object IDs are hashes of these bytes. |
-| [`docs/protocol-v1.md`](docs/protocol-v1.md) | The v1 API contract: calls, limits, status codes, retries, durability and what a client checks |
-| [`docs/cli.md`](docs/cli.md) | Every `scn` command: what it does, its flags, the global flags and env vars, and the exit codes |
-| [`docs/operations.md`](docs/operations.md) | How to run a server: deploy, keys, the access file, Postgres, backups, and what each failure means |
-| [`docs/benchmarks.md`](docs/benchmarks.md) | How the demo and the benchmarks run, what each number means, and how to rerun them |
-| [`docs/RELEASING.md`](docs/RELEASING.md) | For maintainers: how a release is cut and published |
-| [`docs/design/scalable-backend.md`](docs/design/scalable-backend.md) | A design proposal, not built: stateless servers on a shared metadata store and object store |
+| [`crates/scion-core`](https://github.com/bnsd55/open-scion/blob/main/crates/scion-core) | Object model and canonical byte format |
+| [`crates/scion-proto`](https://github.com/bnsd55/open-scion/blob/main/crates/scion-proto) | gRPC API ([`proto/scion.proto`](https://github.com/bnsd55/open-scion/blob/main/proto/scion.proto)) |
+| [`crates/scion-server`](https://github.com/bnsd55/open-scion/blob/main/crates/scion-server) | Storage, commits, lands, reads, git import |
+| [`crates/scion-tier`](https://github.com/bnsd55/open-scion/blob/main/crates/scion-tier) | Cache tiers: `scion-cache` and `scion-daemon` |
+| [`crates/scn`](https://github.com/bnsd55/open-scion/blob/main/crates/scn) | Command-line client |
+| [`scripts`](https://github.com/bnsd55/open-scion/tree/main/scripts) | The demo and the checkout benchmark against git |
+| [`docs/architecture.md`](https://github.com/bnsd55/open-scion/blob/main/docs/architecture.md) | How the parts fit together: storage, lands, reads, and the cache tiers |
+| [`docs/format-v1.md`](https://github.com/bnsd55/open-scion/blob/main/docs/format-v1.md) | The v1 byte format. Object IDs are hashes of these bytes. |
+| [`docs/protocol-v1.md`](https://github.com/bnsd55/open-scion/blob/main/docs/protocol-v1.md) | The v1 API contract: calls, limits, status codes, retries, durability and what a client checks |
+| [`docs/cli.md`](https://github.com/bnsd55/open-scion/blob/main/docs/cli.md) | Every `scn` command: what it does, its flags, the global flags and env vars, and the exit codes |
+| [`docs/operations.md`](https://github.com/bnsd55/open-scion/blob/main/docs/operations.md) | How to run a server: deploy, keys, the access file, Postgres, backups, and what each failure means |
+| [`docs/benchmarks.md`](https://github.com/bnsd55/open-scion/blob/main/docs/benchmarks.md) | How the demo and the benchmarks run, what each number means, and how to rerun them |
+| [`docs/RELEASING.md`](https://github.com/bnsd55/open-scion/blob/main/docs/RELEASING.md) | For maintainers: how a release is cut and published |
+| [`docs/design/scalable-backend.md`](https://github.com/bnsd55/open-scion/blob/main/docs/design/scalable-backend.md) | A design proposal, not built: stateless servers on a shared metadata store and object store |
 
 ## Design notes
 

@@ -422,6 +422,9 @@ impl PgClient {
                 let mut tx = TxState::Idle;
                 for job in rx {
                     if tx.lost() && !job.sql.starts_with("ROLLBACK") {
+                        // The caller may be gone, which is fine: the reply
+                        // fails, and the job's outcome is the caller's
+                        // business. The worker goes on to the next job.
                         let _ = job.reply.send(Err(Error::Corrupt(
                             "the transaction was lost with the connection; \
                              roll it back and run it again"
@@ -463,6 +466,7 @@ impl PgClient {
                     // transaction, and the new one holds none (its COMMIT
                     // would answer Ok about a transaction that is gone).
                     if reconnected && lost_tx && !job.sql.starts_with("ROLLBACK") {
+                        // As above: a gone caller is fine, the worker goes on.
                         let _ = job.reply.send(Err(Error::Corrupt(
                             "the transaction was lost with the connection; \
                              roll it back and run it again"
@@ -488,6 +492,8 @@ impl PgClient {
                         } else {
                             "another server holds this database"
                         };
+                        // As above: a gone caller is fine, the worker goes
+                        // on; the next caller gets the same verdict.
                         let _ = job
                             .reply
                             .send(Err(Error::FailedPrecondition(message.into())));
@@ -597,7 +603,10 @@ impl PgClient {
 /// `application_name`, and registered with its start time, so the
 /// schema of a test that just began is never dropped.
 fn drop_stale_schemas(maker: &PgClient) {
-    let Ok(got) = maker.query_opt("SELECT pg_try_advisory_lock($1)", &[P::i64(CLEAN_LOCK)]) else {
+    let got = maker.query_opt("SELECT pg_try_advisory_lock($1)", &[P::i64(CLEAN_LOCK)]);
+    let Ok(got) = got else {
+        // This connection cannot even ask: another open's cleanup runs, or
+        // the database is in trouble. The next open tries again.
         return;
     };
     // The answer is a row that holds the verdict: a `false` row means
@@ -624,13 +633,19 @@ fn drop_stale_schemas(maker: &PgClient) {
             if !name.starts_with("scion_test_") {
                 continue;
             }
-            let _ = maker.batch(&format!(
+            if let Err(why) = maker.batch(&format!(
                 "DROP SCHEMA IF EXISTS {name} CASCADE;
                  DELETE FROM public.scion_test_schemas WHERE schema = '{name}'"
-            ));
+            )) {
+                tracing::warn!(schema = %name, error = %why, "cannot drop a stale test schema");
+            }
         }
     }
-    let _ = maker.query_opt("SELECT pg_advisory_unlock($1)", &[P::i64(CLEAN_LOCK)]);
+    // The lock frees when this connection closes: a failed unlock needs
+    // nothing but the drop of the maker.
+    if let Err(why) = maker.query_opt("SELECT pg_advisory_unlock($1)", &[P::i64(CLEAN_LOCK)]) {
+        tracing::warn!(error = %why, "cannot unlock the test-schema cleanup");
+    }
 }
 
 /// The advisory lock of the test-schema cleanup.
@@ -2084,7 +2099,8 @@ impl MetaTx for PgTx<'_> {
         let size: i64 = self
             .c
             .query_opt(
-                "SELECT octet_length(body) FROM trees WHERE id = $1",
+                // octet_length of a bytea is int4; the read wants int8.
+                "SELECT octet_length(body)::bigint FROM trees WHERE id = $1",
                 &[P::bytes(&id_bytes(id.as_bytes()))],
             )?
             .ok_or_else(|| Error::NotFound(format!("tree {id}")))?
@@ -2580,10 +2596,21 @@ impl MetaTx for PgTx<'_> {
                 P::i64(i64::try_from(limit).unwrap_or(i64::MAX)),
             ],
         )?;
-        Ok(rows
-            .iter()
-            .map(|row| FsckDerivedRow(row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
-            .collect())
+        rows.iter()
+            .map(|row| -> Result<FsckDerivedRow> {
+                // d.version is BIGINT here and u32 in the row: read the
+                // int8 first, like every numeric expression here.
+                let version: i64 = row.get(1);
+                Ok(FsckDerivedRow(
+                    row.get(0),
+                    u32::try_from(version)
+                        .map_err(|_| Error::Corrupt(format!("derived version {version}")))?,
+                    row.get(2),
+                    row.get(3),
+                    row.get(4),
+                ))
+            })
+            .collect()
     }
 }
 

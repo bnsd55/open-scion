@@ -1354,6 +1354,49 @@ fn an_import_batch_waits_out_a_busy_write_lock_on_postgres() {
 }
 
 #[test]
+fn an_import_that_loses_disk_space_fails_and_is_not_retried() {
+    if Backend::test_is_postgres() {
+        // The blob files are local in every backend, so the hook below
+        // works on Postgres too; the run here is the data-directory one.
+        // (Both jobs run this test.)
+    }
+    let git = Git::init();
+    let rev = git.fast_commits(0, 60);
+    let (_dir, store) = open_store();
+    let before = store.busy_retries();
+    // The import's first blob write is the one the disk refuses.
+    store.blobs().fail_writes_after(0);
+    // A read works before the import starts.
+    assert!(store.read(|c| c.repo_id("r")).is_err());
+    let error = try_import(&store, &git, &rev).unwrap_err();
+    // The import did not answer busy: the out-of-space answer is not a
+    // lock the database holds, and the batch's retry loop does not run.
+    assert!(
+        matches!(
+            &error,
+            Error::Io(e) if e.kind() == std::io::ErrorKind::StorageFull
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        store.busy_retries(),
+        before,
+        "the import retried a full disk"
+    );
+    // Nothing was written: the ref is not there, and a read works right
+    // after the failure.
+    let repo_id = store.read(|c| c.repo_id("r")).unwrap();
+    assert!(
+        store
+            .read(|c| c.get_ref(repo_id, "main"))
+            .unwrap()
+            .is_none()
+    );
+    // The space is back: the same import, again from the top, works.
+    try_import(&store, &git, &rev).unwrap();
+}
+
+#[test]
 fn a_rolled_back_import_batch_verifies_again_when_it_reruns() {
     if skip_on_postgres("counts the import's verification passes, a SQLite test hook") {
         return;

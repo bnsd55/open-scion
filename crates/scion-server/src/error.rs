@@ -121,7 +121,31 @@ impl From<Error> for Status {
                 tracing::warn!(error = %e, "the database stayed busy");
                 Status::unavailable("the database is busy; retry")
             }
-            Error::Corrupt(_) | Error::Pg(_) | Error::Io(_) | Error::Git(_) => {
+            // The disk is full, or the quota spent: the server's own
+            // storage, not the caller's request. The reply is fixed, so it
+            // names no server path; the path and the operation are in the
+            // log line of the write that failed.
+            Error::Io(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+                ) =>
+            {
+                tracing::error!(error = %e, "the server is out of disk space");
+                Status::resource_exhausted("the server is out of disk space; retry later")
+            }
+            Error::Corrupt(_) | Error::Git(_) => {
+                // Details stay in the server log, not in the reply.
+                tracing::error!(error = %e, "internal error");
+                Status::internal("internal error")
+            }
+            // A database out of space is the same shortage, wherever the
+            // metadata lives: on Postgres it answers 53100, disk_full.
+            Error::Pg(e) if e.code() == Some(&PG_DISK_FULL) => {
+                tracing::error!(error = %e, "the server is out of disk space");
+                Status::resource_exhausted("the server is out of disk space; retry later")
+            }
+            Error::Pg(_) => {
                 // Details stay in the server log, not in the reply.
                 tracing::error!(error = %e, "internal error");
                 Status::internal("internal error")
@@ -133,13 +157,20 @@ impl From<Error> for Status {
                 tracing::warn!(error = %e, "the database stayed busy");
                 Status::unavailable("the database is busy; retry")
             }
-            Error::Db(_) => {
+            Error::Db(e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) => {
+                tracing::error!(error = %e, "the server is out of disk space");
+                Status::resource_exhausted("the server is out of disk space; retry later")
+            }
+            Error::Io(_) | Error::Db(_) => {
                 tracing::error!(error = %e, "internal error");
                 Status::internal("internal error")
             }
         }
     }
 }
+
+/// The SQLSTATE of a Postgres database out of space: 53100, `disk_full`.
+pub(crate) const PG_DISK_FULL: postgres::error::SqlState = postgres::error::SqlState::DISK_FULL;
 
 #[cfg(test)]
 mod tests {
@@ -162,5 +193,34 @@ mod tests {
     fn a_drained_reader_pool_is_unavailable() {
         let err = Error::Unavailable("no Postgres reader free".to_owned());
         assert_eq!(Status::from(err).code(), Code::Unavailable);
+    }
+
+    #[test]
+    fn an_out_of_space_write_is_resource_exhausted_with_a_fixed_reply() {
+        // A file write that the disk refused (ENOSPC, errno 28 on Linux
+        // and macOS both): the reply names no path.
+        let io = std::io::Error::from_raw_os_error(28);
+        assert_eq!(io.kind(), std::io::ErrorKind::StorageFull);
+        let status = Status::from(Error::Io(io));
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(
+            status.message(),
+            "the server is out of disk space; retry later"
+        );
+        // A quota refusal maps the same; the kind is built, because the
+        // EDQUOT number differs between the platforms.
+        let io = std::io::Error::from(std::io::ErrorKind::QuotaExceeded);
+        assert_eq!(Status::from(Error::Io(io)).code(), Code::ResourceExhausted);
+        // The metadata database out of space, on either backend.
+        let db = |code| Error::Db(rusqlite::Error::SqliteFailure(ffi::Error::new(code), None));
+        let status = Status::from(db(ffi::SQLITE_FULL));
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(
+            status.message(),
+            "the server is out of disk space; retry later"
+        );
+        // The Postgres arm has no unit test: a `postgres::Error` of a
+        // chosen code cannot be built outside the crate, so the arm keys
+        // on the SQLSTATE alone, 53100, disk_full.
     }
 }
