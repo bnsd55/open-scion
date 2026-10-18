@@ -26,7 +26,7 @@
 //!
 //! Neither query has a bound on its reads. Each fails once its [`Deadline`]
 //! has passed, and runs in steps of about 1,000 reads (`STEPS`). A step holds
-//! one read connection ([`Store::read`]), so writes and other reads run
+//! one read connection ([`Store::read`](crate::store::Store::read)), so writes and other reads run
 //! beside it.
 
 use std::cmp::Reverse;

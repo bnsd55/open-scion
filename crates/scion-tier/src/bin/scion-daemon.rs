@@ -130,6 +130,9 @@ async fn main() -> anyhow::Result<()> {
         },
     ))
     .await?;
+    // A failure leaves a stale socket file, which is harmless: the next
+    // open checks whether a listener is behind it and removes it then
+    // (bind_unix).
     std::fs::remove_file(&socket).ok();
     // The store writes its index when the last task that holds the tier ends,
     // as the runtime stops after this.

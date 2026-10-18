@@ -1006,7 +1006,9 @@ fn walk_objects(db_path: &Path, objects: &Path, walk: &WalkState) {
                 };
                 // Larger than any object: never a good copy.
                 if size > MAX_ENCODED_BYTES {
-                    let _ = ignore_missing(fs::remove_file(file.path()));
+                    if let Err(e) = ignore_missing(fs::remove_file(file.path())) {
+                        tracing::debug!("cannot remove {}: {e}", file.path().display());
+                    }
                     continue;
                 }
                 if !walk.send(key, size) {
@@ -1359,7 +1361,10 @@ impl DiskStore {
             };
             took += 1;
             if size > limit {
-                let _ = ignore_missing(fs::remove_file(object_path(objects, key)));
+                let path = object_path(objects, key);
+                if let Err(e) = ignore_missing(fs::remove_file(&path)) {
+                    tracing::debug!("cannot remove {}: {e}", path.display());
+                }
                 continue;
             }
             disk.insert_oldest(key, size);
