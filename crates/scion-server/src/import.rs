@@ -167,6 +167,8 @@ fn import_with_cache(
 
     let mut importer = Importer {
         git: &git,
+        store,
+        repo_id,
         blobs: LruCache::new(cache_entries),
         put: Vec::new(),
     };
@@ -486,11 +488,16 @@ fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Res
 /// Turns git commits into changesets.
 struct Importer<'a> {
     git: &'a gix::Repository,
+    store: &'a Backend,
+    repo_id: RepoId,
     /// Blobs recently stored in this run, so most are read from git once. A
-    /// miss costs a git read and a read-back of the stored blob, since
-    /// `BlobBatch::put` keeps a stored blob only after checking it.
+    /// miss costs a git read and a row probe: a blob that a committed row
+    /// of this repo names skips the put (its file is durable, see the skip
+    /// in [`Importer::blob`]), and one without a row goes to
+    /// `BlobBatch::put`, which keeps a stored blob only after checking it.
     blobs: LruCache<ObjectId, BlobId>,
-    /// Blobs put since the checker last took them.
+    /// Blobs this run proved stored and durable: put here, or named by a
+    /// committed row. The checker takes them so it reads none back.
     put: Vec<BlobId>,
 }
 
@@ -603,8 +610,30 @@ impl Importer<'_> {
                     path.as_bytes().escape_ascii()
                 )));
             }
-            let id = batch.put(&blob.data)?;
-            self.put.push(id);
+            let id = BlobId::of(&blob.data);
+            // A committed row of this repo names this blob only after the
+            // file's and its directory's fsyncs succeeded (import.rs: the
+            // batch syncs before the batch's rows commit; PutBlob commits
+            // its row after put_upload). The stored copy is durable, so
+            // the put, its read-back check, and the keep fsyncs are not
+            // needed. A blob without a row may be the file of a failed
+            // write whose fsync never succeeded: it goes through put, and
+            // the keep path fsyncs it before it answers.
+            // SHORTCUT: the skip sees only this repo's rows, one probe per
+            // distinct blob. A blob that another repo names still goes
+            // through put with its read-back and fsyncs. Upgrade: an index
+            // on repo_blobs (blob), then any_repo_names, when a cross-repo
+            // import is measured slow.
+            if self
+                .store
+                .read(|c| c.repo_has_blob(self.repo_id, id))?
+            {
+                self.put.push(id);
+                return Ok(id);
+            }
+            let put = batch.put(&blob.data)?;
+            debug_assert_eq!(put, id);
+            self.put.push(put);
             Ok(id)
         })
     }

@@ -882,7 +882,7 @@ pub struct Blobs {
     write_locks: Vec<Mutex<()>>,
     group_flush: GroupFlush,
     /// Calls to [`Blobs::verify`] so far.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     verifies: std::sync::atomic::AtomicU64,
     /// The test hook that fails a file write of this backend with the
     /// disk's answer: `n` lets `n` writes through and fails the one
@@ -1255,7 +1255,7 @@ impl Blobs {
     ///
     /// [`Error::Io`] if the file exists but cannot be read.
     pub fn verify(&self, id: BlobId) -> Result<BlobStatus> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         self.verifies
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let file = match self.open_file(id) {
@@ -1537,8 +1537,9 @@ impl Blobs {
     }
 
     /// Calls to [`Blobs::verify`] so far.
-    #[cfg(test)]
-    pub(crate) fn verifies(&self) -> u64 {
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn verifies(&self) -> u64 {
         self.verifies.load(std::sync::atomic::Ordering::Relaxed)
     }
 }

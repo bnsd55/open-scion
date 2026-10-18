@@ -165,6 +165,11 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Changed
 
+- A git import no longer re-reads and re-fsyncs blobs that a committed
+  row of the target repo already names (#238): one row probe per
+  distinct blob proves the stored copy durable, so a branch import over
+  an existing history skips the read-backs and the drive-cache flushes
+  of its unchanged files. Blobs without a row keep the full put path.
 - `open-scion-server`'s public API is a small facade: `Backend`,
   `service::{serve, ServeOptions}`, `access::Access`, `tickets::Keys`,
   `quotas::Quotas`, `metrics::Metrics`,
