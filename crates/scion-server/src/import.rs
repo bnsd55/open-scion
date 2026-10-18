@@ -880,7 +880,6 @@ mod tests {
     use crate::store::Store;
     use std::fs;
     use std::process::Command;
-    use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
 
@@ -987,7 +986,6 @@ mod tests {
         // its name, and cannot trap its partner.
         let (in_tx, in_rx) = std::sync::mpsc::channel::<()>();
         let (moved_tx, moved_rx) = std::sync::mpsc::channel::<()>();
-        let in_release = in_tx.clone();
         let land = {
             let (server, in_tx, moved_rx) = (server.clone(), in_tx, moved_rx);
             thread::spawn(move || {
@@ -1006,7 +1004,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(30))
             .unwrap_or_else(|_| panic!("the land never moved the ref"));
         let moved = point_ref(&importer, repo, "main", tip);
-        in_release.send(()).unwrap();
+        moved_tx.send(()).unwrap();
         assert!(land.join().unwrap().unwrap());
         // The swap lost, and the check again sees that main has diverged.
         assert!(

@@ -2134,6 +2134,41 @@ mod tests {
         assert!(read_all(second).await == data, "the second reply");
     }
 
+    /// Holds every read connection of `store`: one thread per reader,
+    /// each parked in a read until its own release, announcing itself on
+    /// the returned channel. A blocker that dies before its release fails
+    /// its step in seconds, and cannot trap its siblings in a barrier.
+    fn hold_read_connections(
+        store: &Backend,
+    ) -> (
+        Vec<(
+            std::thread::JoinHandle<Result<(), crate::error::Error>>,
+            std::sync::mpsc::Sender<()>,
+        )>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let blockers = (0..crate::store::READERS)
+            .map(|i| {
+                let (store, arrived_tx) = (store.clone(), arrived_tx.clone());
+                let (go_tx, go_rx) = std::sync::mpsc::channel();
+                let handle = std::thread::spawn(move || {
+                    store.read(|_| {
+                        arrived_tx.send(()).unwrap();
+                        go_rx
+                            .recv_timeout(std::time::Duration::from_secs(30))
+                            .unwrap_or_else(|_| {
+                                panic!("the test never released read connection {i}")
+                            });
+                        Ok(())
+                    })
+                });
+                (handle, go_tx)
+            })
+            .collect();
+        (blockers, arrived_rx)
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn at_most_max_graph_queries_run_at_once() {
         // root ─ a, and root ─ b.
@@ -2153,35 +2188,10 @@ mod tests {
         // One channel per blocker: a blocker that dies before its release
         // fails its step in seconds, and cannot trap its siblings in a
         // barrier.
-        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
-        let blockers: Vec<(std::thread::JoinHandle<_>, std::sync::mpsc::Sender<()>)> = (0
-            ..crate::store::READERS)
-            .map(|i| {
-                let store = store.clone();
-                let arrived_tx = arrived_tx.clone();
-                let (go_tx, go_rx) = std::sync::mpsc::channel();
-                let handle = std::thread::spawn(move || {
-                    store.read(|_| {
-                        arrived_tx.send(()).unwrap();
-                        go_rx
-                            .recv_timeout(std::time::Duration::from_secs(30))
-                            .unwrap_or_else(|_| {
-                                panic!("the test never released read connection {i}")
-                            });
-                        Ok(())
-                    })
-                });
-                (handle, go_tx)
-            })
-            .collect();
+        let (blockers, arrived_rx) = hold_read_connections(&store);
         for _ in 0..crate::store::READERS {
             expect_step(&arrived_rx, "a read connection took its seat");
         }
-        for (handle, go_tx) in &blockers {
-            assert!(!handle.is_finished(), "a blocker died before it held");
-            release_step(go_tx, "the held read connections");
-        }
-        let blockers: Vec<_> = blockers.into_iter().map(|(handle, _)| handle).collect();
         // One call more than the limit, of each kind.
         let calls: Vec<_> = (0..=MAX_GRAPH_QUERIES)
             .map(|i| {
@@ -2238,6 +2248,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(busy(), MAX_GRAPH_QUERIES, "the last call waits for a slot");
 
+        // The reads held; release them, where the old barrier's `go.wait()`
+        // stood, so the parked jobs get their connection.
+        for (handle, go_tx) in &blockers {
+            assert!(!handle.is_finished(), "a blocker died before it held");
+            release_step(go_tx, "the held read connections");
+        }
+        let blockers: Vec<_> = blockers.into_iter().map(|(handle, _)| handle).collect();
         for blocker in blockers {
             blocker.join().unwrap().unwrap();
         }
