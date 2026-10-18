@@ -35,7 +35,6 @@ use crate::backend::Backend;
 use crate::deadline::Deadline;
 use crate::error::Result;
 use crate::meta::{Meta as _, MetaTx, RepoId};
-use crate::store::Store;
 
 /// The context of a tree in the projection: the read prefixes that fall
 /// below the tree's path, relative to it, in the rule set's canonical form.
@@ -123,6 +122,14 @@ pub(crate) fn view_root(
     let real = crate::tree::root_tree(store, repo, cs)?;
     let context: Vec<Vec<u8>> = prefixes.iter().map(|p| p.as_bytes().to_vec()).collect();
     let ctx_digest = context_digest(&context);
+    // The digest the caller derives under is live: every caller holds it
+    // from `Access::read_digest`, and `Access::view_digests` collects the
+    // digests of the same access snapshot (read.rs, objects.rs). The sweep
+    // would otherwise call the caller's own rows dead.
+    debug_assert!(
+        live.iter().any(|live| live == digest),
+        "the derived digest is not among the live digests"
+    );
     // The root's row: one read serves the whole view.
     if let Some(cached) = store.read(|c| {
         c.get_view_tree(
@@ -281,6 +288,7 @@ fn context_digest(ctx: &Context) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Store;
     use proptest::prelude::*;
     use proptest::test_runner::TestCaseError;
     use scion_core::{Changeset, FileEntry, FileState, PathElem};
@@ -1287,5 +1295,4 @@ mod tests {
         out.sort();
         out
     }
-
 }

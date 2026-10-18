@@ -569,9 +569,10 @@ impl MetaTx for SqliteTx<'_> {
             .execute(params![repo.0, version, bound])?;
         // Rows of a digest that no grant of this repo hashes to any more,
         // as far as this server's access file knows. All binds positional:
-        // a numbered list would share its indexes with the columns. An
-        // empty `live` names no dead digest: the caller derives under a
-        // rule set this server's access file holds, so `live` holds it.
+        // a numbered list would share its indexes with the columns. `live`
+        // is never empty here: the deriving caller's digest is among the
+        // digests of its access snapshot (the assert in `view_root`), and
+        // a caller that cannot prove that has no business sweeping.
         if removed < limit && !live.is_empty() {
             let marks = std::iter::repeat_n("?", live.len())
                 .collect::<Vec<_>>()

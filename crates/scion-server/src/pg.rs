@@ -1764,8 +1764,9 @@ impl MetaTx for PgTx<'_> {
             ],
         )?;
         // Rows of a digest that no grant of this repo hashes to any more.
-        // An empty `live` names no dead digest: the caller derives under a
-        // rule set this server's access file holds, so `live` holds it.
+        // `live` is never empty here: the deriving caller's digest is among
+        // the digests of its access snapshot (the assert in `view_root`),
+        // and a caller that cannot prove that has no business sweeping.
         if removed < limit && !live.is_empty() {
             let live: Vec<Vec<u8>> = live.iter().map(|d| d.to_vec()).collect();
             let left = limit - removed;
