@@ -64,6 +64,7 @@ thread_local! {
     /// rolled-back batch read it: with the checker reset, the checks of
     /// the rolled-back transaction run again in the retry.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub static CHECKS: Cell<usize> = const { Cell::new(0) };
 }
 /// Cache for decoded git objects. A tree diff re-reads the trees that the
@@ -216,6 +217,7 @@ fn import_with_cache(
         )?;
         // A batch's commit has ended and the write lock is free: this is
         // the counted boundary a test holds the lock at.
+        #[cfg(any(test, feature = "test-hooks"))]
         store.run_after_batch(batch_no);
     }
 
@@ -315,6 +317,7 @@ fn store_batch(
                     tries += 1;
                     taken = 0;
                     checker.reset_for_retry();
+                    #[cfg(any(test, feature = "test-hooks"))]
                     store.note_busy_retry();
                     tracing::warn!(tries, "the database stayed busy; the batch retries");
                     std::thread::sleep(TX_YIELD);
@@ -645,6 +648,7 @@ impl Checker<'_> {
             }
             // Counted per walk, not per call: a pair the cache already
             // cleared did no work.
+            #[cfg(any(test, feature = "test-hooks"))]
             CHECKS.with(|checks| checks.set(checks.get() + 1));
             let want = read_tree(self.git, commit, Some(git_id))?;
             let have: BTreeMap<Vec<u8>, Entry> = c
