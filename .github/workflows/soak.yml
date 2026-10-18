@@ -1,8 +1,13 @@
 name: soak
 on:
   schedule:
-    # 02:30 UTC daily, outside the working hours of every coder.
+    # Once a day, at 02:30 UTC.
     - cron: "30 2 * * *"
+  pull_request:
+    # A change to the soak is tested by a short soak on its own PR.
+    paths:
+      - scripts/soak.sh
+      - .github/workflows/soak.yml
   workflow_dispatch:
     inputs:
       minutes:
@@ -22,7 +27,12 @@ jobs:
           tool: protoc
       - uses: Swatinem/rust-cache@v2
       - name: run the soak
-        run: RUN_MINUTES=${{ github.event.inputs.minutes || '10' }} timeout 2400 scripts/soak.sh
+        env:
+          # The dispatch input sets the length; a pull_request run gets 3
+          # minutes. The input goes through env:, not through the run:
+          # string, so no shell sees it unquoted.
+          RUN_MINUTES: ${{ github.event_name == 'pull_request' && '3' || (github.event.inputs.minutes || '10') }}
+        run: timeout 2400 scripts/soak.sh
       # The bounds live in the script; a failed bound fails the step and
       # keeps the CSVs and logs.
       - name: upload the samples and the logs
