@@ -5,7 +5,7 @@
 //! drive was never told to flush. What survives each cut is checked by
 //! mounting the file system, reopening the store, and running fsck.
 //!
-//! This is the cut the `LazyFS` suite cannot make: LazyFS persists a
+//! This is the cut the `LazyFS` suite cannot make: `LazyFS` persists a
 //! rename at rename time, so a lost directory fsync is invisible to it.
 //! Here a cut between the file flush and the directory flush takes the
 //! name away, and the test goes red.
@@ -14,7 +14,7 @@
 //! the `replay-log` tool (the CI step builds it and names it with
 //! `SCION_DMW_REPLAY`). Plain `cargo test` skips it, like the disk-full
 //! suite skips without its variable.
-use scion_server::{Backend, Store as _};
+use scion_server::Backend;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
@@ -70,7 +70,6 @@ fn owner() -> String {
 /// story wrote. The `Drop` takes it all down, best effort.
 struct Recording {
     /// The scratch directory of the images.
-    work: PathBuf,
     /// The mount of the `ext4` the story was recorded on.
     mount: PathBuf,
     /// The loop device that holds the log, attached for good.
@@ -118,7 +117,6 @@ impl Recording {
         sudo(&["chown", "-R", &owner(), work.join("mnt").to_str().unwrap()]);
         std::fs::copy(&disk, work.join("disk.pristine.img")).unwrap();
         Self {
-            work: work.to_path_buf(),
             mount: work.join("mnt"),
             log_dev,
             data_loop: RefCell::new(data_loop),
@@ -257,7 +255,7 @@ fn an_acknowledged_blob_survives_a_cut_at_the_last_flush_before_its_reply() {
         // Mounting replays the journal; the store reopens on the cut.
         sudo(&["mount", disk.as_str(), mount.to_str().unwrap()]);
         let store = Backend::open_test(mount.join("data").as_path()).unwrap();
-        for (k, id) in ids.iter().take(n as usize).enumerate() {
+        for (k, id) in ids.iter().take(n.try_into().unwrap()).enumerate() {
             let k = k + 1;
             assert_eq!(
                 store.blobs().get(*id).unwrap(),
