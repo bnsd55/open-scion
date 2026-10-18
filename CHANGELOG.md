@@ -206,6 +206,15 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- A git import gives up instead of planning a ref's move again without
+  end (`#276`): a ref that other lands keep moving while the import
+  runs made the import check the ref's ancestry again and again, with
+  no bound on the tries or on each walk of the history. The import now
+  tries the move at most 3 times, answers that the ref kept moving,
+  and checks ancestry through the derived commit graph, which reads a
+  few nodes and stops at a deadline, instead of walking parents
+  without one.
+
 - Two reads of a Postgres-backed store no longer panic on a column's
   type (`#252`): `GetObjects`' tree-size read and `fsck`'s
   derived-row version read wanted a width Postgres does not give, and
