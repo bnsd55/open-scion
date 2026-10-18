@@ -95,7 +95,7 @@ pub trait Kind {
 /// # Errors
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
-/// [`Kind::derive`], or of [`Store::flush`].
+/// [`Kind::derive`], or of [`Store::flush`](crate::store::Store::flush).
 pub fn get<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
     get_until::<K>(store, repo, cs, None)
 }
@@ -354,7 +354,7 @@ fn in_one_walk<K: Kind>(
 
 /// Derives every missing value of `K` that the value for `cs` needs, in
 /// steps, and returns the value for `cs`. Returns before the values are
-/// durable: call [`Store::flush`] before replying with anything they name.
+/// durable: call [`Store::flush`](crate::store::Store::flush) before replying with anything they name.
 ///
 /// First it walks from `cs` through the parents that `K` reads, and stops at
 /// each changeset with a stored value. It visits at most [`STEP`] changesets
@@ -413,7 +413,7 @@ fn fill_until<K: Kind>(
 ///
 /// # Errors
 ///
-/// As [`fill`] and [`Store::flush`].
+/// As [`fill`] and [`Store::flush`](crate::store::Store::flush).
 pub fn backfill<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<()> {
     fill::<K>(store, repo, cs)?;
     // A short step means that no older row is left.
