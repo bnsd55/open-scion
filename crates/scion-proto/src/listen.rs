@@ -252,11 +252,49 @@ pub async fn health(
     tonic_health::pb::health_server::HealthServer<impl tonic_health::pb::health_server::Health>,
     impl Future<Output = ()>,
 ) {
+    health_fenced(services, shutdown, None).await
+}
+
+/// [`health`], plus a fence: when the flag trips, every served name
+/// flips to `NOT_SERVING` while the server still answers, and after a
+/// short grace the process exits: the server lost its database to
+/// another process, and must not keep serving from stale state.
+pub async fn health_fenced(
+    services: &[&'static str],
+    shutdown: impl Future<Output = ()>,
+    fence: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> (
+    tonic_health::pb::health_server::HealthServer<impl tonic_health::pb::health_server::Health>,
+    impl Future<Output = ()>,
+) {
     let (reporter, service) = tonic_health::server::health_reporter();
     for name in std::iter::once("").chain(services.iter().copied()) {
         reporter
             .set_service_status(name, tonic_health::ServingStatus::Serving)
             .await;
+    }
+    if let Some(fence) = fence {
+        let names: Vec<&'static str> = std::iter::once("")
+            .chain(services.iter().copied())
+            .collect();
+        let reporter = reporter.clone();
+        tokio::spawn(async move {
+            while !fence.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            // The caller sees NOT_SERVING before the process goes away.
+            for name in &names {
+                reporter
+                    .set_service_status(name, tonic_health::ServingStatus::NotServing)
+                    .await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            tracing::error!(
+                "this server process lost the database to another server \
+                 process; it exits now"
+            );
+            std::process::exit(70);
+        });
     }
     let shutdown = async move {
         shutdown.await;

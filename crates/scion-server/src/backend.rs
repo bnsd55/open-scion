@@ -17,7 +17,10 @@ use crate::history::NodeId;
 use crate::land::{LandOutcome, LandRequest, LandState};
 use crate::meta::{Meta, MetaTx, RefState, RepoId};
 use crate::pg::{Pg, PgTx};
+use std::fmt::Write as _;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::store::{Blobs, Store};
 
@@ -67,7 +70,9 @@ const _: () = assert!(PG_READERS == crate::store::READERS);
 const MARKER: &str = "backend";
 
 /// Marks `data` as Postgres-backed, and refuses to open Postgres on a
-/// directory whose metadata a SQLite store already holds.
+/// directory whose metadata a SQLite store already holds. The marker's
+/// second line, the store UUID, is written once the database is open
+/// and names its identity.
 fn postgres_marker(data: &Path) -> Result<()> {
     let db = data.join("scion.db");
     if db.metadata().is_ok_and(|m| m.len() > 0) {
@@ -78,9 +83,13 @@ fn postgres_marker(data: &Path) -> Result<()> {
         ));
     }
     // The open may name a directory that does not exist yet: the marker
-    // is its first file.
+    // is its first file. Written once: an open of an existing store must
+    // not drop the UUID a previous open recorded.
     std::fs::create_dir_all(data).map_err(crate::error::Error::Io)?;
-    std::fs::write(data.join(MARKER), "postgres\n").map_err(crate::error::Error::Io)?;
+    let marker = data.join(MARKER);
+    if !marker.exists() {
+        std::fs::write(&marker, "postgres\n").map_err(crate::error::Error::Io)?;
+    }
     Ok(())
 }
 
@@ -88,7 +97,7 @@ fn postgres_marker(data: &Path) -> Result<()> {
 /// Postgres: its rows live in the database, and a second, empty store
 /// here would look like a server with no data at all.
 fn refuse_postgres_marker(data: &Path) -> Result<()> {
-    if std::fs::read_to_string(data.join(MARKER)).is_ok_and(|s| s.trim() == "postgres") {
+    if marker_names_postgres(&std::fs::read_to_string(data.join(MARKER)).unwrap_or_default()) {
         return Err(crate::error::Error::InvalidArgument(
             "this data directory keeps its metadata in Postgres: \
              give --postgres-url"
@@ -96,6 +105,62 @@ fn refuse_postgres_marker(data: &Path) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Whether a marker file's text names the Postgres backend: its first
+/// line does. The second, when present, is the store UUID.
+fn marker_names_postgres(text: &str) -> bool {
+    text.lines().next().map(str::trim) == Some("postgres")
+}
+
+/// The store UUID a marker carries, if it names one: 32 hex digits on
+/// its second line.
+fn marker_uuid(data: &Path) -> Option<[u8; 16]> {
+    let text = std::fs::read_to_string(data.join(MARKER)).ok()?;
+    let line = text.lines().nth(1)?.trim();
+    if line.len() != 32 || !line.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&line[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
+}
+
+/// Puts the database's UUID in the marker, and refuses when the marker
+/// names another store: a database restored on the directory of another
+/// store would serve metadata whose blobs are not on this disk.
+fn marker_agrees(data: &Path, uuid: [u8; 16]) -> Result<()> {
+    let marker = data.join(MARKER);
+    match marker_uuid(data) {
+        Some(held) if held != uuid => {
+            return Err(crate::error::Error::FailedPrecondition(format!(
+                "this data directory belongs to the store whose UUID is \
+                 {}, but the database names the store {}: one was \
+                 restored over the other; give the directory of the \
+                 database's own store, or a directory the database has \
+                 never served",
+                hex16(&held),
+                hex16(&uuid)
+            )));
+        }
+        Some(_) => {}
+        None => {
+            std::fs::write(&marker, format!("postgres\n{}\n", hex16(&uuid)))
+                .map_err(crate::error::Error::Io)?;
+        }
+    }
+    Ok(())
+}
+
+/// 16 bytes as 32 lowercase hex digits.
+fn hex16(bytes: &[u8; 16]) -> String {
+    let mut hex = String::with_capacity(32);
+    for byte in bytes {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// The URL of the test database.
@@ -162,9 +227,9 @@ impl Backend {
     pub fn open(data: &Path, postgres_url: Option<&str>, ca: Option<&Path>) -> Result<Self> {
         if let Some(url) = postgres_url {
             postgres_marker(data)?;
-            Ok(Self::Postgres(Pg::open_exclusive(
-                url, ca, PG_READERS, data,
-            )?))
+            let pg = Pg::open_exclusive(url, ca, PG_READERS, data)?;
+            marker_agrees(data, pg.store_uuid())?;
+            Ok(Self::Postgres(pg))
         } else {
             refuse_postgres_marker(data)?;
             Ok(Self::Sqlite(Store::open(data)?))
@@ -181,7 +246,9 @@ impl Backend {
     pub fn open_shared(data: &Path, postgres_url: Option<&str>, ca: Option<&Path>) -> Result<Self> {
         if let Some(url) = postgres_url {
             postgres_marker(data)?;
-            Ok(Self::Postgres(Pg::open(url, ca, PG_READERS, data)?))
+            let pg = Pg::open(url, ca, PG_READERS, data)?;
+            marker_agrees(data, pg.store_uuid())?;
+            Ok(Self::Postgres(pg))
         } else {
             refuse_postgres_marker(data)?;
             Ok(Self::Sqlite(Store::open_shared(data)?))
@@ -199,6 +266,7 @@ impl Backend {
         if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
             postgres_marker(data)?;
             let pg = Pg::open_test(&test_url()?, &test_schema(data), PG_READERS, data)?;
+            marker_agrees(data, pg.store_uuid())?;
             return Ok(Self::Postgres(pg));
         }
         refuse_postgres_marker(data)?;
@@ -218,6 +286,7 @@ impl Backend {
         if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
             postgres_marker(data)?;
             let pg = Pg::open_test(&test_url()?, &test_schema(data), PG_READERS, data)?;
+            marker_agrees(data, pg.store_uuid())?;
             return Ok(Self::Postgres(pg));
         }
         refuse_postgres_marker(data)?;
@@ -234,10 +303,42 @@ impl Backend {
         std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres")
     }
 
+    /// Whether this backend lost its database to another process: every
+    /// read and write fails from then on. SQLite has no lock to lose, so
+    /// it is never fenced.
+    #[must_use]
+    pub fn fenced(&self) -> bool {
+        match self {
+            Self::Sqlite(_) => false,
+            Self::Postgres(pg) => pg.fenced(),
+        }
+    }
+
+    /// The flag of [`Backend::fenced`], for the health service of a
+    /// serving process: it flips to `NOT_SERVING` when the fence trips.
+    /// None on SQLite, which has no lock to lose.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn fence_flag(&self) -> Option<Arc<AtomicBool>> {
+        match self {
+            Self::Sqlite(_) => None,
+            Self::Postgres(pg) => Some(pg.fence_flag()),
+        }
+    }
+
+    /// The test hook of a lost one-server lock: the next exclusive setups
+    /// of the database drop the lock and fail, so a test can force the
+    /// fence without a second process. A no-op on SQLite.
+    #[doc(hidden)]
+    pub fn arm_lock_loss(&self) {
+        if let Self::Postgres(pg) = self {
+            pg.arm_lock_loss();
+        }
+    }
+
     /// The schema that [`Backend::open_test`] gave this data directory on
     /// Postgres: a test that counts rows through its own Postgres client
-    /// names it the same way. A result, so the callers unwrap one shape.
-    ///
+    /// names it the same way. A result, so the callers unwrap one shape.    ///
     /// The schema a test backend of this directory uses, when the tests
     /// run on Postgres. Hidden: a test holds a lock in it from a
     /// connection of its own.

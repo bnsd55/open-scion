@@ -166,6 +166,7 @@ pub async fn serve(
     } = options;
     let access = Arc::new(access.into());
     let auth = access.auth();
+    let fence = store.fence_flag();
     let worker = Worker::new(store);
     let lands = Arc::new(Lands::new(pending_lands, Some(Arc::clone(&metrics))));
     // The sweep stops when the server does: the shutdown future resolves,
@@ -209,9 +210,11 @@ pub async fn serve(
         .layer(ObjectsService::new(worker, access, quotas, tickets, metrics).into_server());
     // The health service answers `grpc.health.v1.Check` and `Watch` on the
     // same port, without a token: a probe carries none. The store opens
-    // before this call, so the server starts serving.
+    // before this call, so the server starts serving. On Postgres the
+    // fence rides along: a process that lost its database flips every
+    // name to NOT_SERVING and exits.
     let (health, shutdown) =
-        listen::health(&["scion.v1.Scion", "scion.v1.Objects"], shutdown).await;
+        listen::health_fenced(&["scion.v1.Scion", "scion.v1.Objects"], shutdown, fence).await;
     let router = |server: Server| {
         server
             .timeout(REQUEST_TIMEOUT)

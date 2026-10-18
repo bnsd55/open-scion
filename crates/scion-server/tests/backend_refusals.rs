@@ -111,9 +111,9 @@ fn a_postgres_open_makes_the_data_directory_it_names() {
     let store = Backend::open_test(&fresh).unwrap();
     assert!(fresh.join("backend").exists(), "the marker names Postgres");
     drop(store);
-    let error = Backend::open_shared(&fresh, None, None)
-        .err()
-        .expect("the marker refuses the SQLite backend");
+    let Err(error) = Backend::open_shared(&fresh, None, None) else {
+        panic!("the marker refuses the SQLite backend");
+    };
     assert!(error.to_string().contains("--postgres-url"), "{error}");
 }
 
@@ -152,5 +152,84 @@ fn a_write_blocked_by_another_writer_answers_busy_in_seconds() {
     assert!(
         waited < std::time::Duration::from_secs(20),
         "answered after {waited:?}"
+    );
+}
+
+/// The store UUID: the first Postgres open mints one, the marker file
+/// carries it, and an open of the database against the directory of
+/// another store is refused instead of serving metadata whose blobs
+/// are not on this disk.
+#[test]
+fn a_database_refuses_the_directory_of_another_store() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(dir.path()).unwrap();
+    drop(store);
+    let marker = dir.path().join("backend");
+    let text = std::fs::read_to_string(&marker).unwrap();
+    let uuid = text
+        .lines()
+        .nth(1)
+        .expect("the marker names the store UUID");
+    assert_eq!(uuid.len(), 32, "{text:?}");
+    // The marker of another store: database A restored with directory B.
+    std::fs::write(&marker, format!("postgres\n{}\n", "0".repeat(32))).unwrap();
+    let Err(error) = Backend::open_test(dir.path()) else {
+        panic!("the other store's marker refuses the open");
+    };
+    let message = error.to_string();
+    assert!(message.contains("UUID"), "{message}");
+    assert!(message.contains(&"0".repeat(32)), "{message}");
+    // The real marker still opens: nothing was written by the refusal.
+    drop(std::fs::write(&marker, text));
+    assert!(Backend::open_test(dir.path()).is_ok());
+}
+
+/// A process that loses the one-server lock is fenced: another process
+/// may hold the database now, so every read and write fails, and the
+/// server exits (`health_fenced`). The hook makes the writer's next
+/// setups lose the lock the way a takeover does.
+#[test]
+fn a_lost_server_lock_fences_the_backend() {
+    if skip_on_sqlite() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(dir.path()).unwrap();
+    store
+        .write(|c| c.create_repo("before").map(|_| ()))
+        .unwrap();
+    assert!(!Backend::fenced(&store));
+    store.arm_lock_loss();
+    // The server's own sessions die: the next statement reconnects, and
+    // the hook drops the lock on it, as a takeover would.
+    let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+    let schema = Backend::test_schema(dir.path()).unwrap();
+    let mut killer = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    killer
+        .batch_execute(&format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE application_name = '{schema}' AND pid <> pg_backend_pid()"
+        ))
+        .unwrap();
+    // A write reconnects, loses the lock, and the fence trips.
+    let error = store
+        .write(|c| c.create_repo("after").map(|_| ()))
+        .expect_err("a fenced backend fails writes");
+    assert!(
+        matches!(error, scion_server::Error::FailedPrecondition(_)),
+        "{error:?}"
+    );
+    assert!(Backend::fenced(&store), "the fence tripped");
+    // Reads fail too, though their own connections never lost anything:
+    // the reader pool would otherwise serve rows of another process.
+    let error = store
+        .read(|c| c.repo_id("before").map(|_| ()))
+        .expect_err("a fenced backend fails reads");
+    assert!(
+        matches!(error, scion_server::Error::FailedPrecondition(_)),
+        "{error:?}"
     );
 }
