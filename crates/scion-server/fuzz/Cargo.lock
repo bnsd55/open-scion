@@ -2202,6 +2202,7 @@ dependencies = [
  "hyper",
  "open-scion-core",
  "open-scion-proto",
+ "prost",
  "rusqlite",
  "rustix",
  "tempfile",

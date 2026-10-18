@@ -11,9 +11,10 @@ use std::process::{Command, Output};
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, GitOid, IdentityTime, RepoPath};
 use scion_proto::listen::Limits;
 use scion_server::import::{ImportOptions, import_git};
+use scion_server::meta::Meta as _;
 use scion_server::meta::MetaTx as _;
 use scion_server::read::MAX_DIFF_ENTRIES;
-use scion_server::{Store, service, tree};
+use scion_server::{Backend, Store, service, tree};
 use serde_json::Value;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -77,7 +78,7 @@ struct Server {
 }
 
 impl Server {
-    fn start(data: TempDir, store: Store) -> Self {
+    fn start(data: TempDir, store: Backend) -> Self {
         let runtime = Runtime::new().unwrap();
         let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -132,7 +133,7 @@ impl Server {
 
 /// Every commit of the git repository, mapped to the changeset it was
 /// imported as, in hex.
-fn changesets(store: &Store, dir: &Path) -> HashMap<String, String> {
+fn changesets(store: &Backend, dir: &Path) -> HashMap<String, String> {
     git(dir, &["rev-list", "--all"])
         .lines()
         .map(|commit| {
@@ -142,7 +143,7 @@ fn changesets(store: &Store, dir: &Path) -> HashMap<String, String> {
                 .collect();
             let id = store
                 .read(|c| {
-                    let cs: Vec<u8> = c.query_row(
+                    let cs: Vec<u8> = c.sqlite().unwrap().query_row(
                         "SELECT cs FROM git_import WHERE git_oid = ?1",
                         [&oid],
                         |row| row.get(0),
@@ -225,7 +226,7 @@ fn merge_base_is_ancestor_and_diff_match_git() {
     git(dir, &["merge", "-q", "--no-ff", "side", "-m", "tip"]);
 
     let data = tempfile::tempdir().unwrap();
-    let store = Store::open(data.path()).unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
     let opts = ImportOptions {
         rev: "HEAD".into(),
         target_ref: "main".into(),
@@ -327,7 +328,7 @@ fn assert_diff_json(server: &Server, root: &str, m1: &str) {
 
 /// Stores a changeset with `base`, then a child with `changes`, in a new repo.
 fn two_changesets(
-    store: &Store,
+    store: &Backend,
     base: BTreeMap<RepoPath, Option<FileState>>,
     changes: BTreeMap<RepoPath, Option<FileState>>,
 ) -> (ChangesetId, ChangesetId) {
@@ -336,7 +337,7 @@ fn two_changesets(
 
 /// [`two_changesets`], with the lens lookup of the tree derivation.
 fn two_changesets_lens(
-    store: &Store,
+    store: &Backend,
     base: BTreeMap<RepoPath, Option<FileState>>,
     changes: BTreeMap<RepoPath, Option<FileState>>,
     mut lens: Box<dyn FnMut(BlobId) -> Result<u64, scion_server::Error>>,
@@ -368,7 +369,7 @@ fn two_changesets_lens(
 #[test]
 fn ls_shows_the_size_of_every_entry_that_carries_one() {
     let data = tempfile::tempdir().unwrap();
-    let store = Store::open(data.path()).unwrap();
+    let store = Backend::Sqlite(Store::open(data.path()).unwrap());
     let read = b"one two three"; // 13 bytes
     let link = b"a.md"; // 4 bytes
     let empty = b"";
@@ -438,7 +439,7 @@ fn ls_shows_the_size_of_every_entry_that_carries_one() {
 #[test]
 fn diff_continues_past_one_reply() {
     let data = tempfile::tempdir().unwrap();
-    let store = Store::open(data.path()).unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
     // More paths than one reply holds, with each kind of file. Blobs are
     // never read, so they are not stored.
     let commit = GitOid::Sha1([7; 20]);
@@ -491,7 +492,7 @@ fn diff_continues_past_one_reply() {
 #[test]
 fn diff_prints_a_rename_split_across_replies() {
     let data = tempfile::tempdir().unwrap();
-    let store = Store::open(data.path()).unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
     // `zzz/old` becomes `a/new`, and the paths between fill the first
     // reply, so the two halves of the rename come in different replies.
     // Blobs are never read: the rename has the same content.
@@ -534,7 +535,7 @@ fn diff_prints_a_rename_split_across_replies() {
 #[test]
 fn ls_show_and_log_read_whole_replies() {
     let data = tempfile::tempdir().unwrap();
-    let store = Store::open(data.path()).unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
     // A directory whose TreeV1 and a changeset whose ChangesetV1 are both
     // over one part, so `scn ls` and `scn show` read streamed replies; and
     // `scn log` on the same head.

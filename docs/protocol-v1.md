@@ -94,6 +94,12 @@ from the file; the file's format is a deployment matter and lives in the
 README. The principal of a call's token is its caller. Land request keys and
 land IDs are scoped by (repo, principal).
 
+**Health.** The server also answers `grpc.health.v1.Check` and
+`grpc.health.v1.Watch` on the same address, without a token: a probe
+carries none. They report the serving state of `scion.v1.Scion` and
+`scion.v1.Objects`. A tier reports the serving state of `scion.v1.Objects`
+the same way.
+
 **Access rules.** A call on a repo that the caller may not read fails with
 `NOT_FOUND`, the same as for a repo that does not exist, on every RPC. So a
 caller cannot tell whether such a repo exists. A change fails with
@@ -535,9 +541,8 @@ over the whole stream, not per part. Only the last part carries
 - With a `path`, any number of changesets can lie between two entries. A
   reply can hold fewer entries than `limit`: it stops once the server has
   read about 64 MiB of its path history, which takes fewer entries for a
-  file in a large directory.
-- A reply stops before an entry that would take its changeset bytes over
-  32 MiB. Every reply holds the first entry it found.
+  file in a large directory. A reply with a `path` always holds its first
+  entry.
 - `next_changeset_id` is the first changeset that this reply does not cover,
   or empty when the history ends. To continue, a client calls `Log` again
   with `changeset_id` set to it and the same `path`. This server sends no
@@ -561,8 +566,14 @@ stops at 600 s; what it derived stays, so the next call goes on from there.
 
 ### 6.10 Blame
 
-`rpc Blame(BlameRequest) returns (BlameResponse)`. For each line of a file,
-the changeset that last changed it on first-parent history, across renames.
+`rpc Blame(BlameRequest) returns (stream BlameResponse)`. For each line of
+a file, the changeset that last changed it on first-parent history, across
+renames. The reply streams in parts: the ranges go out in groups, each
+part's ranges, with the changesets its ranges name that no earlier part
+carried, within 1 MiB of encoded bytes, in file order. A client joins the
+parts' ranges in order and unions the changesets by ID; only the last part
+carries `next_cursor`. The reply ends with `DEADLINE_EXCEEDED` when the
+client takes no part for 120 s, as `ReadFile` does.
 
 **Lines.** A line ends after a `\n` byte, or at the end of the file. An empty
 file has no lines and gets no ranges.
@@ -585,9 +596,10 @@ file has no lines and gets no ranges.
   with `INVALID_ARGUMENT`, a cursor that was not made for the repo,
   changeset and path of the request.
 
-**Bounds per call.** At most 1,000 changesets checked, 100 versions diffed,
-and about 1M lines diffed (both sides of each diff; a line counts once per
-64 bytes). A rename search counts as a line each chunk of up to 64 bytes
+**Bounds per call.** At most 100 versions diffed, and about 1M lines
+diffed (both sides of each diff; a line counts once per 64 bytes). The
+path-history nodes a call reads take bytes of the memory budget, as its
+versions do. A rename search counts as a line each chunk of up to 64 bytes
 that it reads and each row of a chunk table that it indexes or compares,
 and as 64 lines each file size that it reads. The first step of a call
 always runs, so every call makes progress. The rules of a rename search are
@@ -917,8 +929,8 @@ order.
   objects it did not get.
 
 **Errors.** An error status of the call is about the whole call, and no
-object was sent: for example a repo that does not exist, or no memory for
-the first object. An error in the stream is about the object in progress,
+object was sent: for example a refused ticket, or no memory for the first
+object. An error in the stream is about the object in progress,
 or the next object if none is in progress. It ends the reply after the
 objects before it. A server or tier MUST NOT put an error about the whole
 call in the stream. A missing object ends the reply with `NOT_FOUND`. A
@@ -929,8 +941,9 @@ MAY keep the objects it got before the error.
 
 | Error | When |
 |---|---|
-| `INVALID_ARGUMENT` | A bad repo name; no ref or more than 1,000; a kind that is not `TREE` or `BLOB`; an ID that is not 32 bytes. |
-| `NOT_FOUND` | The repo does not exist (the call's status); a named object does not exist (in the stream, after the objects before it). |
+| `INVALID_ARGUMENT` | No ref or more than 1,000; a kind that is not `TREE` or `BLOB`; an ID that is not 32 bytes. |
+| `PERMISSION_DENIED` | The ticket is missing, damaged, expired, or not signed by the server's keys (section 7.2). |
+| `NOT_FOUND` | A named object does not exist (in the stream, after the objects before it). |
 | `RESOURCE_EXHAUSTED` | No memory for the first object within 30 s, or before the caller's deadline. No object was sent. |
 | `DEADLINE_EXCEEDED` | From a tier: the caller's deadline ran out while it waited for the first object (section 8). In the stream: the client took no part for 120 s in the middle of an object. |
 | `UNAVAILABLE` | From a tier: its upstream did not answer in time, or it found no fetch slot or no memory for an object from upstream within 30 s (section 8). The call's status for the first object, else in the stream. Ask again. |

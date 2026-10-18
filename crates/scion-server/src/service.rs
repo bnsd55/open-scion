@@ -2,10 +2,12 @@
 //! (`SQLite` and the object folder are synchronous), and maps errors to status
 //! codes.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use prost::Message as _;
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, RepoPath};
 use scion_proto::listen::{self, Limits};
 use scion_proto::tls::ServerTls;
@@ -32,13 +34,14 @@ use tracing::Instrument as _;
 
 use crate::access::Access;
 use crate::auth::Caller;
+use crate::backend::Backend;
 use crate::deadline::Deadline;
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
-use crate::meta::MetaTx as _;
+use crate::meta::{Meta as _, MetaTx as _};
 use crate::objects::ObjectsService;
 use crate::quotas::{Call, Quotas};
-use crate::store::{MAX_OBJECT_BYTES, READER_BYTES, Store};
+use crate::store::{MAX_OBJECT_BYTES, READER_BYTES};
 use crate::tickets::Keys;
 use crate::{blame, names, read, views, write};
 
@@ -146,7 +149,7 @@ pub struct ServeOptions {
 ///
 /// Transport errors.
 pub async fn serve(
-    store: Store,
+    store: Backend,
     listener: TcpListener,
     access: impl Into<Access>,
     options: ServeOptions,
@@ -315,7 +318,7 @@ impl ScionService {
     async fn graph_query<T, F>(&self, deadline: Deadline, query: F) -> Result<T, Status>
     where
         T: Send + 'static,
-        F: FnOnce(&Store, &Deadline) -> Result<T> + Send + 'static,
+        F: FnOnce(&Backend, &Deadline) -> Result<T> + Send + 'static,
     {
         run_graph_query(&self.worker, &self.graph_queries, deadline, query).await
     }
@@ -326,10 +329,11 @@ impl ScionService {
 /// first (section 2 of protocol-v1).
 ///
 /// SHORTCUT: a unary reply's bytes stay in HTTP/2 uncounted until the
-/// client reads them or the connection closes; the encode limit bounds the
-/// encoded bytes of one at the message limit. Upgrade: stream Blame
-/// ([#175](https://github.com/bnsd55/open-scion/issues/175)), the one unary
-/// reply that legitimately grows toward it.
+/// client reads them or the connection closes; the largest one left is
+/// `Diff` (about 120 KB), so a client that never reads holds at most its
+/// connections x streams of those. Every reply that can grow with its
+/// input streams; a new unary RPC must stream, or bound its reply, before
+/// it ships.
 pub fn into_server<S: Scion + Send + 'static>(service: S) -> ScionServer<S> {
     ScionServer::new(service)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
@@ -340,14 +344,14 @@ pub fn into_server<S: Scion + Send + 'static>(service: S) -> ScionServer<S> {
 /// on the work in flight, so both services queue behind the same limit.
 #[derive(Clone)]
 pub(crate) struct Worker {
-    store: Store,
+    store: Backend,
     /// Bounds blocking work, so a flood of requests queues instead of
     /// spawning unbounded threads.
     permits: Arc<Semaphore>,
 }
 
 impl Worker {
-    pub(crate) fn new(store: Store) -> Self {
+    pub(crate) fn new(store: Backend) -> Self {
         Self {
             store,
             permits: Arc::new(Semaphore::new(MAX_BLOCKING)),
@@ -356,7 +360,7 @@ impl Worker {
 
     /// A handle to the store, for work outside the permit queue, such as the
     /// stale-land sweep.
-    pub(crate) fn store(&self) -> Store {
+    pub(crate) fn store(&self) -> Backend {
         self.store.clone()
     }
 
@@ -364,7 +368,7 @@ impl Worker {
     pub(crate) async fn run<T, F>(&self, f: F) -> Result<T, Status>
     where
         T: Send + 'static,
-        F: FnOnce(Store) -> Result<T> + Send + 'static,
+        F: FnOnce(Backend) -> Result<T> + Send + 'static,
     {
         let permit = Arc::clone(&self.permits)
             .acquire_owned()
@@ -498,6 +502,8 @@ type ListDirStream = ReceiverStream<Part<ListDirResponse>>;
 
 type LogStream = ReceiverStream<Part<LogResponse>>;
 
+type BlameStream = ReceiverStream<Part<BlameResponse>>;
+
 /// The share of `READ_BUDGET_BYTES` that a `ReadFile` reply of a `size`-byte
 /// file holds. A file of one part is read in one job, so the reply holds only
 /// that part. A longer file keeps its reader between parts, and reads the
@@ -607,7 +613,7 @@ async fn run_graph_query<T, F>(
 ) -> Result<T, Status>
 where
     T: Send + 'static,
-    F: FnOnce(&Store, &Deadline) -> Result<T> + Send + 'static,
+    F: FnOnce(&Backend, &Deadline) -> Result<T> + Send + 'static,
 {
     // The query checks it at each read: a request timeout, or a client
     // that cancels, drops this call but not a job that is running. The
@@ -651,8 +657,13 @@ fn log_page_parts(entries: Vec<(ChangesetId, Changeset)>, walk: &mut LogWalk) ->
     let mut bytes = 0usize;
     for (id, changeset) in entries {
         if walk.left == 0 {
-            // The call owes no more entries: this one starts the next call.
-            walk.next = Some(id);
+            // Unreachable while `log_parts` fetches every page with
+            // `limit = walk.left.min(MAX_SCAN)`: a page then never holds
+            // more entries than the call still owes, so the page ends
+            // before the call's credit does. If a page ever did hold more,
+            // this entry is the first uncovered one, and the next call
+            // starts here.
+            debug_assert!(false, "a page held more than the call still owes");
             break;
         }
         let body = changeset.encode();
@@ -709,6 +720,87 @@ async fn reserve<'a, T>(
             Taken::Stalled
         }
     }
+}
+
+/// What a streamed `Blame` reply sends: the ranges of the walk and the
+/// changesets they name, where the walk continues, and the state the reply
+/// holds until its client takes it.
+struct BlameSend {
+    ranges: Vec<BlameRange>,
+    changesets: Vec<BlameChangeset>,
+    cursor: Vec<u8>,
+    /// The request slot, held until the reply ends.
+    _call: Call,
+    stalled: Option<scion_proto::listen::Stalled>,
+}
+
+/// Splits a computed blame into parts: groups of ranges whose encoded
+/// bytes, with the changesets they name that no earlier part carried, stay
+/// within [`CHUNK_BYTES`]. The last part carries where the walk continues.
+fn blame_page_parts(send: &mut BlameSend) -> Vec<BlameResponse> {
+    // Where each named changeset sits, so a range names its changeset's
+    // part: the first part that names it carries it.
+    let mut at: HashMap<Vec<u8>, usize> = HashMap::with_capacity(send.changesets.len());
+    for (i, changeset) in send.changesets.iter().enumerate() {
+        at.insert(changeset.changeset_id.clone(), i);
+    }
+    let mut carried = vec![false; send.changesets.len()];
+    let mut parts = Vec::new();
+    let mut ranges: Vec<BlameRange> = Vec::new();
+    let mut changesets: Vec<BlameChangeset> = Vec::new();
+    let mut bytes = 0usize;
+    for range in std::mem::take(&mut send.ranges) {
+        let range_bytes = range.encoded_len();
+        let named = at.get(&range.changeset_id).copied();
+        let mut new_bytes = 0usize;
+        if let Some(i) = named.filter(|i| !carried[*i]) {
+            new_bytes = send.changesets[i].encoded_len();
+        }
+        if !ranges.is_empty() && bytes + range_bytes + new_bytes > CHUNK_BYTES {
+            bytes = 0;
+            parts.push(BlameResponse {
+                ranges: std::mem::take(&mut ranges),
+                changesets: std::mem::take(&mut changesets),
+                next_cursor: Vec::new(),
+            });
+        }
+        bytes += range_bytes + new_bytes;
+        if let Some(i) = named.filter(|i| !carried[*i]) {
+            changesets.push(std::mem::take(&mut send.changesets[i]));
+            carried[i] = true;
+        }
+        ranges.push(range);
+    }
+    parts.push(BlameResponse {
+        ranges,
+        changesets,
+        next_cursor: std::mem::take(&mut send.cursor),
+    });
+    parts
+}
+
+/// Streams a `Blame` reply: sends the parts of the computed blame, until
+/// the client has them all or stops taking parts. A stall counts
+/// [`STALLED_REPLY_BYTES`] on the connection, as any streamed reply does.
+async fn blame_parts(mut send: BlameSend, tx: mpsc::Sender<Part<BlameResponse>>) {
+    for part in blame_page_parts(&mut send) {
+        match reserve(&tx, READ_STALL_TIMEOUT, send.stalled.as_ref()).await {
+            Taken::Slots(mut slots) => {
+                if let Some(slot) = slots.next() {
+                    slot.send(Ok(part));
+                }
+            }
+            Taken::Gone => return,
+            Taken::Stalled => {
+                let detail = format!("the client took no data for {READ_STALL_TIMEOUT:?}");
+                let _ = tx.try_send(Err(Status::deadline_exceeded(detail)));
+                return;
+            }
+        }
+    }
+    // Keeps the request slot until the client has taken the last part; a
+    // client that never does is counted.
+    reserve(&tx, READ_STALL_TIMEOUT, send.stalled.as_ref()).await;
 }
 
 /// Fetches one page of the log: a graph query when `path` is set, because
@@ -782,6 +874,10 @@ async fn log_parts(mut walk: LogWalk, page: read::LogPage, tx: mpsc::Sender<Part
             Ok(page) => page,
             Err(status) => return fail(status),
         };
+        // The next page's continuation is the walk's: without this, the
+        // page after the second one starts at the second page's start, and
+        // the reply repeats it.
+        walk.next = page.next;
     }
 }
 
@@ -1037,6 +1133,8 @@ impl Scion for ScionService {
 
     type LogStream = LogStream;
 
+    type BlameStream = BlameStream;
+
     async fn read_file(
         &self,
         request: Request<ReadFileRequest>,
@@ -1201,12 +1299,12 @@ impl Scion for ScionService {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    async fn blame(
-        &self,
-        request: Request<BlameRequest>,
-    ) -> Result<Response<BlameResponse>, Status> {
+    async fn blame(&self, request: Request<BlameRequest>) -> Result<Response<BlameStream>, Status> {
         let caller = caller(&request)?;
-        let _call = self.quotas.enter(&caller).map_err(Status::from)?;
+        let call = self.quotas.enter(&caller).map_err(Status::from)?;
+        // The handle of the caller's connection, before the request is
+        // taken apart: the reply counts what it leaves in HTTP/2 on it.
+        let stalled = scion_proto::listen::Stalled::of(&request);
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_whole_reader(&self.access, &caller, &req.repo)?;
@@ -1276,11 +1374,18 @@ impl Scion for ScionService {
             .resume
             .map(|resume| blame::encode_cursor(&resume, &req.repo, id, &path))
             .unwrap_or_default();
-        Ok(Response::new(BlameResponse {
+        // The blame is computed; the reply goes on in the producer, so the
+        // request slot lives until the reply ends.
+        let send = BlameSend {
             ranges,
             changesets,
-            next_cursor,
-        }))
+            cursor: next_cursor,
+            _call: call,
+            stalled,
+        };
+        let (tx, rx) = mpsc::channel(2);
+        tokio::spawn(blame_parts(send, tx).instrument(tracing::Span::current()));
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn merge_base(
@@ -1404,7 +1509,9 @@ fn file_state(state: FileState) -> v1::FileState {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::Backend;
     use crate::db;
+    use crate::store::Store;
     use std::time::Instant;
 
     use scion_core::{Changeset, FileState, IdentityTime};
@@ -1432,7 +1539,7 @@ mod tests {
     }
 
     /// A service whose one principal may do everything.
-    fn test_service(store: Store) -> ScionService {
+    fn test_service(store: Backend) -> ScionService {
         ScionService::new(
             Worker::new(store),
             Arc::new(Access::single("t")),
@@ -1496,9 +1603,9 @@ mod tests {
         )
     }
 
-    fn file_store(content: &[u8]) -> (tempfile::TempDir, Store, ChangesetId, BlobId) {
+    fn file_store(content: &[u8]) -> (tempfile::TempDir, Backend, ChangesetId, BlobId) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let blob = store.blobs().put(content).unwrap();
         let state = FileState::Regular {
             content: blob,
@@ -1533,7 +1640,7 @@ mod tests {
     /// Starts [`send_file`] for `blob` with all of a budget of `budget`.
     /// Returns the task, the reply and the budget.
     async fn reply(
-        store: Store,
+        store: Backend,
         blob: BlobId,
         budget: usize,
         stall: Duration,
@@ -1864,7 +1971,7 @@ mod tests {
         // main goes root ─ B. The land's base is root, below the floor of a
         // new path index at B, so its plan walks back.
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let blob = store.blobs().put(b"x").unwrap();
         let put = |parents, path: &str| Changeset {
             parents,
@@ -1939,7 +2046,7 @@ mod tests {
         }
         let sql = "SELECT state FROM lands WHERE request_key = 'k'";
         let state: String = store
-            .read(|c| Ok(c.query_row(sql, [], |row| row.get(0))?))
+            .read(|c| Ok(c.sqlite().unwrap().query_row(sql, [], |row| row.get(0))?))
             .unwrap();
         assert_eq!(state, "pending");
         let main = store.read(|c| {
@@ -1992,11 +2099,11 @@ mod tests {
     async fn at_most_max_graph_queries_run_at_once() {
         // root ─ a, and root ─ b.
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let ids = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
-                db::testing::insert_graph(c, repo, &[vec![], vec![0], vec![0]])
+                db::testing::insert_graph(c.sqlite().unwrap(), repo, &[vec![], vec![0], vec![0]])
             })
             .unwrap();
         let bytes = |i: usize| ids[i].as_bytes().to_vec();
@@ -2093,7 +2200,7 @@ mod tests {
     #[tokio::test]
     async fn a_worker_panic_does_not_reach_the_client() {
         let dir = tempfile::tempdir().unwrap();
-        let worker = Worker::new(Store::open(dir.path()).unwrap());
+        let worker = Worker::new(Backend::Sqlite(Store::open(dir.path()).unwrap()));
         let status = worker
             .run(|_| -> Result<()> { panic!("secret detail") })
             .await

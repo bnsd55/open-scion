@@ -349,6 +349,7 @@ fn cs_string(cs: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::auth::Caller;
+    use crate::backend::Backend;
     use crate::db::SqliteTx;
     use crate::deadline::Deadline;
     use crate::land::{LandRequest, Lands};
@@ -398,7 +399,7 @@ mod tests {
                     &mut tx,
                     repo,
                     cs,
-                    &mut crate::tree::lens_of(store),
+                    &mut crate::tree::lens_of(&Backend::Sqlite(store.clone())),
                 )?;
                 let version = tx.get_ref(repo, "main")?.map(|r| r.version);
                 assert!(tx.cas_ref(repo, "main", version, id)?);
@@ -588,7 +589,9 @@ mod tests {
             request_key: "late".into(),
             deadline: Deadline::new(Instant::now()),
         };
-        let err = lands.land(&store, &Caller("t".into()), &req).unwrap_err();
+        let err = lands
+            .land(&Backend::Sqlite(store.clone()), &Caller("t".into()), &req)
+            .unwrap_err();
         assert!(matches!(err, crate::Error::DeadlineExceeded(_)), "{err:?}");
         // Every stored blob is old, and nothing new is orphaned.
         let report = collect(&store, Duration::ZERO, &mut |_| {});

@@ -1,11 +1,35 @@
-//! gRPC API for Scion, generated from `proto/scion.proto`, plus the rules that
-//! every server of the API shares: bearer tokens ([`auth`]), checks on request
-//! fields ([`check`]), how a caller's deadline passes down ([`deadline`]), how
-//! one object travels in parts and encodings ([`object`]), the operator
-//! metrics ([`metrics`]), how a
-//! `GetObjects` reply streams objects ([`reply`]), and how many connections
-//! and streams a process serves ([`listen`]), and TLS for those connections
-//! ([`tls`]).
+//! gRPC API for Scion, plus the rules that every process of the API shares.
+//!
+//! The message and service types are generated from `proto/scion.proto`
+//! ([`v1`]); everything else is the shared behavior that the server, the
+//! cache tier and the daemon agree on:
+//! bearer tokens ([`auth`]), checks on request fields ([`check`]), how a
+//! caller's deadline passes down ([`deadline`]), how one object travels in
+//! parts and encodings ([`object`]), the operator metrics ([`metrics`]),
+//! how a `GetObjects` reply streams objects ([`reply`]), how many
+//! connections and streams a process serves ([`listen`]), TLS for those
+//! connections ([`tls`]), and the signed read tickets that make object
+//! IDs unreadable without permission ([`ticket`]).
+//!
+//! This crate is the contract the five crates share: the server serves
+//! it, the tiers forward it, and a client talks it; the object bytes
+//! themselves live in [`scion-core`](https://docs.rs/open-scion-core).
+//!
+//! A server mints a read ticket with [`ticket::sign`]; the receiver
+//! checks it with [`ticket::parse`]:
+//!
+//! ```
+//! use scion_proto::ticket::{parse, sign};
+//!
+//! let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+//! let bytes = sign(&key, "monorepo", "alice", [9; 32], 1_700_000_000)
+//!     .map_err(|e| e.to_string())?;
+//! let keys = [ed25519_dalek::VerifyingKey::from(&key)];
+//! let ticket = parse(&bytes, &keys, 1_700_000_100).map_err(|e| e.to_string())?;
+//! assert_eq!(ticket.repo, "monorepo");
+//! assert_eq!(ticket.principal, "alice");
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 pub mod auth;
 pub mod check;

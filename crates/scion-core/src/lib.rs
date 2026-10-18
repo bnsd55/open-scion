@@ -1,5 +1,13 @@
 //! Object model and canonical byte format for Scion.
 //!
+//! This is the lowest layer of the system: the objects that every other
+//! crate of [open-scion] stores, sends and checks. A server keeps them, a
+//! tier caches their bytes, and the client ([`scn`]) builds and reads
+//! them; all of them speak this one format, so they stay interoperable.
+//!
+//! [open-scion]: https://github.com/bnsd55/open-scion
+//! [`scn`]: https://docs.rs/open-scion
+//!
 //! Scion stores two kinds of structured objects, both content-addressed:
 //!
 //! - [`Changeset`]: one commit, stored as the files that changed relative to
@@ -11,28 +19,30 @@
 //! format is a frozen contract. It is specified in `docs/format-v1.md` and
 //! pinned by golden tests.
 //!
+//! A tree is a map of names to entries; encoding it yields the bytes whose
+//! hash is its [`TreeId`], and decoding those bytes yields the same tree:
+//!
 //! ```
 //! use std::collections::BTreeMap;
-//! use scion_core::{BlobId, Changeset, FileState, IdentityTime, RepoPath};
+//! use scion_core::{BlobId, Entry, FileEntry, FileState, PathElem, Tree, TreeId};
 //!
-//! let readme = BlobId::of(b"# hello\n");
-//! let cs = Changeset {
-//!     parents: vec![],
-//!     author: IdentityTime {
-//!         name: b"Ada".to_vec(),
-//!         email: b"ada@example.com".to_vec(),
-//!         unix_secs: 1_700_000_000,
-//!         tz_offset_minutes: 0,
-//!     },
-//!     committer: None,
-//!     message: b"init\n".to_vec(),
-//!     changes: BTreeMap::from([(
-//!         RepoPath::new("README.md")?,
-//!         Some(FileState::Regular { content: readme, executable: false }),
-//!     )]),
+//! let tree = Tree {
+//!     entries: BTreeMap::from([
+//!         (
+//!             PathElem::new("README.md")?,
+//!             Entry::File(FileEntry::new(
+//!                 FileState::Regular {
+//!                     content: BlobId::of(b"# hello\n"),
+//!                     executable: false,
+//!                 },
+//!                 b"# hello\n".len() as u64,
+//!             )),
+//!         ),
+//!         (PathElem::new("src")?, Entry::Dir(TreeId::from_bytes([7; 32]))),
+//!     ]),
 //! };
-//! let bytes = cs.encode();
-//! assert_eq!(Changeset::decode(&bytes)?, cs);
+//! let (bytes, id) = tree.encode_with_id();
+//! assert_eq!(Tree::decode_with_id(&bytes)?.1, id);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 

@@ -2,6 +2,8 @@
 //! exists, and every `#anchor` names a heading of the file it points at.
 //! The checks follow GitHub's slug rules, so a link that renders as a link
 //! on GitHub also resolves here. No network: `http(s)` links are skipped.
+//! The test also pins every RPC of `proto/scion.proto` to a section of
+//! `docs/protocol-v1.md`, so the protocol doc cannot fall behind the proto.
 
 use std::collections::HashMap;
 use std::fs;
@@ -210,6 +212,48 @@ fn every_markdown_link_resolves() {
         "{} of {checked} links are broken:\n{}",
         broken.len(),
         broken.join("\n")
+    );
+}
+
+/// Every RPC that `proto/scion.proto` declares has a section in
+/// `docs/protocol-v1.md`: a `### ` heading that names it. Modeled on the
+/// SHORTCUT table test of `query.rs`: a new, renamed or removed RPC must
+/// update the protocol doc in the same PR, or this fails.
+#[test]
+fn the_protocol_doc_has_a_section_for_every_rpc() {
+    let proto = fs::read_to_string(Path::new(ROOT).join("proto/scion.proto"))
+        .expect("proto/scion.proto exists");
+    let doc = fs::read_to_string(Path::new(ROOT).join("docs/protocol-v1.md"))
+        .expect("docs/protocol-v1.md exists");
+    let headings: Vec<String> = doc
+        .lines()
+        .filter(|line| line.starts_with("### "))
+        .map(|line| line["### ".len()..].trim().to_owned())
+        .collect();
+    assert!(!headings.is_empty(), "the protocol doc has sections");
+    let mut missing = Vec::new();
+    for line in proto
+        .lines()
+        .filter(|line| line.trim_start().starts_with("rpc "))
+    {
+        let rest = line.trim().trim_start_matches("rpc ").trim_start();
+        let name = rest
+            .split(|c: char| c == '(' || c.is_whitespace())
+            .next()
+            .expect("an rpc line holds a name");
+        let named = headings.iter().any(|heading| {
+            heading
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|word| word == name)
+        });
+        if !named {
+            missing.push(name.to_owned());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "these RPCs have no section in docs/protocol-v1.md: {}",
+        missing.join(", ")
     );
 }
 

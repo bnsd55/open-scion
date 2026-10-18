@@ -91,6 +91,8 @@ pub struct Metrics {
     bytes_out: [AtomicU64; RPCS.len()],
     /// Lands by outcome.
     lands: [AtomicU64; LANDS.len()],
+    /// Lands whose ref moved under them and were planned again.
+    land_replans: AtomicU64,
     /// Objects a tier served from its store, and fetched from upstream.
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
@@ -161,6 +163,17 @@ impl Metrics {
         if outcome < LANDS.len() {
             self.lands[outcome].fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Counts one land whose ref moved under it, so it plans again.
+    pub fn land_replan(&self) {
+        self.land_replans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The replan counter, for a test that reads it without a scrape.
+    #[must_use]
+    pub fn land_replans(&self) -> u64 {
+        self.land_replans.load(Ordering::Relaxed)
     }
 
     /// Counts an object a tier served from its store.
@@ -277,6 +290,14 @@ impl Metrics {
             "scion_view_trees_walked_total {}",
             self.view_trees_walked.load(Ordering::Relaxed)
         );
+        text.push_str(
+            "# HELP scion_land_replans_total Lands whose ref moved under them, planned again.\n",
+        );
+        text.push_str("# TYPE scion_land_replans_total counter\n");
+        let replans = self.land_replans.load(Ordering::Relaxed);
+        if replans > 0 {
+            let _ = writeln!(text, "scion_land_replans_total {replans}");
+        }
         text.push_str("# HELP scion_cache_hits_total Objects a tier served from its store.\n");
         text.push_str("# TYPE scion_cache_hits_total counter\n");
         text.push_str("# HELP scion_cache_misses_total Objects a tier fetched from upstream.\n");

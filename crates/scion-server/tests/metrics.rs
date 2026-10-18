@@ -12,7 +12,7 @@ use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{BlameRequest, CreateChangesetRequest, LandRequest, ReadFileRequest};
 use scion_server::meta::MetaTx as _;
 use scion_server::metrics::Metrics;
-use scion_server::{Store, service};
+use scion_server::{Backend, Store, service};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 use tonic::service::interceptor::InterceptedService;
@@ -106,7 +106,7 @@ async fn setup() -> (
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(service::serve(
-        store.clone(),
+        Backend::Sqlite(store.clone()),
         listener,
         TOKEN,
         service::ServeOptions {
@@ -169,7 +169,7 @@ async fn a_blame_counts_a_request_with_its_latency_and_bytes() {
         text(&metrics)
     );
 
-    let reply = client
+    let mut pages = client
         .blame(BlameRequest {
             repo: REPO.into(),
             changeset_id: root.as_bytes().to_vec(),
@@ -179,7 +179,11 @@ async fn a_blame_counts_a_request_with_its_latency_and_bytes() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(reply.ranges.len(), 1, "{}", reply.ranges.len());
+    let mut ranges = 0usize;
+    while let Some(page) = pages.message().await.unwrap() {
+        ranges += page.ranges.len();
+    }
+    assert_eq!(ranges, 1, "{ranges}");
 
     let text = text(&metrics);
     assert!(

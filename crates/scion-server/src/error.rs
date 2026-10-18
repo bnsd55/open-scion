@@ -51,6 +51,9 @@ pub enum Error {
     /// The database failed.
     #[error("database: {0}")]
     Db(rusqlite::Error),
+    /// The Postgres database failed.
+    #[error("database: {0}")]
+    Pg(#[from] postgres::Error),
     /// The database's write lock stayed busy past `busy_timeout`. A caller
     /// that shares the data directory held it; the transaction rolled back
     /// and wrote nothing, so the same work may run again.
@@ -110,7 +113,7 @@ impl From<Error> for Status {
                 tracing::warn!(error = %e, "the database stayed busy");
                 Status::unavailable("the database is busy; retry")
             }
-            Error::Corrupt(_) | Error::Io(_) | Error::Git(_) => {
+            Error::Corrupt(_) | Error::Pg(_) | Error::Io(_) | Error::Git(_) => {
                 // Details stay in the server log, not in the reply.
                 tracing::error!(error = %e, "internal error");
                 Status::internal("internal error")

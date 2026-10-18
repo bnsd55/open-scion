@@ -17,16 +17,16 @@ use scion_server::blame::{
 use scion_server::deadline::Deadline;
 use scion_server::import::{ImportOptions, import_git};
 use scion_server::memory::Bytes;
-use scion_server::meta::MetaTx as _;
+use scion_server::meta::{Meta as _, MetaTx as _};
 use scion_server::read::{self, MAX_SCAN};
-use scion_server::{Error, Store, tree};
+use scion_server::{Backend, Error, tree};
 use tempfile::TempDir;
 
 const REPO: &str = "r";
 
-fn open_store() -> (TempDir, Store) {
+fn open_store() -> (TempDir, Backend) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path()).unwrap();
+    let store = Backend::open_test(dir.path()).unwrap();
     (dir, store)
 }
 
@@ -85,7 +85,7 @@ fn commit(dir: &Path, message: &str, files: &[(&str, Option<&str>)]) -> String {
     git(dir, &["rev-parse", "HEAD"])
 }
 
-fn import(store: &Store, dir: &Path) -> ChangesetId {
+fn import(store: &Backend, dir: &Path) -> ChangesetId {
     common::spawn_guard::prime_gix_lookup();
     let opts = ImportOptions {
         rev: "HEAD".into(),
@@ -96,21 +96,25 @@ fn import(store: &Store, dir: &Path) -> ChangesetId {
 }
 
 /// The changeset that a git commit was imported as.
-fn changeset_of(store: &Store, commit: &str) -> ChangesetId {
+fn changeset_of(store: &Backend, commit: &str) -> ChangesetId {
     let oid = gix::ObjectId::from_hex(commit.as_bytes()).unwrap();
+    let _oid = gix::ObjectId::from_hex(commit.as_bytes()).unwrap();
     store
         .read(|c| {
-            let cs: Vec<u8> = c.query_row(
-                "SELECT cs FROM git_import WHERE git_oid = ?1",
-                [oid.as_slice()],
-                |row| row.get(0),
-            )?;
-            Ok(ChangesetId::try_from(cs.as_slice()).unwrap())
+            let repo = c.repo_id(REPO)?;
+            Ok(c.imported_commits(repo)?
+                .get(&oid)
+                .copied()
+                .unwrap_or_else(|| panic!("{commit} is not imported")))
         })
         .unwrap()
 }
 
-fn path_log(store: &Store, from: ChangesetId, p: &str) -> (Vec<ChangesetId>, Option<ChangesetId>) {
+fn path_log(
+    store: &Backend,
+    from: ChangesetId,
+    p: &str,
+) -> (Vec<ChangesetId>, Option<ChangesetId>) {
     let page = read::log_page(store, REPO, from, Some(&path(p)), 1000, &later()).unwrap();
     (
         page.entries.into_iter().map(|(id, _)| id).collect(),
@@ -218,7 +222,10 @@ fn regular(content: BlobId) -> FileState {
 /// Stores a first-parent chain in a new repo: one changeset per entry of
 /// `puts`, which puts files or deletes them (`None`). Returns the IDs,
 /// oldest first.
-fn chain<S: Into<Option<FileState>>>(store: &Store, puts: Vec<Vec<(&str, S)>>) -> Vec<ChangesetId> {
+fn chain<S: Into<Option<FileState>>>(
+    store: &Backend,
+    puts: Vec<Vec<(&str, S)>>,
+) -> Vec<ChangesetId> {
     store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -248,7 +255,7 @@ fn range(start: usize, count: usize, id: Option<ChangesetId>, origin: u32) -> Bl
     }
 }
 
-fn blame(store: &Store, cs: ChangesetId, p: &str) -> Blame {
+fn blame(store: &Backend, cs: ChangesetId, p: &str) -> Blame {
     blame::blame(
         store,
         REPO,
@@ -269,7 +276,7 @@ fn goes_on(resume: Option<&Resume>, cs: ChangesetId, p: &str) -> bool {
 
 /// Blames with a pool of `cap` bytes.
 fn blame_bounded(
-    store: &Store,
+    store: &Backend,
     cs: ChangesetId,
     p: &str,
     cap: usize,
@@ -454,13 +461,13 @@ fn blame_refuses_a_file_whose_share_is_past_the_whole_budget() {
 /// Blames `p` at `cs` to the end, and continues where a call stops, as a
 /// client does. Each line as its changeset, its line there and the path
 /// there.
-fn blame_lines(store: &Store, cs: ChangesetId, p: &str) -> Vec<(ChangesetId, u32, RepoPath)> {
+fn blame_lines(store: &Backend, cs: ChangesetId, p: &str) -> Vec<(ChangesetId, u32, RepoPath)> {
     blame_calls(store, cs, p).0
 }
 
 /// [`blame_lines`], and the calls it took.
 fn blame_calls(
-    store: &Store,
+    store: &Backend,
     cs: ChangesetId,
     p: &str,
 ) -> (Vec<(ChangesetId, u32, RepoPath)>, usize) {
@@ -554,7 +561,7 @@ fn blame_calls(
 /// first. The oracle of the blame walk, kept here as the test double of
 /// the scan that `read::next_change` did before blame read the path
 /// history.
-fn scan_versions(store: &Store, cs: ChangesetId, p: &str) -> Vec<ChangesetId> {
+fn scan_versions(store: &Backend, cs: ChangesetId, p: &str) -> Vec<ChangesetId> {
     let repo = store.write(|c| c.repo_id(REPO)).unwrap();
     let mut found = Vec::new();
     let mut next = Some(cs);
@@ -666,7 +673,7 @@ proptest::proptest! {
 }
 
 /// `git blame --first-parent` of `file`, in the form of [`blame_lines`].
-fn git_blame_lines(store: &Store, dir: &Path, file: &str) -> Vec<(ChangesetId, u32, RepoPath)> {
+fn git_blame_lines(store: &Backend, dir: &Path, file: &str) -> Vec<(ChangesetId, u32, RepoPath)> {
     // `--porcelain`, not `--line-porcelain`, which is slow on large files.
     let out = git(dir, &["blame", "--first-parent", "--porcelain", file]);
     let mut lines = Vec::new();
@@ -716,7 +723,7 @@ fn commit_cases(dir: &Path, cases: &[Case<'_>]) {
 /// Imports the git history in `dir`, and checks that the blame of each of
 /// `files` at the tip matches `git blame --first-parent`: the changeset,
 /// line and path of each line.
-fn assert_blame_matches_git(dir: &Path, files: &[&str]) -> (TempDir, Store, ChangesetId) {
+fn assert_blame_matches_git(dir: &Path, files: &[&str]) -> (TempDir, Backend, ChangesetId) {
     let (data, store) = open_store();
     let tip = import(&store, dir);
     for file in files {
@@ -1520,7 +1527,7 @@ fn blame_stops_when_its_diff_budget_runs_out() {
 
 /// A chain of changesets in the repo `name`, as [`chain`] does in `r`.
 fn chain_in<S: Into<Option<FileState>>>(
-    store: &Store,
+    store: &Backend,
     name: &str,
     puts: Vec<Vec<(&str, S)>>,
 ) -> Vec<ChangesetId> {
@@ -1577,6 +1584,49 @@ fn a_cursor_with_huge_line_numbers_decodes_without_overflow() {
     assert_eq!(decoded.after_line, usize::MAX);
     assert_eq!(decoded.counted, usize::MAX);
     assert_eq!(decoded.window, Vec::new());
+}
+
+/// A cursor whose run claims more lines than a word holds is refused: the
+/// window bound, not a wrapped total, decides. Found by the `blame-cursor`
+/// fuzz target: `total += len` overflowed, and the fuzz build died on the
+/// check while a release build silently took the wrapped total.
+#[test]
+fn a_cursor_with_a_run_longer_than_the_word_is_refused() {
+    let (_data, store) = open_store();
+    let put = |data: &[u8]| regular(store.blobs().put(data).unwrap());
+    let ids = chain(&store, vec![vec![("f", put(b"a\n")), ("f", put(b"b\n"))]]);
+    let mut bytes = cursor_bytes(
+        &Resume {
+            next: None,
+            search: RenameSearch::default(),
+            after_line: 0,
+            counted: 8,
+            window: vec![Line::Unnamed(0), Line::Unnamed(1)],
+        },
+        ids[0],
+        "f",
+    );
+    // The runs start after the fixed header: the version, the digest, the
+    // walk flag, the search, the window bounds. Replace the run counts and
+    // the runs: a table of none, then one line, then a run of the biggest
+    // count a word holds.
+    bytes.truncate(1 + 16 + 1 + 8 + 1 + 8 + 8);
+    bytes.extend_from_slice(&0u32.to_be_bytes());
+    bytes.extend_from_slice(&2u32.to_be_bytes());
+    bytes.extend_from_slice(&[0x01, 0x00, 0x00]);
+    bytes.extend_from_slice(&[0xff; 9]);
+    bytes.extend_from_slice(&[0x01, 0x00]);
+    let err = blame::decode_cursor(
+        &store,
+        REPO,
+        &bytes,
+        ids[0],
+        &path("f"),
+        &Bytes::new(1 << 30),
+        None,
+    )
+    .expect_err("a cursor with a run longer than the word is refused");
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
 }
 
 #[test]

@@ -21,6 +21,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "write-decode"
+path = "fuzz_targets/write-decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "access"
 path = "fuzz_targets/access.rs"
 test = false

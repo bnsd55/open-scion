@@ -13,8 +13,8 @@ use scion_proto::auth::Bearer;
 use scion_proto::listen::Limits;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::{ObjectKind, ObjectRef};
-use scion_server::meta::MetaTx as _;
-use scion_server::{Store, service, tree};
+use scion_server::meta::{Meta as _, MetaTx as _};
+use scion_server::{Backend, service, tree};
 use scion_tier::{
     CACHE_UPSTREAM_TIMEOUT, DAEMON_UPSTREAM_TIMEOUT, DiskStore, MemoryStore, Tier, bind_unix,
 };
@@ -63,7 +63,7 @@ pub fn blob_ref(id: BlobId, path: &[u8]) -> ObjectRef {
 /// A server, a cache in front of it, and a daemon in front of the cache.
 /// Dropping it stops all three.
 pub struct Tiers {
-    pub store: Store,
+    pub store: Backend,
     /// Address of the server.
     pub server: String,
     pub cache: Tier<MemoryStore>,
@@ -77,7 +77,7 @@ pub struct Tiers {
 }
 
 impl Tiers {
-    pub fn start(data: TempDir, store: Store) -> Self {
+    pub fn start(data: TempDir, store: Backend) -> Self {
         let runtime = Runtime::new().unwrap();
         let _entered = runtime.enter();
         let tcp = || {
@@ -200,7 +200,7 @@ fn object_path(dir: &Path, kind: &str, hex: &str) -> PathBuf {
 /// parts of 1 MiB, packed or not (noise, then text), an executable, nested
 /// directories, two paths with one blob, a symlink and an empty file. Puts
 /// their blobs in `store`, and returns them with the large file's content.
-pub fn files(store: &Store) -> (Vec<(&'static str, FileState)>, Vec<u8>) {
+pub fn files(store: &Backend) -> (Vec<(&'static str, FileState)>, Vec<u8>) {
     let mut big = noise(3 * CHUNK_BYTES + 1);
     big.extend((0..5_000).flat_map(|i| format!("line {i}\n").into_bytes()));
     let mut blobs = store.blobs().batch();
@@ -258,7 +258,7 @@ pub fn changeset(parent: Option<ChangesetId>, files: &[(&str, FileState)]) -> Ch
 }
 
 /// Stores `cs` in the repo and points `main` at it.
-pub fn land(store: &Store, cs: &Changeset) -> ChangesetId {
+pub fn land(store: &Backend, cs: &Changeset) -> ChangesetId {
     store
         .write(|c| {
             let repo = c.create_repo(REPO)?;

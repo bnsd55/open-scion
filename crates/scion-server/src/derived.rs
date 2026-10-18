@@ -18,15 +18,18 @@
 //! unused, and nothing rewrites them: the new version derives its values
 //! again. Each step also removes some rows of older versions of its kind.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::Instant;
 
 use scion_core::{Changeset, ChangesetId};
 
+use crate::backend::Backend;
 use crate::deadline::Deadline;
 use crate::error::{Error, Result};
+use crate::meta::Meta as _;
 use crate::meta::{MetaTx, RepoId};
-use crate::store::Store;
 
 /// Most changesets that one step walks or derives, and most rows of older
 /// versions that one step removes. A step holds the write connection, so
@@ -93,7 +96,7 @@ pub trait Kind {
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`], or of [`Store::flush`].
-pub fn get<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
+pub fn get<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
     get_until::<K>(store, repo, cs, None)
 }
 
@@ -104,7 +107,7 @@ pub fn get<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::V
 ///
 /// As [`get`], and [`Error::DeadlineExceeded`].
 pub fn get_by<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     cs: ChangesetId,
     deadline: &Deadline,
@@ -113,7 +116,7 @@ pub fn get_by<K: Kind>(
 }
 
 fn get_until<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     cs: ChangesetId,
     deadline: Option<&Deadline>,
@@ -129,9 +132,224 @@ fn get_until<K: Kind>(
     // the caller can send it to a client. So it waits for one full flush,
     // shared with concurrent commits. An error is an answer too, so it
     // waits as well: the steps before the error committed.
-    let value = fill_until::<K>(store, repo, cs, deadline);
+    let value = in_one_walk::<K>(store, repo, cs, deadline);
     store.flush()?;
     value
+}
+
+/// The derive walks of one [`Store`]: which are in flight, and the cap on
+/// how many may be. Every `Store` in the process keeps its own, so repo 1
+/// of one store never joins the walk of repo 1 of another.
+pub(crate) struct DeriveFlights {
+    /// The walks in flight, one per kind, version and repo: N cold reads
+    /// of one history wait for one walk instead of repeating its work
+    /// ([#142]).
+    flights: Mutex<HashMap<FlightKey, Arc<Flight>>>,
+    /// Walks in flight, with the condvar a caller over the cap waits on.
+    in_flight: Mutex<usize>,
+    woken: Condvar,
+    /// The cap on walks in flight. Each walk holds the write connection in
+    /// turns, so walks beyond the cap only repeat work and starve writes.
+    walks_cap: usize,
+}
+
+impl DeriveFlights {
+    pub(crate) fn new(walks_cap: usize) -> Self {
+        Self {
+            flights: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(0),
+            woken: Condvar::new(),
+            walks_cap,
+        }
+    }
+}
+
+/// A walk of a kind, version and repo in flight.
+struct Flight {
+    /// How many walks of this key have ended. A waiter that wakes and sees
+    /// the count unchanged keeps waiting.
+    walks: Mutex<u64>,
+    /// Woken when a walk ends, for whatever reason.
+    woken: Condvar,
+}
+
+/// Held while a walk derives. Drop it, and a waiting owner takes it.
+struct Permit<'a> {
+    in_flight: &'a Mutex<usize>,
+    woken: &'a Condvar,
+}
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *in_flight -= 1;
+        self.woken.notify_all();
+    }
+}
+
+/// Takes a walk permit, or waits for one until the deadline, then gives up
+/// with [`Error::ResourceExhausted`]. Without a deadline it waits.
+fn take_walk_permit<'a>(
+    walks: &'a DeriveFlights,
+    deadline: Option<&Deadline>,
+) -> Result<Permit<'a>> {
+    let mut in_flight = walks
+        .in_flight
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    loop {
+        if *in_flight < walks.walks_cap {
+            *in_flight += 1;
+            return Ok(Permit {
+                in_flight: &walks.in_flight,
+                woken: &walks.woken,
+            });
+        }
+        match deadline {
+            None => {
+                in_flight = walks
+                    .woken
+                    .wait(in_flight)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            Some(deadline) => {
+                let budget = deadline.at().saturating_duration_since(Instant::now());
+                let (guard, result) = walks
+                    .woken
+                    .wait_timeout_while(in_flight, budget, |in_flight| {
+                        *in_flight >= walks.walks_cap
+                    })
+                    .unwrap_or_else(PoisonError::into_inner);
+                in_flight = guard;
+                if result.timed_out() {
+                    return Err(Error::ResourceExhausted(
+                        "no derive walk free before the deadline".to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Which walk a caller joins: kind, version and repo. Not the changeset:
+/// the walks of tip-1, tip-2 and so on overlap on the same old range, so
+/// flights per changeset would still walk it once per caller.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct FlightKey {
+    kind: &'static str,
+    version: u32,
+    repo: i64,
+}
+
+impl FlightKey {
+    fn of<K: Kind>(repo: RepoId) -> Self {
+        Self {
+            kind: K::NAME,
+            version: K::VERSION,
+            repo: repo.0,
+        }
+    }
+}
+
+/// The flights map, made on first use.
+/// Joins the walk of `key`, or owns it: the caller that finds no flight
+/// running owns the next walk, and the others wait for it.
+fn join<K: Kind>(walks: &DeriveFlights, repo: RepoId) -> (Arc<Flight>, bool) {
+    let mut flights = walks.flights.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(flight) = flights.get(&FlightKey::of::<K>(repo)) {
+        return (Arc::clone(flight), false);
+    }
+    let flight = Arc::new(Flight {
+        walks: Mutex::new(0),
+        woken: Condvar::new(),
+    });
+    flights.insert(FlightKey::of::<K>(repo), Arc::clone(&flight));
+    (flight, true)
+}
+
+/// Records that the walk `flight` owned ended, and retires the flight:
+/// the next caller owns a fresh walk, even while this flight's waiters
+/// still wake and read its rows. A waiter that finds the value missing
+/// owns the next walk itself.
+fn retire(walks: &DeriveFlights, flight: &Arc<Flight>) {
+    let mut flights = walks.flights.lock().unwrap_or_else(PoisonError::into_inner);
+    flights.retain(|_, running| !Arc::ptr_eq(running, flight));
+    let mut walks = flight.walks.lock().unwrap_or_else(PoisonError::into_inner);
+    *walks += 1;
+    flight.woken.notify_all();
+}
+
+/// Waits for the walk of `flight` to end, until the deadline. False when
+/// the deadline passed first.
+fn waited(flight: &Arc<Flight>, before: u64, deadline: Option<&Deadline>) -> bool {
+    let mut walks = flight.walks.lock().unwrap_or_else(PoisonError::into_inner);
+    loop {
+        if *walks > before {
+            return true;
+        }
+        match deadline {
+            None => {
+                walks = flight
+                    .woken
+                    .wait(walks)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            Some(deadline) => {
+                let budget = deadline.at().saturating_duration_since(Instant::now());
+                let (guard, result) = flight
+                    .woken
+                    .wait_timeout_while(walks, budget, |walks| *walks <= before)
+                    .unwrap_or_else(PoisonError::into_inner);
+                walks = guard;
+                if result.timed_out() {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+/// Fills `K` for `cs` in at most one walk per kind, version and repo: a
+/// caller that finds a walk of its key running waits for it, then reads
+/// again; a caller that finds none owns the next walk. The owner stops at a
+/// step boundary once its deadline has passed; the rows it stored stay, and
+/// a waiter that finds no value takes over the next walk.
+fn in_one_walk<K: Kind>(
+    store: &Backend,
+    repo: RepoId,
+    cs: ChangesetId,
+    deadline: Option<&Deadline>,
+) -> Result<K::Value> {
+    let walks = store.derive_flights();
+    loop {
+        // The value may be there already: a walk of this key that ended
+        // while this caller waited stored it, or it was never missing.
+        let known = store.read(|c| load::<K>(c, cs))?;
+        if let Some(value) = known {
+            return Ok(value);
+        }
+        // Join first: a waiter holds no walk permit, so callers that wait
+        // for a running walk never take a permit from a walk of another
+        // repo or kind ([#142]).
+        let (flight, owner) = join::<K>(walks, repo);
+        if owner {
+            // The walk's permit: walks beyond the cap only repeat work,
+            // and starve the writes. Wait for one until the deadline.
+            let _permit = take_walk_permit(walks, deadline)?;
+            let value = fill_until::<K>(store, repo, cs, deadline);
+            retire(walks, &flight);
+            return value;
+        }
+        let before = *flight.walks.lock().unwrap_or_else(PoisonError::into_inner);
+        if !waited(&flight, before, deadline) {
+            return Err(Error::DeadlineExceeded(
+                "the call ran past its deadline".to_owned(),
+            ));
+        }
+    }
 }
 
 /// Derives every missing value of `K` that the value for `cs` needs, in
@@ -155,7 +373,7 @@ fn get_until<K: Kind>(
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`].
-pub fn fill<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
+pub fn fill<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
     fill_until::<K>(store, repo, cs, None)
 }
 
@@ -166,7 +384,7 @@ pub fn fill<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<K::
 ///
 /// As [`fill`], and [`Error::DeadlineExceeded`].
 pub fn fill_by<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     cs: ChangesetId,
     deadline: &Deadline,
@@ -175,7 +393,7 @@ pub fn fill_by<K: Kind>(
 }
 
 fn fill_until<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     cs: ChangesetId,
     deadline: Option<&Deadline>,
@@ -185,7 +403,7 @@ fn fill_until<K: Kind>(
         ControlFlow::Break(value) => return Ok(value),
         ControlFlow::Continue(pending) => pending,
     };
-    derive_steps::<K>(store, repo, &pending, check)?
+    derive_steps::<K>(store, repo, &pending, deadline, check)?
         .ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
 }
 
@@ -196,7 +414,7 @@ fn fill_until<K: Kind>(
 /// # Errors
 ///
 /// As [`fill`] and [`Store::flush`].
-pub fn backfill<K: Kind>(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<()> {
+pub fn backfill<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<()> {
     fill::<K>(store, repo, cs)?;
     // A short step means that no older row is left.
     while store.commit(|c| remove_old::<K>(c))? == STEP {}
@@ -265,7 +483,7 @@ pub fn on_write<K: Kind>(
 /// The walk of [`fill`]: the stored value for `cs`, or else the changesets
 /// to derive, parents first. Runs `check` before each step after the first.
 fn walk_all<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     cs: ChangesetId,
     check: impl Fn() -> Result<()>,
@@ -361,9 +579,10 @@ impl Walk {
 /// [`STEP`] changesets per transaction. Returns the value for the last one.
 /// Runs `check` before each step.
 fn derive_steps<K: Kind>(
-    store: &Store,
+    store: &Backend,
     repo: RepoId,
     pending: &[ChangesetId],
+    deadline: Option<&Deadline>,
     check: impl Fn() -> Result<()>,
 ) -> Result<Option<K::Value>> {
     let mut value = None;
@@ -374,6 +593,11 @@ fn derive_steps<K: Kind>(
             remove_old::<K>(c)?;
             Ok(value)
         })?;
+        // A writer that waited for the connection while this step held it
+        // gets in before the next step takes it again: the walk waits
+        // while writers wait, so the mutex handoff is deterministic, not
+        // a race the walker wins under load ([#142]).
+        store.wait_for_writers(deadline)?;
     }
     Ok(value)
 }
@@ -474,10 +698,15 @@ fn require(c: &mut dyn MetaTx, repo: RepoId, cs: ChangesetId) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::Backend;
     use crate::db::SqliteTx;
+    use crate::store::Store;
     use rusqlite::Connection;
     use std::cell::Cell;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
 
     use scion_core::{BlobId, FileState, IdentityTime, RepoPath};
 
@@ -570,6 +799,135 @@ mod tests {
         }
     }
 
+    /// Derives of a flight-test kind, across all threads.
+    static COLD_DERIVES: AtomicUsize = AtomicUsize::new(0);
+
+    /// Milliseconds that one derive of the flight kind sleeps, after the
+    /// gate. Only the land test sets it: its walkers hold the write
+    /// connection while they sleep, so a write that arrives then has to
+    /// wait for the walkers' transactions to end.
+    static COLD_SLEEP: AtomicUsize = AtomicUsize::new(0);
+
+    /// How many derives of the flight kind have entered the gate. A test
+    /// that closes the gate waits for a count, so it knows its walking
+    /// owners are inside, with their walk permits taken.
+    static COLD_ENTERED: AtomicUsize = AtomicUsize::new(0);
+
+    /// The derive count that a writer's transaction saw when it got the
+    /// write connection: the writer-priority test reads it to tell a walk
+    /// that waited from a walk that re-took the connection first.
+    static DERIVES_AT_WRITE: AtomicUsize = AtomicUsize::new(0);
+
+    /// The gate of the flight tests: a closed gate holds each derive until
+    /// the test releases it, one release per derive, and an open gate lets
+    /// every derive go at once. A test that closes it holds the walking
+    /// owner inside its derive, with the walk permit taken, so the other
+    /// callers' orders are forced, not timed.
+    static COLD_GATE: Mutex<(bool, u64)> = Mutex::new((true, 0));
+    /// Woken when the gate opens or releases.
+    static COLD_GATE_WOKEN: Condvar = Condvar::new();
+
+    /// Closes the gate, and empties its releases.
+    fn gate_close() {
+        *COLD_GATE.lock().unwrap_or_else(PoisonError::into_inner) = (false, 0);
+        COLD_ENTERED.store(0, Ordering::SeqCst);
+    }
+
+    /// Opens the gate when dropped, even on a panic: a test that fails
+    /// must not leave walkers blocked at the gate, or the failing test
+    /// would hang instead of reporting.
+    struct GateGuard;
+
+    impl Drop for GateGuard {
+        fn drop(&mut self) {
+            gate_open();
+        }
+    }
+
+    /// Closes the gate, and returns the guard that opens it again.
+    fn gate_closed() -> GateGuard {
+        gate_close();
+        GateGuard
+    }
+
+    /// Lets `n` derives through.
+    fn gate_release(n: u64) {
+        let mut gate = COLD_GATE.lock().unwrap_or_else(PoisonError::into_inner);
+        gate.1 += n;
+        COLD_GATE_WOKEN.notify_all();
+    }
+
+    /// Opens the gate for good, and empties its releases.
+    fn gate_open() {
+        let mut gate = COLD_GATE.lock().unwrap_or_else(PoisonError::into_inner);
+        *gate = (true, 0);
+        COLD_GATE_WOKEN.notify_all();
+    }
+
+    /// Waits until `n` derives of the flight kind are inside the gate,
+    /// with a generous ceiling: a bug is a timeout, not a hang without a
+    /// bound.
+    fn wait_entered(n: usize) {
+        for _ in 0..12_000 {
+            if COLD_ENTERED.load(Ordering::SeqCst) >= n {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!(
+            "only {} walks reached the gate",
+            COLD_ENTERED.load(Ordering::SeqCst)
+        );
+    }
+
+    /// A first-parent test kind for the flight tests: 1 + the parent's
+    /// value. Each derive passes the gate, so a test walks a history one
+    /// derive at a time.
+    struct Cold<const VERSION: u32>;
+
+    impl<const V: u32> Kind for Cold<V> {
+        const NAME: &'static str = "cold";
+        const VERSION: u32 = V;
+        type Value = u64;
+
+        fn derive(
+            _: &mut dyn MetaTx,
+            _: ChangesetId,
+            _: &Changeset,
+            parents: Vec<u64>,
+            _: crate::tree::BlobLens<'_>,
+        ) -> Result<u64> {
+            COLD_ENTERED.fetch_add(1, Ordering::SeqCst);
+            let mut gate = COLD_GATE.lock().unwrap_or_else(PoisonError::into_inner);
+            loop {
+                if gate.0 {
+                    break;
+                }
+                if gate.1 > 0 {
+                    gate.1 -= 1;
+                    break;
+                }
+                gate = COLD_GATE_WOKEN
+                    .wait(gate)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            drop(gate);
+            std::thread::sleep(Duration::from_millis(
+                COLD_SLEEP.load(Ordering::Relaxed) as u64
+            ));
+            COLD_DERIVES.fetch_add(1, Ordering::Relaxed);
+            Ok(parents.first().copied().unwrap_or(0) + 1)
+        }
+
+        fn encode(count: &u64) -> Vec<u8> {
+            count.to_le_bytes().to_vec()
+        }
+
+        fn decode(bytes: &[u8]) -> Option<u64> {
+            bytes.try_into().ok().map(u64::from_le_bytes)
+        }
+    }
+
     /// The rule of [`Ancestry`], shared with the model in the tests.
     fn ancestry(id: ChangesetId, parents: Vec<Vec<ChangesetId>>) -> Vec<ChangesetId> {
         let mut seen = HashSet::new();
@@ -601,14 +959,14 @@ mod tests {
     }
 
     /// A new store with `history` in repo `r`, as [`store_chain`] stores it.
-    fn store_with(history: &[Edits]) -> (tempfile::TempDir, Store, RepoId, Vec<ChangesetId>) {
+    fn store_with(history: &[Edits]) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let (repo, ids) = store.write(|c| store_chain(c, history)).unwrap();
         (dir, store, repo, ids)
     }
 
-    /// Stores `history` in a new repo `r` through the one write path, which
+    /// Backends `history` in a new repo `r` through the one write path, which
     /// stores root trees and the commit graph, and nothing else. Returns the
     /// IDs, oldest first.
     fn store_chain(c: &mut dyn MetaTx, history: &[Edits]) -> Result<(RepoId, Vec<ChangesetId>)> {
@@ -619,7 +977,7 @@ mod tests {
         })
     }
 
-    /// Stores `history` in a new repo `r` with `store`. Returns the IDs,
+    /// Backends `history` in a new repo `r` with `store`. Returns the IDs,
     /// oldest first.
     fn chain_with(
         c: &mut dyn MetaTx,
@@ -670,8 +1028,8 @@ mod tests {
     }
 
     /// The rows of kind `name` at `version`, as (changeset, value).
-    fn rows_of(store: &Store, name: &str, version: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let all = store.read(|c| Ok(rows(c))).unwrap();
+    fn rows_of(store: &Backend, name: &str, version: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let all = store.read(|c| Ok(rows(c.sqlite().unwrap()))).unwrap();
         all.into_iter()
             .filter(|(kind, v, ..)| kind == name && *v == version)
             .map(|(_, _, cs, value)| (cs, value))
@@ -679,7 +1037,7 @@ mod tests {
     }
 
     /// The rows of the test kind at `version`, as (changeset, value).
-    fn kind_rows(store: &Store, version: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn kind_rows(store: &Backend, version: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
         rows_of(store, ChangedPathsV1::NAME, version)
     }
 
@@ -760,14 +1118,21 @@ mod tests {
                 .all(|(kind, v, ..)| kind == RootTree::NAME && *v == RootTree::VERSION)
         );
 
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let version: u32 = store
-            .read(|c| Ok(c.pragma_query_value(None, "user_version", |row| row.get(0))?))
+            .read(|c| {
+                Ok(c.sqlite()
+                    .unwrap()
+                    .pragma_query_value(None, "user_version", |row| row.get(0))?)
+            })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         // Migration 7 drops the old root trees: they predate the entry
         // lengths, so they are re-derived from the blob store.
-        assert_eq!(store.read(|c| Ok(rows(c))).unwrap(), vec![]);
+        assert_eq!(
+            store.read(|c| Ok(rows(c.sqlite().unwrap()))).unwrap(),
+            vec![]
+        );
         // The blobs the chain names, by the chain's own convention.
         for path in ["a", "b", "c", "d"] {
             store.blobs().put(path.as_bytes()).unwrap();
@@ -782,15 +1147,15 @@ mod tests {
                 tree.as_bytes().to_vec(),
             ));
         }
-        let mut got = store.read(|c| Ok(rows(c))).unwrap();
+        let mut got = store.read(|c| Ok(rows(c.sqlite().unwrap()))).unwrap();
         got.sort();
         after.sort();
         assert_eq!(got, after);
     }
 
     /// How many root tree rows the store holds.
-    fn root_trees(store: &Store) -> usize {
-        let all = store.read(|c| Ok(rows(c))).unwrap();
+    fn root_trees(store: &Backend) -> usize {
+        let all = store.read(|c| Ok(rows(c.sqlite().unwrap()))).unwrap();
         all.iter()
             .filter(|(kind, ..)| kind == RootTree::NAME)
             .count()
@@ -872,7 +1237,7 @@ mod tests {
         assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), 5);
         assert_eq!(DERIVES.get(), 5);
 
-        let late = derive_steps::<ChangedPathsV1>(&store, repo, &pending, || Ok(())).unwrap();
+        let late = derive_steps::<ChangedPathsV1>(&store, repo, &pending, None, || Ok(())).unwrap();
         assert_eq!(late, Some(5));
         assert_eq!(DERIVES.get(), 5, "the late steps derive nothing again");
     }
@@ -960,7 +1325,7 @@ mod tests {
         let older = "INSERT INTO derived (kind, version, cs, value)
                      SELECT kind, 0, cs, value FROM derived WHERE kind = ?1";
         let added = store
-            .write(|c| Ok(c.execute(older, [RootTree::NAME])?))
+            .write(|c| Ok(c.sqlite().unwrap().execute(older, [RootTree::NAME])?))
             .unwrap();
         assert_eq!(added, 7);
 
@@ -980,13 +1345,18 @@ mod tests {
 
     /// A new store with the graph `parents` in repo `r`, with no derived
     /// rows. Each changeset puts one file.
-    fn store_graph(parents: &[Vec<usize>]) -> (tempfile::TempDir, Store, RepoId, Vec<ChangesetId>) {
+    fn store_graph(
+        parents: &[Vec<usize>],
+    ) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let (repo, ids) = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
-                Ok((repo, testing::insert_graph(c, repo, parents)?))
+                Ok((
+                    repo,
+                    testing::insert_graph(c.sqlite().unwrap(), repo, parents)?,
+                ))
             })
             .unwrap();
         (dir, store, repo, ids)
@@ -1106,5 +1476,389 @@ mod tests {
                 derived.extend(model[i].iter().map(|&id| (id, i)));
             }
         }
+    }
+
+    /// The flight tests share the gate, so they run one at a time.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    /// A second repo with a chain of `n`, beside the one `store_with` made.
+    /// Its author differs, so its changeset IDs differ from the first repo's:
+    /// a changeset ID is the hash of its content, and equal content would
+    /// make the two repos share their derived rows.
+    fn another_chain(store: &Backend, name: &str, history: &[Edits]) -> (RepoId, Vec<ChangesetId>) {
+        store
+            .write(|c| {
+                let repo = c.create_repo(name)?;
+                let mut ids: Vec<ChangesetId> = Vec::new();
+                for edits in history {
+                    let changes = edits
+                        .iter()
+                        .map(|&(path, put)| {
+                            let state = put.then(|| FileState::Regular {
+                                content: BlobId::of(path.as_bytes()),
+                                executable: false,
+                            });
+                            (RepoPath::new(path).unwrap(), state)
+                        })
+                        .collect();
+                    let cs = Changeset {
+                        parents: ids.last().copied().into_iter().collect(),
+                        author: IdentityTime {
+                            name: b"b".to_vec(),
+                            email: [b"b@", name.as_bytes(), b"@x"].concat(),
+                            unix_secs: 0,
+                            tz_offset_minutes: 0,
+                        },
+                        committer: None,
+                        message: vec![],
+                        changes,
+                    };
+                    ids.push(tree::store_changeset(c, repo, &cs, &mut tree::lens_none())?.0);
+                }
+                Ok((repo, ids))
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn n_cold_reads_derive_once() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        COLD_DERIVES.store(0, Ordering::Relaxed);
+        let (_dir, store, repo, ids) = store_with(&chain(12));
+        let tip = *ids.last().unwrap();
+        // Eight cold reads of the tip at once, all starting together: they
+        // join one walk, which derives each changeset once. The gate holds
+        // the walking owner inside its first derive until every caller has
+        // looked for the value, so the round's ownership is decided with
+        // them all inside: a caller that walked on its own would own
+        // another walk, and load cannot change that count.
+        let at_the_gate = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            let _gate = gate_closed();
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    at_the_gate.wait();
+                    assert_eq!(get::<Cold<1>>(&store, repo, tip).unwrap(), 12);
+                });
+            }
+            // All eight are inside the round: the owner holds the walk at
+            // the gate, and the seven others wait for it on its flight.
+            // A waiter holds no walk permit: the walk counter of the store
+            // still counts the owner's walk alone, so the default cap of
+            // 8 keeps seven walks free for other repos and kinds ([#142]).
+            wait_entered(1);
+            for _ in 0..2_000 {
+                if joined_on(&store, repo) >= 9 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(joined_on(&store, repo), 9, "the seven callers never joined");
+            let walks = store.derive_flights();
+            assert_eq!(
+                *walks
+                    .in_flight
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+                1,
+                "a caller that only waits holds a walk permit"
+            );
+            // Open the gate, and the one walk derives every changeset once.
+            gate_open();
+        });
+        assert_eq!(COLD_DERIVES.load(Ordering::Relaxed), 12);
+    }
+
+    #[test]
+    fn a_caller_over_the_cap_waits_then_succeeds() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        COLD_DERIVES.store(0, Ordering::Relaxed);
+        // A cap of one walk, and three repos: the first caller walks repo
+        // one and stops inside its first derive, at the closed gate, with
+        // its permit taken. The gate, not a clock, holds it there: the
+        // walk's permit stays taken for as long as the test wants.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::Sqlite(Store::open_with_walks(dir.path(), 1).unwrap());
+        let (repo1, ids1) = another_chain(&store, "one", &chain(3));
+        let (repo2, ids2) = another_chain(&store, "two", &chain(3));
+        let (repo3, ids3) = another_chain(&store, "three", &chain(3));
+        let dir2 = tempfile::tempdir().unwrap();
+        let store2 = Backend::Sqlite(Store::open(dir2.path()).unwrap());
+        let (repo_b, ids_b) = another_chain(&store2, "r", &chain(3));
+        let (owner, beside) = std::thread::scope(|scope| {
+            let _gate = gate_closed();
+            let owner = scope.spawn(|| get::<Cold<1>>(&store, repo1, ids1[2]).unwrap());
+            // The owner is provably inside its walk: its first derive ran,
+            // and it holds the one permit with the gate closed. Until the
+            // test opens the gate, no other walk can start, whatever the
+            // machine's load does to thread starts.
+            wait_entered(1);
+            // A caller of ANOTHER store in this process walks beside it:
+            // its store keeps its own walks and its own permit count, so
+            // it enters its first derive while the first store's walk
+            // holds its permit. Flights shared across stores would make it
+            // wait for the first store's permit, and it would never reach
+            // the gate.
+            let beside = scope.spawn(|| get::<Cold<1>>(&store2, repo_b, ids_b[2]).unwrap());
+            wait_entered(2);
+            // A caller of repo two waits for the permit, then walks.
+            let waited = scope.spawn(|| get::<Cold<1>>(&store, repo2, ids2[2]).unwrap());
+            // A caller of repo three with a deadline gives up: the one
+            // walk is taken, and the test holds it there.
+            let short = scope.spawn(|| {
+                let deadline = Deadline::new(Instant::now() + Duration::from_millis(200));
+                get_by::<Cold<1>>(&store, repo3, ids3[0], &deadline)
+            });
+            let short = short.join().unwrap();
+            assert!(
+                matches!(short, Err(Error::ResourceExhausted(_))),
+                "the caller with a deadline did not give up: {short:?}"
+            );
+            // Open the gate: the owner finishes its walk, and the waiter
+            // takes the permit and walks repo two.
+            gate_open();
+            let walked = owner.join().unwrap();
+            assert_eq!(waited.join().unwrap(), 3);
+            beside.join().unwrap();
+            (walked, true)
+        });
+        assert_eq!(owner, 3);
+        assert!(beside);
+    }
+
+    /// How many Arcs the flight of `Cold<1>` for `repo` has: the map's one,
+    /// the walking owner's, and one per caller that joined the flight and
+    /// still waits on it. A test that must have a waiter on the flight
+    /// before the walk ends polls this count.
+    fn joined_on(store: &Backend, repo: RepoId) -> usize {
+        store
+            .derive_flights()
+            .flights
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&FlightKey::of::<Cold<1>>(repo))
+            .map_or(0, Arc::strong_count)
+    }
+
+    #[test]
+    fn a_waiter_that_leaves_does_not_trap_the_next_caller() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        COLD_DERIVES.store(0, Ordering::Relaxed);
+        let (_dir, store, repo, ids) = store_with(&chain(6));
+        let tip = *ids.last().unwrap();
+        // The owner's walk stops at a step boundary past its deadline, with
+        // the last changesets still missing. The gate walks it one derive
+        // at a time: the second pair of releases goes out only once the
+        // waiter has joined the walk's flight and the deadline, built
+        // here, has passed - the state decides the order, not a clock's
+        // mercy to thread starts.
+        let owner_deadline = Deadline::new(Instant::now() + Duration::from_millis(50));
+        std::thread::scope(|scope| {
+            let _gate = gate_closed();
+            let owner = scope.spawn(|| get_by::<Cold<1>>(&store, repo, tip, &owner_deadline));
+            wait_entered(1);
+            // A waiter of the same repo, spawned while the owner walks: it
+            // joins the walk's flight. The walk's end wakes it.
+            let waiter = scope.spawn(|| {
+                let deadline = Deadline::new(Instant::now() + Duration::from_secs(5));
+                get_by::<Cold<1>>(&store, repo, ids[1], &deadline).unwrap()
+            });
+            // The waiter is provably on the flight, and the owner's
+            // deadline has provably passed, before the walk is let on.
+            for _ in 0..2_000 {
+                if joined_on(&store, repo) >= 3 && Instant::now() >= owner_deadline.at() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                joined_on(&store, repo) >= 3 && Instant::now() >= owner_deadline.at(),
+                "the waiter never joined the flight"
+            );
+            gate_release(2);
+            gate_release(2);
+            // A waiter of a changeset the stopped walk DID store: it wakes
+            // when the walk ends, reads its value, and leaves without
+            // walking. A caller that comes after it must not join the flight
+            // it held: that walk is over, and the new caller owns a fresh
+            // one. A flight that a waiter's exit leaves behind would hold
+            // the new caller until its deadline, with nobody to wake it.
+            let owner = owner.join().unwrap();
+            assert!(
+                matches!(owner, Err(Error::DeadlineExceeded(_))),
+                "{owner:?}"
+            );
+            // The next caller reads the tip, which the stopped walk did not
+            // store: it owns a fresh walk and finishes the chain.
+            gate_open();
+            let deadline = Deadline::new(Instant::now() + Duration::from_secs(5));
+            let value = get_by::<Cold<1>>(&store, repo, tip, &deadline).unwrap();
+            assert_eq!(value, 6);
+            assert_eq!(waiter.join().unwrap(), 2);
+        });
+    }
+
+    #[test]
+    fn a_stopped_walk_hands_over() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        COLD_DERIVES.store(0, Ordering::Relaxed);
+        let (_dir, store, repo, ids) = store_with(&chain(12));
+        let tip = *ids.last().unwrap();
+        // The owner's walk stops at a step boundary when its deadline passes;
+        // the rows it stored stay. A waiter that joined the walk mid-flight
+        // wakes when the walk ends, finds its value still missing, and owns
+        // the next walk itself: it walks only what is left, and every
+        // changeset is derived once, never redone.
+        let owner_deadline = Deadline::new(Instant::now() + Duration::from_millis(50));
+        std::thread::scope(|scope| {
+            let _gate = gate_closed();
+            let owner = scope.spawn(|| get_by::<Cold<1>>(&store, repo, tip, &owner_deadline));
+            wait_entered(1);
+            // The waiter joins the walk while it is still in flight, so
+            // the walk's end is what wakes it. The test waits for the
+            // waiter's Arc to be on the flight, and for the deadline to
+            // have passed, before it lets the walk on: a waiter that
+            // arrived after the walk ended would join nothing and check
+            // something else.
+            let waiter = scope.spawn(|| {
+                let deadline = Deadline::new(Instant::now() + Duration::from_secs(5));
+                get_by::<Cold<1>>(&store, repo, tip, &deadline).unwrap()
+            });
+            for _ in 0..2_000 {
+                if joined_on(&store, repo) >= 3 && Instant::now() >= owner_deadline.at() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                joined_on(&store, repo) >= 3 && Instant::now() >= owner_deadline.at(),
+                "the waiter never joined the flight"
+            );
+            gate_release(2);
+            gate_release(2);
+            let owner = owner.join().unwrap();
+            assert!(
+                matches!(owner, Err(Error::DeadlineExceeded(_))),
+                "{owner:?}"
+            );
+            // The walk is over: the waiter owns a fresh one, and with the
+            // gate open it walks the rest without waiting.
+            gate_open();
+            assert_eq!(waiter.join().unwrap(), 12);
+        });
+        assert_eq!(COLD_DERIVES.load(Ordering::Relaxed), 12);
+    }
+
+    #[test]
+    fn a_land_finishes_while_cold_reads_walk_deep_history() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        COLD_DERIVES.store(0, Ordering::Relaxed);
+        // A cap of two walks, and a storm of cold reads: forty repos, each
+        // read by one caller. Each walk holds the write connection for two
+        // sleeping derives per step, over two steps, and then it is done:
+        // it never contends again. A land that arrives while the first two
+        // walk queues behind at most their four transactions; the other
+        // thirty-eight callers wait at the permit, and never touch the
+        // write connection. Walks without a cap would all queue their
+        // transactions on the write connection, and the land would wait
+        // behind all of them.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::Sqlite(Store::open_with_walks(dir.path(), 2).unwrap());
+        let mut repos: Vec<(RepoId, ChangesetId)> = Vec::new();
+        for i in 0..40 {
+            let (repo, ids) = another_chain(&store, &format!("r{i}"), &chain(4));
+            repos.push((repo, *ids.last().unwrap()));
+        }
+        COLD_SLEEP.store(100, Ordering::Relaxed);
+        std::thread::scope(|scope| {
+            let mut walkers: Vec<_> = repos
+                .iter()
+                .map(|&(repo, tip)| {
+                    let store = store.clone();
+                    scope.spawn(move || get::<Cold<1>>(&store, repo, tip).unwrap())
+                })
+                .collect();
+            // The storm is provably deep: twenty walkers have entered
+            // their derives. With the cap that took ten waves of walking;
+            // without it, the walkers are all queued on the write
+            // connection by now.
+            wait_entered(20);
+            let at = Instant::now();
+            let (land_repo, _) = another_chain(&store, "land", &chain(1));
+            let waited = at.elapsed();
+            // The storm's walks take at least twenty waves of two
+            // transactions, four seconds of holding; the land finishes in
+            // well under the first two walkers' four transactions.
+            assert!(
+                waited < Duration::from_millis(1_500),
+                "the land waited {waited:?}"
+            );
+            COLD_SLEEP.store(0, Ordering::Relaxed);
+            for walker in walkers.drain(..) {
+                assert_eq!(walker.join().unwrap(), 4);
+            }
+            let _ = land_repo;
+        });
+        COLD_SLEEP.store(0, Ordering::Relaxed);
+    }
+    #[test]
+    fn a_walk_waits_while_a_writer_waits_for_the_connection() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        COLD_DERIVES.store(0, Ordering::Relaxed);
+        let (_dir, store, repo, ids) = store_with(&chain(12));
+        let tip = *ids.last().unwrap();
+        // The walk holds the connection inside its first step, at the
+        // closed gate. A writer arrives and waits for the connection: it
+        // cannot get in while the step's transaction holds it. When the
+        // step ends, the walk waits while the writer waits, so the
+        // writer's write runs first, and only then the walk's next derive
+        // passes the gate. A walk that did not wait would take the
+        // connection back at once, and the writer would wait for the
+        // whole walk.
+        std::thread::scope(|scope| {
+            let _gate = gate_closed();
+            let walker = scope.spawn(|| get::<Cold<1>>(&store, repo, tip).unwrap());
+            wait_entered(1);
+            // The writer reads the walk's derive count inside its own
+            // transaction, right after it got the connection: that is the
+            // one moment that separates the two designs. A walk that
+            // waits while a writer waits has derived only the first
+            // step's two changesets by then; a walk that re-took the
+            // connection has derived its second step too.
+            let writer = scope.spawn(|| {
+                store
+                    .write(|_| {
+                        DERIVES_AT_WRITE
+                            .store(COLD_ENTERED.load(Ordering::SeqCst), Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+            // The writer is provably waiting: it counted itself when its
+            // commit started, and it cannot have gotten in, because the
+            // walk's step still holds the connection.
+            for _ in 0..2_000 {
+                if store.writers_waiting() > 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(store.writers_waiting() > 0, "the writer never waited");
+            // Twelve releases bank the whole walk, so a walk that does not
+            // wait for the writer walks on to the end and is caught by the
+            // snapshot, instead of blocking at the gate forever.
+            gate_release(12);
+            // The writer's write finishes before the walk derives again.
+            writer.join().unwrap();
+            assert_eq!(
+                DERIVES_AT_WRITE.load(Ordering::SeqCst),
+                2,
+                "the walk derived while a writer waited"
+            );
+            // The writer is done: the walk goes on, and the gate lets it.
+            gate_open();
+            assert_eq!(walker.join().unwrap(), 12);
+        });
+        assert_eq!(COLD_DERIVES.load(Ordering::Relaxed), 12);
     }
 }

@@ -104,9 +104,17 @@ impl Lazyfs {
         let config = round_dir.join("lazyfs.toml");
         // The ops trace lives in the round tempdir, which goes away with
         // the test; a CI job that wants it after a failure names a fixed
-        // directory to upload from.
+        // directory to upload from. `LazyFS` does not create the folder of
+        // its logfile, so since #181 every upload found no files at all:
+        // the test creates it.
         let trace = match std::env::var_os("SCION_LAZYFS_TRACE_DIR") {
-            Some(dir) => PathBuf::from(dir).join(format!("lazyfs-r{round}.log")),
+            Some(dir) => {
+                let trace = PathBuf::from(dir).join(format!("lazyfs-r{round}.log"));
+                if let Some(dir) = trace.parent() {
+                    fs::create_dir_all(dir).unwrap();
+                }
+                trace
+            }
             None => round_dir.join("lazyfs.log"),
         };
         fs::write(
