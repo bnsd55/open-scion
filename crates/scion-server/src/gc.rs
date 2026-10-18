@@ -401,7 +401,7 @@ fn cs_string(cs: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::auth::Caller;
-    use crate::backend::Backend;
+    use crate::backend::{Backend, Marker};
     use crate::db::SqliteTx;
     use crate::deadline::Deadline;
     use crate::land::{LandRequest, Lands};
@@ -878,13 +878,13 @@ mod tests {
         let schema = crate::backend::test_schema(dir.path());
         let data = TempDir::new().unwrap();
         let gc_store =
-            crate::pg::Pg::open_test(&url, &schema, 2, data.path(), Default::default()).unwrap();
+            crate::pg::Pg::open_test(&url, &schema, 2, data.path(), Marker::default()).unwrap();
         let writer_store = crate::pg::Pg::open_test(
             &url,
             &schema,
             2,
             data.path().join("w").as_path(),
-            Default::default(),
+            Marker::default(),
         )
         .unwrap();
         let gc_store = Backend::Postgres(gc_store);
