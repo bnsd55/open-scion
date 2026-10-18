@@ -906,7 +906,7 @@ mod tests {
     #[test]
     fn a_fsck_derived_row_reads_its_version() {
         use crate::meta::MetaTx as _;
-        use scion_core::{Changeset, ChangesetId, IdentityTime};
+        use scion_core::{Changeset, IdentityTime};
         use std::collections::BTreeMap;
         let dir = tempfile::tempdir().unwrap();
         let store = Backend::open_test(dir.path()).unwrap();

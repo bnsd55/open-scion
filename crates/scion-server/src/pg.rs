@@ -2396,8 +2396,7 @@ impl MetaTx for PgTx<'_> {
                 P::i64(i64::try_from(limit).unwrap_or(i64::MAX)),
             ],
         )?;
-        Ok(rows
-            .iter()
+        rows.iter()
             .map(|row| -> Result<FsckDerivedRow> {
                 // d.version is BIGINT here and u32 in the row: read the
                 // int8 first, like every numeric expression here.
@@ -2411,7 +2410,7 @@ impl MetaTx for PgTx<'_> {
                     row.get(4),
                 ))
             })
-            .collect::<Result<Vec<_>>>()?)
+            .collect()
     }
 }
 
