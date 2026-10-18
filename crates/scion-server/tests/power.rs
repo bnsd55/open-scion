@@ -175,14 +175,18 @@ impl Lazyfs {
     fn cut(&mut self) {
         let mut fifo = fs::OpenOptions::new().write(true).open(&self.fifo).unwrap();
         fifo.write_all(b"lazyfs::clear-cache\n").unwrap();
-        let completed = self.completed.try_clone().unwrap();
-        let done = std::thread::spawn(move || {
+        let mut completed = self.completed.try_clone().unwrap();
+        let answer = std::thread::spawn(move || {
             let mut done = [0u8; 64];
             let n = completed.read(&mut done).unwrap();
             String::from_utf8_lossy(&done[..n]).into_owned()
         });
-        let done = wait_for("clear-cache to finish", 15, move || {
-            done.is_finished().then(|| done.join().unwrap())
+        let mut answer = Some(answer);
+        let done = wait_for("clear-cache to finish", 15, || {
+            let answer = answer.as_mut()?;
+            answer
+                .is_finished()
+                .then(|| answer.take().unwrap().join().unwrap())
         });
         assert!(done.contains("finished::clear-cache"), "{done:?}");
     }
@@ -403,9 +407,25 @@ async fn race_wave(
                 Arc::clone(&barrier),
             );
             tokio::spawn(async move {
-                let (mut scion, _objects) = connect(&url).await.unwrap();
-                barrier.wait().await;
-                match put_blob(&mut scion, &content).await {
+                // The connect is bounded, and every racer reaches the
+                // barrier whatever it did: one failed connect must not
+                // hold the other fifteen at the barrier to the ceiling.
+                let connected = tokio::time::timeout(Duration::from_secs(30), connect(&url)).await;
+                let put = match connected {
+                    Ok(Ok((mut scion, _objects))) => {
+                        barrier.wait().await;
+                        put_blob(&mut scion, &content).await
+                    }
+                    Ok(Err(status)) => {
+                        barrier.wait().await;
+                        Err(status)
+                    }
+                    Err(_) => {
+                        barrier.wait().await;
+                        Err(Status::deadline_exceeded("the connect hung"))
+                    }
+                };
+                match put {
                     Ok(id) => {
                         log.line(&format!("round {round} wave {wave} racer {i}: acked {id}"));
                         Ok((id, content))

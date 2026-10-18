@@ -1360,7 +1360,6 @@ impl BlobBatch<'_> {
         fs::create_dir_all(&dir)?;
         #[cfg(test)]
         let _rename = self.blobs.rename_gate.enter();
-        fs::create_dir_all(&dir)?;
         tmp.persist(&path).map_err(|e| e.error)?;
         self.dirs.insert(dir);
         Ok(())
