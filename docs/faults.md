@@ -23,16 +23,16 @@ The matrix:
 | A blob file was deleted under the server (corruption) | reads of it fail | `fsck` finds the missing files and lists them | yes, after repair | `backend_refusals.rs::a_fsck_of_a_postgres_backed_store_finds_missing_blob_files` |
 | Serve through a real kernel NFS mount | reads, writes, a rename and a delete through the mount work; a commit from the mount diffs; a tampered mount path is refused | the CI job `mount (NFS)` runs the whole flow under `timeout` | yes | CI job `mount (NFS)`, `scripts/mount-nfs.sh` (#243) |
 | Power cut while clients write | every reply lands or fails; the server restarts clean | the cut is a real lazyfs cache drop; runs in the CI job `power-loss` (needs `SCION_LAZYFS`) | yes | `power.rs::every_reply_survives_a_power_cut`; the durability-order refinements are open: #225, #261 |
-| A disk that fails mid-write or went read-only (`EIO`, `EROFS`) | open - #262 | | | #262 (coder6) |
-| The whole server on a real full disk (tmpfs, not injected faults) | open - #263 | | | #263 (coder8) |
+| A disk that fails mid-write or went read-only (`EIO`, `EROFS`) | open - #262 | | | #262 |
+| The whole server on a real full disk (tmpfs, not injected faults) | open - #263 | | | #263 |
 
 Notes:
 
 - The fence rows are Postgres-only. SQLite has no cross-process lock to
   lose in this way; its crash story is the kill rows.
 - The out-of-space rows inject the fault through the test hooks
-  (`fail_writes_after`, a capped metadata file). #263 replaces them with
-  a real tmpfs that runs out; #262 adds the faults a disk fails with
-  that are not "no space".
+  (`fail_writes_after`, a capped metadata file). #263 adds a real tmpfs
+  test beside them; the injected tests stay. #262 adds the faults a
+  disk fails with that are not "no space".
 - The power-cut row needs LazyFS, so it skips where `SCION_LAZYFS` is
   unset; the CI job sets it.
