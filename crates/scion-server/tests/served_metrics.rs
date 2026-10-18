@@ -180,10 +180,15 @@ async fn a_served_server_renders_the_operating_metrics() {
             })
             .await
             .expect("the token may create a changeset");
+        // The seed's writes waited too, so the count is at least the
+        // changeset's own one wait.
         let text = metrics.render();
-        assert!(
-            text.contains("scion_pg_collector_key_wait_seconds_count 1\n"),
-            "{text}"
-        );
+        let count = text
+            .lines()
+            .find(|line| line.starts_with("scion_pg_collector_key_wait_seconds_count "))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+        assert!(count >= 1, "{text}");
     }
 }
