@@ -346,11 +346,11 @@ impl EventLog {
     /// One event, now to stderr and now to the file.
     fn line(&self, line: &str) {
         eprintln!("{line}");
-        if let Ok(mut slot) = self.file.lock() {
-            if let Some(file) = slot.as_mut() {
-                let _ = writeln!(file, "{line}");
-                let _ = file.flush();
-            }
+        if let Ok(mut slot) = self.file.lock()
+            && let Some(file) = slot.as_mut()
+        {
+            let _ = writeln!(file, "{line}");
+            let _ = file.flush();
         }
     }
 }
