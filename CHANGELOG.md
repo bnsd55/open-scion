@@ -208,9 +208,34 @@ The first release: the server, its cache tiers, and the `scn` client.
   10,000 entries before had none. When the inexact search did not run or
   stopped at its budget, the reply says `renames_incomplete`, and `scn
   diff` prints git's warning about skipped inexact rename detection.
+- The git import now documents what it verifies: the blobs it writes are
+  read back and checked, and a blob it skips, because a committed row of
+  the repo already names it and its file is present, is trusted - damage
+  inside an already stored file is `fsck`'s job, and the import no longer
+  claims to have caught it. A test pins the trust and fsck's report.
+- A git commit with more changed paths than the write path's limit
+  (100,000) is refused with an error that names the commit and the count,
+  before the import builds the whole changeset in memory.
 
 ### Fixed
 
+- A `Diff` call's rename search could index every large added file for
+  one deleted file, far past the budget that bounds it: one file's work
+  was its index of every added file it could be like, and the budget
+  was checked only between files, so a diff of many large added files
+  read and indexed all of them for the first one (`#290`). The budget
+  is now checked after each added file's slot in the index, so one
+  call's cost stays at most the cap, plus one slot, plus one deleted
+  file's read and lookup; a file whose indexing crosses the cap is not
+  read and adds no scores, and the reply's `renames_incomplete` says
+  the search stopped. A resumed search has one target, so its seed
+  always completes and the search moves.
+- `commit --from-mount` and the mount carry raw file names: a name that
+  is not UTF-8 is no longer read from, or written to, the file its
+  lossy spelling names.
+- `commit --put` refuses anything that is not a regular file: a FIFO
+  or a device never sees an end, and the read grew until the OOM
+  killer.
 - The land metrics count lands whose call ended in an error: a land
   that answered `Aborted`, `DeadlineExceeded`, or any other error class
   moved no counter, so an operator could not see failing lands. The
@@ -290,6 +315,11 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Security
 
+- The mount's overlay writes no longer follow a symlink planted in the
+  overlay: a write, a truncate, a mode change, and the deletions note
+  refuse one. A symlinked parent directory still redirects (a named
+  limit: the upgrade is opening every parent through a handle chain,
+  as `materialize.rs` does).
 - The server refuses a data directory that group or others can write, or
   that sits under a directory another user can change: the blobs and the
   metadata are only as private as their directory (`#197`).
