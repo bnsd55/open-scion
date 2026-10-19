@@ -462,10 +462,9 @@ fn missing_is_damage(store: &Backend, blob: BlobId) -> bool {
     if store.blobs().open_file(blob).is_ok() {
         return false;
     }
-    let named = store
+    store
         .read(|c| c.any_repo_names(blob.as_bytes()))
-        .unwrap_or(true);
-    named
+        .unwrap_or(true)
 }
 
 /// Whether the file of `blob` exists at the moment of the check.
