@@ -16,16 +16,6 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Added
 
-- A release smoke test for the release checklist (`#315`):
-  `scripts/release-smoke.sh`
-  builds the release binaries and walks the README quick start on a small
-  git repository it makes — import, ticket-key, serve, `scn` reads (log,
-  ls, cat, blame) and writes (commit, land, read back), `fsck` clean, and
-  a shutdown by one signal that must exit 0. It runs the story once under
-  umask 022 and once under 002, names the step that failed, and removes
-  everything it made. A CI job runs it on Linux; macOS stays out of CI
-  for it, because a cold release build there doubles the job.
-
 - A Postgres-backed store knows which database and which data directory
   belong together: the first open mints a store UUID, keeps it in the
   database and the data directory's `backend` marker, and an open that
