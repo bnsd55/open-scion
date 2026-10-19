@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use scion_proto::auth::Caller;
+use scion_proto::runtime::auth::Caller;
 
 use crate::error::{Error, Result};
 

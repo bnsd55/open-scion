@@ -9,7 +9,7 @@
 
 use gix::ObjectId;
 use scion_core::{BlobId, Changeset, ChangesetId, RepoPath, Tree, TreeId};
-use scion_proto::metrics::Metrics;
+use scion_proto::runtime::metrics::Metrics;
 use std::sync::Arc;
 use std::time::Duration;
 

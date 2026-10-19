@@ -139,8 +139,30 @@ measured.
 - Virtual checkout, where files load when first read
   ([#11](https://github.com/bnsd55/open-scion/issues/11)).
 
+## Where the checkout numbers come from
+
+The workflow [`bench.yml`](../.github/workflows/bench.yml) runs the
+checkout benchmark when a person asks for it (`workflow_dispatch` only:
+never on pushes, pull requests or a schedule). It runs on
+`ubuntu-24.04`, a shared GitHub runner. A shared runner is noisy: other
+work lands on the same machine between and during runs, so the wall-time
+and CPU columns move from run to run, and the min and max in each cell
+are how that noise shows. The published table comes from one workflow
+run, whole.
+
+| | |
+|---|---|
+| Dataset | [tokio-rs/tokio](https://github.com/tokio-rs/tokio) at `be689a35f5ade5a39e507f79d3ec85cdab27806f` (tag `tokio-1.53.0`) |
+| Runner | `ubuntu-24.04`, a shared GitHub runner |
+| Commands | `scripts/bench-checkout.sh`, `JOBS=50 REPS=5` |
+
+Before the table, each run prints the facts that drift: its scion commit,
+its git version, its core count and its kernel. The job summary carries
+those four lines above the table, so the numbers and the facts of the run
+travel together.
+
 ## Results
 
-The numbers here come later, from one quiet machine, as ratios between the
-tools. A table of one run names no machine details, so it can be shared as
-it is.
+The numbers here come from one `bench.yml` run, as ratios between the
+tools. A table of one run names no machine details, so it can be shared
+as it is.

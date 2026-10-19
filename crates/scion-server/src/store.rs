@@ -41,7 +41,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use rustix::fs::FlockOperation;
 use rustix::io::Errno;
 use scion_core::{BlobHasher, BlobId};
-use scion_proto::auth::create_private_dir_all;
+use scion_proto::runtime::auth::create_private_dir_all;
 
 use crate::db::SqliteTx;
 use crate::deadline::Deadline;
@@ -354,7 +354,7 @@ impl Store {
             )
             .into());
         }
-        let dir = scion_proto::auth::check_ancestors(dir, me)?;
+        let dir = scion_proto::runtime::auth::check_ancestors(dir, me)?;
         // A second server fails here, before it waits for anything.
         let server_lock = if server {
             let file = lock_file(&dir, "server.lock")?;

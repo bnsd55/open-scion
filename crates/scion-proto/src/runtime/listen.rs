@@ -20,12 +20,12 @@
 //! connection in time, so a connection that waits for a place gets one:
 //!
 //! - a client that does not send the HTTP/2 preface within
-//!   [`HANDSHAKE_TIMEOUT`] is closed. hyper has no timeout of its own
+//!   `HANDSHAKE_TIMEOUT` is closed. hyper has no timeout of its own
 //!   there, and its keepalive starts only after the preface.
 //! - after the preface, HTTP/2 keepalive closes a connection whose client
 //!   does not answer a ping.
 //! - every connection is asked to close (`GOAWAY`) after
-//!   [`MAX_CONNECTION_AGE`], and is closed [`CONNECTION_GRACE`] later, with
+//!   `MAX_CONNECTION_AGE`, and is closed [`CONNECTION_GRACE`] later, with
 //!   any call still in it. A client then connects again.
 //!
 //! With TLS, a connection takes its place first, and one deadline from its
@@ -33,7 +33,7 @@
 //! handshake gets what is left of the deadline, and the preface timer gets
 //! the rest. A peer that never starts the handshake, never ends it, or
 //! stops right after it gives its place up within
-//! [`TLS_HANDSHAKE_TIMEOUT`] of its accept, the same bound as a silent
+//! `HANDSHAKE_TIMEOUT` of its accept, the same bound as a silent
 //! plain peer.
 
 use std::future::Future;
@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use crate::request_id;
+use crate::runtime::request_id;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
@@ -67,27 +67,23 @@ pub const DEFAULT_CONNECTIONS: NonZeroUsize = NonZeroUsize::new(128).unwrap();
 pub const DEFAULT_STREAMS: NonZeroU32 = NonZeroU32::new(256).unwrap();
 
 /// A client must send the HTTP/2 preface within this long after it gets its
-/// place, or its connection is closed.
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// A TLS handshake must end within this long, or the connection is dropped.
-/// The same wait as [`HANDSHAKE_TIMEOUT`], and generous for one round trip
-/// plus a certificate check.
-pub const TLS_HANDSHAKE_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
+/// place, or its connection is closed. The same bound covers the TLS
+/// handshake on a TLS listener.
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// After this long without a frame from a client, the process sends it an
 /// HTTP/2 ping.
-pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A connection whose client does not answer a ping within this long is
 /// closed. So after the preface, a dead peer frees its connection, and all
 /// that its replies hold, within [`KEEPALIVE_INTERVAL`] plus this of its
 /// last frame.
-pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// After this long, a connection is asked to close, so one that a client
 /// keeps for life (a daemon keeps one to its cache) gives its place up.
-pub const MAX_CONNECTION_AGE: Duration = Duration::from_secs(30 * 60);
+pub(crate) const MAX_CONNECTION_AGE: Duration = Duration::from_secs(30 * 60);
 
 /// A connection that was asked to close is closed this long later, with any
 /// call still in it. At least the server's longest call (600 s).
@@ -107,7 +103,7 @@ pub const DEFAULT_STALLED_BYTES: NonZeroU64 = NonZeroU64::new(64 << 20).unwrap()
 pub struct Limits {
     /// Most connections served at once. A connection beyond that is
     /// accepted, and waits unread until another connection closes: within
-    /// [`MAX_CONNECTION_AGE`] plus [`CONNECTION_GRACE`].
+    /// `MAX_CONNECTION_AGE` plus [`CONNECTION_GRACE`].
     pub connections: NonZeroUsize,
     /// Most streams (calls) that one connection may have open at once, as
     /// HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS`. A client that has this many
@@ -616,9 +612,9 @@ mod tests {
 
     use super::*;
     use crate::Bytes;
-    use crate::object::Header;
-    use crate::reply::{self, Body, IN_FLIGHT_BYTES, Outgoing};
-    use crate::tls::ServerTls;
+    use crate::runtime::object::Header;
+    use crate::runtime::reply::{self, Body, IN_FLIGHT_BYTES, Outgoing};
+    use crate::runtime::tls::ServerTls;
     use crate::v1::objects_client::ObjectsClient;
     use crate::v1::objects_server::{Objects, ObjectsServer};
     use crate::v1::{
@@ -834,7 +830,7 @@ mod tests {
         roots
             .add(CertificateDer::from_pem_slice(ca.cert_pem.as_bytes()).unwrap())
             .unwrap();
-        let builder = ClientConfig::builder_with_provider(crate::tls::provider())
+        let builder = ClientConfig::builder_with_provider(crate::runtime::tls::provider())
             .with_safe_default_protocol_versions()
             .unwrap();
         let config = match identity {
@@ -1102,13 +1098,7 @@ mod tests {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, None);
-        let addr = serve_tls(
-            Limits::default(),
-            TIMERS,
-            &server_tls,
-            TLS_HANDSHAKE_TIMEOUT,
-        )
-        .await;
+        let addr = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
         let mut client = client(addr, &certs.authority.cert(), None).await.unwrap();
         assert_eq!(quick(&mut client).await, Code::NotFound);
     }
@@ -1119,13 +1109,7 @@ mod tests {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, Some(&certs.authority.cert()));
-        let addr = serve_tls(
-            Limits::default(),
-            TIMERS,
-            &server_tls,
-            TLS_HANDSHAKE_TIMEOUT,
-        )
-        .await;
+        let addr = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
         // The connect of a client can end before the server has checked its
         // certificate, so the refusal may show in the connect or in the
         // call. A served client gets the stub's `NotFound`; anything else is
@@ -1149,13 +1133,7 @@ mod tests {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, Some(&certs.authority.cert()));
-        let addr = serve_tls(
-            Limits::default(),
-            TIMERS,
-            &server_tls,
-            TLS_HANDSHAKE_TIMEOUT,
-        )
-        .await;
+        let addr = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
         let mut client = client(addr, &certs.authority.cert(), Some(&certs.client))
             .await
             .unwrap();
@@ -1169,13 +1147,7 @@ mod tests {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, None);
-        let addr = serve_tls(
-            Limits::default(),
-            TIMERS,
-            &server_tls,
-            TLS_HANDSHAKE_TIMEOUT,
-        )
-        .await;
+        let addr = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
         assert!(client(addr, &certs.stranger.cert(), None).await.is_err());
     }
 
@@ -1185,13 +1157,7 @@ mod tests {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, Some(&certs.authority.cert()));
-        let addr = serve_tls(
-            Limits::default(),
-            TIMERS,
-            &server_tls,
-            TLS_HANDSHAKE_TIMEOUT,
-        )
-        .await;
+        let addr = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
         // As above: the refusal may show in the connect or in the call.
         match client(addr, &certs.authority.cert(), Some(&certs.stranger_client)).await {
             Err(_) => {}
@@ -1272,7 +1238,7 @@ mod tests {
                 CertificateDer::from_pem_slice(certs.authority.cert().cert_pem.as_bytes()).unwrap(),
             )
             .unwrap();
-        let builder = ClientConfig::builder_with_provider(crate::tls::provider())
+        let builder = ClientConfig::builder_with_provider(crate::runtime::tls::provider())
             .with_safe_default_protocol_versions()
             .unwrap();
         let config = builder.with_root_certificates(roots).with_no_client_auth();

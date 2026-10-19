@@ -60,7 +60,7 @@ fn names(data: &[u8], most: usize) -> Vec<String> {
     let mut names = vec!["r".to_owned()];
     if let Ok(text) = std::str::from_utf8(data) {
         for piece in text.split_whitespace().take(most) {
-            if scion_proto::check::name("name", piece).is_ok() {
+            if scion_proto::runtime::check::name("name", piece).is_ok() {
                 names.push(piece.to_owned());
             }
         }
