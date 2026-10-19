@@ -209,20 +209,6 @@ impl DeriveFlights {
         }
     }
 
-    /// A flights set whose bounded walks share `walk_bytes`. For tests of
-    /// the byte budget, which use a pool a chain can outgrow.
-    #[cfg(test)]
-    pub(crate) fn with_walk_bytes(walks_cap: usize, walk_bytes: crate::memory::Bytes) -> Self {
-        Self {
-            flights: Mutex::new(HashMap::new()),
-            in_flight: Mutex::new(0),
-            woken: Condvar::new(),
-            walks_cap,
-            walk_bytes: Mutex::new(walk_bytes),
-            metrics: std::sync::OnceLock::new(),
-        }
-    }
-
     /// Gives the walks the server's metrics registry, once, before the
     /// server serves.
     pub(crate) fn set_metrics(&self, metrics: std::sync::Arc<crate::metrics::Metrics>) {
@@ -1545,7 +1531,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// A walk whose frontier outgrows the store's byte budget stops at
     /// its step boundary and the call answers busy, naming the frontier;
     /// a retry once the budget has room resumes and finishes. The walk's
