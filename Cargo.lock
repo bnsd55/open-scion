@@ -2501,6 +2501,7 @@ dependencies = [
  "ed25519-dalek",
  "hashlink",
  "nfsserve",
+ "open-scion",
  "open-scion-core",
  "open-scion-proto",
  "open-scion-server",

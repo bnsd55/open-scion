@@ -12,12 +12,17 @@
 //!   handling of every call.
 //! - [`cmd`]: one module per command (`cat`, `ls`, `log`, `commit`,
 //!   `checkout`, `mount`, the query commands) and their `--json` output.
-//! - [`out`]: the one stdout writer, and the quiet exit that a closed
+//! - `out`: the one stdout writer, and the quiet exit that a closed
 //!   pipe (`scn blame f | head -1`) gets.
-//! - [`materialize`]: writing trees to disk, the checkout and the mount
+//! - `materialize`: writing trees to disk, the checkout and the mount
 //!   overlay.
-//! - [`vfs`]: reading trees through the API, with the sizes and states
+//! - `vfs`: reading trees through the API, with the sizes and states
 //!   that `scn ls` shows.
+//!
+//! The library exists for the `scn` binary and this package's tests: it
+//! is the binary's pieces, not an API to build on. The one test seam is
+//! the `test_support` module, behind the `test-hooks` feature (default
+//! off); it carries no stability promise.
 //!
 //! A `scn` process reaches a server, a `scion-cache`, or a
 //! `scion-daemon` over its `--server` and `--objects` addresses; how the
@@ -32,9 +37,34 @@
 
 pub mod client;
 pub mod cmd;
-pub mod materialize;
-pub mod out;
-pub mod vfs;
+pub(crate) mod materialize;
+pub(crate) mod out;
+pub(crate) mod vfs;
+
+/// The test seams, behind the test-hooks feature (default off). One
+/// module, the only way in: the integration tests reach the pieces the
+/// binary drives only from outside. Not API, and not covered by a
+/// stability promise.
+#[cfg(feature = "test-hooks")]
+pub mod test_support {
+    /// A client pre-set for tests: the object roots of a running server.
+    pub mod client {
+        pub use crate::client::test_objects;
+    }
+    /// The mount session file, so a test stages what
+    /// `scn commit --from-mount` reads.
+    pub mod cmd {
+        /// The session records of the mount command.
+        pub mod mount {
+            pub use crate::cmd::mount::record::{MountRecord, write_sessions};
+        }
+    }
+    /// The NFS filesystem the mount serves, so a test drives it
+    /// in-process.
+    pub mod vfs {
+        pub use crate::vfs::{NFSFileSystem, Vfs};
+    }
+}
 
 /// The gate the unit tests of this binary run their forks and their
 /// serve-lock reads under: a fork copies the process's open lock files

@@ -73,10 +73,10 @@ pub fn flush<W: Write>(out: &mut W) -> io::Result<()> {
     }
 }
 
-/// stdout's `println!` of scn: it prints through [`line`](fn@line) and
-/// propagates a non-broken-pipe error with `?`, so a closed pipe ends
-/// the command quietly and any other stdout error fails it the usual
-/// way. Like `println!`, each call prints one newline after its
+/// stdout's `println!` of scn: it prints through the module's `line`
+/// function and propagates a non-broken-pipe error with `?`, so a closed
+/// pipe ends the command quietly and any other stdout error fails it the
+/// usual way. Like `println!`, each call prints one newline after its
 /// arguments.
 #[macro_export]
 macro_rules! outln {
