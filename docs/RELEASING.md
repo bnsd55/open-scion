@@ -63,10 +63,20 @@ A release is cut through one PR from a branch named
    git push origin v0.1.0
    ```
 
+   Then check the tag landed on the release commit:
+
+   ```sh
+   git ls-remote --tags origin v0.1.0
+   ```
+
+   The line it prints must name the commit the notes describe. If it
+   does not, stop and redo the tag per "Undoing a bad tag" before any
+   release notes point at it.
+
 2. **GitHub release.** Open a release for the tag with the notes
-   taken from the `CHANGELOG.md` section of the version at that
-   commit, and the measured numbers with the provenance the checklist
-   asks for.
+   rebuilt from the `CHANGELOG.md` section of the version at that
+   commit (`git show v0.1.0:CHANGELOG.md`), and the measured numbers
+   with the provenance the checklist asks for.
 
 ## Undoing a bad tag
 
