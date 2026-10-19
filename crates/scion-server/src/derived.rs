@@ -88,15 +88,19 @@ pub(crate) trait Kind {
     fn decode(bytes: &[u8]) -> Option<Self::Value>;
 }
 
-/// The value of `K` for a changeset that `repo` may see, derived as
-/// [`fill`] does if needed. Returns once the value, and what it names, is
-/// durable.
+/// [`get_by`] with no deadline: the caller has no request to serve, so
+/// nothing bounds the fill in time. For background and command callers
+/// only; a call that answers a request passes its deadline to
+/// [`get_by`] instead.
 ///
 /// # Errors
 ///
-/// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
-/// [`Kind::derive`], or of [`Store::flush`](crate::store::Store::flush).
-pub(crate) fn get<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
+/// As [`get_by`], without [`Error::DeadlineExceeded`].
+pub(crate) fn get_unbounded<K: Kind>(
+    store: &Backend,
+    repo: RepoId,
+    cs: ChangesetId,
+) -> Result<K::Value> {
     get_until::<K>(store, repo, cs, None)
 }
 
@@ -395,7 +399,8 @@ fn in_one_walk<K: Kind>(
 ///
 /// The walk keeps the changesets without a value in memory, 40 bytes each,
 /// so that it visits each one once. A walk over every parent also keeps the
-/// set of the changesets it visited.
+/// set of the changesets it visited; the set keeps `next` deduplicated, so
+/// it holds at most one entry per visited changeset.
 ///
 /// # Errors
 ///
@@ -590,9 +595,6 @@ impl Walk {
             let Some((id, generation)) = self.next.pop() else {
                 break;
             };
-            if K::ALL_PARENTS && !self.seen.insert(id) {
-                continue;
-            }
             if c.get_derived(K::NAME, K::VERSION, id)?.is_some() {
                 continue;
             }
@@ -600,8 +602,20 @@ impl Walk {
             let mut parents = c.parents(id, generation)?;
             if !K::ALL_PARENTS {
                 parents.truncate(1);
+                self.next.extend(parents);
+                continue;
             }
-            self.next.extend(parents);
+            // A walk over every parent keeps each changeset once: the seen
+            // set drops a parent that another child pushed already, so
+            // `next` holds no duplicates and stays as wide as the DAG's
+            // frontier instead of as wide as its edges. Parents are older
+            // than their children, so the walk never reaches a changeset
+            // twice with this set alone.
+            for parent in parents {
+                if self.seen.insert(parent.0) {
+                    self.next.push(parent);
+                }
+            }
         }
         Ok(())
     }
@@ -1147,14 +1161,17 @@ mod tests {
         DERIVES.set(0);
         let start = store.blobs().full_flushes();
         let flushes = || store.blobs().full_flushes() - start;
-        assert_eq!(get::<ChangedPathsV1>(&store, repo, ids[2]).unwrap(), 5);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV1>(&store, repo, ids[2]).unwrap(),
+            5
+        );
         assert_eq!(DERIVES.get(), 3, "each changeset once, from the root");
         // None where the commit's own fsync flushes the drive cache.
         let one = u64::from(FSYNC_LEAVES_DRIVE_CACHE);
         assert_eq!(flushes(), one, "durable before get returns");
         let counts: Vec<u64> = ids
             .iter()
-            .map(|&cs| get::<ChangedPathsV1>(&store, repo, cs).unwrap())
+            .map(|&cs| get_unbounded::<ChangedPathsV1>(&store, repo, cs).unwrap())
             .collect();
         assert_eq!(counts, [2, 4, 5]);
         assert_eq!(DERIVES.get(), 3, "later reads use the stored values");
@@ -1167,7 +1184,7 @@ mod tests {
         let other = store.write(|c| c.create_repo("other")).unwrap();
         let tip = ids[2];
         assert!(matches!(
-            get::<ChangedPathsV1>(&store, other, tip),
+            get_unbounded::<ChangedPathsV1>(&store, other, tip),
             Err(Error::NotFound(_))
         ));
         assert!(matches!(
@@ -1180,10 +1197,16 @@ mod tests {
     fn a_version_bump_derives_every_value_again() {
         let (_dir, store, repo, ids) = store_with(&HISTORY);
         let tip = ids[2];
-        assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), 5);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV1>(&store, repo, tip).unwrap(),
+            5
+        );
 
         DERIVES.set(0);
-        assert_eq!(get::<ChangedPathsV2>(&store, repo, tip).unwrap(), 4);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV2>(&store, repo, tip).unwrap(),
+            4
+        );
         assert_eq!(DERIVES.get(), 3, "version 2 derives every value again");
         assert_eq!(kind_rows(&store, 2).len(), 3);
         assert!(
@@ -1237,7 +1260,7 @@ mod tests {
         }
         let mut after = Vec::new();
         for &cs in &ids {
-            let tree = tree::root_tree(&store, repo, cs).unwrap();
+            let tree = tree::root_tree_unbounded(&store, repo, cs).unwrap();
             after.push((
                 RootTree::NAME.to_owned(),
                 RootTree::VERSION,
@@ -1283,12 +1306,18 @@ mod tests {
 
         DERIVES.set(0);
         let commits = store.commits();
-        assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), 7);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV1>(&store, repo, tip).unwrap(),
+            7
+        );
         assert_eq!(DERIVES.get(), 7, "each changeset once");
         assert_eq!(store.commits() - commits, steps(7), "one per step");
         // Each step went on from the value of the step before it.
         for (count, &cs) in (1..).zip(&ids) {
-            assert_eq!(get::<ChangedPathsV1>(&store, repo, cs).unwrap(), count);
+            assert_eq!(
+                get_unbounded::<ChangedPathsV1>(&store, repo, cs).unwrap(),
+                count
+            );
         }
         assert_eq!(DERIVES.get(), 7);
     }
@@ -1301,7 +1330,7 @@ mod tests {
         // The error waits until the steps before it are durable.
         FAIL_AT.set(Some(ids[2 * STEP]));
         let flushes = store.blobs().full_flushes();
-        let failed = get::<ChangedPathsV1>(&store, repo, tip);
+        let failed = get_unbounded::<ChangedPathsV1>(&store, repo, tip);
         FAIL_AT.set(None);
         assert!(matches!(failed, Err(Error::Corrupt(_))), "{failed:?}");
         let one = u64::from(FSYNC_LEAVES_DRIVE_CACHE);
@@ -1316,7 +1345,10 @@ mod tests {
         assert_eq!(kind_rows(&store, 1), kept);
 
         DERIVES.set(0);
-        assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), 7);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV1>(&store, repo, tip).unwrap(),
+            7
+        );
         assert_eq!(DERIVES.get(), 3, "the next read derives only the rest");
     }
 
@@ -1332,7 +1364,10 @@ mod tests {
         };
         assert_eq!(pending, ids);
         DERIVES.set(0);
-        assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), 5);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV1>(&store, repo, tip).unwrap(),
+            5
+        );
         assert_eq!(DERIVES.get(), 5);
 
         let late = derive_steps::<ChangedPathsV1>(&store, repo, &pending, None, || Ok(())).unwrap();
@@ -1361,20 +1396,29 @@ mod tests {
             );
             assert_eq!(DERIVES.get(), 0, "{n}");
             assert!(kind_rows(&store, 1).is_empty(), "{n}");
-            assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), n as u64);
+            assert_eq!(
+                get_unbounded::<ChangedPathsV1>(&store, repo, tip).unwrap(),
+                n as u64
+            );
         }
     }
 
     #[test]
     fn a_step_removes_rows_of_older_versions_only() {
         let (_dir, store, repo, ids) = store_with(&chain(7));
-        assert_eq!(get::<ChangedPathsV1>(&store, repo, ids[6]).unwrap(), 7);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV1>(&store, repo, ids[6]).unwrap(),
+            7
+        );
         assert_eq!(kind_rows(&store, 1).len(), 7);
         assert_eq!(root_trees(&store), 7);
 
         // The first step of version 2 derives two values and removes two
         // rows of version 1.
-        assert_eq!(get::<ChangedPathsV2>(&store, repo, ids[1]).unwrap(), 1);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV2>(&store, repo, ids[1]).unwrap(),
+            1
+        );
         assert_eq!(kind_rows(&store, 2).len(), STEP);
         assert_eq!(kind_rows(&store, 1).len(), 7 - STEP);
 
@@ -1396,7 +1440,10 @@ mod tests {
         backfill::<ChangedPathsV2>(&store, "r", tip).unwrap();
         assert_eq!(kind_rows(&store, 2).len(), 7);
         // A build with version 1 derives its own rows and keeps version 2.
-        assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), 7);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV1>(&store, repo, tip).unwrap(),
+            7
+        );
         assert_eq!(kind_rows(&store, 1).len(), 7);
         assert_eq!(kind_rows(&store, 2).len(), 7);
 
@@ -1414,7 +1461,10 @@ mod tests {
         assert_eq!(store.blobs().full_flushes() - flushes, one);
         assert_eq!(kind_rows(&store, 2).len(), 7);
         assert_eq!(root_trees(&store), 7);
-        assert_eq!(get::<ChangedPathsV2>(&store, repo, tip).unwrap(), 4);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV2>(&store, repo, tip).unwrap(),
+            4
+        );
     }
 
     #[test]
@@ -1486,6 +1536,37 @@ mod tests {
         ]
     }
 
+    /// A walk over every parent pushes each parent once: on a graph with
+    /// diamonds, `next` never holds the same changeset twice. Before the
+    /// seen set checked pushes, each parent sat in `next` once per child
+    /// that reached it, and on a dense DAG that is as wide as the edges.
+    #[test]
+    fn a_walk_over_every_parent_holds_no_duplicate_in_next() {
+        let parents = criss_cross();
+        let (_dir, store, repo, ids) = store_graph(&parents);
+        store
+            .read_unflushed(|c| {
+                let ControlFlow::Continue(mut walk) = Walk::start::<Ancestry>(c, repo, ids[7])?
+                else {
+                    panic!("no value is stored yet");
+                };
+                let mut visits = 0;
+                while !walk.next.is_empty() {
+                    walk.step::<Ancestry>(c, 1)?;
+                    let mut ids_in_next: Vec<ChangesetId> =
+                        walk.next.iter().map(|&(id, _)| id).collect();
+                    let count = ids_in_next.len();
+                    ids_in_next.sort_unstable();
+                    ids_in_next.dedup();
+                    assert_eq!(ids_in_next.len(), count, "next holds a duplicate");
+                    visits += 1;
+                    assert!(visits < 100, "the walk never ends");
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
     #[test]
     fn a_kind_over_every_parent_derives_the_graph_parents_first() {
         let parents = criss_cross();
@@ -1507,18 +1588,24 @@ mod tests {
 
         DERIVES.set(0);
         let commits = store.commits();
-        assert_eq!(get::<Ancestry>(&store, repo, tip).unwrap(), model[7]);
+        assert_eq!(
+            get_unbounded::<Ancestry>(&store, repo, tip).unwrap(),
+            model[7]
+        );
         assert_eq!(DERIVES.get(), 8, "each changeset once");
         assert_eq!(store.commits() - commits, steps(8), "one per step");
         for (i, &cs) in ids.iter().enumerate() {
-            assert_eq!(get::<Ancestry>(&store, repo, cs).unwrap(), model[i]);
+            assert_eq!(
+                get_unbounded::<Ancestry>(&store, repo, cs).unwrap(),
+                model[i]
+            );
         }
         assert_eq!(DERIVES.get(), 8, "later reads use the stored values");
 
         // A first-parent kind derives only the first-parent history: 7, 5,
         // 3, 1, 0.
         DERIVES.set(0);
-        get::<ChangedPathsV1>(&store, repo, tip).unwrap();
+        get_unbounded::<ChangedPathsV1>(&store, repo, tip).unwrap();
         assert_eq!(DERIVES.get(), 5);
         assert_eq!(kind_rows(&store, 1).len(), 5);
     }
@@ -1568,7 +1655,7 @@ mod tests {
                 let missing = model[i].iter().filter(|id| !derived.contains_key(id)).count();
                 DERIVES.set(0);
                 let commits = store.commits();
-                proptest::prop_assert_eq!(&get::<Ancestry>(&store, repo, ids[i]).unwrap(), &model[i]);
+                proptest::prop_assert_eq!(&get_unbounded::<Ancestry>(&store, repo, ids[i]).unwrap(), &model[i]);
                 proptest::prop_assert_eq!(DERIVES.get(), missing);
                 proptest::prop_assert_eq!(store.commits() - commits, steps(missing));
                 derived.extend(model[i].iter().map(|&id| (id, i)));

@@ -165,6 +165,12 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Changed
 
+- A second Ctrl-C or SIGTERM while the server drains ends it at once
+  (`#294`): a drain waits for the calls in flight, and one held open by
+  a stuck client left the operator with a server that answered nothing
+  and ended only under `kill -9`. The first signal's graceful drain is
+  as it was; the second cuts the calls in flight, logs that it did,
+  and exits 1.
 - A git import no longer re-reads and re-fsyncs blobs that a committed
   row of the target repo already names (#238): one row probe per
   distinct blob proves the stored copy durable, so a branch import over
@@ -227,12 +233,43 @@ The first release: the server, its cache tiers, and the `scn` client.
   `--max-principal-pending-lands` refuse 0: those values used to mean
   that the sweep rejects every pending land, or that every call and
   land is refused, with no word of it at start.
+- A fill of a kind over every parent (the commit graph) no longer holds
+  a parent once per child that reached it in its walk: the seen set now
+  checks pushes, so the walk's queue is as wide as the graph's frontier
+  instead of as wide as its edges.
+
+- A silent TLS peer holds its connection's place for at most the
+  handshake timeout, not twice that: one deadline from the accept
+  bounds the TLS handshake and the HTTP/2 preface that follows it
+  together, so the preface timer gets what is left of the deadline
+  after the handshake ends.
+- A `Diff` call's rename search could index every large added file for
+  one deleted file, far past the budget that bounds it: one file's work
+  was its index of every added file it could be like, and the budget
+  was checked only between files, so a diff of many large added files
+  read and indexed all of them for the first one (`#290`). The budget
+  is now checked after each added file's slot in the index, so one
+  call's cost stays at most the cap, plus one slot, plus one deleted
+  file's read and lookup; a file whose indexing crosses the cap is not
+  read and adds no scores, and the reply's `renames_incomplete` says
+  the search stopped. A resumed search has one target, so its seed
+  always completes and the search moves.
 - `commit --from-mount` and the mount carry raw file names: a name that
   is not UTF-8 is no longer read from, or written to, the file its
   lossy spelling names.
 - `commit --put` refuses anything that is not a regular file: a FIFO
   or a device never sees an end, and the read grew until the OOM
   killer.
+- A Postgres read whose connection died inside its transaction left the
+  pooled client unusable: the worker that serves the client kept the
+  transaction's lost state on every later BEGIN, so every statement of
+  that client failed and the read that opened a fresh transaction was
+  refused too, with nothing to roll the open one back. The worker now
+  follows a BEGIN that ran on the fresh session (the lost transaction
+  is gone with the old session, and its caller cannot commit it
+  through a new BEGIN), and a read's timeout statements that fail
+  after the BEGIN roll the read transaction back before the reader
+  returns to the pool.
 - Two reads stop at the caller's deadline and the reply's budget
   (#283): a `Log` call without a path read up to 1,000 changesets, each
   as large as a changeset can be, with the call's deadline never
@@ -307,11 +344,18 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Security
 
+- A blame cursor that claims an impossible line count is refused as a
+  bad cursor (`#288`): the count is the client's word, and its
+  per-line memory cost was multiplied without an overflow check, so a
+  count of 2^57 wrapped to zero and the walk went on to size its
+  window from the count - one request could stop the server.
+
 - The mount's overlay writes no longer follow a symlink planted in the
   overlay: a write, a truncate, a mode change, and the deletions note
   refuse one. A symlinked parent directory still redirects (a named
   limit: the upgrade is opening every parent through a handle chain,
   as `materialize.rs` does).
+
 - The server refuses a data directory that group or others can write, or
   that sits under a directory another user can change: the blobs and the
   metadata are only as private as their directory (`#197`).

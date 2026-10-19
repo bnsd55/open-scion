@@ -196,8 +196,10 @@ pub struct Budget<'a> {
     /// read counts [`SIZE_COST`]. Steps 2 and 3 share it.
     pub cost: &'a mut usize,
     /// Once `cost` reaches this, the search starts no more work. It checks
-    /// before each pair of step 2 and each deleted file of step 3, so the
-    /// work on one of them runs to the end.
+    /// before each pair of step 2, before each deleted file of step 3, and
+    /// after each target's slot in a file's indexing, so the work on one of
+    /// them runs to the end and one call's cost stays at most `cap`, plus
+    /// one target's slot cost, plus one deleted file's read and lookup.
     pub cap: usize,
     /// Whether step 3 looks at one more deleted file than it already had,
     /// even past the cap, so that a search that goes on over calls always
@@ -226,7 +228,9 @@ pub struct Outcome {
     pub pairs: Vec<Pair>,
     /// Set when step 3 stopped at the budget: the first deleted file it did
     /// not look at. Then `pairs` holds the best pairs among the files it
-    /// looked at.
+    /// looked at. A file also stops there when its indexing crosses the
+    /// cap: it is not read and adds no scores, so a resumed call redoes it
+    /// from its index.
     pub stopped: Option<usize>,
     /// Set when the inexact search (steps 2 and 3) did not run: more than
     /// `max_pairs` pairs were left, as git skips inexact rename detection
@@ -261,10 +265,13 @@ pub struct Outcome {
 /// Step 3 takes the deleted files in path order, one at a time. For each,
 /// it reads the added files that it could be like into one index by chunk
 /// hash, if not read yet, then reads the deleted file and looks up its
-/// chunks in the index. Added files with the same blob share one place in
-/// the index, so a blob is read and indexed once, however many paths add
-/// it. So it holds the tables of those added blobs, and of one deleted
-/// file.
+/// chunks in the index. The budget is checked after each target's slot, so
+/// one file's indexing costs at most one slot past the cap; a file that
+/// stops there is not read and adds no scores. The last target's slot
+/// completes the file's indexing, so that file is still read and looked up
+/// past the cap. Added files with the same blob share one place in the
+/// index, so a blob is read and indexed once, however many paths add it.
+/// So it holds the tables of those added blobs, and of one deleted file.
 ///
 /// A search for one added file can stop at the budget and go on later: pass
 /// the [`Progress`] made of [`Outcome::stopped`] and the deleted file of the
@@ -541,16 +548,33 @@ impl<R: FnMut(&RepoPath, BlobId, usize) -> Result<Option<Chunks>>> Search<'_, R>
             let known = self.known.get(&d).copied();
             found.clear();
             wanted.clear();
+            // The budget bounds one call at its cap, plus one target's
+            // slot cost, plus one deleted file's read and lookup. When a
+            // slot crosses the cap, this file stops here: it is not read
+            // and adds no scores, so a resumed call redoes it from its
+            // index. The last target's slot is exempt: it completes the
+            // file's indexing, so the file is read and looked up past the
+            // cap. This keeps a resumed search moving: it has one target
+            // (blame), so its seed always completes.
+            let mut over = false;
             for (t, &(a, to, to_size)) in targets.iter().enumerate() {
                 match known {
                     Some((known_a, value)) if known_a == a => found.push((t, value)),
                     _ if can_be(from_size, to_size, MIN_SCORE) => {
                         if let Some(s) = self.slot(&mut index, &mut slots, a, to)? {
                             wanted.push((t, s));
+                            if self.spent() && t + 1 < targets.len() {
+                                over = true;
+                                break;
+                            }
                         }
                     }
                     _ => {}
                 }
+            }
+            if over {
+                stopped = Some(d);
+                break;
             }
             if !wanted.is_empty()
                 && let Some(chunks) = self.read_file(self.deleted[d].0, from)?
@@ -791,5 +815,114 @@ mod tests {
         let found = renames(&store, &added, &deleted, read, MAX_PAIRS, from, budget).unwrap();
         assert_eq!(found.pairs, []);
         assert_eq!(reads, [new, refused]);
+    }
+
+    /// A file whose indexing crosses the budget stops before its read: it
+    /// adds no scores, the search stops at it, and one call's cost stays at
+    /// most the cap plus one target's slot cost, its chunks read and its
+    /// rows indexed.
+    #[test]
+    fn a_file_whose_indexing_crosses_the_budget_stops_before_its_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let deleted_blob = store.blobs().put(&lines(0..60)).unwrap();
+        // Two added files, 60 chunks each and of a different content, so no
+        // same-content pair is found before step 3: the first slot that
+        // crosses the cap cuts the file's indexing, with one target left to
+        // index.
+        let added_blobs = [
+            store.blobs().put(&lines(100..160)).unwrap(),
+            store.blobs().put(&lines(200..260)).unwrap(),
+        ];
+        let deleted_path = RepoPath::new("old").unwrap();
+        let added_paths = ["a/new", "b/new"].map(|p| RepoPath::new(p).unwrap());
+        let added: Vec<_> = added_paths
+            .iter()
+            .zip(added_blobs)
+            .map(|(path, blob)| (path, file(blob)))
+            .collect();
+        let deleted = [(&deleted_path, file(deleted_blob))];
+        let mut reads = Vec::new();
+        let read = |_: &RepoPath, blob, _| {
+            reads.push(blob);
+            Ok(Some(Chunks::read(&store, blob)?))
+        };
+        let mut cost = 0;
+        let budget = Budget {
+            cost: &mut cost,
+            cap: 200,
+            progress: false,
+        };
+        let from = Progress::default();
+        let found = renames(&store, &added, &deleted, read, MAX_PAIRS, from, budget).unwrap();
+        // The first slot (60 chunks read, 60 rows indexed, on top of the
+        // sizes) crossed the cap of 200: the file was not read.
+        assert_eq!(found.pairs, []);
+        assert_eq!(found.stopped, Some(0));
+        assert!(!reads.contains(&deleted_blob));
+        // The bound: the cap plus one slot, 60 + 60.
+        assert!(cost <= 200 + 120, "cost {cost} over the bound");
+    }
+
+    /// Resumed calls reach the same renames as one call with no cap: a
+    /// resumed search has one target, so its seed always completes, and
+    /// each call looks at one more deleted file past the cap.
+    #[test]
+    fn resumed_calls_reach_the_renames_of_one_uncapped_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let added_blob = store.blobs().put(&lines(0..60)).unwrap();
+        let added_path = RepoPath::new("new").unwrap();
+        // One deleted file 90% like the added file, two unlike.
+        let like = store
+            .blobs()
+            .put(&[lines(0..54), lines(1000..1006)].concat())
+            .unwrap();
+        let other1 = store.blobs().put(&lines(2000..2060)).unwrap();
+        let other2 = store.blobs().put(&lines(3000..3060)).unwrap();
+        // The deleted files in path order, the like one last.
+        let deleted_paths = ["a/one", "b/two", "z/like"].map(|p| RepoPath::new(p).unwrap());
+        let deleted = [
+            (&deleted_paths[0], file(other1)),
+            (&deleted_paths[1], file(other2)),
+            (&deleted_paths[2], file(like)),
+        ];
+        let added = [(&added_path, file(added_blob))];
+        let read = |_: &RepoPath, blob, _| Ok(Some(Chunks::read(&store, blob)?));
+        let uncapped = {
+            let mut cost = 0;
+            let budget = Budget {
+                cost: &mut cost,
+                cap: usize::MAX,
+                progress: false,
+            };
+            let from = Progress::default();
+            renames(&store, &added, &deleted, read, MAX_PAIRS, from, budget)
+                .unwrap()
+                .pairs
+        };
+        // Blame's resume: a fresh cost per call, the deleted-file point and
+        // the best file carried over.
+        let mut from = Progress::default();
+        let mut pairs = Vec::new();
+        for _ in 0..10 {
+            let mut cost = 0;
+            let budget = Budget {
+                cost: &mut cost,
+                cap: 300,
+                progress: true,
+            };
+            let found = renames(&store, &added, &deleted, read, MAX_PAIRS, from, budget).unwrap();
+            pairs = found.pairs.clone();
+            match found.stopped {
+                Some(d) => {
+                    let best = found.pairs.first().map(|pair| pair.deleted);
+                    from = Progress { searched: d, best };
+                }
+                None => break,
+            }
+        }
+        assert_eq!(pairs, uncapped);
+        assert_eq!(pairs.len(), 1);
     }
 }

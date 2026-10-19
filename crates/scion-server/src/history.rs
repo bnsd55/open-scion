@@ -1298,7 +1298,7 @@ mod tests {
             let roots: Vec<String> = ids
                 .iter()
                 .map(|&cs| {
-                    derived::get::<PathHistory>(&store, repo, cs)
+                    derived::get_unbounded::<PathHistory>(&store, repo, cs)
                         .unwrap()
                         .to_string()
                 })

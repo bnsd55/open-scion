@@ -374,10 +374,13 @@ async fn a_stream_holds_its_slot_until_the_stream_ends() {
     let quotas = Quotas::new(Some(1), None);
     let observed = quotas.clone();
     let (stop, channel) = server(&store, dir.path(), access, quotas).await;
-    // A file of several parts, so its reply has a producer that stays alive
-    // after the handler has returned, and that waits on a client which
-    // takes no message.
-    let big = vec![b'z'; 3 * 1024 * 1024];
+    // A file far past what the reply path buffers, so its producer really
+    // parks: a reply under about 4 MiB fits whole in the mpsc, hyper's
+    // read-ahead and the h2 send buffer, so its producer sends every part
+    // and returns at once, freeing the call's slot while the test is still
+    // reading the quota — a 3 MiB file once let the first probe win only by
+    // a few milliseconds. 16 MiB makes the hold deterministic.
+    let big = vec![b'z'; 16 * 1024 * 1024];
     let blob = store.blobs().put(&big).unwrap();
     // The root's `README` is small, so point `main` at a changeset whose
     // `README` is the big one.
@@ -425,6 +428,11 @@ async fn a_stream_holds_its_slot_until_the_stream_ends() {
         .into_inner();
     until(|| async { observed.in_flight("alice") == 1 }).await;
     assert_eq!(probe(&prober).await, Code::ResourceExhausted);
+    // The producer is still parked while the probe runs: the slot is held
+    // by a live reply, not by one that already ended. If the reply buffers
+    // ever grow past the file again, this says so loudly instead of leaving
+    // the probe to race the producer's end.
+    assert_eq!(observed.in_flight("alice"), 1);
 
     // Bob is under his own cap: his calls complete while alice holds hers.
     let _ = probe(&client(channel.clone(), "bob")).await;
@@ -447,7 +455,15 @@ fn objects(channel: Channel) -> scion_proto::v1::objects_client::ObjectsClient<C
 /// server's own keys.
 fn ticket_for(keys: &scion_server::tickets::Keys, principal: &str, store: &Backend) -> Vec<u8> {
     let cs = main_ref(store).target;
-    let root = scion_server::read::root_tree(store, REPO, cs).unwrap();
+    let root = scion_server::read::root_tree(
+        store,
+        REPO,
+        cs,
+        &scion_server::deadline::Deadline::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(300),
+        ),
+    )
+    .unwrap();
     keys.sign(REPO, principal, *root.as_bytes()).unwrap()
 }
 

@@ -1,6 +1,7 @@
 //! Health suite: the real `scion-server` binary answers `grpc.health.v1`
 //! `Watch` with `SERVING` once the store is open, and with `NOT_SERVING`
-//! when shutdown starts, while the server still answers on the open watch.
+//! when shutdown starts, while the server still answers on the open watch;
+//! a second signal while the drain runs ends it, cutting the open calls.
 #![cfg(unix)]
 
 mod common;
@@ -166,4 +167,55 @@ async fn the_server_serves_until_shutdown_starts() {
         .expect("the named watch stays open through the drain")
         .expect("a status update");
     assert_eq!(update.status(), ServingStatus::NotServing);
+}
+
+/// The drain holds while a call is open, and a second signal ends it: the
+/// in-flight calls are cut, the log says so, and the process exits 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_signal_ends_the_drain_of_an_open_call() {
+    let mut server = spawn();
+    let log = server.log.clone();
+    wait_serving(&mut server, &log).await;
+    let mut watcher = server.watcher.take().unwrap();
+
+    // The first signal starts the drain: the open watch sees NOT_SERVING
+    // and stays open, so the server keeps running. The watch's first
+    // status, `SERVING`, comes first.
+    let first = common::ceiling("the first overall status", watcher.message())
+        .await
+        .unwrap()
+        .expect("a status");
+    assert_eq!(first.status(), ServingStatus::Serving);
+    interrupt(&server.child);
+    let update = common::ceiling("the NOT_SERVING update", watcher.message())
+        .await
+        .expect("the watcher stays open through the drain")
+        .expect("a status update");
+    assert_eq!(update.status(), ServingStatus::NotServing);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        server.child.try_wait().unwrap().is_none(),
+        "the drain ended while the watch was open"
+    );
+
+    // The second signal cuts the drain: the process ends promptly, with a
+    // non-zero exit code, and the log names the cut.
+    interrupt(&server.child);
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the second signal did not end the drain within 5 s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(status.code(), Some(1), "the cut is a non-zero exit");
+    let logged = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        logged.contains("a second signal ended the drain"),
+        "the log does not name the cut"
+    );
 }
