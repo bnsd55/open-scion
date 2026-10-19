@@ -19,7 +19,10 @@ use scion_proto::v1::scion_client::ScionClient;
 use scion_server::Metrics;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::tree;
-use scion_server::{Backend, Store, test_support::service};
+use scion_server::{
+    Backend,
+    test_support::{service, store::Store},
+};
 use tonic::codec::Streaming;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
