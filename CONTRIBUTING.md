@@ -36,8 +36,9 @@ cargo test --workspace
 
 CI runs them again, and adds: `cargo deny check` (supply chain), the
 power-loss suite, the grpcurl conformance check, the docker demo, the
-publish check, the MSRV build on 1.88, the fuzz smoke test, and the same
-tests on macOS. Run one test file or one test directly:
+publish check, the MSRV build on 1.88, the fuzz smoke test, the release
+smoke test on Linux, and the same tests on macOS. Run one test file or one
+test directly:
 
 ```sh
 cargo test -p open-scion-server --test write
