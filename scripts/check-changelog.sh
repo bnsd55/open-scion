@@ -12,6 +12,18 @@ base=${1:-HEAD^1}
 head=${2:-HEAD}
 branch=${GITHUB_HEAD_REF:-$(git rev-parse --abbrev-ref HEAD)}
 
+# The check fails closed: a revision the checkout cannot see is a broken
+# setup, never a pass.
+for rev in "$base" "$head"; do
+    if ! git rev-parse --verify --quiet "$rev^{commit}" >/dev/null; then
+        echo "check-changelog: revision '$rev' is missing from this" >&2
+        echo "checkout, so the changed files cannot be named; the check" >&2
+        echo "refuses to pass. Give the checkout a fetch-depth that has" >&2
+        echo "the base side of the pull request's merge commit." >&2
+        exit 1
+    fi
+done
+
 case $branch in
     release/*) exit 0 ;;
 esac
