@@ -90,6 +90,7 @@ pub enum Error {
     #[error("{0}")]
     Unavailable(String),
 }
+
 /// Result with the server [`Error`].
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

@@ -284,11 +284,11 @@ impl Lands {
         let outcome = outcome?;
         if let Some(metrics) = &self.metrics {
             metrics.land(match outcome.state {
-                LandState::Landed => 0,
-                LandState::Conflict => 1,
-                LandState::Rejected => 2,
+                LandState::Landed => "landed",
+                LandState::Conflict => "conflict",
+                LandState::Rejected => "rejected",
                 // A pending land waits for a retry with its key.
-                LandState::Pending => 3,
+                LandState::Pending => "retry",
             });
         }
         // Lands on one ref commit one at a time. Waiting for the flush after
@@ -1838,6 +1838,58 @@ mod tests {
             };
             let err = f.lands.land(&f.store, &caller(), &late).unwrap_err();
             assert!(matches!(err, Error::DeadlineExceeded(_)), "{key}: {err}");
+            assert_eq!(f.main(), before, "{key}");
+            let sql = "SELECT state FROM lands WHERE request_key = ?1";
+            let row: String = f
+                .store
+                .read(|c| {
+                    Ok(c.sqlite()
+                        .unwrap()
+                        .query_row(sql, [key], |row| row.get(0))?)
+                })
+                .unwrap();
+            assert_eq!(row, "pending", "{key}");
+            // The index stays, so a retry goes on from where the plan stopped.
+            f.index(|_| ());
+            let out = f.land(cs, key);
+            assert_eq!(out.state, state, "{key}: {}", out.detail);
+        }
+    }
+
+    /// A land whose call has gone: the deadline has not passed, but the
+    /// call's guard dropped, so the plan's next check answers
+    /// [`Error::Cancelled`]. The land stays pending, keeps its path index,
+    /// and a retry with the same key finishes it: the same promise a
+    /// deadline-stopped land keeps.
+    #[test]
+    fn a_land_whose_call_went_stays_pending_and_a_retry_finishes_it() {
+        use LandState::{Conflict, Landed};
+        let f = fixture();
+        // The index starts at B, so root is below its floor.
+        f.move_main(f.commit(f.root, &[put("b/y", "B")]));
+        f.fill("f", 1);
+        // An import moves main, so the next plan advances the index.
+        f.move_main(f.commit(f.main().target, &[put("c", "import")]));
+        let on_head = f.commit(f.main().target, &[put("a/x", "mine")]);
+        // The plan of this one walks back from the floor.
+        let on_root = f.commit(f.root, &[put("c", "mine")]);
+        for (cs, key, state) in [(on_head, "gone head", Landed), (on_root, "gone root", Conflict)]
+        {
+            let before = f.main();
+            // The call went before the plan started: the guard drops, the
+            // deadline itself is far in the future.
+            let deadline = Deadline::new(Instant::now() + std::time::Duration::from_secs(600));
+            let guard = deadline.guard();
+            let gone = LandRequest {
+                deadline,
+                ..req(cs, key)
+            };
+            drop(guard);
+            let err = f.lands.land(&f.store, &caller(), &gone).unwrap_err();
+            assert!(
+                matches!(&err, Error::Cancelled(why) if why.contains("its call has gone")),
+                "{key}: {err}"
+            );
             assert_eq!(f.main(), before, "{key}");
             let sql = "SELECT state FROM lands WHERE request_key = ?1";
             let row: String = f

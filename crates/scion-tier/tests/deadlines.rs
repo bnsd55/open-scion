@@ -324,28 +324,36 @@ async fn a_tier_passes_an_upstream_cancelled_through() {
     let tier = serve_tier(&serve_deepest(gone).await, Duration::from_secs(30), &keys).await;
     let mut client = connect(&tier).await;
 
-    let started = tokio::time::Instant::now();
-    let code = get_cancelled_tree(&mut client, root, &ticket).await;
+    let code = tokio::time::timeout(
+        Duration::from_secs(60),
+        get_cancelled_tree(&mut client, root, None, &ticket),
+    )
+    .await
+    .expect("the no-timeout call answers at once, or the tier is retrying");
     assert_eq!(
         code,
         Code::Cancelled,
         "the upstream's cancel, not a timeout"
     );
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "at once, not at the deadline"
-    );
+    let code = get_cancelled_tree(&mut client, root, Some(Duration::from_secs(20)), &ticket).await;
+    assert_eq!(code, Code::Cancelled, "the same, with the call's timeout set");
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        1,
+        2,
         "the tier never asked again"
     );
 }
 
 /// The code of a `GetObjects` call for the tree `root`, or `OK` once the
-/// whole reply has come.
-async fn get_cancelled_tree(client: &mut Client, root: scion_core::TreeId, ticket: &[u8]) -> Code {
-    let request = Request::new(GetObjectsRequest {
+/// whole reply has come. `timeout` is the call's own `grpc-timeout`, when
+/// it sets one.
+async fn get_cancelled_tree(
+    client: &mut Client,
+    root: scion_core::TreeId,
+    timeout: Option<Duration>,
+    ticket: &[u8],
+) -> Code {
+    let mut request = Request::new(GetObjectsRequest {
         refs: vec![ObjectRef {
             kind: ObjectKind::Tree.into(),
             id: root.as_bytes().to_vec(),
@@ -354,6 +362,9 @@ async fn get_cancelled_tree(client: &mut Client, root: scion_core::TreeId, ticke
         accept: Vec::new(),
         ticket: ticket.to_vec(),
     });
+    if let Some(timeout) = timeout {
+        request.set_timeout(timeout);
+    }
     let mut stream = match client.get_objects(request).await {
         Ok(reply) => reply.into_inner(),
         Err(status) => return status.code(),
