@@ -222,6 +222,10 @@ mod tests {
     /// or of /dev/zero would otherwise grow until the OOM killer.
     #[test]
     fn a_put_refuses_what_never_sees_an_end() {
+        // mkfifo forks, and a fork carries every lock the process holds
+        // to the child until it execs: it runs under the crate's gate,
+        // like every test here that forks.
+        let _serial = crate::fork_gate::serial();
         let refused = |file: std::path::PathBuf| {
             let (sent, done) = std::sync::mpsc::channel();
             std::thread::spawn(move || sent.send(read_put(&file).is_err()).unwrap());

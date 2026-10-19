@@ -716,20 +716,13 @@ mod tests {
 mod silent_failures {
     use super::*;
     use std::fs;
-    use std::sync::{Mutex, MutexGuard, PoisonError};
 
     /// The gate every test of this module that forks a process or holds
-    /// or reads a serve lock runs under. A fork copies the process's open
-    /// lock files to the child until the child execs, and macOS is slow
-    /// to exec, so a parallel test's fork can hold a probe's lock for
-    /// ticks and flip its answer - the macOS flake of
-    /// `an_unmount_does_not_signal_an_unrelated_process`. One gate keeps
-    /// a fork off another test's lock.
-    static SERIAL: Mutex<()> = Mutex::new(());
-
-    fn serial() -> MutexGuard<'static, ()> {
-        SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
-    }
+    /// or reads a serve lock runs under, with the crate's own fork gate:
+    /// a fork of one test can hold another test's lock exactly like its
+    /// own, so the gate lives where every forking test of the binary can
+    /// reach it.
+    use crate::fork_gate::serial;
 
     /// A spawned stand-in server in its own process group. Its drop
     /// signals the whole group and reaps the child, also on a panic, so
