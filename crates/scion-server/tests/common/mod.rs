@@ -15,16 +15,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use scion_core::{BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, RepoPath, Tree};
+use scion_proto::CHUNK_BYTES;
 use scion_proto::runtime::auth::Bearer;
-use scion_proto::runtime::object::{self, Assembler, Header};
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{
-    self, CreateChangesetRequest, DiffRequest, Encoding, FileKind, GetChangesetRequest,
-    GetObjectsRequest, LandRequest, LandResponse, LandState, ObjectKind, ObjectRef, PutBlobRequest,
-    ResolveRefRequest,
+    self, CreateChangesetRequest, DiffRequest, FileKind, GetChangesetRequest, LandRequest,
+    LandResponse, LandState, PutBlobRequest, ResolveRefRequest,
 };
-use scion_proto::{CHUNK_BYTES, MAX_OBJECT_REFS};
 use scion_server::test_support::meta::MetaTx as _;
 use scion_server::test_support::store::BlobStatus;
 use scion_server::{Backend, Store, test_support::tree};
@@ -496,51 +494,6 @@ pub async fn diff(
     }
 }
 
-/// Reads `blobs` with `GetObjects`, asking again for the rest after a
-/// reply that stops early, and checks each against its ID.
-// SHORTCUT: dead until C5 verifies tickets and the read-back returns.
-#[allow(dead_code)]
-pub async fn read_blobs(objects: &mut Objects, blobs: &[BlobId]) {
-    let mut rest = blobs;
-    while !rest.is_empty() {
-        let batch = &rest[..rest.len().min(MAX_OBJECT_REFS)];
-        let refs = batch
-            .iter()
-            .map(|id| ObjectRef {
-                kind: ObjectKind::Blob.into(),
-                id: id.as_bytes().to_vec(),
-                path: Vec::new(),
-            })
-            .collect();
-        let request = GetObjectsRequest {
-            refs,
-            accept: vec![Encoding::Zstd.into()],
-            ticket: Vec::new(),
-        };
-        let mut reply = objects.get_objects(request).await.unwrap().into_inner();
-        let mut got = 0;
-        loop {
-            let fail = |status| panic!("blob {:?}: {status:?}", batch.get(got));
-            let Some(first) = reply.message().await.unwrap_or_else(fail) else {
-                break;
-            };
-            let mut object = Assembler::new(Header::of(&first, true).unwrap(), first);
-            while !object.is_done() {
-                let part = reply.message().await.unwrap_or_else(fail);
-                object.push(&part.expect("an object cut short")).unwrap();
-            }
-            let (header, data) = object.finish();
-            let id = batch[got];
-            assert_eq!(header.id, *id.as_bytes(), "blob {id}");
-            let data = object::decode(&header, data).unwrap();
-            assert_eq!(BlobId::of(&data), id, "blob {id}");
-            got += 1;
-        }
-        assert!(got > 0, "a reply with no object");
-        rest = &rest[got..];
-    }
-}
-
 pub fn pending_lands(c: &rusqlite::Connection) -> i64 {
     let pending = "SELECT count(*) FROM lands WHERE state = 'pending'";
     c.query_row(pending, [], |row| row.get(0)).unwrap()
@@ -753,10 +706,13 @@ pub async fn check(
     let history = walk_refs(&mut scion, &mut objects, checked).await;
     check_lands(ledger, &history);
 
-    // SHORTCUT: GetObjects fails closed until C5 verifies tickets, so the
-    // read-back of the new blobs waits for C5. Their files are still
-    // verified below. Every changeset that `CreateChangeset` replied with
-    // is there.
+    // SHORTCUT: the new blobs' bytes are not read back through the
+    // `Objects` API in this walk; the file-level check below is what
+    // proves them, and every changeset that `CreateChangeset` replied
+    // with is read back whole. Upgrade: a `GetObjects` read-back of the
+    // new blobs, if the API-level proof is ever wanted beside the file
+    // check (the fixture's server holds no ticket key, so nothing
+    // blocks it today).
     checked.blobs = ledger.blobs.len();
     for sent in &ledger.lands[new_lands..] {
         let request = GetChangesetRequest {

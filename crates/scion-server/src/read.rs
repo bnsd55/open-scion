@@ -35,7 +35,8 @@ pub fn get_changeset(store: &Backend, repo: &str, id: ChangesetId) -> Result<Cha
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or changeset does not exist.
-/// [`Error::DeadlineExceeded`] once `deadline` has passed.
+/// [`Error::DeadlineExceeded`] once `deadline` has passed, or
+/// [`Error::Cancelled`] once the call has gone.
 pub fn root_tree(
     store: &Backend,
     repo: &str,
@@ -52,9 +53,9 @@ pub fn root_tree(
 ///
 /// [`Error::NotFound`] if nothing is at `path`. [`Error::InvalidArgument`] if
 /// `path` is a directory or a submodule. [`Error::DeadlineExceeded`] once
-/// `deadline` has passed, which a cold root tree may need. The tests of
-/// the trees and the imports read through it, so it rides behind the
-/// test-hooks feature.
+/// `deadline` has passed, which a cold root tree may need, or
+/// [`Error::Cancelled`] once the call has gone. The tests of the trees and
+/// the imports read through it, so it rides behind the test-hooks feature.
 #[cfg(any(test, feature = "test-hooks"))]
 pub fn read_file(
     store: &Backend,
@@ -196,7 +197,8 @@ pub fn log(
 ///
 /// [`Error::NotFound`] if the repo or changeset does not exist.
 /// [`Error::DeadlineExceeded`] if `deadline` passed while the path history
-/// was derived; the steps before it stay.
+/// was derived, or [`Error::Cancelled`] once the call has gone; the steps
+/// before it stay.
 pub fn log_page(
     store: &Backend,
     repo: &str,
@@ -294,7 +296,8 @@ pub fn changes_path(cs: &Changeset, path: &RepoPath) -> bool {
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or a changeset does not exist.
-/// [`Error::DeadlineExceeded`] once `deadline` has passed.
+/// [`Error::DeadlineExceeded`] once `deadline` has passed, or
+/// [`Error::Cancelled`] once the call has gone.
 pub fn is_ancestor(
     store: &Backend,
     repo: &str,
@@ -319,7 +322,8 @@ pub fn is_ancestor(
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or a changeset does not exist.
-/// [`Error::DeadlineExceeded`] once `deadline` has passed.
+/// [`Error::DeadlineExceeded`] once `deadline` has passed, or
+/// [`Error::Cancelled`] once the call has gone.
 pub fn merge_base(
     store: &Backend,
     repo: &str,

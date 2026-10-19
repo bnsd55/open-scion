@@ -69,11 +69,17 @@ pub enum Error {
     /// request may succeed if retried.
     #[error("{0}")]
     Aborted(String),
-    /// The request's deadline passed, or its call has gone, before the work
-    /// was done. A blocking job checks this in its long loops, because a
-    /// dropped call does not stop the job.
+    /// The request's deadline passed before the work was done. A blocking
+    /// job checks this in its long loops, because a dropped call does not
+    /// stop the job.
     #[error("{0}")]
     DeadlineExceeded(String),
+    /// The call that asked for the work has gone: the client cancelled, or
+    /// its connection ended. A job that outlives its call stops at its
+    /// next check. Nothing was written, and the reply reaches no one; the
+    /// code keeps the metrics honest (`cancelled`, not `deadline_exceeded`).
+    #[error("{0}")]
+    Cancelled(String),
     /// The call reached its bound on work before it found the answer. The
     /// same request fails again.
     #[error("{0}")]
@@ -107,6 +113,9 @@ impl From<Error> for Status {
             Error::InvalidArgument(_) | Error::Apply(_) => Status::invalid_argument(e.to_string()),
             Error::PermissionDenied(_) => Status::permission_denied(e.to_string()),
             Error::Aborted(_) => Status::aborted(e.to_string()),
+            // The call went; the job that served it stopped at its next
+            // check. Nobody reads the reply, so the message is for the log.
+            Error::Cancelled(_) => Status::cancelled(e.to_string()),
             Error::DeadlineExceeded(_) => Status::deadline_exceeded(e.to_string()),
             Error::FailedPrecondition(_) => Status::failed_precondition(e.to_string()),
             Error::ResourceExhausted(_) => Status::resource_exhausted(e.to_string()),
@@ -189,6 +198,12 @@ mod tests {
     use tonic::Code;
 
     use super::*;
+
+    #[test]
+    fn a_cancelled_call_answers_cancelled_not_deadline_exceeded() {
+        let err = Error::Cancelled("its call has gone".to_owned());
+        assert_eq!(Status::from(err).code(), Code::Cancelled);
+    }
 
     #[test]
     fn a_busy_database_is_unavailable_so_that_the_client_retries() {
