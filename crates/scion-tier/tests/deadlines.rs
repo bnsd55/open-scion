@@ -336,7 +336,11 @@ async fn a_tier_passes_an_upstream_cancelled_through() {
         "the upstream's cancel, not a timeout"
     );
     let code = get_cancelled_tree(&mut client, root, Some(Duration::from_secs(20)), &ticket).await;
-    assert_eq!(code, Code::Cancelled, "the same, with the call's timeout set");
+    assert_eq!(
+        code,
+        Code::Cancelled,
+        "the same, with the call's timeout set"
+    );
     assert_eq!(
         calls.load(Ordering::SeqCst),
         2,

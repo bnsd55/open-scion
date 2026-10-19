@@ -1873,8 +1873,10 @@ mod tests {
         let on_head = f.commit(f.main().target, &[put("a/x", "mine")]);
         // The plan of this one walks back from the floor.
         let on_root = f.commit(f.root, &[put("c", "mine")]);
-        for (cs, key, state) in [(on_head, "gone head", Landed), (on_root, "gone root", Conflict)]
-        {
+        for (cs, key, state) in [
+            (on_head, "gone head", Landed),
+            (on_root, "gone root", Conflict),
+        ] {
             let before = f.main();
             // The call went before the plan started: the guard drops, the
             // deadline itself is far in the future.
