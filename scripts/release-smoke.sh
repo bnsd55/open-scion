@@ -91,8 +91,9 @@ run_story() {
   # the server refuses to open a data directory whose parent another user
   # can change. mktemp -d already makes 0700 on Linux and macOS; the chmod
   # says so and keeps a umask-002 run from a mktemp that does not. The
-  # server's own directories are 0700 whatever the umask (#302), so this
-  # parent is the only one the story has to get right itself.
+  # server's own directories are 0700 whatever the umask (#303); a
+  # group-writable parent is still refused until #302, so this parent is
+  # the only one the story has to get right itself.
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/scion-smoke.XXXXXX")
   chmod 700 "$WORK"
   note "run under umask $UMASK_RUN in $WORK"
