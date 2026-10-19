@@ -172,7 +172,6 @@ fn concurrent_creates_of_one_changeset_store_it_once() {
 /// core enforces the format's bounds, and every edit in the table stays
 /// inside them; the server's own limits are what the rows test.
 fn rebuilt(
-    cs: &Changeset,
     parents: Vec<ChangesetId>,
     committer: Option<IdentityTime>,
     message: Vec<u8>,
@@ -184,6 +183,7 @@ fn rebuilt(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn bad_requests_are_rejected_and_store_nothing() {
     // Asserts the rows of the data directory's database.
     if skip_on_postgres("asserts the rows of the data directory's database") {
@@ -208,7 +208,6 @@ fn bad_requests_are_rejected_and_store_nothing() {
             "no parents",
             ok(|cs| {
                 rebuilt(
-                    cs,
                     Vec::new(),
                     cs.committer().cloned(),
                     cs.message().to_vec(),
@@ -223,7 +222,6 @@ fn bad_requests_are_rejected_and_store_nothing() {
             ok(|cs| {
                 let p = cs.parents()[0];
                 rebuilt(
-                    cs,
                     vec![p, p],
                     cs.committer().cloned(),
                     cs.message().to_vec(),
@@ -244,7 +242,6 @@ fn bad_requests_are_rejected_and_store_nothing() {
                 let mut changes = cs.changes().clone();
                 changes.insert(path("dir/zzz"), Some(regular("never uploaded")));
                 rebuilt(
-                    cs,
                     cs.parents().to_vec(),
                     cs.committer().cloned(),
                     cs.message().to_vec(),
@@ -258,7 +255,6 @@ fn bad_requests_are_rejected_and_store_nothing() {
             "committer set",
             ok(|cs| {
                 rebuilt(
-                    cs,
                     cs.parents().to_vec(),
                     Some(cs.author().clone()),
                     cs.message().to_vec(),
@@ -284,7 +280,6 @@ fn bad_requests_are_rejected_and_store_nothing() {
             "message too long",
             ok(|cs| {
                 rebuilt(
-                    cs,
                     cs.parents().to_vec(),
                     cs.committer().cloned(),
                     vec![b'm'; MAX_COMMIT_MESSAGE_BYTES + 1],
@@ -306,7 +301,6 @@ fn bad_requests_are_rejected_and_store_nothing() {
                 )
                 .expect("identity fits the format");
                 rebuilt(
-                    cs,
                     cs.parents().to_vec(),
                     cs.committer().cloned(),
                     cs.message().to_vec(),

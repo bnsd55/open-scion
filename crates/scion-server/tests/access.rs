@@ -701,8 +701,11 @@ async fn a_partial_reader_reads_only_its_view() {
     }
     let (listed, listed_id) = Tree::decode_with_id(&tree_bytes).unwrap();
     assert_eq!(listed_id, view_root, "the list is of the view root");
-    assert!(listed.entries.contains_key(&elem(b"docs")), "{listed:?}");
-    assert!(!listed.entries.contains_key(&elem(b"secret")), "{listed:?}");
+    assert!(listed.entries().contains_key(&elem(b"docs")), "{listed:?}");
+    assert!(
+        !listed.entries().contains_key(&elem(b"secret")),
+        "{listed:?}"
+    );
 
     // ReadFile serves a visible path and hides a hidden one, the same as a
     // missing one.
@@ -1317,7 +1320,7 @@ async fn the_authz_matrix_answers_as_documented() {
                 Ok(()) => OK,
                 Err(status) => status.code(),
             };
-            assert_eq!(got, row.want[col], "{} / {}", row.rpc, who.name());
+            assert_eq!(got, row.want[col], "{} / {}", row.rpc, who.name);
         }
     }
 }

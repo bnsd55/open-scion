@@ -171,7 +171,7 @@ fn path_log_follows_files_directories_deletes_and_first_parents() {
     // A limit stops the walk after the last entry it returns.
     let page = read::log_page(&store, REPO, tip, Some(&path("a.txt")), 2, &later()).unwrap();
     let delete = changeset_of(&store, &delete_a);
-    let parent = read::get_changeset(&store, REPO, delete).unwrap().parents[0];
+    let parent = read::get_changeset(&store, REPO, delete).unwrap().parents()[0];
     assert_eq!(page.entries.len(), 2);
     assert_eq!(page.next, Some(parent));
 }
