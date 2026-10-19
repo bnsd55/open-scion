@@ -226,7 +226,7 @@ The first release: the server, its cache tiers, and the `scn` client.
 ### Fixed
 
 - A blame walk checks the call's deadline before each step, the first
-  diff too (`#295`), and one diff reads no version past 1,048,576
+  diff too (`#299`), and one diff reads no version past 1,048,576
   lines: a request file over the cap answers `RESOURCE_EXHAUSTED`, as
   one whose memory share is more than the whole budget does, and a
   version over the cap in the file's history counts as absent, as one
@@ -234,7 +234,6 @@ The first release: the server, its cache tiers, and the `scn` client.
   diff ran past every bound: two versions of a file at the blob limit
   that share nothing kept a worker for hours, with no deadline check
   inside the diff.
-
 - A damaged backend marker is refused, in both directions: a marker
   whose first line is neither `postgres` nor absent used to be read as
   absent, so a Postgres-backed directory opened as a fresh, empty
