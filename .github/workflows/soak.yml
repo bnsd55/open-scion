@@ -19,9 +19,8 @@ jobs:
   soak:
     name: soak
     runs-on: ubuntu-24.04
-    # The run itself is bounded to 120 minutes by the soak's own timeout
-    # below; the build and the checks share the rest of the two hours and
-    # a margin.
+    # The load runs 120 minutes and the step cap on it is 150; the build,
+    # the checks and the teardown share the rest of the job's 165 minutes.
     timeout-minutes: 165
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -32,18 +31,19 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: run the soak
         env:
-          # The nightly run is 120 minutes; a dispatch names its own
-          # length. The input goes through env:, not through the run:
-          # string, so no shell sees it unquoted.
-          RUN_MINUTES: ${{ github.event_name == 'schedule' && '120' || (github.event.inputs.minutes || '120') }}
+          # The nightly schedule runs 120 minutes; a dispatch names its
+          # own length, 10 by default. The input goes through env:, not
+          # through the run: string, so no shell sees it unquoted.
+          RUN_MINUTES: ${{ github.event.inputs.minutes || '120' }}
           # The resource ceilings, each named here and enforced by
           # scripts/soak.sh: a server may grow to
           SOAK_RSS_PCT: "150" # 150 percent of its warm RSS,
           SOAK_FD_GROWTH: "100" # 100 open files over its start, steady,
           SOAK_P99_FACTOR: "2" # and its late p99 must stay under 2x its early p99.
         run: |
-          # The soak's own cap: 150 min covers 120 min of load plus the
-          # build, the checks and the teardown inside the job's 180.
+          # The soak's own cap: 150 min covers the 120 min of load, and
+          # the build, the checks and the teardown live in the job's
+          # remaining 15. (9000 s = 150 min.)
           timeout 9000 scripts/soak.sh
       # The bounds live in the script; a failed bound fails the step and
       # keeps the CSVs and logs.
