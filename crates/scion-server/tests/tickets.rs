@@ -777,7 +777,7 @@ async fn reachable(objects: &mut Objects, ticket: &[u8], root: &[u8]) -> Vec<Obj
             }
             below.extend_from_slice(name.as_bytes());
             match entry {
-                Entry::Dir(id) => level.push((below, id)),
+                Entry::Dir(id) => level.push((below, *id)),
                 Entry::File(file) => {
                     if let Some(blob) = file.state().blob() {
                         found.push(ObjectRef {

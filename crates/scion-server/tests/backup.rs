@@ -76,17 +76,12 @@ fn put_blob(store: &Backend, label: &str, i: u8) -> (BlobId, Vec<u8>) {
 /// The changeset `i` of a chain: one file backed by `blob`, on `parent`,
 /// with a message that names it.
 fn chain_changeset(label: &str, i: u8, blob: BlobId, parent: Option<ChangesetId>) -> Changeset {
-    Changeset {
-        parents: parent.into_iter().collect(),
-        author: IdentityTime {
-            name: b"b".to_vec(),
-            email: b"b@x".to_vec(),
-            unix_secs: 0,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: format!("{label} {i}").into_bytes(),
-        changes: [(
+    Changeset::new(
+        parent.into_iter().collect(),
+        IdentityTime::new(b"b".to_vec(), b"b@x".to_vec(), 0, 0).expect("identity fits the format"),
+        None,
+        format!("{label} {i}").into_bytes(),
+        [(
             RepoPath::new(format!("f{i}").into_bytes()).unwrap(),
             Some(FileState::Regular {
                 content: blob,
@@ -94,7 +89,8 @@ fn chain_changeset(label: &str, i: u8, blob: BlobId, parent: Option<ChangesetId>
             }),
         )]
         .into(),
-    }
+    )
+    .expect("changeset fits the format")
 }
 
 /// The writes the backup must keep: a chain of `n` changesets, each with

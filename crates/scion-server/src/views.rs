@@ -494,7 +494,7 @@ mod tests {
             .map(|k| k.as_bytes().to_vec())
             .collect();
         assert_eq!(names, [b"left".to_vec()]);
-        let Entry::Dir(left_view) = shown.entries.get(&name(b"left")).unwrap() else {
+        let Entry::Dir(left_view) = shown.entries().get(&name(b"left")).unwrap() else {
             panic!("left is a directory in the view");
         };
         let left_tree = store.read(|c| c.get_tree(*left_view)).unwrap();
@@ -534,7 +534,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let shown = store.read(|c| c.get_tree(view)).unwrap();
-        let Entry::Dir(kept) = shown.entries.get(&name(b"docs")).unwrap() else {
+        let Entry::Dir(kept) = shown.entries().get(&name(b"docs")).unwrap() else {
             panic!("docs is a directory in the view");
         };
         assert_eq!(*kept, docs_id, "the fully visible folder is unchanged");
@@ -919,7 +919,7 @@ mod tests {
             } else {
                 format!("{dir}/{name}")
             };
-            let entry = shown.entries.get(&elem(name.as_bytes())).unwrap();
+            let entry = shown.entries().get(&elem(name.as_bytes())).unwrap();
             match state {
                 DirState::Whole => {
                     if paths.contains(&child_path) {

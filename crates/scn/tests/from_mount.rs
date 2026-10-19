@@ -8,11 +8,17 @@ use std::process::Command;
 
 use common::{REPO, TOKEN, changeset, land};
 use nfsserve::nfs::{filename3, nfspath3, nfsstat3, sattr3, set_size3};
-use open_scion::client::{Ctx, id_from, test_objects};
+#[cfg(target_os = "linux")]
+use open_scion::client::Ctx;
+use open_scion::client::{id_from, test_objects};
 use open_scion::cmd::mount::{MountRecord, write_sessions};
 use open_scion::vfs::{NFSFileSystem, Vfs};
-use scion_core::{Changeset, ChangesetId, FileState, RepoPath};
-use scion_proto::v1::{GetChangesetRequest, GetRootTreeRequest};
+#[cfg(target_os = "linux")]
+use scion_core::{Changeset, RepoPath};
+use scion_core::{ChangesetId, FileState};
+#[cfg(target_os = "linux")]
+use scion_proto::v1::GetChangesetRequest;
+use scion_proto::v1::GetRootTreeRequest;
 use scion_server::Backend;
 
 mod common;

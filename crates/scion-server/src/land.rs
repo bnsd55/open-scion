@@ -1549,7 +1549,7 @@ mod tests {
         // replanned onto the head the import made.
         let parents = f
             .store
-            .read(|c| Ok(c.get_changeset(f.repo, landed)?.parents))
+            .read(|c| Ok(c.get_changeset(f.repo, landed)?.parents().to_vec()))
             .unwrap();
         assert_eq!(parents, vec![import], "the land rebased onto the import");
         assert_eq!(metrics.land_replans(), 1, "the replan counted once");
@@ -1604,7 +1604,7 @@ mod tests {
             assert_eq!(after.version, before.version + 1, "{crash:?}: moved once");
             assert_eq!(Some(after.target), out.result);
             let landed = f.store.read(|c| c.get_changeset(repo, after.target));
-            assert_eq!(landed.unwrap().parents, vec![before.target], "{crash:?}");
+            assert_eq!(landed.unwrap().parents(), [before.target], "{crash:?}");
             assert_eq!(fresh.land(&f.store, &caller(), &req).unwrap(), out);
             assert_eq!(f.landed_count(), 1, "{crash:?}");
         }
@@ -2453,7 +2453,7 @@ mod tests {
                     let tip = out.result.unwrap();
                     assert_eq!(m.f.main().target, tip, "{case}");
                     let rebased = m.f.store.read(|c| c.get_changeset(m.f.repo, tip));
-                    assert_eq!(rebased.unwrap().parents, vec![m.head], "{case}");
+                    assert_eq!(rebased.unwrap().parents(), [m.head], "{case}");
                     assert_eq!(
                         m.f.file(tip, path),
                         change

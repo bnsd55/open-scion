@@ -245,7 +245,7 @@ async fn snapshot(
             }
             below.extend_from_slice(name.as_bytes());
             match entry {
-                Entry::Dir(id) => trees.push((id, below)),
+                Entry::Dir(id) => trees.push((*id, below)),
                 Entry::File(file) => {
                     if let Some(blob) = file.state().blob() {
                         blobs.push((blob, below));

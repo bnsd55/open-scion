@@ -323,7 +323,8 @@ fn root_entry(store: &Backend, cs: ChangesetId, name: &str) -> Option<Entry> {
     )
     .unwrap()
     .entries()
-    .remove(&PathElem::new(name).unwrap())
+    .get(&PathElem::new(name).unwrap())
+    .copied()
 }
 
 #[test]
@@ -448,7 +449,7 @@ fn changesets_carry_git_metadata_and_first_parent_diffs() {
     assert_eq!(swap.parents(), [changeset_of(&store, &h.root)]);
     assert_eq!(
         swap.author(),
-        IdentityTime::new(
+        &IdentityTime::new(
             b"Ada".to_vec(),
             b"ada@example.com".to_vec(),
             1_700_000_000,
@@ -459,7 +460,7 @@ fn changesets_carry_git_metadata_and_first_parent_diffs() {
     assert_eq!(
         swap.committer(),
         Some(
-            IdentityTime::new(
+            &IdentityTime::new(
                 b"Bob".to_vec(),
                 b"bob@example.com".to_vec(),
                 1_700_000_100,

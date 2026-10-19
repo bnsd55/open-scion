@@ -433,7 +433,7 @@ mod tests {
                 let path = format!("{prefix}{}", String::from_utf8_lossy(name.as_bytes()));
                 match entry {
                     Entry::File(_) => out.push(path),
-                    Entry::Dir(child) => stack.push((format!("{path}/"), child)),
+                    Entry::Dir(child) => stack.push((format!("{path}/"), *child)),
                 }
             }
         }

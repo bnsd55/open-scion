@@ -122,7 +122,7 @@ async fn call(
             // The reply streams newest first; a repeated ID inside one
             // reply is a repeat.
             assert_ne!(got.last().map(|(_, id)| id), Some(&id), "a repeat");
-            let message = String::from_utf8(cs.message()).unwrap();
+            let message = String::from_utf8(cs.message().to_vec()).unwrap();
             let i: usize = message
                 .trim()
                 .strip_prefix("change ")
