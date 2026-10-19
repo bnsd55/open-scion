@@ -83,12 +83,7 @@ impl Bytes {
     ///
     /// If the budget lock is poisoned, which only a panic inside it causes.
     pub fn take(&self, n: usize, until: Option<Instant>) -> Result<Held> {
-        if n > self.0.cap {
-            return Err(Error::ResourceExhausted(format!(
-                "a blame of {n} bytes does not fit the budget of {} bytes",
-                self.0.cap
-            )));
-        }
+        self.refuse_over_cap(n)?;
         let mut free = self.0.free.lock().expect("the budget lock is not poisoned");
         #[cfg(test)]
         let _waiting = if *free < n {
@@ -143,12 +138,7 @@ impl Bytes {
     ///
     /// If the budget lock is poisoned, which only a panic inside it causes.
     pub fn try_take(&self, n: usize) -> Result<Held> {
-        if n > self.0.cap {
-            return Err(Error::ResourceExhausted(format!(
-                "a blame of {n} bytes does not fit the budget of {} bytes",
-                self.0.cap
-            )));
-        }
+        self.refuse_over_cap(n)?;
         let mut free = self.0.free.lock().expect("the budget lock is not poisoned");
         if *free < n {
             return Err(Error::ResourceExhausted(format!(
@@ -161,6 +151,24 @@ impl Bytes {
             pool: Arc::clone(&self.0),
             n,
         })
+    }
+}
+
+impl Bytes {
+    /// [`Error::ResourceExhausted`] when `n` is more than the whole pool:
+    /// one check, one message, for [`Bytes::take`] and [`Bytes::try_take`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ResourceExhausted`], with the budget named.
+    fn refuse_over_cap(&self, n: usize) -> Result<()> {
+        if n > self.0.cap {
+            return Err(Error::ResourceExhausted(format!(
+                "a blame of {n} bytes does not fit the budget of {} bytes",
+                self.0.cap
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -272,13 +280,14 @@ mod tests {
         drop(held);
     }
 
-    /// A give that lands while a waiter sits in its wait hands the bytes
-    /// over: the drop's notify wakes it, and the take rechecks the budget
-    /// after the wait, so the bytes are taken however the wake and the
-    /// timeout race. A release that lands this close to the deadline is
-    /// the case the recheck is for.
+    /// A give wakes a waiting take, and the take rechecks the budget after
+    /// the wait, so a give that lands while it waits is taken however the
+    /// wake and the timeout race. The recheck after a timed-out wait is a
+    /// one-line condition (`timeout.timed_out() && *free < n`), covered by
+    /// reading: the window between the timeout's fire and the relock is a
+    /// microsecond race no test can pin.
     #[test]
-    fn a_give_that_lands_in_the_wait_is_taken() {
+    fn a_waiting_take_is_woken_by_a_give() {
         let bytes = Arc::new(Bytes::new(100));
         let held = bytes.take(100, None).expect("fits");
         let waiter = {
