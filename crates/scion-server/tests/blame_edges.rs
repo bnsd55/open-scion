@@ -529,7 +529,7 @@ async fn a_cursor_that_names_an_impossible_line_count_is_refused() {
     cursor.extend_from_slice(&digest.as_bytes()[..16]);
     cursor.push(1);
     cursor.extend_from_slice(root.as_bytes());
-    cursor.extend_from_slice(&(PATH.len() as u32).to_be_bytes());
+    cursor.extend_from_slice(&u32::try_from(PATH.len()).unwrap().to_be_bytes());
     cursor.extend_from_slice(PATH.as_bytes());
     cursor.extend_from_slice(&0u64.to_be_bytes());
     cursor.push(0);
