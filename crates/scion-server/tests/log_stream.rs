@@ -296,6 +296,7 @@ async fn a_unary_reply_over_the_message_limit_is_refused() {
         scion_proto::runtime::listen::tcp(listener),
         None,
         std::future::pending(),
+        std::sync::Arc::new(scion_proto::runtime::metrics::Metrics::default()),
     ));
     let channel = Channel::from_shared(format!("http://{addr}"))
         .unwrap()

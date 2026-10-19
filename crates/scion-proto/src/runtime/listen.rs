@@ -15,8 +15,10 @@
 //! [`Limits::streams`] open streams, and each with at most
 //! [`Limits::stalled_bytes`] bytes held by its stalled replies — when a
 //! reply stalls, it adds what it leaves in HTTP/2 to its connection's
-//! count, and a connection over the limit is closed, which frees its
-//! stalled streams' buffers at once ([`Stalled`]). And it closes every
+//! count, a connection over the limit is closed, which frees its
+//! stalled streams' buffers at once ([`Stalled`]), and a stalled reply
+//! gives its count back when its stream ends, so a connection that has
+//! served its stalls counts nothing. And it closes every
 //! connection in time, so a connection that waits for a place gets one:
 //!
 //! - a client that does not send the HTTP/2 preface within
@@ -45,6 +47,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use crate::runtime::metrics::Metrics;
 use crate::runtime::request_id;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -125,12 +128,13 @@ impl Default for Limits {
 }
 
 /// What the stalled replies of one connection hold, counted when a reply
-/// stalls. The count lives as long as the connection: a call gets the
-/// handle in its extensions (as the connection's connect info), and passes
-/// it to its reply. When the count passes the limit, the connection's read
-/// side fails, so hyper closes the connection and frees what every stalled
-/// stream of it holds — even though the client sends nothing, because the
-/// count wakes the stored read waker.
+/// stalls, and given back when the reply's stream ends, so a connection
+/// whose stalled replies are all served again counts nothing ([`Stall`]).
+/// A call gets the handle in its extensions (as the connection's connect
+/// info), and passes it to its reply. When the count passes the limit, the
+/// connection's read side fails, so hyper closes the connection and frees
+/// what every stalled stream of it holds — even though the client sends
+/// nothing, because the count wakes the stored read waker.
 #[derive(Clone)]
 pub struct Stalled(Arc<Counted>);
 
@@ -139,6 +143,9 @@ struct Counted {
     limit: u64,
     /// Bytes that stalled replies are estimated to hold now.
     bytes: AtomicU64,
+    /// The process's registry, whose `scion_stalled_reply_bytes` gauge
+    /// sums what the stalled replies of every live connection hold.
+    metrics: Arc<Metrics>,
     /// The waker of the connection's last read poll, woken once the count
     /// passes the limit, so the close is seen without a frame from the
     /// client.
@@ -148,10 +155,11 @@ struct Counted {
 }
 
 impl Stalled {
-    fn new(limit: u64) -> Self {
+    pub(crate) fn new(limit: u64, metrics: Arc<Metrics>) -> Self {
         Self(Arc::new(Counted {
             limit,
             bytes: AtomicU64::new(0),
+            metrics,
             waker: Mutex::new(None),
             logged: AtomicBool::new(false),
         }))
@@ -164,14 +172,18 @@ impl Stalled {
         request.extensions().get::<Self>().cloned()
     }
 
-    /// `bytes` more that stalled replies leave in HTTP/2. Past the limit,
-    /// logs once, and wakes the read side, which then fails the connection.
+    /// Counts `bytes` more that stalled replies leave in HTTP/2, onto the
+    /// connection and onto the process's `scion_stalled_reply_bytes`
+    /// gauge, and hands the count back as a [`Stall`]: the reply gives it
+    /// up when its body drops. Past the limit, logs once, and wakes the
+    /// read side, which then fails the connection.
     ///
     /// # Panics
     ///
     /// Only if a lock is poisoned, which cannot happen: no holder panics.
-    pub fn add(&self, bytes: u64) {
+    pub fn hold(&self, bytes: u64) -> Stall {
         let held = self.0.bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        self.0.metrics.stalled_reply_held(bytes);
         if held >= self.0.limit && !self.0.logged.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 held,
@@ -187,6 +199,10 @@ impl Stalled {
             {
                 waker.wake();
             }
+        }
+        Stall {
+            counted: Arc::clone(&self.0),
+            bytes,
         }
     }
 
@@ -211,6 +227,24 @@ impl Stalled {
                 self.0.limit
             ),
         )
+    }
+}
+
+/// The count of one stalled reply: the estimate of what its parts hold in
+/// HTTP/2. Dropping it gives the bytes back to the connection's count and
+/// to the process's gauge, which is when the reply's body drops: its
+/// stream ended — it finished, its client reset it, or the connection
+/// closed.
+#[must_use = "the bytes stay counted until the Stall drops"]
+pub struct Stall {
+    counted: Arc<Counted>,
+    bytes: u64,
+}
+
+impl Drop for Stall {
+    fn drop(&mut self) {
+        self.counted.bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.counted.metrics.stalled_reply_freed(self.bytes);
     }
 }
 
@@ -266,7 +300,8 @@ impl Limits {
     /// Serves the services that `router` adds to a server, on `incoming`
     /// connections, within these limits and with the timers above, until
     /// `shutdown` resolves. A connection that waits for its place logs a
-    /// warning.
+    /// warning. The stalled replies of its connections count in `metrics`,
+    /// on the `scion_stalled_reply_bytes` gauge.
     ///
     /// # Errors
     ///
@@ -277,12 +312,13 @@ impl Limits {
         incoming: I,
         tls: Option<Arc<ServerConfig>>,
         shutdown: impl Future<Output = ()>,
+        metrics: Arc<Metrics>,
     ) -> Result<(), tonic::transport::Error>
     where
         I: Stream<Item = io::Result<IO>> + Send + 'static,
         IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
     {
-        self.serve_with(&TIMERS, router, incoming, tls, shutdown)
+        self.serve_with(&TIMERS, router, incoming, tls, shutdown, metrics)
             .await
     }
 
@@ -293,6 +329,7 @@ impl Limits {
         incoming: I,
         tls: Option<Arc<ServerConfig>>,
         shutdown: impl Future<Output = ()>,
+        metrics: Arc<Metrics>,
     ) -> Result<(), tonic::transport::Error>
     where
         I: Stream<Item = io::Result<IO>> + Send + 'static,
@@ -341,6 +378,7 @@ impl Limits {
                 timers.handshake,
                 self.stalled_bytes,
                 config,
+                Arc::clone(&metrics),
             );
             return router(server)
                 .serve_with_incoming_shutdown(incoming, shutdown)
@@ -351,6 +389,7 @@ impl Limits {
             self.connections,
             timers.handshake,
             self.stalled_bytes,
+            metrics,
         );
         router(server)
             .serve_with_incoming_shutdown(incoming, shutdown)
@@ -385,6 +424,7 @@ fn accept_tls<I, IO>(
     handshake: Duration,
     stalled_bytes: NonZeroU64,
     config: Arc<ServerConfig>,
+    metrics: Arc<Metrics>,
 ) -> ReceiverStream<io::Result<Connection<TlsStream<IO>>>>
 where
     I: Stream<Item = io::Result<IO>> + Send + 'static,
@@ -430,6 +470,8 @@ where
                 Box::pin(tokio::time::sleep_until(deadline)) as Pin<Box<Sleep>>,
             ));
             let sender = done.clone();
+            let stalled_bytes = stalled_bytes.get();
+            let metrics = Arc::clone(&metrics);
             tokio::spawn(async move {
                 match wait.await {
                     Ok(Ok(stream)) => {
@@ -440,7 +482,7 @@ where
                                 io: stream,
                                 _place: place,
                                 preface,
-                                stalled: Stalled::new(stalled_bytes.get()),
+                                stalled: Stalled::new(stalled_bytes, metrics),
                             }))
                             .await;
                     }
@@ -468,6 +510,7 @@ fn accept<I, IO, E>(
     max: NonZeroUsize,
     handshake: Duration,
     stalled_bytes: NonZeroU64,
+    metrics: Arc<Metrics>,
 ) -> impl Stream<Item = Result<Connection<IO>, E>>
 where
     I: Stream<Item = Result<IO, E>>,
@@ -477,6 +520,7 @@ where
     let places = Arc::new(Semaphore::new(max));
     incoming.then(move |accepted| {
         let places = Arc::clone(&places);
+        let metrics = Arc::clone(&metrics);
         async move {
             let io = accepted?;
             let place = if let Ok(place) = Arc::clone(&places).try_acquire_owned() {
@@ -492,7 +536,7 @@ where
                 io,
                 _place: place,
                 preface: Some((PREFACE_BYTES, Box::pin(tokio::time::sleep(handshake)))),
-                stalled: Stalled::new(stalled_bytes),
+                stalled: Stalled::new(stalled_bytes, metrics),
             })
         }
     })
@@ -688,7 +732,7 @@ mod tests {
             // holds.
             let budget = Arc::new(Semaphore::new(IN_FLIGHT_BYTES));
             let permit = reply::try_take(&budget, 1).unwrap();
-            let (tx, stream) = reply::channel();
+            let (tx, stream, slot) = reply::channel();
             // The stall is short, so the test does not wait for the real
             // one; the counting is what the test watches.
             let stall = Duration::from_millis(100);
@@ -698,6 +742,7 @@ mod tests {
                 tx,
                 stall,
                 Stalled::of(&request),
+                slot,
                 |()| async { None },
             ));
             Ok(Response::new(stream))
@@ -860,34 +905,50 @@ mod tests {
         timers: Timers,
         server_tls: &ServerTls,
         tls_timeout: Duration,
-    ) -> SocketAddr {
+    ) -> (SocketAddr, Arc<Metrics>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let config = server_tls.config();
-        tokio::spawn(async move {
-            let router = |mut server: Server| server.add_service(ObjectsServer::new(Stalls));
-            let pending = std::future::pending();
-            let timers = Timers {
-                handshake: tls_timeout,
-                ..timers
-            };
-            Box::pin(limits.serve_with(&timers, router, tcp(listener), Some(config), pending)).await
+        let metrics = Arc::new(Metrics::default());
+        tokio::spawn({
+            let metrics = Arc::clone(&metrics);
+            async move {
+                let router = |mut server: Server| server.add_service(ObjectsServer::new(Stalls));
+                let pending = std::future::pending();
+                let timers = Timers {
+                    handshake: tls_timeout,
+                    ..timers
+                };
+                Box::pin(limits.serve_with(
+                    &timers,
+                    router,
+                    tcp(listener),
+                    Some(config),
+                    pending,
+                    metrics,
+                ))
+                .await
+            }
         });
-        addr
+        (addr, metrics)
     }
 
     /// The stub, served within `limits` with `timers`, and its address.
-    async fn serve(limits: Limits, timers: Timers) -> SocketAddr {
+    async fn serve(limits: Limits, timers: Timers) -> (SocketAddr, Arc<Metrics>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let router = |mut server: Server| server.add_service(ObjectsServer::new(Stalls));
-            let pending = std::future::pending();
-            limits
-                .serve_with(&timers, router, tcp(listener), None, pending)
-                .await
+        let metrics = Arc::new(Metrics::default());
+        tokio::spawn({
+            let metrics = Arc::clone(&metrics);
+            async move {
+                let router = |mut server: Server| server.add_service(ObjectsServer::new(Stalls));
+                let pending = std::future::pending();
+                limits
+                    .serve_with(&timers, router, tcp(listener), None, pending, metrics)
+                    .await
+            }
         });
-        addr
+        (addr, metrics)
     }
 
     fn endpoint(addr: SocketAddr) -> Endpoint {
@@ -936,7 +997,7 @@ mod tests {
             streams: NonZeroU32::new(streams).unwrap(),
             ..Limits::default()
         };
-        let addr = serve(limits, TIMERS).await;
+        let (addr, _) = serve(limits, TIMERS).await;
         // The smallest windows, so no reply ends while it is unread.
         let channel = endpoint(addr)
             .initial_stream_window_size(65_535)
@@ -972,7 +1033,8 @@ mod tests {
             connections: NonZeroUsize::new(connections).unwrap(),
             ..Limits::default()
         };
-        let endpoint = endpoint(serve(limits, TIMERS).await);
+        let (addr, _) = serve(limits, TIMERS).await;
+        let endpoint = endpoint(addr);
         let mut open = Vec::new();
         for _ in 0..connections {
             let mut client = ObjectsClient::new(endpoint.connect().await.unwrap());
@@ -1003,7 +1065,8 @@ mod tests {
             connections: NonZeroUsize::MIN,
             ..Limits::default()
         };
-        let endpoint = endpoint(serve(limits, timers("keepalive")).await);
+        let (addr, _) = serve(limits, timers("keepalive")).await;
+        let endpoint = endpoint(addr);
         let mut old = ObjectsClient::new(endpoint.connect().await.unwrap());
         assert_eq!(quick(&mut old).await, Code::NotFound);
 
@@ -1019,7 +1082,7 @@ mod tests {
     /// for life, though keepalive never starts without the preface.
     #[tokio::test]
     async fn a_peer_without_the_preface_is_closed() {
-        let addr = serve(Limits::default(), timers("age")).await;
+        let (addr, _) = serve(Limits::default(), timers("age")).await;
         assert!(closes_a_peer_that_sends(addr, b"").await);
     }
 
@@ -1028,7 +1091,7 @@ mod tests {
     /// replies hold, forever.
     #[tokio::test]
     async fn keepalive_closes_a_silent_peer() {
-        let addr = serve(Limits::default(), timers("age")).await;
+        let (addr, _) = serve(Limits::default(), timers("age")).await;
         // The client preface, then an empty SETTINGS frame. No frame of the
         // server is ever answered, so its ping is not either.
         let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0";
@@ -1056,7 +1119,7 @@ mod tests {
             age: long,
             grace: long,
         };
-        let addr = serve(limits, timers).await;
+        let (addr, _) = serve(limits, timers).await;
         let mut stalling = ObjectsClient::new(
             endpoint(addr)
                 .initial_stream_window_size(65_535)
@@ -1081,6 +1144,107 @@ mod tests {
         assert!(matches!(stalled_stream.message().await, Err(_) | Ok(None)));
     }
 
+    /// What the process's gauge says the stalled replies hold, from a
+    /// scrape: this is the series an operator reads.
+    fn stalled_gauge(metrics: &Metrics) -> u64 {
+        for line in metrics.render().lines() {
+            if let Some(value) = line.strip_prefix("scion_stalled_reply_bytes ") {
+                return value.parse().unwrap();
+            }
+        }
+        0
+    }
+
+    /// Waits until `done` holds, at most 10 s.
+    async fn until(done: impl Fn() -> bool) {
+        let started = tokio::time::Instant::now();
+        while !done() {
+            assert!(started.elapsed() < Duration::from_secs(10), "timed out");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// A client with the smallest windows, so a reply it does not read
+    /// stalls.
+    async fn a_stalling_client(addr: SocketAddr) -> ObjectsClient<Channel> {
+        ObjectsClient::new(
+            endpoint(addr)
+                .initial_stream_window_size(65_535)
+                .initial_connection_window_size(65_535)
+                .connect()
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// Limits under which one stalled reply is served, and two together
+    /// would close the connection.
+    fn stall_limits() -> Limits {
+        Limits {
+            stalled_bytes: NonZeroU64::new(2 * reply::STALLED_REPLY_BYTES).unwrap(),
+            ..Limits::default()
+        }
+    }
+
+    /// A stalled reply counts its estimate on the process's gauge while its
+    /// client does not read, and gives it back when the client resets the
+    /// stream, which frees the parts: the connection goes on holding
+    /// nothing for the stalls it served.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stalled_reply_gives_its_count_back_when_its_stream_is_reset() {
+        let (addr, metrics) = serve(stall_limits(), TIMERS).await;
+        let mut client = a_stalling_client(addr).await;
+        let stalled_stream = stall(&mut client).await;
+        until(|| stalled_gauge(&metrics) >= reply::STALLED_REPLY_BYTES).await;
+
+        // The reset frees the parts, and with them the count.
+        drop(stalled_stream);
+        until(|| stalled_gauge(&metrics) == 0).await;
+        assert_eq!(
+            quick(&mut client).await,
+            Code::NotFound,
+            "the connection served no call after the reset"
+        );
+    }
+
+    /// A client that closes its connection while a reply of it is stalled
+    /// gives the estimate back: the connection's teardown drops the reply's
+    /// body, and with it the parked count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_that_closes_with_a_stalled_reply_gives_the_count_back() {
+        let (addr, metrics) = serve(stall_limits(), TIMERS).await;
+        let mut client = a_stalling_client(addr).await;
+        let stalled_stream = stall(&mut client).await;
+        until(|| stalled_gauge(&metrics) >= reply::STALLED_REPLY_BYTES).await;
+
+        // The close of the connection frees every stalled stream of it.
+        drop(stalled_stream);
+        drop(client);
+        until(|| stalled_gauge(&metrics) == 0).await;
+    }
+
+    /// Stall-and-reset cycles on one connection do not ratchet its count:
+    /// every reply gives its estimate back when its stream is reset, so the
+    /// connection stays under the close limit however many stalls it
+    /// served. (Before the give-back, each reply held its estimate for
+    /// life, and the second cycle already crossed this limit.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stall_and_reset_cycles_stay_under_the_close_limit() {
+        let (addr, metrics) = serve(stall_limits(), TIMERS).await;
+        let mut client = a_stalling_client(addr).await;
+        for _ in 0..5 {
+            let stalled_stream = stall(&mut client).await;
+            until(|| stalled_gauge(&metrics) >= reply::STALLED_REPLY_BYTES).await;
+            drop(stalled_stream);
+            until(|| stalled_gauge(&metrics) == 0).await;
+        }
+        assert_eq!(
+            quick(&mut client).await,
+            Code::NotFound,
+            "the connection was closed under the stall cycles"
+        );
+    }
+
     /// TCP connections have Nagle's algorithm off, so a small reply does not
     /// wait for the client's ACK.
     #[tokio::test]
@@ -1098,7 +1262,7 @@ mod tests {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, None);
-        let addr = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
+        let (addr, _) = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
         let mut client = client(addr, &certs.authority.cert(), None).await.unwrap();
         assert_eq!(quick(&mut client).await, Code::NotFound);
     }
@@ -1109,7 +1273,7 @@ mod tests {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, Some(&certs.authority.cert()));
-        let addr = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
+        let (addr, _) = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
         // The connect of a client can end before the server has checked its
         // certificate, so the refusal may show in the connect or in the
         // call. A served client gets the stub's `NotFound`; anything else is
@@ -1133,7 +1297,7 @@ mod tests {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, Some(&certs.authority.cert()));
-        let addr = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
+        let (addr, _) = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
         let mut client = client(addr, &certs.authority.cert(), Some(&certs.client))
             .await
             .unwrap();
@@ -1147,7 +1311,7 @@ mod tests {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, None);
-        let addr = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
+        let (addr, _) = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
         assert!(client(addr, &certs.stranger.cert(), None).await.is_err());
     }
 
@@ -1157,7 +1321,7 @@ mod tests {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, Some(&certs.authority.cert()));
-        let addr = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
+        let (addr, _) = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
         // As above: the refusal may show in the connect or in the call.
         match client(addr, &certs.authority.cert(), Some(&certs.stranger_client)).await {
             Err(_) => {}
@@ -1179,7 +1343,7 @@ mod tests {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, None);
-        let addr = serve_tls(
+        let (addr, _) = serve_tls(
             Limits::default(),
             TIMERS,
             &server_tls,
@@ -1199,7 +1363,7 @@ mod tests {
         // All timers are short (timers("age")), so the peer is closed soon
         // after it goes silent: the TLS handshake timeout can no longer
         // reach it once the handshake ended, so only the preface timer can.
-        let addr = serve_tls(
+        let (addr, _) = serve_tls(
             Limits::default(),
             timers("age"),
             &server_tls,
@@ -1225,7 +1389,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, None);
         let deadline = Duration::from_secs(1);
-        let addr = serve_tls(Limits::default(), TIMERS, &server_tls, deadline).await;
+        let (addr, _) = serve_tls(Limits::default(), TIMERS, &server_tls, deadline).await;
         // The peer connects at once, waits out most of the deadline, then
         // ends its handshake and sends nothing more. The clock runs from the
         // connect, which is the server's accept to within a millisecond.
@@ -1273,7 +1437,7 @@ mod tests {
         let server_tls = server_tls(dir.path(), &certs.server, None);
         // The silent peer's handshake timeout: far beyond the next test
         // step, so only the blocking of a sequential handshake can end it.
-        let addr = serve_tls(
+        let (addr, _) = serve_tls(
             Limits::default(),
             TIMERS,
             &server_tls,
