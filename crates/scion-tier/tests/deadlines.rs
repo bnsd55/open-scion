@@ -267,7 +267,7 @@ impl Gone {
             )),
         ))
         .collect();
-        let (_tree_bytes, root) = scion_core::Tree { entries }.encode_with_id();
+        let (_tree_bytes, root) = scion_core::Tree::new(entries).unwrap().encode_with_id();
         Self {
             key: ed25519_dalek::SigningKey::from_bytes(&[4; 32]),
             root,
