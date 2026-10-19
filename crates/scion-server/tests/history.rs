@@ -171,18 +171,19 @@ fn path_log_follows_files_directories_deletes_and_first_parents() {
     // A limit stops the walk after the last entry it returns.
     let page = read::log_page(&store, REPO, tip, Some(&path("a.txt")), 2, &later()).unwrap();
     let delete = changeset_of(&store, &delete_a);
-    let parent = read::get_changeset(&store, REPO, delete).unwrap().parents[0];
+    let parent = read::get_changeset(&store, REPO, delete).unwrap().parents()[0];
     assert_eq!(page.entries.len(), 2);
     assert_eq!(page.next, Some(parent));
 }
 
 fn author() -> IdentityTime {
-    IdentityTime {
-        name: b"Ada".to_vec(),
-        email: b"ada@example.com".to_vec(),
-        unix_secs: 1_700_000_000,
-        tz_offset_minutes: 0,
-    }
+    IdentityTime::new(
+        b"Ada".to_vec(),
+        b"ada@example.com".to_vec(),
+        1_700_000_000,
+        0,
+    )
+    .expect("identity fits the format")
 }
 
 fn regular(content: BlobId) -> FileState {
@@ -204,13 +205,14 @@ fn chain<S: Into<Option<FileState>>>(
             let repo = c.create_repo(REPO)?;
             let mut ids: Vec<ChangesetId> = Vec::new();
             for puts in puts {
-                let cs = Changeset {
-                    parents: ids.last().copied().into_iter().collect(),
-                    author: author(),
-                    committer: None,
-                    message: format!("change {}", ids.len()).into_bytes(),
-                    changes: puts.into_iter().map(|(p, s)| (path(p), s.into())).collect(),
-                };
+                let cs = Changeset::new(
+                    ids.last().copied().into_iter().collect(),
+                    author(),
+                    None,
+                    format!("change {}", ids.len()).into_bytes(),
+                    puts.into_iter().map(|(p, s)| (path(p), s.into())).collect(),
+                )
+                .expect("changeset fits the format");
                 ids.push(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0);
             }
             Ok(ids)
@@ -540,8 +542,8 @@ fn scan_versions(store: &Backend, cs: ChangesetId, p: &str) -> Vec<ChangesetId> 
     let mut next = Some(cs);
     while let Some(id) = next {
         let cs = store.read(|c| c.get_changeset(repo, id)).unwrap();
-        next = cs.parents.first().copied();
-        if cs.changes.keys().any(|changed| {
+        next = cs.parents().first().copied();
+        if cs.changes().keys().any(|changed| {
             let (changed, p) = (changed.as_bytes(), p.as_bytes());
             changed.starts_with(p) && matches!(changed.get(p.len()), None | Some(b'/'))
         }) {
@@ -1510,13 +1512,14 @@ fn chain_in<S: Into<Option<FileState>>>(
             let repo = c.create_repo(name)?;
             let mut ids: Vec<ChangesetId> = Vec::new();
             for puts in puts {
-                let cs = Changeset {
-                    parents: ids.last().copied().into_iter().collect(),
-                    author: author(),
-                    committer: None,
-                    message: format!("{name} change {}", ids.len()).into_bytes(),
-                    changes: puts.into_iter().map(|(p, s)| (path(p), s.into())).collect(),
-                };
+                let cs = Changeset::new(
+                    ids.last().copied().into_iter().collect(),
+                    author(),
+                    None,
+                    format!("{name} change {}", ids.len()).into_bytes(),
+                    puts.into_iter().map(|(p, s)| (path(p), s.into())).collect(),
+                )
+                .expect("changeset fits the format");
                 ids.push(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0);
             }
             Ok(ids)

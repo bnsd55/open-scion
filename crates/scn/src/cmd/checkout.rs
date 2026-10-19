@@ -8,11 +8,6 @@
 //! into a temp directory that becomes the destination by renames (see
 //! [`crate::materialize`]).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{self, Write as _};
-use std::path::PathBuf;
-use std::task::Poll;
-
 use anyhow::{Context, Result, anyhow, bail};
 use hashlink::LinkedHashMap;
 use scion_core::{BlobId, Entry, FileEntry, FileState, PathElem, RepoPath, Tree, TreeId};
@@ -20,10 +15,15 @@ use scion_proto::MAX_OBJECT_REFS;
 use scion_proto::runtime::object::{self, Assembler, Header};
 use scion_proto::v1::{Encoding, GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
 use serde_json::json;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{self, Write as _};
+use std::path::PathBuf;
+use std::task::Poll;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use crate::client::{Ctx, Objects, id_from};
 use crate::materialize::{self, Checkout, check_dest, check_name, is_within};
+use crate::outln;
 
 /// Arguments of `scn checkout`.
 #[derive(clap::Args)]
@@ -169,9 +169,9 @@ async fn run(ctx: &mut Ctx, args: &CheckoutArgs) -> Result<()> {
     if ctx.json {
         let summary =
             json!({ "changeset": id.to_string(), "files": count, "into": into.to_string() });
-        println!("{summary}");
+        outln!("{summary}");
     } else {
-        println!("checked out {count} files from {id} into {into}");
+        outln!("checked out {count} files from {id} into {into}");
     }
     Ok(())
 }
@@ -219,7 +219,7 @@ async fn walk(
         let mut next = Vec::new();
         for (dir, id, tree_path) in level {
             let tree = trees.get(&id).context("server skipped a tree")?;
-            for (name, entry) in &tree.entries {
+            for (name, entry) in tree.entries() {
                 let path = join(dir.as_ref(), name)?;
                 let bytes = path.as_bytes();
                 let inside =
@@ -494,8 +494,8 @@ mod tests {
     #[test]
     fn objects_with_the_wrong_bytes_are_refused() {
         let blob = BlobId::of(b"hello\n");
-        let tree = Tree {
-            entries: [(
+        let tree = Tree::new(
+            [(
                 PathElem::new("hello.txt").unwrap(),
                 Entry::File(FileEntry::new(
                     FileState::Regular {
@@ -506,7 +506,8 @@ mod tests {
                 )),
             )]
             .into(),
-        };
+        )
+        .expect("tree fits the format");
         let (bytes, id) = tree.encode_with_id();
         assert_eq!(decode_tree(id, &bytes).unwrap(), tree);
         check_blob(blob, b"hello\n").unwrap();

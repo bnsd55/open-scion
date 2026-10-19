@@ -51,16 +51,18 @@ impl Deadline {
         self.at
     }
 
-    /// Fails with [`Error::DeadlineExceeded`] once the deadline has passed.
+    /// Fails with [`Error::Cancelled`] once the call has gone, or
+    /// [`Error::DeadlineExceeded`] once the deadline has passed.
     pub(crate) fn check(&self) -> Result<()> {
-        let why = if self.gone.load(Ordering::Relaxed) {
-            "its call has gone"
-        } else if Instant::now() >= self.at {
-            "the call ran past its deadline"
-        } else {
-            return Ok(());
-        };
-        Err(Error::DeadlineExceeded(why.to_owned()))
+        if self.gone.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled("its call has gone".to_owned()));
+        }
+        if Instant::now() >= self.at {
+            return Err(Error::DeadlineExceeded(
+                "the call ran past its deadline".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -72,5 +74,37 @@ pub struct CallGuard(Arc<AtomicBool>);
 impl Drop for CallGuard {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tonic::{Code, Status};
+
+    use super::*;
+
+    #[test]
+    fn a_check_after_its_call_went_answers_cancelled() {
+        let deadline = Deadline::new(Instant::now() + Duration::from_secs(600));
+        let guard = deadline.guard();
+        drop(guard);
+        let err = deadline.check().expect_err("the call has gone");
+        assert!(
+            matches!(&err, Error::Cancelled(why) if why == "its call has gone"),
+            "{err:?}"
+        );
+        assert_eq!(Status::from(err).code(), Code::Cancelled);
+    }
+
+    #[test]
+    fn a_check_past_the_deadline_with_its_call_alive_answers_deadline_exceeded() {
+        let deadline = Deadline::new(Instant::now());
+        let _guard = deadline.guard();
+        let err = deadline.check().expect_err("the deadline has passed");
+        assert!(
+            matches!(&err, Error::DeadlineExceeded(why) if why == "the call ran past its deadline"),
+            "{err:?}"
+        );
+        assert_eq!(Status::from(err).code(), Code::DeadlineExceeded);
     }
 }

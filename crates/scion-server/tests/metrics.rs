@@ -50,24 +50,26 @@ async fn eventually(metrics: &Metrics, want: &str) {
 }
 
 fn author(secs: u64) -> IdentityTime {
-    IdentityTime {
-        name: b"Ada".to_vec(),
-        email: b"ada@example.com".to_vec(),
-        unix_secs: i64::try_from(secs).unwrap_or(i64::MAX),
-        tz_offset_minutes: 0,
-    }
+    IdentityTime::new(
+        b"Ada".to_vec(),
+        b"ada@example.com".to_vec(),
+        i64::try_from(secs).unwrap_or(i64::MAX),
+        0,
+    )
+    .expect("identity fits the format")
 }
 
 fn changeset(parents: Vec<ChangesetId>, path: &str, state: Option<FileState>) -> Changeset {
-    Changeset {
+    Changeset::new(
         parents,
-        author: author(1_700_000_000),
-        committer: None,
-        message: path.as_bytes().to_vec(),
-        changes: [(RepoPath::new(path).unwrap(), state)]
+        author(1_700_000_000),
+        None,
+        path.as_bytes().to_vec(),
+        [(RepoPath::new(path).unwrap(), state)]
             .into_iter()
             .collect(),
-    }
+    )
+    .expect("changeset fits the format")
 }
 
 /// A store with one repo, one root changeset that writes a file, and a
@@ -142,12 +144,12 @@ fn on_top(store: &Store, parent: ChangesetId, path: &str, content: &[u8]) -> Cha
     store
         .write(|c| {
             let repo = c.repo_id(REPO)?;
-            let cs = Changeset {
-                parents: vec![parent],
-                author: author(1_700_000_001),
-                committer: None,
-                message: path.as_bytes().to_vec(),
-                changes: [(
+            let cs = Changeset::new(
+                vec![parent],
+                author(1_700_000_001),
+                None,
+                path.as_bytes().to_vec(),
+                [(
                     RepoPath::new(path).unwrap(),
                     Some(FileState::Regular {
                         content: BlobId::of(content),
@@ -156,7 +158,8 @@ fn on_top(store: &Store, parent: ChangesetId, path: &str, content: &[u8]) -> Cha
                 )]
                 .into_iter()
                 .collect(),
-            };
+            )
+            .expect("changeset fits the format");
             c.insert_changeset(repo, &cs)
         })
         .unwrap()
@@ -339,3 +342,9 @@ async fn a_read_file_counts_its_bytes_and_a_stopped_call_counts_as_cancelled() {
     )
     .await;
 }
+// A streamed `Log` the client stops has no test here: the transport counts
+// a dropped reply as cancelled before any answer of the server's own is
+// read, so the count is the same whatever `check()` answers, and no test
+// of it can fail for a real reason (mutation-checked). The locks for a
+// cancelled call are the unit tests of `deadline::check` and the graph
+// walks, and the land tests that read a pending row and its retry.

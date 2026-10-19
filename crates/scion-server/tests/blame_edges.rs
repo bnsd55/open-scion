@@ -62,18 +62,20 @@ fn commit(
     state: Option<FileState>,
     name_len: usize,
 ) -> Changeset {
-    Changeset {
+    Changeset::new(
         parents,
-        author: IdentityTime {
-            name: vec![b'a'; name_len],
-            email: b"a@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"change\n".to_vec(),
-        changes: [(RepoPath::new(path).unwrap(), state)].into(),
-    }
+        IdentityTime::new(
+            vec![b'a'; name_len],
+            b"a@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"change\n".to_vec(),
+        [(RepoPath::new(path).unwrap(), state)].into(),
+    )
+    .expect("changeset fits the format")
 }
 
 /// A store whose repo has one root changeset that puts `file.txt` with
@@ -473,11 +475,20 @@ async fn a_partial_reader_gets_one_answer_for_any_path() {
     let tip = store
         .write(|c| {
             let repo = c.repo_id(REPO)?;
-            let mut cs = commit(vec![root], "docs/a", Some(regular(docs_blob)), 4);
-            cs.changes.insert(
+            let cs = commit(vec![root], "docs/a", Some(regular(docs_blob)), 4);
+            let mut changes = cs.changes().clone();
+            changes.insert(
                 RepoPath::new("secret/b").unwrap(),
                 Some(regular(secret_blob)),
             );
+            let cs = Changeset::new(
+                cs.parents().to_vec(),
+                cs.author().clone(),
+                cs.committer().cloned(),
+                cs.message().to_vec(),
+                changes,
+            )
+            .expect("changeset fits the format");
             c.insert_changeset(repo, &cs)
         })
         .unwrap();

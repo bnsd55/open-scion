@@ -43,17 +43,18 @@ async fn server() -> (
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     let readme = store.blobs().put(CONTENT).unwrap();
-    let changeset = Changeset {
-        parents: Vec::new(),
-        author: IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"add\n".to_vec(),
-        changes: [(
+    let changeset = Changeset::new(
+        Vec::new(),
+        IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"add\n".to_vec(),
+        [(
             RepoPath::new("README").unwrap(),
             Some(FileState::Regular {
                 content: readme,
@@ -62,7 +63,8 @@ async fn server() -> (
         )]
         .into_iter()
         .collect(),
-    };
+    )
+    .expect("changeset fits the format");
     let (_bytes, id) = changeset.encode_with_id();
     store
         .write(|c| {
@@ -280,17 +282,18 @@ async fn server_of_readme() -> (
     let dir = tempfile::tempdir().unwrap();
     let server_store = Store::open(dir.path()).unwrap();
     let readme = server_store.blobs().put(CONTENT).unwrap();
-    let changeset = Changeset {
-        parents: Vec::new(),
-        author: IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"add\n".to_vec(),
-        changes: [(
+    let changeset = Changeset::new(
+        Vec::new(),
+        IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"add\n".to_vec(),
+        [(
             RepoPath::new("README").unwrap(),
             Some(FileState::Regular {
                 content: readme,
@@ -299,7 +302,8 @@ async fn server_of_readme() -> (
         )]
         .into_iter()
         .collect(),
-    };
+    )
+    .expect("changeset fits the format");
     let (_bytes, cs) = changeset.encode_with_id();
     server_store
         .write(|c| {
@@ -474,17 +478,18 @@ fn changesets(
             executable: false,
         })
     };
-    let main = Changeset {
-        parents: Vec::new(),
-        author: IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"main\n".to_vec(),
-        changes: [
+    let main = Changeset::new(
+        Vec::new(),
+        IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"main\n".to_vec(),
+        [
             (RepoPath::new("README").unwrap(), file(readme)),
             (RepoPath::new("src/lib.rs").unwrap(), file(lib)),
             (RepoPath::new("docs/a.md").unwrap(), file(readme)),
@@ -499,24 +504,27 @@ fn changesets(
         ]
         .into_iter()
         .collect(),
-    };
-    let side = Changeset {
-        parents: Vec::new(),
-        author: IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_001,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"side\n".to_vec(),
-        changes: [
+    )
+    .expect("changeset fits the format");
+    let side = Changeset::new(
+        Vec::new(),
+        IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_001,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"side\n".to_vec(),
+        [
             (RepoPath::new("other.txt").unwrap(), file(other)),
             (RepoPath::new("shared.txt").unwrap(), file(shared)),
         ]
         .into_iter()
         .collect(),
-    };
+    )
+    .expect("changeset fits the format");
     (main, side)
 }
 
@@ -765,14 +773,14 @@ async fn reachable(objects: &mut Objects, ticket: &[u8], root: &[u8]) -> Vec<Obj
             path: path.clone(),
         });
         let tree = Tree::decode(&got[0].1).unwrap();
-        for (name, entry) in tree.entries {
+        for (name, entry) in tree.entries() {
             let mut below = path.clone();
             if !below.is_empty() {
                 below.push(b'/');
             }
             below.extend_from_slice(name.as_bytes());
             match entry {
-                Entry::Dir(id) => level.push((below, id)),
+                Entry::Dir(id) => level.push((below, *id)),
                 Entry::File(file) => {
                     if let Some(blob) = file.state().blob() {
                         found.push(ObjectRef {

@@ -46,18 +46,15 @@ fn chain(count: usize) -> (tempfile::TempDir, Backend, Vec<scion_core::Changeset
                     executable: false,
                 };
                 let path: &[u8] = if i % 2 == 0 { b"d/f.txt" } else { b"other.txt" };
-                let cs = Changeset {
-                    parents: ids.last().copied().into_iter().collect(),
-                    author: scion_core::IdentityTime {
-                        name: b"a".to_vec(),
-                        email: b"t@x".to_vec(),
-                        unix_secs: 1_700_000_000,
-                        tz_offset_minutes: 0,
-                    },
-                    committer: None,
-                    message: format!("change {i}\n").into_bytes(),
-                    changes: [(RepoPath::new(path).unwrap(), Some(regular))].into(),
-                };
+                let cs = Changeset::new(
+                    ids.last().copied().into_iter().collect(),
+                    scion_core::IdentityTime::new(b"a".to_vec(), b"t@x".to_vec(), 1_700_000_000, 0)
+                        .expect("identity fits the format"),
+                    None,
+                    format!("change {i}\n").into_bytes(),
+                    [(RepoPath::new(path).unwrap(), Some(regular))].into(),
+                )
+                .expect("changeset fits the format");
                 ids.push(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0);
             }
             Ok(ids)
@@ -126,7 +123,7 @@ async fn call(
             // The reply streams newest first; a repeated ID inside one
             // reply is a repeat.
             assert_ne!(got.last().map(|(_, id)| id), Some(&id), "a repeat");
-            let message = String::from_utf8(cs.message).unwrap();
+            let message = String::from_utf8(cs.message().to_vec()).unwrap();
             let i: usize = message
                 .trim()
                 .strip_prefix("change ")

@@ -4,16 +4,16 @@
 //! then walks `main` back to where it started and checks that every landed
 //! change is there exactly once.
 
-use std::collections::{BTreeMap, HashSet};
-use std::time::{Duration, Instant};
-
 use anyhow::{Context, Result, ensure};
 use scion_core::{Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_proto::v1::{LandRequest, LandState, LogRequest};
 use serde_json::json;
+use std::collections::{BTreeMap, HashSet};
+use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 
 use crate::client::{Ctx, id_from, now_unix_secs};
+use crate::outln;
 
 /// Arguments of `scn bench`.
 #[derive(clap::Args)]
@@ -80,7 +80,7 @@ pub async fn bench(ctx: &Ctx, args: BenchArgs) -> Result<()> {
     }
     let elapsed = started.elapsed();
     verify(ctx.clone(), start, &stats.landed).await?;
-    report(ctx.json, agents, &mut stats, elapsed);
+    report(ctx.json, agents, &mut stats, elapsed)?;
     Ok(())
 }
 
@@ -103,24 +103,26 @@ async fn run_agent(
             .put_blob(format!("run {start} agent {agent} change {i}\n").into_bytes())
             .await?;
         let path = RepoPath::new(format!("bench/agent-{agent:04}/{i:06}.txt"))?;
-        let changeset = Changeset {
-            parents: vec![parent],
-            author: IdentityTime {
-                name: b"scn bench".to_vec(),
-                email: b"bench@localhost".to_vec(),
-                unix_secs: now_unix_secs()?,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: format!("bench: agent {agent} change {i}\n").into_bytes(),
-            changes: BTreeMap::from([(
+        let changeset = Changeset::new(
+            vec![parent],
+            IdentityTime::new(
+                b"scn bench".to_vec(),
+                b"bench@localhost".to_vec(),
+                now_unix_secs()?,
+                0,
+            )
+            .expect("identity fits the format"),
+            None,
+            format!("bench: agent {agent} change {i}\n").into_bytes(),
+            BTreeMap::from([(
                 path,
                 Some(FileState::Regular {
                     content: blob,
                     executable: false,
                 }),
             )]),
-        };
+        )
+        .expect("changeset fits the format");
         let id = ctx.create_changeset(&changeset).await?;
         let landing = Instant::now();
         let reply = ctx
@@ -169,7 +171,7 @@ async fn verify(mut ctx: Ctx, start: ChangesetId, landed: &[ChangesetId]) -> Res
                 }
                 ensure!(history.insert(id), "changeset {id} appears twice on main");
                 cur = Changeset::decode(&entry.changeset)?
-                    .parents
+                    .parents()
                     .first()
                     .copied();
             }
@@ -211,7 +213,7 @@ fn percentiles_ms(sorted: &[Duration]) -> [f64; 3] {
     [at(0.50), at(0.99), at(1.0)]
 }
 
-fn report(json: bool, agents: usize, stats: &mut Stats, elapsed: Duration) {
+fn report(json: bool, agents: usize, stats: &mut Stats, elapsed: Duration) -> Result<()> {
     stats.land.sort();
     stats.total.sort();
     let [land_p50, land_p99, land_max] = percentiles_ms(&stats.land);
@@ -231,17 +233,18 @@ fn report(json: bool, agents: usize, stats: &mut Stats, elapsed: Duration) {
             "end_to_end_ms": { "p50": total_p50, "p99": total_p99 },
             "verified_on_main": true,
         });
-        println!("{out}");
-        return;
+        outln!("{out}");
+        return Ok(());
     }
-    println!(
+    outln!(
         "{landed} lands by {agents} agents in {:.1} s: {rate:.0} lands/s",
         elapsed.as_secs_f64()
     );
-    println!("conflicts {}, rejected {}", stats.conflicts, stats.rejected);
-    println!("land RPC     p50 {land_p50:.1} ms  p99 {land_p99:.1} ms  max {land_max:.1} ms");
-    println!("end to end   p50 {total_p50:.1} ms  p99 {total_p99:.1} ms  (upload + create + land)");
-    println!("verified: main gained exactly the {landed} landed changesets");
+    outln!("conflicts {}, rejected {}", stats.conflicts, stats.rejected);
+    outln!("land RPC     p50 {land_p50:.1} ms  p99 {land_p99:.1} ms  max {land_max:.1} ms");
+    outln!("end to end   p50 {total_p50:.1} ms  p99 {total_p99:.1} ms  (upload + create + land)");
+    outln!("verified: main gained exactly the {landed} landed changesets");
+    Ok(())
 }
 
 #[cfg(test)]

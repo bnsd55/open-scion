@@ -1,14 +1,14 @@
 //! `commit`.
 
+use anyhow::{Context, Result, bail, ensure};
+use scion_core::{Changeset, FileState, IdentityTime, RepoPath};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
-use scion_core::{Changeset, FileState, IdentityTime, RepoPath};
-
 use crate::client::{Ctx, now_unix_secs};
+use crate::outln;
 
 /// Arguments of `scn commit`.
 #[derive(clap::Args)]
@@ -124,25 +124,23 @@ pub async fn commit(ctx: &mut Ctx, args: CommitArgs) -> Result<()> {
         };
         changes.insert(path, state);
     }
-    let changeset = Changeset {
-        parents: vec![parent],
-        author: IdentityTime {
-            name,
-            email,
-            unix_secs: now_unix_secs()?,
-            // SHORTCUT: always UTC, since std cannot read the local time zone.
-            // Upgrade: a time zone crate.
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: args.message.into_bytes(),
+    // SHORTCUT: always UTC, since std cannot read the local time zone.
+    // Upgrade: a time zone crate.
+    let author =
+        IdentityTime::new(name, email, now_unix_secs()?, 0).expect("identity fits the format");
+    let changeset = Changeset::new(
+        vec![parent],
+        author,
+        None,
+        args.message.into_bytes(),
         changes,
-    };
+    )
+    .expect("changeset fields fit the format");
     let id = ctx.create_changeset(&changeset).await?;
     if ctx.json {
-        println!("{}", serde_json::json!({ "changeset": id.to_string() }));
+        outln!("{}", serde_json::json!({ "changeset": id.to_string() }));
     } else {
-        println!("{id}");
+        outln!("{id}");
     }
     Ok(())
 }

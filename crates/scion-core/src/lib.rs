@@ -26,21 +26,19 @@
 //! use std::collections::BTreeMap;
 //! use scion_core::{BlobId, Entry, FileEntry, FileState, PathElem, Tree, TreeId};
 //!
-//! let tree = Tree {
-//!     entries: BTreeMap::from([
-//!         (
-//!             PathElem::new("README.md")?,
-//!             Entry::File(FileEntry::new(
-//!                 FileState::Regular {
-//!                     content: BlobId::of(b"# hello\n"),
-//!                     executable: false,
-//!                 },
-//!                 b"# hello\n".len() as u64,
-//!             )),
-//!         ),
-//!         (PathElem::new("src")?, Entry::Dir(TreeId::from_bytes([7; 32]))),
-//!     ]),
-//! };
+//! let tree = Tree::new(BTreeMap::from([
+//!     (
+//!         PathElem::new("README.md")?,
+//!         Entry::File(FileEntry::new(
+//!             FileState::Regular {
+//!                 content: BlobId::of(b"# hello\n"),
+//!                 executable: false,
+//!             },
+//!             b"# hello\n".len() as u64,
+//!         )),
+//!     ),
+//!     (PathElem::new("src")?, Entry::Dir(TreeId::from_bytes([7; 32]))),
+//! ]))?;
 //! let (bytes, id) = tree.encode_with_id();
 //! assert_eq!(Tree::decode_with_id(&bytes)?.1, id);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -52,21 +50,74 @@ mod path;
 
 use std::collections::BTreeMap;
 
-pub use codec::DecodeError;
+use crate::codec::{MAX_FIELD, check_fit};
+
+pub use codec::{DecodeError, EncodeError};
 pub use id::{BlobHasher, BlobId, ChangesetId, ParseIdError, TreeId};
 pub use path::{PathElem, PathError, RepoPath};
 
 /// A person and the moment they acted, as recorded on a changeset.
+///
+/// Every value of this type encodes: [`IdentityTime::new`] refuses a name or
+/// an email that the v1 format cannot carry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityTime {
     /// Display name, raw bytes.
-    pub name: Vec<u8>,
+    name: Vec<u8>,
     /// Email address, raw bytes.
-    pub email: Vec<u8>,
+    email: Vec<u8>,
     /// Seconds since the Unix epoch.
-    pub unix_secs: i64,
+    unix_secs: i64,
     /// Offset from UTC, in minutes. `+05:30` is `330`.
-    pub tz_offset_minutes: i32,
+    tz_offset_minutes: i32,
+}
+
+impl IdentityTime {
+    /// Builds an identity whose fields the v1 encoder can write.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError::FieldTooLong`] if `name` or `email` is longer than
+    /// `u32::MAX` bytes.
+    pub fn new(
+        name: Vec<u8>,
+        email: Vec<u8>,
+        unix_secs: i64,
+        tz_offset_minutes: i32,
+    ) -> Result<Self, EncodeError> {
+        check_fit(name.len(), MAX_FIELD, "identity name")?;
+        check_fit(email.len(), MAX_FIELD, "identity email")?;
+        Ok(Self {
+            name,
+            email,
+            unix_secs,
+            tz_offset_minutes,
+        })
+    }
+
+    /// Display name, raw bytes.
+    #[must_use]
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+
+    /// Email address, raw bytes.
+    #[must_use]
+    pub fn email(&self) -> &[u8] {
+        &self.email
+    }
+
+    /// Seconds since the Unix epoch.
+    #[must_use]
+    pub fn unix_secs(&self) -> i64 {
+        self.unix_secs
+    }
+
+    /// Offset from UTC, in minutes. `+05:30` is `330`.
+    #[must_use]
+    pub fn tz_offset_minutes(&self) -> i32 {
+        self.tz_offset_minutes
+    }
 }
 
 /// A git object name, tagged with its hash algorithm.
@@ -135,18 +186,88 @@ impl FileState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Changeset {
     /// Parents, in order. `parents[0]` is the diff base. No parents means a root.
-    pub parents: Vec<ChangesetId>,
+    parents: Vec<ChangesetId>,
     /// Who wrote the change.
-    pub author: IdentityTime,
+    author: IdentityTime,
     /// Who committed it, when different from the author. Set only by git import.
-    pub committer: Option<IdentityTime>,
+    committer: Option<IdentityTime>,
     /// Commit message, raw bytes.
-    pub message: Vec<u8>,
+    message: Vec<u8>,
     /// Paths that differ from `parents[0]`. `None` deletes the path.
     ///
     /// A map keeps paths sorted and unique, so every value of this type has
     /// exactly one encoding.
-    pub changes: BTreeMap<RepoPath, Option<FileState>>,
+    changes: BTreeMap<RepoPath, Option<FileState>>,
+}
+
+impl Changeset {
+    /// Builds a changeset whose fields the v1 encoder can write.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError::FieldTooLong`] if `message` is longer than `u32::MAX`
+    /// bytes, or if `parents` or `changes` hold more than `u32::MAX` items.
+    pub fn new(
+        parents: Vec<ChangesetId>,
+        author: IdentityTime,
+        committer: Option<IdentityTime>,
+        message: Vec<u8>,
+        changes: BTreeMap<RepoPath, Option<FileState>>,
+    ) -> Result<Self, EncodeError> {
+        check_fit(parents.len(), MAX_FIELD, "parents")?;
+        check_fit(message.len(), MAX_FIELD, "message")?;
+        check_fit(changes.len(), MAX_FIELD, "changes")?;
+        Ok(Self {
+            parents,
+            author,
+            committer,
+            message,
+            changes,
+        })
+    }
+
+    /// Parents, in order. `parents()[0]` is the diff base; empty means a root.
+    #[must_use]
+    pub fn parents(&self) -> &[ChangesetId] {
+        &self.parents
+    }
+
+    /// Who wrote the change.
+    #[must_use]
+    pub fn author(&self) -> &IdentityTime {
+        &self.author
+    }
+
+    /// Who committed it, when different from the author. Set only by git import.
+    #[must_use]
+    pub fn committer(&self) -> Option<&IdentityTime> {
+        self.committer.as_ref()
+    }
+
+    /// Commit message, raw bytes.
+    #[must_use]
+    pub fn message(&self) -> &[u8] {
+        &self.message
+    }
+
+    /// Paths that differ from `parents()[0]`. `None` deletes the path.
+    #[must_use]
+    pub fn changes(&self) -> &BTreeMap<RepoPath, Option<FileState>> {
+        &self.changes
+    }
+
+    /// This changeset with different parents. `parents[0]` is the new diff
+    /// base.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError::FieldTooLong`] if `parents` holds more than `u32::MAX`
+    /// items.
+    pub fn with_parents(mut self, parents: Vec<ChangesetId>) -> Result<Self, EncodeError> {
+        check_fit(parents.len(), MAX_FIELD, "parents")?;
+        self.parents = parents;
+        Ok(self)
+    }
 }
 
 /// A file entry of a tree: what the path holds, and the byte length of
@@ -204,5 +325,24 @@ pub enum Entry {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Tree {
     /// Entries by name, sorted by raw name bytes.
-    pub entries: BTreeMap<PathElem, Entry>,
+    entries: BTreeMap<PathElem, Entry>,
+}
+
+impl Tree {
+    /// Builds a tree whose entries the v1 encoder can write.
+    ///
+    /// # Errors
+    ///
+    /// [`EncodeError::FieldTooLong`] if `entries` holds more than `u32::MAX`
+    /// items.
+    pub fn new(entries: BTreeMap<PathElem, Entry>) -> Result<Self, EncodeError> {
+        check_fit(entries.len(), MAX_FIELD, "entries")?;
+        Ok(Self { entries })
+    }
+
+    /// Entries by name, sorted by raw name bytes.
+    #[must_use]
+    pub fn entries(&self) -> &BTreeMap<PathElem, Entry> {
+        &self.entries
+    }
 }

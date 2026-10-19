@@ -102,7 +102,7 @@ impl Kind for CommitGraph {
         _lens: crate::tree::BlobLens<'_>,
     ) -> Result<Node> {
         let generation = 1 + parents.iter().map(|p| p.generation).max().unwrap_or(0);
-        let (Some(first), Some(&first_id)) = (parents.first(), changeset.parents.first()) else {
+        let (Some(first), Some(&first_id)) = (parents.first(), changeset.parents().first()) else {
             let root = Link {
                 id,
                 generation,
@@ -134,7 +134,7 @@ impl Kind for CommitGraph {
         } else {
             parent
         };
-        let merge = if changeset.parents.len() > 1 {
+        let merge = if changeset.parents().len() > 1 {
             Some(Link {
                 id,
                 generation,
@@ -204,7 +204,8 @@ impl Kind for CommitGraph {
 /// # Errors
 ///
 /// [`Error::NotFound`] if `repo` does not have either changeset.
-/// [`Error::DeadlineExceeded`] once `deadline` has passed.
+/// [`Error::DeadlineExceeded`] once `deadline` has passed, or
+/// [`Error::Cancelled`] once the call has gone.
 pub fn is_ancestor(
     store: &Backend,
     repo: RepoId,
@@ -228,7 +229,8 @@ pub fn is_ancestor(
 /// # Errors
 ///
 /// [`Error::NotFound`] if `repo` does not have either changeset.
-/// [`Error::DeadlineExceeded`] once `deadline` has passed.
+/// [`Error::DeadlineExceeded`] once `deadline` has passed, or
+/// [`Error::Cancelled`] once the call has gone.
 pub fn merge_bases(
     store: &Backend,
     repo: RepoId,
@@ -254,7 +256,8 @@ pub fn merge_bases(
 ///
 /// # Errors
 ///
-/// [`Error::DeadlineExceeded`] once `deadline` has passed.
+/// [`Error::DeadlineExceeded`] once `deadline` has passed, or
+/// [`Error::Cancelled`] once the call has gone.
 pub(crate) fn on_first_parents(
     c: &mut dyn MetaTx,
     tip: ChangesetId,
@@ -327,10 +330,14 @@ fn in_steps<T>(
     // see is durable, with one flush for all steps.
     store.wait_durable(seen)?;
     let Cost { reads, steps } = cost;
-    if let Err(Error::DeadlineExceeded(why)) = &result {
-        tracing::info!(reads, steps, %why, "a graph query stopped");
-    } else {
-        tracing::debug!(reads, steps, "graph query");
+    match &result {
+        Err(Error::DeadlineExceeded(why)) => {
+            tracing::info!(reads, steps, %why, "a graph query stopped at its deadline");
+        }
+        Err(Error::Cancelled(why)) => {
+            tracing::info!(reads, steps, %why, "a graph query stopped: its call went");
+        }
+        _ => tracing::debug!(reads, steps, "graph query"),
     }
     result.map(|answer| (answer, cost))
 }
@@ -912,17 +919,13 @@ mod tests {
             .write(|c| {
                 let repo = c.create_repo("r")?;
                 let mut add = |parent: Option<ChangesetId>, message: String| {
-                    let cs = Changeset {
-                        parents: parent.into_iter().collect(),
-                        author: IdentityTime {
-                            name: b"a".to_vec(),
-                            email: b"a@x".to_vec(),
-                            unix_secs: 0,
-                            tz_offset_minutes: 0,
-                        },
-                        committer: None,
-                        message: message.into_bytes(),
-                        changes: [(
+                    let cs = Changeset::new(
+                        parent.into_iter().collect(),
+                        IdentityTime::new(b"a".to_vec(), b"a@x".to_vec(), 0, 0)
+                            .expect("identity fits the format"),
+                        None,
+                        message.into_bytes(),
+                        [(
                             RepoPath::new("f").unwrap(),
                             Some(FileState::Regular {
                                 content: BlobId::of(b"f"),
@@ -930,7 +933,8 @@ mod tests {
                             }),
                         )]
                         .into(),
-                    };
+                    )
+                    .expect("changeset fits the format");
                     let id = c.insert_changeset(repo, &cs)?;
                     derived::on_write::<CommitGraph>(c, id, &cs, &mut crate::tree::lens_of(store))?;
                     Ok::<_, Error>(id)
@@ -1030,10 +1034,15 @@ mod tests {
         for i in 0..6 {
             store.blobs().put(format!("f{i}").as_bytes()).unwrap();
         }
-        let cs = Changeset {
-            parents: vec![ids[4], ids[1]],
-            ..store.read(|c| c.get_changeset(repo, ids[4])).unwrap()
-        };
+        let base = store.read(|c| c.get_changeset(repo, ids[4])).unwrap();
+        let cs = Changeset::new(
+            vec![ids[4], ids[1]],
+            base.author().clone(),
+            base.committer().cloned(),
+            base.message().to_vec(),
+            base.changes().clone(),
+        )
+        .unwrap();
         let (merge, _) = store
             .write(|c| {
                 crate::tree::store_changeset(c, repo, &cs, &mut crate::tree::lens_of(&store))
@@ -1138,7 +1147,7 @@ mod tests {
         assert!(found.unwrap());
         let mut stopped = search();
         let (late, moves) = walk_until(&store, 50, |index| stopped.next(index));
-        assert!(matches!(late, Err(Error::DeadlineExceeded(_))), "{late:?}");
+        assert!(matches!(late, Err(Error::Cancelled(_))), "{late:?}");
         assert!(50 < moves && moves < all, "{moves} of {all} moves");
 
         let paint = || {
@@ -1152,7 +1161,7 @@ mod tests {
         assert_eq!(bases.unwrap(), [side]);
         let mut stopped = paint();
         let (late, moves) = walk_until(&store, 50, |index| stopped.next(index));
-        assert!(matches!(late, Err(Error::DeadlineExceeded(_))), "{late:?}");
+        assert!(matches!(late, Err(Error::Cancelled(_))), "{late:?}");
         assert!(50 < moves && moves < all, "{moves} of {all} moves");
     }
 

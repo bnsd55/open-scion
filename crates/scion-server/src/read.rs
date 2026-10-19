@@ -35,7 +35,8 @@ pub fn get_changeset(store: &Backend, repo: &str, id: ChangesetId) -> Result<Cha
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or changeset does not exist.
-/// [`Error::DeadlineExceeded`] once `deadline` has passed.
+/// [`Error::DeadlineExceeded`] once `deadline` has passed, or
+/// [`Error::Cancelled`] once the call has gone.
 pub fn root_tree(
     store: &Backend,
     repo: &str,
@@ -52,9 +53,9 @@ pub fn root_tree(
 ///
 /// [`Error::NotFound`] if nothing is at `path`. [`Error::InvalidArgument`] if
 /// `path` is a directory or a submodule. [`Error::DeadlineExceeded`] once
-/// `deadline` has passed, which a cold root tree may need. The tests of
-/// the trees and the imports read through it, so it rides behind the
-/// test-hooks feature.
+/// `deadline` has passed, which a cold root tree may need, or
+/// [`Error::Cancelled`] once the call has gone. The tests of the trees and
+/// the imports read through it, so it rides behind the test-hooks feature.
 #[cfg(any(test, feature = "test-hooks"))]
 pub fn read_file(
     store: &Backend,
@@ -196,7 +197,8 @@ pub fn log(
 ///
 /// [`Error::NotFound`] if the repo or changeset does not exist.
 /// [`Error::DeadlineExceeded`] if `deadline` passed while the path history
-/// was derived; the steps before it stay.
+/// was derived, or [`Error::Cancelled`] once the call has gone; the steps
+/// before it stay.
 pub fn log_page(
     store: &Backend,
     repo: &str,
@@ -247,7 +249,7 @@ pub fn log_page(
                 break;
             };
             let changeset = c.get_changeset(repo, id)?;
-            next = changeset.parents.first().copied();
+            next = changeset.parents().first().copied();
             entries.push((id, changeset));
         }
         Ok(LogPage { entries, next })
@@ -268,7 +270,7 @@ pub(crate) fn next_change(
     };
     *budget -= 1;
     let changeset = c.get_changeset(repo, id)?;
-    *next = changeset.parents.first().copied();
+    *next = changeset.parents().first().copied();
     Ok(Some((id, changeset)))
 }
 
@@ -280,7 +282,7 @@ pub(crate) fn next_change(
 #[must_use]
 pub fn changes_path(cs: &Changeset, path: &RepoPath) -> bool {
     let path = path.as_bytes();
-    cs.changes.keys().any(|changed| {
+    cs.changes().keys().any(|changed| {
         let changed = changed.as_bytes();
         changed.starts_with(path) && matches!(changed.get(path.len()), None | Some(b'/'))
     })
@@ -294,7 +296,8 @@ pub fn changes_path(cs: &Changeset, path: &RepoPath) -> bool {
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or a changeset does not exist.
-/// [`Error::DeadlineExceeded`] once `deadline` has passed.
+/// [`Error::DeadlineExceeded`] once `deadline` has passed, or
+/// [`Error::Cancelled`] once the call has gone.
 pub fn is_ancestor(
     store: &Backend,
     repo: &str,
@@ -319,7 +322,8 @@ pub fn is_ancestor(
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or a changeset does not exist.
-/// [`Error::DeadlineExceeded`] once `deadline` has passed.
+/// [`Error::DeadlineExceeded`] once `deadline` has passed, or
+/// [`Error::Cancelled`] once the call has gone.
 pub fn merge_base(
     store: &Backend,
     repo: &str,
@@ -678,7 +682,7 @@ impl DiffWalk<'_> {
     /// a read connection on its own, so a long walk does not hold one.
     fn children(&self, entry: Option<Entry>) -> Result<BTreeMap<PathElem, Entry>> {
         match entry {
-            Some(Entry::Dir(id)) => Ok(self.store.read(|c| c.get_tree(id))?.entries),
+            Some(Entry::Dir(id)) => Ok(self.store.read(|c| c.get_tree(id))?.entries().clone()),
             _ => Ok(BTreeMap::new()),
         }
     }

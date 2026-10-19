@@ -78,7 +78,7 @@ const BUCKETS: [u64; 10] = [
 /// The outcomes of a land, by how the server's land path decides them,
 /// then the classes of a land whose call ended in an error: the names of
 /// the gRPC codes the land's reply can answer.
-const LANDS: [&str; 13] = [
+const LANDS: [&str; 14] = [
     "landed",
     "conflict",
     "rejected",
@@ -91,27 +91,33 @@ const LANDS: [&str; 13] = [
     "invalid_argument",
     "permission_denied",
     "failed_precondition",
+    "cancelled",
     "internal",
 ];
 
 /// The land counter's label for a land whose call ended in an error, by
 /// the gRPC code of the reply the caller saw: one source, the reply's own
-/// code, so the counter cannot drift from what callers read. The land
-/// handler counts after it builds the reply's `Status`.
+/// code, so the counter cannot drift from what callers read. The label is
+/// the text the registry renders, so a renumbering of the table cannot
+/// change a label's meaning. The land handler counts after it builds the
+/// reply's `Status`.
 #[must_use]
-pub fn land_error_label(code: tonic::Code) -> usize {
+pub fn land_error_label(code: tonic::Code) -> &'static str {
     match code {
-        tonic::Code::Aborted => 4,
-        tonic::Code::DeadlineExceeded => 5,
-        tonic::Code::ResourceExhausted => 6,
-        tonic::Code::Unavailable => 7,
-        tonic::Code::NotFound => 8,
-        tonic::Code::InvalidArgument => 9,
-        tonic::Code::PermissionDenied => 10,
-        tonic::Code::FailedPrecondition => 11,
+        tonic::Code::Aborted => "aborted",
+        tonic::Code::DeadlineExceeded => "deadline_exceeded",
+        tonic::Code::ResourceExhausted => "resource_exhausted",
+        tonic::Code::Unavailable => "unavailable",
+        tonic::Code::NotFound => "not_found",
+        tonic::Code::InvalidArgument => "invalid_argument",
+        tonic::Code::PermissionDenied => "permission_denied",
+        tonic::Code::FailedPrecondition => "failed_precondition",
+        // The call went while its land was planned: the land stays pending,
+        // and a retry with the same request key resumes it.
+        tonic::Code::Cancelled => "cancelled",
         // Every other code the land's reply can answer, the caller reads
         // as an internal error.
-        _ => 12,
+        _ => "internal",
     }
 }
 
@@ -221,12 +227,12 @@ impl Metrics {
         self.bytes_out[rpc.0].fetch_add(bytes_out, Ordering::Relaxed);
     }
 
-    /// Counts one land that ended as `outcome`, in `LANDS` order: how the
-    /// server's land path decided it, or the class of the error it ended
-    /// in.
-    pub fn land(&self, outcome: usize) {
-        if outcome < LANDS.len() {
-            self.lands[outcome].fetch_add(1, Ordering::Relaxed);
+    /// Counts one land that ended as `outcome`: how the server's land path
+    /// decided it, or the class of the error it ended in, as the label the
+    /// registry renders. A label outside the table counts nothing.
+    pub fn land(&self, outcome: &'static str) {
+        if let Some(at) = LANDS.iter().position(|known| *known == outcome) {
+            self.lands[at].fetch_add(1, Ordering::Relaxed);
         }
     }
 

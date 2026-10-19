@@ -503,7 +503,7 @@ the process, scraped from there. The names:
   where refusals and failures show).
 - `scion_request_seconds` — one latency histogram per RPC.
 - `scion_rpc_bytes_total` — request and reply bytes by RPC.
-- `scion_lands_total` — lands by outcome; the error labels (`aborted`, `deadline_exceeded`, `resource_exhausted`, `unavailable`, `not_found`, `invalid_argument`, `internal`) count lands whose call ended in an error, by the class of the answer the caller saw.
+- `scion_lands_total` — lands by outcome; the error labels (`aborted`, `deadline_exceeded`, `resource_exhausted`, `unavailable`, `not_found`, `invalid_argument`, `permission_denied`, `failed_precondition`, `cancelled`, `internal`) count lands whose call ended in an error, by the class of the answer the caller saw.
 - `scion_land_replans_total` — lands that planned again because their ref
   moved under them; a rising rate means lands contending with imports or
   other writers on one ref.

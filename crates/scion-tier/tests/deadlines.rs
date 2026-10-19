@@ -64,7 +64,9 @@ impl Deepest {
         )]
         .into_iter()
         .collect();
-        let (tree_bytes, root) = scion_core::Tree { entries }.encode_with_id();
+        let (tree_bytes, root) = scion_core::Tree::new(entries)
+            .expect("tree fits the format")
+            .encode_with_id();
         Self {
             data,
             key: ed25519_dalek::SigningKey::from_bytes(&[4; 32]),
@@ -156,14 +158,14 @@ impl Objects for Deepest {
     }
 }
 
-/// `deepest` on a port of its own, and its address.
-async fn serve_deepest(deepest: Deepest) -> String {
+/// The upstream on a port of its own, and its address.
+async fn serve_deepest(upstream: impl Objects + 'static) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let incoming = TcpListenerStream::new(listener);
     tokio::spawn(
         Server::builder()
-            .add_service(ObjectsServer::new(deepest))
+            .add_service(ObjectsServer::new(upstream))
             .serve_with_incoming(incoming),
     );
     url
@@ -231,6 +233,148 @@ async fn get(client: &mut Client, id: BlobId, deadline: Option<Duration>, ticket
     };
     // A ceiling per message: a server that stalls mid-drain fails the
     // test in seconds, not at the CI cancel.
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(30), stream.message())
+            .await
+            .unwrap_or_else(|_| panic!("the drain never finished within 30 s"));
+        match message {
+            Ok(Some(_)) => {}
+            Ok(None) => return Code::Ok,
+            Err(status) => return status.code(),
+        }
+    }
+}
+
+/// An upstream that answers `CANCELLED` for every `GetObjects`, as an
+/// upstream serves a call whose client went: the status of a cancelled
+/// call, not a timeout of its own.
+#[derive(Clone)]
+struct Gone {
+    key: ed25519_dalek::SigningKey,
+    root: scion_core::TreeId,
+    calls: Arc<AtomicUsize>,
+}
+impl Gone {
+    fn new() -> Self {
+        let entries = std::iter::once((
+            scion_core::PathElem::new(b"x".to_vec()).unwrap(),
+            scion_core::Entry::File(scion_core::FileEntry::new(
+                scion_core::FileState::Regular {
+                    content: BlobId::of(b"y".as_slice()),
+                    executable: false,
+                },
+                0,
+            )),
+        ))
+        .collect();
+        let (_tree_bytes, root) = scion_core::Tree::new(entries).unwrap().encode_with_id();
+        Self {
+            key: ed25519_dalek::SigningKey::from_bytes(&[4; 32]),
+            root,
+            calls: Arc::default(),
+        }
+    }
+
+    fn ticket(&self) -> Vec<u8> {
+        scion_proto::ticket::sign(
+            &self.key,
+            "r",
+            "test",
+            *self.root.as_bytes(),
+            scion_proto::ticket::now(),
+        )
+        .unwrap()
+    }
+}
+
+#[tonic::async_trait]
+impl Objects for Gone {
+    async fn resolve_ref(
+        &self,
+        _: Request<ResolveRefRequest>,
+    ) -> Result<Response<ResolveRefResponse>, Status> {
+        Err(Status::unimplemented("not here"))
+    }
+
+    async fn get_root_tree(
+        &self,
+        _: Request<GetRootTreeRequest>,
+    ) -> Result<Response<GetRootTreeResponse>, Status> {
+        Err(Status::unimplemented("not here"))
+    }
+
+    type GetObjectsStream = Parts;
+
+    async fn get_objects(&self, _: Request<GetObjectsRequest>) -> Result<Response<Parts>, Status> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        // What a server answers when the call's client went while its job
+        // walked: the walk stopped at its next check, and the job's error
+        // maps to `CANCELLED`.
+        Err(Status::cancelled("its call has gone"))
+    }
+}
+
+/// A tier passes an upstream `CANCELLED` through: the code reaches the
+/// client at once, and the tier neither retries it nor reads a timeout of
+/// its own. A cancel is final; asking again cannot bring the call back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tier_passes_an_upstream_cancelled_through() {
+    let gone = Gone::new();
+    let calls = Arc::clone(&gone.calls);
+    let (ticket, keys) = (gone.ticket(), vec![gone.key.verifying_key()]);
+    let root = gone.root;
+    let tier = serve_tier(&serve_deepest(gone).await, Duration::from_secs(30), &keys).await;
+    let mut client = connect(&tier).await;
+
+    let code = tokio::time::timeout(
+        Duration::from_secs(60),
+        get_cancelled_tree(&mut client, root, None, &ticket),
+    )
+    .await
+    .expect("the no-timeout call answers at once, or the tier is retrying");
+    assert_eq!(
+        code,
+        Code::Cancelled,
+        "the upstream's cancel, not a timeout"
+    );
+    let code = get_cancelled_tree(&mut client, root, Some(Duration::from_secs(20)), &ticket).await;
+    assert_eq!(
+        code,
+        Code::Cancelled,
+        "the same, with the call's timeout set"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the tier never asked again"
+    );
+}
+
+/// The code of a `GetObjects` call for the tree `root`, or `OK` once the
+/// whole reply has come. `timeout` is the call's own `grpc-timeout`, when
+/// it sets one.
+async fn get_cancelled_tree(
+    client: &mut Client,
+    root: scion_core::TreeId,
+    timeout: Option<Duration>,
+    ticket: &[u8],
+) -> Code {
+    let mut request = Request::new(GetObjectsRequest {
+        refs: vec![ObjectRef {
+            kind: ObjectKind::Tree.into(),
+            id: root.as_bytes().to_vec(),
+            path: b"x".to_vec(),
+        }],
+        accept: Vec::new(),
+        ticket: ticket.to_vec(),
+    });
+    if let Some(timeout) = timeout {
+        request.set_timeout(timeout);
+    }
+    let mut stream = match client.get_objects(request).await {
+        Ok(reply) => reply.into_inner(),
+        Err(status) => return status.code(),
+    };
     loop {
         let message = tokio::time::timeout(Duration::from_secs(30), stream.message())
             .await

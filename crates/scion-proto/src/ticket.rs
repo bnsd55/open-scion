@@ -332,7 +332,7 @@ impl Walker {
             let Ok(elem) = PathElem::new((*part).to_vec()) else {
                 return Ok(Walk::Absent);
             };
-            let Some(entry) = tree.entries.get(&elem) else {
+            let Some(entry) = tree.entries().get(&elem) else {
                 return Ok(Walk::Absent);
             };
             match entry {
@@ -523,8 +523,8 @@ mod tests {
     /// A tree with one regular file `leaf`, inside `a`, plus a symlink and a
     /// gitlink at the root. Returns the trees and the blobs they name.
     fn trees() -> (Tree, Tree, BlobId, BlobId) {
-        let leaf = Tree {
-            entries: [(
+        let leaf = Tree::new(
+            [(
                 PathElem::new("leaf").unwrap(),
                 Entry::File(FileEntry::new(
                     FileState::Regular {
@@ -535,9 +535,10 @@ mod tests {
                 )),
             )]
             .into(),
-        };
-        let root = Tree {
-            entries: [
+        )
+        .expect("tree fits the format");
+        let root = Tree::new(
+            [
                 (PathElem::new("a").unwrap(), Entry::Dir(leaf.id())),
                 (
                     PathElem::new("link").unwrap(),
@@ -559,7 +560,8 @@ mod tests {
                 ),
             ]
             .into(),
-        };
+        )
+        .expect("tree fits the format");
         (leaf, root, BlobId::of(b"file\n"), BlobId::of(b"leaf"))
     }
 

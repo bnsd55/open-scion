@@ -135,7 +135,8 @@ pub struct LandRequest {
     /// Caller-chosen key. A retry with the same key returns the same land.
     pub request_key: String,
     /// When the server gives up on the request. The plan stops at it with
-    /// [`Error::DeadlineExceeded`], and the land stays pending.
+    /// [`Error::DeadlineExceeded`], or with [`Error::Cancelled`] once the
+    /// call that asked has gone, and the land stays pending.
     pub deadline: Deadline,
 }
 
@@ -270,9 +271,10 @@ impl Lands {
     /// [`Error::NotFound`] if the repo or changeset does not exist.
     /// [`Error::InvalidArgument`] for a malformed request, or a request key
     /// reused for a different land. [`Error::Aborted`] if other writers kept
-    /// moving the ref, and [`Error::DeadlineExceeded`] if the plan ran past
-    /// the request's deadline. The land then stays pending, and a retry with
-    /// the same request key resumes it. Store errors otherwise.
+    /// moving the ref, [`Error::DeadlineExceeded`] if the plan ran past
+    /// the request's deadline, or [`Error::Cancelled`] if the call went.
+    /// The land then stays pending, and a retry with the same request key
+    /// resumes it. Store errors otherwise.
     pub fn land(&self, store: &Backend, caller: &Caller, req: &LandRequest) -> Result<LandOutcome> {
         let outcome = self.land_committed(store, caller, req);
         // An index can hold up to the whole budget, and freeing it takes a
@@ -282,11 +284,11 @@ impl Lands {
         let outcome = outcome?;
         if let Some(metrics) = &self.metrics {
             metrics.land(match outcome.state {
-                LandState::Landed => 0,
-                LandState::Conflict => 1,
-                LandState::Rejected => 2,
+                LandState::Landed => "landed",
+                LandState::Conflict => "conflict",
+                LandState::Rejected => "rejected",
                 // A pending land waits for a retry with its key.
-                LandState::Pending => 3,
+                LandState::Pending => "retry",
             });
         }
         // Lands on one ref commit one at a time. Waiting for the flush after
@@ -328,13 +330,16 @@ impl Lands {
             let result = finish(self, store, repo, land_id, req, &mut index);
             // The index may be ahead of the database; rebuild it next time. A
             // lost race wrote nothing, so the index is still good. So is an
-            // index that a deadline stopped: an advance adds nothing until it
-            // reaches the tip, and a reach adds one whole changeset at a time,
-            // so a retry goes on from where the reach stopped.
-            if result
-                .as_ref()
-                .is_err_and(|e| !matches!(e, Error::Aborted(_) | Error::DeadlineExceeded(_)))
-            {
+            // index that a deadline stopped, or that stopped because the
+            // call went: an advance adds nothing until it reaches the tip,
+            // and a reach adds one whole changeset at a time, so a retry
+            // goes on from where the reach stopped.
+            if result.as_ref().is_err_and(|e| {
+                !matches!(
+                    e,
+                    Error::Aborted(_) | Error::DeadlineExceeded(_) | Error::Cancelled(_)
+                )
+            }) {
                 *index = None;
             }
             let head = match result.map_err(stays_pending)? {
@@ -503,10 +508,14 @@ enum Finished {
     Derive(ChangesetId),
 }
 
-/// Says that a land that stopped at its deadline stays pending.
+/// Says that a land that stopped at its deadline, or whose call went,
+/// stays pending.
 fn stays_pending(e: Error) -> Error {
     match e {
         Error::DeadlineExceeded(why) => Error::DeadlineExceeded(format!(
+            "{why}; the land stays pending, retry with the same request key"
+        )),
+        Error::Cancelled(why) => Error::Cancelled(format!(
             "{why}; the land stays pending, retry with the same request key"
         )),
         e => e,
@@ -580,7 +589,7 @@ fn plan(
 ) -> Result<Plan> {
     let target = &req.target_ref;
     let cs = c.get_changeset(repo, req.changeset)?;
-    let [base] = cs.parents[..] else {
+    let [base] = cs.parents()[..] else {
         return Ok(Plan::Reject(
             "a land needs a changeset with exactly one parent".into(),
         ));
@@ -593,7 +602,7 @@ fn plan(
         None => index.insert(PathIndex::new(c, repo, head.target, &lands.used)?),
     };
     index.advance_to(lands, c, repo, head.target, &req.deadline)?;
-    let conflicts = match index.check(lands, c, repo, base, &cs.changes, &req.deadline)? {
+    let conflicts = match index.check(lands, c, repo, base, cs.changes(), &req.deadline)? {
         Checked::Paths(conflicts) => conflicts,
         Checked::NotOnHistory => {
             return Ok(Plan::Reject(format!(
@@ -609,10 +618,9 @@ fn plan(
         );
         return Ok(Plan::Conflict(detail, conflicts));
     }
-    let rebased = Changeset {
-        parents: vec![head.target],
-        ..cs
-    };
+    let rebased = cs
+        .with_parents(vec![head.target])
+        .expect("one parent fits the format");
     Ok(Plan::Land { rebased, head })
 }
 
@@ -673,7 +681,7 @@ fn settle(
     match landed {
         Ok((outcome, generation)) => {
             if let (Some(index), Some(id)) = (index.as_mut(), outcome.result) {
-                index.record(lands, id, generation, &rebased.changes);
+                index.record(lands, id, generation, rebased.changes());
             }
             tracing::info!(land_id, id = ?outcome.result, target = %target, "landed");
             Ok(Finished::Outcome(outcome))
@@ -811,7 +819,7 @@ impl PathIndex {
                 break;
             }
             let cs = c.get_changeset(repo, id)?;
-            most += added_bytes(&cs.changes);
+            most += added_bytes(cs.changes());
             if self.bytes + most > MAX_INDEX_BYTES {
                 tracing::info!(
                     generation,
@@ -819,8 +827,8 @@ impl PathIndex {
                 );
                 break;
             }
-            cur = cs.parents.first().copied();
-            walked.push((id, generation, cs.changes));
+            cur = cs.parents().first().copied();
+            walked.push((id, generation, cs.changes().clone()));
         }
         *self = Self::new(c, repo, head, &self.used)?;
         Ok(())
@@ -883,7 +891,7 @@ impl PathIndex {
     /// changeset that does not fit in [`MAX_INDEX_BYTES`], which is then the
     /// floor. The caller has checked that `base` is not the floor and not in
     /// the index. Fails with [`Error::DeadlineExceeded`] once `deadline` has
-    /// passed.
+    /// passed, or [`Error::Cancelled`] once the call has gone.
     fn reach(
         &mut self,
         lands: &Lands,
@@ -901,11 +909,11 @@ impl PathIndex {
                 return Ok(Walk::Missed);
             }
             let cs = c.get_changeset(repo, id)?;
-            let cost = self.cost([(generation, &cs.changes)]);
-            if !self.grow(lands, cost, |index| index.add(id, generation, &cs.changes)) {
+            let cost = self.cost([(generation, cs.changes())]);
+            if !self.grow(lands, cost, |index| index.add(id, generation, cs.changes())) {
                 return Ok(Walk::Stopped);
             }
-            let Some(&parent) = cs.parents.first() else {
+            let Some(&parent) = cs.parents().first() else {
                 return Ok(Walk::Missed);
             };
             self.floor = parent;
@@ -1192,12 +1200,7 @@ mod tests {
     }
 
     fn author() -> IdentityTime {
-        IdentityTime {
-            name: b"t".to_vec(),
-            email: b"t@x".to_vec(),
-            unix_secs: 0,
-            tz_offset_minutes: 0,
-        }
+        IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0).expect("identity fits the format")
     }
 
     thread_local! {
@@ -1229,13 +1232,14 @@ mod tests {
         let (repo, root) = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
-                let root = Changeset {
-                    parents: vec![],
-                    author: author(),
-                    committer: None,
-                    message: b"root".to_vec(),
-                    changes: BTreeMap::from([put("a/x", "1"), put("b/y", "2"), put("c", "3")]),
-                };
+                let root = Changeset::new(
+                    vec![],
+                    author(),
+                    None,
+                    b"root".to_vec(),
+                    BTreeMap::from([put("a/x", "1"), put("b/y", "2"), put("c", "3")]),
+                )
+                .expect("changeset fits the format");
                 let id = c.insert_changeset(repo, &root)?;
                 assert!(c.cas_ref(repo, "main", None, id)?);
                 Ok((repo, id))
@@ -1266,13 +1270,14 @@ mod tests {
     }
 
     fn changeset(parents: Vec<ChangesetId>, changes: Edits<'_>) -> Changeset {
-        Changeset {
+        Changeset::new(
             parents,
-            author: author(),
-            committer: None,
-            message: format!("{changes:?}").into_bytes(),
-            changes: changes.iter().cloned().collect(),
-        }
+            author(),
+            None,
+            format!("{changes:?}").into_bytes(),
+            changes.iter().cloned().collect(),
+        )
+        .expect("changeset fits the format")
     }
 
     impl Fixture {
@@ -1466,7 +1471,7 @@ mod tests {
         assert!(f.file(tip, "a/x").is_some() && f.file(tip, "b/new").is_some());
         assert!(f.file(tip, "c").is_none());
         let rebased = f.store.read(|c| c.get_changeset(f.repo, tip)).unwrap();
-        assert_eq!(rebased.parents, vec![one]);
+        assert_eq!(rebased.parents(), vec![one]);
     }
 
     #[test]
@@ -1553,7 +1558,7 @@ mod tests {
         // replanned onto the head the import made.
         let parents = f
             .store
-            .read(|c| Ok(c.get_changeset(f.repo, landed)?.parents))
+            .read(|c| Ok(c.get_changeset(f.repo, landed)?.parents().to_vec()))
             .unwrap();
         assert_eq!(parents, vec![import], "the land rebased onto the import");
         assert_eq!(metrics.land_replans(), 1, "the replan counted once");
@@ -1608,7 +1613,7 @@ mod tests {
             assert_eq!(after.version, before.version + 1, "{crash:?}: moved once");
             assert_eq!(Some(after.target), out.result);
             let landed = f.store.read(|c| c.get_changeset(repo, after.target));
-            assert_eq!(landed.unwrap().parents, vec![before.target], "{crash:?}");
+            assert_eq!(landed.unwrap().parents(), [before.target], "{crash:?}");
             assert_eq!(fresh.land(&f.store, &caller(), &req).unwrap(), out);
             assert_eq!(f.landed_count(), 1, "{crash:?}");
         }
@@ -1847,6 +1852,60 @@ mod tests {
         }
     }
 
+    /// A land whose call has gone: the deadline has not passed, but the
+    /// call's guard dropped, so the plan's next check answers
+    /// [`Error::Cancelled`]. The land stays pending, keeps its path index,
+    /// and a retry with the same key finishes it: the same promise a
+    /// deadline-stopped land keeps.
+    #[test]
+    fn a_land_whose_call_went_stays_pending_and_a_retry_finishes_it() {
+        use LandState::{Conflict, Landed};
+        let f = fixture();
+        // The index starts at B, so root is below its floor.
+        f.move_main(f.commit(f.root, &[put("b/y", "B")]));
+        f.fill("f", 1);
+        // An import moves main, so the next plan advances the index.
+        f.move_main(f.commit(f.main().target, &[put("c", "import")]));
+        let on_head = f.commit(f.main().target, &[put("a/x", "mine")]);
+        // The plan of this one walks back from the floor.
+        let on_root = f.commit(f.root, &[put("c", "mine")]);
+        for (cs, key, state) in [
+            (on_head, "gone head", Landed),
+            (on_root, "gone root", Conflict),
+        ] {
+            let before = f.main();
+            // The call went before the plan started: the guard drops, the
+            // deadline itself is far in the future.
+            let deadline = Deadline::new(Instant::now() + std::time::Duration::from_secs(600));
+            let guard = deadline.guard();
+            let gone = LandRequest {
+                deadline,
+                ..req(cs, key)
+            };
+            drop(guard);
+            let err = f.lands.land(&f.store, &caller(), &gone).unwrap_err();
+            assert!(
+                matches!(&err, Error::Cancelled(why) if why.contains("its call has gone")),
+                "{key}: {err}"
+            );
+            assert_eq!(f.main(), before, "{key}");
+            let sql = "SELECT state FROM lands WHERE request_key = ?1";
+            let row: String = f
+                .store
+                .read(|c| {
+                    Ok(c.sqlite()
+                        .unwrap()
+                        .query_row(sql, [key], |row| row.get(0))?)
+                })
+                .unwrap();
+            assert_eq!(row, "pending", "{key}");
+            // The index stays, so a retry goes on from where the plan stopped.
+            f.index(|_| ());
+            let out = f.land(cs, key);
+            assert_eq!(out.state, state, "{key}: {}", out.detail);
+        }
+    }
+
     /// An import moves `main` to root ─ C1 ─ … ─ Cn, where Ci puts `ci`, and
     /// C1 also puts `d/e/f`. None of them has derived data. Then a land on
     /// the head builds the path index there. Returns the fixture and the
@@ -1987,7 +2046,7 @@ mod tests {
         let mut files: HashSet<&[u8]> = HashSet::new();
         let mut dirs: HashSet<&[u8]> = HashSet::new();
         for cs in changesets {
-            for path in cs.changes.keys() {
+            for path in cs.changes().keys() {
                 let path = path.as_bytes();
                 if let Some(&key) = paths.get(path).or_else(|| parents.get(path)) {
                     files.insert(key);
@@ -2058,7 +2117,7 @@ mod tests {
                     let mut next = Some(tip);
                     while let Some(id) = next {
                         let cs = c.get_changeset(repo, id)?;
-                        next = cs.parents.first().copied();
+                        next = cs.parents().first().copied();
                         chain.push((id, c.generation(repo, id)?, cs));
                     }
                     // One index for all bases, as a ref's index serves its lands.
@@ -2068,8 +2127,8 @@ mod tests {
                     let mut model = PathIndex::at(tip, tip_gen, &lands.used);
                     for (n, &(base, base_gen, _)) in chain.iter().enumerate() {
                         if let Some((id, generation, cs)) = n.checked_sub(1).map(|m| &chain[m]) {
-                            let cost = model.cost([(*generation, &cs.changes)]);
-                            let add = |m: &mut PathIndex| m.add(*id, *generation, &cs.changes);
+                            let cost = model.cost([(*generation, cs.changes())]);
+                            let add = |m: &mut PathIndex| m.add(*id, *generation, cs.changes());
                             assert!(model.grow(&lands, cost, add));
                         }
                         let walked = touched_by(chain[..n].iter().map(|(.., cs)| cs), &land);
@@ -2457,7 +2516,7 @@ mod tests {
                     let tip = out.result.unwrap();
                     assert_eq!(m.f.main().target, tip, "{case}");
                     let rebased = m.f.store.read(|c| c.get_changeset(m.f.repo, tip));
-                    assert_eq!(rebased.unwrap().parents, vec![m.head], "{case}");
+                    assert_eq!(rebased.unwrap().parents(), [m.head], "{case}");
                     assert_eq!(
                         m.f.file(tip, path),
                         change

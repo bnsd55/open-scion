@@ -1,14 +1,14 @@
 //! `blame`.
 
-use std::collections::HashMap;
-
 use anyhow::{Context, Result, bail};
 use scion_core::{ChangesetId, IdentityTime};
 use scion_proto::v1::BlameRequest;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 use crate::client::{Ctx, id_from, lossy, split_spec};
 use crate::cmd::read::{identity_json, opt_id, read_stream};
+use crate::outln;
 
 /// The author of each changeset, and the path of the file there.
 type Sources = HashMap<ChangesetId, (IdentityTime, Vec<u8>)>;
@@ -55,12 +55,13 @@ async fn blame_call(
             .with_context(|| format!("cannot blame {spec}"))?;
         let Some(page) = page else { break };
         for c in page.changesets {
-            let author = IdentityTime {
-                name: c.author_name,
-                email: c.author_email,
-                unix_secs: c.author_unix_secs,
-                tz_offset_minutes: c.author_tz_offset_minutes,
-            };
+            let author = IdentityTime::new(
+                c.author_name,
+                c.author_email,
+                c.author_unix_secs,
+                c.author_tz_offset_minutes,
+            )
+            .expect("identity fits the format");
             sources.insert(id_from::<ChangesetId>(&c.changeset_id)?, (author, c.path));
         }
         ranges.extend(page.ranges);
@@ -143,7 +144,7 @@ pub async fn blame(ctx: &mut Ctx, spec: &str) -> Result<()> {
         .filter_map(|(source, origin)| Some((source?, origin)))
         .collect();
     if ctx.json {
-        println!("{}", Value::from(ranges_json(&lines, &sources)));
+        outln!("{}", Value::from(ranges_json(&lines, &sources)));
         return Ok(());
     }
     let mut stream = read_stream(ctx, changeset_id, &path)
@@ -157,14 +158,19 @@ pub async fn blame(ctx: &mut Ctx, spec: &str) -> Result<()> {
     {
         text.extend(chunk.data);
     }
-    print_text(&lines, &sources, path.as_bytes(), &text);
+    print_text(&lines, &sources, path.as_bytes(), &text)?;
     Ok(())
 }
 
 /// Prints each line of `text`, the file at `path`, after its changeset, its
 /// author and time, and its line number. As in git, each line also shows
 /// the path of its source if any line came from another path.
-fn print_text(lines: &[(ChangesetId, u32)], sources: &Sources, path: &[u8], text: &[u8]) {
+fn print_text(
+    lines: &[(ChangesetId, u32)],
+    sources: &Sources,
+    path: &[u8],
+    text: &[u8],
+) -> Result<()> {
     let width = lines.len().to_string().len();
     let path_width = if sources.values().any(|(_, p)| p != path) {
         sources
@@ -180,20 +186,21 @@ fn print_text(lines: &[(ChangesetId, u32)], sources: &Sources, path: &[u8], text
         .enumerate()
     {
         let source = sources.get(id);
-        let name = source.map(|(a, _)| lossy(&a.name)).unwrap_or_default();
-        let secs = source.map_or(0, |(a, _)| a.unix_secs);
+        let name = source.map(|(a, _)| lossy(a.name())).unwrap_or_default();
+        let secs = source.map_or(0, |(a, _)| a.unix_secs());
         let source_path = match (source, path_width) {
             (Some((_, p)), Some(path_width)) => format!(" {:<path_width$}", lossy(p)),
             _ => String::new(),
         };
         let text = lossy(text);
-        println!(
+        outln!(
             "{}{source_path} ({name} {secs} {:>width$}) {}",
             &id.to_string()[..12],
             n + 1,
             text.strip_suffix('\n').unwrap_or(&text)
         );
     }
+    Ok(())
 }
 
 /// Lines grouped into ranges, as JSON: consecutive lines from the same

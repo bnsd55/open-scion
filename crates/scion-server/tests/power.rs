@@ -27,10 +27,11 @@
 //!
 //! SHORTCUT: the cut is sync-before-reply, and the sync path tested is the
 //! Linux one; macOS syncs differently (`F_FULLFSYNC`) and its CI job cannot
-//! run `LazyFS`, so there the crash suite is what runs. Upgrade to a model
-//! that replays writes to each FLUSH point (dm-log-writes) when a report
-//! says that acknowledged writes were lost on hardware with a volatile
-//! cache.
+//! run `LazyFS`, so there the crash suite is what runs. No macOS tool cuts
+//! power or drops flushes at a barrier today, and the Linux replay
+//! (`dm-log-writes`) cannot run there; a harness that replays a macOS run
+//! to each `F_FULLFSYNC`, or a `LazyFS` port to the Mac, would close it.
+//! Write one when a report says acknowledged writes were lost on a Mac.
 //!
 //! The suite needs a `LazyFS` build, pinned to release 0.3.1, commit
 //! `045a0b3a1126725e693934e29d3ba15e08cc39ec` (the CI job clones and builds
