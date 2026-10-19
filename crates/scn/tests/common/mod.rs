@@ -11,6 +11,7 @@ use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPa
 use scion_proto::CHUNK_BYTES;
 use scion_proto::runtime::auth::Bearer;
 use scion_proto::runtime::listen::Limits;
+use scion_proto::runtime::listen::bind_unix;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::{ObjectKind, ObjectRef};
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
@@ -18,9 +19,7 @@ use scion_server::{
     Backend,
     test_support::{service, tree},
 };
-use scion_tier::{
-    CACHE_UPSTREAM_TIMEOUT, DAEMON_UPSTREAM_TIMEOUT, DiskStore, MemoryStore, Tier, bind_unix,
-};
+use scion_tier::{CACHE_UPSTREAM_TIMEOUT, DAEMON_UPSTREAM_TIMEOUT, DiskStore, MemoryStore, Tier};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;

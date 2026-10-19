@@ -21,6 +21,8 @@ bytes.workspace = true
 ed25519-dalek.workspace = true
 http.workspace = true
 http-body.workspace = true
+# The unix-socket bind checks the socket directory's owner.
+rustix.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true

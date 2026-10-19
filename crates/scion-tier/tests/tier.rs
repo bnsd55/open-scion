@@ -12,6 +12,7 @@ use std::time::Duration;
 use scion_core::{BlobId, Entry, FileState, PathElem, Tree};
 use scion_proto::CHUNK_BYTES;
 use scion_proto::runtime::listen::Limits;
+use scion_proto::runtime::listen::bind_unix;
 use scion_proto::runtime::object::{self, Assembler, Header};
 use scion_proto::runtime::tls::{ClientTls, ServerTls};
 use scion_proto::v1::objects_client::ObjectsClient;
@@ -20,7 +21,7 @@ use scion_proto::v1::{
     Encoding, GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, ObjectKind, ObjectPart,
     ObjectRef, ResolveRefRequest, ResolveRefResponse,
 };
-use scion_tier::{CACHE_UPSTREAM_TIMEOUT, DiskStore, Key, MemoryStore, Store, Tier, bind_unix};
+use scion_tier::{CACHE_UPSTREAM_TIMEOUT, DiskStore, Key, MemoryStore, Store, Tier};
 use tokio::net::TcpListener;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::{TcpListenerStream, UnixListenerStream};
