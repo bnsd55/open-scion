@@ -17,8 +17,8 @@ use scion_proto::v1::{
 use std::sync::Arc;
 
 use scion_server::Access;
-use scion_server::Store;
 use scion_server::test_support::meta::Meta as _;
+use scion_server::test_support::store::Store;
 
 /// The second repo of the two-world comparisons: its tree holds `docs`
 /// only, so the same path is genuinely missing there.

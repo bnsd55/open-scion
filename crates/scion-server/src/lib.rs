@@ -170,6 +170,5 @@ pub use import::{ImportOptions, ImportReport, import_git};
 pub use metrics::Metrics;
 pub use quotas::Quotas;
 pub use service::{ServeOptions, serve};
-pub use store::Store;
 pub use tickets::Keys;
 pub use tree::{RootTree, backfill_root_tree};

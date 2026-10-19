@@ -4,7 +4,8 @@
 //! lost, no file is left half-written, and the next write works once the
 //! space is back.
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
-use scion_server::{Backend, Error, StorageClass, Store};
+use scion_server::test_support::store::Store;
+use scion_server::{Backend, Error, StorageClass};
 
 /// A store on the backend the tests run on.
 fn store() -> (tempfile::TempDir, Backend) {

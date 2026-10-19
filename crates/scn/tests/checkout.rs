@@ -27,13 +27,11 @@ use scion_proto::v1::{
     Encoding, GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, ObjectKind, ObjectPart,
     ResolveRefRequest, ResolveRefResponse,
 };
+use scion_server::Backend;
 use scion_server::test_support::error::from_sqlite;
 use scion_server::test_support::meta::Meta as _;
 use scion_server::test_support::meta::MetaTx as _;
-use scion_server::{
-    Backend, Store,
-    test_support::{service, tree},
-};
+use scion_server::test_support::{service, store::Store, tree};
 use scion_server::{ImportOptions, import_git};
 use std::sync::Arc;
 use tempfile::TempDir;
