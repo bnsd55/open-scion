@@ -28,7 +28,7 @@ fn stop_quietly() -> ! {
     std::process::exit(0)
 }
 
-/// Prints one line to stdout. The [`outln!`] macro calls this; never
+/// Prints one line to stdout. The `outln!` macro calls this; never
 /// call it directly, so every print site reads like a `println!`.
 pub fn line(args: std::fmt::Arguments<'_>) {
     let mut out = io::stdout();
@@ -53,7 +53,7 @@ pub fn write<W: Write>(out: &mut W, args: std::fmt::Arguments<'_>) -> io::Result
 }
 
 /// Writes raw bytes to a stdout writer, `scn cat`'s streamed chunks.
-/// Same broken-pipe answer as [`write`].
+/// Same broken-pipe answer as [`write`](fn@write).
 pub fn write_all<W: Write>(out: &mut W, buf: &[u8]) -> io::Result<()> {
     match out.write_all(buf) {
         Ok(()) => Ok(()),
@@ -63,7 +63,7 @@ pub fn write_all<W: Write>(out: &mut W, buf: &[u8]) -> io::Result<()> {
 }
 
 /// Flushes a stdout writer with the same broken-pipe answer as
-/// [`write`]: a `BufWriter` holds whole lines back, so the reader can
+/// [`write`](fn@write): a `BufWriter` holds whole lines back, so the reader can
 /// leave while the buffer still holds them.
 pub fn flush<W: Write>(out: &mut W) -> io::Result<()> {
     match out.flush() {
@@ -73,7 +73,7 @@ pub fn flush<W: Write>(out: &mut W) -> io::Result<()> {
     }
 }
 
-/// stdout's `println!` of scn: it prints through [`line`], so a closed
+/// stdout's `println!` of scn: it prints through [`line`](fn@line), so a closed
 /// pipe ends the command quietly instead of panicking. Like `println!`,
 /// each call prints one newline after its arguments.
 #[macro_export]
