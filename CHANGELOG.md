@@ -225,6 +225,15 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- docs/architecture.md said a tier forwards `ResolveRef` and caches
+  `GetRootTree`; it refuses both with `UNIMPLEMENTED`, as its own
+  statements elsewhere in the doc already said. The tier tables now
+  match the code, the duplicated rename-index sentences are gone, the
+  derived-data table names `derived::get_by` and the deadline a cold
+  derive now carries, the blame bounds say the walk checks the deadline
+  between steps and refuses a file over the diff-line cap, and the fault
+  suites name the dm-log-writes suite that the directory-fsync row used
+  to list as future work.
 - A blame walk checks the call's deadline before each step, the first
   diff too (`#299`), and one diff reads no version past 1,048,576
   lines: a request file over the cap answers `RESOURCE_EXHAUSTED`, as
