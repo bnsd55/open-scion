@@ -1,13 +1,19 @@
 name: mount-reps
 
 # Evidence that the fork gate (#309) fixed the macOS mount flake: the
-# scn mount tests fork processes and read serve locks, and they flaked
-# on macOS runners before the gate serialized every forking test. On a
-# dispatch this workflow builds the test binary once and runs the mount
+# original flake was a race between a mount test and ANOTHER forking
+# test running in parallel, because a fork copies the process's open
+# serve.lock files to the child until it execs, and macOS is slow to
+# exec. The gate's users live in two modules, so the run takes both
+# filters (libtest ORs them): cmd::mount is the flaked test's module
+# and cmd::commit holds the other forking, serve-lock-reading test.
+# The tests run at cargo's default thread count, so the parallel forks
+# of the original race are all in the room. On a dispatch this
+# workflow builds the test binary once and repeats the two modules'
 # tests the number of times the reps input gives, on the same fixed
-# macos-15 image CI's test job uses, and stops at the first failure and
-# uploads that run's log. Runs only when a person asks: never on pushes
-# or pull requests.
+# macos-15 image CI's test job uses, and stops at the first failure
+# and uploads that run's log. Runs only when a person asks: never on
+# pushes or pull requests.
 
 on:
   workflow_dispatch:
@@ -32,9 +38,13 @@ jobs:
   mount-reps:
     name: mount tests x reps
     runs-on: macos-15
-    # 100 reps of the mount suite share the build's minutes; the cap
-    # bounds a dispatched outlier, not the default run.
-    timeout-minutes: 60
+    # One rep of the two filters took 0.15 s on a local Mac (five reps
+    # in 0.75 s), so 100 reps stay under half a minute even at a
+    # runner's slower pace; the one-time build of the lib test binary is
+    # the bulk of the job (CI's whole-workspace macOS test job, cache
+    # warm, runs about 12 minutes). The cap is that build plus the reps
+    # with a wide margin.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -43,8 +53,11 @@ jobs:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: build the scn test binary once
+        # No filter here: cargo takes one positional TESTNAME, and with
+        # --lib the one binary holds every lib test anyway. The two
+        # filters select at run time, in the step below.
         run: |
-          cargo test -p open-scion --lib cmd::mount --no-run \
+          cargo test -p open-scion --lib --no-run \
             --message-format=json > "$RUNNER_TEMP/build.json"
           bin=$(jq -r 'select(.executable != null and .profile.test == true
                 and .target.kind[0] == "lib") | .executable' \
@@ -69,7 +82,7 @@ jobs:
             # on every one: alarm survives exec, so this bounds each rep
             # the way the nfs-mount job's `timeout` bounds its script.
             if ! perl -e 'alarm shift; exec @ARGV' 300 \
-                 "$bin" cmd::mount >"$log" 2>&1; then
+                 "$bin" cmd::mount cmd::commit >"$log" 2>&1; then
               echo "run $i of $REPS failed; the log is in the artifact"
               tail -80 "$log"
               exit 1
