@@ -2195,7 +2195,39 @@ mod tests {
     /// the operator sees the failed land.
     #[tokio::test]
     async fn a_land_whose_call_failed_moves_its_counter() {
-        let (_dir, store, cs) = landed_store();
+        // main moved past the changeset's parent, so the land's plan has
+        // a walk to make: the spent deadline stops it at its first check.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let blob = store.blobs().put(b"x").unwrap();
+        let put = |parents, path: &str| Changeset {
+            parents,
+            author: IdentityTime {
+                name: b"t".to_vec(),
+                email: b"t@x".to_vec(),
+                unix_secs: 0,
+                tz_offset_minutes: 0,
+            },
+            committer: None,
+            message: path.as_bytes().to_vec(),
+            changes: [(
+                RepoPath::new(path.into_bytes()).unwrap(),
+                Some(FileState::Regular {
+                    content: blob,
+                    executable: false,
+                }),
+            )]
+            .into(),
+        };
+        let cs = store
+            .write(|c| {
+                let repo = c.create_repo("r")?;
+                let root = c.insert_changeset(repo, &put(vec![], "a"))?;
+                let b = c.insert_changeset(repo, &put(vec![root], "b"))?;
+                assert!(c.cas_ref(repo, "main", None, b)?);
+                c.insert_changeset(repo, &put(vec![root], "c"))
+            })
+            .unwrap();
         let metrics = Arc::new(Metrics::default());
         let service = counting_service(&store, &metrics);
         let mut request = as_default(scion_proto::v1::LandRequest {
