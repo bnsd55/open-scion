@@ -484,10 +484,16 @@ async fn serve(
     // it.
     let metrics = Arc::new(Metrics::default());
     // One signal task ends the gRPC listener and the metrics export alike.
+    // A second signal while the drain runs ends it at once: the in-flight
+    // calls are cut, the log says so, and the process exits non-zero, so
+    // the operator does not need kill -9.
     let (end_tx, end_rx) = tokio::sync::watch::channel(());
     tokio::spawn(async move {
         scion_proto::metrics::shutdown_signal().await;
         let _ = end_tx.send(());
+        scion_proto::metrics::shutdown_signal().await;
+        tracing::warn!("a second signal ended the drain; the in-flight calls were cut");
+        std::process::exit(1);
     });
     if let Some(metrics_listen) = config.metrics_listen {
         let address = metrics_listen.to_string();

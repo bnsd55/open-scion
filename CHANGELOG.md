@@ -165,6 +165,12 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Changed
 
+- A second Ctrl-C or SIGTERM while the server drains ends it at once: a
+  drain waits for the calls in flight, and one held open by a stuck
+  client left the operator with a server that answered nothing and
+  ended only under `kill -9`. The first signal's graceful drain is as
+  it was; the second cuts the calls in flight, logs that it did, and
+  exits 1.
 - A git import no longer re-reads and re-fsyncs blobs that a committed
   row of the target repo already names (#238): one row probe per
   distinct blob proves the stored copy durable, so a branch import over
