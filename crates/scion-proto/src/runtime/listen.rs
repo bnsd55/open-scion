@@ -33,7 +33,7 @@
 //! handshake gets what is left of the deadline, and the preface timer gets
 //! the rest. A peer that never starts the handshake, never ends it, or
 //! stops right after it gives its place up within
-//! [`TLS_HANDSHAKE_TIMEOUT`] of its accept, the same bound as a silent
+//! [`HANDSHAKE_TIMEOUT`] of its accept, the same bound as a silent
 //! plain peer.
 
 use std::future::Future;
@@ -73,7 +73,6 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// A TLS handshake must end within this long, or the connection is dropped.
 /// The same wait as [`HANDSHAKE_TIMEOUT`], and generous for one round trip
 /// plus a certificate check.
-pub(crate) const TLS_HANDSHAKE_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
 
 /// After this long without a frame from a client, the process sends it an
 /// HTTP/2 ping.
@@ -1102,13 +1101,7 @@ mod tests {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, None);
-        let addr = serve_tls(
-            Limits::default(),
-            TIMERS,
-            &server_tls,
-            TLS_HANDSHAKE_TIMEOUT,
-        )
-        .await;
+        let addr = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
         let mut client = client(addr, &certs.authority.cert(), None).await.unwrap();
         assert_eq!(quick(&mut client).await, Code::NotFound);
     }
@@ -1119,13 +1112,7 @@ mod tests {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, Some(&certs.authority.cert()));
-        let addr = serve_tls(
-            Limits::default(),
-            TIMERS,
-            &server_tls,
-            TLS_HANDSHAKE_TIMEOUT,
-        )
-        .await;
+        let addr = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
         // The connect of a client can end before the server has checked its
         // certificate, so the refusal may show in the connect or in the
         // call. A served client gets the stub's `NotFound`; anything else is
@@ -1149,13 +1136,7 @@ mod tests {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, Some(&certs.authority.cert()));
-        let addr = serve_tls(
-            Limits::default(),
-            TIMERS,
-            &server_tls,
-            TLS_HANDSHAKE_TIMEOUT,
-        )
-        .await;
+        let addr = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
         let mut client = client(addr, &certs.authority.cert(), Some(&certs.client))
             .await
             .unwrap();
@@ -1169,13 +1150,7 @@ mod tests {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, None);
-        let addr = serve_tls(
-            Limits::default(),
-            TIMERS,
-            &server_tls,
-            TLS_HANDSHAKE_TIMEOUT,
-        )
-        .await;
+        let addr = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
         assert!(client(addr, &certs.stranger.cert(), None).await.is_err());
     }
 
@@ -1185,13 +1160,7 @@ mod tests {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, Some(&certs.authority.cert()));
-        let addr = serve_tls(
-            Limits::default(),
-            TIMERS,
-            &server_tls,
-            TLS_HANDSHAKE_TIMEOUT,
-        )
-        .await;
+        let addr = serve_tls(Limits::default(), TIMERS, &server_tls, HANDSHAKE_TIMEOUT).await;
         // As above: the refusal may show in the connect or in the call.
         match client(addr, &certs.authority.cert(), Some(&certs.stranger_client)).await {
             Err(_) => {}
