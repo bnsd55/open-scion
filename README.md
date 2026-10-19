@@ -14,7 +14,9 @@ AI agents. The server keeps the history and makes the commits; clients ask
 only for what they need. Written in Rust.
 
 > **Early proof of concept.** It runs on one machine and is not ready for real
-> code. Planned work is tracked in [issues](https://github.com/bnsd55/open-scion/issues)
+> code. The order of the work, and what stays out until it passes, is in
+> [docs/ROADMAP.md](docs/ROADMAP.md); planned work is tracked in
+> [issues](https://github.com/bnsd55/open-scion/issues)
 > and [milestones](https://github.com/bnsd55/open-scion/milestones).
 
 ## What this is, and what it is not

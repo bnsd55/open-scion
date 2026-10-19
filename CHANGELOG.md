@@ -16,6 +16,10 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Added
 
+- [docs/ROADMAP.md](docs/ROADMAP.md), the owner's order of the work: the
+  v0.1.1 distribution and portability gate, the v0.2.0 compatibility and
+  recovery gate, the v0.3.0 single-node operational beta, and the work
+  that stays out until those pass. The README links it.
 - A Postgres-backed store knows which database and which data directory
   belong together: the first open mints a store UUID, keeps it in the
   database and the data directory's `backend` marker, and an open that
