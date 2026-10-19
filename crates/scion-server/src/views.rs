@@ -106,8 +106,8 @@ pub(crate) const VIEW_EXPIRE_STEP: usize = 256;
 ///
 /// # Errors
 ///
-/// Store errors, or [`crate::error::Error::DeadlineExceeded`] once
-/// `deadline` passes.
+/// Store errors, [`crate::error::Error::DeadlineExceeded`] once `deadline`
+/// passes, or [`crate::error::Error::Cancelled`] once the call has gone.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn view_root(
     store: &Backend,
@@ -200,8 +200,8 @@ pub(crate) fn view_root(
 ///
 /// # Errors
 ///
-/// Store errors, or [`crate::error::Error::DeadlineExceeded`] once
-/// `deadline` passes.
+/// Store errors, [`crate::error::Error::DeadlineExceeded`] once `deadline`
+/// passes, or [`crate::error::Error::Cancelled`] once the call has gone.
 fn project(
     c: &mut dyn MetaTx,
     repo: RepoId,

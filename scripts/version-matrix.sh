@@ -126,18 +126,18 @@ fi
 PREV_SRC=$(cd "$PREV_SRC" && pwd -P)
 
 WORK=
-# The daemon's socket sits outside WORK: the pair's temp path is longer
-# than the Unix socket limit of 104 bytes. It sits in the temp root
-# itself, which is the user's: the daemon refuses a socket whose parent
-# another user owns, so macOS's /tmp (a root-owned link) is out. One
-# path per run and per direction, named by the pid, cannot collide: a
-# slow daemon that unlinks its socket on exit must not touch the next
-# daemon's live one.
-SOCK=$(cd "${TMPDIR:-/tmp}" && pwd -P)/scion-matrix-$$.sock
+# The daemon's socket: in a directory the run owns (the daemon refuses
+# a socket whose parent another user owns, and a CI runner's /tmp is
+# root's), and short (the pair's temp path on macOS is longer than the
+# Unix socket limit of 104 bytes). One socket per direction, named by
+# the pid: a slow daemon's exit unlink cannot reach the next one's.
+SOCKDIR=$(mktemp -d "${TMPDIR:-/tmp}/vmsock.XXXXXX")
+SOCKDIR=$(cd "$SOCKDIR" && pwd -P)
+SOCK="$SOCKDIR/matrix-$$.sock"
 
 cleanup() {
   local rc=$1 f
-  rm -f "$SOCK" "$SOCK-cur" "$SOCK-prev"
+  rm -rf "$SOCKDIR"
   [ -n "$WORK" ] || return 0
   for f in "$WORK"/*/*.pid; do
     if [ -e "$f" ]; then stop "$(dirname "$f")"; fi
@@ -168,13 +168,6 @@ make_work() {
   # Resolve symlinks (macOS: /var is /private/var), as git daemon does.
   WORK=$(cd "$WORK" && pwd -P)
 }
-
-if [ -n "${SCION_BIN:-}" ]; then
-  BIN=$SCION_BIN
-else
-  note "building the N release binaries"
-  (cd "$ROOT" && cargo build --release --locked --quiet) || die "step 'build N' failed"
-fi
 
 # build_prev REF: the N-1 binaries and their source checkout. PREV_BIN
 # skips the build (a local debug run); the source checkout is made
@@ -267,28 +260,35 @@ start() {
   return 0
 }
 
-# stop DIR: stop every process `start DIR` started. The pids are not
-# children of this shell (each server started inside a command
+# stop_one DIR NAME: stop the one process `start DIR NAME` started. The
+# pid is not a child of this shell (the server started inside a command
 # substitution that has since exited), so wait cannot confirm a death:
 # poll kill -0 for ten seconds, then KILL, and say which process needed
 # it. A wedged server here is exactly what the matrix hunts; it must
 # fail loud, not hang cleanup.
+stop_one() {
+  local dir=$1 name=$2 f="$1/$2.log.pid" pid n
+  [ -e "$f" ] || return 0
+  pid=$(cat "$f")
+  rm -f "$f"
+  kill -TERM "$pid" 2> /dev/null || true
+  n=0
+  while kill -0 "$pid" 2> /dev/null && [ "$n" -lt 100 ]; do
+    sleep 0.1
+    n=$((n + 1))
+  done
+  if kill -0 "$pid" 2> /dev/null; then
+    note "$name (pid $pid) ignored TERM; sent KILL"
+    kill -KILL "$pid" 2> /dev/null || true
+  fi
+}
+
+# stop DIR: stop every process `start DIR` started.
 stop() {
-  local dir=$1 f pid n
+  local dir=$1 f
   for f in "$dir"/*.log.pid; do
     [ -e "$f" ] || return 0
-    pid=$(cat "$f")
-    rm -f "$f"
-    kill -TERM "$pid" 2> /dev/null || true
-    n=0
-    while kill -0 "$pid" 2> /dev/null && [ "$n" -lt 100 ]; do
-      sleep 0.1
-      n=$((n + 1))
-    done
-    if kill -0 "$pid" 2> /dev/null; then
-      note "$(basename "$f" .log.pid) (pid $pid) ignored TERM; sent KILL"
-      kill -KILL "$pid" 2> /dev/null || true
-    fi
+    stop_one "$dir" "$(basename "$f" .log.pid)"
   done
 }
 
@@ -370,14 +370,22 @@ pair_2() {
     --metrics-listen 127.0.0.1:0)
   mport=$(metrics_port "$dir/server.log")
   [ -n "$mport" ] || die "pair '$PAIR' ($SIDE): the server logged no metrics port"
-  # The cache logs the address it asked for, not the one it bound, so
-  # port 0 would name itself. SHORTCUT: it takes the port beside the
-  # server's, which the kernel never reserved; coder5's fix makes
-  # scion-cache log its bound address, and this becomes :0 again.
-  cport=$((sport + 1))
-  start cache "$dir" "$cache/scion-cache" port --listen "127.0.0.1:$cport" \
+  # The cache binds port 0 and its serving line names the address it
+  # bound, as the server's does. An N-1 cache older than a826c71 logged
+  # the port it asked for instead, 0, which nothing can connect to; for
+  # such a pair, take the port beside the server's, which the kernel
+  # never reserved for it.
+  cport=$(start cache "$dir" "$cache/scion-cache" port --listen 127.0.0.1:0 \
     --upstream "http://127.0.0.1:$sport" \
-    --ticket-public-key "$(cat "$dir/ticket.pub")" > /dev/null
+    --ticket-public-key "$(cat "$dir/ticket.pub")")
+  if [ "$cport" = 0 ]; then
+    note "the N-1 cache predates a826c71: it cannot name its port"
+    stop_one "$dir" cache
+    cport=$((sport + 1))
+    start cache "$dir" "$cache/scion-cache" port --listen "127.0.0.1:$cport" \
+      --upstream "http://127.0.0.1:$sport" \
+      --ticket-public-key "$(cat "$dir/ticket.pub")" > /dev/null
+  fi
   # The read through the tier must match the direct read byte for byte.
   # The ref and its ticket come from the server; the objects ride the
   # cache, as cli.md documents the split.
@@ -477,12 +485,31 @@ command -v cargo > /dev/null || die "needs cargo"
 command -v git > /dev/null || die "needs git"
 command -v curl > /dev/null || die "needs curl"
 
+# The ref first: a run with nothing to compare against says so before it
+# builds anything.
 ref=$(prev_ref)
 if [ -z "$ref" ]; then
+  # A workflow that resolved an N-1 ref hands it to the run through
+  # PREV_REF. The resolve step also leaves it in this file, which no env
+  # wiring can lose: a run that received no ref while the file is here
+  # tested nothing, and it must fail loud, never pass as a skip.
+  if [ -s version-matrix.prev-ref ]; then
+    die "the workflow resolved N-1 $(cat version-matrix.prev-ref), but this run never received it (PREV_REF was empty)"
+  fi
   summary "skipped: no release tag yet"
   exit 0
 fi
+# The file has said all it can: the run has its ref, and a leftover
+# must not reach the next run on a reused runner.
+rm -f version-matrix.prev-ref
 note "N-1 is $ref"
+
+if [ -n "${SCION_BIN:-}" ]; then
+  BIN=$SCION_BIN
+else
+  note "building the N release binaries"
+  (cd "$ROOT" && cargo build --release --locked --quiet) || die "step 'build N' failed"
+fi
 build_prev "$ref"
 
 make_work

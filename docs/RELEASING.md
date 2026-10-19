@@ -10,7 +10,8 @@ tags by itself: each step is run by a person.
 
 - Every required check is green on the release commit. A red check
   blocks the release; `gh pr checks` on the release PR lists them.
-- The milestone for the version has no open issues.
+- The milestone for the version has no open issues but the release's
+  own tracking one, which closes with the release itself.
 - The `publish check` CI job runs on every PR and keeps the five
   crates valid for the later crates.io publish: each crate carries the
   metadata crates.io wants (a description, the license
@@ -31,18 +32,30 @@ A release is cut through one PR from a branch named
    commit it on the release branch.
 2. **Set the date in `CHANGELOG.md`.** Rename the `## [v0.1.0] -
    unreleased` section to `## [v0.1.0] - YYYY-MM-DD` with the release
-   day, and add a fresh empty `## [Unreleased]` above it. The entry
+   day, and add a fresh empty `## [Unreleased]` above it. The note that
+   the old `Unreleased` carried, pointing new entries at the version's
+   section, goes with the rename: a dated section takes no pointer, and
+   a fresh `Unreleased` needs none. The entry
    must say what the release adds and changes in plain language,
    grouped by area, with the issue numbers that stay true after the
    release.
 3. **Check the version.** All five crates share one version through
    `[workspace.package]` in the root `Cargo.toml`. A release bumps one
    number there and the four `version = "..."` entries of the internal
-   dependencies in `[workspace.dependencies]` to the same value.
+   dependencies in `[workspace.dependencies]` to the same value. For
+   the first release nothing is bumped: the five already say 0.1.0,
+   and the step is the check that they are equal. A later release
+   bumps all five in one commit.
 4. **Notes regenerated from the tagged commit.** The GitHub release
    notes come from the version's `CHANGELOG.md` section read at the
    tagged commit (`git show v0.1.0:CHANGELOG.md`), never from a local
-   working tree or an edited copy.
+   working tree or an edited copy. The command prints the whole file;
+   the version's section alone comes out of
+
+   ```sh
+   git show v0.1.0:CHANGELOG.md | awk \
+     '/^## \[v0.1.0\]/{f=1} f && /^## \[/{if(++n==2) exit} f'
+   ```
 5. **A clean-checkout build and quick-start smoke.** From a fresh
    clone of the tagged commit, build the workspace and run the
    README's `Try it` flow end to end.
@@ -63,7 +76,14 @@ A release is cut through one PR from a branch named
    git push origin v0.1.0
    ```
 
-   Then check the tag landed on the release commit. An annotated tag
+   Before the push, the same check runs locally, on the tag alone:
+
+   ```sh
+   test "$(git rev-parse 'v0.1.0^{}')" = "$(git rev-parse <the release commit>)"
+   ```
+
+   Then push, and check the tag landed on the release commit. An
+   annotated tag
    makes `git ls-remote` print the tag object's SHA, so compare the
    peeled ref to the commit:
 

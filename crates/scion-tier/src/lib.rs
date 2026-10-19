@@ -73,6 +73,7 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::server::Connected;
 use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Code, Request, Response, Status, Streaming};
+use tracing::Instrument as _;
 
 use store::lock;
 pub use store::{DiskStore, MemoryStore, Store};
@@ -1383,7 +1384,15 @@ impl<S: Store> Objects for Tier<S> {
             .ok_or_else(reply::busy)?;
         let first = split(first)?;
         let (tx, stream, slot) = reply::channel();
-        tokio::spawn(self.clone().reply(ask, progress, first, tx, slot));
+        // The reply runs outside the call, but stays in its span: the
+        // GetObjects line carries the call's rpc, peer and request_id, the
+        // way the server's call lines do.
+        let span = tracing::Span::current();
+        tokio::spawn(
+            self.clone()
+                .reply(ask, progress, first, tx, slot)
+                .instrument(span),
+        );
         Ok(Response::new(stream))
     }
 }

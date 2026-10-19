@@ -1,15 +1,16 @@
 //! `merge-base`, `is-ancestor`, `diff`.
 
-use std::collections::HashMap;
-use std::io::{BufWriter, Write as _};
-
 use anyhow::{Context, Result, bail};
 use scion_core::{ChangesetId, Entry, FileEntry, FileState, GitOid, RepoPath};
 use scion_proto::v1::{self, DiffRequest, FileKind, IsAncestorRequest, MergeBaseRequest};
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::io::BufWriter;
 
 use crate::client::{Ctx, id_from, lossy};
 use crate::cmd::read::entry_json;
+use crate::out::{flush, write};
+use crate::outln;
 
 /// Prints the best common ancestors of two revisions, one per line, as
 /// `git merge-base --all`. Usually one; criss-cross merges can give several.
@@ -34,11 +35,11 @@ pub async fn merge_base(ctx: &mut Ctx, a: &str, b: &str) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     if ctx.json {
         let bases: Vec<String> = bases.iter().map(ToString::to_string).collect();
-        println!("{}", Value::from(bases));
+        outln!("{}", Value::from(bases));
         return Ok(());
     }
     for id in bases {
-        println!("{id}");
+        outln!("{id}");
     }
     Ok(())
 }
@@ -59,7 +60,7 @@ pub async fn is_ancestor(ctx: &mut Ctx, ancestor: &str, descendant: &str) -> Res
         .with_context(|| format!("cannot check whether {ancestor} is an ancestor of {descendant}"))?
         .into_inner();
     if ctx.json {
-        println!("{}", json!({ "is_ancestor": reply.is_ancestor }));
+        outln!("{}", json!({ "is_ancestor": reply.is_ancestor }));
     }
     Ok(reply.is_ancestor)
 }
@@ -126,12 +127,15 @@ pub async fn diff(ctx: &mut Ctx, old: &str, new: &str, path: Option<&RepoPath>) 
                 }
                 json_entries.push((entry.rename_from, value));
             } else if renamed {
-                writeln!(out, "R\t{} -> {path}", lossy(&entry.rename_from))?;
+                write(
+                    &mut out,
+                    format_args!("R\t{} -> {path}\n", lossy(&entry.rename_from)),
+                )?;
             } else {
-                writeln!(out, "{status}\t{path}")?;
+                write(&mut out, format_args!("{status}\t{path}\n"))?;
             }
         }
-        out.flush()?;
+        flush(&mut out)?;
         drop(out);
         renames_incomplete |= reply.renames_incomplete;
         if reply.next_after.is_empty() {
@@ -154,7 +158,7 @@ pub async fn diff(ctx: &mut Ctx, old: &str, new: &str, path: Option<&RepoPath>) 
             }
             value
         });
-        println!("{}", Value::from_iter(values));
+        outln!("{}", Value::from_iter(values));
     }
     Ok(())
 }
