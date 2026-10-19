@@ -71,6 +71,15 @@ cleanup() {
   for f in "$WORK"/*.pid; do
     if [ -e "$f" ]; then stop "$(basename "$f" .pid)"; fi
   done
+  # A failed run's only evidence is its logs: the servers', the batch's,
+  # and the results. Setting SCION_KEEP_LOGS to a directory keeps them
+  # there instead of losing them with $WORK. Unset: nothing changes.
+  if [ -n "${SCION_KEEP_LOGS:-}" ] && [ -d "$WORK" ]; then
+    mkdir -p "$SCION_KEEP_LOGS"
+    for f in "$WORK"/*.log "$WORK"/results; do
+      if [ -e "$f" ]; then cp "$f" "$SCION_KEEP_LOGS/$(basename "$WORK").$(basename "$f")"; fi
+    done
+  fi
   rm -rf "$WORK"
 }
 
@@ -188,7 +197,17 @@ batch() {
   local name=$1 jobs=$2 cmd=$3
   export BIN DAEMON SPARSE_DIR
   mkdir "$WORK/$name"
-  seq 1 "$jobs" | /usr/bin/time -p xargs -P "$jobs" -I{} sh -c "$cmd" sh "$WORK/$name/{}" \
+  # Each job starts 20 ms after the one before it, round-robin over 20
+  # steps. All jobs starting at once can overflow a server's accept
+  # queue: git daemon listens with a backlog of 5 (daemon.c:
+  # listen(sockfd, 5)), and Linux resets a connection that lands on a
+  # full queue, which the client sees as "read error: Connection reset
+  # by peer" in the middle of a run. A start every 20 ms keeps the queue
+  # near empty; the fraction of a second it adds to a 50-job batch is
+  # inside the noise, and both tools pay it alike.
+  seq 1 "$jobs" | /usr/bin/time -p xargs -P "$jobs" -I{} sh -c \
+    'sleep "$(printf "0.%02ds" $(( ($1 - 1) % 20 )))"; eval "$2"' \
+    sh "$WORK/$name/{}" "$cmd" \
     > "$WORK/$name.log" 2>&1 || {
     tail -n 20 "$WORK/$name.log" >&2
     die "$name: a job failed"
