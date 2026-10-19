@@ -350,6 +350,19 @@ impl Store {
         // change.
         let me = rustix::process::geteuid().as_raw();
         let meta = fs::symlink_metadata(dir)?;
+        // The refusal is by kind, not by the link's mode: on macOS lchmod
+        // can give a symlink any mode, so a mode check alone does not
+        // catch one, and a link's target can change behind the checks.
+        if meta.file_type().is_symlink() {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "{} is a symlink (the data directory must be a real directory: a symlink's target and mode can change behind the checks)",
+                    dir.display()
+                ),
+            )
+            .into());
+        }
         if meta.mode() & 0o022 != 0 {
             return Err(io::Error::new(
                 ErrorKind::PermissionDenied,
@@ -2328,6 +2341,23 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    /// A symlinked data directory is refused by kind, not by the link's
+    /// mode: on macOS lchmod can give a symlink any mode, so a mode check
+    /// alone does not catch one, and a link's target can change behind
+    /// the checks.
+    #[test]
+    fn a_symlinked_data_directory_is_refused() {
+        let real = tempfile::tempdir().unwrap();
+        let holder = tempfile::tempdir().unwrap();
+        let link = holder.path().join("data");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        let err = match Store::open(&link) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("a symlinked data directory is accepted"),
+        };
+        assert!(err.contains("is a symlink"), "{err}");
+    }
 
     /// A write of one blob waits for the stripe of a write that is held:
     /// while the stripe is held by hand, the blob's file stays absent,

@@ -1298,8 +1298,8 @@ mod tests {
     use scion_core::{FileState, GitOid, IdentityTime, RepoPath};
 
     use super::*;
-    use crate::Store;
     use crate::store::migrate;
+    use crate::test_support::store::Store;
 
     fn changeset(parents: Vec<ChangesetId>, changes: &[(&str, Option<FileState>)]) -> Changeset {
         Changeset::new(

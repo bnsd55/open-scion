@@ -83,7 +83,7 @@ const LINK_BYTES: usize = 32 + 8 + 8;
 ///
 /// # Errors
 ///
-/// Errors of the `derived` fill, and of [`Store::flush`](crate::store::Store::flush).
+/// Errors of the `derived` fill, and of `Store::flush`.
 pub fn backfill_commit_graph(store: &Backend, repo: &str, cs: ChangesetId) -> Result<&'static str> {
     crate::derived::backfill::<CommitGraph>(store, repo, cs)
 }

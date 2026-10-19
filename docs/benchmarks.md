@@ -166,3 +166,42 @@ travel together.
 The numbers here come from one `bench.yml` run, as ratios between the
 tools. A table of one run names no machine details, so it can be shared
 as it is.
+
+- Run: [bench.yml run 39306408455](https://github.com/bnsd55/openscion/actions/runs/39306408455),
+  on `main` at `7b7789fd76ad616efafcc52637079213f47a8aa2`.
+- The facts of the run: scion commit `7b7789f`, git `2.55.0` — the two
+  the run's own logs show. The run's summary also printed its core
+  count and kernel; they travel with the run, not with this page.
+- 50 checkouts at once of `tokio/src/` (377 files), 5 repetitions per
+  state; the table shows the median, with min and max.
+
+| Run (median, min–max) | wall s | CPU s | server CPU s | server MiB |
+|---|---|---|---|---|
+| scion, cold daemon | 1.50 (1.45–1.52) | 5.34 (5.18–5.45) | 0.09 (0.08–0.10) | 0.91 (0.91–0.91) |
+| git clone | 33.15 (32.76–33.57) | 130.02 (130.00–130.17) | 18.21 (18.18–18.34) | 799.89 (799.89–799.89) |
+| git clone --filter=blob:none | 13.96 (13.89–14.01) | 52.11 (51.99–52.35) | 29.18 (29.09–29.36) | 289.28 (289.28–289.28) |
+| scion, warm daemon | 1.35 (1.32–1.41) | 4.86 (4.75–4.92) | 0.03 (0.03–0.04) | 0.01 (0.01–0.01) |
+| git clone --reference mirror | 0.80 (0.79–0.84) | 3.01 (2.99–3.04) | 0.16 (0.15–0.16) | 0.00 (0.00–0.00) |
+
+| git ÷ scion (medians) | wall | CPU | server CPU | server MiB |
+|---|---|---|---|---|
+| git clone ÷ scion, cold daemon | 22.1x | 24.3x | 202.3x | 879.0x |
+| git clone --filter=blob:none ÷ scion, cold daemon | 9.3x | 9.8x | 324.2x | 317.9x |
+| git clone --reference mirror ÷ scion, warm daemon | 0.6x | 0.6x | 5.3x | 0.0x |
+
+Where scion wins: a cold checkout of `tokio/src` is 9.3–22.1x faster
+than git's clones of the same files, because the daemon and the server
+send only what `tokio/src` needs — 0.91 MiB against git's 289–800 MiB
+of pack files — and the server side stays nearly idle (0.09 CPU s
+against git's 18–29 s).
+
+Where scion loses: the warm daemon, 1.35 s, against git's mirror clone,
+0.80 s — git is 1.7x faster here, and lighter on the CPU too (3.01
+against 4.86 CPU s). The data says where the gap lives: the server side
+is idle in both (0.03 against 0.16 CPU s, 0.01 MiB moved — the daemon
+serves the objects the cold run left), so the difference is what each
+of the 50 fresh client processes pays: a scn checkout starts a process,
+connects, resolves the ref and walks the tree call by call, while git's
+jobs read local objects the mirror already holds and move nothing over
+the wire. A long-lived client, or a mount that keeps one process, does
+not pay that 50 times — but this benchmark's 50 fresh checkouts do.
