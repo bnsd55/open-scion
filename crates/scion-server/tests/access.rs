@@ -1318,14 +1318,15 @@ async fn the_authz_matrix_answers_as_documented() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_file_runs_while_the_blame_slots_are_full() {
     let (dir, store, root, _blob) = store();
-    // Five versions of a 1,048,576-line file: one blame call diffs at
-    // least one version pair, which takes seconds, and stops at its diff
-    // budget with a cursor.
+    // Five versions of a 1,048,576-line file (the line cap, so the
+    // blames are served): one blame call diffs at least one version
+    // pair, which takes seconds, and stops at its diff budget with a
+    // cursor.
     let line = "x".repeat(15) + "\n";
     let mut text = String::new();
     let mut puts = Vec::new();
     for n in 0..5 {
-        text = format!("version {n}\n") + &line.repeat(1 << 20);
+        text = format!("version {n}\n") + &line.repeat((1 << 20) - 1);
         puts.push(Some(regular(store.blobs().put(text.as_bytes()).unwrap())));
     }
     let tip = store
