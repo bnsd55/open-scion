@@ -71,20 +71,19 @@ A release is cut through one PR from a branch named
 ## Undoing a bad tag
 
 A tag that names the wrong commit, or a release whose notes are wrong,
-is fixed by redoing it, not by moving it:
+is fixed one of two ways. Git's own advice (`git tag --help`, "On
+Re-tagging") is not to reuse a name that others may have fetched.
 
-1. Delete the GitHub release that points at the tag.
-2. Delete the tag on the remote and locally:
-
-   ```sh
-   git push origin :refs/tags/v0.1.0
-   git tag -d v0.1.0
-   ```
-
-3. Fix what was wrong, cut a new tag from the right commit, and open
-   the release again.
-4. Anyone who fetched the old tag re-fetches with
-   `git fetch --tags --force`; say so in the release thread.
+- If the bad tag was public only briefly and the release had no users
+  yet: delete the GitHub release that points at the tag, delete the
+  tag on the remote and locally (`git push origin :refs/tags/v0.1.0`,
+  then `git tag -d v0.1.0`), fix what was wrong, cut a new tag from
+  the right commit, and open the release again. Anyone who fetched the
+  old tag re-fetches with `git fetch --tags --force`; say so in the
+  release thread.
+- Otherwise leave the tag and its release: mark the release as bad in
+  its notes, and cut the next patch version (v0.1.1) from the fixed
+  commit.
 
 Never move a tag to a different commit in place.
 
