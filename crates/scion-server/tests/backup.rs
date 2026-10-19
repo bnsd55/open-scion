@@ -6,7 +6,8 @@
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_server::test_support::meta::{Meta as _, MetaTx as _, RepoId};
-use scion_server::{Backend, Store, fsck};
+use scion_server::test_support::store::Store;
+use scion_server::{Backend, fsck};
 
 /// A backup taken while the store serves: the metadata snapshot names
 /// every blob a later blob copy brings, the restored store opens, `fsck`

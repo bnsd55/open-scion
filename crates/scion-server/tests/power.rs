@@ -53,8 +53,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use common::*;
 use scion_core::BlobId;
-use scion_server::Store;
 use scion_server::test_support::store::BlobStatus;
+use scion_server::test_support::store::Store;
 use tonic::Status;
 
 /// The `LazyFS` checkout the suite runs against: it must hold

@@ -25,9 +25,10 @@ use scion_proto::v1::{
     ResolveRefRequest,
 };
 use scion_proto::{CHUNK_BYTES, MAX_OBJECT_REFS};
+use scion_server::Backend;
 use scion_server::test_support::meta::MetaTx as _;
 use scion_server::test_support::store::BlobStatus;
-use scion_server::{Backend, Store, test_support::tree};
+use scion_server::test_support::{store::Store, tree};
 use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;

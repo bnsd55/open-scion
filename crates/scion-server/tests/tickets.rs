@@ -13,7 +13,10 @@ use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::{GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
 use scion_server::Keys;
 use scion_server::test_support::meta::MetaTx as _;
-use scion_server::{Backend, Store, test_support::service};
+use scion_server::{
+    Backend,
+    test_support::{service, store::Store},
+};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tonic::Code;

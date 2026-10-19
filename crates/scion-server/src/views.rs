@@ -320,7 +320,7 @@ mod tests {
 
     fn store() -> (tempfile::TempDir, Backend) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(crate::Store::open(dir.path()).unwrap());
+        let store = Backend::Sqlite(crate::test_support::store::Store::open(dir.path()).unwrap());
         (dir, store)
     }
 
