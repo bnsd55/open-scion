@@ -765,6 +765,7 @@ impl Checker<'_> {
             let have: BTreeMap<Vec<u8>, Entry> = c
                 .get_tree(scion_id)?
                 .entries()
+                .clone()
                 .into_iter()
                 .map(|(name, entry)| (name.as_bytes().to_vec(), entry))
                 .collect();
@@ -897,7 +898,7 @@ fn read_tree(
         .decode()
         .map_err(|e| bad(format!("cannot decode: {e}")))?;
     let mut entries = BTreeMap::new();
-    for e in decoded.entries() {
+    for e in &decoded.entries {
         let oid = e.oid.to_owned();
         let entry = match e.mode.value() {
             0o040_000 => GitEntry::Dir(oid),

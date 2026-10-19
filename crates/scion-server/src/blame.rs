@@ -409,7 +409,7 @@ pub fn blame(
         }
         diffed += cost;
         if give_lines(&mut lines, id, older.as_ref(), &text) {
-            changesets.push((id, changeset.author(), path.clone()));
+            changesets.push((id, changeset.author().clone(), path.clone()));
         }
         progressed = true;
         drop(diff_hold);

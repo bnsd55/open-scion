@@ -101,7 +101,7 @@ pub async fn ls(ctx: &mut Ctx, spec: &str) -> Result<()> {
         println!("{}", Value::from(entries));
         return Ok(());
     }
-    for (name, entry) in &tree.entries() {
+    for (name, entry) in tree.entries() {
         let (mode, kind) = describe(entry);
         let slash = if matches!(entry, Entry::Dir(_)) {
             "/"
@@ -224,7 +224,7 @@ pub async fn show(ctx: &mut Ctx, rev: &str) -> Result<()> {
         return Ok(());
     }
     println!("changeset {id}");
-    for parent in &cs.parents() {
+    for parent in cs.parents() {
         println!("parent    {parent}");
     }
     println!("author    {}", identity(&cs.author()));
@@ -236,7 +236,7 @@ pub async fn show(ctx: &mut Ctx, rev: &str) -> Result<()> {
         println!("    {line}");
     }
     println!();
-    for (path, state) in &cs.changes() {
+    for (path, state) in cs.changes() {
         let op = if state.is_some() { "put   " } else { "delete" };
         println!("{op} {}", lossy(path.as_bytes()));
     }

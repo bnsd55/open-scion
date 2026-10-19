@@ -116,7 +116,7 @@ pub fn lookup(c: &mut dyn MetaTx, root: TreeId, path: &RepoPath) -> Result<Optio
         let Entry::Dir(id) = entry else {
             return Ok(None);
         };
-        match c.get_tree(id)?.entries().remove(&name) {
+        match c.get_tree(id)?.entries().clone().remove(&name) {
             Some(next) => entry = next,
             None => return Ok(None),
         }
@@ -151,7 +151,7 @@ impl Kind for RootTree {
         parents: Vec<TreeId>,
         lens: BlobLens<'_>,
     ) -> Result<TreeId> {
-        apply(c, parents.first().copied(), &changeset.changes(), lens).map_err(|e| match e {
+        apply(c, parents.first().copied(), changeset.changes(), lens).map_err(|e| match e {
             Error::Apply(e) => Error::Corrupt(format!("stored changeset {id} does not apply: {e}")),
             other => other,
         })
@@ -256,7 +256,7 @@ pub fn store_changeset(
         .first()
         .map(|&parent| derive_root_tree(c, repo, parent, lens))
         .transpose()?;
-    let tree = apply(c, base, &cs.changes(), lens)?;
+    let tree = apply(c, base, cs.changes(), lens)?;
     let id = c.insert_changeset(repo, cs)?;
     for (_, blob) in db::puts(cs) {
         c.add_repo_blob(repo, blob)?;
@@ -298,6 +298,7 @@ impl Dir {
             let entries = c
                 .get_tree(id)?
                 .entries()
+                .clone()
                 .into_iter()
                 .map(|(name, entry)| {
                     let node = match entry {

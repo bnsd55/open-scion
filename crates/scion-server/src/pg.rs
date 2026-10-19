@@ -1991,7 +1991,7 @@ impl MetaTx for PgTx<'_> {
         // write, on both backends.
         let (body, id) = cs.encode_with_id();
         let mut parent_gen = 0;
-        for parent in &cs.parents() {
+        for parent in cs.parents() {
             parent_gen = parent_gen.max(self.generation(repo, *parent)?);
         }
         self.c.execute(
@@ -2003,7 +2003,7 @@ impl MetaTx for PgTx<'_> {
                 P::bytes(&body),
             ],
         )?;
-        for (n, parent) in (0_i64..).zip(&cs.parents()) {
+        for (n, parent) in (0_i64..).zip(cs.parents()) {
             self.c.execute(
                 "INSERT INTO changeset_parents (cs, n, parent) VALUES ($1, $2, $3)
                  ON CONFLICT (cs, n) DO NOTHING",

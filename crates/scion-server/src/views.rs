@@ -231,7 +231,7 @@ fn project(
     memo.walked += 1;
     let tree = c.get_tree(id)?;
     let mut kept = std::collections::BTreeMap::new();
-    for (name, entry) in &tree.entries() {
+    for (name, entry) in tree.entries() {
         // A file is visible when a prefix names it exactly; a prefix
         // can name nothing below a file.
         match entry {
@@ -1281,7 +1281,7 @@ mod tests {
         let mut stack = vec![(root, Vec::new())];
         while let Some((id, path)) = stack.pop() {
             let tree = store.read(|c| c.get_tree(id)).unwrap();
-            for (name, entry) in &tree.entries() {
+            for (name, entry) in tree.entries() {
                 let mut path = path.clone();
                 path.extend_from_slice(name.as_bytes());
                 match entry {

@@ -133,7 +133,7 @@ fn check_parent(c: &mut dyn MetaTx, repo: &str, parent: ChangesetId) -> Result<R
 
 /// Checks what a client may send, and returns the one parent.
 fn check_request(cs: &Changeset) -> Result<ChangesetId> {
-    let &[parent] = cs.parents().as_slice() else {
+    let &[parent] = cs.parents() else {
         return Err(Error::InvalidArgument(format!(
             "a changeset needs exactly one parent, got {}",
             cs.parents().len()
@@ -149,7 +149,9 @@ fn check_request(cs: &Changeset) -> Result<ChangesetId> {
             "message is longer than {MAX_COMMIT_MESSAGE_BYTES} bytes"
         )));
     }
-    if cs.author().name.len() > MAX_IDENTITY_BYTES || cs.author().email.len() > MAX_IDENTITY_BYTES {
+    if cs.author().name().len() > MAX_IDENTITY_BYTES
+        || cs.author().email().len() > MAX_IDENTITY_BYTES
+    {
         return Err(Error::InvalidArgument(format!(
             "author name or email is longer than {MAX_IDENTITY_BYTES} bytes"
         )));

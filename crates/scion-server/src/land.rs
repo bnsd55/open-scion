@@ -593,7 +593,7 @@ fn plan(
         None => index.insert(PathIndex::new(c, repo, head.target, &lands.used)?),
     };
     index.advance_to(lands, c, repo, head.target, &req.deadline)?;
-    let conflicts = match index.check(lands, c, repo, base, &cs.changes(), &req.deadline)? {
+    let conflicts = match index.check(lands, c, repo, base, cs.changes(), &req.deadline)? {
         Checked::Paths(conflicts) => conflicts,
         Checked::NotOnHistory => {
             return Ok(Plan::Reject(format!(
@@ -672,7 +672,7 @@ fn settle(
     match landed {
         Ok((outcome, generation)) => {
             if let (Some(index), Some(id)) = (index.as_mut(), outcome.result) {
-                index.record(lands, id, generation, &rebased.changes());
+                index.record(lands, id, generation, rebased.changes());
             }
             tracing::info!(land_id, id = ?outcome.result, target = %target, "landed");
             Ok(Finished::Outcome(outcome))
@@ -810,7 +810,7 @@ impl PathIndex {
                 break;
             }
             let cs = c.get_changeset(repo, id)?;
-            most += added_bytes(&cs.changes());
+            most += added_bytes(cs.changes());
             if self.bytes + most > MAX_INDEX_BYTES {
                 tracing::info!(
                     generation,
@@ -819,7 +819,7 @@ impl PathIndex {
                 break;
             }
             cur = cs.parents().first().copied();
-            walked.push((id, generation, cs.changes()));
+            walked.push((id, generation, cs.changes().clone()));
         }
         *self = Self::new(c, repo, head, &self.used)?;
         Ok(())
@@ -900,10 +900,8 @@ impl PathIndex {
                 return Ok(Walk::Missed);
             }
             let cs = c.get_changeset(repo, id)?;
-            let cost = self.cost([(generation, &cs.changes())]);
-            if !self.grow(lands, cost, |index| {
-                index.add(id, generation, &cs.changes())
-            }) {
+            let cost = self.cost([(generation, cs.changes())]);
+            if !self.grow(lands, cost, |index| index.add(id, generation, cs.changes())) {
                 return Ok(Walk::Stopped);
             }
             let Some(&parent) = cs.parents().first() else {
@@ -2066,8 +2064,8 @@ mod tests {
                     let mut model = PathIndex::at(tip, tip_gen, &lands.used);
                     for (n, &(base, base_gen, _)) in chain.iter().enumerate() {
                         if let Some((id, generation, cs)) = n.checked_sub(1).map(|m| &chain[m]) {
-                            let cost = model.cost([(*generation, &cs.changes())]);
-                            let add = |m: &mut PathIndex| m.add(*id, *generation, &cs.changes());
+                            let cost = model.cost([(*generation, cs.changes())]);
+                            let add = |m: &mut PathIndex| m.add(*id, *generation, cs.changes());
                             assert!(model.grow(&lands, cost, add));
                         }
                         let walked = touched_by(chain[..n].iter().map(|(.., cs)| cs), &land);

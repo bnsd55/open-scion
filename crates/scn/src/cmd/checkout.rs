@@ -219,7 +219,7 @@ async fn walk(
         let mut next = Vec::new();
         for (dir, id, tree_path) in level {
             let tree = trees.get(&id).context("server skipped a tree")?;
-            for (name, entry) in &tree.entries() {
+            for (name, entry) in tree.entries() {
                 let path = join(dir.as_ref(), name)?;
                 let bytes = path.as_bytes();
                 let inside =

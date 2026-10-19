@@ -203,7 +203,7 @@ impl Kind for PathHistory {
             id,
             generation: c.generation_of(id)?,
         };
-        apply(c, parents.first().copied(), by, &changeset.changes())
+        apply(c, parents.first().copied(), by, changeset.changes())
     }
 
     fn encode(root: &NodeId) -> Vec<u8> {

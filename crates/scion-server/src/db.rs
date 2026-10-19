@@ -181,13 +181,13 @@ impl MetaTx for SqliteTx<'_> {
     fn insert_changeset(&mut self, repo: RepoId, cs: &Changeset) -> Result<ChangesetId> {
         let (body, id) = cs.encode_with_id();
         let mut parent_gen = 0;
-        for parent in &cs.parents() {
+        for parent in cs.parents() {
             parent_gen = parent_gen.max(self.generation(repo, *parent)?);
         }
         self.0
             .prepare_cached("INSERT OR IGNORE INTO changesets (id, gen, body) VALUES (?1, ?2, ?3)")?
             .execute(params![id.as_bytes(), parent_gen + 1, body])?;
-        for (n, parent) in (0_i64..).zip(&cs.parents()) {
+        for (n, parent) in (0_i64..).zip(cs.parents()) {
             self.0
                 .prepare_cached(
                     "INSERT OR IGNORE INTO changeset_parents (cs, n, parent) VALUES (?1, ?2, ?3)",
