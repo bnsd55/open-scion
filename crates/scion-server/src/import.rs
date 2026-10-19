@@ -694,7 +694,11 @@ impl Importer<'_> {
             // SHORTCUT: the skip sees only this repo's rows, one probe per
             // distinct blob, and checks the file is there: a row whose
             // file someone deleted under the server still refuses the
-            // import through put's read-back (fsck lists it too). A blob
+            // import through put's read-back (fsck lists it too), and the
+            // record path still reads the blob's size from its file, so
+            // damage that breaks the zstd frame header fails the import.
+            // Deeper damage inside an already stored file is fsck's job.
+            // A blob
             // that another repo names still goes through put. Upgrade:
             // an index on repo_blobs (blob), then any_repo_names, when a
             // cross-repo import is measured slow.
@@ -1078,10 +1082,14 @@ mod tests {
         import_git(&store, "main", dir, &opts("main")).unwrap();
 
         // The blob's file is damaged in place: the row and the file are
-        // there, the bytes are not what they were.
+        // there, the frame header still parses (the import reads the
+        // blob's size from it), but the bytes are not what they were.
         let blob = BlobId::of(b"payload\n");
         let (_, path) = store.blobs().location(blob);
-        fs::write(&path, b"PAYLOAD\n").unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
 
         // The next commit touches the same path with the same content, so
         // the import's diff names the blob and takes the skip: the row and
