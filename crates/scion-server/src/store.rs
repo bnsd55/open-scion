@@ -1086,7 +1086,16 @@ impl Blobs {
     /// crashed process holds nothing.
     pub(crate) fn dir_flock(&self, id: BlobId) -> io::Result<DirFlock> {
         let (dir, _) = self.location(id);
-        let file = fs::File::open(&dir)?;
+        // A first put reaches here before anything created the fan-out
+        // directory; create it, the way the write below would.
+        let file = match fs::File::open(&dir) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir_all(&dir)?;
+                fs::File::open(&dir)?
+            }
+            Err(e) => return Err(e),
+        };
         flock(&file, FlockOperation::LockExclusive)?;
         Ok(DirFlock { _file: file })
     }
