@@ -377,6 +377,13 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Security
 
+- The CI workflow pins every third-party action to the commit SHA its
+  version tag named, with the version in a comment, runs on fixed
+  runner images (`ubuntu-24.04`, `macos-15`) and pins the Postgres
+  service to `postgres:17.11`; Dependabot keeps the pins current, and
+  a runner or image upgrade is a diff, not a surprise. The MSRV job
+  checks everything the CI checks, locked, with every feature, on
+  `cargo +1.88`.
 - A blame cursor that claims an impossible line count is refused as a
   bad cursor (`#288`): the count is the client's word, and its
   per-line memory cost was multiplied without an overflow check, so a
