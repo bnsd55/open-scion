@@ -225,6 +225,12 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- A blame call whose wait for the memory budget ended as the bytes it
+  needed came free is served, where it was refused before: the take
+  rechecks the budget after the wait, and refuses only a budget that
+  still does not hold the bytes. That refusal now answers
+  `DEADLINE_EXCEEDED`, the code every other deadline gives, instead of
+  `RESOURCE_EXHAUSTED`; the doc says so.
 - A blame walk checks the call's deadline before each step, the first
   diff too (`#299`), and one diff reads no version past 1,048,576
   lines: a request file over the cap answers `RESOURCE_EXHAUSTED`, as

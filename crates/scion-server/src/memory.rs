@@ -75,7 +75,9 @@ impl Bytes {
     /// # Errors
     ///
     /// [`Error::ResourceExhausted`] if `n` is more than the whole pool, or
-    /// if `until` passes first; the error names the budget.
+    /// [`Error::DeadlineExceeded`] if `until` passes first; the error names
+    /// the budget. Bytes that free up just as the wait ends are taken: the
+    /// recheck after the wait sees them.
     ///
     /// # Panics
     ///
@@ -111,13 +113,17 @@ impl Bytes {
                 .woke
                 .wait_timeout(free, wait)
                 .expect("the budget lock is not poisoned");
-            if timeout.timed_out() {
-                return Err(Error::ResourceExhausted(format!(
+            free = locked;
+            // A give that lands as the wait ends hands the bytes over: the
+            // timeout says the wait ran out, not that the bytes are still
+            // missing. Only a budget that still does not hold them fails,
+            // with the deadline's code, as every other deadline does.
+            if timeout.timed_out() && *free < n {
+                return Err(Error::DeadlineExceeded(format!(
                     "a blame of {n} bytes waited past its deadline for the budget of {} bytes",
                     self.0.cap
                 )));
             }
-            free = locked;
         }
         *free -= n;
         Ok(Held {
@@ -133,7 +139,24 @@ impl Bytes {
     /// [`Error::ResourceExhausted`] if they are not free now or `n` is more
     /// than the whole pool; the error names the budget.
     pub fn try_take(&self, n: usize) -> Result<Held> {
-        self.take(n, Some(Instant::now()))
+        if n > self.0.cap {
+            return Err(Error::ResourceExhausted(format!(
+                "a blame of {n} bytes does not fit the budget of {} bytes",
+                self.0.cap
+            )));
+        }
+        let mut free = self.0.free.lock().expect("the budget lock is not poisoned");
+        if *free < n {
+            return Err(Error::ResourceExhausted(format!(
+                "{n} bytes need more than the {} bytes free of the budget of {} bytes",
+                *free, self.0.cap
+            )));
+        }
+        *free -= n;
+        Ok(Held {
+            pool: Arc::clone(&self.0),
+            n,
+        })
     }
 }
 
@@ -233,16 +256,53 @@ mod tests {
     }
 
     #[test]
-    fn a_take_that_waits_times_out_at_its_deadline() {
+    fn a_take_that_waits_past_its_deadline_gives_deadline_exceeded() {
         let bytes = Bytes::new(100);
         let held = bytes.take(100, None).expect("fits");
         let started = Instant::now();
         let err = bytes
             .take(1, Some(started + Duration::from_millis(10)))
             .expect_err("the pool is spent");
-        assert!(matches!(err, Error::ResourceExhausted(_)), "{err:?}");
+        assert!(matches!(err, Error::DeadlineExceeded(_)), "{err:?}");
         assert!(started.elapsed() >= Duration::from_millis(10));
         drop(held);
+    }
+
+    /// A give that lands at the timeout boundary hands its bytes over: the
+    /// waiter's timeout and the drop race for the lock, and the recheck
+    /// after the wait makes the race harmless. Before the recheck, the
+    /// rounds whose timeout relocked first refused bytes that were free.
+    #[test]
+    fn a_give_that_lands_at_the_timeout_boundary_is_taken() {
+        for round in 0..5 {
+            let bytes = Arc::new(Bytes::new(100));
+            let held = bytes.take(100, None).expect("fits");
+            let waiter = {
+                let bytes = Arc::clone(&bytes);
+                std::thread::spawn(move || {
+                    let until = Instant::now() + Duration::from_millis(100);
+                    bytes.take(100, Some(until))
+                })
+            };
+            let blocked = (0..2000).any(|_| {
+                if bytes.0.waiting.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+                false
+            });
+            assert!(blocked, "round {round}: the waiter never blocked");
+            // The give lands 2 ms before the deadline. A waiter that wakes
+            // at its deadline anyway rechecks a budget that already holds
+            // the give, and takes what the old code refused.
+            std::thread::sleep(Duration::from_millis(98));
+            drop(held);
+            let got = waiter.join().unwrap();
+            assert!(
+                got.is_ok(),
+                "round {round}: the give at the boundary was refused: {got:?}"
+            );
+        }
     }
 
     #[test]
