@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Tests scripts/merge-changelog.sh against a fixture: a CHANGELOG.md and
-# two fragments, the output compared with the expected text. Run from the
-# repository root; CI runs it in the lint job.
+# three fragments, two of them in one section, the output compared with
+# the expected text. Two in one section is what catches a check on the
+# fragment list that reads its own newlines as whitespace (2026-10-19:
+# that bug refused every section that held more than one fragment). Run
+# from the repository root; CI runs it in the lint job.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -25,6 +28,11 @@ The first release.
 ### Fixed
 
 - An existing fix.
+EOF
+
+cat >"$work/changes/11.added.md" <<'EOF'
+An earlier thing, whose file sorts before the other added fragment, so
+the merged rows come out in the fragment names' order.
 EOF
 
 cat >"$work/changes/12.added.md" <<'EOF'
@@ -61,6 +69,8 @@ The first release.
 
 ### Added
 
+- An earlier thing, whose file sorts before the other added fragment, so
+  the merged rows come out in the fragment names' order.
 - A new thing that the changelog will name first, in a fragment of three
   lines of plain text, no row marker and no indent on any line, wrapped
   at 76 columns so the merged row fits in 79.
