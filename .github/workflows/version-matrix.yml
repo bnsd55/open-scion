@@ -43,6 +43,9 @@ jobs:
           # no shell sees it unquoted.
           PREV_REF: ${{ github.event.inputs.prev_ref }}
         run: |
+          # A stale file from an older run on a reused runner would turn
+          # this run's real skip into a misleading death: clear it first.
+          rm -f version-matrix.prev-ref
           ref=$(scripts/version-matrix.sh --resolve-ref)
           if [ -n "$ref" ]; then
             echo "ref=$ref" >> "$GITHUB_OUTPUT"

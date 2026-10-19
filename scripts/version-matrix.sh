@@ -169,10 +169,6 @@ make_work() {
   WORK=$(cd "$WORK" && pwd -P)
 }
 
-command -v cargo > /dev/null || die "needs cargo"
-command -v git > /dev/null || die "needs git"
-command -v curl > /dev/null || die "needs curl"
-
 # build_prev REF: the N-1 binaries and their source checkout. PREV_BIN
 # skips the build (a local debug run); the source checkout is made
 # either way, because pair 4 reads the schema version out of its source.
@@ -503,6 +499,9 @@ if [ -z "$ref" ]; then
   summary "skipped: no release tag yet"
   exit 0
 fi
+# The file has said all it can: the run has its ref, and a leftover
+# must not reach the next run on a reused runner.
+rm -f version-matrix.prev-ref
 note "N-1 is $ref"
 
 if [ -n "${SCION_BIN:-}" ]; then
