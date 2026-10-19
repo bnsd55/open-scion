@@ -947,9 +947,16 @@ mod silent_failures {
             rev: "main".to_owned(),
             pid: std::process::id(),
         };
-        let _lock = hold_serve_lock(&overlay).unwrap();
-        assert!(live_record_for(Path::new("/mnt/view"), &[known.clone()], &serving).is_some());
-        drop(_lock);
+        let lock = hold_serve_lock(&overlay).unwrap();
+        assert!(
+            live_record_for(
+                Path::new("/mnt/view"),
+                std::slice::from_ref(&known),
+                &serving
+            )
+            .is_some()
+        );
+        drop(lock);
         assert!(wait_for(2, || live_record_for(
             Path::new("/mnt/view"),
             std::slice::from_ref(&known),
