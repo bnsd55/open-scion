@@ -1,0 +1,46 @@
+name: bench
+
+# The checkout benchmark (issue #6): 50 parallel sparse checkouts through
+# one scion-daemon, against git in three ways, on the fixed public dataset.
+# Runs only when a person asks, never on pushes, pull requests or a
+# schedule: shared runners are noisy, and the min and max columns in the
+# output are how that shows.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checkout:
+    name: checkout vs git clone
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo build --release
+      # pipefail: the benchmark's exit code is the run's verdict (it checks
+      # that every job wrote the same files), and the tee must not eat it.
+      - name: run the checkout benchmark
+        run: |
+          set -o pipefail
+          scripts/bench-checkout.sh 2>&1 | tee "$RUNNER_TEMP/bench-output.txt" >> "$GITHUB_STEP_SUMMARY"
+      - name: upload the raw output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bench-checkout-output
+          path: ${{ runner.temp }}/bench-output.txt
+          if-no-files-found: error
