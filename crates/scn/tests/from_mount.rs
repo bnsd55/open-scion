@@ -5,7 +5,7 @@
 #![cfg(unix)]
 
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::process::Command;
 
 use common::{REPO, TOKEN, changeset, land};

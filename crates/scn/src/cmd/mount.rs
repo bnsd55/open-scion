@@ -896,9 +896,12 @@ mod silent_failures {
             rev: "main".to_owned(),
             pid: sleeper.id(),
         };
-        // The stale record is taken over, and the sleeper lives on.
+        // The stale record is taken over, and the sleeper lives on. The
+        // lock state is polled with a ceiling: a fork of another test can
+        // hold this probe's lock until its child execs, and macOS is slow
+        // to exec, so one read right after a release can see it held.
         assert!(stop_serving(&known, &known.dir));
-        assert!(!serving(&known));
+        assert!(wait_for(2, || !serving(&known)));
         assert!(
             sleeper.try_wait().unwrap().is_none(),
             "an unrelated process was signalled"
