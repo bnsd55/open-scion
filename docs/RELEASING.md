@@ -93,6 +93,18 @@ Never move a tag to a different commit in place.
 - The tag and its release notes stay: they are what a later reader
   checks out, and what the later crates.io publish of #21 tags from.
 
+## The crates.io publish
+
+The crates publish after the release tag ([#21]). One step guards
+what they publish: on the tagged commit, run
+`scripts/public-api.sh api-<version>`. The script writes one file per
+crate (`api-<version>/open-scion-core.txt` and so on), built with
+cargo-public-api from a nightly rustdoc (it installs both when they
+are missing). Diff each file against the same listing taken from the
+previous release's tag, and read the diff before anything publishes:
+every new `pub` item and every changed signature is a promise
+crates.io cannot take back.
+
 ## Notes
 
 - Each crate ships both license files: `crates/<crate>/LICENSE-MIT` and
