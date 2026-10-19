@@ -478,10 +478,13 @@ impl PgClient {
                 let mut ever_held = setup.ok();
                 for job in rx {
                     // A transaction the reconnect dropped fails every
-                    // statement until its caller ends it. A new BEGIN may
+                    // statement until its caller ends it. Its COMMIT
+                    // never runs: on the fresh session it would answer
+                    // Ok about a transaction that is gone. A BEGIN may
                     // pass: the reconnect ended the old tx, so a BEGIN
-                    // starts a fresh one on the fresh session, and nothing
-                    // of the old tx ever runs outside a tx.
+                    // starts a fresh one on the fresh session, and a new
+                    // BEGIN comes only from a new holder of the client,
+                    // which the lost transaction cannot reach.
                     if tx.lost()
                         && !job.sql.starts_with("ROLLBACK")
                         && !job.sql.starts_with("BEGIN")
@@ -1272,18 +1275,23 @@ impl<'a> PgTx<'a> {
             "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
             &[],
         )?;
-        c.execute(
+        // The transaction exists from here on: a SET LOCAL that fails
+        // drops this `PgTx`, and its Drop rolls the transaction back, so
+        // the pooled client never stays inside one whose statements no
+        // longer run.
+        let mut tx = Self { c, ended: false };
+        tx.c.execute(
             &format!("SET LOCAL statement_timeout = {}", statement.as_millis()),
             &[],
         )?;
-        c.execute(
+        tx.c.execute(
             &format!(
                 "SET LOCAL idle_in_transaction_session_timeout = {}",
                 idle.as_millis()
             ),
             &[],
         )?;
-        Ok(Self { c, ended: false })
+        Ok(tx)
     }
 
     /// One transaction over the same client, for a caller that wraps this
@@ -1568,8 +1576,12 @@ impl TxState {
     fn after(self, sql: &str, ok: bool) -> Self {
         // Only a BEGIN that ran opens a transaction: one the connection
         // refused leaves the worker outside it, and the caller's Drop
-        // rolls no transaction back that never opened.
-        if sql.starts_with("BEGIN") && ok && !self.lost() {
+        // rolls no transaction back that never opened. A BEGIN that ran
+        // after a reconnect opens a real one too: the lost transaction
+        // is gone with the old session, and its caller cannot commit it
+        // through a new BEGIN, whose statements belong to the client's
+        // next holder.
+        if sql.starts_with("BEGIN") && ok {
             return TxState::InTx;
         }
         if sql.starts_with("ROLLBACK") || (sql.starts_with("COMMIT") && !self.lost()) {
@@ -3165,6 +3177,42 @@ mod pool_tests {
             crate::backend::Backend::Postgres(pg) => Some(pg),
             crate::backend::Backend::Sqlite(_) => unreachable!("the env named postgres"),
         }
+    }
+
+    /// A transaction whose connection dies mid-way leaves the worker's
+    /// client usable: the next read on the same reader takes a fresh
+    /// session, and a BEGIN on it opens a real transaction. A build that
+    /// keeps the lost state on a running BEGIN bricks the reader: every
+    /// later read on it fails, and its session holds an open transaction
+    /// forever.
+    #[test]
+    fn a_read_whose_connection_died_mid_transaction_recovers() {
+        let Some(pg) = pg() else { return };
+        // One reader client, out of the pool, in a transaction.
+        let mut reader = pg.inner.readers.take(READER_WAIT).unwrap();
+        let client = reader.client();
+        client.execute("BEGIN", &[]).unwrap();
+        let pid: i32 = client.query("SELECT pg_backend_pid()", &[]).unwrap()[0].get(0);
+        // The session dies under the transaction, from another
+        // connection. The next statement reconnects, finds the
+        // transaction lost, and answers what a caller rolls back.
+        pg.commit(|tx| {
+            tx.c.execute(
+                "SELECT pg_terminate_backend($1::bigint::int)",
+                &[P::i64(i64::from(pid))],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let err = client.query_opt("SELECT 1", &[]).unwrap_err();
+        assert!(
+            matches!(err, Error::Corrupt(ref m) if m.contains("lost")),
+            "the lost transaction answered {err}"
+        );
+        drop(reader);
+        // The same reader, back from the pool: a full read on it runs.
+        let again = pg.read(|tx| tx.c.query_opt("SELECT 1", &[]).map(|row| row.is_some()));
+        assert!(again.unwrap(), "the reader never recovered");
     }
 
     /// One statement that runs past its bound is cancelled, and the

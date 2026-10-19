@@ -219,6 +219,16 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- A Postgres read whose connection died inside its transaction left the
+  pooled client unusable: the worker that serves the client kept the
+  transaction's lost state on every later BEGIN, so every statement of
+  that client failed and the read that opened a fresh transaction was
+  refused too, with nothing to roll the open one back. The worker now
+  follows a BEGIN that ran on the fresh session (the lost transaction
+  is gone with the old session, and its caller cannot commit it
+  through a new BEGIN), and a read's timeout statements that fail
+  after the BEGIN roll the read transaction back before the reader
+  returns to the pool.
 - Two reads stop at the caller's deadline and the reply's budget
   (#283): a `Log` call without a path read up to 1,000 changesets, each
   as large as a changeset can be, with the call's deadline never
