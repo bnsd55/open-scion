@@ -211,6 +211,12 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- `commit --from-mount` and the mount carry raw file names: a name that
+  is not UTF-8 is no longer read from, or written to, the file its
+  lossy spelling names.
+- `commit --put` refuses anything that is not a regular file: a FIFO
+  or a device never sees an end, and the read grew until the OOM
+  killer.
 - Two reads stop at the caller's deadline and the reply's budget
   (#283): a `Log` call without a path read up to 1,000 changesets, each
   as large as a changeset can be, with the call's deadline never
@@ -285,6 +291,11 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Security
 
+- The mount's overlay writes no longer follow a symlink planted in the
+  overlay: a write, a truncate, a mode change, and the deletions note
+  refuse one. A symlinked parent directory still redirects (a named
+  limit: the upgrade is opening every parent through a handle chain,
+  as `materialize.rs` does).
 - The server refuses a data directory that group or others can write, or
   that sits under a directory another user can change: the blobs and the
   metadata are only as private as their directory (`#197`).
