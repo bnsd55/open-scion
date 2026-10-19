@@ -3139,7 +3139,7 @@ mod tests {
         let cs = old_store::changeset(blob_a, blob_b);
         let (body, id) = cs.encode_with_id();
         {
-            let db = Client::connect(&url, NoTls).unwrap();
+            let mut db = Client::connect(&url, NoTls).unwrap();
             db.batch_execute(&format!(
                 "CREATE SCHEMA {schema}; SET search_path TO {schema}"
             ))
@@ -3188,7 +3188,7 @@ mod tests {
         )
         .unwrap();
         let ledger: i64 = {
-            let db = Client::connect(&url, NoTls).unwrap();
+            let mut db = Client::connect(&url, NoTls).unwrap();
             db.batch_execute(&format!("SET search_path TO {schema}"))
                 .unwrap();
             db.query_one("SELECT max(version) FROM schema_migrations", &[])
