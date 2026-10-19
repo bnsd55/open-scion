@@ -29,8 +29,9 @@ use crate::error::{Error, Result};
 use crate::graph;
 use crate::meta::Meta as _;
 use crate::meta::{MetaTx, RepoId};
-use crate::store::{BlobBatch, BlobStatus, MAX_CHANGES, MAX_OBJECT_BYTES};
+use crate::store::{BlobBatch, BlobStatus, MAX_OBJECT_BYTES};
 use crate::tree;
+use crate::write::MAX_CHANGES;
 
 /// `git_import.git_algo` for SHA-1 object names.
 pub(crate) const SHA1: i64 = 1;
