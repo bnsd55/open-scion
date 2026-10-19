@@ -1048,7 +1048,7 @@ mod tests {
         let import = |cache_entries| {
             let data = tempfile::tempdir().unwrap();
             let store = Backend::Sqlite(Store::open(data.path()).unwrap());
-            import_with_cache(&store, "main", dir, &opts, cache_entries).unwrap()
+            import_with_cache(&store, "main", dir, &opts, cache_entries, MAX_CHANGES).unwrap()
         };
         let tiny = import(2);
         let unbounded = import(usize::MAX);
