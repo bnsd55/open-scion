@@ -28,16 +28,13 @@
 //!   [`MAX_CONNECTION_AGE`], and is closed [`CONNECTION_GRACE`] later, with
 //!   any call still in it. A client then connects again.
 //!
-//! With TLS, the accept of [`tls`](crate::tls) runs the TLS handshake, under
-//! [`HANDSHAKE_TIMEOUT`], before a connection gets its place: a peer that
-//! never starts or never ends the handshake frees no place, because it
-//! A connection takes its place first, and its TLS handshake then runs on
-//! its own, under [`TLS_HANDSHAKE_TIMEOUT`], while it holds that place. So
-//! at most `--max-connections` silent handshakers can exist at once, and
-//! each gives its place up within the timeout, the same bound as a silent
-//! plain peer. `accept_tls` then reads the HTTP/2 preface from the
-//! decrypted connection, so the preface timer covers a peer that stops
-//! right after the handshake too.
+//! With TLS, a connection takes its place first, and one deadline from its
+//! accept bounds the TLS handshake and the HTTP/2 preface together: the
+//! handshake gets what is left of the deadline, and the preface timer gets
+//! the rest. A peer that never starts the handshake, never ends it, or
+//! stops right after it gives its place up within
+//! [`TLS_HANDSHAKE_TIMEOUT`] of its accept, the same bound as a silent
+//! plain peer.
 
 use std::future::Future;
 use std::io;
@@ -427,9 +424,16 @@ where
                     .await
                     .expect("the semaphore of places is never closed")
             };
+            // One deadline, from the accept: the TLS handshake and the
+            // HTTP/2 preface that follows share it, so a silent peer holds
+            // its place for at most `handshake` in all.
+            let deadline = tokio::time::Instant::now() + handshake;
+            let wait = tokio::time::timeout_at(deadline, acceptor.accept(io));
+            let preface = Some((
+                PREFACE_BYTES,
+                Box::pin(tokio::time::sleep_until(deadline)) as Pin<Box<Sleep>>,
+            ));
             let sender = done.clone();
-            let preface_wait = handshake;
-            let wait = tokio::time::timeout(handshake, acceptor.accept(io));
             tokio::spawn(async move {
                 match wait.await {
                     Ok(Ok(stream)) => {
@@ -439,10 +443,7 @@ where
                             .send(Ok(Connection {
                                 io: stream,
                                 _place: place,
-                                preface: Some((
-                                    PREFACE_BYTES,
-                                    Box::pin(tokio::time::sleep(preface_wait)),
-                                )),
+                                preface,
                                 stalled: Stalled::new(stalled_bytes.get()),
                             }))
                             .await;
@@ -452,7 +453,7 @@ where
                     }
                     Err(_) => {
                         tracing::warn!(
-                            timeout = ?preface_wait,
+                            timeout = ?handshake,
                             "no TLS handshake within the timeout"
                         );
                     }
@@ -1246,6 +1247,51 @@ mod tests {
         let read =
             tokio::time::timeout(Duration::from_secs(10), peer.read_to_end(&mut Vec::new())).await;
         assert!(read.is_ok(), "the server closed the silent peer");
+    }
+
+    /// A peer whose TLS handshake ends late, and that goes silent right
+    /// after it, is closed within one deadline from its accept: the
+    /// handshake and the preface share the deadline, so the close comes
+    /// before a second full handshake timeout could run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_tls_peer_is_closed_within_one_deadline() {
+        let certs = test_certs();
+        let dir = tempfile::tempdir().unwrap();
+        let server_tls = server_tls(dir.path(), &certs.server, None);
+        let deadline = Duration::from_millis(300);
+        let addr = serve_tls(Limits::default(), TIMERS, &server_tls, deadline).await;
+        // The peer connects at once, waits out most of the deadline, then
+        // ends its handshake and sends nothing more. The clock runs from the
+        // connect, which is the server's accept to within a millisecond.
+        let started = std::time::Instant::now();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(deadline * 5 / 6).await;
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(
+                CertificateDer::from_pem_slice(certs.authority.cert().cert_pem.as_bytes()).unwrap(),
+            )
+            .unwrap();
+        let builder = ClientConfig::builder_with_provider(crate::tls::provider())
+            .with_safe_default_protocol_versions()
+            .unwrap();
+        let config = builder.with_root_certificates(roots).with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let mut peer = connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        let read =
+            tokio::time::timeout(Duration::from_secs(10), peer.read_to_end(&mut Vec::new())).await;
+        assert!(read.is_ok(), "the server closed the silent peer");
+        // One deadline from the accept, with slack for the handshake round
+        // trip and a loaded runner. The old code (a full preface timer after
+        // the handshake) closes past deadline + delay, beyond this bound.
+        assert!(
+            started.elapsed() < deadline + deadline / 3,
+            "the silent peer held its place {:?}, past the deadline",
+            started.elapsed()
+        );
     }
 
     /// A peer that opens a TLS connection and sends nothing holds its place,

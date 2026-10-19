@@ -211,6 +211,11 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- A silent TLS peer holds its connection's place for at most the
+  handshake timeout, not twice that: one deadline from the accept
+  bounds the TLS handshake and the HTTP/2 preface that follows it
+  together, so the preface timer gets what is left of the deadline
+  after the handshake ends.
 - Two reads stop at the caller's deadline and the reply's budget
   (#283): a `Log` call without a path read up to 1,000 changesets, each
   as large as a changeset can be, with the call's deadline never
