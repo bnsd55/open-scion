@@ -645,7 +645,7 @@ takes from it the bytes of every version it reads and 128 bytes per line of
 the file it blames, from its first step to its last, and a cursor's bytes
 and state while the call runs. A call's first take may wait for another
 call to free bytes, until the call's deadline, then fails with
-`RESOURCE_EXHAUSTED`. Every later take of a call fails at once if the
+`DEADLINE_EXCEEDED`. Every later take of a call fails at once if the
 bytes are not free, so a call that holds budget never waits for more and
 two calls cannot wait for each other. A failed call frees its bytes; the
 client retries it whole. A file of more than 1,048,576 lines is refused at
@@ -658,7 +658,8 @@ of its own steps).
 |---|---|
 | `INVALID_ARGUMENT` | A bad repo name or ID; a bad or empty path; the file is not a regular file; a cursor that was not made for the repo, changeset and path of the request, is damaged, or names a changeset the repo does not have, or lines that do not fit its window. |
 | `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
-| `RESOURCE_EXHAUSTED` | The call's share does not fit the memory budget, or a wait for bytes ran past the deadline. |
+| `RESOURCE_EXHAUSTED` | The call's share does not fit the memory budget. |
+| `DEADLINE_EXCEEDED` | A wait for memory bytes ran past the call's deadline. |
 
 ### 6.11 MergeBase
 

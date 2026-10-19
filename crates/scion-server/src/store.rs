@@ -11,6 +11,12 @@
 //!                                  one folder per process, held with a lock
 //! ```
 //!
+//! Every directory that a store makes, `<data>` and the ones above it
+//! included, gets mode 0700 whatever the umask
+//! ([`create_private_dir_all`]): the data is this user's alone, and the
+//! check of `<data>` below refuses a directory the group can write, as
+//! a plain mkdir under Ubuntu's umask 002 makes it.
+//!
 //! The locks are `flock`s on open files. A forked child shares its parent's
 //! file descriptions, and with them the locks, until it execs, so a child
 //! spawned while a store is dropped can hold the dropped store's lock for
@@ -24,7 +30,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, ErrorKind, Read, Seek, Write};
 use std::ops::Deref;
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +41,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use rustix::fs::FlockOperation;
 use rustix::io::Errno;
 use scion_core::{BlobHasher, BlobId};
+use scion_proto::auth::create_private_dir_all;
 
 use crate::db::SqliteTx;
 use crate::deadline::Deadline;
@@ -267,9 +274,10 @@ impl Store {
     }
 
     /// Opens or creates a data directory as its server: the one `Store` that
-    /// may land. Lands are serialized in memory, so a second server `Store`,
-    /// in this process or another, is refused. Shared `Store`s
-    /// ([`Store::open_shared`]) may use the directory at the same time.
+    /// may land. A new directory gets mode 0700. Lands are serialized in
+    /// memory, so a second server `Store`, in this process or another, is
+    /// refused. Shared `Store`s ([`Store::open_shared`]) may use the
+    /// directory at the same time.
     ///
     /// The locks are released when the last clone of the returned `Store` is
     /// dropped.
@@ -312,7 +320,7 @@ impl Store {
 
     /// Opens a data directory for a process of build `build` ([`build`]).
     fn open_as(dir: &Path, server: bool, build: &str, walks_cap: usize) -> Result<Self> {
-        fs::create_dir_all(dir)?;
+        create_private_dir_all(dir)?;
         // The blobs and the metadata are only as private as the directory:
         // a group- or others-writable directory lets another user read or
         // replace them, and so does one under a directory another user can
@@ -1060,8 +1068,8 @@ impl Blobs {
         let objects = dir.join("objects");
         let root = objects.join("blob");
         let tmp = dir.join("tmp");
-        fs::create_dir_all(&root)?;
-        fs::create_dir_all(&tmp)?;
+        create_private_dir_all(&root)?;
+        create_private_dir_all(&tmp)?;
         // This process stages its temp files in its own folder of `tmp/`, and
         // holds the folder's lock file for as long as it lives. An open that
         // finds no holder for a folder removes it, so a crashed import leaves
@@ -1075,7 +1083,7 @@ impl Blobs {
                 FOLDERS.fetch_add(1, Ordering::Relaxed)
             );
             let mine = tmp.join(name);
-            if let Err(e) = fs::create_dir(&mine) {
+            if let Err(e) = fs::DirBuilder::new().mode(0o700).create(&mine) {
                 if e.kind() == io::ErrorKind::AlreadyExists {
                     continue;
                 }
@@ -1151,7 +1159,7 @@ impl Blobs {
         let file = match fs::File::open(&dir) {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir_all(&dir)?;
+                create_private_dir_all(&dir)?;
                 fs::File::open(&dir)?
             }
             Err(e) => return Err(e),
@@ -2002,7 +2010,7 @@ impl BlobBatch<'_> {
             &SyncStep::TempFile(id),
             || fsync(tmp.as_file()),
         )?;
-        fs::create_dir_all(&dir)?;
+        create_private_dir_all(&dir)?;
         #[cfg(any(test, feature = "test-hooks"))]
         persist_logged(&self.blobs.log, id, tmp, &path)?;
         #[cfg(not(any(test, feature = "test-hooks")))]

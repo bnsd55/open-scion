@@ -338,9 +338,20 @@ fn overlay_dir() -> Result<PathBuf> {
         all
     });
     let dir = std::env::temp_dir().join(format!("scn-mount-{name}"));
-    std::fs::create_dir(&dir).context("cannot make the overlay directory")?;
+    // Made with mode 0700, which a umask can only narrow, so the directory
+    // is never open to others, not even before the chmod. A name that
+    // exists is refused, as with `create_dir`.
+    let private = {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    private
+        .create(&dir)
+        .context("cannot make the overlay directory")?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    std::fs::create_dir(dir.join(CHANGES))?;
+    private.create(dir.join(CHANGES))?;
     Ok(dir)
 }
 
@@ -349,8 +360,14 @@ pub(crate) fn session_file() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("cannot read $HOME"))?;
+    session_file_in(&home)
+}
+
+/// The path of the session file below `home`. Its directory, and any missing
+/// directory above it, is made with mode 0700 whatever the umask.
+fn session_file_in(home: &Path) -> Result<PathBuf> {
     let dir = home.join(".scion");
-    std::fs::create_dir_all(&dir)?;
+    scion_proto::auth::create_private_dir_all(&dir)?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     Ok(dir.join("mounts.json"))
 }
@@ -618,6 +635,23 @@ fn walk_changes(dir: &Path, prefix: &[u8], out: &mut Vec<(RepoPath, Change)>) ->
 mod tests {
     use super::*;
     use std::fs;
+    #[test]
+    fn the_overlay_and_the_session_directory_are_private_whatever_the_umask() {
+        // The run's umask, 002 or 022, would leave 0775 or 0755 on a plain
+        // mkdir.
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        let overlay = overlay_dir().unwrap();
+        let modes = (mode(&overlay), mode(&overlay.join(CHANGES)));
+        fs::remove_dir_all(&overlay).unwrap();
+        assert_eq!(modes, (0o700, 0o700));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let file = session_file_in(&home).unwrap();
+        assert_eq!(file, home.join(".scion").join("mounts.json"));
+        assert_eq!(mode(&home), 0o700);
+        assert_eq!(mode(&home.join(".scion")), 0o700);
+    }
 
     #[test]
     fn a_session_survives_a_round_trip() {
@@ -717,6 +751,57 @@ mod tests {
 mod silent_failures {
     use super::*;
     use std::fs;
+
+    /// The gate every test of this module that forks a process or holds
+    /// or reads a serve lock runs under, with the crate's own fork gate:
+    /// a fork of one test can hold another test's lock exactly like its
+    /// own, so the gate lives where every forking test of the binary can
+    /// reach it.
+    use crate::fork_gate::serial;
+
+    /// A spawned stand-in server in its own process group. Its drop
+    /// signals the whole group and reaps the child, also on a panic, so
+    /// no test leaves a process behind whose pid a later test could read
+    /// or whose lock a fork could carry.
+    struct Parked(std::process::Child);
+
+    impl Parked {
+        fn spawn(seconds: &str) -> Self {
+            use std::os::unix::process::CommandExt as _;
+            Self(
+                std::process::Command::new("sleep")
+                    .arg(seconds)
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+    }
+
+    impl std::ops::Deref for Parked {
+        type Target = std::process::Child;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for Parked {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    impl Drop for Parked {
+        fn drop(&mut self) {
+            // The group's id is the child's pid, so the kill takes the
+            // child and anything it left; then the reap.
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &format!("-{}", self.0.id())])
+                .status();
+            let _ = self.0.wait();
+        }
+    }
 
     fn temp_file(name: &str) -> PathBuf {
         let dir =
@@ -881,15 +966,13 @@ mod silent_failures {
     #[test]
     #[cfg(unix)]
     fn an_unmount_does_not_signal_an_unrelated_process() {
+        let _serial = serial();
         let home = tempfile::tempdir().unwrap();
         let overlay = home.path().join("overlay");
         fs::create_dir_all(&overlay).unwrap();
         // The lock file exists, and no one holds it: no server lives.
         std::fs::File::create(overlay.join("serve.lock")).unwrap();
-        let mut sleeper = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut sleeper = Parked::spawn("30");
         let known = MountRecord {
             dir: PathBuf::from("/mnt/view"),
             overlay: overlay.clone(),
@@ -897,30 +980,26 @@ mod silent_failures {
             pid: sleeper.id(),
         };
         // The stale record is taken over, and the sleeper lives on. The
-        // lock state is polled with a ceiling: a fork of another test can
-        // hold this probe's lock until its child execs, and macOS is slow
-        // to exec, so one read right after a release can see it held.
+        // lock state is polled with a ceiling: macOS may tear a released
+        // lock down one tick late, so one read right after a release can
+        // see it held.
         assert!(stop_serving(&known, &known.dir));
         assert!(wait_for(2, || !serving(&known)));
         assert!(
             sleeper.try_wait().unwrap().is_none(),
             "an unrelated process was signalled"
         );
-        let _ = sleeper.kill();
-        sleeper.wait().unwrap();
     }
 
     /// A record whose serve lock is held is live: the unmount signals the
     /// recorded pid, and the process goes away.
     #[test]
     fn an_unmount_signals_the_live_server() {
+        let _serial = serial();
         let home = tempfile::tempdir().unwrap();
         let overlay = home.path().join("overlay");
         fs::create_dir_all(&overlay).unwrap();
-        let mut server = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut server = Parked::spawn("30");
         let known = MountRecord {
             dir: PathBuf::from("/mnt/view"),
             overlay: overlay.clone(),
@@ -940,6 +1019,7 @@ mod silent_failures {
     /// macOS may tear a reaped child's lock down one tick late.
     #[test]
     fn a_dead_server_record_is_taken_over() {
+        let _serial = serial();
         let home = tempfile::tempdir().unwrap();
         let overlay = home.path().join("overlay");
         fs::create_dir_all(&overlay).unwrap();

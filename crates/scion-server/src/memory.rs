@@ -85,18 +85,15 @@ impl Bytes {
     /// # Errors
     ///
     /// [`Error::ResourceExhausted`] if `n` is more than the whole pool, or
-    /// if `until` passes first; the error names the budget.
+    /// [`Error::DeadlineExceeded`] if `until` passes first; the error names
+    /// the budget. Bytes that free up just as the wait ends are taken: the
+    /// recheck after the wait sees them.
     ///
     /// # Panics
     ///
     /// If the budget lock is poisoned, which only a panic inside it causes.
     pub fn take(&self, n: usize, until: Option<Instant>) -> Result<Held> {
-        if n > self.0.cap {
-            return Err(Error::ResourceExhausted(format!(
-                "a {} of {n} bytes does not fit the budget of {} bytes",
-                self.0.name, self.0.cap
-            )));
-        }
+        self.refuse_over_cap(n)?;
         let mut free = self.0.free.lock().expect("the budget lock is not poisoned");
         #[cfg(test)]
         let _waiting = if *free < n {
@@ -121,13 +118,17 @@ impl Bytes {
                 .woke
                 .wait_timeout(free, wait)
                 .expect("the budget lock is not poisoned");
-            if timeout.timed_out() {
-                return Err(Error::ResourceExhausted(format!(
+            free = locked;
+            // A give that lands as the wait ends hands the bytes over: the
+            // timeout says the wait ran out, not that the bytes are still
+            // missing. Only a budget that still does not hold them fails,
+            // with the deadline's code, as every other deadline does.
+            if timeout.timed_out() && *free < n {
+                return Err(Error::DeadlineExceeded(format!(
                     "a {} of {n} bytes waited past its deadline for the budget of {} bytes",
                     self.0.name, self.0.cap
                 )));
             }
-            free = locked;
         }
         *free -= n;
         Ok(Held {
@@ -142,8 +143,42 @@ impl Bytes {
     ///
     /// [`Error::ResourceExhausted`] if they are not free now or `n` is more
     /// than the whole pool; the error names the budget.
+    ///
+    /// # Panics
+    ///
+    /// If the budget lock is poisoned, which only a panic inside it causes.
     pub fn try_take(&self, n: usize) -> Result<Held> {
-        self.take(n, Some(Instant::now()))
+        self.refuse_over_cap(n)?;
+        let mut free = self.0.free.lock().expect("the budget lock is not poisoned");
+        if *free < n {
+            return Err(Error::ResourceExhausted(format!(
+                "{n} bytes need more than the {} bytes free of the budget of {} bytes",
+                *free, self.0.cap
+            )));
+        }
+        *free -= n;
+        Ok(Held {
+            pool: Arc::clone(&self.0),
+            n,
+        })
+    }
+}
+
+impl Bytes {
+    /// [`Error::ResourceExhausted`] when `n` is more than the whole pool:
+    /// one check, one message, for [`Bytes::take`] and [`Bytes::try_take`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ResourceExhausted`], with the budget named.
+    fn refuse_over_cap(&self, n: usize) -> Result<()> {
+        if n > self.0.cap {
+            return Err(Error::ResourceExhausted(format!(
+                "a {} of {n} bytes does not fit the budget of {} bytes",
+                self.0.name, self.0.cap
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -243,16 +278,46 @@ mod tests {
     }
 
     #[test]
-    fn a_take_that_waits_times_out_at_its_deadline() {
+    fn a_take_that_waits_past_its_deadline_gives_deadline_exceeded() {
         let bytes = Bytes::new(100);
         let held = bytes.take(100, None).expect("fits");
         let started = Instant::now();
         let err = bytes
             .take(1, Some(started + Duration::from_millis(10)))
             .expect_err("the pool is spent");
-        assert!(matches!(err, Error::ResourceExhausted(_)), "{err:?}");
+        assert!(matches!(err, Error::DeadlineExceeded(_)), "{err:?}");
         assert!(started.elapsed() >= Duration::from_millis(10));
         drop(held);
+    }
+
+    /// A give wakes a waiting take, and the take rechecks the budget after
+    /// the wait, so a give that lands while it waits is taken however the
+    /// wake and the timeout race. The recheck after a timed-out wait is a
+    /// one-line condition (`timeout.timed_out() && *free < n`), covered by
+    /// reading: the window between the timeout's fire and the relock is a
+    /// microsecond race no test can pin.
+    #[test]
+    fn a_waiting_take_is_woken_by_a_give() {
+        let bytes = Arc::new(Bytes::new(100));
+        let held = bytes.take(100, None).expect("fits");
+        let waiter = {
+            let bytes = Arc::clone(&bytes);
+            std::thread::spawn(move || {
+                let until = Instant::now() + Duration::from_secs(5);
+                bytes.take(100, Some(until))
+            })
+        };
+        let blocked = (0..2000).any(|_| {
+            if bytes.0.waiting.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            false
+        });
+        assert!(blocked, "the waiter never blocked on the empty budget");
+        drop(held);
+        let got = waiter.join().unwrap();
+        assert!(got.is_ok(), "the give in the wait was refused: {got:?}");
     }
 
     #[test]

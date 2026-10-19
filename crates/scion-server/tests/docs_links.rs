@@ -192,11 +192,13 @@ fn broken_links(documents: &[PathBuf], root: &Path) -> (Vec<String>, usize) {
                 Some((file, anchor)) => (file, Some(anchor)),
                 None => (target, None),
             };
-            // A target with no file part names a heading of this file.
+            // A target with no file part names a heading of this file. The
+            // file is the part before `#`: `other.md#heading` names a heading
+            // of `other.md`.
             let resolved = if path.is_empty() {
                 document.clone()
             } else {
-                dir.join(target)
+                dir.join(path)
             };
             if !(resolved.is_file() || resolved.is_dir()) {
                 broken.push(format!(
@@ -215,7 +217,7 @@ fn broken_links(documents: &[PathBuf], root: &Path) -> (Vec<String>, usize) {
                 broken.push(format!(
                     "{} -> {}#{anchor} (headings: {})",
                     document.strip_prefix(root).unwrap().display(),
-                    target,
+                    path,
                     heading.join(", ")
                 ));
             }
@@ -282,22 +284,27 @@ fn the_protocol_doc_has_a_section_for_every_rpc() {
 #[test]
 fn a_broken_link_is_reported() {
     // One tree: `a.md` links to a file that is not there, to a heading
-    // that `b.md` does not have, and to a repo-absolute link of this
-    // repository whose path is not in the repo. The checker must name all
-    // three.
+    // that `b.md` does not have, to a repo-absolute link of this
+    // repository whose path is not in the repo, and to a heading that
+    // `b.md` has. The checker must name the first three, each for its own
+    // reason, and pass the fourth.
     let root = tempfile::tempdir().expect("a temp tree");
     fs::write(
         root.path().join("a.md"),
-        "[file](missing.md)\n[anchor](b.md#no)\n[repo](https://github.com/bnsd55/open-scion/blob/main/docs/no-such-doc.md)\n",
+        "[file](missing.md)\n[anchor](b.md#no)\n[repo](https://github.com/bnsd55/open-scion/blob/main/docs/no-such-doc.md)\n[good](b.md#real)\n",
     )
     .unwrap();
     fs::write(root.path().join("b.md"), "# Real\n").unwrap();
     let documents = vec![root.path().join("a.md"), root.path().join("b.md")];
     let (broken, checked) = broken_links(&documents, root.path());
-    assert_eq!(checked, 3);
+    assert_eq!(checked, 4);
     assert_eq!(broken.len(), 3, "{}", broken.join("\n"));
     assert!(broken[0].contains("a.md -> missing.md (no file)"));
-    assert!(broken[1].contains("b.md#no"));
+    assert!(
+        broken[1].contains("b.md#no (headings: real)"),
+        "{}",
+        broken[1]
+    );
     assert!(broken[2].contains("docs/no-such-doc.md (not in the repo)"));
 }
 

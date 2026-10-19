@@ -32,3 +32,21 @@ pub mod client;
 pub mod cmd;
 pub mod materialize;
 pub mod vfs;
+
+/// The gate the unit tests of this binary run their forks and their
+/// serve-lock reads under: a fork copies the process's open lock files
+/// to the child until the child execs, and macOS is slow to exec, so a
+/// parallel test's fork can hold a probe's lock for ticks and flip its
+/// answer (`an_unmount_does_not_signal_an_unrelated_process` flaked so
+/// twice). **Every test in this binary that forks takes the gate**, and
+/// so does every test that reads a serve lock.
+#[cfg(test)]
+pub(crate) mod fork_gate {
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn serial() -> MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}

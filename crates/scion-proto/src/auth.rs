@@ -1,9 +1,10 @@
 //! Bearer tokens: the check on every RPC ([`Auth`]), shared by the server and
 //! the cache tiers, and the client side that sends the token ([`Bearer`]).
 //! Also the check that no other user can swap a local path on its way
-//! ([`check_ancestors`]), shared by `scn` and the daemon.
+//! ([`check_ancestors`]), shared by `scn` and the daemon, and the way every
+//! process makes its own directories private ([`create_private_dir_all`]).
 
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fs, io};
@@ -195,6 +196,25 @@ pub fn check_ancestors(path: &Path, me: u32) -> io::Result<PathBuf> {
     Ok(parent.join(name))
 }
 
+/// Makes `dir` and each missing directory above it with mode 0700, where
+/// [`fs::create_dir_all`] asks for 0777. A umask only takes bits away from
+/// the mode asked for, so whatever the umask is, group and others get no
+/// access: Ubuntu's default umask 002 does not make these directories
+/// writable by the group, as it does with 0777. A directory that exists
+/// already keeps its mode, for the caller's own check, such as
+/// [`check_ancestors`], to judge.
+///
+/// # Errors
+///
+/// As [`fs::DirBuilder::create`]: a part of `dir` is a file, or cannot be
+/// made.
+pub fn create_private_dir_all(dir: &Path) -> io::Result<()> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
 fn digest(token: &[u8]) -> [u8; 32] {
     *blake3::hash(token).as_bytes()
 }
@@ -220,6 +240,35 @@ mod tests {
     fn mkdir(path: &Path, mode: u32) {
         fs::create_dir(path).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().mode() & 0o7777
+    }
+
+    #[test]
+    fn private_directories_are_made_0700_and_existing_ones_keep_their_mode() {
+        let (tmp, me) = tempdir();
+        // The temp directory's own mode is the umask's: set it, so only the
+        // directories made below it are judged.
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        // Every part that is made is private, not only the last one. The
+        // run's umask, 002 or 022, would leave 0775 or 0755 on a plain mkdir.
+        create_private_dir_all(&tmp.path().join("a/b/c")).unwrap();
+        for made in ["a", "a/b", "a/b/c"] {
+            assert_eq!(mode_of(&tmp.path().join(made)), 0o700, "{made}");
+        }
+        check_ancestors(&tmp.path().join("a/b/c/daemon.sock"), me).unwrap();
+        // Again: a directory that exists is no error.
+        create_private_dir_all(&tmp.path().join("a/b/c")).unwrap();
+        // One that exists keeps its mode, open or not: the checks judge it.
+        mkdir(&tmp.path().join("open"), 0o777);
+        create_private_dir_all(&tmp.path().join("open/new")).unwrap();
+        assert_eq!(mode_of(&tmp.path().join("open")), 0o777);
+        assert_eq!(mode_of(&tmp.path().join("open/new")), 0o700);
+        // A file in the way fails.
+        fs::write(tmp.path().join("file"), b"").unwrap();
+        create_private_dir_all(&tmp.path().join("file/dir")).unwrap_err();
     }
 
     #[test]
