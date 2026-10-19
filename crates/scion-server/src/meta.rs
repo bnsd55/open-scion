@@ -133,6 +133,7 @@ pub trait MetaTx {
     fn generation_of(&mut self, id: ChangesetId) -> Result<i64>;
 
     /// The first parent of a changeset, if it has one.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn first_parent(&mut self, id: ChangesetId) -> Result<Option<ChangesetId>>;
 
     /// Every parent of `id`, in order, with its generation.
@@ -140,6 +141,7 @@ pub trait MetaTx {
 
     /// Whether `ancestor` is `descendant` or reachable from it, within a
     /// bounded walk.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn is_ancestor(
         &mut self,
         repo: RepoId,

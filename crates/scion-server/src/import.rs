@@ -8,6 +8,7 @@
 //! Git headers that Scion does not model (`encoding`, `gpgsig`, `mergetag`)
 //! are dropped, so a changeset ID is not a function of the git object name.
 
+#[cfg(any(test, feature = "test-hooks"))]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -207,6 +208,7 @@ fn import_with_cache(
         intact: LruCache::new(cache_entries),
     };
     let mut done = 0;
+    #[cfg_attr(not(any(test, feature = "test-hooks")), allow(unused_variables))]
     for (batch_no, batch) in plan.todo.chunks(BATCH).enumerate() {
         // Blobs are made durable first, so no stored metadata points at a
         // blob that a crash could lose.

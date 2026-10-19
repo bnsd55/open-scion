@@ -53,6 +53,7 @@ pub fn root_tree(
 /// [`Error::NotFound`] if nothing is at `path`. [`Error::InvalidArgument`] if
 /// `path` is a directory or a submodule. [`Error::DeadlineExceeded`] once
 /// `deadline` has passed, which a cold root tree may need.
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn read_file(
     store: &Backend,
     repo: &str,
@@ -272,6 +273,7 @@ pub(crate) fn next_change(
 /// Whether a changeset changes `path`: the file itself, or anything below it
 /// if it is a directory. A changeset lists every file it changes, so this
 /// needs no tree.
+#[cfg(any(test, feature = "test-hooks"))]
 #[must_use]
 pub fn changes_path(cs: &Changeset, path: &RepoPath) -> bool {
     let path = path.as_bytes();

@@ -230,6 +230,7 @@ fn hex16(bytes: &[u8; 16]) -> String {
 }
 
 /// The URL of the test database.
+#[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn test_url() -> Result<String> {
     std::env::var("SCION_TEST_POSTGRES_URL").map_err(|_| {
         crate::error::Error::InvalidArgument(
@@ -240,6 +241,7 @@ pub(crate) fn test_url() -> Result<String> {
 
 /// A database schema name that belongs to `data`, so the tests of one
 /// directory share it and no others see it.
+#[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn test_schema(data: &Path) -> String {
     let path = data.canonicalize().unwrap_or_else(|_| data.to_path_buf());
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -697,6 +699,7 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn first_parent(&mut self, id: ChangesetId) -> Result<Option<ChangesetId>> {
         match self {
             Self::Sqlite(tx) => tx.first_parent(id),
@@ -966,6 +969,7 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn is_ancestor(
         &mut self,
         repo: RepoId,

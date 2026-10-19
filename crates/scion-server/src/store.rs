@@ -242,7 +242,9 @@ struct Inner {
     /// `<data>/server.lock`, for a server `Store`.
     _server_lock: Option<fs::File>,
     /// Write transactions run so far, for tests of how imports share the
-    /// write lock.
+    /// write lock. The commits of a serving binary count too; only the
+    /// tests read the count.
+    #[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
     txes: AtomicU64,
     /// How many of the next commits fail as a busy database, for tests of
     /// the import's busy retry: the transaction ran and rolled back, so
@@ -1007,7 +1009,9 @@ pub struct Blobs {
 
 /// Which entry the order test records for one gated fsync. Production
 /// code names the step and pays nothing for it; only a test-hooks build
-/// records anything.
+/// records anything. The payloads are read only by that build, so the
+/// fields are dead in a plain build and the enum says so.
+#[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
 enum SyncStep<'a> {
     /// The temp file of a blob, before its rename.
     TempFile(BlobId),
@@ -1561,7 +1565,7 @@ impl Blobs {
             }
         }
         #[cfg(not(any(test, feature = "test-hooks")))]
-        drop(step);
+        let _ = step;
         self.record_sync(started);
         out.map_err(Error::Io)
     }
