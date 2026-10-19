@@ -3,7 +3,7 @@
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -669,8 +669,12 @@ fn load_access(
             Ok((scion_server::Access::single(&token), true))
         }
         (None, Some(file)) => {
-            let text = std::fs::read_to_string(&file)
-                .with_context(|| format!("cannot read {}", file.display()))?;
+            // The access file holds bearer tokens: read through one checked
+            // descriptor, the way the ticket keys are read.
+            let bytes = scion_proto::runtime::auth::read_secret_file(&file)
+                .map_err(|why| scion_proto::runtime::auth::checked_read_error(&file, why))?;
+            let text = String::from_utf8(bytes)
+                .map_err(|_| anyhow::anyhow!("{} is not UTF-8", file.display()))?;
             let access = scion_server::Access::parse(&text)
                 .map_err(|why| anyhow::anyhow!("bad access file {}: {why}", file.display()))?;
             Ok((access, false))
@@ -706,79 +710,21 @@ fn load_tickets(
 /// anyone who can read it. A public key is not a secret, so anyone may
 /// read it; but group or others must not be able to WRITE it, because a
 /// changed key breaks every tier that verifies against the old one, and a
-/// new one mints nothing good. Both refuse a symlink, both are owned by
-/// the user that runs the server or by root, and both sit under
-/// directories that only their owner (or root) can change.
-///
-/// The kind, owner, and mode checks run on the open descriptor, not on
-/// the path: the path [`check_ancestors`] resolved is opened once with
-/// `O_NOFOLLOW`, and the descriptor's own metadata is checked before
-/// anything is read from it. A swap in a directory another user can
-/// change between the checks and the read then dies at the open (a
-/// symlink lands there), or on the descriptor's checks (a file the
-/// swapper owns or a mode they set), and the bytes come from the checked
-/// descriptor either way.
+/// new one mints nothing good. Both are read through one checked
+/// descriptor, by [`read_secret_file`] and [`read_shared_file`]: the
+/// directories above are checked, the file is opened once with
+/// `O_NOFOLLOW`, and kind, owner, and mode run on the open descriptor the
+/// bytes are read from.
 fn read_hex(file: &Path, secret: bool) -> anyhow::Result<String> {
-    let me = rustix::process::geteuid().as_raw();
-    let resolved = scion_proto::runtime::auth::check_ancestors(file, me)
-        .with_context(|| format!("{} sits in a directory that is not private", file.display()))?;
-    let opened = rustix::fs::open(
-        &resolved,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )
-    .map_err(|why| {
-        if why == rustix::io::Errno::LOOP {
-            anyhow::anyhow!("{} is a symlink (a symlink is refused too)", file.display())
-        } else {
-            anyhow::anyhow!(why).context(format!("cannot read {}", file.display()))
-        }
-    })?;
-    let opened = std::fs::File::from(opened);
-    let meta = opened
-        .metadata()
-        .with_context(|| format!("cannot read {}", file.display()))?;
-    ensure_key_file(meta.mode(), meta.uid(), me, secret, file)?;
-    let mut text = String::new();
-    std::io::Read::read_to_string(&mut &opened, &mut text)
-        .with_context(|| format!("cannot read {}", file.display()))?;
-    Ok(text.trim().to_owned())
-}
-
-/// The descriptor checks of [`read_hex`]: a regular file, owned by the
-/// user that runs the server or by root, with a mode that keeps the key
-/// whole (a seed is also read by its owner alone). Pure over the fstat
-/// fields, so the tests can prove each refusal without a second user.
-fn ensure_key_file(mode: u32, uid: u32, me: u32, secret: bool, file: &Path) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        rustix::fs::FileType::from_raw_mode(mode.try_into().unwrap()).is_file(),
-        "{} is not a file (a symlink is refused too)",
-        file.display()
-    );
-    anyhow::ensure!(
-        uid == 0 || uid == me,
-        "{} is owned by another user (uid {}); the server runs as uid {}",
-        file.display(),
-        uid,
-        me
-    );
-    let bits = mode & 0o777;
-    if secret {
-        anyhow::ensure!(
-            bits.trailing_zeros() >= 6,
-            "{} can be read by group or others (fix: chmod 600 {})",
-            file.display(),
-            file.display()
-        );
+    let bytes = if secret {
+        scion_proto::runtime::auth::read_secret_file(file)
     } else {
-        anyhow::ensure!(
-            bits & 0o022 == 0,
-            "{} can be written by group or others (fix: chmod go-w {})",
-            file.display(),
-            file.display()
-        );
+        scion_proto::runtime::auth::read_shared_file(file)
     }
-    Ok(())
+    .map_err(|why| scion_proto::runtime::auth::checked_read_error(file, why))?;
+    let text =
+        String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("{} is not UTF-8", file.display()))?;
+    Ok(text.trim().to_owned())
 }
 
 /// Writes a fresh ticket key to `--out` and prints its public key. The
@@ -825,59 +771,6 @@ fn hash_token() -> anyhow::Result<()> {
 #[cfg(test)]
 mod key_file_tests {
     use super::*;
-
-    /// The raw fstat mode of a regular file with permission bits `bits`.
-    fn file_mode(bits: u32) -> u32 {
-        0o100_000 | bits
-    }
-
-    #[test]
-    fn a_key_owned_by_the_server_user_passes() {
-        ensure_key_file(file_mode(0o600), 501, 501, true, Path::new("key")).unwrap();
-        ensure_key_file(file_mode(0o644), 501, 501, false, Path::new("key")).unwrap();
-    }
-
-    /// A key owned by root passes: a service manager that holds the keys
-    /// at root-owned files is normal.
-    #[test]
-    fn a_root_owned_key_passes() {
-        ensure_key_file(file_mode(0o600), 0, 501, true, Path::new("key")).unwrap();
-        ensure_key_file(file_mode(0o644), 0, 501, false, Path::new("key")).unwrap();
-    }
-
-    /// The owner check is what keeps a key file another user holds —
-    /// and can replace at will — out, whatever its mode.
-    #[test]
-    fn a_key_owned_by_another_user_is_refused() {
-        let err = ensure_key_file(file_mode(0o644), 502, 501, false, Path::new("key"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("owned by another user"), "{err}");
-    }
-
-    #[test]
-    fn a_key_that_is_not_a_file_is_refused() {
-        let err = ensure_key_file(0o040_700, 501, 501, true, Path::new("key"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("is not a file"), "{err}");
-    }
-
-    #[test]
-    fn a_group_readable_seed_is_refused() {
-        let err = ensure_key_file(file_mode(0o640), 501, 501, true, Path::new("key"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("read by group or others"), "{err}");
-    }
-
-    #[test]
-    fn a_group_writable_public_key_is_refused() {
-        let err = ensure_key_file(file_mode(0o664), 501, 501, false, Path::new("key"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("written by group or others"), "{err}");
-    }
 
     fn write_key(dir: &Path, name: &str, mode: u32, text: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
@@ -928,6 +821,48 @@ mod key_file_tests {
         let link = dir.path().join("seed");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let err = read_hex(&link, true).unwrap_err().to_string();
+        assert!(err.contains("symlink"), "{err}");
+    }
+}
+
+/// The access file of `--access` holds bearer tokens: the same checked
+/// read as the keys ([`read_secret_file`]), so a file that group or
+/// others can read is refused, not silently taken.
+#[cfg(test)]
+mod access_file_tests {
+    use super::*;
+
+    fn write_access(dir: &Path, name: &str, mode: u32, text: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let file = dir.join(name);
+        std::fs::write(&file, text).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+        file
+    }
+
+    #[test]
+    fn an_access_file_the_group_or_others_can_read_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write_access(dir.path(), "access", 0o644, "# rules\n");
+        let err = load_access(None, Some(file)).unwrap_err().to_string();
+        assert!(err.contains("read by group or others"), "{err}");
+    }
+
+    #[test]
+    fn a_private_access_file_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write_access(dir.path(), "access", 0o600, "# rules\n");
+        let (_, single) = load_access(None, Some(file)).unwrap();
+        assert!(!single);
+    }
+
+    #[test]
+    fn a_symlinked_access_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = write_access(dir.path(), "real", 0o600, "# rules\n");
+        let link = dir.path().join("access");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = load_access(None, Some(link)).unwrap_err().to_string();
         assert!(err.contains("symlink"), "{err}");
     }
 }

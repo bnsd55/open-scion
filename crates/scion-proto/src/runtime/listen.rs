@@ -833,10 +833,14 @@ mod tests {
         }
     }
 
-    /// Writes `pem` into the temp directory of a test, as `name`.
+    /// Writes `pem` into the temp directory of a test, as `name`, 0600:
+    /// the keys are secrets, and the checked read refuses one that group
+    /// or others can read.
     fn write(dir: &Path, name: &str, pem: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join(name);
         std::fs::write(&path, pem).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         path
     }
 

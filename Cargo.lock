@@ -2543,6 +2543,7 @@ dependencies = [
  "open-scion-core",
  "prost",
  "rcgen",
+ "rustix",
  "tempfile",
  "tokio",
  "tokio-rustls",
