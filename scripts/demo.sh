@@ -42,7 +42,7 @@ landed=$(json_num landed "$WORK/bench.json")
 rate=$(json_num lands_per_second "$WORK/bench.json")
 p99=$(sed -E -n 's/.*"land_ms":\{[^}]*"p99":([0-9.eE+-]+).*/\1/p' "$WORK/bench.json")
 row() { printf '%-40s %s\n' "$1" "$2"; }
-echo "open-scion demo: $REPO_URL at ${REPO_COMMIT:0:12}"
+echo "openscion demo: $REPO_URL at ${REPO_COMMIT:0:12}"
 echo
 row "step" "result"
 row "import, $COMMITS commits" "$(wall "$WORK/import.log") s"
