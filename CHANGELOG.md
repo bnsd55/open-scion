@@ -206,6 +206,15 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- A git import gives up instead of planning a ref's move again without
+  end (#280): a ref that other lands keep moving while the import
+  runs made the import check the ref's ancestry again and again, with
+  no bound on the tries or on each walk of the history. The import now
+  tries the move at most 3 times, answers that the ref kept moving,
+  and checks ancestry through the derived commit graph, which reads a
+  few nodes and stops at a deadline, instead of walking parents
+  without one.
+
 - A disk cache whose index row names more bytes than any object holds
   answers that row as corrupt, naming the object, instead of sizing
   its read buffer for the row.
