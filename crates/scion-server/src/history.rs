@@ -950,6 +950,23 @@ mod tests {
         }
     }
 
+    /// A `Log` page without a path checks the deadline at each entry, as
+    /// the with-path branch does at its derive: an expired one answers at
+    /// once, before it reads the first changeset.
+    #[test]
+    fn a_log_page_without_a_path_checks_its_deadline() {
+        let (_dir, store, repo) = open();
+        let steps: &[(&str, bool)] = &[("a", true)];
+        let ids = store_chain(&store, repo, None, &[steps; 4], true);
+        let past = Deadline::new(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap(),
+        );
+        let page = read::log_page(&store, "r", *ids.last().unwrap(), None, 10, &past);
+        assert!(matches!(page, Err(Error::DeadlineExceeded(_))), "{page:?}");
+    }
+
     #[test]
     fn a_path_log_reads_only_the_changesets_that_change_the_path() {
         let (_dir, store, repo) = open();

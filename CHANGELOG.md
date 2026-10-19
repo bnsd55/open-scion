@@ -165,6 +165,11 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Changed
 
+- A git import no longer re-reads and re-fsyncs blobs that a committed
+  row of the target repo already names (#238): one row probe per
+  distinct blob proves the stored copy durable, so a branch import over
+  an existing history skips the read-backs and the drive-cache flushes
+  of its unchanged files. Blobs without a row keep the full put path.
 - `open-scion-server`'s public API is a small facade: `Backend`,
   `service::{serve, ServeOptions}`, `access::Access`, `tickets::Keys`,
   `quotas::Quotas`, `metrics::Metrics`,
@@ -205,6 +210,31 @@ The first release: the server, its cache tiers, and the `scn` client.
   diff` prints git's warning about skipped inexact rename detection.
 
 ### Fixed
+
+- Two reads stop at the caller's deadline and the reply's budget
+  (#283): a `Log` call without a path read up to 1,000 changesets, each
+  as large as a changeset can be, with the call's deadline never
+  checked; a `GetObjects` call's ticket walk decoded every tree on up
+  to 1,000 requested paths, however many bytes that is, before the
+  reply budget that bounds the reply was even consulted. The log page
+  now checks the deadline at each entry, and the walk hands a tree to
+  the walk only while the bytes it holds fit the budget's whole size,
+  and stops at the deadline, before it decodes one more tree.
+- `gc` no longer unlinks the file of a blob that a `PutBlob` in another
+  process is writing at that moment: a put of an old orphan kept its
+  file with a touch and renamed a replacing one, and a collector whose
+  re-stat and unlink ran between those and the put's row commit deleted
+  the file, so an acknowledged put named a file that was gone. The put
+  and the sweep now hold the fan-out directory's `flock` around their
+  file work, which orders them across processes the way the in-process
+  stripe orders the writers of one process; a touch or rename that
+  lands first changes the mtime the sweep re-stats, and an unlink that
+  lands first makes the put's keep see a missing file and write anew.
+- `fsck` no longer reports a blob-missing when the file it lists is an
+  old orphan the concurrent `gc` collected while the check ran: a file
+  that is gone and named by no row is the collector's take, not damage,
+  and a file that is back between the check's two looks was rewritten
+  by a racing put. A file a row names is still reported missing.
 
 - A git import gives up instead of planning a ref's move again without
   end (#280): a ref that other lands keep moving while the import

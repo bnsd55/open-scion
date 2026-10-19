@@ -186,7 +186,14 @@ pub fn log_page(
             let mut entries = Vec::new();
             let mut next = Some(cs);
             let mut budget = limit;
-            while let Some(entry) = next_change(c, repo, &mut next, &mut budget)? {
+            // The deadline guards a read that has more to read: while the
+            // walk still holds a cursor. A page whose last entry ended the
+            // walk comes back whole, whatever the clock says.
+            while next.is_some() {
+                deadline.check()?;
+                let Some(entry) = next_change(c, repo, &mut next, &mut budget)? else {
+                    break;
+                };
                 entries.push(entry);
             }
             Ok(LogPage { entries, next })
@@ -203,6 +210,7 @@ pub fn log_page(
         let mut entries = Vec::new();
         let mut next = Some(cs);
         while let Some(from) = next.filter(|_| entries.len() < limit) {
+            deadline.check()?;
             if !entries.is_empty() && nodes.bytes() >= MAX_LOG_NODE_BYTES {
                 break;
             }

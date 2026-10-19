@@ -128,6 +128,60 @@ impl ImportHooks {
     }
 }
 
+/// The write park of the test that races two processes onto one blob
+/// ([#268]). With `SCION_TEST_PARK_WRITES` in the environment, a writer
+/// whose `keep` found the blob missing parks while the park file of that
+/// blob's ID exists next to the data directory. The spawned server picks
+/// the variable up at start, so a test parks the writer of a real
+/// process; the park file is the release.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Default)]
+pub struct WritePark {
+    enabled: bool,
+    root: PathBuf,
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+impl WritePark {
+    /// Arms the park from the environment, over the data root.
+    pub(crate) fn from_env(root: &Path) -> Self {
+        Self {
+            enabled: std::env::var_os("SCION_TEST_PARK_WRITES").is_some(),
+            root: root.to_owned(),
+        }
+    }
+
+    /// Parks the caller while the park file of `id` exists. The writer
+    /// holds its stripe all the while, so no same-blob write of this
+    /// process moves either. A marker file says the writer is inside the
+    /// park: a stat of the park file can come from the kernel's cache,
+    /// so the test cannot see the park in the ops trace. The ceiling
+    /// bounds the park of the good code: a park nobody lifts fails the
+    /// holder, not the whole store.
+    pub fn park(&self, id: &BlobId) {
+        if !self.enabled {
+            return;
+        }
+        let hooks = self.root.join("hooks");
+        let file = hooks.join(format!("park-{id}"));
+        let marker = hooks.join(format!("parked-{id}"));
+        let _ = fs::write(&marker, b"");
+        // A cold CI import of one commit took about 30 s; the ceiling
+        // sits well above it, and the test lifts the park long before.
+        let give_up = Instant::now() + Duration::from_secs(180);
+        while file.exists() {
+            assert!(
+                Instant::now() < give_up,
+                "the park of {id} was never lifted"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = fs::remove_file(&marker);
+    }
+}
+
 /// Handle to one data directory. Cheap to clone.
 #[derive(Clone)]
 pub struct Store {
@@ -872,7 +926,12 @@ pub enum BlobStatus {
     Corrupt,
 }
 
-/// Immutable file contents, one zstd-compressed file per [`BlobId`].
+/// The held fan-out directory flock of a blob: the handle's close
+/// releases the lock, so a drop is enough and a crash holds nothing.
+pub(crate) struct DirFlock {
+    _file: fs::File,
+}
+
 /// Immutable file contents, one zstd-compressed file per [`BlobId`].
 pub struct Blobs {
     root: PathBuf,
@@ -888,13 +947,16 @@ pub struct Blobs {
     /// in this process, so two puts of the same bytes never race their
     /// renames onto one path ([#185]).
     write_locks: Vec<Mutex<()>>,
+    /// The test park of the write path, armed by the environment.
+    #[cfg(any(test, feature = "test-hooks"))]
+    park: WritePark,
     group_flush: GroupFlush,
     /// The operator metrics, set once by the server before it serves:
     /// every full flush records how long it took. Empty in import, fsck
     /// and gc, which export none.
     metrics: std::sync::OnceLock<std::sync::Arc<crate::metrics::Metrics>>,
     /// Calls to [`Blobs::verify`] so far.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     verifies: std::sync::atomic::AtomicU64,
     /// The test hook that fails a file write of this backend with the
     /// disk's answer: `n` lets `n` writes through and fails the one
@@ -1034,6 +1096,10 @@ impl Blobs {
             fsync_dir(path)?;
         }
         Ok(Self {
+            // The park files live under the data dir, not under
+            // `objects/blob`: the test writes them next to the data root.
+            #[cfg(any(test, feature = "test-hooks"))]
+            park: WritePark::from_env(dir),
             root,
             tmp,
             mine,
@@ -1041,7 +1107,7 @@ impl Blobs {
             write_locks: (0..WRITE_STRIPES).map(|_| Mutex::new(())).collect(),
             group_flush: GroupFlush::default(),
             metrics: std::sync::OnceLock::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             verifies: std::sync::atomic::AtomicU64::default(),
             fail_writes: std::sync::atomic::AtomicUsize::new(UNARMED),
             fail_writes_errno: std::sync::atomic::AtomicU8::new(28),
@@ -1066,6 +1132,32 @@ impl Blobs {
         self.write_locks[stripe]
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Holds the fan-out directory of `id` against the file work of
+    /// another process: the rename of a put, the touch of a keep, and
+    /// the re-stat and unlink of the collector's sweep all run under it,
+    /// so a touch or rename that lands first changes the mtime the sweep
+    /// re-stats, and an unlink that lands first makes the put's keep see
+    /// a missing file and write anew. The metadata transaction orders the
+    /// rows; the file work itself needs this lock. Always taken inside
+    /// the stripe of the blob: the lock order is stripe, then dir flock,
+    /// everywhere. The kernel releases it when the handle drops, so a
+    /// crashed process holds nothing.
+    pub(crate) fn dir_flock(&self, id: BlobId) -> io::Result<DirFlock> {
+        let (dir, _) = self.location(id);
+        // A first put reaches here before anything created the fan-out
+        // directory; create it, the way the write below would.
+        let file = match fs::File::open(&dir) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir_all(&dir)?;
+                fs::File::open(&dir)?
+            }
+            Err(e) => return Err(e),
+        };
+        flock(&file, FlockOperation::LockExclusive)?;
+        Ok(DirFlock { _file: file })
     }
 
     /// Removes what crashes left in `tmp/`: the folders of processes that no
@@ -1289,7 +1381,7 @@ impl Blobs {
     ///
     /// [`Error::Io`] if the file exists but cannot be read.
     pub fn verify(&self, id: BlobId) -> Result<BlobStatus> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         self.verifies
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let file = match self.open_file(id) {
@@ -1606,14 +1698,22 @@ impl Blobs {
         (dir, path)
     }
 
+    /// Whether the blob's file is on disk. A cheap stat, no read: the
+    /// importer's skip checks it, so a blob whose row survives but whose
+    /// file was deleted under the server still refuses the import.
+    pub(crate) fn file_exists(&self, id: BlobId) -> bool {
+        self.location(id).1.exists()
+    }
+
     #[cfg(test)]
     pub(crate) fn full_flushes(&self) -> u64 {
         self.group_flush.lock().finished
     }
 
     /// Calls to [`Blobs::verify`] so far.
-    #[cfg(test)]
-    pub(crate) fn verifies(&self) -> u64 {
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn verifies(&self) -> u64 {
         self.verifies.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
@@ -1820,8 +1920,10 @@ impl BlobBatch<'_> {
     fn write(&mut self, id: BlobId, len: usize, raw: impl Read) -> Result<()> {
         // One blob, one writer: the lock spans the check of the stored
         // file, the touch of a kept one, and the rename that replaces it
-        // (see `Blobs::write_lock`).
+        // (see `Blobs::write_lock`). The dir flock under it orders this
+        // file work against the collector's sweep in another process.
         let _write = self.blobs.write_lock(id);
+        let _dir = self.blobs.dir_flock(id)?;
         match self.keep(id)? {
             BlobStatus::Valid => {
                 // A put that keeps the stored copy writes nothing, so the
@@ -1859,6 +1961,11 @@ impl BlobBatch<'_> {
             BlobStatus::Corrupt => tracing::warn!(blob = %id, "rewriting a corrupt blob file"),
             BlobStatus::Missing => {}
         }
+        // The test seam of [#268]: the writer has passed keep and holds
+        // its stripe, and parks here while the park file exists, so the
+        // rename lands after another process's rename of the same path.
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.blobs.park.park(&id);
         self.replace(id, len, raw)
     }
 
@@ -1918,9 +2025,15 @@ impl BlobBatch<'_> {
     /// rename.
     fn replace_stored(&mut self, id: BlobId, len: usize, raw: impl Read) -> Result<()> {
         // The rename below lands on the same path as any other write of
-        // this blob, so it waits for the same stripe.
+        // this blob, so it waits for the same stripe, and under it the
+        // dir flock orders the rename against the collector's sweep.
         let _write = self.blobs.write_lock(id);
+        let _dir = self.blobs.dir_flock(id)?;
         self.blobs.full_flush()?;
+        // The same test seam as `write`: a put of a blob the repo does
+        // not have yet takes this path, and the race test parks it here.
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.blobs.park.park(&id);
         self.replace(id, len, raw)
     }
 

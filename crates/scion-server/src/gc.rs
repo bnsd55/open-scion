@@ -349,6 +349,14 @@ fn sweep_files(
         let started = std::time::Instant::now();
         store.write(|c| {
             for (path, listed, id) in batch {
+                // The directory's flock orders this unlink against a put
+                // of the same blob in another process: a touch or a
+                // rename that lands first changes the mtime, so the
+                // re-stat below skips the file, and an unlink that lands
+                // first makes the put's keep see a missing file and
+                // write anew. The metadata transaction orders the row
+                // check; the file work itself needs this lock.
+                let _dir = store.blobs().dir_flock(*id)?;
                 if c.any_repo_names(id.as_bytes())? {
                     continue;
                 }
@@ -754,6 +762,68 @@ mod tests {
             &mut |_| {},
         );
         assert_eq!(report.files_removed, 1, "{report:?}");
+    }
+
+    /// The sweep of a file another process is writing waits for the
+    /// process's flock of the file's fan-out directory: it never unlinks
+    /// a file under a put that is about to rename or touch it, and a
+    /// touch that landed under the lock makes the sweep skip the file.
+    /// A build without the flock unlinks the aged orphan right away.
+    #[test]
+    fn a_sweep_of_a_file_another_process_writes_waits_for_its_flock() {
+        let (dir, store) = store();
+        // A second process beside the collector, the way a serving server
+        // and `scion-server gc` run.
+        let other = Store::open_shared(dir.path()).unwrap();
+        let x = store.blobs().put(b"raced\n").unwrap();
+        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+
+        // The put of the other process holds the lock while it works on
+        // the file. Every wait below is bounded.
+        let held = other.blobs().dir_flock(x).unwrap();
+        let listed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listed2 = listed.clone();
+        let (done, done_rx) = std::sync::mpsc::channel();
+        let backend = Backend::Sqlite(store.clone());
+        std::thread::spawn(move || {
+            let report = collect(
+                &backend,
+                Duration::from_secs(DEFAULT_GRACE_SECS),
+                &mut |stage: Stage| {
+                    if stage == Stage::BlobFiles {
+                        listed2.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                },
+            );
+            let _ = done.send(report);
+        });
+        let started = std::time::Instant::now();
+        while !listed.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "gc never listed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The sweep listed the file and reached its re-stat and unlink.
+        // With the flock it waits; without it the file is gone by now.
+        std::thread::sleep(Duration::from_millis(150));
+        let (_, path) = store.blobs().location(x);
+        assert!(path.exists(), "the sweep unlinked a file a put was writing");
+        // The put's touch lands under the lock, so its mtime is young and
+        // the sweep that follows skips the file.
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(SystemTime::now()).unwrap();
+        drop(held);
+        let report = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("gc never finished");
+        assert_eq!(report.files_removed, 0, "{report:?}");
+        assert!(path.exists());
+        assert_eq!(
+            store.blobs().verify(x).unwrap(),
+            crate::store::BlobStatus::Valid
+        );
     }
 
     #[test]
