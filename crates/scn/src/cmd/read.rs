@@ -227,12 +227,12 @@ pub async fn show(ctx: &mut Ctx, rev: &str) -> Result<()> {
     for parent in cs.parents() {
         println!("parent    {parent}");
     }
-    println!("author    {}", identity(&cs.author()));
+    println!("author    {}", identity(cs.author()));
     if let Some(committer) = &cs.committer() {
         println!("committer {}", identity(committer));
     }
     println!();
-    for line in lossy(&cs.message()).lines() {
+    for line in lossy(cs.message()).lines() {
         println!("    {line}");
     }
     println!();
@@ -285,8 +285,8 @@ fn identity(who: &IdentityTime) -> String {
     let minutes = who.tz_offset_minutes().unsigned_abs();
     format!(
         "{} <{}> {} {sign}{:02}{:02}",
-        lossy(&who.name()),
-        lossy(&who.email()),
+        lossy(who.name()),
+        lossy(who.email()),
         who.unix_secs(),
         minutes / 60,
         minutes % 60
@@ -295,8 +295,8 @@ fn identity(who: &IdentityTime) -> String {
 
 pub(crate) fn identity_json(who: &IdentityTime) -> Value {
     json!({
-        "name": lossy(&who.name()),
-        "email": lossy(&who.email()),
+        "name": lossy(who.name()),
+        "email": lossy(who.email()),
         "unix_secs": who.unix_secs(),
         "tz_offset_minutes": who.tz_offset_minutes(),
     })
@@ -306,9 +306,9 @@ fn changeset_json(id: ChangesetId, cs: &Changeset) -> Value {
     json!({
         "id": id.to_string(),
         "parents": cs.parents().iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "author": identity_json(&cs.author()),
+        "author": identity_json(cs.author()),
         "committer": cs.committer().map(identity_json),
-        "message": lossy(&cs.message()),
+        "message": lossy(cs.message()),
     })
 }
 
