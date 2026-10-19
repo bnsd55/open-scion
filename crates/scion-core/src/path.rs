@@ -5,6 +5,7 @@ const MAX_PATH_PARTS: usize = 256;
 
 /// Why a path or name was rejected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PathError {
     /// The path is empty.
     Empty,

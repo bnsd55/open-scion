@@ -64,7 +64,9 @@ impl Deepest {
         )]
         .into_iter()
         .collect();
-        let (tree_bytes, root) = scion_core::Tree { entries }.encode_with_id();
+        let (tree_bytes, root) = scion_core::Tree::new(entries)
+            .expect("tree fits the format")
+            .encode_with_id();
         Self {
             data,
             key: ed25519_dalek::SigningKey::from_bytes(&[4; 32]),

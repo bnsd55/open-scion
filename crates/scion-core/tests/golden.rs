@@ -61,12 +61,8 @@ fn hash(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
 }
 
 fn identity(name: &str, email: &str, unix_secs: i64, tz_offset_minutes: i32) -> IdentityTime {
-    IdentityTime {
-        name: name.into(),
-        email: email.into(),
-        unix_secs,
-        tz_offset_minutes,
-    }
+    IdentityTime::new(name.into(), email.into(), unix_secs, tz_offset_minutes)
+        .expect("identity fits the format")
 }
 
 fn path(p: &str) -> RepoPath {
@@ -81,12 +77,12 @@ fn regular(content: &[u8], executable: bool) -> FileState {
 }
 
 fn root() -> Changeset {
-    Changeset {
-        parents: vec![],
-        author: identity("Ada Lovelace", "ada@example.com", 1_700_000_000, 120),
-        committer: Some(identity("Bob", "bob@example.com", 1_700_000_100, -300)),
-        message: b"init\n".to_vec(),
-        changes: BTreeMap::from([
+    Changeset::new(
+        vec![],
+        identity("Ada Lovelace", "ada@example.com", 1_700_000_000, 120),
+        Some(identity("Bob", "bob@example.com", 1_700_000_100, -300)),
+        b"init\n".to_vec(),
+        BTreeMap::from([
             (path("README.md"), Some(regular(b"# demo\n", false))),
             (path("bin/run"), Some(regular(b"#!/bin/sh\n", true))),
             (
@@ -102,16 +98,17 @@ fn root() -> Changeset {
                 }),
             ),
         ]),
-    }
+    )
+    .expect("changeset fits the format")
 }
 
 fn child() -> Changeset {
-    Changeset {
-        parents: vec![root().id()],
-        author: identity("Ada Lovelace", "ada@example.com", 1_700_000_200, 120),
-        committer: None,
-        message: b"fix\n".to_vec(),
-        changes: BTreeMap::from([
+    Changeset::new(
+        vec![root().id()],
+        identity("Ada Lovelace", "ada@example.com", 1_700_000_200, 120),
+        None,
+        b"fix\n".to_vec(),
+        BTreeMap::from([
             (path("README.md"), None),
             (path("src/main.rs"), Some(regular(b"fn main() {}\n", false))),
             (
@@ -121,67 +118,68 @@ fn child() -> Changeset {
                 }),
             ),
         ]),
-    }
+    )
+    .expect("changeset fits the format")
 }
 
 fn merge() -> Changeset {
-    Changeset {
-        parents: vec![child().id(), root().id()],
-        author: identity("Bob", "bob@example.com", 1_700_000_300, -300),
-        committer: None,
-        message: vec![],
-        changes: BTreeMap::new(),
-    }
+    Changeset::new(
+        vec![child().id(), root().id()],
+        identity("Bob", "bob@example.com", 1_700_000_300, -300),
+        None,
+        vec![],
+        BTreeMap::new(),
+    )
+    .expect("changeset fits the format")
 }
 
 fn tree() -> Tree {
     let name = |n: &str| PathElem::new(n).unwrap();
-    Tree {
-        entries: BTreeMap::from([
-            (
-                name("README.md"),
-                Entry::File(FileEntry::new(
-                    regular(b"# demo\n", false),
-                    b"# demo\n".len() as u64,
-                )),
-            ),
-            (name("bin"), Entry::Dir(TreeId::from_bytes([0x11; 32]))),
-            (
-                name("link"),
-                Entry::File(FileEntry::new(
-                    FileState::Symlink {
-                        target: BlobId::of(b"README.md"),
-                    },
-                    b"README.md".len() as u64,
-                )),
-            ),
-            (
-                name("run.sh"),
-                Entry::File(FileEntry::new(
-                    regular(b"#!/bin/sh\n", true),
-                    b"#!/bin/sh\n".len() as u64,
-                )),
-            ),
-            (
-                name("sub"),
-                Entry::File(FileEntry::new(
-                    FileState::Gitlink {
-                        commit: GitOid::Sha1([0x22; 20]),
-                    },
-                    0,
-                )),
-            ),
-            (
-                name("sub256"),
-                Entry::File(FileEntry::new(
-                    FileState::Gitlink {
-                        commit: GitOid::Sha256([0x33; 32]),
-                    },
-                    0,
-                )),
-            ),
-        ]),
-    }
+    Tree::new(BTreeMap::from([
+        (
+            name("README.md"),
+            Entry::File(FileEntry::new(
+                regular(b"# demo\n", false),
+                b"# demo\n".len() as u64,
+            )),
+        ),
+        (name("bin"), Entry::Dir(TreeId::from_bytes([0x11; 32]))),
+        (
+            name("link"),
+            Entry::File(FileEntry::new(
+                FileState::Symlink {
+                    target: BlobId::of(b"README.md"),
+                },
+                b"README.md".len() as u64,
+            )),
+        ),
+        (
+            name("run.sh"),
+            Entry::File(FileEntry::new(
+                regular(b"#!/bin/sh\n", true),
+                b"#!/bin/sh\n".len() as u64,
+            )),
+        ),
+        (
+            name("sub"),
+            Entry::File(FileEntry::new(
+                FileState::Gitlink {
+                    commit: GitOid::Sha1([0x22; 20]),
+                },
+                0,
+            )),
+        ),
+        (
+            name("sub256"),
+            Entry::File(FileEntry::new(
+                FileState::Gitlink {
+                    commit: GitOid::Sha256([0x33; 32]),
+                },
+                0,
+            )),
+        ),
+    ]))
+    .expect("tree fits the format")
 }
 
 #[test]
@@ -561,12 +559,16 @@ fn a_tree_of_every_kind_round_trips() {
     let gitlink = FileState::Gitlink {
         commit: GitOid::Sha1([0x44; 20]),
     };
-    let plain = Tree {
-        entries: BTreeMap::from([(name("sub"), Entry::File(FileEntry::new(gitlink, 0)))]),
-    };
-    let lied = Tree {
-        entries: BTreeMap::from([(name("sub"), Entry::File(FileEntry::new(gitlink, 5)))]),
-    };
+    let plain = Tree::new(BTreeMap::from([(
+        name("sub"),
+        Entry::File(FileEntry::new(gitlink, 0)),
+    )]))
+    .expect("tree fits the format");
+    let lied = Tree::new(BTreeMap::from([(
+        name("sub"),
+        Entry::File(FileEntry::new(gitlink, 5)),
+    )]))
+    .expect("tree fits the format");
     assert_eq!(plain, lied, "the length of a gitlink is not a field");
     assert_eq!(plain.encode(), lied.encode());
     assert_eq!(Tree::decode(&lied.encode()).unwrap(), plain);

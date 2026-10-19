@@ -96,18 +96,20 @@ fn write_pem(dir: &TempDir, name: &str, cert: &str, key: &str) -> (PathBuf, Path
 /// Stores a first changeset in the repo, and points `main` at it, so `scn
 /// log main` has something to show.
 fn land(store: &Backend) {
-    let cs = Changeset {
-        parents: Vec::new(),
-        author: IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"tls\n".to_vec(),
-        changes: std::collections::BTreeMap::new(),
-    };
+    let cs = Changeset::new(
+        Vec::new(),
+        IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"tls\n".to_vec(),
+        std::collections::BTreeMap::new(),
+    )
+    .expect("changeset fits the format");
     store
         .write(|c| {
             let repo = c.create_repo(REPO)?;

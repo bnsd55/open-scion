@@ -128,13 +128,8 @@ fn version_2_data(data: &Path) -> ChangesetId {
         .unwrap();
     c.execute_batch(include_str!("../migrations/0002_land_retention.sql"))
         .unwrap();
-    let root = Changeset {
-        parents: vec![],
-        author: author(),
-        committer: None,
-        message: b"root\n".to_vec(),
-        changes: BTreeMap::new(),
-    };
+    let root = Changeset::new(vec![], author(), None, b"root\n".to_vec(), BTreeMap::new())
+        .expect("changeset fits the format");
     let (body, id) = root.encode_with_id();
     let id_bytes = id.as_bytes().as_slice();
     c.execute("INSERT INTO repos (repo_id, name) VALUES (1, ?1)", [REPO])

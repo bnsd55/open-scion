@@ -11,12 +11,13 @@ use std::collections::BTreeMap;
 const REPO: &str = "r";
 
 fn author() -> IdentityTime {
-    IdentityTime {
-        name: b"Ada".to_vec(),
-        email: b"ada@example.com".to_vec(),
-        unix_secs: 1_700_000_000,
-        tz_offset_minutes: 0,
-    }
+    IdentityTime::new(
+        b"Ada".to_vec(),
+        b"ada@example.com".to_vec(),
+        1_700_000_000,
+        0,
+    )
+    .expect("identity fits the format")
 }
 
 /// A change whose blob is stored in the store, so the land's lens reads
@@ -38,13 +39,14 @@ struct Fixture {
 }
 
 fn changeset(parents: Vec<ChangesetId>, changes: Vec<(RepoPath, Option<FileState>)>) -> Changeset {
-    Changeset {
+    Changeset::new(
         parents,
-        author: author(),
-        committer: None,
-        message: b"land path test".to_vec(),
-        changes: changes.into_iter().collect(),
-    }
+        author(),
+        None,
+        b"land path test".to_vec(),
+        changes.into_iter().collect(),
+    )
+    .expect("changeset fits the format")
 }
 
 impl Fixture {
@@ -79,13 +81,8 @@ fn setup() -> Fixture {
         (RepoPath::new("a/f").unwrap(), state(blob("f"))),
         (RepoPath::new("b/y").unwrap(), state(blob("y"))),
     ]);
-    let root = Changeset {
-        parents: vec![],
-        author: author(),
-        committer: None,
-        message: b"root".to_vec(),
-        changes,
-    };
+    let root = Changeset::new(vec![], author(), None, b"root".to_vec(), changes)
+        .expect("changeset fits the format");
     let root_id = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;

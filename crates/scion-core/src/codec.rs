@@ -10,6 +10,42 @@ use crate::{
 
 const VERSION: u8 = 1;
 
+/// The largest length or count the v1 format can carry: every such field
+/// is a `u32be`.
+pub(crate) const MAX_FIELD: usize = u32::MAX as usize;
+
+/// Why a value cannot be encoded. Constructors refuse values that break a
+/// v1 bound, so [`Changeset::encode`] and [`Tree::encode`] never see one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EncodeError {
+    /// A field or count is above the v1 format's `u32be` bound.
+    FieldTooLong(&'static str),
+}
+
+impl fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FieldTooLong(what) => {
+                write!(f, "the {what} is above the v1 format's u32::MAX bound")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EncodeError {}
+
+/// The boundary the constructors enforce: a length of `cap` fits, one more
+/// does not. `cap` is a parameter so tests can pin the boundary without
+/// allocating `u32::MAX` bytes.
+pub(crate) fn check_fit(len: usize, cap: usize, what: &'static str) -> Result<(), EncodeError> {
+    if len <= cap {
+        Ok(())
+    } else {
+        Err(EncodeError::FieldTooLong(what))
+    }
+}
+
 const TAG_DELETE: u8 = 0;
 const TAG_REGULAR: u8 = 1;
 const TAG_SYMLINK: u8 = 2;
@@ -21,6 +57,7 @@ const GIT_SHA256: u8 = 2;
 
 /// Why bytes are not a canonical v1 object, or break a limit the caller set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecodeError {
     /// The input ends before the object does, or a length points past the end.
     UnexpectedEnd,
@@ -63,9 +100,8 @@ impl std::error::Error for DecodeError {}
 impl Changeset {
     /// Encodes the changeset in the v1 canonical format.
     ///
-    /// # Panics
-    ///
-    /// If a field is longer than `u32::MAX` bytes or items.
+    /// A value a constructor built, or the decoder returned, always
+    /// encodes: the constructors refuse what the format cannot carry.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut w = vec![VERSION];
@@ -184,9 +220,8 @@ impl Changeset {
 impl Tree {
     /// Encodes the tree in the v1 canonical format.
     ///
-    /// # Panics
-    ///
-    /// If a field is longer than `u32::MAX` bytes or items.
+    /// A value a constructor built, or the decoder returned, always
+    /// encodes: the constructors refuse what the format cannot carry.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut w = vec![VERSION];
@@ -271,9 +306,14 @@ impl Tree {
 // ---- encode helpers ----
 
 fn put_len(w: &mut Vec<u8>, len: usize) {
-    // SHORTCUT: panics past u32::MAX. Every ingest path caps object size far
-    // below that. Switch to a `try_encode -> Result` if one ever does not.
-    let len = u32::try_from(len).expect("object field longer than u32::MAX");
+    // The types guarantee this: every value is built through a checked
+    // constructor or by the decoder, whose lengths come from u32be fields.
+    debug_assert!(len <= MAX_FIELD, "object field longer than u32::MAX");
+    // A release build that somehow broke the invariant writes u32::MAX
+    // rather than a truncated neighbor: the bytes no longer decode
+    // (UnexpectedEnd, TrailingBytes), and encode_with_id hashes the bytes
+    // it wrote, so no stored byte is silently misread.
+    let len = u32::try_from(len).unwrap_or(u32::MAX);
     w.extend_from_slice(&len.to_be_bytes());
 }
 
@@ -377,12 +417,13 @@ impl<'a> Reader<'a> {
     }
 
     fn identity(&mut self) -> Result<IdentityTime, DecodeError> {
-        Ok(IdentityTime {
-            name: self.bytes()?.to_vec(),
-            email: self.bytes()?.to_vec(),
-            unix_secs: i64::from_be_bytes(self.array()?),
-            tz_offset_minutes: i32::from_be_bytes(self.array()?),
-        })
+        Ok(IdentityTime::new(
+            self.bytes()?.to_vec(),
+            self.bytes()?.to_vec(),
+            i64::from_be_bytes(self.array()?),
+            i32::from_be_bytes(self.array()?),
+        )
+        .expect("identity fits the format"))
     }
 
     fn file(&mut self, tag: u8) -> Result<FileState, DecodeError> {
@@ -412,5 +453,29 @@ impl<'a> Reader<'a> {
         } else {
             Err(DecodeError::TrailingBytes)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_length_at_the_cap_fits_and_one_more_does_not() {
+        assert_eq!(check_fit(76, 76, "field"), Ok(()));
+        assert_eq!(
+            check_fit(77, 76, "field"),
+            Err(EncodeError::FieldTooLong("field"))
+        );
+        assert_eq!(check_fit(0, 0, "field"), Ok(()));
+    }
+
+    #[test]
+    fn the_format_bound_is_u32_max() {
+        assert_eq!(MAX_FIELD, u32::MAX as usize);
+        assert_eq!(
+            check_fit(usize::MAX, MAX_FIELD, "field"),
+            Err(EncodeError::FieldTooLong("field"))
+        );
     }
 }

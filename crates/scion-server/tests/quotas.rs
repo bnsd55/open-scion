@@ -64,17 +64,18 @@ fn store() -> (tempfile::TempDir, Backend) {
             let repo = c.create_repo(REPO)?;
             let root = c.insert_changeset(
                 repo,
-                &Changeset {
-                    parents: vec![],
-                    author: scion_core::IdentityTime {
-                        name: b"Ada".to_vec(),
-                        email: b"ada@example.com".to_vec(),
-                        unix_secs: 1_700_000_000,
-                        tz_offset_minutes: 0,
-                    },
-                    committer: None,
-                    message: b"root\n".to_vec(),
-                    changes: [(
+                &Changeset::new(
+                    vec![],
+                    scion_core::IdentityTime::new(
+                        b"Ada".to_vec(),
+                        b"ada@example.com".to_vec(),
+                        1_700_000_000,
+                        0,
+                    )
+                    .expect("identity fits the format"),
+                    None,
+                    b"root\n".to_vec(),
+                    [(
                         RepoPath::new("README").unwrap(),
                         Some(FileState::Regular {
                             content: blob,
@@ -82,7 +83,8 @@ fn store() -> (tempfile::TempDir, Backend) {
                         }),
                     )]
                     .into(),
-                },
+                )
+                .expect("changeset fits the format"),
             )?;
             c.cas_ref(repo, "main", None, root)?;
             c.add_repo_blob(repo, blob)?;
@@ -393,17 +395,18 @@ async fn a_stream_holds_its_slot_until_the_stream_ends() {
         .write(|c| {
             let repo = c.repo_id(REPO)?;
             c.add_repo_blob(repo, blob)?;
-            let cs = Changeset {
-                parents: vec![],
-                author: scion_core::IdentityTime {
-                    name: b"Ada".to_vec(),
-                    email: b"ada@example.com".to_vec(),
-                    unix_secs: 1_700_000_000,
-                    tz_offset_minutes: 0,
-                },
-                committer: None,
-                message: b"big\n".to_vec(),
-                changes: [(
+            let cs = Changeset::new(
+                vec![],
+                scion_core::IdentityTime::new(
+                    b"Ada".to_vec(),
+                    b"ada@example.com".to_vec(),
+                    1_700_000_000,
+                    0,
+                )
+                .expect("identity fits the format"),
+                None,
+                b"big\n".to_vec(),
+                [(
                     RepoPath::new("README").unwrap(),
                     Some(FileState::Regular {
                         content: blob,
@@ -411,7 +414,8 @@ async fn a_stream_holds_its_slot_until_the_stream_ends() {
                     }),
                 )]
                 .into(),
-            };
+            )
+            .expect("changeset fits the format");
             let id = c.insert_changeset(repo, &cs)?;
             let version = c.get_ref(repo, "main")?.unwrap().version;
             assert!(c.cas_ref(repo, "main", Some(version), id)?);
@@ -525,17 +529,18 @@ async fn a_get_objects_stream_holds_its_principals_slot() {
         .write(|c| {
             let repo = c.repo_id(REPO)?;
             c.add_repo_blob(repo, blob)?;
-            let cs = Changeset {
-                parents: vec![],
-                author: scion_core::IdentityTime {
-                    name: b"Ada".to_vec(),
-                    email: b"ada@example.com".to_vec(),
-                    unix_secs: 1_700_000_000,
-                    tz_offset_minutes: 0,
-                },
-                committer: None,
-                message: b"big\n".to_vec(),
-                changes: [(
+            let cs = Changeset::new(
+                vec![],
+                scion_core::IdentityTime::new(
+                    b"Ada".to_vec(),
+                    b"ada@example.com".to_vec(),
+                    1_700_000_000,
+                    0,
+                )
+                .expect("identity fits the format"),
+                None,
+                b"big\n".to_vec(),
+                [(
                     RepoPath::new("README").unwrap(),
                     Some(FileState::Regular {
                         content: blob,
@@ -543,7 +548,8 @@ async fn a_get_objects_stream_holds_its_principals_slot() {
                     }),
                 )]
                 .into(),
-            };
+            )
+            .expect("changeset fits the format");
             let id = c.insert_changeset(repo, &cs)?;
             let version = c.get_ref(repo, "main")?.unwrap().version;
             assert!(c.cas_ref(repo, "main", Some(version), id)?);
