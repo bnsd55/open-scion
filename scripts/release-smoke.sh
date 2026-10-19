@@ -29,10 +29,13 @@ esac
 # The script passes every address, name and path as a flag or its own
 # export, so the caller's environment must not change the story. Git runs
 # without the user's and the system's config, and scn commits as its own
-# author, so local identities do not leak into the story.
+# author, so local identities do not leak into the story. NO_COLOR gives
+# plain log lines, so the `serving listen=` line parses without escape
+# codes (the same reason the server's tests set it).
 unset SCION_SERVER SCION_REPO SCION_DATA SCION_DAEMON_DATA SCION_AUTHOR
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 export SCION_TOKEN=smoke
+export NO_COLOR=1
 
 WORK=
 SERVER_PID=
