@@ -227,8 +227,13 @@ pub fn blame(
         resume.counted
     };
     // The rows of the answer, and the state of one diff, stay taken for the
-    // whole call. Not a first take: it never waits.
-    let _state_hold = memory.try_take(counted * BYTES_PER_LINE)?;
+    // whole call. Not a first take: it never waits. The cursor's line
+    // count is the client's word, so its product with the per-line cost
+    // is checked: a count that overflows is a bad cursor, not a wrap that
+    // takes no bytes and reads an unbounded window.
+    let _state_hold = memory.try_take(counted.checked_mul(BYTES_PER_LINE).ok_or_else(|| {
+        Error::InvalidArgument(format!("bad blame cursor: {counted} lines is too many"))
+    })?)?;
     if resume.after_line > counted {
         return Err(Error::InvalidArgument(format!(
             "the cursor's line {} is past the {counted} lines of {path:?}",

@@ -229,6 +229,11 @@ The first release: the server, its cache tiers, and the `scn` client.
   a parent once per child that reached it in its walk: the seen set now
   checks pushes, so the walk's queue is as wide as the graph's frontier
   instead of as wide as its edges.
+- A fill step reads the blob lengths its trees carry before its write
+  transaction, not under the one write lock: up to a step's changesets
+  of frame-header file reads sat between the lock's take and its
+  release. Kinds that never read lengths (the commit graph, the path
+  history) read no blob files at all.
 - A land's check of a base that the path index does not reach kept
   every history node row it read, with no cap on their bytes: a row is
   up to 64 KiB, and one check reads one or more per part of each of the
@@ -268,6 +273,11 @@ The first release: the server, its cache tiers, and the `scn` client.
   through a new BEGIN), and a read's timeout statements that fail
   after the BEGIN roll the read transaction back before the reader
   returns to the pool.
+- The land metrics count lands whose call ended in an error: a land
+  that answered `Aborted`, `DeadlineExceeded`, or any other error class
+  moved no counter, so an operator could not see failing lands. The
+  land counter now moves for the error's class, under the same
+  `scion_lands_total{outcome}` series.
 - Two reads stop at the caller's deadline and the reply's budget
   (#283): a `Log` call without a path read up to 1,000 changesets, each
   as large as a changeset can be, with the call's deadline never
@@ -342,11 +352,18 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Security
 
+- A blame cursor that claims an impossible line count is refused as a
+  bad cursor (`#288`): the count is the client's word, and its
+  per-line memory cost was multiplied without an overflow check, so a
+  count of 2^57 wrapped to zero and the walk went on to size its
+  window from the count - one request could stop the server.
+
 - The mount's overlay writes no longer follow a symlink planted in the
   overlay: a write, a truncate, a mode change, and the deletions note
   refuse one. A symlinked parent directory still redirects (a named
   limit: the upgrade is opening every parent through a handle chain,
   as `materialize.rs` does).
+
 - The server refuses a data directory that group or others can write, or
   that sits under a directory another user can change: the blobs and the
   metadata are only as private as their directory (`#197`).

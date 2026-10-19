@@ -30,6 +30,7 @@ use crate::deadline::Deadline;
 use crate::error::{Error, Result};
 use crate::meta::Meta as _;
 use crate::meta::{MetaTx, RepoId};
+use crate::tree;
 
 /// Most changesets that one step walks or derives, and most rows of older
 /// versions that one step removes. A step holds the write connection, so
@@ -58,6 +59,11 @@ pub(crate) trait Kind {
     /// parent, so a kind over snapshots, such as the root tree, needs no
     /// more.
     const ALL_PARENTS: bool = false;
+    /// Whether [`Kind::derive`] reads blob lengths through its lens. Only
+    /// kinds that build trees do; the fill of a kind that does not reads no
+    /// blob files at all. A kind that sets it true but reads the lens for a
+    /// blob it did not name fails with [`Error::NotFound`].
+    const NEEDS_LENS: bool = false;
     /// The value for one changeset.
     type Value;
 
@@ -641,8 +647,32 @@ fn derive_steps<K: Kind>(
     let mut value = None;
     for step in pending.chunks(STEP) {
         check()?;
+        // The lengths the step's trees carry come from the blob files'
+        // frame headers: a kind that reads them gets them read before the
+        // transaction, as tree.rs's lens doc says, so the one write
+        // connection does no file I/O. A blob the repo no longer holds
+        // fails here, before any write.
+        let lens = if K::NEEDS_LENS {
+            // Unflushed on purpose: the walk reads unflushed, and the
+            // caller flushes before it replies (fill's doc). A plain read
+            // would flush here, and a land's fills would each cost one.
+            store.read_unflushed(|c| {
+                let changesets = step
+                    .iter()
+                    .map(|&id| c.get_changeset(repo, id))
+                    .collect::<Result<Vec<_>>>()?;
+                tree::lens_of_puts(
+                    store,
+                    changesets
+                        .iter()
+                        .flat_map(|cs| crate::db::puts(cs).map(|(_, blob)| blob)),
+                )
+            })?
+        } else {
+            HashMap::new()
+        };
         value = store.commit(|c| {
-            let value = derive_chain::<K>(c, repo, step, &mut crate::tree::lens_of(store))?;
+            let value = derive_chain::<K>(c, repo, step, &mut tree::lens_from(&lens))?;
             remove_old::<K>(c)?;
             Ok(value)
         })?;
