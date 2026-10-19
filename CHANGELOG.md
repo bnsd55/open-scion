@@ -225,6 +225,14 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- A derive walk that answers a request holds its frontier of seen and
+  pending changesets inside a byte budget the store's walks share:
+  before, a walk over every parent held about 40 bytes per cold
+  changeset with no bound in repo depth, so 10M commits after a
+  derived-version bump held about 3 GB, eight walks at once. Over the
+  budget the walk stops at its step boundary and the call answers
+  `Unavailable` for a retry; the unbounded forms (fsck, import, the
+  derive command) still finish the walk.
 - A blame walk checks the call's deadline before each step, the first
   diff too (`#299`), and one diff reads no version past 1,048,576
   lines: a request file over the cap answers `RESOURCE_EXHAUSTED`, as
