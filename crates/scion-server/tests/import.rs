@@ -23,11 +23,12 @@ use scion_core::{
 };
 use scion_server::test_support::auth::Caller;
 use scion_server::test_support::deadline::Deadline;
-use scion_server::test_support::{BUSY_TRIES, CHECKS};
-use scion_server::{ImportOptions, ImportReport, import_git};
+use scion_server::test_support::import::{BUSY_TRIES, CHECKS};
 use scion_server::test_support::land::{LandRequest, LandState, Lands};
 use scion_server::test_support::meta::{Meta as _, MetaTx as _, RefState};
-use scion_server::{Backend, Error, read, tree, write};
+use scion_server::test_support::{read, tree, write};
+use scion_server::{Backend, Error};
+use scion_server::{ImportOptions, ImportReport, import_git};
 use tempfile::TempDir;
 
 const SUBMODULE: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -856,7 +857,11 @@ fn create(store: &Backend, base: ChangesetId, path: &str) -> ChangesetId {
 }
 
 /// Lands `cs` on `main`, and retries with the same key while the ref moves.
-fn land(store: &Backend, lands: &Lands, cs: ChangesetId) -> scion_server::test_support::land::LandOutcome {
+fn land(
+    store: &Backend,
+    lands: &Lands,
+    cs: ChangesetId,
+) -> scion_server::test_support::land::LandOutcome {
     let request = LandRequest {
         repo: "r".into(),
         changeset: cs,

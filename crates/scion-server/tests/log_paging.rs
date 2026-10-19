@@ -14,9 +14,10 @@ use scion_proto::runtime::auth::Bearer;
 use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::LogRequest;
 use scion_proto::v1::scion_client::ScionClient;
-use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::Metrics;
-use scion_server::{Backend, Store, service, tree};
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::test_support::{service, tree};
+use scion_server::{Backend, Store};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 

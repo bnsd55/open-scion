@@ -1644,7 +1644,10 @@ mod tests {
         ResolveRefResponse,
     };
     use scion_server::test_support::meta::{Meta as _, MetaTx as _};
-    use scion_server::{Backend, test_support::{service, tree}};
+    use scion_server::{
+        Backend,
+        test_support::{service, tree},
+    };
     use std::collections::HashMap as StdHashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;

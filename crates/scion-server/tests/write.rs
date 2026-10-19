@@ -8,7 +8,7 @@ use rusqlite::{Connection, params};
 use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileEntry, FileState, IdentityTime, RepoPath,
 };
-use scion_server::test_support::ApplyError;
+use scion_server::test_support::error::ApplyError;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::store::BlobStatus;
 use scion_server::test_support::write::{

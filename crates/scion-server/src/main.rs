@@ -17,7 +17,7 @@ use scion_server::{ImportOptions, import_git};
 
 use scion_server::Metrics;
 use scion_server::Quotas;
-use scion_server::{Backend, Error, ServeOptions, serve};
+use scion_server::{Backend, Error, ServeOptions, fsck, gc};
 use tracing_subscriber::EnvFilter;
 
 /// The scion server: import, serve and derive.
@@ -363,9 +363,7 @@ async fn main() -> anyhow::Result<()> {
             let (name, tip) = tokio::task::spawn_blocking(move || {
                 let tip = store.resolve_ref(&repo, &target_ref)?;
                 let name = match kind {
-                    KindName::RootTree => {
-                        scion_server::backfill_root_tree(&store, &repo, tip)?
-                    }
+                    KindName::RootTree => scion_server::backfill_root_tree(&store, &repo, tip)?,
                     KindName::CommitGraph => {
                         scion_server::backfill_commit_graph(&store, &repo, tip)?
                     }
@@ -558,7 +556,7 @@ async fn serve(
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "serving");
 
-    Box::pin(serve(
+    Box::pin(scion_server::serve(
         store,
         listener,
         access,

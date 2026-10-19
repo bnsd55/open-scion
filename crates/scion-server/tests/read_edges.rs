@@ -12,7 +12,10 @@ use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{ListDirRequest, ReadFileRequest};
 use scion_server::Access;
 use scion_server::test_support::meta::MetaTx as _;
-use scion_server::{Backend, Store, meta::Meta as _, service};
+use scion_server::{
+    Backend, Store,
+    test_support::{meta::Meta as _, service},
+};
 use tokio::net::TcpListener;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;

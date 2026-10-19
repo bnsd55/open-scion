@@ -253,7 +253,7 @@ fn blame_bounded(
     cs: ChangesetId,
     p: &str,
     cap: usize,
-) -> std::result::Result<Blame, scion_server::error::Error> {
+) -> std::result::Result<Blame, scion_server::Error> {
     blame::blame(
         store,
         REPO,

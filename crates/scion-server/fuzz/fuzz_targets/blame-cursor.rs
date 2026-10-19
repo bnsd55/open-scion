@@ -61,7 +61,7 @@ fn fixture() -> &'static (TempDir, Backend, ChangesetId) {
                         if b == content {
                             Ok(len)
                         } else {
-                            Err(scion_server::error::Error::NotFound(format!("blob {b}")))
+                            Err(scion_server::Error::NotFound(format!("blob {b}")))
                         }
                     })?
                     .0);

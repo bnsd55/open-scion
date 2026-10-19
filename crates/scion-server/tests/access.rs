@@ -16,15 +16,15 @@ use scion_proto::v1::{
 };
 use std::sync::Arc;
 
-use scion_server::Store;
 use scion_server::Access;
+use scion_server::Store;
 use scion_server::test_support::meta::Meta as _;
 
 /// The second repo of the two-world comparisons: its tree holds `docs`
 /// only, so the same path is genuinely missing there.
 const OTHER: &str = "other";
-use scion_server::test_support::meta::MetaTx as _;
 use scion_server::Metrics;
+use scion_server::test_support::meta::MetaTx as _;
 use scion_server::{Backend, test_support::service};
 use std::future::Future;
 use std::pin::Pin;

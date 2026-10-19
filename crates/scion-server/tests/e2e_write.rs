@@ -7,8 +7,8 @@ use scion_proto::runtime::auth::Bearer;
 use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ReadFileRequest};
-use scion_server::test_support::meta::MetaTx as _;
 use scion_server::Metrics;
+use scion_server::test_support::meta::MetaTx as _;
 use std::sync::Arc;
 
 use scion_server::test_support::meta::Meta as _;

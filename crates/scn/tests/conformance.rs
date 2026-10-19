@@ -19,9 +19,9 @@ use scion_proto::runtime::object::{self, Assembler, Header};
 use scion_proto::v1::{
     Encoding, GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef, ResolveRefRequest,
 };
-use scion_server::meta::Meta as _;
-use scion_server::meta::MetaTx as _;
-use scion_server::{Backend, tree};
+use scion_server::test_support::meta::Meta as _;
+use scion_server::test_support::meta::MetaTx as _;
+use scion_server::{Backend, test_support::tree};
 use tonic::Code;
 
 mod common;

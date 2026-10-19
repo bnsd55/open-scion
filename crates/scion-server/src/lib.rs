@@ -65,8 +65,11 @@ pub(crate) mod db;
 pub(crate) mod deadline;
 pub(crate) mod derived;
 pub(crate) mod error;
-pub(crate) mod fsck;
-pub(crate) mod gc;
+// These two are API, not implementation: a server main runs them by hand,
+// and docs/operations.md documents both. Everything else in the list is
+// an implementation detail of the two binaries, however public it looks.
+pub mod fsck;
+pub mod gc;
 pub(crate) mod graph;
 pub(crate) mod history;
 pub(crate) mod import;
@@ -87,16 +90,69 @@ pub(crate) mod tree;
 pub(crate) mod views;
 pub(crate) mod write;
 
-// The test seams, behind the test-hooks feature (default off). One module,
-// the only way in: the integration tests and the fuzz targets reach the
-// implementation through these re-exports, and nothing else. Not API, and
-// not covered by a stability promise.
+/// The test seams, behind the test-hooks feature (default off). One module,
+/// the only way in: the integration tests and the fuzz targets reach the
+/// implementation through these re-exports, and nothing else. Not API, and
+/// not covered by a stability promise.
+///
+/// The submodules re-export the implementation modules' public items rather
+/// than the modules themselves: the modules are pub(crate), and a pub
+/// re-export of a pub(crate) module is refused (E0365), while a re-export
+/// of the items inside a public submodule is fine.
 #[cfg(feature = "test-hooks")]
 pub mod test_support {
-    pub use crate::{blame, deadline, land, memory, meta, read, service, store, tree, write};
-    pub use crate::auth::Caller;
-    pub use crate::error::ApplyError;
-    pub use crate::import::{BUSY_TRIES, CHECKS};
+    /// The caller behind an authenticated RPC, for tests that name one.
+    pub mod auth {
+        pub use crate::auth::Caller;
+    }
+    /// The blame operation behind the `Blame` RPC, with its limits.
+    pub mod blame {
+        pub use crate::blame::*;
+    }
+    /// The per-call deadline every long operation stops at.
+    pub mod deadline {
+        pub use crate::deadline::*;
+    }
+    /// The error a changeset apply can end in, for the write tests.
+    pub mod error {
+        pub use crate::error::ApplyError;
+    }
+    /// The counters the import tests read between retries.
+    pub mod import {
+        pub use crate::import::{BUSY_TRIES, CHECKS};
+    }
+    /// The land operation: its queue, requests and outcomes.
+    pub mod land {
+        pub use crate::land::*;
+    }
+    /// The blob pool the server hands out reads from.
+    pub mod memory {
+        pub use crate::memory::*;
+    }
+    /// The metadata traits the tests and the fuzz target call directly.
+    pub mod meta {
+        pub use crate::meta::*;
+    }
+    /// The read operations behind the read RPCs, and their limits.
+    pub mod read {
+        pub use crate::read::*;
+    }
+    /// The gRPC front end, so tests and fuzz targets serve on a port.
+    pub mod service {
+        pub use crate::service::*;
+    }
+    /// The on-disk store, so tests open and inspect one directly.
+    pub mod store {
+        pub use crate::store::*;
+    }
+    /// Tree apply and the per-changeset root tree.
+    pub mod tree {
+        pub use crate::tree::*;
+    }
+    /// The write path: changeset decode and apply, and its limits.
+    pub mod write {
+        pub use crate::write::*;
+    }
 }
 
 // The facade: the API of this crate, one list, kept here so it is one
@@ -116,8 +172,3 @@ pub use service::{ServeOptions, serve};
 pub use store::Store;
 pub use tickets::Keys;
 pub use tree::{RootTree, backfill_root_tree};
-
-// The operations a server main runs by hand: check the data directory for
-// damage, and collect the blobs nothing names any more. Both are documented
-// in docs/operations.md and are API for that reason.
-pub use crate::{fsck, gc};
