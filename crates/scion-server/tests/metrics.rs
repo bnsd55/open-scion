@@ -9,7 +9,9 @@ use scion_proto::CHUNK_BYTES;
 use scion_proto::runtime::auth::Bearer;
 use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
-use scion_proto::v1::{BlameRequest, CreateChangesetRequest, LandRequest, ReadFileRequest};
+use scion_proto::v1::{
+    BlameRequest, CreateChangesetRequest, LandRequest, LogRequest, ReadFileRequest,
+};
 use scion_server::meta::MetaTx as _;
 use scion_server::metrics::Metrics;
 use scion_server::{Backend, Store, service};
@@ -130,6 +132,40 @@ async fn setup() -> (
         .unwrap();
     let client = ScionClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap());
     (dir, stop, store, metrics, client, root, addr)
+}
+
+/// A repo whose log of `count` changesets on top of `root` carries a huge
+/// message each, so every entry of a streamed `Log` reply is its own part:
+/// the reply is far larger than the transport buffers, so the producer
+/// still owes parts when the client stops reading. Returns the tip.
+fn heavy_log(store: &Store, root: ChangesetId, count: usize) -> ChangesetId {
+    let message = vec![b'm'; 96 << 10];
+    let mut parent = root;
+    for i in 0..count {
+        store.blobs().put(format!("f{i:04}").as_bytes()).unwrap();
+        parent = store
+            .write(|c| {
+                let repo = c.repo_id(REPO)?;
+                let cs = Changeset {
+                    parents: vec![parent],
+                    author: author(1_700_000_001),
+                    committer: None,
+                    message: message.clone(),
+                    changes: [(
+                        RepoPath::new(format!("f{i:04}").into_bytes()).unwrap(),
+                        Some(FileState::Regular {
+                            content: BlobId::of(format!("f{i:04}").as_bytes()),
+                            executable: false,
+                        }),
+                    )]
+                    .into_iter()
+                    .collect(),
+                };
+                c.insert_changeset(repo, &cs)
+            })
+            .unwrap();
+    }
+    parent
 }
 
 /// Puts `content` into the store and names it in a changeset on top of
@@ -335,4 +371,40 @@ async fn a_read_file_counts_its_bytes_and_a_stopped_call_counts_as_cancelled() {
         "scion_requests_total{rpc=\"Scion/ReadFile\",code=\"cancelled\"} 1\n",
     )
     .await;
+}
+
+/// A streamed `Log` call the client stops counts as cancelled, and no
+/// deadline count rises: a client that goes is not a call that ran past
+/// its deadline, so the operator reads the two apart.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_log_call_counts_as_cancelled_and_never_as_deadline_exceeded() {
+    let (_dir, _stop, store, metrics, mut client, root, _addr) = setup().await;
+
+    // A walk whose reply is far larger than the transport's buffers, so
+    // the producer still owes parts when the client stops.
+    let tip = heavy_log(&store, root, 64);
+
+    let mut stream = client
+        .log(LogRequest {
+            repo: REPO.into(),
+            changeset_id: tip.as_bytes().to_vec(),
+            limit: 64,
+            path: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let first = stream.next().await.unwrap().unwrap();
+    assert_ne!(first.entries.len(), 0, "{first:?}");
+    drop(stream);
+
+    // The reply body without its trailers counts as cancelled.
+    eventually(
+        &metrics,
+        "scion_requests_total{rpc=\"Scion/Log\",code=\"cancelled\"} 1\n",
+    )
+    .await;
+    // Nothing read `deadline_exceeded` for it, on any counter.
+    let text = text(&metrics);
+    assert!(!text.contains("deadline_exceeded"), "{text}");
 }

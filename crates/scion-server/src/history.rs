@@ -541,7 +541,8 @@ pub(crate) fn newest_change(
 /// # Errors
 ///
 /// [`Error::Corrupt`] if a node is missing. [`Error::DeadlineExceeded`]
-/// once `deadline` has passed.
+/// once `deadline` has passed, or [`Error::Cancelled`] once the call has
+/// gone.
 pub(crate) fn touched_after<'p>(
     c: &mut dyn MetaTx,
     root: NodeId,

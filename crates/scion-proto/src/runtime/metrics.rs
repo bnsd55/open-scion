@@ -78,7 +78,7 @@ const BUCKETS: [u64; 10] = [
 /// The outcomes of a land, by how the server's land path decides them,
 /// then the classes of a land whose call ended in an error: the names of
 /// the gRPC codes the land's reply can answer.
-const LANDS: [&str; 13] = [
+const LANDS: [&str; 14] = [
     "landed",
     "conflict",
     "rejected",
@@ -91,6 +91,7 @@ const LANDS: [&str; 13] = [
     "invalid_argument",
     "permission_denied",
     "failed_precondition",
+    "cancelled",
     "internal",
 ];
 
@@ -109,9 +110,12 @@ pub fn land_error_label(code: tonic::Code) -> usize {
         tonic::Code::InvalidArgument => 9,
         tonic::Code::PermissionDenied => 10,
         tonic::Code::FailedPrecondition => 11,
+        // The call went while its land was planned: the land stays pending,
+        // and a retry with the same request key resumes it.
+        tonic::Code::Cancelled => 12,
         // Every other code the land's reply can answer, the caller reads
         // as an internal error.
-        _ => 12,
+        _ => 13,
     }
 }
 
