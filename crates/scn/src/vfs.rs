@@ -671,11 +671,11 @@ impl NFSFileSystem for Vfs {
         if let set_mode3::mode(m) = setattr.mode {
             let exec = m & 0o111 != 0;
             let handle = open_overlay_chmod(&file).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-            rustix::fs::fchmod(
-                &handle,
-                Mode::from_raw_mode(file_mode(0o644, exec).try_into().unwrap()),
-            )
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            // RawMode is u32 on Linux and u16 on macOS, so the conversion
+            // is real only on macOS.
+            #[allow(clippy::useless_conversion)]
+            let mode = Mode::from_raw_mode(file_mode(0o644, exec).try_into().unwrap());
+            rustix::fs::fchmod(&handle, mode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
             if let Some(Node {
                 kind: Kind::Local { exec: slot },
                 ..
