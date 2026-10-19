@@ -3209,22 +3209,22 @@ mod tests {
         for (name, file, hex) in [
             (
                 "0001_init",
-                include_bytes!("../../migrations/postgres/0001_init.sql").as_slice(),
+                include_bytes!("../migrations/postgres/0001_init.sql").as_slice(),
                 "9f95c671379b0d1c8e2ac2af34d95badca7929d379edcf0f8e8a02572f4a0c63",
             ),
             (
                 "0002_view_roots",
-                include_bytes!("../../migrations/postgres/0002_view_roots.sql").as_slice(),
+                include_bytes!("../migrations/postgres/0002_view_roots.sql").as_slice(),
                 "483a299895752535dbe3856ed496894687f4840b5edfcc2fdc24b6eece02dff2",
             ),
             (
                 "0003_view_trees",
-                include_bytes!("../../migrations/postgres/0003_view_trees.sql").as_slice(),
+                include_bytes!("../migrations/postgres/0003_view_trees.sql").as_slice(),
                 "3935e99d760f8848860acf33aeb33633a288b03aadd856a65cbe474d88989716",
             ),
             (
                 "0004_store_uuid",
-                include_bytes!("../../migrations/postgres/0004_store_uuid.sql").as_slice(),
+                include_bytes!("../migrations/postgres/0004_store_uuid.sql").as_slice(),
                 "6ac9d420e9499b40e38196c598d4c7c75c88180ed729261844b4e44f368dfab4",
             ),
         ] {
