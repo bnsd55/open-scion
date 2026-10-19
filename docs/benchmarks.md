@@ -169,8 +169,9 @@ as it is.
 
 - Run: [bench.yml run 39306408455](https://github.com/bnsd55/openscion/actions/runs/39306408455),
   on `main` at `7b7789fd76ad616efafcc52637079213f47a8aa2`.
-- The facts of the run: scion commit `7b7789f`, git `2.55.0`, 4 cores,
-  kernel `6.17.0-1022-azure` (runner image 20261012.334).
+- The facts of the run: scion commit `7b7789f`, git `2.55.0` — the two
+  the run's own logs show. The run's summary also printed its core
+  count and kernel; they travel with the run, not with this page.
 - 50 checkouts at once of `tokio/src/` (377 files), 5 repetitions per
   state; the table shows the median, with min and max.
 
