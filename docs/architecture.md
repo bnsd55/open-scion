@@ -1283,7 +1283,10 @@ accepts names that are not safe to write, so the checkout adds its own rules:
 
 Platforms: `scn` builds on Linux and macOS, which CI covers. A FreeBSD build
 fails: `rustix::fs::renameat_with` exists only on Apple systems, Linux and
-Redox.
+Redox. The mount and commit tests that fork (issue
+[#309](https://github.com/bnsd55/openscion/issues/309)'s fork gate) passed
+100 runs in a row on macos-15 ([the matrix
+run](https://github.com/bnsd55/openscion/actions/runs/39310255775)).
 
 **Cache tiers (`scion-tier`).** What the article says: one `scion-daemon`
 per node stores objects for every job on it and is reached over a socket. It
