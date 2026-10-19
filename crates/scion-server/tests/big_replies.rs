@@ -4,8 +4,8 @@
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath, Tree};
 use scion_proto::MAX_PART_MESSAGE_BYTES;
-use scion_proto::auth::Bearer;
-use scion_proto::listen::Limits;
+use scion_proto::runtime::auth::Bearer;
+use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{
     CreateChangesetRequest, GetChangesetRequest, ListDirRequest, PutBlobRequest,

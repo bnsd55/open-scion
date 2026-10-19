@@ -5,7 +5,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use scion_proto::request_id;
+use scion_proto::runtime::request_id;
 
 // sanitize's own cap, restated here: a logged ID is at most 64 bytes.
 const MAX_BYTES: usize = 64;

@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_proto::CHUNK_BYTES;
-use scion_proto::auth::Bearer;
-use scion_proto::listen::Limits;
+use scion_proto::runtime::auth::Bearer;
+use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{BlameRequest, CreateChangesetRequest, LandRequest, ReadFileRequest};
 use scion_server::test_support::meta::MetaTx as _;

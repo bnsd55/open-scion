@@ -10,8 +10,8 @@
 use std::sync::Arc;
 
 use scion_core::{Changeset, FileState, RepoPath};
-use scion_proto::auth::Bearer;
-use scion_proto::listen::Limits;
+use scion_proto::runtime::auth::Bearer;
+use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::LogRequest;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};

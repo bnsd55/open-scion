@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use scion_proto::listen::{self, Limits};
-use scion_proto::metrics::{loopback_or_allow, serve as metrics_serve};
-use scion_proto::tls::ServerTls;
+use scion_proto::runtime::listen::{self, Limits};
+use scion_proto::runtime::metrics::{loopback_or_allow, serve as metrics_serve};
+use scion_proto::runtime::tls::ServerTls;
 use scion_server::{ImportOptions, import_git};
 
 use scion_server::Metrics;
@@ -529,9 +529,9 @@ async fn serve(
     // the operator does not need kill -9.
     let (end_tx, end_rx) = tokio::sync::watch::channel(());
     tokio::spawn(async move {
-        scion_proto::metrics::shutdown_signal().await;
+        scion_proto::runtime::metrics::shutdown_signal().await;
         let _ = end_tx.send(());
-        scion_proto::metrics::shutdown_signal().await;
+        scion_proto::runtime::metrics::shutdown_signal().await;
         tracing::warn!("a second signal ended the drain; the in-flight calls were cut");
         std::process::exit(1);
     });
@@ -662,7 +662,7 @@ fn read_hex(file: &Path, secret: bool) -> anyhow::Result<String> {
         );
     }
     let me = rustix::process::geteuid().as_raw();
-    scion_proto::auth::check_ancestors(file, me)
+    scion_proto::runtime::auth::check_ancestors(file, me)
         .with_context(|| format!("{} sits in a directory that is not private", file.display()))?;
     let text =
         std::fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))?;
@@ -705,7 +705,7 @@ fn hash_token() -> anyhow::Result<()> {
     anyhow::ensure!(!token.is_empty(), "--token must not be empty");
     println!(
         "{}",
-        blake3::Hash::from(scion_proto::auth::token_digest(&token)).to_hex()
+        blake3::Hash::from(scion_proto::runtime::auth::token_digest(&token)).to_hex()
     );
     Ok(())
 }

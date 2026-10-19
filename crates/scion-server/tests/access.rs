@@ -4,8 +4,8 @@
 use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, RepoPath, Tree, TreeId,
 };
-use scion_proto::auth::token_digest;
-use scion_proto::listen::Limits;
+use scion_proto::runtime::auth::token_digest;
+use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{

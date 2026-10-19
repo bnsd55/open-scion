@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath, Tree};
 use scion_proto::CHUNK_BYTES;
-use scion_proto::auth::token_digest;
-use scion_proto::listen::Limits;
+use scion_proto::runtime::auth::token_digest;
+use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{ListDirRequest, ReadFileRequest};
 use scion_server::Access;

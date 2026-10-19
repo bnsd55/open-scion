@@ -3,8 +3,8 @@
 //! is which calls complete while it is held; no test asserts a duration.
 
 use scion_core::{Changeset, FileState, RepoPath};
-use scion_proto::auth::token_digest;
-use scion_proto::listen::Limits;
+use scion_proto::runtime::auth::token_digest;
+use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{GetLandRequest, LogRequest, PutBlobRequest};
 use scion_server::Access;

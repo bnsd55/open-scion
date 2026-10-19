@@ -5,8 +5,8 @@
 use std::sync::Arc;
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
-use scion_proto::auth::token_digest;
-use scion_proto::listen::Limits;
+use scion_proto::runtime::auth::token_digest;
+use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{BlameChangeset, BlameRange, BlameRequest};
 use scion_server::Access;

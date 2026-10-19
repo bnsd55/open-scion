@@ -4,8 +4,8 @@
 //! end-to-end check that the wiring reached the backend, which the unit
 //! tests of each set-point cannot say.
 
-use scion_proto::auth::token_digest;
-use scion_proto::listen::Limits;
+use scion_proto::runtime::auth::token_digest;
+use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest};
 

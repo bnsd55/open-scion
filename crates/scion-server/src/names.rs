@@ -1,18 +1,18 @@
 //! Limits on names that clients send: repos, refs and request keys.
 
-pub use scion_proto::check::MAX_NAME_BYTES;
+pub use scion_proto::runtime::check::MAX_NAME_BYTES;
 
 use crate::error::{Error, Result};
 
 /// Checks a client-supplied name: 1 to [`MAX_NAME_BYTES`] bytes and no
 /// control characters, so names are safe to log and to print. The tiers use
-/// the same rule ([`scion_proto::check::name`]).
+/// the same rule ([`scion_proto::runtime::check::name`]).
 ///
 /// # Errors
 ///
 /// [`Error::InvalidArgument`] naming `what` if the name breaks a rule.
 pub fn check(what: &str, value: &str) -> Result<()> {
-    scion_proto::check::name(what, value).map_err(Error::InvalidArgument)
+    scion_proto::runtime::check::name(what, value).map_err(Error::InvalidArgument)
 }
 
 #[cfg(test)]
