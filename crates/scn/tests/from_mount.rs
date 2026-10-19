@@ -34,25 +34,6 @@ fn scn(url: &str, home: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
-/// Runs `scn ARGS` against `url`, with `home` as the home directory,
-/// and answers the raw stdout bytes: names in arguments and output need
-/// not be UTF-8.
-fn scn_bytes(url: &str, home: &std::path::Path, args: &[&OsStr]) -> Vec<u8> {
-    let out = Command::new(env!("CARGO_BIN_EXE_scn"))
-        .args(["--server", url, "--repo", REPO])
-        .args(args)
-        .env("SCION_TOKEN", TOKEN)
-        .env("HOME", home)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    out.stdout
-}
-
 /// Lands `keep.txt` and `docs/{a.txt,b.txt}` on `store`, and points
 /// `main` at the last changeset.
 fn start(store: &Backend) -> ChangesetId {
@@ -308,23 +289,31 @@ fn a_non_utf8_name_commits_its_own_content() {
     // Each name carries its own content. The CLI's cat cannot take a
     // non-UTF-8 name (clap reads String), so the changeset is read from
     // the server's RPC and its blobs from the store.
-    let mut ctx = Ctx::connect(&tiers.server, None, TOKEN, None, REPO.to_owned(), false)
-        .await
+    let mut ctx = tiers
+        .runtime
+        .block_on(async {
+            Ctx::connect(&tiers.server, None, TOKEN, None, REPO.to_owned(), false).await
+        })
         .unwrap();
     let id: ChangesetId = cs.parse().unwrap();
-    let mut reply = ctx
-        .client
-        .get_changeset(GetChangesetRequest {
-            repo: REPO.to_owned(),
-            changeset_id: id.as_bytes().to_vec(),
+    let mut reply = tiers
+        .runtime
+        .block_on(async {
+            ctx.client
+                .get_changeset(GetChangesetRequest {
+                    repo: REPO.to_owned(),
+                    changeset_id: id.as_bytes().to_vec(),
+                })
+                .await
         })
-        .await
         .unwrap()
         .into_inner();
     let mut bytes = Vec::new();
-    while let Some(part) = reply.message().await.unwrap() {
-        bytes.extend_from_slice(&part.changeset);
-    }
+    tiers.runtime.block_on(async {
+        while let Some(part) = reply.message().await.unwrap() {
+            bytes.extend_from_slice(&part.changeset);
+        }
+    });
     let committed = Changeset::decode(&bytes).unwrap();
     let state = |name: &[u8]| {
         committed
