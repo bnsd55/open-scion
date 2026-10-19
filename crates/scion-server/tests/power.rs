@@ -874,6 +874,9 @@ async fn import_process_races_the_server_on_the_same_blob() {
                 "race",
                 git_dir.to_str().unwrap(),
             ])
+            // An exported variable on a dev box must never park both
+            // processes: the import never takes the seam.
+            .env_remove("SCION_TEST_PARK_WRITES")
             .stderr(Stdio::piped())
             .spawn()
     })
@@ -898,9 +901,19 @@ async fn import_process_races_the_server_on_the_same_blob() {
     // lands after the import's, from another tmp folder. A second rename
     // never came, and the park never held: the seam failed.
     let server_from = wait_for_rename(&lazy.trace, &blob_name, 60, Some(&import_from));
+    // Compare the offsets of the matched rename lines themselves: a from
+    // path also names the temp file's earlier create and write, so a
+    // first-occurrence search would measure the wrong line.
     let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
+    let offset = |from: &str| {
+        trace.lines().enumerate().find_map(|(n, line)| {
+            (line.contains("lfs_rename") && line.contains(&format!("from={from},"))).then_some(n)
+        })
+    };
+    let import_at = offset(&import_from).unwrap_or(usize::MAX);
+    let server_at = offset(&server_from).unwrap_or(0);
     assert!(
-        trace.find(&server_from).unwrap_or(0) > trace.find(&import_from).unwrap_or(usize::MAX),
+        server_at > import_at,
         "the server's rename did not land after the import's"
     );
     server.freeze();
