@@ -1136,6 +1136,9 @@ fn write_pem(dir: &tempfile::TempDir, name: &str, cert: &str, key: &str) -> Test
     use std::os::unix::fs::PermissionsExt as _;
     let cert_path = dir.path().join(format!("{name}.pem"));
     std::fs::write(&cert_path, cert).unwrap();
+    // A certificate is a shared file: the checked read refuses one that
+    // group or others can write, whatever the umask of the run.
+    std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o644)).unwrap();
     let key_path = dir.path().join(format!("{name}.key"));
     std::fs::write(&key_path, key).unwrap();
     // A key is a secret: the checked read refuses one that group or

@@ -11,7 +11,6 @@
 //! the object.
 
 use std::fmt::Write as _;
-use std::fs;
 use std::io::{self, BufRead as _, BufReader, BufWriter, ErrorKind, Read as _, Write as _};
 use std::path::Path;
 
@@ -117,7 +116,11 @@ pub fn seed(store: &DiskStore, path: &Path) -> io::Result<Option<Seeded>> {
             format!("{} is not a snapshot: {why}", path.display()),
         )
     };
-    let mut file = BufReader::new(fs::File::open(path)?);
+    // The snapshot is a shared file: the checked read refuses a symlink,
+    // a directory another user can change, and a mode that lets another
+    // user rewrite what the daemon is about to serve.
+    let bytes = scion_proto::runtime::auth::read_shared_file(path)?;
+    let mut file = BufReader::new(bytes.as_slice());
     let mut header = [0; MAGIC.len() + 2];
     if !fill(&mut file, &mut header)? || !header.starts_with(MAGIC) {
         return Err(not_snapshot("it does not start as one"));
@@ -188,6 +191,8 @@ fn fill(file: &mut impl io::Read, buf: &mut [u8]) -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use scion_core::{BlobId, Entry, FileEntry, FileState, PathElem, Tree};
     use scion_proto::runtime::object;
     use scion_proto::ticket::{self, now};
@@ -276,6 +281,37 @@ mod tests {
         let cold = DiskStore::open(&dir.path().join("cold"), 1 << 20).unwrap();
         let err = seed(&cold, &missing).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    /// A snapshot that group or others can write is refused: a swapped
+    /// file can seed what the daemon serves, so the checked read refuses
+    /// one, even though the records inside are checked too.
+    #[test]
+    fn a_group_writable_snapshot_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.scnsnap");
+        write(&path, "r", &[blob(b"aaaa")]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let store = DiskStore::open(&dir.path().join("one"), 1 << 20).unwrap();
+        let err = seed(&store, &path).unwrap_err().to_string();
+        assert!(err.contains("written by group or others"), "{err}");
+    }
+
+    /// A symlinked snapshot is refused at the open, even when its target
+    /// has a perfect mode.
+    #[test]
+    fn a_symlinked_snapshot_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.scnsnap");
+        write(&real, "r", &[blob(b"aaaa")]).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("r.scnsnap");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let store = DiskStore::open(&dir.path().join("one"), 1 << 20).unwrap();
+        let err = seed(&store, &link).unwrap_err().to_string();
+        assert!(err.contains("symlink"), "{err}");
     }
 
     #[test]
