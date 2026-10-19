@@ -1499,7 +1499,8 @@ mod tests {
         let tip = ids[4];
         // One fill walks. Another fill derives the history before the first
         // one's steps run.
-        let walked = walk_all::<ChangedPathsV1>(&store, repo, tip, || Ok(()));
+        let walked =
+            walk_all::<ChangedPathsV1>(&store, repo, tip, || Ok(()), None, &mut Vec::new());
         let ControlFlow::Continue(pending) = walked.unwrap() else {
             panic!("no value is stored yet");
         };
