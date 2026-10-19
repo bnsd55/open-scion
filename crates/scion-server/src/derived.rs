@@ -88,15 +88,19 @@ pub(crate) trait Kind {
     fn decode(bytes: &[u8]) -> Option<Self::Value>;
 }
 
-/// The value of `K` for a changeset that `repo` may see, derived as
-/// [`fill`] does if needed. Returns once the value, and what it names, is
-/// durable.
+/// [`get_by`] with no deadline: the caller has no request to serve, so
+/// nothing bounds the fill in time. For background and command callers
+/// only; a call that answers a request passes its deadline to
+/// [`get_by`] instead.
 ///
 /// # Errors
 ///
-/// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
-/// [`Kind::derive`], or of [`Store::flush`](crate::store::Store::flush).
-pub(crate) fn get<K: Kind>(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<K::Value> {
+/// As [`get_by`], without [`Error::DeadlineExceeded`].
+pub(crate) fn get_unbounded<K: Kind>(
+    store: &Backend,
+    repo: RepoId,
+    cs: ChangesetId,
+) -> Result<K::Value> {
     get_until::<K>(store, repo, cs, None)
 }
 
@@ -1147,14 +1151,17 @@ mod tests {
         DERIVES.set(0);
         let start = store.blobs().full_flushes();
         let flushes = || store.blobs().full_flushes() - start;
-        assert_eq!(get::<ChangedPathsV1>(&store, repo, ids[2]).unwrap(), 5);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV1>(&store, repo, ids[2]).unwrap(),
+            5
+        );
         assert_eq!(DERIVES.get(), 3, "each changeset once, from the root");
         // None where the commit's own fsync flushes the drive cache.
         let one = u64::from(FSYNC_LEAVES_DRIVE_CACHE);
         assert_eq!(flushes(), one, "durable before get returns");
         let counts: Vec<u64> = ids
             .iter()
-            .map(|&cs| get::<ChangedPathsV1>(&store, repo, cs).unwrap())
+            .map(|&cs| get_unbounded::<ChangedPathsV1>(&store, repo, cs).unwrap())
             .collect();
         assert_eq!(counts, [2, 4, 5]);
         assert_eq!(DERIVES.get(), 3, "later reads use the stored values");
@@ -1167,7 +1174,7 @@ mod tests {
         let other = store.write(|c| c.create_repo("other")).unwrap();
         let tip = ids[2];
         assert!(matches!(
-            get::<ChangedPathsV1>(&store, other, tip),
+            get_unbounded::<ChangedPathsV1>(&store, other, tip),
             Err(Error::NotFound(_))
         ));
         assert!(matches!(
@@ -1180,10 +1187,16 @@ mod tests {
     fn a_version_bump_derives_every_value_again() {
         let (_dir, store, repo, ids) = store_with(&HISTORY);
         let tip = ids[2];
-        assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), 5);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV1>(&store, repo, tip).unwrap(),
+            5
+        );
 
         DERIVES.set(0);
-        assert_eq!(get::<ChangedPathsV2>(&store, repo, tip).unwrap(), 4);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV2>(&store, repo, tip).unwrap(),
+            4
+        );
         assert_eq!(DERIVES.get(), 3, "version 2 derives every value again");
         assert_eq!(kind_rows(&store, 2).len(), 3);
         assert!(
@@ -1283,12 +1296,18 @@ mod tests {
 
         DERIVES.set(0);
         let commits = store.commits();
-        assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), 7);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV1>(&store, repo, tip).unwrap(),
+            7
+        );
         assert_eq!(DERIVES.get(), 7, "each changeset once");
         assert_eq!(store.commits() - commits, steps(7), "one per step");
         // Each step went on from the value of the step before it.
         for (count, &cs) in (1..).zip(&ids) {
-            assert_eq!(get::<ChangedPathsV1>(&store, repo, cs).unwrap(), count);
+            assert_eq!(
+                get_unbounded::<ChangedPathsV1>(&store, repo, cs).unwrap(),
+                count
+            );
         }
         assert_eq!(DERIVES.get(), 7);
     }
@@ -1301,7 +1320,7 @@ mod tests {
         // The error waits until the steps before it are durable.
         FAIL_AT.set(Some(ids[2 * STEP]));
         let flushes = store.blobs().full_flushes();
-        let failed = get::<ChangedPathsV1>(&store, repo, tip);
+        let failed = get_unbounded::<ChangedPathsV1>(&store, repo, tip);
         FAIL_AT.set(None);
         assert!(matches!(failed, Err(Error::Corrupt(_))), "{failed:?}");
         let one = u64::from(FSYNC_LEAVES_DRIVE_CACHE);
@@ -1316,7 +1335,10 @@ mod tests {
         assert_eq!(kind_rows(&store, 1), kept);
 
         DERIVES.set(0);
-        assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), 7);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV1>(&store, repo, tip).unwrap(),
+            7
+        );
         assert_eq!(DERIVES.get(), 3, "the next read derives only the rest");
     }
 
@@ -1332,7 +1354,10 @@ mod tests {
         };
         assert_eq!(pending, ids);
         DERIVES.set(0);
-        assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), 5);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV1>(&store, repo, tip).unwrap(),
+            5
+        );
         assert_eq!(DERIVES.get(), 5);
 
         let late = derive_steps::<ChangedPathsV1>(&store, repo, &pending, None, || Ok(())).unwrap();
@@ -1361,20 +1386,29 @@ mod tests {
             );
             assert_eq!(DERIVES.get(), 0, "{n}");
             assert!(kind_rows(&store, 1).is_empty(), "{n}");
-            assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), n as u64);
+            assert_eq!(
+                get_unbounded::<ChangedPathsV1>(&store, repo, tip).unwrap(),
+                n as u64
+            );
         }
     }
 
     #[test]
     fn a_step_removes_rows_of_older_versions_only() {
         let (_dir, store, repo, ids) = store_with(&chain(7));
-        assert_eq!(get::<ChangedPathsV1>(&store, repo, ids[6]).unwrap(), 7);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV1>(&store, repo, ids[6]).unwrap(),
+            7
+        );
         assert_eq!(kind_rows(&store, 1).len(), 7);
         assert_eq!(root_trees(&store), 7);
 
         // The first step of version 2 derives two values and removes two
         // rows of version 1.
-        assert_eq!(get::<ChangedPathsV2>(&store, repo, ids[1]).unwrap(), 1);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV2>(&store, repo, ids[1]).unwrap(),
+            1
+        );
         assert_eq!(kind_rows(&store, 2).len(), STEP);
         assert_eq!(kind_rows(&store, 1).len(), 7 - STEP);
 
@@ -1396,7 +1430,10 @@ mod tests {
         backfill::<ChangedPathsV2>(&store, "r", tip).unwrap();
         assert_eq!(kind_rows(&store, 2).len(), 7);
         // A build with version 1 derives its own rows and keeps version 2.
-        assert_eq!(get::<ChangedPathsV1>(&store, repo, tip).unwrap(), 7);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV1>(&store, repo, tip).unwrap(),
+            7
+        );
         assert_eq!(kind_rows(&store, 1).len(), 7);
         assert_eq!(kind_rows(&store, 2).len(), 7);
 
@@ -1414,7 +1451,10 @@ mod tests {
         assert_eq!(store.blobs().full_flushes() - flushes, one);
         assert_eq!(kind_rows(&store, 2).len(), 7);
         assert_eq!(root_trees(&store), 7);
-        assert_eq!(get::<ChangedPathsV2>(&store, repo, tip).unwrap(), 4);
+        assert_eq!(
+            get_unbounded::<ChangedPathsV2>(&store, repo, tip).unwrap(),
+            4
+        );
     }
 
     #[test]
@@ -1507,18 +1547,24 @@ mod tests {
 
         DERIVES.set(0);
         let commits = store.commits();
-        assert_eq!(get::<Ancestry>(&store, repo, tip).unwrap(), model[7]);
+        assert_eq!(
+            get_unbounded::<Ancestry>(&store, repo, tip).unwrap(),
+            model[7]
+        );
         assert_eq!(DERIVES.get(), 8, "each changeset once");
         assert_eq!(store.commits() - commits, steps(8), "one per step");
         for (i, &cs) in ids.iter().enumerate() {
-            assert_eq!(get::<Ancestry>(&store, repo, cs).unwrap(), model[i]);
+            assert_eq!(
+                get_unbounded::<Ancestry>(&store, repo, cs).unwrap(),
+                model[i]
+            );
         }
         assert_eq!(DERIVES.get(), 8, "later reads use the stored values");
 
         // A first-parent kind derives only the first-parent history: 7, 5,
         // 3, 1, 0.
         DERIVES.set(0);
-        get::<ChangedPathsV1>(&store, repo, tip).unwrap();
+        get_unbounded::<ChangedPathsV1>(&store, repo, tip).unwrap();
         assert_eq!(DERIVES.get(), 5);
         assert_eq!(kind_rows(&store, 1).len(), 5);
     }
@@ -1568,7 +1614,7 @@ mod tests {
                 let missing = model[i].iter().filter(|id| !derived.contains_key(id)).count();
                 DERIVES.set(0);
                 let commits = store.commits();
-                proptest::prop_assert_eq!(&get::<Ancestry>(&store, repo, ids[i]).unwrap(), &model[i]);
+                proptest::prop_assert_eq!(&get_unbounded::<Ancestry>(&store, repo, ids[i]).unwrap(), &model[i]);
                 proptest::prop_assert_eq!(DERIVES.get(), missing);
                 proptest::prop_assert_eq!(store.commits() - commits, steps(missing));
                 derived.extend(model[i].iter().map(|&id| (id, i)));

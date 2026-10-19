@@ -212,7 +212,7 @@ pub fn is_ancestor(
     descendant: ChangesetId,
     deadline: &Deadline,
 ) -> Result<bool> {
-    let from = At::get(store, repo, descendant)?;
+    let from = At::get(store, repo, descendant, deadline)?;
     let floor = store.read(|c| c.generation(repo, ancestor))?;
     let mut search = Search::new(from, ancestor, floor);
     Ok(in_steps(store, deadline, STEPS, |index| search.next(index))?.0)
@@ -236,7 +236,10 @@ pub fn merge_bases(
     b: ChangesetId,
     deadline: &Deadline,
 ) -> Result<Vec<ChangesetId>> {
-    let (a, b) = (At::get(store, repo, a)?, At::get(store, repo, b)?);
+    let (a, b) = (
+        At::get(store, repo, a, deadline)?,
+        At::get(store, repo, b, deadline)?,
+    );
     if let Some(bases) = store.read(|c| meeting(&mut Index::new(c, deadline), a, b))? {
         return Ok(bases);
     }
@@ -540,10 +543,10 @@ struct At {
 }
 
 impl At {
-    /// A changeset of `repo` and its node. Derives the commit graph first if
-    /// it has no node.
-    fn get(store: &Backend, repo: RepoId, id: ChangesetId) -> Result<Self> {
-        let node = derived::get::<CommitGraph>(store, repo, id)?;
+    /// A changeset of `repo` and its node. Derives the commit graph first
+    /// if it has no node, until `deadline`.
+    fn get(store: &Backend, repo: RepoId, id: ChangesetId, deadline: &Deadline) -> Result<Self> {
+        let node = derived::get_by::<CommitGraph>(store, repo, id, deadline)?;
         Ok(Self { id, node })
     }
 }
@@ -652,6 +655,23 @@ mod tests {
     use super::*;
     use crate::db::testing;
     use crate::derived::steps;
+
+    /// A cold commit graph and a past deadline: the query refuses instead of
+    /// deriving the graph first. On main, where the derive ran without the
+    /// deadline, this call returned a result.
+    #[test]
+    fn a_query_with_a_past_deadline_derives_nothing() {
+        let parents = criss_cross();
+        let (_dir, store, repo, ids) = store_graph(&parents);
+        let past = Deadline::new(Instant::now());
+        let got = is_ancestor(&store, repo, ids[0], ids[5], &past);
+        assert!(
+            matches!(got, Err(crate::error::Error::DeadlineExceeded(_))),
+            "{got:?}"
+        );
+        let cold = store.read(|c| Ok(derived::load::<CommitGraph>(c, ids[5]).unwrap()));
+        assert!(cold.unwrap().is_none(), "the query derived a node");
+    }
 
     /// Steps of a few reads, so that walks go on across steps.
     const SMALL: Steps = Steps { reads: 4 };
@@ -777,7 +797,7 @@ mod tests {
             let ancestors = ancestors(&parents);
             let nodes: Vec<Node> = ids
                 .iter()
-                .map(|&id| derived::get::<CommitGraph>(&store, repo, id).unwrap())
+                .map(|&id| derived::get_unbounded::<CommitGraph>(&store, repo, id).unwrap())
                 .collect();
             let index_of = |id: ChangesetId| ids.iter().position(|&i| i == id).unwrap();
             for (i, node) in nodes.iter().enumerate() {

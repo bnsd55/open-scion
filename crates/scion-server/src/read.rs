@@ -29,14 +29,21 @@ pub fn get_changeset(store: &Backend, repo: &str, id: ChangesetId) -> Result<Cha
     })
 }
 
-/// The root tree of a changeset the repo may see.
+/// The root tree of a changeset the repo may see, deriving it if needed,
+/// until `deadline`.
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or changeset does not exist.
-pub fn root_tree(store: &Backend, repo: &str, cs: ChangesetId) -> Result<TreeId> {
+/// [`Error::DeadlineExceeded`] once `deadline` has passed.
+pub fn root_tree(
+    store: &Backend,
+    repo: &str,
+    cs: ChangesetId,
+    deadline: &Deadline,
+) -> Result<TreeId> {
     let repo = store.read(|c| c.repo_id(repo))?;
-    tree::root_tree(store, repo, cs)
+    tree::root_tree(store, repo, cs, deadline)
 }
 
 /// The content of a regular file, or the target of a symlink.
@@ -44,9 +51,18 @@ pub fn root_tree(store: &Backend, repo: &str, cs: ChangesetId) -> Result<TreeId>
 /// # Errors
 ///
 /// [`Error::NotFound`] if nothing is at `path`. [`Error::InvalidArgument`] if
-/// `path` is a directory or a submodule.
-pub fn read_file(store: &Backend, repo: &str, cs: ChangesetId, path: &RepoPath) -> Result<Vec<u8>> {
-    store.blobs().get(file_blob(store, repo, cs, path)?)
+/// `path` is a directory or a submodule. [`Error::DeadlineExceeded`] once
+/// `deadline` has passed, which a cold root tree may need.
+pub fn read_file(
+    store: &Backend,
+    repo: &str,
+    cs: ChangesetId,
+    path: &RepoPath,
+    deadline: &Deadline,
+) -> Result<Vec<u8>> {
+    store
+        .blobs()
+        .get(file_blob(store, repo, cs, path, deadline)?)
 }
 
 /// The blob of a regular file, or of a symlink's target.
@@ -54,8 +70,14 @@ pub fn read_file(store: &Backend, repo: &str, cs: ChangesetId, path: &RepoPath) 
 /// # Errors
 ///
 /// As [`read_file`], without reading the blob.
-pub fn file_blob(store: &Backend, repo: &str, cs: ChangesetId, path: &RepoPath) -> Result<BlobId> {
-    let root = root_tree(store, repo, cs)?;
+pub fn file_blob(
+    store: &Backend,
+    repo: &str,
+    cs: ChangesetId,
+    path: &RepoPath,
+    deadline: &Deadline,
+) -> Result<BlobId> {
+    let root = root_tree(store, repo, cs, deadline)?;
     file_blob_at(store, root, path)
 }
 
@@ -87,8 +109,9 @@ pub fn list_dir(
     repo: &str,
     cs: ChangesetId,
     path: Option<&RepoPath>,
+    deadline: &Deadline,
 ) -> Result<Tree> {
-    let root = root_tree(store, repo, cs)?;
+    let root = root_tree(store, repo, cs, deadline)?;
     list_dir_at(store, root, path)
 }
 
@@ -402,8 +425,18 @@ pub fn diff(
     new: ChangesetId,
     path: Option<&RepoPath>,
     after: Option<&RepoPath>,
+    deadline: &Deadline,
 ) -> Result<DiffPage> {
-    diff_with(store, repo, old, new, path, after, MAX_RENAME_ENTRIES)
+    diff_with(
+        store,
+        repo,
+        old,
+        new,
+        path,
+        after,
+        MAX_RENAME_ENTRIES,
+        deadline,
+    )
 }
 
 /// [`diff`], with the entries that the rename pass may walk bounded by
@@ -420,8 +453,12 @@ pub fn diff_with(
     path: Option<&RepoPath>,
     after: Option<&RepoPath>,
     rename_entries: usize,
+    deadline: &Deadline,
 ) -> Result<DiffPage> {
-    let roots = (root_tree(store, repo, old)?, root_tree(store, repo, new)?);
+    let roots = (
+        root_tree(store, repo, old, deadline)?,
+        root_tree(store, repo, new, deadline)?,
+    );
     let mut entries = diff_walk(store, roots, path, after, MAX_DIFF_ENTRIES)?;
     // The walk finds one entry more than a page, to know whether more follow.
     let next_after = if entries.len() > MAX_DIFF_ENTRIES {
