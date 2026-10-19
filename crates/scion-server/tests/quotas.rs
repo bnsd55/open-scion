@@ -374,13 +374,19 @@ async fn a_stream_holds_its_slot_until_the_stream_ends() {
     let quotas = Quotas::new(Some(1), None);
     let observed = quotas.clone();
     let (stop, channel) = server(&store, dir.path(), access, quotas).await;
-    // A file far past what the reply path buffers, so its producer really
-    // parks: a reply under about 4 MiB fits whole in the mpsc, hyper's
-    // read-ahead and the h2 send buffer, so its producer sends every part
-    // and returns at once, freeing the call's slot while the test is still
-    // reading the quota — a 3 MiB file once let the first probe win only by
-    // a few milliseconds. 16 MiB makes the hold deterministic.
-    let big = vec![b'z'; 16 * 1024 * 1024];
+    // A file far past what the reply path can absorb while the client
+    // reads nothing, so the producer really parks: about 4 MiB of
+    // userspace (the reply's mpsc, hyper's read-ahead, the h2 send
+    // buffer) plus up to about 10 MB of loopback TCP autotuning (the
+    // server's send buffer and the client's receive buffer, whatever the
+    // runner tunes them to) can soak up a reply before the producer must
+    // wait for a read. 16 MiB left too little margin — a runner with fat
+    // autotune could absorb the whole reply, free the slot before the
+    // probe, and the probe saw NotFound instead of ResourceExhausted
+    // (#291's failure, once). 64 MiB clears every buffer a CI runner can
+    // tune; raise it if this failure ever comes back, and raise the
+    // hold assert below with it.
+    let big = vec![b'z'; 64 * 1024 * 1024];
     let blob = store.blobs().put(&big).unwrap();
     // The root's `README` is small, so point `main` at a changeset whose
     // `README` is the big one.
