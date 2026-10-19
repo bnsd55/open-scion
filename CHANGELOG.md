@@ -236,6 +236,16 @@ The first release: the server, its cache tiers, and the `scn` client.
 - `commit --put` refuses anything that is not a regular file: a FIFO
   or a device never sees an end, and the read grew until the OOM
   killer.
+- A Postgres read whose connection died inside its transaction left the
+  pooled client unusable: the worker that serves the client kept the
+  transaction's lost state on every later BEGIN, so every statement of
+  that client failed and the read that opened a fresh transaction was
+  refused too, with nothing to roll the open one back. The worker now
+  follows a BEGIN that ran on the fresh session (the lost transaction
+  is gone with the old session, and its caller cannot commit it
+  through a new BEGIN), and a read's timeout statements that fail
+  after the BEGIN roll the read transaction back before the reader
+  returns to the pool.
 - The land metrics count lands whose call ended in an error: a land
   that answered `Aborted`, `DeadlineExceeded`, or any other error class
   moved no counter, so an operator could not see failing lands. The
