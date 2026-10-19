@@ -1547,7 +1547,7 @@ mod tests {
             .derive_flights()
             .set_walk_bytes(crate::memory::Bytes::named(budget, "derive walk"));
         let deadline = Deadline::new(std::time::Instant::now() + Duration::from_secs(60));
-        let busy = get_by::<crate::graph::CommitGraph>(&store, repo, tip, &deadline);
+        let busy = get_by::<Ancestry>(&store, repo, tip, &deadline);
         let Err(Error::Unavailable(why)) = &busy else {
             panic!("not busy: {busy:?}");
         };
@@ -1566,16 +1566,12 @@ mod tests {
         // The steps before the stop stay: the walk stored nothing, and
         // neither did the derives it never reached.
         assert_eq!(
-            rows_of(
-                &store,
-                crate::graph::CommitGraph::NAME,
-                crate::graph::CommitGraph::VERSION
-            ),
+            rows_of(&store, Ancestry::NAME, Ancestry::VERSION),
             [] as [(Vec<u8>, Vec<u8>); 0]
         );
         // A retry on the same tiny budget stops busy again.
         assert!(matches!(
-            get_by::<crate::graph::CommitGraph>(&store, repo, tip, &deadline),
+            get_by::<Ancestry>(&store, repo, tip, &deadline),
             Err(Error::Unavailable(_))
         ));
         // With room again, a retry resumes and finishes.
@@ -1585,16 +1581,8 @@ mod tests {
                 DERIVE_WALK_BUDGET,
                 "derive walk",
             ));
-        get_by::<crate::graph::CommitGraph>(&store, repo, tip, &deadline).unwrap();
-        assert_eq!(
-            rows_of(
-                &store,
-                crate::graph::CommitGraph::NAME,
-                crate::graph::CommitGraph::VERSION
-            )
-            .len(),
-            12
-        );
+        get_by::<Ancestry>(&store, repo, tip, &deadline).unwrap();
+        assert_eq!(rows_of(&store, Ancestry::NAME, Ancestry::VERSION).len(), 12);
     }
 
     /// The unbounded forms (fsck, import, the derive command) take no
@@ -1609,20 +1597,12 @@ mod tests {
                 "derive walk",
             ));
         assert_eq!(
-            get_unbounded::<crate::graph::CommitGraph>(&store, repo, ids[11])
+            get_unbounded::<Ancestry>(&store, repo, ids[11])
                 .unwrap()
-                .depth,
-            11
-        );
-        assert_eq!(
-            rows_of(
-                &store,
-                crate::graph::CommitGraph::NAME,
-                crate::graph::CommitGraph::VERSION
-            )
-            .len(),
+                .len(),
             12
         );
+        assert_eq!(rows_of(&store, Ancestry::NAME, Ancestry::VERSION).len(), 12);
     }
 
     #[test]
