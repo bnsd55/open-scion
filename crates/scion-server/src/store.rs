@@ -1180,7 +1180,7 @@ impl Blobs {
             self.gated_fsync(
                 "the blob root",
                 "fsync blob root",
-                SyncStep::Unnamed,
+                &SyncStep::Unnamed,
                 || fsync_dir(&self.root),
             )?;
         }
@@ -1421,11 +1421,11 @@ impl Blobs {
     /// the fsync, the record, and the timer in one place. One observation
     /// of `scion_blob_sync_seconds` per fsync of the blob path (a temp
     /// file, a stored file, a blob directory, or the drive cache).
-    fn gated_fsync<'a>(
+    fn gated_fsync(
         &self,
         name: &str,
         operation: &str,
-        step: SyncStep<'a>,
+        step: &SyncStep<'_>,
         f: impl FnOnce() -> io::Result<()>,
     ) -> Result<()> {
         self.fsync_gate(name, operation)?;
@@ -1434,8 +1434,10 @@ impl Blobs {
         #[cfg(any(test, feature = "test-hooks"))]
         if out.is_ok() {
             match step {
-                SyncStep::TempFile(id) => self.log.record(DurabilityStep::FileFsync(id)),
-                SyncStep::StoredFile(id) => self.log.record(DurabilityStep::StoredFileFsync(id)),
+                SyncStep::TempFile(id) => self.log.record(DurabilityStep::FileFsync(*id)),
+                SyncStep::StoredFile(id) => {
+                    self.log.record(DurabilityStep::StoredFileFsync(*id));
+                }
                 SyncStep::Dir(path) => self
                     .log
                     .record(DurabilityStep::DirFsync(path.to_path_buf())),
@@ -1840,14 +1842,14 @@ impl BlobBatch<'_> {
                 self.blobs.gated_fsync(
                     "the stored blob file",
                     "fsync stored blob",
-                    SyncStep::StoredFile(id),
+                    &SyncStep::StoredFile(id),
                     || fsync(&file),
                 )?;
                 let name = dir.display().to_string();
                 self.blobs.gated_fsync(
                     &name,
                     "fsync blob directory",
-                    SyncStep::Dir(dir.as_path()),
+                    &SyncStep::Dir(dir.as_path()),
                     || fsync_dir(&dir),
                 )?;
                 return Ok(());
@@ -1890,7 +1892,7 @@ impl BlobBatch<'_> {
         self.blobs.gated_fsync(
             "the blob's temp file",
             "fsync blob file",
-            SyncStep::TempFile(id),
+            &SyncStep::TempFile(id),
             || fsync(tmp.as_file()),
         )?;
         fs::create_dir_all(&dir)?;
@@ -1973,7 +1975,7 @@ impl BlobBatch<'_> {
             self.blobs.gated_fsync(
                 &name,
                 "fsync blob directory",
-                SyncStep::Dir(dir.as_path()),
+                &SyncStep::Dir(dir.as_path()),
                 || fsync_dir(dir),
             )?;
         }
