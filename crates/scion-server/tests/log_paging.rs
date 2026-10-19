@@ -228,7 +228,12 @@ async fn log_paging_with_a_path_matches_one_full_walk() {
     // The reference: the full path walk, assembled the same way.
     let mut full: Vec<(usize, scion_core::ChangesetId)> = Vec::new();
     let mut from = tip;
+    // A ceiling on the pages: a server that repeats its cursor must fail
+    // the test, not hang it.
+    let mut pages = 0;
     loop {
+        pages += 1;
+        assert!(pages <= HISTORY, "the walk never left {from:?}");
         let (ids, next) = call(&mut client, &from, 1_000, b"d/f.txt").await;
         full.extend(ids);
         if next.is_empty() {

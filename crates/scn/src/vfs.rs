@@ -906,12 +906,42 @@ impl NFSFileSystem for Vfs {
         let from_id = Self::id_of(&nodes, Some(&from_path))
             .filter(|_| !nodes.deleted.contains(&from_path))
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
-        // A directory moves with everything under it: each file and
-        // symlink of the ref is materialized at the new path, and its old
-        // path is a deletion.
+        // A directory rename is checked before anything moves: a target
+        // that is a file is not a directory, an existing non-empty
+        // directory is not empty, and a move into the mover's own subtree
+        // is invalid (the children would be written under the mover).
         if nodes.by_id[&from_id].kind.is_dir() {
+            let mut under = from_path.as_bytes().to_vec();
+            under.push(b'/');
+            if to_path.as_bytes().starts_with(&under) {
+                return Err(nfsstat3::NFS3ERR_INVAL);
+            }
+            // The target of a directory rename must be a directory, and
+            // empty at most. The check runs before anything moves.
+            let target =
+                Self::id_of(&nodes, Some(&to_path)).filter(|_| !nodes.deleted.contains(&to_path));
+            if let Some(to_id) = target {
+                if !nodes.by_id[&to_id].kind.is_dir() {
+                    return Err(nfsstat3::NFS3ERR_NOTDIR);
+                }
+                if !self.dir_is_empty(&mut nodes, to_id, &to_path).await? {
+                    return Err(nfsstat3::NFS3ERR_NOTEMPTY);
+                }
+            }
+            // A directory moves with everything under it: each file and
+            // symlink of the ref is materialized at the new path, and its old
+            // path is a deletion.
             self.move_dir(&mut nodes, from_id, &from_path, &to_path)
                 .await?;
+            // The move landed; an empty target goes away now, so a failed
+            // move leaves both directories as they were. Its directory on
+            // disk stays: the moved children land in it, and an empty
+            // directory holds no tree entry (trees keep only dirs with
+            // children), so a target of the ref needs no deletion note.
+            if let Some(to_id) = Self::id_of(&nodes, Some(&to_path)).filter(|id| *id != from_id) {
+                drop_listed(&mut nodes, to_dirid, to_filename.as_ref());
+                nodes.drop_node(to_id);
+            }
             drop_listed(&mut nodes, from_dirid, from_filename.as_ref());
             nodes.drop_node(from_id);
             // The new directory is of the overlay; its children are its
@@ -1214,23 +1244,120 @@ impl Vfs {
     }
 }
 
-/// The note of the paths that the ref held and the mount deleted.
+/// The version byte of a deletions note. Version 1 holds raw paths: one
+/// `u32` little-endian count, then per path a `u32` length and the bytes.
+/// The note of a build older than this one starts with `[`: a JSON array
+/// of lossy names (the old format lost non-UTF-8 names at write time; it
+/// is read the best it can).
+const DELETES_VERSION_1: u8 = 1;
+
+/// Writes the note of the paths that the ref held and the mount deleted:
+/// a temp file, an fsync, and a rename, so a crash mid-write leaves the
+/// old note whole, not a half-written one.
 fn write_deletes(overlay: &Path, deleted: &HashSet<RepoPath>) -> std::io::Result<()> {
-    let names: Vec<String> = deleted
-        .iter()
-        .map(|p| String::from_utf8_lossy(p.as_bytes()).into_owned())
-        .collect();
-    let file = std::fs::File::create(overlay.join(DELETES))?;
-    serde_json::to_writer(std::io::BufWriter::new(file), &names)?;
-    Ok(())
+    use std::io::Write as _;
+    let mut bytes = Vec::with_capacity(1 + 4 + deleted.len() * 8);
+    bytes.push(DELETES_VERSION_1);
+    bytes.extend_from_slice(
+        &u32::try_from(deleted.len())
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "too many deletions")
+            })?
+            .to_le_bytes(),
+    );
+    for path in deleted {
+        bytes.extend_from_slice(
+            &(u32::try_from(path.as_bytes().len())
+                .expect("a path fits")
+                .to_le_bytes()),
+        );
+        bytes.extend_from_slice(path.as_bytes());
+    }
+    let tmp = overlay.join(".deletes.tmp");
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, overlay.join(DELETES))?;
+    // The rename's directory entry is as durable as the note: a crash
+    // that loses it brings back the old note, and with it every
+    // deletion the mount made.
+    std::fs::File::open(overlay)?.sync_all()
 }
 
-/// Reads the note of deletions back, for `scn commit --from-mount`.
-pub fn read_deletes(overlay: &Path) -> Vec<String> {
-    std::fs::read_to_string(overlay.join(DELETES))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+/// Reads the note of deletions back, for `scn commit --from-mount`. A
+/// note that is not there holds none. A damaged note is an error, not
+/// "no deletions": a commit that reads a broken note as empty would
+/// keep every path the mount deleted.
+pub fn read_deletes(overlay: &Path) -> anyhow::Result<Vec<RepoPath>> {
+    let bytes = match std::fs::read(overlay.join(DELETES)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "cannot read the note of deletions ({e}): re-make the \
+                 deletions on the mount, or run `scn unmount DIR` and \
+                 mount again"
+            ));
+        }
+    };
+    if bytes.first() == Some(&b'[') {
+        // A note of the old format: a JSON array of lossy names.
+        let names: Vec<String> =
+            serde_json::from_slice(&bytes).map_err(|e| broken_note(e.into()))?;
+        return names
+            .into_iter()
+            .map(|name| {
+                RepoPath::new(name.into_bytes())
+                    .map_err(|_| broken_note(anyhow!("a name of the note is not a path")))
+            })
+            .collect();
+    }
+    if bytes.first() != Some(&DELETES_VERSION_1) {
+        return Err(broken_note(anyhow!(
+            "the note holds no deletions format this build reads"
+        )));
+    }
+    let mut at = 1usize;
+    let mut take = |want: usize| -> anyhow::Result<&[u8]> {
+        if bytes.len() < at + want {
+            return Err(broken_note(anyhow!("the note ends in the middle")));
+        }
+        let head = &bytes[at..at + want];
+        at += want;
+        Ok(head)
+    };
+    // The count is not trusted for the size of the vector: a damaged
+    // note can name millions of entries. Each entry costs at least four
+    // bytes, so a count the note cannot pay for is a damaged note, and
+    // a count the bytes outlive is one too.
+    let count = u32::from_le_bytes(take(4)?.try_into().expect("four bytes")) as usize;
+    if count > (bytes.len() - 1) / 4 {
+        return Err(broken_note(anyhow!(
+            "the note names more deletions than it holds"
+        )));
+    }
+    let mut deleted = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = u32::from_le_bytes(take(4)?.try_into().expect("four bytes")) as usize;
+        let path = RepoPath::new(take(len)?)
+            .map_err(|_| broken_note(anyhow!("the note holds a name that is not a path")));
+        deleted.push(path?);
+    }
+    if at != bytes.len() {
+        return Err(broken_note(anyhow!(
+            "the note holds bytes past its last deletion"
+        )));
+    }
+    Ok(deleted)
+}
+
+/// The error for a deletions note this build cannot read.
+fn broken_note(why: anyhow::Error) -> anyhow::Error {
+    why.context(
+        "the note of deletions in the mount's overlay is damaged; \
+         re-make the deletions on the mount, or run `scn unmount DIR` \
+         and mount again",
+    )
 }
 
 /// Records `name` in the listing of the directory `dirid`, if it is loaded.
@@ -1307,6 +1434,39 @@ fn secret_from_urandom() -> [u8; 16] {
 }
 
 impl Vfs {
+    /// Whether the directory `id` (`path`) holds nothing: no overlay child
+    /// and no listed child of the tree. The tree of a directory that was
+    /// never listed is fetched first, so the answer is about the real
+    /// contents.
+    async fn dir_is_empty(
+        &self,
+        nodes: &mut Nodes,
+        id: u64,
+        path: &RepoPath,
+    ) -> Result<bool, nfsstat3> {
+        if let Some(node) = nodes.by_id.get(&id)
+            && matches!(node.kind, Kind::Dir { listed: None, .. })
+        {
+            self.list_dir(nodes, id).await?;
+        }
+        let overlay_child = nodes.by_path.iter().any(|(p, _)| {
+            p.as_ref()
+                .is_some_and(|p| Self::parent(p).as_ref() == Some(path))
+        });
+        let tree_child = match nodes.by_id.get(&id) {
+            Some(Node {
+                kind:
+                    Kind::Dir {
+                        listed: Some(listed),
+                        ..
+                    },
+                ..
+            }) => !listed.is_empty(),
+            _ => false,
+        };
+        Ok(!overlay_child && !tree_child)
+    }
+
     /// Moves the directory `from_id` (`from_path`) to `to_path`. Boxed:
     /// the walk recurses.
     fn move_dir<'a>(
@@ -1685,8 +1845,10 @@ mod tests {
             .await
             .unwrap();
         assert!(find(&test.vfs, "README.md").await.is_err());
-        let note = std::fs::read_to_string(test.vfs.overlay.join(DELETES)).unwrap();
-        assert_eq!(note, r#"["README.md"]"#);
+        assert_eq!(
+            read_deletes(&test.vfs.overlay).unwrap(),
+            [RepoPath::new("README.md").unwrap()]
+        );
     }
 
     #[tokio::test]
@@ -1719,6 +1881,136 @@ mod tests {
         );
     }
 
+    /// The target of a directory rename must be a directory, and empty
+    /// at most ([F1 of the hunt]: a rename once merged two directories).
+    /// Fails on main, which merges the target's children in.
+    #[tokio::test]
+    async fn a_rename_of_a_dir_over_a_non_empty_dir_is_refused() {
+        let test = start(&[("x/a", b"ax\n", Some(false)), ("y/b", b"by\n", Some(false))]).await;
+        let root = NFSFileSystem::root_dir(&test.vfs);
+        test.vfs
+            .rename(
+                root,
+                &filename3::from(b"x".to_vec()),
+                root,
+                &filename3::from(b"y".to_vec()),
+            )
+            .await
+            .unwrap_err();
+        // Both directories are as they were.
+        assert!(find(&test.vfs, "x/a").await.is_ok());
+        assert!(find(&test.vfs, "y/b").await.is_ok());
+        // The shape of the refusal: the same rename answers NOTEMPTY.
+        let from = filename3::from(b"x".to_vec());
+        let refused = test
+            .vfs
+            .rename(root, &from, root, &filename3::from(b"y".to_vec()))
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, nfsstat3::NFS3ERR_NOTEMPTY));
+    }
+
+    /// A rename of a directory over an existing file is not a directory
+    /// ([F1]). Fails on main, which merges the two.
+    #[tokio::test]
+    async fn a_rename_of_a_dir_over_a_file_is_refused() {
+        let test = start(&[("d/f", b"df\n", Some(false)), ("f", b"fx\n", Some(false))]).await;
+        let root = NFSFileSystem::root_dir(&test.vfs);
+        let refused = test
+            .vfs
+            .rename(
+                root,
+                &filename3::from(b"d".to_vec()),
+                root,
+                &filename3::from(b"f".to_vec()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, nfsstat3::NFS3ERR_NOTDIR));
+    }
+
+    /// A rename of a directory into its own subtree is invalid ([F2]).
+    /// Fails on main, which accepts it and loses the mover's children at
+    /// the commit.
+    #[tokio::test]
+    async fn a_rename_of_a_dir_into_itself_is_refused() {
+        let test = start(&[("a/b", b"b\n", Some(false)), ("a/c", b"c\n", Some(false))]).await;
+        let a = find(&test.vfs, "a").await.unwrap();
+        let refused = test
+            .vfs
+            .rename(
+                NFSFileSystem::root_dir(&test.vfs),
+                &filename3::from(b"a".to_vec()),
+                a,
+                &filename3::from(b"b".to_vec()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, nfsstat3::NFS3ERR_INVAL));
+    }
+
+    /// A rename over an empty directory replaces it, as POSIX allows.
+    #[tokio::test]
+    async fn a_rename_of_a_dir_over_an_empty_local_dir_replaces_it() {
+        let test = start(&[("x/a", b"ax\n", Some(false))]).await;
+        let root = NFSFileSystem::root_dir(&test.vfs);
+        test.vfs
+            .mkdir(root, &filename3::from(b"y".to_vec()))
+            .await
+            .unwrap();
+        test.vfs
+            .rename(
+                NFSFileSystem::root_dir(&test.vfs),
+                &filename3::from(b"x".to_vec()),
+                NFSFileSystem::root_dir(&test.vfs),
+                &filename3::from(b"y".to_vec()),
+            )
+            .await
+            .unwrap();
+        assert!(find(&test.vfs, "x").await.is_err());
+        let y = find(&test.vfs, "y").await.unwrap();
+        let listed = test.vfs.readdir(y, 0, 10).await.unwrap();
+        let names: Vec<Vec<u8>> = listed.entries.iter().map(|e| e.name.0.clone()).collect();
+        assert_eq!(names, [b"a".to_vec()]);
+    }
+
+    /// A damaged note of deletions is an error, not "no deletions" ([F5]):
+    /// a commit that read one as empty would keep every path the mount
+    /// deleted.
+    #[test]
+    fn a_damaged_note_of_deletions_is_an_error() {
+        let overlay = tempfile::tempdir().unwrap();
+        // A note that is not there holds none.
+        assert_eq!(read_deletes(overlay.path()).unwrap(), Vec::new());
+        // The old format still reads: a note of an older build.
+        std::fs::write(overlay.path().join(DELETES), r#"["gone"]"#).unwrap();
+        assert_eq!(
+            read_deletes(overlay.path()).unwrap(),
+            [RepoPath::new("gone").unwrap()]
+        );
+        // A truncated note of the new format refuses.
+        let mut bytes = vec![DELETES_VERSION_1];
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        std::fs::write(overlay.path().join(DELETES), &bytes).unwrap();
+        let why = read_deletes(overlay.path()).unwrap_err().to_string();
+        assert!(why.contains("damaged"), "{why}");
+    }
+
+    /// The note holds raw bytes, so a name that is not UTF-8 comes back
+    /// as itself ([F6]). The lossy names of main would delete the wrong
+    /// path or none.
+    #[test]
+    fn a_note_of_a_name_that_is_not_utf8_round_trips() {
+        let overlay = tempfile::tempdir().unwrap();
+        let mut deleted = std::collections::HashSet::new();
+        deleted.insert(RepoPath::new(b"bad\xffname".as_slice()).unwrap());
+        write_deletes(overlay.path(), &deleted).unwrap();
+        assert_eq!(
+            read_deletes(overlay.path()).unwrap(),
+            deleted.into_iter().collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn a_rename_moves_the_overlay_file() {
         let test = start(&[("old", b"same\n", Some(false))]).await;
@@ -1737,8 +2029,10 @@ mod tests {
         assert_eq!(data, b"same\n\n");
         // The old path is a deletion, the new one a change; the old
         // overlay file is gone.
-        let note = std::fs::read_to_string(test.vfs.overlay.join(DELETES)).unwrap();
-        assert_eq!(note, r#"["old"]"#);
+        assert_eq!(
+            read_deletes(&test.vfs.overlay).unwrap(),
+            [RepoPath::new("old").unwrap()]
+        );
         assert!(
             test.vfs
                 .overlay_file(&RepoPath::new("new").unwrap())

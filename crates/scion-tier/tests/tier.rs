@@ -406,6 +406,15 @@ async fn serve_fake(fake: Fake) -> String {
 /// `zstd` or not: the objects it returns, unpacked, with the number of parts
 /// and the encoding of each, or the error that ends it. `Err` from the outer
 /// result is the call's status.
+async fn message_of<I>(step: &str, stream: &mut tonic::Streaming<I>) -> Result<Option<I>, Status>
+where
+    I: Unpin,
+{
+    tokio::time::timeout(std::time::Duration::from_secs(30), stream.message())
+        .await
+        .unwrap_or_else(|_| panic!("the step {step} never finished within 30 s"))
+}
+
 async fn get_parts(
     client: &mut Client,
     fake: &Fake,
@@ -433,7 +442,7 @@ async fn get_parts(
     let mut stream = client.get_objects(request).await?.into_inner();
     let mut got = Vec::new();
     loop {
-        let first = match stream.message().await {
+        let first = match message_of("the first object part", &mut stream).await {
             Ok(Some(part)) => part,
             Ok(None) => return Ok(Ok(got)),
             Err(status) => return Ok(Err(status)),
@@ -441,7 +450,7 @@ async fn get_parts(
         let mut object = Assembler::new(Header::of(&first, zstd).unwrap(), first);
         let mut parts = 1;
         while !object.is_done() {
-            match stream.message().await {
+            match message_of("the next object part", &mut stream).await {
                 Ok(Some(part)) => object.push(&part).unwrap(),
                 Ok(None) => panic!("the reply ended in the middle of an object"),
                 Err(status) => return Ok(Err(status)),
@@ -484,14 +493,14 @@ async fn get_with(
     let mut stream = client.get_objects(request).await?.into_inner();
     let mut got = Vec::new();
     loop {
-        let first = match stream.message().await {
+        let first = match message_of("the first object part", &mut stream).await {
             Ok(Some(part)) => part,
             Ok(None) => return Ok(Ok(got)),
             Err(status) => return Ok(Err(status)),
         };
         let mut object = Assembler::new(Header::of(&first, false).unwrap(), first);
         while !object.is_done() {
-            match stream.message().await {
+            match message_of("the next object part", &mut stream).await {
                 Ok(Some(part)) => object.push(&part).unwrap(),
                 Ok(None) => panic!("the reply ended in the middle of an object"),
                 Err(status) => return Ok(Err(status)),

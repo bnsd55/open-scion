@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -78,6 +79,16 @@ jobs:
         run: cargo test -p open-scion-server --test disk_full
         env:
           SCION_DISK_REQUIRE: "1"
+      - name: block-level power cuts (dm-log-writes)
+        run: |
+          # replay-log, pinned at 7b70d8a6863c5de30933d42a7672d35d01d2dc6c so the tool cannot move under the test.
+          git clone https://github.com/josefbacik/log-writes "$RUNNER_TEMP/dlw"
+          git -C "$RUNNER_TEMP/dlw" checkout 7b70d8a6863c5de30933d42a7672d35d01d2dc6c
+          gcc -O2 -o "$RUNNER_TEMP/replay-log" "$RUNNER_TEMP/dlw/replay-log.c" "$RUNNER_TEMP/dlw/log-writes.c"
+          cargo test -p open-scion-server --test dm_log_writes
+        env:
+          SCION_DMW_REQUIRE: "1"
+          SCION_DMW_REPLAY: ${{ runner.temp }}/replay-log
 
   test-postgres:
     name: test (postgres)
