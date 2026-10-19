@@ -225,12 +225,6 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
-- The mount is read-only by default, and `scn commit --from-mount`
-  refuses a read-only mount: a symlinked parent directory in the
-  overlay can still redirect a write outside it, so the writes and the
-  commit live behind `scn mount --unstable-writable` alone. The
-  read-only mount answers every NFS write with `EROFS`, and the
-  refusal names the flag.
 - A directory that the server, a cache tier or `scn` makes is mode 0700,
   whatever the umask (`#303`). On a default Ubuntu account (umask 002),
   the first command on a new data directory failed: the server refused

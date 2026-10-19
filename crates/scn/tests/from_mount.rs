@@ -353,8 +353,6 @@ fn a_read_only_mount_answers_rofs_to_every_write() {
 
     tiers.runtime.block_on(async {
         let root = NFSFileSystem::root_dir(vfs);
-        let rofs = nfsstat3::NFS3ERR_ROFS;
-
         // A read still works: the mount is read-only, not dark.
         let id = vfs
             .lookup(root, &filename3::from(b"keep.txt".to_vec()))
@@ -364,62 +362,82 @@ fn a_read_only_mount_answers_rofs_to_every_write() {
         assert_eq!(bytes, b"same\n");
 
         // Every mutating call the VFS implements is refused.
-        assert_eq!(
-            vfs.setattr(id, sattr3::default()).await.unwrap_err(),
-            rofs,
+        assert!(
+            matches!(
+                vfs.setattr(id, sattr3::default()).await.unwrap_err(),
+                nfsstat3::NFS3ERR_ROFS
+            ),
             "setattr"
         );
-        assert_eq!(vfs.write(id, 0, b"x").await.unwrap_err(), rofs, "write");
-        assert_eq!(
-            vfs.create(root, &filename3::from(b"n".to_vec()), sattr3::default())
-                .await
-                .unwrap_err(),
-            rofs,
+        assert!(
+            matches!(
+                vfs.write(id, 0, b"x").await.unwrap_err(),
+                nfsstat3::NFS3ERR_ROFS
+            ),
+            "write"
+        );
+        assert!(
+            matches!(
+                vfs.create(root, &filename3::from(b"n".to_vec()), sattr3::default())
+                    .await
+                    .unwrap_err(),
+                nfsstat3::NFS3ERR_ROFS
+            ),
             "create"
         );
-        assert_eq!(
-            vfs.create_exclusive(root, &filename3::from(b"e".to_vec()))
-                .await
-                .unwrap_err(),
-            rofs,
+        assert!(
+            matches!(
+                vfs.create_exclusive(root, &filename3::from(b"e".to_vec()))
+                    .await
+                    .unwrap_err(),
+                nfsstat3::NFS3ERR_ROFS
+            ),
             "create_exclusive"
         );
-        assert_eq!(
-            vfs.mkdir(root, &filename3::from(b"d".to_vec()))
-                .await
-                .unwrap_err(),
-            rofs,
+        assert!(
+            matches!(
+                vfs.mkdir(root, &filename3::from(b"d".to_vec()))
+                    .await
+                    .unwrap_err(),
+                nfsstat3::NFS3ERR_ROFS
+            ),
             "mkdir"
         );
-        assert_eq!(
-            vfs.remove(root, &filename3::from(b"keep.txt".to_vec()))
-                .await
-                .unwrap_err(),
-            rofs,
+        assert!(
+            matches!(
+                vfs.remove(root, &filename3::from(b"keep.txt".to_vec()))
+                    .await
+                    .unwrap_err(),
+                nfsstat3::NFS3ERR_ROFS
+            ),
             "remove"
         );
-        assert_eq!(
-            vfs.rename(
-                root,
-                &filename3::from(b"keep.txt".to_vec()),
-                root,
-                &filename3::from(b"moved".to_vec())
-            )
-            .await
-            .unwrap_err(),
-            rofs,
+        assert!(
+            matches!(
+                vfs.rename(
+                    root,
+                    &filename3::from(b"keep.txt".to_vec()),
+                    root,
+                    &filename3::from(b"moved".to_vec())
+                )
+                .await
+                .unwrap_err(),
+                nfsstat3::NFS3ERR_ROFS
+            ),
             "rename"
         );
-        assert_eq!(
-            vfs.symlink(
-                root,
-                &filename3::from(b"lnk".to_vec()),
-                &nfspath3::from(b"x".to_vec()),
-                &sattr3::default()
-            )
-            .await
-            .unwrap_err(),
-            rofs,
+        assert!(
+            matches!(
+                vfs.symlink(
+                    root,
+                    &filename3::from(b"lnk".to_vec()),
+                    &nfspath3::from(b"x".to_vec()),
+                    &sattr3::default()
+                )
+                .await
+                .unwrap_err(),
+                nfsstat3::NFS3ERR_ROFS
+            ),
             "symlink"
         );
     });
