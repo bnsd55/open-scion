@@ -285,6 +285,12 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Security
 
+- A blame cursor that claims an impossible line count is refused as a
+  bad cursor (`#288`): the count is the client's word, and its
+  per-line memory cost was multiplied without an overflow check, so a
+  count of 2^57 wrapped to zero and the walk went on to size its
+  window from the count - one request could stop the server.
+
 - The server refuses a data directory that group or others can write, or
   that sits under a directory another user can change: the blobs and the
   metadata are only as private as their directory (`#197`).
