@@ -119,7 +119,8 @@ fn land(store: &Backend) {
 /// A server that serves TLS, and its https address.
 async fn serve_tls(certs: &TestCerts) -> String {
     let tls =
-        scion_proto::runtime::tls::ServerTls::load(&certs.server_cert, &certs.server_key, None).unwrap();
+        scion_proto::runtime::tls::ServerTls::load(&certs.server_cert, &certs.server_key, None)
+            .unwrap();
     let store = Backend::open_test(&certs.dir.path().join("data")).unwrap();
     let data = certs.dir.path().join("data");
     land(&store);

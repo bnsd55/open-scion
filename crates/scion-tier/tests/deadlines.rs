@@ -18,7 +18,7 @@ use scion_proto::v1::{
     Encoding, GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, ObjectKind, ObjectPart,
     ObjectRef, ResolveRefRequest, ResolveRefResponse,
 };
-scion_proto::{Bytes, MAX_PART_MESSAGE_BYTES};
+use scion_proto::{Bytes, MAX_PART_MESSAGE_BYTES};
 use scion_tier::{MemoryStore, Tier};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;

@@ -15,7 +15,8 @@ use std::fs;
 use std::io::{self, BufRead as _, BufReader, BufWriter, ErrorKind, Read as _, Write as _};
 use std::path::Path;
 
-scion_proto::{Bytes}, scion_proto::runtime::check;
+use scion_proto::Bytes;
+use scion_proto::runtime::check;
 
 use crate::Key;
 use crate::store::{DiskStore, RECORD, Store as _, parse_record, push_record};

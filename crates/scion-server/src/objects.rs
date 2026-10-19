@@ -24,7 +24,7 @@ use scion_proto::v1::{
     Encoding, GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, ObjectKind, ObjectRef,
     ResolveRefRequest, ResolveRefResponse,
 };
-scion_proto::{Bytes, CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_PART_MESSAGE_BYTES};
+use scion_proto::{Bytes, CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_PART_MESSAGE_BYTES};
 use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 use tracing::Instrument as _;

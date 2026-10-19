@@ -166,7 +166,8 @@ async fn main() -> anyhow::Result<()> {
     });
     if let Some(metrics_listen) = cli.metrics_listen {
         let address = metrics_listen.to_string();
-        let checked = scion_proto::runtime::metrics::loopback_or_allow(metrics_listen, cli.insecure_listen);
+        let checked =
+            scion_proto::runtime::metrics::loopback_or_allow(metrics_listen, cli.insecure_listen);
         anyhow::ensure!(checked.is_ok(), "{}", checked.unwrap_err());
         let metrics_listener = tokio::net::TcpListener::bind(metrics_listen)
             .await

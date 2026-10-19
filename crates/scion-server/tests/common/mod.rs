@@ -24,7 +24,7 @@ use scion_proto::v1::{
     GetObjectsRequest, LandRequest, LandResponse, LandState, ObjectKind, ObjectRef, PutBlobRequest,
     ResolveRefRequest,
 };
-scion_proto::{CHUNK_BYTES, MAX_OBJECT_REFS};
+use scion_proto::{CHUNK_BYTES, MAX_OBJECT_REFS};
 use scion_server::meta::MetaTx as _;
 use scion_server::store::BlobStatus;
 use scion_server::{Backend, Store, tree};

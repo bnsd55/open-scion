@@ -20,7 +20,7 @@ use scion_proto::v1::{
     MergeBaseResponse, PutBlobRequest, PutBlobResponse, ReadFileRequest, ReadFileResponse,
     ResolveRefRequest, ResolveRefResponse,
 };
-scion_proto::{Bytes, CHUNK_BYTES, MAX_MESSAGE_BYTES};
+use scion_proto::{Bytes, CHUNK_BYTES, MAX_MESSAGE_BYTES};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio_stream::StreamExt;

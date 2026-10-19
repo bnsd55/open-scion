@@ -49,19 +49,21 @@ use scion_proto::runtime::auth::{Auth, Bearer};
 use scion_proto::runtime::check;
 use scion_proto::runtime::deadline::Until;
 use scion_proto::runtime::listen::{self, Limits};
-use scion_proto::runtime::object::{self, Assembler, Header, MAX_ENCODED_BYTES, UNPACK_BYTES, zstd_bound};
+use scion_proto::runtime::object::{
+    self, Assembler, Header, MAX_ENCODED_BYTES, UNPACK_BYTES, zstd_bound,
+};
 use scion_proto::runtime::reply::{
     self, BUSY_TIMEOUT, Body, IN_FLIGHT_BYTES, ObjectStream, Outgoing, STALL_TIMEOUT,
 };
-use scion_proto::ticket::Walk;
 use scion_proto::runtime::tls::{ClientTls, ServerTls};
+use scion_proto::ticket::Walk;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::objects_server::{Objects, ObjectsServer};
 use scion_proto::v1::{
     Encoding, GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, ObjectKind, ObjectPart,
     ObjectRef, ResolveRefRequest, ResolveRefResponse,
 };
-scion_proto::{Bytes, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES, MAX_PART_MESSAGE_BYTES};
+use scion_proto::{Bytes, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES, MAX_PART_MESSAGE_BYTES};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
@@ -570,13 +572,14 @@ impl<S: Store> Tier<S> {
         IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
     {
         // Outside the token check, so a refused call counts too.
-        let objects = scion_proto::runtime::metrics::MetricsLayer::new(Arc::clone(&self.inner.metrics))
-            .layer(InterceptedService::new(
-                ObjectsServer::new(self)
-                    .max_decoding_message_size(MAX_MESSAGE_BYTES)
-                    .max_encoding_message_size(MAX_PART_MESSAGE_BYTES),
-                Auth::new(token),
-            ));
+        let objects =
+            scion_proto::runtime::metrics::MetricsLayer::new(Arc::clone(&self.inner.metrics))
+                .layer(InterceptedService::new(
+                    ObjectsServer::new(self)
+                        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+                        .max_encoding_message_size(MAX_PART_MESSAGE_BYTES),
+                    Auth::new(token),
+                ));
         // The health service answers `grpc.health.v1.Check` and `Watch` on
         // the same port, without a token: a probe carries none. The store
         // and the upstream channel opened before this call, so the tier
