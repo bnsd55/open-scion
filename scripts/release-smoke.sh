@@ -131,7 +131,7 @@ run_story() {
 
   # Read the history the import made.
   "$BIN/scn" log -n 5 | grep -q third || die "step 'log' failed (umask $UMASK_RUN)"
-  "$BIN/scn" ls main:. | grep -q README.md || die "step 'ls' failed (umask $UMASK_RUN)"
+  "$BIN/scn" ls main | grep -q README.md || die "step 'ls' failed (umask $UMASK_RUN)"
   "$BIN/scn" cat main:README.md | grep -q 'A small repository' \
     || die "step 'cat' failed (umask $UMASK_RUN)"
   "$BIN/scn" blame main:README.md | grep -q . || die "step 'blame' failed (umask $UMASK_RUN)"
