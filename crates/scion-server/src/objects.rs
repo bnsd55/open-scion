@@ -476,12 +476,10 @@ impl Objects for ObjectsService {
             .collect::<Result<Vec<_>, Status>>()?;
         // Encodings that this server does not know are ignored.
         let zstd = accept.contains(&Encoding::Zstd.into());
-        // The walk pays as it goes, against the reply budget's capacity: a
-        // tree is handed to the walk only while the bytes it holds fit the
-        // capacity, a static cap, and the walk stops at the caller's
-        // deadline. The reply itself still waits for its share.
+        // The walk pays as it goes, against the reply budget's whole size
+        // (a static cap), and stops at the caller's deadline. The reply
+        // itself still waits for its share.
         let in_flight = Arc::clone(&self.in_flight);
-        let walk_budget = Arc::clone(&in_flight);
         let (allowed, decoded, keys) = self
             .worker
             .run(move |store| {
@@ -489,7 +487,7 @@ impl Objects for ObjectsService {
                     &store,
                     ticket.root_tree,
                     &refs,
-                    &walk_budget,
+                    IN_FLIGHT_BYTES,
                     waits.until.at(),
                 )?;
                 let keys = refs.into_iter().map(|(key, _)| key).collect();
@@ -521,21 +519,21 @@ impl Objects for ObjectsService {
 /// ones. A tree that `store` does not hold, or one whose bytes do not
 /// match its ID, refuses the ref.
 ///
-/// The walk pays as it goes, against the budget's capacity: a tree is
-/// handed to the walk only while the bytes it holds stay within the
-/// budget's whole size, `budget.capacity()`, and only while `until` is
-/// ahead. Past either, the walk stops before it decodes one more tree,
-/// with the same answer the reply would give. The capacity is a static
-/// cap, so a walk that would exceed it fails for a reason that no other
-/// reader's share changes; the reply itself still waits for its share.
+/// The walk pays as it goes, against the reply budget's whole size: a
+/// tree is handed to the walk only while the bytes it holds stay within
+/// `cap`, the budget's static total, and only while `until` is ahead.
+/// Past either, the walk stops before it decodes one more tree, with the
+/// same answer the reply would give. The cap never changes with other
+/// readers' shares, so a walk that would exceed it fails for a reason
+/// that no other reader changes; the reply itself still waits for its
+/// share.
 fn prove(
     store: &Backend,
     root: [u8; 32],
     refs: &[(Key, Vec<u8>)],
-    budget: &Semaphore,
+    cap: usize,
     until: Option<Instant>,
 ) -> Result<(HashSet<Key>, usize)> {
-    let cap = budget.capacity();
     let mut walk = scion_proto::ticket::Walker::new(root);
     let mut allowed = HashSet::new();
     // The bytes of the trees the walk holds, as the Walker counts them.
@@ -988,24 +986,22 @@ mod tests {
         let shared = Arc::new(Semaphore::new(1 << 20));
         shared.try_acquire_many((1 << 20) - 50).unwrap().forget();
         WALK_DECODED.store(0, Ordering::SeqCst);
-        let (_, decoded) = prove(&store, *root.as_bytes(), &refs, &shared, None).unwrap();
+        let (_, decoded) = prove(&store, *root.as_bytes(), &refs, 1 << 20, None).unwrap();
         let held = WALK_DECODED.load(Ordering::SeqCst);
         assert!(held > 50, "{held}");
         assert_eq!(decoded, held, "the reply takes what the walk decoded");
 
         // The budget fits the root but not the middle tree: the walk
         // hands the root over, and stops before it decodes the middle.
-        let budget = Arc::new(Semaphore::new(200));
         WALK_DECODED.store(0, Ordering::SeqCst);
-        let err = prove(&store, *root.as_bytes(), &refs, &budget, None).unwrap_err();
+        let err = prove(&store, *root.as_bytes(), &refs, 200, None).unwrap_err();
         assert!(matches!(err, Error::ResourceExhausted(_)), "{err:?}");
         let decoded = WALK_DECODED.load(Ordering::SeqCst);
         assert!(decoded > 0 && decoded <= 200, "{decoded}");
 
         // An expired deadline stops the walk before the first tree.
         let past = Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
-        let plenty = Arc::new(Semaphore::new(1 << 20));
-        let err = prove(&store, *root.as_bytes(), &refs, &plenty, past).unwrap_err();
+        let err = prove(&store, *root.as_bytes(), &refs, 1 << 20, past).unwrap_err();
         assert!(matches!(err, Error::DeadlineExceeded(_)), "{err:?}");
         assert_eq!(WALK_DECODED.load(Ordering::SeqCst), decoded);
     }
