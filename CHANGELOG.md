@@ -229,6 +229,11 @@ The first release: the server, its cache tiers, and the `scn` client.
   a parent once per child that reached it in its walk: the seen set now
   checks pushes, so the walk's queue is as wide as the graph's frontier
   instead of as wide as its edges.
+- A fill step reads the blob lengths its trees carry before its write
+  transaction, not under the one write lock: up to a step's changesets
+  of frame-header file reads sat between the lock's take and its
+  release. Kinds that never read lengths (the commit graph, the path
+  history) read no blob files at all.
 
 - A silent TLS peer holds its connection's place for at most the
   handshake timeout, not twice that: one deadline from the accept
