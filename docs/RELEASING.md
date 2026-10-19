@@ -63,15 +63,17 @@ A release is cut through one PR from a branch named
    git push origin v0.1.0
    ```
 
-   Then check the tag landed on the release commit:
+   Then check the tag landed on the release commit. An annotated tag
+   makes `git ls-remote` print the tag object's SHA, so compare the
+   peeled ref to the commit:
 
    ```sh
-   git ls-remote --tags origin v0.1.0
+   test "$(git ls-remote origin 'refs/tags/v0.1.0^{}' | cut -f1)" \
+     = "$(git rev-parse <the release commit>)"
    ```
 
-   The line it prints must name the commit the notes describe. If it
-   does not, stop and redo the tag per "Undoing a bad tag" before any
-   release notes point at it.
+   If the check fails, stop and redo the tag per "Undoing a bad tag"
+   before any release notes point at it.
 
 2. **GitHub release.** Open a release for the tag with the notes
    rebuilt from the `CHANGELOG.md` section of the version at that
