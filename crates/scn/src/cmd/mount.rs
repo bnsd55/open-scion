@@ -556,7 +556,7 @@ pub fn session_for_dir(dir: &Path) -> Result<MountRecord> {
 pub fn overlay_changes(record: &MountRecord) -> Result<Vec<(RepoPath, Change)>> {
     let mut changes = Vec::new();
     let tree = record.overlay.join(CHANGES);
-    walk_changes(&tree, "", &mut changes)?;
+    walk_changes(&tree, b"", &mut changes)?;
     // The recorded deletions, but not of a path that the overlay holds.
     for path in crate::vfs::read_deletes(&tree)? {
         if !changes.iter().any(|(known, _)| known == &path) {
@@ -568,7 +568,7 @@ pub fn overlay_changes(record: &MountRecord) -> Result<Vec<(RepoPath, Change)>> 
 }
 
 /// Walks one directory of the overlay, collecting its changes.
-fn walk_changes(dir: &Path, prefix: &str, out: &mut Vec<(RepoPath, Change)>) -> Result<()> {
+fn walk_changes(dir: &Path, prefix: &[u8], out: &mut Vec<(RepoPath, Change)>) -> Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -581,7 +581,7 @@ fn walk_changes(dir: &Path, prefix: &str, out: &mut Vec<(RepoPath, Change)>) -> 
         let rel = if prefix.is_empty() {
             name.as_bytes().to_vec()
         } else {
-            let mut rel = prefix.as_bytes().to_vec();
+            let mut rel = prefix.to_vec();
             rel.push(b'/');
             rel.extend_from_slice(name.as_bytes());
             rel
@@ -596,8 +596,7 @@ fn walk_changes(dir: &Path, prefix: &str, out: &mut Vec<(RepoPath, Change)>) -> 
             .file_type()
             .with_context(|| format!("cannot read {}", entry.path().display()))?;
         if kind.is_dir() {
-            let next = String::from_utf8_lossy(path.as_bytes()).into_owned();
-            walk_changes(&entry.path(), &next, out)?;
+            walk_changes(&entry.path(), &rel, out)?;
         } else if kind.is_symlink() {
             let target = std::fs::read_link(entry.path())?;
             let target = target.as_os_str().as_bytes().to_vec();
@@ -897,9 +896,12 @@ mod silent_failures {
             rev: "main".to_owned(),
             pid: sleeper.id(),
         };
-        // The stale record is taken over, and the sleeper lives on.
+        // The stale record is taken over, and the sleeper lives on. The
+        // lock state is polled with a ceiling: a fork of another test can
+        // hold this probe's lock until its child execs, and macOS is slow
+        // to exec, so one read right after a release can see it held.
         assert!(stop_serving(&known, &known.dir));
-        assert!(!serving(&known));
+        assert!(wait_for(2, || !serving(&known)));
         assert!(
             sleeper.try_wait().unwrap().is_none(),
             "an unrelated process was signalled"
