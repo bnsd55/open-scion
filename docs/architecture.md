@@ -1777,6 +1777,7 @@ into fixed buckets. The values are read on export only.
 | `scion_pg_pool_wait_seconds` | histogram | The time a call waited for a read connection of the Postgres reader pool. A rising tail means the readers are held by long walks; a call that waited past the pool's bound failed `unavailable`. |
 | `scion_pg_readers_busy` | gauge | Postgres read connections of the pool that are in use now, refreshed at each take and give-back. |
 | `scion_pg_tx_age_seconds` | gauge | Age of the oldest open Postgres read transaction, sampled every 5 s. Long ages hold a snapshot that keeps the database from cleaning old rows. |
+| `scion_gc_last_success_timestamp_seconds`, `scion_gc_duration_seconds`, `scion_gc_rows_pruned`, `scion_gc_files_removed` | gauge | Written by `scion-server gc --metrics-file` (section 6), not by the server's `/metrics`: the collector runs as its own process. The file holds the last finished run's end time, its duration, and the rows and files it collected, each with a `dry_run` label on every series, so a dry run cannot pass for a real one. The collector writes it atomically and only when the run succeeds, so a failed run leaves the old file whose timestamp goes stale — the alert is the age of the last success, on `dry_run="false"`. |
 
 The layer sits inside the axum router, around both gRPC services and
 outside the access checks. A refusal (bad token, unknown repo, a budget
