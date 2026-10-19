@@ -91,7 +91,7 @@ pub fn sign(
     root_tree: [u8; 32],
     now: u64,
 ) -> Result<Vec<u8>, String> {
-    crate::check::name("repo", repo)?;
+    crate::runtime::check::name("repo", repo)?;
     if principal.is_empty() {
         return Err("principal name is empty".into());
     }

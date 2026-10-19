@@ -15,7 +15,7 @@ use std::path::Path;
 
 use scion_core::{BlobId, ChangesetId, Entry, FileState, Tree, TreeId};
 use scion_proto::MAX_OBJECT_REFS;
-use scion_proto::object::{self, Assembler, Header};
+use scion_proto::runtime::object::{self, Assembler, Header};
 use scion_proto::v1::{
     Encoding, GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef, ResolveRefRequest,
 };

@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use clap::Parser;
-use scion_proto::check;
-use scion_proto::listen::{self, Limits};
-use scion_proto::tls::{ClientTls, ServerTls};
+use scion_proto::runtime::check;
+use scion_proto::runtime::listen::{self, Limits};
+use scion_proto::runtime::tls::{ClientTls, ServerTls};
 use scion_tier::{CACHE_UPSTREAM_TIMEOUT, MemoryStore, Tier, snapshot};
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::EnvFilter;
@@ -161,12 +161,13 @@ async fn main() -> anyhow::Result<()> {
     // alike.
     let (end_tx, end_rx) = tokio::sync::watch::channel(());
     tokio::spawn(async move {
-        scion_proto::metrics::shutdown_signal().await;
+        scion_proto::runtime::metrics::shutdown_signal().await;
         let _ = end_tx.send(());
     });
     if let Some(metrics_listen) = cli.metrics_listen {
         let address = metrics_listen.to_string();
-        let checked = scion_proto::metrics::loopback_or_allow(metrics_listen, cli.insecure_listen);
+        let checked =
+            scion_proto::runtime::metrics::loopback_or_allow(metrics_listen, cli.insecure_listen);
         anyhow::ensure!(checked.is_ok(), "{}", checked.unwrap_err());
         let metrics_listener = tokio::net::TcpListener::bind(metrics_listen)
             .await
@@ -175,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(listen = %metrics_addr, "serving metrics");
         let metrics = tier.metrics();
         let mut stopped = end_rx.clone();
-        tokio::spawn(scion_proto::metrics::serve(
+        tokio::spawn(scion_proto::runtime::metrics::serve(
             metrics_listener,
             metrics,
             async move {

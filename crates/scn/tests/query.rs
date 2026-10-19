@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, GitOid, IdentityTime, RepoPath};
-use scion_proto::listen::Limits;
+use scion_proto::runtime::listen::Limits;
 use scion_server::import::{ImportOptions, import_git};
 use scion_server::meta::Meta as _;
 use scion_server::meta::MetaTx as _;

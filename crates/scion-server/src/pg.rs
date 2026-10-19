@@ -33,7 +33,7 @@ use postgres::{Client, Config, NoTls};
 /// Shorthand for the owned query parameter.
 type P = Param;
 use scion_core::{BlobId, Changeset, ChangesetId, RepoPath, Tree, TreeId};
-use scion_proto::metrics::Metrics;
+use scion_proto::runtime::metrics::Metrics;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::auth::Caller;

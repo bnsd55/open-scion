@@ -6,9 +6,9 @@ mod common;
 use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, RepoPath, Tree, TreeId,
 };
-use scion_proto::auth::Bearer;
-use scion_proto::listen::Limits;
-use scion_proto::object::{Assembler, Header};
+use scion_proto::runtime::auth::Bearer;
+use scion_proto::runtime::listen::Limits;
+use scion_proto::runtime::object::{Assembler, Header};
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::{GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
 use scion_server::meta::MetaTx as _;
@@ -138,7 +138,7 @@ async fn get(
     while let Some(first) = stream.message().await? {
         let kind = ObjectKind::try_from(first.kind).unwrap();
         let mut object = Assembler::new(
-            scion_proto::object::Header::of(&first, false).unwrap(),
+            scion_proto::runtime::object::Header::of(&first, false).unwrap(),
             first,
         );
         while !object.is_done() {

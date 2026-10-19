@@ -13,9 +13,8 @@
 # The story is the one a reader of the README walks through, so a release
 # that fails here fails the front door, not an internal test seam.
 #
-# CI runs this on Linux. macOS does not run it in CI: a cold release build
-# there nearly doubles the job for a story that Linux already tells. Run
-# it by hand on a Mac before a release.
+# CI runs this on Linux and macOS (macos-15): the README quick start,
+# proved on every platform the project names.
 
 set -euo pipefail
 

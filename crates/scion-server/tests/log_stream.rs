@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use scion_core::{Changeset, FileState, RepoPath};
 use scion_proto::MAX_MESSAGE_BYTES;
-use scion_proto::auth::Bearer;
-use scion_proto::listen::Limits;
+use scion_proto::runtime::auth::Bearer;
+use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::BlameRequest;
 use scion_proto::v1::LogRequest;
 use scion_proto::v1::scion_client::ScionClient;
@@ -293,9 +293,9 @@ impl scion_proto::v1::scion_server::Scion for Huge {
 async fn a_unary_reply_over_the_message_limit_is_refused() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(scion_proto::listen::Limits::default().serve(
+    tokio::spawn(scion_proto::runtime::listen::Limits::default().serve(
         |mut server| server.add_service(service::into_server(Huge)),
-        scion_proto::listen::tcp(listener),
+        scion_proto::runtime::listen::tcp(listener),
         None,
         std::future::pending(),
     ));

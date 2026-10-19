@@ -21,8 +21,8 @@ use hashlink::LruCache;
 use rustix::fs::FlockOperation;
 use scion_core::{BlobId, TreeId};
 use scion_proto::Bytes;
-use scion_proto::auth::create_private_dir_all;
-use scion_proto::object::MAX_ENCODED_BYTES;
+use scion_proto::runtime::auth::create_private_dir_all;
+use scion_proto::runtime::object::MAX_ENCODED_BYTES;
 
 use crate::Key;
 
@@ -1681,7 +1681,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use scion_core::{BlobId, Tree};
-    use scion_proto::object;
+    use scion_proto::runtime::object;
 
     use super::*;
 

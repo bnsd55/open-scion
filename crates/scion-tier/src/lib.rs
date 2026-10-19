@@ -23,7 +23,7 @@
 //! to a client that accepts zstd, so a blob is packed once, on the server,
 //! and unpacked once, by the client that writes it.
 //!
-//! A `GetObjects` reply follows the server's rules ([`scion_proto::reply`]):
+//! A `GetObjects` reply follows the server's rules ([`scion_proto::runtime::reply`]):
 //! 1 to 1,000 objects per call, a reply stops after 64 MiB, each object takes
 //! its share of a byte budget before its bytes are read, and a reply ends when
 //! its client stops reading. Misses are fetched in batches, and concurrent
@@ -45,16 +45,18 @@ use std::{fmt, fs, io, iter};
 
 use anyhow::Context as _;
 use scion_core::{BlobId, Tree, TreeId};
-use scion_proto::auth::{Auth, Bearer};
-use scion_proto::check;
-use scion_proto::deadline::Until;
-use scion_proto::listen::{self, Limits};
-use scion_proto::object::{self, Assembler, Header, MAX_ENCODED_BYTES, UNPACK_BYTES, zstd_bound};
-use scion_proto::reply::{
+use scion_proto::runtime::auth::{Auth, Bearer};
+use scion_proto::runtime::check;
+use scion_proto::runtime::deadline::Until;
+use scion_proto::runtime::listen::{self, Limits};
+use scion_proto::runtime::object::{
+    self, Assembler, Header, MAX_ENCODED_BYTES, UNPACK_BYTES, zstd_bound,
+};
+use scion_proto::runtime::reply::{
     self, BUSY_TIMEOUT, Body, IN_FLIGHT_BYTES, ObjectStream, Outgoing, STALL_TIMEOUT,
 };
+use scion_proto::runtime::tls::{ClientTls, ServerTls};
 use scion_proto::ticket::Walk;
-use scion_proto::tls::{ClientTls, ServerTls};
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::objects_server::{Objects, ObjectsServer};
 use scion_proto::v1::{
@@ -397,7 +399,7 @@ struct Inner<S> {
     upstream_calls: Arc<AtomicU64>,
     /// The registry that counts objects served from the store and fetched
     /// from upstream, and, when the binary exports, the `Objects` calls.
-    metrics: Arc<scion_proto::metrics::Metrics>,
+    metrics: Arc<scion_proto::runtime::metrics::Metrics>,
     /// The reply budget, as on the server: object bytes read or copied for a
     /// reply and not yet taken by its client.
     in_flight: Arc<Semaphore>,
@@ -430,7 +432,7 @@ struct Progress {
 fn request_id_bytes<T>(request: &Request<T>) -> Option<&[u8]> {
     request
         .metadata()
-        .get(scion_proto::request_id::REQUEST_ID)
+        .get(scion_proto::runtime::request_id::REQUEST_ID)
         .map(tonic::metadata::MetadataValue::as_bytes)
 }
 
@@ -456,7 +458,7 @@ struct Ask {
     request_id: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     /// The handle of the caller's connection, which counts what a stalled
     /// reply leaves in HTTP/2.
-    stalled: Option<scion_proto::listen::Stalled>,
+    stalled: Option<scion_proto::runtime::listen::Stalled>,
 }
 
 impl<S: Store> Tier<S> {
@@ -513,7 +515,7 @@ impl<S: Store> Tier<S> {
                 timeout,
                 busy: BUSY_TIMEOUT,
                 upstream_calls,
-                metrics: Arc::new(scion_proto::metrics::Metrics::default()),
+                metrics: Arc::new(scion_proto::runtime::metrics::Metrics::default()),
                 in_flight: Arc::new(Semaphore::new(IN_FLIGHT_BYTES)),
                 fetch_slots: Arc::new(Semaphore::new(FETCH_SLOTS)),
                 fetching: Arc::new(Semaphore::new(FETCH_BYTES)),
@@ -545,7 +547,7 @@ impl<S: Store> Tier<S> {
 
     /// The registry this tier counts in: `scion-cache` exports it.
     #[must_use]
-    pub fn metrics(&self) -> Arc<scion_proto::metrics::Metrics> {
+    pub fn metrics(&self) -> Arc<scion_proto::runtime::metrics::Metrics> {
         Arc::clone(&self.inner.metrics)
     }
 
@@ -570,13 +572,14 @@ impl<S: Store> Tier<S> {
         IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
     {
         // Outside the token check, so a refused call counts too.
-        let objects = scion_proto::metrics::MetricsLayer::new(Arc::clone(&self.inner.metrics))
-            .layer(InterceptedService::new(
-                ObjectsServer::new(self)
-                    .max_decoding_message_size(MAX_MESSAGE_BYTES)
-                    .max_encoding_message_size(MAX_PART_MESSAGE_BYTES),
-                Auth::new(token),
-            ));
+        let objects =
+            scion_proto::runtime::metrics::MetricsLayer::new(Arc::clone(&self.inner.metrics))
+                .layer(InterceptedService::new(
+                    ObjectsServer::new(self)
+                        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+                        .max_encoding_message_size(MAX_PART_MESSAGE_BYTES),
+                    Auth::new(token),
+                ));
         // The health service answers `grpc.health.v1.Check` and `Watch` on
         // the same port, without a token: a probe carries none. The store
         // and the upstream channel opened before this call, so the tier
@@ -1160,7 +1163,7 @@ impl<S: Store> Flight<S> {
             if let Some(id) = &self.request_id {
                 request
                     .metadata_mut()
-                    .insert(scion_proto::request_id::REQUEST_ID, id.clone());
+                    .insert(scion_proto::runtime::request_id::REQUEST_ID, id.clone());
             }
             let mut upstream = self.tier.inner.upstream.clone();
             let mut stream = self
@@ -1315,10 +1318,10 @@ impl<S: Store> Objects for Tier<S> {
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<ObjectStream>, Status> {
         let until = Until::of(&request);
-        let stalled = scion_proto::listen::Stalled::of(&request);
+        let stalled = scion_proto::runtime::listen::Stalled::of(&request);
         // The caller's request ID, if it sent one that fits; else one this
         // process makes. The fetch to upstream carries it.
-        let request_id = scion_proto::request_id::sanitize(request_id_bytes(&request))
+        let request_id = scion_proto::runtime::request_id::sanitize(request_id_bytes(&request))
             .and_then(|id| id.parse().ok());
         let GetObjectsRequest {
             refs,
@@ -1379,13 +1382,13 @@ impl<S: Store> Objects for Tier<S> {
 /// Checks that only this user can reach `dir`: a real directory (not a
 /// symlink), owned by the effective user, with no access for group or
 /// others, under directories that no other user can change
-/// ([`check_ancestors`](scion_proto::auth::check_ancestors)). Then nobody
+/// ([`check_ancestors`](scion_proto::runtime::auth::check_ancestors)). Then nobody
 /// else can read what is inside, or put a file there. Returns `dir` with its
 /// parent resolved: use it, not `dir`, so no symlink is followed again.
 /// Fails with `PermissionDenied`, naming the rule that `dir` breaks.
 pub(crate) fn check_private_dir(dir: &Path) -> io::Result<std::path::PathBuf> {
     let me = rustix::process::geteuid().as_raw();
-    let dir = scion_proto::auth::check_ancestors(dir, me)?;
+    let dir = scion_proto::runtime::auth::check_ancestors(dir, me)?;
     let meta = fs::symlink_metadata(&dir)?;
     let refuse = |why: &str| {
         Err(io::Error::new(

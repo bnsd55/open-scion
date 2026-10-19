@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use scion_core::{BlobId, Entry, FileState, PathElem, Tree};
 use scion_proto::CHUNK_BYTES;
-use scion_proto::listen::Limits;
-use scion_proto::object::{self, Assembler, Header};
-use scion_proto::tls::{ClientTls, ServerTls};
+use scion_proto::runtime::listen::Limits;
+use scion_proto::runtime::object::{self, Assembler, Header};
+use scion_proto::runtime::tls::{ClientTls, ServerTls};
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::objects_server::{Objects, ObjectsServer};
 use scion_proto::v1::{

@@ -12,10 +12,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use scion_core::{BlobId, TreeId};
-use scion_proto::auth::{Auth, Caller};
-use scion_proto::deadline::Until;
-use scion_proto::object::{self, Header, zstd_bound};
-use scion_proto::reply::{
+use scion_proto::runtime::auth::{Auth, Caller};
+use scion_proto::runtime::deadline::Until;
+use scion_proto::runtime::object::{self, Header, zstd_bound};
+use scion_proto::runtime::reply::{
     self, BUSY_TIMEOUT, Body, Found, IN_FLIGHT_BYTES, ObjectStream, Outgoing, STALL_TIMEOUT,
 };
 use scion_proto::ticket::Walk;
@@ -256,7 +256,7 @@ struct Reply {
     waits: Waits,
     /// The handle of the caller's connection: the reply counts what it
     /// leaves in HTTP/2 on it.
-    stalled: Option<scion_proto::listen::Stalled>,
+    stalled: Option<scion_proto::runtime::listen::Stalled>,
     /// The quota slot of the ticket's principal, held to the stream's end.
     call: Call,
 }
@@ -443,13 +443,13 @@ impl Objects for ObjectsService {
         };
         // The handle of the caller's connection, before the request is taken
         // apart: the reply counts what it leaves in HTTP/2 on it.
-        let stalled = scion_proto::listen::Stalled::of(&request);
+        let stalled = scion_proto::runtime::listen::Stalled::of(&request);
         let GetObjectsRequest {
             refs,
             accept,
             ticket,
         } = request.into_inner();
-        scion_proto::check::object_count(refs.len())?;
+        scion_proto::runtime::check::object_count(refs.len())?;
         // The ticket is the only permission an object read has: it names
         // the repo and the root tree, and every object must be reachable
         // from that tree over the path that its ref names. An object ID
@@ -595,7 +595,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use scion_proto::CHUNK_BYTES;
-    use scion_proto::object::Assembler;
+    use scion_proto::runtime::object::Assembler;
     use tokio_stream::StreamExt as _;
     use tonic::Code;
 
