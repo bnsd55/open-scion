@@ -87,6 +87,21 @@ jobs:
               tail -80 "$log"
               exit 1
             fi
+            # A filter that matches nothing also passes in 0.15 s, so
+            # each green rep must prove the race ran at all: the flaky
+            # test itself passed, and the pass count reached the floor
+            # the two filters matched when measured (18: 15 in
+            # cmd::mount, 3 in cmd::commit; raise the floor if the
+            # suites grow).
+            grep -qF 'test cmd::mount::silent_failures::an_unmount_does_not_signal_an_unrelated_process ... ok' "$log" || {
+              echo "run $i: the filters ran too few tests: the flaky test is absent"; tail -5 "$log"; exit 1
+            }
+            passed=$(sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' "$log" | head -1)
+            if [ -z "$passed" ] || [ "$passed" -lt 18 ]; then
+              echo "run $i: the filters ran too few tests ($passed passed, floor 18)"
+              tail -5 "$log"
+              exit 1
+            fi
             echo "run $i/$REPS ok"
           done
       - name: upload the failing run's log
