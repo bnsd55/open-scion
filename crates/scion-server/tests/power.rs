@@ -847,7 +847,9 @@ async fn import_process_races_the_server_on_the_same_blob() {
         .unwrap();
     // One blob both processes write: the import commits it, the client
     // puts it, and the park holds the server's writer between keep and
-    // rename while the import renames the same path.
+    // rename. The writer holds the fan-out directory's flock while it
+    // sits in the park, so the import's write of the same blob waits
+    // for it: no rename of the blob lands while the park holds.
     let content = rng.bytes(2 << 10);
     let want = BlobId::of(&content);
     arm_park(&data, &want);
@@ -862,8 +864,8 @@ async fn import_process_races_the_server_on_the_same_blob() {
     // kernel's cache, so the trace cannot show the park itself.
     let mut put = tokio::spawn(async move { put_blob(&mut scion, &content).await });
     wait_parked(&data.join("hooks"), &want);
-    // Only now the import runs: its rename lands while the server holds
-    // the stripe and sits in the park.
+    // Only now the import runs. Its write of the blob waits for the
+    // writer's flock, the way any other process's write would.
     let import = common::spawn_guard::across_spawn(|| {
         Command::new(env!("CARGO_BIN_EXE_scion-server"))
             .args([
@@ -882,13 +884,13 @@ async fn import_process_races_the_server_on_the_same_blob() {
     })
     .unwrap();
     let import_handle = Mutex::new(Some(std::thread::spawn(move || import.wait_with_output())));
-    // The trace names every rename. The dest path splits the ID: its
-    // first two hex digits name the folder, the remaining sixty-two name
-    // the file, so the needle is the tail.
+    // The dest path of a rename splits the ID: its first two hex digits
+    // name the folder, the remaining sixty-two name the file, so the
+    // needle is the tail.
     let blob_name = want.to_string()[2..].to_owned();
-    let import_from = wait_for_rename(&lazy.trace, &blob_name, 240, None);
-    // The release ends the park: the server's rename lands after the
-    // import's, on the same path, from its own tmp folder.
+    // The release ends the park: the server's writer renames the blob,
+    // answers the put, and drops the flock; the import's write that
+    // waited for it finds the blob stored and keeps it.
     release_park(&lazy.mount.join("data"), &want);
     let id = tokio::time::timeout(Duration::from_secs(30), &mut put)
         .await
@@ -897,25 +899,20 @@ async fn import_process_races_the_server_on_the_same_blob() {
         .unwrap();
     assert_eq!(id, want);
     wait_import(&import_handle);
-    // The order is the point: the server's rename of the raced blob
-    // lands after the import's, from another tmp folder. A second rename
-    // never came, and the park never held: the seam failed.
-    let server_from = wait_for_rename(&lazy.trace, &blob_name, 60, Some(&import_from));
-    // Compare the offsets of the matched rename lines themselves: a from
-    // path also names the temp file's earlier create and write, so a
-    // first-occurrence search would measure the wrong line.
+    // The order is the point: the two processes are ordered by the
+    // fan-out directory's flock, so the import's write of the blob
+    // never renamed it mid-put. The trace names every rename, and the
+    // dest path splits the ID: its first two hex digits name the
+    // folder, the remaining sixty-two name the file, so the needle is
+    // the tail. Exactly one rename of the blob landed - the server's;
+    // on a build without the flock the import's rename lands first and
+    // the server's follows it, two renames of one blob.
     let trace = fs::read_to_string(&lazy.trace).unwrap_or_default();
-    let offset = |from: &str| {
-        trace.lines().enumerate().find_map(|(n, line)| {
-            (line.contains("lfs_rename") && line.contains(&format!("from={from},"))).then_some(n)
-        })
-    };
-    let import_at = offset(&import_from).unwrap_or(usize::MAX);
-    let server_at = offset(&server_from).unwrap_or(0);
-    assert!(
-        server_at > import_at,
-        "the server's rename did not land after the import's"
-    );
+    let renames = trace
+        .lines()
+        .filter(|line| line.contains("lfs_rename") && line.contains(&blob_name))
+        .count();
+    assert_eq!(renames, 1, "the blob was renamed {renames} times");
     server.freeze();
     lazy.cut();
     // The client moved into the parked put's task: it ends with it.
@@ -996,35 +993,4 @@ fn one_file_repo(git_dir: &Path, content: &[u8]) {
     fs::write(git_dir.join("f.bin"), content).unwrap();
     git(git_dir, &["add", "."]);
     git(git_dir, &["commit", "-q", "-m", "the race"]);
-}
-
-/// The from path of one `lfs_rename` ops line: the writer's temp folder
-/// names the process that ran it.
-fn from_of(line: &str) -> String {
-    let body = line.split("lfs_rename(from=").nth(1).unwrap_or(line);
-    let to = body.find(",to=").unwrap_or(body.len());
-    body[..to].to_owned()
-}
-
-/// Waits for a rename of the named blob in the ops trace, and returns
-/// the from path of the first line that matches. `not_from` skips one
-/// writer's temp folder, so the second wait sees only the other one.
-fn wait_for_rename(trace: &Path, blob_name: &str, secs: u64, not_from: Option<&str>) -> String {
-    let until = Instant::now() + Duration::from_secs(secs);
-    loop {
-        let text = fs::read_to_string(trace).unwrap_or_default();
-        let line = text.lines().find(|line| {
-            line.contains("lfs_rename")
-                && line.contains(blob_name)
-                && not_from.is_none_or(|from| !line.contains(from))
-        });
-        if let Some(line) = line {
-            return from_of(line);
-        }
-        assert!(
-            Instant::now() < until,
-            "no rename of {blob_name} landed within {secs} s"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
 }

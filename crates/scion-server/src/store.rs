@@ -926,6 +926,12 @@ pub enum BlobStatus {
     Corrupt,
 }
 
+/// The held fan-out directory flock of a blob: the handle's close
+/// releases the lock, so a drop is enough and a crash holds nothing.
+pub(crate) struct DirFlock {
+    _file: fs::File,
+}
+
 /// Immutable file contents, one zstd-compressed file per [`BlobId`].
 pub struct Blobs {
     root: PathBuf,
@@ -1126,6 +1132,32 @@ impl Blobs {
         self.write_locks[stripe]
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Holds the fan-out directory of `id` against the file work of
+    /// another process: the rename of a put, the touch of a keep, and
+    /// the re-stat and unlink of the collector's sweep all run under it,
+    /// so a touch or rename that lands first changes the mtime the sweep
+    /// re-stats, and an unlink that lands first makes the put's keep see
+    /// a missing file and write anew. The metadata transaction orders the
+    /// rows; the file work itself needs this lock. Always taken inside
+    /// the stripe of the blob: the lock order is stripe, then dir flock,
+    /// everywhere. The kernel releases it when the handle drops, so a
+    /// crashed process holds nothing.
+    pub(crate) fn dir_flock(&self, id: BlobId) -> io::Result<DirFlock> {
+        let (dir, _) = self.location(id);
+        // A first put reaches here before anything created the fan-out
+        // directory; create it, the way the write below would.
+        let file = match fs::File::open(&dir) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir_all(&dir)?;
+                fs::File::open(&dir)?
+            }
+            Err(e) => return Err(e),
+        };
+        flock(&file, FlockOperation::LockExclusive)?;
+        Ok(DirFlock { _file: file })
     }
 
     /// Removes what crashes left in `tmp/`: the folders of processes that no
@@ -1888,8 +1920,10 @@ impl BlobBatch<'_> {
     fn write(&mut self, id: BlobId, len: usize, raw: impl Read) -> Result<()> {
         // One blob, one writer: the lock spans the check of the stored
         // file, the touch of a kept one, and the rename that replaces it
-        // (see `Blobs::write_lock`).
+        // (see `Blobs::write_lock`). The dir flock under it orders this
+        // file work against the collector's sweep in another process.
         let _write = self.blobs.write_lock(id);
+        let _dir = self.blobs.dir_flock(id)?;
         match self.keep(id)? {
             BlobStatus::Valid => {
                 // A put that keeps the stored copy writes nothing, so the
@@ -1991,8 +2025,10 @@ impl BlobBatch<'_> {
     /// rename.
     fn replace_stored(&mut self, id: BlobId, len: usize, raw: impl Read) -> Result<()> {
         // The rename below lands on the same path as any other write of
-        // this blob, so it waits for the same stripe.
+        // this blob, so it waits for the same stripe, and under it the
+        // dir flock orders the rename against the collector's sweep.
         let _write = self.blobs.write_lock(id);
+        let _dir = self.blobs.dir_flock(id)?;
         self.blobs.full_flush()?;
         // The same test seam as `write`: a put of a blob the repo does
         // not have yet takes this path, and the race test parks it here.

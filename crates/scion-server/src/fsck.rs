@@ -194,12 +194,22 @@ fn check_blob_files(store: &Backend, report: &mut Report) -> crate::error::Resul
             }
             match store.blobs().verify(id) {
                 Ok(BlobStatus::Valid) => {}
-                Ok(BlobStatus::Missing) => report.problem(Problem::new(
-                    "blob-missing",
-                    id.to_string(),
-                    Some(path),
-                    "gone when checked".into(),
-                )),
+                Ok(BlobStatus::Missing) => {
+                    // The collector runs beside this check and unlinks
+                    // the files no row names, so a listed file can be
+                    // gone by the time it is checked. Report damage
+                    // only when a row names the blob, or the file is
+                    // still gone after a second check and a row names
+                    // it (see `missing_is_damage`).
+                    if missing_is_damage(store, id) {
+                        report.problem(Problem::new(
+                            "blob-missing",
+                            id.to_string(),
+                            Some(path),
+                            "gone when checked".into(),
+                        ));
+                    }
+                }
                 Ok(BlobStatus::Corrupt) => report.problem(Problem::new(
                     "blob-corrupt",
                     id.to_string(),
@@ -444,16 +454,38 @@ fn check_repo_blobs(
     Ok(())
 }
 
+/// Whether a blob file a check found missing is damage. The check
+/// looks again first: a racing put may have rewritten the file between
+/// the two looks. When it is still gone, a row naming it makes it
+/// damage; a file no row names was an orphan the collector took.
+fn missing_is_damage(store: &Backend, blob: BlobId) -> bool {
+    if store.blobs().open_file(blob).is_ok() {
+        return false;
+    }
+    store
+        .read(|c| c.any_repo_names(blob.as_bytes()))
+        .unwrap_or(true)
+}
+
 /// Whether the file of `blob` exists at the moment of the check.
 fn named_blob_exists(store: &Backend, blob: BlobId, report: &mut Report, why: &str) {
     match store.blobs().open_file(blob) {
         Ok(_) => {}
-        Err(crate::error::Error::NotFound(_)) => report.problem(Problem::new(
-            "blob-missing",
-            blob.to_string(),
-            Some(store.blobs().location(blob).1),
-            why.into(),
-        )),
+        Err(crate::error::Error::NotFound(_)) => {
+            // The collector runs beside this check and owns the files
+            // no row names, so a file that vanished while it was being
+            // checked is not damage when no row names it: the collector
+            // took an orphan. A row-named file is damage whatever the
+            // collector did.
+            if missing_is_damage(store, blob) {
+                report.problem(Problem::new(
+                    "blob-missing",
+                    blob.to_string(),
+                    Some(store.blobs().location(blob).1),
+                    why.into(),
+                ));
+            }
+        }
         Err(e) => report.problem(Problem::new(
             "blob-corrupt",
             blob.to_string(),
@@ -654,6 +686,43 @@ mod tests {
         let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(report.is_clean(), "{:?}", kinds(&report));
         assert!(report.old.is_empty());
+    }
+
+    /// A file that vanished while it was being checked is damage only
+    /// when a row names the blob: the collector runs beside the check
+    /// and owns the files no row names.
+    #[test]
+    fn a_missing_file_no_row_names_is_the_collectors_orphan_not_damage() {
+        let (_dir, store, _) = store();
+        let id = store.blobs().put(b"orphan\n").unwrap();
+        let (_, path) = store.blobs().location(id);
+        std::fs::remove_file(&path).unwrap();
+        assert!(!missing_is_damage(&Backend::Sqlite(store.clone()), id));
+    }
+
+    #[test]
+    fn a_missing_file_a_row_names_is_damage() {
+        let (_dir, store, _) = store();
+        let id = store.blobs().put(b"kept\n").unwrap();
+        store
+            .write(|c| {
+                let mut tx = SqliteTx(c);
+                let repo = tx.repo_id(REPO)?;
+                tx.add_repo_blob(repo, id)
+            })
+            .unwrap();
+        let (_, path) = store.blobs().location(id);
+        std::fs::remove_file(&path).unwrap();
+        assert!(missing_is_damage(&Backend::Sqlite(store.clone()), id));
+    }
+
+    /// A file that is back between the two looks of the check was
+    /// rewritten by a racing put: not damage.
+    #[test]
+    fn a_file_back_between_the_two_looks_is_not_damage() {
+        let (_dir, store, _) = store();
+        let id = store.blobs().put(b"again\n").unwrap();
+        assert!(!missing_is_damage(&Backend::Sqlite(store.clone()), id));
     }
 
     /// The blob of the first put of the changeset `id`.
