@@ -100,9 +100,8 @@ impl std::error::Error for DecodeError {}
 impl Changeset {
     /// Encodes the changeset in the v1 canonical format.
     ///
-    /// # Panics
-    ///
-    /// If a field is longer than `u32::MAX` bytes or items.
+    /// A value a constructor built, or the decoder returned, always
+    /// encodes: the constructors refuse what the format cannot carry.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut w = vec![VERSION];
@@ -221,9 +220,8 @@ impl Changeset {
 impl Tree {
     /// Encodes the tree in the v1 canonical format.
     ///
-    /// # Panics
-    ///
-    /// If a field is longer than `u32::MAX` bytes or items.
+    /// A value a constructor built, or the decoder returned, always
+    /// encodes: the constructors refuse what the format cannot carry.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut w = vec![VERSION];
@@ -312,8 +310,9 @@ fn put_len(w: &mut Vec<u8>, len: usize) {
     // constructor or by the decoder, whose lengths come from u32be fields.
     debug_assert!(len <= MAX_FIELD, "object field longer than u32::MAX");
     // A release build that somehow broke the invariant writes u32::MAX
-    // rather than a truncated neighbor: the object's ID then fails its
-    // check, and no stored byte is silently misread.
+    // rather than a truncated neighbor: the bytes no longer decode
+    // (UnexpectedEnd, TrailingBytes), and encode_with_id hashes the bytes
+    // it wrote, so no stored byte is silently misread.
     let len = u32::try_from(len).unwrap_or(u32::MAX);
     w.extend_from_slice(&len.to_be_bytes());
 }
