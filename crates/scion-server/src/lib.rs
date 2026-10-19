@@ -1,6 +1,6 @@
 //! Scion server: durable storage, server-side commits and lands, and reads.
 //!
-//! This is the storage and serving crate of [open-scion]: the bottom of the
+//! This is the storage and serving crate of [openscion]: the bottom of the
 //! system above the object model ([`scion-core`]), holding the metadata and
 //! blobs, doing commits, lands and reads, and serving the API of
 //! [`scion-proto`](https://docs.rs/open-scion-proto) to the client
@@ -11,7 +11,7 @@
 //! Postgres instead of the data directory; the blobs stay on local disk in
 //! both. The operations guide, `docs/operations.md`, covers both shapes.
 //!
-//! [open-scion]: https://github.com/bnsd55/open-scion
+//! [openscion]: https://github.com/bnsd55/openscion
 //! [`scion-core`]: https://docs.rs/open-scion-core
 //! [`scn`]: https://docs.rs/open-scion
 //!

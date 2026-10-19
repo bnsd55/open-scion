@@ -25,7 +25,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -103,11 +103,23 @@ pub struct Sent {
 
 /// The `GetObjects` reply: the parts from the channel. If the channel closes
 /// in the middle of an object, the reply ends with `DEADLINE_EXCEEDED`.
-#[derive(Debug)]
 pub struct ObjectStream {
     rx: mpsc::Receiver<Sent>,
     /// The last part taken did not end its object.
     in_object: bool,
+    /// Where the reply parks its stall count, if it stalled. Dropping the
+    /// body drops the parked count with it: the stream is what the stalled
+    /// bytes are counted against.
+    stall: StallSlot,
+}
+
+impl std::fmt::Debug for ObjectStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectStream")
+            .field("in_object", &self.in_object)
+            .field("stall", &self.stall)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Stream for ObjectStream {
@@ -132,15 +144,47 @@ impl Stream for ObjectStream {
     }
 }
 
-/// A new reply: the sender for [`send_objects`] and the stream for tonic.
+/// A new reply: the sender for [`send_objects`], the stream for tonic, and
+/// the slot that carries the reply's stall count — `send_objects` parks it
+/// there when the reply stalls, and the count goes when the stream does.
 #[must_use]
-pub fn channel() -> (mpsc::Sender<Sent>, ObjectStream) {
+pub fn channel() -> (mpsc::Sender<Sent>, ObjectStream, StallSlot) {
     let (tx, rx) = mpsc::channel(1);
+    let stall = StallSlot::default();
     let stream = ObjectStream {
         rx,
         in_object: false,
+        stall: stall.clone(),
     };
-    (tx, stream)
+    (tx, stream, stall)
+}
+
+/// Where a stalled reply parks the [`crate::runtime::listen::Stall`] its
+/// count comes back with, until the reply's body drops: its stream ended —
+/// it finished, its client reset it, or the connection closed. One slot per
+/// reply, made with the reply by [`channel`].
+#[derive(Clone, Default)]
+pub struct StallSlot(Arc<Mutex<Option<crate::runtime::listen::Stall>>>);
+
+impl StallSlot {
+    /// Parks `stall`. A reply parks at most once, on the stall that ends
+    /// it; a second park gives the first count back.
+    fn park(&self, stall: crate::runtime::listen::Stall) {
+        let _ = self
+            .0
+            .lock()
+            .expect("the stall slot lock is not poisoned")
+            .replace(stall);
+    }
+}
+
+impl std::fmt::Debug for StallSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let parked = self.0.try_lock().is_ok_and(|stall| stall.is_some());
+        f.debug_struct("StallSlot")
+            .field("parked", &parked)
+            .finish()
+    }
 }
 
 /// The share of the budget for `bytes` bytes: at least 1, at most
@@ -254,14 +298,17 @@ impl Parts {
 /// A stall leaves the reply's parts in HTTP/2, where no budget counts them
 /// ([`crate::runtime::listen`]), so `stalled` — the handle of the connection, from
 /// [`crate::runtime::listen::Stalled::of`] — takes the estimate
-/// [`STALLED_REPLY_BYTES`] onto its connection's count. `None` when there
-/// is no such connection (tests, or a transport without the count).
+/// [`STALLED_REPLY_BYTES`] onto its connection's count, and the reply parks
+/// it in `slot`, which gives it back when the reply's body drops. `None`
+/// when there is no such connection (tests, or a transport without the
+/// count).
 pub async fn send_objects<K, F>(
     first: Found,
     keys: impl IntoIterator<Item = K>,
     tx: mpsc::Sender<Sent>,
     stall: Duration,
     stalled: Option<crate::runtime::listen::Stalled>,
+    slot: StallSlot,
     produce: impl Fn(K) -> F,
 ) where
     F: Future<Output = Option<Found>>,
@@ -283,7 +330,7 @@ pub async fn send_objects<K, F>(
                     // It stopped reading: the parts stay in HTTP/2.
                     Err(_) => {
                         if let Some(stalled) = &stalled {
-                            stalled.add(STALLED_REPLY_BYTES);
+                            slot.park(stalled.hold(STALLED_REPLY_BYTES));
                         }
                     }
                 }
@@ -302,11 +349,11 @@ pub async fn send_objects<K, F>(
                 // the stream then ends with `DEADLINE_EXCEEDED`.
                 Ok(Err(_)) => return,
                 // Stalled: the parts stay in HTTP/2 until the connection
-                // ends. Count them, so a connection that stalls too much is
-                // closed with them.
+                // ends or the client resets the stream. Count them, so a
+                // connection that stalls too much is closed with them.
                 Err(_) => {
                     if let Some(stalled) = &stalled {
-                        stalled.add(STALLED_REPLY_BYTES);
+                        slot.park(stalled.hold(STALLED_REPLY_BYTES));
                     }
                     return;
                 }
@@ -365,7 +412,7 @@ mod tests {
         for whole in [true, false] {
             let budget = Arc::new(Semaphore::new(IN_FLIGHT_BYTES));
             let permit = take(&budget, len, BUSY_TIMEOUT).await.unwrap();
-            let (tx, mut stream) = channel();
+            let (tx, mut stream, _slot) = channel();
             let object = blob(len, whole);
             // Where the bytes of a whole buffer are.
             let buffer = match &object.body {
@@ -374,9 +421,15 @@ mod tests {
             };
             let first = (Ok(object), permit);
             let stall = Duration::from_secs(10);
-            let reply = tokio::spawn(send_objects(first, [(); 0], tx, stall, None, |()| async {
-                None
-            }));
+            let reply = tokio::spawn(send_objects(
+                first,
+                [(); 0],
+                tx,
+                stall,
+                None,
+                StallSlot::default(),
+                |()| async { None },
+            ));
             let held = || IN_FLIGHT_BYTES - budget.available_permits();
 
             // Each part is a buffer of its own. The share stays until the
@@ -407,12 +460,18 @@ mod tests {
         let len = 2 * CHUNK_BYTES + 1;
         let budget = Arc::new(Semaphore::new(IN_FLIGHT_BYTES));
         let permit = take(&budget, len, BUSY_TIMEOUT).await.unwrap();
-        let (tx, mut stream) = channel();
+        let (tx, mut stream, _slot) = channel();
         let stall = Duration::from_millis(50);
         let first = (Ok(blob(len, true)), permit);
-        let reply = tokio::spawn(send_objects(first, [(); 0], tx, stall, None, |()| async {
-            None
-        }));
+        let reply = tokio::spawn(send_objects(
+            first,
+            [(); 0],
+            tx,
+            stall,
+            None,
+            StallSlot::default(),
+            |()| async { None },
+        ));
 
         // The client takes one part and stops. The second part waits in the
         // channel, the third stalls, and the reply ends. Its object and its
@@ -436,5 +495,43 @@ mod tests {
         assert_eq!(budget.available_permits(), 80);
         trim(&mut permit, 0);
         assert_eq!(budget.available_permits(), 99);
+    }
+
+    /// A reply that stalls on its connection counts its estimate onto the
+    /// process's gauge, and gives it back when the reply's body drops —
+    /// here, the test dropping the stream. This is what keeps a connection
+    /// that serves stall after stall from ratcheting its count up to the
+    /// close limit for bytes it no longer holds.
+    #[tokio::test]
+    async fn a_stalled_reply_counts_until_its_body_drops() {
+        use crate::runtime::listen::Stalled;
+        use crate::runtime::metrics::Metrics;
+
+        let metrics = Arc::new(Metrics::default());
+        let stalled = Stalled::new(STALLED_REPLY_BYTES * 2, Arc::clone(&metrics));
+        let budget = Arc::new(Semaphore::new(IN_FLIGHT_BYTES));
+        let permit = take(&budget, 3 * CHUNK_BYTES, BUSY_TIMEOUT).await.unwrap();
+        let (tx, mut stream, slot) = channel();
+        let stall = Duration::from_millis(50);
+        let first = (Ok(blob(3 * CHUNK_BYTES, true)), permit);
+        let reply = tokio::spawn(send_objects(
+            first,
+            [(); 0],
+            tx,
+            stall,
+            Some(stalled),
+            slot,
+            |()| async { None },
+        ));
+
+        // The first part goes out; the next one stalls, and the reply ends.
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.data.len(), CHUNK_BYTES);
+        reply.await.unwrap();
+        until(|| metrics.stalled_reply_bytes() >= STALLED_REPLY_BYTES).await;
+
+        // Dropping the body drops the parked count with it.
+        drop(stream);
+        until(|| metrics.stalled_reply_bytes() == 0).await;
     }
 }

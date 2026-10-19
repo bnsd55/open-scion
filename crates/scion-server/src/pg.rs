@@ -1,5 +1,5 @@
 //! The Postgres metadata backend of [`Meta`](crate::meta::Meta)
-//! ([#47](https://github.com/bnsd55/open-scion/issues/47)).
+//! ([#47](https://github.com/bnsd55/openscion/issues/47)).
 //!
 //! One shared database takes the place of one data directory: many
 //! processes can hold clients, and Postgres sorts the writers out, so
@@ -592,7 +592,8 @@ impl PgClient {
 
     /// Runs one closure with the client on the worker thread. The sync
     /// client must never be touched from a tokio thread, which this
-    /// keeps true for the few setup statements a caller needs.
+    /// keeps true for the few setup statements a caller needs. Only the
+    /// test schema's preparation calls it.
     #[cfg(any(test, feature = "test-hooks"))]
     fn as_raw(&self, f: impl FnOnce(&mut Client) -> Result<()> + Send + 'static) -> Result<()> {
         let (reply, rx) = std::sync::mpsc::channel();
@@ -1650,8 +1651,7 @@ fn server_lock_raw(client: &mut Client, key: i64) -> bool {
         .is_ok_and(|row| row.is_some_and(|row| row.get::<_, bool>(0)))
 }
 
-/// Opens one client connection. Test setup uses it directly; the open of
-/// a backend goes through [`connect_with`].
+/// A plain connection. Only the test schema's preparation calls it.
 #[cfg(any(test, feature = "test-hooks"))]
 fn connect(url: &str, ca: Option<&Path>) -> Result<PgClient> {
     connect_with(url, ca, "", None)
@@ -1943,7 +1943,6 @@ fn load_tree(c: &PgClient, id: TreeId) -> Result<(Tree, Vec<u8>)> {
 }
 
 /// The error of a graph walk that reached its bound.
-#[cfg(any(test, feature = "test-hooks"))]
 fn too_deep(max_visits: usize) -> Error {
     Error::ResourceExhausted(format!(
         "the history is too deep: the answer needs more than {max_visits} changesets"
@@ -2122,7 +2121,6 @@ impl MetaTx for PgTx<'_> {
     }
 
     /// The first parent of a changeset, or `None` for a root.
-    #[cfg(any(test, feature = "test-hooks"))]
     fn first_parent(&mut self, id: ChangesetId) -> Result<Option<ChangesetId>> {
         let parent = self
             .c
@@ -2168,7 +2166,6 @@ impl MetaTx for PgTx<'_> {
     /// [`Error::NotFound`] if `repo` does not have either changeset.
     /// [`Error::ResourceExhausted`] if the walk needs more than `max_visits`
     /// changesets.
-    #[cfg(any(test, feature = "test-hooks"))]
     fn is_ancestor(
         &mut self,
         repo: RepoId,

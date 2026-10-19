@@ -1,8 +1,8 @@
 # Design: a backend that scales out
 
 **Status: proposal. Nothing in this file is built.** It answers
-[#47](https://github.com/bnsd55/open-scion/issues/47). It describes how
-open-scion could run on many stateless servers that share one metadata store
+[#47](https://github.com/bnsd55/openscion/issues/47). It describes how
+openscion could run on many stateless servers that share one metadata store
 and one object store, and land changes without a lock in process memory.
 [`architecture.md`](../architecture.md) describes the code on `main`, and
 [`protocol-v1.md`](../protocol-v1.md) is the contract that this design keeps.
@@ -67,7 +67,7 @@ v0.1 is one `scion-server serve` process on one machine.
 | Write path | One write connection behind a mutex (`Inner::db`), and 8 read-only connections. Write transactions use `BEGIN IMMEDIATE`. | Every write of every repo waits for one lock. Throughput is that of one connection on one drive. |
 | Durability | Group commit: callers share one full drive flush (`GroupFlush`). A read waits if it saw a commit that no flush covers yet. | The counters that decide when to flush (`committing`, `committed`, `flushed`) are in process memory. A commit by another process is not counted. |
 | Land lock | One mutex per (repo, ref) in `Lands::refs` (`land.rs`). | A second process does not see it. |
-| Path index | `PathIndex`: per ref, in memory, built on the first land and pruned in cycles of 10,000 generations. | Each process builds its own copy for each ref, and a restart loses it. A base more than `MAX_DEPTH` below the tip walks history on each land ([#38](https://github.com/bnsd55/open-scion/issues/38)). |
+| Path index | `PathIndex`: per ref, in memory, built on the first land and pruned in cycles of 10,000 generations. | Each process builds its own copy for each ref, and a restart loses it. A base more than `MAX_DEPTH` below the tip walks history on each land ([#38](https://github.com/bnsd55/openscion/issues/38)). |
 | Blobs | One zstd file per blob in `<data>/objects/blob/` on the local disk. | Other machines cannot read them, and one drive holds the only copy. |
 | Land IDs | SQLite row IDs. The newest land row is never deleted, so an ID is never given out twice. | A counter in one file. |
 | Data directory | `Store::open` takes `<data>/server.lock`, so one server uses a directory. An import process shares it (`Store::open_shared`). | Both processes are on one machine, and the land lock is in the server's memory. |
@@ -86,7 +86,7 @@ Section 4.4 keeps that rule without the mutex.
 **Proposal.** Many `scion-server` processes answer both services. Any server
 can answer any call. Each one holds only caches and temporary files, so a
 restart or a new server loses no data. The cache tiers
-([#5](https://github.com/bnsd55/open-scion/issues/5)) stay in front of them,
+([#5](https://github.com/bnsd55/openscion/issues/5)) stay in front of them,
 unchanged.
 
 ```mermaid
@@ -214,12 +214,12 @@ part of each changed path, whatever the age of the base. The proof in
 architecture section 5 still holds: generations strictly increase along first
 parents, and the history tree covers the whole first-parent history, not a
 window. So pruning, `MAX_DEPTH` and the old-base walk go away
-([#38](https://github.com/bnsd55/open-scion/issues/38),
-[#75](https://github.com/bnsd55/open-scion/issues/75)).
+([#38](https://github.com/bnsd55/openscion/issues/38),
+[#75](https://github.com/bnsd55/openscion/issues/75)).
 
 The same tree answers path history. `file_gen` or `dir_gen` of a path is the
 generation of the next `Log` entry, and the skip list (section 4.2) finds that
-changeset, with no scan ([#61](https://github.com/bnsd55/open-scion/issues/61)).
+changeset, with no scan ([#61](https://github.com/bnsd55/openscion/issues/61)).
 
 ```text
 history tree of H (gen 13), base B has gen 10
@@ -235,7 +235,7 @@ history tree of H (gen 13), base B has gen 10
 
 The base B must be on the head's first-parent history. **Proposal.** A
 first-parent skip list as derived data
-([#72](https://github.com/bnsd55/open-scion/issues/72)), for example one
+([#72](https://github.com/bnsd55/openscion/issues/72)), for example one
 extra jump pointer per changeset in a skew-binary scheme. From the head, the
 server finds the first-parent ancestor at B's generation in O(log n) reads,
 and compares it with B. The article keeps "skip lists for the commit graph".
@@ -376,7 +376,7 @@ This model treats each attempt as independent, so it is rough.
 
 Past about 20 lands per second on one ref, plain retries are not enough. The
 fix then is a lander that rebases a batch of pending lands and moves the ref
-once ([#18](https://github.com/bnsd55/open-scion/issues/18), closed until a
+once ([#18](https://github.com/bnsd55/openscion/issues/18), closed until a
 measurement shows the need). Across servers, one server holds a lease per
 ref in the store and runs the lander for it. Correctness still comes only
 from the compare-and-swap: two landers at once waste work, but land nothing
@@ -417,7 +417,7 @@ twice.
   writes them for each changeset, as it does `root_tree` today.
 - **Deferred kinds** derive on first read, as today. A long backfill must run
   in bounded batches, one transaction each
-  ([#71](https://github.com/bnsd55/open-scion/issues/71)). On FoundationDB
+  ([#71](https://github.com/bnsd55/openscion/issues/71)). On FoundationDB
   this is required by its 5 s limit. A lease per (kind, version) can stop two
   servers from doing the same backfill. The lease only saves work.
 - **Durable before the reply.** A commit in a store with P3 is durable when
@@ -481,7 +481,7 @@ run on both backends: `a_crash_at_any_step_lands_exactly_once_on_retry`,
 `lands_after_a_merge_that_made_the_old_tip_a_second_parent`, and the
 retention tests. The pruning tests become old-base tests on the history tree.
 `root_trees_match_golden_ids` pins the trees on both backends. The
-conformance suite ([#60](https://github.com/bnsd55/open-scion/issues/60))
+conformance suite ([#60](https://github.com/bnsd55/openscion/issues/60))
 runs the same calls against SQLite, the distributed backend and the tiers,
 and must get the same answers. Its fault injection gains two faults:
 a retryable error and an unknown result at each commit.
@@ -496,7 +496,7 @@ need new wording:
 - Section 4: "on disk" means "durable in the metadata store". The rules stay.
 - Section 2: the queue limits are per server.
 - A deployment across machines needs TLS
-  ([#14](https://github.com/bnsd55/open-scion/issues/14)).
+  ([#14](https://github.com/bnsd55/openscion/issues/14)).
 
 ## 7. Risks and open questions
 
@@ -521,7 +521,7 @@ need new wording:
 | Q2 | Trees in the metadata store, as today, or in the object store? The metadata store gives one batch write per land. The object store gives cheaper bytes and a put per tree. |
 | Q3 | Keep T1? Folding the pending row into T2 saves one commit per land (5 to 15 ms, **estimate**). But `GetLand` could then not show `PENDING`, and protocol section 6.3 says the first call records the land. |
 | Q4 | Land IDs: a sequence, a random ID, or a time-based ID (section 4.5). |
-| Q5 | Per-principal quotas ([#15](https://github.com/bnsd55/open-scion/issues/15)) need counters that all servers share. Where do they live? |
+| Q5 | Per-principal quotas ([#15](https://github.com/bnsd55/openscion/issues/15)) need counters that all servers share. Where do they live? |
 | Q6 | Several regions: the ref row has one home. A land from a far region pays a cross-region commit, about 50 to 200 ms (**estimate**). |
 | Q7 | `CreateChangeset`: check that each blob exists (cheap), or read it back and hash it (today, safe if others can write the store)? |
 | Q8 | Collection of rows and blobs that nothing names, and of old derived versions (#71). |

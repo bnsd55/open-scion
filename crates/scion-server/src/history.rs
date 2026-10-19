@@ -1193,7 +1193,7 @@ mod tests {
         let (_dir, store, repo) = open();
         // `d` holds 100,000 files. Then one changeset changes `d/f50000`.
         // The nodes it stores are the chunks the change touches, not the
-        // 6.3 MB level of every name (https://github.com/bnsd55/open-scion/
+        // 6.3 MB level of every name (https://github.com/bnsd55/openscion/
         // issues/114).
         let wide: Vec<String> = (0..100_000).map(|i| format!("d/f{i}")).collect();
         let first: Vec<(&str, bool)> = wide.iter().map(|p| (p.as_str(), true)).collect();

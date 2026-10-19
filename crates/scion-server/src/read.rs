@@ -52,7 +52,9 @@ pub fn root_tree(
 ///
 /// [`Error::NotFound`] if nothing is at `path`. [`Error::InvalidArgument`] if
 /// `path` is a directory or a submodule. [`Error::DeadlineExceeded`] once
-/// `deadline` has passed, which a cold root tree may need.
+/// `deadline` has passed, which a cold root tree may need. The tests of
+/// the trees and the imports read through it, so it rides behind the
+/// test-hooks feature.
 #[cfg(any(test, feature = "test-hooks"))]
 pub fn read_file(
     store: &Backend,
@@ -70,7 +72,7 @@ pub fn read_file(
 ///
 /// # Errors
 ///
-/// As [`read_file`], without reading the blob.
+/// As `read_file`, without reading the blob.
 pub fn file_blob(
     store: &Backend,
     repo: &str,
@@ -87,7 +89,7 @@ pub fn file_blob(
 ///
 /// # Errors
 ///
-/// As [`read_file`].
+/// As `read_file`.
 pub fn file_blob_at(store: &Backend, root: TreeId, path: &RepoPath) -> Result<BlobId> {
     match store.read(|c| tree::lookup(c, root, path))? {
         Some(Entry::File(file)) => match file.state().blob() {
@@ -183,7 +185,7 @@ pub fn log(
 
 /// Up to `limit` changesets, and at most [`MAX_SCAN`], walking first
 /// parents from `cs`, newest first. With a `path`, only the changesets that
-/// change it ([`changes_path`]), found in the path history of `cs`
+/// change it (`changes_path`), found in the path history of `cs`
 /// ([`history`]): each entry reads one changeset and at most one history
 /// node per part of the path, however many changesets lie between two
 /// entries. Such a page stops early, after its first entry, once it has read
@@ -272,7 +274,8 @@ pub(crate) fn next_change(
 
 /// Whether a changeset changes `path`: the file itself, or anything below it
 /// if it is a directory. A changeset lists every file it changes, so this
-/// needs no tree.
+/// needs no tree. The path history's tests call it, so it rides behind
+/// the test-hooks feature.
 #[cfg(any(test, feature = "test-hooks"))]
 #[must_use]
 pub fn changes_path(cs: &Changeset, path: &RepoPath) -> bool {

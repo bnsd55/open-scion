@@ -1,12 +1,12 @@
 //! The library of `scn`, the command-line client of Scion.
 //!
-//! `scn` is one of the five crates of [open-scion]: the user-facing client
+//! `scn` is one of the five crates of [openscion]: the user-facing client
 //! that checks out, mounts, inspects and commits against a server, a
 //! cache, or a local daemon. The binary is the same crate's `scn` target;
 //! this library holds its pieces, so the tests drive them and other
 //! clients can reuse them.
 //!
-//! [open-scion]: https://github.com/bnsd55/open-scion
+//! [openscion]: https://github.com/bnsd55/openscion
 //!
 //! - [`client`]: the gRPC client stubs, the deadline and the ticket
 //!   handling of every call.
@@ -23,7 +23,7 @@
 //! contract.
 // These items were crate-private behind the `scn` binary, and their docs
 // hold no `# Errors` sections; relaxed until the docs are written out
-// (https://github.com/bnsd55/open-scion/issues/11).
+// (https://github.com/bnsd55/openscion/issues/11).
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::must_use_candidate)]

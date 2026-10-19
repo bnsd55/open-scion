@@ -1,6 +1,6 @@
 //! A virtual checkout over `NFSv3`: `scn mount` serves one ref of the
 //! repository as a filesystem, so files load when they are first read
-//! ([#11](https://github.com/bnsd55/open-scion/issues/11)), through the
+//! ([#11](https://github.com/bnsd55/openscion/issues/11)), through the
 //! same `Objects` calls that a checkout sends.
 //!
 //! What the article says: files load when they are first read. The rest is
