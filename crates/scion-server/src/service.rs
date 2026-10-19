@@ -87,6 +87,29 @@ const READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// How often the stale-land sweep runs after the first one.
 const SWEEP_PERIOD: Duration = Duration::from_secs(60 * 60);
 
+/// How often the tx-age gauge is refreshed: a scrape reads the gauge, and
+/// an age that grows without a pool event must still show.
+const TX_AGE_PERIOD: Duration = Duration::from_secs(5);
+
+/// Keeps the `scion_pg_tx_age_seconds` gauge current: the age of the
+/// oldest open Postgres read transaction, sampled every [`TX_AGE_PERIOD`]
+/// until `stop` resolves. On SQLite the sample is always zero.
+async fn pg_tx_age_sample(store: Backend, metrics: Arc<Metrics>, mut stop: watch::Receiver<()>) {
+    let mut tick = tokio::time::interval(TX_AGE_PERIOD);
+    loop {
+        let store = store.clone();
+        let age = tokio::task::spawn_blocking(move || store.pg_tx_age()).await;
+        match age {
+            Ok(age) => metrics.pg_tx_age(age),
+            Err(e) => tracing::warn!(error = %e, "the tx-age sample failed"),
+        }
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = stop.changed() => break,
+        }
+    }
+}
+
 /// Runs the stale-land sweep at once, then once per [`SWEEP_PERIOD`], until
 /// `stop` resolves. The first sweep settles what a restart left pending
 /// before the first client asks.
@@ -167,11 +190,12 @@ pub async fn serve(
     let access = Arc::new(access.into());
     let auth = access.auth();
     let fence = store.fence_flag();
+    // The Postgres reader pool records into the registry: the wait for a
+    // reader, the busy readers, and the tx age, which this task keeps
+    // fresh. On SQLite this is a no-op.
+    store.set_metrics(Arc::clone(&metrics));
     let worker = Worker::new(store);
     let lands = Arc::new(Lands::new(pending_lands, Some(Arc::clone(&metrics))));
-    // The sweep stops when the server does: the shutdown future resolves,
-    // the watch says so, and the loop breaks. The same watch ends the
-    // server itself.
     let (stop_tx, stop_rx) = watch::channel(());
     // The fence of a Postgres server that lost its database to another
     // process: it resolves the same shutdown the operator's signal does,
@@ -184,6 +208,11 @@ pub async fn serve(
         shutdown.await;
         let _ = stop_tx.send(());
     });
+    tokio::spawn(pg_tx_age_sample(
+        worker.store(),
+        Arc::clone(&metrics),
+        stop_rx.clone(),
+    ));
     let shutdown = {
         let mut stopped = stop_rx.clone();
         async move {
@@ -1543,6 +1572,21 @@ mod tests {
 
     use super::*;
 
+    /// Receives one step's go signal, or panics naming the step: a
+    /// release that never comes fails the test in seconds, not the
+    /// 30-minute CI cancel a stuck barrier costs.
+    pub(crate) fn expect_step(rx: &std::sync::mpsc::Receiver<()>, step: &str) {
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("the test never released {step}"));
+    }
+
+    /// Lets one step go, or panics naming the step when its receiver is
+    /// gone.
+    pub(crate) fn release_step(tx: &std::sync::mpsc::Sender<()>, step: &str) {
+        tx.send(())
+            .unwrap_or_else(|_| panic!("the step {step} is gone"));
+    }
+
     /// The log of the test binary, into this one buffer.
     static LOG: std::sync::LazyLock<Captured> = std::sync::LazyLock::new(Captured::default);
 
@@ -2119,6 +2163,38 @@ mod tests {
         assert!(read_all(second).await == data, "the second reply");
     }
 
+    type Blocker = (
+        std::thread::JoinHandle<Result<(), crate::error::Error>>,
+        std::sync::mpsc::Sender<()>,
+    );
+
+    /// Holds every read connection of `store`: one thread per reader,
+    /// each parked in a read until its own release, announcing itself on
+    /// the returned channel. A blocker that dies before its release fails
+    /// its step in seconds, and cannot trap its siblings in a barrier.
+    fn hold_read_connections(store: &Backend) -> (Vec<Blocker>, std::sync::mpsc::Receiver<()>) {
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let blockers = (0..crate::store::READERS)
+            .map(|i| {
+                let (store, arrived_tx) = (store.clone(), arrived_tx.clone());
+                let (go_tx, go_rx) = std::sync::mpsc::channel();
+                let handle = std::thread::spawn(move || {
+                    store.read(|_| {
+                        arrived_tx.send(()).unwrap();
+                        go_rx
+                            .recv_timeout(std::time::Duration::from_secs(30))
+                            .unwrap_or_else(|_| {
+                                panic!("the test never released read connection {i}")
+                            });
+                        Ok(())
+                    })
+                });
+                (handle, go_tx)
+            })
+            .collect();
+        (blockers, arrived_rx)
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn at_most_max_graph_queries_run_at_once() {
         // root ─ a, and root ─ b.
@@ -2135,22 +2211,12 @@ mod tests {
         let busy = || MAX_BLOCKING - service.worker.permits.available_permits();
 
         // Hold every read connection, so each job waits at its first read.
-        let (held_tx, held_rx) = std::sync::mpsc::channel();
-        let go = Arc::new(std::sync::Barrier::new(crate::store::READERS + 1));
-        let blockers: Vec<_> = (0..crate::store::READERS)
-            .map(|_| {
-                let (store, held_tx, go) = (store.clone(), held_tx.clone(), Arc::clone(&go));
-                std::thread::spawn(move || {
-                    store.read(|_| {
-                        held_tx.send(()).unwrap();
-                        go.wait();
-                        Ok(())
-                    })
-                })
-            })
-            .collect();
-        for _ in &blockers {
-            held_rx.recv().unwrap();
+        // One channel per blocker: a blocker that dies before its release
+        // fails its step in seconds, and cannot trap its siblings in a
+        // barrier.
+        let (blockers, arrived_rx) = hold_read_connections(&store);
+        for _ in 0..crate::store::READERS {
+            expect_step(&arrived_rx, "a read connection took its seat");
         }
         // One call more than the limit, of each kind.
         let calls: Vec<_> = (0..=MAX_GRAPH_QUERIES)
@@ -2208,7 +2274,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(busy(), MAX_GRAPH_QUERIES, "the last call waits for a slot");
 
-        go.wait();
+        // The reads held; release them, where the old barrier's `go.wait()`
+        // stood, so the parked jobs get their connection.
+        for (handle, go_tx) in &blockers {
+            assert!(!handle.is_finished(), "a blocker died before it held");
+            release_step(go_tx, "the held read connections");
+        }
+        let blockers: Vec<_> = blockers.into_iter().map(|(handle, _)| handle).collect();
         for blocker in blockers {
             blocker.join().unwrap().unwrap();
         }

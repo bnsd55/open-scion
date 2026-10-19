@@ -915,3 +915,11 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
     assert!(ok, "git {args:?} failed");
     stdout
 }
+
+/// Awaits `fut`, or panics naming `step`: a server that never answers a
+/// step fails the test in seconds, not at the CI cancel.
+pub async fn ceiling<T>(step: &str, fut: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(30), fut)
+        .await
+        .unwrap_or_else(|_| panic!("the step {step} never finished within 30 s"))
+}

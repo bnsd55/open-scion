@@ -11,6 +11,8 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
+#[cfg(test)]
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use gix::ObjectId;
@@ -22,7 +24,9 @@ use scion_core::{
 };
 
 use crate::backend::Backend;
+use crate::deadline::{CALL_LIMIT, Deadline};
 use crate::error::{Error, Result};
+use crate::graph;
 use crate::meta::Meta as _;
 use crate::meta::{MetaTx, RepoId};
 use crate::store::{BlobBatch, BlobStatus, MAX_OBJECT_BYTES};
@@ -51,6 +55,20 @@ const TX_YIELD: Duration = Duration::from_millis(100);
 /// the import fails with the busy error. A client that shares the data
 /// directory reads this to bound its own wait for an import.
 pub const BUSY_TRIES: u32 = 10;
+
+/// The most swaps one import makes for one ref. Like a land's swaps (see
+/// `MAX_ATTEMPTS` in `land`), a swap loses only to another move of the
+/// ref; a ref that moves this often in a row would keep the import
+/// walking its history, so past the bound the import stops and says so.
+const REF_TRIES: u32 = 3;
+
+/// A test's move of the ref between `point_ref`'s read of it and its
+/// compare-and-swap, so the swap loses as if another server had moved the
+/// ref. Tests set it and drop it back to `None`.
+#[cfg(test)]
+type RefMover = Box<dyn Fn(&Backend, RepoId, &str) -> Result<()> + Send>;
+#[cfg(test)]
+static REF_MOVER: Mutex<Option<RefMover>> = Mutex::new(None);
 
 // How long the write transaction sleeps per commit of a batch, for the
 // tests of a slow batch. It models a batch whose records are slow.
@@ -455,11 +473,13 @@ fn record(
 /// server can land on the ref while the import checks it, so a lost swap
 /// checks the ref again.
 fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Result<()> {
-    // The walks run in reads, outside any write transaction, so a server
-    // that shares the data directory does not wait for them. They have no
-    // bound. The swap fails if the ref moved after the read.
-    let contains = |head, cs| store.read(|c| c.is_ancestor(repo, cs, head, usize::MAX));
-    loop {
+    // The check runs in reads, outside any write transaction, so a server
+    // that shares the data directory does not wait for it. Each check
+    // reads O(log n) nodes of the derived commit graph, and stops at the
+    // deadline of a job with no call of its own.
+    let deadline = Deadline::new(Instant::now() + CALL_LIMIT);
+    let contains = |head, cs| graph::is_ancestor(store, repo, cs, head, &deadline);
+    for attempt in 0..REF_TRIES {
         let current = store.read(|c| c.get_ref(repo, name))?;
         if let Some(current) = current {
             // Already there, or the ref already contains the tip (changes
@@ -476,11 +496,27 @@ fn point_ref(store: &Backend, repo: RepoId, name: &str, tip: ChangesetId) -> Res
             }
         }
         let expected = current.map(|r| r.version);
+        #[cfg(test)]
+        if let Some(move_ref) = REF_MOVER
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            move_ref(store, repo, name)?;
+        }
         if store.write(|c| c.cas_ref(repo, name, expected, tip))? {
             return Ok(());
         }
-        tracing::info!(name, "the ref moved during the import; checking it again");
+        tracing::info!(
+            name,
+            attempt,
+            "the ref moved during the import; checking it again"
+        );
     }
+    Err(Error::ResourceExhausted(format!(
+        "ref {name:?} kept moving while the import pointed it at {tip}; \
+         run the import again once the lands on it have settled"
+    )))
 }
 
 /// Turns git commits into changesets.
@@ -880,7 +916,8 @@ mod tests {
     use crate::store::Store;
     use std::fs;
     use std::process::Command;
-    use std::sync::{Arc, Barrier};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::thread;
     use std::time::Duration;
 
@@ -982,20 +1019,32 @@ mod tests {
             .unwrap();
 
         // The land's transaction has moved main but not committed, so the
-        // import still reads root, then waits to write.
-        let started = Arc::new(Barrier::new(2));
+        // import still reads root, then waits to write. Channels, not a
+        // barrier: a step whose release never comes fails in seconds with
+        // its name, and cannot trap its partner.
+        let (in_tx, in_rx) = std::sync::mpsc::channel::<()>();
+        let (moved_tx, moved_rx) = std::sync::mpsc::channel::<()>();
         let land = {
-            let (server, started) = (server.clone(), Arc::clone(&started));
+            let (server, in_tx, moved_rx) = (server.clone(), in_tx, moved_rx);
             thread::spawn(move || {
                 server.write(|c| {
                     let moved = c.cas_ref(repo, "main", Some(1), x)?;
-                    started.wait();
+                    in_tx.send(()).unwrap();
+                    moved_rx
+                        .recv_timeout(Duration::from_secs(30))
+                        .unwrap_or_else(|_| panic!("the import never looked again"));
                     thread::sleep(Duration::from_millis(300));
                     Ok(moved)
                 })
             })
         };
-        started.wait();
+        in_rx
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("the land never moved the ref"));
+        // The import starts its check while the land's transaction still
+        // holds the write lock: it reads `root`, then waits to write, like
+        // it would against a live land.
+        moved_tx.send(()).unwrap();
         let moved = point_ref(&importer, repo, "main", tip);
         assert!(land.join().unwrap().unwrap());
         // The swap lost, and the check again sees that main has diverged.
@@ -1005,6 +1054,95 @@ mod tests {
         );
         let main = server.read(|c| c.get_ref(repo, "main")).unwrap();
         assert_eq!(main.unwrap().target, x);
+    }
+
+    /// Takes a test's ref mover back when the test ends, an assert's panic
+    /// included: a mover left set would move other tests' refs.
+    struct MoverGuard;
+
+    impl Drop for MoverGuard {
+        fn drop(&mut self) {
+            *REF_MOVER.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+    }
+
+    /// A ref that moves before every swap stops the import after `REF_TRIES`
+    /// swaps, with a busy answer, instead of walking the history again
+    /// without end. Each move lands main forward on the chain below the
+    /// tip, so the import never hears "diverged".
+    #[test]
+    fn an_import_that_keeps_losing_the_ref_swap_gives_up() {
+        let data = tempfile::tempdir().unwrap();
+        let server = Backend::Sqlite(Store::open(data.path()).unwrap());
+        let importer = Backend::Sqlite(Store::open_shared(data.path()).unwrap());
+        // main is at root. The chain root <- a1 <- a2 <- a3 <- tip hangs
+        // under it, so every mover target is still an ancestor of the
+        // imported tip and the import never hears "diverged".
+        let changeset = |parents, message: &str| Changeset {
+            parents,
+            author: IdentityTime {
+                name: b"Ada".to_vec(),
+                email: b"ada@example.com".to_vec(),
+                unix_secs: 0,
+                tz_offset_minutes: 0,
+            },
+            committer: None,
+            message: message.into(),
+            changes: BTreeMap::new(),
+        };
+        let (repo, tip, links): (RepoId, ChangesetId, Arc<[ChangesetId]>) = server
+            .write(|c| {
+                let repo = c.create_repo("r")?;
+                let mut parent = c.insert_changeset(repo, &changeset(vec![], "root"))?;
+                let root = parent;
+                let mut links = Vec::new();
+                for message in ["a1", "a2", "a3", "tip"] {
+                    parent = c.insert_changeset(repo, &changeset(vec![parent], message))?;
+                    links.push(parent);
+                }
+                assert!(c.cas_ref(repo, "main", None, root)?);
+                Ok((repo, parent, Arc::from(links.into_boxed_slice())))
+            })
+            .unwrap();
+
+        // The mover points main at the next link of the chain before every
+        // swap, so the swap's version is always stale. Dropping the guard
+        // takes the mover back, also when an assert fails.
+        let _guard = MoverGuard;
+        let swaps = Arc::new(AtomicUsize::new(0));
+        // Only this test's importer handle moves: other tests' point_ref
+        // calls run in the same process, and the mover must stay inert for
+        // them.
+        let mine = std::ptr::from_ref(&importer) as usize;
+        *REF_MOVER.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new({
+            let (links, swaps) = (Arc::clone(&links), Arc::clone(&swaps));
+            move |store: &Backend, repo: RepoId, name: &str| {
+                if std::ptr::from_ref(store) as usize != mine {
+                    return Ok(());
+                }
+                let at = swaps
+                    .fetch_add(1, AtomicOrdering::SeqCst)
+                    .min(links.len() - 2);
+                store.write(|c| {
+                    let version = c.get_ref(repo, name)?.map(|r| r.version);
+                    c.cas_ref(repo, name, version, links[at])
+                })?;
+                Ok(())
+            }
+        }));
+
+        let pointed = point_ref(&importer, repo, "main", tip);
+        // The swap lost REF_TRIES times, and the import gave up instead of
+        // planning again without end.
+        assert!(
+            matches!(pointed, Err(Error::ResourceExhausted(_))),
+            "{pointed:?}"
+        );
+        assert_eq!(swaps.load(AtomicOrdering::SeqCst), REF_TRIES as usize);
+        // The ref moved forward once per swap, to a3, and never to the tip.
+        let main = importer.read(|c| c.get_ref(repo, "main")).unwrap().unwrap();
+        assert_eq!(main.target, links[2]);
+        assert_ne!(main.target, tip);
     }
 
     #[test]

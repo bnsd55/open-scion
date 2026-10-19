@@ -12,15 +12,18 @@
 //! before the reply went out, so a cut can lose nothing that a reply
 //! promised. It is not a full proof of power-loss survival: it does not
 //! model a drive's volatile cache, which can also lose writes that reached
-//! the drive but were never flushed, and it does not reorder writes.
+//! the drive but were never flushed, and it does not reorder writes; the
+//! dm-log-writes suite (`dm_log_writes.rs`) replays a block-level log to
+//! each barrier - a flush or a FUA write - which is what models that
+//! drive.
 //!
 //! SHORTCUT: the cut cannot catch a lost fsync of a directory. `LazyFS`
 //! persists a rename at rename time, so the directory-entry durability
 //! that `fsync_dir` guards (the `fsync` of the blob directory after the
-//! rename) is not modelled; the mutation without it passes. Upgrade to a
-//! block-level replay that drops un-flushed writes in order
-//! (dm-log-writes replay to each FLUSH), when a bug report or a change to
-//! the rename path says a directory entry was lost.
+//! rename) is not modelled; the mutation without it passes. The
+//! dm-log-writes suite (`dm_log_writes.rs`) is that block-level replay:
+//! it cuts at each barrier, and on ext4 the directory fsync and the full
+//! flush back each other up, so there a mutation of both turns it red.
 //!
 //! SHORTCUT: the cut is sync-before-reply, and the sync path tested is the
 //! Linux one; macOS syncs differently (`F_FULLFSYNC`) and its CI job cannot
@@ -280,8 +283,9 @@ async fn every_reply_survives_a_power_cut() {
         eprintln!("round {round}: mounted");
         create_repo(&data);
         eprintln!("round {round}: repo created");
-        // A reaped child's flock can outlive the waitpid by one tick; the
-        // next server must not race it.
+        // A reaped child's flock can outlive the waitpid by one tick, and
+        // the restart's open raced it (#260): wait for the lock to be free
+        // before the new server opens.
         common::spawn_guard::across_release(|| {
             common::spawn_guard::wait_for_lock_release(&data);
         });
@@ -602,8 +606,8 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
         let mut lazy = Lazyfs::start(dir.path(), &lazyfs, round);
         let data = lazy.mount.join("data");
         create_repo(&data);
-        // A reaped child's flock can outlive the waitpid by one tick; the
-        // next server must not race it.
+        // A reaped child's flock can outlive the waitpid by one tick, and
+        // the next round's server must not race it (#260).
         common::spawn_guard::across_release(|| {
             common::spawn_guard::wait_for_lock_release(&data);
         });

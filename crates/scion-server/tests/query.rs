@@ -884,14 +884,18 @@ fn diff_pages(
 ) -> Vec<DiffEntry> {
     let mut entries = Vec::new();
     let mut after = None;
-    loop {
+    // A ceiling on the pages: a server that repeats its cursor must fail
+    // the test, not hang it.
+    for pages in 0..10_000 {
         let page = read::diff(store, REPO, old, new, prefix, after.as_ref()).unwrap();
         entries.extend(page.entries);
         match page.next_after {
             Some(next) => after = Some(next),
             None => return entries,
         }
+        assert!(pages < 9_999, "the diff pages never ended");
     }
+    unreachable!("the diff loop exits by returning");
 }
 
 #[test]

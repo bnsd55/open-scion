@@ -78,6 +78,11 @@ pub enum Error {
     /// same request fails again.
     #[error("{0}")]
     ResourceExhausted(String),
+    /// The server cannot take the work now: a shared resource (the
+    /// Postgres reader pool) is exhausted by other calls. The same
+    /// request may succeed when the pool drains.
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 /// Result with the server [`Error`].
@@ -105,6 +110,9 @@ impl From<Error> for Status {
             Error::DeadlineExceeded(_) => Status::deadline_exceeded(e.to_string()),
             Error::FailedPrecondition(_) => Status::failed_precondition(e.to_string()),
             Error::ResourceExhausted(_) => Status::resource_exhausted(e.to_string()),
+            // The pool of read connections is drained: a retry after it
+            // refills may succeed.
+            Error::Unavailable(_) => Status::unavailable(e.to_string()),
             // Another process that shares the data directory held the
             // database's write lock for longer than `busy_timeout`.
             Error::Busy => {
@@ -188,6 +196,12 @@ mod tests {
         assert_eq!(Status::from(Error::Busy).code(), Code::Unavailable);
         assert_eq!(Status::from(db(ffi::SQLITE_BUSY)).code(), Code::Unavailable);
         assert_eq!(Status::from(db(ffi::SQLITE_CORRUPT)).code(), Code::Internal);
+    }
+
+    #[test]
+    fn a_drained_reader_pool_is_unavailable() {
+        let err = Error::Unavailable("no Postgres reader free".to_owned());
+        assert_eq!(Status::from(err).code(), Code::Unavailable);
     }
 
     #[test]

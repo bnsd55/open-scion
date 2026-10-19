@@ -1,6 +1,8 @@
 //! Object reads with tickets, against an in-process server: a ticket from
 //! `GetRootTree` serves the objects that its walk reaches, and nothing else.
 
+mod common;
+
 use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, RepoPath, Tree, TreeId,
 };
@@ -399,12 +401,17 @@ async fn a_cache_without_a_token_fetches_over_a_ticket() {
         .await
         .unwrap()
         .into_inner();
-    let first = stream.message().await.unwrap().unwrap();
+    let first = common::ceiling("the first object part", stream.message())
+        .await
+        .unwrap()
+        .unwrap();
     let mut object = Assembler::new(Header::of(&first, false).unwrap(), first);
     while !object.is_done() {
-        object
-            .push(&stream.message().await.unwrap().unwrap())
+        let part = common::ceiling("the next object part", stream.message())
+            .await
+            .unwrap()
             .unwrap();
+        object.push(&part).unwrap();
     }
     let (_header, data) = object.finish();
     assert_eq!(data, CONTENT);
