@@ -219,6 +219,14 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- The `serve` flags are all checked before the data directory opens:
+  a bad flag answers with its own error, instead of taking the data
+  directory's one-server lock or creating a file in an empty directory.
+- `--land-stale-secs` refuses 0 and negative values, and
+  `--max-principal-requests`, `--max-principal-upload-bytes` and
+  `--max-principal-pending-lands` refuse 0: those values used to mean
+  that the sweep rejects every pending land, or that every call and
+  land is refused, with no word of it at start.
 - `commit --from-mount` and the mount carry raw file names: a name that
   is not UTF-8 is no longer read from, or written to, the file its
   lossy spelling names.

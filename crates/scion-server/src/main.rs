@@ -67,20 +67,25 @@ enum Command {
         /// Most requests one principal may hold at once. With `--access`
         /// the default is 64; with `--token` the check is off.
         #[arg(long)]
-        max_principal_requests: Option<usize>,
+        max_principal_requests: Option<NonZeroUsize>,
         /// Most upload bytes one principal may hold in flight. With
         /// `--access` the default is 536870912 (512 MiB); with `--token`
         /// the check is off.
         #[arg(long, value_name = "BYTES")]
-        max_principal_upload_bytes: Option<usize>,
+        max_principal_upload_bytes: Option<NonZeroUsize>,
         /// Most pending lands one principal may hold at once. With
         /// `--access` the default is 64; with `--token` the check is off.
         #[arg(long)]
-        max_principal_pending_lands: Option<usize>,
+        max_principal_pending_lands: Option<NonZeroUsize>,
         /// A land that has been pending for longer than this many seconds is
         /// rejected by the sweep, so a restart cannot leave one pending
         /// forever. The default is 86400 (24 hours).
-        #[arg(long, default_value_t = 24 * 60 * 60)]
+        #[arg(
+            long,
+            default_value_t = 24 * 60 * 60,
+            value_parser = positive_secs,
+            allow_negative_numbers = true
+        )]
         land_stale_secs: i64,
         /// Allow a non-loopback address. Without TLS, traffic, including the
         /// token, is not encrypted, so use this only on a trusted network.
@@ -255,6 +260,18 @@ fn gc_command(store: &Backend, grace: Duration, dry_run: bool) {
     );
 }
 
+/// A positive number of seconds, for `--land-stale-secs`: 0 or a negative
+/// would make the sweep reject every pending land the moment it lands.
+fn positive_secs(s: &str) -> Result<i64, String> {
+    let secs: i64 = s
+        .parse()
+        .map_err(|_| "must be a number of seconds".to_owned())?;
+    if secs < 1 {
+        return Err(format!("{secs} is not a positive number of seconds"));
+    }
+    Ok(secs)
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
@@ -265,6 +282,49 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
+    // Every `serve` flag is checked before the data directory opens: a bad
+    // flag must not take the data directory's one-server lock, and must
+    // not create a file in an empty directory.
+    let flags = match &cli.command {
+        Command::Serve {
+            listen,
+            token,
+            access,
+            max_principal_requests,
+            max_principal_upload_bytes,
+            max_principal_pending_lands,
+            land_stale_secs,
+            insecure_listen,
+            tls_cert,
+            tls_key,
+            tls_client_ca,
+            max_connections,
+            max_streams,
+            max_stalled_bytes,
+            metrics_listen,
+            ticket_key,
+            ticket_key_old,
+        } => Some(serve_flags(
+            *listen,
+            token.clone(),
+            access.clone(),
+            *max_principal_requests,
+            *max_principal_upload_bytes,
+            *max_principal_pending_lands,
+            *land_stale_secs,
+            *insecure_listen,
+            tls_cert.as_deref(),
+            tls_key.as_deref(),
+            tls_client_ca.as_deref(),
+            *max_connections,
+            *max_streams,
+            *max_stalled_bytes,
+            *metrics_listen,
+            ticket_key.as_deref(),
+            ticket_key_old.as_deref(),
+        )?),
+        _ => None,
+    };
     // `hash-token` needs no data directory. An import does not land, so it
     // can run beside the server. `derive` removes rows of older versions of a
     // kind, which a running server of an older build may read, so it opens as
@@ -285,58 +345,25 @@ async fn main() -> anyhow::Result<()> {
     }
     .with_context(|| format!("cannot open data directory {}", cli.data.display()))?;
     match cli.command {
-        Command::Serve {
-            listen,
-            token,
-            access,
-            max_principal_requests,
-            max_principal_upload_bytes,
-            max_principal_pending_lands,
-            land_stale_secs,
-            insecure_listen,
-            tls_cert,
-            tls_key,
-            tls_client_ca,
-            max_connections,
-            max_streams,
-            max_stalled_bytes,
-            metrics_listen,
-            ticket_key,
-            ticket_key_old,
-        } => {
-            // The second reply says whether the mode is one token: with one
-            // principal, a per-principal cap is a global one, so the quotas
-            // are off unless a flag sets one.
-            let (access, single) = load_access(token, access)?;
-            let caps = caps(
-                single,
-                max_principal_requests,
-                max_principal_upload_bytes,
-                max_principal_pending_lands,
-            );
-            let server_tls = server_tls(
-                tls_cert.as_deref(),
-                tls_key.as_deref(),
-                tls_client_ca.as_deref(),
-            )?;
-            let tickets = load_tickets(ticket_key.as_deref(), ticket_key_old.as_deref())?;
+        Command::Serve { .. } => {
+            let flags = flags.expect("a serve command validated its flags");
             serve(
                 store,
-                listen,
-                access,
+                flags.listen,
+                flags.access,
                 ServeConfig {
                     data: cli.data.clone(),
-                    insecure_listen,
-                    quotas: caps.quotas,
-                    pending_lands: caps.pending_lands,
-                    land_stale_secs,
-                    server_tls,
-                    max_connections,
-                    max_streams,
-                    max_stalled_bytes,
-                    metrics_listen,
+                    insecure_listen: flags.insecure_listen,
+                    quotas: flags.caps.quotas,
+                    pending_lands: flags.caps.pending_lands,
+                    land_stale_secs: flags.land_stale_secs,
+                    server_tls: flags.server_tls,
+                    max_connections: flags.max_connections,
+                    max_streams: flags.max_streams,
+                    max_stalled_bytes: flags.max_stalled_bytes,
+                    metrics_listen: flags.metrics_listen,
                 },
-                tickets,
+                flags.tickets,
             )
             .await?;
         }
@@ -427,15 +454,15 @@ struct Caps {
 
 fn caps(
     single: bool,
-    requests: Option<usize>,
-    upload_bytes: Option<usize>,
-    pending_lands: Option<usize>,
+    requests: Option<NonZeroUsize>,
+    upload_bytes: Option<NonZeroUsize>,
+    pending_lands: Option<NonZeroUsize>,
 ) -> Caps {
-    let with_default = |flag: Option<usize>, default: usize| {
+    let with_default = |flag: Option<NonZeroUsize>, default: usize| {
         if single {
-            flag
+            flag.map(NonZeroUsize::get)
         } else {
-            Some(flag.unwrap_or(default))
+            Some(flag.map_or(default, NonZeroUsize::get))
         }
     };
     Caps {
@@ -462,6 +489,83 @@ struct ServeConfig {
     data: std::path::PathBuf,
 }
 
+/// The validated flags of a `serve` command: everything `serve` needs is
+/// checked here, before the data directory opens, so a bad flag never takes
+/// the data directory's one-server lock and never creates a file.
+struct ServeFlags {
+    listen: SocketAddr,
+    access: scion_server::access::Access,
+    caps: Caps,
+    land_stale_secs: i64,
+    insecure_listen: bool,
+    server_tls: Option<ServerTls>,
+    max_connections: NonZeroUsize,
+    max_streams: NonZeroU32,
+    max_stalled_bytes: NonZeroU64,
+    metrics_listen: Option<SocketAddr>,
+    tickets: Option<Arc<scion_server::tickets::Keys>>,
+}
+
+/// Checks every `serve` flag that a parse alone does not settle: the rules
+/// of `--token` against `--access`, the TLS files, the ticket keys, and the
+/// listen rule (a non-loopback address needs TLS or `--insecure-listen`).
+#[allow(clippy::too_many_arguments)]
+fn serve_flags(
+    listen: SocketAddr,
+    token: Option<String>,
+    access: Option<PathBuf>,
+    max_principal_requests: Option<NonZeroUsize>,
+    max_principal_upload_bytes: Option<NonZeroUsize>,
+    max_principal_pending_lands: Option<NonZeroUsize>,
+    land_stale_secs: i64,
+    insecure_listen: bool,
+    tls_cert: Option<&Path>,
+    tls_key: Option<&Path>,
+    tls_client_ca: Option<&Path>,
+    max_connections: NonZeroUsize,
+    max_streams: NonZeroU32,
+    max_stalled_bytes: NonZeroU64,
+    metrics_listen: Option<SocketAddr>,
+    ticket_key: Option<&Path>,
+    ticket_key_old: Option<&Path>,
+) -> anyhow::Result<ServeFlags> {
+    // The second reply says whether the mode is one token: with one
+    // principal, a per-principal cap is a global one, so the quotas
+    // are off unless a flag sets one.
+    let (access, single) = load_access(token, access)?;
+    let caps = caps(
+        single,
+        max_principal_requests,
+        max_principal_upload_bytes,
+        max_principal_pending_lands,
+    );
+    let server_tls = server_tls(tls_cert, tls_key, tls_client_ca)?;
+    let tickets = load_tickets(ticket_key, ticket_key_old)?;
+    anyhow::ensure!(
+        listen.ip().is_loopback() || insecure_listen || server_tls.is_some(),
+        "{listen} is not a loopback address; without TLS the traffic and the \
+         token would travel unencrypted. Pass --tls-cert and --tls-key, or \
+         --insecure-listen to allow it."
+    );
+    if let Some(metrics_listen) = metrics_listen {
+        let checked = metrics::loopback_or_allow(metrics_listen, insecure_listen);
+        anyhow::ensure!(checked.is_ok(), "{}", checked.unwrap_err());
+    }
+    Ok(ServeFlags {
+        listen,
+        access,
+        caps,
+        land_stale_secs,
+        insecure_listen,
+        server_tls,
+        max_connections,
+        max_streams,
+        max_stalled_bytes,
+        metrics_listen,
+        tickets,
+    })
+}
+
 /// Serves the gRPC API on `listen`, with the TLS files of the flags, until
 /// the caller stops it.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -472,12 +576,6 @@ async fn serve(
     config: ServeConfig,
     tickets: Option<Arc<scion_server::tickets::Keys>>,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        listen.ip().is_loopback() || config.insecure_listen || config.server_tls.is_some(),
-        "{listen} is not a loopback address; without TLS the traffic and the \
-         token would travel unencrypted. Pass --tls-cert and --tls-key, or \
-         --insecure-listen to allow it."
-    );
     // The registry always counts; only its plain-HTTP export is optional.
     // The metrics listener has no token, so unlike the gRPC listener, TLS
     // does not excuse a non-loopback address: `--insecure-listen` must allow
@@ -491,8 +589,6 @@ async fn serve(
     });
     if let Some(metrics_listen) = config.metrics_listen {
         let address = metrics_listen.to_string();
-        let checked = metrics::loopback_or_allow(metrics_listen, config.insecure_listen);
-        anyhow::ensure!(checked.is_ok(), "{}", checked.unwrap_err());
         let metrics_listener = tokio::net::TcpListener::bind(metrics_listen)
             .await
             .with_context(|| format!("cannot listen on {address}"))?;
