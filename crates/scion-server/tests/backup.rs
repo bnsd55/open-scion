@@ -36,9 +36,10 @@ fn a_backup_taken_while_serving_restores_whole() {
     // The copy of the blob files runs while more writes land: a blob the
     // snapshot names stays reachable, and the copy may or may not hold
     // the newer ones.
+    let tip = *ids.last().unwrap();
     let writer = {
         let store = store.clone();
-        std::thread::spawn(move || write_raced(&store, repo, "raced", 10, *ids.last().unwrap()))
+        std::thread::spawn(move || write_raced(&store, repo, "raced", 10, tip))
     };
     let backup = tempfile::tempdir().unwrap();
     copy_tree(&dir.path().join("objects"), &backup.path().join("objects"));
