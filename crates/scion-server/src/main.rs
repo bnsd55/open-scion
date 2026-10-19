@@ -286,8 +286,7 @@ fn write_gc_metrics_file(path: &Path, report: &gc::Report, took: Duration, dry_r
     let dry = if dry_run { "true" } else { "false" };
     let unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let text = format!(
         "# HELP scion_gc_last_success_timestamp_seconds When the collector last finished a run, in seconds since the Unix epoch.\n\
          # TYPE scion_gc_last_success_timestamp_seconds gauge\n\
