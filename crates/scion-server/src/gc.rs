@@ -786,11 +786,15 @@ mod tests {
         let (done, done_rx) = std::sync::mpsc::channel();
         let backend = Backend::Sqlite(store.clone());
         std::thread::spawn(move || {
-            let report = collect(&backend, DEFAULT_GRACE_SECS, &mut |stage: Stage| {
-                if stage == Stage::BlobFiles {
-                    listed2.store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-            });
+            let report = collect(
+                &backend,
+                Duration::from_secs(DEFAULT_GRACE_SECS),
+                &mut |stage: Stage| {
+                    if stage == Stage::BlobFiles {
+                        listed2.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                },
+            );
             let _ = done.send(report);
         });
         let started = std::time::Instant::now();
