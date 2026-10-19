@@ -1580,13 +1580,13 @@ mod tests {
         );
         // The steps before the stop stay: the walk stored nothing, and
         // neither did the derives it never reached.
-        assert!(
+        assert_eq!(
             rows_of(
                 &store,
                 crate::graph::CommitGraph::NAME,
                 crate::graph::CommitGraph::VERSION
-            )
-            .is_empty()
+            ),
+            [] as [(Vec<u8>, Vec<u8>); 0]
         );
         // A retry on the same tiny budget stops busy again.
         assert!(matches!(
