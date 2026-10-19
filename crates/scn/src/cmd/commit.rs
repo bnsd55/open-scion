@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use scion_core::{Changeset, FileState, IdentityTime, RepoPath};
@@ -193,6 +192,7 @@ fn parse_author(author: &str) -> Result<(Vec<u8>, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn author_splits_name_and_email() {

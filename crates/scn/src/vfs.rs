@@ -20,8 +20,10 @@
 //! handle stop stray and accidental callers only.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::future::Future;
 use std::io::{Read as _, Write as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -289,11 +291,13 @@ impl Vfs {
         })
     }
 
-    /// The path of `path` under the overlay directory.
+    /// The path of `path` under the overlay directory, from the raw
+    /// bytes: a name that is not UTF-8 must name its own file, not the
+    /// file its lossy spelling names.
     pub fn overlay_file(&self, path: &RepoPath) -> PathBuf {
         let mut file = self.overlay.clone();
         for part in path.as_bytes().split(|&b| b == b'/') {
-            file.push(String::from_utf8_lossy(part).as_ref());
+            file.push(OsStr::from_bytes(part));
         }
         file
     }
@@ -1266,7 +1270,9 @@ fn write_deletes(overlay: &Path, deleted: &HashSet<RepoPath>) -> std::io::Result
         bytes.extend_from_slice(path.as_bytes());
     }
     let tmp = overlay.join(".deletes.tmp");
-    let mut file = std::fs::File::create(&tmp)?;
+    // The temp note is made like every overlay write: no symlink at its
+    // path is followed. The rename then replaces whatever is there.
+    let mut file = open_overlay_write(&tmp, true)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
     std::fs::rename(&tmp, overlay.join(DELETES))?;
@@ -1918,6 +1924,21 @@ mod tests {
             Err(nfsstat3::NFS3ERR_IO)
         );
         assert_eq!(std::fs::read(&target).unwrap(), b"keep\n");
+
+        // The note of deletions refuses a planted symlink too, and the
+        // rename still lands the note where it belongs.
+        let note = tempfile::tempdir().unwrap();
+        let outside = note.path().join("outside");
+        std::fs::write(&outside, b"keep\n").unwrap();
+        std::os::unix::fs::symlink(&outside, note.path().join(".deletes.tmp")).unwrap();
+        let mut deleted = std::collections::HashSet::new();
+        deleted.insert(RepoPath::new("gone.txt").unwrap());
+        write_deletes(note.path(), &deleted).unwrap();
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep\n");
+        assert_eq!(
+            read_deletes(note.path()).unwrap(),
+            [RepoPath::new("gone.txt").unwrap()]
+        );
     }
 
     #[tokio::test]
