@@ -479,6 +479,7 @@ impl Objects for ObjectsService {
         // The walk pays as it goes, against the same budget the reply takes
         // its shares from, and stops at the caller's deadline.
         let in_flight = Arc::clone(&self.in_flight);
+        let walk_budget = Arc::clone(&in_flight);
         let (allowed, decoded, keys) = self
             .worker
             .run(move |store| {
@@ -486,7 +487,7 @@ impl Objects for ObjectsService {
                     &store,
                     ticket.root_tree,
                     &refs,
-                    &in_flight,
+                    &walk_budget,
                     waits.until.at(),
                 )?;
                 let keys = refs.into_iter().map(|(key, _)| key).collect();
