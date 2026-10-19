@@ -1023,16 +1023,16 @@ mod tests {
         let base_edits: Vec<(String, bool)> = (0..40)
             .flat_map(|d| {
                 (0..20)
-                    .map(|f| (format!("d{d}/f{f:02}{}", "x".repeat(280)), true))
+                    .map(move |f| (format!("d{d}/f{f:02}{}", "x".repeat(280)), true))
                     .chain(std::iter::once((format!("e{d}/old"), true)))
             })
             .collect();
         let tip_edits: Vec<(String, bool)> = (0..40).map(|d| (format!("d{d}/x"), true)).collect();
-        let edits: Vec<Vec<(&str, bool)>> = [base_edits, tip_edits]
+        let sets: [&Vec<(String, bool)>; 2] = [&base_edits, &tip_edits];
+        let refs: Vec<&[(&str, bool)]> = sets
             .iter()
             .map(|set| set.iter().map(|(p, put)| (p.as_str(), *put)).collect())
             .collect();
-        let refs: Vec<&[(&str, bool)]> = edits.iter().map(|e| e.as_slice()).collect();
         let ids = store_chain(&store, repo, None, &refs, true);
         let (base, tip) = (ids[0], ids[1]);
         let base_gen = store.read(|c| c.generation(repo, base)).unwrap();
