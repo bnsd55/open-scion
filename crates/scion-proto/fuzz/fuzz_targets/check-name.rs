@@ -6,7 +6,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use scion_proto::check;
+use scion_proto::runtime::check;
 
 fuzz_target!(|data: &[u8]| {
     // The check runs on what gRPC metadata already made UTF-8, so the

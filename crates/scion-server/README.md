@@ -6,7 +6,7 @@ and reads.
 The `scion-server` binary: one store per data directory, gRPC over TLS,
 crash-safe lands and blob storage.
 
-Part of [open-scion](https://github.com/bnsd55/open-scion), a version
+Part of [openscion](https://github.com/bnsd55/openscion), a version
 control system for large monorepos. See the repository for the design
 and the rest of the system.
 

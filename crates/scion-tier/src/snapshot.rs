@@ -1,6 +1,6 @@
 //! Snapshots of the objects that a cache sent for one repo, so that a cold
 //! daemon can start with them instead of fetching them all
-//! ([#59](https://github.com/bnsd55/open-scion/issues/59)).
+//! ([#59](https://github.com/bnsd55/openscion/issues/59)).
 //!
 //! A snapshot is one file: [`MAGIC`], the repo name (its length as a `u16`,
 //! little-endian, then its bytes), then one entry per object, least recently
@@ -15,7 +15,8 @@ use std::fs;
 use std::io::{self, BufRead as _, BufReader, BufWriter, ErrorKind, Read as _, Write as _};
 use std::path::Path;
 
-use scion_proto::{Bytes, check};
+use scion_proto::Bytes;
+use scion_proto::runtime::check;
 
 use crate::Key;
 use crate::store::{DiskStore, RECORD, Store as _, parse_record, push_record};
@@ -188,7 +189,7 @@ fn fill(file: &mut impl io::Read, buf: &mut [u8]) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use scion_core::{BlobId, Entry, FileEntry, FileState, PathElem, Tree};
-    use scion_proto::object;
+    use scion_proto::runtime::object;
     use scion_proto::ticket::{self, now};
     use scion_proto::v1::objects_server::Objects as _;
     use scion_proto::v1::{Encoding, GetObjectsRequest};

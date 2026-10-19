@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath, TreeId};
 use scion_proto::CHUNK_BYTES;
-use scion_proto::auth::Bearer;
-use scion_proto::listen::Limits;
+use scion_proto::runtime::auth::Bearer;
+use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::{ObjectKind, ObjectRef};
 use scion_server::meta::{Meta as _, MetaTx as _};

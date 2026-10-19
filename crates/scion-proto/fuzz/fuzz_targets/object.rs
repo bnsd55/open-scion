@@ -9,7 +9,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use scion_proto::object;
+use scion_proto::runtime::object;
 use scion_proto::v1::ObjectPart;
 use prost::Message;
 

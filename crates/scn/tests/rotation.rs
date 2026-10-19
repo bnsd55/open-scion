@@ -12,8 +12,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 use scion_core::{BlobId, FileState};
-use scion_proto::auth::Bearer;
-use scion_proto::listen::Limits;
+use scion_proto::runtime::auth::Bearer;
+use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::{GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
 use scion_server::tickets::Keys;

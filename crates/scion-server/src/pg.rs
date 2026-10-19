@@ -1,5 +1,5 @@
 //! The Postgres metadata backend of [`Meta`](crate::meta::Meta)
-//! ([#47](https://github.com/bnsd55/open-scion/issues/47)).
+//! ([#47](https://github.com/bnsd55/openscion/issues/47)).
 //!
 //! One shared database takes the place of one data directory: many
 //! processes can hold clients, and Postgres sorts the writers out, so
@@ -33,7 +33,7 @@ use postgres::{Client, Config, NoTls};
 /// Shorthand for the owned query parameter.
 type P = Param;
 use scion_core::{BlobId, Changeset, ChangesetId, RepoPath, Tree, TreeId};
-use scion_proto::metrics::Metrics;
+use scion_proto::runtime::metrics::Metrics;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::auth::Caller;
@@ -3074,7 +3074,8 @@ fn prepare_test_schema(url: &str, schema: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, NoTls, merged_options};
+    use super::{Client, NoTls, P, merged_options};
+    use crate::backend::old_store;
     use crate::pg::Pg;
     use std::sync::Arc;
 
@@ -3100,6 +3101,158 @@ mod tests {
     fn a_url_without_options_gets_the_backends_only() {
         assert_eq!(merged_options(None, OWN), OWN);
         assert_eq!(merged_options(Some(""), OWN), OWN);
+    }
+
+    /// A Postgres store of schema version 1 opens on this build, migrates
+    /// forward through every migration it has not run, and serves what it
+    /// held ([#318]). The fixture is the schema of
+    /// `migrations/postgres/0001` with the rows an old build's write
+    /// paths left: one repo, its root changeset, the blobs it names, and
+    /// its ref. The plain open runs migrations 2 to the end under the
+    /// schema lock, and the shared asserts of `backend::old_store` run
+    /// the rest. Postgres only: it needs the test database.
+    #[test]
+    fn a_store_of_schema_version_1_opens_upgrades_and_serves() {
+        if !crate::Backend::test_is_postgres() {
+            return;
+        }
+        let url = crate::backend::test_url().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = crate::backend::test_schema(dir.path());
+        // The blob files, made by this build's writer and copied into the
+        // old store's object folder: blob files carry no schema.
+        let (blob_a, blob_b) = {
+            let scratch = tempfile::tempdir().unwrap();
+            let store = crate::store::Store::open(scratch.path()).unwrap();
+            let a = store.blobs().put(old_store::A).unwrap();
+            let b = store.blobs().put(old_store::B).unwrap();
+            for id in [a, b] {
+                // The file of `id` sits at objects/blob/<2 hex>/<rest>;
+                // the copy must land at the same place in the old store's
+                // object folder. A prefix strip would miss: an open may
+                // spell the same directory through its canonical path.
+                let (_, from) = store.blobs().location(id);
+                let hex = id.to_string();
+                let to = dir
+                    .path()
+                    .join("objects")
+                    .join("blob")
+                    .join(&hex[..2])
+                    .join(&hex[2..]);
+                std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+                std::fs::copy(from, &to).unwrap();
+            }
+            (a, b)
+        };
+        // The metadata at version 1: the schema of 0001, the ledger at 1,
+        // and the rows an old build's write paths left.
+        let cs = old_store::changeset(blob_a, blob_b);
+        let (body, id) = cs.encode_with_id();
+        {
+            let mut db = Client::connect(&url, NoTls).unwrap();
+            db.batch_execute(&format!(
+                "CREATE SCHEMA {schema}; SET search_path TO {schema}"
+            ))
+            .unwrap();
+            db.batch_execute(super::PG_MIGRATIONS[0]).unwrap();
+            // The ledger is not a migration file: an old build's open
+            // made it under its lock, at the shape of `migrate_under_lock`.
+            db.batch_execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                     version BIGINT PRIMARY KEY,
+                     name    TEXT NOT NULL
+                 )",
+            )
+            .unwrap();
+            db.batch_execute(
+                "INSERT INTO schema_migrations (version, name) \
+                 VALUES (1, 'postgres schema')",
+            )
+            .unwrap();
+            db.execute("INSERT INTO repos (repo_id, name) VALUES (1, 'main')", &[])
+                .unwrap();
+            db.execute(
+                "INSERT INTO changesets (id, gen, body) VALUES ($1, 1, $2)",
+                &[&P::bytes(&id.as_bytes()[..]), &P::bytes(&body)],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO repo_changesets (repo_id, cs) VALUES (1, $1)",
+                &[&P::bytes(&id.as_bytes()[..])],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO repo_blobs (repo_id, blob) VALUES (1, $1), (1, $2)",
+                &[
+                    &P::bytes(&blob_a.as_bytes()[..]),
+                    &P::bytes(&blob_b.as_bytes()[..]),
+                ],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO refs (repo_id, name, target, version) \
+                 VALUES (1, 'main', $1, 1)",
+                &[&P::bytes(&id.as_bytes()[..])],
+            )
+            .unwrap();
+        }
+        // A plain open of this build runs the migrations it has not run,
+        // under the schema's lock, and serves.
+        let pg = Pg::open_test(
+            &url,
+            &schema,
+            2,
+            dir.path(),
+            crate::backend::Marker::read(dir.path()),
+        )
+        .unwrap();
+        let ledger: i64 = {
+            let mut db = Client::connect(&url, NoTls).unwrap();
+            db.batch_execute(&format!("SET search_path TO {schema}"))
+                .unwrap();
+            db.query_one("SELECT max(version) FROM schema_migrations", &[])
+                .unwrap()
+                .get(0)
+        };
+        assert_eq!(ledger, i64::from(super::PG_SCHEMA_VERSION));
+        let backend = crate::Backend::Postgres(pg);
+        old_store::assert_serves(&backend, &cs, id, blob_a, blob_b);
+    }
+
+    /// The shipped Postgres migrations are frozen, like the SQLite ones
+    /// (the twin test in store.rs): a database an old build made was
+    /// built from these files as they shipped, and an edit would cut it
+    /// off ([#318]).
+    #[test]
+    fn the_shipped_migrations_stay_as_they_shipped() {
+        for (name, file, hex) in [
+            (
+                "0001_init",
+                include_bytes!("../migrations/postgres/0001_init.sql").as_slice(),
+                "9f95c671379b0d1c8e2ac2af34d95badca7929d379edcf0f8e8a02572f4a0c63",
+            ),
+            (
+                "0002_view_roots",
+                include_bytes!("../migrations/postgres/0002_view_roots.sql").as_slice(),
+                "483a299895752535dbe3856ed496894687f4840b5edfcc2fdc24b6eece02dff2",
+            ),
+            (
+                "0003_view_trees",
+                include_bytes!("../migrations/postgres/0003_view_trees.sql").as_slice(),
+                "3935e99d760f8848860acf33aeb33633a288b03aadd856a65cbe474d88989716",
+            ),
+            (
+                "0004_store_uuid",
+                include_bytes!("../migrations/postgres/0004_store_uuid.sql").as_slice(),
+                "6ac9d420e9499b40e38196c598d4c7c75c88180ed729261844b4e44f368dfab4",
+            ),
+        ] {
+            assert_eq!(
+                blake3::hash(file).to_hex().as_str(),
+                hex,
+                "migration {name} shipped: add a new migration, never edit one",
+            );
+        }
     }
 
     /// A write that waits for the collector's key records the wait in the

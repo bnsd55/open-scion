@@ -1,5 +1,5 @@
 //! `mount` and `unmount`: the virtual checkout
-//! ([#11](https://github.com/bnsd55/open-scion/issues/11)).
+//! ([#11](https://github.com/bnsd55/openscion/issues/11)).
 
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
@@ -377,7 +377,7 @@ pub(crate) fn session_file() -> Result<PathBuf> {
 /// directory above it, is made with mode 0700 whatever the umask.
 fn session_file_in(home: &Path) -> Result<PathBuf> {
     let dir = home.join(".scion");
-    scion_proto::auth::create_private_dir_all(&dir)?;
+    scion_proto::runtime::auth::create_private_dir_all(&dir)?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     Ok(dir.join("mounts.json"))
 }

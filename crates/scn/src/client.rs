@@ -8,9 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use scion_core::{BlobId, Changeset, ChangesetId, RepoPath};
-use scion_proto::auth::{Bearer, check_ancestors};
-use scion_proto::request_id;
-use scion_proto::tls::ClientTls;
+use scion_proto::runtime::auth::{Bearer, check_ancestors};
+use scion_proto::runtime::request_id;
+use scion_proto::runtime::tls::ClientTls;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ResolveRefRequest};
@@ -321,7 +321,7 @@ pub(crate) fn now_unix_secs() -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scion_proto::deadline::Until;
+    use scion_proto::runtime::deadline::Until;
 
     /// The deadline goes out on every call, so a waiting `scn` never hangs
     /// silently, and each tier on the way can end its waits in time.

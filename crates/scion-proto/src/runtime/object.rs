@@ -40,7 +40,7 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// Largest window of a zstd frame that a receiver accepts: 8 MiB, the window
 /// that RFC 8878 asks every decoder to support. libzstd stays within it at
 /// every level up to 19.
-pub const MAX_WINDOW_BYTES: usize = 1 << MAX_WINDOW_LOG;
+pub(crate) const MAX_WINDOW_BYTES: usize = 1 << MAX_WINDOW_LOG;
 const MAX_WINDOW_LOG: u32 = 23;
 
 /// Most memory that [`unpacker`] holds besides the bytes it returns: the
@@ -265,7 +265,7 @@ pub fn decode(header: &Header, data: Vec<u8>) -> Result<Vec<u8>, String> {
 /// The size in the header of `frame`, which must be exactly one Zstandard
 /// frame (RFC 8878): the frame magic number, so not a skippable frame or a
 /// legacy format; no dictionary ID; a window of at most
-/// [`MAX_WINDOW_BYTES`]; its size in its header, at most
+/// `MAX_WINDOW_BYTES`; its size in its header, at most
 /// [`MAX_OBJECT_BYTES`]; and no bytes after it. Reads only the frame's
 /// headers, not its content.
 ///

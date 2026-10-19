@@ -331,23 +331,71 @@ are process state, not data. A copy of the directory is a backup:
 cp -R /srv/scion /backups/scion-$(date +%F)
 ```
 
-With the server stopped, the copy is exact. While the server runs, a copy
-can tear a file that a commit is writing; `fsck` on the copy tells you what
-state you got:
+With the server stopped, the copy is exact. While the server runs, take
+the backup in an order that keeps it whole: the metadata first, the blob
+files second. A blob file is written once and is durable before the row
+that names it commits, so a metadata snapshot never names a blob that a
+later copy of `objects/` misses; a backup that takes the blobs first can
+miss a blob that a row of its own metadata names.
+
+On SQLite, the snapshot is `VACUUM INTO`, which reads a consistent
+committed state and does not stop the server:
 
 ```sh
-./scion-server --data /backups/scion-2026-10-17 fsck
+sqlite3 /srv/scion/scion.db "VACUUM INTO '/backups/scion.db'"
 ```
 
-`fsck` changes nothing and can run while the server runs: it checks every
-blob file against its ID, every blob a row names, every changeset, tree and
-history node against its ID, every ref and derived row, and every derived
-value with its kind's decoder. It prints one line per problem (kind, ID,
-path) and exits 0 when it saw no damage, 1 when it did, 2 when it could not
-run. A clean report means "no damage seen", not a snapshot: it reads in
-short batches. For a quiet backup, stop the server, copy, fsck the copy,
-start the server again. To restore, stop the server, replace the data
-directory with the backup, run `fsck` on it, start the server.
+On Postgres, the metadata lives in the database, so the snapshot is a
+dump:
+
+```sh
+pg_dump --no-owner --file /backups/metadata.sql <the metadata database>
+```
+
+Then copy the blob files into the backup:
+
+```sh
+cp -R /srv/scion/objects /backups/scion-$(date +%F)/objects
+```
+
+The `backend` marker is part of the metadata: it holds the store's UUID,
+which the metadata holds too, and together they bind the database to its
+data directory. An open refuses a database whose UUID differs from the
+marker's, so the marker and the metadata always travel together. Copy
+the marker when the directory has one (a Postgres deployment writes it;
+a SQLite directory keeps its UUID in `scion.db` itself):
+
+```sh
+cp /srv/scion/backend /backups/scion-$(date +%F)/backend
+```
+
+A copy taken this way never tears a file that a commit is writing, and
+`fsck` tells you what state a backup holds. `fsck` changes nothing and
+can run while the server runs: it checks every blob file against its ID,
+every blob a row names, every changeset, tree and history node against
+its ID, every ref and derived row, and every derived value with its
+kind's decoder. It prints one line per problem (kind, ID, path) and
+exits 0 when it saw no damage, 1 when it did, 2 when it could not run.
+A clean report means "no damage seen", not a snapshot: it reads in short
+batches.
+
+Two things bound a backup taken while the server runs:
+
+- A write acknowledged before the metadata snapshot reads back after a
+  restore. A write acknowledged during the backup may be in it or out
+  of it.
+- Do not run `gc` during a backup. A blob the snapshot names can lose
+  its last row after the snapshot (a repo removed, a ref that moved),
+  and the collector ages an orphan by the blob file's mtime, which for
+  an old blob is older than the grace: the sweep can delete the file
+  before the copy reaches it, and the restored store names a blob that
+  is gone.
+
+To restore: put the metadata (the snapshot, or the dump loaded into a
+new database), the marker, and `objects/` into a fresh directory; run
+`fsck` on it; start the server. `fsck` catches the gap a torn or
+gc-raced backup left, so run it after every restore, before the server
+serves.
 
 ## 4. Upgrades
 
@@ -408,8 +456,34 @@ The routines are these:
   without removing anything. Run it on a schedule, and `fsck` after it the
   first few times, until you trust the two together. Its progress is in
   the gc log: one line when it starts, one per pruned batch and per swept
-  file batch, and one when it ends, each with the counts and the time it
-  took.
+  file batch, one when it ends, each with the counts and the time it
+  took, and a line at most every 10 s of a long run with the repos done
+  and the total.
+
+**The collector's metrics file.** The collector runs as its own process,
+so the server's `/metrics` cannot show what it did. Instead, give the run
+a metrics file, and scrape it from the machine:
+
+```sh
+scion-server --data /tmp/scion gc --metrics-file /var/lib/node_exporter/textfile/scion_gc.prom
+```
+
+A cron line runs the collector on its schedule and writes the file, which
+the node exporter's `textfile` collector serves with the rest of the
+machine's metrics. The file holds the last finished run's end time
+(`scion_gc_last_success_timestamp_seconds`), its duration
+(`scion_gc_duration_seconds`), and the rows and files it collected
+(`scion_gc_rows_pruned`, `scion_gc_files_removed`), each with a `dry_run`
+label on every series. The file is written atomically, and only when the
+run succeeds: a failed run leaves the previous file, so the timestamp
+goes stale. One file holds one run: each run rewrites the whole file, so
+after a dry run the series are the dry run's, until the next real run
+replaces them. The alert to have on the folder is the age of the last
+success, counted on the real runs only —
+`time() - scion_gc_last_success_timestamp_seconds{dry_run="false"} > <N>`
+— so a dry run cannot reset it: a run that did not finish, or a cron that
+stopped firing, shows up as a timestamp that stops moving, not as a gap
+in the scrape.
 - Derived data can be rebuilt with `scion-server derive --kind ... --ref
   ...` (server stopped); it is safe to repeat and removes rows of older
   versions itself.
