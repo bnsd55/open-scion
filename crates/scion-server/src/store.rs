@@ -1004,12 +1004,15 @@ pub struct Blobs {
     /// The durability steps this `Blobs` ran, in order, for the order
     /// test: a test-hooks build records them, a production build stores
     /// nothing.
+    #[cfg(any(test, feature = "test-hooks"))]
     log: DurabilityLog,
 }
 
 /// Which entry the order test records for one gated fsync. Production
 /// code names the step and pays nothing for it; only a test-hooks build
-/// records anything.
+/// records anything, so a release build constructs the payloads and
+/// never reads them.
+#[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
 enum SyncStep<'a> {
     /// The temp file of a blob, before its rename.
     TempFile(BlobId),
@@ -1023,6 +1026,7 @@ enum SyncStep<'a> {
 
 /// One durability step of the blob path, recorded for the order test.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DurabilityStep {
     /// A temp file for a blob was written.
@@ -1043,24 +1047,20 @@ pub enum DurabilityStep {
 
 /// The ordered log of [`DurabilityStep`]s behind the test-hooks seam.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Default)]
 pub struct DurabilityLog {
-    #[cfg(any(test, feature = "test-hooks"))]
     steps: std::sync::Mutex<Vec<DurabilityStep>>,
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 impl DurabilityLog {
-    /// Records one step. A release build keeps no steps: a record is a
-    /// drop.
-    #[cfg_attr(not(any(test, feature = "test-hooks")), allow(clippy::unused_self))]
+    /// Records one step.
     fn record(&self, step: DurabilityStep) {
-        #[cfg(any(test, feature = "test-hooks"))]
         self.steps
             .lock()
             .expect("the durability log's lock")
             .push(step);
-        #[cfg(not(any(test, feature = "test-hooks")))]
-        drop(step);
     }
 
     /// The steps recorded so far, oldest first.
@@ -1068,7 +1068,6 @@ impl DurabilityLog {
     /// # Panics
     ///
     /// Panics if the log's lock is poisoned.
-    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn steps(&self) -> Vec<DurabilityStep> {
         self.steps
@@ -1144,6 +1143,7 @@ impl Blobs {
             fail_reads: std::sync::atomic::AtomicUsize::new(UNARMED),
             fail_fsyncs: std::sync::atomic::AtomicUsize::new(UNARMED),
             fsync_count: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
             log: DurabilityLog::default(),
         })
     }
@@ -1553,6 +1553,7 @@ impl Blobs {
         let started = std::time::Instant::now();
         let out = f();
         if out.is_ok() {
+            #[cfg(any(test, feature = "test-hooks"))]
             match step {
                 SyncStep::TempFile(id) => self.log.record(DurabilityStep::FileFsync(*id)),
                 SyncStep::StoredFile(id) => {
@@ -1563,6 +1564,9 @@ impl Blobs {
                     .record(DurabilityStep::DirFsync(path.to_path_buf())),
                 SyncStep::Unnamed => {}
             }
+            // A release build names the step and pays nothing for it.
+            #[cfg(not(any(test, feature = "test-hooks")))]
+            let _ = step;
         }
         self.record_sync(started);
         out.map_err(Error::Io)
