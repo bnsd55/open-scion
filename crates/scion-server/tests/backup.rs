@@ -21,7 +21,7 @@ fn a_backup_taken_while_serving_restores_whole() {
     }
     let dir = tempfile::tempdir().unwrap();
     let store = Backend::open_test(dir.path()).unwrap();
-    let (repo, blob_ids, ids) = write_chain(&store, "backup", 20);
+    let chain = write_chain(&store, "backup", 20);
 
     // The metadata snapshot: the runbook's `VACUUM INTO`, on its own
     // connection to the live database, while the store keeps serving.
@@ -36,10 +36,10 @@ fn a_backup_taken_while_serving_restores_whole() {
     // The copy of the blob files runs while more writes land: a blob the
     // snapshot names stays reachable, and the copy may or may not hold
     // the newer ones.
-    let tip = *ids.last().unwrap();
+    let tip = *chain.ids.last().unwrap();
     let writer = {
         let store = store.clone();
-        std::thread::spawn(move || write_raced(&store, repo, "raced", 10, tip))
+        std::thread::spawn(move || write_raced(&store, chain.repo, "raced", 10, tip))
     };
     let backup = tempfile::tempdir().unwrap();
     copy_tree(&dir.path().join("objects"), &backup.path().join("objects"));
@@ -64,7 +64,7 @@ fn a_backup_taken_while_serving_restores_whole() {
         "the restore is whole: {:?}",
         report.problems
     );
-    assert_reads_back(&restored, repo, "backup", &ids, &blob_ids);
+    assert_reads_back(&restored, chain.repo, "backup", &chain.ids, &chain.blobs);
 }
 
 /// Puts the blob named `label i` and returns its ID with its bytes.
@@ -100,29 +100,32 @@ fn chain_changeset(label: &str, i: u8, blob: BlobId, parent: Option<ChangesetId>
 /// The writes the backup must keep: a chain of `n` changesets, each with
 /// its own blob, acknowledged before the caller takes its snapshot. The
 /// blobs go in first: a blob file is durable before the row that names it.
-fn write_chain(
-    store: &Backend,
-    label: &str,
-    n: u8,
-) -> (RepoId, Vec<(BlobId, Vec<u8>)>, Vec<ChangesetId>) {
-    let blob_ids: Vec<(BlobId, Vec<u8>)> = (0..n).map(|i| put_blob(store, label, i)).collect();
+struct Chain {
+    /// The repo the chain lives in.
+    repo: RepoId,
+    /// Each changeset's blob, with the bytes put.
+    blobs: Vec<(BlobId, Vec<u8>)>,
+    /// The changesets, oldest first; the last one is ref `main`'s target.
+    ids: Vec<ChangesetId>,
+}
+
+fn write_chain(store: &Backend, label: &str, n: u8) -> Chain {
+    let blobs: Vec<(BlobId, Vec<u8>)> = (0..n).map(|i| put_blob(store, label, i)).collect();
     let (repo, ids) = store
         .write(|c| {
             let repo = c.create_repo("r")?;
             let mut ids = Vec::new();
             let mut parent = None;
-            for (i, (blob, _)) in blob_ids.iter().enumerate() {
+            for (i, (blob, _)) in (0..n).zip(blobs.iter()) {
                 c.add_repo_blob(repo, *blob)?;
-                parent = Some(
-                    c.insert_changeset(repo, &chain_changeset(label, i as u8, *blob, parent))?,
-                );
+                parent = Some(c.insert_changeset(repo, &chain_changeset(label, i, *blob, parent))?);
                 ids.push(parent.unwrap());
             }
             assert!(c.cas_ref(repo, "main", None, *ids.last().unwrap())?);
             Ok((repo, ids))
         })
         .unwrap();
-    (repo, blob_ids, ids)
+    Chain { repo, blobs, ids }
 }
 
 /// The writes that race the blob copy: `n` more changesets on the chain,
