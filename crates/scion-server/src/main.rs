@@ -186,6 +186,16 @@ enum Command {
         /// Report what a real run would collect, and remove nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Write this run's report as a Prometheus text file, in the
+        /// format of the node exporter's textfile collector, so the
+        /// machine's scrape can carry what the collector did: the
+        /// collector runs as its own process, so the server's /metrics
+        /// cannot show it. Written only when the run succeeds, atomically
+        /// (temp file, fsync, rename), so a reader never sees half a file
+        /// and a failed run leaves the previous file, whose timestamp
+        /// then goes stale.
+        #[arg(long, value_name = "PATH")]
+        metrics_file: Option<PathBuf>,
     },
     /// Derive one kind of derived data for the history of a ref, in bounded
     /// steps, and remove the rows of its older versions. Safe to repeat.
@@ -247,7 +257,8 @@ fn fsck_command(store: &Backend) -> anyhow::Result<()> {
 
 /// Runs `gc` against `store` and prints what it collected. Exits 2 when it
 /// could not run.
-fn gc_command(store: &Backend, grace: Duration, dry_run: bool) {
+fn gc_command(store: &Backend, grace: Duration, dry_run: bool, metrics_file: Option<&Path>) {
+    let started = std::time::Instant::now();
     let report = match gc::run(store, grace, dry_run, &mut |_| {}) {
         Ok(report) => report,
         Err(e) => {
@@ -262,6 +273,58 @@ fn gc_command(store: &Backend, grace: Duration, dry_run: bool) {
         report.files_removed,
         if dry_run { " (dry run)" } else { "" },
     );
+    if let Some(path) = metrics_file {
+        write_gc_metrics_file(path, &report, started.elapsed(), dry_run);
+    }
+}
+
+/// Writes the metrics file of `scion-server gc --metrics-file`: the
+/// gauges of one finished run, in the Prometheus text format the node
+/// exporter's textfile collector reads. A failed run never touches the
+/// file, so its timestamp goes stale and an alert on it fires.
+fn write_gc_metrics_file(path: &Path, report: &gc::Report, took: Duration, dry_run: bool) {
+    let dry = if dry_run { "true" } else { "false" };
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let text = format!(
+        "# HELP scion_gc_last_success_timestamp_seconds When the collector last finished a run, in seconds since the Unix epoch.\n\
+         # TYPE scion_gc_last_success_timestamp_seconds gauge\n\
+         scion_gc_last_success_timestamp_seconds {unix}\n\
+         # HELP scion_gc_duration_seconds How long the last finished run took, in seconds.\n\
+         # TYPE scion_gc_duration_seconds gauge\n\
+         scion_gc_duration_seconds {}\n\
+         # HELP scion_gc_rows_pruned Repo blob rows the last finished run pruned.\n\
+         # TYPE scion_gc_rows_pruned gauge\n\
+         scion_gc_rows_pruned{{dry_run=\"{dry}\"}} {}\n\
+         # HELP scion_gc_files_removed Blob files the last finished run removed.\n\
+         # TYPE scion_gc_files_removed gauge\n\
+         scion_gc_files_removed{{dry_run=\"{dry}\"}} {}\n",
+        took.as_secs_f64(),
+        report.rows_pruned,
+        report.files_removed,
+    );
+    // Write to a temp file beside the target, fsync it, then rename: a
+    // reader of PATH never sees half a file, and a crash leaves the old
+    // file whole.
+    let tmp = path.with_extension("tmp");
+    let write = || -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    };
+    if let Err(e) = write() {
+        // The run itself succeeded, so the command stays 0: the stale
+        // timestamp of the old file is what the alert on the folder sees.
+        eprintln!(
+            "scion-server gc: cannot write the metrics file {}: {e}",
+            path.display()
+        );
+    }
 }
 
 #[tokio::main]
@@ -331,8 +394,14 @@ async fn main() -> anyhow::Result<()> {
         Command::Gc {
             grace_secs,
             dry_run,
+            metrics_file,
         } => {
-            gc_command(&store, Duration::from_secs(grace_secs), dry_run);
+            gc_command(
+                &store,
+                Duration::from_secs(grace_secs),
+                dry_run,
+                metrics_file.as_deref(),
+            );
         }
         Command::Import {
             repo,

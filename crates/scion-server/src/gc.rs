@@ -75,6 +75,11 @@ const PRUNE_BATCH: usize = 256;
 /// this clock only reports the batches that ran past it.
 const BATCH_BUDGET: Duration = Duration::from_millis(100);
 
+/// How long between two progress lines of a long run: a collector over
+/// millions of rows stays silent for minutes otherwise, and an operator
+/// tailing the log cannot tell a slow walk from a hung one.
+const PROGRESS_LOG: Duration = Duration::from_secs(10);
+
 /// The grace period, when `--grace-secs` is not given: seven days.
 pub const DEFAULT_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
 
@@ -218,6 +223,9 @@ fn prune_rows(
     // Every repo, not only the ones with changesets: a repo whose rows all
     // came from uploads gets its prune too.
     report.repos = u64::try_from(repos.len()).unwrap_or(u64::MAX);
+    let total = report.repos;
+    let mut done = 0u64;
+    let mut logged = std::time::Instant::now();
     for (repo, name) in repos {
         // The candidate scan reads rows and files: it runs in a read
         // transaction, so it does not hold the collector's key while it
@@ -307,6 +315,14 @@ fn prune_rows(
                 );
             }
             between(Stage::RepoRows);
+        }
+        done += 1;
+        // One progress line at most every `PROGRESS_LOG`, with the repos
+        // done and the total: the counts live here, where the walk runs,
+        // so the callback stays as it is.
+        if logged.elapsed() >= PROGRESS_LOG {
+            logged = std::time::Instant::now();
+            tracing::info!(done, total, "the collector's progress over the repos");
         }
     }
     Ok(())

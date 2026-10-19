@@ -408,8 +408,29 @@ The routines are these:
   without removing anything. Run it on a schedule, and `fsck` after it the
   first few times, until you trust the two together. Its progress is in
   the gc log: one line when it starts, one per pruned batch and per swept
-  file batch, and one when it ends, each with the counts and the time it
-  took.
+  file batch, one when it ends, each with the counts and the time it
+  took, and a line at most every 10 s of a long run with the repos done
+  and the total.
+
+**The collector's metrics file.** The collector runs as its own process,
+so the server's `/metrics` cannot show what it did. Instead, give the run
+a metrics file, and scrape it from the machine:
+
+```sh
+scion-server --data /tmp/scion gc --metrics-file /var/lib/node_exporter/textfile/scion_gc.prom
+```
+
+A cron line runs the collector on its schedule and writes the file, which
+the node exporter's `textfile` collector serves with the rest of the
+machine's metrics. The file holds the last finished run's end time
+(`scion_gc_last_success_timestamp_seconds`), its duration
+(`scion_gc_duration_seconds`), and the rows and files it collected
+(`scion_gc_rows_pruned`, `scion_gc_files_removed`), each with a `dry_run`
+label. The file is written atomically, and only when the run succeeds: a
+failed run leaves the previous file, so the timestamp goes stale. The
+alert to have on the folder is the age of the last success — a run that
+did not finish, or a cron that stopped firing, shows up as a timestamp
+that stops moving, not as a gap in the scrape.
 - Derived data can be rebuilt with `scion-server derive --kind ... --ref
   ...` (server stopped); it is safe to repeat and removes rows of older
   versions itself.
