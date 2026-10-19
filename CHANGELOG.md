@@ -232,6 +232,14 @@ The first release: the server, its cache tiers, and the `scn` client.
   error says what to check. The fresh-directory claim that preceded
   the durable marker write is gone: `write_marker` writes the same
   first line, durable, so no crash can leave a partial marker behind.
+- The `serve` flags are all checked before the data directory opens:
+  a bad flag answers with its own error, instead of taking the data
+  directory's one-server lock or creating a file in an empty directory.
+- `--land-stale-secs` refuses 0 and negative values, and
+  `--max-principal-requests`, `--max-principal-upload-bytes` and
+  `--max-principal-pending-lands` refuse 0: those values used to mean
+  that the sweep rejects every pending land, or that every call and
+  land is refused, with no word of it at start.
 - A fill of a kind over every parent (the commit graph) no longer holds
   a parent once per child that reached it in its walk: the seen set now
   checks pushes, so the walk's queue is as wide as the graph's frontier
@@ -241,7 +249,13 @@ The first release: the server, its cache tiers, and the `scn` client.
   of frame-header file reads sat between the lock's take and its
   release. Kinds that never read lengths (the commit graph, the path
   history) read no blob files at all.
-
+- A land's check of a base that the path index does not reach kept
+  every history node row it read, with no cap on their bytes: a row is
+  up to 64 KiB, and one check reads one or more per part of each of the
+  land's paths, so only the deadline stopped the read. The check's
+  cache now clears its rows once they pass the same byte cap a log
+  page's nodes stop at, so the answer never changes and only re-reads
+  cost more.
 - A silent TLS peer holds its connection's place for at most the
   handshake timeout, not twice that: one deadline from the accept
   bounds the TLS handshake and the HTTP/2 preface that follows it
@@ -274,6 +288,11 @@ The first release: the server, its cache tiers, and the `scn` client.
   through a new BEGIN), and a read's timeout statements that fail
   after the BEGIN roll the read transaction back before the reader
   returns to the pool.
+- The land metrics count lands whose call ended in an error: a land
+  that answered `Aborted`, `DeadlineExceeded`, or any other error class
+  moved no counter, so an operator could not see failing lands. The
+  land counter now moves for the error's class, under the same
+  `scion_lands_total{outcome}` series.
 - Two reads stop at the caller's deadline and the reply's budget
   (#283): a `Log` call without a path read up to 1,000 changesets, each
   as large as a changeset can be, with the call's deadline never

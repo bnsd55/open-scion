@@ -44,85 +44,94 @@ struct Cli {
     command: Command,
 }
 
+/// The flags of `serve`, as clap parses them.
+#[derive(clap::Args)]
+struct ServeArgs {
+    /// Address to listen on.
+    #[arg(long, default_value = "127.0.0.1:7878")]
+    listen: SocketAddr,
+    /// Bearer token that clients must send. Its principal, `default`,
+    /// may read and write every repo. Give `--token` or `--access`, not
+    /// both. With this, the per-principal quotas are off unless a flag
+    /// sets one: every client is the same principal, so a cap would be
+    /// a global one.
+    #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
+    token: Option<String>,
+    /// Access file: tokens with principals, and which repos and paths
+    /// each principal may read and write. Give `--token` or `--access`,
+    /// not both.
+    #[arg(long, value_name = "FILE")]
+    access: Option<PathBuf>,
+    /// Most requests one principal may hold at once. With `--access`
+    /// the default is 64; with `--token` the check is off.
+    #[arg(long)]
+    max_principal_requests: Option<NonZeroUsize>,
+    /// Most upload bytes one principal may hold in flight. With
+    /// `--access` the default is 536870912 (512 MiB); with `--token`
+    /// the check is off.
+    #[arg(long, value_name = "BYTES")]
+    max_principal_upload_bytes: Option<NonZeroUsize>,
+    /// Most pending lands one principal may hold at once. With
+    /// `--access` the default is 64; with `--token` the check is off.
+    #[arg(long)]
+    max_principal_pending_lands: Option<NonZeroUsize>,
+    /// A land that has been pending for longer than this many seconds is
+    /// rejected by the sweep, so a restart cannot leave one pending
+    /// forever. The default is 86400 (24 hours).
+    #[arg(
+        long,
+        default_value_t = 24 * 60 * 60,
+        value_parser = clap::value_parser!(i64).range(1..),
+        allow_negative_numbers = true
+    )]
+    land_stale_secs: i64,
+    /// Allow a non-loopback address. Without TLS, traffic, including the
+    /// token, is not encrypted, so use this only on a trusted network.
+    /// With `--tls-cert` and `--tls-key`, a non-loopback address is
+    /// allowed without this flag.
+    #[arg(long)]
+    insecure_listen: bool,
+    /// Serve TLS with this certificate (PEM), together with `--tls-key`.
+    /// Then a non-loopback address needs no `--insecure-listen`.
+    #[arg(long, requires = "tls_key", value_name = "FILE")]
+    tls_cert: Option<PathBuf>,
+    /// The key of `--tls-cert` (PEM).
+    #[arg(long, requires = "tls_cert", value_name = "FILE")]
+    tls_key: Option<PathBuf>,
+    /// Require a client certificate (mTLS) that this CA (PEM) signed.
+    #[arg(long, requires = "tls_cert", value_name = "FILE")]
+    tls_client_ca: Option<PathBuf>,
+    /// Most connections served at once. More clients wait until one closes.
+    #[arg(long, default_value_t = listen::DEFAULT_CONNECTIONS)]
+    max_connections: NonZeroUsize,
+    /// Most calls (HTTP/2 streams) that one connection may have open at once.
+    #[arg(long, default_value_t = listen::DEFAULT_STREAMS)]
+    max_streams: NonZeroU32,
+    /// File with the Ed25519 seed (64 hex characters) that signs the
+    /// tickets of `GetRootTree` replies, from `ticket-key`. Without it,
+    /// no object is readable: a read needs a ticket.
+    #[arg(long, value_name = "FILE")]
+    ticket_key: Option<PathBuf>,
+    /// File with the previous ticket key (64 hex characters of its
+    /// public key), whose tickets stay valid during a rotation.
+    #[arg(long, value_name = "FILE", requires = "ticket_key")]
+    ticket_key_old: Option<PathBuf>,
+    /// Most bytes that the stalled replies of one connection may hold. A
+    /// connection over it is closed with them.
+    #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
+    max_stalled_bytes: NonZeroU64,
+    /// Serve Prometheus metrics over plain HTTP on this address. Off by
+    /// default. Follows the listen rule: a non-loopback address needs
+    /// `--insecure-listen`, because the metrics travel unencrypted.
+    #[arg(long, value_name = "ADDR")]
+    metrics_listen: Option<SocketAddr>,
+}
+
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)] // SHORTCUT: `Serve` holds its flags by value, 309 bytes against `Import`'s 109: 20 bytes over the lint. Box the TLS paths if a variant grows further.
 enum Command {
     /// Serve the gRPC API.
-    Serve {
-        /// Address to listen on.
-        #[arg(long, default_value = "127.0.0.1:7878")]
-        listen: SocketAddr,
-        /// Bearer token that clients must send. Its principal, `default`,
-        /// may read and write every repo. Give `--token` or `--access`, not
-        /// both. With this, the per-principal quotas are off unless a flag
-        /// sets one: every client is the same principal, so a cap would be
-        /// a global one.
-        #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
-        token: Option<String>,
-        /// Access file: tokens with principals, and which repos and paths
-        /// each principal may read and write. Give `--token` or `--access`,
-        /// not both.
-        #[arg(long, value_name = "FILE")]
-        access: Option<PathBuf>,
-        /// Most requests one principal may hold at once. With `--access`
-        /// the default is 64; with `--token` the check is off.
-        #[arg(long)]
-        max_principal_requests: Option<usize>,
-        /// Most upload bytes one principal may hold in flight. With
-        /// `--access` the default is 536870912 (512 MiB); with `--token`
-        /// the check is off.
-        #[arg(long, value_name = "BYTES")]
-        max_principal_upload_bytes: Option<usize>,
-        /// Most pending lands one principal may hold at once. With
-        /// `--access` the default is 64; with `--token` the check is off.
-        #[arg(long)]
-        max_principal_pending_lands: Option<usize>,
-        /// A land that has been pending for longer than this many seconds is
-        /// rejected by the sweep, so a restart cannot leave one pending
-        /// forever. The default is 86400 (24 hours).
-        #[arg(long, default_value_t = 24 * 60 * 60)]
-        land_stale_secs: i64,
-        /// Allow a non-loopback address. Without TLS, traffic, including the
-        /// token, is not encrypted, so use this only on a trusted network.
-        /// With `--tls-cert` and `--tls-key`, a non-loopback address is
-        /// allowed without this flag.
-        #[arg(long)]
-        insecure_listen: bool,
-        /// Serve TLS with this certificate (PEM), together with `--tls-key`.
-        /// Then a non-loopback address needs no `--insecure-listen`.
-        #[arg(long, requires = "tls_key", value_name = "FILE")]
-        tls_cert: Option<PathBuf>,
-        /// The key of `--tls-cert` (PEM).
-        #[arg(long, requires = "tls_cert", value_name = "FILE")]
-        tls_key: Option<PathBuf>,
-        /// Require a client certificate (mTLS) that this CA (PEM) signed.
-        #[arg(long, requires = "tls_cert", value_name = "FILE")]
-        tls_client_ca: Option<PathBuf>,
-        /// Most connections served at once. More clients wait until one closes.
-        #[arg(long, default_value_t = listen::DEFAULT_CONNECTIONS)]
-        max_connections: NonZeroUsize,
-        /// Most calls (HTTP/2 streams) that one connection may have open at once.
-        #[arg(long, default_value_t = listen::DEFAULT_STREAMS)]
-        max_streams: NonZeroU32,
-        /// File with the Ed25519 seed (64 hex characters) that signs the
-        /// tickets of `GetRootTree` replies, from `ticket-key`. Without it,
-        /// no object is readable: a read needs a ticket.
-        #[arg(long, value_name = "FILE")]
-        ticket_key: Option<PathBuf>,
-        /// File with the previous ticket key (64 hex characters of its
-        /// public key), whose tickets stay valid during a rotation.
-        #[arg(long, value_name = "FILE", requires = "ticket_key")]
-        ticket_key_old: Option<PathBuf>,
-        /// Most bytes that the stalled replies of one connection may hold. A
-        /// connection over it is closed with them.
-        #[arg(long, default_value_t = listen::DEFAULT_STALLED_BYTES)]
-        max_stalled_bytes: NonZeroU64,
-        /// Serve Prometheus metrics over plain HTTP on this address. Off by
-        /// default. Follows the listen rule: a non-loopback address needs
-        /// `--insecure-listen`, because the metrics travel unencrypted.
-        #[arg(long, value_name = "ADDR")]
-        metrics_listen: Option<SocketAddr>,
-    },
+    Serve(ServeArgs),
     /// Print the BLAKE3 digest of a token, as a `token` line of an access
     /// file wants it. The file holds digests, never tokens.
     HashToken {
@@ -265,6 +274,13 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
+    // Every `serve` flag is checked before the data directory opens: a bad
+    // flag must not take the data directory's one-server lock, and must
+    // not create a file in an empty directory.
+    let flags = match &cli.command {
+        Command::Serve(args) => Some(serve_flags(args)?),
+        _ => None,
+    };
     // `hash-token` needs no data directory. An import does not land, so it
     // can run beside the server. `derive` removes rows of older versions of a
     // kind, which a running server of an older build may read, so it opens as
@@ -285,58 +301,24 @@ async fn main() -> anyhow::Result<()> {
     }
     .with_context(|| format!("cannot open data directory {}", cli.data.display()))?;
     match cli.command {
-        Command::Serve {
-            listen,
-            token,
-            access,
-            max_principal_requests,
-            max_principal_upload_bytes,
-            max_principal_pending_lands,
-            land_stale_secs,
-            insecure_listen,
-            tls_cert,
-            tls_key,
-            tls_client_ca,
-            max_connections,
-            max_streams,
-            max_stalled_bytes,
-            metrics_listen,
-            ticket_key,
-            ticket_key_old,
-        } => {
-            // The second reply says whether the mode is one token: with one
-            // principal, a per-principal cap is a global one, so the quotas
-            // are off unless a flag sets one.
-            let (access, single) = load_access(token, access)?;
-            let caps = caps(
-                single,
-                max_principal_requests,
-                max_principal_upload_bytes,
-                max_principal_pending_lands,
-            );
-            let server_tls = server_tls(
-                tls_cert.as_deref(),
-                tls_key.as_deref(),
-                tls_client_ca.as_deref(),
-            )?;
-            let tickets = load_tickets(ticket_key.as_deref(), ticket_key_old.as_deref())?;
+        Command::Serve { .. } => {
+            let flags = flags.expect("a serve command validated its flags");
             serve(
                 store,
-                listen,
-                access,
+                flags.listen,
+                flags.access,
                 ServeConfig {
                     data: cli.data.clone(),
-                    insecure_listen,
-                    quotas: caps.quotas,
-                    pending_lands: caps.pending_lands,
-                    land_stale_secs,
-                    server_tls,
-                    max_connections,
-                    max_streams,
-                    max_stalled_bytes,
-                    metrics_listen,
+                    quotas: flags.caps.quotas,
+                    pending_lands: flags.caps.pending_lands,
+                    land_stale_secs: flags.land_stale_secs,
+                    server_tls: flags.server_tls,
+                    max_connections: flags.max_connections,
+                    max_streams: flags.max_streams,
+                    max_stalled_bytes: flags.max_stalled_bytes,
+                    metrics_listen: flags.metrics_listen,
                 },
-                tickets,
+                flags.tickets,
             )
             .await?;
         }
@@ -427,15 +409,15 @@ struct Caps {
 
 fn caps(
     single: bool,
-    requests: Option<usize>,
-    upload_bytes: Option<usize>,
-    pending_lands: Option<usize>,
+    requests: Option<NonZeroUsize>,
+    upload_bytes: Option<NonZeroUsize>,
+    pending_lands: Option<NonZeroUsize>,
 ) -> Caps {
-    let with_default = |flag: Option<usize>, default: usize| {
+    let with_default = |flag: Option<NonZeroUsize>, default: usize| {
         if single {
-            flag
+            flag.map(NonZeroUsize::get)
         } else {
-            Some(flag.unwrap_or(default))
+            Some(flag.map_or(default, NonZeroUsize::get))
         }
     };
     Caps {
@@ -450,7 +432,6 @@ fn caps(
 /// What a `serve` command serves with, besides the data directory and the
 /// access rules.
 struct ServeConfig {
-    insecure_listen: bool,
     quotas: Quotas,
     pending_lands: Option<usize>,
     land_stale_secs: i64,
@@ -460,6 +441,70 @@ struct ServeConfig {
     max_stalled_bytes: NonZeroU64,
     metrics_listen: Option<SocketAddr>,
     data: std::path::PathBuf,
+}
+
+/// The validated flags of a `serve` command: everything `serve` needs is
+/// checked here, before the data directory opens, so a bad flag never takes
+/// the data directory's one-server lock and never creates a file.
+struct ServeFlags {
+    listen: SocketAddr,
+    access: scion_server::access::Access,
+    caps: Caps,
+    land_stale_secs: i64,
+    server_tls: Option<ServerTls>,
+    max_connections: NonZeroUsize,
+    max_streams: NonZeroU32,
+    max_stalled_bytes: NonZeroU64,
+    metrics_listen: Option<SocketAddr>,
+    tickets: Option<Arc<scion_server::tickets::Keys>>,
+}
+
+/// Checks every `serve` flag that a parse alone does not settle: the rules
+/// of `--token` against `--access`, the TLS files, the ticket keys, and the
+/// listen rule (a non-loopback address needs TLS or `--insecure-listen`).
+/// Checks every `serve` flag that a parse alone does not settle: the rules
+/// of `--token` against `--access`, the TLS files, the ticket keys, and the
+/// listen rule (a non-loopback address needs TLS or `--insecure-listen`).
+fn serve_flags(args: &ServeArgs) -> anyhow::Result<ServeFlags> {
+    // The second reply says whether the mode is one token: with one
+    // principal, a per-principal cap is a global one, so the quotas
+    // are off unless a flag sets one.
+    let (access, single) = load_access(args.token.clone(), args.access.clone())?;
+    let caps = caps(
+        single,
+        args.max_principal_requests,
+        args.max_principal_upload_bytes,
+        args.max_principal_pending_lands,
+    );
+    let server_tls = server_tls(
+        args.tls_cert.as_deref(),
+        args.tls_key.as_deref(),
+        args.tls_client_ca.as_deref(),
+    )?;
+    let tickets = load_tickets(args.ticket_key.as_deref(), args.ticket_key_old.as_deref())?;
+    anyhow::ensure!(
+        args.listen.ip().is_loopback() || args.insecure_listen || server_tls.is_some(),
+        "{} is not a loopback address; without TLS the traffic and the \
+         token would travel unencrypted. Pass --tls-cert and --tls-key, or \
+         --insecure-listen to allow it.",
+        args.listen
+    );
+    if let Some(metrics_listen) = args.metrics_listen {
+        let checked = metrics::loopback_or_allow(metrics_listen, args.insecure_listen);
+        anyhow::ensure!(checked.is_ok(), "{}", checked.unwrap_err());
+    }
+    Ok(ServeFlags {
+        listen: args.listen,
+        access,
+        caps,
+        land_stale_secs: args.land_stale_secs,
+        server_tls,
+        max_connections: args.max_connections,
+        max_streams: args.max_streams,
+        max_stalled_bytes: args.max_stalled_bytes,
+        metrics_listen: args.metrics_listen,
+        tickets,
+    })
 }
 
 /// Serves the gRPC API on `listen`, with the TLS files of the flags, until
@@ -472,12 +517,6 @@ async fn serve(
     config: ServeConfig,
     tickets: Option<Arc<scion_server::tickets::Keys>>,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        listen.ip().is_loopback() || config.insecure_listen || config.server_tls.is_some(),
-        "{listen} is not a loopback address; without TLS the traffic and the \
-         token would travel unencrypted. Pass --tls-cert and --tls-key, or \
-         --insecure-listen to allow it."
-    );
     // The registry always counts; only its plain-HTTP export is optional.
     // The metrics listener has no token, so unlike the gRPC listener, TLS
     // does not excuse a non-loopback address: `--insecure-listen` must allow
@@ -497,8 +536,6 @@ async fn serve(
     });
     if let Some(metrics_listen) = config.metrics_listen {
         let address = metrics_listen.to_string();
-        let checked = metrics::loopback_or_allow(metrics_listen, config.insecure_listen);
-        anyhow::ensure!(checked.is_ok(), "{}", checked.unwrap_err());
         let metrics_listener = tokio::net::TcpListener::bind(metrics_listen)
             .await
             .with_context(|| format!("cannot listen on {address}"))?;
