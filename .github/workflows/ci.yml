@@ -29,11 +29,20 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      # Depth 2: the changelog check names the pull request's own changes
+      # as HEAD^1..HEAD, the base side of the merge commit.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
       - name: every doc(hidden) item is behind test-hooks
         run: |
           scripts/check-test-seams.sh --self-test
           scripts/check-test-seams.sh
+      - name: the changelog takes fragments, not edits
+        if: github.event_name == 'pull_request'
+        run: scripts/check-changelog.sh
+      - name: the changelog merge script does what it says
+        run: scripts/test-merge-changelog.sh
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy

@@ -14,7 +14,9 @@ AI agents. The server keeps the history and makes the commits; clients ask
 only for what they need. Written in Rust.
 
 > **Early proof of concept.** It runs on one machine and is not ready for real
-> code. Planned work is tracked in [issues](https://github.com/bnsd55/open-scion/issues)
+> code. The order of the work, and what stays out until it passes, is in
+> [docs/ROADMAP.md](docs/ROADMAP.md); planned work is tracked in
+> [issues](https://github.com/bnsd55/open-scion/issues)
 > and [milestones](https://github.com/bnsd55/open-scion/milestones).
 
 ## What this is, and what it is not
@@ -32,7 +34,9 @@ This project rebuilds the ideas from that public article.
   to [GoogleCloudPlatform/scion](https://github.com/GoogleCloudPlatform/scion),
   or to the `scion` crate on crates.io.
 
-**Platforms.** Linux and macOS. Windows is not supported.
+**Platforms.** Linux and macOS. Windows is not supported. What exactly is
+tested and what is not: [Supported platforms](#supported-platforms) below.
+What each release promises per surface: [docs/stability.md](docs/stability.md).
 
 **Scope of v0.1.** v0.1 is one server process on one machine. The article
 describes a horizontally scalable system: a small fleet of servers that need
@@ -349,6 +353,7 @@ A bearer token over plain TCP to a non-loopback address stays refused.
 | [`docs/faults.md`](https://github.com/bnsd55/open-scion/blob/main/docs/faults.md) | One row per fault: what the client sees, what the operator sees, what survives a restart, and the test that proves it |
 | [`docs/benchmarks.md`](https://github.com/bnsd55/open-scion/blob/main/docs/benchmarks.md) | How the demo and the benchmarks run, what each number means, and how to rerun them |
 | [`docs/RELEASING.md`](https://github.com/bnsd55/open-scion/blob/main/docs/RELEASING.md) | For maintainers: how a release is cut and published |
+| [`docs/stability.md`](https://github.com/bnsd55/open-scion/blob/main/docs/stability.md) | What 0.x promises per surface: the crates' APIs, the CLI and its `--json`, protocol v1, object format v1, the schemas, snapshots, tickets, and the test hooks |
 | [`docs/design/scalable-backend.md`](https://github.com/bnsd55/open-scion/blob/main/docs/design/scalable-backend.md) | A design proposal, not built: stateless servers on a shared metadata store and object store |
 
 ## Design notes
@@ -370,6 +375,46 @@ These are this project's choices where the article does not give details.
 
 Deliberate simplifications are marked `SHORTCUT:` in the code, each with its
 limit and its upgrade path.
+
+limit and its upgrade path.
+
+## Supported platforms
+
+What CI runs, on the runners that CI books, is what "supported" means
+here. Every job is in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+| Where | Runner, architecture | What runs there |
+|---|---|---|
+| Ubuntu 24.04, x86-64 | GitHub's `ubuntu-24.04` image, Linux 6.x, ext4 | All 13 CI jobs: the lint and doc jobs, `test`, the tmpfs disk-full test, block-level power cuts (dm-log-writes), the Postgres suite, the power-loss suite on LazyFS 0.3.1, the mount (NFS) job through the kernel's NFS client, the demo in Docker, the fuzz smoke on `x86_64-unknown-linux-gnu`, and `publish check` |
+| macOS 15, Apple Silicon (arm64) | GitHub's `macos-15` image, APFS | `test (macOS)`: the whole test suite |
+
+PostgreSQL 17.11 (`postgres:17.11`) is the version the Postgres job tests;
+it is the only version CI exercises, and other server versions are untested.
+The release builds target x86-64 Linux; macOS runs the same suite from
+source. The toolchain floor is Rust 1.88 (`rust-version`, checked by the
+`check (MSRV)` job).
+
+Not supported, or tested only in parts:
+
+- **Windows**: not supported, no build.
+- **FreeBSD**: does not build (`rustix::fs::renameat_with` does not exist
+  there; [architecture.md](docs/architecture.md), section 11).
+- **A data directory on a network filesystem**: untested. The servers keep
+  every byte in one directory (SQLite file or Postgres, plus a blob folder)
+  and rely on its fsync and rename behavior; the power-loss and disk-full
+  tests run on local and emulated block devices only.
+- **`scn checkout` on NFS, FUSE or SMB mounts**: the code has paths for
+  them (rename that never replaces, hard links, lost replies), and the
+  tests force those paths, but they are untested on a real NFS mount or
+  FUSE filesystem ([architecture.md](docs/architecture.md), section 11).
+- **`scn mount`**: single-user machines only, by design: the kernel's NFS
+  client reaches it as any local user ([#11](https://github.com/bnsd55/open-scion/issues/11)).
+
+The CI jobs: `fmt + clippy`, `rustdoc`, `cargo-deny`, `test` (with the
+tmpfs disk-full and dm-log-writes jobs), `test (postgres)` (Postgres
+17.11), `test (macOS)`, `power-loss` (LazyFS), `mount (NFS)`, `check
+(MSRV)` (Rust 1.88), `conformance (grpcurl)`, `docker demo`, `fuzz smoke`
+and `publish check`.
 
 ## Build and test
 
