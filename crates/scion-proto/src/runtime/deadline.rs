@@ -7,7 +7,7 @@
 //! as its `grpc-timeout`. Each process down the line then ends its waits
 //! before the one above it, and the status of the deepest one reaches the
 //! caller in time. The margin is a tenth of the timeout, at most
-//! [`MAX_MARGIN`]: room for the answer to travel back, and a short deadline
+//! `MAX_MARGIN`: room for the answer to travel back, and a short deadline
 //! still leaves most of its time to the deepest process.
 
 use std::time::{Duration, Instant};

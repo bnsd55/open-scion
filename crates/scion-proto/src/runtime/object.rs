@@ -265,7 +265,7 @@ pub fn decode(header: &Header, data: Vec<u8>) -> Result<Vec<u8>, String> {
 /// The size in the header of `frame`, which must be exactly one Zstandard
 /// frame (RFC 8878): the frame magic number, so not a skippable frame or a
 /// legacy format; no dictionary ID; a window of at most
-/// [`MAX_WINDOW_BYTES`]; its size in its header, at most
+/// `MAX_WINDOW_BYTES`; its size in its header, at most
 /// [`MAX_OBJECT_BYTES`]; and no bytes after it. Reads only the frame's
 /// headers, not its content.
 ///

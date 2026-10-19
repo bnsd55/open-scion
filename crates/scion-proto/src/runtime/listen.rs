@@ -20,12 +20,12 @@
 //! connection in time, so a connection that waits for a place gets one:
 //!
 //! - a client that does not send the HTTP/2 preface within
-//!   [`HANDSHAKE_TIMEOUT`] is closed. hyper has no timeout of its own
+//!   `HANDSHAKE_TIMEOUT` is closed. hyper has no timeout of its own
 //!   there, and its keepalive starts only after the preface.
 //! - after the preface, HTTP/2 keepalive closes a connection whose client
 //!   does not answer a ping.
 //! - every connection is asked to close (`GOAWAY`) after
-//!   [`MAX_CONNECTION_AGE`], and is closed [`CONNECTION_GRACE`] later, with
+//!   `MAX_CONNECTION_AGE`, and is closed [`CONNECTION_GRACE`] later, with
 //!   any call still in it. A client then connects again.
 //!
 //! With TLS, a connection takes its place first, and one deadline from its
@@ -33,7 +33,7 @@
 //! handshake gets what is left of the deadline, and the preface timer gets
 //! the rest. A peer that never starts the handshake, never ends it, or
 //! stops right after it gives its place up within
-//! [`HANDSHAKE_TIMEOUT`] of its accept, the same bound as a silent
+//! `HANDSHAKE_TIMEOUT` of its accept, the same bound as a silent
 //! plain peer.
 
 use std::future::Future;
@@ -103,7 +103,7 @@ pub const DEFAULT_STALLED_BYTES: NonZeroU64 = NonZeroU64::new(64 << 20).unwrap()
 pub struct Limits {
     /// Most connections served at once. A connection beyond that is
     /// accepted, and waits unread until another connection closes: within
-    /// [`MAX_CONNECTION_AGE`] plus [`CONNECTION_GRACE`].
+    /// `MAX_CONNECTION_AGE` plus [`CONNECTION_GRACE`].
     pub connections: NonZeroUsize,
     /// Most streams (calls) that one connection may have open at once, as
     /// HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS`. A client that has this many

@@ -11,7 +11,7 @@
 //! object in memory.
 //!
 //! A reply sends the next object only while it has sent less than
-//! [`REPLY_BUDGET_BYTES`]. It ends when its client takes no part for
+//! `REPLY_BUDGET_BYTES`. It ends when its client takes no part for
 //! [`STALL_TIMEOUT`], or when the budget has no room for the next object for
 //! [`BUSY_TIMEOUT`]. A reply finds its first object before the call answers.
 //! If the budget has no room for it, the call fails with [`busy`]. So a reply
@@ -246,7 +246,7 @@ impl Parts {
 /// object per key, part by part, as the client takes them. `produce` finds an
 /// object, takes its share of the budget with [`take`], and only then reads
 /// the bytes, so a reply that waits for budget holds no object. Stops after
-/// an error, once the reply has sent [`REPLY_BUDGET_BYTES`], when the client
+/// an error, once the reply has sent `REPLY_BUDGET_BYTES`, when the client
 /// has gone, when `produce` returns `None`, or when the client does not take
 /// a part within `stall`. Finding an object has no time limit here: a cache
 /// tier bounds its upstream fetches itself.
