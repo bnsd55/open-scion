@@ -1,0 +1,31 @@
+# A one-off measurement: what scripts/release-smoke.sh costs on a macOS
+# runner, to decide whether the release smoke joins CI on macos-15 or
+# stays an on-demand workflow. Run by hand with:
+#   gh workflow run release-smoke-macos.yml --ref <branch>
+# This file does not run on push or pull_request.
+
+name: release-smoke-macos
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  measure:
+    name: release smoke (macOS, measured)
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: scripts/release-smoke.sh
