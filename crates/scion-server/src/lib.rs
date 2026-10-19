@@ -50,7 +50,7 @@
 //! functions a server main and a client need, plus the `fsck` and `gc`
 //! operations a server main runs by hand. Everything else exists for the
 //! two binaries that this workspace ships, and can change without a
-//! release. The one test seam is [`test_support`], behind the `test-hooks`
+//! release. The one test seam is `test_support`, behind the `test-hooks`
 //! feature (default off): it exists so the integration tests and the fuzz
 //! targets can hold locks, move refs and inject commit failures at exact
 //! moments. Nothing behind the feature carries a stability promise:
