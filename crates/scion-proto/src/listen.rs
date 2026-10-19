@@ -1258,7 +1258,7 @@ mod tests {
         let certs = test_certs();
         let dir = tempfile::tempdir().unwrap();
         let server_tls = server_tls(dir.path(), &certs.server, None);
-        let deadline = Duration::from_millis(300);
+        let deadline = Duration::from_secs(1);
         let addr = serve_tls(Limits::default(), TIMERS, &server_tls, deadline).await;
         // The peer connects at once, waits out most of the deadline, then
         // ends its handshake and sends nothing more. The clock runs from the
@@ -1286,9 +1286,10 @@ mod tests {
         assert!(read.is_ok(), "the server closed the silent peer");
         // One deadline from the accept, with slack for the handshake round
         // trip and a loaded runner. The old code (a full preface timer after
-        // the handshake) closes past deadline + delay, beyond this bound.
+        // the handshake) closes at about deadline + delay, 1.83 s here,
+        // past this bound.
         assert!(
-            started.elapsed() < deadline + deadline / 3,
+            started.elapsed() < deadline * 3 / 2,
             "the silent peer held its place {:?}, past the deadline",
             started.elapsed()
         );

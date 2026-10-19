@@ -1,7 +1,9 @@
 //! `commit`.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use scion_core::{Changeset, FileState, IdentityTime, RepoPath};
@@ -64,10 +66,12 @@ pub async fn commit(ctx: &mut Ctx, args: CommitArgs) -> Result<()> {
             for (path, change) in crate::cmd::mount::overlay_changes(&record)? {
                 let edit = match change {
                     crate::vfs::Change::Put { exec } => {
+                        // The raw bytes, never a lossy name: a name that is
+                        // not UTF-8 must name its own file.
                         let file = record
                             .overlay
                             .join(crate::vfs::CHANGES)
-                            .join(String::from_utf8_lossy(path.as_bytes()).as_ref());
+                            .join(OsStr::from_bytes(path.as_bytes()));
                         Edit::Put { file, exec }
                     }
                     crate::vfs::Change::PutLink(target) => Edit::Link(target),
@@ -98,8 +102,7 @@ pub async fn commit(ctx: &mut Ctx, args: CommitArgs) -> Result<()> {
                 // SHORTCUT: reads each file whole, so memory caps the file
                 // size (the server caps it at 100 MiB). Upgrade: stream
                 // chunks from the file.
-                let data = std::fs::read(&file)
-                    .with_context(|| format!("cannot read {}", file.display()))?;
+                let data = read_put(&file)?;
                 let content = ctx
                     .put_blob(data)
                     .await
@@ -157,6 +160,21 @@ fn arg_edits(args: &CommitArgs) -> Result<BTreeMap<RepoPath, Edit>> {
     Ok(edits)
 }
 
+/// Reads the local file of a put, and refuses anything that is not a
+/// regular file: a device or FIFO never sees an end, so the read would
+/// grow until the OOM killer.
+fn read_put(file: &Path) -> Result<Vec<u8>> {
+    let meta =
+        std::fs::metadata(file).with_context(|| format!("cannot read {}", file.display()))?;
+    if !meta.is_file() {
+        bail!(
+            "{}: not a regular file; --put takes the content of a file",
+            file.display()
+        );
+    }
+    std::fs::read(file).with_context(|| format!("cannot read {}", file.display()))
+}
+
 /// Splits `Name <email>` into name and email bytes.
 fn parse_author(author: &str) -> Result<(Vec<u8>, Vec<u8>)> {
     let well_formed = |part: &str| !part.is_empty() && !part.contains(['<', '>', '\n']);
@@ -174,6 +192,7 @@ fn parse_author(author: &str) -> Result<(Vec<u8>, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn author_splits_name_and_email() {
@@ -197,5 +216,32 @@ mod tests {
         ] {
             assert!(parse_author(bad).is_err(), "{bad:?} was accepted");
         }
+    }
+
+    /// A put refuses what never sees an end, at once: a read of a FIFO
+    /// or of /dev/zero would otherwise grow until the OOM killer.
+    #[test]
+    fn a_put_refuses_what_never_sees_an_end() {
+        let refused = |file: std::path::PathBuf| {
+            let (sent, done) = std::sync::mpsc::channel();
+            std::thread::spawn(move || sent.send(read_put(&file).is_err()).unwrap());
+            // The refusal needs no read: one that hangs fails the test.
+            done.recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|_| panic!("the read was not refused at once"))
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+            .then_some(())
+            .expect("mkfifo runs");
+        assert!(refused(fifo), "a FIFO was accepted");
+        assert!(
+            refused(std::path::PathBuf::from("/dev/zero")),
+            "/dev/zero was accepted"
+        );
     }
 }
