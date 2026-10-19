@@ -224,6 +224,17 @@ The first release: the server, its cache tiers, and the `scn` client.
   bounds the TLS handshake and the HTTP/2 preface that follows it
   together, so the preface timer gets what is left of the deadline
   after the handshake ends.
+- A `Diff` call's rename search could index every large added file for
+  one deleted file, far past the budget that bounds it: one file's work
+  was its index of every added file it could be like, and the budget
+  was checked only between files, so a diff of many large added files
+  read and indexed all of them for the first one (`#290`). The budget
+  is now checked after each added file's slot in the index, so one
+  call's cost stays at most the cap, plus one slot, plus one deleted
+  file's read and lookup; a file whose indexing crosses the cap is not
+  read and adds no scores, and the reply's `renames_incomplete` says
+  the search stopped. A resumed search has one target, so its seed
+  always completes and the search moves.
 - `commit --from-mount` and the mount carry raw file names: a name that
   is not UTF-8 is no longer read from, or written to, the file its
   lossy spelling names.
