@@ -3154,26 +3154,26 @@ mod tests {
                 .unwrap();
             db.execute(
                 "INSERT INTO changesets (id, gen, body) VALUES ($1, 1, $2)",
-                &[P::bytes(&id.as_bytes()[..]), P::bytes(&body)],
+                &[&P::bytes(&id.as_bytes()[..]), &P::bytes(&body)],
             )
             .unwrap();
             db.execute(
                 "INSERT INTO repo_changesets (repo_id, cs) VALUES (1, $1)",
-                &[P::bytes(&id.as_bytes()[..])],
+                &[&P::bytes(&id.as_bytes()[..])],
             )
             .unwrap();
             db.execute(
                 "INSERT INTO repo_blobs (repo_id, blob) VALUES (1, $1), (1, $2)",
                 &[
-                    P::bytes(&blob_a.as_bytes()[..]),
-                    P::bytes(&blob_b.as_bytes()[..]),
+                    &P::bytes(&blob_a.as_bytes()[..]),
+                    &P::bytes(&blob_b.as_bytes()[..]),
                 ],
             )
             .unwrap();
             db.execute(
                 "INSERT INTO refs (repo_id, name, target, version) \
                  VALUES (1, 'main', $1, 1)",
-                &[P::bytes(&id.as_bytes()[..])],
+                &[&P::bytes(&id.as_bytes()[..])],
             )
             .unwrap();
         }

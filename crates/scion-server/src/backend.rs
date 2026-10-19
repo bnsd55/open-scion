@@ -1149,7 +1149,7 @@ pub(crate) mod old_store {
             backend,
             "main",
             id,
-            RepoPath::new("README").unwrap(),
+            &RepoPath::new("README").unwrap(),
             &deadline,
         )
         .unwrap();
