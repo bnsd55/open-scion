@@ -234,6 +234,13 @@ The first release: the server, its cache tiers, and the `scn` client.
   between steps and refuses a file over the diff-line cap, and the fault
   suites name the dm-log-writes suite that the directory-fsync row used
   to list as future work.
+- A blame's window doc matched a rule that no longer holds, and the
+  code behind it could not run (`#305`): a file of more than
+  1,048,576 lines is refused, and a window is that many lines, so one
+  call's window holds the whole servable file. The second-window
+  branch of the resume, which re-walked the history from the request
+  for a file's next window, is gone; the cursor still goes on over the
+  walk's versions.
 - A blame walk checks the call's deadline before each step, the first
   diff too (`#299`), and one diff reads no version past 1,048,576
   lines: a request file over the cap answers `RESOURCE_EXHAUSTED`, as
