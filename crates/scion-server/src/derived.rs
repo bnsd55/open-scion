@@ -1560,8 +1560,8 @@ mod tests {
             .and_then(|n| n.parse().ok())
             .expect("the busy answer names the frontier");
         assert!(
-            frontier * BYTES_PER_WALKED <= budget + walk_step_bytes(),
-            "frontier {frontier} of a budget of {budget} bytes"
+            frontier <= budget + walk_step_bytes(),
+            "a frontier of {frontier} bytes on a budget of {budget} bytes"
         );
         // The steps before the stop stay: the walk stored nothing, and
         // neither did the derives it never reached.
