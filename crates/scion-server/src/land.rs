@@ -279,17 +279,6 @@ impl Lands {
         // while, so it happens here, outside every lock.
         let evicted = mem::take(&mut *self.evicted.lock().unwrap_or_else(PoisonError::into_inner));
         drop(evicted);
-        // A land that ends in an error is an outcome too: the operator
-        // sees failing lands by the class the reply answers with.
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                if let Some(metrics) = &self.metrics {
-                    metrics.land(land_error_label(&e));
-                }
-                return Err(e);
-            }
-        };
         if let Some(metrics) = &self.metrics {
             metrics.land(match outcome.state {
                 LandState::Landed => 0,
@@ -511,25 +500,6 @@ enum Finished {
     Outcome(LandOutcome),
     /// Derive the history of this head, then plan again.
     Derive(ChangesetId),
-}
-
-/// The land counter's label for a land that ended in an error: the same
-/// class the reply's gRPC code uses, so an operator reads failing lands
-/// by the answer the callers saw.
-fn land_error_label(e: &Error) -> usize {
-    use crate::metrics::{
-        LAND_ABORTED, LAND_DEADLINE_EXCEEDED, LAND_INTERNAL, LAND_INVALID_ARGUMENT, LAND_NOT_FOUND,
-        LAND_RESOURCE_EXHAUSTED, LAND_UNAVAILABLE,
-    };
-    match e {
-        Error::Aborted(_) => LAND_ABORTED,
-        Error::DeadlineExceeded(_) => LAND_DEADLINE_EXCEEDED,
-        Error::ResourceExhausted(_) => LAND_RESOURCE_EXHAUSTED,
-        Error::Unavailable(_) | Error::Busy => LAND_UNAVAILABLE,
-        Error::NotFound(_) => LAND_NOT_FOUND,
-        Error::InvalidArgument(_) | Error::Apply(_) => LAND_INVALID_ARGUMENT,
-        _ => LAND_INTERNAL,
-    }
 }
 
 /// Says that a land that stopped at its deadline stays pending.

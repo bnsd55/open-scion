@@ -76,9 +76,9 @@ const BUCKETS: [u64; 10] = [
 ];
 
 /// The outcomes of a land, by how the server's land path decides them,
-/// then the classes of a land that ends in an error: the same names the
-/// reply's gRPC code uses.
-const LANDS: [&str; 11] = [
+/// then the classes of a land whose call ended in an error: the names of
+/// the gRPC codes the land's reply can answer.
+const LANDS: [&str; 13] = [
     "landed",
     "conflict",
     "rejected",
@@ -89,23 +89,30 @@ const LANDS: [&str; 11] = [
     "unavailable",
     "not_found",
     "invalid_argument",
+    "permission_denied",
+    "failed_precondition",
     "internal",
 ];
 
-/// The labels of a land that ended in an error, for [`Metrics::land`].
-pub const LAND_ABORTED: usize = 4;
-/// See [`LAND_ABORTED`].
-pub const LAND_DEADLINE_EXCEEDED: usize = 5;
-/// See [`LAND_ABORTED`].
-pub const LAND_RESOURCE_EXHAUSTED: usize = 6;
-/// See [`LAND_ABORTED`].
-pub const LAND_UNAVAILABLE: usize = 7;
-/// See [`LAND_ABORTED`].
-pub const LAND_NOT_FOUND: usize = 8;
-/// See [`LAND_ABORTED`].
-pub const LAND_INVALID_ARGUMENT: usize = 9;
-/// See [`LAND_ABORTED`].
-pub const LAND_INTERNAL: usize = 10;
+/// The land counter's label for a land whose call ended in an error, by
+/// the gRPC code of the reply the caller saw: one source, the reply's own
+/// code, so the counter cannot drift from what callers read. The land
+/// handler counts after it builds the reply's `Status`.
+pub fn land_error_label(code: tonic::Code) -> usize {
+    match code {
+        tonic::Code::Aborted => 4,
+        tonic::Code::DeadlineExceeded => 5,
+        tonic::Code::ResourceExhausted => 6,
+        tonic::Code::Unavailable => 7,
+        tonic::Code::NotFound => 8,
+        tonic::Code::InvalidArgument => 9,
+        tonic::Code::PermissionDenied => 10,
+        tonic::Code::FailedPrecondition => 11,
+        // Every other code the land's reply can answer, the caller reads
+        // as an internal error.
+        _ => 12,
+    }
+}
 
 /// What the processes count. Every field is atomics: a request only adds.
 #[derive(Default)]

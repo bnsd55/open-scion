@@ -27,7 +27,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
 
-use crate::metrics::{Metrics, MetricsLayer};
+use crate::metrics::{Metrics, MetricsLayer, land_error_label};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::Instrument as _;
@@ -1155,6 +1155,10 @@ impl Scion for ScionService {
             deadline,
         };
         let (lands, access) = (Arc::clone(&self.lands), Arc::clone(&self.access));
+        // The land's own result comes back inside an Ok, so this handler,
+        // not the worker, builds the reply's Status: a land that ends in
+        // an error moves the land counter, by the code of the reply the
+        // caller saw.
         let outcome = self
             .worker
             .run(move |store| {
@@ -1163,10 +1167,20 @@ impl Scion for ScionService {
                 // before the land records anything, also on a retry.
                 let cs = read::get_changeset(&store, &req.repo, req.changeset)?;
                 access.check_write(&caller, &req.repo, cs.changes.keys())?;
-                lands.land(&store, &caller, &req)
+                Ok(lands.land(&store, &caller, &req))
             })
-            .await?;
-        Ok(Response::new(land_response(outcome)))
+            .await;
+        match outcome {
+            Ok(Ok(outcome)) => Ok(Response::new(land_response(outcome))),
+            Ok(Err(e)) => {
+                let status = Status::from(e);
+                self.metrics.land(land_error_label(status.code()));
+                Err(status)
+            }
+            // The worker's own failures (a panic, a shutdown) built no
+            // land outcome, and the worker logged them.
+            Err(status) => Err(status),
+        }
     }
 
     async fn get_land(
@@ -2162,6 +2176,119 @@ mod tests {
             c.get_ref(repo, "main")
         });
         assert_eq!(main.unwrap().unwrap().target, b, "main did not move");
+    }
+
+    /// A service whose land counters the test reads: the service and its
+    /// land worker share one metrics registry.
+    fn counting_service(store: &Backend, metrics: &Arc<Metrics>) -> ScionService {
+        ScionService::new(
+            Worker::new(store.clone()),
+            Arc::new(Access::single("t")),
+            Arc::new(Lands::new(None, Some(Arc::clone(metrics)))),
+            Quotas::off(),
+            Arc::clone(metrics),
+        )
+    }
+
+    /// A land whose call already ran past its deadline moves the land
+    /// counter for its outcome: the caller read `deadline_exceeded`, and
+    /// the operator sees the failed land.
+    #[tokio::test]
+    async fn a_land_whose_call_failed_moves_its_counter() {
+        let (_dir, store, cs) = landed_store();
+        let metrics = Arc::new(Metrics::default());
+        let service = counting_service(&store, &metrics);
+        let mut request = as_default(scion_proto::v1::LandRequest {
+            repo: "r".into(),
+            changeset_id: cs.as_bytes().to_vec(),
+            target_ref: "main".into(),
+            request_key: "k".into(),
+        });
+        // A timeout the call has already spent.
+        request.set_timeout(Duration::from_nanos(1));
+        let status = service.land(request).await.expect_err("past deadline");
+        assert_eq!(status.code(), Code::DeadlineExceeded);
+        let text = metrics.render();
+        assert!(
+            text.contains("scion_lands_total{outcome=\"deadline_exceeded\"} 1\n"),
+            "{text}"
+        );
+        assert!(!text.contains("outcome=\"landed\""), "{text}");
+    }
+
+    /// A land whose call fails on a full disk moves the land counter for
+    /// the class the caller read: the server is out of space, so the
+    /// reply is `resource_exhausted`, and the operator sees the failed
+    /// land.
+    #[tokio::test]
+    async fn a_land_that_hits_a_full_disk_moves_its_counter() {
+        let (_dir, store, cs) = landed_store();
+        if Backend::test_is_postgres() {
+            // The page cap is a data-directory hook; the Postgres disk
+            // full is the SQLSTATE 53100 arm, counted by the same code.
+            return;
+        }
+        let Backend::Sqlite(store) = &store else {
+            panic!("the page cap is a data-directory test");
+        };
+        // The land's own changeset must grow the file past its cap: two
+        // thousand files, far past any space the setup left free.
+        store.cap_database_pages(0);
+        let metrics = Arc::new(Metrics::default());
+        let service = counting_service(&Backend::Sqlite(store.clone()), &metrics);
+        let request = as_default(scion_proto::v1::LandRequest {
+            repo: "r".into(),
+            changeset_id: cs.as_bytes().to_vec(),
+            target_ref: "main".into(),
+            request_key: "k".into(),
+        });
+        let status = service.land(request).await.expect_err("out of space");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        let text = metrics.render();
+        assert!(
+            text.contains("scion_lands_total{outcome=\"resource_exhausted\"} 1\n"),
+            "{text}"
+        );
+    }
+
+    /// A repo with a root changeset under `main`, and a child changeset
+    /// ready to land: two thousand files, so its landed changeset must
+    /// grow the metadata file.
+    fn landed_store() -> (tempfile::TempDir, Backend, ChangesetId) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let blob = store.blobs().put(b"x").unwrap();
+        let mut files = Vec::new();
+        for i in 0..2000 {
+            files.push((
+                RepoPath::new(&format!("f{i:04}")).unwrap(),
+                Some(FileState::Regular {
+                    content: blob,
+                    executable: false,
+                }),
+            ));
+        }
+        let changeset = |parents, changes| Changeset {
+            parents,
+            author: IdentityTime {
+                name: b"t".to_vec(),
+                email: b"t@x".to_vec(),
+                unix_secs: 0,
+                tz_offset_minutes: 0,
+            },
+            committer: None,
+            message: vec![],
+            changes,
+        };
+        let cs = store
+            .write(|c| {
+                let repo = c.create_repo("r")?;
+                let root = c.insert_changeset(repo, &changeset(vec![], [].into()))?;
+                assert!(c.cas_ref(repo, "main", None, root)?);
+                c.insert_changeset(repo, &changeset(vec![root], files.into()))
+            })
+            .unwrap();
+        (dir, store, cs)
     }
 
     #[tokio::test]
