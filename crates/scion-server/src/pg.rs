@@ -1943,6 +1943,7 @@ fn load_tree(c: &PgClient, id: TreeId) -> Result<(Tree, Vec<u8>)> {
 }
 
 /// The error of a graph walk that reached its bound.
+#[cfg(any(test, feature = "test-hooks"))]
 fn too_deep(max_visits: usize) -> Error {
     Error::ResourceExhausted(format!(
         "the history is too deep: the answer needs more than {max_visits} changesets"
@@ -2121,6 +2122,7 @@ impl MetaTx for PgTx<'_> {
     }
 
     /// The first parent of a changeset, or `None` for a root.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn first_parent(&mut self, id: ChangesetId) -> Result<Option<ChangesetId>> {
         let parent = self
             .c
@@ -2166,6 +2168,7 @@ impl MetaTx for PgTx<'_> {
     /// [`Error::NotFound`] if `repo` does not have either changeset.
     /// [`Error::ResourceExhausted`] if the walk needs more than `max_visits`
     /// changesets.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn is_ancestor(
         &mut self,
         repo: RepoId,

@@ -701,6 +701,7 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn first_parent(&mut self, id: ChangesetId) -> Result<Option<ChangesetId>> {
         match self {
             Self::Sqlite(tx) => tx.first_parent(id),
@@ -970,6 +971,7 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn is_ancestor(
         &mut self,
         repo: RepoId,

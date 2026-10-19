@@ -307,6 +307,7 @@ impl MetaTx for SqliteTx<'_> {
     ///
     /// Database errors.
     #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(any(test, feature = "test-hooks"))]
     fn first_parent(&mut self, id: ChangesetId) -> Result<Option<ChangesetId>> {
         let parent: Option<Vec<u8>> = self
             .0
@@ -357,6 +358,7 @@ impl MetaTx for SqliteTx<'_> {
     /// [`Error::NotFound`] if `repo` does not have either changeset.
     /// [`Error::ResourceExhausted`] if the walk needs more than `max_visits`
     /// changesets.
+    #[cfg(any(test, feature = "test-hooks"))]
     #[cfg(any(test, feature = "test-hooks"))]
     fn is_ancestor(
         &mut self,
