@@ -392,6 +392,12 @@ here. Every job is in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 | Ubuntu 24.04, x86-64 | GitHub's `ubuntu-24.04` image, Linux 6.x, ext4 | All 13 CI jobs: the lint and doc jobs, `test`, the tmpfs disk-full test, block-level power cuts (dm-log-writes), the Postgres suite, the power-loss suite on LazyFS 0.3.1, the mount (NFS) job through the kernel's NFS client, the demo in Docker, the fuzz smoke on `x86_64-unknown-linux-gnu`, and `publish check` |
 | macOS 15, Apple Silicon (arm64) | GitHub's `macos-15` image, APFS | `test (macOS)`: the whole test suite |
 
+The macOS row carries its repetition evidence: after PR
+[#309](https://github.com/bnsd55/openscion/pull/309)'s fork gate, the mount
+and commit tests that fork passed 100 runs in a row on macos-15 ([the
+mount-reps
+run](https://github.com/bnsd55/openscion/actions/runs/39310255775)).
+
 PostgreSQL 17.11 (`postgres:17.11`) is the version the Postgres job tests;
 it is the only version CI exercises, and other server versions are untested.
 The release builds target x86-64 Linux; macOS runs the same suite from
