@@ -399,7 +399,8 @@ fn in_one_walk<K: Kind>(
 ///
 /// The walk keeps the changesets without a value in memory, 40 bytes each,
 /// so that it visits each one once. A walk over every parent also keeps the
-/// set of the changesets it visited.
+/// set of the changesets it visited; the set keeps `next` deduplicated, so
+/// it holds at most one entry per visited changeset.
 ///
 /// # Errors
 ///
@@ -594,9 +595,6 @@ impl Walk {
             let Some((id, generation)) = self.next.pop() else {
                 break;
             };
-            if K::ALL_PARENTS && !self.seen.insert(id) {
-                continue;
-            }
             if c.get_derived(K::NAME, K::VERSION, id)?.is_some() {
                 continue;
             }
@@ -604,8 +602,20 @@ impl Walk {
             let mut parents = c.parents(id, generation)?;
             if !K::ALL_PARENTS {
                 parents.truncate(1);
+                self.next.extend(parents);
+                continue;
             }
-            self.next.extend(parents);
+            // A walk over every parent keeps each changeset once: the seen
+            // set drops a parent that another child pushed already, so
+            // `next` holds no duplicates and stays as wide as the DAG's
+            // frontier instead of as wide as its edges. Parents are older
+            // than their children, so the walk never reaches a changeset
+            // twice with this set alone.
+            for parent in parents {
+                if self.seen.insert(parent.0) {
+                    self.next.push(parent);
+                }
+            }
         }
         Ok(())
     }
@@ -1524,6 +1534,37 @@ mod tests {
             vec![],
             vec![5, 6],
         ]
+    }
+
+    /// A walk over every parent pushes each parent once: on a graph with
+    /// diamonds, `next` never holds the same changeset twice. Before the
+    /// seen set checked pushes, each parent sat in `next` once per child
+    /// that reached it, and on a dense DAG that is as wide as the edges.
+    #[test]
+    fn a_walk_over_every_parent_holds_no_duplicate_in_next() {
+        let parents = criss_cross();
+        let (_dir, store, repo, ids) = store_graph(&parents);
+        store
+            .read_unflushed(|c| {
+                let ControlFlow::Continue(mut walk) = Walk::start::<Ancestry>(c, repo, ids[7])?
+                else {
+                    panic!("no value is stored yet");
+                };
+                let mut visits = 0;
+                while !walk.next.is_empty() {
+                    walk.step::<Ancestry>(c, 1)?;
+                    let mut ids_in_next: Vec<ChangesetId> =
+                        walk.next.iter().map(|&(id, _)| id).collect();
+                    let count = ids_in_next.len();
+                    ids_in_next.sort_unstable();
+                    ids_in_next.dedup();
+                    assert_eq!(ids_in_next.len(), count, "next holds a duplicate");
+                    visits += 1;
+                    assert!(visits < 100, "the walk never ends");
+                }
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

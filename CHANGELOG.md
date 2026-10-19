@@ -219,6 +219,11 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- A fill of a kind over every parent (the commit graph) no longer holds
+  a parent once per child that reached it in its walk: the seen set now
+  checks pushes, so the walk's queue is as wide as the graph's frontier
+  instead of as wide as its edges.
+
 - A silent TLS peer holds its connection's place for at most the
   handshake timeout, not twice that: one deadline from the accept
   bounds the TLS handshake and the HTTP/2 preface that follows it
