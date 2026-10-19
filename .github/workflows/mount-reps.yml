@@ -1,0 +1,85 @@
+name: mount-reps
+
+# Evidence that the fork gate (#309) fixed the macOS mount flake: the
+# scn mount tests fork processes and read serve locks, and they flaked
+# on macOS runners before the gate serialized every forking test. On a
+# dispatch this workflow builds the test binary once and runs the mount
+# tests the number of times the reps input gives, on the same fixed
+# macos-15 image CI's test job uses, and stops at the first failure and
+# uploads that run's log. Runs only when a person asks: never on pushes
+# or pull requests.
+
+on:
+  workflow_dispatch:
+    inputs:
+      reps:
+        description: how many times to run the scn mount tests
+        default: "100"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Every third-party action is pinned to the commit SHA its version tag
+# named, with the version in a comment, as ci.yml does.
+jobs:
+  mount-reps:
+    name: mount tests x reps
+    runs-on: macos-15
+    # 100 reps of the mount suite share the build's minutes; the cap
+    # bounds a dispatched outlier, not the default run.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: build the scn test binary once
+        run: |
+          cargo test -p open-scion --lib cmd::mount --no-run \
+            --message-format=json > "$RUNNER_TEMP/build.json"
+          bin=$(jq -r 'select(.executable != null and .profile.test == true
+                and .target.kind[0] == "lib") | .executable' \
+                "$RUNNER_TEMP/build.json")
+          test -n "$bin" || { echo "the lib test binary did not build"; exit 1; }
+          echo "bin=$bin" >> "$GITHUB_ENV"
+      - name: run the mount tests, one rep at a time
+        env:
+          # The input goes through env:, not through the run: string, so
+          # no shell sees it unquoted (as soak.yml does). An API dispatch
+          # with an empty reps falls back to the same 100 the input
+          # defaults to.
+          REPS: ${{ github.event.inputs.reps || '100' }}
+        run: |
+          case "$REPS" in ''|*[!0-9]*|0)
+            echo "reps must be a positive number, got: $REPS"; exit 1;; esac
+          i=0
+          while [ "$i" -lt "$REPS" ]; do
+            i=$((i + 1))
+            log="$RUNNER_TEMP/mount-rep-$i.log"
+            # macOS has no coreutils timeout on this image, and perl is
+            # on every one: alarm survives exec, so this bounds each rep
+            # the way the nfs-mount job's `timeout` bounds its script.
+            if ! perl -e 'alarm shift; exec @ARGV' 300 \
+                 "$bin" cmd::mount >"$log" 2>&1; then
+              echo "run $i of $REPS failed; the log is in the artifact"
+              tail -80 "$log"
+              exit 1
+            fi
+            echo "run $i/$REPS ok"
+          done
+      - name: upload the failing run's log
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mount-rep-failure
+          path: ${{ runner.temp }}/mount-rep-*.log
+          if-no-files-found: ignore
