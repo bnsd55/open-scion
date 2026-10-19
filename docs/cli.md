@@ -59,7 +59,9 @@ Every command takes these flags, before or after the subcommand:
   files executable, and `--author "Name <email>"` (default
   `scn <scn@localhost>`) names the author. `--from-mount DIR` takes the
   changes from the overlay of a `scn mount` on `DIR`, instead of `--put`
-  and `--delete`.
+  and `--delete`; it commits what the overlay holds at that moment, so a
+  commit while a file of the mount is still being written records the
+  bytes written so far, the way `git add` does on a file being saved.
 - `scn land CHANGESET` — rebase a changeset onto a ref and move the ref
   (`--onto`, default `main`). `--request-id KEY` is the retry key; it
   defaults to the changeset ID and ref, so a retry of the same land is

@@ -20,8 +20,10 @@
 //! handle stop stray and accidental callers only.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::future::Future;
 use std::io::{Read as _, Write as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -37,6 +39,7 @@ use nfsserve::nfs::{
 };
 pub use nfsserve::vfs::NFSFileSystem;
 use nfsserve::vfs::{DirEntry, ReadDirResult, VFSCapabilities};
+use rustix::fs::{Mode, OFlags};
 use scion_core::{BlobId, ChangesetId, Entry, FileState, RepoPath, Tree, TreeId};
 use scion_proto::object::{self, Assembler, Header};
 use scion_proto::ticket::{self, TICKET_SKEW_SECS};
@@ -288,11 +291,13 @@ impl Vfs {
         })
     }
 
-    /// The path of `path` under the overlay directory.
+    /// The path of `path` under the overlay directory, from the raw
+    /// bytes: a name that is not UTF-8 must name its own file, not the
+    /// file its lossy spelling names.
     pub fn overlay_file(&self, path: &RepoPath) -> PathBuf {
         let mut file = self.overlay.clone();
         for part in path.as_bytes().split(|&b| b == b'/') {
-            file.push(String::from_utf8_lossy(part).as_ref());
+            file.push(OsStr::from_bytes(part));
         }
         file
     }
@@ -665,11 +670,12 @@ impl NFSFileSystem for Vfs {
         let file = self.overlay_file(nodes.by_id.get(&id).unwrap().path.as_ref().unwrap());
         if let set_mode3::mode(m) = setattr.mode {
             let exec = m & 0o111 != 0;
-            std::fs::set_permissions(
-                &file,
-                std::fs::Permissions::from_mode(file_mode(0o644, exec)),
-            )
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            let handle = open_overlay_chmod(&file).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            // RawMode is u32 on Linux and u16 on macOS, so the conversion
+            // is real only on macOS.
+            #[allow(clippy::useless_conversion)]
+            let mode = Mode::from_raw_mode(file_mode(0o644, exec).try_into().unwrap());
+            rustix::fs::fchmod(&handle, mode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
             if let Some(Node {
                 kind: Kind::Local { exec: slot },
                 ..
@@ -679,11 +685,7 @@ impl NFSFileSystem for Vfs {
             }
         }
         if let set_size3::size(bytes) = setattr.size {
-            std::fs::File::create(&file).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-            let f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&file)
-                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            let f = open_overlay_write(&file, true).map_err(|_| nfsstat3::NFS3ERR_IO)?;
             f.set_len(bytes).map_err(|_| nfsstat3::NFS3ERR_IO)?;
         }
         self.attr_of(&nodes, id)
@@ -768,10 +770,7 @@ impl NFSFileSystem for Vfs {
             _ => {}
         }
         self.materialize(&mut nodes, id).await?;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&file)
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        let mut file = open_overlay_write(&file, false).map_err(|_| nfsstat3::NFS3ERR_IO)?;
         file.seek(std::io::SeekFrom::Start(offset))
             .and_then(|_| file.write_all(data))
             .map_err(|_| nfsstat3::NFS3ERR_IO)?;
@@ -1274,7 +1273,9 @@ fn write_deletes(overlay: &Path, deleted: &HashSet<RepoPath>) -> std::io::Result
         bytes.extend_from_slice(path.as_bytes());
     }
     let tmp = overlay.join(".deletes.tmp");
-    let mut file = std::fs::File::create(&tmp)?;
+    // The temp note is made like every overlay write: no symlink at its
+    // path is followed. The rename then replaces whatever is there.
+    let mut file = open_overlay_write(&tmp, true)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
     std::fs::rename(&tmp, overlay.join(DELETES))?;
@@ -1407,11 +1408,38 @@ fn write_file(file: &Path, bytes: &[u8], exec: bool) -> std::io::Result<()> {
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(file, bytes)?;
-    std::fs::set_permissions(
+    let made = open_overlay_write(file, true)?;
+    (&made).write_all(bytes)?;
+    made.set_permissions(std::fs::Permissions::from_mode(file_mode(0o644, exec)))
+}
+
+/// Opens an overlay file for the VFS to write, and refuses a symlink at
+/// its path: the mount is reachable by anyone who can read the mount
+/// table, so the VFS never writes through an OS symlink a client could
+/// have planted there. SHORTCUT: the final name is checked only; a
+/// planted symlink one level up still redirects. Upgrade: open every
+/// parent through handles, as `materialize.rs` does.
+fn open_overlay_write(file: &Path, create: bool) -> std::io::Result<std::fs::File> {
+    let mut flags = OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    if create {
+        flags |= OFlags::CREATE | OFlags::TRUNC;
+    }
+    rustix::fs::open(file, flags, Mode::from_raw_mode(0o644))
+        .map(std::fs::File::from)
+        .map_err(std::io::Error::from)
+}
+
+/// Opens an overlay file without following a symlink, for a mode
+/// change: a read-only handle is enough for `fchmod`, and a read-only
+/// open needs no write bit.
+fn open_overlay_chmod(file: &Path) -> std::io::Result<std::fs::File> {
+    rustix::fs::open(
         file,
-        std::fs::Permissions::from_mode(file_mode(0o644, exec)),
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
     )
+    .map(std::fs::File::from)
+    .map_err(std::io::Error::from)
 }
 
 /// Makes a symlink that names `target`.
@@ -1848,6 +1876,86 @@ mod tests {
         assert_eq!(
             read_deletes(&test.vfs.overlay).unwrap(),
             [RepoPath::new("README.md").unwrap()]
+        );
+    }
+
+    /// A symlink planted at an overlay path redirects nothing: the mount
+    /// is reachable by anyone who can read the mount table, so the VFS
+    /// never writes through, or sets the mode of, an OS symlink there.
+    #[tokio::test]
+    async fn a_planted_symlink_is_never_written_through() {
+        let test = start(&[("README.md", b"hello\n", Some(false))]).await;
+        let id = find(&test.vfs, "README.md").await.unwrap();
+        // The overlay file exists only once the VFS materializes it.
+        let _ = test
+            .vfs
+            .setattr(
+                id,
+                sattr3 {
+                    mode: set_mode3::mode(0o644),
+                    ..sattr3::default()
+                },
+            )
+            .await
+            .unwrap();
+        let file = test
+            .vfs
+            .overlay_file(&test.vfs.nodes.read().await.by_id[&id].path.clone().unwrap());
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("outside");
+        std::fs::write(&target, b"keep\n").unwrap();
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(&target, &file).unwrap();
+
+        // A write is refused, and the target keeps its bytes.
+        assert!(matches!(
+            test.vfs.write(id, 0, b"planted\n").await,
+            Err(nfsstat3::NFS3ERR_IO)
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep\n");
+        // So are a mode change and a truncate.
+        assert!(matches!(
+            test.vfs
+                .setattr(
+                    id,
+                    sattr3 {
+                        mode: set_mode3::mode(0o755),
+                        ..sattr3::default()
+                    },
+                )
+                .await,
+            Err(nfsstat3::NFS3ERR_IO)
+        ));
+        assert!(matches!(
+            test.vfs
+                .setattr(
+                    id,
+                    sattr3 {
+                        size: set_size3::size(0),
+                        ..sattr3::default()
+                    },
+                )
+                .await,
+            Err(nfsstat3::NFS3ERR_IO)
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep\n");
+
+        // The note of deletions refuses a planted symlink: no temp note
+        // is made, and the symlink's target keeps its bytes. Without the
+        // symlink, the note lands, and the rename replaces nothing.
+        let note = tempfile::tempdir().unwrap();
+        let outside = note.path().join("outside");
+        std::fs::write(&outside, b"keep\n").unwrap();
+        std::os::unix::fs::symlink(&outside, note.path().join(".deletes.tmp")).unwrap();
+        let mut deleted = std::collections::HashSet::new();
+        deleted.insert(RepoPath::new("gone.txt").unwrap());
+        assert!(write_deletes(note.path(), &deleted).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep\n");
+        std::fs::remove_file(note.path().join(".deletes.tmp")).unwrap();
+        write_deletes(note.path(), &deleted).unwrap();
+        assert_eq!(
+            read_deletes(note.path()).unwrap(),
+            [RepoPath::new("gone.txt").unwrap()]
         );
     }
 

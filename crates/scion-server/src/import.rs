@@ -31,6 +31,7 @@ use crate::meta::Meta as _;
 use crate::meta::{MetaTx, RepoId};
 use crate::store::{BlobBatch, BlobStatus, MAX_OBJECT_BYTES};
 use crate::tree;
+use crate::write::MAX_CHANGES;
 
 /// `git_import.git_algo` for SHA-1 object names.
 pub(crate) const SHA1: i64 = 1;
@@ -128,26 +129,33 @@ pub struct ImportReport {
 /// # Errors
 ///
 /// [`Error::Git`] if git cannot be read, or a path or file is not valid in
-/// Scion. [`Error::Corrupt`] if a verified commit's tree differs from git's or
-/// names a blob that is not stored intact. [`Error::FailedPrecondition`] if
-/// `opts.target_ref` points at a changeset that the tip does not descend
-/// from; the commits stay imported and the ref is left alone.
+/// Scion. [`Error::Corrupt`] if a verified commit's tree differs from git's,
+/// or names a blob the import wrote that is not stored intact. The import
+/// verifies the blobs it writes; a blob it skipped, because a committed row
+/// of the repo already names it and its file is present, is trusted, and
+/// damage inside an already stored file is fsck's job.
+/// [`Error::FailedPrecondition`] if `opts.target_ref` points at a changeset
+/// that the tip does not descend from; the commits stay imported and the ref
+/// is left alone.
 pub fn import_git(
     store: &Backend,
     repo: &str,
     git_dir: &Path,
     opts: &ImportOptions,
 ) -> Result<ImportReport> {
-    import_with_cache(store, repo, git_dir, opts, BLOB_CACHE_ENTRIES)
+    import_with_cache(store, repo, git_dir, opts, BLOB_CACHE_ENTRIES, MAX_CHANGES)
 }
 
-/// [`import_git`] with at most `cache_entries` entries in each blob cache.
+/// [`import_git`] with at most `cache_entries` entries in each blob cache,
+/// and a commit capped at `max_changes` changed paths (the write path's
+/// [`MAX_CHANGES`]; a test overrides it with a smaller one).
 fn import_with_cache(
     store: &Backend,
     repo: &str,
     git_dir: &Path,
     opts: &ImportOptions,
     cache_entries: usize,
+    max_changes: usize,
 ) -> Result<ImportReport> {
     let started = Instant::now();
     let mut git = gix::open(git_dir)
@@ -189,6 +197,7 @@ fn import_with_cache(
         repo_id,
         blobs: LruCache::new(cache_entries),
         put: Vec::new(),
+        max_changes,
     };
     let mut checker = Checker {
         git: &git,
@@ -532,6 +541,10 @@ struct Importer<'a> {
     /// in [`Importer::blob`]), and one without a row goes to
     /// `BlobBatch::put`, which keeps a stored blob only after checking it.
     blobs: LruCache<ObjectId, BlobId>,
+    /// Most changed paths one commit may bring. Past it the import fails:
+    /// Scion stores a commit as one changeset, and the write path accepts
+    /// at most [`MAX_CHANGES`] changes in one.
+    max_changes: usize,
     /// Blobs this run proved stored and durable: put here, or named by a
     /// committed row. The checker takes them so it reads none back.
     put: Vec<BlobId>,
@@ -616,16 +629,39 @@ impl Importer<'_> {
                     (_, Some(GitEntry::File(kind, id))) => {
                         let state =
                             file_state(*kind, *id, |id| self.blob(commit, &path, id, batch))?;
-                        changes.insert(path, Some(state));
+                        self.capped(&mut changes, commit, path, Some(state))?;
                     }
                     (Some(GitEntry::File(..)), _) => {
-                        changes.insert(path, None);
+                        self.capped(&mut changes, commit, path, None)?;
                     }
                     _ => {}
                 }
             }
         }
         Ok(changes)
+    }
+
+    /// Records one change, and fails the commit once its changed paths pass
+    /// the limit. The check runs as the map grows, so a commit with millions
+    /// of changes never builds the whole map, and the error names the commit
+    /// and the count.
+    fn capped(
+        &self,
+        changes: &mut BTreeMap<RepoPath, Option<FileState>>,
+        commit: ObjectId,
+        path: RepoPath,
+        state: Option<FileState>,
+    ) -> Result<()> {
+        changes.insert(path, state);
+        if changes.len() > self.max_changes {
+            return Err(Error::Git(format!(
+                "commit {commit}: {} changed paths exceed the import's limit of {}, \
+                 and Scion stores one commit as one changeset",
+                changes.len(),
+                self.max_changes
+            )));
+        }
+        Ok(())
     }
 
     /// Writes the git blob for `path` in `commit` to `batch` and returns its
@@ -658,7 +694,11 @@ impl Importer<'_> {
             // SHORTCUT: the skip sees only this repo's rows, one probe per
             // distinct blob, and checks the file is there: a row whose
             // file someone deleted under the server still refuses the
-            // import through put's read-back (fsck lists it too). A blob
+            // import through put's read-back (fsck lists it too), and the
+            // record path still reads the blob's size from its file, so
+            // damage that breaks the zstd frame header fails the import.
+            // Deeper damage inside an already stored file is fsck's job.
+            // A blob
             // that another repo names still goes through put. Upgrade:
             // an index on repo_blobs (blob), then any_repo_names, when a
             // cross-repo import is measured slow.
@@ -685,7 +725,11 @@ struct Checker<'a> {
     /// Blob IDs hashed from git content, apart from the importer's cache.
     blobs: LruCache<ObjectId, BlobId>,
     /// Stored blobs recently known to be intact: put in this run, or read
-    /// back by an earlier check. A miss costs a read-back of the stored blob.
+    /// back by an earlier check. A blob the importer skipped, because a
+    /// committed row of the repo names it and its file is present, counts
+    /// as intact too: the import verifies the blobs it writes, and damage
+    /// inside an already stored file is fsck's job. A miss costs a
+    /// read-back of the stored blob.
     intact: LruCache<BlobId, ()>,
 }
 
@@ -1008,7 +1052,7 @@ mod tests {
         let import = |cache_entries| {
             let data = tempfile::tempdir().unwrap();
             let store = Backend::Sqlite(Store::open(data.path()).unwrap());
-            import_with_cache(&store, "main", dir, &opts, cache_entries).unwrap()
+            import_with_cache(&store, "main", dir, &opts, cache_entries, MAX_CHANGES).unwrap()
         };
         let tiny = import(2);
         let unbounded = import(usize::MAX);
@@ -1016,6 +1060,94 @@ mod tests {
         // Each changeset names its parents by ID, so equal tips mean that
         // every changeset is the same.
         assert_eq!(tiny.tip, unbounded.tip);
+    }
+
+    #[test]
+    fn a_reimport_trusts_a_stored_blob_it_skips_and_fsck_reports_the_damage() {
+        crate::store::spawn_guard::prime_gix_lookup();
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        fs::write(dir.join("f"), "payload\n").unwrap();
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "add"]);
+
+        let data = tempfile::tempdir().unwrap();
+        let store = Backend::Sqlite(Store::open(data.path()).unwrap());
+        let opts = |rev: &str| ImportOptions {
+            rev: rev.into(),
+            target_ref: "main".into(),
+            verify_sample: usize::MAX,
+        };
+        import_git(&store, "main", dir, &opts("main")).unwrap();
+
+        // The blob's file is damaged in place: the row and the file are
+        // there, the frame header still parses (the import reads the
+        // blob's size from it), but the bytes are not what they were.
+        let blob = BlobId::of(b"payload\n");
+        let (_, path) = store.blobs().location(blob);
+        let mut bytes = fs::read(&path).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+
+        // The next commit touches the same path with the same content, so
+        // the import's diff names the blob and takes the skip: the row and
+        // the file are there. The import trusts it and lands.
+        git(dir, &["update-index", "--chmod=+x", "f"]);
+        git(dir, &["commit", "-q", "-m", "chmod"]);
+        let report = import_git(&store, "main", dir, &opts("main")).unwrap();
+        assert_eq!((report.imported, report.verified), (1, 1));
+
+        // The damage is fsck's to find, and it does.
+        let report = crate::fsck::run(&store, 1, &mut |_| {}).unwrap();
+        assert!(!report.is_clean());
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|p| p.to_string().contains(&blob.to_string())),
+            "fsck missed the damaged blob: {:?}",
+            report.problems
+        );
+    }
+
+    #[test]
+    fn a_commit_with_too_many_changes_is_named_and_refused() {
+        crate::store::spawn_guard::prime_gix_lookup();
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        fs::write(dir.join("f"), "one\n").unwrap();
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "one"]);
+
+        let data = tempfile::tempdir().unwrap();
+        let store = Backend::Sqlite(Store::open(data.path()).unwrap());
+        let opts = ImportOptions {
+            rev: "main".into(),
+            target_ref: "main".into(),
+            verify_sample: 0,
+        };
+        import_with_cache(&store, "main", dir, &opts, BLOB_CACHE_ENTRIES, MAX_CHANGES).unwrap();
+
+        // Three changed paths against a cap of two: the error names the
+        // commit and the count, and the store holds nothing of the commit.
+        for i in 0..3 {
+            fs::write(dir.join(format!("n{i}")), format!("{i}\n")).unwrap();
+        }
+        fs::remove_file(dir.join("f")).unwrap();
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "three"]);
+        let error =
+            import_with_cache(&store, "main", dir, &opts, BLOB_CACHE_ENTRIES, 2).unwrap_err();
+        assert!(
+            error.to_string().contains("3 changed paths exceed"),
+            "the error does not name the count: {error}"
+        );
+        // The store is clean: the ref never moved, no changeset landed.
+        let report = crate::fsck::run(&store, 1, &mut |_| {}).unwrap();
+        assert!(report.is_clean(), "{:?}", report.problems);
     }
 
     #[test]
