@@ -2261,7 +2261,7 @@ mod tests {
         let mut files = Vec::new();
         for i in 0..2000 {
             files.push((
-                RepoPath::new(&format!("f{i:04}")).unwrap(),
+                RepoPath::new(format!("f{i:04}").into_bytes()).unwrap(),
                 Some(FileState::Regular {
                     content: blob,
                     executable: false,
@@ -2285,7 +2285,7 @@ mod tests {
                 let repo = c.create_repo("r")?;
                 let root = c.insert_changeset(repo, &changeset(vec![], [].into()))?;
                 assert!(c.cas_ref(repo, "main", None, root)?);
-                c.insert_changeset(repo, &changeset(vec![root], files.into()))
+                c.insert_changeset(repo, &changeset(vec![root], files.into_iter().collect()))
             })
             .unwrap();
         (dir, store, cs)
