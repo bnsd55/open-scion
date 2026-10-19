@@ -369,7 +369,7 @@ impl Dir {
     // write in a directory of n entries stores about n x (name + 38) bytes:
     // 500 KB for 10,000 names of 12 bytes. Upgrade: directories cut into
     // chunks, a new tree format, so a write stores only the chunks it changes
-    // (https://github.com/bnsd55/open-scion/issues/114).
+    // (https://github.com/bnsd55/openscion/issues/114).
     fn store(self, c: &mut dyn MetaTx) -> Result<TreeId> {
         match self {
             Self::Stored(id) => Ok(id),

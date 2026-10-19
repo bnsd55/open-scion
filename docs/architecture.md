@@ -1,13 +1,13 @@
 # Architecture
 
-This document explains how open-scion works, for a new contributor who has
+This document explains how openscion works, for a new contributor who has
 read the [README](../README.md). It describes the code on `main`. Parts that do
 not exist yet are marked **planned**, with the issue that tracks them.
 The design follows Anthropic's article
 [Redesigning source control](https://www.anthropic.com/engineering/redesigning-source-control).
 The README lists where this project makes its own choices.
 The metadata may live in Postgres instead of the data directory (#178,
-part 2 of [#47](https://github.com/bnsd55/open-scion/issues/47)); a
+part 2 of [#47](https://github.com/bnsd55/openscion/issues/47)); a
 backend that scales out to *many servers* on one database is still a
 proposal ([`design/scalable-backend.md`](design/scalable-backend.md)).
 
@@ -324,7 +324,7 @@ import with `Store::open_shared`. Each holds its `flock`s until the last
   no process holds: each process stages its temp files in its own folder,
   which it holds with a `flock` for as long as it lives, so the temp files
   of a crashed import are removed by the next open, of any process
-  ([#101](https://github.com/bnsd55/open-scion/issues/101)).
+  ([#101](https://github.com/bnsd55/openscion/issues/101)).
   A shared open of an older schema fails: stop the other processes to
   upgrade it.
 - **One build.** Each process removes the derived rows of older versions of
@@ -338,7 +338,7 @@ import with `Store::open_shared`. Each holds its `flock`s until the last
   the client retries. An import ends a write transaction after 1 s, so a
   server write waits for at most that plus one commit, and the import stays
   off the lock 100 ms between two transactions
-  ([#100](https://github.com/bnsd55/open-scion/issues/100)). While a server
+  ([#100](https://github.com/bnsd55/openscion/issues/100)). While a server
   write waits, it holds the server's write connection, so the server's
   other writes wait too. Its reads do not: they use the read connections.
 - **Refs.** Both processes move a ref by compare-and-swap on its `version`,
@@ -495,7 +495,7 @@ derives it in steps. A golden test pins the root nodes of a fixed history.
 A deleted path keeps its entry, so a land on a base from before the delete
 still sees the change. The cost: the rows of a level hold every name that
 its directory ever had on the first-parent history, and no row is ever
-deleted ([#114](https://github.com/bnsd55/open-scion/issues/114)). A
+deleted ([#114](https://github.com/bnsd55/openscion/issues/114)). A
 change rewrites only the chunks its names land in, but the chunks it
 touches are rewritten whole, while a tree holds only the live names. A
 directory that churns through new names spreads its level over more
@@ -550,7 +550,7 @@ it with `ReadFile`. A rename needs no new upload: the repo has the blob. Two
 repos that share content each have their own row. A blob uploaded to a repo
 but not yet named belongs to that repo, whoever uploaded it. `GetObjects`
 still reads any tree or blob by ID
-([#13](https://github.com/bnsd55/open-scion/issues/13), section 7).
+([#13](https://github.com/bnsd55/openscion/issues/13), section 7).
 
 **Land** (`land.rs`):
 
@@ -751,7 +751,7 @@ it stay. If the head still has no path history after that, the land fails
 with `INTERNAL`.
 
 **Not planned now:** a lander that rebases a batch of pending lands and moves
-the ref once ([#18](https://github.com/bnsd55/open-scion/issues/18), closed: one
+the ref once ([#18](https://github.com/bnsd55/openscion/issues/18), closed: one
 machine already gives about 200 durable lands/s). The
 [scalable backend design](design/scalable-backend.md) says when it would be
 needed: many servers on one database, which the Postgres backend does not
@@ -840,7 +840,7 @@ So each entry reads one changeset and the node rows of each path part,
 however many changesets lie between two entries. A level above 64 KiB is
 cut into chunks (section 4), but a name can land anywhere in its level, so
 a file in a directory that churns through names reads more rows per entry
-([#114](https://github.com/bnsd55/open-scion/issues/114)). So a call stops
+([#114](https://github.com/bnsd55/openscion/issues/114)). So a call stops
 once it has read 64 MiB of nodes (`read::MAX_LOG_NODE_BYTES`), after its
 first entry, and `next_changeset_id` says where to continue. A call
 keeps the nodes it read, so it reads each node once. A `Log` with a path
@@ -902,7 +902,7 @@ there. `Log` with a path does not follow renames, as `git log` without
 Where rename following differs from `git blame`:
 
 - A deleted file over a limit of step 1 is never similar here
-  ([#90](https://github.com/bnsd55/open-scion/issues/90)).
+  ([#90](https://github.com/bnsd55/openscion/issues/90)).
 - git also treats a file as binary, so a CR counts, when `.gitattributes`
   marks it `binary` or `-diff`. Here only the NUL byte test counts.
 - git keeps the four best similar files while it compares, and on a tie the
@@ -1400,7 +1400,7 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
   checked by the server's code, and sends its own token upstream
   (`--upstream-token`, `SCION_UPSTREAM_TOKEN`). A tier does not ask whether
   a repo exists: it serves a stored object for any valid repo name
-  ([#13](https://github.com/bnsd55/open-scion/issues/13)).
+  ([#13](https://github.com/bnsd55/openscion/issues/13)).
 - **Logs.** Each `GetObjects` reply logs its hits and misses at `info`, and
   each object at `debug`. The daemon logs at `info` how many objects its
   start found and whether it scanned, whether its stop wrote a clean index,
@@ -1413,7 +1413,7 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
 | Upstream | `--upstream`, by default the server at `127.0.0.1:7878`. | `--upstream`, by default the cache at `127.0.0.1:7879`. |
 | Store | Memory, at most `--max-bytes` (1 GiB) of stored objects (blobs packed). | Disk, at most `--max-bytes` (10 GiB) of stored object bytes (not disk blocks): one file per object under `<data>/objects/`, a tree's `TreeV1` bytes or a blob's zstd frame, written to a temp file and renamed, unpacked as a stream and checked against its ID when read back. A file that the limit drops leaves its name by a rename under the index lock, and is removed after it, so a put of the same object keeps its new file. `<data>` is made with mode 0700 if missing. It must be a real directory (not a symlink), owned by the daemon's user, and closed to others, or the daemon refuses it. One daemon locks it. |
 | Eviction | Least recently used first. | Least recently used first, from the index db's order of use (below), so the order survives a restart. |
-| Start | Empty. | Reads `<data>/index.db`. After a clean stop (SIGINT or SIGTERM) it opens no object directory. After a crash it still opens at once, and a low-priority walk adopts the files that the crash left behind ([#115](https://github.com/bnsd55/open-scion/issues/115)). Then, if it holds no object, it imports each `--seed` file (below). |
+| Start | Empty. | Reads `<data>/index.db`. After a clean stop (SIGINT or SIGTERM) it opens no object directory. After a crash it still opens at once, and a low-priority walk adopts the files that the crash left behind ([#115](https://github.com/bnsd55/openscion/issues/115)). Then, if it holds no object, it imports each `--seed` file (below). |
 | Snapshots | With `--snapshot DIR` and `--snapshot-repo R`, writes `DIR/<repo>.scnsnap` every `--snapshot-every` seconds (600): the objects that went into that repo's replies, the most recently used up to `--snapshot-bytes` (256 MiB), least recently used first. | With `--seed FILE`, repeatable: before it serves, a cold store only (one that names no object) takes the file's objects (below). |
 
 **The daemon's index.** `<data>/index.db` is a SQLite database (through
@@ -1525,13 +1525,13 @@ followed again. A tier serves only `Objects`, so of the `scn` commands only
 `scripts/bench-checkout.sh` runs 50 sparse checkouts at once through one
 daemon, cold and warm, against `git clone` doing the same checkout
 ([benchmarks](benchmarks.md),
-[#6](https://github.com/bnsd55/open-scion/issues/6)).
+[#6](https://github.com/bnsd55/openscion/issues/6)).
 
 ### Virtual checkout
 
 `scn mount DIR [REV]` serves one ref of the repository as an NFSv3
 filesystem, so files load when they are first read
-([#11](https://github.com/bnsd55/open-scion/issues/11)). The server runs
+([#11](https://github.com/bnsd55/openscion/issues/11)). The server runs
 inside `scn`, on a free port of 127.0.0.1, and the mount uses the operating
 system's NFS client. A directory's tree is fetched when the directory is
 first listed or looked up in; a file's blob when the file is first read,
@@ -1559,19 +1559,19 @@ secret stops stray and accidental callers only; it is not a protection.
 
 ## 8. Security model
 
-open-scion is a proof of concept for one trusted machine. Do not expose it to
+openscion is a proof of concept for one trusted machine. Do not expose it to
 an untrusted network.
 
 | Area | Today | Limit |
 |---|---|---|
 | Authentication | The server knows the principal of each of its tokens: `--token T` makes one principal, `default`, which may read and write every repo, and `--access FILE` maps the BLAKE3 digest of each token to a principal, with which repos it may read and which paths of a repo it may write (a write rule needs a read rule without a prefix, refused at load otherwise: a partial reader cannot write in v0.1). A read rule MAY name a path prefix: a principal whose read rules are all prefixes is a *partial reader* and reads through the view the server derives for it (the `Repo isolation` row). A principal with no rule for a repo cannot see it, so every call answers `NOT_FOUND`, as for a repo that does not exist. The server and each tier compare BLAKE3 digests of the tokens in constant time, and `scion-server hash-token` prints the digest that an access file wants, so the file never holds a token. A tier sends its own token upstream. | A tier knows one token, so one principal upstream. `GetObjects` carries no token: its permission is the read ticket, which the walk of every serving tier checks (see "Read tickets" below). Per-principal caps are on with `--access` (section 2 of protocol-v1); the request and upload-byte counts live in memory. A ticket is not checked against the rules in force: after a reload that narrows its principal, the old ticket works for at most 15 minutes from signing, on the server and the caches; to cut it at once, rotate the ticket key. |
-| Network | The server listens on `127.0.0.1:7878` and `scion-cache` on `127.0.0.1:7879` by default. A non-loopback address is refused unless `--insecure-listen` is given, or the process serves TLS (`--tls-cert` and `--tls-key`; a private CA is trusted by `scn` with `--tls-ca`). With `--tls-client-ca`, a tier must present a client certificate that CA signed. `scion-daemon` listens only on a Unix socket with mode 0600, in a directory that only its user can reach; it refuses any other. `scn` refuses a socket that another user owns. Both refuse a socket or data directory under a directory that another user can change: one that another user owns, or that group or others can write and has no sticky bit. | With TLS, the process trusts the server's certificate only if a CA is given; there are no public roots. Without TLS, the token and all data travel unencrypted: a bearer token over plain TCP to a non-loopback address stays refused. TLS certificates are not checked against hostnames beyond what the CA signs, and there is no revocation ([#14](https://github.com/bnsd55/open-scion/issues/14) tracks TLS; revocation has no issue). By choice, as OpenSSH's `StrictModes`, the directory checks refuse a group-writable directory (`chmod go-w` fixes it; with umask 002, new directories are group-writable), and read only the owner and the mode bits, not ACLs: an ACL that lets other users write a directory gets past them. |
+| Network | The server listens on `127.0.0.1:7878` and `scion-cache` on `127.0.0.1:7879` by default. A non-loopback address is refused unless `--insecure-listen` is given, or the process serves TLS (`--tls-cert` and `--tls-key`; a private CA is trusted by `scn` with `--tls-ca`). With `--tls-client-ca`, a tier must present a client certificate that CA signed. `scion-daemon` listens only on a Unix socket with mode 0600, in a directory that only its user can reach; it refuses any other. `scn` refuses a socket that another user owns. Both refuse a socket or data directory under a directory that another user can change: one that another user owns, or that group or others can write and has no sticky bit. | With TLS, the process trusts the server's certificate only if a CA is given; there are no public roots. Without TLS, the token and all data travel unencrypted: a bearer token over plain TCP to a non-loopback address stays refused. TLS certificates are not checked against hostnames beyond what the CA signs, and there is no revocation ([#14](https://github.com/bnsd55/openscion/issues/14) tracks TLS; revocation has no issue). By choice, as OpenSSH's `StrictModes`, the directory checks refuse a group-writable directory (`chmod go-w` fixes it; with umask 002, new directories are group-writable), and read only the owner and the mode bits, not ACLs: an ACL that lets other users write a directory gets past them. |
 | Data directory | The server's `--data` directory holds the blob files and the ticket key, and the SQLite metadata, unless the metadata is in Postgres (`--postgres-url`; then the directory holds only the blobs and the ticket key). The blobs are content-addressed files, and the metadata answers who may read what only through the server. Every open of a data directory (serve, import, fsck, gc, derive) refuses one that group or others can write, and one under a directory that another user can change (`check_ancestors`, as for a socket). The ticket key is wherever `--ticket-key` points, made mode 0600, with the same chain check. | The server does not demand mode 0700: a directory that only group or others can write is refused, the rest is the operator's choice. Whoever can read the directory has every blob and every row, and a copied data directory is a full copy of every repo. The same holds for a daemon's store (see "Read tickets"). The machine must be trusted, as the intro says. |
 | Repo isolation | Every call first checks the caller's read rule for the repo, and a repo it may not read answers `NOT_FOUND`. A principal whose read rules name prefixes (a *partial reader*) reads `ReadFile` and `ListDir` through the view the server derives from its prefixes, and a path outside them answers exactly as a missing one: the same code and the same text as the same path in a repo where it does not exist. `ResolveRef` resolves as for any caller, and `GetRootTree` mints the read ticket on the view root, so the walk behind the ticket cannot reach a hidden entry. Its history reads (`GetChangeset`, `Log`, `Blame`, `MergeBase`, `IsAncestor`, `Diff`) and every write answer `UNIMPLEMENTED` with one text, before any data is read. For a whole-repo reader, changesets and derived root trees are reached only through `repo_changesets`. A changeset names only blobs of its own repo (`repo_blobs`, section 5), so the path reads reach only the repo's own content. Path history nodes are reached only through the derived value of a changeset that the repo has, and name only changesets on its first-parent history. No answer of the write calls shows whether another repo has a blob: `CreateChangeset` gives the error of content that no repo stored, before any file is read, and `PutBlob` of such content takes the same write path as for new content. Two leaks stay: the rename frees the old file, and the page cache makes a shared blob fast. | `GetObjects` reads only what a read ticket's walk reaches; see "Read tickets" below. |
 | Lands | `GetLand` and request keys are scoped by the caller's principal: two tokens of one principal share a scope, and the retry of a land finds the outcome of its request key. | With `--token`, every caller is the same principal, `default`, so all callers share one scope. |
 | Checkout | `scn checkout` writes into a private temp directory with a random name. It renames it onto a new destination, or moves its entries up into an existing empty directory that the user owns, never over an entry already there. It never follows a symlink while writing or removing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure, or on SIGINT, SIGTERM or SIGHUP, the destination stays as it was. | The directory that gets the checkout (an existing destination, or a new one's parent) must not be writable by all users, unless it has the sticky bit: they could swap parts of the checkout. An existing destination that breaks this is refused. Members of a group that can write it are trusted. Where the filesystem has no rename that never replaces (NFS), any empty mode 0700 directory of the user at a top-level directory name counts as the checkout's claim after `mkdirat` fails with `EEXIST`, and is replaced. Where it has no hard links either (some FUSE filesystems), any symlink of the user with the same target at a top-level symlink name counts as made after `symlinkat` fails with `EEXIST`, and is kept. This is for a lost NFS version 3 reply, but a trusted user (the owner, a group member, root) can also put such an entry there: it is taken, and no data is lost. A filesystem that shows one owner for every entry (a FUSE or SMB mount with `-o uid=`) passes every ownership check. In the temp directory, an entry found after `EEXIST` that is what the call makes counts as made, unless a recorded path in the same directory has its inode. A filesystem that folds names but shows another inode number under each name (CIFS with `noserverino`, FUSE without `use_ino`) would let such a fold through only for two empty files or two symlinks with one target: the two paths then share one entry, with the same content. A folded directory always fails: each directory that the checkout made already holds an entry. The check reads only the mode bits, not ACLs: an ACL that lets other users add or delete entries gets past it. No Windows rules: Windows is unsupported, so device names and names that end
 | Cache tiers | A tier refuses every call but `GetObjects` with `UNIMPLEMENTED`, and `GetObjects` serves only what the read ticket's walk reaches (see "Read tickets" below). A snapshot file (`--snapshot`) holds whole objects of the repos named, and whoever can read the file can read them: a snapshot is a full-repo credential, so `scion-daemon --seed` refuses it unless the operator passes `--seed-full-repo`, which says every user of the node may read the repo whole. | The file is mode 0600 in a directory made with mode 0700, but a node gets it by any copy tool or a shared mount. Two side channels stay for a partial reader: the real changeset IDs of its view, so a new ID with the same view root shows that a hidden-only change landed, and the tiers' walk metrics count such refusals. Metrics are for the operator, not for the readers. |
-| Virtual checkout | `scn mount` binds to 127.0.0.1 on a free port, and every mount path and file handle carries a secret of 16 random bytes: a mount of a wrong path is refused (`MNT3ERR_NOENT`), and a handle that was not made by this mount is refused (`NFS3ERR_STALE`). The mount point's directory is the user's, and the overlay lives in a mode 0700 directory of the system's temporary directory. `scn mount` says at start, and in `--help`, that it is for single-user machines. The mount sends its read ticket with every `GetObjects`, and refreshes it through `GetRootTree` of the mounted changeset before it expires. | Single-user machines only, and the secret is not a protection: the NFS server sees neither the caller's user ID nor its source port (`nfsserve` passes neither to the file system), so it cannot tell local users apart, and the mount path with its secret is in the mount table that every local user can read. Any local user who can read the mount table can reach the mounted content through the NFS port, and root always can ([#11](https://github.com/bnsd55/open-scion/issues/11)). |
+| Virtual checkout | `scn mount` binds to 127.0.0.1 on a free port, and every mount path and file handle carries a secret of 16 random bytes: a mount of a wrong path is refused (`MNT3ERR_NOENT`), and a handle that was not made by this mount is refused (`NFS3ERR_STALE`). The mount point's directory is the user's, and the overlay lives in a mode 0700 directory of the system's temporary directory. `scn mount` says at start, and in `--help`, that it is for single-user machines. The mount sends its read ticket with every `GetObjects`, and refreshes it through `GetRootTree` of the mounted changeset before it expires. | Single-user machines only, and the secret is not a protection: the NFS server sees neither the caller's user ID nor its source port (`nfsserve` passes neither to the file system), so it cannot tell local users apart, and the mount path with its secret is in the mount table that every local user can read. Any local user who can read the mount table can reach the mounted content through the NFS port, and root always can ([#11](https://github.com/bnsd55/openscion/issues/11)). |
 | Client machine | `scn` takes its bearer token from `SCION_TOKEN` or `--token`, and never writes it to a file or a log. It trusts the server's certificate only through `--tls-ca` (the Network row). Its `--help` says to pass the token in the environment. | The command line is readable by every local user through `ps`; the environment of a process is not readable by other users. So a token passed as `--token` is a secret from no one: pass it in `SCION_TOKEN`. `scion-cache --token` and `scion-daemon --token` sit in argv for the same reason, and a daemon or cache that serves several users must read its token from its environment or a mode 0600 file instead. |
 | Errors | Internal errors reply `internal error`. The detail stays in the server or tier log. | |
 
@@ -1619,26 +1619,26 @@ limit and its upgrade path. This is the list on `main` today.
 
 | File | Shortcut | Upgrade | Issue |
 |---|---|---|---|
-| `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
+| `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/openscion/issues/35) |
 | `scion-server/src/store.rs` (`flush_dirs`) | LazyFS persists a rename at rename time, so the power-loss cut never drops a directory entry: the `fsync` of each directory after a rename (section 3) is invisible there. The dm-log-writes suite (section 9) covers it: a real ext4 log replayed to each reply's last flush, and the mutation that deletes the directory fsync turns it red. | A suite over a filesystem whose directory fsync does not force a journal commit, when a bug report says a directory entry was lost on one. | |
 | `scion-server/src/main.rs` (`Command`) | The `Serve` subcommand holds its flags by value: 309 bytes against `Import`'s 109, 20 bytes over `clippy::large_enum_variant`, so the lint is off for the enum. | Box the TLS and ticket paths of `Serve` if a variant grows further. | |
-| `scion-server/src/import.rs` (`TX_BUDGET`) | A transaction of an import ends at 1 s, but one commit's record and check can run longer, and a server write then waits for it. Ceiling: the changes and trees of the biggest commit. | A separate write connection for the import, or per-statement yields. | [#100](https://github.com/bnsd55/open-scion/issues/100) |
+| `scion-server/src/import.rs` (`TX_BUDGET`) | A transaction of an import ends at 1 s, but one commit's record and check can run longer, and a server write then waits for it. Ceiling: the changes and trees of the biggest commit. | A separate write connection for the import, or per-statement yields. | [#100](https://github.com/bnsd55/openscion/issues/100) |
 | `scion-server/src/import.rs` (`Importer::blob`) | The skip sees only the target repo's rows, one probe per distinct blob, and stats the file: a blob another repo names, or whose row is missing, still goes through put with its read-back and fsyncs. | An index on `repo_blobs` (`blob`), then `any_repo_names`, when a cross-repo import is measured slow. | |
-| `scion-server/src/pg.rs` (the collector's key in `Pg::commit`) | One advisory key per schema orders every writer of the schema against one collector, so the stores of a test database (one schema each) do not serialize against each other; a slow batch of the collector is bounded by its `PRUNE_BATCH` rows and its 100 ms budget warn. | Per-repo keys, or the collector's batches reading a snapshot instead of holding a lock. | [#47](https://github.com/bnsd55/open-scion/issues/47) |
+| `scion-server/src/pg.rs` (the collector's key in `Pg::commit`) | One advisory key per schema orders every writer of the schema against one collector, so the stores of a test database (one schema each) do not serialize against each other; a slow batch of the collector is bounded by its `PRUNE_BATCH` rows and its 100 ms budget warn. | Per-repo keys, or the collector's batches reading a snapshot instead of holding a lock. | [#47](https://github.com/bnsd55/openscion/issues/47) |
 | `scion-server/src/pg.rs` (`begin_read`) | Every read runs at repeatable read for one snapshot per read, even reads that touch only immutable rows, which would be safe at read committed with a shorter snapshot hold. Nobody has measured the gain, and the split needs an audit of every walk that re-reads a ref. | Measure the snapshot hold first; then split the reads by the rows they touch, keeping repeatable read where a walk re-reads a ref. | |
 | `scion-server/src/gc.rs` (`prune_rows`) | A prune chunk re-loads every changeset ID of its repo to pin what committed while it waited for the collector's key, so a repo with many changesets pays that walk per chunk. | Load the IDs once per repo per sweep and share them across chunks, at the cost of a wider pin window. | |
-| `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | Per-ref serialization in a shared database ([design](design/scalable-backend.md)). | [#47](https://github.com/bnsd55/open-scion/issues/47) |
+| `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | Per-ref serialization in a shared database ([design](design/scalable-backend.md)). | [#47](https://github.com/bnsd55/openscion/issues/47) |
 | `scion-server/src/service.rs` (`into_server`) | A unary reply's bytes stay in HTTP/2 uncounted until the client reads them or the connection closes. Every reply that can grow with its input streams (`ReadFile`, `GetChangeset`, `ListDir`, `Log`, `Blame`, `GetObjects`) and takes the counted stall path instead, so the largest unary reply left is `Diff` (at most 1,000 paths, about 120 KB) and the rest are KBs: at the defaults, a client that never reads holds at most 128 connections x 256 streams x about 120 KB of unary replies, until its connections close. The encoder's message limit (64 MiB) refuses anything over it. | A new unary RPC streams, or bounds its reply, before it ships. | |
 | `scion-server/src/service.rs` (`whole_share`) | A `ListDir` or `GetChangeset` reply holds its whole object even when its share is capped at the budget, so a directory whose bytes are over the budget holds what the budget cannot pay for. The budget bounds how many such replies run at once, not their size. | Cap the encoded size of a directory or changeset reply if that ever matters. | |
-| `scion-server/src/objects.rs` (`find`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
-| `scion-server/src/tree.rs` (`Dir::store`) | A change rewrites each directory on its paths whole: a tree of every live name. With names of 12 bytes, a write in a directory of 10,000 names stores 500 KB of tree. | Trees cut into chunks, so a write stores only the chunks it changes. Trees need a new format for it. | [#114](https://github.com/bnsd55/open-scion/issues/114) |
-| `scion-server/src/history.rs` (`Edit::stored`) | An edit of a chunked level holds and re-encodes the whole chunk index of the level, so a write re-stores the index row that changed: about 32 KB at 100,000 names, about 2.7 MB at 10M. | Keep the index stacked in the edit, and edit one index chunk per level of the stack. | [#114](https://github.com/bnsd55/open-scion/issues/114) |
+| `scion-server/src/objects.rs` (`find`) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/openscion/issues/6) |
+| `scion-server/src/tree.rs` (`Dir::store`) | A change rewrites each directory on its paths whole: a tree of every live name. With names of 12 bytes, a write in a directory of 10,000 names stores 500 KB of tree. | Trees cut into chunks, so a write stores only the chunks it changes. Trees need a new format for it. | [#114](https://github.com/bnsd55/openscion/issues/114) |
+| `scion-server/src/history.rs` (`Edit::stored`) | An edit of a chunked level holds and re-encodes the whole chunk index of the level, so a write re-stores the index row that changed: about 32 KB at 100,000 names, about 2.7 MB at 10M. | Keep the index stacked in the edit, and edit one index chunk per level of the stack. | [#114](https://github.com/bnsd55/openscion/issues/114) |
 | `scion-server/src/history.rs` (`Nodes::row`) | A check's cache clears all its rows once they pass the cap, so a check whose paths share nodes re-reads them. A check reads each path once, so the re-reads are rare. | A per-entry LRU, if one check's re-reads ever show in the node-read metrics. | |
-| `scion-server/src/blame.rs` (`MAX_BLAME_VERSIONS`) | One call diffs at most 100 versions of a file. A file with more versions costs more calls. | Blame as derived data, kept per file version. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
-| `scion-server/src/blame.rs` (`MAX_BLAME_DIFF_LINES`) | One call diffs about 1M lines, and a long line counts once per 64 bytes. A diff of many repeated lines grows faster than its lines, so one diff of two files of 1,048,576 lines is the worst case of a call. A rename search shares the budget and goes on over calls, so a changeset that deletes many large files costs one call per about 64 MiB of them. | Blame from derived data, so a call does not diff whole versions, and an index of each changeset's deleted files by chunk, so a search reads only files that share chunks with the new file. | [#61](https://github.com/bnsd55/open-scion/issues/61) |
-| `scion-tier/src/lib.rs` (`produce`) | Two blocking hops per hit (size, then read) and no read-ahead, as on the server. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/open-scion/issues/6) |
-| `scion-tier/src/lib.rs` (`produce`) | A daemon checks no ticket and runs no walk: it forwards the ticket and paths upstream, whose check and walk keep unproven reads out. Safe only while one daemon serves one OS user over its 0600 socket in a private directory; that user can read the daemon's store files anyway. | A daemon that serves several OS users must check tickets and walk, like a cache. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
-| `scion-server/src/quotas.rs` (`Quotas`) | The request and upload-byte caps live in memory, so a restart forgets them; only the pending-lands cap counts rows of the store. A restart also frees every count. | Count the in-flight work in the store, or share the counts across processes. | [#15](https://github.com/bnsd55/open-scion/issues/15) |
+| `scion-server/src/blame.rs` (`MAX_BLAME_VERSIONS`) | One call diffs at most 100 versions of a file. A file with more versions costs more calls. | Blame as derived data, kept per file version. | [#61](https://github.com/bnsd55/openscion/issues/61) |
+| `scion-server/src/blame.rs` (`MAX_BLAME_DIFF_LINES`) | One call diffs about 1M lines, and a long line counts once per 64 bytes. A diff of many repeated lines grows faster than its lines, so one diff of two files of 1,048,576 lines is the worst case of a call. A rename search shares the budget and goes on over calls, so a changeset that deletes many large files costs one call per about 64 MiB of them. | Blame from derived data, so a call does not diff whole versions, and an index of each changeset's deleted files by chunk, so a search reads only files that share chunks with the new file. | [#61](https://github.com/bnsd55/openscion/issues/61) |
+| `scion-tier/src/lib.rs` (`produce`) | Two blocking hops per hit (size, then read) and no read-ahead, as on the server. | Read a batch capped by bytes per hop, or keep a few reads in flight. | [#6](https://github.com/bnsd55/openscion/issues/6) |
+| `scion-tier/src/lib.rs` (`produce`) | A daemon checks no ticket and runs no walk: it forwards the ticket and paths upstream, whose check and walk keep unproven reads out. Safe only while one daemon serves one OS user over its 0600 socket in a private directory; that user can read the daemon's store files anyway. | A daemon that serves several OS users must check tickets and walk, like a cache. | [#13](https://github.com/bnsd55/openscion/issues/13) |
+| `scion-server/src/quotas.rs` (`Quotas`) | The request and upload-byte caps live in memory, so a restart forgets them; only the pending-lands cap counts rows of the store. A restart also frees every count. | Count the in-flight work in the store, or share the counts across processes. | [#15](https://github.com/bnsd55/openscion/issues/15) |
 | `scn/src/client.rs` (`lossy`) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | Escape or base64 raw bytes in JSON. | |
 | `scn/src/vfs.rs` (`open_overlay_write`) | Only the overlay file's final name refuses a planted symlink; a symlink one level up still redirects a write below it. The mount is read-only without `scn mount --unstable-writable` for exactly this reason, so the exposure is only behind the flag. | Open every parent through handles, as `scn/src/materialize.rs` does. | |
 | `scn/src/cmd/commit.rs` (`commit`) | Reads each local file whole, so memory caps the file size. | Stream chunks from the file. | |
@@ -1739,7 +1739,7 @@ changeset, and the requests that the server refuses. Two more tests damage a
 stored copy. A damaged copy on the daemon is fetched again. A damaged blob
 on the server ends each tier's reply with `DATA_LOSS`, and no tier keeps it.
 One known difference is left out: a tier sends an object that it holds for
-any valid repo name ([#13](https://github.com/bnsd55/open-scion/issues/13)).
+any valid repo name ([#13](https://github.com/bnsd55/openscion/issues/13)).
 
 ## 11. Metrics
 

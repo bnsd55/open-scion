@@ -1,6 +1,6 @@
 //! `scn commit --from-mount` end to end: a mount's overlay through the VFS
 //! API, then the commit and the diff through the `scn` binary, against the
-//! in-process server ([#11](https://github.com/bnsd55/open-scion/issues/11)).
+//! in-process server ([#11](https://github.com/bnsd55/openscion/issues/11)).
 
 #![cfg(unix)]
 

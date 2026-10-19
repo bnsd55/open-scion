@@ -1,9 +1,9 @@
 # Releasing
 
-How to cut a release of open-scion. v0.1.x is a source release: a git
+How to cut a release of openscion. v0.1.x is a source release: a git
 tag plus GitHub release notes. Nothing publishes crates: the crates
 publish later, after their public APIs are narrowed
-([#21](https://github.com/bnsd55/open-scion/issues/21)). Nothing here
+([#21](https://github.com/bnsd55/openscion/issues/21)). Nothing here
 tags by itself: each step is run by a person.
 
 ## Before a release
@@ -59,7 +59,7 @@ A release is cut through one PR from a branch named
    notes describe:
 
    ```sh
-   git tag -a v0.1.0 -m "open-scion v0.1.0"
+   git tag -a v0.1.0 -m "openscion v0.1.0"
    git push origin v0.1.0
    ```
 
@@ -104,6 +104,23 @@ Never move a tag to a different commit in place.
 - Close the milestone if it is still open.
 - The tag and its release notes stay: they are what a later reader
   checks out, and what the later crates.io publish of #21 tags from.
+
+## The crates.io publish
+
+The crates publish after the release tag ([#21]). One step guards
+what they publish: on the tagged commit, run
+`scripts/public-api.sh api-<version>`. The script writes one file per
+crate (`api-<version>/open-scion-core.txt` and so on), built with
+cargo-public-api from a nightly rustdoc (it installs both when they
+are missing), and a `VERSIONS` file with the exact `cargo public-api`
+and nightly `rustc` versions that made the listing. Diff each file
+against the same listing taken from the previous release's tag, and
+read the diff before anything publishes: every new `pub` item and
+every changed signature is a promise crates.io cannot take back. A
+diff between two listings that different tool versions made can show
+format noise instead of an API change; compare the `VERSIONS` files,
+and when they differ, remake one side with the other's versions
+before you read the diff as an API change.
 
 ## Notes
 

@@ -1,5 +1,5 @@
 //! The metadata storage that a server needs, as one trait, with SQLite
-//! behind it ([#47](https://github.com/bnsd55/open-scion/issues/47)).
+//! behind it ([#47](https://github.com/bnsd55/openscion/issues/47)).
 //!
 //! [`Store`] is the SQLite implementation: one data directory, one write
 //! connection, readers around it, and the group flush that makes a reply

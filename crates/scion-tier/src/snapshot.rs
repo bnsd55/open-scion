@@ -1,6 +1,6 @@
 //! Snapshots of the objects that a cache sent for one repo, so that a cold
 //! daemon can start with them instead of fetching them all
-//! ([#59](https://github.com/bnsd55/open-scion/issues/59)).
+//! ([#59](https://github.com/bnsd55/openscion/issues/59)).
 //!
 //! A snapshot is one file: [`MAGIC`], the repo name (its length as a `u16`,
 //! little-endian, then its bytes), then one entry per object, least recently
