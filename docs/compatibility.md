@@ -8,6 +8,12 @@ talk to whom, what that talk must deliver, and what a break needs. All
 five crates carry one version ([RELEASING.md](RELEASING.md)), so "at
 version N" names a release, not a per-crate number.
 
+**N-1 means the previous release, including the previous minor**: a
+0.2 client, tier or daemon works with a 0.1 server, and the reverse.
+Per-node daemons and clients do not all upgrade at once, so the
+promise reaches back one minor, not one release. A patch (`0.1.z`)
+keeps every pair below working in both directions.
+
 ## The moving pieces
 
 - `scion-server`: the store (metadata + blobs) and the v1 gRPC services.
@@ -21,39 +27,43 @@ version N" names a release, not a per-crate number.
 
 | Pair | Versions | "Works" means |
 |---|---|---|
-| `scn` ↔ `scion-server` | N vs. N-1, both directions, across one minor step | Every RPC of `scion.v1.*` the client sends is answered within [protocol-v1.md](protocol-v1.md)'s status codes and limits; the ticket it holds verifies; the commands it runs do what [cli.md](cli.md) says |
-| `scion-cache` / `scion-daemon` ↔ `scion-server` | N vs. N-1, both directions, one minor step | Reads forwarded within the same v1 contract; the ticket verifies; snapshots and tickets follow their versioned formats (stability.md) |
-| `scn` ↔ `scion-daemon` (the `unix://` path) | N vs. N-1, both directions, one minor step | Reads over the socket behave as [cli.md](cli.md) documents; the CLI's `--json` rules are stability.md's |
+| `scn` ↔ `scion-server` | N vs. N-1, both directions | Every RPC of `scion.v1.*` the client sends is answered within [protocol-v1.md](protocol-v1.md)'s status codes and limits; the ticket it holds verifies; the commands it runs do what [cli.md](cli.md) says |
+| `scion-cache` / `scion-daemon` ↔ `scion-server` | N vs. N-1, both directions | Reads forwarded within the same v1 contract; the ticket verifies; snapshots and tickets follow their versioned formats (stability.md) |
+| `scn` ↔ `scion-daemon` (the `unix://` path) | N vs. N-1, both directions | Reads over the socket behave as [cli.md](cli.md) documents; the CLI's `--json` rules are stability.md's |
 | `scion-server` N ↔ a store of N-1 | One direction only | The open migrates forward, one transaction per released migration; a store newer than the build is refused (stability.md's schema rows) |
 | `scn` ↔ repositories of any 0.x | Forever, both directions | Object bytes and IDs never change (object format v1): a checkout of anything any 0.x server wrote reads on any later build |
-| tier ↔ tier (a chain of caches) | N vs. N-1, both directions, one minor step | Forwarding stays within the v1 object contract; a chain works when every hop does |
+| tier ↔ tier (a chain of caches) | N vs. N-1, both directions | Forwarding stays within the v1 object contract; a chain works when every hop does |
 
-A pair this table does not list has no cross-version promise: two
-servers of different versions behind one load balancer share a store
-only if their schema versions agree, and a server that finds a newer
-schema is refused at open, not half-broken.
+A pair this table does not list has no cross-version promise.
 
 ## What a break needs
 
-[stability.md](stability.md) sets the rule this file enforces: a patch
-(`0.1.z`) fixes bugs and never changes a contract, so a patch release
-keeps every pair above working in both directions; a minor (`0.x.0`)
-may change anything stability.md does not pin. A change that would
-break a listed pair therefore:
+[stability.md](stability.md) sets the base rule: a patch (`0.1.z`)
+fixes bugs and never changes a contract. A minor (`0.x.0`) may change
+anything stability.md does not pin, and this file adds what a change
+that touches a listed pair must carry:
 
-- rides a minor bump, never a patch;
-- on the wire, a new protocol version served beside v1, not a change to
-  v1 (the version is the gRPC service name, so both live on one
-  server);
-- in the objects, a new format version beside v1, never a rewrite of
-  the bytes an ID names;
-- in the store, a forward-only migration at the end of the list, so a
-  store of N-1 opens on N;
-- and the release notes of that minor name every pair it narrows.
+- A minor that changes the wire contract serves the new protocol
+  version beside the old one — the version is the gRPC service name, so
+  both live on one server — keeps the old version through that whole
+  minor, and drops it no earlier than the next minor; the release
+  notes of minor N name what minor N+1 will drop.
+- The same reaches the other versioned formats: a ticket reader of N
+  accepts a ticket of N-1, and a snapshot reader of N accepts the
+  magic of N-1. A minor that issues a new ticket or snapshot format
+  keeps reading the old one through that minor and drops it no earlier
+  than the next minor, named in the release notes the same way.
+- In the objects, a new format version sits beside v1, never a rewrite
+  of the bytes an ID names.
+- In the store, the migrations stay forward-only, appended at the end
+  of the list, so a store of N-1 opens on N; the reverse direction
+  stays refused. The store pair is one-directional by design.
+- The release notes of every minor name each pair it narrows.
 
 Within a minor line, a newer client keeps working against an N-1
-server: it sends nothing the old server cannot answer, and degrades or
-errors clearly where the old server cannot follow.
+server: it sends nothing the old server cannot answer. A client that
+calls an RPC an older server does not have gets `UNIMPLEMENTED`, and
+prints which server version the call needs.
 
 ## What is proven today, and what lands later
 
@@ -64,7 +74,7 @@ backends migrate; the demo and the release smoke run a server and
 `scn` from one tree.
 
 What is not yet proven is cross-version: every CI job builds one tree.
-The version matrix (#239, v0.3.0, part 1) starts once v0.1.0 is
+The version matrix (#239, v0.2.0, part 1) starts once v0.1.0 is
 tagged: it builds the tagged N-1 binaries and runs the pairs of the
 table — a client of N against a server of N-1 and the reverse, a tier
 of N behind a server of N-1, a checkout of a store N-1 wrote, and the
