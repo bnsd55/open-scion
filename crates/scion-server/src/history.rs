@@ -448,16 +448,14 @@ impl Nodes {
     fn row(&mut self, c: &mut dyn MetaTx, id: NodeId) -> Result<&Row> {
         if !self.rows.contains_key(&id) {
             let (row, bytes) = get_row(c, id)?;
-            if let Some(cap) = self.cap {
-                if self.bytes + bytes > cap {
-                    // SHORTCUT: clears all at once, not a per-entry LRU: a
-                    // check reads each path once, so a row it cleared is
-                    // unlikely to be wanted again before the check ends.
-                    // Upgrade to an LRU if one check's re-reads ever show
-                    // in the node-read metrics.
-                    self.rows.clear();
-                    self.bytes = 0;
-                }
+            if self.bytes + bytes > self.cap.unwrap_or(usize::MAX) {
+                // SHORTCUT: clears all at once, not a per-entry LRU: a
+                // check reads each path once, so a row it cleared is
+                // unlikely to be wanted again before the check ends.
+                // Upgrade to an LRU if one check's re-reads ever show in
+                // the node-read metrics.
+                self.rows.clear();
+                self.bytes = 0;
             }
             self.bytes += bytes;
             self.rows.insert(id, row);
