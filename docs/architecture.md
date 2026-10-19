@@ -378,7 +378,7 @@ computed eagerly or on demand. The rest is this project's choice.
 |---|---|
 | A kind | `derived::Kind`: a name, a version, and `derive`, a function from a changeset and its parents' values, in parent order, to a value. Each kind encodes its value as bytes. |
 | Inputs | By default the first parent's value only, and only first-parent history is derived: a changeset stores only its changes against its first parent (section 2), so a kind over snapshots needs no more. A kind with `ALL_PARENTS`, such as `commit_graph` (below), gets the value of every parent, and every ancestor is derived. `derive` may also read the stored value of an older changeset that it reaches through those parents. |
-| On demand | `derived::get` reads the stored value. If there is none, `derived::fill` derives it in steps (below). |
+| On demand | `derived::get_by` reads the stored value; if there is none, it derives it in steps (`fill`, below) under the caller's deadline. The doors without a request of their own (`fsck`, the import, background work) use `derived::get_unbounded`, which never fails for time. |
 | Steps | `fill` walks from the changeset through the parents that the kind reads, and stops at each changeset with a stored value. It visits at most `derived::STEP` (100) changesets per hold of the write connection. It keeps the changesets without a value, 40 bytes each with the generation, so it visits each one once. A walk over every parent also keeps the set of changesets it visited. Then it derives them in generation order, oldest first, at most `STEP` changesets per transaction, and commits each one. A parent's generation is below its child's, so each changeset comes after its parents. Other writes run between steps. A step reads a value that is already stored, for example by a concurrent `fill`, and does not derive it again. So a changeset has a value only if each parent that its kind reads has one, back to the roots. |
 | Eager | A kind can also store its value when the changeset is written. `root_tree` does (below). `commit_graph` does if each parent has a value, and `path_history` if the first parent has one (`derived::on_write`), so a write never derives a long history. |
 | Storage | One `derived` row per (kind, version, changeset), written in the transaction that derives it. A large structure belongs in its own table, and the value is its ID, as `root_tree` keeps trees in `trees`. |
@@ -389,10 +389,12 @@ computed eagerly or on demand. The rest is this project's choice.
 | Crashes | Each step commits on its own, and values never change. So a crash or an error between steps leaves only correct rows. The next read walks back to the stored values and goes on from there. |
 | One answer | A second write of a value must equal the first, or the store reports corruption. |
 
-**Cost of a new kind or version.** The first read of a tip with a long history
-still derives the whole history before it replies, so that read waits. Other
-requests wait for at most one step at a time. A backfill before the server
-starts removes that wait.
+**Cost of a new kind or version.** The first read of a tip with a long
+history derives the whole history under its call's 600 s deadline. A cold
+history that takes longer fails the call with `DEADLINE_EXCEEDED`, and
+because each step commits, the next call goes on from the stored steps.
+Other requests wait for at most one step at a time. A backfill before the
+server starts removes the wait.
 
 **Root trees.** Kind `root_tree` version 1 (`tree::RootTree`): the root tree
 of a changeset's full snapshot, as a 32-byte tree ID. It is the first
@@ -925,7 +927,14 @@ also diffs
 at most 100 versions, and about 1M lines (`MAX_BLAME_DIFF_LINES`, both
 sides of each diff, a line counts once per 64 bytes; a rename search counts
 each chunk it reads, each row of a chunk table it indexes or compares, and
-64 for each file size it reads, `SIZE_COST`). A version with the same
+64 for each file size it reads, `SIZE_COST`). The walk checks the call's
+deadline before each step, the first diff too: a step that never starts
+within it fails the call with `DEADLINE_EXCEEDED`, and a retry re-does at
+most the one diff that was running. One diff reads two whole versions, so
+a version of more than 1,048,576 lines is too big to diff: the blamed file
+over the cap fails the call with `RESOURCE_EXHAUSTED`, and an older
+version over the cap counts as absent, as one whose bytes do not fit the
+budget. A version with the same
 content as the newer one (a mode change, or a rename with no edit) is not
 read and costs nothing. The first step of a call always runs, so a call
 always makes progress.
@@ -941,10 +950,11 @@ budget never waits for more, so two calls can never wait for each other
 with nobody able to finish. An older version whose
 bytes do not fit the whole budget counts as absent, so its lines go to the
 changeset that replaced it, and only its read cost counts (once per 64
-bytes, as before). A blamed file whose share (its bytes, and 128 bytes per
-line) is more than the whole budget is `RESOURCE_EXHAUSTED` at once: a
-file of 16-byte lines fits at about 7 lines per byte of budget, so a 1 GiB
-budget refuses a file above about 13 million such lines.
+bytes, as before). A blamed file of more than 1,048,576 lines is
+`RESOURCE_EXHAUSTED` at once, whatever its bytes: one diff reads no
+version past that line cap, so the cap refuses long files before the
+memory share can — under the cap, one file's share (its bytes, and
+128 bytes per line) is at most about 230 MiB of the 1 GiB budget.
 
 A rename search uses the budget that the call has left, and checks it
 before each deleted file. Where the budget runs out, the call stops there.
@@ -965,8 +975,9 @@ blamed file, plus a few files past the budget. The first step, which always
 runs, can pass it by one deleted file, and by the source it found, which it
 reads once more to diff it: the search keeps only chunk tables. The step
 that stops the call can read one older version, or one deleted file and
-that source, and then drop them. Each file is at most 16 MiB, so one call
-reads at most about 150 MiB. To find the deleted files, a search reads each
+that source, and then drop them. A diff reads no version past the line
+cap of the bounds above, so one call reads at most about 150 MiB. To find
+the deleted files, a search reads each
 directory on their paths once, about the work of applying C to its parent
 tree. A resumed search does this again on each call.
 
@@ -1101,15 +1112,11 @@ and their bounds, are this project's choices.
   call finds no renames and sets `renames_incomplete`. Steps 2 and 3
   (inexact) run only while the added files left times the deleted files
   left are at most 1,000,000, git's default limit. Step 3 compares files
-  only under that limit. It reads the
-  added files that some deleted file could be like into one index by chunk
-  hash, then reads each deleted file and looks up its chunks there, so it
-  never compares two files row by row.
-  added files that some deleted file could be like into one index by chunk
-  hash, then reads each deleted file and looks up its chunks there, so it
-  never compares two files row by row. Added files with the same blob share
-  one place in the index, so a blob added at many paths is read and indexed
-  once. It reads
+  only under that limit. It reads the added files that some deleted file
+  could be like into one index by chunk hash, then reads each deleted file
+  and looks up its chunks there, so it never compares two files row by
+  row. Added files with the same blob share one place in the index, so a
+  blob added at many paths is read and indexed once. It reads
   each file in parts of 1 MiB, so it holds the chunk tables but never a
   whole file. Steps 2 and 3 share one budget, about 4M chunks read and
   table rows indexed or compared (`MAX_RENAME_CHUNKS`). It is the same on
@@ -1174,8 +1181,8 @@ starting at the root tree, and never says what it already has.
 
 | RPC | Answer | Cache |
 |---|---|---|
-| `ResolveRef` | Same as on `Scion` (one shared implementation). | Never: a tier forwards it. |
-| `GetRootTree(changeset)` | The root tree ID, from `derived`. Checks that the repo has the changeset. | Forever, by repo and changeset, and only as upstream answered: a changeset never changes. |
+| `ResolveRef` | Same as on `Scion` (one shared implementation). | The server only: a tier answers `UNIMPLEMENTED`. |
+| `GetRootTree(changeset)` | The root tree ID, from `derived`. Checks that the repo has the changeset. | The server only: a tier answers `UNIMPLEMENTED`, and the client brings the ticket it mints to `GetObjects`. |
 | `GetObjects(refs)` | Streams the trees (`TreeV1` bytes) and blobs (the stored zstd file as it is, or the content for a client that does not accept zstd) named by `(kind, id)`, in request order, each in parts of 1 MiB. | Forever. |
 
 - A call names 1 to 1,000 objects. A task reads them one at a time and
@@ -1296,8 +1303,10 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
 
 | Call | What a tier does |
 |---|---|
-| `ResolveRef` | Always forwards. Never kept: a ref moves. |
-| `GetRootTree` | Answers from memory if upstream gave the answer for this repo and changeset before (at most 10,000 kept). Else forwards, then keeps the answer. |
+| Call | What a tier does |
+|---|---|
+| `ResolveRef` | Refused with `UNIMPLEMENTED`: a caller resolves on the server, then brings the ticket of the root tree. |
+| `GetRootTree` | Refused with `UNIMPLEMENTED`: only the server mints tickets. A tier that answered it could mint a ticket for any repo. |
 | `GetObjects` | Serves hits from its store. Fetches the misses from upstream in batched calls, checks each object against its ID, stores it, then sends it. A blob stays one zstd frame from the server's disk to the client. |
 
 - **A tier never trusts its upstream's bytes.** Every tree and blob from
@@ -1612,7 +1621,7 @@ limit and its upgrade path. This is the list on `main` today.
 |---|---|---|---|
 | `scion-core/src/codec.rs` (`put_len`) | Encoding panics if a field is longer than `u32::MAX`. Every ingest path caps sizes far below that. | `try_encode` returning `Result`, if a path ever does not. | |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
-| `scion-server/src/store.rs` (`flush_dirs`) | The power-loss suite cannot catch a lost fsync of a blob directory: LazyFS persists a rename at rename time, so the cut never drops a directory entry. The `fsync` of each directory after a rename (section 3) is therefore untested by that suite. | A block-level replay that drops un-flushed writes in order (dm-log-writes replay to each FLUSH), when a bug report or a change to the rename path says a directory entry was lost. | |
+| `scion-server/src/store.rs` (`flush_dirs`) | LazyFS persists a rename at rename time, so the power-loss cut never drops a directory entry: the `fsync` of each directory after a rename (section 3) is invisible there. The dm-log-writes suite (section 9) covers it: a real ext4 log replayed to each reply's last flush, and the mutation that deletes the directory fsync turns it red. | A suite over a filesystem whose directory fsync does not force a journal commit, when a bug report says a directory entry was lost on one. | |
 | `scion-server/src/main.rs` (`Command`) | The `Serve` subcommand holds its flags by value: 309 bytes against `Import`'s 109, 20 bytes over `clippy::large_enum_variant`, so the lint is off for the enum. | Box the TLS and ticket paths of `Serve` if a variant grows further. | |
 | `scion-server/src/import.rs` (`TX_BUDGET`) | A transaction of an import ends at 1 s, but one commit's record and check can run longer, and a server write then waits for it. Ceiling: the changes and trees of the biggest commit. | A separate write connection for the import, or per-statement yields. | [#100](https://github.com/bnsd55/open-scion/issues/100) |
 | `scion-server/src/import.rs` (`Importer::blob`) | The skip sees only the target repo's rows, one probe per distinct blob, and stats the file: a blob another repo names, or whose row is missing, still goes through put with its read-back and fsyncs. | An index on `repo_blobs` (`blob`), then `any_repo_names`, when a cross-repo import is measured slow. | |
@@ -1686,14 +1695,10 @@ the check fails. It caught a mutation without the fsync of a blob file
 before its row, and a mutation with SQLite's `synchronous = OFF`. What
 it does not prove:
 
-- A drive's volatile cache. The cut models what the process had not
-  fsynced, not what the drive held in cache; a `sync_all` that only
-  flushes a drive cache passes it. Upgrade to a model that replays
-  writes to each FLUSH point (dm-log-writes) when a report says that
-  acknowledged writes were lost on such hardware.
-- Directory entries. LazyFS persists a rename at rename time, so the
-  `fsync` of the blob directory after the rename (section 3) is never
-  exercised (section 9).
+- A drive's volatile cache, or a directory entry lost for lack of a
+  directory fsync: the cut models what the process had not fsynced on
+  LazyFS, which persists a rename at rename time. The dm-log-writes
+  suite (below) covers both on a real ext4.
 - Reordering of writes. The cut takes everything unsynced at once.
 
 The suite is Linux-only (macOS syncs with `F_FULLFSYNC`, and its CI job
@@ -1712,6 +1717,18 @@ What the suite does not prove:
   run can miss a short window. Each run prints its seed, and
   `SCION_CRASH_SEED` runs the same workload and kill times again (thread
   timing still differs). `SCION_CRASH_KILLS` sets more kills.
+
+**The dm-log-writes suite.** A real ext4 filesystem over a dm-log-writes
+target answers the cut that LazyFS cannot make: the suite records a blob
+story, marks each put reply, then replays the log to the last flush entry
+before a reply's mark — everything the drive was never told to flush is
+lost, and whatever the drive flushed stays. After every replayed cut the
+store is mounted, reopened, `fsck` must be clean, and every blob
+acknowledged at or before the cut reads back with its name. It is the
+suite that exercises the directory fsync after a rename and the drive's
+own cache semantics; it is Linux-only and gated by `SCION_DMW_REQUIRE=1`,
+so only the Linux test job runs it. The fault matrix
+(`docs/faults.md`) names what it proves.
 
 **Conformance.** The same `ResolveRef`, `GetRootTree` and `GetObjects` calls
 go to the daemon, the cache and the server, then to the daemon and the cache
