@@ -30,12 +30,22 @@ tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
 
+[features]
+# The integration tests drive the pieces the binary uses only from
+# outside, which the feature makes reachable (#332: nothing gated may
+# live ungated in a release build).
+test-hooks = []
+
 [dev-dependencies]
 rcgen.workspace = true
 # The rotation test builds the tier key sets by hand.
 ed25519-dalek.workspace = true
 # scn's tests drive the server's test seams, which the feature turns on.
 open-scion-server = { workspace = true, features = ["test-hooks"] }
+# scn's tests drive scn's own test seam, which the feature turns on.
+# Path only: a version would make `cargo package` resolve it from the
+# registry.
+open-scion = { path = ".", features = ["test-hooks"] }
 open-scion-tier.workspace = true
 tempfile.workspace = true
 tracing.workspace = true

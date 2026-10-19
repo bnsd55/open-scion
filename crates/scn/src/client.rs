@@ -79,6 +79,7 @@ impl Interceptor for Call {
 /// # Panics
 ///
 /// Panics when `url` is not a valid address.
+#[cfg(any(test, feature = "test-hooks"))]
 pub async fn test_objects(url: &str, token: &str) -> Objects {
     let channel = Endpoint::from_shared(url.to_owned())
         .unwrap()
