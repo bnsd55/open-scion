@@ -1,43 +1,53 @@
 name: soak
 on:
   schedule:
-    # Once a day, at 02:30 UTC.
+    # Once a day, at 02:30 UTC. The nightly soak runs 120 minutes: long
+    # enough for the latency trend's thirds to mean something, bounded so
+    # a hung client cannot hold the runner past the job's own timeout.
     - cron: "30 2 * * *"
-  pull_request:
-    # A change to the soak is tested by a short soak on its own PR.
-    paths:
-      - scripts/soak.sh
-      - .github/workflows/soak.yml
   workflow_dispatch:
     inputs:
       minutes:
         description: run length in minutes
-        default: "10"
+        default: "120"
 
+# Every third-party action is pinned to the commit SHA its version tag
+# named, with the version in a comment, as ci.yml does.
 jobs:
   soak:
     name: soak
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    runs-on: ubuntu-24.04
+    # The run itself is bounded to 120 minutes by the soak's own timeout
+    # below; the build and the checks share the rest of the two hours and
+    # a margin.
+    timeout-minutes: 165
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: run the soak
         env:
-          # The dispatch input sets the length; a pull_request run gets 3
-          # minutes. The input goes through env:, not through the run:
+          # The nightly run is 120 minutes; a dispatch names its own
+          # length. The input goes through env:, not through the run:
           # string, so no shell sees it unquoted.
-          RUN_MINUTES: ${{ github.event_name == 'pull_request' && '3' || (github.event.inputs.minutes || '10') }}
-        run: timeout 2400 scripts/soak.sh
+          RUN_MINUTES: ${{ github.event_name == 'schedule' && '120' || (github.event.inputs.minutes || '120') }}
+          # The resource ceilings, each named here and enforced by
+          # scripts/soak.sh: a server may grow to
+          SOAK_RSS_PCT: "150" # 150 percent of its warm RSS,
+          SOAK_FD_GROWTH: "100" # 100 open files over its start, steady,
+          SOAK_P99_FACTOR: "2" # and its late p99 must stay under 2x its early p99.
+        run: |
+          # The soak's own cap: 150 min covers 120 min of load plus the
+          # build, the checks and the teardown inside the job's 180.
+          timeout 9000 scripts/soak.sh
       # The bounds live in the script; a failed bound fails the step and
       # keeps the CSVs and logs.
       - name: upload the samples and the logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: soak-artifacts
           path: ${{ runner.temp }}/soak-artifacts/
