@@ -129,21 +129,29 @@ run_story() {
   [ -n "$PORT" ] || die "step 'serve' logged no port (umask $UMASK_RUN)"
   export SCION_SERVER=http://127.0.0.1:$PORT
 
-  # Read the history the import made.
-  "$BIN/scn" log -n 5 | grep -q third || die "step 'log' failed (umask $UMASK_RUN)"
-  "$BIN/scn" ls main | grep -q README.md || die "step 'ls' failed (umask $UMASK_RUN)"
-  "$BIN/scn" cat main:README.md | grep -q 'A small repository' \
+  # Read the history the import made. Each scn run writes a file and
+  # the grep reads the file: a pipe into `grep -q` closes at the first
+  # match, so the reader leaves while scn still writes, and the check
+  # would race against how scn answers a closed pipe.
+  "$BIN/scn" log -n 5 >"$WORK/log.out"
+  grep -q third "$WORK/log.out" || die "step 'log' failed (umask $UMASK_RUN)"
+  "$BIN/scn" ls main >"$WORK/ls.out"
+  grep -q README.md "$WORK/ls.out" || die "step 'ls' failed (umask $UMASK_RUN)"
+  "$BIN/scn" cat main:README.md >"$WORK/cat.out"
+  grep -q 'A small repository' "$WORK/cat.out" \
     || die "step 'cat' failed (umask $UMASK_RUN)"
-  "$BIN/scn" blame main:README.md | grep -q . || die "step 'blame' failed (umask $UMASK_RUN)"
+  "$BIN/scn" blame main:README.md >"$WORK/blame.out"
+  grep -q . "$WORK/blame.out" || die "step 'blame' failed (umask $UMASK_RUN)"
 
   # Write, as an agent does: commit, land, and read back through main.
   printf 'hello from the release smoke test\n' >"$WORK/hello.txt"
   CS=$("$BIN/scn" commit -m "add hello" --put hello.txt="$WORK/hello.txt") ||
     die "step 'commit' failed (umask $UMASK_RUN)"
   [ -n "$CS" ] || die "step 'commit' printed no changeset (umask $UMASK_RUN)"
-  "$BIN/scn" land "$CS" | grep -q '^landed ' \
-    || die "step 'land' failed (umask $UMASK_RUN)"
-  "$BIN/scn" cat main:hello.txt | grep -q '^hello from the release smoke test$' \
+  "$BIN/scn" land "$CS" >"$WORK/land.out"
+  grep -q '^landed ' "$WORK/land.out" || die "step 'land' failed (umask $UMASK_RUN)"
+  "$BIN/scn" cat main:hello.txt >"$WORK/hello.out"
+  grep -q '^hello from the release smoke test$' "$WORK/hello.out" \
     || die "step 'land' did not move main (umask $UMASK_RUN)"
 
   # fsck while the server runs, as the README says is safe: it must be

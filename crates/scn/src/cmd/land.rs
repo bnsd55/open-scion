@@ -1,11 +1,11 @@
 //! `land`.
 
+use crate::client::{Ctx, id_from, lossy};
+use crate::outln;
 use anyhow::{Context, Result, anyhow};
 use scion_core::ChangesetId;
 use scion_proto::v1::{LandRequest, LandResponse, LandState};
 use serde_json::json;
-
-use crate::client::{Ctx, id_from, lossy};
 
 /// Arguments of `scn land`.
 #[derive(clap::Args)]
@@ -82,19 +82,19 @@ fn print_outcome(json: bool, reply: &LandResponse) -> Result<()> {
             "detail": reply.detail,
             "conflict_paths": paths,
         });
-        println!("{out}");
+        outln!("{out}");
         return Ok(());
     }
     match (reply.state(), result) {
-        (LandState::Landed, Some(id)) => println!("landed {id}"),
+        (LandState::Landed, Some(id)) => outln!("landed {id}"),
         (LandState::Conflict, _) => {
-            println!("conflict: {}", reply.detail);
+            outln!("conflict: {}", reply.detail);
             for path in &paths {
-                println!("  {path}");
+                outln!("  {path}");
             }
-            println!("re-read those paths on the target, redo the change, commit again");
+            outln!("re-read those paths on the target, redo the change, commit again");
         }
-        (state, _) => println!("{}: {}", state.as_str_name(), reply.detail),
+        (state, _) => outln!("{}: {}", state.as_str_name(), reply.detail),
     }
     Ok(())
 }

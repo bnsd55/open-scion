@@ -1,7 +1,5 @@
 //! `cat`, `ls`, `log`, `show`.
 
-use std::io::Write as _;
-
 use anyhow::{Context, Result, bail};
 use scion_core::{Changeset, ChangesetId, Entry, FileState, IdentityTime, RepoPath, Tree};
 use scion_proto::v1::{
@@ -11,6 +9,8 @@ use serde_json::{Value, json};
 use tonic::{Status, Streaming};
 
 use crate::client::{Ctx, MAX_JOINED_REPLY_BYTES, id_from, lossy, split_spec};
+use crate::out::{flush, write_all};
+use crate::outln;
 
 /// Prints a file's raw bytes. The content is printed as it is, also with
 /// `--json`.
@@ -27,9 +27,9 @@ pub async fn cat(ctx: &mut Ctx, spec: &str) -> Result<()> {
         .await
         .with_context(|| format!("cannot read {spec}"))?
     {
-        stdout.write_all(&chunk.data)?;
+        write_all(&mut stdout, &chunk.data)?;
     }
-    stdout.flush()?;
+    flush(&mut stdout)?;
     Ok(())
 }
 
@@ -98,7 +98,7 @@ pub async fn ls(ctx: &mut Ctx, spec: &str) -> Result<()> {
                 value
             })
             .collect();
-        println!("{}", Value::from(entries));
+        outln!("{}", Value::from(entries));
         return Ok(());
     }
     for (name, entry) in &tree.entries {
@@ -114,7 +114,7 @@ pub async fn ls(ctx: &mut Ctx, spec: &str) -> Result<()> {
             Entry::File(file) if file.state().blob().is_some() => file.size().to_string(),
             _ => String::new(),
         };
-        println!(
+        outln!(
             "{mode} {kind:<7} {size:>10} {}{slash}",
             lossy(name.as_bytes())
         );
@@ -166,12 +166,12 @@ pub async fn log(ctx: &mut Ctx, rev: &str, path: Option<&RepoPath>, limit: u32) 
             .iter()
             .map(|(id, cs)| changeset_json(*id, cs))
             .collect();
-        println!("{}", Value::from(entries));
+        outln!("{}", Value::from(entries));
         return Ok(());
     }
     for (id, cs) in &entries {
         let subject = cs.message.split(|&b| b == b'\n').next().unwrap_or_default();
-        println!(
+        outln!(
             "{} {} {}",
             &id.to_string()[..12],
             lossy(&cs.author.name),
@@ -216,25 +216,25 @@ pub async fn show(ctx: &mut Ctx, rev: &str) -> Result<()> {
                 change
             })
             .collect();
-        println!("{value}");
+        outln!("{value}");
         return Ok(());
     }
-    println!("changeset {id}");
+    outln!("changeset {id}");
     for parent in &cs.parents {
-        println!("parent    {parent}");
+        outln!("parent    {parent}");
     }
-    println!("author    {}", identity(&cs.author));
+    outln!("author    {}", identity(&cs.author));
     if let Some(committer) = &cs.committer {
-        println!("committer {}", identity(committer));
+        outln!("committer {}", identity(committer));
     }
-    println!();
+    outln!();
     for line in lossy(&cs.message).lines() {
-        println!("    {line}");
+        outln!("    {line}");
     }
-    println!();
+    outln!();
     for (path, state) in &cs.changes {
         let op = if state.is_some() { "put   " } else { "delete" };
-        println!("{op} {}", lossy(path.as_bytes()));
+        outln!("{op} {}", lossy(path.as_bytes()));
     }
     Ok(())
 }

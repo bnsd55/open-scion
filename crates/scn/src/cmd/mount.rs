@@ -1,16 +1,16 @@
 //! `mount` and `unmount`: the virtual checkout
 //! ([#11](https://github.com/bnsd55/openscion/issues/11)).
 
-use std::io::Write as _;
-use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
-
 use anyhow::{Context as _, Result, anyhow, bail};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use scion_core::RepoPath;
 use scion_proto::v1::GetRootTreeRequest;
+use std::io::Write as _;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
 
 use crate::client::{Ctx, id_from};
+use crate::outln;
 use crate::vfs::{CHANGES, Change, Vfs};
 
 /// The export name of every mount.
@@ -148,10 +148,10 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
         }
     });
 
-    println!(
+    outln!(
         "single-user machines only: any local user who can read the mount table can reach this mount"
     );
-    println!("{}", mount_command(port, &secret, &dir));
+    outln!("{}", mount_command(port, &secret, &dir));
     if !args.no_mount {
         try_mount(port, &secret, &dir);
     }
@@ -163,7 +163,7 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
     for warning in cleanup_after_stop(&dir, &overlay) {
         eprintln!("scn mount: {warning}");
     }
-    println!("stopped serving {}", dir.display());
+    outln!("stopped serving {}", dir.display());
     Ok(())
 }
 
@@ -192,10 +192,10 @@ pub async fn unmount(_ctx: &mut Ctx, args: UnmountArgs) -> Result<()> {
         .status()
         .is_ok_and(|s| s.success())
     {
-        println!("unmount failed; to unmount, run:");
-        println!("sudo umount {}", dir.display());
+        outln!("unmount failed; to unmount, run:");
+        outln!("sudo umount {}", dir.display());
     }
-    println!("unmounted {}", dir.display());
+    outln!("unmounted {}", dir.display());
     Ok(())
 }
 
@@ -317,8 +317,8 @@ fn try_mount(port: u16, secret: &str, dir: &Path) {
         .arg(dir);
     let mounted = command.status().is_ok_and(|status| status.success());
     if !mounted {
-        println!("mount failed; to mount, run:");
-        println!("{}", mount_command(port, secret, dir));
+        outln!("mount failed; to mount, run:");
+        outln!("{}", mount_command(port, secret, dir));
     }
 }
 

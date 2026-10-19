@@ -1,14 +1,14 @@
 //! `blame`.
 
-use std::collections::HashMap;
-
 use anyhow::{Context, Result, bail};
 use scion_core::{ChangesetId, IdentityTime};
 use scion_proto::v1::BlameRequest;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 use crate::client::{Ctx, id_from, lossy, split_spec};
 use crate::cmd::read::{identity_json, opt_id, read_stream};
+use crate::outln;
 
 /// The author of each changeset, and the path of the file there.
 type Sources = HashMap<ChangesetId, (IdentityTime, Vec<u8>)>;
@@ -143,7 +143,7 @@ pub async fn blame(ctx: &mut Ctx, spec: &str) -> Result<()> {
         .filter_map(|(source, origin)| Some((source?, origin)))
         .collect();
     if ctx.json {
-        println!("{}", Value::from(ranges_json(&lines, &sources)));
+        outln!("{}", Value::from(ranges_json(&lines, &sources)));
         return Ok(());
     }
     let mut stream = read_stream(ctx, changeset_id, &path)
@@ -187,7 +187,7 @@ fn print_text(lines: &[(ChangesetId, u32)], sources: &Sources, path: &[u8], text
             _ => String::new(),
         };
         let text = lossy(text);
-        println!(
+        outln!(
             "{}{source_path} ({name} {secs} {:>width$}) {}",
             &id.to_string()[..12],
             n + 1,

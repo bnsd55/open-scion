@@ -4,16 +4,16 @@
 //! then walks `main` back to where it started and checks that every landed
 //! change is there exactly once.
 
-use std::collections::{BTreeMap, HashSet};
-use std::time::{Duration, Instant};
-
 use anyhow::{Context, Result, ensure};
 use scion_core::{Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_proto::v1::{LandRequest, LandState, LogRequest};
 use serde_json::json;
+use std::collections::{BTreeMap, HashSet};
+use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 
 use crate::client::{Ctx, id_from, now_unix_secs};
+use crate::outln;
 
 /// Arguments of `scn bench`.
 #[derive(clap::Args)]
@@ -231,17 +231,17 @@ fn report(json: bool, agents: usize, stats: &mut Stats, elapsed: Duration) {
             "end_to_end_ms": { "p50": total_p50, "p99": total_p99 },
             "verified_on_main": true,
         });
-        println!("{out}");
+        outln!("{out}");
         return;
     }
-    println!(
+    outln!(
         "{landed} lands by {agents} agents in {:.1} s: {rate:.0} lands/s",
         elapsed.as_secs_f64()
     );
-    println!("conflicts {}, rejected {}", stats.conflicts, stats.rejected);
-    println!("land RPC     p50 {land_p50:.1} ms  p99 {land_p99:.1} ms  max {land_max:.1} ms");
-    println!("end to end   p50 {total_p50:.1} ms  p99 {total_p99:.1} ms  (upload + create + land)");
-    println!("verified: main gained exactly the {landed} landed changesets");
+    outln!("conflicts {}, rejected {}", stats.conflicts, stats.rejected);
+    outln!("land RPC     p50 {land_p50:.1} ms  p99 {land_p99:.1} ms  max {land_max:.1} ms");
+    outln!("end to end   p50 {total_p50:.1} ms  p99 {total_p99:.1} ms  (upload + create + land)");
+    outln!("verified: main gained exactly the {landed} landed changesets");
 }
 
 #[cfg(test)]
