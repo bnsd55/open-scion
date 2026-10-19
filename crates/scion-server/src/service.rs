@@ -110,6 +110,35 @@ async fn pg_tx_age_sample(store: Backend, metrics: Arc<Metrics>, mut stop: watch
     }
 }
 
+/// Polls the free space of the data directory's filesystem into the
+/// gauge. The latest poll is the value; a failed stat keeps the last
+/// good value and logs once a poll. The poll stops when the server
+/// does.
+fn spawn_free_space_poll(
+    data: std::path::PathBuf,
+    metrics: Arc<Metrics>,
+    stop: tokio::sync::watch::Receiver<()>,
+) {
+    tokio::spawn(async move {
+        let mut stop = stop;
+        loop {
+            let data = data.clone();
+            let free = tokio::task::spawn_blocking(move || crate::store::free_bytes(&data));
+            match free.await {
+                Ok(Ok(bytes)) => metrics.data_free_bytes(bytes),
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "cannot stat the data directory's free space");
+                }
+                Err(e) => tracing::warn!(error = %e, "the free-space poll failed"),
+            }
+            tokio::select! {
+                () = tokio::time::sleep(FREE_SPACE_POLL) => {}
+                _ = stop.changed() => break,
+            }
+        }
+    });
+}
+
 /// Runs the stale-land sweep at once, then once per [`SWEEP_PERIOD`], until
 /// `stop` resolves. The first sweep settles what a restart left pending
 /// before the first client asks.
@@ -139,6 +168,9 @@ const _: () = assert!(REQUEST_TIMEOUT.as_secs() <= listen::CONNECTION_GRACE.as_s
 const _: () = assert!(read_share(MAX_OBJECT_BYTES) <= READ_BUDGET_BYTES);
 const _: () = assert!(READ_BUDGET_BYTES <= u32::MAX as usize);
 
+/// How often the free-space gauge of the data directory is refreshed.
+const FREE_SPACE_POLL: Duration = Duration::from_secs(30);
+
 /// What a server serves with, besides the data directory and the access
 /// rules: its limits, its per-principal quotas, its TLS, and its metrics.
 pub struct ServeOptions {
@@ -157,6 +189,9 @@ pub struct ServeOptions {
     /// exports. A server without the export still counts, so the flag can
     /// turn on without a restart.
     pub metrics: Arc<Metrics>,
+    /// The data directory the server serves, for the free-space gauge of
+    /// its filesystem.
+    pub data: std::path::PathBuf,
 }
 
 /// Serves the API on `listener` within `options`, until `shutdown` resolves,
@@ -186,13 +221,15 @@ pub async fn serve(
         land_stale_secs,
         tls,
         metrics,
+        data,
     } = options;
     let access = Arc::new(access.into());
     let auth = access.auth();
     let fence = store.fence_flag();
-    // The Postgres reader pool records into the registry: the wait for a
-    // reader, the busy readers, and the tx age, which this task keeps
-    // fresh. On SQLite this is a no-op.
+    // The backend records into the registry: the Postgres pool's wait,
+    // busy readers and tx age (which this task keeps fresh), and on both
+    // backends the blob full flushes, the derive-walk gauges and the
+    // collector-key wait.
     store.set_metrics(Arc::clone(&metrics));
     let worker = Worker::new(store);
     let lands = Arc::new(Lands::new(pending_lands, Some(Arc::clone(&metrics))));
@@ -208,6 +245,9 @@ pub async fn serve(
         shutdown.await;
         let _ = stop_tx.send(());
     });
+    // The free space of the data directory's filesystem, so the operator
+    // sees a full drive before the server hits it.
+    spawn_free_space_poll(data, Arc::clone(&metrics), stop_rx.clone());
     tokio::spawn(pg_tx_age_sample(
         worker.store(),
         Arc::clone(&metrics),

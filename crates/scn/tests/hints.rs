@@ -27,6 +27,7 @@ async fn serve_http(data: &TempDir, token: &'static str) -> String {
         listener,
         token,
         service::ServeOptions {
+            data: data.path().to_path_buf(),
             limits: Limits::default(),
             quotas: scion_server::quotas::Quotas::off(),
             pending_lands: None,
@@ -195,6 +196,7 @@ async fn serve_tls(data: &TempDir, certs: &TestCerts) -> String {
         listener,
         TOKEN,
         service::ServeOptions {
+            data: data.path().to_path_buf(),
             limits: Limits::default(),
             quotas: scion_server::quotas::Quotas::off(),
             pending_lands: None,

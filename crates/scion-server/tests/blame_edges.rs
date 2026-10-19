@@ -115,7 +115,12 @@ fn whole_access() -> Access {
 
 /// Serves `store` with `access`, and returns the stop signal and a client
 /// that sends `token`.
-async fn serve(store: &Backend, access: Access, token: &str) -> (Stop, Scion) {
+async fn serve(
+    store: &Backend,
+    dir: &std::path::Path,
+    access: Access,
+    token: &str,
+) -> (Stop, Scion) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -124,6 +129,7 @@ async fn serve(store: &Backend, access: Access, token: &str) -> (Stop, Scion) {
         listener,
         access,
         service::ServeOptions {
+            data: dir.to_path_buf(),
             limits: Limits::default(),
             quotas: scion_server::quotas::Quotas::off(),
             pending_lands: None,
@@ -193,7 +199,7 @@ fn covered(ranges: &[BlameRange]) -> Vec<u32> {
 /// range for it would have a client print a line that does not exist.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_empty_file_is_blamed_with_no_ranges() {
-    let (_dir, store, root) = store(b"start\n");
+    let (dir, store, root) = store(b"start\n");
     let empty = put(&store, b"");
     let tip = store
         .write(|c| {
@@ -204,7 +210,7 @@ async fn an_empty_file_is_blamed_with_no_ranges() {
             )
         })
         .unwrap();
-    let (_stop, mut client) = serve(&store, whole_access(), TOKEN).await;
+    let (_stop, mut client) = serve(&store, dir.path(), whole_access(), TOKEN).await;
     let (ranges, changesets, next, _parts) = blame(&mut client, &tip, "empty.txt", b"").await;
     assert!(ranges.is_empty(), "{ranges:?}");
     assert!(changesets.is_empty(), "{changesets:?}");
@@ -216,7 +222,7 @@ async fn an_empty_file_is_blamed_with_no_ranges() {
 /// drop it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_file_with_no_final_newline_still_names_its_last_line() {
-    let (_dir, store, root) = store(b"one\n");
+    let (dir, store, root) = store(b"one\n");
     let body = put(&store, b"one\ntwo");
     let tip = store
         .write(|c| {
@@ -224,7 +230,7 @@ async fn a_file_with_no_final_newline_still_names_its_last_line() {
             c.insert_changeset(repo, &commit(vec![root], PATH, Some(regular(body)), 8))
         })
         .unwrap();
-    let (_stop, mut client) = serve(&store, whole_access(), TOKEN).await;
+    let (_stop, mut client) = serve(&store, dir.path(), whole_access(), TOKEN).await;
     let (ranges, changesets, next, _parts) = blame(&mut client, &tip, PATH, b"").await;
     assert_eq!(covered(&ranges), vec![1, 2], "{ranges:?}");
     assert!(next.is_empty(), "both lines are explained at once");
@@ -241,7 +247,7 @@ async fn a_file_with_no_final_newline_still_names_its_last_line() {
 /// boundaries would blame the pieces of the line apart.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_line_longer_than_a_stream_part_is_blamed_whole() {
-    let (_dir, store, root) = store(b"start\n");
+    let (dir, store, root) = store(b"start\n");
     let mut body = vec![b'x'; 2 * scion_proto::CHUNK_BYTES];
     body.extend_from_slice(b"\nend\n");
     let blob = put(&store, &body);
@@ -251,7 +257,7 @@ async fn a_line_longer_than_a_stream_part_is_blamed_whole() {
             c.insert_changeset(repo, &commit(vec![root], PATH, Some(regular(blob)), 4))
         })
         .unwrap();
-    let (_stop, mut client) = serve(&store, whole_access(), TOKEN).await;
+    let (_stop, mut client) = serve(&store, dir.path(), whole_access(), TOKEN).await;
     let (ranges, _changesets, next, _parts) = blame(&mut client, &tip, PATH, b"").await;
     assert_eq!(covered(&ranges), vec![1, 2], "{ranges:?}");
     assert!(next.is_empty(), "both lines are explained at once");
@@ -310,9 +316,9 @@ fn seam_store(name_len: usize, count: usize) -> (tempfile::TempDir, Backend, Vec
 #[tokio::test(flavor = "multi_thread")]
 async fn the_part_seam_loses_no_range_and_no_changeset() {
     for (name_len, parts_expected) in [(1_000, 1usize), (14_000, 2usize)] {
-        let (_dir, store, ids) = seam_store(name_len, 90);
+        let (dir, store, ids) = seam_store(name_len, 90);
         let tip = ids[ids.len() - 1];
-        let (_stop, mut client) = serve(&store, whole_access(), TOKEN).await;
+        let (_stop, mut client) = serve(&store, dir.path(), whole_access(), TOKEN).await;
         let (ranges, changesets, next, parts) = blame(&mut client, &tip, PATH, b"").await;
         assert_eq!(parts, parts_expected, "name_len {name_len}");
         // Every line is covered, once each.
@@ -339,7 +345,7 @@ async fn the_part_seam_loses_no_range_and_no_changeset() {
 /// never the ranges of a blame it did not ask for.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cursor_of_another_file_or_changeset_is_refused() {
-    let (_dir, store, root) = store(b"a\n");
+    let (dir, store, root) = store(b"a\n");
     let other = put(&store, b"other\n");
     // 120 children that all put the same blob: the walk keeps the line and
     // runs out of versions at 100, so the first blame returns a cursor.
@@ -359,7 +365,7 @@ async fn a_cursor_of_another_file_or_changeset_is_refused() {
             )
         })
         .unwrap();
-    let (_stop, mut client) = serve(&store, whole_access(), TOKEN).await;
+    let (_stop, mut client) = serve(&store, dir.path(), whole_access(), TOKEN).await;
     let (_ranges, _changesets, cursor, _parts) = blame(&mut client, &tip, PATH, b"").await;
     assert!(!cursor.is_empty(), "the walk stopped at its bound");
 
@@ -393,7 +399,7 @@ async fn a_cursor_of_another_file_or_changeset_is_refused() {
 /// the window it did the first time, instead of skipping past it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cursor_sent_twice_gives_the_same_answer() {
-    let (_dir, store, root) = store(b"a\n");
+    let (dir, store, root) = store(b"a\n");
     // 120 children that all put the same blob: the walk keeps the line and
     // runs out of versions at 100, so the first blame returns a cursor.
     let tip = store
@@ -408,7 +414,7 @@ async fn a_cursor_sent_twice_gives_the_same_answer() {
             Ok(id)
         })
         .unwrap();
-    let (_stop, mut client) = serve(&store, whole_access(), TOKEN).await;
+    let (_stop, mut client) = serve(&store, dir.path(), whole_access(), TOKEN).await;
     let (first, _, cursor, _parts) = blame(&mut client, &tip, PATH, b"").await;
     assert!(!cursor.is_empty(), "the walk stopped at its bound");
     let (again, _, cursor_again, _parts) = blame(&mut client, &tip, PATH, &cursor).await;
@@ -427,7 +433,7 @@ async fn a_cursor_sent_twice_gives_the_same_answer() {
 /// added them before the deletion.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_file_deleted_and_added_again_blames_the_new_add() {
-    let (_dir, store, root) = store(b"gone\n");
+    let (dir, store, root) = store(b"gone\n");
     // Added again, with new content and a new author. `put` takes the
     // store's write lock itself, so it runs before the changeset write.
     let body = put(&store, b"back\n");
@@ -442,7 +448,7 @@ async fn a_file_deleted_and_added_again_blames_the_new_add() {
         })
         .unwrap();
     let tip = ids[1];
-    let (_stop, mut client) = serve(&store, whole_access(), TOKEN).await;
+    let (_stop, mut client) = serve(&store, dir.path(), whole_access(), TOKEN).await;
     let (ranges, changesets, next, _parts) = blame(&mut client, &tip, PATH, b"").await;
     assert_eq!(covered(&ranges), vec![1], "{ranges:?}");
     // Every named changeset is the one that added the line the second
@@ -459,7 +465,7 @@ async fn a_file_deleted_and_added_again_blames_the_new_add() {
 /// per-object difference, so a hidden path reveals nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_partial_reader_gets_one_answer_for_any_path() {
-    let (_dir, store, root) = store(b"docs body\n");
+    let (dir, store, root) = store(b"docs body\n");
     let (docs_blob, secret_blob) = (put(&store, b"docs a\n"), put(&store, b"secret b\n"));
     let tip = store
         .write(|c| {
@@ -478,7 +484,7 @@ async fn a_partial_reader_gets_one_answer_for_any_path() {
         hex("pat")
     ))
     .unwrap();
-    let (_stop, mut client) = serve(&store, access, "pat").await;
+    let (_stop, mut client) = serve(&store, dir.path(), access, "pat").await;
     for (path, note) in [(&b"docs/a"[..], "allowed"), (&b"secret/b"[..], "hidden")] {
         let err = client
             .blame(BlameRequest {

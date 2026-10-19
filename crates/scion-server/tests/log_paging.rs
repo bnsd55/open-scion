@@ -65,7 +65,7 @@ fn chain(count: usize) -> (tempfile::TempDir, Backend, Vec<scion_core::Changeset
     (dir, store, ids)
 }
 
-async fn serve(store: Backend) -> String {
+async fn serve(store: Backend, dir: &std::path::Path) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(service::serve(
@@ -73,6 +73,7 @@ async fn serve(store: Backend) -> String {
         listener,
         TOKEN,
         service::ServeOptions {
+            data: dir.to_path_buf(),
             limits: Limits::default(),
             quotas: scion_server::quotas::Quotas::off(),
             pending_lands: None,
@@ -178,9 +179,9 @@ async fn paged(
 
 #[tokio::test]
 async fn log_paging_matches_one_full_walk() {
-    let (_data, store, ids) = chain(HISTORY);
+    let (dir, store, ids) = chain(HISTORY);
     let tip = *ids.last().unwrap();
-    let url = serve(store).await;
+    let url = serve(store, dir.path()).await;
     let mut client = client(&url).await;
 
     // The reference: the full walk, assembled from calls at the maximum
@@ -219,9 +220,9 @@ async fn log_paging_matches_one_full_walk() {
 
 #[tokio::test]
 async fn log_paging_with_a_path_matches_one_full_walk() {
-    let (_data, store, ids) = chain(HISTORY);
+    let (dir, store, ids) = chain(HISTORY);
     let tip = *ids.last().unwrap();
-    let url = serve(store).await;
+    let url = serve(store, dir.path()).await;
     let mut client = client(&url).await;
 
     // The reference: the full path walk, assembled the same way.

@@ -147,6 +147,10 @@ struct PgInner {
     /// keeps its own.
     #[cfg(any(test, feature = "test-hooks"))]
     hooks: crate::store::ImportHooks,
+    /// The operator metrics, set once by the server before it serves: a
+    /// commit's wait for the collector's advisory key records how long
+    /// it waited. Empty in import, fsck and gc, which export none.
+    metrics: std::sync::OnceLock<std::sync::Arc<crate::metrics::Metrics>>,
 }
 
 /// Clients for [`Pg::read`], so at most [`READERS`](crate::store::READERS)
@@ -267,6 +271,8 @@ impl Readers {
         if let Some(at) = open.iter().position(|known| *known == started) {
             open.swap_remove(at);
         }
+        drop(open);
+        self.report_busy();
     }
 
     /// How many readers are out of the pool, for the busy gauge.
@@ -914,6 +920,7 @@ impl Pg {
             derive: crate::derived::DeriveFlights::new(crate::store::DERIVE_WALKS_CAP),
             #[cfg(any(test, feature = "test-hooks"))]
             hooks: crate::store::ImportHooks::default(),
+            metrics: std::sync::OnceLock::new(),
         });
         // The probe of a server that lost its lock: once a minute the
         // session checks itself, through the job queue like every
@@ -980,6 +987,9 @@ impl Pg {
     /// server before it serves; import, fsck, and gc pass none, and the
     /// pool then records nothing.
     pub(crate) fn set_metrics(&self, metrics: Arc<Metrics>) {
+        let _ = self.inner.metrics.set(Arc::clone(&metrics));
+        self.inner.blobs.set_metrics(Arc::clone(&metrics));
+        self.inner.derive.set_metrics(Arc::clone(&metrics));
         self.inner.readers.set_metrics(metrics);
     }
 
@@ -1089,10 +1099,16 @@ impl Pg {
             &format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT_FOR_KEY}'"),
             &[],
         )?;
+        let key_started = std::time::Instant::now();
         tx.c.query_opt(
             "SELECT pg_advisory_xact_lock(hashtext(current_schema() || ':gc'))",
             &[],
         )?;
+        if let Some(metrics) = self.inner.metrics.get() {
+            metrics.collector_key_wait(
+                u64::try_from(key_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
+        }
         tx.c.query(
             &format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT_FOR_WRITERS}'"),
             &[],
@@ -2728,12 +2744,15 @@ impl MetaTx for PgTx<'_> {
         let len = body.len();
         Ok((body, len))
     }
-    /// Every repo, in ID order.
-    fn repos(&mut self) -> Result<Vec<RepoId>> {
+    /// Every repo with its name, in ID order.
+    fn repos(&mut self) -> Result<Vec<(RepoId, String)>> {
         let rows = self
             .c
-            .query("SELECT repo_id FROM repos ORDER BY repo_id", &[])?;
-        Ok(rows.iter().map(|row| RepoId(row.get(0))).collect())
+            .query("SELECT repo_id, name FROM repos ORDER BY repo_id", &[])?;
+        Ok(rows
+            .iter()
+            .map(|row| (RepoId(row.get(0)), row.get(1)))
+            .collect())
     }
 
     /// The `(repo, changeset ID, body)` of the stored changesets after
@@ -3043,7 +3062,9 @@ fn prepare_test_schema(url: &str, schema: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::merged_options;
+    use super::{Client, NoTls, merged_options};
+    use crate::pg::Pg;
+    use std::sync::Arc;
 
     const OWN: &str = "-csynchronous_commit=on -cstatement_timeout=600000 -clock_timeout=5000";
 
@@ -3067,6 +3088,61 @@ mod tests {
     fn a_url_without_options_gets_the_backends_only() {
         assert_eq!(merged_options(None, OWN), OWN);
         assert_eq!(merged_options(Some(""), OWN), OWN);
+    }
+
+    /// A write that waits for the collector's key records the wait in the
+    /// metrics: the gauge an operator watches for a busy database.
+    #[test]
+    fn a_commit_records_its_wait_for_the_collectors_key() {
+        if !crate::Backend::test_is_postgres() {
+            return;
+        }
+        let url = crate::backend::test_url().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = crate::backend::test_schema(dir.path());
+        let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
+        let pg = Pg::open_test(
+            &url,
+            &schema,
+            2,
+            dir.path(),
+            crate::backend::Marker::read(dir.path()),
+        )
+        .unwrap();
+        pg.set_metrics(Arc::clone(&metrics));
+        assert!(
+            !metrics.render().contains("scion_pg_collector_key_wait"),
+            "nothing waited yet"
+        );
+        // Another client holds the key, so the commit below really waits.
+        let mut holder = Client::connect(&url, NoTls).unwrap();
+        holder
+            .batch_execute(&format!(
+                "SET search_path TO {schema};
+                 BEGIN;
+                 SELECT pg_advisory_xact_lock(hashtext(current_schema() || ':gc'));"
+            ))
+            .unwrap();
+        let writer = std::thread::spawn(move || {
+            pg.commit(|_tx| Ok(())).unwrap();
+        });
+        // Give the writer time to reach the key, then let it in.
+        for _ in 0..2_000 {
+            std::thread::yield_now();
+        }
+        holder.batch_execute("COMMIT").unwrap();
+        let mut spins = 0;
+        while !writer.is_finished() {
+            spins += 1;
+            assert!(spins < 1_000_000, "the writer never finished");
+            std::thread::yield_now();
+        }
+        writer.join().unwrap();
+        let text = metrics.render();
+        assert!(
+            text.contains("scion_pg_collector_key_wait_seconds_count 1\n"),
+            "{text}"
+        );
     }
 }
 

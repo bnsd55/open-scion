@@ -77,6 +77,7 @@ async fn server() -> (
         listener,
         TOKEN,
         service::ServeOptions {
+            data: dir.path().to_path_buf(),
             limits: Limits::default(),
             quotas: scion_server::quotas::Quotas::off(),
             pending_lands: None,
@@ -312,6 +313,7 @@ async fn server_of_readme() -> (
         listener,
         TOKEN,
         service::ServeOptions {
+            data: dir.path().to_path_buf(),
             limits: Limits::default(),
             quotas: scion_server::quotas::Quotas::off(),
             pending_lands: None,
@@ -549,6 +551,7 @@ async fn tiers() -> (Tiers, tokio::sync::oneshot::Sender<()>, tempfile::TempDir)
         listener,
         TOKEN,
         service::ServeOptions {
+            data: dir.path().to_path_buf(),
             limits: Limits::default(),
             quotas: scion_server::quotas::Quotas::off(),
             pending_lands: None,

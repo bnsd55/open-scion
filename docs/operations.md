@@ -400,7 +400,10 @@ The routines are these:
   and safe to repeat; rows go before files, so a crash leaves orphan files
   only, which the next run removes. `--dry-run` reports a run's result
   without removing anything. Run it on a schedule, and `fsck` after it the
-  first few times, until you trust the two together.
+  first few times, until you trust the two together. Its progress is in
+  the gc log: one line when it starts, one per pruned batch and per swept
+  file batch, and one when it ends, each with the counts and the time it
+  took.
 - Derived data can be rebuilt with `scion-server derive --kind ... --ref
   ...` (server stopped); it is safe to repeat and removes rows of older
   versions itself.
@@ -429,6 +432,23 @@ the process, scraped from there. The names:
   set means the per-tree memo is not serving and every derivation re-walks.
 - `scion_cache_hits_total` / `scion_cache_misses_total` — what a tier
   served from its store against what it fetched upstream.
+- `scion_blob_sync_seconds` — one fsync attempt on the blob write path, failed ones included (temp file, stored file, blob directory, or the drive-cache flush)
+  (batches that sync at once share one flush, so one caller's duration
+  includes the wait for the flush in progress); a sum that outruns the
+  counts says a drive that cannot keep up with the imports.
+- `scion_data_free_bytes` — free bytes on the filesystem that holds the
+  data directory, refreshed every 30 s; alert before it reaches zero.
+- `scion_derive_walks_in_flight` / `scion_derive_walks_waiting` — derive
+  walks that hold a permit, and walks that wait for one; waits that pile
+  up while the in-flight count sits at the cap mean a cold history read
+  that queues behind the walkers.
+- `scion_pg_collector_key_wait_seconds` — a Postgres write's wait for the
+  collector's advisory key; waits that climb toward the key's own 60 s
+  bound mean the writer queue does not drain.
+- `scion_pg_pool_wait_seconds` — (Postgres only) how long calls waited for
+  a read connection. A rising tail means the 8 readers are held by long
+  walks; the calls that waited past the pool's bound failed
+  `unavailable`.
 - `scion_pg_pool_wait_seconds` — (Postgres only) how long calls waited for
   a read connection. A read transaction is bounded at 300 s per statement
   and 30 s idle between statements, and a call waits at most 30 s for a

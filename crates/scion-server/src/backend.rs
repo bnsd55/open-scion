@@ -446,13 +446,16 @@ impl Backend {
         }
     }
 
-    /// Gives the Postgres reader pool the server's metrics registry. A
-    /// no-op on the data directory backend, whose readers are threads of
-    /// one process and need no pool metrics. Set once: a second set is
-    /// a no-op with a debug log.
+    /// Gives the backend the server's metrics registry, once before the
+    /// server serves: the Postgres pool's reader metrics (a no-op on the
+    /// data-directory backend, whose readers are threads of one process),
+    /// and on the data directory the blob full flushes, the derive-walk
+    /// gauges and the collector-key wait. Without it, import, fsck and
+    /// gc record nothing.
     pub fn set_metrics(&self, metrics: Arc<Metrics>) {
-        if let Self::Postgres(pg) = self {
-            pg.set_metrics(metrics);
+        match self {
+            Self::Sqlite(store) => store.set_metrics(metrics),
+            Self::Postgres(pg) => pg.set_metrics(metrics),
         }
     }
 
@@ -800,7 +803,7 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
-    fn repos(&mut self) -> Result<Vec<RepoId>> {
+    fn repos(&mut self) -> Result<Vec<(RepoId, String)>> {
         match self {
             Self::Sqlite(tx) => tx.repos(),
             Self::Postgres(pg) => pg.repos(),

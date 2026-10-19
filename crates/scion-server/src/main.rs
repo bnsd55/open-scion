@@ -325,6 +325,7 @@ async fn main() -> anyhow::Result<()> {
                 listen,
                 access,
                 ServeConfig {
+                    data: cli.data.clone(),
                     insecure_listen,
                     quotas: caps.quotas,
                     pending_lands: caps.pending_lands,
@@ -458,6 +459,7 @@ struct ServeConfig {
     max_streams: NonZeroU32,
     max_stalled_bytes: NonZeroU64,
     metrics_listen: Option<SocketAddr>,
+    data: std::path::PathBuf,
 }
 
 /// Serves the gRPC API on `listen`, with the TLS files of the flags, until
@@ -517,6 +519,7 @@ async fn serve(
         listener,
         access,
         service::ServeOptions {
+            data: config.data,
             limits: Limits {
                 connections: config.max_connections,
                 streams: config.max_streams,
