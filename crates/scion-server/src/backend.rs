@@ -1072,3 +1072,91 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 }
+
+/// The fixtures and the checks of the old-store tests (#318): a data
+/// store of the previous schema version must open on this build, migrate
+/// forward, and serve what it held. The SQLite test builds its store at
+/// version 1, the Postgres test at its version 1; the checks here run on
+/// both.
+#[cfg(test)]
+pub(crate) mod old_store {
+    use scion_core::{Changeset, FileState, RepoPath};
+    use scion_proto::deadline::Deadline;
+
+    /// The bytes of the two files the old store holds.
+    pub(crate) const A: &[u8] = b"the old store's README\n";
+    pub(crate) const B: &[u8] = b"\x00\x01\xfeold bytes\n";
+
+    /// The root changeset the old store holds: it puts both files.
+    pub(crate) fn changeset() -> Changeset {
+        Changeset {
+            parents: vec![],
+            author: scion_core::IdentityTime {
+                name: b"Ada".to_vec(),
+                email: b"ada@example.com".to_vec(),
+                unix_secs: 1_700_000_000,
+                tz_offset_minutes: 0,
+            },
+            committer: None,
+            message: b"root\n".to_vec(),
+            changes: [
+                (
+                    RepoPath::new("README").unwrap(),
+                    Some(FileState::Regular {
+                        content: A.to_vec(),
+                        executable: false,
+                    }),
+                ),
+                (
+                    RepoPath::new("data.bin").unwrap(),
+                    Some(FileState::Regular {
+                        content: B.to_vec(),
+                        executable: false,
+                    }),
+                ),
+            ]
+            .into(),
+        }
+    }
+
+    /// What a plain open of an old store must serve after it migrated:
+    /// the ref and the changeset read back, the blobs read back byte for
+    /// byte, a file reads through the rebuilt tree (the SQLite upgrade
+    /// drops trees stored in the old format and rebuilds them from the
+    /// changesets), and fsck is clean.
+    pub(crate) fn assert_serves(
+        backend: &super::Backend,
+        cs: &Changeset,
+        id: scion_core::ChangesetId,
+        blob_a: scion_core::BlobId,
+        blob_b: scion_core::BlobId,
+    ) {
+        use crate::meta::MetaTx as _;
+
+        let repo = backend.write(|c| c.repo_id("main")).unwrap();
+        let state = backend.read(|c| c.get_ref(repo, "main")).unwrap().unwrap();
+        assert_eq!(state.target, id, "the ref survived the migration");
+        assert_eq!(state.version, 1);
+        let read = backend.read(|c| c.get_changeset(repo, id)).unwrap();
+        assert_eq!(read.encode(), cs.encode(), "the changeset survived");
+        assert_eq!(backend.blobs().get(blob_a).unwrap(), A);
+        assert_eq!(backend.blobs().get(blob_b).unwrap(), B);
+        let deadline = Deadline::after(std::time::Duration::from_secs(30));
+        let bytes = crate::read::read_file(
+            backend,
+            "main",
+            id,
+            RepoPath::new("README").unwrap(),
+            &deadline,
+        )
+        .unwrap();
+        assert_eq!(bytes, A, "a file reads through the rebuilt tree");
+        let report = crate::fsck::run(backend, 100, &mut |_| {}).unwrap();
+        assert!(
+            report.problems.is_empty() && report.old.is_empty(),
+            "fsck found damage: {:?} {:?}",
+            report.problems,
+            report.old
+        );
+    }
+}

@@ -2634,6 +2634,71 @@ mod tests {
         });
     }
 
+    /// A data directory written at schema version 1 opens on this build:
+    /// the open migrates it forward through every migration, and what it
+    /// held reads back ([#318]). The fixture is the rows a v1 store's
+    /// write paths left: one repo, one root changeset, its ref, and the
+    /// blob files, which carry no schema. The repo_blobs rows the v1
+    /// schema has no room for are filled by the upgrade's own Rust step
+    /// (`db::fill_repo_blobs`), and the trees the old format held are
+    /// dropped by the upgrade and rebuilt from the changesets on demand.
+    #[test]
+    fn a_store_of_schema_version_1_opens_upgrades_and_serves() {
+        use crate::backend::old_store;
+        super::spawn_guard::across_release(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let scratch = tempfile::tempdir().unwrap();
+            // The blob files, made by this build's writer and copied into
+            // the old directory: blob files are content-addressed and
+            // carry no schema.
+            let (blob_a, blob_b) = {
+                let store = Store::open(scratch.path()).unwrap();
+                let a = store.blobs().put(old_store::A).unwrap();
+                let b = store.blobs().put(old_store::B).unwrap();
+                for id in [a, b] {
+                    let (_, file) = store.blobs().location(id);
+                    let to = dir.path().join(file.strip_prefix(scratch.path()).unwrap());
+                    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+                    std::fs::copy(&file, &to).unwrap();
+                }
+                (a, b)
+            };
+            // The metadata at version 1, as this build's migrations make
+            // it: the schema of 0001 alone, with one repo, its root
+            // changeset and its ref.
+            let cs = old_store::changeset();
+            let (body, id) = cs.encode_with_id();
+            {
+                let db = Connection::open(dir.path().join("scion.db")).unwrap();
+                super::migrate(&db, 1).unwrap();
+                db.execute("INSERT INTO repos (repo_id, name) VALUES (1, 'main')", [])
+                    .unwrap();
+                db.execute(
+                    "INSERT INTO changesets (id, gen, body) VALUES (?1, 1, ?2)",
+                    rusqlite::params![&id.as_bytes()[..], &body],
+                )
+                .unwrap();
+                db.execute(
+                    "INSERT INTO repo_changesets (repo_id, cs) VALUES (1, ?1)",
+                    rusqlite::params![&id.as_bytes()[..]],
+                )
+                .unwrap();
+                db.execute(
+                    "INSERT INTO refs (repo_id, name, target, version) \
+                     VALUES (1, 'main', ?1, 1)",
+                    rusqlite::params![&id.as_bytes()[..]],
+                )
+                .unwrap();
+            }
+            // A plain open of this build, alone in the directory, moves
+            // the schema to this build's version and serves.
+            let store = Store::open(dir.path()).unwrap();
+            assert_eq!(store.read(user_version).unwrap(), SCHEMA_VERSION);
+            let backend = crate::Backend::Sqlite(store);
+            old_store::assert_serves(&backend, &cs, id, blob_a, blob_b);
+        });
+    }
+
     #[test]
     fn a_process_that_holds_the_directory_alone_keeps_every_store_out() {
         // The drops and reopens of this test must see a lock released, so
