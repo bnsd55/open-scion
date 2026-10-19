@@ -1080,7 +1080,6 @@ mod tests {
                 for p in &paths {
                     lookup(c, &mut nodes, root, p)?;
                     most = most.max(nodes.bytes());
-                    Ok(())
                 }
                 Ok(())
             })
