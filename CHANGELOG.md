@@ -211,6 +211,11 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- The land metrics count lands whose call ended in an error: a land
+  that answered `Aborted`, `DeadlineExceeded`, or any other error class
+  moved no counter, so an operator could not see failing lands. The
+  land counter now moves for the error's class, under the same
+  `scion_lands_total{outcome}` series.
 - Two reads stop at the caller's deadline and the reply's budget
   (#283): a `Log` call without a path read up to 1,000 changesets, each
   as large as a changeset can be, with the call's deadline never

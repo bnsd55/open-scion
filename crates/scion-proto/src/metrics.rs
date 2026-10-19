@@ -75,8 +75,37 @@ const BUCKETS: [u64; 10] = [
     u64::MAX,
 ];
 
-/// The outcomes of a land, by how the server's land path decides them.
-const LANDS: [&str; 4] = ["landed", "conflict", "rejected", "retry"];
+/// The outcomes of a land, by how the server's land path decides them,
+/// then the classes of a land that ends in an error: the same names the
+/// reply's gRPC code uses.
+const LANDS: [&str; 11] = [
+    "landed",
+    "conflict",
+    "rejected",
+    "retry",
+    "aborted",
+    "deadline_exceeded",
+    "resource_exhausted",
+    "unavailable",
+    "not_found",
+    "invalid_argument",
+    "internal",
+];
+
+/// The labels of a land that ended in an error, for [`Metrics::land`].
+pub const LAND_ABORTED: usize = 4;
+/// See [`LAND_ABORTED`].
+pub const LAND_DEADLINE_EXCEEDED: usize = 5;
+/// See [`LAND_ABORTED`].
+pub const LAND_RESOURCE_EXHAUSTED: usize = 6;
+/// See [`LAND_ABORTED`].
+pub const LAND_UNAVAILABLE: usize = 7;
+/// See [`LAND_ABORTED`].
+pub const LAND_NOT_FOUND: usize = 8;
+/// See [`LAND_ABORTED`].
+pub const LAND_INVALID_ARGUMENT: usize = 9;
+/// See [`LAND_ABORTED`].
+pub const LAND_INTERNAL: usize = 10;
 
 /// What the processes count. Every field is atomics: a request only adds.
 #[derive(Default)]
@@ -179,7 +208,9 @@ impl Metrics {
         self.bytes_out[rpc.0].fetch_add(bytes_out, Ordering::Relaxed);
     }
 
-    /// Counts one land that ended as `outcome` (0-3, in `LANDS` order).
+    /// Counts one land that ended as `outcome`, in `LANDS` order: how the
+    /// server's land path decided it, or the class of the error it ended
+    /// in.
     pub fn land(&self, outcome: usize) {
         if outcome < LANDS.len() {
             self.lands[outcome].fetch_add(1, Ordering::Relaxed);

@@ -279,7 +279,17 @@ impl Lands {
         // while, so it happens here, outside every lock.
         let evicted = mem::take(&mut *self.evicted.lock().unwrap_or_else(PoisonError::into_inner));
         drop(evicted);
-        let outcome = outcome?;
+        // A land that ends in an error is an outcome too: the operator
+        // sees failing lands by the class the reply answers with.
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.land(land_error_label(&e));
+                }
+                return Err(e);
+            }
+        };
         if let Some(metrics) = &self.metrics {
             metrics.land(match outcome.state {
                 LandState::Landed => 0,
@@ -501,6 +511,25 @@ enum Finished {
     Outcome(LandOutcome),
     /// Derive the history of this head, then plan again.
     Derive(ChangesetId),
+}
+
+/// The land counter's label for a land that ended in an error: the same
+/// class the reply's gRPC code uses, so an operator reads failing lands
+/// by the answer the callers saw.
+fn land_error_label(e: &Error) -> usize {
+    use crate::metrics::{
+        LAND_ABORTED, LAND_DEADLINE_EXCEEDED, LAND_INTERNAL, LAND_INVALID_ARGUMENT, LAND_NOT_FOUND,
+        LAND_RESOURCE_EXHAUSTED, LAND_UNAVAILABLE,
+    };
+    match e {
+        Error::Aborted(_) => LAND_ABORTED,
+        Error::DeadlineExceeded(_) => LAND_DEADLINE_EXCEEDED,
+        Error::ResourceExhausted(_) => LAND_RESOURCE_EXHAUSTED,
+        Error::Unavailable(_) | Error::Busy => LAND_UNAVAILABLE,
+        Error::NotFound(_) => LAND_NOT_FOUND,
+        Error::InvalidArgument(_) | Error::Apply(_) => LAND_INVALID_ARGUMENT,
+        _ => LAND_INTERNAL,
+    }
 }
 
 /// Says that a land that stopped at its deadline stays pending.
@@ -1253,6 +1282,34 @@ mod tests {
 
     fn caller() -> Caller {
         Caller("t".into())
+    }
+
+    /// A land whose deadline is already past ends in an error, and the
+    /// land counter moves for its outcome: the operator sees failing
+    /// lands, not only the ones that decided.
+    #[test]
+    fn a_land_that_ends_in_an_error_moves_its_counter() {
+        let f = fixture();
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        let lands = Lands::new(None, Some(Arc::clone(&metrics)));
+        let cs = f.commit(f.root, &[put("a/x", "late\n")]);
+        let late = LandRequest {
+            deadline: Deadline::new(Instant::now()),
+            ..req(cs, "late")
+        };
+        assert!(matches!(
+            lands.land(&f.store, &caller(), &late),
+            Err(Error::DeadlineExceeded(_))
+        ));
+        let text = metrics.render();
+        assert!(
+            text.contains("scion_lands_total{outcome=\"deadline_exceeded\"} 1\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("outcome=\"landed\""),
+            "no landed lands happened: {text}"
+        );
     }
 
     fn req(cs: ChangesetId, key: &str) -> LandRequest {
