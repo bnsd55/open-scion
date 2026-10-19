@@ -552,3 +552,73 @@ async fn a_cursor_that_names_an_impossible_line_count_is_refused() {
         .unwrap_err();
     assert_eq!(err.code(), Code::InvalidArgument, "{err}");
 }
+
+/// A file of more lines than one diff may read is refused with
+/// `RESOURCE_EXHAUSTED`, the same code as a file whose memory share is
+/// more than the whole budget: both are too big to serve, and the client
+/// sees one code for it. The file here is 1 MiB of one-byte lines - the
+/// cap is line-based, so no big file is needed to cross it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_with_too_many_lines_is_refused() {
+    let (dir, store, root) = store("");
+    let over = scion_server::blame::MAX_BLAME_DIFF_LINES + 1;
+    let blob = put(&store, vec![b'\n'; over].as_slice());
+    let tip = store
+        .write(|c| {
+            let repo = c.repo_id(REPO)?;
+            let cs = commit(vec![root], PATH, Some(regular(blob)), 4);
+            c.insert_changeset(repo, &cs)
+        })
+        .unwrap();
+    let (_stop, mut client) = serve(&store, dir.path(), whole_access(), TOKEN).await;
+    let err = client
+        .blame(BlameRequest {
+            repo: REPO.to_string(),
+            changeset_id: tip.as_bytes().to_vec(),
+            path: PATH.as_bytes().to_vec(),
+            cursor: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::ResourceExhausted, "{err}");
+    assert!(err.message().contains("lines"), "{err}");
+}
+
+/// A version past the line cap in the file's history counts as absent:
+/// the walk goes on, and the lines it held name the change that
+/// introduced the text being explained. The reply completes - no cursor,
+/// no diff of the over-cap version.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_version_with_too_many_lines_counts_as_absent() {
+    let (dir, store, root) = store("");
+    let over = scion_server::blame::MAX_BLAME_DIFF_LINES + 1;
+    // The parent: `over` empty lines. The child: the first `over - 1` of
+    // them, under the cap, so the request itself is servable.
+    let parent_blob = put(&store, vec![b'\n'; over].as_slice());
+    let under = scion_server::blame::MAX_BLAME_DIFF_LINES;
+    // `under - 1` newlines and a last line without one: exactly `under`
+    // lines, at the cap, so the request itself is servable.
+    let mut body = vec![b'\n'; under - 1];
+    body.push(b'x');
+    let child_blob = put(&store, &body);
+    let (parent, child) = store
+        .write(|c| {
+            let repo = c.repo_id(REPO)?;
+            let parent = c.insert_changeset(
+                repo,
+                &commit(vec![root], PATH, Some(regular(parent_blob)), 4),
+            )?;
+            let child = c.insert_changeset(
+                repo,
+                &commit(vec![parent], PATH, Some(regular(child_blob)), 4),
+            )?;
+            Ok((parent, child))
+        })
+        .unwrap();
+    let (_stop, mut client) = serve(&store, dir.path(), whole_access(), TOKEN).await;
+    let (ranges, changesets, next, _parts) = blame(&mut client, &child, PATH, b"").await;
+    assert_eq!(covered(&ranges), (1..=under).collect::<Vec<u32>>());
+    assert_eq!(changesets.len(), 1, "{changesets:?}");
+    assert_eq!(changesets[0].changeset_id, child.as_bytes().to_vec());
+    assert!(next.is_empty(), "the walk explained the whole file");
+}

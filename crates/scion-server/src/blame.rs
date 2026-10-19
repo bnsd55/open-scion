@@ -172,7 +172,11 @@ enum Older {
 /// Every version read takes its bytes from `memory`, and the lines of the
 /// blamed file take [`BYTES_PER_LINE`] each; the takes wait for the budget
 /// to free up, until `until`. A file whose share is more than the whole
-/// budget is refused: see [`memory`](crate::memory).
+/// budget is refused: see [`memory`](crate::memory). A file of more than
+/// [`MAX_BLAME_DIFF_LINES`] lines is refused too: one diff reads two whole
+/// versions, and the walk checks the deadline between steps, so one diff
+/// at the cap stays within a fair share of a call. A version past the cap
+/// counts as absent, as one whose bytes do not fit the budget does.
 ///
 /// # Errors
 ///
@@ -180,7 +184,9 @@ enum Older {
 /// exist. [`Error::InvalidArgument`] if the path is not a regular file, or
 /// if `from` is not where a rename search of `path` at `cs` can stop.
 /// [`Error::ResourceExhausted`] if the share of the file is more than the
-/// whole budget, or a take waited past `until`.
+/// whole budget, or the file has more than [`MAX_BLAME_DIFF_LINES`] lines,
+/// or a take waited past `until`. [`Error::DeadlineExceeded`] once
+/// `until` has passed.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn blame(
     store: &Backend,
@@ -200,10 +206,12 @@ pub fn blame(
     let repo = store.read(|c| c.repo_id(repo))?;
     // The walk reads the path history of `start`: derive it first, in
     // steps, the way `Log` with a path does, so every changeset on its
-    // first-parent history has a value.
-    let derive_until = Deadline::new(until.unwrap_or_else(|| Instant::now() + CALL_LIMIT));
-    crate::derived::get_by::<history::PathHistory>(store, repo, start, &derive_until)?;
-    let root = tree::root_tree(store, repo, start, &derive_until)?;
+    // first-parent history has a value. The same deadline stops the walk:
+    // each step diffs two whole versions, so the walk checks the deadline
+    // before it starts the next one, the first diff too.
+    let walk_until = Deadline::new(until.unwrap_or_else(|| Instant::now() + CALL_LIMIT));
+    crate::derived::get_by::<history::PathHistory>(store, repo, start, &walk_until)?;
+    let root = tree::root_tree(store, repo, start, &walk_until)?;
     let mut blob = regular_blob(store, root, &start_path)?;
     // The text of the version the walk starts at. Its bytes stay taken for
     // the whole call: each step's older text replaces them when it becomes
@@ -226,6 +234,15 @@ pub fn blame(
     } else {
         resume.counted
     };
+    // One diff reads two whole versions, however different they are, so a
+    // version past the line cap is too big to serve, as one whose share
+    // is more than the whole budget is. The check covers a cursor's count
+    // too, which is the client's word.
+    if counted > MAX_BLAME_DIFF_LINES {
+        return Err(Error::ResourceExhausted(format!(
+            "{path:?} has {counted} lines, and blame diffs at most {MAX_BLAME_DIFF_LINES}"
+        )));
+    }
     // The rows of the answer, and the state of one diff, stay taken for the
     // whole call. Not a first take: it never waits. The cursor's line
     // count is the client's word, so its product with the per-line cost
@@ -266,6 +283,9 @@ pub fn blame(
     // client round the same step for ever.
     let mut progressed = false;
     for _ in 0..MAX_BLAME_VERSIONS {
+        // Each step diffs two whole versions: the walk stops at the
+        // deadline before it starts the next one, the first diff too.
+        walk_until.check()?;
         if lines[resume.after_line..window_end]
             .iter()
             .all(|(source, _)| source.is_some())
@@ -562,10 +582,16 @@ fn read_version(store: &Backend, blob: BlobId, memory: &Bytes) -> Result<Option<
     // bytes come free when a concurrent call ends, or the call fails with
     // `RESOURCE_EXHAUSTED` and the client retries.
     let hold = memory.try_take(size)?;
-    Ok(Some(HeldText {
-        text: store.blobs().get(blob)?,
-        hold,
-    }))
+    let text = store.blobs().get(blob)?;
+    // A version past the line cap counts as absent, as one whose bytes do
+    // not fit the budget does: one diff of it would run past the walk's
+    // deadline, so the walk goes on, and the lines it held name the
+    // change that introduced the text being explained. Dropping `hold`
+    // gives the bytes back.
+    if byte_lines(&text).count() > MAX_BLAME_DIFF_LINES {
+        return Ok(None);
+    }
+    Ok(Some(HeldText { text, hold }))
 }
 
 /// What diffing `text` costs against [`MAX_BLAME_DIFF_LINES`]: one per line,

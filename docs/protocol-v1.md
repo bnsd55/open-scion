@@ -602,7 +602,14 @@ path-history nodes a call reads take bytes of the memory budget, as its
 versions do. A rename search counts as a line each chunk of up to 64 bytes
 that it reads and each row of a chunk table that it indexes or compares,
 and as 64 lines each file size that it reads. The first step of a call
-always runs, so every call makes progress. The rules of a rename search are
+always runs, so every call makes progress. The walk checks the call's
+deadline before each step, so one step never starts past it. One diff
+reads two whole versions, so a file of more than 1,048,576 lines is too
+big to serve: the call fails with `RESOURCE_EXHAUSTED`, as one whose
+memory share is more than the whole budget does. A version past that cap
+in the file's history counts as absent: the walk goes on, and the lines it
+held name the change that introduced the text being explained. The rules
+of a rename search are
 those of `Diff` (section 6.13) for one added file, with git's limit of
 1,000,000 pairs only: it looks at every deleted file, over several calls if
 it must.
