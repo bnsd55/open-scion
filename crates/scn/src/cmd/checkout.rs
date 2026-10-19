@@ -6,7 +6,7 @@
 //! against its ID on arrival. Nothing is written until the whole tree is
 //! walked and every name has passed the checkout path rules, and then only
 //! into a temp directory that becomes the destination by renames (see
-//! [`crate::materialize`]).
+//! the `materialize` module).
 
 use anyhow::{Context, Result, anyhow, bail};
 use hashlink::LinkedHashMap;
