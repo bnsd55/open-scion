@@ -19,9 +19,9 @@ use scion_proto::runtime::object::{self, Assembler, Header};
 use scion_proto::v1::{
     Encoding, GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef, ResolveRefRequest,
 };
-use scion_server::meta::Meta as _;
-use scion_server::meta::MetaTx as _;
-use scion_server::{Backend, tree};
+use scion_server::test_support::meta::Meta as _;
+use scion_server::test_support::meta::MetaTx as _;
+use scion_server::{Backend, test_support::tree};
 use tonic::Code;
 
 mod common;
@@ -238,14 +238,14 @@ async fn snapshot(
         };
         let (got, data) = get_objects(&mut client, &request).await;
         assert_eq!(got.end, None);
-        for (name, entry) in Tree::decode(&data[0]).unwrap().entries {
+        for (name, entry) in Tree::decode(&data[0]).unwrap().entries() {
             let mut below = path.clone();
             if !below.is_empty() {
                 below.push(b'/');
             }
             below.extend_from_slice(name.as_bytes());
             match entry {
-                Entry::Dir(id) => trees.push((id, below)),
+                Entry::Dir(id) => trees.push((*id, below)),
                 Entry::File(file) => {
                     if let Some(blob) = file.state().blob() {
                         blobs.push((blob, below));

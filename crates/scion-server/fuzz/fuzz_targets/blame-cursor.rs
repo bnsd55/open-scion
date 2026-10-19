@@ -9,10 +9,10 @@
 
 use libfuzzer_sys::fuzz_target;
 use scion_core::{Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
-use scion_server::blame::{self, Resume};
-use scion_server::memory::Bytes;
-use scion_server::meta::{Meta as _, MetaTx as _};
-use scion_server::{Backend, Store, tree};
+use scion_server::test_support::blame::{self, Resume};
+use scion_server::test_support::memory::Bytes;
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::{Backend, Store, test_support::tree};
 use std::sync::OnceLock;
 use tempfile::TempDir;
 
@@ -37,17 +37,7 @@ fn fixture() -> &'static (TempDir, Backend, ChangesetId) {
                 for (n, line) in [b"a\n".as_slice(), b"b\n", b"c\n"].iter().enumerate() {
                     let content = store.blobs().put(line).expect("blob");
                     let len = line.len() as u64;
-                    let cs = Changeset {
-                        parents: ids.last().copied().into_iter().collect(),
-                        author: IdentityTime {
-                            name: b"Ada".to_vec(),
-                            email: b"ada@example.com".to_vec(),
-                            unix_secs: 1_700_000_000 + n as i64,
-                            tz_offset_minutes: 0,
-                        },
-                        committer: None,
-                        message: format!("change {n}").into_bytes(),
-                        changes: [(
+                    let cs = Changeset::new(ids.last().copied().into_iter().collect(), IdentityTime::new(b"Ada".to_vec(), b"ada@example.com".to_vec(), 1_700_000_000 + n as i64, 0).expect("identity fits the format"), None, format!("change {n}").into_bytes(), [(
                             RepoPath::new(PATH).unwrap(),
                             Some(FileState::Regular {
                                 content,
@@ -55,13 +45,12 @@ fn fixture() -> &'static (TempDir, Backend, ChangesetId) {
                             }),
                         )]
                         .into_iter()
-                        .collect(),
-                    };
+                        .collect()).expect("changeset fits the format");
                     ids.push(tree::store_changeset(c, repo, &cs, &mut move |b| {
                         if b == content {
                             Ok(len)
                         } else {
-                            Err(scion_server::error::Error::NotFound(format!("blob {b}")))
+                            Err(scion_server::Error::NotFound(format!("blob {b}")))
                         }
                     })?
                     .0);

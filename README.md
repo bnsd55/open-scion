@@ -310,12 +310,12 @@ Without `--ticket-key` on the server, no object is readable: a read needs a
 ticket, and the server mints none. An object ID alone is not a permission.
 
 `scn bench` runs many agents that land changes at the same time, then checks
-that `main` gained each landed change exactly once. With one server process on
-one machine, 200 agents landed 10,000 changes at about 200 lands per second,
-with none lost or duplicated. Every land is on disk before it replies, and
-concurrent requests share each full disk flush
-([#3](https://github.com/bnsd55/openscion/issues/3)). Importing a git
-repository with 23,871 commits took 50 seconds.
+that `main` gained each landed change exactly once. In a run of 200 agents
+that landed 10,000 changes, none was lost or duplicated. Every land is on
+disk before it replies, and concurrent requests share each full disk flush
+([#3](https://github.com/bnsd55/openscion/issues/3)). The numbers depend on
+the machine; how to rerun them, and what each one means, is in
+[docs/benchmarks.md](https://github.com/bnsd55/openscion/blob/main/docs/benchmarks.md).
 
 ### TLS
 
@@ -381,8 +381,6 @@ These are this project's choices where the article does not give details.
 Deliberate simplifications are marked `SHORTCUT:` in the code, each with its
 limit and its upgrade path.
 
-limit and its upgrade path.
-
 ## Supported platforms
 
 What CI runs, on the runners that CI books, is what "supported" means
@@ -390,8 +388,8 @@ here. Every job is in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 | Where | Runner, architecture | What runs there |
 |---|---|---|
-| Ubuntu 24.04, x86-64 | GitHub's `ubuntu-24.04` image, Linux 6.x, ext4 | All 13 CI jobs: the lint and doc jobs, `test`, the tmpfs disk-full test, block-level power cuts (dm-log-writes), the Postgres suite, the power-loss suite on LazyFS 0.3.1, the mount (NFS) job through the kernel's NFS client, the demo in Docker, the fuzz smoke on `x86_64-unknown-linux-gnu`, and `publish check` |
-| macOS 15, Apple Silicon (arm64) | GitHub's `macos-15` image, APFS | `test (macOS)`: the whole test suite |
+| Ubuntu 24.04, x86-64 | GitHub's `ubuntu-24.04` image, Linux 6.x, ext4 | All 15 CI jobs: the lint and doc jobs, `test`, the tmpfs disk-full test, block-level power cuts (dm-log-writes), the Postgres suite, the power-loss suite on LazyFS 0.3.1, the mount (NFS) job through the kernel's NFS client, the demo in Docker, the fuzz smoke on `x86_64-unknown-linux-gnu`, the release smoke of the README quick start, and `publish check` |
+| macOS 15, Apple Silicon (arm64) | GitHub's `macos-15` image, APFS | `test (macOS)`: the whole test suite; `release smoke (macos-15)`: the README quick start on release binaries |
 
 The macOS row carries its repetition evidence: after PR
 [#309](https://github.com/bnsd55/openscion/pull/309)'s fork gate, the mount
@@ -422,10 +420,10 @@ Not supported, or tested only in parts:
   client reaches it as any local user ([#11](https://github.com/bnsd55/openscion/issues/11)).
 
 The CI jobs: `fmt + clippy`, `rustdoc`, `cargo-deny`, `test` (with the
-tmpfs disk-full and dm-log-writes jobs), `test (postgres)` (Postgres
+tmpfs disk-full and dm-log-writes steps), `test (postgres)` (Postgres
 17.11), `test (macOS)`, `power-loss` (LazyFS), `mount (NFS)`, `check
-(MSRV)` (Rust 1.88), `conformance (grpcurl)`, `docker demo`, `fuzz smoke`
-and `publish check`.
+(MSRV)` (Rust 1.88), `conformance (grpcurl)`, `docker demo`, `fuzz smoke`,
+`release smoke` (ubuntu-24.04 and macos-15) and `publish check`.
 
 ## Build and test
 
@@ -441,10 +439,13 @@ CI also runs `cargo deny check` (license and advisory checks on every
 crate), a rustdoc build whose warnings fail the build, and the test that
 follows every relative link in the repo's markdown.
 
-Fuzz the decoders (needs nightly and `cargo-fuzz`):
+Fuzz the decoders (needs nightly and `cargo-fuzz`). The corpus directory is
+not checked in, and cargo-fuzz refuses to start without one; the seeds
+directory is:
 
 ```sh
 cd crates/scion-core
+mkdir -p "$PWD/fuzz/corpus/decode"
 cargo +nightly fuzz run decode "$PWD/fuzz/corpus/decode" "$PWD/fuzz/seeds/decode"
 ```
 
@@ -452,7 +453,8 @@ cargo +nightly fuzz run decode "$PWD/fuzz/corpus/decode" "$PWD/fuzz/seeds/decode
 
 The project is at an early stage and the design still moves. Issues and
 discussion are welcome. Before a large pull request, please open an issue to
-agree on the approach.
+agree on the approach. Report a security problem privately, not as a public
+issue: [SECURITY.md](SECURITY.md) says how.
 
 ## License
 

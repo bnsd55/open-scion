@@ -247,7 +247,7 @@ pub fn log_page(
                 break;
             };
             let changeset = c.get_changeset(repo, id)?;
-            next = changeset.parents.first().copied();
+            next = changeset.parents().first().copied();
             entries.push((id, changeset));
         }
         Ok(LogPage { entries, next })
@@ -268,7 +268,7 @@ pub(crate) fn next_change(
     };
     *budget -= 1;
     let changeset = c.get_changeset(repo, id)?;
-    *next = changeset.parents.first().copied();
+    *next = changeset.parents().first().copied();
     Ok(Some((id, changeset)))
 }
 
@@ -280,7 +280,7 @@ pub(crate) fn next_change(
 #[must_use]
 pub fn changes_path(cs: &Changeset, path: &RepoPath) -> bool {
     let path = path.as_bytes();
-    cs.changes.keys().any(|changed| {
+    cs.changes().keys().any(|changed| {
         let changed = changed.as_bytes();
         changed.starts_with(path) && matches!(changed.get(path.len()), None | Some(b'/'))
     })
@@ -678,7 +678,7 @@ impl DiffWalk<'_> {
     /// a read connection on its own, so a long walk does not hold one.
     fn children(&self, entry: Option<Entry>) -> Result<BTreeMap<PathElem, Entry>> {
         match entry {
-            Some(Entry::Dir(id)) => Ok(self.store.read(|c| c.get_tree(id))?.entries),
+            Some(Entry::Dir(id)) => Ok(self.store.read(|c| c.get_tree(id))?.entries().clone()),
             _ => Ok(BTreeMap::new()),
         }
     }

@@ -1156,7 +1156,7 @@ impl Scion for ScionService {
                 // reads no blob. Decoding twice costs little next to reading
                 // every blob back.
                 let (cs, _) = write::decode(&changeset)?;
-                access.check_write(&caller, &repo, cs.changes.keys())?;
+                access.check_write(&caller, &repo, cs.changes().keys())?;
                 write::create_changeset(&store, &repo, &changeset)
             })
             .await?;
@@ -1199,7 +1199,7 @@ impl Scion for ScionService {
                 // land changes, on any ref of the repo. Checked on every call,
                 // before the land records anything, also on a retry.
                 let cs = read::get_changeset(&store, &req.repo, req.changeset)?;
-                access.check_write(&caller, &req.repo, cs.changes.keys())?;
+                access.check_write(&caller, &req.repo, cs.changes().keys())?;
                 Ok(lands.land(&store, &caller, &req))
             })
             .await;
@@ -1503,10 +1503,10 @@ impl Scion for ScionService {
             .into_iter()
             .map(|(id, author, path)| BlameChangeset {
                 changeset_id: id.as_bytes().to_vec(),
-                author_name: author.name,
-                author_email: author.email,
-                author_unix_secs: author.unix_secs,
-                author_tz_offset_minutes: author.tz_offset_minutes,
+                author_name: author.name().to_vec(),
+                author_email: author.email().to_vec(),
+                author_unix_secs: author.unix_secs(),
+                author_tz_offset_minutes: author.tz_offset_minutes(),
                 path: path.as_bytes().to_vec(),
             })
             .collect();
@@ -1776,18 +1776,15 @@ mod tests {
             content: blob,
             executable: false,
         };
-        let changeset = Changeset {
-            parents: vec![],
-            author: IdentityTime {
-                name: b"t".to_vec(),
-                email: b"t@x".to_vec(),
-                unix_secs: 0,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: vec![],
-            changes: [(RepoPath::new("f").unwrap(), Some(state))].into(),
-        };
+        let changeset = Changeset::new(
+            vec![],
+            IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0)
+                .expect("identity fits the format"),
+            None,
+            vec![],
+            [(RepoPath::new("f").unwrap(), Some(state))].into(),
+        )
+        .expect("changeset fits the format");
         let cs = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
@@ -1936,18 +1933,15 @@ mod tests {
             content: store.blobs().put(b"x").unwrap(),
             executable: false,
         };
-        let cs = Changeset {
-            parents: vec![],
-            author: IdentityTime {
-                name: b"t".to_vec(),
-                email: b"t@x".to_vec(),
-                unix_secs: 0,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: vec![],
-            changes: [(RepoPath::new("f").unwrap(), Some(state))].into(),
-        };
+        let cs = Changeset::new(
+            vec![],
+            IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0)
+                .expect("identity fits the format"),
+            None,
+            vec![],
+            [(RepoPath::new("f").unwrap(), Some(state))].into(),
+        )
+        .expect("changeset fits the format");
         let mut request = Request::new(CreateChangesetRequest {
             repo: "log-open".to_owned(),
             changeset: cs.encode(),
@@ -2138,24 +2132,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let blob = store.blobs().put(b"x").unwrap();
-        let put = |parents, path: &str| Changeset {
-            parents,
-            author: IdentityTime {
-                name: b"t".to_vec(),
-                email: b"t@x".to_vec(),
-                unix_secs: 0,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: path.as_bytes().to_vec(),
-            changes: [(
-                RepoPath::new(path).unwrap(),
-                Some(FileState::Regular {
-                    content: blob,
-                    executable: false,
-                }),
-            )]
-            .into(),
+        let put = |parents, path: &str| {
+            Changeset::new(
+                parents,
+                IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0)
+                    .expect("identity fits the format"),
+                None,
+                path.as_bytes().to_vec(),
+                [(
+                    RepoPath::new(path).unwrap(),
+                    Some(FileState::Regular {
+                        content: blob,
+                        executable: false,
+                    }),
+                )]
+                .into(),
+            )
+            .expect("changeset fits the format")
         };
         let (b, cs) = store
             .write(|c| {
@@ -2243,24 +2236,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let blob = store.blobs().put(b"x").unwrap();
-        let put = |parents, path: &str| Changeset {
-            parents,
-            author: IdentityTime {
-                name: b"t".to_vec(),
-                email: b"t@x".to_vec(),
-                unix_secs: 0,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: path.as_bytes().to_vec(),
-            changes: [(
-                RepoPath::new(path.as_bytes().to_vec()).unwrap(),
-                Some(FileState::Regular {
-                    content: blob,
-                    executable: false,
-                }),
-            )]
-            .into(),
+        let put = |parents, path: &str| {
+            Changeset::new(
+                parents,
+                IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0)
+                    .expect("identity fits the format"),
+                None,
+                path.as_bytes().to_vec(),
+                [(
+                    RepoPath::new(path.as_bytes().to_vec()).unwrap(),
+                    Some(FileState::Regular {
+                        content: blob,
+                        executable: false,
+                    }),
+                )]
+                .into(),
+            )
+            .expect("changeset fits the format")
         };
         let cs = store
             .write(|c| {
@@ -2346,17 +2338,16 @@ mod tests {
                 }),
             ));
         }
-        let changeset = |parents, changes| Changeset {
-            parents,
-            author: IdentityTime {
-                name: b"t".to_vec(),
-                email: b"t@x".to_vec(),
-                unix_secs: 0,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: vec![],
-            changes,
+        let changeset = |parents, changes| {
+            Changeset::new(
+                parents,
+                IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0)
+                    .expect("identity fits the format"),
+                None,
+                vec![],
+                changes,
+            )
+            .expect("changeset fits the format")
         };
         let cs = store
             .write(|c| {

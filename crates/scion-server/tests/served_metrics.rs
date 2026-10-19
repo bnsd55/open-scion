@@ -9,13 +9,13 @@ use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest};
 
-use scion_server::access::Access;
+use scion_server::Access;
 use std::collections::BTreeMap;
 
-use scion_server::meta::{Meta as _, MetaTx as _};
-use scion_server::metrics::Metrics;
-use scion_server::tickets::Keys;
-use scion_server::{Backend, service};
+use scion_server::Keys;
+use scion_server::Metrics;
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::{Backend, test_support::service};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tonic::service::interceptor::{InterceptedService, Interceptor};
@@ -62,18 +62,20 @@ async fn served() -> (
             let repo = c.create_repo(REPO)?;
             let root = c.insert_changeset(
                 repo,
-                &scion_core::Changeset {
-                    parents: vec![],
-                    author: scion_core::IdentityTime {
-                        name: b"Ada".to_vec(),
-                        email: b"ada@example.com".to_vec(),
-                        unix_secs: 1_700_000_000,
-                        tz_offset_minutes: 0,
-                    },
-                    committer: None,
-                    message: b"root\n".to_vec(),
-                    changes: BTreeMap::new(),
-                },
+                &scion_core::Changeset::new(
+                    vec![],
+                    scion_core::IdentityTime::new(
+                        b"Ada".to_vec(),
+                        b"ada@example.com".to_vec(),
+                        1_700_000_000,
+                        0,
+                    )
+                    .expect("identity fits the format"),
+                    None,
+                    b"root\n".to_vec(),
+                    BTreeMap::new(),
+                )
+                .expect("changeset fits the format"),
             )?;
             c.cas_ref(repo, "main", None, root)?;
             Ok(root)
@@ -90,7 +92,7 @@ async fn served() -> (
         service::ServeOptions {
             data: dir.path().to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
@@ -152,17 +154,18 @@ async fn a_served_server_renders_the_operating_metrics() {
     // On Postgres, a write transaction waits for the collector's key,
     // and the wait is in the histogram. The changeset names the blob the
     // upload above stored.
-    let cs = scion_core::Changeset {
-        parents: vec![root],
-        author: scion_core::IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"metrics\n".to_vec(),
-        changes: [(
+    let cs = scion_core::Changeset::new(
+        vec![root],
+        scion_core::IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"metrics\n".to_vec(),
+        [(
             scion_core::RepoPath::new("METRICS.md").unwrap(),
             Some(scion_core::FileState::Regular {
                 content: scion_core::BlobId::of(b"# served metrics\n"),
@@ -170,7 +173,8 @@ async fn a_served_server_renders_the_operating_metrics() {
             }),
         )]
         .into(),
-    };
+    )
+    .expect("changeset fits the format");
     if Backend::test_is_postgres() {
         let (bytes, _id) = cs.encode_with_id();
         let _ = scion

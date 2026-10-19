@@ -27,6 +27,7 @@ pub type BlobLens<'a> = &'a mut dyn FnMut(BlobId) -> Result<u64>;
 /// The lens of the store's blobs, from each frame header, for the callers
 /// that hold the store and no pre-read lengths, such as tests and the
 /// in-transaction derive of `store_changeset`.
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn lens_of(store: &Backend) -> impl FnMut(BlobId) -> Result<u64> + '_ {
     |blob| Ok(store.blobs().size(blob)? as u64)
 }
@@ -116,7 +117,7 @@ pub fn lookup(c: &mut dyn MetaTx, root: TreeId, path: &RepoPath) -> Result<Optio
         let Entry::Dir(id) = entry else {
             return Ok(None);
         };
-        match c.get_tree(id)?.entries.remove(&name) {
+        match c.get_tree(id)?.entries().clone().remove(&name) {
             Some(next) => entry = next,
             None => return Ok(None),
         }
@@ -151,7 +152,7 @@ impl Kind for RootTree {
         parents: Vec<TreeId>,
         lens: BlobLens<'_>,
     ) -> Result<TreeId> {
-        apply(c, parents.first().copied(), &changeset.changes, lens).map_err(|e| match e {
+        apply(c, parents.first().copied(), changeset.changes(), lens).map_err(|e| match e {
             Error::Apply(e) => Error::Corrupt(format!("stored changeset {id} does not apply: {e}")),
             other => other,
         })
@@ -189,6 +190,7 @@ pub fn root_tree(
 /// # Errors
 ///
 /// As [`root_tree`], without [`Error::DeadlineExceeded`].
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn root_tree_unbounded(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
     derived::get_unbounded::<RootTree>(store, repo, cs)
 }
@@ -252,11 +254,11 @@ pub fn store_changeset(
     lens: BlobLens<'_>,
 ) -> Result<(ChangesetId, TreeId)> {
     let base = cs
-        .parents
+        .parents()
         .first()
         .map(|&parent| derive_root_tree(c, repo, parent, lens))
         .transpose()?;
-    let tree = apply(c, base, &cs.changes, lens)?;
+    let tree = apply(c, base, cs.changes(), lens)?;
     let id = c.insert_changeset(repo, cs)?;
     for (_, blob) in db::puts(cs) {
         c.add_repo_blob(repo, blob)?;
@@ -297,7 +299,8 @@ impl Dir {
         if let Self::Stored(id) = *self {
             let entries = c
                 .get_tree(id)?
-                .entries
+                .entries()
+                .clone()
                 .into_iter()
                 .map(|(name, entry)| {
                     let node = match entry {
@@ -373,14 +376,15 @@ impl Dir {
         match self {
             Self::Stored(id) => Ok(id),
             Self::Loaded(entries) => {
-                let mut tree = Tree::default();
+                let mut loaded = std::collections::BTreeMap::new();
                 for (name, node) in entries {
                     let entry = match node {
                         Node::File(file) => Entry::File(file),
                         Node::Dir(dir) => Entry::Dir(dir.store(c)?),
                     };
-                    tree.entries.insert(name, entry);
+                    loaded.insert(name, entry);
                 }
+                let tree = Tree::new(loaded).expect("loaded entries fit the format");
                 c.put_tree(&tree)
             }
         }
@@ -427,11 +431,11 @@ mod tests {
         let mut out = Vec::new();
         let mut stack = vec![(String::new(), root)];
         while let Some((prefix, id)) = stack.pop() {
-            for (name, entry) in c.get_tree(id).unwrap().entries {
+            for (name, entry) in c.get_tree(id).unwrap().entries() {
                 let path = format!("{prefix}{}", String::from_utf8_lossy(name.as_bytes()));
                 match entry {
                     Entry::File(_) => out.push(path),
-                    Entry::Dir(child) => stack.push((format!("{path}/"), child)),
+                    Entry::Dir(child) => stack.push((format!("{path}/"), *child)),
                 }
             }
         }
@@ -684,18 +688,15 @@ mod tests {
     }
 
     fn changeset(parent: Option<ChangesetId>, edits: Edits<'_>) -> Changeset {
-        Changeset {
-            parents: parent.into_iter().collect(),
-            author: IdentityTime {
-                name: b"a".to_vec(),
-                email: b"a@x".to_vec(),
-                unix_secs: 0,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: vec![],
-            changes: changes(edits),
-        }
+        Changeset::new(
+            parent.into_iter().collect(),
+            IdentityTime::new(b"a".to_vec(), b"a@x".to_vec(), 0, 0)
+                .expect("identity fits the format"),
+            None,
+            vec![],
+            changes(edits),
+        )
+        .expect("changeset fits the format")
     }
 
     /// A cold root tree and a past deadline: the read refuses instead of
@@ -760,12 +761,8 @@ mod tests {
     fn root_tree_derives_a_long_chain_and_caches_it() {
         let dir = tempfile::tempdir().unwrap();
         let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
-        let author = IdentityTime {
-            name: b"a".to_vec(),
-            email: b"a@x".to_vec(),
-            unix_secs: 0,
-            tz_offset_minutes: 0,
-        };
+        let author = IdentityTime::new(b"a".to_vec(), b"a@x".to_vec(), 0, 0)
+            .expect("identity fits the format");
         // Every put of the chain names its index as the blob; their files
         // feed the real lens that reads the chain's trees with.
         for i in 0..2000 {
@@ -776,13 +773,14 @@ mod tests {
                 let repo = c.create_repo("r")?;
                 let mut parent: Option<ChangesetId> = None;
                 for i in 0..2000 {
-                    let cs = Changeset {
-                        parents: parent.into_iter().collect(),
-                        author: author.clone(),
-                        committer: None,
-                        message: vec![],
-                        changes: changes(&[(&format!("f{}", i % 7), Some(&i.to_string()))]),
-                    };
+                    let cs = Changeset::new(
+                        parent.into_iter().collect(),
+                        author.clone(),
+                        None,
+                        vec![],
+                        changes(&[(&format!("f{}", i % 7), Some(&i.to_string()))]),
+                    )
+                    .expect("changeset fits the format");
                     parent = Some(c.insert_changeset(repo, &cs)?);
                 }
                 Ok((repo, parent.unwrap()))

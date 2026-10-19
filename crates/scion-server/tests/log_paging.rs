@@ -14,9 +14,10 @@ use scion_proto::runtime::auth::Bearer;
 use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::LogRequest;
 use scion_proto::v1::scion_client::ScionClient;
-use scion_server::meta::{Meta as _, MetaTx as _};
-use scion_server::metrics::Metrics;
-use scion_server::{Backend, Store, service, tree};
+use scion_server::Metrics;
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::test_support::{service, tree};
+use scion_server::{Backend, Store};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
@@ -45,18 +46,15 @@ fn chain(count: usize) -> (tempfile::TempDir, Backend, Vec<scion_core::Changeset
                     executable: false,
                 };
                 let path: &[u8] = if i % 2 == 0 { b"d/f.txt" } else { b"other.txt" };
-                let cs = Changeset {
-                    parents: ids.last().copied().into_iter().collect(),
-                    author: scion_core::IdentityTime {
-                        name: b"a".to_vec(),
-                        email: b"t@x".to_vec(),
-                        unix_secs: 1_700_000_000,
-                        tz_offset_minutes: 0,
-                    },
-                    committer: None,
-                    message: format!("change {i}\n").into_bytes(),
-                    changes: [(RepoPath::new(path).unwrap(), Some(regular))].into(),
-                };
+                let cs = Changeset::new(
+                    ids.last().copied().into_iter().collect(),
+                    scion_core::IdentityTime::new(b"a".to_vec(), b"t@x".to_vec(), 1_700_000_000, 0)
+                        .expect("identity fits the format"),
+                    None,
+                    format!("change {i}\n").into_bytes(),
+                    [(RepoPath::new(path).unwrap(), Some(regular))].into(),
+                )
+                .expect("changeset fits the format");
                 ids.push(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0);
             }
             Ok(ids)
@@ -75,7 +73,7 @@ async fn serve(store: Backend, dir: &std::path::Path) -> String {
         service::ServeOptions {
             data: dir.to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
@@ -125,7 +123,7 @@ async fn call(
             // The reply streams newest first; a repeated ID inside one
             // reply is a repeat.
             assert_ne!(got.last().map(|(_, id)| id), Some(&id), "a repeat");
-            let message = String::from_utf8(cs.message).unwrap();
+            let message = String::from_utf8(cs.message().to_vec()).unwrap();
             let i: usize = message
                 .trim()
                 .strip_prefix("change ")

@@ -5,7 +5,7 @@
 mod common;
 
 use common::{git, git_status};
-use scion_server::import::{ImportOptions, import_git};
+use scion_server::{ImportOptions, import_git};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -14,10 +14,12 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
-use scion_server::deadline::Deadline;
-use scion_server::meta::{Meta as _, MetaTx as _};
-use scion_server::read::{self, DiffEntry, MAX_DIFF_ENTRIES, MAX_RENAME_CHUNKS, Rename};
-use scion_server::{Backend, Error, tree};
+use scion_server::test_support::deadline::Deadline;
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::test_support::read::{
+    self, DiffEntry, MAX_DIFF_ENTRIES, MAX_RENAME_CHUNKS, Rename,
+};
+use scion_server::{Backend, Error, test_support::tree};
 use tempfile::TempDir;
 
 const REPO: &str = "r";
@@ -198,12 +200,13 @@ fn merge_base_and_is_ancestor_match_git() {
 }
 
 fn author() -> IdentityTime {
-    IdentityTime {
-        name: b"Ada".to_vec(),
-        email: b"ada@example.com".to_vec(),
-        unix_secs: 1_700_000_000,
-        tz_offset_minutes: 0,
-    }
+    IdentityTime::new(
+        b"Ada".to_vec(),
+        b"ada@example.com".to_vec(),
+        1_700_000_000,
+        0,
+    )
+    .expect("identity fits the format")
 }
 
 /// Stores a first-parent chain in a new repo: one changeset per entry of
@@ -214,13 +217,14 @@ fn chain(store: &Backend, changes: Vec<BTreeMap<RepoPath, Option<FileState>>>) -
             let repo = c.create_repo(REPO)?;
             let mut ids: Vec<ChangesetId> = Vec::new();
             for changes in changes {
-                let cs = Changeset {
-                    parents: ids.last().copied().into_iter().collect(),
-                    author: author(),
-                    committer: None,
-                    message: format!("change {}", ids.len()).into_bytes(),
+                let cs = Changeset::new(
+                    ids.last().copied().into_iter().collect(),
+                    author(),
+                    None,
+                    format!("change {}", ids.len()).into_bytes(),
                     changes,
-                };
+                )
+                .expect("changeset fits the format");
                 ids.push(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0);
             }
             Ok(ids)
@@ -262,13 +266,14 @@ fn graph_queries_across_many_merges_answer() {
         .write(|c| {
             let repo = c.create_repo(REPO)?;
             let mut put = |parents: Vec<ChangesetId>, message: String| {
-                let cs = Changeset {
+                let cs = Changeset::new(
                     parents,
-                    author: author(),
-                    committer: None,
-                    message: message.into_bytes(),
-                    changes: BTreeMap::new(),
-                };
+                    author(),
+                    None,
+                    message.into_bytes(),
+                    BTreeMap::new(),
+                )
+                .expect("changeset fits the format");
                 Ok::<_, Error>(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0)
             };
             let mut main = vec![put(vec![], "root".into())?];

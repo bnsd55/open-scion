@@ -21,12 +21,14 @@ use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileEntry, FileState, GitOid, IdentityTime, PathElem,
     RepoPath,
 };
-use scion_server::auth::Caller;
-use scion_server::deadline::Deadline;
-use scion_server::import::{BUSY_TRIES, CHECKS, ImportOptions, ImportReport, import_git};
-use scion_server::land::{LandRequest, LandState, Lands};
-use scion_server::meta::{Meta as _, MetaTx as _, RefState};
-use scion_server::{Backend, Error, read, tree, write};
+use scion_server::test_support::auth::Caller;
+use scion_server::test_support::deadline::Deadline;
+use scion_server::test_support::import::{BUSY_TRIES, CHECKS};
+use scion_server::test_support::land::{LandRequest, LandState, Lands};
+use scion_server::test_support::meta::{Meta as _, MetaTx as _, RefState};
+use scion_server::test_support::{read, tree, write};
+use scion_server::{Backend, Error};
+use scion_server::{ImportOptions, ImportReport, import_git};
 use tempfile::TempDir;
 
 const SUBMODULE: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -322,8 +324,9 @@ fn root_entry(store: &Backend, cs: ChangesetId, name: &str) -> Option<Entry> {
         &Deadline::new(Instant::now() + Duration::from_secs(300)),
     )
     .unwrap()
-    .entries
-    .remove(&PathElem::new(name).unwrap())
+    .entries()
+    .get(&PathElem::new(name).unwrap())
+    .copied()
 }
 
 #[test]
@@ -430,7 +433,7 @@ fn changesets_carry_git_metadata_and_first_parent_diffs() {
 
     let swap = changeset(&h.swap);
     let changes: BTreeMap<&[u8], bool> = swap
-        .changes
+        .changes()
         .iter()
         .map(|(p, state)| (p.as_bytes(), state.is_some()))
         .collect();
@@ -445,41 +448,45 @@ fn changesets_carry_git_metadata_and_first_parent_diffs() {
     ]
     .into();
     assert_eq!(changes, expected, "true is a put, false a delete");
-    assert_eq!(swap.parents, [changeset_of(&store, &h.root)]);
+    assert_eq!(swap.parents(), [changeset_of(&store, &h.root)]);
     assert_eq!(
-        swap.author,
-        IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 330,
-        }
+        swap.author(),
+        &IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            330
+        )
+        .expect("identity fits the format")
     );
     assert_eq!(
-        swap.committer,
-        Some(IdentityTime {
-            name: b"Bob".to_vec(),
-            email: b"bob@example.com".to_vec(),
-            unix_secs: 1_700_000_100,
-            tz_offset_minutes: -420,
-        })
+        swap.committer(),
+        Some(
+            &IdentityTime::new(
+                b"Bob".to_vec(),
+                b"bob@example.com".to_vec(),
+                1_700_000_100,
+                -420
+            )
+            .expect("identity fits the format")
+        )
     );
-    assert_eq!(swap.message, b"swap files and directories\n");
+    assert_eq!(swap.message(), b"swap files and directories\n");
 
     let merge = changeset(&h.merge);
     assert_eq!(
-        merge.parents,
+        merge.parents(),
         [changeset_of(&store, &h.main), changeset_of(&store, &h.side)]
     );
-    let merged: Vec<&[u8]> = merge.changes.keys().map(RepoPath::as_bytes).collect();
+    let merged: Vec<&[u8]> = merge.changes().keys().map(RepoPath::as_bytes).collect();
     assert_eq!(
         merged,
         [&b"side.txt"[..], b"src/nested/deep/file.txt"],
         "a merge stores its diff against the first parent"
     );
 
-    assert_eq!(changeset(&h.non_utf8).message, NON_UTF8_MESSAGE);
-    assert_eq!(changeset(&h.root).parents, []);
+    assert_eq!(changeset(&h.non_utf8).message(), NON_UTF8_MESSAGE);
+    assert_eq!(changeset(&h.root).parents(), []);
 }
 
 #[test]
@@ -544,7 +551,7 @@ fn modes_100644_and_100664_are_the_same_file() {
     let report = import(&store, &git, &c2);
     assert_eq!(report.verified, 2);
     let cs = read::get_changeset(&store, "r", report.tip).unwrap();
-    assert!(cs.changes.is_empty(), "{:?}", cs.changes);
+    assert!(cs.changes().is_empty(), "{:?}", cs.changes());
 }
 
 #[test]
@@ -765,7 +772,7 @@ fn criss_cross_merges_import_and_the_ref_moves_only_to_descendants() {
     assert_eq!(main_ref(&store).target, report.tip);
     let merge = read::get_changeset(&store, "r", report.tip).unwrap();
     assert_eq!(
-        merge.parents,
+        merge.parents(),
         [changeset_of(&store, &a2), changeset_of(&store, &b2)]
     );
     for name in ["a.txt", "b.txt", "c.txt", "base.txt"] {
@@ -827,12 +834,13 @@ fn assert_success(out: &Output) {
 }
 
 fn identity() -> IdentityTime {
-    IdentityTime {
-        name: b"Ada".to_vec(),
-        email: b"ada@example.com".to_vec(),
-        unix_secs: 1_700_000_200,
-        tz_offset_minutes: 0,
-    }
+    IdentityTime::new(
+        b"Ada".to_vec(),
+        b"ada@example.com".to_vec(),
+        1_700_000_200,
+        0,
+    )
+    .expect("identity fits the format")
 }
 
 /// Creates a changeset on `base` that puts `path`, through the write path.
@@ -844,18 +852,23 @@ fn create(store: &Backend, base: ChangesetId, path: &str) -> ChangesetId {
         content: write::put_blob(store, repo, upload).unwrap(),
         executable: false,
     };
-    let cs = Changeset {
-        parents: vec![base],
-        author: identity(),
-        committer: None,
-        message: path.as_bytes().to_vec(),
-        changes: BTreeMap::from([(self::path(path), Some(file))]),
-    };
+    let cs = Changeset::new(
+        vec![base],
+        identity(),
+        None,
+        path.as_bytes().to_vec(),
+        BTreeMap::from([(self::path(path), Some(file))]),
+    )
+    .expect("changeset fits the format");
     write::create_changeset(store, "r", &cs.encode()).unwrap()
 }
 
 /// Lands `cs` on `main`, and retries with the same key while the ref moves.
-fn land(store: &Backend, lands: &Lands, cs: ChangesetId) -> scion_server::land::LandOutcome {
+fn land(
+    store: &Backend,
+    lands: &Lands,
+    cs: ChangesetId,
+) -> scion_server::test_support::land::LandOutcome {
     let request = LandRequest {
         repo: "r".into(),
         changeset: cs,
@@ -898,13 +911,8 @@ fn an_import_process_shares_the_data_directory_with_lands() {
     // A land whose base is not on main builds main's path index at the
     // start, and leaves main alone.
     let repo = store.read(|c| c.repo_id("r")).unwrap();
-    let side = Changeset {
-        parents: vec![],
-        author: identity(),
-        committer: None,
-        message: b"side".to_vec(),
-        changes: BTreeMap::new(),
-    };
+    let side = Changeset::new(vec![], identity(), None, b"side".to_vec(), BTreeMap::new())
+        .expect("changeset fits the format");
     let side = store.write(|c| c.insert_changeset(repo, &side)).unwrap();
     let out = land(&store, &lands, create(&store, side, "s.txt"));
     assert_eq!(out.state, LandState::Rejected, "{}", out.detail);
@@ -921,7 +929,10 @@ fn an_import_process_shares_the_data_directory_with_lands() {
     let out = land(&store, &lands, create(&store, start, "mine.txt"));
     assert_eq!(out.state, LandState::Landed, "{}", out.detail);
     let mine = out.result.unwrap();
-    let parents = read::get_changeset(&store, "r", mine).unwrap().parents;
+    let parents = read::get_changeset(&store, "r", mine)
+        .unwrap()
+        .parents()
+        .to_vec();
     assert_eq!(parents, [imported]);
 
     // Agents land on main while another process imports more commits into
@@ -984,7 +995,7 @@ fn an_import_process_shares_the_data_directory_with_lands() {
     while at != mine {
         assert!(history.len() < landed.len(), "main does not reach {mine}");
         history.push(at);
-        at = read::get_changeset(&store, "r", at).unwrap().parents[0];
+        at = read::get_changeset(&store, "r", at).unwrap().parents()[0];
     }
     let mut want = landed;
     want.sort();
@@ -1021,13 +1032,8 @@ fn an_import_process_shares_the_postgres_database_with_lands() {
     // A land whose base is not on main builds main's path index at the
     // start, and leaves main alone.
     let repo = store.read(|c| c.repo_id("r")).unwrap();
-    let side = Changeset {
-        parents: vec![],
-        author: identity(),
-        committer: None,
-        message: b"side".to_vec(),
-        changes: BTreeMap::new(),
-    };
+    let side = Changeset::new(vec![], identity(), None, b"side".to_vec(), BTreeMap::new())
+        .expect("changeset fits the format");
     let side = store.write(|c| c.insert_changeset(repo, &side)).unwrap();
     let out = land(&store, &lands, create(&store, side, "s.txt"));
     assert_eq!(out.state, LandState::Rejected, "{}", out.detail);
@@ -1044,7 +1050,10 @@ fn an_import_process_shares_the_postgres_database_with_lands() {
     let out = land(&store, &lands, create(&store, start, "mine.txt"));
     assert_eq!(out.state, LandState::Landed, "{}", out.detail);
     let mine = out.result.unwrap();
-    let parents = read::get_changeset(&store, "r", mine).unwrap().parents;
+    let parents = read::get_changeset(&store, "r", mine)
+        .unwrap()
+        .parents()
+        .to_vec();
     assert_eq!(parents, [imported]);
 
     // Agents land on main while another process imports more commits into
@@ -1107,7 +1116,7 @@ fn an_import_process_shares_the_postgres_database_with_lands() {
     while at != mine {
         assert!(history.len() < landed.len(), "main does not reach {mine}");
         history.push(at);
-        at = read::get_changeset(&store, "r", at).unwrap().parents[0];
+        at = read::get_changeset(&store, "r", at).unwrap().parents()[0];
     }
     let mut want = landed;
     want.sort();
