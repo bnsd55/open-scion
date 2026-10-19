@@ -299,7 +299,7 @@ async fn start_reply(
     let first = find(&worker, &in_flight, busy, read, &allowed, zstd, key)
         .await
         .ok_or_else(reply::busy)?;
-    let (tx, stream) = reply::channel();
+    let (tx, stream, slot) = reply::channel();
     tokio::spawn(
         async move {
             let _walk_share = walk_share;
@@ -318,7 +318,7 @@ async fn start_reply(
                     key,
                 )
             };
-            reply::send_objects(first, rest, tx, waits.stall, stalled, produce).await;
+            reply::send_objects(first, rest, tx, waits.stall, stalled, slot, produce).await;
         }
         // The reply runs outside the call, but stays in its span.
         .instrument(tracing::Span::current()),

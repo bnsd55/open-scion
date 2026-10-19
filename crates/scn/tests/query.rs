@@ -10,11 +10,14 @@ use std::process::{Command, Output};
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, GitOid, IdentityTime, RepoPath};
 use scion_proto::runtime::listen::Limits;
-use scion_server::import::{ImportOptions, import_git};
-use scion_server::meta::Meta as _;
-use scion_server::meta::MetaTx as _;
-use scion_server::read::MAX_DIFF_ENTRIES;
-use scion_server::{Backend, Store, service, tree};
+use scion_server::test_support::meta::Meta as _;
+use scion_server::test_support::meta::MetaTx as _;
+use scion_server::test_support::read::MAX_DIFF_ENTRIES;
+use scion_server::{
+    Backend, Store,
+    test_support::{service, tree},
+};
+use scion_server::{ImportOptions, import_git};
 use serde_json::Value;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -89,7 +92,7 @@ impl Server {
             service::ServeOptions {
                 data: data.path().to_path_buf(),
                 limits: Limits::default(),
-                quotas: scion_server::quotas::Quotas::off(),
+                quotas: scion_server::Quotas::off(),
                 pending_lands: None,
                 land_stale_secs: 1 << 40,
                 tls: None,

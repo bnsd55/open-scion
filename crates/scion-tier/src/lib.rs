@@ -572,14 +572,15 @@ impl<S: Store> Tier<S> {
         IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
     {
         // Outside the token check, so a refused call counts too.
-        let objects =
-            scion_proto::runtime::metrics::MetricsLayer::new(Arc::clone(&self.inner.metrics))
-                .layer(InterceptedService::new(
-                    ObjectsServer::new(self)
-                        .max_decoding_message_size(MAX_MESSAGE_BYTES)
-                        .max_encoding_message_size(MAX_PART_MESSAGE_BYTES),
-                    Auth::new(token),
-                ));
+        let metrics = Arc::clone(&self.inner.metrics);
+        let objects = scion_proto::runtime::metrics::MetricsLayer::new(metrics.clone()).layer(
+            InterceptedService::new(
+                ObjectsServer::new(self)
+                    .max_decoding_message_size(MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_PART_MESSAGE_BYTES),
+                Auth::new(token),
+            ),
+        );
         // The health service answers `grpc.health.v1.Check` and `Watch` on
         // the same port, without a token: a probe carries none. The store
         // and the upstream channel opened before this call, so the tier
@@ -587,7 +588,13 @@ impl<S: Store> Tier<S> {
         let (health, shutdown) = listen::health(&["scion.v1.Objects"], shutdown).await;
         let router = |mut server: Server| server.add_service(health).add_service(objects);
         limits
-            .serve(router, incoming, tls.map(|tls| tls.config()), shutdown)
+            .serve(
+                router,
+                incoming,
+                tls.map(|tls| tls.config()),
+                shutdown,
+                metrics,
+            )
             .await
     }
 
@@ -637,6 +644,7 @@ impl<S: Store> Tier<S> {
         progress: Progress,
         first: reply::Found,
         tx: mpsc::Sender<reply::Sent>,
+        slot: reply::StallSlot,
     ) {
         let (tier, ask, progress) = (&self, &ask, &progress);
         let stalled = ask.stalled.clone();
@@ -647,6 +655,7 @@ impl<S: Store> Tier<S> {
             tx,
             STALL_TIMEOUT,
             stalled,
+            slot,
             produce,
         )
         .await;
@@ -1373,8 +1382,8 @@ impl<S: Store> Objects for Tier<S> {
             .await
             .ok_or_else(reply::busy)?;
         let first = split(first)?;
-        let (tx, stream) = reply::channel();
-        tokio::spawn(self.clone().reply(ask, progress, first, tx));
+        let (tx, stream, slot) = reply::channel();
+        tokio::spawn(self.clone().reply(ask, progress, first, tx, slot));
         Ok(Response::new(stream))
     }
 }

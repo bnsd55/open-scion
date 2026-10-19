@@ -8,16 +8,10 @@ use std::process::Command;
 
 use common::{REPO, TOKEN, changeset, land};
 use nfsserve::nfs::{filename3, nfspath3, nfsstat3, sattr3, set_size3};
-#[cfg(target_os = "linux")]
-use open_scion::client::Ctx;
 use open_scion::client::{id_from, test_objects};
 use open_scion::cmd::mount::{MountRecord, write_sessions};
 use open_scion::vfs::{NFSFileSystem, Vfs};
-#[cfg(target_os = "linux")]
-use scion_core::{Changeset, RepoPath};
 use scion_core::{ChangesetId, FileState};
-#[cfg(target_os = "linux")]
-use scion_proto::v1::GetChangesetRequest;
 use scion_proto::v1::GetRootTreeRequest;
 use scion_server::Backend;
 
@@ -259,6 +253,10 @@ fn a_mounts_overlay_commits_without_a_scan() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_non_utf8_name_commits_its_own_content() {
+    use open_scion::client::Ctx;
+    use scion_core::{Changeset, RepoPath};
+    use scion_proto::v1::GetChangesetRequest;
+
     let data = tempfile::tempdir().unwrap();
     let store = Backend::open_test(data.path()).unwrap();
     let base = start(&store);

@@ -592,7 +592,9 @@ impl PgClient {
 
     /// Runs one closure with the client on the worker thread. The sync
     /// client must never be touched from a tokio thread, which this
-    /// keeps true for the few setup statements a caller needs.
+    /// keeps true for the few setup statements a caller needs. Only the
+    /// test schema's preparation calls it.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn as_raw(&self, f: impl FnOnce(&mut Client) -> Result<()> + Send + 'static) -> Result<()> {
         let (reply, rx) = std::sync::mpsc::channel();
         self.jobs
@@ -665,6 +667,7 @@ impl PgClient {
 /// whose owner still runs is named in `pg_stat_activity` under its
 /// `application_name`, and registered with its start time, so the
 /// schema of a test that just began is never dropped.
+#[cfg(any(test, feature = "test-hooks"))]
 fn drop_stale_schemas(maker: &PgClient) {
     let got = maker.query_opt("SELECT pg_try_advisory_lock($1)", &[P::i64(CLEAN_LOCK)]);
     let Ok(got) = got else {
@@ -712,6 +715,7 @@ fn drop_stale_schemas(maker: &PgClient) {
 }
 
 /// The advisory lock of the test-schema cleanup.
+#[cfg(any(test, feature = "test-hooks"))]
 const CLEAN_LOCK: i64 = 0x5343_494F_4E53_5445;
 
 /// The libpq options of every connection of this backend. The commit of
@@ -785,6 +789,7 @@ impl Pg {
     /// # Errors
     ///
     /// As [`Pg::open`].
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn open_test(
         url: &str,
         schema: &str,
@@ -803,6 +808,7 @@ impl Pg {
     /// schema the same way and takes no one-server lock, and its loss
     /// fences nothing, like a `gc`, `fsck` or `import` beside a live
     /// server.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn open_test_shared(
         url: &str,
         schema: &str,
@@ -1645,6 +1651,8 @@ fn server_lock_raw(client: &mut Client, key: i64) -> bool {
         .is_ok_and(|row| row.is_some_and(|row| row.get::<_, bool>(0)))
 }
 
+/// A plain connection. Only the test schema's preparation calls it.
+#[cfg(any(test, feature = "test-hooks"))]
 fn connect(url: &str, ca: Option<&Path>) -> Result<PgClient> {
     connect_with(url, ca, "", None)
 }
@@ -1935,6 +1943,7 @@ fn load_tree(c: &PgClient, id: TreeId) -> Result<(Tree, Vec<u8>)> {
 }
 
 /// The error of a graph walk that reached its bound.
+#[cfg(any(test, feature = "test-hooks"))]
 fn too_deep(max_visits: usize) -> Error {
     Error::ResourceExhausted(format!(
         "the history is too deep: the answer needs more than {max_visits} changesets"
@@ -2113,6 +2122,7 @@ impl MetaTx for PgTx<'_> {
     }
 
     /// The first parent of a changeset, or `None` for a root.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn first_parent(&mut self, id: ChangesetId) -> Result<Option<ChangesetId>> {
         let parent = self
             .c
@@ -2158,6 +2168,7 @@ impl MetaTx for PgTx<'_> {
     /// [`Error::NotFound`] if `repo` does not have either changeset.
     /// [`Error::ResourceExhausted`] if the walk needs more than `max_visits`
     /// changesets.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn is_ancestor(
         &mut self,
         repo: RepoId,
@@ -3040,6 +3051,7 @@ impl Meta for Pg {
 /// narrows its search path to it. One maker at a time: two concurrent
 /// `CREATE TABLE IF NOT EXISTS` of the registry race on the type
 /// catalog, and the loser dies.
+#[cfg(any(test, feature = "test-hooks"))]
 fn prepare_test_schema(url: &str, schema: &str) -> Result<()> {
     let preparer = connect(url, None)?;
     preparer.as_raw({

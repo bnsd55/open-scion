@@ -8,11 +8,14 @@
 //! Git headers that Scion does not model (`encoding`, `gpgsig`, `mergetag`)
 //! are dropped, so a changeset ID is not a function of the git object name.
 
-use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 #[cfg(test)]
 use std::sync::{Mutex, PoisonError};
+// Both `Cell` users sit behind a cfg: the slow-record model of a test,
+// and the check counter the test-hooks feature turns on.
+#[cfg(any(test, feature = "test-hooks"))]
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use gix::ObjectId;
@@ -146,6 +149,28 @@ pub fn import_git(
     import_with_cache(store, repo, git_dir, opts, BLOB_CACHE_ENTRIES, MAX_CHANGES)
 }
 
+/// Opens the git repository of an import and resolves the commit `rev`
+/// names: the tip the import works toward. Only SHA-1 repositories are
+/// supported.
+fn open_tip(git_dir: &Path, rev: &str) -> Result<(gix::Repository, gix::hash::ObjectId)> {
+    let mut git = gix::open(git_dir)
+        .map_err(|e| Error::Git(format!("cannot open {}: {e}", git_dir.display())))?;
+    if git.object_hash() != gix::hash::Kind::Sha1 {
+        return Err(Error::Git(format!(
+            "{}: only SHA-1 repositories are supported",
+            git_dir.display()
+        )));
+    }
+    git.object_cache_size_if_unset(OBJECT_CACHE_BYTES);
+    let tip = git
+        .rev_parse_single(rev)
+        .and_then(|id| id.object())
+        .and_then(gix::Object::peel_to_commit)
+        .map_err(|e| Error::Git(format!("cannot resolve {rev:?} to a commit: {e}")))?
+        .id;
+    Ok((git, tip))
+}
+
 /// [`import_git`] with at most `cache_entries` entries in each blob cache,
 /// and a commit capped at `max_changes` changed paths (the write path's
 /// [`MAX_CHANGES`]; a test overrides it with a smaller one).
@@ -158,21 +183,7 @@ fn import_with_cache(
     max_changes: usize,
 ) -> Result<ImportReport> {
     let started = Instant::now();
-    let mut git = gix::open(git_dir)
-        .map_err(|e| Error::Git(format!("cannot open {}: {e}", git_dir.display())))?;
-    if git.object_hash() != gix::hash::Kind::Sha1 {
-        return Err(Error::Git(format!(
-            "{}: only SHA-1 repositories are supported",
-            git_dir.display()
-        )));
-    }
-    git.object_cache_size_if_unset(OBJECT_CACHE_BYTES);
-    let tip = git
-        .rev_parse_single(opts.rev.as_str())
-        .and_then(|id| id.object())
-        .and_then(gix::Object::peel_to_commit)
-        .map_err(|e| Error::Git(format!("cannot resolve {:?} to a commit: {e}", opts.rev)))?
-        .id;
+    let (git, tip) = open_tip(git_dir, &opts.rev)?;
 
     // A shared import re-runs often: look the repo up before opening a
     // write transaction for it, so the common path does not commit at all
@@ -248,6 +259,9 @@ fn import_with_cache(
         // the counted boundary a test holds the lock at.
         #[cfg(any(test, feature = "test-hooks"))]
         store.run_after_batch(batch_no);
+        // A release build reads the batch index nowhere.
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = batch_no;
     }
 
     // The tip was imported before, or planned and imported above.

@@ -10,11 +10,11 @@ use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{
     CreateChangesetRequest, GetChangesetRequest, ListDirRequest, PutBlobRequest,
 };
-use scion_server::meta::MetaTx;
+use scion_server::test_support::meta::MetaTx;
 use std::sync::Arc;
 
-use scion_server::metrics::Metrics;
-use scion_server::{Backend, Store, service};
+use scion_server::Metrics;
+use scion_server::{Backend, Store, test_support::service};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 use tonic::Status;
@@ -77,7 +77,7 @@ async fn big_repo(names: usize) -> (tempfile::TempDir, Scion, ChangesetId) {
         service::ServeOptions {
             data: dir.path().to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,

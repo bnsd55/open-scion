@@ -9,9 +9,9 @@ use scion_proto::runtime::auth::token_digest;
 use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{BlameChangeset, BlameRange, BlameRequest};
-use scion_server::access::Access;
-use scion_server::meta::{Meta as _, MetaTx as _};
-use scion_server::{Backend, Store, service};
+use scion_server::Access;
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::{Backend, Store, test_support::service};
 use tokio::net::TcpListener;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -133,13 +133,13 @@ async fn serve(
         service::ServeOptions {
             data: dir.to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
-            metrics: Arc::new(scion_server::metrics::Metrics::default()),
+            metrics: Arc::new(scion_server::Metrics::default()),
         },
-        Some(Arc::new(scion_server::tickets::Keys::generate())),
+        Some(Arc::new(scion_server::Keys::generate())),
         async {
             stopped.await.ok();
         },
@@ -575,7 +575,7 @@ async fn a_cursor_that_names_an_impossible_line_count_is_refused() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_file_with_too_many_lines_is_refused() {
     let (dir, store, root) = store(b"");
-    let over = scion_server::blame::MAX_BLAME_DIFF_LINES + 1;
+    let over = scion_server::test_support::blame::MAX_BLAME_DIFF_LINES + 1;
     let blob = put(&store, vec![b'\n'; over].as_slice());
     let tip = store
         .write(|c| {
@@ -605,11 +605,11 @@ async fn a_file_with_too_many_lines_is_refused() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_older_version_with_too_many_lines_counts_as_absent() {
     let (dir, store, root) = store(b"");
-    let over = scion_server::blame::MAX_BLAME_DIFF_LINES + 1;
+    let over = scion_server::test_support::blame::MAX_BLAME_DIFF_LINES + 1;
     // The parent: `over` empty lines. The child: the first `over - 1` of
     // them, under the cap, so the request itself is servable.
     let parent_blob = put(&store, vec![b'\n'; over].as_slice());
-    let under = scion_server::blame::MAX_BLAME_DIFF_LINES;
+    let under = scion_server::test_support::blame::MAX_BLAME_DIFF_LINES;
     // `under - 1` newlines and a last line without one: exactly `under`
     // lines, at the cap, so the request itself is servable.
     let mut body = vec![b'\n'; under - 1];

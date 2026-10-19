@@ -4,8 +4,8 @@
 //! transaction open leaves the reader pool healthy.
 
 use scion_core::{Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
-use scion_server::meta::MetaTx as _;
-use scion_server::{Backend, Store, meta::Meta as _};
+use scion_server::test_support::meta::MetaTx as _;
+use scion_server::{Backend, Store, test_support::meta::Meta as _};
 use std::collections::BTreeMap;
 
 const REPO: &str = "r";
@@ -121,7 +121,7 @@ fn a_read_that_leaves_a_transaction_open_is_replaced() {
                     .execute("BEGIN", params![])?;
                 panic!("the read dies with its transaction open");
                 #[allow(unreachable_code)]
-                Ok::<(), scion_server::error::Error>(())
+                Ok::<(), scion_server::Error>(())
             });
         }));
         assert!(panicked.is_err(), "the read panicked");

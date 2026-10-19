@@ -27,10 +27,13 @@ use scion_proto::v1::{
     Encoding, GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, ObjectKind, ObjectPart,
     ResolveRefRequest, ResolveRefResponse,
 };
-use scion_server::import::{ImportOptions, import_git};
-use scion_server::meta::Meta as _;
-use scion_server::meta::MetaTx as _;
-use scion_server::{Backend, Store, service, tree};
+use scion_server::test_support::meta::Meta as _;
+use scion_server::test_support::meta::MetaTx as _;
+use scion_server::{
+    Backend, Store,
+    test_support::{service, tree},
+};
+use scion_server::{ImportOptions, import_git};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -121,7 +124,7 @@ impl Server {
         let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         // The server mints the checkout's ticket, which scn then spends.
-        let tickets = Some(std::sync::Arc::new(scion_server::tickets::Keys::generate()));
+        let tickets = Some(std::sync::Arc::new(scion_server::Keys::generate()));
         runtime.spawn(service::serve(
             store,
             listener,
@@ -129,7 +132,7 @@ impl Server {
             service::ServeOptions {
                 data: data.path().to_path_buf(),
                 limits: Limits::default(),
-                quotas: scion_server::quotas::Quotas::off(),
+                quotas: scion_server::Quotas::off(),
                 pending_lands: None,
                 land_stale_secs: 1 << 40,
                 tls: None,
@@ -1133,7 +1136,7 @@ fn a_schema_6_data_dir_upgrades_and_checks_out() {
             let repo = c.create_repo(REPO)?;
             let mut missing = |b| {
                 lens.remove(&b)
-                    .ok_or_else(|| scion_server::error::Error::NotFound(format!("blob {b}")))
+                    .ok_or_else(|| scion_server::Error::NotFound(format!("blob {b}")))
             };
             let root = tree::store_changeset(c, repo, &changeset(None, hello), &mut missing)?.0;
             let child =

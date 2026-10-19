@@ -187,7 +187,9 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(cli.listen)
         .await
         .with_context(|| format!("cannot listen on {}", cli.listen))?;
-    tracing::info!(listen = %cli.listen, upstream = %cli.upstream, "serving");
+    // The bound address, so port 0 shows the port that the OS chose.
+    let listen = listener.local_addr()?;
+    tracing::info!(%listen, upstream = %cli.upstream, "serving");
     let limits = Limits {
         connections: cli.max_connections,
         streams: cli.max_streams,

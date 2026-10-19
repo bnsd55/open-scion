@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::Command;
 
 use scion_server::Backend;
-use scion_server::meta::{Meta as _, MetaTx as _};
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 
 /// The refusal needs a directory whose marker names Postgres, which only
 /// a Postgres-backed open writes.

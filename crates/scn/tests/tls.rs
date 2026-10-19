@@ -6,9 +6,12 @@ use std::process::Command;
 
 use scion_core::{Changeset, IdentityTime};
 use scion_proto::runtime::listen::Limits;
-use scion_server::meta::Meta as _;
-use scion_server::meta::MetaTx as _;
-use scion_server::{Backend, service, tree};
+use scion_server::test_support::meta::Meta as _;
+use scion_server::test_support::meta::MetaTx as _;
+use scion_server::{
+    Backend,
+    test_support::{service, tree},
+};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -135,7 +138,7 @@ async fn serve_tls(certs: &TestCerts) -> String {
         service::ServeOptions {
             data: data.clone(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: Some(tls),

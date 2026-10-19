@@ -16,11 +16,11 @@ use scion_proto::v1::{
     LogRequest, MergeBaseRequest, PutBlobRequest, ReadFileRequest, ResolveRefRequest,
 };
 
-use scion_server::access::Access;
-use scion_server::meta::{Meta as _, MetaTx as _};
-use scion_server::metrics::Metrics;
-use scion_server::tickets::Keys;
-use scion_server::{Backend, service};
+use scion_server::Access;
+use scion_server::Keys;
+use scion_server::Metrics;
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::{Backend, test_support::service};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -116,7 +116,7 @@ async fn serve(
         service::ServeOptions {
             data: dir.to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
