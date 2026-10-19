@@ -640,7 +640,7 @@ fn take_walk_bytes(
         Ok(one) => held.push(one),
         Err(_) => {
             return Err(Error::Unavailable(format!(
-                "the derive walk is over its byte budget, at a frontier of {} changesets; retry",
+                "the derive walk is over its byte budget, at a frontier of {} bytes; retry",
                 walk.bytes()
             )));
         }
