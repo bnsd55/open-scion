@@ -8,11 +8,11 @@ use std::process::Command;
 
 use common::{REPO, TOKEN, changeset, land};
 use nfsserve::nfs::{filename3, sattr3, set_size3};
-use open_scion::client::{id_from, test_objects};
+use open_scion::client::{Ctx, id_from, test_objects};
 use open_scion::cmd::mount::{MountRecord, write_sessions};
 use open_scion::vfs::{NFSFileSystem, Vfs};
-use scion_core::{ChangesetId, FileState};
-use scion_proto::v1::GetRootTreeRequest;
+use scion_core::{Changeset, ChangesetId, FileState, RepoPath};
+use scion_proto::v1::{GetChangesetRequest, GetRootTreeRequest};
 use scion_server::Backend;
 
 mod common;
@@ -237,4 +237,96 @@ fn a_mounts_overlay_commits_without_a_scan() {
         ),
         "added"
     );
+}
+
+/// A name that is not UTF-8 commits its own content, not that of the
+/// file its lossy spelling names. Linux filesystems hold such names;
+/// macOS's refuse them at create time, so there is nothing to commit.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_non_utf8_name_commits_its_own_content() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
+    let base = start(&store);
+    let tiers = common::Tiers::start(data, store.clone());
+    let mounted = mount(&tiers, &base);
+    let vfs = &mounted.vfs;
+
+    // Through the VFS: a file named with an invalid byte, and one whose
+    // name is that byte's lossy spelling (U+FFFD).
+    let raw = b"a\xffb";
+    let lossy = String::from_utf8_lossy(raw).into_owned();
+    assert_ne!(lossy.as_bytes(), &raw[..]);
+    tiers.runtime.block_on(async {
+        let root = NFSFileSystem::root_dir(vfs);
+        let (id, _) = vfs
+            .create(root, &filename3::from(raw.to_vec()), sattr3::default())
+            .await
+            .unwrap();
+        vfs.write(id, 0, b"raw\n").await.unwrap();
+        let (id, _) = vfs
+            .create(
+                root,
+                &filename3::from(lossy.clone().into_bytes()),
+                sattr3::default(),
+            )
+            .await
+            .unwrap();
+        vfs.write(id, 0, b"lossy\n").await.unwrap();
+    });
+
+    let cs = scn(
+        &tiers.server,
+        mounted.home.path(),
+        &[
+            "commit",
+            "-m",
+            "raw names",
+            "--from-mount",
+            mounted.view.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(cs.len(), 64, "the commit printed no changeset: {cs}");
+
+    // Each name carries its own content. The CLI's cat cannot take a
+    // non-UTF-8 name (clap reads String), so the changeset is read from
+    // the server's RPC and its blobs from the store.
+    let mut ctx = tiers
+        .runtime
+        .block_on(async {
+            Ctx::connect(&tiers.server, None, TOKEN, None, REPO.to_owned(), false).await
+        })
+        .unwrap();
+    let id: ChangesetId = cs.parse().unwrap();
+    let mut reply = tiers
+        .runtime
+        .block_on(async {
+            ctx.client
+                .get_changeset(GetChangesetRequest {
+                    repo: REPO.to_owned(),
+                    changeset_id: id.as_bytes().to_vec(),
+                })
+                .await
+        })
+        .unwrap()
+        .into_inner();
+    let mut bytes = Vec::new();
+    tiers.runtime.block_on(async {
+        while let Some(part) = reply.message().await.unwrap() {
+            bytes.extend_from_slice(&part.changeset);
+        }
+    });
+    let committed = Changeset::decode(&bytes).unwrap();
+    let state = |name: &[u8]| {
+        committed
+            .changes
+            .get(&RepoPath::new(name.to_vec()).unwrap())
+            .and_then(|state| state.as_ref())
+    };
+    let blob = |state: Option<&FileState>| match state {
+        Some(FileState::Regular { content, .. }) => store.blobs().get(*content).unwrap(),
+        _ => panic!("not a regular file: {state:?}"),
+    };
+    assert_eq!(blob(state(raw)), b"raw\n");
+    assert_eq!(blob(state(lossy.as_bytes())), b"lossy\n");
 }
