@@ -21,7 +21,6 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::Instant;
 
 use scion_core::{Changeset, ChangesetId};
 
@@ -297,7 +296,7 @@ fn take_walk_permit<'a>(
                     .unwrap_or_else(PoisonError::into_inner);
             }
             Some(deadline) => {
-                let budget = deadline.at().saturating_duration_since(Instant::now());
+                let budget = deadline.remaining();
                 let (guard, result) = walks
                     .woken
                     .wait_timeout_while(in_flight, budget, |in_flight| {
@@ -385,7 +384,7 @@ fn waited(flight: &Arc<Flight>, before: u64, deadline: Option<&Deadline>) -> boo
                     .unwrap_or_else(PoisonError::into_inner);
             }
             Some(deadline) => {
-                let budget = deadline.at().saturating_duration_since(Instant::now());
+                let budget = deadline.remaining();
                 let (guard, result) = flight
                     .woken
                     .wait_timeout_while(walks, budget, |walks| *walks <= before)
@@ -887,7 +886,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use scion_core::{BlobId, FileState, IdentityTime, RepoPath};
 
@@ -1178,9 +1177,8 @@ mod tests {
             for _ in 0..8 {
                 scope.spawn(|| {
                     at_the_gate.wait();
-                    let deadline = crate::deadline::Deadline::new(
-                        std::time::Instant::now() + Duration::from_secs(60),
-                    );
+                    let deadline =
+                        crate::deadline::Deadline::new(Instant::now() + Duration::from_secs(60));
                     assert_eq!(get_by::<Cold<1>>(store, repo, tip, &deadline).unwrap(), 12);
                 });
             }
@@ -1504,7 +1502,7 @@ mod tests {
 
     #[test]
     fn a_fill_with_a_deadline_stops_between_steps() {
-        let past = Deadline::new(std::time::Instant::now());
+        let past = Deadline::new(Instant::now());
         // A history of one step is walked in one go, and the deadline stops
         // the first derivation step. A longer one stops in its walk.
         for n in [STEP, 7] {
@@ -1557,7 +1555,7 @@ mod tests {
             .walk_bytes()
             .try_take(2 * walk_step_bytes())
             .unwrap();
-        let deadline = Deadline::new(std::time::Instant::now() + Duration::from_secs(60));
+        let deadline = Deadline::new(Instant::now() + Duration::from_secs(60));
         let busy = get_by::<Ancestry>(&store, repo, tip, &deadline);
         let Err(Error::Unavailable(why)) = &busy else {
             panic!("not busy: {busy:?}");
@@ -1947,9 +1945,8 @@ mod tests {
             for _ in 0..8 {
                 scope.spawn(|| {
                     at_the_gate.wait();
-                    let deadline = crate::deadline::Deadline::new(
-                        std::time::Instant::now() + Duration::from_secs(60),
-                    );
+                    let deadline =
+                        crate::deadline::Deadline::new(Instant::now() + Duration::from_secs(60));
                     assert_eq!(get_by::<Cold<1>>(&store, repo, tip, &deadline).unwrap(), 12);
                 });
             }
@@ -2062,9 +2059,8 @@ mod tests {
         let (owner, beside) = std::thread::scope(|scope| {
             let _gate = gate_closed();
             let owner = scope.spawn(|| {
-                let deadline = crate::deadline::Deadline::new(
-                    std::time::Instant::now() + Duration::from_secs(60),
-                );
+                let deadline =
+                    crate::deadline::Deadline::new(Instant::now() + Duration::from_secs(60));
                 get_by::<Cold<1>>(&store, repo1, ids1[2], &deadline).unwrap()
             });
             // The owner is provably inside its walk: its first derive ran,
@@ -2079,17 +2075,15 @@ mod tests {
             // wait for the first store's permit, and it would never reach
             // the gate.
             let beside = scope.spawn(|| {
-                let deadline = crate::deadline::Deadline::new(
-                    std::time::Instant::now() + Duration::from_secs(60),
-                );
+                let deadline =
+                    crate::deadline::Deadline::new(Instant::now() + Duration::from_secs(60));
                 get_by::<Cold<1>>(&store2, repo_b, ids_b[2], &deadline).unwrap()
             });
             wait_entered(2);
             // A caller of repo two waits for the permit, then walks.
             let waited = scope.spawn(|| {
-                let deadline = crate::deadline::Deadline::new(
-                    std::time::Instant::now() + Duration::from_secs(60),
-                );
+                let deadline =
+                    crate::deadline::Deadline::new(Instant::now() + Duration::from_secs(60));
                 get_by::<Cold<1>>(&store, repo2, ids2[2], &deadline).unwrap()
             });
             // A caller of repo three with a deadline gives up: the one
@@ -2266,7 +2260,7 @@ mod tests {
                     let store = store.clone();
                     scope.spawn(move || {
                         let deadline = crate::deadline::Deadline::new(
-                            std::time::Instant::now() + Duration::from_secs(60),
+                            Instant::now() + Duration::from_secs(60),
                         );
                         get_by::<Cold<1>>(&store, repo, tip, &deadline).unwrap()
                     })
@@ -2312,9 +2306,8 @@ mod tests {
         std::thread::scope(|scope| {
             let _gate = gate_closed();
             let walker = scope.spawn(|| {
-                let deadline = crate::deadline::Deadline::new(
-                    std::time::Instant::now() + Duration::from_secs(60),
-                );
+                let deadline =
+                    crate::deadline::Deadline::new(Instant::now() + Duration::from_secs(60));
                 get_by::<Cold<1>>(&store, repo, tip, &deadline).unwrap()
             });
             wait_entered(1);
@@ -2376,9 +2369,8 @@ mod tests {
         std::thread::scope(|scope| {
             let _gate = gate_closed();
             let walker = scope.spawn(|| {
-                let deadline = crate::deadline::Deadline::new(
-                    std::time::Instant::now() + Duration::from_secs(60),
-                );
+                let deadline =
+                    crate::deadline::Deadline::new(Instant::now() + Duration::from_secs(60));
                 get_by::<Cold<1>>(&store, repo, tip, &deadline).unwrap()
             });
             wait_entered(1);

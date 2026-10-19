@@ -1211,9 +1211,7 @@ impl Pg {
                     .unwrap_or_else(PoisonError::into_inner);
                 continue;
             };
-            let budget = deadline
-                .at()
-                .saturating_duration_since(std::time::Instant::now());
+            let budget = deadline.remaining();
             let (guard, timed_out) = self
                 .inner
                 .write_woken

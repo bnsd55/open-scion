@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use rustix::fs::FlockOperation;
@@ -177,10 +177,10 @@ impl WritePark {
         let _ = fs::write(&marker, b"");
         // A cold CI import of one commit took about 30 s; the ceiling
         // sits well above it, and the test lifts the park long before.
-        let give_up = Instant::now() + Duration::from_secs(180);
+        let give_up = std::time::Instant::now() + Duration::from_secs(180);
         while file.exists() {
             assert!(
-                Instant::now() < give_up,
+                std::time::Instant::now() < give_up,
                 "the park of {id} was never lifted"
             );
             std::thread::sleep(Duration::from_millis(5));
@@ -508,7 +508,7 @@ impl Store {
                     .unwrap_or_else(PoisonError::into_inner);
                 continue;
             };
-            let budget = deadline.at().saturating_duration_since(Instant::now());
+            let budget = deadline.remaining();
             let (guard, timed_out) = self
                 .inner
                 .write_woken
@@ -2410,9 +2410,9 @@ mod tests {
             // A ceiling only bounds the wait of the good code: the write
             // of the broken code renames at once, and the absence assert
             // fails.
-            let until = Instant::now() + Duration::from_millis(200);
+            let until = std::time::Instant::now() + Duration::from_millis(200);
             let mut landed = false;
-            while Instant::now() < until {
+            while std::time::Instant::now() < until {
                 if store.blobs().verify(id).unwrap() == BlobStatus::Valid {
                     landed = true;
                     break;
