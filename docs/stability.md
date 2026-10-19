@@ -27,6 +27,14 @@ version (`[workspace.package]`), a release bumps it in one place
 changes. In 0.x, the patch-vs-minor rule above is the whole promise; 1.0
 will say which surfaces are frozen.
 
+The toolchain floor (the MSRV, `rust-version` in
+`[workspace.package]`) rises only in a minor release: a patch release
+never raises it. A release that raises the floor says so in its release
+notes. The floor never rises above the stable toolchain of six months
+ago, so a user on a recent-at-release Rust can always build a 0.x
+source tree. The rule lives here; CI's `check (MSRV)` job proves the
+floor builds, not that the six-month rule holds.
+
 ## Where each promise is written down
 
 - Wire protocol: [protocol-v1.md](protocol-v1.md), the contract of
