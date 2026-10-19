@@ -2306,6 +2306,7 @@ pub(crate) mod spawn_guard {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::old_store;
     use crate::db::SqliteTx;
     use crate::meta::MetaTx as _;
     use std::cell::{Cell, RefCell};
@@ -2632,6 +2633,145 @@ mod tests {
                 assert!(matches!(open(dir.path()), Err(Error::Corrupt(_))));
             }
         });
+    }
+
+    /// A data directory written at schema version 1 opens on this build:
+    /// the open migrates it forward through every migration, and what it
+    /// held reads back ([#318]). The fixture is the rows a v1 store's
+    /// write paths left: one repo, one root changeset, its ref, and the
+    /// blob files, which carry no schema. The `repo_blobs` rows the v1
+    /// schema has no room for are filled by the upgrade's own Rust step
+    /// (`db::fill_repo_blobs`), and the trees the old format held are
+    /// dropped by the upgrade and rebuilt from the changesets on demand.
+    #[test]
+    fn a_store_of_schema_version_1_opens_upgrades_and_serves() {
+        super::spawn_guard::across_release(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let scratch = tempfile::tempdir().unwrap();
+            // The blob files, made by this build's writer and copied into
+            // the old directory: blob files are content-addressed and
+            // carry no schema.
+            let (blob_a, blob_b) = {
+                let store = Store::open(scratch.path()).unwrap();
+                let a = store.blobs().put(old_store::A).unwrap();
+                let b = store.blobs().put(old_store::B).unwrap();
+                for id in [a, b] {
+                    // The file of `id` sits at objects/blob/<2 hex>/<rest>
+                    // (the layout of a store's object folder); the copy
+                    // must land at the same place in the old directory.
+                    // A prefix strip would miss: an open may spell the
+                    // same directory through its canonical path, and on
+                    // macOS the two spellings differ (/var, /private/var).
+                    let (_, from) = store.blobs().location(id);
+                    let hex = id.to_string();
+                    let to = dir
+                        .path()
+                        .join("objects")
+                        .join("blob")
+                        .join(&hex[..2])
+                        .join(&hex[2..]);
+                    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+                    std::fs::copy(from, &to).unwrap();
+                }
+                (a, b)
+            };
+            // The metadata at version 1, as this build's migrations make
+            // it: the schema of 0001 alone, with one repo, its root
+            // changeset and its ref.
+            let cs = old_store::changeset(blob_a, blob_b);
+            let (body, id) = cs.encode_with_id();
+            {
+                let db = Connection::open(dir.path().join("scion.db")).unwrap();
+                super::migrate(&db, 1).unwrap();
+                db.execute("INSERT INTO repos (repo_id, name) VALUES (1, 'main')", [])
+                    .unwrap();
+                db.execute(
+                    "INSERT INTO changesets (id, gen, body) VALUES (?1, 1, ?2)",
+                    rusqlite::params![&id.as_bytes()[..], &body],
+                )
+                .unwrap();
+                db.execute(
+                    "INSERT INTO repo_changesets (repo_id, cs) VALUES (1, ?1)",
+                    rusqlite::params![&id.as_bytes()[..]],
+                )
+                .unwrap();
+                db.execute(
+                    "INSERT INTO refs (repo_id, name, target, version) \
+                     VALUES (1, 'main', ?1, 1)",
+                    rusqlite::params![&id.as_bytes()[..]],
+                )
+                .unwrap();
+            }
+            // A plain open of this build, alone in the directory, moves
+            // the schema to this build's version and serves.
+            let store = Store::open(dir.path()).unwrap();
+            assert_eq!(store.read(user_version).unwrap(), SCHEMA_VERSION);
+            let backend = crate::Backend::Sqlite(store);
+            old_store::assert_serves(&backend, &cs, id, blob_a, blob_b);
+        });
+    }
+
+    /// The shipped migrations are frozen: a store an old build made was
+    /// built from these files as they shipped, and an edit would cut
+    /// that store off — its schema and its data would no longer match
+    /// what this build's migrations expect. A change ships as a new
+    /// migration that repairs the data (the `db::fill_repo_blobs` step
+    /// of 0004 is one), never as an edit ([#318]).
+    #[test]
+    fn the_shipped_migrations_stay_as_they_shipped() {
+        for (name, file, hex) in [
+            (
+                "0001_init",
+                include_bytes!("../migrations/0001_init.sql").as_slice(),
+                "eb65ae7921f3617de1e5e1f4e56d6ede0ab665347e3234750d0f823ecaf3ed33",
+            ),
+            (
+                "0002_land_retention",
+                include_bytes!("../migrations/0002_land_retention.sql").as_slice(),
+                "b78776cc8a0e9c819d26b128d0447855d92f54d11fd57a6f9b09180fb49d5e60",
+            ),
+            (
+                "0003_derived_values",
+                include_bytes!("../migrations/0003_derived_values.sql").as_slice(),
+                "24eca54488a578d89eaab1605dc4d7f0de6ab193b894d0b006efc1fc18a16f56",
+            ),
+            (
+                "0004_repo_blobs",
+                include_bytes!("../migrations/0004_repo_blobs.sql").as_slice(),
+                "a0daf78fdc229c5566733a2f024b83406c1db44099c3bdcbb5420ab5b0254ae4",
+            ),
+            (
+                "0005_path_history",
+                include_bytes!("../migrations/0005_path_history.sql").as_slice(),
+                "d2f6208c0ac468954dc8b1c042a5e49b4670eab01db3166991f54b1bae62b410",
+            ),
+            (
+                "0006_land_created_at",
+                include_bytes!("../migrations/0006_land_created_at.sql").as_slice(),
+                "65b9444e6acb7e2ea464ae57cc6353d7ebe678b9ffd36da62ad1cf55e9056392",
+            ),
+            (
+                "0007_tree_sizes",
+                include_bytes!("../migrations/0007_tree_sizes.sql").as_slice(),
+                "147d93ba2ea43a186914895350986cc5e604d3da0a763d455ba3ba6c03d046eb",
+            ),
+            (
+                "0008_view_roots",
+                include_bytes!("../migrations/0008_view_roots.sql").as_slice(),
+                "a6e9a1945d8568082356fb2a7c9b690f83767d291b3e86327501e3176c30c281",
+            ),
+            (
+                "0009_view_trees",
+                include_bytes!("../migrations/0009_view_trees.sql").as_slice(),
+                "f185aa49659731e6da817dc050c8689b1d7618d290d22d98a70998b601704e32",
+            ),
+        ] {
+            assert_eq!(
+                blake3::hash(file).to_hex().as_str(),
+                hex,
+                "migration {name} shipped: add a new migration, never edit one",
+            );
+        }
     }
 
     #[test]
