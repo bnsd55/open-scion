@@ -307,7 +307,7 @@ fn changeset_json(id: ChangesetId, cs: &Changeset) -> Value {
         "id": id.to_string(),
         "parents": cs.parents().iter().map(ToString::to_string).collect::<Vec<_>>(),
         "author": identity_json(&cs.author()),
-        "committer": cs.committer().as_ref().map(identity_json),
+        "committer": cs.committer().map(identity_json),
         "message": lossy(&cs.message()),
     })
 }

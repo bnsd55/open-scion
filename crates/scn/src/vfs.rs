@@ -557,7 +557,7 @@ impl Vfs {
                 }
                 let kind = match entry {
                     Entry::Dir(tree) => Kind::Dir {
-                        tree: Some(tree),
+                        tree: Some(*tree),
                         listed: None,
                     },
                     Entry::File(file) => match (file.state(), file.size()) {
