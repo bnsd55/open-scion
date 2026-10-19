@@ -179,7 +179,13 @@ async fn a_second_signal_ends_the_drain_of_an_open_call() {
     let mut watcher = server.watcher.take().unwrap();
 
     // The first signal starts the drain: the open watch sees NOT_SERVING
-    // and stays open, so the server keeps running.
+    // and stays open, so the server keeps running. The watch's first
+    // status, `SERVING`, comes first.
+    let first = common::ceiling("the first overall status", watcher.message())
+        .await
+        .unwrap()
+        .expect("a status");
+    assert_eq!(first.status(), ServingStatus::Serving);
     interrupt(&server.child);
     let update = common::ceiling("the NOT_SERVING update", watcher.message())
         .await
