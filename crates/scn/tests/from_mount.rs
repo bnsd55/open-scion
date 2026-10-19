@@ -4,17 +4,15 @@
 
 #![cfg(unix)]
 
-use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::OsStrExt as _;
 use std::process::Command;
 
 use common::{REPO, TOKEN, changeset, land};
 use nfsserve::nfs::{filename3, sattr3, set_size3};
-use open_scion::client::{id_from, test_objects};
+use open_scion::client::{Ctx, id_from, test_objects};
 use open_scion::cmd::mount::{MountRecord, write_sessions};
 use open_scion::vfs::{NFSFileSystem, Vfs};
-use scion_core::{ChangesetId, FileState};
-use scion_proto::v1::GetRootTreeRequest;
+use scion_core::{Changeset, ChangesetId, FileState, RepoPath};
+use scion_proto::v1::{GetChangesetRequest, GetRootTreeRequest};
 use scion_server::Backend;
 
 mod common;
@@ -267,7 +265,7 @@ fn a_non_utf8_name_commits_its_own_content() {
     let data = tempfile::tempdir().unwrap();
     let store = Backend::open_test(data.path()).unwrap();
     let base = start(&store);
-    let tiers = common::Tiers::start(data, store);
+    let tiers = common::Tiers::start(data, store.clone());
     let mounted = mount(&tiers, &base);
     let vfs = &mounted.vfs;
 
@@ -307,16 +305,37 @@ fn a_non_utf8_name_commits_its_own_content() {
     );
     assert_eq!(cs.len(), 64, "the commit printed no changeset: {cs}");
 
-    // Each name carries its own content.
-    let cat = |name: &[u8]| {
-        let mut arg = OsString::from("cs:");
-        arg.push(OsStr::from_bytes(name));
-        scn_bytes(
-            &tiers.server,
-            mounted.home.path(),
-            &[OsStr::new("cat"), arg.as_os_str()],
-        )
+    // Each name carries its own content. The CLI's cat cannot take a
+    // non-UTF-8 name (clap reads String), so the changeset is read from
+    // the server's RPC and its blobs from the store.
+    let mut ctx = Ctx::connect(&tiers.server, None, TOKEN, None, REPO.to_owned(), false)
+        .await
+        .unwrap();
+    let id: ChangesetId = cs.parse().unwrap();
+    let mut reply = ctx
+        .client
+        .get_changeset(GetChangesetRequest {
+            repo: REPO.to_owned(),
+            changeset_id: id.as_bytes().to_vec(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut bytes = Vec::new();
+    while let Some(part) = reply.message().await.unwrap() {
+        bytes.extend_from_slice(&part.changeset);
+    }
+    let committed = Changeset::decode(&bytes).unwrap();
+    let state = |name: &[u8]| {
+        committed
+            .changes
+            .get(&RepoPath::new(name.to_vec()).unwrap())
+            .and_then(|state| state.as_ref())
     };
-    assert_eq!(cat(raw), b"raw\n");
-    assert_eq!(cat(lossy.as_bytes()), b"lossy\n");
+    let blob = |state: Option<&FileState>| match state {
+        Some(FileState::Regular { content, .. }) => store.blobs().get(*content).unwrap(),
+        _ => panic!("not a regular file: {state:?}"),
+    };
+    assert_eq!(blob(state(raw)), b"raw\n");
+    assert_eq!(blob(state(lossy.as_bytes())), b"lossy\n");
 }
