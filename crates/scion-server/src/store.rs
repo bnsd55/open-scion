@@ -128,6 +128,60 @@ impl ImportHooks {
     }
 }
 
+/// The write park of the test that races two processes onto one blob
+/// ([#268]). With `SCION_TEST_PARK_WRITES` in the environment, a writer
+/// whose `keep` found the blob missing parks while the park file of that
+/// blob's ID exists next to the data directory. The spawned server picks
+/// the variable up at start, so a test parks the writer of a real
+/// process; the park file is the release.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Default)]
+pub struct WritePark {
+    enabled: bool,
+    root: PathBuf,
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+impl WritePark {
+    /// Arms the park from the environment, over the data root.
+    pub(crate) fn from_env(root: &Path) -> Self {
+        Self {
+            enabled: std::env::var_os("SCION_TEST_PARK_WRITES").is_some(),
+            root: root.to_owned(),
+        }
+    }
+
+    /// Parks the caller while the park file of `id` exists. The writer
+    /// holds its stripe all the while, so no same-blob write of this
+    /// process moves either. A marker file says the writer is inside the
+    /// park: a stat of the park file can come from the kernel's cache,
+    /// so the test cannot see the park in the ops trace. The ceiling
+    /// bounds the park of the good code: a park nobody lifts fails the
+    /// holder, not the whole store.
+    pub fn park(&self, id: &BlobId) {
+        if !self.enabled {
+            return;
+        }
+        let hooks = self.root.join("hooks");
+        let file = hooks.join(format!("park-{id}"));
+        let marker = hooks.join(format!("parked-{id}"));
+        let _ = fs::write(&marker, b"");
+        // A cold CI import of one commit took about 30 s; the ceiling
+        // sits well above it, and the test lifts the park long before.
+        let give_up = Instant::now() + Duration::from_secs(180);
+        while file.exists() {
+            assert!(
+                Instant::now() < give_up,
+                "the park of {id} was never lifted"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = fs::remove_file(&marker);
+    }
+}
+
 /// Handle to one data directory. Cheap to clone.
 #[derive(Clone)]
 pub struct Store {
@@ -873,7 +927,6 @@ pub enum BlobStatus {
 }
 
 /// Immutable file contents, one zstd-compressed file per [`BlobId`].
-/// Immutable file contents, one zstd-compressed file per [`BlobId`].
 pub struct Blobs {
     root: PathBuf,
     /// The staging folder for temp files of every process.
@@ -888,6 +941,9 @@ pub struct Blobs {
     /// in this process, so two puts of the same bytes never race their
     /// renames onto one path ([#185]).
     write_locks: Vec<Mutex<()>>,
+    /// The test park of the write path, armed by the environment.
+    #[cfg(any(test, feature = "test-hooks"))]
+    park: WritePark,
     group_flush: GroupFlush,
     /// The operator metrics, set once by the server before it serves:
     /// every full flush records how long it took. Empty in import, fsck
@@ -1034,6 +1090,10 @@ impl Blobs {
             fsync_dir(path)?;
         }
         Ok(Self {
+            // The park files live under the data dir, not under
+            // `objects/blob`: the test writes them next to the data root.
+            #[cfg(any(test, feature = "test-hooks"))]
+            park: WritePark::from_env(dir),
             root,
             tmp,
             mine,
@@ -1867,6 +1927,11 @@ impl BlobBatch<'_> {
             BlobStatus::Corrupt => tracing::warn!(blob = %id, "rewriting a corrupt blob file"),
             BlobStatus::Missing => {}
         }
+        // The test seam of [#268]: the writer has passed keep and holds
+        // its stripe, and parks here while the park file exists, so the
+        // rename lands after another process's rename of the same path.
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.blobs.park.park(&id);
         self.replace(id, len, raw)
     }
 
@@ -1929,6 +1994,10 @@ impl BlobBatch<'_> {
         // this blob, so it waits for the same stripe.
         let _write = self.blobs.write_lock(id);
         self.blobs.full_flush()?;
+        // The same test seam as `write`: a put of a blob the repo does
+        // not have yet takes this path, and the race test parks it here.
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.blobs.park.park(&id);
         self.replace(id, len, raw)
     }
 
