@@ -285,8 +285,8 @@ pub trait MetaTx {
     /// Whether `repo` may name `blob`.
     fn repo_has_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool>;
 
-    /// Every repo, in ID order. The walker of `gc`.
-    fn repos(&mut self) -> Result<Vec<RepoId>>;
+    /// Every repo with its name, in ID order. The walker of `gc`.
+    fn repos(&mut self) -> Result<Vec<(RepoId, String)>>;
 
     /// The `(repo, changeset ID, body)` of the stored changesets after
     /// `(repo, cs)`, in that order, at most `limit`. The batched walk of

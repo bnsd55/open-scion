@@ -151,6 +151,10 @@ pub(crate) struct DeriveFlights {
     /// The cap on walks in flight. Each walk holds the write connection in
     /// turns, so walks beyond the cap only repeat work and starve writes.
     walks_cap: usize,
+    /// The operator metrics, set once by the server before it serves:
+    /// the walks in flight and the walks in the wait are gauges there.
+    /// Empty in import, fsck and gc, which export none.
+    metrics: std::sync::OnceLock<std::sync::Arc<crate::metrics::Metrics>>,
 }
 
 impl DeriveFlights {
@@ -160,7 +164,14 @@ impl DeriveFlights {
             in_flight: Mutex::new(0),
             woken: Condvar::new(),
             walks_cap,
+            metrics: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Gives the walks the server's metrics registry, once, before the
+    /// server serves.
+    pub(crate) fn set_metrics(&self, metrics: std::sync::Arc<crate::metrics::Metrics>) {
+        let _ = self.metrics.set(metrics);
     }
 }
 
@@ -177,6 +188,7 @@ struct Flight {
 struct Permit<'a> {
     in_flight: &'a Mutex<usize>,
     woken: &'a Condvar,
+    metrics: Option<&'a std::sync::Arc<crate::metrics::Metrics>>,
 }
 
 impl Drop for Permit<'_> {
@@ -187,6 +199,9 @@ impl Drop for Permit<'_> {
             .unwrap_or_else(PoisonError::into_inner);
         *in_flight -= 1;
         self.woken.notify_all();
+        if let Some(metrics) = self.metrics {
+            metrics.derive_walk_ended();
+        }
     }
 }
 
@@ -203,10 +218,17 @@ fn take_walk_permit<'a>(
     loop {
         if *in_flight < walks.walks_cap {
             *in_flight += 1;
+            if let Some(metrics) = walks.metrics.get() {
+                metrics.derive_walk_started();
+            }
             return Ok(Permit {
                 in_flight: &walks.in_flight,
                 woken: &walks.woken,
+                metrics: walks.metrics.get(),
             });
+        }
+        if let Some(metrics) = walks.metrics.get() {
+            metrics.derive_walk_wait_started();
         }
         match deadline {
             None => {
@@ -225,11 +247,17 @@ fn take_walk_permit<'a>(
                     .unwrap_or_else(PoisonError::into_inner);
                 in_flight = guard;
                 if result.timed_out() {
+                    if let Some(metrics) = walks.metrics.get() {
+                        metrics.derive_walk_wait_ended();
+                    }
                     return Err(Error::ResourceExhausted(
                         "no derive walk free before the deadline".to_owned(),
                     ));
                 }
             }
+        }
+        if let Some(metrics) = walks.metrics.get() {
+            metrics.derive_walk_wait_ended();
         }
     }
 }
@@ -1655,6 +1683,53 @@ mod tests {
         // cold readers of one repo join one walk, and the walk derives
         // each changeset once.
         n_cold_reads_derive_once_on(&store, repo, tip);
+    }
+
+    #[test]
+    fn the_walk_gauges_count_holders_and_waiters() {
+        let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
+        let flights = DeriveFlights::new(1);
+        flights.set_metrics(Arc::clone(&metrics));
+        // The gauges read from a scrape: a line's number, 0 when the
+        // gauge renders nothing.
+        let gauge = |name: &str| {
+            metrics
+                .render()
+                .lines()
+                .find(|line| line.starts_with(&format!("{name} ")))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let first = take_walk_permit(&flights, None).unwrap();
+        assert_eq!(gauge("scion_derive_walks_in_flight"), 1);
+        assert_eq!(gauge("scion_derive_walks_waiting"), 0);
+        // A second caller waits: the gauge says it is in the wait, without
+        // a clock, because the drop of `first` is what ends it.
+        let holder = std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| take_walk_permit(&flights, None).unwrap());
+            let mut spins = 0;
+            while gauge("scion_derive_walks_waiting") == 0 {
+                spins += 1;
+                assert!(spins < 1_000_000, "the waiter never entered the wait");
+                std::thread::yield_now();
+            }
+            assert_eq!(gauge("scion_derive_walks_in_flight"), 1);
+            assert_eq!(gauge("scion_derive_walks_waiting"), 1);
+            drop(first);
+            let permit = waiter.join().unwrap();
+            assert_eq!(gauge("scion_derive_walks_in_flight"), 1);
+            assert_eq!(gauge("scion_derive_walks_waiting"), 0);
+            permit
+        });
+        drop(holder);
+        assert_eq!(gauge("scion_derive_walks_in_flight"), 0);
+        assert_eq!(gauge("scion_derive_walks_waiting"), 0);
+        assert!(
+            !metrics.render().contains("scion_derive_walks"),
+            "zero gauges do not render: {}",
+            metrics.render()
+        );
     }
 
     #[test]

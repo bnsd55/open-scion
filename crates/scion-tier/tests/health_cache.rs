@@ -122,6 +122,14 @@ async fn wait_serving(cache: &mut Cache) {
     cache.watcher = Some(watcher);
 }
 
+/// Awaits `fut`, or panics naming `step`: a cache that never answers a
+/// step fails the test in seconds, not at the CI cancel.
+async fn ceiling<T>(step: &str, fut: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(30), fut)
+        .await
+        .unwrap_or_else(|_| panic!("the step {step} never finished within 30 s"))
+}
+
 /// Sends `SIGINT`, as Ctrl-C does.
 fn interrupt(child: &Child) {
     Command::new("kill")
@@ -138,14 +146,16 @@ async fn the_cache_serves_until_shutdown_starts() {
 
     // The first status is `SERVING`: the store and the upstream channel are
     // open.
-    let first = watcher.message().await.unwrap().expect("a status");
+    let first = ceiling("the first status", watcher.message())
+        .await
+        .unwrap()
+        .expect("a status");
     assert_eq!(first.status(), ServingStatus::Serving);
 
     // Shutdown starts: the watcher sees `NOT_SERVING` on its open stream,
     // while the cache still answers.
     interrupt(&cache.child);
-    let update = watcher
-        .message()
+    let update = ceiling("the NOT_SERVING update", watcher.message())
         .await
         .expect("the watcher stays open through the drain")
         .expect("a status update");

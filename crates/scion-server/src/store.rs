@@ -204,6 +204,14 @@ struct Inner {
 }
 
 impl Store {
+    /// Gives the blob folder and the derive walks the server's metrics
+    /// registry, once, before the server serves. Import, fsck and gc
+    /// pass none, and nothing records.
+    pub(crate) fn set_metrics(&self, metrics: std::sync::Arc<crate::metrics::Metrics>) {
+        self.inner.blobs.set_metrics(Arc::clone(&metrics));
+        self.inner.derive.set_metrics(metrics);
+    }
+
     /// Opens or creates a data directory as its server: the one `Store` that
     /// may land. Lands are serialized in memory, so a second server `Store`,
     /// in this process or another, is refused. Shared `Store`s
@@ -881,6 +889,10 @@ pub struct Blobs {
     /// renames onto one path ([#185]).
     write_locks: Vec<Mutex<()>>,
     group_flush: GroupFlush,
+    /// The operator metrics, set once by the server before it serves:
+    /// every full flush records how long it took. Empty in import, fsck
+    /// and gc, which export none.
+    metrics: std::sync::OnceLock<std::sync::Arc<crate::metrics::Metrics>>,
     /// Calls to [`Blobs::verify`] so far.
     #[cfg(any(test, feature = "test-hooks"))]
     verifies: std::sync::atomic::AtomicU64,
@@ -905,6 +917,20 @@ pub struct Blobs {
     /// nothing.
     #[cfg(any(test, feature = "test-hooks"))]
     log: DurabilityLog,
+}
+
+/// Which entry the order test records for one gated fsync. Production
+/// code names the step and pays nothing for it; only a test-hooks build
+/// records anything.
+enum SyncStep<'a> {
+    /// The temp file of a blob, before its rename.
+    TempFile(BlobId),
+    /// A stored blob file, on the keep path.
+    StoredFile(BlobId),
+    /// A blob directory.
+    Dir(&'a Path),
+    /// An fsync the order test does not name (the blob root of an upload).
+    Unnamed,
 }
 
 /// One durability step of the blob path, recorded for the order test.
@@ -944,15 +970,6 @@ impl DurabilityLog {
             .lock()
             .expect("the durability log's lock")
             .push(step);
-    }
-
-    /// Flushes a stored file and records the step together: whoever
-    /// deletes the fsync deletes the record with it, and the order test
-    /// fails.
-    fn record_stored_fsync(&self, id: BlobId, file: &fs::File) -> Result<()> {
-        fsync(file)?;
-        self.record(DurabilityStep::StoredFileFsync(id));
-        Ok(())
     }
 
     /// The steps recorded so far, oldest first.
@@ -1023,6 +1040,7 @@ impl Blobs {
             _mine_lock: mine_lock,
             write_locks: (0..WRITE_STRIPES).map(|_| Mutex::new(())).collect(),
             group_flush: GroupFlush::default(),
+            metrics: std::sync::OnceLock::new(),
             #[cfg(any(test, feature = "test-hooks"))]
             verifies: std::sync::atomic::AtomicU64::default(),
             fail_writes: std::sync::atomic::AtomicUsize::new(UNARMED),
@@ -1033,6 +1051,12 @@ impl Blobs {
             #[cfg(any(test, feature = "test-hooks"))]
             log: DurabilityLog::default(),
         })
+    }
+
+    /// Gives the blob folder the server's metrics registry, once: every
+    /// full flush then records how long it took.
+    pub(crate) fn set_metrics(&self, metrics: std::sync::Arc<crate::metrics::Metrics>) {
+        let _ = self.metrics.set(metrics);
     }
 
     fn write_lock(&self, id: BlobId) -> MutexGuard<'_, ()> {
@@ -1082,11 +1106,16 @@ impl Blobs {
     /// directory, then the drive cache. That covers everything that reached
     /// the drive before it, the database too, which lives on the same drive.
     pub(crate) fn full_flush(&self) -> io::Result<()> {
-        self.group_flush
-            .run(|| fs::File::open(&self.root)?.sync_all())?;
+        let started = std::time::Instant::now();
+        let result = self
+            .group_flush
+            .run(|| fs::File::open(&self.root)?.sync_all());
         #[cfg(any(test, feature = "test-hooks"))]
-        self.log.record(DurabilityStep::FullFlush);
-        Ok(())
+        if result.is_ok() {
+            self.log.record(DurabilityStep::FullFlush);
+        }
+        self.record_sync(started);
+        result
     }
 
     /// Stores one file's content durably. Safe to repeat.
@@ -1148,7 +1177,12 @@ impl Blobs {
         if batch.flush_dirs()? {
             // A new fan-out directory is an entry in the root. The full flush
             // of `sync` would cover it.
-            fsync_dir(&self.root)?;
+            self.gated_fsync(
+                "the blob root",
+                "fsync blob root",
+                &SyncStep::Unnamed,
+                || fsync_dir(&self.root),
+            )?;
         }
         Ok(id)
     }
@@ -1373,6 +1407,47 @@ impl Blobs {
             );
             return Err(error.into());
         }
+    }
+
+    /// Records how long one fsync of the blob path took.
+    fn record_sync(&self, started: std::time::Instant) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics.blob_sync(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+        }
+    }
+
+    /// Runs the real fsync of `f` through the gate, records `step` for
+    /// the order test, and records how long the fsync took: the gate,
+    /// the fsync, the record, and the timer in one place. One observation
+    /// of `scion_blob_sync_seconds` per fsync of the blob path (a temp
+    /// file, a stored file, a blob directory, or the drive cache).
+    fn gated_fsync(
+        &self,
+        name: &str,
+        operation: &str,
+        step: &SyncStep<'_>,
+        f: impl FnOnce() -> io::Result<()>,
+    ) -> Result<()> {
+        self.fsync_gate(name, operation)?;
+        let started = std::time::Instant::now();
+        let out = f();
+        #[cfg(any(test, feature = "test-hooks"))]
+        if out.is_ok() {
+            match step {
+                SyncStep::TempFile(id) => self.log.record(DurabilityStep::FileFsync(*id)),
+                SyncStep::StoredFile(id) => {
+                    self.log.record(DurabilityStep::StoredFileFsync(*id));
+                }
+                SyncStep::Dir(path) => self
+                    .log
+                    .record(DurabilityStep::DirFsync(path.to_path_buf())),
+                SyncStep::Unnamed => {}
+            }
+        }
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        drop(step);
+        self.record_sync(started);
+        out.map_err(Error::Io)
     }
 
     /// Arms the hook: it lets the next `n` file reads through, fails the
@@ -1704,6 +1779,18 @@ fn too_large() -> Error {
     Error::InvalidArgument(format!("blob is larger than {MAX_OBJECT_BYTES} bytes"))
 }
 
+/// The bytes free for this user on the filesystem that holds `dir`, as
+/// the operator's free-space gauge reads them. `f_bavail`, not `f_bfree`:
+/// the blocks a non-root process can really get.
+///
+/// # Errors
+///
+/// The `statvfs` of `dir` failed (a directory that is gone).
+pub fn free_bytes(dir: &Path) -> std::io::Result<u64> {
+    let stats = rustix::fs::statvfs(dir)?;
+    Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
+}
+
 /// Blobs written but not yet durable. Call [`BlobBatch::sync`] before
 /// committing any metadata that names them.
 ///
@@ -1760,18 +1847,19 @@ impl BlobBatch<'_> {
                 // the blob on the drive and no name is ever removed.
                 let (dir, path) = self.blobs.location(id);
                 let file = fs::File::open(&path)?;
-                self.blobs
-                    .fsync_gate("the stored blob file", "fsync stored blob")?;
-                #[cfg(any(test, feature = "test-hooks"))]
-                self.blobs.log.record_stored_fsync(id, &file)?;
-                #[cfg(not(any(test, feature = "test-hooks")))]
-                fsync(&file)?;
+                self.blobs.gated_fsync(
+                    "the stored blob file",
+                    "fsync stored blob",
+                    &SyncStep::StoredFile(id),
+                    || fsync(&file),
+                )?;
                 let name = dir.display().to_string();
-                self.blobs.fsync_gate(&name, "fsync blob directory")?;
-                #[cfg(any(test, feature = "test-hooks"))]
-                fsync_dir_logged(&self.blobs.log, &dir)?;
-                #[cfg(not(any(test, feature = "test-hooks")))]
-                fsync_dir(&dir)?;
+                self.blobs.gated_fsync(
+                    &name,
+                    "fsync blob directory",
+                    &SyncStep::Dir(dir.as_path()),
+                    || fsync_dir(&dir),
+                )?;
                 return Ok(());
             }
             // The rename below replaces it in one step. No repo on this
@@ -1809,12 +1897,12 @@ impl BlobBatch<'_> {
         zstd::stream::compress_sized_into(raw, &mut tmp, 3, len as u64)?;
         #[cfg(any(test, feature = "test-hooks"))]
         self.blobs.log.record(DurabilityStep::TmpWrite(id));
-        self.blobs
-            .fsync_gate("the blob's temp file", "fsync blob file")?;
-        #[cfg(any(test, feature = "test-hooks"))]
-        fsync_logged(&self.blobs.log, id, tmp.as_file())?;
-        #[cfg(not(any(test, feature = "test-hooks")))]
-        fsync(tmp.as_file())?;
+        self.blobs.gated_fsync(
+            "the blob's temp file",
+            "fsync blob file",
+            &SyncStep::TempFile(id),
+            || fsync(tmp.as_file()),
+        )?;
         fs::create_dir_all(&dir)?;
         #[cfg(any(test, feature = "test-hooks"))]
         persist_logged(&self.blobs.log, id, tmp, &path)?;
@@ -1892,11 +1980,12 @@ impl BlobBatch<'_> {
     fn flush_dirs(self) -> Result<bool> {
         for dir in &self.dirs {
             let name = dir.display().to_string();
-            self.blobs.fsync_gate(&name, "fsync blob directory")?;
-            #[cfg(any(test, feature = "test-hooks"))]
-            fsync_dir_logged(&self.blobs.log, dir)?;
-            #[cfg(not(any(test, feature = "test-hooks")))]
-            fsync_dir(dir)?;
+            self.blobs.gated_fsync(
+                &name,
+                "fsync blob directory",
+                &SyncStep::Dir(dir.as_path()),
+                || fsync_dir(dir),
+            )?;
         }
         Ok(!self.dirs.is_empty())
     }
@@ -1992,23 +2081,6 @@ fn fsync(file: &fs::File) -> io::Result<()> {
 
 pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
     fsync(&fs::File::open(path)?)
-}
-
-/// Flushes a directory and records the step together: whoever deletes the
-/// fsync deletes the record with it, and the order test fails.
-#[cfg(any(test, feature = "test-hooks"))]
-fn fsync_dir_logged(log: &DurabilityLog, path: &Path) -> Result<()> {
-    fsync_dir(path)?;
-    log.record(DurabilityStep::DirFsync(path.to_path_buf()));
-    Ok(())
-}
-
-/// The fsync of a temp file, with its step recorded in one call.
-#[cfg(any(test, feature = "test-hooks"))]
-fn fsync_logged(log: &DurabilityLog, id: BlobId, file: &fs::File) -> Result<()> {
-    fsync(file)?;
-    log.record(DurabilityStep::FileFsync(id));
-    Ok(())
 }
 
 /// The rename of a temp file onto the blob's name, with its step recorded
@@ -2546,6 +2618,42 @@ mod tests {
         };
         assert!(!fullfsync(&Store::open(dir.path()).unwrap()));
         assert!(fullfsync(&Store::open_shared(dir.path()).unwrap()));
+    }
+
+    #[test]
+    fn a_put_records_one_observation_per_fsync_of_the_blob_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
+        let store = Store::open(dir.path()).unwrap();
+        store.set_metrics(Arc::clone(&metrics));
+        assert!(
+            !metrics.render().contains("scion_blob_sync_seconds"),
+            "nothing synced yet: {}",
+            metrics.render()
+        );
+        store.blobs().put(b"recorded").unwrap();
+        let text = metrics.render();
+        // One put fsyncs the temp file and the fan-out directory in
+        // `sync`, and `sync` then runs one full flush of the drive cache
+        // on every platform: three observations.
+        let want = 3;
+        assert!(
+            text.contains(&format!("scion_blob_sync_seconds_count {want}\n")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "scion_blob_sync_seconds_bucket{{le=\"+Inf\"}} {want}\n"
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn free_bytes_of_a_tempdir_is_positive() {
+        let dir = tempfile::tempdir().unwrap();
+        let free = free_bytes(dir.path()).unwrap();
+        assert!(free > 0, "{free}");
     }
 
     #[test]

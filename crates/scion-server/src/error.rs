@@ -198,6 +198,8 @@ mod tests {
         assert_eq!(Status::from(db(ffi::SQLITE_CORRUPT)).code(), Code::Internal);
     }
 
+    /// A drained pool of Postgres readers answers `unavailable`, so the
+    /// client retries after the pool refills.
     #[test]
     fn a_drained_reader_pool_is_unavailable() {
         let err = Error::Unavailable("no Postgres reader free".to_owned());

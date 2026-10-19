@@ -147,6 +147,10 @@ struct PgInner {
     /// keeps its own.
     #[cfg(any(test, feature = "test-hooks"))]
     hooks: crate::store::ImportHooks,
+    /// The operator metrics, set once by the server before it serves: a
+    /// commit's wait for the collector's advisory key records how long
+    /// it waited. Empty in import, fsck and gc, which export none.
+    metrics: std::sync::OnceLock<std::sync::Arc<crate::metrics::Metrics>>,
 }
 
 /// Clients for [`Pg::read`], so at most [`READERS`](crate::store::READERS)
@@ -267,6 +271,8 @@ impl Readers {
         if let Some(at) = open.iter().position(|known| *known == started) {
             open.swap_remove(at);
         }
+        drop(open);
+        self.report_busy();
     }
 
     /// How many readers are out of the pool, for the busy gauge.
@@ -914,6 +920,7 @@ impl Pg {
             derive: crate::derived::DeriveFlights::new(crate::store::DERIVE_WALKS_CAP),
             #[cfg(any(test, feature = "test-hooks"))]
             hooks: crate::store::ImportHooks::default(),
+            metrics: std::sync::OnceLock::new(),
         });
         // The probe of a server that lost its lock: once a minute the
         // session checks itself, through the job queue like every
@@ -980,6 +987,9 @@ impl Pg {
     /// server before it serves; import, fsck, and gc pass none, and the
     /// pool then records nothing.
     pub(crate) fn set_metrics(&self, metrics: Arc<Metrics>) {
+        let _ = self.inner.metrics.set(Arc::clone(&metrics));
+        self.inner.blobs.set_metrics(Arc::clone(&metrics));
+        self.inner.derive.set_metrics(Arc::clone(&metrics));
         self.inner.readers.set_metrics(metrics);
     }
 
@@ -1089,10 +1099,16 @@ impl Pg {
             &format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT_FOR_KEY}'"),
             &[],
         )?;
+        let key_started = std::time::Instant::now();
         tx.c.query_opt(
             "SELECT pg_advisory_xact_lock(hashtext(current_schema() || ':gc'))",
             &[],
         )?;
+        if let Some(metrics) = self.inner.metrics.get() {
+            metrics.collector_key_wait(
+                u64::try_from(key_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
+        }
         tx.c.query(
             &format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT_FOR_WRITERS}'"),
             &[],
@@ -2496,7 +2512,13 @@ impl MetaTx for PgTx<'_> {
             if let Some(limit) = pending_limit {
                 // The pending-lands quota counts new pending rows. A retry
                 // of an existing key resumes its land and adds no row, so a
-                // client can always finish what it started.
+                // client can always finish what it started. The count and
+                // the insert need no lock of their own: every write
+                // transaction of the schema holds the schema's one advisory
+                // key (see `commit`) until it commits, so two lands that
+                // record at the same time, even from two processes, run
+                // one after the other, and the second counts the first
+                // one's row. SQLite gets the same from its one writer.
                 let pending: i64 = self
                     .c
                     .query_opt(
@@ -2722,12 +2744,15 @@ impl MetaTx for PgTx<'_> {
         let len = body.len();
         Ok((body, len))
     }
-    /// Every repo, in ID order.
-    fn repos(&mut self) -> Result<Vec<RepoId>> {
+    /// Every repo with its name, in ID order.
+    fn repos(&mut self) -> Result<Vec<(RepoId, String)>> {
         let rows = self
             .c
-            .query("SELECT repo_id FROM repos ORDER BY repo_id", &[])?;
-        Ok(rows.iter().map(|row| RepoId(row.get(0))).collect())
+            .query("SELECT repo_id, name FROM repos ORDER BY repo_id", &[])?;
+        Ok(rows
+            .iter()
+            .map(|row| (RepoId(row.get(0)), row.get(1)))
+            .collect())
     }
 
     /// The `(repo, changeset ID, body)` of the stored changesets after
@@ -3037,7 +3062,9 @@ fn prepare_test_schema(url: &str, schema: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::merged_options;
+    use super::{Client, NoTls, merged_options};
+    use crate::pg::Pg;
+    use std::sync::Arc;
 
     const OWN: &str = "-csynchronous_commit=on -cstatement_timeout=600000 -clock_timeout=5000";
 
@@ -3061,6 +3088,61 @@ mod tests {
     fn a_url_without_options_gets_the_backends_only() {
         assert_eq!(merged_options(None, OWN), OWN);
         assert_eq!(merged_options(Some(""), OWN), OWN);
+    }
+
+    /// A write that waits for the collector's key records the wait in the
+    /// metrics: the gauge an operator watches for a busy database.
+    #[test]
+    fn a_commit_records_its_wait_for_the_collectors_key() {
+        if !crate::Backend::test_is_postgres() {
+            return;
+        }
+        let url = crate::backend::test_url().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = crate::backend::test_schema(dir.path());
+        let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
+        let pg = Pg::open_test(
+            &url,
+            &schema,
+            2,
+            dir.path(),
+            crate::backend::Marker::read(dir.path()),
+        )
+        .unwrap();
+        pg.set_metrics(Arc::clone(&metrics));
+        assert!(
+            !metrics.render().contains("scion_pg_collector_key_wait"),
+            "nothing waited yet"
+        );
+        // Another client holds the key, so the commit below really waits.
+        let mut holder = Client::connect(&url, NoTls).unwrap();
+        holder
+            .batch_execute(&format!(
+                "SET search_path TO {schema};
+                 BEGIN;
+                 SELECT pg_advisory_xact_lock(hashtext(current_schema() || ':gc'));"
+            ))
+            .unwrap();
+        let writer = std::thread::spawn(move || {
+            pg.commit(|_tx| Ok(())).unwrap();
+        });
+        // Give the writer time to reach the key, then let it in.
+        for _ in 0..2_000 {
+            std::thread::yield_now();
+        }
+        holder.batch_execute("COMMIT").unwrap();
+        let mut spins = 0;
+        while !writer.is_finished() {
+            spins += 1;
+            assert!(spins < 1_000_000, "the writer never finished");
+            std::thread::yield_now();
+        }
+        writer.join().unwrap();
+        let text = metrics.render();
+        assert!(
+            text.contains("scion_pg_collector_key_wait_seconds_count 1\n"),
+            "{text}"
+        );
     }
 }
 
@@ -3317,5 +3399,88 @@ mod pool_tests {
         assert!(pg.tx_age() > Duration::ZERO, "{:?}", pg.tx_age());
         hold.join().unwrap();
         assert_eq!(pg.tx_age(), Duration::ZERO);
+    }
+
+    /// Two lands of one principal that record at the same time, from two
+    /// independent backends over one database, cannot both pass the
+    /// pending-lands cap. The count and the insert are one step: every
+    /// write transaction of the schema holds the schema's advisory key
+    /// (`Pg::commit`) until it commits, so the second land counts the
+    /// first one's row and hears the limit's answer.
+    #[test]
+    fn two_lands_that_record_together_respect_the_pending_cap() {
+        let data = tempfile::tempdir().unwrap();
+        let a = crate::backend::Backend::open_test(data.path()).unwrap();
+        let b = crate::backend::Backend::open_test_shared(data.path()).unwrap();
+        let cs = a
+            .commit(|c| {
+                let repo = c.create_repo("r")?;
+                let cs = c.insert_changeset(
+                    repo,
+                    &Changeset {
+                        parents: vec![],
+                        author: scion_core::IdentityTime {
+                            name: b"Ada".to_vec(),
+                            email: b"ada@example.com".to_vec(),
+                            unix_secs: 0,
+                            tz_offset_minutes: 0,
+                        },
+                        committer: None,
+                        message: b"root".to_vec(),
+                        changes: std::collections::BTreeMap::new(),
+                    },
+                )?;
+                assert!(c.cas_ref(repo, "main", None, cs)?);
+                Ok(cs)
+            })
+            .unwrap();
+        let req = move |key: &str| LandRequest {
+            repo: "r".into(),
+            changeset: cs,
+            target_ref: "main".into(),
+            request_key: key.into(),
+            deadline: crate::deadline::Deadline::new(Instant::now() + Duration::from_secs(60)),
+        };
+
+        // Both backends release together, one caller, a cap of one, two
+        // new keys: exactly one land records, and the other is over the
+        // cap. Every wait has a ceiling that names its stall.
+        let go = Arc::new(std::sync::Barrier::new(2));
+        let done = Arc::new(AtomicUsize::new(0));
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let mut threads = Vec::new();
+        for (store, key) in [(a, "k1"), (b, "k2")] {
+            let (go, done, results) = (Arc::clone(&go), Arc::clone(&done), Arc::clone(&results));
+            threads.push(std::thread::spawn(move || {
+                go.wait();
+                let out = store.commit(|c| c.record_land(&Caller("t".into()), &req(key), Some(1)));
+                results
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(out);
+                done.fetch_add(1, AtomicOrdering::SeqCst);
+            }));
+        }
+        let ceiling = Instant::now() + Duration::from_secs(30);
+        while done.load(AtomicOrdering::SeqCst) < 2 {
+            assert!(
+                Instant::now() < ceiling,
+                "the two record_land calls never finished within 30 s"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let results = std::mem::take(&mut *results.lock().unwrap_or_else(PoisonError::into_inner));
+        let recorded = results
+            .iter()
+            .filter(|out| matches!(out, Ok((_, row)) if row.state == LandState::Pending))
+            .count();
+        let refused = results
+            .iter()
+            .filter(|out| matches!(out, Err(Error::ResourceExhausted(_))))
+            .count();
+        assert_eq!((recorded, refused), (1, 1), "{results:?}");
     }
 }

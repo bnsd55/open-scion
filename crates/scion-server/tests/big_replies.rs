@@ -78,6 +78,7 @@ async fn big_repo(names: usize) -> (tempfile::TempDir, Scion, ChangesetId) {
         listener,
         TOKEN,
         service::ServeOptions {
+            data: dir.path().to_path_buf(),
             limits: Limits::default(),
             quotas: scion_server::quotas::Quotas::off(),
             pending_lands: None,

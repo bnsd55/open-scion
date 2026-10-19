@@ -152,7 +152,7 @@ fn put(store: &Backend, content: &[u8]) -> BlobId {
 /// signal: hold it, or the server shuts down when the caller drops it. The
 /// second is its `http://` URL.
 type Stop = tokio::sync::oneshot::Sender<()>;
-async fn serve(store: &Backend, access: Access) -> (Stop, String) {
+async fn serve(store: &Backend, dir: &std::path::Path, access: Access) -> (Stop, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -161,6 +161,7 @@ async fn serve(store: &Backend, access: Access) -> (Stop, String) {
         listener,
         access,
         service::ServeOptions {
+            data: dir.to_path_buf(),
             limits: Limits::default(),
             quotas: scion_server::quotas::Quotas::off(),
             pending_lands: None,
@@ -211,8 +212,13 @@ async fn objects(url: &str, token: Option<&str>) -> Objects {
 /// A server of `store` with `access`, and a client of each service as
 /// `token`. The first reply is the server's stop signal: hold it, or the
 /// server shuts down when the caller drops it.
-async fn server(store: &Backend, access: Access, token: &str) -> (Stop, Scion, Objects) {
-    let (stop, url) = serve(store, access).await;
+async fn server(
+    store: &Backend,
+    dir: &std::path::Path,
+    access: Access,
+    token: &str,
+) -> (Stop, Scion, Objects) {
+    let (stop, url) = serve(store, dir, access).await;
     (
         stop,
         scion(&url, Some(token)).await,
@@ -225,11 +231,11 @@ async fn server(store: &Backend, access: Access, token: &str) -> (Stop, Scion, O
 /// rules, so its one answer is the uniform `UNIMPLEMENTED`.
 #[tokio::test(flavor = "multi_thread")]
 async fn writes_outside_a_prefix_are_denied_with_the_path() {
-    let (_dir, store, root, _blob) = store();
+    let (dir, store, root, _blob) = store();
     let access = access();
 
     // ci may write every path: a change outside `docs` is fine.
-    let (_ci_stop, mut ci, _) = server(&store, access.clone(), "ci").await;
+    let (_ci_stop, mut ci, _) = server(&store, dir.path(), access.clone(), "ci").await;
     let guide = put(&store, b"guide");
     let (bytes, _) = changeset(vec![root], "src/guide", Some(regular(guide))).encode_with_id();
     ci.create_changeset(CreateChangesetRequest {
@@ -241,7 +247,7 @@ async fn writes_outside_a_prefix_are_denied_with_the_path() {
 
     // alice may write `docs` only: inside the prefix is accepted, and a
     // path outside it is named by the denial.
-    let (_alice_stop, mut alice, _) = server(&store, access, "alice").await;
+    let (_alice_stop, mut alice, _) = server(&store, dir.path(), access, "alice").await;
     let source = put(&store, b"source");
     let (bytes, _) = changeset(vec![root], "docs/guide", Some(regular(source))).encode_with_id();
     alice
@@ -280,9 +286,9 @@ async fn writes_outside_a_prefix_are_denied_with_the_path() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn put_upload_create_and_land_need_write_rules() {
-    let (_dir, store, root, _blob) = store();
+    let (dir, store, root, _blob) = store();
     let access = access();
-    let (_bob_stop, mut bob, _) = server(&store, access, "bob").await;
+    let (_bob_stop, mut bob, _) = server(&store, dir.path(), access, "bob").await;
 
     // A blob upload names no path, so a read-only principal is denied.
     let status = bob
@@ -322,11 +328,11 @@ async fn put_upload_create_and_land_need_write_rules() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_lander_of_another_principals_changeset_needs_write() {
-    let (_dir, store, root, _blob) = store();
+    let (dir, store, root, _blob) = store();
     let access = access();
 
     // ci, who may write every path, creates a changeset.
-    let (_ci_stop, mut ci, _) = server(&store, access.clone(), "ci").await;
+    let (_ci_stop, mut ci, _) = server(&store, dir.path(), access.clone(), "ci").await;
     let guide = put(&store, b"guide");
     let (bytes, id) = changeset(vec![root], "docs/guide", Some(regular(guide))).encode_with_id();
     ci.create_changeset(CreateChangesetRequest {
@@ -337,7 +343,7 @@ async fn the_lander_of_another_principals_changeset_needs_write() {
     .unwrap();
 
     // bob, read-only, cannot land it.
-    let (_bob_stop, mut bob, _) = server(&store, access, "bob").await;
+    let (_bob_stop, mut bob, _) = server(&store, dir.path(), access, "bob").await;
     let status = bob
         .land(LandRequest {
             repo: REPO.into(),
@@ -500,17 +506,18 @@ mod req {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_principal_without_a_read_rule_sees_no_repo_on_any_rpc() {
-    let (_dir, store, root, blob) = store();
+    let (dir, store, root, blob) = store();
     let access = access();
 
     // Control: with a rule, the repo is there.
-    let (_ci_stop, _, mut objects) = server(&store, access, "ci").await;
+    let (_ci_stop, _, mut objects) = server(&store, dir.path(), access, "ci").await;
     let seen = objects.resolve_ref(req::resolve_ref()).await;
     assert!(seen.is_ok(), "{seen:?}");
 
     // mallory has a token, but no rule for any repo. Every RPC answers as
     // for a repo that does not exist.
-    let (_mallory_stop, mut mallory, mut objects) = server(&store, no_rules(), "mallory").await;
+    let (_mallory_stop, mut mallory, mut objects) =
+        server(&store, dir.path(), no_rules(), "mallory").await;
     let (root, blob) = (root.as_bytes(), blob.as_bytes());
 
     denied(
@@ -626,8 +633,8 @@ fn root_tree_id(store: &Backend, tip: ChangesetId) -> TreeId {
 /// answers exactly like a missing one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_partial_reader_reads_only_its_view() {
-    let (_dir, store, tip, _docs, _secret) = repo_with_docs_and_secret();
-    let (_stop, mut scion, mut objects) = server(&store, partial_access(), "pat").await;
+    let (dir, store, tip, _docs, _secret) = repo_with_docs_and_secret();
+    let (_stop, mut scion, mut objects) = server(&store, dir.path(), partial_access(), "pat").await;
     // The missing world: a second repo whose tree has `docs` only, served
     // to a whole reader, for the same-path comparison below.
     let docs_only = put(&store, b"a\n");
@@ -638,8 +645,13 @@ async fn a_partial_reader_reads_only_its_view() {
         })
         .unwrap();
     let whole_text = format!("token\tbob\t{}\nread\tbob\t{OTHER}\n", hex("bob"));
-    let (_whole_stop, mut whole_scion, _whole_objects) =
-        server(&store, Access::parse(&whole_text).unwrap(), "bob").await;
+    let (_whole_stop, mut whole_scion, _whole_objects) = server(
+        &store,
+        dir.path(),
+        Access::parse(&whole_text).unwrap(),
+        "bob",
+    )
+    .await;
 
     // ResolveRef answers as today: the ref's real changeset.
     let seen = scion.resolve_ref(req::resolve_ref()).await.unwrap();
@@ -715,8 +727,8 @@ async fn a_partial_reader_reads_only_its_view() {
 /// with the same uniform refusal.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_partial_reader_gets_no_history() {
-    let (_dir, store, tip, _docs, _secret) = repo_with_docs_and_secret();
-    let (_stop, mut scion, _) = server(&store, partial_access(), "pat").await;
+    let (dir, store, tip, _docs, _secret) = repo_with_docs_and_secret();
+    let (_stop, mut scion, _) = server(&store, dir.path(), partial_access(), "pat").await;
     unimplemented(
         "GetChangeset",
         scion
@@ -744,12 +756,17 @@ async fn a_partial_reader_gets_no_history() {
 /// with the same prefixes deriving the same view.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_partial_readers_ticket_reaches_only_its_view() {
-    let (_dir, store, tip, docs, secret) = repo_with_docs_and_secret();
-    let (_stop, _scion, mut objects) = server(&store, partial_access(), "pat").await;
+    let (dir, store, tip, docs, secret) = repo_with_docs_and_secret();
+    let (_stop, _scion, mut objects) = server(&store, dir.path(), partial_access(), "pat").await;
     // A whole-repo reader, for the real root it still gets.
     let whole_text = format!("token\tbob\t{}\nread\tbob\t{REPO}\n", hex("bob"));
-    let (_whole_stop, _whole_scion, mut whole) =
-        server(&store, Access::parse(&whole_text).unwrap(), "bob").await;
+    let (_whole_stop, _whole_scion, mut whole) = server(
+        &store,
+        dir.path(),
+        Access::parse(&whole_text).unwrap(),
+        "bob",
+    )
+    .await;
     let view = objects
         .get_root_tree(req::get_root_tree(tip.as_bytes()))
         .await
@@ -830,7 +847,7 @@ async fn a_partial_readers_ticket_reaches_only_its_view() {
     // shared view root.
     let text = format!("token\tpat2\t{}\nread\tpat2\t{REPO}\tdocs\n", hex("pat2"));
     let shared = Access::parse(&text).unwrap();
-    let (_stop2, _scion2, mut objects2) = server(&store, shared, "pat2").await;
+    let (_stop2, _scion2, mut objects2) = server(&store, dir.path(), shared, "pat2").await;
     let again = objects2
         .get_root_tree(req::get_root_tree(tip.as_bytes()))
         .await
@@ -847,8 +864,8 @@ async fn a_partial_readers_ticket_reaches_only_its_view() {
 /// uniform `UNIMPLEMENTED`, with no per-object difference.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_partial_reader_writes_nothing() {
-    let (_dir, store, root, _blob) = store();
-    let (_stop, mut scion, _) = server(&store, partial_access(), "pat").await;
+    let (dir, store, root, _blob) = store();
+    let (_stop, mut scion, _) = server(&store, dir.path(), partial_access(), "pat").await;
     unimplemented(
         "PutBlob",
         scion.put_blob(tokio_stream::once(req::put_blob())).await,
@@ -1156,7 +1173,7 @@ fn get_objects(clients: &Clients, prep: &Prep, _col: usize) -> Fut {
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn the_authz_matrix_answers_as_documented() {
-    let (_dir, store, root, blob) = store();
+    let (dir, store, root, blob) = store();
 
     // A changeset inside alice's prefix, stored as if she had created it.
     let guide_blob = put(&store, b"guide");
@@ -1181,8 +1198,8 @@ async fn the_authz_matrix_answers_as_documented() {
 
     // Two servers: one with the rules of `access`, one whose only
     // principal has no rule for any repo. Every column calls its own.
-    let (_rules_stop, rules_url) = serve(&store, access()).await;
-    let (_no_rules_stop, no_rules_url) = serve(&store, no_rules()).await;
+    let (_rules_stop, rules_url) = serve(&store, dir.path(), access()).await;
+    let (_no_rules_stop, no_rules_url) = serve(&store, dir.path(), no_rules()).await;
     let mut clients = Vec::new();
     for who in &CALLERS {
         let url = if who.rules { &rules_url } else { &no_rules_url };
@@ -1292,7 +1309,7 @@ async fn the_authz_matrix_answers_as_documented() {
 /// must still run at once: the slots bound how many permits blame can hold.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_file_runs_while_the_blame_slots_are_full() {
-    let (_dir, store, root, _blob) = store();
+    let (dir, store, root, _blob) = store();
     // Five versions of a 1,048,576-line file: one blame call diffs at
     // least one version pair, which takes seconds, and stops at its diff
     // budget with a cursor.
@@ -1314,7 +1331,7 @@ async fn a_read_file_runs_while_the_blame_slots_are_full() {
         })
         .unwrap();
     // bob may read the repo, and so may blame and read its files.
-    let (_stop, mut scion, _) = server(&store, access(), "bob").await;
+    let (_stop, mut scion, _) = server(&store, dir.path(), access(), "bob").await;
 
     let mut blames = Vec::new();
     for _ in 0..4 {
@@ -1550,8 +1567,8 @@ fn a_partial_reader_case(paths: &[String], rule_seeds: &[u16]) -> Result<(), Tes
         .build()
         .unwrap();
     runtime.block_on(async {
-        let (_stop, mut scion, _objects) = server(&store, access.clone(), "pat").await;
-        let (_stop_b, mut scion_b, _objects_b) = server(&store_b, access, "pat").await;
+        let (_stop, mut scion, _objects) = server(&store, dir.path(), access.clone(), "pat").await;
+        let (_stop_b, mut scion_b, _objects_b) = server(&store_b, dir.path(), access, "pat").await;
         // What two answers must share to be the same: the code and the
         // message, not the bytes of the transport.
         let same = |a: &tonic::Status, b: &tonic::Status| {

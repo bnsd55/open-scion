@@ -856,12 +856,19 @@ fn land(store: &Backend, lands: &Lands, cs: ChangesetId) -> scion_server::land::
         request_key: cs.to_string(),
         deadline: Deadline::new(Instant::now() + Duration::from_secs(600)),
     };
-    loop {
+    // A ceiling on the retries: a land that aborts forever must fail the
+    // test, not hang it.
+    for tries in 0..100 {
         match lands.land(store, &Caller("t".into()), &request) {
             Err(Error::Aborted(_)) => {}
             outcome => return outcome.unwrap(),
         }
+        assert!(
+            tries < 99,
+            "the land aborted {tries} times and never landed"
+        );
     }
+    unreachable!("the land loop exits by returning");
 }
 
 #[test]
@@ -927,7 +934,12 @@ fn an_import_process_shares_the_data_directory_with_lands() {
                 let (store, lands, done) = (&store, &lands, &done);
                 scope.spawn(move || {
                     let mut landed = Vec::new();
+                    let started = std::time::Instant::now();
                     while !done.load(Ordering::Relaxed) || landed.is_empty() {
+                        assert!(
+                            started.elapsed() < Duration::from_secs(120),
+                            "an agent's lands never landed"
+                        );
                         let head = main_ref(store).target;
                         let cs = create(store, head, &format!("agent{agent}/{}", landed.len()));
                         let out = land(store, lands, cs);
@@ -1045,7 +1057,12 @@ fn an_import_process_shares_the_postgres_database_with_lands() {
                 let (store, lands, done) = (&store, &lands, &done);
                 scope.spawn(move || {
                     let mut landed = Vec::new();
+                    let started = std::time::Instant::now();
                     while !done.load(Ordering::Relaxed) || landed.is_empty() {
+                        assert!(
+                            started.elapsed() < Duration::from_secs(120),
+                            "an agent's lands never landed"
+                        );
                         let head = main_ref(store).target;
                         let cs = create(store, head, &format!("agent{agent}/{}", landed.len()));
                         let out = land(store, lands, cs);

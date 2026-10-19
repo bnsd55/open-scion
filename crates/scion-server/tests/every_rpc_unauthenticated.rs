@@ -99,7 +99,11 @@ async fn store() -> (tempfile::TempDir, Backend, scion_core::ChangesetId) {
 
 /// The server of `store` behind `access`, as a `http://` URL. Hold the
 /// stop signal, or the server shuts down when it drops.
-async fn serve(store: &Backend, access: Access) -> (tokio::sync::oneshot::Sender<()>, String) {
+async fn serve(
+    store: &Backend,
+    dir: &std::path::Path,
+    access: Access,
+) -> (tokio::sync::oneshot::Sender<()>, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -108,6 +112,7 @@ async fn serve(store: &Backend, access: Access) -> (tokio::sync::oneshot::Sender
         listener,
         access,
         service::ServeOptions {
+            data: dir.to_path_buf(),
             limits: Limits::default(),
             quotas: scion_server::quotas::Quotas::off(),
             pending_lands: None,
@@ -505,7 +510,7 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
     }
 
     let (dir, store, root) = store().await;
-    let (stop, url) = serve(&store, access()).await;
+    let (stop, url) = serve(&store, dir.path(), access()).await;
 
     let channel = Channel::from_shared(url.clone())
         .unwrap()
