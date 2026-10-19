@@ -19,7 +19,7 @@ use std::io::{self, Write};
 
 /// True when `err` is a closed pipe: the reader of scn's stdout went
 /// away, which is how `| head` and `grep -q` end a pipeline.
-pub fn broken_pipe(err: &io::Error) -> bool {
+pub(crate) fn broken_pipe(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::BrokenPipe
 }
 
@@ -33,7 +33,7 @@ fn stop_quietly() -> ! {
 /// print site reads like a `println!`. A broken pipe ends the process
 /// quietly; any other error returns, and the caller fails the command
 /// the usual way.
-pub fn line(args: std::fmt::Arguments<'_>) -> io::Result<()> {
+pub(crate) fn line(args: std::fmt::Arguments<'_>) -> io::Result<()> {
     match io::stdout().write_fmt(args) {
         Ok(()) => Ok(()),
         Err(e) if broken_pipe(&e) => stop_quietly(),
@@ -44,7 +44,7 @@ pub fn line(args: std::fmt::Arguments<'_>) -> io::Result<()> {
 /// Writes `args` to a stdout writer that the caller holds, a lock or a
 /// `BufWriter`. A broken pipe stops the process quietly; any other
 /// error returns, and the caller fails the command the usual way.
-pub fn write<W: Write>(out: &mut W, args: std::fmt::Arguments<'_>) -> io::Result<()> {
+pub(crate) fn write<W: Write>(out: &mut W, args: std::fmt::Arguments<'_>) -> io::Result<()> {
     match out.write_fmt(args) {
         Ok(()) => Ok(()),
         Err(e) if broken_pipe(&e) => stop_quietly(),
@@ -54,7 +54,7 @@ pub fn write<W: Write>(out: &mut W, args: std::fmt::Arguments<'_>) -> io::Result
 
 /// Writes raw bytes to a stdout writer, `scn cat`'s streamed chunks.
 /// Same broken-pipe answer as [`write`](fn@write).
-pub fn write_all<W: Write>(out: &mut W, buf: &[u8]) -> io::Result<()> {
+pub(crate) fn write_all<W: Write>(out: &mut W, buf: &[u8]) -> io::Result<()> {
     match out.write_all(buf) {
         Ok(()) => Ok(()),
         Err(e) if broken_pipe(&e) => stop_quietly(),
@@ -65,7 +65,7 @@ pub fn write_all<W: Write>(out: &mut W, buf: &[u8]) -> io::Result<()> {
 /// Flushes a stdout writer with the same broken-pipe answer as
 /// [`write`](fn@write): a `BufWriter` holds whole lines back, so the reader can
 /// leave while the buffer still holds them.
-pub fn flush<W: Write>(out: &mut W) -> io::Result<()> {
+pub(crate) fn flush<W: Write>(out: &mut W) -> io::Result<()> {
     match out.flush() {
         Ok(()) => Ok(()),
         Err(e) if broken_pipe(&e) => stop_quietly(),

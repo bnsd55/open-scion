@@ -37,6 +37,9 @@ use nfsserve::nfs::{
     fattr3, fileid3, filename3, ftype3, nfs_fh3, nfspath3, nfsstat3, nfstime3, sattr3, set_mode3,
     set_size3, specdata3,
 };
+// The test seam re-exports this (test_support.vfs), and
+// unreachable_pub does not see through a re-export.
+#[allow(unreachable_pub)]
 pub use nfsserve::vfs::NFSFileSystem;
 use nfsserve::vfs::{DirEntry, ReadDirResult, VFSCapabilities};
 use rustix::fs::{Mode, OFlags};
@@ -49,10 +52,10 @@ use crate::client::{Objects, id_from};
 use crate::materialize::check_name;
 
 /// The name of the file that the commit reads the deletions from.
-pub const DELETES: &str = "deletes.json";
+pub(crate) const DELETES: &str = "deletes.json";
 
 /// The subdirectory of the overlay that mirrors the changed paths.
-pub const CHANGES: &str = "tree";
+pub(crate) const CHANGES: &str = "tree";
 
 /// The bytes of decoded blobs kept in memory, least recently used first.
 /// The daemon holds the stored form on disk; this cache saves the unpacking
@@ -148,7 +151,7 @@ impl Kind {
 }
 
 /// A change that `scn commit --from-mount` commits for one path.
-pub enum Change {
+pub(crate) enum Change {
     /// The file at the overlay path replaces the path, or adds it.
     Put {
         /// Whether the file is executable.
@@ -198,6 +201,9 @@ impl Nodes {
 }
 
 /// The NFS file system of one mount.
+// The test seam re-exports this (test_support.vfs), and
+// unreachable_pub does not see through a re-export.
+#[allow(unreachable_pub)]
 pub struct Vfs {
     objects: Objects,
     /// The client of the server, for the refresh of the ticket: a
@@ -245,6 +251,9 @@ impl Vfs {
     /// is the read ticket that minted for `root`; a ticket that does not
     /// parse is stored as expired, so the first read mints a fresh one.
     /// Changes go to `overlay`.
+    // The test seam re-exports the Vfs surface (test_support.vfs), and
+    // unreachable_pub does not see through a re-export.
+    #[allow(unreachable_pub)]
     pub fn new(
         objects: Objects,
         roots: Objects,
@@ -292,6 +301,9 @@ impl Vfs {
     /// is the only caller that passes true. A read-only VFS answers every
     /// mutating call with `EROFS`, before it looks at its arguments.
     #[must_use]
+    // The test seam re-exports the Vfs surface (test_support.vfs), and
+    // unreachable_pub does not see through a re-export.
+    #[allow(unreachable_pub)]
     pub fn writable(mut self, on: bool) -> Self {
         self.writable = on;
         self
@@ -307,6 +319,9 @@ impl Vfs {
     }
 
     /// The mount secret, as the file-name part of a mount path.
+    // The test seam re-exports the Vfs surface (test_support.vfs), and
+    // unreachable_pub does not see through a re-export.
+    #[allow(unreachable_pub)]
     pub fn secret_name(&self) -> String {
         self.secret.iter().fold(String::new(), |mut all, b| {
             use std::fmt::Write as _;
@@ -318,6 +333,9 @@ impl Vfs {
     /// The path of `path` under the overlay directory, from the raw
     /// bytes: a name that is not UTF-8 must name its own file, not the
     /// file its lossy spelling names.
+    // The test seam re-exports the Vfs surface (test_support.vfs), and
+    // unreachable_pub does not see through a re-export.
+    #[allow(unreachable_pub)]
     pub fn overlay_file(&self, path: &RepoPath) -> PathBuf {
         let mut file = self.overlay.clone();
         for part in path.as_bytes().split(|&b| b == b'/') {
@@ -1321,7 +1339,7 @@ fn write_deletes(overlay: &Path, deleted: &HashSet<RepoPath>) -> std::io::Result
 /// note that is not there holds none. A damaged note is an error, not
 /// "no deletions": a commit that reads a broken note as empty would
 /// keep every path the mount deleted.
-pub fn read_deletes(overlay: &Path) -> anyhow::Result<Vec<RepoPath>> {
+pub(crate) fn read_deletes(overlay: &Path) -> anyhow::Result<Vec<RepoPath>> {
     let bytes = match std::fs::read(overlay.join(DELETES)) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
