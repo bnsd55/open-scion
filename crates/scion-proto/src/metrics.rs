@@ -98,6 +98,7 @@ const LANDS: [&str; 13] = [
 /// the gRPC code of the reply the caller saw: one source, the reply's own
 /// code, so the counter cannot drift from what callers read. The land
 /// handler counts after it builds the reply's `Status`.
+#[must_use]
 pub fn land_error_label(code: tonic::Code) -> usize {
     match code {
         tonic::Code::Aborted => 4,
