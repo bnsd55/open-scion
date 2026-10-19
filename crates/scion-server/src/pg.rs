@@ -1279,7 +1279,7 @@ impl<'a> PgTx<'a> {
         // drops this `PgTx`, and its Drop rolls the transaction back, so
         // the pooled client never stays inside one whose statements no
         // longer run.
-        let mut tx = Self { c, ended: false };
+        let tx = Self { c, ended: false };
         tx.c.execute(
             &format!("SET LOCAL statement_timeout = {}", statement.as_millis()),
             &[],
