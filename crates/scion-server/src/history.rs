@@ -956,8 +956,13 @@ mod tests {
     #[test]
     fn a_log_page_without_a_path_checks_its_deadline() {
         let (_dir, store, repo) = open();
-        let ids = store_chain(&store, repo, None, &vec![&[("a", true)][..]; 4], true);
-        let past = Deadline::new(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let steps: &[(&str, bool)] = &[("a", true)];
+        let ids = store_chain(&store, repo, None, &[steps; 4], true);
+        let past = Deadline::new(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap(),
+        );
         let page = read::log_page(&store, "r", *ids.last().unwrap(), None, 10, &past);
         assert!(matches!(page, Err(Error::DeadlineExceeded(_))), "{page:?}");
     }

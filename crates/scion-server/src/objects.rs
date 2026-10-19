@@ -929,22 +929,25 @@ mod tests {
 
     /// The ticket walk pays as it goes: a tree is handed to the walk only
     /// while the bytes it holds fit the reply budget, and an expired
-    /// deadline stops the walk before the first tree.
+    /// deadline stops the walk before the first tree. The walk reaches a
+    /// ref's own tree by its ID without decoding it, so the wide tree
+    /// here is one the path crosses, not one it ends at.
     #[test]
     fn a_ticket_walk_stops_before_it_decodes_past_the_budget() {
         use scion_core::{Entry, FileEntry, FileState, PathElem, Tree};
         use std::collections::BTreeMap;
         let dir = tempfile::tempdir().unwrap();
         let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
-        // A child tree whose one file entry has a wide name, so its body
-        // is hundreds of bytes, under a root of one small entry.
+        // A middle tree whose one file entry has a wide name, so its body
+        // is hundreds of bytes, under a root of one small entry, over a
+        // leaf the ref ends at.
         let wide = PathElem::new(vec![b'x'; 300]).unwrap();
-        let (root, child) = store
+        let (root, leaf) = store
             .write(|c| {
                 let blob = BlobId::of(b"blob");
-                let child = c.put_tree(&Tree {
+                let leaf = c.put_tree(&Tree {
                     entries: BTreeMap::from([(
-                        wide,
+                        PathElem::new("f").unwrap(),
                         Entry::File(FileEntry::new(
                             FileState::Regular {
                                 content: blob,
@@ -954,16 +957,31 @@ mod tests {
                         )),
                     )]),
                 })?;
-                let root = c.put_tree(&Tree {
-                    entries: BTreeMap::from([(PathElem::new("d").unwrap(), Entry::Dir(child))]),
+                let mid = c.put_tree(&Tree {
+                    entries: BTreeMap::from([
+                        (
+                            wide,
+                            Entry::File(FileEntry::new(
+                                FileState::Regular {
+                                    content: blob,
+                                    executable: false,
+                                },
+                                0,
+                            )),
+                        ),
+                        (PathElem::new("s").unwrap(), Entry::Dir(leaf)),
+                    ]),
                 })?;
-                Ok((root, child))
+                let root = c.put_tree(&Tree {
+                    entries: BTreeMap::from([(PathElem::new("d").unwrap(), Entry::Dir(mid))]),
+                })?;
+                Ok((root, leaf))
             })
             .unwrap();
-        let refs = [(Key::Tree(child), b"d".to_vec())];
+        let refs = [(Key::Tree(leaf), b"d/s".to_vec())];
 
-        // The budget fits the root but not the child: the walk hands the
-        // root over, and stops before it decodes the child.
+        // The budget fits the root but not the middle tree: the walk
+        // hands the root over, and stops before it decodes the middle.
         let budget = Arc::new(Semaphore::new(200));
         WALK_DECODED.store(0, Ordering::SeqCst);
         let err = prove(&store, *root.as_bytes(), &refs, &budget, None).unwrap_err();
@@ -972,7 +990,7 @@ mod tests {
         assert!(decoded > 0 && decoded <= 200, "{decoded}");
 
         // An expired deadline stops the walk before the first tree.
-        let past = Some(Instant::now() - Duration::from_secs(1));
+        let past = Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
         let plenty = Arc::new(Semaphore::new(1 << 20));
         let err = prove(&store, *root.as_bytes(), &refs, &plenty, past).unwrap_err();
         assert!(matches!(err, Error::DeadlineExceeded(_)), "{err:?}");
