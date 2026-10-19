@@ -648,11 +648,11 @@ call to free bytes, until the call's deadline, then fails with
 `RESOURCE_EXHAUSTED`. Every later take of a call fails at once if the
 bytes are not free, so a call that holds budget never waits for more and
 two calls cannot wait for each other. A failed call frees its bytes; the
-client retries it whole. A window holds at most 1,048,576 lines: a file with
-more is blamed over several calls, one window each, and each new window
-re-walks the history from the requested changeset (the cursor carries the
-lines' state, so a call diffs only the versions of its own window). A file
-whose share is more than the whole budget is refused at once.
+client retries it whole. A file of more than 1,048,576 lines is refused at
+once, as one whose share is more than the whole budget is: one call's
+window holds the whole file, and the cursor goes on only over the walk's
+versions (it carries the lines' state, so a call diffs only the versions
+of its own steps).
 
 | Error | When |
 |---|---|

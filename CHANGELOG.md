@@ -234,6 +234,22 @@ The first release: the server, its cache tiers, and the `scn` client.
   under a gate, and each stand-in server they start runs in its own
   process group, killed and reaped whole on drop.
 
+- docs/architecture.md said a tier forwards `ResolveRef` and caches
+  `GetRootTree`; it refuses both with `UNIMPLEMENTED` (`#307`), as its own
+  statements elsewhere in the doc already said. The tier tables now
+  match the code, the duplicated rename-index sentences are gone, the
+  derived-data table names `derived::get_by` and the deadline a cold
+  derive now carries, the blame bounds say the walk checks the deadline
+  between steps and refuses a file over the diff-line cap, and the fault
+  suites name the dm-log-writes suite that the directory-fsync row used
+  to list as future work.
+- A blame's window doc matched a rule that no longer holds, and the
+  code behind it could not run (`#305`): a file of more than
+  1,048,576 lines is refused, and a window is that many lines, so one
+  call's window holds the whole servable file. The second-window
+  branch of the resume, which re-walked the history from the request
+  for a file's next window, is gone; the cursor still goes on over the
+  walk's versions.
 - A blame walk checks the call's deadline before each step, the first
   one whose memory share is more than the whole budget does, and a
   version over the cap in the file's history counts as absent, as one
@@ -384,6 +400,13 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Security
 
+- The CI workflow pins every third-party action to the commit SHA its
+  version tag named, with the version in a comment, runs on fixed
+  runner images (`ubuntu-24.04`, `macos-15`) and pins the Postgres
+  service to `postgres:17.11`; Dependabot keeps the pins current, and
+  a runner or image upgrade is a diff, not a surprise. The MSRV job
+  checks everything the CI checks, locked, with every feature, on
+  `cargo +1.88`.
 - A blame cursor that claims an impossible line count is refused as a
   bad cursor (`#288`): the count is the client's word, and its
   per-line memory cost was multiplied without an overflow check, so a
