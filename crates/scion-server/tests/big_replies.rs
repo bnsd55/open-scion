@@ -14,7 +14,10 @@ use scion_server::test_support::meta::MetaTx;
 use std::sync::Arc;
 
 use scion_server::Metrics;
-use scion_server::{Backend, Store, test_support::service};
+use scion_server::{
+    Backend,
+    test_support::{service, store::Store},
+};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 use tonic::Status;

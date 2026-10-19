@@ -12,7 +12,7 @@ use scion_core::{Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_server::test_support::blame::{self, Resume};
 use scion_server::test_support::memory::Bytes;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
-use scion_server::{Backend, Store, test_support::tree};
+use scion_server::{Backend, test_support::{store::Store, tree}};
 use std::sync::OnceLock;
 use tempfile::TempDir;
 

@@ -11,7 +11,10 @@ use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{BlameChangeset, BlameRange, BlameRequest};
 use scion_server::Access;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
-use scion_server::{Backend, Store, test_support::service};
+use scion_server::{
+    Backend,
+    test_support::{service, store::Store},
+};
 use tokio::net::TcpListener;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
