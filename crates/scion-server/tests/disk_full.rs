@@ -11,7 +11,7 @@
 //! `mount`, `remount`, and `umount` commands themselves.
 mod common;
 
-use scion_server::meta::{Meta as _, MetaTx as _};
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::{Backend, Error};
 
 fn required() -> bool {

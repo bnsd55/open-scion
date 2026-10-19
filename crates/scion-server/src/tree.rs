@@ -27,6 +27,7 @@ pub type BlobLens<'a> = &'a mut dyn FnMut(BlobId) -> Result<u64>;
 /// The lens of the store's blobs, from each frame header, for the callers
 /// that hold the store and no pre-read lengths, such as tests and the
 /// in-transaction derive of `store_changeset`.
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn lens_of(store: &Backend) -> impl FnMut(BlobId) -> Result<u64> + '_ {
     |blob| Ok(store.blobs().size(blob)? as u64)
 }
@@ -189,6 +190,7 @@ pub fn root_tree(
 /// # Errors
 ///
 /// As [`root_tree`], without [`Error::DeadlineExceeded`].
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn root_tree_unbounded(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
     derived::get_unbounded::<RootTree>(store, repo, cs)
 }

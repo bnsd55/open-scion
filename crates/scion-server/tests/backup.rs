@@ -5,7 +5,7 @@
 //! `pg_dump`, which the runbook documents.
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
-use scion_server::meta::{Meta as _, MetaTx as _, RepoId};
+use scion_server::test_support::meta::{Meta as _, MetaTx as _, RepoId};
 use scion_server::{Backend, Store, fsck};
 
 /// A backup taken while the store serves: the metadata snapshot names

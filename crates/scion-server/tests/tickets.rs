@@ -11,9 +11,9 @@ use scion_proto::runtime::listen::Limits;
 use scion_proto::runtime::object::{Assembler, Header};
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::{GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
-use scion_server::meta::MetaTx as _;
-use scion_server::tickets::Keys;
-use scion_server::{Backend, Store, service};
+use scion_server::Keys;
+use scion_server::test_support::meta::MetaTx as _;
+use scion_server::{Backend, Store, test_support::service};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tonic::Code;
@@ -79,7 +79,7 @@ async fn server() -> (
         service::ServeOptions {
             data: dir.path().to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
@@ -315,7 +315,7 @@ async fn server_of_readme() -> (
         service::ServeOptions {
             data: dir.path().to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
@@ -553,7 +553,7 @@ async fn tiers() -> (Tiers, tokio::sync::oneshot::Sender<()>, tempfile::TempDir)
         service::ServeOptions {
             data: dir.path().to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,

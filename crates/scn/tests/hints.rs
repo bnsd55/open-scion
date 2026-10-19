@@ -11,7 +11,7 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 
 use scion_proto::runtime::listen::Limits;
-use scion_server::{Backend, service};
+use scion_server::{Backend, test_support::service};
 
 const REPO: &str = "r";
 const TOKEN: &str = "secret";
@@ -29,7 +29,7 @@ async fn serve_http(data: &TempDir, token: &'static str) -> String {
         service::ServeOptions {
             data: data.path().to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
@@ -199,7 +199,7 @@ async fn serve_tls(data: &TempDir, certs: &TestCerts) -> String {
         service::ServeOptions {
             data: data.path().to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: Some(tls),

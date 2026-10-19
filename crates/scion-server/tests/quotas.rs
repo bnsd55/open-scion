@@ -7,10 +7,10 @@ use scion_proto::runtime::auth::token_digest;
 use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{GetLandRequest, LogRequest, PutBlobRequest};
-use scion_server::access::Access;
-use scion_server::meta::{Meta as _, MetaTx as _, RefState};
-use scion_server::quotas::Quotas;
-use scion_server::{Backend, service};
+use scion_server::Access;
+use scion_server::Quotas;
+use scion_server::test_support::meta::{Meta as _, MetaTx as _, RefState};
+use scion_server::{Backend, test_support::service};
 use std::fmt::Write as _;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -122,7 +122,7 @@ async fn server_with_tickets(
     dir: &std::path::Path,
     access: Access,
     quotas: Quotas,
-    tickets: Option<scion_server::tickets::Keys>,
+    tickets: Option<scion_server::Keys>,
 ) -> (Stop, Channel) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -458,13 +458,13 @@ fn objects(channel: Channel) -> scion_proto::v1::objects_client::ObjectsClient<C
 
 /// The ticket of `principal` for the root tree of `main`, signed by the
 /// server's own keys.
-fn ticket_for(keys: &scion_server::tickets::Keys, principal: &str, store: &Backend) -> Vec<u8> {
+fn ticket_for(keys: &scion_server::Keys, principal: &str, store: &Backend) -> Vec<u8> {
     let cs = main_ref(store).target;
-    let root = scion_server::read::root_tree(
+    let root = scion_server::test_support::read::root_tree(
         store,
         REPO,
         cs,
-        &scion_server::deadline::Deadline::new(
+        &scion_server::test_support::deadline::Deadline::new(
             std::time::Instant::now() + std::time::Duration::from_secs(300),
         ),
     )
@@ -506,7 +506,7 @@ async fn hold_objects(
 async fn a_get_objects_stream_holds_its_principals_slot() {
     let (dir, store) = store();
     let access = access(&["alice", "bob"]);
-    let keys = scion_server::tickets::Keys::generate();
+    let keys = scion_server::Keys::generate();
     // One request in flight per principal.
     let (stop, channel) = server_with_tickets(
         &store,
