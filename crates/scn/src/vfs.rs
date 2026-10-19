@@ -254,23 +254,6 @@ impl Vfs {
         ticket: &[u8],
         overlay: PathBuf,
     ) -> Self {
-        Self::with_writable(
-            objects, roots, repo, changeset, root, ticket, overlay, false,
-        )
-    }
-
-    /// [`Vfs::new`], with writes taken (`on`) or refused. A read-only VFS
-    /// answers every mutating call with `EROFS`.
-    pub fn with_writable(
-        objects: Objects,
-        roots: Objects,
-        repo: String,
-        changeset: ChangesetId,
-        root: TreeId,
-        ticket: &[u8],
-        overlay: PathBuf,
-        writable: bool,
-    ) -> Self {
         let grant = Grant::of(ticket);
         Self {
             objects,
@@ -301,13 +284,14 @@ impl Vfs {
             uid: rustix::process::geteuid().as_raw(),
             gid: rustix::process::getegid().as_raw(),
             overlay,
-            writable,
+            writable: false,
         }
     }
 
     /// Takes writes on this mount, or not: `scn mount --unstable-writable`
     /// is the only caller that passes true. A read-only VFS answers every
     /// mutating call with `EROFS`, before it looks at its arguments.
+    #[must_use]
     pub fn writable(mut self, on: bool) -> Self {
         self.writable = on;
         self
@@ -795,9 +779,9 @@ impl NFSFileSystem for Vfs {
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
-        self.want_write()?;
         use std::io::Seek as _;
 
+        self.want_write()?;
         let mut nodes = self.nodes.write().await;
         let file = match nodes.by_id.get(&id) {
             None => return Err(nfsstat3::NFS3ERR_STALE),
