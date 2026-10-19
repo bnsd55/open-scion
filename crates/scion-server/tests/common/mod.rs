@@ -572,7 +572,7 @@ pub fn metadata(store: &Backend, seen: &mut HashSet<Vec<u8>>) -> (BTreeSet<BlobI
                     let changes = Changeset::decode(&body).unwrap().changes().clone();
                     changes.into_values().flatten().collect()
                 } else {
-                    let entries = Tree::decode(&body).unwrap().entries().into_values();
+                    let entries = Tree::decode(&body).unwrap().entries().clone().into_values();
                     let file = |entry| match entry {
                         Entry::File(file) => Some(file.state()),
                         Entry::Dir(_) => None,

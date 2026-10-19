@@ -159,7 +159,7 @@ fn assert_reads_back(
             assert_eq!(head, Some(*ids.last().unwrap()), "main reads back");
             for (i, id) in ids.iter().enumerate() {
                 let cs = c.get_changeset(repo, *id)?;
-                assert_eq!(cs.message, format!("{label} {i}").into_bytes());
+                assert_eq!(cs.message(), format!("{label} {i}").into_bytes());
             }
             Ok(())
         })

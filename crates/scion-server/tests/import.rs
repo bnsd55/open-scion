@@ -445,9 +445,9 @@ fn changesets_carry_git_metadata_and_first_parent_diffs() {
     ]
     .into();
     assert_eq!(changes, expected, "true is a put, false a delete");
-    assert_eq!(swap.parents, [changeset_of(&store, &h.root)]);
+    assert_eq!(swap.parents(), [changeset_of(&store, &h.root)]);
     assert_eq!(
-        swap.author,
+        swap.author(),
         IdentityTime::new(
             b"Ada".to_vec(),
             b"ada@example.com".to_vec(),
@@ -457,7 +457,7 @@ fn changesets_carry_git_metadata_and_first_parent_diffs() {
         .expect("identity fits the format")
     );
     assert_eq!(
-        swap.committer,
+        swap.committer(),
         Some(
             IdentityTime::new(
                 b"Bob".to_vec(),
@@ -468,7 +468,7 @@ fn changesets_carry_git_metadata_and_first_parent_diffs() {
             .expect("identity fits the format")
         )
     );
-    assert_eq!(swap.message, b"swap files and directories\n");
+    assert_eq!(swap.message(), b"swap files and directories\n");
 
     let merge = changeset(&h.merge);
     assert_eq!(
@@ -482,8 +482,8 @@ fn changesets_carry_git_metadata_and_first_parent_diffs() {
         "a merge stores its diff against the first parent"
     );
 
-    assert_eq!(changeset(&h.non_utf8).message, NON_UTF8_MESSAGE);
-    assert_eq!(changeset(&h.root).parents, []);
+    assert_eq!(changeset(&h.non_utf8).message(), NON_UTF8_MESSAGE);
+    assert_eq!(changeset(&h.root).parents(), []);
 }
 
 #[test]
@@ -922,7 +922,10 @@ fn an_import_process_shares_the_data_directory_with_lands() {
     let out = land(&store, &lands, create(&store, start, "mine.txt"));
     assert_eq!(out.state, LandState::Landed, "{}", out.detail);
     let mine = out.result.unwrap();
-    let parents = read::get_changeset(&store, "r", mine).unwrap().parents;
+    let parents = read::get_changeset(&store, "r", mine)
+        .unwrap()
+        .parents()
+        .to_vec();
     assert_eq!(parents, [imported]);
 
     // Agents land on main while another process imports more commits into
@@ -985,7 +988,7 @@ fn an_import_process_shares_the_data_directory_with_lands() {
     while at != mine {
         assert!(history.len() < landed.len(), "main does not reach {mine}");
         history.push(at);
-        at = read::get_changeset(&store, "r", at).unwrap().parents[0];
+        at = read::get_changeset(&store, "r", at).unwrap().parents()[0];
     }
     let mut want = landed;
     want.sort();
@@ -1040,7 +1043,10 @@ fn an_import_process_shares_the_postgres_database_with_lands() {
     let out = land(&store, &lands, create(&store, start, "mine.txt"));
     assert_eq!(out.state, LandState::Landed, "{}", out.detail);
     let mine = out.result.unwrap();
-    let parents = read::get_changeset(&store, "r", mine).unwrap().parents;
+    let parents = read::get_changeset(&store, "r", mine)
+        .unwrap()
+        .parents()
+        .to_vec();
     assert_eq!(parents, [imported]);
 
     // Agents land on main while another process imports more commits into
@@ -1103,7 +1109,7 @@ fn an_import_process_shares_the_postgres_database_with_lands() {
     while at != mine {
         assert!(history.len() < landed.len(), "main does not reach {mine}");
         history.push(at);
-        at = read::get_changeset(&store, "r", at).unwrap().parents[0];
+        at = read::get_changeset(&store, "r", at).unwrap().parents()[0];
     }
     let mut want = landed;
     want.sort();
