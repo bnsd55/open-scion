@@ -111,8 +111,10 @@ fn is_out_of_space(e: &Error) -> bool {
 }
 
 /// A store on the mount, like a server opens its data directory.
-fn open_store(mount: &Mount) -> Backend {
-    Backend::open_test(mount.0.join("data").as_path()).unwrap()
+/// `which` names the call site, so a failure says which open failed.
+fn open_store(mount: &Mount, which: &str) -> Backend {
+    Backend::open_test(mount.0.join("data").as_path())
+        .unwrap_or_else(|error| panic!("{which}: {error}"))
 }
 
 /// Fills the store with distinct blobs of `len` bytes until the disk
@@ -143,7 +145,7 @@ fn a_full_disk_answers_out_of_space_and_needs_no_repair() {
         return;
     }
     let mount = Mount::new("space", "8m", "4096");
-    let store = open_store(&mount);
+    let store = open_store(&mount, "first open of the full-disk test");
     // The first blob lands, so a read has something to keep serving.
     let kept = store.blobs().put(b"kept\n").unwrap();
     assert_eq!(store.blobs().get(kept).unwrap(), b"kept\n");
@@ -167,12 +169,14 @@ fn a_full_disk_answers_out_of_space_and_needs_no_repair() {
     let after = store.blobs().put(b"after\n").unwrap();
     assert_eq!(store.blobs().get(after).unwrap(), b"after\n");
     drop(store);
-    // A restart needs no repair: the store opens again, and fsck is
-    // clean. The write side of the spawn guard, as above.
-    let store = common::spawn_guard::across_release(|| {
+    // A reaped helper's inherited lock can outlive the drop by one tick:
+    // no spawn starts, and the lock is free, before the reopen (#281).
+    common::spawn_guard::across_release(|| {
         common::spawn_guard::wait_for_lock_release(&mount.0.join("data"));
-        open_store(&mount)
     });
+    // A restart needs no repair: the store opens again, and fsck is
+    // clean.
+    let store = open_store(&mount, "reopen of the full-disk test");
     assert_eq!(store.blobs().get(kept).unwrap(), b"kept\n");
     let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
     assert!(report.is_clean(), "{:?}", report.problems);
@@ -189,7 +193,7 @@ fn a_full_metadata_disk_answers_out_of_space_and_needs_no_repair() {
         return;
     }
     let mount = Mount::new("meta", "1m", "4096");
-    let store = open_store(&mount);
+    let store = open_store(&mount, "first open of the metadata test");
     // Repos fill the metadata database until its file cannot grow.
     let mut names = Vec::new();
     let error = loop {
@@ -213,14 +217,12 @@ fn a_full_metadata_disk_answers_out_of_space_and_needs_no_repair() {
     mount.remount_bigger("64m", "4096");
     store.write(|c| c.create_repo("after")).unwrap();
     drop(store);
-    // A restart needs no repair, and fsck is clean. The write side of
-    // the spawn guard: no child of another test is in its fork-to-exec
-    // window while this lock is released and taken again, and the poll
-    // waits out the operating system's own teardown tick.
-    let store = common::spawn_guard::across_release(|| {
+    // As above: the reopen must not race a lingering lock.
+    common::spawn_guard::across_release(|| {
         common::spawn_guard::wait_for_lock_release(&mount.0.join("data"));
-        open_store(&mount)
     });
+    // A restart needs no repair, and fsck is clean.
+    let store = open_store(&mount, "reopen of the metadata test");
     let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
     assert!(report.is_clean(), "{:?}", report.problems);
 }
@@ -231,7 +233,7 @@ fn a_disk_out_of_inodes_answers_out_of_space_and_needs_no_repair() {
         return;
     }
     let mount = Mount::new("inodes", "64m", "128");
-    let store = open_store(&mount);
+    let store = open_store(&mount, "first open of the inodes test");
     // Tiny blobs eat the inode budget one file at a time, until the
     // create itself is refused.
     let (error, landed) = fill_with_blobs(&store, 16);
@@ -250,11 +252,11 @@ fn a_disk_out_of_inodes_answers_out_of_space_and_needs_no_repair() {
     mount.remount_bigger("64m", "4096");
     store.blobs().put(b"after\n").unwrap();
     drop(store);
-    // The write side of the spawn guard, as above.
-    let store = common::spawn_guard::across_release(|| {
+    // As above: the reopen must not race a lingering lock.
+    common::spawn_guard::across_release(|| {
         common::spawn_guard::wait_for_lock_release(&mount.0.join("data"));
-        open_store(&mount)
     });
+    let store = open_store(&mount, "reopen of the inodes test");
     let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
     assert!(report.is_clean(), "{:?}", report.problems);
 }
