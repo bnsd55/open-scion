@@ -226,7 +226,7 @@ The first release: the server, its cache tiers, and the `scn` client.
 ### Fixed
 
 - docs/architecture.md said a tier forwards `ResolveRef` and caches
-  `GetRootTree`; it refuses both with `UNIMPLEMENTED`, as its own
+  `GetRootTree`; it refuses both with `UNIMPLEMENTED` (`#307`), as its own
   statements elsewhere in the doc already said. The tier tables now
   match the code, the duplicated rename-index sentences are gone, the
   derived-data table names `derived::get_by` and the deadline a cold
