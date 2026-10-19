@@ -1991,7 +1991,7 @@ impl MetaTx for PgTx<'_> {
         // write, on both backends.
         let (body, id) = cs.encode_with_id();
         let mut parent_gen = 0;
-        for parent in &cs.parents {
+        for parent in &cs.parents() {
             parent_gen = parent_gen.max(self.generation(repo, *parent)?);
         }
         self.c.execute(
@@ -2003,7 +2003,7 @@ impl MetaTx for PgTx<'_> {
                 P::bytes(&body),
             ],
         )?;
-        for (n, parent) in (0_i64..).zip(&cs.parents) {
+        for (n, parent) in (0_i64..).zip(&cs.parents()) {
             self.c.execute(
                 "INSERT INTO changeset_parents (cs, n, parent) VALUES ($1, $2, $3)
                  ON CONFLICT (cs, n) DO NOTHING",
@@ -3465,18 +3465,20 @@ mod pool_tests {
                 let repo = c.create_repo("r")?;
                 let cs = c.insert_changeset(
                     repo,
-                    &Changeset {
-                        parents: vec![],
-                        author: scion_core::IdentityTime {
-                            name: b"Ada".to_vec(),
-                            email: b"ada@example.com".to_vec(),
-                            unix_secs: 0,
-                            tz_offset_minutes: 0,
-                        },
-                        committer: None,
-                        message: b"root".to_vec(),
-                        changes: std::collections::BTreeMap::new(),
-                    },
+                    &Changeset::new(
+                        vec![],
+                        scion_core::IdentityTime::new(
+                            b"Ada".to_vec(),
+                            b"ada@example.com".to_vec(),
+                            0,
+                            0,
+                        )
+                        .expect("identity fits the format"),
+                        None,
+                        b"root".to_vec(),
+                        std::collections::BTreeMap::new(),
+                    )
+                    .expect("changeset fits the format"),
                 )?;
                 assert!(c.cas_ref(repo, "main", None, cs)?);
                 Ok(cs)

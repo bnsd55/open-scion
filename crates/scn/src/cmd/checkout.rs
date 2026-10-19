@@ -219,7 +219,7 @@ async fn walk(
         let mut next = Vec::new();
         for (dir, id, tree_path) in level {
             let tree = trees.get(&id).context("server skipped a tree")?;
-            for (name, entry) in &tree.entries {
+            for (name, entry) in &tree.entries() {
                 let path = join(dir.as_ref(), name)?;
                 let bytes = path.as_bytes();
                 let inside =
@@ -494,8 +494,8 @@ mod tests {
     #[test]
     fn objects_with_the_wrong_bytes_are_refused() {
         let blob = BlobId::of(b"hello\n");
-        let tree = Tree {
-            entries: [(
+        let tree = Tree::new(
+            [(
                 PathElem::new("hello.txt").unwrap(),
                 Entry::File(FileEntry::new(
                     FileState::Regular {
@@ -506,7 +506,8 @@ mod tests {
                 )),
             )]
             .into(),
-        };
+        )
+        .expect("tree fits the format");
         let (bytes, id) = tree.encode_with_id();
         assert_eq!(decode_tree(id, &bytes).unwrap(), tree);
         check_blob(blob, b"hello\n").unwrap();

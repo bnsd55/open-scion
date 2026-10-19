@@ -238,7 +238,7 @@ async fn snapshot(
         };
         let (got, data) = get_objects(&mut client, &request).await;
         assert_eq!(got.end, None);
-        for (name, entry) in Tree::decode(&data[0]).unwrap().entries {
+        for (name, entry) in Tree::decode(&data[0]).unwrap().entries() {
             let mut below = path.clone();
             if !below.is_empty() {
                 below.push(b'/');

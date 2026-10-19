@@ -37,17 +37,7 @@ fn fixture() -> &'static (TempDir, Backend, ChangesetId) {
                 for (n, line) in [b"a\n".as_slice(), b"b\n", b"c\n"].iter().enumerate() {
                     let content = store.blobs().put(line).expect("blob");
                     let len = line.len() as u64;
-                    let cs = Changeset {
-                        parents: ids.last().copied().into_iter().collect(),
-                        author: IdentityTime {
-                            name: b"Ada".to_vec(),
-                            email: b"ada@example.com".to_vec(),
-                            unix_secs: 1_700_000_000 + n as i64,
-                            tz_offset_minutes: 0,
-                        },
-                        committer: None,
-                        message: format!("change {n}").into_bytes(),
-                        changes: [(
+                    let cs = Changeset::new(ids.last().copied().into_iter().collect(), IdentityTime::new(b"Ada".to_vec(), b"ada@example.com".to_vec(), 1_700_000_000 + n as i64, 0).expect("identity fits the format"), None, format!("change {n}").into_bytes(), [(
                             RepoPath::new(PATH).unwrap(),
                             Some(FileState::Regular {
                                 content,
@@ -55,8 +45,7 @@ fn fixture() -> &'static (TempDir, Backend, ChangesetId) {
                             }),
                         )]
                         .into_iter()
-                        .collect(),
-                    };
+                        .collect()).expect("changeset fits the format");
                     ids.push(tree::store_changeset(c, repo, &cs, &mut move |b| {
                         if b == content {
                             Ok(len)

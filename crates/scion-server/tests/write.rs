@@ -90,18 +90,20 @@ fn path(p: &str) -> RepoPath {
 }
 
 fn changeset(parents: Vec<ChangesetId>, changes: &[(&str, Option<FileState>)]) -> Changeset {
-    Changeset {
+    Changeset::new(
         parents,
-        author: IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"change\n".to_vec(),
-        changes: changes.iter().map(|(p, s)| (path(p), *s)).collect(),
-    }
+        IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"change\n".to_vec(),
+        changes.iter().map(|(p, s)| (path(p), *s)).collect(),
+    )
+    .expect("changeset fits the format")
 }
 
 /// The bytes of a changeset on `parent` whose change count is `n`, with no
@@ -178,21 +180,52 @@ fn bad_requests_are_rejected_and_store_nothing() {
         .store
         .read(|c| count_changesets(c.sqlite().unwrap()))
         .unwrap();
-    let ok = |edit: fn(&mut Changeset)| {
-        let mut cs = changeset(vec![f.root], &[("dir/new", Some(regular("new")))]);
-        edit(&mut cs);
-        cs.encode()
+    // Rebuilds the base changeset with the edit's fields. The core
+    // constructor enforces the format's bounds, and every edit here stays
+    // inside them; the server's own limits are what these rows test.
+    let ok = |build: fn(&Changeset) -> Changeset| {
+        let base = changeset(vec![f.root], &[("dir/new", Some(regular("new")))]);
+        build(&base).encode()
     };
+    let rebuilt =
+        |cs: &Changeset,
+         parents: Vec<ChangesetId>,
+         committer: Option<IdentityTime>,
+         message: Vec<u8>,
+         author: IdentityTime,
+         changes: std::collections::BTreeMap<RepoPath, Option<FileState>>| {
+            Changeset::new(parents, author, committer, message, changes)
+                .expect("rebuilt changeset fits the format")
+        };
     let invalid = [
         ("undecodable", b"not a changeset".to_vec(), "bad changeset"),
         (
             "no parents",
-            ok(|cs| cs.parents.clear()),
+            ok(|cs| {
+                rebuilt(
+                    cs,
+                    Vec::new(),
+                    cs.committer().cloned(),
+                    cs.message().to_vec(),
+                    cs.author().clone(),
+                    cs.changes().clone(),
+                )
+            }),
             "exactly one parent",
         ),
         (
             "two parents",
-            ok(|cs| cs.parents.push(cs.parents[0])),
+            ok(|cs| {
+                let p = cs.parents()[0];
+                rebuilt(
+                    cs,
+                    vec![p, p],
+                    cs.committer().cloned(),
+                    cs.message().to_vec(),
+                    cs.author().clone(),
+                    cs.changes().clone(),
+                )
+            }),
             "exactly one parent",
         ),
         (
@@ -203,14 +236,31 @@ fn bad_requests_are_rejected_and_store_nothing() {
         (
             "missing blob",
             ok(|cs| {
-                cs.changes
-                    .insert(path("dir/zzz"), Some(regular("never uploaded")));
+                let mut changes = cs.changes().clone();
+                changes.insert(path("dir/zzz"), Some(regular("never uploaded")));
+                rebuilt(
+                    cs,
+                    cs.parents().to_vec(),
+                    cs.committer().cloned(),
+                    cs.message().to_vec(),
+                    cs.author().clone(),
+                    changes,
+                )
             }),
             "is not stored",
         ),
         (
             "committer set",
-            ok(|cs| cs.committer = Some(cs.author.clone())),
+            ok(|cs| {
+                rebuilt(
+                    cs,
+                    cs.parents().to_vec(),
+                    Some(cs.author().clone()),
+                    cs.message().to_vec(),
+                    cs.author().clone(),
+                    cs.changes().clone(),
+                )
+            }),
             "committer",
         ),
         // No change follows these counts. The limit error, not "ends early",
@@ -227,12 +277,38 @@ fn bad_requests_are_rejected_and_store_nothing() {
         ),
         (
             "message too long",
-            ok(|cs| cs.message = vec![b'm'; MAX_COMMIT_MESSAGE_BYTES + 1]),
+            ok(|cs| {
+                rebuilt(
+                    cs,
+                    cs.parents().to_vec(),
+                    cs.committer().cloned(),
+                    vec![b'm'; MAX_COMMIT_MESSAGE_BYTES + 1],
+                    cs.author().clone(),
+                    cs.changes().clone(),
+                )
+            }),
             "message",
         ),
         (
             "email too long",
-            ok(|cs| cs.author.email = vec![b'e'; MAX_IDENTITY_BYTES + 1]),
+            ok(|cs| {
+                let a = cs.author();
+                let long = IdentityTime::new(
+                    a.name().to_vec(),
+                    vec![b'e'; MAX_IDENTITY_BYTES + 1],
+                    a.unix_secs(),
+                    a.tz_offset_minutes(),
+                )
+                .expect("identity fits the format");
+                rebuilt(
+                    cs,
+                    cs.parents().to_vec(),
+                    cs.committer().cloned(),
+                    cs.message().to_vec(),
+                    long,
+                    cs.changes().clone(),
+                )
+            }),
             "author",
         ),
     ];

@@ -52,18 +52,20 @@ fn chain(
                     content: store.blobs().put(&content).unwrap(),
                     executable: false,
                 };
-                let cs = Changeset {
-                    parents: ids.last().copied().into_iter().collect(),
-                    author: scion_core::IdentityTime {
-                        name: vec![b'a'; name_len],
-                        email: b"t@x".to_vec(),
-                        unix_secs: 1_700_000_000,
-                        tz_offset_minutes: 0,
-                    },
-                    committer: None,
-                    message: format!("change {i}\n").into_bytes(),
-                    changes: [(RepoPath::new(b"d/f.txt").unwrap(), Some(regular))].into(),
-                };
+                let cs = Changeset::new(
+                    ids.last().copied().into_iter().collect(),
+                    scion_core::IdentityTime::new(
+                        vec![b'a'; name_len],
+                        b"t@x".to_vec(),
+                        1_700_000_000,
+                        0,
+                    )
+                    .expect("identity fits the format"),
+                    None,
+                    format!("change {i}\n").into_bytes(),
+                    [(RepoPath::new(b"d/f.txt").unwrap(), Some(regular))].into(),
+                )
+                .expect("changeset fits the format");
                 ids.push(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0);
             }
             Ok(ids)

@@ -51,18 +51,20 @@ async fn blobs_are_per_repo(mut client: Client, root: ChangesetId) {
 }
 
 fn changeset(parents: Vec<ChangesetId>, path: &str, state: Option<FileState>) -> Changeset {
-    Changeset {
+    Changeset::new(
         parents,
-        author: IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"change\n".to_vec(),
-        changes: [(RepoPath::new(path).unwrap(), state)].into(),
-    }
+        IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"change\n".to_vec(),
+        [(RepoPath::new(path).unwrap(), state)].into(),
+    )
+    .expect("changeset fits the format")
 }
 
 fn regular(content: BlobId) -> FileState {

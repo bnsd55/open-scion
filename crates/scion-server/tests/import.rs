@@ -322,7 +322,7 @@ fn root_entry(store: &Backend, cs: ChangesetId, name: &str) -> Option<Entry> {
         &Deadline::new(Instant::now() + Duration::from_secs(300)),
     )
     .unwrap()
-    .entries
+    .entries()
     .remove(&PathElem::new(name).unwrap())
 }
 
@@ -430,7 +430,7 @@ fn changesets_carry_git_metadata_and_first_parent_diffs() {
 
     let swap = changeset(&h.swap);
     let changes: BTreeMap<&[u8], bool> = swap
-        .changes
+        .changes()
         .iter()
         .map(|(p, state)| (p.as_bytes(), state.is_some()))
         .collect();
@@ -448,30 +448,34 @@ fn changesets_carry_git_metadata_and_first_parent_diffs() {
     assert_eq!(swap.parents, [changeset_of(&store, &h.root)]);
     assert_eq!(
         swap.author,
-        IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 330,
-        }
+        IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            330
+        )
+        .expect("identity fits the format")
     );
     assert_eq!(
         swap.committer,
-        Some(IdentityTime {
-            name: b"Bob".to_vec(),
-            email: b"bob@example.com".to_vec(),
-            unix_secs: 1_700_000_100,
-            tz_offset_minutes: -420,
-        })
+        Some(
+            IdentityTime::new(
+                b"Bob".to_vec(),
+                b"bob@example.com".to_vec(),
+                1_700_000_100,
+                -420
+            )
+            .expect("identity fits the format")
+        )
     );
     assert_eq!(swap.message, b"swap files and directories\n");
 
     let merge = changeset(&h.merge);
     assert_eq!(
-        merge.parents,
+        merge.parents(),
         [changeset_of(&store, &h.main), changeset_of(&store, &h.side)]
     );
-    let merged: Vec<&[u8]> = merge.changes.keys().map(RepoPath::as_bytes).collect();
+    let merged: Vec<&[u8]> = merge.changes().keys().map(RepoPath::as_bytes).collect();
     assert_eq!(
         merged,
         [&b"side.txt"[..], b"src/nested/deep/file.txt"],
@@ -544,7 +548,7 @@ fn modes_100644_and_100664_are_the_same_file() {
     let report = import(&store, &git, &c2);
     assert_eq!(report.verified, 2);
     let cs = read::get_changeset(&store, "r", report.tip).unwrap();
-    assert!(cs.changes.is_empty(), "{:?}", cs.changes);
+    assert!(cs.changes().is_empty(), "{:?}", cs.changes());
 }
 
 #[test]
@@ -765,7 +769,7 @@ fn criss_cross_merges_import_and_the_ref_moves_only_to_descendants() {
     assert_eq!(main_ref(&store).target, report.tip);
     let merge = read::get_changeset(&store, "r", report.tip).unwrap();
     assert_eq!(
-        merge.parents,
+        merge.parents(),
         [changeset_of(&store, &a2), changeset_of(&store, &b2)]
     );
     for name in ["a.txt", "b.txt", "c.txt", "base.txt"] {
@@ -827,12 +831,13 @@ fn assert_success(out: &Output) {
 }
 
 fn identity() -> IdentityTime {
-    IdentityTime {
-        name: b"Ada".to_vec(),
-        email: b"ada@example.com".to_vec(),
-        unix_secs: 1_700_000_200,
-        tz_offset_minutes: 0,
-    }
+    IdentityTime::new(
+        b"Ada".to_vec(),
+        b"ada@example.com".to_vec(),
+        1_700_000_200,
+        0,
+    )
+    .expect("identity fits the format")
 }
 
 /// Creates a changeset on `base` that puts `path`, through the write path.
@@ -844,13 +849,14 @@ fn create(store: &Backend, base: ChangesetId, path: &str) -> ChangesetId {
         content: write::put_blob(store, repo, upload).unwrap(),
         executable: false,
     };
-    let cs = Changeset {
-        parents: vec![base],
-        author: identity(),
-        committer: None,
-        message: path.as_bytes().to_vec(),
-        changes: BTreeMap::from([(self::path(path), Some(file))]),
-    };
+    let cs = Changeset::new(
+        vec![base],
+        identity(),
+        None,
+        path.as_bytes().to_vec(),
+        BTreeMap::from([(self::path(path), Some(file))]),
+    )
+    .expect("changeset fits the format");
     write::create_changeset(store, "r", &cs.encode()).unwrap()
 }
 
@@ -898,13 +904,8 @@ fn an_import_process_shares_the_data_directory_with_lands() {
     // A land whose base is not on main builds main's path index at the
     // start, and leaves main alone.
     let repo = store.read(|c| c.repo_id("r")).unwrap();
-    let side = Changeset {
-        parents: vec![],
-        author: identity(),
-        committer: None,
-        message: b"side".to_vec(),
-        changes: BTreeMap::new(),
-    };
+    let side = Changeset::new(vec![], identity(), None, b"side".to_vec(), BTreeMap::new())
+        .expect("changeset fits the format");
     let side = store.write(|c| c.insert_changeset(repo, &side)).unwrap();
     let out = land(&store, &lands, create(&store, side, "s.txt"));
     assert_eq!(out.state, LandState::Rejected, "{}", out.detail);
@@ -1021,13 +1022,8 @@ fn an_import_process_shares_the_postgres_database_with_lands() {
     // A land whose base is not on main builds main's path index at the
     // start, and leaves main alone.
     let repo = store.read(|c| c.repo_id("r")).unwrap();
-    let side = Changeset {
-        parents: vec![],
-        author: identity(),
-        committer: None,
-        message: b"side".to_vec(),
-        changes: BTreeMap::new(),
-    };
+    let side = Changeset::new(vec![], identity(), None, b"side".to_vec(), BTreeMap::new())
+        .expect("changeset fits the format");
     let side = store.write(|c| c.insert_changeset(repo, &side)).unwrap();
     let out = land(&store, &lands, create(&store, side, "s.txt"));
     assert_eq!(out.state, LandState::Rejected, "{}", out.detail);

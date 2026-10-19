@@ -231,7 +231,7 @@ fn import_with_cache(
         // first, in steps: after a version bump it has none, and the
         // transaction would derive its whole history.
         for (_, cs, _) in &prepared {
-            if let Some(&parent) = cs.parents.first().filter(|p| !in_batch.contains(*p)) {
+            if let Some(&parent) = cs.parents().first().filter(|p| !in_batch.contains(*p)) {
                 tree::fill_root_tree(store, repo_id, parent)?;
             }
         }
@@ -585,13 +585,14 @@ impl Importer<'_> {
             })
             .transpose()?;
         let git_tree = decoded.tree();
-        let changeset = Changeset {
+        let changeset = Changeset::new(
             parents,
-            author: identity(commit, "author", decoded.author())?,
-            committer: Some(identity(commit, "committer", decoded.committer())?),
-            message: decoded.message.to_vec(),
-            changes: self.diff(commit, base, git_tree, batch)?,
-        };
+            identity(commit, "author", decoded.author())?,
+            Some(identity(commit, "committer", decoded.committer())?),
+            decoded.message.to_vec(),
+            self.diff(commit, base, git_tree, batch)?,
+        )
+        .expect("changeset fits the format");
         Ok((changeset, git_tree))
     }
 
@@ -763,7 +764,7 @@ impl Checker<'_> {
             let want = read_tree(self.git, commit, Some(git_id))?;
             let have: BTreeMap<Vec<u8>, Entry> = c
                 .get_tree(scion_id)?
-                .entries
+                .entries()
                 .into_iter()
                 .map(|(name, entry)| (name.as_bytes().to_vec(), entry))
                 .collect();
@@ -896,7 +897,7 @@ fn read_tree(
         .decode()
         .map_err(|e| bad(format!("cannot decode: {e}")))?;
     let mut entries = BTreeMap::new();
-    for e in &decoded.entries {
+    for e in decoded.entries() {
         let oid = e.oid.to_owned();
         let entry = match e.mode.value() {
             0o040_000 => GitEntry::Dir(oid),
@@ -971,13 +972,13 @@ fn identity(
     let bad = |e: gix::Error| Error::Git(format!("commit {commit}: bad {role}: {e}"));
     let signature = signature.map_err(bad)?;
     let time = signature.time().map_err(bad)?;
-    Ok(IdentityTime {
-        name: signature.name.to_vec(),
-        email: signature.email.to_vec(),
-        unix_secs: time.seconds,
-        // Git stores whole minutes, so this is exact.
-        tz_offset_minutes: time.offset / 60,
-    })
+    Ok(IdentityTime::new(
+        signature.name.to_vec(),
+        signature.email.to_vec(),
+        time.seconds,
+        time.offset / 60,
+    )
+    .expect("identity fits the format"))
 }
 
 fn per_sec(count: usize, since: Instant) -> u128 {
@@ -1157,17 +1158,16 @@ mod tests {
         let server = Backend::Sqlite(Store::open(data.path()).unwrap());
         let importer = Backend::Sqlite(Store::open_shared(data.path()).unwrap());
         // main is at root. Git has root ─ tip, and a land puts X on root.
-        let changeset = |parents, message: &str| Changeset {
-            parents,
-            author: IdentityTime {
-                name: b"Ada".to_vec(),
-                email: b"ada@example.com".to_vec(),
-                unix_secs: 0,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: message.into(),
-            changes: BTreeMap::new(),
+        let changeset = |parents, message: &str| {
+            Changeset::new(
+                parents,
+                IdentityTime::new(b"Ada".to_vec(), b"ada@example.com".to_vec(), 0, 0)
+                    .expect("identity fits the format"),
+                None,
+                message.into(),
+                BTreeMap::new(),
+            )
+            .expect("changeset fits the format")
         };
         let (repo, tip, x) = server
             .write(|c| {
@@ -1240,17 +1240,16 @@ mod tests {
         // main is at root. The chain root <- a1 <- a2 <- a3 <- tip hangs
         // under it, so every mover target is still an ancestor of the
         // imported tip and the import never hears "diverged".
-        let changeset = |parents, message: &str| Changeset {
-            parents,
-            author: IdentityTime {
-                name: b"Ada".to_vec(),
-                email: b"ada@example.com".to_vec(),
-                unix_secs: 0,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: message.into(),
-            changes: BTreeMap::new(),
+        let changeset = |parents, message: &str| {
+            Changeset::new(
+                parents,
+                IdentityTime::new(b"Ada".to_vec(), b"ada@example.com".to_vec(), 0, 0)
+                    .expect("identity fits the format"),
+                None,
+                message.into(),
+                BTreeMap::new(),
+            )
+            .expect("changeset fits the format")
         };
         let (repo, tip, links): (RepoId, ChangesetId, Arc<[ChangesetId]>) = server
             .write(|c| {

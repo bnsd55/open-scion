@@ -240,12 +240,13 @@ pub async fn resolve_ref(objects: &mut Objects, name: &str) -> Result<ChangesetI
 }
 
 pub fn author() -> IdentityTime {
-    IdentityTime {
-        name: b"Ada".to_vec(),
-        email: b"ada@example.com".to_vec(),
-        unix_secs: 1_700_000_000,
-        tz_offset_minutes: 0,
-    }
+    IdentityTime::new(
+        b"Ada".to_vec(),
+        b"ada@example.com".to_vec(),
+        1_700_000_000,
+        0,
+    )
+    .expect("identity fits the format")
 }
 
 pub fn changeset_id(bytes: &[u8]) -> ChangesetId {
@@ -285,12 +286,12 @@ pub struct Ledger {
 pub fn create_repo(data: &Path) {
     let store = Store::open(data).unwrap();
     let readme = store.blobs().put(b"crash suite\n").unwrap();
-    let root = Changeset {
-        parents: vec![],
-        author: author(),
-        committer: None,
-        message: b"root\n".to_vec(),
-        changes: [(
+    let root = Changeset::new(
+        vec![],
+        author(),
+        None,
+        b"root\n".to_vec(),
+        [(
             RepoPath::new("README").unwrap(),
             Some(FileState::Regular {
                 content: readme,
@@ -298,7 +299,8 @@ pub fn create_repo(data: &Path) {
             }),
         )]
         .into(),
-    };
+    )
+    .expect("changeset fits the format");
     store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -403,13 +405,14 @@ pub async fn client(url: String, name: String, mut rng: Rng, signals: Arc<Signal
         }
 
         let key = format!("{name}-{op}");
-        let changeset = Changeset {
-            parents: vec![base],
-            author: author(),
-            committer: None,
-            message: key.clone().into_bytes(),
+        let changeset = Changeset::new(
+            vec![base],
+            author(),
+            None,
+            key.clone().into_bytes(),
             changes,
-        };
+        )
+        .expect("changeset fits the format");
         let (bytes, id) = changeset.encode_with_id();
         let request = CreateChangesetRequest {
             repo: REPO.into(),
@@ -569,7 +572,7 @@ pub fn metadata(store: &Backend, seen: &mut HashSet<Vec<u8>>) -> (BTreeSet<BlobI
                     let changes = Changeset::decode(&body).unwrap().changes;
                     changes.into_values().flatten().collect()
                 } else {
-                    let entries = Tree::decode(&body).unwrap().entries.into_values();
+                    let entries = Tree::decode(&body).unwrap().entries().into_values();
                     let file = |entry| match entry {
                         Entry::File(file) => Some(file.state()),
                         Entry::Dir(_) => None,
@@ -660,12 +663,12 @@ pub async fn walk_refs(
             let bytes = changeset_bytes(scion, request, &format!("{target}: {at}")).await;
             let (changeset, id) = Changeset::decode_with_id(&bytes).unwrap();
             assert_eq!(id, at, "{target}: changeset {at} does not match its ID");
-            let Some(&parent) = changeset.parents.first() else {
+            let Some(&parent) = changeset.parents().first() else {
                 break;
             };
             if checked.changesets.insert(at) {
                 let diff = diff(scion, parent, at).await;
-                assert_eq!(diff, changeset.changes, "{target}: root tree of {at}");
+                assert_eq!(diff, changeset.changes(), "{target}: root tree of {at}");
             }
             let previous = history.insert(at, (target, changeset));
             let twice = "is on two refs, or twice on one";
@@ -706,7 +709,7 @@ pub fn check_lands(ledger: &Ledger, history: &HashMap<ChangesetId, (&str, Change
             }
             LandState::Conflict => {
                 let shared = RepoPath::new(SHARED).unwrap();
-                let changes = &sent.changeset.changes;
+                let changes = &sent.changeset.changes();
                 assert!(changes.contains_key(&shared), "{key}: {reply:?}");
                 assert_eq!(
                     reply.conflict_paths,

@@ -327,7 +327,7 @@ fn a_non_utf8_name_commits_its_own_content() {
     let committed = Changeset::decode(&bytes).unwrap();
     let state = |name: &[u8]| {
         committed
-            .changes
+            .changes()
             .get(&RepoPath::new(name.to_vec()).unwrap())
             .and_then(|state| state.as_ref())
     };

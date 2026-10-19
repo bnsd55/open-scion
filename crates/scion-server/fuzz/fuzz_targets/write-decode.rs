@@ -14,6 +14,6 @@ fuzz_target!(|data: &[u8]| {
         let (bytes, again) = cs.encode_with_id();
         assert_eq!(bytes, data);
         assert_eq!(again, id);
-        assert!(cs.changes.len() <= write::MAX_CHANGES);
+        assert!(cs.changes().len() <= write::MAX_CHANGES);
     }
 });

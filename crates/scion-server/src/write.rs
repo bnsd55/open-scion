@@ -133,23 +133,23 @@ fn check_parent(c: &mut dyn MetaTx, repo: &str, parent: ChangesetId) -> Result<R
 
 /// Checks what a client may send, and returns the one parent.
 fn check_request(cs: &Changeset) -> Result<ChangesetId> {
-    let &[parent] = cs.parents.as_slice() else {
+    let &[parent] = cs.parents().as_slice() else {
         return Err(Error::InvalidArgument(format!(
             "a changeset needs exactly one parent, got {}",
-            cs.parents.len()
+            cs.parents().len()
         )));
     };
-    if cs.committer.is_some() {
+    if cs.committer().is_some() {
         return Err(Error::InvalidArgument(
             "committer must be empty: only git import sets it".into(),
         ));
     }
-    if cs.message.len() > MAX_COMMIT_MESSAGE_BYTES {
+    if cs.message().len() > MAX_COMMIT_MESSAGE_BYTES {
         return Err(Error::InvalidArgument(format!(
             "message is longer than {MAX_COMMIT_MESSAGE_BYTES} bytes"
         )));
     }
-    if cs.author.name.len() > MAX_IDENTITY_BYTES || cs.author.email.len() > MAX_IDENTITY_BYTES {
+    if cs.author().name.len() > MAX_IDENTITY_BYTES || cs.author().email.len() > MAX_IDENTITY_BYTES {
         return Err(Error::InvalidArgument(format!(
             "author name or email is longer than {MAX_IDENTITY_BYTES} bytes"
         )));
@@ -203,18 +203,20 @@ mod tests {
     use crate::store::FSYNC_LEAVES_DRIVE_CACHE;
 
     fn changeset(parents: Vec<ChangesetId>) -> Changeset {
-        Changeset {
+        Changeset::new(
             parents,
-            author: IdentityTime {
-                name: b"Ada".to_vec(),
-                email: b"ada@example.com".to_vec(),
-                unix_secs: 1_700_000_000,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: b"change\n".to_vec(),
-            changes: BTreeMap::new(),
-        }
+            IdentityTime::new(
+                b"Ada".to_vec(),
+                b"ada@example.com".to_vec(),
+                1_700_000_000,
+                0,
+            )
+            .expect("identity fits the format"),
+            None,
+            b"change\n".to_vec(),
+            BTreeMap::new(),
+        )
+        .expect("changeset fits the format")
     }
 
     /// A store with repo `main` and an empty root changeset in it.
@@ -232,15 +234,24 @@ mod tests {
 
     /// A child of `parent` that puts each `(path, blob)`.
     fn child(parent: ChangesetId, puts: &[(&str, BlobId)]) -> Vec<u8> {
-        let mut cs = changeset(vec![parent]);
+        let cs = changeset(vec![parent]);
+        let mut changes = cs.changes().clone();
         for &(path, content) in puts {
             let file = FileState::Regular {
                 content,
                 executable: false,
             };
-            cs.changes.insert(RepoPath::new(path).unwrap(), Some(file));
+            changes.insert(RepoPath::new(path).unwrap(), Some(file));
         }
-        cs.encode()
+        Changeset::new(
+            cs.parents().to_vec(),
+            cs.author().clone(),
+            cs.committer().cloned(),
+            cs.message().to_vec(),
+            changes,
+        )
+        .expect("changeset fits the format")
+        .encode()
     }
 
     /// Repo `name`, made if missing.
@@ -354,8 +365,17 @@ mod tests {
         let module = FileState::Gitlink {
             commit: GitOid::Sha256(*theirs.as_bytes()),
         };
-        let mut cs = changeset(vec![root]);
-        cs.changes.insert(RepoPath::new("m").unwrap(), Some(module));
+        let cs = changeset(vec![root]);
+        let mut changes = cs.changes().clone();
+        changes.insert(RepoPath::new("m").unwrap(), Some(module));
+        let cs = Changeset::new(
+            cs.parents().to_vec(),
+            cs.author().clone(),
+            cs.committer().cloned(),
+            cs.message().to_vec(),
+            changes,
+        )
+        .expect("changeset fits the format");
         let with_module = create_changeset(&store, "main", &cs.encode()).unwrap();
         // Storing the gitlink did not make the blob `main`'s.
         let named = child(with_module, &[("f", theirs)]);

@@ -549,7 +549,7 @@ impl Vfs {
                     warn("cannot read a tree of the mount", &e);
                     nfsstat3::NFS3ERR_IO
                 })?;
-            for (name, entry) in tree.entries {
+            for (name, entry) in tree.entries() {
                 let path = Self::child(dir_path.as_ref(), name.as_bytes())?;
                 if nodes.deleted.contains(&path) || nodes.by_path.contains_key(&Some(path.clone()))
                 {
@@ -1691,18 +1691,20 @@ mod tests {
                     .zip(&contents)
                     .map(|((path, _, _), state)| (RepoPath::new(*path).unwrap(), Some(*state)))
                     .collect();
-                let cs = Changeset {
-                    parents: vec![],
-                    author: IdentityTime {
-                        name: b"Ada".to_vec(),
-                        email: b"ada@example.com".to_vec(),
-                        unix_secs: 1_700_000_000,
-                        tz_offset_minutes: 0,
-                    },
-                    committer: None,
-                    message: b"test\n".to_vec(),
-                    changes: changes.into_iter().collect(),
-                };
+                let cs = Changeset::new(
+                    vec![],
+                    IdentityTime::new(
+                        b"Ada".to_vec(),
+                        b"ada@example.com".to_vec(),
+                        1_700_000_000,
+                        0,
+                    )
+                    .expect("identity fits the format"),
+                    None,
+                    b"test\n".to_vec(),
+                    changes.into_iter().collect(),
+                )
+                .expect("changeset fits the format");
                 let (id, _) = tree::store_changeset(c, repo, &cs, &mut lens)?;
                 let version = c.get_ref(repo, "main")?.map(|r| r.version);
                 c.cas_ref(repo, "main", version, id)?;
@@ -2252,8 +2254,8 @@ mod tests {
                 id: BlobId::of(b"x\n").as_bytes().to_vec(),
                 data: b"x\n".to_vec(),
             };
-            let tree = Tree {
-                entries: [(
+            let tree = Tree::new(
+                [(
                     PathElem::new("a").unwrap(),
                     Entry::File(FileEntry::new(
                         FileState::Regular {
@@ -2264,7 +2266,8 @@ mod tests {
                     )),
                 )]
                 .into(),
-            };
+            )
+            .expect("tree fits the format");
             let (data, root) = tree.encode_with_id();
             let tree = Sent {
                 kind: ObjectKind::Tree.into(),

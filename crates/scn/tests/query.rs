@@ -348,18 +348,20 @@ fn two_changesets_lens(
             let repo = c.create_repo(REPO)?;
             let mut parents = Vec::new();
             for changes in [base, changes] {
-                let cs = Changeset {
-                    parents: parents.last().copied().into_iter().collect(),
-                    author: IdentityTime {
-                        name: b"Ada".to_vec(),
-                        email: b"ada@example.com".to_vec(),
-                        unix_secs: 1_700_000_000,
-                        tz_offset_minutes: 0,
-                    },
-                    committer: None,
-                    message: b"change".to_vec(),
+                let cs = Changeset::new(
+                    parents.last().copied().into_iter().collect(),
+                    IdentityTime::new(
+                        b"Ada".to_vec(),
+                        b"ada@example.com".to_vec(),
+                        1_700_000_000,
+                        0,
+                    )
+                    .expect("identity fits the format"),
+                    None,
+                    b"change".to_vec(),
                     changes,
-                };
+                )
+                .expect("changeset fits the format");
                 parents.push(tree::store_changeset(c, repo, &cs, &mut *lens)?.0);
             }
             Ok((parents[0], parents[1]))

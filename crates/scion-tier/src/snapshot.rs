@@ -222,10 +222,9 @@ mod tests {
                 )),
             )
         });
-        let (tree, id) = Tree {
-            entries: entries.into_iter().collect(),
-        }
-        .encode_with_id();
+        let (tree, id) = Tree::new(entries.into_iter().collect())
+            .expect("tree fits the format")
+            .encode_with_id();
         let objects = vec![
             (Key::Tree(id), Bytes::from(tree)),
             blob(b"one\n"),

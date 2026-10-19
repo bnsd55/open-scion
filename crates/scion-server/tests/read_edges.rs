@@ -52,12 +52,13 @@ fn regular(content: BlobId) -> FileState {
 }
 
 fn author() -> IdentityTime {
-    IdentityTime {
-        name: b"root".to_vec(),
-        email: b"a@example.com".to_vec(),
-        unix_secs: 1_700_000_000,
-        tz_offset_minutes: 0,
-    }
+    IdentityTime::new(
+        b"root".to_vec(),
+        b"a@example.com".to_vec(),
+        1_700_000_000,
+        0,
+    )
+    .expect("identity fits the format")
 }
 
 /// A store whose repo has one root changeset that puts `files` at the repo
@@ -74,13 +75,14 @@ fn store(files: &[(Vec<u8>, &[u8])]) -> (tempfile::TempDir, Backend, ChangesetId
                 c.add_repo_blob(repo, blob)?;
                 changes.push((RepoPath::new(name.as_slice()).unwrap(), Some(regular(blob))));
             }
-            let root = Changeset {
-                parents: vec![],
-                author: author(),
-                committer: None,
-                message: b"root\n".to_vec(),
-                changes: changes.into_iter().collect(),
-            };
+            let root = Changeset::new(
+                vec![],
+                author(),
+                None,
+                b"root\n".to_vec(),
+                changes.into_iter().collect(),
+            )
+            .expect("changeset fits the format");
             let root = c.insert_changeset(repo, &root)?;
             c.cas_ref(repo, "main", None, root)?;
             Ok(root)
@@ -182,7 +184,7 @@ async fn an_empty_directory_lists_as_one_part_of_no_entries() {
     let (parts, bytes) = list_dir(&mut client, &root, b"").await;
     assert_eq!(parts, 1, "the empty tree is its header only");
     let tree = Tree::decode(&bytes).expect("the part is a whole TreeV1");
-    assert!(tree.entries.is_empty(), "{tree:?}");
+    assert!(tree.entries().is_empty(), "{tree:?}");
 }
 
 /// A directory whose `TreeV1` bytes are exactly one part arrives in one
@@ -208,7 +210,7 @@ async fn the_part_seam_of_a_directory_loses_no_entry() {
     assert_eq!(parts, 1, "a tree of exactly {CHUNK_BYTES} bytes");
     assert_eq!(bytes.len(), CHUNK_BYTES, "the whole tree in one part");
     let tree = Tree::decode(&bytes).expect("the part is a whole TreeV1");
-    assert_eq!(tree.entries.len(), small + 1, "every entry came");
+    assert_eq!(tree.entries().len(), small + 1, "every entry came");
 
     // One entry more: one part plus one entry, in two parts.
     let mut files: Vec<(Vec<u8>, &[u8])> = (0..small)
@@ -226,7 +228,7 @@ async fn the_part_seam_of_a_directory_loses_no_entry() {
         "the last part carries the one entry over"
     );
     let tree = Tree::decode(&bytes).expect("the parts are a whole TreeV1");
-    assert_eq!(tree.entries.len(), small + 2, "every entry came");
+    assert_eq!(tree.entries().len(), small + 2, "every entry came");
 }
 
 /// An entry whose name is at the 4096-byte path cap lists with its whole
@@ -241,8 +243,8 @@ async fn a_name_at_the_cap_lists_and_reads_back() {
     let (parts, bytes) = list_dir(&mut client, &root, b"").await;
     assert_eq!(parts, 1);
     let tree = Tree::decode(&bytes).unwrap();
-    assert_eq!(tree.entries.len(), 1);
-    let listed = tree.entries.keys().next().unwrap();
+    assert_eq!(tree.entries().len(), 1);
+    let listed = tree.entries().keys().next().unwrap();
     assert_eq!(listed.as_bytes(), &name, "the name lost no byte");
 
     let (parts, content) = read_file(&mut client, &root, &name).await;

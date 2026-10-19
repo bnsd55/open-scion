@@ -44,11 +44,9 @@ fn identity() -> impl Strategy<Value = IdentityTime> {
         any::<i64>(),
         any::<i32>(),
     )
-        .prop_map(|(name, email, unix_secs, tz_offset_minutes)| IdentityTime {
-            name,
-            email,
-            unix_secs,
-            tz_offset_minutes,
+        .prop_map(|(name, email, unix_secs, tz_offset_minutes)| {
+            IdentityTime::new(name, email, unix_secs, tz_offset_minutes)
+                .expect("identity fits the format")
         })
 }
 
@@ -60,12 +58,9 @@ fn changeset() -> impl Strategy<Value = Changeset> {
         vec(any::<u8>(), 0..16),
         btree_map(repo_path(), option::of(file_state()), 0..6),
     )
-        .prop_map(|(parents, author, committer, message, changes)| Changeset {
-            parents,
-            author,
-            committer,
-            message,
-            changes,
+        .prop_map(|(parents, author, committer, message, changes)| {
+            Changeset::new(parents, author, committer, message, changes)
+                .expect("changeset fits the format")
         })
 }
 
@@ -76,7 +71,7 @@ fn tree() -> impl Strategy<Value = Tree> {
         any::<[u8; 32]>().prop_map(|b| Entry::Dir(TreeId::from_bytes(b))),
     ];
     btree_map(part().prop_map(|p| PathElem::new(p).unwrap()), entry, 0..6)
-        .prop_map(|entries| Tree { entries })
+        .prop_map(|entries| Tree::new(entries).expect("tree fits the format"))
 }
 
 proptest! {

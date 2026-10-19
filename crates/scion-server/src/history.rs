@@ -203,7 +203,7 @@ impl Kind for PathHistory {
             id,
             generation: c.generation_of(id)?,
         };
-        apply(c, parents.first().copied(), by, &changeset.changes)
+        apply(c, parents.first().copied(), by, &changeset.changes())
     }
 
     fn encode(root: &NodeId) -> Vec<u8> {
@@ -821,17 +821,13 @@ mod tests {
 
     /// A changeset that puts a file with `blob`, or deletes it, at each path.
     fn changeset(parent: Option<ChangesetId>, edits: &[(&str, Option<BlobId>)]) -> Changeset {
-        Changeset {
-            parents: parent.into_iter().collect(),
-            author: IdentityTime {
-                name: b"a".to_vec(),
-                email: b"a@x".to_vec(),
-                unix_secs: 0,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: vec![],
-            changes: edits
+        Changeset::new(
+            parent.into_iter().collect(),
+            IdentityTime::new(b"a".to_vec(), b"a@x".to_vec(), 0, 0)
+                .expect("identity fits the format"),
+            None,
+            vec![],
+            edits
                 .iter()
                 .map(|&(p, blob)| {
                     let state = blob.map(|content| FileState::Regular {
@@ -841,7 +837,8 @@ mod tests {
                     (path(p), state)
                 })
                 .collect(),
-        }
+        )
+        .expect("changeset fits the format")
     }
 
     /// A new store with repo `r`.
@@ -936,7 +933,7 @@ mod tests {
                         if read::changes_path(&cs, &path(p)) {
                             walked.push(id);
                         }
-                        next = cs.parents.first().copied();
+                        next = cs.parents().first().copied();
                     }
                     proptest::prop_assert_eq!(path_log(&store, tip, p, limit), walked, "{}", p);
                 }
