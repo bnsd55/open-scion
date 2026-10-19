@@ -169,12 +169,9 @@ make_work() {
   WORK=$(cd "$WORK" && pwd -P)
 }
 
-if [ -n "${SCION_BIN:-}" ]; then
-  BIN=$SCION_BIN
-else
-  note "building the N release binaries"
-  (cd "$ROOT" && cargo build --release --locked --quiet) || die "step 'build N' failed"
-fi
+command -v cargo > /dev/null || die "needs cargo"
+command -v git > /dev/null || die "needs git"
+command -v curl > /dev/null || die "needs curl"
 
 # build_prev REF: the N-1 binaries and their source checkout. PREV_BIN
 # skips the build (a local debug run); the source checkout is made
@@ -492,12 +489,28 @@ command -v cargo > /dev/null || die "needs cargo"
 command -v git > /dev/null || die "needs git"
 command -v curl > /dev/null || die "needs curl"
 
+# The ref first: a run with nothing to compare against says so before it
+# builds anything.
 ref=$(prev_ref)
 if [ -z "$ref" ]; then
+  # A workflow that resolved an N-1 ref hands it to the run through
+  # PREV_REF. The resolve step also leaves it in this file, which no env
+  # wiring can lose: a run that received no ref while the file is here
+  # tested nothing, and it must fail loud, never pass as a skip.
+  if [ -s version-matrix.prev-ref ]; then
+    die "the workflow resolved N-1 $(cat version-matrix.prev-ref), but this run never received it (PREV_REF was empty)"
+  fi
   summary "skipped: no release tag yet"
   exit 0
 fi
 note "N-1 is $ref"
+
+if [ -n "${SCION_BIN:-}" ]; then
+  BIN=$SCION_BIN
+else
+  note "building the N release binaries"
+  (cd "$ROOT" && cargo build --release --locked --quiet) || die "step 'build N' failed"
+fi
 build_prev "$ref"
 
 make_work

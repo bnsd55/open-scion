@@ -44,7 +44,13 @@ jobs:
           PREV_REF: ${{ github.event.inputs.prev_ref }}
         run: |
           ref=$(scripts/version-matrix.sh --resolve-ref)
-          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          if [ -n "$ref" ]; then
+            echo "ref=$ref" >> "$GITHUB_OUTPUT"
+            # The run step reads the ref through env, and a wiring slip
+            # there must never be green: the script also checks this
+            # file, which no env wiring can lose.
+            printf '%s\n' "$ref" > version-matrix.prev-ref
+          fi
       # The N-1 checkout at a stable path, so rust-cache can key on it.
       # The ref goes through env:, not through the run: string, so no
       # shell sees it unquoted — it ends in the dispatch input.
@@ -64,6 +70,9 @@ jobs:
       - name: run the version matrix
         if: steps.prev.outputs.ref != ''
         env:
+          # The resolved ref of the step above: the script uses it, and
+          # its absence while the file exists fails the run.
+          PREV_REF: ${{ steps.prev.outputs.ref }}
           # The pair runs share the job's workspace; PREV_SRC stays in
           # place after the script, so the cache step above it can save
           # the N-1 target dir (rust-cache's post step runs last).
