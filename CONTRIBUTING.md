@@ -52,10 +52,10 @@ A pull request does not edit `CHANGELOG.md`. It adds a fragment,
 - `<section>` is one of `added`, `changed`, `fixed`, `security`.
 - `<slug>` is the pull request's number when you know it, else a short
   kebab name (`rename-budget`).
-- The file holds the row's text as it will read: wrapped at 79 columns,
-  continuation lines carrying the row's two-space indent, no leading
-  `- `. Write it so it stands on its own: what changed, for whom, and
-  the pull request's number in parentheses.
+- The file is plain text: no leading `- `, and no indent on any line.
+  Wrap it at 76 columns, so the merged row fits in 79. Write it so it
+  stands on its own: what changed, for whom, and the pull request's
+  number in parentheses.
 
 At a release, `scripts/merge-changelog.sh <release>` turns the
 fragments into the changelog's rows and deletes them. CI refuses a

@@ -28,13 +28,14 @@ The first release.
 EOF
 
 cat >"$work/changes/12.added.md" <<'EOF'
-A new thing that the changelog will name first, wrapped at seventy-nine
-  columns in the file, with no row marker.
+A new thing that the changelog will name first, in a fragment of three
+lines of plain text, no row marker and no indent on any line, wrapped
+at 76 columns so the merged row fits in 79.
 EOF
 
 cat >"$work/changes/13.security.md" <<'EOF'
 A report whose subsection does not exist yet, so the merge creates it
-  at the end of the release block.
+at the end of the release block.
 EOF
 
 (cd "$work" && "$here/merge-changelog.sh" v0.1.0) >"$work/out.txt"
@@ -60,8 +61,9 @@ The first release.
 
 ### Added
 
-- A new thing that the changelog will name first, wrapped at seventy-nine
-  columns in the file, with no row marker.
+- A new thing that the changelog will name first, in a fragment of three
+  lines of plain text, no row marker and no indent on any line, wrapped
+  at 76 columns so the merged row fits in 79.
 - An existing row.
 
 ### Fixed

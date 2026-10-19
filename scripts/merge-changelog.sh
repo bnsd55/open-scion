@@ -50,9 +50,10 @@ for section in added changed fixed security; do
     rows=$work/rows.txt
     : >"$rows"
     for fragment in $fragments; do
-        # The fragment holds the row text as it will read; the row marker
-        # goes on the first line only.
-        sed '1s/^/- /' "$fragment" >>"$rows"
+        # A fragment is plain text: no row marker, no indent. The row
+        # marker goes on the first line, and every later line takes the
+        # row's two-space indent, as today's changelog rows read.
+        sed '1s/^/- /; 2,$s/^/  /' "$fragment" >>"$rows"
         echo "$fragment" >>"$merged"
     done
 
