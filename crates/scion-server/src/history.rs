@@ -1028,12 +1028,15 @@ mod tests {
             })
             .collect();
         let tip_edits: Vec<(String, bool)> = (0..40).map(|d| (format!("d{d}/x"), true)).collect();
-        let sets: [&Vec<(String, bool)>; 2] = [&base_edits, &tip_edits];
-        let refs: Vec<&[(&str, bool)]> = sets
+        let base: Vec<(&str, bool)> = base_edits
             .iter()
-            .map(|set| set.iter().map(|(p, put)| (p.as_str(), *put)).collect())
+            .map(|(p, put)| (p.as_str(), *put))
             .collect();
-        let ids = store_chain(&store, repo, None, &refs, true);
+        let tip: Vec<(&str, bool)> = tip_edits
+            .iter()
+            .map(|(p, put)| (p.as_str(), *put))
+            .collect();
+        let ids = store_chain(&store, repo, None, &[base.as_slice(), tip.as_slice()], true);
         let (base, tip) = (ids[0], ids[1]);
         let base_gen = store.read(|c| c.generation(repo, base)).unwrap();
 
