@@ -2211,7 +2211,7 @@ mod tests {
             committer: None,
             message: path.as_bytes().to_vec(),
             changes: [(
-                RepoPath::new(path.into_bytes()).unwrap(),
+                RepoPath::new(path.as_bytes().to_vec()).unwrap(),
                 Some(FileState::Regular {
                     content: blob,
                     executable: false,
