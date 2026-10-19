@@ -5,7 +5,7 @@
 mod common;
 
 use common::{git, git_status};
-use scion_server::import::{ImportOptions, import_git};
+use scion_server::{ImportOptions, import_git};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -14,10 +14,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
-use scion_server::deadline::Deadline;
-use scion_server::meta::{Meta as _, MetaTx as _};
-use scion_server::read::{self, DiffEntry, MAX_DIFF_ENTRIES, MAX_RENAME_CHUNKS, Rename};
-use scion_server::{Backend, Error, tree};
+use scion_server::test_support::deadline::Deadline;
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::test_support::read::{self, DiffEntry, MAX_DIFF_ENTRIES, MAX_RENAME_CHUNKS, Rename};
+use scion_server::{Backend, Error, test_support::tree};
 use tempfile::TempDir;
 
 const REPO: &str = "r";

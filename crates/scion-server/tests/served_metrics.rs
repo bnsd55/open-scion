@@ -9,13 +9,13 @@ use scion_proto::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest};
 
-use scion_server::access::Access;
+use scion_server::Access;
 use std::collections::BTreeMap;
 
-use scion_server::meta::{Meta as _, MetaTx as _};
-use scion_server::metrics::Metrics;
-use scion_server::tickets::Keys;
-use scion_server::{Backend, service};
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::Metrics;
+use scion_server::Keys;
+use scion_server::{Backend, test_support::service};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tonic::service::interceptor::{InterceptedService, Interceptor};
@@ -90,7 +90,7 @@ async fn served() -> (
         service::ServeOptions {
             data: dir.path().to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,

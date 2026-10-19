@@ -4,7 +4,7 @@
 //! transaction open leaves the reader pool healthy.
 
 use scion_core::{Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
-use scion_server::meta::MetaTx as _;
+use scion_server::test_support::meta::MetaTx as _;
 use scion_server::{Backend, Store, meta::Meta as _};
 use std::collections::BTreeMap;
 

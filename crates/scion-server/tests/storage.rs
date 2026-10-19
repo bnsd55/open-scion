@@ -3,7 +3,7 @@
 //! out-of-space reply that names no server path; nothing acknowledged is
 //! lost, no file is left half-written, and the next write works once the
 //! space is back.
-use scion_server::meta::{Meta as _, MetaTx as _};
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::{Backend, Error, Store};
 
 /// A store on the backend the tests run on.

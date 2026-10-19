@@ -7,12 +7,12 @@ use scion_proto::auth::Bearer;
 use scion_proto::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ReadFileRequest};
-use scion_server::meta::MetaTx as _;
-use scion_server::metrics::Metrics;
+use scion_server::test_support::meta::MetaTx as _;
+use scion_server::Metrics;
 use std::sync::Arc;
 
-use scion_server::meta::Meta as _;
-use scion_server::{Backend, service};
+use scion_server::test_support::meta::Meta as _;
+use scion_server::{Backend, test_support::service};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 use tonic::Code;
@@ -96,7 +96,7 @@ async fn uploaded_file_reads_back_through_a_created_changeset() {
         service::ServeOptions {
             data: dir.path().to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,

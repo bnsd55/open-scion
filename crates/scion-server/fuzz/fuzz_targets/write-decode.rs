@@ -7,7 +7,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use scion_server::write;
+use scion_server::test_support::write;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok((cs, id)) = write::decode(data) {

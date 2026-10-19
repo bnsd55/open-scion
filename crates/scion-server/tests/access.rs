@@ -17,15 +17,15 @@ use scion_proto::v1::{
 use std::sync::Arc;
 
 use scion_server::Store;
-use scion_server::access::Access;
-use scion_server::meta::Meta as _;
+use scion_server::Access;
+use scion_server::test_support::meta::Meta as _;
 
 /// The second repo of the two-world comparisons: its tree holds `docs`
 /// only, so the same path is genuinely missing there.
 const OTHER: &str = "other";
-use scion_server::meta::MetaTx as _;
-use scion_server::metrics::Metrics;
-use scion_server::{Backend, service};
+use scion_server::test_support::meta::MetaTx as _;
+use scion_server::Metrics;
+use scion_server::{Backend, test_support::service};
 use std::future::Future;
 use std::pin::Pin;
 use tokio::net::TcpListener;
@@ -163,13 +163,13 @@ async fn serve(store: &Backend, dir: &std::path::Path, access: Access) -> (Stop,
         service::ServeOptions {
             data: dir.to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::new(Metrics::default()),
         },
-        Some(Arc::new(scion_server::tickets::Keys::generate())),
+        Some(Arc::new(scion_server::Keys::generate())),
         async {
             stopped.await.ok();
         },
@@ -617,11 +617,11 @@ fn repo_with_docs_and_secret() -> (tempfile::TempDir, Backend, ChangesetId, Blob
 /// The tree ID of `secret` under the real root of `tip`.
 fn root_tree_id(store: &Backend, tip: ChangesetId) -> TreeId {
     let repo_id = store.read(|c| c.repo_id(REPO)).unwrap();
-    let root = scion_server::tree::root_tree(
+    let root = scion_server::test_support::tree::root_tree(
         store,
         repo_id,
         tip,
-        &scion_server::deadline::Deadline::new(
+        &scion_server::test_support::deadline::Deadline::new(
             std::time::Instant::now() + std::time::Duration::from_secs(300),
         ),
     )

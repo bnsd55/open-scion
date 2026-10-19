@@ -11,12 +11,13 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use scion_proto::listen::{self, Limits};
+use scion_proto::metrics::{loopback_or_allow, serve as metrics_serve};
 use scion_proto::tls::ServerTls;
-use scion_server::import::{ImportOptions, import_git};
+use scion_server::{ImportOptions, import_git};
 
-use scion_server::metrics::{self, Metrics};
-use scion_server::quotas::Quotas;
-use scion_server::{Backend, Error, fsck, gc, service};
+use scion_server::Metrics;
+use scion_server::Quotas;
+use scion_server::{Backend, Error, ServeOptions, serve};
 use tracing_subscriber::EnvFilter;
 
 /// The scion server: import, serve and derive.
@@ -363,13 +364,13 @@ async fn main() -> anyhow::Result<()> {
                 let tip = store.resolve_ref(&repo, &target_ref)?;
                 let name = match kind {
                     KindName::RootTree => {
-                        scion_server::tree::backfill_root_tree(&store, &repo, tip)?
+                        scion_server::backfill_root_tree(&store, &repo, tip)?
                     }
                     KindName::CommitGraph => {
-                        scion_server::graph::backfill_commit_graph(&store, &repo, tip)?
+                        scion_server::backfill_commit_graph(&store, &repo, tip)?
                     }
                     KindName::PathHistory => {
-                        scion_server::history::backfill_path_history(&store, &repo, tip)?
+                        scion_server::backfill_path_history(&store, &repo, tip)?
                     }
                 };
                 Ok::<_, Error>((name, tip))
@@ -448,7 +449,7 @@ struct ServeConfig {
 /// the data directory's one-server lock and never creates a file.
 struct ServeFlags {
     listen: SocketAddr,
-    access: scion_server::access::Access,
+    access: scion_server::Access,
     caps: Caps,
     land_stale_secs: i64,
     server_tls: Option<ServerTls>,
@@ -456,7 +457,7 @@ struct ServeFlags {
     max_streams: NonZeroU32,
     max_stalled_bytes: NonZeroU64,
     metrics_listen: Option<SocketAddr>,
-    tickets: Option<Arc<scion_server::tickets::Keys>>,
+    tickets: Option<Arc<scion_server::Keys>>,
 }
 
 /// Checks every `serve` flag that a parse alone does not settle: the rules
@@ -490,7 +491,7 @@ fn serve_flags(args: &ServeArgs) -> anyhow::Result<ServeFlags> {
         args.listen
     );
     if let Some(metrics_listen) = args.metrics_listen {
-        let checked = metrics::loopback_or_allow(metrics_listen, args.insecure_listen);
+        let checked = loopback_or_allow(metrics_listen, args.insecure_listen);
         anyhow::ensure!(checked.is_ok(), "{}", checked.unwrap_err());
     }
     Ok(ServeFlags {
@@ -513,9 +514,9 @@ fn serve_flags(args: &ServeArgs) -> anyhow::Result<ServeFlags> {
 async fn serve(
     store: Backend,
     listen: SocketAddr,
-    access: scion_server::access::Access,
+    access: scion_server::Access,
     config: ServeConfig,
-    tickets: Option<Arc<scion_server::tickets::Keys>>,
+    tickets: Option<Arc<scion_server::Keys>>,
 ) -> anyhow::Result<()> {
     // The registry always counts; only its plain-HTTP export is optional.
     // The metrics listener has no token, so unlike the gRPC listener, TLS
@@ -542,7 +543,7 @@ async fn serve(
         let metrics_addr = metrics_listener.local_addr()?;
         tracing::info!(listen = %metrics_addr, "serving metrics");
         let mut stopped = end_rx.clone();
-        tokio::spawn(metrics::serve(
+        tokio::spawn(metrics_serve(
             metrics_listener,
             metrics.clone(),
             async move {
@@ -557,11 +558,11 @@ async fn serve(
     let listen = listener.local_addr()?;
     tracing::info!(%listen, "serving");
 
-    Box::pin(service::serve(
+    Box::pin(serve(
         store,
         listener,
         access,
-        service::ServeOptions {
+        ServeOptions {
             data: config.data,
             limits: Limits {
                 connections: config.max_connections,
@@ -589,17 +590,17 @@ async fn serve(
 fn load_access(
     token: Option<String>,
     file: Option<PathBuf>,
-) -> anyhow::Result<(scion_server::access::Access, bool)> {
+) -> anyhow::Result<(scion_server::Access, bool)> {
     match (token, file) {
         (Some(_), Some(_)) => anyhow::bail!("give --token or --access, not both"),
         (Some(token), None) => {
             anyhow::ensure!(!token.is_empty(), "--token must not be empty");
-            Ok((scion_server::access::Access::single(&token), true))
+            Ok((scion_server::Access::single(&token), true))
         }
         (None, Some(file)) => {
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("cannot read {}", file.display()))?;
-            let access = scion_server::access::Access::parse(&text)
+            let access = scion_server::Access::parse(&text)
                 .map_err(|why| anyhow::anyhow!("bad access file {}: {why}", file.display()))?;
             Ok((access, false))
         }
@@ -612,12 +613,12 @@ fn load_access(
 fn load_tickets(
     seed: Option<&Path>,
     old: Option<&Path>,
-) -> anyhow::Result<Option<Arc<scion_server::tickets::Keys>>> {
+) -> anyhow::Result<Option<Arc<scion_server::Keys>>> {
     let Some(seed) = seed else {
         anyhow::ensure!(old.is_none(), "--ticket-key-old needs --ticket-key");
         return Ok(None);
     };
-    let keys = scion_server::tickets::Keys::load(
+    let keys = scion_server::Keys::load(
         &read_hex(seed, true)?,
         &match old {
             Some(file) => vec![read_hex(file, false)?],
@@ -677,7 +678,7 @@ fn write_ticket_key() -> anyhow::Result<()> {
     let Command::TicketKey { out } = command else {
         unreachable!("write_ticket_key handles only the ticket-key command")
     };
-    let keys = scion_server::tickets::Keys::generate();
+    let keys = scion_server::Keys::generate();
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
