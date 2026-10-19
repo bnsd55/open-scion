@@ -10,13 +10,11 @@ use std::process::{Command, Output};
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, GitOid, IdentityTime, RepoPath};
 use scion_proto::runtime::listen::Limits;
+use scion_server::Backend;
 use scion_server::test_support::meta::Meta as _;
 use scion_server::test_support::meta::MetaTx as _;
 use scion_server::test_support::read::MAX_DIFF_ENTRIES;
-use scion_server::{
-    Backend, Store,
-    test_support::{service, tree},
-};
+use scion_server::test_support::{service, store::Store, tree};
 use scion_server::{ImportOptions, import_git};
 use serde_json::Value;
 use std::sync::Arc;
