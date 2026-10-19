@@ -72,20 +72,17 @@ const _: () = assert!(PG_READERS == crate::store::READERS);
 /// directory is a SQLite one: directories of older builds have no file.
 const MARKER: &str = "backend";
 
-/// What the data directory's marker held when an open began.
+/// The store UUID the data directory's marker held when an open began.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Marker {
     pub(crate) uuid: Option<[u8; 16]>,
-    pub(crate) present: bool,
 }
 
 impl Marker {
     /// Reads the marker of `data`, if any.
     pub(crate) fn read(data: &Path) -> Self {
-        let present = data.join(MARKER).exists();
         Self {
             uuid: marker_uuid(data),
-            present,
         }
     }
 }
