@@ -12,7 +12,6 @@ use std::fs;
 use std::io::{self, ErrorKind, Read as _, Write as _};
 
 use rusqlite::OptionalExtension as _;
-use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -22,6 +21,7 @@ use hashlink::LruCache;
 use rustix::fs::FlockOperation;
 use scion_core::{BlobId, TreeId};
 use scion_proto::Bytes;
+use scion_proto::auth::create_private_dir_all;
 use scion_proto::object::MAX_ENCODED_BYTES;
 
 use crate::Key;
@@ -1179,7 +1179,8 @@ pub struct DiskStore {
 
 impl DiskStore {
     /// Opens the store in `dir`, keeping at most `limit` bytes of objects.
-    /// Creates `dir` with mode 0700 if it is missing. Refuses a `dir` that
+    /// Creates `dir` if it is missing. It, and every directory the store
+    /// makes in it, gets mode 0700 whatever the umask. Refuses a `dir` that
     /// other users can reach (not a real directory owned by this user and
     /// closed to others): only this user may read the objects or place files
     /// there. If the stored objects add up to more than `limit`, the least
@@ -1190,10 +1191,7 @@ impl DiskStore {
     /// [`ErrorKind::PermissionDenied`] if `dir` is not private,
     /// [`ErrorKind::WouldBlock`] if another process uses `dir`, or I/O errors.
     pub fn open(dir: &Path, limit: usize) -> io::Result<Self> {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
+        create_private_dir_all(dir)?;
         // The checked directory, so no symlink in `dir` is followed again.
         let dir = &crate::check_private_dir(dir)?;
         let lock_file = lock_dir(dir)?;
@@ -1201,8 +1199,8 @@ impl DiskStore {
         let tmp = dir.join("tmp");
         // Temp files left by a crash. The lock keeps other processes out.
         ignore_missing(fs::remove_dir_all(&tmp))?;
-        fs::create_dir_all(&tmp)?;
-        fs::create_dir_all(&objects)?;
+        create_private_dir_all(&tmp)?;
+        create_private_dir_all(&objects)?;
         let db_path = dir.join(INDEX);
         let (mut disk, meta) = Self::open_disk(&db_path)?;
         let mut walk_owed = false;
@@ -1620,7 +1618,7 @@ impl Store for DiskStore {
         self.flush();
         let path = self.path(key);
         if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
+            create_private_dir_all(dir)?;
         }
         let mut tmp = tempfile::NamedTempFile::new_in(&self.tmp)?;
         tmp.write_all(data)?;
@@ -1819,11 +1817,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
         let store = DiskStore::open(&data, 1 << 20).unwrap();
-        let mode = fs::metadata(&data).unwrap().permissions();
-        assert_eq!(
-            std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
-            0o700
-        );
 
         let (blob_key, frame) = blob(b"hello\n");
         let n = frame.len();
@@ -1833,6 +1826,25 @@ mod tests {
         store
             .put(tree_key, &Bytes::from(tree_bytes.clone()))
             .unwrap();
+        // Every directory of the store is private, whatever the umask of the
+        // run: the data directory, and each one made in it.
+        let fan_out = store.path(blob_key).parent().unwrap().to_owned();
+        let kind = fan_out.parent().unwrap().to_owned();
+        for made in [
+            data.clone(),
+            data.join("objects"),
+            kind,
+            fan_out,
+            store.tmp.clone(),
+        ] {
+            let mode = fs::symlink_metadata(&made).unwrap().permissions();
+            assert_eq!(
+                std::os::unix::fs::PermissionsExt::mode(&mode) & 0o7777,
+                0o700,
+                "{}",
+                made.display()
+            );
+        }
         assert_eq!(store.size(blob_key).unwrap(), Some(n));
         assert_eq!(store.get(blob_key, n).unwrap(), Some(frame.clone()));
         let tree_size = tree_bytes.len();

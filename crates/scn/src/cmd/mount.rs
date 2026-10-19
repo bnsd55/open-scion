@@ -338,9 +338,20 @@ fn overlay_dir() -> Result<PathBuf> {
         all
     });
     let dir = std::env::temp_dir().join(format!("scn-mount-{name}"));
-    std::fs::create_dir(&dir).context("cannot make the overlay directory")?;
+    // Made with mode 0700, which a umask can only narrow, so the directory
+    // is never open to others, not even before the chmod. A name that
+    // exists is refused, as with `create_dir`.
+    let private = {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    private
+        .create(&dir)
+        .context("cannot make the overlay directory")?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    std::fs::create_dir(dir.join(CHANGES))?;
+    private.create(dir.join(CHANGES))?;
     Ok(dir)
 }
 
@@ -349,8 +360,14 @@ pub(crate) fn session_file() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("cannot read $HOME"))?;
+    session_file_in(&home)
+}
+
+/// The path of the session file below `home`. Its directory, and any missing
+/// directory above it, is made with mode 0700 whatever the umask.
+fn session_file_in(home: &Path) -> Result<PathBuf> {
     let dir = home.join(".scion");
-    std::fs::create_dir_all(&dir)?;
+    scion_proto::auth::create_private_dir_all(&dir)?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     Ok(dir.join("mounts.json"))
 }
@@ -618,6 +635,24 @@ fn walk_changes(dir: &Path, prefix: &[u8], out: &mut Vec<(RepoPath, Change)>) ->
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn the_overlay_and_the_session_directory_are_private_whatever_the_umask() {
+        // The run's umask, 002 or 022, would leave 0775 or 0755 on a plain
+        // mkdir.
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        let overlay = overlay_dir().unwrap();
+        let modes = (mode(&overlay), mode(&overlay.join(CHANGES)));
+        fs::remove_dir_all(&overlay).unwrap();
+        assert_eq!(modes, (0o700, 0o700));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let file = session_file_in(&home).unwrap();
+        assert_eq!(file, home.join(".scion").join("mounts.json"));
+        assert_eq!(mode(&home), 0o700);
+        assert_eq!(mode(&home.join(".scion")), 0o700);
+    }
 
     #[test]
     fn a_session_survives_a_round_trip() {
