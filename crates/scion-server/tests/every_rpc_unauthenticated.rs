@@ -424,19 +424,19 @@ fn state_of_blocking(store: &Backend, dir: &Path) -> (i64, Vec<i64>) {
                      WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
                      ORDER BY name",
                 )
-                .map_err(scion_server::Error::from)?;
+                .map_err(scion_server::test_support::error::from_sqlite)?;
             let names = names
                 .query_map([], |row| row.get::<_, String>(0))
-                .map_err(scion_server::Error::from)?
+                .map_err(scion_server::test_support::error::from_sqlite)?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(scion_server::Error::from)?;
+                .map_err(scion_server::test_support::error::from_sqlite)?;
             names
                 .iter()
                 .map(|name| {
                     c.query_row::<i64, _, _>(&format!("SELECT COUNT(*) FROM {name}"), [], |row| {
                         row.get(0)
                     })
-                    .map_err(scion_server::Error::from)
+                    .map_err(scion_server::test_support::error::from_sqlite)
                 })
                 .collect()
         })

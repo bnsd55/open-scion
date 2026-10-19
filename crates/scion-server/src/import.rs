@@ -1345,7 +1345,12 @@ mod tests {
         import("main~1");
         // As after a version bump of the root tree: no stored root trees.
         let sql = "DELETE FROM derived WHERE kind = ?1";
-        let removed = store.write(|c| Ok(c.sqlite().unwrap().execute(sql, [RootTree::NAME])?));
+        let removed = store.write(|c| {
+            c.sqlite()
+                .unwrap()
+                .execute(sql, [RootTree::NAME])
+                .map_err(crate::error::from_sqlite)
+        });
         assert_eq!(removed.unwrap(), 4);
 
         let commits = store.commits();

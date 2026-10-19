@@ -188,19 +188,19 @@ impl Error {
     }
 }
 
-impl From<rusqlite::Error> for Error {
-    fn from(e: rusqlite::Error) -> Self {
-        // Classified here, once: a busy database is not a database
-        // failure (the transaction rolled back and wrote nothing), and
-        // neither is a full one (the shortage is the server's own). The
-        // rest keep the engine's error as the source.
-        if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) {
-            Error::Storage(Storage::busy(e))
-        } else if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) {
-            Error::Storage(Storage::disk_full(e))
-        } else {
-            Error::Storage(Storage::internal(e))
-        }
+/// Classifies a SQLite engine error, once, where it is built: a busy
+/// database is not a database failure (the transaction rolled back and
+/// wrote nothing), a full one is the server's own shortage, and the rest
+/// keep the engine's error as the source. The test seams export it, so
+/// the integration tests convert the way the crate does.
+#[must_use]
+pub fn from_sqlite(e: rusqlite::Error) -> Error {
+    if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) {
+        Error::Storage(Storage::busy(e))
+    } else if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) {
+        Error::Storage(Storage::disk_full(e))
+    } else {
+        Error::Storage(Storage::internal(e))
     }
 }
 
@@ -303,7 +303,7 @@ mod tests {
 
     /// A SQLite error of a chosen engine code.
     fn db(code: std::ffi::c_int) -> Error {
-        Error::from(rusqlite::Error::SqliteFailure(ffi::Error::new(code), None))
+        from_sqlite(rusqlite::Error::SqliteFailure(ffi::Error::new(code), None))
     }
 
     /// A busy store answers `unavailable`, so the client retries: the
@@ -358,6 +358,7 @@ mod tests {
             cause.sqlite_error_code(),
             Some(rusqlite::ErrorCode::DatabaseCorrupt)
         );
+    }
 
     /// A cancelled call maps to its own code, not a deadline's.
     #[test]

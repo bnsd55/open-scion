@@ -113,9 +113,10 @@ pub mod test_support {
     pub mod deadline {
         pub use crate::deadline::*;
     }
-    /// The error a changeset apply can end in, for the write tests.
+    /// The error a changeset apply can end in, and the conversion the
+    /// tests share with the crate, for the write tests.
     pub mod error {
-        pub use crate::error::ApplyError;
+        pub use crate::error::{ApplyError, from_sqlite};
     }
     /// The counters the import tests read between retries.
     pub mod import {
