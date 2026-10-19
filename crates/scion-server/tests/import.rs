@@ -1518,7 +1518,6 @@ fn a_second_import_of_row_named_blobs_neither_verifies_nor_fsyncs() {
     let _middle = git.commit("take beta away");
     git.write("g/b", "beta\n");
     let next = git.commit("put beta back");
-    let verifies = store.blobs().verifies();
     let fsyncs = store.blobs().fsync_count();
     import(&store, &git, &next);
     // The skip's proof is the fsyncs: the put of the row-named blob never
