@@ -4,8 +4,8 @@
 //! RPC without a row here fails this test, so a new method cannot land
 //! without auth coverage.
 
-use scion_proto::auth::token_digest;
-use scion_proto::listen::Limits;
+use scion_proto::runtime::auth::token_digest;
+use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::objects_server::SERVICE_NAME as OBJECTS_SERVICE;
 use scion_proto::v1::scion_client::ScionClient;
