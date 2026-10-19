@@ -168,8 +168,11 @@ fn a_full_disk_answers_out_of_space_and_needs_no_repair() {
     assert_eq!(store.blobs().get(after).unwrap(), b"after\n");
     drop(store);
     // A restart needs no repair: the store opens again, and fsck is
-    // clean.
-    let store = open_store(&mount);
+    // clean. The write side of the spawn guard, as above.
+    let store = common::spawn_guard::across_release(|| {
+        common::spawn_guard::wait_for_lock_release(&mount.0.join("data"));
+        open_store(&mount)
+    });
     assert_eq!(store.blobs().get(kept).unwrap(), b"kept\n");
     let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
     assert!(report.is_clean(), "{:?}", report.problems);
@@ -210,8 +213,14 @@ fn a_full_metadata_disk_answers_out_of_space_and_needs_no_repair() {
     mount.remount_bigger("64m", "4096");
     store.write(|c| c.create_repo("after")).unwrap();
     drop(store);
-    // A restart needs no repair, and fsck is clean.
-    let store = open_store(&mount);
+    // A restart needs no repair, and fsck is clean. The write side of
+    // the spawn guard: no child of another test is in its fork-to-exec
+    // window while this lock is released and taken again, and the poll
+    // waits out the operating system's own teardown tick.
+    let store = common::spawn_guard::across_release(|| {
+        common::spawn_guard::wait_for_lock_release(&mount.0.join("data"));
+        open_store(&mount)
+    });
     let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
     assert!(report.is_clean(), "{:?}", report.problems);
 }
@@ -241,7 +250,11 @@ fn a_disk_out_of_inodes_answers_out_of_space_and_needs_no_repair() {
     mount.remount_bigger("64m", "4096");
     store.blobs().put(b"after\n").unwrap();
     drop(store);
-    let store = open_store(&mount);
+    // The write side of the spawn guard, as above.
+    let store = common::spawn_guard::across_release(|| {
+        common::spawn_guard::wait_for_lock_release(&mount.0.join("data"));
+        open_store(&mount)
+    });
     let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
     assert!(report.is_clean(), "{:?}", report.problems);
 }

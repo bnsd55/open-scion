@@ -240,7 +240,9 @@ fn a_mounts_overlay_commits_without_a_scan() {
 }
 
 /// A name that is not UTF-8 commits its own content, not that of the
-/// file its lossy spelling names.
+/// file its lossy spelling names. Linux filesystems hold such names;
+/// macOS's refuse them at create time, so there is nothing to commit.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_non_utf8_name_commits_its_own_content() {
     let data = tempfile::tempdir().unwrap();
