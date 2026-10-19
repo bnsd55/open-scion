@@ -4,14 +4,13 @@
 //! the snapshot is SQLite's `VACUUM INTO`, and the Postgres backup is
 //! `pg_dump`, which the runbook documents.
 
-use scion_core::{BlobId, Changeset, FileState, IdentityTime, RepoPath};
-use scion_server::meta::{Meta as _, MetaTx as _};
+use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
+use scion_server::meta::{Meta as _, MetaTx as _, RepoId};
 use scion_server::{Backend, Store, fsck};
 
 /// A backup taken while the store serves: the metadata snapshot names
-/// every blob a later blob copy brings, the restored store opens (its
-/// marker and its database carry the same store UUID), `fsck` is clean,
-/// and every write acknowledged before the snapshot reads back.
+/// every blob a later blob copy brings, the restored store opens, `fsck`
+/// is clean, and every write acknowledged before the snapshot reads back.
 #[test]
 fn a_backup_taken_while_serving_restores_whole() {
     if Backend::test_is_postgres() {
@@ -22,49 +21,7 @@ fn a_backup_taken_while_serving_restores_whole() {
     }
     let dir = tempfile::tempdir().unwrap();
     let store = Backend::open_test(dir.path()).unwrap();
-
-    // The writes the backup must keep: a chain of 20 changesets, each
-    // with its own blob, acknowledged before the snapshot. The blobs go
-    // in first: a blob file is durable before the row that names it.
-    let blob_ids: Vec<(BlobId, Vec<u8>)> = (0..20u8)
-        .map(|i| {
-            let bytes = format!("backup {i}\n").into_bytes();
-            (store.blobs().put(&bytes).unwrap(), bytes)
-        })
-        .collect();
-    let (repo, ids) = store
-        .write(|c| {
-            let repo = c.create_repo("r")?;
-            let mut ids = Vec::new();
-            let mut parent = None;
-            for (i, (blob, _)) in blob_ids.iter().enumerate() {
-                c.add_repo_blob(repo, *blob)?;
-                let changeset = Changeset {
-                    parents: parent.take().into_iter().collect(),
-                    author: IdentityTime {
-                        name: b"b".to_vec(),
-                        email: b"b@x".to_vec(),
-                        unix_secs: 0,
-                        tz_offset_minutes: 0,
-                    },
-                    committer: None,
-                    message: format!("backup {i}").into_bytes(),
-                    changes: [(
-                        RepoPath::new(format!("f{i}").into_bytes()).unwrap(),
-                        Some(FileState::Regular {
-                            content: *blob,
-                            executable: false,
-                        }),
-                    )]
-                    .into(),
-                };
-                parent = Some(c.insert_changeset(repo, &changeset)?);
-                ids.push(parent.unwrap());
-            }
-            assert!(c.cas_ref(repo, "main", None, *ids.last().unwrap())?);
-            Ok((repo, ids))
-        })
-        .unwrap();
+    let (repo, blob_ids, ids) = write_chain(&store, "backup", 20);
 
     // The metadata snapshot: the runbook's `VACUUM INTO`, on its own
     // connection to the live database, while the store keeps serving.
@@ -77,46 +34,12 @@ fn a_backup_taken_while_serving_restores_whole() {
         .expect("the metadata snapshot is taken");
 
     // The copy of the blob files runs while more writes land: a blob the
-    // snapshot names stays reachable, whatever gc does not do here, and
-    // the copy may or may not hold the newer ones.
+    // snapshot names stays reachable, and the copy may or may not hold
+    // the newer ones.
     let writer = {
         let store = store.clone();
-        let mut parent = Some(*ids.last().unwrap());
-        std::thread::spawn(move || {
-            for i in 20..30u8 {
-                let bytes = format!("raced {i}\n").into_bytes();
-                let blob = store.blobs().put(&bytes).unwrap();
-                let id = store
-                    .write(|c| {
-                        c.add_repo_blob(repo, blob)?;
-                        let changeset = Changeset {
-                            parents: parent.take().into_iter().collect(),
-                            author: IdentityTime {
-                                name: b"b".to_vec(),
-                                email: b"b@x".to_vec(),
-                                unix_secs: 0,
-                                tz_offset_minutes: 0,
-                            },
-                            committer: None,
-                            message: format!("raced {i}").into_bytes(),
-                            changes: [(
-                                RepoPath::new(format!("f{i}").into_bytes()).unwrap(),
-                                Some(FileState::Regular {
-                                    content: blob,
-                                    executable: false,
-                                }),
-                            )]
-                            .into(),
-                        };
-                        c.insert_changeset(repo, &changeset)
-                    })
-                    .unwrap();
-                parent = Some(id);
-            }
-        })
+        std::thread::spawn(move || write_raced(&store, repo, "raced", 10, *ids.last().unwrap()))
     };
-
-    // The copy of the blob files, into the backup.
     let backup = tempfile::tempdir().unwrap();
     copy_tree(&dir.path().join("objects"), &backup.path().join("objects"));
     writer.join().unwrap();
@@ -133,7 +56,6 @@ fn a_backup_taken_while_serving_restores_whole() {
         &restored_dir.path().join("objects"),
     );
 
-    // The store opens: the restore is accepted, and fsck sees no damage.
     let restored = Backend::Sqlite(Store::open(restored_dir.path()).unwrap());
     let report = fsck::run(&restored, 1, &mut |_| {}).unwrap();
     assert!(
@@ -141,22 +63,105 @@ fn a_backup_taken_while_serving_restores_whole() {
         "the restore is whole: {:?}",
         report.problems
     );
+    assert_reads_back(&restored, repo, "backup", &ids, &blob_ids);
+}
 
-    // Every write acknowledged before the snapshot reads back: the
-    // changesets, and the blob bytes their trees name.
-    restored
+/// Puts the blob named `label i` and returns its ID with its bytes.
+fn put_blob(store: &Backend, label: &str, i: u8) -> (BlobId, Vec<u8>) {
+    let bytes = format!("{label} {i}\n").into_bytes();
+    (store.blobs().put(&bytes).unwrap(), bytes)
+}
+
+/// The changeset `i` of a chain: one file backed by `blob`, on `parent`,
+/// with a message that names it.
+fn chain_changeset(label: &str, i: u8, blob: BlobId, parent: Option<ChangesetId>) -> Changeset {
+    Changeset {
+        parents: parent.into_iter().collect(),
+        author: IdentityTime {
+            name: b"b".to_vec(),
+            email: b"b@x".to_vec(),
+            unix_secs: 0,
+            tz_offset_minutes: 0,
+        },
+        committer: None,
+        message: format!("{label} {i}").into_bytes(),
+        changes: [(
+            RepoPath::new(format!("f{i}").into_bytes()).unwrap(),
+            Some(FileState::Regular {
+                content: blob,
+                executable: false,
+            }),
+        )]
+        .into(),
+    }
+}
+
+/// The writes the backup must keep: a chain of `n` changesets, each with
+/// its own blob, acknowledged before the caller takes its snapshot. The
+/// blobs go in first: a blob file is durable before the row that names it.
+fn write_chain(
+    store: &Backend,
+    label: &str,
+    n: u8,
+) -> (RepoId, Vec<(BlobId, Vec<u8>)>, Vec<ChangesetId>) {
+    let blob_ids: Vec<(BlobId, Vec<u8>)> = (0..n).map(|i| put_blob(store, label, i)).collect();
+    let (repo, ids) = store
+        .write(|c| {
+            let repo = c.create_repo("r")?;
+            let mut ids = Vec::new();
+            let mut parent = None;
+            for (i, (blob, _)) in blob_ids.iter().enumerate() {
+                c.add_repo_blob(repo, *blob)?;
+                parent = Some(
+                    c.insert_changeset(repo, &chain_changeset(label, i as u8, *blob, parent))?,
+                );
+                ids.push(parent.unwrap());
+            }
+            assert!(c.cas_ref(repo, "main", None, *ids.last().unwrap())?);
+            Ok((repo, ids))
+        })
+        .unwrap();
+    (repo, blob_ids, ids)
+}
+
+/// The writes that race the blob copy: `n` more changesets on the chain,
+/// acknowledged while the caller walks `objects/`.
+fn write_raced(store: &Backend, repo: RepoId, label: &str, n: u8, tip: ChangesetId) {
+    let mut parent = Some(tip);
+    for i in 0..n {
+        let (blob, _) = put_blob(store, label, i);
+        let id = store
+            .write(|c| {
+                c.add_repo_blob(repo, blob)?;
+                c.insert_changeset(repo, &chain_changeset(label, i, blob, parent))
+            })
+            .unwrap();
+        parent = Some(id);
+    }
+}
+
+/// Every write acknowledged before the snapshot reads back: the ref at
+/// the tip, each changeset of the chain, and the blob bytes.
+fn assert_reads_back(
+    store: &Backend,
+    repo: RepoId,
+    label: &str,
+    ids: &[ChangesetId],
+    blob_ids: &[(BlobId, Vec<u8>)],
+) {
+    store
         .read(|c| {
             let head = c.get_ref(repo, "main")?.map(|r| r.target);
             assert_eq!(head, Some(*ids.last().unwrap()), "main reads back");
             for (i, id) in ids.iter().enumerate() {
                 let cs = c.get_changeset(repo, *id)?;
-                assert_eq!(cs.message, format!("backup {i}").into_bytes());
+                assert_eq!(cs.message, format!("{label} {i}").into_bytes());
             }
             Ok(())
         })
         .unwrap();
-    for (blob, bytes) in &blob_ids {
-        assert_eq!(&restored.blobs().get(*blob).unwrap(), bytes);
+    for (blob, bytes) in blob_ids {
+        assert_eq!(&store.blobs().get(*blob).unwrap(), bytes);
     }
 }
 
