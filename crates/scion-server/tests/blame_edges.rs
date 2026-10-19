@@ -504,11 +504,11 @@ async fn a_partial_reader_gets_one_answer_for_any_path() {
     }
 }
 
-/// A hand-made cursor that claims an impossible line count is refused with
-/// `INVALID_ARGUMENT`, not answered: the count is the client's word, and a
-/// count whose per-line cost overflows usize must not reach the walk. The
-/// cursor is one any client can build - the digest is over the request's
-/// own repo, changeset and path - so the check cannot trust the count.
+/// A hand-made cursor that claims an impossible line count is refused,
+/// not answered: the count is the client's word, past the line cap, so
+/// the walk refuses it as too big to serve. The cursor is one any client
+/// can build - the digest is over the request's own repo, changeset and
+/// path - so the check cannot trust the count.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cursor_that_names_an_impossible_line_count_is_refused() {
     let (dir, store, root) = store(b"a\n");
@@ -550,7 +550,10 @@ async fn a_cursor_that_names_an_impossible_line_count_is_refused() {
         })
         .await
         .unwrap_err();
-    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+    // The count is past the line cap, so the refusal is the one code for
+    // too big to serve: RESOURCE_EXHAUSTED, with the cap in the message.
+    assert_eq!(err.code(), Code::ResourceExhausted, "{err}");
+    assert!(err.message().contains("lines"), "{err}");
 }
 
 /// A file of more lines than one diff may read is refused with
