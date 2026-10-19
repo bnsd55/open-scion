@@ -450,3 +450,5 @@ The first release: the server, its cache tiers, and the `scn` client.
 - `scion-daemon --seed` refuses a snapshot unless `--seed-full-repo` says
   every user of the node may read the repo whole (`#241`): a snapshot is
   a full-repo credential.
+
+A row the changelog check must catch.
