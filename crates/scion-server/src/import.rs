@@ -58,6 +58,9 @@ const TX_YIELD: Duration = Duration::from_millis(100);
 /// The batch's writes are idempotent, so a retry is safe; past the bound
 /// the import fails with the busy error. A client that shares the data
 /// directory reads this to bound its own wait for an import.
+// The test seam re-exports this (test_support.import in lib.rs), and
+// unreachable_pub does not see through a re-export.
+#[allow(unreachable_pub)]
 pub const BUSY_TRIES: u32 = 10;
 
 /// The most swaps one import makes for one ref. Like a land's swaps (see

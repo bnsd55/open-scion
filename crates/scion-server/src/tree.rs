@@ -5,6 +5,11 @@
 //! transaction of their write, so all trees from one apply or derivation
 //! commit together.
 
+// Every pub item of this module is re-exported by the test seam
+// (`test_support` in lib.rs), and unreachable_pub does not see
+// through a re-export, so this marker would fire on all of them
+// under any feature set.
+#![allow(unreachable_pub)]
 use std::collections::{BTreeMap, HashMap};
 
 use scion_core::{

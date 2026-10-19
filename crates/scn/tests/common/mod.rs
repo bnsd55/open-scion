@@ -29,14 +29,14 @@ use tokio_stream::wrappers::{TcpListenerStream, UnixListenerStream};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Endpoint};
 
-pub const REPO: &str = "r";
-pub const TOKEN: &str = "secret";
+pub(crate) const REPO: &str = "r";
+pub(crate) const TOKEN: &str = "secret";
 
-pub type Client = ObjectsClient<InterceptedService<Channel, Bearer>>;
+pub(crate) type Client = ObjectsClient<InterceptedService<Channel, Bearer>>;
 
 /// An `Objects` client of `url` (`http://` or `unix://`) that sends the
 /// token.
-pub async fn connect(url: &str) -> Client {
+pub(crate) async fn connect(url: &str) -> Client {
     let channel = Endpoint::from_shared(url.to_owned())
         .unwrap()
         .connect()
@@ -47,7 +47,7 @@ pub async fn connect(url: &str) -> Client {
 
 /// A ref of `id` at `path`, from the root tree of the ticket that carries
 /// it. An empty `path` names the root tree itself.
-pub fn tree_ref(id: TreeId, path: &[u8]) -> ObjectRef {
+pub(crate) fn tree_ref(id: TreeId, path: &[u8]) -> ObjectRef {
     ObjectRef {
         kind: ObjectKind::Tree.into(),
         id: id.as_bytes().to_vec(),
@@ -55,7 +55,7 @@ pub fn tree_ref(id: TreeId, path: &[u8]) -> ObjectRef {
     }
 }
 
-pub fn blob_ref(id: BlobId, path: &[u8]) -> ObjectRef {
+pub(crate) fn blob_ref(id: BlobId, path: &[u8]) -> ObjectRef {
     ObjectRef {
         kind: ObjectKind::Blob.into(),
         id: id.as_bytes().to_vec(),
@@ -65,7 +65,7 @@ pub fn blob_ref(id: BlobId, path: &[u8]) -> ObjectRef {
 
 /// A server, a cache in front of it, and a daemon in front of the cache.
 /// Dropping it stops all three.
-pub struct Tiers {
+pub(crate) struct Tiers {
     pub store: Backend,
     /// Address of the server.
     pub server: String,
@@ -80,7 +80,7 @@ pub struct Tiers {
 }
 
 impl Tiers {
-    pub fn start(data: TempDir, store: Backend) -> Self {
+    pub(crate) fn start(data: TempDir, store: Backend) -> Self {
         let runtime = Runtime::new().unwrap();
         let _entered = runtime.enter();
         let tcp = || {
@@ -164,31 +164,31 @@ impl Tiers {
     }
 
     /// Calls past the daemon, and calls that reached the server.
-    pub fn upstream_calls(&self) -> (u64, u64) {
+    pub(crate) fn upstream_calls(&self) -> (u64, u64) {
         (self.daemon.upstream_calls(), self.cache.upstream_calls())
     }
 
     /// Where the server, and the daemon, keep blob `id`.
-    pub fn blob_paths(&self, id: BlobId) -> [PathBuf; 2] {
+    pub(crate) fn blob_paths(&self, id: BlobId) -> [PathBuf; 2] {
         let [server, node] = &self.dirs;
         [server.path().to_path_buf(), node.path().join("data")].map(|dir| blob_path(&dir, id))
     }
 
     /// The file of blob `id` on the server, and on the daemon's disk.
-    pub fn blob_files(&self, id: BlobId) -> [Vec<u8>; 2] {
+    pub(crate) fn blob_files(&self, id: BlobId) -> [Vec<u8>; 2] {
         self.blob_paths(id).map(|path| fs::read(path).unwrap())
     }
 
     /// Where the daemon keeps tree `id`. The server keeps trees in its
     /// database.
-    pub fn daemon_tree_path(&self, id: TreeId) -> PathBuf {
+    pub(crate) fn daemon_tree_path(&self, id: TreeId) -> PathBuf {
         let node = self.dirs[1].path().join("data");
         object_path(&node, "tree", &id.to_string())
     }
 }
 
 /// Where the server, and the daemon, keep blob `id` under `dir`.
-pub fn blob_path(dir: &Path, id: BlobId) -> PathBuf {
+pub(crate) fn blob_path(dir: &Path, id: BlobId) -> PathBuf {
     object_path(dir, "blob", &id.to_string())
 }
 
@@ -204,7 +204,7 @@ fn object_path(dir: &Path, kind: &str, hex: &str) -> PathBuf {
 /// parts of 1 MiB, packed or not (noise, then text), an executable, nested
 /// directories, two paths with one blob, a symlink and an empty file. Puts
 /// their blobs in `store`, and returns them with the large file's content.
-pub fn files(store: &Backend) -> (Vec<(&'static str, FileState)>, Vec<u8>) {
+pub(crate) fn files(store: &Backend) -> (Vec<(&'static str, FileState)>, Vec<u8>) {
     let mut big = noise(3 * CHUNK_BYTES + 1);
     big.extend((0..5_000).flat_map(|i| format!("line {i}\n").into_bytes()));
     let mut blobs = store.blobs().batch();
@@ -230,7 +230,7 @@ pub fn files(store: &Backend) -> (Vec<(&'static str, FileState)>, Vec<u8>) {
 }
 
 /// `len` bytes that zstd cannot make smaller.
-pub fn noise(len: usize) -> Vec<u8> {
+pub(crate) fn noise(len: usize) -> Vec<u8> {
     let mut state = 1_u64;
     (0..len)
         .map(|_| {
@@ -243,7 +243,7 @@ pub fn noise(len: usize) -> Vec<u8> {
 }
 
 /// A changeset on `parent` that puts `files` (raw path and state).
-pub fn changeset(parent: Option<ChangesetId>, files: &[(&str, FileState)]) -> Changeset {
+pub(crate) fn changeset(parent: Option<ChangesetId>, files: &[(&str, FileState)]) -> Changeset {
     Changeset::new(
         parent.into_iter().collect(),
         IdentityTime::new(
@@ -264,7 +264,7 @@ pub fn changeset(parent: Option<ChangesetId>, files: &[(&str, FileState)]) -> Ch
 }
 
 /// Stores `cs` in the repo and points `main` at it.
-pub fn land(store: &Backend, cs: &Changeset) -> ChangesetId {
+pub(crate) fn land(store: &Backend, cs: &Changeset) -> ChangesetId {
     store
         .write(|c| {
             let repo = c.create_repo(REPO)?;

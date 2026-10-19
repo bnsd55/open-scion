@@ -13,7 +13,7 @@ use crate::error::Result;
 use crate::store::BlobReader;
 
 /// git's similarity scale: this score means the same content.
-pub const SAME: u32 = 60_000;
+pub(crate) const SAME: u32 = 60_000;
 
 /// The least score of a rename: 50%, git's default.
 const MIN_SCORE: u32 = SAME / 2;
@@ -25,7 +25,7 @@ const MIN_NAME_SCORE: u32 = MIN_SCORE + (SAME - MIN_SCORE) / 2;
 /// git's default rename limit (`diff.renameLimit`, 1,000), squared. Step 3
 /// of [`renames`] runs only when the added files left times the deleted
 /// files left are at most this many pairs.
-pub const MAX_PAIRS: usize = 1000 * 1000;
+pub(crate) const MAX_PAIRS: usize = 1000 * 1000;
 
 /// Most deleted files with the same content that step 1 looks at for one
 /// added file, as in git.
@@ -47,7 +47,7 @@ const PART_BYTES: usize = 1 << 20;
 /// scores the same with either line end. Each chunk is hashed to one of
 /// `HASHBASE` values, as in git, so two different chunks can count as the
 /// same. So a table has at most `HASHBASE` rows, whatever the file size.
-pub struct Chunks {
+pub(crate) struct Chunks {
     /// For each hash, the bytes of the chunks with that hash, by hash.
     table: Vec<(u32, u32)>,
     /// How many chunks the file has.
@@ -57,7 +57,7 @@ pub struct Chunks {
 impl Chunks {
     /// Cuts `text` into chunks, with git's hash (`diffcore-delta.c`).
     #[must_use]
-    pub fn of(text: &[u8]) -> Self {
+    pub(crate) fn of(text: &[u8]) -> Self {
         let mut chunker = Chunker::default();
         chunker.push(text);
         chunker.finish()
@@ -69,7 +69,7 @@ impl Chunks {
     /// # Errors
     ///
     /// As [`crate::store::Blobs::reader`] and [`BlobReader::read_part`].
-    pub fn read(store: &Backend, blob: BlobId) -> Result<Self> {
+    pub(crate) fn read(store: &Backend, blob: BlobId) -> Result<Self> {
         let mut reader: BlobReader = store.blobs().reader(blob)?;
         let mut chunker = Chunker::default();
         while let Some(part) = reader.read_part(PART_BYTES)? {
@@ -179,7 +179,7 @@ impl Chunker {
 
 /// A rename that [`renames`] found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Pair {
+pub(crate) struct Pair {
     /// The added file, as its index.
     pub added: usize,
     /// The deleted file it came from, as its index.
@@ -189,7 +189,7 @@ pub struct Pair {
 }
 
 /// The work that one [`renames`] call may do.
-pub struct Budget<'a> {
+pub(crate) struct Budget<'a> {
     /// The cost so far, with what the caller counted before. Each chunk of
     /// a file read counts once, each row of a chunk table put in the index
     /// of step 3 or read by a comparison counts once, and each file size
@@ -209,11 +209,11 @@ pub struct Budget<'a> {
 
 /// What one file size read costs against a [`Budget`]: about the work of
 /// cutting this many chunks, since it opens the file.
-pub const SIZE_COST: usize = 64;
+pub(crate) const SIZE_COST: usize = 64;
 
 /// Where step 3 of a search for one added file stands ([`renames`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Progress {
+pub(crate) struct Progress {
     /// How many deleted files, in path order, step 3 has looked at.
     pub searched: usize,
     /// The deleted file most like the added file among those, if one is at
@@ -223,7 +223,7 @@ pub struct Progress {
 
 /// What [`renames`] found.
 #[derive(Debug)]
-pub struct Outcome {
+pub(crate) struct Outcome {
     /// The renames.
     pub pairs: Vec<Pair>,
     /// Set when step 3 stopped at the budget: the first deleted file it did
@@ -283,7 +283,7 @@ pub struct Outcome {
 /// # Errors
 ///
 /// A failure to read a size, or what `read` returns.
-pub fn renames(
+pub(crate) fn renames(
     store: &Backend,
     added: &[(&RepoPath, FileState)],
     deleted: &[(&RepoPath, FileState)],

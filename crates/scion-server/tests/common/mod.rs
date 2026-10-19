@@ -32,35 +32,35 @@ use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
-pub const TOKEN: &str = "secret";
-pub const REPO: &str = "r";
-pub const REFS: [&str; 2] = ["main", "dev"];
-pub const CLIENTS: usize = 4;
+pub(crate) const TOKEN: &str = "secret";
+pub(crate) const REPO: &str = "r";
+pub(crate) const REFS: [&str; 2] = ["main", "dev"];
+pub(crate) const CLIENTS: usize = 4;
 /// A path that some lands put, so that some lands conflict.
-pub const SHARED: &str = "shared.txt";
+pub(crate) const SHARED: &str = "shared.txt";
 /// Older lands that each check retries again.
-pub const OLD_RETRIES: usize = 16;
+pub(crate) const OLD_RETRIES: usize = 16;
 
 /// A seeded stream of numbers (xorshift64*), so a run can be replayed.
-pub struct Rng(u64);
+pub(crate) struct Rng(u64);
 
 impl Rng {
-    pub fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
     }
 
-    pub fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
         self.0 ^= self.0 >> 27;
         self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
-    pub fn below(&mut self, n: usize) -> usize {
+    pub(crate) fn below(&mut self, n: usize) -> usize {
         usize::try_from(self.next() % u64::try_from(n).unwrap()).unwrap()
     }
 
-    pub fn bytes(&mut self, len: usize) -> Vec<u8> {
+    pub(crate) fn bytes(&mut self, len: usize) -> Vec<u8> {
         let mut bytes: Vec<u8> = (0..len.div_ceil(8))
             .flat_map(|_| self.next().to_le_bytes())
             .collect();
@@ -70,7 +70,7 @@ impl Rng {
 }
 
 /// SIGKILL.
-pub struct Server {
+pub(crate) struct Server {
     child: Child,
     addr: SocketAddr,
     pub url: String,
@@ -79,7 +79,7 @@ pub struct Server {
 impl Server {
     /// The server process's id, for a test that must tell the server's
     /// files from another process's.
-    pub fn pid(&self) -> u32 {
+    pub(crate) fn pid(&self) -> u32 {
         self.child.id()
     }
 }
@@ -87,7 +87,7 @@ impl Server {
 impl Server {
     /// Starts a server on `data` and waits until it listens. It appends its
     /// log to `log`.
-    pub fn start(data: &Path, log: &Path) -> Self {
+    pub(crate) fn start(data: &Path, log: &Path) -> Self {
         let mut server = Self::spawn(data, log);
         let start = Instant::now();
         while !server.listens(log) {
@@ -106,7 +106,7 @@ impl Server {
     /// picks a free port and no other process can take it in between. It
     /// opens the data directory before, so it has removed the temp files and
     /// upgraded the schema.
-    pub fn listens(&mut self, log: &Path) -> bool {
+    pub(crate) fn listens(&mut self, log: &Path) -> bool {
         let Some(addr) = bound_addr(log) else {
             return false;
         };
@@ -116,7 +116,7 @@ impl Server {
     }
 
     /// Starts a server on `data`, and does not wait for it.
-    pub fn spawn(data: &Path, log: &Path) -> Self {
+    pub(crate) fn spawn(data: &Path, log: &Path) -> Self {
         let log_file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -151,7 +151,7 @@ impl Server {
 }
 
 /// The address of the newest `serving` line in the log, if there is one.
-pub fn bound_addr(log: &Path) -> Option<SocketAddr> {
+pub(crate) fn bound_addr(log: &Path) -> Option<SocketAddr> {
     let text = fs::read_to_string(log).unwrap_or_default();
     let line = text.lines().rev().find(|line| line.contains("serving"))?;
     line.split("listen=").nth(1)?.parse().ok()
@@ -174,7 +174,7 @@ impl Server {
     /// nothing of the server runs after a power cut, so no ack can follow
     /// one either. The caller kills the frozen server; nothing of it runs
     /// past the cut.
-    pub fn freeze(&mut self) {
+    pub(crate) fn freeze(&mut self) {
         let pid = self.child.id();
         let pid_i32 = pid.cast_signed();
         rustix::process::kill_process(
@@ -214,10 +214,10 @@ impl Server {
     }
 }
 
-pub type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
-pub type Objects = ObjectsClient<InterceptedService<Channel, Bearer>>;
+pub(crate) type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
+pub(crate) type Objects = ObjectsClient<InterceptedService<Channel, Bearer>>;
 
-pub async fn connect(url: &str) -> Result<(Scion, Objects), tonic::transport::Error> {
+pub(crate) async fn connect(url: &str) -> Result<(Scion, Objects), tonic::transport::Error> {
     let channel = Channel::from_shared(url.to_owned())
         .unwrap()
         .connect()
@@ -230,7 +230,7 @@ pub async fn connect(url: &str) -> Result<(Scion, Objects), tonic::transport::Er
 /// `Objects.ResolveRef` as one call: the changeset ID that `name` names.
 /// The `Objects` calls stay in one place, so a change to the service moves
 /// one helper, not every call.
-pub async fn resolve_ref(objects: &mut Objects, name: &str) -> Result<ChangesetId, Status> {
+pub(crate) async fn resolve_ref(objects: &mut Objects, name: &str) -> Result<ChangesetId, Status> {
     let request = ResolveRefRequest {
         repo: REPO.into(),
         name: name.into(),
@@ -239,7 +239,7 @@ pub async fn resolve_ref(objects: &mut Objects, name: &str) -> Result<ChangesetI
     Ok(changeset_id(&reply.into_inner().changeset_id))
 }
 
-pub fn author() -> IdentityTime {
+pub(crate) fn author() -> IdentityTime {
     IdentityTime::new(
         b"Ada".to_vec(),
         b"ada@example.com".to_vec(),
@@ -249,12 +249,12 @@ pub fn author() -> IdentityTime {
     .expect("identity fits the format")
 }
 
-pub fn changeset_id(bytes: &[u8]) -> ChangesetId {
+pub(crate) fn changeset_id(bytes: &[u8]) -> ChangesetId {
     ChangesetId::try_from(bytes).unwrap()
 }
 
 /// A land that a client sent, and its reply if one came.
-pub struct Sent {
+pub(crate) struct Sent {
     pub key: String,
     pub target: &'static str,
     pub changeset: Changeset,
@@ -263,7 +263,7 @@ pub struct Sent {
 }
 
 impl Sent {
-    pub fn request(&self) -> LandRequest {
+    pub(crate) fn request(&self) -> LandRequest {
         LandRequest {
             repo: REPO.into(),
             changeset_id: self.id.as_bytes().to_vec(),
@@ -275,7 +275,7 @@ impl Sent {
 
 /// What the server replied to the clients.
 #[derive(Default)]
-pub struct Ledger {
+pub(crate) struct Ledger {
     /// Blobs that `PutBlob` replied with.
     pub blobs: Vec<BlobId>,
     /// Every land sent, in order. `CreateChangeset` replied for each one.
@@ -283,7 +283,7 @@ pub struct Ledger {
 }
 
 /// Repo `r` with one root changeset, and refs `main` and `dev` at it. No RPC
-pub fn create_repo(data: &Path) {
+pub(crate) fn create_repo(data: &Path) {
     let store = Store::open(data).unwrap();
     let readme = store.blobs().put(b"crash suite\n").unwrap();
     let root = Changeset::new(
@@ -318,7 +318,7 @@ pub fn create_repo(data: &Path) {
         .unwrap();
 }
 
-pub async fn put_blob(scion: &mut Scion, data: &[u8]) -> Result<BlobId, Status> {
+pub(crate) async fn put_blob(scion: &mut Scion, data: &[u8]) -> Result<BlobId, Status> {
     let parts: Vec<PutBlobRequest> = data
         .chunks(CHUNK_BYTES)
         .enumerate()
@@ -333,7 +333,7 @@ pub async fn put_blob(scion: &mut Scion, data: &[u8]) -> Result<BlobId, Status> 
 
 /// What the clients and the test that kills the server share.
 #[derive(Default)]
-pub struct Signals {
+pub(crate) struct Signals {
     /// Set just before the kill.
     pub killed: AtomicBool,
     /// `PutBlob` calls of a large file in progress.
@@ -342,12 +342,17 @@ pub struct Signals {
 
 /// A file of more than this many bytes counts as large. Its upload writes
 /// the blob near its end, 10 to 30 ms after it starts.
-pub const LARGE: usize = 64 << 10;
+pub(crate) const LARGE: usize = 64 << 10;
 
 /// One client: uploads files, creates a changeset on a ref's head (or on an
 /// older base of it), and lands it, until a call fails. Only the kill may
 /// fail a call, and it sets `signals.killed` first.
-pub async fn client(url: String, name: String, mut rng: Rng, signals: Arc<Signals>) -> Ledger {
+pub(crate) async fn client(
+    url: String,
+    name: String,
+    mut rng: Rng,
+    signals: Arc<Signals>,
+) -> Ledger {
     let mut ledger = Ledger::default();
     let cut = |ledger, call: &str, error: &dyn std::fmt::Debug| {
         let killed = signals.killed.load(Ordering::SeqCst);
@@ -443,7 +448,7 @@ pub async fn client(url: String, name: String, mut rng: Rng, signals: Arc<Signal
 /// What earlier checks verified. Objects never change, so each one is
 /// checked once.
 #[derive(Default)]
-pub struct Checked {
+pub(crate) struct Checked {
     /// Lands `..lands` were retried after a restart.
     pub lands: usize,
     /// Blobs `..blobs` of the ledger were read back.
@@ -457,7 +462,7 @@ pub struct Checked {
 }
 
 /// The changes of `new` against `old`, from `Diff`.
-pub async fn diff(
+pub(crate) async fn diff(
     scion: &mut Scion,
     old: ChangesetId,
     new: ChangesetId,
@@ -500,7 +505,7 @@ pub async fn diff(
 /// reply that stops early, and checks each against its ID.
 // SHORTCUT: dead until C5 verifies tickets and the read-back returns.
 #[allow(dead_code)]
-pub async fn read_blobs(objects: &mut Objects, blobs: &[BlobId]) {
+pub(crate) async fn read_blobs(objects: &mut Objects, blobs: &[BlobId]) {
     let mut rest = blobs;
     while !rest.is_empty() {
         let batch = &rest[..rest.len().min(MAX_OBJECT_REFS)];
@@ -541,7 +546,7 @@ pub async fn read_blobs(objects: &mut Objects, blobs: &[BlobId]) {
     }
 }
 
-pub fn pending_lands(c: &rusqlite::Connection) -> i64 {
+pub(crate) fn pending_lands(c: &rusqlite::Connection) -> i64 {
     let pending = "SELECT count(*) FROM lands WHERE state = 'pending'";
     c.query_row(pending, [], |row| row.get(0)).unwrap()
 }
@@ -549,7 +554,7 @@ pub fn pending_lands(c: &rusqlite::Connection) -> i64 {
 /// The blobs that the changeset and tree rows of the database name, and the
 /// number of pending lands. Rows in `seen` are skipped, and new rows added:
 /// a row never changes.
-pub fn metadata(store: &Backend, seen: &mut HashSet<Vec<u8>>) -> (BTreeSet<BlobId>, i64) {
+pub(crate) fn metadata(store: &Backend, seen: &mut HashSet<Vec<u8>>) -> (BTreeSet<BlobId>, i64) {
     // The rows of the data directory's own database: this helper asserts the
     // storage's internals, which only the SQLite backend holds.
     let raw = match store {
@@ -588,7 +593,7 @@ pub fn metadata(store: &Backend, seen: &mut HashSet<Vec<u8>>) -> (BTreeSet<BlobI
 }
 
 /// Every blob file under `<data>/objects/blob`, by its ID.
-pub fn blob_files(data: &Path) -> Vec<BlobId> {
+pub(crate) fn blob_files(data: &Path) -> Vec<BlobId> {
     let mut ids = Vec::new();
     for dir in fs::read_dir(data.join("objects/blob")).unwrap() {
         let dir = dir.unwrap();
@@ -604,7 +609,12 @@ pub fn blob_files(data: &Path) -> Vec<BlobId> {
 /// Retries each land sent since the last check, and a few older ones, with
 /// its key. A land whose reply was lost is retried twice at once: calls with
 /// the same key wait for each other and return the same land. All calls run
-pub async fn retry_lands(scion: &Scion, ledger: &mut Ledger, checked: &mut Checked, rng: &mut Rng) {
+pub(crate) async fn retry_lands(
+    scion: &Scion,
+    ledger: &mut Ledger,
+    checked: &mut Checked,
+    rng: &mut Rng,
+) {
     let new = checked.lands..ledger.lands.len();
     let lost = new.clone().filter(|&i| ledger.lands[i].reply.is_none());
     let mut retry: Vec<usize> = lost.chain(new).collect();
@@ -647,7 +657,7 @@ async fn changeset_bytes(scion: &mut Scion, request: GetChangesetRequest, what: 
 /// The changesets on each ref's first-parent history, but the root, with
 /// the ref. Checks that each one hashes to its ID, and that its root tree
 /// differs from its parent's by exactly its changes.
-pub async fn walk_refs(
+pub(crate) async fn walk_refs(
     scion: &mut Scion,
     objects: &mut Objects,
     checked: &mut Checked,
@@ -681,7 +691,7 @@ pub async fn walk_refs(
 
 /// Checks that each landed changeset is on its ref once, with the changes
 /// sent, and that nothing else is on a ref.
-pub fn check_lands(ledger: &Ledger, history: &HashMap<ChangesetId, (&str, Changeset)>) {
+pub(crate) fn check_lands(ledger: &Ledger, history: &HashMap<ChangesetId, (&str, Changeset)>) {
     let mut lands_on_refs = 0;
     // A land ID names one request key for ever, so no second reply may
     // carry it.
@@ -725,7 +735,7 @@ pub fn check_lands(ledger: &Ledger, history: &HashMap<ChangesetId, (&str, Change
 }
 
 /// Checks what a crash must never break (`docs/architecture.md`, section
-pub async fn check(
+pub(crate) async fn check(
     url: &str,
     data: &Path,
     ledger: &mut Ledger,
@@ -786,7 +796,7 @@ pub async fn check(
 }
 
 /// Waits until `ready` holds, for at most 10 s.
-pub async fn wait_until(ready: impl Fn() -> bool) {
+pub(crate) async fn wait_until(ready: impl Fn() -> bool) {
     let give_up = Instant::now() + Duration::from_secs(10);
     while !ready() && Instant::now() < give_up {
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -794,7 +804,7 @@ pub async fn wait_until(ready: impl Fn() -> bool) {
 }
 
 /// The environment variable `name` as a number, or `default`.
-pub fn env(name: &str, default: u64) -> u64 {
+pub(crate) fn env(name: &str, default: u64) -> u64 {
     std::env::var(name).map_or(default, |v| v.parse().unwrap())
 }
 
@@ -807,14 +817,14 @@ pub fn env(name: &str, default: u64) -> u64 {
 /// drop and reopen: a pending write side also stops new read sides, so the
 /// spawners finish before the release window opens. (The same guard, for
 /// the unit tests of the server, is `store::spawn_guard`.)
-pub mod spawn_guard {
+pub(crate) mod spawn_guard {
     use std::sync::RwLock;
 
     static SPAWNS: RwLock<()> = RwLock::new(());
 
     /// Holds the read side while `f` spawns its child: any number of tests
     /// may spawn at once.
-    pub fn across_spawn<T>(f: impl FnOnce() -> T) -> T {
+    pub(crate) fn across_spawn<T>(f: impl FnOnce() -> T) -> T {
         let _held = SPAWNS.read().expect("the spawn guard is not poisoned");
         f()
     }
@@ -822,7 +832,7 @@ pub mod spawn_guard {
     /// Holds the write side while `f` drops a store and checks its lock is
     /// released: no child is in its fork-to-exec window, and no new spawn
     /// starts, until `f` is done.
-    pub fn across_release<T>(f: impl FnOnce() -> T) -> T {
+    pub(crate) fn across_release<T>(f: impl FnOnce() -> T) -> T {
         let _held = SPAWNS.write().expect("the spawn guard is not poisoned");
         f()
     }
@@ -832,7 +842,7 @@ pub mod spawn_guard {
     /// control (gix-path), and caches the result afterwards. Every test
     /// that reaches `gix` calls this first, so that fork waits out any
     /// release window like our own spawns do.
-    pub fn prime_gix_lookup() {
+    pub(crate) fn prime_gix_lookup() {
         across_spawn(|| {
             let _ = gix::path::env::installation_config();
         });
@@ -852,7 +862,7 @@ pub mod spawn_guard {
     /// `EWOULDBLOCK` there, sub-ms; Linux shows 0 of 2,000 rounds (a
     /// standalone probe). (The same helper, for the unit tests of the
     /// server, is `store::spawn_guard::wait_for_lock_release`.)
-    pub fn wait_for_lock_release(dir: &std::path::Path) {
+    pub(crate) fn wait_for_lock_release(dir: &std::path::Path) {
         use std::time::{Duration, Instant};
 
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -887,7 +897,7 @@ pub mod spawn_guard {
 /// and reports whether it succeeded with its stdout. The child shares a
 /// flock until it execs (see `spawn_guard`), so the read side of one test
 /// cannot land inside another test's lock-release window.
-pub fn git_status(dir: &Path, args: &[&str]) -> (bool, String) {
+pub(crate) fn git_status(dir: &Path, args: &[&str]) -> (bool, String) {
     let out = spawn_guard::across_spawn(|| {
         Command::new("git")
             // No auto gc or maintenance: they pack loose objects in the
@@ -913,7 +923,7 @@ pub fn git_status(dir: &Path, args: &[&str]) -> (bool, String) {
 
 /// Runs git in `dir` and returns its stdout. Fails the test unless git
 /// succeeds.
-pub fn git(dir: &Path, args: &[&str]) -> String {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
     let (ok, stdout) = git_status(dir, args);
     assert!(ok, "git {args:?} failed");
     stdout
@@ -921,7 +931,7 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
 
 /// Awaits `fut`, or panics naming `step`: a server that never answers a
 /// step fails the test in seconds, not at the CI cancel.
-pub async fn ceiling<T>(step: &str, fut: impl std::future::Future<Output = T>) -> T {
+pub(crate) async fn ceiling<T>(step: &str, fut: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(std::time::Duration::from_secs(30), fut)
         .await
         .unwrap_or_else(|_| panic!("the step {step} never finished within 30 s"))

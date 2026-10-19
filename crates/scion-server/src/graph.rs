@@ -44,7 +44,7 @@ use crate::meta::{MetaTx, RepoId};
 /// A changeset that a [`Node`] points to, with what a query needs to decide
 /// whether to go there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Link {
+pub(crate) struct Link {
     /// The changeset.
     pub id: ChangesetId,
     /// Its generation.
@@ -55,7 +55,7 @@ pub struct Link {
 
 /// The value of [`CommitGraph`] for one changeset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Node {
+pub(crate) struct Node {
     /// 1 for a root, else 1 + the highest generation of its parents.
     pub generation: i64,
     /// How many first parents lead from it to its root: 0 for a root.
@@ -205,7 +205,7 @@ impl Kind for CommitGraph {
 ///
 /// [`Error::NotFound`] if `repo` does not have either changeset.
 /// [`Error::DeadlineExceeded`] once `deadline` has passed.
-pub fn is_ancestor(
+pub(crate) fn is_ancestor(
     store: &Backend,
     repo: RepoId,
     ancestor: ChangesetId,
@@ -229,7 +229,7 @@ pub fn is_ancestor(
 ///
 /// [`Error::NotFound`] if `repo` does not have either changeset.
 /// [`Error::DeadlineExceeded`] once `deadline` has passed.
-pub fn merge_bases(
+pub(crate) fn merge_bases(
     store: &Backend,
     repo: RepoId,
     a: ChangesetId,

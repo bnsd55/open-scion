@@ -8,6 +8,11 @@
 //! deadline passes. A file whose share is more than the whole budget is
 //! refused: a wrong blame is worse than a refused one.
 
+// Every pub item of this module is re-exported by the test seam
+// (`test_support` in lib.rs), and unreachable_pub does not see
+// through a re-export, so this marker would fire on all of them
+// under any feature set.
+#![allow(unreachable_pub)]
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
