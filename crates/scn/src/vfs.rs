@@ -1749,7 +1749,10 @@ mod tests {
             root,
             &reply.ticket,
             overlay.path().to_path_buf(),
-        );
+        )
+        // The unit tests of the VFS carry writes: a `--unstable-writable`
+        // mount is what they exercise.
+        .writable(true);
         Test {
             vfs,
             dirs: [data, overlay],
