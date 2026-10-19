@@ -294,8 +294,16 @@ fn read_checked_file(file: &Path, secret: bool) -> io::Result<Vec<u8>> {
 /// the file whole (a secret is also read by its owner alone). Pure over the
 /// fstat fields, so the tests can prove each refusal without a second
 /// account.
+/// The type and permission bits of an `st_mode`, as POSIX fixes them for
+/// every platform: the kind in the `S_IFMT` mask, `S_IFREG` for a regular
+/// file. Plain constants, so the check is over the `u32` mode the tests
+/// hold, with no conversion that is a no-op on Linux and would truncate
+/// on macOS.
+const S_IFMT: u32 = 0o170_000;
+const S_IFREG: u32 = 0o100_000;
+
 fn ensure_file_checks(mode: u32, uid: u32, me: u32, secret: bool, file: &Path) -> io::Result<()> {
-    if !rustix::fs::FileType::from_raw_mode(mode.try_into().unwrap()).is_file() {
+    if mode & S_IFMT != S_IFREG {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(

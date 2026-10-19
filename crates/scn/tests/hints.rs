@@ -146,12 +146,15 @@ impl TestCerts {
 }
 
 /// Writes a certificate and its key into `dir`, as `name.pem` and
-/// `name.key`.
+/// `name.key`. The key is 0600: it is a secret, and the server's checked
+/// read refuses one that group or others can read.
 fn write_pem(dir: &TempDir, name: &str, cert: &str, key: &str) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
     let cert_path = dir.path().join(format!("{name}.pem"));
     std::fs::write(&cert_path, cert).unwrap();
     let key_path = dir.path().join(format!("{name}.key"));
     std::fs::write(&key_path, key).unwrap();
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     (cert_path, key_path)
 }
 
