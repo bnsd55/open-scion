@@ -7,11 +7,14 @@
 #   scripts/public-api.sh api-v0.1.0
 #
 # Writes <folder>/<crate>.txt for each crate and prints one line per
-# crate with the line count of its listing. The listing is built from
-# a nightly rustdoc: cargo-public-api builds the rustdoc JSON with the
-# nightly toolchain even when stable is active, and switches to it by
-# itself. The script installs cargo-public-api (locked) and the
-# nightly toolchain when either is missing.
+# crate with the line count of its listing, and the exact tool versions
+# into <folder>/VERSIONS: the listings are diffed across releases, and
+# a diff taken across two different tool versions can show format
+# noise, not API change. The listing is built from a nightly rustdoc:
+# cargo-public-api builds the rustdoc JSON with the nightly toolchain
+# even when stable is active, and switches to it by itself. The script
+# installs cargo-public-api (locked) and the nightly toolchain when
+# either is missing.
 set -euo pipefail
 
 die() {
@@ -41,9 +44,16 @@ if ! rustup run nightly rustdoc --version >/dev/null 2>&1; then
     rustup toolchain install nightly
 fi
 
+# Resolve the output folder against the caller's directory, before the
+# cd below: a relative folder must land where the caller meant it, not
+# inside the repository.
+out=$(mkdir -p "$1" && cd "$1" && pwd)
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-out=$1
-mkdir -p "$out"
+
+{
+    cargo public-api --version
+    rustup run nightly rustc --version
+} >"$out/VERSIONS"
 
 for crate in $crates; do
     file="$out/$crate.txt"
