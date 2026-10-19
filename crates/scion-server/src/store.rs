@@ -242,7 +242,9 @@ struct Inner {
     /// `<data>/server.lock`, for a server `Store`.
     _server_lock: Option<fs::File>,
     /// Write transactions run so far, for tests of how imports share the
-    /// write lock.
+    /// write lock. Only a test-hooks build reads it, and only its unit
+    /// tests bump it.
+    #[cfg(any(test, feature = "test-hooks"))]
     txes: AtomicU64,
     /// How many of the next commits fail as a busy database, for tests of
     /// the import's busy retry: the transaction ran and rolled back, so
@@ -440,6 +442,7 @@ impl Store {
                 alone,
                 _lock: lock,
                 _server_lock: server_lock,
+                #[cfg(any(test, feature = "test-hooks"))]
                 txes: AtomicU64::new(0),
                 fail_commits: AtomicU64::new(0),
                 #[cfg(any(test, feature = "test-hooks"))]
@@ -1007,7 +1010,9 @@ pub struct Blobs {
 
 /// Which entry the order test records for one gated fsync. Production
 /// code names the step and pays nothing for it; only a test-hooks build
-/// records anything.
+/// records anything, so a release build constructs the payloads and
+/// never reads them.
+#[cfg_attr(not(any(test, feature = "test-hooks")), allow(dead_code))]
 enum SyncStep<'a> {
     /// The temp file of a blob, before its rename.
     TempFile(BlobId),
@@ -1547,8 +1552,8 @@ impl Blobs {
         self.fsync_gate(name, operation)?;
         let started = std::time::Instant::now();
         let out = f();
-        #[cfg(any(test, feature = "test-hooks"))]
         if out.is_ok() {
+            #[cfg(any(test, feature = "test-hooks"))]
             match step {
                 SyncStep::TempFile(id) => self.log.record(DurabilityStep::FileFsync(*id)),
                 SyncStep::StoredFile(id) => {
@@ -1559,9 +1564,10 @@ impl Blobs {
                     .record(DurabilityStep::DirFsync(path.to_path_buf())),
                 SyncStep::Unnamed => {}
             }
+            // A release build names the step and pays nothing for it.
+            #[cfg(not(any(test, feature = "test-hooks")))]
+            let _ = step;
         }
-        #[cfg(not(any(test, feature = "test-hooks")))]
-        drop(step);
         self.record_sync(started);
         out.map_err(Error::Io)
     }

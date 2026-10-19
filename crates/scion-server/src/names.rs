@@ -1,12 +1,11 @@
 //! Limits on names that clients send: repos, refs and request keys.
 
-pub use scion_proto::runtime::check::MAX_NAME_BYTES;
-
 use crate::error::{Error, Result};
 
-/// Checks a client-supplied name: 1 to [`MAX_NAME_BYTES`] bytes and no
-/// control characters, so names are safe to log and to print. The tiers use
-/// the same rule ([`scion_proto::runtime::check::name`]).
+/// Checks a client-supplied name: 1 to
+/// [`MAX_NAME_BYTES`](scion_proto::runtime::check::MAX_NAME_BYTES) bytes and
+/// no control characters, so names are safe to log and to print. The tiers
+/// use the same rule ([`scion_proto::runtime::check::name`]).
 ///
 /// # Errors
 ///
@@ -18,6 +17,7 @@ pub fn check(what: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scion_proto::runtime::check::MAX_NAME_BYTES;
 
     #[test]
     fn accepts_ordinary_names_and_rejects_the_rest() {

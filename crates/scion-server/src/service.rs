@@ -296,8 +296,9 @@ pub async fn serve(
     // ticket alone, and the service's other calls check the token
     // themselves. So a tier needs no token of the server to fetch objects.
     // The counting layer wraps it all the same, outside the ticket checks.
-    let objects = MetricsLayer::new(Arc::clone(&metrics))
-        .layer(ObjectsService::new(worker, access, quotas, tickets, metrics).into_server());
+    let objects = MetricsLayer::new(Arc::clone(&metrics)).layer(
+        ObjectsService::new(worker, access, quotas, tickets, Arc::clone(&metrics)).into_server(),
+    );
     // The health service answers `grpc.health.v1.Check` and `Watch` on the
     // same port, without a token: a probe carries none. The store opens
     // before this call, so the server starts serving. A fence trip
@@ -318,6 +319,7 @@ pub async fn serve(
             listen::tcp(listener),
             tls.map(|tls| tls.config()),
             shutdown,
+            Arc::clone(&metrics),
         )
         .await
 }
@@ -791,8 +793,27 @@ enum Taken<'a, T> {
     Gone,
     /// The client took nothing for `stall`: the parts of the reply stay in
     /// HTTP/2 until the stream ends or the connection closes, and the
-    /// connection counts them.
-    Stalled,
+    /// connection counts them until then. The count is the parked
+    /// [`Stall`](scion_proto::runtime::listen::Stall), to give back when
+    /// the body drops.
+    Stalled(Option<scion_proto::runtime::listen::Stall>),
+}
+
+/// Parks a stalled reply's count until its body drops: the parts stay in
+/// HTTP/2 until the client resets the stream or the connection closes,
+/// which drops the reply's body and closes its channel. This is what keeps
+/// a connection that serves stall after stall from ratcheting its count up
+/// to the close limit for bytes it no longer holds. The reply's request
+/// slot and budget share, if it holds any, stay with it as long as its
+/// parts do.
+async fn park_until_body_gone<T>(
+    parked: Option<scion_proto::runtime::listen::Stall>,
+    tx: &mpsc::Sender<Part<T>>,
+) {
+    if let Some(parked) = parked {
+        tx.closed().await;
+        drop(parked);
+    }
 }
 
 /// Waits `stall` for two free slots of the reply's channel, as
@@ -806,12 +827,9 @@ async fn reserve<'a, T>(
         Ok(Ok(slots)) => Taken::Slots(slots),
         // The client has gone with the connection.
         Ok(Err(_)) => Taken::Gone,
-        Err(_) => {
-            if let Some(stalled) = stalled {
-                stalled.add(scion_proto::runtime::reply::STALLED_REPLY_BYTES);
-            }
-            Taken::Stalled
-        }
+        Err(_) => Taken::Stalled(
+            stalled.map(|stalled| stalled.hold(scion_proto::runtime::reply::STALLED_REPLY_BYTES)),
+        ),
     }
 }
 
@@ -884,16 +902,19 @@ async fn blame_parts(mut send: BlameSend, tx: mpsc::Sender<Part<BlameResponse>>)
                 }
             }
             Taken::Gone => return,
-            Taken::Stalled => {
+            Taken::Stalled(parked) => {
                 let detail = format!("the client took no data for {READ_STALL_TIMEOUT:?}");
                 let _ = tx.try_send(Err(Status::deadline_exceeded(detail)));
+                park_until_body_gone(parked, &tx).await;
                 return;
             }
         }
     }
     // Keeps the request slot until the client has taken the last part; a
-    // client that never does is counted.
-    reserve(&tx, READ_STALL_TIMEOUT, send.stalled.as_ref()).await;
+    // client that never does is counted until its body drops.
+    if let Taken::Stalled(parked) = reserve(&tx, READ_STALL_TIMEOUT, send.stalled.as_ref()).await {
+        park_until_body_gone(parked, &tx).await;
+    }
 }
 
 /// Fetches one page of the log: a graph query when `path` is set, because
@@ -939,16 +960,23 @@ async fn log_parts(mut walk: LogWalk, page: read::LogPage, tx: mpsc::Sender<Part
                     }
                 }
                 Taken::Gone => return,
-                Taken::Stalled => {
+                Taken::Stalled(parked) => {
                     let detail = format!("the client took no data for {READ_STALL_TIMEOUT:?}");
-                    return fail(Status::deadline_exceeded(detail));
+                    let _ = tx.try_send(Err(Status::deadline_exceeded(detail)));
+                    park_until_body_gone(parked, &tx).await;
+                    return;
                 }
             }
         }
         if walk.left == 0 || walk.next.is_none() {
             // Keeps the request slot until the client has taken the last
-            // part; a client that never does is counted.
-            reserve(&tx, READ_STALL_TIMEOUT, walk.stalled.as_ref()).await;
+            // part; a client that never does is counted until its body
+            // drops.
+            if let Taken::Stalled(parked) =
+                reserve(&tx, READ_STALL_TIMEOUT, walk.stalled.as_ref()).await
+            {
+                park_until_body_gone(parked, &tx).await;
+            }
             return;
         }
         let from = walk.next.unwrap();
@@ -1001,16 +1029,21 @@ async fn send_parts<T: Send + 'static>(
                     }
                 }
                 Taken::Gone => return,
-                Taken::Stalled => {
+                Taken::Stalled(parked) => {
                     // The client took no part: it is owed the error, so it
                     // never takes the file for a whole one.
                     let detail = format!("the client took no data for {stall:?}");
-                    return fail(Status::deadline_exceeded(detail));
+                    let _ = tx.try_send(Err(Status::deadline_exceeded(detail)));
+                    park_until_body_gone(parked, &tx).await;
+                    return;
                 }
             }
         } else {
-            // Keeps the share until the client has taken the last part.
-            reserve(&tx, stall, stalled.as_ref()).await;
+            // Keeps the share until the client has taken the last part; a
+            // client that never does is counted until its body drops.
+            if let Taken::Stalled(parked) = reserve(&tx, stall, stalled.as_ref()).await {
+                park_until_body_gone(parked, &tx).await;
+            }
             return;
         }
     }

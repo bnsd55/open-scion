@@ -8,13 +8,13 @@ use rusqlite::{Connection, params};
 use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileEntry, FileState, IdentityTime, RepoPath,
 };
-use scion_server::error::ApplyError;
-use scion_server::meta::{Meta as _, MetaTx as _};
-use scion_server::store::BlobStatus;
-use scion_server::write::{
+use scion_server::test_support::error::ApplyError;
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::test_support::store::BlobStatus;
+use scion_server::test_support::write::{
     MAX_CHANGES, MAX_COMMIT_MESSAGE_BYTES, MAX_IDENTITY_BYTES, create_changeset,
 };
-use scion_server::{Backend, Error, tree};
+use scion_server::{Backend, Error, test_support::tree};
 use tempfile::TempDir;
 
 const REPO: &str = "main";
@@ -302,7 +302,7 @@ fn created_changesets_have_the_expected_root_tree() {
     .unwrap();
 
     let repo = f.store.read(|c| c.repo_id(REPO)).unwrap();
-    let deadline = scion_server::deadline::Deadline::new(
+    let deadline = scion_server::test_support::deadline::Deadline::new(
         std::time::Instant::now() + std::time::Duration::from_secs(300),
     );
     let lookup = |cs, p: &str| {

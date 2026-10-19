@@ -9,12 +9,10 @@ use scion_proto::CHUNK_BYTES;
 use scion_proto::runtime::auth::Bearer;
 use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
-use scion_proto::v1::{
-    BlameRequest, CreateChangesetRequest, LandRequest, ReadFileRequest,
-};
-use scion_server::meta::MetaTx as _;
-use scion_server::metrics::Metrics;
-use scion_server::{Backend, Store, service};
+use scion_proto::v1::{BlameRequest, CreateChangesetRequest, LandRequest, ReadFileRequest};
+use scion_server::Metrics;
+use scion_server::test_support::meta::MetaTx as _;
+use scion_server::{Backend, Store, test_support::service};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 use tonic::service::interceptor::InterceptedService;
@@ -114,7 +112,7 @@ async fn setup() -> (
         service::ServeOptions {
             data: dir.path().to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,

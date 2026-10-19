@@ -52,6 +52,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # A release build has no dev-dependencies, so the test-hooks feature
+      # stays off and every test-only item that a cfg misses shows up as
+      # dead code. --all-targets unifies the dev-dependency that turns
+      # the feature on, and cannot see this.
+      - run: cargo clippy --workspace --lib --bins -- -D warnings
 
   docs:
     name: rustdoc

@@ -4,7 +4,7 @@
 mod common;
 
 use common::git;
-use scion_server::import::{ImportOptions, import_git};
+use scion_server::{ImportOptions, import_git};
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -13,14 +13,14 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
-use scion_server::blame::{
+use scion_server::test_support::blame::{
     self, Blame, BlameRange, Line, MAX_BLAME_DIFF_LINES, MAX_BLAME_VERSIONS, RenameSearch, Resume,
 };
-use scion_server::deadline::Deadline;
-use scion_server::memory::Bytes;
-use scion_server::meta::{Meta as _, MetaTx as _};
-use scion_server::read::{self, MAX_SCAN};
-use scion_server::{Backend, Error, tree};
+use scion_server::test_support::deadline::Deadline;
+use scion_server::test_support::memory::Bytes;
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::test_support::read::{self, MAX_SCAN};
+use scion_server::{Backend, Error, test_support::tree};
 use tempfile::TempDir;
 
 const REPO: &str = "r";
@@ -253,7 +253,7 @@ fn blame_bounded(
     cs: ChangesetId,
     p: &str,
     cap: usize,
-) -> std::result::Result<Blame, scion_server::error::Error> {
+) -> std::result::Result<Blame, scion_server::Error> {
     blame::blame(
         store,
         REPO,

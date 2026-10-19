@@ -9,10 +9,10 @@
 
 use libfuzzer_sys::fuzz_target;
 use scion_core::{Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
-use scion_server::blame::{self, Resume};
-use scion_server::memory::Bytes;
-use scion_server::meta::{Meta as _, MetaTx as _};
-use scion_server::{Backend, Store, tree};
+use scion_server::test_support::blame::{self, Resume};
+use scion_server::test_support::memory::Bytes;
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::{Backend, Store, test_support::tree};
 use std::sync::OnceLock;
 use tempfile::TempDir;
 
@@ -61,7 +61,7 @@ fn fixture() -> &'static (TempDir, Backend, ChangesetId) {
                         if b == content {
                             Ok(len)
                         } else {
-                            Err(scion_server::error::Error::NotFound(format!("blob {b}")))
+                            Err(scion_server::Error::NotFound(format!("blob {b}")))
                         }
                     })?
                     .0);

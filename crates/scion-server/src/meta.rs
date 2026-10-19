@@ -1,5 +1,5 @@
 //! The metadata storage that a server needs, as one trait, with SQLite
-//! behind it ([#47](https://github.com/bnsd55/open-scion/issues/47)).
+//! behind it ([#47](https://github.com/bnsd55/openscion/issues/47)).
 //!
 //! [`Store`] is the SQLite implementation: one data directory, one write
 //! connection, readers around it, and the group flush that makes a reply
@@ -133,6 +133,7 @@ pub trait MetaTx {
     fn generation_of(&mut self, id: ChangesetId) -> Result<i64>;
 
     /// The first parent of a changeset, if it has one.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn first_parent(&mut self, id: ChangesetId) -> Result<Option<ChangesetId>>;
 
     /// Every parent of `id`, in order, with its generation.
@@ -140,6 +141,7 @@ pub trait MetaTx {
 
     /// Whether `ancestor` is `descendant` or reachable from it, within a
     /// bounded walk.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn is_ancestor(
         &mut self,
         repo: RepoId,

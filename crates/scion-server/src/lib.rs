@@ -1,6 +1,6 @@
 //! Scion server: durable storage, server-side commits and lands, and reads.
 //!
-//! This is the storage and serving crate of [open-scion]: the bottom of the
+//! This is the storage and serving crate of [openscion]: the bottom of the
 //! system above the object model ([`scion-core`]), holding the metadata and
 //! blobs, doing commits, lands and reads, and serving the API of
 //! [`scion-proto`](https://docs.rs/open-scion-proto) to the client
@@ -11,7 +11,7 @@
 //! Postgres instead of the data directory; the blobs stay on local disk in
 //! both. The operations guide, `docs/operations.md`, covers both shapes.
 //!
-//! [open-scion]: https://github.com/bnsd55/open-scion
+//! [openscion]: https://github.com/bnsd55/openscion
 //! [`scion-core`]: https://docs.rs/open-scion-core
 //! [`scn`]: https://docs.rs/open-scion
 //!
@@ -26,131 +26,134 @@
 //!   user touches is [`Backend`].
 //! - `derived`: one mechanism for every kind of derived data, which
 //!   `backfill_root_tree` and its two sibling functions drive.
-//! - [`tree`]: apply changesets to trees and derive each changeset's root
+//! - `tree`: apply changesets to trees and derive each changeset's root
 //!   tree.
-//! - [`graph`]: the commit-graph index, and the graph queries that read it.
-//! - [`history`]: the path history of each changeset, for `Log` with a path
+//! - `graph`: the commit-graph index, and the graph queries that read it.
+//! - `history`: the path history of each changeset, for `Log` with a path
 //!   and for lands on old bases.
 //! - `read`, `blame`, the `write` module, `land`: the operations behind the
 //!   RPCs. A long one stops at its call's deadline. `similar` finds
 //!   renames for `Diff` and `Blame`.
 //! - `views`: the view of the repo that a partial reader (folder read
-//!   rules, [`access`]) reads through.
-//! - [`quotas`]: what one principal may hold at once; [`tickets`]: the
+//!   rules, `access`) reads through.
+//! - `quotas`: what one principal may hold at once; `tickets`: the
 //!   signed read tickets of object reads.
 //! - [`fsck`]: reports the damage in a data directory. Read-only.
 //! - [`gc`]: collects the blobs that nothing names any more.
-//! - [`import`]: one-way import from a git repository.
-//! - [`service`], `objects` and `auth`: the gRPC front end. [`access`]:
+//! - `import`: one-way import from a git repository.
+//! - `service`, `objects` and `auth`: the gRPC front end. `access`:
 //!   which principal may read or write what.
 
 //! ### What the facade is
 //!
 //! The API of this crate is the list below the modules: the types and
-//! functions a server main and a client need. Everything else exists for
-//! the two binaries that this workspace ships, and can change without a
-//! release. Items marked `#[doc(hidden)]` are not API at all: they are
-//! the test seams, behind the `test-hooks` feature (default off), which
-//! exists so the integration tests can hold locks, move refs and inject
-//! commit failures at exact moments. Nothing behind the feature, and
-//! nothing `#[doc(hidden)]`, carries a stability promise: enabling it in
-//! a build is at the user's own risk.
+//! functions a server main and a client need, plus the `fsck` and `gc`
+//! operations a server main runs by hand. Everything else exists for the
+//! two binaries that this workspace ships, and can change without a
+//! release. The one test seam is `test_support`, behind the `test-hooks`
+//! feature (default off): it exists so the integration tests and the fuzz
+//! targets can hold locks, move refs and inject commit failures at exact
+//! moments. Nothing behind the feature carries a stability promise:
+//! enabling it in a build is at the user's own risk.
 
-pub mod access;
-// Internal: the binaries' implementation. Tests reach it only with the
-// test-hooks feature on, which the crate's own dev-dependency sets.
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod auth;
-#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod access;
 pub(crate) mod auth;
-pub mod backend;
+pub(crate) mod backend;
 pub use backend::Backend;
-// Internal: the binaries' implementation. Tests reach it only with the
-// test-hooks feature on, which the crate's own dev-dependency sets.
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod blame;
-#[cfg(not(any(test, feature = "test-hooks")))]
 pub(crate) mod blame;
-// Internal: the binaries' implementation. Tests reach it only with the
-// test-hooks feature on, which the crate's own dev-dependency sets.
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod db;
-#[cfg(not(any(test, feature = "test-hooks")))]
 pub(crate) mod db;
-// Internal: the binaries' implementation. Tests reach it only with the
-// test-hooks feature on, which the crate's own dev-dependency sets.
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod deadline;
-#[cfg(not(any(test, feature = "test-hooks")))]
 pub(crate) mod deadline;
-pub mod derived;
-pub mod error;
+pub(crate) mod derived;
+pub(crate) mod error;
+// These two are API, not implementation: a server main runs them by hand,
+// and docs/operations.md documents both. Everything else in the list is
+// an implementation detail of the two binaries, however public it looks.
 pub mod fsck;
 pub mod gc;
-pub mod graph;
-pub mod history;
-pub mod import;
-// Internal: the binaries' implementation. Tests reach it only with the
-// test-hooks feature on, which the crate's own dev-dependency sets.
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod land;
-#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod graph;
+pub(crate) mod history;
+pub(crate) mod import;
 pub(crate) mod land;
-// Internal: the binaries' implementation. Tests reach it only with the
-// test-hooks feature on, which the crate's own dev-dependency sets.
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod memory;
-#[cfg(not(any(test, feature = "test-hooks")))]
 pub(crate) mod memory;
-// Internal: the binaries' implementation. Tests reach it only with the
-// test-hooks feature on, which the crate's own dev-dependency sets.
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod meta;
-#[cfg(not(any(test, feature = "test-hooks")))]
 pub(crate) mod meta;
-pub mod metrics;
-// Internal: the binaries' implementation. Tests reach it only with the
-// test-hooks feature on, which the crate's own dev-dependency sets.
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod names;
-#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod metrics;
 pub(crate) mod names;
-// Internal: the binaries' implementation. Tests reach it only with the
-// test-hooks feature on, which the crate's own dev-dependency sets.
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod objects;
-#[cfg(not(any(test, feature = "test-hooks")))]
 pub(crate) mod objects;
 mod pg;
-pub mod quotas;
-// Internal: the binaries' implementation. Tests reach it only with the
-// test-hooks feature on, which the crate's own dev-dependency sets.
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod read;
-#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod quotas;
 pub(crate) mod read;
-pub mod service;
-// Internal: the binaries' implementation. Tests reach it only with the
-// test-hooks feature on, which the crate's own dev-dependency sets.
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod similar;
-#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod service;
 pub(crate) mod similar;
-pub mod store;
-pub mod tickets;
-pub mod tree;
-// Internal: the binaries' implementation. Tests reach it only with the
-// test-hooks feature on, which the crate's own dev-dependency sets.
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod views;
-#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) mod store;
+pub(crate) mod tickets;
+pub(crate) mod tree;
 pub(crate) mod views;
-// Internal: the binaries' implementation. Tests reach it only with the
-// test-hooks feature on, which the crate's own dev-dependency sets.
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod write;
-#[cfg(not(any(test, feature = "test-hooks")))]
 pub(crate) mod write;
+
+/// The test seams, behind the test-hooks feature (default off). One module,
+/// the only way in: the integration tests and the fuzz targets reach the
+/// implementation through these re-exports, and nothing else. Not API, and
+/// not covered by a stability promise.
+///
+/// The submodules re-export the implementation modules' public items rather
+/// than the modules themselves: the modules are pub(crate), and a pub
+/// re-export of a pub(crate) module is refused (E0365), while a re-export
+/// of the items inside a public submodule is fine.
+#[cfg(feature = "test-hooks")]
+pub mod test_support {
+    /// The caller behind an authenticated RPC, for tests that name one.
+    pub mod auth {
+        pub use crate::auth::Caller;
+    }
+    /// The blame operation behind the `Blame` RPC, with its limits.
+    pub mod blame {
+        pub use crate::blame::*;
+    }
+    /// The per-call deadline every long operation stops at.
+    pub mod deadline {
+        pub use crate::deadline::*;
+    }
+    /// The error a changeset apply can end in, for the write tests.
+    pub mod error {
+        pub use crate::error::ApplyError;
+    }
+    /// The counters the import tests read between retries.
+    pub mod import {
+        pub use crate::import::{BUSY_TRIES, CHECKS};
+    }
+    /// The land operation: its queue, requests and outcomes.
+    pub mod land {
+        pub use crate::land::*;
+    }
+    /// The blob pool the server hands out reads from.
+    pub mod memory {
+        pub use crate::memory::*;
+    }
+    /// The metadata traits the tests and the fuzz target call directly.
+    pub mod meta {
+        pub use crate::meta::*;
+    }
+    /// The read operations behind the read RPCs, and their limits.
+    pub mod read {
+        pub use crate::read::*;
+    }
+    /// The gRPC front end, so tests and fuzz targets serve on a port.
+    pub mod service {
+        pub use crate::service::*;
+    }
+    /// The on-disk store, so tests open and inspect one directly.
+    pub mod store {
+        pub use crate::store::*;
+    }
+    /// Tree apply and the per-changeset root tree.
+    pub mod tree {
+        pub use crate::tree::*;
+    }
+    /// The write path: changeset decode and apply, and its limits.
+    pub mod write {
+        pub use crate::write::*;
+    }
+}
 
 // The facade: the API of this crate, one list, kept here so it is one
 // thing to read and one thing to keep honest. Every other name in the

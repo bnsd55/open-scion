@@ -1,6 +1,6 @@
 //! A virtual checkout over `NFSv3`: `scn mount` serves one ref of the
 //! repository as a filesystem, so files load when they are first read
-//! ([#11](https://github.com/bnsd55/open-scion/issues/11)), through the
+//! ([#11](https://github.com/bnsd55/openscion/issues/11)), through the
 //! same `Objects` calls that a checkout sends.
 //!
 //! What the article says: files load when they are first read. The rest is
@@ -1643,8 +1643,11 @@ mod tests {
         GetRootTreeRequest as Ask, GetRootTreeResponse, ObjectPart, ResolveRefRequest,
         ResolveRefResponse,
     };
-    use scion_server::meta::{Meta as _, MetaTx as _};
-    use scion_server::{Backend, service, tree};
+    use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+    use scion_server::{
+        Backend,
+        test_support::{service, tree},
+    };
     use std::collections::HashMap as StdHashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -1719,13 +1722,13 @@ mod tests {
             service::ServeOptions {
                 data: data.path().to_path_buf(),
                 limits: Limits::default(),
-                quotas: scion_server::quotas::Quotas::off(),
+                quotas: scion_server::Quotas::off(),
                 pending_lands: None,
                 land_stale_secs: 1 << 40,
                 tls: None,
-                metrics: std::sync::Arc::new(scion_server::metrics::Metrics::default()),
+                metrics: std::sync::Arc::new(scion_server::Metrics::default()),
             },
-            Some(std::sync::Arc::new(scion_server::tickets::Keys::generate())),
+            Some(std::sync::Arc::new(scion_server::Keys::generate())),
             std::future::pending(),
         ));
         let client = crate::client::test_objects(&url, TOKEN).await;
@@ -2237,7 +2240,7 @@ mod tests {
     struct Expiring {
         root: TreeId,
         objects: StdHashMap<Vec<u8>, Sent>,
-        key: std::sync::Arc<scion_server::tickets::Keys>,
+        key: std::sync::Arc<scion_server::Keys>,
         /// The ticket of the first mint, which `get_objects` refuses.
         first: std::sync::Mutex<Vec<u8>>,
         /// Shared with the test, which reads it while the server runs.
@@ -2276,7 +2279,7 @@ mod tests {
                 objects: [(blob.id.clone(), blob), (tree.id.clone(), tree)]
                     .into_iter()
                     .collect(),
-                key: std::sync::Arc::new(scion_server::tickets::Keys::generate()),
+                key: std::sync::Arc::new(scion_server::Keys::generate()),
                 first: std::sync::Mutex::new(Vec::new()),
                 mints: std::sync::Arc::new(AtomicUsize::new(0)),
             }

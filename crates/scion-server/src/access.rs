@@ -176,7 +176,7 @@ fn check_write_needs_read(
             return Err(format!(
                 "line {n}: a write rule needs a read rule without a prefix, so principal \
                  {principal:?} may read {repo:?} whole: partial readers cannot write in \
-                 v0.1 ([#183](https://github.com/bnsd55/open-scion/issues/183))"
+                 v0.1 ([#183](https://github.com/bnsd55/openscion/issues/183))"
             ));
         }
     }

@@ -10,9 +10,12 @@ use scion_proto::runtime::auth::token_digest;
 use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{ListDirRequest, ReadFileRequest};
-use scion_server::access::Access;
-use scion_server::meta::MetaTx as _;
-use scion_server::{Backend, Store, meta::Meta as _, service};
+use scion_server::Access;
+use scion_server::test_support::meta::MetaTx as _;
+use scion_server::{
+    Backend, Store,
+    test_support::{meta::Meta as _, service},
+};
 use tokio::net::TcpListener;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -106,13 +109,13 @@ async fn serve(store: &Backend, dir: &std::path::Path) -> (Stop, Scion) {
         service::ServeOptions {
             data: dir.to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
-            metrics: Arc::new(scion_server::metrics::Metrics::default()),
+            metrics: Arc::new(scion_server::Metrics::default()),
         },
-        Some(Arc::new(scion_server::tickets::Keys::generate())),
+        Some(Arc::new(scion_server::Keys::generate())),
         async {
             stopped.await.ok();
         },

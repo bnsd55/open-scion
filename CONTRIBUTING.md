@@ -1,6 +1,6 @@
-# Contributing to open-scion
+# Contributing to openscion
 
-Thank you for your interest. open-scion is at an early stage and the design
+Thank you for your interest. openscion is at an early stage and the design
 still moves, so the best first step is an issue: describe the problem or the
 idea, and agree on the approach before writing a large change.
 
@@ -18,8 +18,8 @@ gRPC code) and `git` (the import tests build small git repositories). For fuzzin
 `cargo-fuzz`.
 
 ```sh
-git clone https://github.com/bnsd55/open-scion
-cd open-scion
+git clone https://github.com/bnsd55/openscion
+cd openscion
 cargo test --workspace
 ```
 
@@ -91,6 +91,22 @@ scion-server: re-importing a tip the ref already contains is a no-op
 A ref that holds lands on top of an earlier import already contains the
 git tip, so a repeated import leaves it alone and succeeds.
 ```
+
+## Who decides
+
+open-scion has one maintainer today: the owner decides what lands, per
+[the roadmap](docs/ROADMAP.md). A decision is recorded where its work
+happens: a direction or a refusal in an issue, the decision itself in
+the pull request that lands it. When a second maintainer joins, this
+section says so before their decisions carry.
+
+## The commit's author and committer
+
+An outside pull request is squash-merged with the contributor as the
+commit's **author**: the authorship of the work stays with the person
+who wrote it. The maintainer who merges is the **committer**. A
+maintainer never replaces an outside author with their own identity;
+`Co-authored-by` is for a second material author, not a substitute.
 
 ## License
 

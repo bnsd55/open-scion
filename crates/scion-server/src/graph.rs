@@ -70,7 +70,7 @@ pub struct Node {
     pub merge: Option<Link>,
 }
 
-/// The commit-graph index: a [`Node`] for each changeset. A write stores the
+/// The commit-graph index: a `Node` for each changeset. A write stores the
 /// node of a changeset whose parents have nodes (`tree::store_changeset`).
 /// Else the first query that needs it derives it, in steps.
 pub struct CommitGraph;

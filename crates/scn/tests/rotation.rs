@@ -16,8 +16,8 @@ use scion_proto::runtime::auth::Bearer;
 use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::{GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
-use scion_server::tickets::Keys;
-use scion_server::{Backend, service};
+use scion_server::Keys;
+use scion_server::{Backend, test_support::service};
 use scion_tier::{CACHE_UPSTREAM_TIMEOUT, DAEMON_UPSTREAM_TIMEOUT, DiskStore, MemoryStore, Tier};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -86,7 +86,7 @@ fn start_stack(
             service::ServeOptions {
                 data,
                 limits: Limits::default(),
-                quotas: scion_server::quotas::Quotas::off(),
+                quotas: scion_server::Quotas::off(),
                 pending_lands: None,
                 land_stale_secs: 1 << 40,
                 tls: None,

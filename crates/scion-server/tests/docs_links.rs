@@ -13,8 +13,8 @@ const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
 /// The two repo-absolute link shapes the README uses: a file at main
 /// (`/blob/`) and a raw file at main (`/raw/`), both of this repository.
-const REPO_BLOB: &str = "https://github.com/bnsd55/open-scion/blob/main/";
-const REPO_RAW: &str = "https://github.com/bnsd55/open-scion/raw/main/";
+const REPO_BLOB: &str = "https://github.com/bnsd55/openscion/blob/main/";
+const REPO_RAW: &str = "https://github.com/bnsd55/openscion/raw/main/";
 
 /// The markdown files whose links the test checks.
 fn documents() -> Vec<PathBuf> {
@@ -291,7 +291,7 @@ fn a_broken_link_is_reported() {
     let root = tempfile::tempdir().expect("a temp tree");
     fs::write(
         root.path().join("a.md"),
-        "[file](missing.md)\n[anchor](b.md#no)\n[repo](https://github.com/bnsd55/open-scion/blob/main/docs/no-such-doc.md)\n[good](b.md#real)\n",
+        "[file](missing.md)\n[anchor](b.md#no)\n[repo](https://github.com/bnsd55/openscion/blob/main/docs/no-such-doc.md)\n[good](b.md#real)\n",
     )
     .unwrap();
     fs::write(root.path().join("b.md"), "# Real\n").unwrap();

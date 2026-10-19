@@ -102,6 +102,7 @@ pub(crate) trait Kind {
 /// # Errors
 ///
 /// As [`get_by`], without [`Error::DeadlineExceeded`].
+#[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn get_unbounded<K: Kind>(
     store: &Backend,
     repo: RepoId,

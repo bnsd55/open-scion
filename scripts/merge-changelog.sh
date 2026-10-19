@@ -42,14 +42,19 @@ for section in added changed fixed security; do
     if [ -z "$fragments" ]; then
         continue
     fi
-    case $fragments in *[[:space:]]*)
-        echo "fragment file names must not contain whitespace" >&2
-        exit 1
-        ;;
-    esac
     rows=$work/rows.txt
     : >"$rows"
     for fragment in $fragments; do
+        # A fragment is plain text: no row marker, no indent, and a file
+        # name with no whitespace, which the row's own text would name as
+        # two words. The list's newlines between paths are not names: the
+        # check runs on each path, or two fragments in one section would
+        # refuse the whole release.
+        case $fragment in *[[:space:]]*)
+            echo "fragment file names must not contain whitespace: $fragment" >&2
+            exit 1
+            ;;
+        esac
         # A fragment is plain text: no row marker, no indent. The row
         # marker goes on the first line, and every later line takes the
         # row's two-space indent, as today's changelog rows read.

@@ -1,11 +1,11 @@
 //! Object model and canonical byte format for Scion.
 //!
 //! This is the lowest layer of the system: the objects that every other
-//! crate of [open-scion] stores, sends and checks. A server keeps them, a
+//! crate of [openscion] stores, sends and checks. A server keeps them, a
 //! tier caches their bytes, and the client ([`scn`]) builds and reads
 //! them; all of them speak this one format, so they stay interoperable.
 //!
-//! [open-scion]: https://github.com/bnsd55/open-scion
+//! [openscion]: https://github.com/bnsd55/openscion
 //! [`scn`]: https://docs.rs/open-scion
 //!
 //! Scion stores two kinds of structured objects, both content-addressed:
