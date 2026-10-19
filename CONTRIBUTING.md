@@ -92,6 +92,22 @@ A ref that holds lands on top of an earlier import already contains the
 git tip, so a repeated import leaves it alone and succeeds.
 ```
 
+## Who decides
+
+open-scion has one maintainer today: the owner decides what lands, per
+[the roadmap](docs/ROADMAP.md). A decision is recorded where its work
+happens: a direction or a refusal in an issue, the decision itself in
+the pull request that lands it. When a second maintainer joins, this
+section says so before their decisions carry.
+
+## The commit's author and committer
+
+An outside pull request is squash-merged with the contributor as the
+commit's **author**: the authorship of the work stays with the person
+who wrote it. The maintainer who merges is the **committer**. A
+maintainer never replaces an outside author with their own identity;
+`Co-authored-by` is for a second material author, not a substitute.
+
 ## License
 
 By contributing, you agree that your contributions are dual licensed under the
