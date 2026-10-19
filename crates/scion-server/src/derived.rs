@@ -653,7 +653,10 @@ fn derive_steps<K: Kind>(
         // connection does no file I/O. A blob the repo no longer holds
         // fails here, before any write.
         let lens = if K::NEEDS_LENS {
-            store.read(|c| {
+            // Unflushed on purpose: the walk reads unflushed, and the
+            // caller flushes before it replies (fill's doc). A plain read
+            // would flush here, and a land's fills would each cost one.
+            store.read_unflushed(|c| {
                 let changesets = step
                     .iter()
                     .map(|&id| c.get_changeset(repo, id))
