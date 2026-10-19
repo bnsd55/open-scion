@@ -196,10 +196,14 @@ pub(crate) struct DeriveFlights {
 
 impl DeriveFlights {
     pub(crate) fn new(walks_cap: usize) -> Self {
-        Self::with_walk_bytes(
+        Self {
+            flights: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(0),
+            woken: Condvar::new(),
             walks_cap,
-            crate::memory::Bytes::named(DERIVE_WALK_BUDGET, "derive walk"),
-        )
+            walk_bytes: crate::memory::Bytes::named(DERIVE_WALK_BUDGET, "derive walk"),
+            metrics: std::sync::OnceLock::new(),
+        }
     }
 
     /// A flights set whose bounded walks share `walk_bytes`. For tests of
