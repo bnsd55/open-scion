@@ -39,7 +39,7 @@ fn scn(url: &str, home: &std::path::Path, args: &[&str]) -> String {
 /// Runs `scn ARGS` against `url`, with `home` as the home directory,
 /// and answers the raw stdout bytes: names in arguments and output need
 /// not be UTF-8.
-fn scn_bytes(url: &str, home: &std::path::Path, args: &[OsStr]) -> Vec<u8> {
+fn scn_bytes(url: &str, home: &std::path::Path, args: &[&OsStr]) -> Vec<u8> {
     let out = Command::new(env!("CARGO_BIN_EXE_scn"))
         .args(["--server", url, "--repo", REPO])
         .args(args)
@@ -314,7 +314,7 @@ fn a_non_utf8_name_commits_its_own_content() {
         scn_bytes(
             &tiers.server,
             mounted.home.path(),
-            &[OsStr::new("cat"), &arg],
+            &[OsStr::new("cat"), arg.as_os_str()],
         )
     };
     assert_eq!(cat(raw), b"raw\n");

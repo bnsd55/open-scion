@@ -1893,13 +1893,13 @@ mod tests {
         std::os::unix::fs::symlink(&target, &file).unwrap();
 
         // A write is refused, and the target keeps its bytes.
-        assert_eq!(
+        assert!(matches!(
             test.vfs.write(id, 0, b"planted\n").await,
             Err(nfsstat3::NFS3ERR_IO)
-        );
+        ));
         assert_eq!(std::fs::read(&target).unwrap(), b"keep\n");
         // So are a mode change and a truncate.
-        assert_eq!(
+        assert!(matches!(
             test.vfs
                 .setattr(
                     id,
@@ -1910,8 +1910,8 @@ mod tests {
                 )
                 .await,
             Err(nfsstat3::NFS3ERR_IO)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             test.vfs
                 .setattr(
                     id,
@@ -1922,7 +1922,7 @@ mod tests {
                 )
                 .await,
             Err(nfsstat3::NFS3ERR_IO)
-        );
+        ));
         assert_eq!(std::fs::read(&target).unwrap(), b"keep\n");
 
         // The note of deletions refuses a planted symlink too, and the
