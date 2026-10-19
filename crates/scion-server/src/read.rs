@@ -186,7 +186,11 @@ pub fn log_page(
             let mut entries = Vec::new();
             let mut next = Some(cs);
             let mut budget = limit;
-            while let Some(entry) = next_change(c, repo, &mut next, &mut budget)? {
+            loop {
+                deadline.check()?;
+                let Some(entry) = next_change(c, repo, &mut next, &mut budget)? else {
+                    break;
+                };
                 entries.push(entry);
             }
             Ok(LogPage { entries, next })
@@ -203,6 +207,7 @@ pub fn log_page(
         let mut entries = Vec::new();
         let mut next = Some(cs);
         while let Some(from) = next.filter(|_| entries.len() < limit) {
+            deadline.check()?;
             if !entries.is_empty() && nodes.bytes() >= MAX_LOG_NODE_BYTES {
                 break;
             }

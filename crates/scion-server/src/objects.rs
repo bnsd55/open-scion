@@ -7,7 +7,9 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use scion_core::{BlobId, TreeId};
 use scion_proto::auth::{Auth, Caller};
@@ -43,6 +45,11 @@ use crate::views;
 
 // The store keeps exactly the objects that the API promises to send.
 const _: () = assert!(store::MAX_OBJECT_BYTES == scion_proto::MAX_OBJECT_BYTES);
+
+/// The bytes of trees the last `prove` handed to its walk. Tests read it to
+/// check that the walk stops before it decodes past the reply budget.
+#[cfg(test)]
+static WALK_DECODED: AtomicUsize = AtomicUsize::new(0);
 
 /// One object to read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -469,15 +476,23 @@ impl Objects for ObjectsService {
             .collect::<Result<Vec<_>, Status>>()?;
         // Encodings that this server does not know are ignored.
         let zstd = accept.contains(&Encoding::Zstd.into());
+        // The walk pays as it goes, against the same budget the reply takes
+        // its shares from, and stops at the caller's deadline.
+        let in_flight = Arc::clone(&self.in_flight);
         let (allowed, decoded, keys) = self
             .worker
             .run(move |store| {
-                let (allowed, decoded) = prove(&store, ticket.root_tree, &refs)?;
+                let (allowed, decoded) = prove(
+                    &store,
+                    ticket.root_tree,
+                    &refs,
+                    &in_flight,
+                    waits.until.at(),
+                )?;
                 let keys = refs.into_iter().map(|(key, _)| key).collect();
                 Ok((allowed, decoded, keys))
             })
             .await?;
-        let in_flight = Arc::clone(&self.in_flight);
         // The reply runs to the stream's end, not to this handler's return:
         // its work goes on in the producer task.
         let stream = start_reply(
@@ -502,19 +517,50 @@ impl Objects for ObjectsService {
 /// `store`: the caller keeps the keys, and `plan` serves only the proven
 /// ones. A tree that `store` does not hold, or one whose bytes do not
 /// match its ID, refuses the ref.
+///
+/// The walk pays as it goes: a tree is handed to the walk only while the
+/// bytes the walk holds stay within `budget.available_permits()`, the
+/// share `start_reply` would take for it, and only while `until` is
+/// ahead. Past either, the walk stops before it decodes one more tree,
+/// with the same answer the reply would give. A tree that was read from
+/// the store but not handed over was still read: the next call reads it
+/// again, within its own budget.
 fn prove(
     store: &Backend,
     root: [u8; 32],
     refs: &[(Key, Vec<u8>)],
+    budget: &Semaphore,
+    until: Option<Instant>,
 ) -> Result<(HashSet<Key>, usize)> {
     let mut walk = scion_proto::ticket::Walker::new(root);
     let mut allowed = HashSet::new();
+    // The bytes of the trees the walk holds, as the Walker counts them.
+    // The reader needs its own count: it decides before the walk decodes.
+    let mut held = 0usize;
     store.read(|c| {
         let mut reader = |id: [u8; 32]| {
             // The walk only hands back the 32 bytes it got from a tree.
             let id = TreeId::try_from(id.as_slice()).expect("a walk names a tree id");
+            if until.is_some_and(|at| Instant::now() >= at) {
+                return Err(Error::DeadlineExceeded(
+                    "the ticket walk ran past its deadline".into(),
+                ));
+            }
             match c.get_tree_body(id) {
-                Ok(bytes) => Ok(Some(bytes)),
+                Ok(bytes) => {
+                    let free = budget.available_permits();
+                    if held + bytes.len() > free {
+                        return Err(Error::ResourceExhausted(format!(
+                            "the ticket walk would hold {} bytes of trees, \
+                             more than the {free} bytes of reply budget left",
+                            held + bytes.len()
+                        )));
+                    }
+                    held += bytes.len();
+                    #[cfg(test)]
+                    WALK_DECODED.store(held, Ordering::SeqCst);
+                    Ok(Some(bytes))
+                }
                 Err(Error::NotFound(_)) => Ok(None),
                 Err(why) => Err(why),
             }
@@ -878,6 +924,58 @@ mod tests {
         assert_eq!(parts, 4);
         assert_eq!(data, content);
         assert_eq!(in_flight.available_permits(), IN_FLIGHT_BYTES);
+    }
+
+    /// The ticket walk pays as it goes: a tree is handed to the walk only
+    /// while the bytes it holds fit the reply budget, and an expired
+    /// deadline stops the walk before the first tree.
+    #[test]
+    fn a_ticket_walk_stops_before_it_decodes_past_the_budget() {
+        use scion_core::{Entry, FileEntry, FileState, PathElem, Tree};
+        use std::collections::BTreeMap;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        // A child tree whose one file entry has a wide name, so its body
+        // is hundreds of bytes, under a root of one small entry.
+        let wide = PathElem::new(vec![b'x'; 300]).unwrap();
+        let (root, child) = store
+            .write(|c| {
+                let blob = BlobId::of(b"blob");
+                let child = c.put_tree(&Tree {
+                    entries: BTreeMap::from([(
+                        wide,
+                        Entry::File(FileEntry::new(
+                            FileState::Regular {
+                                content: blob,
+                                executable: false,
+                            },
+                            0,
+                        )),
+                    )]),
+                })?;
+                let root = c.put_tree(&Tree {
+                    entries: BTreeMap::from([(PathElem::new("d").unwrap(), Entry::Dir(child))]),
+                })?;
+                Ok((root, child))
+            })
+            .unwrap();
+        let refs = [(Key::Tree(child), b"d".to_vec())];
+
+        // The budget fits the root but not the child: the walk hands the
+        // root over, and stops before it decodes the child.
+        let budget = Arc::new(Semaphore::new(200));
+        WALK_DECODED.store(0, Ordering::SeqCst);
+        let err = prove(&store, *root.as_bytes(), &refs, &budget, None).unwrap_err();
+        assert!(matches!(err, Error::ResourceExhausted(_)), "{err:?}");
+        let decoded = WALK_DECODED.load(Ordering::SeqCst);
+        assert!(decoded > 0 && decoded <= 200, "{decoded}");
+
+        // An expired deadline stops the walk before the first tree.
+        let past = Some(Instant::now() - Duration::from_secs(1));
+        let room = Arc::new(Semaphore::new(1 << 20));
+        let err = prove(&store, *root.as_bytes(), &refs, &room, past).unwrap_err();
+        assert!(matches!(err, Error::DeadlineExceeded(_)), "{err:?}");
+        assert_eq!(WALK_DECODED.load(Ordering::SeqCst), decoded);
     }
 
     /// `tree_size` reads the byte length of a stored tree on every

@@ -206,6 +206,16 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- Two reads stop at the caller's deadline and the reply's budget
+  (#282): a `Log` call without a path read up to 1,000 changesets, each
+  as large as a changeset can be, with the call's deadline never
+  checked; a `GetObjects` call's ticket walk decoded every tree on up
+  to 1,000 requested paths, however many bytes that is, before the
+  reply budget that bounds the reply was even consulted. The log page
+  now checks the deadline at each entry, and the walk hands a tree to
+  the walk only while the bytes it holds fit the budget, and stops at
+  the deadline, before it decodes one more tree.
+
 - A git import gives up instead of planning a ref's move again without
   end (#280): a ref that other lands keep moving while the import
   runs made the import check the ref's ancestry again and again, with
