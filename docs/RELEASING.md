@@ -27,8 +27,8 @@ A release is cut through one PR from a branch named
 1. **Merge the CHANGELOG fragments.** Run
    `scripts/merge-changelog.sh v0.1.0` (or the release's section), so
    that the fragments under `changes/` (`changes/<slug>.<section>.md`)
-   are merged into the version's section. Review the result, date the
-   section, and commit it on the release branch.
+   are merged into the version's section. Review the result, and
+   commit it on the release branch.
 2. **Set the date in `CHANGELOG.md`.** Rename the `## [v0.1.0] -
    unreleased` section to `## [v0.1.0] - YYYY-MM-DD` with the release
    day, and add a fresh empty `## [Unreleased]` above it. The entry
