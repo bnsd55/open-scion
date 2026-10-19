@@ -476,8 +476,10 @@ impl Objects for ObjectsService {
             .collect::<Result<Vec<_>, Status>>()?;
         // Encodings that this server does not know are ignored.
         let zstd = accept.contains(&Encoding::Zstd.into());
-        // The walk pays as it goes, against the same budget the reply takes
-        // its shares from, and stops at the caller's deadline.
+        // The walk pays as it goes, against the reply budget's capacity: a
+        // tree is handed to the walk only while the bytes it holds fit the
+        // capacity, a static cap, and the walk stops at the caller's
+        // deadline. The reply itself still waits for its share.
         let in_flight = Arc::clone(&self.in_flight);
         let walk_budget = Arc::clone(&in_flight);
         let (allowed, decoded, keys) = self
@@ -519,13 +521,13 @@ impl Objects for ObjectsService {
 /// ones. A tree that `store` does not hold, or one whose bytes do not
 /// match its ID, refuses the ref.
 ///
-/// The walk pays as it goes: a tree is handed to the walk only while the
-/// bytes the walk holds stay within `budget.available_permits()`, the
-/// share `start_reply` would take for it, and only while `until` is
+/// The walk pays as it goes, against the budget's capacity: a tree is
+/// handed to the walk only while the bytes it holds stay within the
+/// budget's whole size, `budget.capacity()`, and only while `until` is
 /// ahead. Past either, the walk stops before it decodes one more tree,
-/// with the same answer the reply would give. A tree that was read from
-/// the store but not handed over was still read: the next call reads it
-/// again, within its own budget.
+/// with the same answer the reply would give. The capacity is a static
+/// cap, so a walk that would exceed it fails for a reason that no other
+/// reader's share changes; the reply itself still waits for its share.
 fn prove(
     store: &Backend,
     root: [u8; 32],
@@ -533,6 +535,7 @@ fn prove(
     budget: &Semaphore,
     until: Option<Instant>,
 ) -> Result<(HashSet<Key>, usize)> {
+    let cap = budget.capacity();
     let mut walk = scion_proto::ticket::Walker::new(root);
     let mut allowed = HashSet::new();
     // The bytes of the trees the walk holds, as the Walker counts them.
@@ -549,11 +552,10 @@ fn prove(
             }
             match c.get_tree_body(id) {
                 Ok(bytes) => {
-                    let free = budget.available_permits();
-                    if held + bytes.len() > free {
+                    if held + bytes.len() > cap {
                         return Err(Error::ResourceExhausted(format!(
                             "the ticket walk would hold {} bytes of trees, \
-                             more than the {free} bytes of reply budget left",
+                             more than the {cap} bytes a reply may hold",
                             held + bytes.len()
                         )));
                     }
@@ -979,6 +981,17 @@ mod tests {
             })
             .unwrap();
         let refs = [(Key::Tree(leaf), b"d/s".to_vec())];
+
+        // Other readers hold the budget's free share, but the walk fits
+        // the capacity: it goes ahead, as a reply would. The free share
+        // here is 50 bytes, less than the ~410 the walk decodes.
+        let shared = Arc::new(Semaphore::new(1 << 20));
+        shared.try_acquire_many((1 << 20) - 50).unwrap().forget();
+        WALK_DECODED.store(0, Ordering::SeqCst);
+        let (_, decoded) = prove(&store, *root.as_bytes(), &refs, &shared, None).unwrap();
+        let held = WALK_DECODED.load(Ordering::SeqCst);
+        assert!(held > 50, "{held}");
+        assert_eq!(decoded, held, "the reply takes what the walk decoded");
 
         // The budget fits the root but not the middle tree: the walk
         // hands the root over, and stops before it decodes the middle.
