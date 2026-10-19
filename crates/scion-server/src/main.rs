@@ -353,7 +353,6 @@ async fn main() -> anyhow::Result<()> {
                 flags.access,
                 ServeConfig {
                     data: cli.data.clone(),
-                    insecure_listen: flags.insecure_listen,
                     quotas: flags.caps.quotas,
                     pending_lands: flags.caps.pending_lands,
                     land_stale_secs: flags.land_stale_secs,
@@ -477,7 +476,6 @@ fn caps(
 /// What a `serve` command serves with, besides the data directory and the
 /// access rules.
 struct ServeConfig {
-    insecure_listen: bool,
     quotas: Quotas,
     pending_lands: Option<usize>,
     land_stale_secs: i64,
