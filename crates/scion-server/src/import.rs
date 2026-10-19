@@ -916,8 +916,8 @@ mod tests {
     use crate::store::Store;
     use std::fs;
     use std::process::Command;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
 
