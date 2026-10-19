@@ -3075,6 +3075,7 @@ fn prepare_test_schema(url: &str, schema: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{Client, NoTls, P, merged_options};
+    use crate::backend::old_store;
     use crate::pg::Pg;
     use std::sync::Arc;
 
@@ -3115,7 +3116,6 @@ mod tests {
         if !crate::Backend::test_is_postgres() {
             return;
         }
-        use crate::backend::old_store;
         let url = crate::backend::test_url().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let schema = crate::backend::test_schema(dir.path());
@@ -3127,10 +3127,20 @@ mod tests {
             let a = store.blobs().put(old_store::A).unwrap();
             let b = store.blobs().put(old_store::B).unwrap();
             for id in [a, b] {
-                let (_, file) = store.blobs().location(id);
-                let to = dir.path().join(file.strip_prefix(scratch.path()).unwrap());
+                // The file of `id` sits at objects/blob/<2 hex>/<rest>;
+                // the copy must land at the same place in the old store's
+                // object folder. A prefix strip would miss: an open may
+                // spell the same directory through its canonical path.
+                let (_, from) = store.blobs().location(id);
+                let hex = id.to_string();
+                let to = dir
+                    .path()
+                    .join("objects")
+                    .join("blob")
+                    .join(&hex[..2])
+                    .join(&hex[2..]);
                 std::fs::create_dir_all(to.parent().unwrap()).unwrap();
-                std::fs::copy(&file, &to).unwrap();
+                std::fs::copy(from, &to).unwrap();
             }
             (a, b)
         };
@@ -3145,6 +3155,15 @@ mod tests {
             ))
             .unwrap();
             db.batch_execute(super::PG_MIGRATIONS[0]).unwrap();
+            // The ledger is not a migration file: an old build's open
+            // made it under its lock, at the shape of `migrate_under_lock`.
+            db.batch_execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                     version BIGINT PRIMARY KEY,
+                     name    TEXT NOT NULL
+                 )",
+            )
+            .unwrap();
             db.batch_execute(
                 "INSERT INTO schema_migrations (version, name) \
                  VALUES (1, 'postgres schema')",

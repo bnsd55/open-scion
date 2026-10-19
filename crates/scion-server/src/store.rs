@@ -2306,6 +2306,7 @@ pub(crate) mod spawn_guard {
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::old_store;
     use crate::db::SqliteTx;
     use crate::meta::MetaTx as _;
     use std::cell::{Cell, RefCell};
@@ -2638,13 +2639,12 @@ mod tests {
     /// the open migrates it forward through every migration, and what it
     /// held reads back ([#318]). The fixture is the rows a v1 store's
     /// write paths left: one repo, one root changeset, its ref, and the
-    /// blob files, which carry no schema. The repo_blobs rows the v1
+    /// blob files, which carry no schema. The `repo_blobs` rows the v1
     /// schema has no room for are filled by the upgrade's own Rust step
     /// (`db::fill_repo_blobs`), and the trees the old format held are
     /// dropped by the upgrade and rebuilt from the changesets on demand.
     #[test]
     fn a_store_of_schema_version_1_opens_upgrades_and_serves() {
-        use crate::backend::old_store;
         super::spawn_guard::across_release(|| {
             let dir = tempfile::tempdir().unwrap();
             let scratch = tempfile::tempdir().unwrap();
@@ -2656,10 +2656,22 @@ mod tests {
                 let a = store.blobs().put(old_store::A).unwrap();
                 let b = store.blobs().put(old_store::B).unwrap();
                 for id in [a, b] {
-                    let (_, file) = store.blobs().location(id);
-                    let to = dir.path().join(file.strip_prefix(scratch.path()).unwrap());
+                    // The file of `id` sits at objects/blob/<2 hex>/<rest>
+                    // (the layout of a store's object folder); the copy
+                    // must land at the same place in the old directory.
+                    // A prefix strip would miss: an open may spell the
+                    // same directory through its canonical path, and on
+                    // macOS the two spellings differ (/var, /private/var).
+                    let (_, from) = store.blobs().location(id);
+                    let hex = id.to_string();
+                    let to = dir
+                        .path()
+                        .join("objects")
+                        .join("blob")
+                        .join(&hex[..2])
+                        .join(&hex[2..]);
                     std::fs::create_dir_all(to.parent().unwrap()).unwrap();
-                    std::fs::copy(&file, &to).unwrap();
+                    std::fs::copy(from, &to).unwrap();
                 }
                 (a, b)
             };
