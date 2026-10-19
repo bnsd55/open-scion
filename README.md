@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="https://github.com/bnsd55/open-scion/raw/main/docs/assets/banner.jpg" alt="open-scion logo: a young scion grafted onto a rootstock whose roots are circuit traces" width="720">
+  <img src="https://github.com/bnsd55/openscion/raw/main/docs/assets/banner.jpg" alt="openscion logo: a young scion grafted onto a rootstock whose roots are circuit traces" width="720">
 </p>
 
-# open-scion
+# openscion
 
-[![CI](https://github.com/bnsd55/open-scion/actions/workflows/ci.yml/badge.svg)](https://github.com/bnsd55/open-scion/actions/workflows/ci.yml)
+[![CI](https://github.com/bnsd55/openscion/actions/workflows/ci.yml/badge.svg)](https://github.com/bnsd55/openscion/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 ![Status: proof of concept](https://img.shields.io/badge/status-proof%20of%20concept-yellow.svg)
@@ -16,12 +16,12 @@ only for what they need. Written in Rust.
 > **Early proof of concept.** It runs on one machine and is not ready for real
 > code. The order of the work, and what stays out until it passes, is in
 > [docs/ROADMAP.md](docs/ROADMAP.md); planned work is tracked in
-> [issues](https://github.com/bnsd55/open-scion/issues)
-> and [milestones](https://github.com/bnsd55/open-scion/milestones).
+> [issues](https://github.com/bnsd55/openscion/issues)
+> and [milestones](https://github.com/bnsd55/openscion/milestones).
 
 ## What this is, and what it is not
 
-open-scion is an independent, open-source implementation of the design that
+openscion is an independent, open-source implementation of the design that
 Anthropic described in
 [Redesigning source control](https://www.anthropic.com/engineering/redesigning-source-control)
 (October 2026). Anthropic built a system called Scion for its own monorepo.
@@ -46,7 +46,7 @@ Here, all data is in one SQLite file and one blob folder on one machine, all
 writes go through one database connection, and lands to a ref are serialized
 by a lock in the server's memory. So a second server process cannot share the
 data. A backend that scales out is not built
-([#47](https://github.com/bnsd55/open-scion/issues/47)); the cache tiers are
+([#47](https://github.com/bnsd55/openscion/issues/47)); the cache tiers are
 built and run in front of the server (below).
 
 ## Why
@@ -65,7 +65,7 @@ pushed first.
 
 ```
  git:          agent ── clone everything ──> work ── rebase, push ──> server
- open-scion:   agent ── "src/a.rs changed" ──> server: commit, rebase, move main
+ openscion:   agent ── "src/a.rs changed" ──> server: commit, rebase, move main
 ```
 
 **The server does the work.** History, commits and rebases live on the
@@ -112,7 +112,7 @@ the server returns the first result.
 Every call carries a request ID (16 hex characters, one per command), which
 the server and each tier log, so one command can be followed through every
 hop's log
-([docs/operations.md](https://github.com/bnsd55/open-scion/blob/main/docs/operations.md), section 6). A partial reader - a
+([docs/operations.md](https://github.com/bnsd55/openscion/blob/main/docs/operations.md), section 6). A partial reader - a
 principal whose read rules name folder prefixes - reads the paths its rules
 cover and cannot write; the server derives a view of the repo for it.
 
@@ -120,7 +120,7 @@ cover and cannot write; the server derives a view of the repo for it.
 
 `scripts/demo.sh` does all of the steps below on a fixed public repository,
 prints the numbers, and removes what it made. The method and the checkout
-benchmark against git are in [docs/benchmarks.md](https://github.com/bnsd55/open-scion/blob/main/docs/benchmarks.md).
+benchmark against git are in [docs/benchmarks.md](https://github.com/bnsd55/openscion/blob/main/docs/benchmarks.md).
 
 ```sh
 cargo build --release
@@ -178,7 +178,7 @@ The server and a cache can also export Prometheus metrics: start them with
 on a non-loopback address unless `--insecure-listen` is given. The
 registry counts requests by RPC and code, a latency histogram, reply
 bytes, lands by outcome, and a tier's cache hits and misses; the details
-are in [docs/architecture.md](https://github.com/bnsd55/open-scion/blob/main/docs/architecture.md), section 11.
+are in [docs/architecture.md](https://github.com/bnsd55/openscion/blob/main/docs/architecture.md), section 11.
 
 ### Garbage collection
 
@@ -314,7 +314,7 @@ that `main` gained each landed change exactly once. With one server process on
 one machine, 200 agents landed 10,000 changes at about 200 lands per second,
 with none lost or duplicated. Every land is on disk before it replies, and
 concurrent requests share each full disk flush
-([#3](https://github.com/bnsd55/open-scion/issues/3)). Importing a git
+([#3](https://github.com/bnsd55/openscion/issues/3)). Importing a git
 repository with 23,871 commits took 50 seconds.
 
 ### TLS
@@ -343,22 +343,22 @@ A bearer token over plain TCP to a non-loopback address stays refused.
 
 | Path | Contents |
 |---|---|
-| [`crates/scion-core`](https://github.com/bnsd55/open-scion/blob/main/crates/scion-core) | Object model and canonical byte format |
-| [`crates/scion-proto`](https://github.com/bnsd55/open-scion/blob/main/crates/scion-proto) | gRPC API ([`proto/scion.proto`](https://github.com/bnsd55/open-scion/blob/main/proto/scion.proto)) |
-| [`crates/scion-server`](https://github.com/bnsd55/open-scion/blob/main/crates/scion-server) | Storage, commits, lands, reads, git import |
-| [`crates/scion-tier`](https://github.com/bnsd55/open-scion/blob/main/crates/scion-tier) | Cache tiers: `scion-cache` and `scion-daemon` |
-| [`crates/scn`](https://github.com/bnsd55/open-scion/blob/main/crates/scn) | Command-line client |
-| [`scripts`](https://github.com/bnsd55/open-scion/tree/main/scripts) | The demo and the checkout benchmark against git |
-| [`docs/architecture.md`](https://github.com/bnsd55/open-scion/blob/main/docs/architecture.md) | How the parts fit together: storage, lands, reads, and the cache tiers |
-| [`docs/format-v1.md`](https://github.com/bnsd55/open-scion/blob/main/docs/format-v1.md) | The v1 byte format. Object IDs are hashes of these bytes. |
-| [`docs/protocol-v1.md`](https://github.com/bnsd55/open-scion/blob/main/docs/protocol-v1.md) | The v1 API contract: calls, limits, status codes, retries, durability and what a client checks |
-| [`docs/cli.md`](https://github.com/bnsd55/open-scion/blob/main/docs/cli.md) | Every `scn` command: what it does, its flags, the global flags and env vars, and the exit codes |
-| [`docs/operations.md`](https://github.com/bnsd55/open-scion/blob/main/docs/operations.md) | How to run a server: deploy, keys, the access file, Postgres, backups, and what each failure means |
-| [`docs/faults.md`](https://github.com/bnsd55/open-scion/blob/main/docs/faults.md) | One row per fault: what the client sees, what the operator sees, what survives a restart, and the test that proves it |
-| [`docs/benchmarks.md`](https://github.com/bnsd55/open-scion/blob/main/docs/benchmarks.md) | How the demo and the benchmarks run, what each number means, and how to rerun them |
-| [`docs/RELEASING.md`](https://github.com/bnsd55/open-scion/blob/main/docs/RELEASING.md) | For maintainers: how a release is cut and published |
-| [`docs/stability.md`](https://github.com/bnsd55/open-scion/blob/main/docs/stability.md) | What 0.x promises per surface: the crates' APIs, the CLI and its `--json`, protocol v1, object format v1, the schemas, snapshots, tickets, and the test hooks |
-| [`docs/design/scalable-backend.md`](https://github.com/bnsd55/open-scion/blob/main/docs/design/scalable-backend.md) | A design proposal, not built: stateless servers on a shared metadata store and object store |
+| [`crates/scion-core`](https://github.com/bnsd55/openscion/blob/main/crates/scion-core) | Object model and canonical byte format |
+| [`crates/scion-proto`](https://github.com/bnsd55/openscion/blob/main/crates/scion-proto) | gRPC API ([`proto/scion.proto`](https://github.com/bnsd55/openscion/blob/main/proto/scion.proto)) |
+| [`crates/scion-server`](https://github.com/bnsd55/openscion/blob/main/crates/scion-server) | Storage, commits, lands, reads, git import |
+| [`crates/scion-tier`](https://github.com/bnsd55/openscion/blob/main/crates/scion-tier) | Cache tiers: `scion-cache` and `scion-daemon` |
+| [`crates/scn`](https://github.com/bnsd55/openscion/blob/main/crates/scn) | Command-line client |
+| [`scripts`](https://github.com/bnsd55/openscion/tree/main/scripts) | The demo and the checkout benchmark against git |
+| [`docs/architecture.md`](https://github.com/bnsd55/openscion/blob/main/docs/architecture.md) | How the parts fit together: storage, lands, reads, and the cache tiers |
+| [`docs/format-v1.md`](https://github.com/bnsd55/openscion/blob/main/docs/format-v1.md) | The v1 byte format. Object IDs are hashes of these bytes. |
+| [`docs/protocol-v1.md`](https://github.com/bnsd55/openscion/blob/main/docs/protocol-v1.md) | The v1 API contract: calls, limits, status codes, retries, durability and what a client checks |
+| [`docs/cli.md`](https://github.com/bnsd55/openscion/blob/main/docs/cli.md) | Every `scn` command: what it does, its flags, the global flags and env vars, and the exit codes |
+| [`docs/operations.md`](https://github.com/bnsd55/openscion/blob/main/docs/operations.md) | How to run a server: deploy, keys, the access file, Postgres, backups, and what each failure means |
+| [`docs/faults.md`](https://github.com/bnsd55/openscion/blob/main/docs/faults.md) | One row per fault: what the client sees, what the operator sees, what survives a restart, and the test that proves it |
+| [`docs/benchmarks.md`](https://github.com/bnsd55/openscion/blob/main/docs/benchmarks.md) | How the demo and the benchmarks run, what each number means, and how to rerun them |
+| [`docs/RELEASING.md`](https://github.com/bnsd55/openscion/blob/main/docs/RELEASING.md) | For maintainers: how a release is cut and published |
+| [`docs/stability.md`](https://github.com/bnsd55/openscion/blob/main/docs/stability.md) | What 0.x promises per surface: the crates' APIs, the CLI and its `--json`, protocol v1, object format v1, the schemas, snapshots, tickets, and the test hooks |
+| [`docs/design/scalable-backend.md`](https://github.com/bnsd55/openscion/blob/main/docs/design/scalable-backend.md) | A design proposal, not built: stateless servers on a shared metadata store and object store |
 
 ## Design notes
 
@@ -374,7 +374,7 @@ These are this project's choices where the article does not give details.
 | Retries | Each land has a caller-chosen request key, so a retry returns the first result |
 | Git | One-way import. Commit IDs are not kept identical to git commit IDs. |
 | Cache tiers | As in the article, a daemon per machine on a socket and a regional cache in memory, and objects sent in the disk format that the daemon keeps. The Unix socket, TCP between tiers, the disk store, zstd as that format, the byte limits, and one shared fetch per missed object are this project's choices. |
-| History and blame | Path history is derived data, as in the article: the form, one history tree per changeset, is this project's choice. Blame is computed on each call from first-parent changes, with a bound per call; the article keeps it as derived data too, which is planned ([#61](https://github.com/bnsd55/open-scion/issues/61)). Blame follows renames, as `git blame` does; path history does not, as `git log` without `--follow`. |
+| History and blame | Path history is derived data, as in the article: the form, one history tree per changeset, is this project's choice. Blame is computed on each call from first-parent changes, with a bound per call; the article keeps it as derived data too, which is planned ([#61](https://github.com/bnsd55/openscion/issues/61)). Blame follows renames, as `git blame` does; path history does not, as `git log` without `--follow`. |
 | Diff | Compares file states, not lines, in pages of 1,000 paths. Finds renames as `git diff` does, over the whole diff below a path, with a bound per call. |
 
 Deliberate simplifications are marked `SHORTCUT:` in the code, each with its
@@ -412,7 +412,7 @@ Not supported, or tested only in parts:
   tests force those paths, but they are untested on a real NFS mount or
   FUSE filesystem ([architecture.md](docs/architecture.md), section 11).
 - **`scn mount`**: single-user machines only, by design: the kernel's NFS
-  client reaches it as any local user ([#11](https://github.com/bnsd55/open-scion/issues/11)).
+  client reaches it as any local user ([#11](https://github.com/bnsd55/openscion/issues/11)).
 
 The CI jobs: `fmt + clippy`, `rustdoc`, `cargo-deny`, `test` (with the
 tmpfs disk-full and dm-log-writes jobs), `test (postgres)` (Postgres

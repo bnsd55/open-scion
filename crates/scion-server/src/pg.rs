@@ -1,5 +1,5 @@
 //! The Postgres metadata backend of [`Meta`](crate::meta::Meta)
-//! ([#47](https://github.com/bnsd55/open-scion/issues/47)).
+//! ([#47](https://github.com/bnsd55/openscion/issues/47)).
 //!
 //! One shared database takes the place of one data directory: many
 //! processes can hold clients, and Postgres sorts the writers out, so

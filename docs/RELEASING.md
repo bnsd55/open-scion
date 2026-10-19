@@ -1,9 +1,9 @@
 # Releasing
 
-How to cut a release of open-scion. v0.1.x is a source release: a git
+How to cut a release of openscion. v0.1.x is a source release: a git
 tag plus GitHub release notes. Nothing publishes crates: the crates
 publish later, after their public APIs are narrowed
-([#21](https://github.com/bnsd55/open-scion/issues/21)). Nothing here
+([#21](https://github.com/bnsd55/openscion/issues/21)). Nothing here
 tags by itself: each step is run by a person.
 
 ## Before a release
@@ -59,14 +59,26 @@ A release is cut through one PR from a branch named
    notes describe:
 
    ```sh
-   git tag -a v0.1.0 -m "open-scion v0.1.0"
+   git tag -a v0.1.0 -m "openscion v0.1.0"
    git push origin v0.1.0
    ```
 
+   Then check the tag landed on the release commit. An annotated tag
+   makes `git ls-remote` print the tag object's SHA, so compare the
+   peeled ref to the commit:
+
+   ```sh
+   test "$(git ls-remote origin 'refs/tags/v0.1.0^{}' | cut -f1)" \
+     = "$(git rev-parse <the release commit>)"
+   ```
+
+   If the check fails, stop and redo the tag per "Undoing a bad tag"
+   before any release notes point at it.
+
 2. **GitHub release.** Open a release for the tag with the notes
-   taken from the `CHANGELOG.md` section of the version at that
-   commit, and the measured numbers with the provenance the checklist
-   asks for.
+   rebuilt from the `CHANGELOG.md` section of the version at that
+   commit (`git show v0.1.0:CHANGELOG.md`), and the measured numbers
+   with the provenance the checklist asks for.
 
 ## Undoing a bad tag
 

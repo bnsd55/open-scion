@@ -4,8 +4,8 @@ Two scripts make the numbers of this project, so anyone can run them again:
 
 | Script | What it shows |
 |---|---|
-| [`scripts/demo.sh`](../scripts/demo.sh) | The whole system on one machine: import, many agents that land at once, and sparse checkouts through the cache tiers ([#55](https://github.com/bnsd55/open-scion/issues/55)). |
-| [`scripts/bench-checkout.sh`](../scripts/bench-checkout.sh) | 50 sparse checkouts at once through one `scion-daemon`, against git doing the same checkout ([#6](https://github.com/bnsd55/open-scion/issues/6)). |
+| [`scripts/demo.sh`](../scripts/demo.sh) | The whole system on one machine: import, many agents that land at once, and sparse checkouts through the cache tiers ([#55](https://github.com/bnsd55/openscion/issues/55)). |
+| [`scripts/bench-checkout.sh`](../scripts/bench-checkout.sh) | 50 sparse checkouts at once through one `scion-daemon`, against git doing the same checkout ([#6](https://github.com/bnsd55/openscion/issues/6)). |
 
 Each script builds the release binaries, fetches the dataset, and runs every
 process on loopback, inside one private temp directory. When it exits, for
@@ -137,7 +137,7 @@ measured.
 - The cost of the access checks and tickets against git, which has none:
   both sides pay what their own checks cost, inside the numbers.
 - Virtual checkout, where files load when first read
-  ([#11](https://github.com/bnsd55/open-scion/issues/11)).
+  ([#11](https://github.com/bnsd55/openscion/issues/11)).
 
 ## Where the checkout numbers come from
 

@@ -41,7 +41,7 @@ calls an `https://` address trusts the CA of its certificate: `scn` reads it
 from `--tls-ca`, a tier from its own `--tls-ca`. A bearer token over plain
 tcp to a non-loopback address is refused, so a client SHOULD reach a server
 only over loopback, a trusted network, or TLS. Certificate revocation is not
-in v1 ([#14](https://github.com/bnsd55/open-scion/issues/14)).
+in v1 ([#14](https://github.com/bnsd55/openscion/issues/14)).
 
 **Connections and streams.** The server serves at most 128 connections at
 once (`--max-connections`). It reads nothing from a connection beyond that
@@ -1041,7 +1041,7 @@ and its data directory in the same way.
 Tiers are trusted in v0.1. A client cannot check a `ResolveRef` or
 `GetRootTree` answer by hash, so it trusts every tier on its path for them.
 Access tickets that a tier checks are not in v1
-([#13](https://github.com/bnsd55/open-scion/issues/13)).
+([#13](https://github.com/bnsd55/openscion/issues/13)).
 
 ## 9. Compatibility
 
@@ -1087,7 +1087,7 @@ version, a server stops serving its package; its clients then get
 ## 10. Not in v1
 
 - Certificate revocation and a public CA store; trust comes only from a CA
-  file ([#14](https://github.com/bnsd55/open-scion/issues/14)).
+  file ([#14](https://github.com/bnsd55/openscion/issues/14)).
 - Calls that create a repo or a ref, delete a ref, move a ref other than by
   `Land`, or list repos or refs. `scion-server import` creates repos and refs.
 - Client changesets with no parent, several parents or a committer. Only git
@@ -1095,7 +1095,7 @@ version, a server stops serving its package; its clients then get
 - Text merge. Conflicts are path-level.
 - Diff renames past the entry bound of the rename pass (1,000,000
   entries), or past the inexact search's pair limit or budget
-  ([#107](https://github.com/bnsd55/open-scion/issues/107)).
+  ([#107](https://github.com/bnsd55/openscion/issues/107)).
 - `Blame` without per-call bounds
-  ([#61](https://github.com/bnsd55/open-scion/issues/61)), and `Log` that
+  ([#61](https://github.com/bnsd55/openscion/issues/61)), and `Log` that
   follows renames.
