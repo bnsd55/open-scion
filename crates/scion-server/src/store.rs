@@ -926,13 +926,13 @@ pub enum BlobStatus {
     Corrupt,
 }
 
-/// Immutable file contents, one zstd-compressed file per [`BlobId`].
 /// The held fan-out directory flock of a blob: the handle's close
 /// releases the lock, so a drop is enough and a crash holds nothing.
 pub(crate) struct DirFlock {
     _file: fs::File,
 }
 
+/// Immutable file contents, one zstd-compressed file per [`BlobId`].
 pub struct Blobs {
     root: PathBuf,
     /// The staging folder for temp files of every process.
