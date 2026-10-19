@@ -16,16 +16,6 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Added
 
-- Two documents that say what the project stands behind:
-  [docs/stability.md](docs/stability.md), one row per surface (the
-  crates' APIs, the CLI and its `--json` output, protocol v1, object
-  format v1, the SQLite and Postgres schemas, snapshot files, ticket
-  bytes, and the `test-hooks` feature) saying what 0.x promises, what a
-  patch or a minor release may change, and how to upgrade; and a
-  "Supported platforms" section in the README naming the runner images
-  and architectures CI tests (Ubuntu 24.04 x86-64, macOS 15 arm64),
-  Postgres 17.11, and what is untested or unsupported (Windows, FreeBSD,
-  a data directory on a network filesystem) (#312).
 - A Postgres-backed store knows which database and which data directory
   belong together: the first open mints a store UUID, keeps it in the
   database and the data directory's `backend` marker, and an open that
