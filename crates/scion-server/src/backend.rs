@@ -1080,15 +1080,19 @@ impl MetaTx for BackendTx<'_> {
 /// both.
 #[cfg(test)]
 pub(crate) mod old_store {
-    use scion_core::{Changeset, FileState, RepoPath};
-    use scion_proto::deadline::Deadline;
+    use crate::deadline::Deadline;
+    use crate::meta::{Meta as _, MetaTx as _};
+    use scion_core::{BlobId, Changeset, FileState, RepoPath};
 
     /// The bytes of the two files the old store holds.
     pub(crate) const A: &[u8] = b"the old store's README\n";
     pub(crate) const B: &[u8] = b"\x00\x01\xfeold bytes\n";
 
-    /// The root changeset the old store holds: it puts both files.
-    pub(crate) fn changeset() -> Changeset {
+    /// The root changeset the old store holds: it puts both files. The
+    /// files name their content blobs, so the blob ids come first — each
+    /// fixture writes the blobs with this build's writer, then names
+    /// them here.
+    pub(crate) fn changeset(blob_a: BlobId, blob_b: BlobId) -> Changeset {
         Changeset {
             parents: vec![],
             author: scion_core::IdentityTime {
@@ -1103,14 +1107,14 @@ pub(crate) mod old_store {
                 (
                     RepoPath::new("README").unwrap(),
                     Some(FileState::Regular {
-                        content: A.to_vec(),
+                        content: blob_a,
                         executable: false,
                     }),
                 ),
                 (
                     RepoPath::new("data.bin").unwrap(),
                     Some(FileState::Regular {
-                        content: B.to_vec(),
+                        content: blob_b,
                         executable: false,
                     }),
                 ),
@@ -1128,12 +1132,10 @@ pub(crate) mod old_store {
         backend: &super::Backend,
         cs: &Changeset,
         id: scion_core::ChangesetId,
-        blob_a: scion_core::BlobId,
-        blob_b: scion_core::BlobId,
+        blob_a: BlobId,
+        blob_b: BlobId,
     ) {
-        use crate::meta::MetaTx as _;
-
-        let repo = backend.write(|c| c.repo_id("main")).unwrap();
+        let repo = backend.read(|c| c.repo_id("main")).unwrap();
         let state = backend.read(|c| c.get_ref(repo, "main")).unwrap().unwrap();
         assert_eq!(state.target, id, "the ref survived the migration");
         assert_eq!(state.version, 1);
@@ -1141,7 +1143,8 @@ pub(crate) mod old_store {
         assert_eq!(read.encode(), cs.encode(), "the changeset survived");
         assert_eq!(backend.blobs().get(blob_a).unwrap(), A);
         assert_eq!(backend.blobs().get(blob_b).unwrap(), B);
-        let deadline = Deadline::after(std::time::Duration::from_secs(30));
+        let deadline =
+            Deadline::new(std::time::Instant::now() + std::time::Duration::from_secs(30));
         let bytes = crate::read::read_file(
             backend,
             "main",

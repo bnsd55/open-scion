@@ -2666,7 +2666,7 @@ mod tests {
             // The metadata at version 1, as this build's migrations make
             // it: the schema of 0001 alone, with one repo, its root
             // changeset and its ref.
-            let cs = old_store::changeset();
+            let cs = old_store::changeset(blob_a, blob_b);
             let (body, id) = cs.encode_with_id();
             {
                 let db = Connection::open(dir.path().join("scion.db")).unwrap();
@@ -2697,6 +2697,69 @@ mod tests {
             let backend = crate::Backend::Sqlite(store);
             old_store::assert_serves(&backend, &cs, id, blob_a, blob_b);
         });
+    }
+
+    /// The shipped migrations are frozen: a store an old build made was
+    /// built from these files as they shipped, and an edit would cut
+    /// that store off — its schema and its data would no longer match
+    /// what this build's migrations expect. A change ships as a new
+    /// migration that repairs the data (the `db::fill_repo_blobs` step
+    /// of 0004 is one), never as an edit ([#318]).
+    #[test]
+    fn the_shipped_migrations_stay_as_they_shipped() {
+        for (name, file, hex) in [
+            (
+                "0001_init",
+                include_bytes!("../../migrations/0001_init.sql").as_slice(),
+                "eb65ae7921f3617de1e5e1f4e56d6ede0ab665347e3234750d0f823ecaf3ed33",
+            ),
+            (
+                "0002_land_retention",
+                include_bytes!("../../migrations/0002_land_retention.sql").as_slice(),
+                "b78776cc8a0e9c819d26b128d0447855d92f54d11fd57a6f9b09180fb49d5e60",
+            ),
+            (
+                "0003_derived_values",
+                include_bytes!("../../migrations/0003_derived_values.sql").as_slice(),
+                "24eca54488a578d89eaab1605dc4d7f0de6ab193b894d0b006efc1fc18a16f56",
+            ),
+            (
+                "0004_repo_blobs",
+                include_bytes!("../../migrations/0004_repo_blobs.sql").as_slice(),
+                "a0daf78fdc229c5566733a2f024b83406c1db44099c3bdcbb5420ab5b0254ae4",
+            ),
+            (
+                "0005_path_history",
+                include_bytes!("../../migrations/0005_path_history.sql").as_slice(),
+                "d2f6208c0ac468954dc8b1c042a5e49b4670eab01db3166991f54b1bae62b410",
+            ),
+            (
+                "0006_land_created_at",
+                include_bytes!("../../migrations/0006_land_created_at.sql").as_slice(),
+                "65b9444e6acb7e2ea464ae57cc6353d7ebe678b9ffd36da62ad1cf55e9056392",
+            ),
+            (
+                "0007_tree_sizes",
+                include_bytes!("../../migrations/0007_tree_sizes.sql").as_slice(),
+                "147d93ba2ea43a186914895350986cc5e604d3da0a763d455ba3ba6c03d046eb",
+            ),
+            (
+                "0008_view_roots",
+                include_bytes!("../../migrations/0008_view_roots.sql").as_slice(),
+                "a6e9a1945d8568082356fb2a7c9b690f83767d291b3e86327501e3176c30c281",
+            ),
+            (
+                "0009_view_trees",
+                include_bytes!("../../migrations/0009_view_trees.sql").as_slice(),
+                "f185aa49659731e6da817dc050c8689b1d7618d290d22d98a70998b601704e32",
+            ),
+        ] {
+            assert_eq!(
+                blake3::hash(file).to_hex().as_str(),
+                hex,
+                "migration {name} shipped: add a new migration, never edit one",
+            );
+        }
     }
 
     #[test]

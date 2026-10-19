@@ -3074,7 +3074,7 @@ fn prepare_test_schema(url: &str, schema: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, NoTls, merged_options};
+    use super::{Client, NoTls, P, merged_options};
     use crate::pg::Pg;
     use std::sync::Arc;
 
@@ -3136,7 +3136,7 @@ mod tests {
         };
         // The metadata at version 1: the schema of 0001, the ledger at 1,
         // and the rows an old build's write paths left.
-        let cs = old_store::changeset();
+        let cs = old_store::changeset(blob_a, blob_b);
         let (body, id) = cs.encode_with_id();
         {
             let db = Client::connect(&url, NoTls).unwrap();
@@ -3154,23 +3154,26 @@ mod tests {
                 .unwrap();
             db.execute(
                 "INSERT INTO changesets (id, gen, body) VALUES ($1, 1, $2)",
-                &[&id.as_bytes()[..], &body],
+                &[P::bytes(&id.as_bytes()[..]), P::bytes(&body)],
             )
             .unwrap();
             db.execute(
                 "INSERT INTO repo_changesets (repo_id, cs) VALUES (1, $1)",
-                &[&id.as_bytes()[..]],
+                &[P::bytes(&id.as_bytes()[..])],
             )
             .unwrap();
             db.execute(
                 "INSERT INTO repo_blobs (repo_id, blob) VALUES (1, $1), (1, $2)",
-                &[&blob_a.as_bytes()[..], &blob_b.as_bytes()[..]],
+                &[
+                    P::bytes(&blob_a.as_bytes()[..]),
+                    P::bytes(&blob_b.as_bytes()[..]),
+                ],
             )
             .unwrap();
             db.execute(
                 "INSERT INTO refs (repo_id, name, target, version) \
                  VALUES (1, 'main', $1, 1)",
-                &[&id.as_bytes()[..]],
+                &[P::bytes(&id.as_bytes()[..])],
             )
             .unwrap();
         }
@@ -3195,6 +3198,42 @@ mod tests {
         assert_eq!(ledger, i64::from(super::PG_SCHEMA_VERSION));
         let backend = crate::Backend::Postgres(pg);
         old_store::assert_serves(&backend, &cs, id, blob_a, blob_b);
+    }
+
+    /// The shipped Postgres migrations are frozen, like the SQLite ones
+    /// (the twin test in store.rs): a database an old build made was
+    /// built from these files as they shipped, and an edit would cut it
+    /// off ([#318]).
+    #[test]
+    fn the_shipped_migrations_stay_as_they_shipped() {
+        for (name, file, hex) in [
+            (
+                "0001_init",
+                include_bytes!("../../migrations/postgres/0001_init.sql").as_slice(),
+                "9f95c671379b0d1c8e2ac2af34d95badca7929d379edcf0f8e8a02572f4a0c63",
+            ),
+            (
+                "0002_view_roots",
+                include_bytes!("../../migrations/postgres/0002_view_roots.sql").as_slice(),
+                "483a299895752535dbe3856ed496894687f4840b5edfcc2fdc24b6eece02dff2",
+            ),
+            (
+                "0003_view_trees",
+                include_bytes!("../../migrations/postgres/0003_view_trees.sql").as_slice(),
+                "3935e99d760f8848860acf33aeb33633a288b03aadd856a65cbe474d88989716",
+            ),
+            (
+                "0004_store_uuid",
+                include_bytes!("../../migrations/postgres/0004_store_uuid.sql").as_slice(),
+                "6ac9d420e9499b40e38196c598d4c7c75c88180ed729261844b4e44f368dfab4",
+            ),
+        ] {
+            assert_eq!(
+                blake3::hash(file).to_hex().as_str(),
+                hex,
+                "migration {name} shipped: add a new migration, never edit one",
+            );
+        }
     }
 
     /// A write that waits for the collector's key records the wait in the
