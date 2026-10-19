@@ -225,12 +225,21 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- The mount tests' serve-lock probes no longer race a parallel test's
+  fork: a fork copies the process's open lock files to the child until
+  the child execs, and macOS is slow to exec, so a parallel test's fork
+  could hold a probe's lock for ticks and flip its answer
+  (`an_unmount_does_not_signal_an_unrelated_process` failed twice this
+  way). The tests that fork or read a serve lock now run one at a time
+  under a gate, and each stand-in server they start runs in its own
+  process group, killed and reaped whole on drop.
 - A blame call whose wait for the memory budget ended as the bytes it
   needed came free is served, where it was refused before: the take
   rechecks the budget after the wait, and refuses only a budget that
   still does not hold the bytes. That refusal now answers
   `DEADLINE_EXCEEDED`, the code every other deadline gives, instead of
   `RESOURCE_EXHAUSTED`; the doc says so.
+
 - docs/architecture.md said a tier forwards `ResolveRef` and caches
   `GetRootTree`; it refuses both with `UNIMPLEMENTED` (`#307`), as its own
   statements elsewhere in the doc already said. The tier tables now
@@ -247,14 +256,7 @@ The first release: the server, its cache tiers, and the `scn` client.
   branch of the resume, which re-walked the history from the request
   for a file's next window, is gone; the cursor still goes on over the
   walk's versions.
-<<<<<<< HEAD
-
-
-=======
->>>>>>> origin/main
 - A blame walk checks the call's deadline before each step, the first
-  diff too (`#299`), and one diff reads no version past 1,048,576
-  lines: a request file over the cap answers `RESOURCE_EXHAUSTED`, as
   one whose memory share is more than the whole budget does, and a
   version over the cap in the file's history counts as absent, as one
   whose bytes do not fit the budget does. Before, the first step's

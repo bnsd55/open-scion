@@ -618,7 +618,6 @@ fn walk_changes(dir: &Path, prefix: &[u8], out: &mut Vec<(RepoPath, Change)>) ->
 mod tests {
     use super::*;
     use std::fs;
-
     #[test]
     fn a_session_survives_a_round_trip() {
         let home = tempfile::tempdir().unwrap();
@@ -717,6 +716,57 @@ mod tests {
 mod silent_failures {
     use super::*;
     use std::fs;
+
+    /// The gate every test of this module that forks a process or holds
+    /// or reads a serve lock runs under, with the crate's own fork gate:
+    /// a fork of one test can hold another test's lock exactly like its
+    /// own, so the gate lives where every forking test of the binary can
+    /// reach it.
+    use crate::fork_gate::serial;
+
+    /// A spawned stand-in server in its own process group. Its drop
+    /// signals the whole group and reaps the child, also on a panic, so
+    /// no test leaves a process behind whose pid a later test could read
+    /// or whose lock a fork could carry.
+    struct Parked(std::process::Child);
+
+    impl Parked {
+        fn spawn(seconds: &str) -> Self {
+            use std::os::unix::process::CommandExt as _;
+            Self(
+                std::process::Command::new("sleep")
+                    .arg(seconds)
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+    }
+
+    impl std::ops::Deref for Parked {
+        type Target = std::process::Child;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for Parked {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    impl Drop for Parked {
+        fn drop(&mut self) {
+            // The group's id is the child's pid, so the kill takes the
+            // child and anything it left; then the reap.
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &format!("-{}", self.0.id())])
+                .status();
+            let _ = self.0.wait();
+        }
+    }
 
     fn temp_file(name: &str) -> PathBuf {
         let dir =
@@ -881,15 +931,13 @@ mod silent_failures {
     #[test]
     #[cfg(unix)]
     fn an_unmount_does_not_signal_an_unrelated_process() {
+        let _serial = serial();
         let home = tempfile::tempdir().unwrap();
         let overlay = home.path().join("overlay");
         fs::create_dir_all(&overlay).unwrap();
         // The lock file exists, and no one holds it: no server lives.
         std::fs::File::create(overlay.join("serve.lock")).unwrap();
-        let mut sleeper = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut sleeper = Parked::spawn("30");
         let known = MountRecord {
             dir: PathBuf::from("/mnt/view"),
             overlay: overlay.clone(),
@@ -897,30 +945,26 @@ mod silent_failures {
             pid: sleeper.id(),
         };
         // The stale record is taken over, and the sleeper lives on. The
-        // lock state is polled with a ceiling: a fork of another test can
-        // hold this probe's lock until its child execs, and macOS is slow
-        // to exec, so one read right after a release can see it held.
+        // lock state is polled with a ceiling: macOS may tear a released
+        // lock down one tick late, so one read right after a release can
+        // see it held.
         assert!(stop_serving(&known, &known.dir));
         assert!(wait_for(2, || !serving(&known)));
         assert!(
             sleeper.try_wait().unwrap().is_none(),
             "an unrelated process was signalled"
         );
-        let _ = sleeper.kill();
-        sleeper.wait().unwrap();
     }
 
     /// A record whose serve lock is held is live: the unmount signals the
     /// recorded pid, and the process goes away.
     #[test]
     fn an_unmount_signals_the_live_server() {
+        let _serial = serial();
         let home = tempfile::tempdir().unwrap();
         let overlay = home.path().join("overlay");
         fs::create_dir_all(&overlay).unwrap();
-        let mut server = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut server = Parked::spawn("30");
         let known = MountRecord {
             dir: PathBuf::from("/mnt/view"),
             overlay: overlay.clone(),
@@ -940,6 +984,7 @@ mod silent_failures {
     /// macOS may tear a reaped child's lock down one tick late.
     #[test]
     fn a_dead_server_record_is_taken_over() {
+        let _serial = serial();
         let home = tempfile::tempdir().unwrap();
         let overlay = home.path().join("overlay");
         fs::create_dir_all(&overlay).unwrap();
