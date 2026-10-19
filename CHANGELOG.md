@@ -14,17 +14,7 @@ until that section gets its release date.
 
 The first release: the server, its cache tiers, and the `scn` client.
 
-### Changed
-
-- The git import now documents what it verifies: the blobs it writes are
-  read back and checked, and a blob it skips, because a committed row of
-  the repo already names it and its file is present, is trusted - damage
-  inside an already stored file is `fsck`'s job, and the import no longer
-  claims to have caught it. A test pins the trust and fsck's report.
-- A git commit with more changed paths than the write path's limit
-  (100,000) is refused with an error that names the commit and the count,
-  before the import builds the whole changeset in memory.
-
+### Added
 
 - A Postgres-backed store knows which database and which data directory
   belong together: the first open mints a store UUID, keeps it in the
