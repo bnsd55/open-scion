@@ -18,6 +18,13 @@ set -euo pipefail
 
 RUN_MINUTES=${RUN_MINUTES:-10}
 AGENTS=${AGENTS:-2}
+# The resource ceilings, each named in soak.yml: a server may grow to
+# SOAK_RSS_PCT percent of its warm RSS, hold at most SOAK_FD_GROWTH more
+# open files than it started with, and its late p99 must stay under
+# SOAK_P99_FACTOR times its early p99.
+SOAK_RSS_PCT=${SOAK_RSS_PCT:-150}
+SOAK_FD_GROWTH=${SOAK_FD_GROWTH:-100}
+SOAK_P99_FACTOR=${SOAK_P99_FACTOR:-2}
 # Enough lands that the writers would need more than the run to finish;
 # bench is stopped at the end, and the server's own Land counter says what
 # it landed.
@@ -197,11 +204,11 @@ third=$((rows / 3))
 rss_warm=$(sed -n 1p "$WORK/metrics.csv" | cut -d, -f2)
 rss_end=$(tail -n 1 "$WORK/metrics.csv" | cut -d, -f2)
 fds_start=$(sed -n 1p "$WORK/metrics.csv" | cut -d, -f3)
-if [ -n "$rss_warm" ] && [ -n "$rss_end" ] && [ "$rss_end" -gt $((rss_warm * 3 / 2)) ]; then
-  echo "FAIL: server RSS grew past 1.5x: $rss_warm KB -> $rss_end KB" >&2
+if [ -n "$rss_warm" ] && [ -n "$rss_end" ] && [ "$rss_end" -gt $((rss_warm * SOAK_RSS_PCT / 100)) ]; then
+  echo "FAIL: server RSS grew past ${SOAK_RSS_PCT}%: $rss_warm KB -> $rss_end KB" >&2
   fail=1
 fi
-if awk -F, -v s="${fds_start:-0}" '$3 > s + 100 { c++; if (c >= 3) exit 1 }' \
+if awk -F, -v s="${fds_start:-0}" -v g="$SOAK_FD_GROWTH" '$3 > s + g { c++; if (c >= 3) exit 1 }' \
   "$WORK/metrics.csv"; then
   :
 else
@@ -221,7 +228,7 @@ late=""
 if [ "$rows" -ge 30 ]; then
   early=$(p99 1 "$third")
   late=$(p99 "$((rows - third + 1))" "$rows")
-  if [ -n "$early" ] && [ -n "$late" ] && [ "$late" -gt $((early * 2)) ]; then
+  if [ -n "$early" ] && [ -n "$late" ] && [ "$late" -gt $((early * SOAK_P99_FACTOR)) ]; then
     echo "FAIL: p99 grew: $early ms early, $late ms late" >&2
     fail=1
   fi

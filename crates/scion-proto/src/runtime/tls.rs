@@ -1,4 +1,4 @@
-//! TLS for the connections of [`listen`](crate::listen): how a process that serves loads
+//! TLS for the connections of [`listen`](crate::runtime::listen): how a process that serves loads
 //! its certificate and key, and how a process that calls trusts the
 //! certificate of the process it calls, and presents its own for mTLS.
 //!
@@ -29,7 +29,7 @@ fn certificates(path: &Path, what: &str) -> anyhow::Result<Vec<CertificateDer<'s
 
 /// The TLS server side: the certificate and key that a process which serves
 /// presents, and, with mTLS, the CA that a client certificate must come
-/// from. Built once, for the connections of [`listen`](crate::listen).
+/// from. Built once, for the connections of [`listen`](crate::runtime::listen).
 pub struct ServerTls {
     config: Arc<ServerConfig>,
 }
