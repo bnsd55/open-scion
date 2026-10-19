@@ -314,10 +314,16 @@ fn path(p: &str) -> RepoPath {
 
 /// The root directory entry at `name`.
 fn root_entry(store: &Backend, cs: ChangesetId, name: &str) -> Option<Entry> {
-    read::list_dir(store, "r", cs, None)
-        .unwrap()
-        .entries
-        .remove(&PathElem::new(name).unwrap())
+    read::list_dir(
+        store,
+        "r",
+        cs,
+        None,
+        &Deadline::new(Instant::now() + Duration::from_secs(300)),
+    )
+    .unwrap()
+    .entries
+    .remove(&PathElem::new(name).unwrap())
 }
 
 #[test]
@@ -370,7 +376,8 @@ fn files_read_back_with_git_content() {
         for line in listing.lines() {
             let (meta, name) = line.split_once('\t').unwrap();
             let fields: Vec<&str> = meta.split(' ').collect();
-            let content = read::read_file(&store, "r", cs, &path(name));
+            let deadline = Deadline::new(Instant::now() + Duration::from_secs(300));
+            let content = read::read_file(&store, "r", cs, &path(name), &deadline);
             if fields[1] == "commit" {
                 assert!(matches!(content, Err(Error::InvalidArgument(_))));
                 continue;

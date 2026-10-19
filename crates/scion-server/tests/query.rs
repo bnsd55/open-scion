@@ -503,7 +503,7 @@ fn diff_skips_a_subtree_with_the_same_id_on_both_sides() {
         ],
     );
     // Delete the shared subtree: a walk that reads it fails.
-    let root = read::root_tree(&store, REPO, ids[0]).unwrap();
+    let root = read::root_tree(&store, REPO, ids[0], &later()).unwrap();
     store
         .write(|c| {
             let Some(scion_core::Entry::Dir(keep)) = tree::lookup(c, root, &path("keep"))? else {
@@ -1010,11 +1010,11 @@ fn a_diff_over_the_rename_entry_cap_gets_the_flag() {
     change.extend((0..3_000).map(|n| (path(&format!("new/f{n:05}")), Some(unstored(n)))));
     change.insert(path("aa/new"), Some(content));
     let ids = chain(&store, vec![base, change]);
-    let page = read::diff_with(&store, REPO, ids[0], ids[1], None, None, 5_000).unwrap();
+    let page = read::diff_with(&store, REPO, ids[0], ids[1], None, None, 5_000, &later()).unwrap();
     assert!(page.renames_incomplete, "past the entry bound");
     assert!(page.entries.iter().all(|e| e.rename.is_none()));
     // Under the bound, the exact rename is paired, and the page is whole.
-    let page = read::diff_with(&store, REPO, ids[0], ids[1], None, None, 10_000).unwrap();
+    let page = read::diff_with(&store, REPO, ids[0], ids[1], None, None, 10_000, &later()).unwrap();
     assert!(!page.renames_incomplete);
     let added = page
         .entries

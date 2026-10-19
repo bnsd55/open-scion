@@ -661,7 +661,7 @@ mod tests {
     /// deadline, this call returned a result.
     #[test]
     fn a_query_with_a_past_deadline_derives_nothing() {
-        let parents = criss_cross();
+        let parents = vec![vec![], vec![0], vec![0], vec![1, 2]];
         let (_dir, store, repo, ids) = store_graph(&parents);
         let past = Deadline::new(Instant::now());
         let got = is_ancestor(&store, repo, ids[0], ids[5], &past);
