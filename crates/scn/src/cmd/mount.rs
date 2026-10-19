@@ -1,7 +1,6 @@
 //! `mount` and `unmount`: the virtual checkout
 //! ([#11](https://github.com/bnsd55/openscion/issues/11)).
 
-use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
@@ -12,6 +11,8 @@ use scion_proto::v1::GetRootTreeRequest;
 
 use crate::client::{Ctx, id_from};
 use crate::vfs::{CHANGES, Change, Vfs};
+
+use self::record::{MountRecord, write_sessions};
 
 /// The export name of every mount.
 const EXPORT: &str = "scion";
@@ -44,20 +45,60 @@ pub struct UnmountArgs {
     dir: PathBuf,
 }
 
-/// One live mount, as the session file holds it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MountRecord {
-    /// The mounted directory, absolute.
-    pub dir: PathBuf,
-    /// The overlay directory with the changes.
-    pub overlay: PathBuf,
-    /// The revision that the mount serves.
-    pub rev: String,
-    /// The process that serves the NFS server.
-    pub pid: u32,
-    /// Whether the mount takes writes: `--unstable-writable` sets it. A
-    /// record that predates the flag was a read-only mount.
-    pub writable: bool,
+/// The mount record and its session file: what one live mount is, and
+/// how `mount`, `unmount` and `commit --from-mount` hand it over. The
+/// module is crate-internal: the session file is the two commands'
+/// contract, not the CLI's API, and the tests reach it through
+/// `test_support::cmd::mount`.
+pub(crate) mod record {
+    use std::io::Write as _;
+    use std::path::{Path, PathBuf};
+
+    use anyhow::Result;
+
+    /// One live mount, as the session file holds it.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct MountRecord {
+        /// The mounted directory, absolute.
+        pub dir: PathBuf,
+        /// The overlay directory with the changes.
+        pub overlay: PathBuf,
+        /// The revision that the mount serves.
+        pub rev: String,
+        /// The process that serves the NFS server.
+        pub pid: u32,
+        /// Whether the mount takes writes: `--unstable-writable` sets it. A
+        /// record that predates the flag was a read-only mount.
+        pub writable: bool,
+    }
+
+    /// Writes `records` as the session file `file`. The write is atomic: a
+    /// sibling temp file, made durable, renamed over the table. A crash mid
+    /// write leaves the old table, not a torn one; a concurrent scn writes
+    /// its own temp file, so a clobber is impossible.
+    pub fn write_sessions(file: &Path, sessions: &[MountRecord]) -> Result<()> {
+        let records: Vec<serde_json::Value> = sessions
+            .iter()
+            .map(|record| {
+                serde_json::json!({
+                    "dir": record.dir.display().to_string(),
+                    "overlay": record.overlay.display().to_string(),
+                    "rev": record.rev,
+                    "pid": record.pid,
+                    "writable": record.writable,
+                })
+            })
+            .collect();
+        let temp = file.with_extension(format!("json.{}.tmp", std::process::id()));
+        let mut out = std::fs::File::create(&temp)?;
+        out.write_all(&serde_json::to_vec(&records)?)?;
+        out.sync_all()?;
+        std::fs::rename(&temp, file)?;
+        if let Ok(dir) = std::fs::File::open(file.parent().unwrap_or(Path::new("."))) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    }
 }
 
 /// Serves the ref over the network filesystem on a free loopback port,
@@ -458,34 +499,6 @@ fn add_session(file: &Path, record: &MountRecord) -> Result<()> {
     write_sessions(file, &sessions)
 }
 
-/// Writes `records` as the session file `file`. The write is atomic: a
-/// sibling temp file, made durable, renamed over the table. A crash mid
-/// write leaves the old table, not a torn one; a concurrent scn writes
-/// its own temp file, so a clobber is impossible.
-pub fn write_sessions(file: &Path, sessions: &[MountRecord]) -> Result<()> {
-    let records: Vec<serde_json::Value> = sessions
-        .iter()
-        .map(|record| {
-            serde_json::json!({
-                "dir": record.dir.display().to_string(),
-                "overlay": record.overlay.display().to_string(),
-                "rev": record.rev,
-                "pid": record.pid,
-                "writable": record.writable,
-            })
-        })
-        .collect();
-    let temp = file.with_extension(format!("json.{}.tmp", std::process::id()));
-    let mut out = std::fs::File::create(&temp)?;
-    out.write_all(&serde_json::to_vec(&records)?)?;
-    out.sync_all()?;
-    std::fs::rename(&temp, file)?;
-    if let Ok(dir) = std::fs::File::open(file.parent().unwrap_or(Path::new("."))) {
-        let _ = dir.sync_all();
-    }
-    Ok(())
-}
-
 /// Drops the session of `dir` from `file`, and returns its record. The
 /// table is read strictly: a corrupt file is an error, not "no mount".
 fn drop_session(file: &Path, dir: &Path) -> Result<Option<MountRecord>> {
@@ -575,7 +588,7 @@ async fn wait_stopped() {
 }
 
 /// The recorded mount of `dir`.
-pub fn session_for_dir(dir: &Path) -> Result<MountRecord> {
+pub(crate) fn session_for_dir(dir: &Path) -> Result<MountRecord> {
     let dir = std::path::absolute(dir).context("cannot resolve the mount directory")?;
     load_sessions()?
         .into_iter()
@@ -585,7 +598,7 @@ pub fn session_for_dir(dir: &Path) -> Result<MountRecord> {
 
 /// The changes of a mount, from its overlay: each file or symlink under it,
 /// and each recorded deletion of the ref.
-pub fn overlay_changes(record: &MountRecord) -> Result<Vec<(RepoPath, Change)>> {
+pub(crate) fn overlay_changes(record: &MountRecord) -> Result<Vec<(RepoPath, Change)>> {
     let mut changes = Vec::new();
     let tree = record.overlay.join(CHANGES);
     walk_changes(&tree, b"", &mut changes)?;

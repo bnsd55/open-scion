@@ -8,9 +8,12 @@ use std::process::Command;
 
 use common::{REPO, TOKEN, changeset, land};
 use nfsserve::nfs::{filename3, nfspath3, nfsstat3, sattr3, set_size3};
-use open_scion::client::{id_from, test_objects};
-use open_scion::cmd::mount::{MountRecord, write_sessions};
-use open_scion::vfs::{NFSFileSystem, Vfs};
+use open_scion::client::id_from;
+use open_scion::test_support::{
+    client::test_objects,
+    cmd::mount::{MountRecord, write_sessions},
+    vfs::{NFSFileSystem, Vfs},
+};
 use scion_core::{ChangesetId, FileState};
 use scion_proto::v1::GetRootTreeRequest;
 use scion_server::Backend;
