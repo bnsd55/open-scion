@@ -225,6 +225,14 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- A blame's window doc matched a rule that no longer holds, and the
+  code behind it could not run (`#305`): a file of more than
+  1,048,576 lines is refused, and a window is that many lines, so one
+  call's window holds the whole servable file. The second-window
+  branch of the resume, which re-walked the history from the request
+  for a file's next window, is gone; the cursor still goes on over the
+  walk's versions.
+
 - A derive walk that answers a request holds its frontier of seen and
   pending changesets inside a byte budget the store's walks share:
   before, a walk over every parent held about 40 bytes per cold

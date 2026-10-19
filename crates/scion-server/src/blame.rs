@@ -78,10 +78,10 @@ pub struct Blame {
     /// from the blamed path after a rename. Only the changesets that the
     /// reply's ranges name.
     pub changesets: Vec<(ChangesetId, IdentityTime, RepoPath)>,
-    /// Set when more lines are left: the rest of this window, when the call
-    /// stopped at a bound, or the next window's first line, when this
-    /// window is complete. Pass it to the next call for the same file.
-    /// `None` when the blame is done.
+    /// Set when the call stopped at a bound before every line was named:
+    /// the rest of this window. Pass it to the next call for the same
+    /// file. A file is never more than one window of lines, so `None`
+    /// always ends the blame.
     pub resume: Option<Resume>,
 }
 
@@ -474,13 +474,9 @@ fn next_resume(
         .iter()
         .all(|(source, _)| source.is_some());
     Ok(if window_is_done {
-        (window_end < counted).then(|| Resume {
-            next: None,
-            search: RenameSearch::default(),
-            after_line: window_end,
-            counted,
-            window: Vec::new(),
-        })
+        // A servable file is at most one window of lines, so a done window
+        // is the whole file: the blame is over.
+        None
     } else if next.is_none() {
         return Err(Error::Corrupt(format!(
             "no changeset on the history of {start} adds {path:?}"
