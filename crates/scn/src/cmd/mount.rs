@@ -852,6 +852,7 @@ mod silent_failures {
             overlay: PathBuf::from(format!("{dir}/overlay")),
             rev: "main".to_owned(),
             pid,
+            writable: false,
         }
     }
 
