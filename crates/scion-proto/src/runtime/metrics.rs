@@ -892,7 +892,7 @@ impl<S> tower::Layer<S> for MetricsLayer {
 /// The wrapped service: it times the call and hands the reply's frames to
 /// `CountingBody`.
 #[derive(Clone)]
-pub(crate) struct MetricsService<S> {
+pub struct MetricsService<S> {
     inner: S,
     metrics: std::sync::Arc<Metrics>,
 }
