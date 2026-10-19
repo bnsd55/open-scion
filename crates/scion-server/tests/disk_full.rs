@@ -167,8 +167,8 @@ fn a_full_disk_answers_out_of_space_and_needs_no_repair() {
     let after = store.blobs().put(b"after\n").unwrap();
     assert_eq!(store.blobs().get(after).unwrap(), b"after\n");
     drop(store);
-    // A reaped helper's inherited lock can outlive the drop by one tick
-    // (#284): no spawn starts, and the lock is free, before the reopen.
+    // A reaped helper's inherited lock can outlive the drop by one tick:
+    // no spawn starts, and the lock is free, before the reopen (#281).
     common::spawn_guard::across_release(|| {
         common::spawn_guard::wait_for_lock_release(&mount.0.join("data"));
     });
@@ -215,7 +215,7 @@ fn a_full_metadata_disk_answers_out_of_space_and_needs_no_repair() {
     mount.remount_bigger("64m", "4096");
     store.write(|c| c.create_repo("after")).unwrap();
     drop(store);
-    // As above: the reopen must not race a lingering lock (#284).
+    // As above: the reopen must not race a lingering lock.
     common::spawn_guard::across_release(|| {
         common::spawn_guard::wait_for_lock_release(&mount.0.join("data"));
     });
@@ -250,7 +250,7 @@ fn a_disk_out_of_inodes_answers_out_of_space_and_needs_no_repair() {
     mount.remount_bigger("64m", "4096");
     store.blobs().put(b"after\n").unwrap();
     drop(store);
-    // As above: the reopen must not race a lingering lock (#284).
+    // As above: the reopen must not race a lingering lock.
     common::spawn_guard::across_release(|| {
         common::spawn_guard::wait_for_lock_release(&mount.0.join("data"));
     });
