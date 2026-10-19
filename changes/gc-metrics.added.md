@@ -1,4 +1,4 @@
-The collector's operating metrics (`#239`): `scion-server gc
+The collector's operating metrics (#239): `scion-server gc
 --metrics-file PATH` writes the last finished run as a Prometheus
 textfile — the end time, the duration, and the rows and files it
 collected, each with a `dry_run` label — atomically, and only when the

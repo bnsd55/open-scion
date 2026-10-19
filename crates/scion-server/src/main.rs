@@ -281,7 +281,10 @@ fn gc_command(store: &Backend, grace: Duration, dry_run: bool, metrics_file: Opt
 /// Writes the metrics file of `scion-server gc --metrics-file`: the
 /// gauges of one finished run, in the Prometheus text format the node
 /// exporter's textfile collector reads. A failed run never touches the
-/// file, so its timestamp goes stale and an alert on it fires.
+/// file, so its timestamp goes stale and an alert on it fires. One file
+/// holds one run: each run rewrites the whole file, so its four series
+/// always describe that run, never a mix of two runs; the label that
+/// says which is on every series.
 fn write_gc_metrics_file(path: &Path, report: &gc::Report, took: Duration, dry_run: bool) {
     let dry = if dry_run { "true" } else { "false" };
     let unix = std::time::SystemTime::now()
@@ -290,10 +293,10 @@ fn write_gc_metrics_file(path: &Path, report: &gc::Report, took: Duration, dry_r
     let text = format!(
         "# HELP scion_gc_last_success_timestamp_seconds When the collector last finished a run, in seconds since the Unix epoch.\n\
          # TYPE scion_gc_last_success_timestamp_seconds gauge\n\
-         scion_gc_last_success_timestamp_seconds {unix}\n\
+         scion_gc_last_success_timestamp_seconds{{dry_run=\"{dry}\"}} {unix}\n\
          # HELP scion_gc_duration_seconds How long the last finished run took, in seconds.\n\
          # TYPE scion_gc_duration_seconds gauge\n\
-         scion_gc_duration_seconds {}\n\
+         scion_gc_duration_seconds{{dry_run=\"{dry}\"}} {}\n\
          # HELP scion_gc_rows_pruned Repo blob rows the last finished run pruned.\n\
          # TYPE scion_gc_rows_pruned gauge\n\
          scion_gc_rows_pruned{{dry_run=\"{dry}\"}} {}\n\
@@ -306,8 +309,10 @@ fn write_gc_metrics_file(path: &Path, report: &gc::Report, took: Duration, dry_r
     );
     // Write to a temp file beside the target, fsync it, then rename: a
     // reader of PATH never sees half a file, and a crash leaves the old
-    // file whole.
-    let tmp = path.with_extension("tmp");
+    // file whole. The temp name carries the pid: no lock spans a whole
+    // gc run (the collector's key is per write transaction), so two runs
+    // on one --metrics-file must not share a temp.
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     let write = || -> std::io::Result<()> {
         use std::io::Write as _;
         let mut file = std::fs::File::create(&tmp)?;

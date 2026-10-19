@@ -474,11 +474,16 @@ machine's metrics. The file holds the last finished run's end time
 (`scion_gc_last_success_timestamp_seconds`), its duration
 (`scion_gc_duration_seconds`), and the rows and files it collected
 (`scion_gc_rows_pruned`, `scion_gc_files_removed`), each with a `dry_run`
-label. The file is written atomically, and only when the run succeeds: a
-failed run leaves the previous file, so the timestamp goes stale. The
-alert to have on the folder is the age of the last success — a run that
-did not finish, or a cron that stopped firing, shows up as a timestamp
-that stops moving, not as a gap in the scrape.
+label on every series. The file is written atomically, and only when the
+run succeeds: a failed run leaves the previous file, so the timestamp
+goes stale. One file holds one run: each run rewrites the whole file, so
+after a dry run the series are the dry run's, until the next real run
+replaces them. The alert to have on the folder is the age of the last
+success, counted on the real runs only —
+`time() - scion_gc_last_success_timestamp_seconds{dry_run="false"} > <N>`
+— so a dry run cannot reset it: a run that did not finish, or a cron that
+stopped firing, shows up as a timestamp that stops moving, not as a gap
+in the scrape.
 - Derived data can be rebuilt with `scion-server derive --kind ... --ref
   ...` (server stopped); it is safe to repeat and removes rows of older
   versions itself.

@@ -2,7 +2,8 @@
 //! writes its gauges in the Prometheus text format of the node exporter's
 //! textfile collector, the values match the report the command prints, a
 //! dry run labels itself `dry_run="true"`, and a failed run never touches
-//! the file.
+//! the file. A dry run after a real run rewrites the whole file: what it
+//! leaves is the dry run's own series, never a mix of two runs.
 
 use std::fs;
 use std::process::{Command, Output};
@@ -125,7 +126,12 @@ fn a_dry_run_labels_itself_and_a_failed_run_touches_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let metrics = dir.path().join("gc.prom");
 
-    let out = run_gc(dir.path(), &metrics, true);
+    // A real run first, then a dry run on the same --metrics-file: what
+    // the file shows after both is the dry run's own series. Every one of
+    // the four gauges carries the dry_run label, and none of the real
+    // run's series survive: each run rewrites the whole file, so an
+    // operator reading it never mixes two runs.
+    let out = run_gc(dir.path(), &metrics, false);
     assert!(
         out.status.success(),
         "{}",
@@ -136,7 +142,27 @@ fn a_dry_run_labels_itself_and_a_failed_run_touches_nothing() {
         .lines()
         .find(|line| line.starts_with("scion_gc_rows_pruned"))
         .unwrap();
-    assert!(dry_line.contains("dry_run=\"true\""), "{dry_line}");
+    assert!(dry_line.contains("dry_run=\"false\""), "{dry_line}");
+
+    let out = run_gc(dir.path(), &metrics, true);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = fs::read_to_string(&metrics).unwrap();
+    let samples = text
+        .lines()
+        .filter(|line| line.starts_with("scion_gc_"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        samples.len(),
+        4,
+        "one file, one run, four series: {samples:?}"
+    );
+    for line in samples {
+        assert!(line.contains("dry_run=\"true\""), "{line}");
+    }
 
     // A failed run leaves the old file alone: a run whose data directory
     // cannot open answers 2 and writes nothing — the target of --data is
@@ -157,8 +183,14 @@ fn a_dry_run_labels_itself_and_a_failed_run_touches_nothing() {
         .unwrap();
     assert!(!out.status.success(), "a gc on an absent store must fail");
     assert_eq!(fs::read(&metrics).unwrap(), before, "the file is untouched");
+    let strays = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension() == Some(std::ffi::OsStr::new("tmp")))
+        .collect::<Vec<_>>();
     assert!(
-        !dir.path().join("gc.tmp").exists(),
-        "no temp file left beside the target"
+        strays.is_empty(),
+        "no temp file left beside the target: {strays:?}"
     );
 }
