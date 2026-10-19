@@ -126,18 +126,18 @@ fi
 PREV_SRC=$(cd "$PREV_SRC" && pwd -P)
 
 WORK=
-# The daemon's socket sits outside WORK: the pair's temp path is longer
-# than the Unix socket limit of 104 bytes. It sits in the temp root
-# itself, which is the user's: the daemon refuses a socket whose parent
-# another user owns, so macOS's /tmp (a root-owned link) is out. One
-# path per run and per direction, named by the pid, cannot collide: a
-# slow daemon that unlinks its socket on exit must not touch the next
-# daemon's live one.
-SOCK=$(cd "${TMPDIR:-/tmp}" && pwd -P)/scion-matrix-$$.sock
+# The daemon's socket: in a directory the run owns (the daemon refuses
+# a socket whose parent another user owns, and a CI runner's /tmp is
+# root's), and short (the pair's temp path on macOS is longer than the
+# Unix socket limit of 104 bytes). One socket per direction, named by
+# the pid: a slow daemon's exit unlink cannot reach the next one's.
+SOCKDIR=$(mktemp -d "${TMPDIR:-/tmp}/vmsock.XXXXXX")
+SOCKDIR=$(cd "$SOCKDIR" && pwd -P)
+SOCK="$SOCKDIR/matrix-$$.sock"
 
 cleanup() {
   local rc=$1 f
-  rm -f "$SOCK" "$SOCK-cur" "$SOCK-prev"
+  rm -rf "$SOCKDIR"
   [ -n "$WORK" ] || return 0
   for f in "$WORK"/*/*.pid; do
     if [ -e "$f" ]; then stop "$(dirname "$f")"; fi
