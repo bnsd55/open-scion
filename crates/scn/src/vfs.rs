@@ -41,7 +41,7 @@ pub use nfsserve::vfs::NFSFileSystem;
 use nfsserve::vfs::{DirEntry, ReadDirResult, VFSCapabilities};
 use rustix::fs::{Mode, OFlags};
 use scion_core::{BlobId, ChangesetId, Entry, FileState, RepoPath, Tree, TreeId};
-use scion_proto::object::{self, Assembler, Header};
+use scion_proto::runtime::object::{self, Assembler, Header};
 use scion_proto::ticket::{self, TICKET_SKEW_SECS};
 use scion_proto::v1::{Encoding, GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
 
@@ -1637,7 +1637,7 @@ impl Vfs {
 mod tests {
     use super::*;
     use scion_core::{Changeset, FileEntry, FileState, IdentityTime, PathElem};
-    use scion_proto::listen::Limits;
+    use scion_proto::runtime::listen::Limits;
     use scion_proto::v1::objects_server::{Objects, ObjectsServer};
     use scion_proto::v1::{
         GetRootTreeRequest as Ask, GetRootTreeResponse, ObjectPart, ResolveRefRequest,

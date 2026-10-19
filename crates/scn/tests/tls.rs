@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use scion_core::{Changeset, IdentityTime};
-use scion_proto::listen::Limits;
+use scion_proto::runtime::listen::Limits;
 use scion_server::meta::Meta as _;
 use scion_server::meta::MetaTx as _;
 use scion_server::{Backend, service, tree};
@@ -119,7 +119,7 @@ fn land(store: &Backend) {
 /// A server that serves TLS, and its https address.
 async fn serve_tls(certs: &TestCerts) -> String {
     let tls =
-        scion_proto::tls::ServerTls::load(&certs.server_cert, &certs.server_key, None).unwrap();
+        scion_proto::runtime::tls::ServerTls::load(&certs.server_cert, &certs.server_key, None).unwrap();
     let store = Backend::open_test(&certs.dir.path().join("data")).unwrap();
     let data = certs.dir.path().join("data");
     land(&store);

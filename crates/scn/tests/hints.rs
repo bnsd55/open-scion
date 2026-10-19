@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
-use scion_proto::listen::Limits;
+use scion_proto::runtime::listen::Limits;
 use scion_server::{Backend, service};
 
 const REPO: &str = "r";
@@ -187,7 +187,7 @@ async fn a_wrong_ca_hints_at_the_ca() {
 
 async fn serve_tls(data: &TempDir, certs: &TestCerts) -> String {
     let tls =
-        scion_proto::tls::ServerTls::load(&certs.server_cert, &certs.server_key, None).unwrap();
+        scion_proto::runtime::tls::ServerTls::load(&certs.server_cert, &certs.server_key, None).unwrap();
     let store = Backend::open_test(data.path()).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

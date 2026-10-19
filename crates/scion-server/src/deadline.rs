@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use scion_proto::deadline::Until;
+use scion_proto::runtime::deadline::Until;
 use tonic::Request;
 
 use crate::error::{Error, Result};

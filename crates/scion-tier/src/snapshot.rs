@@ -15,7 +15,7 @@ use std::fs;
 use std::io::{self, BufRead as _, BufReader, BufWriter, ErrorKind, Read as _, Write as _};
 use std::path::Path;
 
-use scion_proto::{Bytes, check};
+scion_proto::{Bytes}, scion_proto::runtime::check;
 
 use crate::Key;
 use crate::store::{DiskStore, RECORD, Store as _, parse_record, push_record};
@@ -188,7 +188,7 @@ fn fill(file: &mut impl io::Read, buf: &mut [u8]) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use scion_core::{BlobId, Entry, FileEntry, FileState, PathElem, Tree};
-    use scion_proto::object;
+    use scion_proto::runtime::object;
     use scion_proto::ticket::{self, now};
     use scion_proto::v1::objects_server::Objects as _;
     use scion_proto::v1::{Encoding, GetObjectsRequest};

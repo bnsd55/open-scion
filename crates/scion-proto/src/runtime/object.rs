@@ -40,7 +40,7 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// Largest window of a zstd frame that a receiver accepts: 8 MiB, the window
 /// that RFC 8878 asks every decoder to support. libzstd stays within it at
 /// every level up to 19.
-pub const MAX_WINDOW_BYTES: usize = 1 << MAX_WINDOW_LOG;
+pub(crate) const MAX_WINDOW_BYTES: usize = 1 << MAX_WINDOW_LOG;
 const MAX_WINDOW_LOG: u32 = 23;
 
 /// Most memory that [`unpacker`] holds besides the bytes it returns: the

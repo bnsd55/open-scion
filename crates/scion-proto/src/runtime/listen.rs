@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use crate::request_id;
+use crate::runtime::request_id;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
@@ -68,26 +68,26 @@ pub const DEFAULT_STREAMS: NonZeroU32 = NonZeroU32::new(256).unwrap();
 
 /// A client must send the HTTP/2 preface within this long after it gets its
 /// place, or its connection is closed.
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A TLS handshake must end within this long, or the connection is dropped.
 /// The same wait as [`HANDSHAKE_TIMEOUT`], and generous for one round trip
 /// plus a certificate check.
-pub const TLS_HANDSHAKE_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
+pub(crate) const TLS_HANDSHAKE_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
 
 /// After this long without a frame from a client, the process sends it an
 /// HTTP/2 ping.
-pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A connection whose client does not answer a ping within this long is
 /// closed. So after the preface, a dead peer frees its connection, and all
 /// that its replies hold, within [`KEEPALIVE_INTERVAL`] plus this of its
 /// last frame.
-pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// After this long, a connection is asked to close, so one that a client
 /// keeps for life (a daemon keeps one to its cache) gives its place up.
-pub const MAX_CONNECTION_AGE: Duration = Duration::from_secs(30 * 60);
+pub(crate) const MAX_CONNECTION_AGE: Duration = Duration::from_secs(30 * 60);
 
 /// A connection that was asked to close is closed this long later, with any
 /// call still in it. At least the server's longest call (600 s).
@@ -616,9 +616,9 @@ mod tests {
 
     use super::*;
     use crate::Bytes;
-    use crate::object::Header;
-    use crate::reply::{self, Body, IN_FLIGHT_BYTES, Outgoing};
-    use crate::tls::ServerTls;
+    use crate::runtime::object::Header;
+    use crate::runtime::reply::{self, Body, IN_FLIGHT_BYTES, Outgoing};
+    use crate::runtime::tls::ServerTls;
     use crate::v1::objects_client::ObjectsClient;
     use crate::v1::objects_server::{Objects, ObjectsServer};
     use crate::v1::{
@@ -834,7 +834,7 @@ mod tests {
         roots
             .add(CertificateDer::from_pem_slice(ca.cert_pem.as_bytes()).unwrap())
             .unwrap();
-        let builder = ClientConfig::builder_with_provider(crate::tls::provider())
+        let builder = ClientConfig::builder_with_provider(crate::runtime::tls::provider())
             .with_safe_default_protocol_versions()
             .unwrap();
         let config = match identity {
@@ -1272,7 +1272,7 @@ mod tests {
                 CertificateDer::from_pem_slice(certs.authority.cert().cert_pem.as_bytes()).unwrap(),
             )
             .unwrap();
-        let builder = ClientConfig::builder_with_provider(crate::tls::provider())
+        let builder = ClientConfig::builder_with_provider(crate::runtime::tls::provider())
             .with_safe_default_protocol_versions()
             .unwrap();
         let config = builder.with_root_certificates(roots).with_no_client_auth();

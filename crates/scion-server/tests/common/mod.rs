@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use scion_core::{BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, RepoPath, Tree};
-use scion_proto::auth::Bearer;
-use scion_proto::object::{self, Assembler, Header};
+use scion_proto::runtime::auth::Bearer;
+use scion_proto::runtime::object::{self, Assembler, Header};
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{
@@ -24,7 +24,7 @@ use scion_proto::v1::{
     GetObjectsRequest, LandRequest, LandResponse, LandState, ObjectKind, ObjectRef, PutBlobRequest,
     ResolveRefRequest,
 };
-use scion_proto::{CHUNK_BYTES, MAX_OBJECT_REFS};
+scion_proto::{CHUNK_BYTES, MAX_OBJECT_REFS};
 use scion_server::meta::MetaTx as _;
 use scion_server::store::BlobStatus;
 use scion_server::{Backend, Store, tree};

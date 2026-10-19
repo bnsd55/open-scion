@@ -50,7 +50,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use scion_core::RepoPath;
-use scion_proto::auth::{Auth, Caller, DEFAULT_PRINCIPAL, token_digest};
+use scion_proto::runtime::auth::{Auth, Caller, DEFAULT_PRINCIPAL, token_digest};
 
 use crate::db;
 use crate::error::{Error, Result};
@@ -380,7 +380,7 @@ impl Access {
     /// The grant of `principal` in `repo`, made if missing.
     fn grant(&mut self, principal: &str, repo: &str) -> Result<&mut Grant, String> {
         check_principal(principal)?;
-        scion_proto::check::name("repo", repo)?;
+        scion_proto::runtime::check::name("repo", repo)?;
         Ok(self
             .grants
             .entry((principal.to_owned(), repo.to_owned()))

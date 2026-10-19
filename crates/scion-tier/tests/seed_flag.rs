@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::Command;
 
 use scion_core::BlobId;
-use scion_proto::{Bytes, object};
+scion_proto::{Bytes}, scion_proto::runtime::object;
 use scion_tier::{Key, snapshot};
 use tempfile::TempDir;
 

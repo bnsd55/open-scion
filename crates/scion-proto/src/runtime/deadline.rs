@@ -16,7 +16,7 @@ use tonic::Request;
 use tonic::metadata::MetadataMap;
 
 /// The most that a process keeps of a caller's timeout for its answer.
-pub const MAX_MARGIN: Duration = Duration::from_secs(1);
+pub(crate) const MAX_MARGIN: Duration = Duration::from_secs(1);
 
 /// The instant by which a process ends its waits for a call. With no
 /// deadline from the caller, only the fixed limits of each wait apply.

@@ -1,22 +1,10 @@
 //! gRPC API for Scion, plus the rules that every process of the API shares.
 //!
-//! The message and service types are generated from `proto/scion.proto`
-//! ([`v1`]); everything else is the shared behavior that the server, the
-//! cache tier and the daemon agree on:
-//! bearer tokens ([`auth`]), checks on request fields ([`check`]), how a
-//! caller's deadline passes down ([`deadline`]), how one object travels in
-//! parts and encodings ([`object`]), the operator metrics ([`metrics`]),
-//! how a `GetObjects` reply streams objects ([`reply`]), how many
-//! connections and streams a process serves ([`listen`]), TLS for those
-//! connections ([`tls`]), and the signed read tickets that make object
-//! IDs unreadable without permission ([`ticket`]).
-//!
-//! This crate is the contract the five crates share: the server serves
-//! it, the tiers forward it, and a client talks it; the object bytes
-//! themselves live in [`scion-core`](https://docs.rs/open-scion-core).
-//!
-//! A server mints a read ticket with [`ticket::sign`]; the receiver
-//! checks it with [`ticket::parse`]:
+//! The supported surface is the protocol contract: the message and service
+//! types generated from `proto/scion.proto` ([`v1`]), the wire constants
+//! of this module, and the signed read tickets that make object IDs
+//! unreadable without permission ([`ticket`]). A server mints a ticket
+//! with [`ticket::sign`]; the receiver checks it with [`ticket::parse`]:
 //!
 //! ```
 //! use scion_proto::ticket::{parse, sign};
@@ -30,17 +18,35 @@
 //! assert_eq!(ticket.principal, "alice");
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
+//!
+//! Everything else the five crates share — bearer tokens and the access
+//! checks ([`runtime::auth`]), checks on request fields
+//! ([`runtime::check`]), how a caller's deadline passes down
+//! ([`runtime::deadline`]), how one object travels in parts and
+//! encodings ([`runtime::object`]), the operator metrics
+//! ([`runtime::metrics`]), how a `GetObjects` reply streams objects
+//! ([`runtime::reply`]), how many connections and streams a process
+//! serves ([`runtime::listen`]), TLS for those connections
+//! ([`runtime::tls`]), and request IDs ([`runtime::request_id`]) — is
+//! runtime code in [`runtime`], which is not the published contract.
+//!
+//! The object bytes themselves live in
+//! [`scion-core`](https://docs.rs/open-scion-core).
 
-pub mod auth;
-pub mod check;
-pub mod deadline;
-pub mod listen;
-pub mod metrics;
-pub mod object;
-pub mod reply;
-pub mod request_id;
+/// The runtime code that serves the contract: transport, TLS, the
+/// listener, metrics, the reply loop, and the access rules our binaries
+/// enforce.
+///
+/// # Unstable
+///
+/// This module is not the published contract of the crate. It moves and
+/// changes with the binaries it serves, and an outside implementer codes
+/// against [`v1`], the wire constants, and [`ticket`] instead. The crate
+/// publishes it for the server, the tiers and the daemon of this
+/// repository, which share it.
+pub mod runtime;
+
 pub mod ticket;
-pub mod tls;
 
 /// The buffer type of `ObjectPart.data`: parts of one object are slices of one
 /// buffer.

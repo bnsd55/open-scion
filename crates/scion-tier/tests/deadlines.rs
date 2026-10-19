@@ -8,17 +8,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use scion_core::BlobId;
-use scion_proto::auth::Bearer;
-use scion_proto::deadline::Until;
-use scion_proto::listen::Limits;
-use scion_proto::object::{self, Header};
+use scion_proto::runtime::auth::Bearer;
+use scion_proto::runtime::deadline::Until;
+use scion_proto::runtime::listen::Limits;
+use scion_proto::runtime::object::{self, Header};
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::objects_server::{Objects, ObjectsServer};
 use scion_proto::v1::{
     Encoding, GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, ObjectKind, ObjectPart,
     ObjectRef, ResolveRefRequest, ResolveRefResponse,
 };
-use scion_proto::{Bytes, MAX_PART_MESSAGE_BYTES};
+scion_proto::{Bytes, MAX_PART_MESSAGE_BYTES};
 use scion_tier::{MemoryStore, Tier};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;

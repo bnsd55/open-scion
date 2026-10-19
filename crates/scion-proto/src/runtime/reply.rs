@@ -1,7 +1,7 @@
 //! How a `GetObjects` reply streams objects. The server and every cache tier
 //! follow the same rules, so they share this code.
 //!
-//! A reply hands the parts of its objects ([`crate::object`]) to its client
+//! A reply hands the parts of its objects ([`crate::runtime::object`]) to its client
 //! one at a time, through a one-slot channel. Before a reply reads an
 //! object's bytes, it takes the object's share of a byte budget: all the
 //! memory that the reply holds for the object. The reply keeps the object,
@@ -20,7 +20,7 @@
 //! `ReadFile` does, never `OK`.
 //!
 //! Not counted in the budget: the parts that a reply leaves in its channel
-//! and in HTTP/2 when its client stops reading ([`crate::listen`]).
+//! and in HTTP/2 when its client stops reading ([`crate::runtime::listen`]).
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -33,14 +33,14 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::Stream;
 use tonic::Status;
 
-use crate::object::{Header, MAX_ENCODED_BYTES, UNPACK_BYTES};
+use crate::runtime::object::{Header, MAX_ENCODED_BYTES, UNPACK_BYTES};
 use crate::v1::ObjectPart;
 use crate::{Bytes, CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES};
 
 /// A reply stops before the next object once it has sent this many encoded
 /// bytes, so it holds less than this plus one object. The client asks again
 /// for the rest, so one call stays short.
-pub const REPLY_BUDGET_BYTES: usize = MAX_MESSAGE_BYTES;
+pub(crate) const REPLY_BUDGET_BYTES: usize = MAX_MESSAGE_BYTES;
 
 /// The byte budget of one process: the most memory that all its replies
 /// together hold for their objects.
@@ -59,7 +59,7 @@ pub const STALL_TIMEOUT: Duration = Duration::from_secs(120);
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What a reply leaves in HTTP/2 when its client stops reading, as its
-/// connection counts it ([`crate::listen::Stalled`]): the part in the
+/// connection counts it ([`crate::runtime::listen::Stalled`]): the part in the
 /// channel, the parts that hyper has read ahead, and the h2 send buffer —
 /// under 4 MiB, so this pays for it all.
 pub const STALLED_REPLY_BYTES: u64 = 4 << 20;
@@ -73,7 +73,7 @@ const _: () = assert!(IN_FLIGHT_BYTES <= u32::MAX as usize);
 #[derive(Debug)]
 pub enum Body {
     /// Chunks of [`CHUNK_BYTES`] (the last shorter), each a buffer of its
-    /// own, as [`crate::object::read_chunks`] makes them. Each goes out as a
+    /// own, as [`crate::runtime::object::read_chunks`] makes them. Each goes out as a
     /// part as it is.
     Chunks(Vec<Bytes>),
     /// One buffer. Each part is copied out of it as it goes, so a part never
@@ -252,8 +252,8 @@ impl Parts {
 /// tier bounds its upstream fetches itself.
 ///
 /// A stall leaves the reply's parts in HTTP/2, where no budget counts them
-/// ([`crate::listen`]), so `stalled` — the handle of the connection, from
-/// [`crate::listen::Stalled::of`] — takes the estimate
+/// ([`crate::runtime::listen`]), so `stalled` — the handle of the connection, from
+/// [`crate::runtime::listen::Stalled::of`] — takes the estimate
 /// [`STALLED_REPLY_BYTES`] onto its connection's count. `None` when there
 /// is no such connection (tests, or a transport without the count).
 pub async fn send_objects<K, F>(
@@ -261,7 +261,7 @@ pub async fn send_objects<K, F>(
     keys: impl IntoIterator<Item = K>,
     tx: mpsc::Sender<Sent>,
     stall: Duration,
-    stalled: Option<crate::listen::Stalled>,
+    stalled: Option<crate::runtime::listen::Stalled>,
     produce: impl Fn(K) -> F,
 ) where
     F: Future<Output = Option<Found>>,
@@ -328,7 +328,7 @@ mod tests {
     use tonic::Code;
 
     use super::*;
-    use crate::object::read_chunks;
+    use crate::runtime::object::read_chunks;
     use crate::v1::{Encoding, ObjectKind};
 
     /// A raw blob of `len` bytes, in one buffer or in chunks.

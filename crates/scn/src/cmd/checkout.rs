@@ -17,7 +17,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use hashlink::LinkedHashMap;
 use scion_core::{BlobId, Entry, FileEntry, FileState, PathElem, RepoPath, Tree, TreeId};
 use scion_proto::MAX_OBJECT_REFS;
-use scion_proto::object::{self, Assembler, Header};
+use scion_proto::runtime::object::{self, Assembler, Header};
 use scion_proto::v1::{Encoding, GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
 use serde_json::json;
 use tokio::signal::unix::{Signal, SignalKind, signal};

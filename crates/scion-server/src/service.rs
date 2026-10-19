@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use prost::Message as _;
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, RepoPath};
-use scion_proto::listen::{self, Limits};
-use scion_proto::tls::ServerTls;
+use scion_proto::runtime::listen::{self, Limits};
+use scion_proto::runtime::tls::ServerTls;
 use scion_proto::v1::scion_server::{Scion, ScionServer};
 use scion_proto::v1::{
     self, BlameChangeset, BlameRange, BlameRequest, BlameResponse, CreateChangesetRequest,
@@ -20,7 +20,7 @@ use scion_proto::v1::{
     MergeBaseResponse, PutBlobRequest, PutBlobResponse, ReadFileRequest, ReadFileResponse,
     ResolveRefRequest, ResolveRefResponse,
 };
-use scion_proto::{Bytes, CHUNK_BYTES, MAX_MESSAGE_BYTES};
+scion_proto::{Bytes, CHUNK_BYTES, MAX_MESSAGE_BYTES};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio_stream::StreamExt;
@@ -81,7 +81,7 @@ const READ_BUDGET_BYTES: usize = 256 << 20;
 /// A `ReadFile` reply ends when its client takes no part for this long, and
 /// frees its share, so a client that stops reading does not hold budget.
 /// The parts that it leaves in its channel and in HTTP/2 stay outside the
-/// budget (`scion_proto::listen`).
+/// budget (`scion_proto::runtime::listen`).
 const READ_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How often the stale-land sweep runs after the first one.
@@ -354,7 +354,7 @@ impl ScionService {
         &self,
         call: Call,
         data: Vec<u8>,
-        stalled: Option<scion_proto::listen::Stalled>,
+        stalled: Option<scion_proto::runtime::listen::Stalled>,
         make: fn(Vec<u8>) -> T,
     ) -> Result<Response<ReceiverStream<Part<T>>>, Status> {
         // Taken after the bytes are read, so a call that waits holds a
@@ -487,7 +487,7 @@ impl Worker {
     }
 }
 
-pub(crate) use scion_proto::check::id as parse_id;
+pub(crate) use scion_proto::runtime::check::id as parse_id;
 
 pub(crate) fn check_name(what: &str, value: &str) -> Result<(), Status> {
     names::check(what, value).map_err(Status::from)
@@ -737,7 +737,7 @@ struct LogWalk {
     left: usize,
     path: Option<RepoPath>,
     deadline: Deadline,
-    stalled: Option<scion_proto::listen::Stalled>,
+    stalled: Option<scion_proto::runtime::listen::Stalled>,
 }
 
 /// Splits a fetched page into parts: groups of entries whose encoded bytes
@@ -800,7 +800,7 @@ enum Taken<'a, T> {
 async fn reserve<'a, T>(
     tx: &'a mpsc::Sender<Part<T>>,
     stall: Duration,
-    stalled: Option<&'a scion_proto::listen::Stalled>,
+    stalled: Option<&'a scion_proto::runtime::listen::Stalled>,
 ) -> Taken<'a, T> {
     match tokio::time::timeout(stall, tx.reserve_many(2)).await {
         Ok(Ok(slots)) => Taken::Slots(slots),
@@ -808,7 +808,7 @@ async fn reserve<'a, T>(
         Ok(Err(_)) => Taken::Gone,
         Err(_) => {
             if let Some(stalled) = stalled {
-                stalled.add(scion_proto::reply::STALLED_REPLY_BYTES);
+                stalled.add(scion_proto::runtime::reply::STALLED_REPLY_BYTES);
             }
             Taken::Stalled
         }
@@ -824,7 +824,7 @@ struct BlameSend {
     cursor: Vec<u8>,
     /// The request slot, held until the reply ends.
     _call: Call,
-    stalled: Option<scion_proto::listen::Stalled>,
+    stalled: Option<scion_proto::runtime::listen::Stalled>,
 }
 
 /// Splits a computed blame into parts: groups of ranges whose encoded
@@ -980,7 +980,7 @@ async fn send_parts<T: Send + 'static>(
     _call: Call,
     tx: mpsc::Sender<Part<T>>,
     stall: Duration,
-    stalled: Option<scion_proto::listen::Stalled>,
+    stalled: Option<scion_proto::runtime::listen::Stalled>,
     make: fn(Vec<u8>) -> T,
 ) {
     let fail = |status: Status| {
@@ -1025,7 +1025,7 @@ async fn send_file(
     call: Call,
     tx: mpsc::Sender<Part<ReadFileResponse>>,
     stall: Duration,
-    stalled: Option<scion_proto::listen::Stalled>,
+    stalled: Option<scion_proto::runtime::listen::Stalled>,
 ) {
     send_parts(
         Parts::Blob {
@@ -1218,7 +1218,7 @@ impl Scion for ScionService {
         let call = self.quotas.enter(&caller).map_err(Status::from)?;
         // The handle of the caller's connection, before the request is taken
         // apart: the reply counts what it leaves in HTTP/2 on it.
-        let stalled = scion_proto::listen::Stalled::of(&request);
+        let stalled = scion_proto::runtime::listen::Stalled::of(&request);
         let req = request.into_inner();
         check_whole_reader(&self.access, &caller, &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
@@ -1250,7 +1250,7 @@ impl Scion for ScionService {
         let call = self.quotas.enter(&caller).map_err(Status::from)?;
         // The handle of the caller's connection, before the request is taken
         // apart: the reply counts what it leaves in HTTP/2 on it.
-        let stalled = scion_proto::listen::Stalled::of(&request);
+        let stalled = scion_proto::runtime::listen::Stalled::of(&request);
         // The derivation of a first view walks the real tree, under the
         // call's deadline.
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
@@ -1321,7 +1321,7 @@ impl Scion for ScionService {
         let call = self.quotas.enter(&caller).map_err(Status::from)?;
         // The handle of the caller's connection, before the request is taken
         // apart: the reply counts what it leaves in HTTP/2 on it.
-        let stalled = scion_proto::listen::Stalled::of(&request);
+        let stalled = scion_proto::runtime::listen::Stalled::of(&request);
         // The derivation of a first view walks the real tree, under the
         // call's deadline.
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
@@ -1368,7 +1368,7 @@ impl Scion for ScionService {
         let call = self.quotas.enter(&caller).map_err(Status::from)?;
         // The handle of the caller's connection, before the request is taken
         // apart: the reply counts what it leaves in HTTP/2 on it.
-        let stalled = scion_proto::listen::Stalled::of(&request);
+        let stalled = scion_proto::runtime::listen::Stalled::of(&request);
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_whole_reader(&self.access, &caller, &req.repo)?;
@@ -1411,7 +1411,7 @@ impl Scion for ScionService {
         let call = self.quotas.enter(&caller).map_err(Status::from)?;
         // The handle of the caller's connection, before the request is
         // taken apart: the reply counts what it leaves in HTTP/2 on it.
-        let stalled = scion_proto::listen::Stalled::of(&request);
+        let stalled = scion_proto::runtime::listen::Stalled::of(&request);
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let req = request.into_inner();
         check_whole_reader(&self.access, &caller, &req.repo)?;
@@ -1880,7 +1880,7 @@ mod tests {
     /// `message` as a request of that principal.
     fn as_default<T>(message: T) -> Request<T> {
         let mut request = Request::new(message);
-        let caller = Caller(scion_proto::auth::DEFAULT_PRINCIPAL.into());
+        let caller = Caller(scion_proto::runtime::auth::DEFAULT_PRINCIPAL.into());
         request.extensions_mut().insert(caller);
         request
     }
