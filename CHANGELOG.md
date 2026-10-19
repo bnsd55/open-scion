@@ -16,7 +16,8 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Added
 
-- A release smoke test for the release checklist: `scripts/release-smoke.sh`
+- A release smoke test for the release checklist (`#315`):
+  `scripts/release-smoke.sh`
   builds the release binaries and walks the README quick start on a small
   git repository it makes — import, ticket-key, serve, `scn` reads (log,
   ls, cat, blame) and writes (commit, land, read back), `fsck` clean, and
