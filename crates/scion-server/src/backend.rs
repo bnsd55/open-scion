@@ -1099,17 +1099,18 @@ pub(crate) mod old_store {
     /// fixture writes the blobs with this build's writer, then names
     /// them here.
     pub(crate) fn changeset(blob_a: BlobId, blob_b: BlobId) -> Changeset {
-        Changeset {
-            parents: vec![],
-            author: scion_core::IdentityTime {
-                name: b"Ada".to_vec(),
-                email: b"ada@example.com".to_vec(),
-                unix_secs: 1_700_000_000,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: b"root\n".to_vec(),
-            changes: [
+        Changeset::new(
+            vec![],
+            scion_core::IdentityTime::new(
+                b"Ada".to_vec(),
+                b"ada@example.com".to_vec(),
+                1_700_000_000,
+                0,
+            )
+            .expect("identity fits the format"),
+            None,
+            b"root\n".to_vec(),
+            [
                 (
                     RepoPath::new("README").unwrap(),
                     Some(FileState::Regular {
@@ -1126,7 +1127,8 @@ pub(crate) mod old_store {
                 ),
             ]
             .into(),
-        }
+        )
+        .expect("changeset fits the format")
     }
 
     /// What a plain open of an old store must serve after it migrated:

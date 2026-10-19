@@ -93,18 +93,20 @@ fn hex(token: &str) -> String {
 }
 
 fn changeset(parents: Vec<ChangesetId>, path: &str, state: Option<FileState>) -> Changeset {
-    Changeset {
+    Changeset::new(
         parents,
-        author: IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"change\n".to_vec(),
-        changes: [(RepoPath::new(path).unwrap(), state)].into(),
-    }
+        IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"change\n".to_vec(),
+        [(RepoPath::new(path).unwrap(), state)].into(),
+    )
+    .expect("changeset fits the format")
 }
 
 fn regular(content: BlobId) -> FileState {
@@ -603,11 +605,20 @@ fn repo_with_docs_and_secret() -> (tempfile::TempDir, Backend, ChangesetId, Blob
     let tip = store
         .write(|c| {
             let repo = c.repo_id(REPO)?;
-            let mut cs = changeset(vec![root], "docs/a", Some(regular(docs_blob)));
-            cs.changes.insert(
+            let cs = changeset(vec![root], "docs/a", Some(regular(docs_blob)));
+            let mut changes = cs.changes().clone();
+            changes.insert(
                 RepoPath::new("secret/b").unwrap(),
                 Some(regular(secret_blob)),
             );
+            let cs = Changeset::new(
+                cs.parents().to_vec(),
+                cs.author().clone(),
+                cs.committer().cloned(),
+                cs.message().to_vec(),
+                changes,
+            )
+            .expect("changeset fits the format");
             c.insert_changeset(repo, &cs)
         })
         .unwrap();
@@ -628,7 +639,7 @@ fn root_tree_id(store: &Backend, tip: ChangesetId) -> TreeId {
     .unwrap();
     let tree = store.read(|c| c.get_tree(root)).unwrap();
     match tree
-        .entries
+        .entries()
         .get(&scion_core::PathElem::new(b"secret".to_vec()).unwrap())
     {
         Some(Entry::Dir(id)) => *id,
@@ -690,8 +701,11 @@ async fn a_partial_reader_reads_only_its_view() {
     }
     let (listed, listed_id) = Tree::decode_with_id(&tree_bytes).unwrap();
     assert_eq!(listed_id, view_root, "the list is of the view root");
-    assert!(listed.entries.contains_key(&elem(b"docs")), "{listed:?}");
-    assert!(!listed.entries.contains_key(&elem(b"secret")), "{listed:?}");
+    assert!(listed.entries().contains_key(&elem(b"docs")), "{listed:?}");
+    assert!(
+        !listed.entries().contains_key(&elem(b"secret")),
+        "{listed:?}"
+    );
 
     // ReadFile serves a visible path and hides a hidden one, the same as a
     // missing one.
@@ -1675,7 +1689,7 @@ fn a_partial_reader_case(paths: &[String], rule_seeds: &[u16]) -> Result<(), Tes
                         }
                         let (listed, _id) = Tree::decode_with_id(&bytes).unwrap();
                         listed
-                            .entries
+                            .entries()
                             .keys()
                             .map(|k| k.as_bytes().to_vec())
                             .collect::<Vec<_>>()

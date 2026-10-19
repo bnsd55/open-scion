@@ -231,7 +231,7 @@ fn project(
     memo.walked += 1;
     let tree = c.get_tree(id)?;
     let mut kept = std::collections::BTreeMap::new();
-    for (name, entry) in &tree.entries {
+    for (name, entry) in tree.entries() {
         // A file is visible when a prefix names it exactly; a prefix
         // can name nothing below a file.
         match entry {
@@ -259,7 +259,7 @@ fn project(
     let view = if kept.is_empty() {
         None
     } else {
-        let view = Tree { entries: kept };
+        let view = Tree::new(kept).expect("tree fits the format");
         let id = view.encode_with_id().1;
         memo.trees.push(view);
         Some(id)
@@ -334,24 +334,26 @@ mod tests {
 
         let (repo, digest) = bare();
         // /README, /src/public, /src/secret, /docs/note, /ops/only-hidden
-        let src = Tree {
-            entries: [
+        let src = Tree::new(
+            [
                 (name(b"public"), file(&store, b"public\n")),
                 (name(b"secret"), file(&store, b"secret\n")),
             ]
             .into(),
-        };
+        )
+        .expect("tree fits the format");
         let (src_id, root_id) = store
             .write(|c| {
                 let src_id = c.put_tree(&src)?;
-                let root = Tree {
-                    entries: [
+                let root = Tree::new(
+                    [
                         (name(b"README"), file(&store, b"readme\n")),
                         (name(b"docs"), file(&store, b"note\n")),
                         (name(b"ops"), Entry::Dir(src_id)),
                     ]
                     .into(),
-                };
+                )
+                .expect("tree fits the format");
                 let root_id = c.put_tree(&root)?;
                 Ok((src_id, root_id))
             })
@@ -373,7 +375,7 @@ mod tests {
             .unwrap();
         let shown = store.read(|c| c.get_tree(view)).unwrap();
         let names: Vec<Vec<u8>> = shown
-            .entries
+            .entries()
             .keys()
             .map(|k| k.as_bytes().to_vec())
             .collect();
@@ -382,13 +384,13 @@ mod tests {
             names,
             [b"README".to_vec(), b"docs".to_vec(), b"ops".to_vec()]
         );
-        let Entry::Dir(ops) = shown.entries.get(&name(b"ops")).unwrap() else {
+        let Entry::Dir(ops) = shown.entries().get(&name(b"ops")).unwrap() else {
             panic!("ops is a directory in the view");
         };
         assert_ne!(*ops, src_id, "the hidden entry changed the subtree");
         let ops_tree = store.write(|c| c.get_tree(*ops)).unwrap();
         let ops_names: Vec<Vec<u8>> = ops_tree
-            .entries
+            .entries()
             .keys()
             .map(|k| k.as_bytes().to_vec())
             .collect();
@@ -428,23 +430,25 @@ mod tests {
 
         let (repo, digest) = bare();
         // Two directories with the same content: one visible, one not.
-        let inner = Tree {
-            entries: [
+        let inner = Tree::new(
+            [
                 (name(b"a"), file(&store, b"a\n")),
                 (name(b"b"), file(&store, b"b\n")),
             ]
             .into(),
-        };
+        )
+        .expect("tree fits the format");
         let (left, root_id) = store
             .write(|c| {
                 let id = c.put_tree(&inner)?;
-                let root = Tree {
-                    entries: [
+                let root = Tree::new(
+                    [
                         (name(b"left"), Entry::Dir(id)),
                         (name(b"right"), Entry::Dir(id)),
                     ]
                     .into(),
-                };
+                )
+                .expect("tree fits the format");
                 let root_id = c.put_tree(&root)?;
                 Ok((id, root_id))
             })
@@ -478,24 +482,24 @@ mod tests {
             .unwrap();
         let right_tree = store.read(|c| c.get_tree(view2)).unwrap();
         let right_names: Vec<Vec<u8>> = right_tree
-            .entries
+            .entries()
             .keys()
             .map(|k| k.as_bytes().to_vec())
             .collect();
         assert_eq!(right_names, [b"right".to_vec()]);
         let shown = store.write(|c| c.get_tree(view)).unwrap();
         let names: Vec<Vec<u8>> = shown
-            .entries
+            .entries()
             .keys()
             .map(|k| k.as_bytes().to_vec())
             .collect();
         assert_eq!(names, [b"left".to_vec()]);
-        let Entry::Dir(left_view) = shown.entries.get(&name(b"left")).unwrap() else {
+        let Entry::Dir(left_view) = shown.entries().get(&name(b"left")).unwrap() else {
             panic!("left is a directory in the view");
         };
         let left_tree = store.read(|c| c.get_tree(*left_view)).unwrap();
         let kept: Vec<Vec<u8>> = left_tree
-            .entries
+            .entries()
             .keys()
             .map(|k| k.as_bytes().to_vec())
             .collect();
@@ -512,15 +516,13 @@ mod tests {
         let (_dir, store) = store();
 
         let (repo, digest) = bare();
-        let docs = Tree {
-            entries: [(name(b"note"), file(&store, b"note\n"))].into(),
-        };
+        let docs = Tree::new([(name(b"note"), file(&store, b"note\n"))].into())
+            .expect("tree fits the format");
         let (docs_id, root_id) = store
             .write(|c| {
                 let docs_id = c.put_tree(&docs)?;
-                let root = Tree {
-                    entries: [(name(b"docs"), Entry::Dir(docs_id))].into(),
-                };
+                let root = Tree::new([(name(b"docs"), Entry::Dir(docs_id))].into())
+                    .expect("tree fits the format");
                 Ok((docs_id, c.put_tree(&root)?))
             })
             .unwrap();
@@ -532,7 +534,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let shown = store.read(|c| c.get_tree(view)).unwrap();
-        let Entry::Dir(kept) = shown.entries.get(&name(b"docs")).unwrap() else {
+        let Entry::Dir(kept) = shown.entries().get(&name(b"docs")).unwrap() else {
             panic!("docs is a directory in the view");
         };
         assert_eq!(*kept, docs_id, "the fully visible folder is unchanged");
@@ -644,7 +646,7 @@ mod tests {
                     entries.insert(elem(rest.as_bytes()), file_entry(store, &content_of(p)));
                 }
             }
-            let tree = Tree { entries };
+            let tree = Tree::new(entries).expect("tree fits the format");
             let id = store.write(|c| c.put_tree(&tree)).unwrap();
             ids.insert(path.clone(), id);
             dirs.insert(path.clone(), tree);
@@ -900,12 +902,12 @@ mod tests {
         };
         // The names the view shows, straight from the projected tree: the
         // leak check below compares these against the model's visibility.
-        for name in shown.entries.keys() {
+        for name in shown.entries().keys() {
             w.names.insert(name.as_bytes().to_vec());
         }
         let model = model_view(dir, paths, rules);
         let shown_names: Vec<Vec<u8>> = shown
-            .entries
+            .entries()
             .keys()
             .map(|k| k.as_bytes().to_vec())
             .collect();
@@ -917,7 +919,7 @@ mod tests {
             } else {
                 format!("{dir}/{name}")
             };
-            let entry = shown.entries.get(&elem(name.as_bytes())).unwrap();
+            let entry = shown.entries().get(&elem(name.as_bytes())).unwrap();
             match state {
                 DirState::Whole => {
                     if paths.contains(&child_path) {
@@ -972,29 +974,31 @@ mod tests {
             Entry::File(file) => file.state(),
             Entry::Dir(_) => unreachable!("a file"),
         };
-        let ada = scion_core::IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        };
+        let ada = scion_core::IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format");
         let tip = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
                 c.insert_changeset(
                     repo,
-                    &Changeset {
-                        parents: vec![],
-                        author: ada,
-                        committer: None,
-                        message: b"root\n".to_vec(),
-                        changes: [
+                    &Changeset::new(
+                        vec![],
+                        ada,
+                        None,
+                        b"root\n".to_vec(),
+                        [
                             (RepoPath::new("left/x").unwrap(), Some(regular(a))),
                             (RepoPath::new("right/y").unwrap(), Some(regular(b))),
                             (RepoPath::new("secret/z").unwrap(), Some(regular(z))),
                         ]
                         .into(),
-                    },
+                    )
+                    .expect("changeset fits the format"),
                 )
             })
             .unwrap();
@@ -1058,18 +1062,20 @@ mod tests {
                 };
                 c.insert_changeset(
                     repo,
-                    &Changeset {
-                        parents: vec![tip],
-                        author: scion_core::IdentityTime {
-                            name: b"Ada".to_vec(),
-                            email: b"ada@example.com".to_vec(),
-                            unix_secs: 1_700_000_000,
-                            tz_offset_minutes: 0,
-                        },
-                        committer: None,
-                        message: b"hidden change\n".to_vec(),
-                        changes: [(RepoPath::new("secret/z").unwrap(), Some(state))].into(),
-                    },
+                    &Changeset::new(
+                        vec![tip],
+                        scion_core::IdentityTime::new(
+                            b"Ada".to_vec(),
+                            b"ada@example.com".to_vec(),
+                            1_700_000_000,
+                            0,
+                        )
+                        .expect("identity fits the format"),
+                        None,
+                        b"hidden change\n".to_vec(),
+                        [(RepoPath::new("secret/z").unwrap(), Some(state))].into(),
+                    )
+                    .expect("changeset fits the format"),
                 )
             })
             .unwrap();
@@ -1108,18 +1114,20 @@ mod tests {
                 };
                 c.insert_changeset(
                     repo,
-                    &Changeset {
-                        parents: vec![tip],
-                        author: scion_core::IdentityTime {
-                            name: b"Ada".to_vec(),
-                            email: b"ada@example.com".to_vec(),
-                            unix_secs: 1_700_000_000,
-                            tz_offset_minutes: 0,
-                        },
-                        committer: None,
-                        message: b"left/x\n".to_vec(),
-                        changes: [(RepoPath::new("left/x").unwrap(), Some(state))].into(),
-                    },
+                    &Changeset::new(
+                        vec![tip],
+                        scion_core::IdentityTime::new(
+                            b"Ada".to_vec(),
+                            b"ada@example.com".to_vec(),
+                            1_700_000_000,
+                            0,
+                        )
+                        .expect("identity fits the format"),
+                        None,
+                        b"left/x\n".to_vec(),
+                        [(RepoPath::new("left/x").unwrap(), Some(state))].into(),
+                    )
+                    .expect("changeset fits the format"),
                 )
             })
             .unwrap();
@@ -1147,13 +1155,13 @@ mod tests {
         let head_right = store
             .read(|c| c.get_tree(head))
             .unwrap()
-            .entries
+            .entries()
             .get(&name(b"right"))
             .copied();
         let next_right = store
             .read(|c| c.get_tree(next))
             .unwrap()
-            .entries
+            .entries()
             .get(&name(b"right"))
             .copied();
         assert_eq!(
@@ -1213,18 +1221,20 @@ mod tests {
             .write(|c| {
                 c.insert_changeset(
                     repo,
-                    &Changeset {
-                        parents: vec![tip],
-                        author: scion_core::IdentityTime {
-                            name: b"Ada".to_vec(),
-                            email: b"ada@example.com".to_vec(),
-                            unix_secs: 1_700_000_000,
-                            tz_offset_minutes: 0,
-                        },
-                        committer: None,
-                        message: b"one file\n".to_vec(),
-                        changes: [(lib_rs, Some(state))].into(),
-                    },
+                    &Changeset::new(
+                        vec![tip],
+                        scion_core::IdentityTime::new(
+                            b"Ada".to_vec(),
+                            b"ada@example.com".to_vec(),
+                            1_700_000_000,
+                            0,
+                        )
+                        .expect("identity fits the format"),
+                        None,
+                        b"one file\n".to_vec(),
+                        [(lib_rs, Some(state))].into(),
+                    )
+                    .expect("changeset fits the format"),
                 )
             })
             .unwrap();
@@ -1271,7 +1281,7 @@ mod tests {
         let mut stack = vec![(root, Vec::new())];
         while let Some((id, path)) = stack.pop() {
             let tree = store.read(|c| c.get_tree(id)).unwrap();
-            for (name, entry) in &tree.entries {
+            for (name, entry) in tree.entries() {
                 let mut path = path.clone();
                 path.extend_from_slice(name.as_bytes());
                 match entry {

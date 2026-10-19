@@ -55,12 +55,13 @@ async fn blame_call(
             .with_context(|| format!("cannot blame {spec}"))?;
         let Some(page) = page else { break };
         for c in page.changesets {
-            let author = IdentityTime {
-                name: c.author_name,
-                email: c.author_email,
-                unix_secs: c.author_unix_secs,
-                tz_offset_minutes: c.author_tz_offset_minutes,
-            };
+            let author = IdentityTime::new(
+                c.author_name,
+                c.author_email,
+                c.author_unix_secs,
+                c.author_tz_offset_minutes,
+            )
+            .expect("identity fits the format");
             sources.insert(id_from::<ChangesetId>(&c.changeset_id)?, (author, c.path));
         }
         ranges.extend(page.ranges);
@@ -180,8 +181,8 @@ fn print_text(lines: &[(ChangesetId, u32)], sources: &Sources, path: &[u8], text
         .enumerate()
     {
         let source = sources.get(id);
-        let name = source.map(|(a, _)| lossy(&a.name)).unwrap_or_default();
-        let secs = source.map_or(0, |(a, _)| a.unix_secs);
+        let name = source.map(|(a, _)| lossy(a.name())).unwrap_or_default();
+        let secs = source.map_or(0, |(a, _)| a.unix_secs());
         let source_path = match (source, path_width) {
             (Some((_, p)), Some(path_width)) => format!(" {:<path_width$}", lossy(p)),
             _ => String::new(),

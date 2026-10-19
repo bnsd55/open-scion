@@ -28,12 +28,8 @@ type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
 
 /// The identity of every changeset in these tests.
 fn author() -> IdentityTime {
-    IdentityTime {
-        name: b"t".to_vec(),
-        email: b"t@x".to_vec(),
-        unix_secs: 1_700_000_000,
-        tz_offset_minutes: 0,
-    }
+    IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 1_700_000_000, 0)
+        .expect("identity fits the format")
 }
 
 /// Stores `repo` with `root` as its root changeset.
@@ -55,12 +51,12 @@ async fn big_repo(names: usize) -> (tempfile::TempDir, Scion, ChangesetId) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     // The root changeset, so the changeset under test has a parent.
-    let root = Changeset {
-        parents: vec![],
-        author: author(),
-        committer: None,
-        message: b"root\n".to_vec(),
-        changes: [(
+    let root = Changeset::new(
+        vec![],
+        author(),
+        None,
+        b"root\n".to_vec(),
+        [(
             RepoPath::new(b"seed".as_slice()).unwrap(),
             Some(FileState::Regular {
                 content: store.blobs().put(b"seed\n").unwrap(),
@@ -68,7 +64,8 @@ async fn big_repo(names: usize) -> (tempfile::TempDir, Scion, ChangesetId) {
             }),
         )]
         .into(),
-    };
+    )
+    .expect("changeset fits the format");
     let root = seed_root(&store, &root);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -117,12 +114,12 @@ async fn big_repo(names: usize) -> (tempfile::TempDir, Scion, ChangesetId) {
         .blob_id;
     let blob = BlobId::try_from(blob.as_slice()).unwrap();
 
-    let changeset = Changeset {
-        parents: vec![root],
-        author: author(),
-        committer: None,
-        message: b"big\n".to_vec(),
-        changes: (0..names)
+    let changeset = Changeset::new(
+        vec![root],
+        author(),
+        None,
+        b"big\n".to_vec(),
+        (0..names)
             .map(|i| {
                 (
                     RepoPath::new(format!("entry-{i:06}.bin").as_bytes()).unwrap(),
@@ -133,7 +130,8 @@ async fn big_repo(names: usize) -> (tempfile::TempDir, Scion, ChangesetId) {
                 )
             })
             .collect(),
-    };
+    )
+    .expect("changeset fits the format");
     let created = client
         .create_changeset(CreateChangesetRequest {
             repo: REPO.into(),
@@ -179,7 +177,7 @@ async fn a_tree_and_a_changeset_over_one_message_arrive_in_parts() {
     let (parts, tree_bytes) = whole(&mut stream, |p| &p.tree).await;
     assert!(parts > 1, "the tree arrived in {parts} parts");
     let tree = Tree::decode(&tree_bytes).expect("the parts are a whole TreeV1");
-    assert_eq!(tree.entries.len(), 40_001, "every entry came");
+    assert_eq!(tree.entries().len(), 40_001, "every entry came");
 
     // The whole changeset, in parts, and it is the one that was asked for.
     let mut stream = client
@@ -197,7 +195,7 @@ async fn a_tree_and_a_changeset_over_one_message_arrive_in_parts() {
         id, created,
         "the bytes are the changeset that was asked for"
     );
-    assert_eq!(cs.changes.len(), 40_000, "every change came");
+    assert_eq!(cs.changes().len(), 40_000, "every change came");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -219,5 +217,5 @@ async fn a_client_that_stops_mid_reply_can_read_on() {
     let mut stream = client.list_dir(request).await.unwrap().into_inner();
     let (_, tree_bytes) = whole(&mut stream, |p| &p.tree).await;
     let tree = Tree::decode(&tree_bytes).expect("the second reply is whole");
-    assert_eq!(tree.entries.len(), 40_001);
+    assert_eq!(tree.entries().len(), 40_001);
 }

@@ -330,7 +330,7 @@ fn check_trees(
                         ));
                         continue;
                     }
-                    for file in tree.entries.values() {
+                    for file in tree.entries().values() {
                         let scion_core::Entry::File(file) = file else {
                             continue;
                         };
@@ -604,21 +604,23 @@ mod tests {
 
     /// A changeset on `parent` that puts `files`, or deletes them on `None`.
     fn cs(parent: Option<ChangesetId>, files: &[(&str, Option<FileState>)]) -> Changeset {
-        Changeset {
-            parents: parent.into_iter().collect(),
-            author: IdentityTime {
-                name: b"Ada".to_vec(),
-                email: b"ada@example.com".to_vec(),
-                unix_secs: 1_700_000_000,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: b"fsck\n".to_vec(),
-            changes: files
+        Changeset::new(
+            parent.into_iter().collect(),
+            IdentityTime::new(
+                b"Ada".to_vec(),
+                b"ada@example.com".to_vec(),
+                1_700_000_000,
+                0,
+            )
+            .expect("identity fits the format"),
+            None,
+            b"fsck\n".to_vec(),
+            files
                 .iter()
                 .map(|(path, state)| (RepoPath::new(*path).unwrap(), *state))
                 .collect(),
-        }
+        )
+        .expect("changeset fits the format")
     }
 
     /// Stores `cs` in the repo and moves `main` to it, as a land does.

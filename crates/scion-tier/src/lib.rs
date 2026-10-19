@@ -1568,9 +1568,8 @@ mod tests {
         // A real root tree, so the walk of a ticket reaches every blob
         // at its index.
         let paths: Vec<Vec<u8>> = (0..count).map(|i| i.to_string().into_bytes()).collect();
-        let tree = Tree {
-            entries: keys
-                .iter()
+        let tree = Tree::new(
+            keys.iter()
                 .zip(&paths)
                 .map(|(key, path)| {
                     (
@@ -1585,7 +1584,8 @@ mod tests {
                     )
                 })
                 .collect(),
-        };
+        )
+        .expect("tree fits the format");
         let (tree_bytes, root) = tree.encode_with_id();
         let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
         let mut objects: HashMap<_, _> = keys
@@ -2109,37 +2109,43 @@ mod tests {
     fn decoding_a_tree_fits_its_factor() {
         use scion_core::{BlobId, Entry, FileEntry, FileState, PathElem};
         // The smallest entry: a one-byte name of a directory.
-        let tree = |names: &[&str]| Tree {
-            entries: names
-                .iter()
-                .map(|name| {
-                    (
-                        PathElem::new(*name).unwrap(),
-                        Entry::Dir(Tree::default().id()),
-                    )
-                })
-                .collect(),
+        let tree = |names: &[&str]| {
+            Tree::new(
+                names
+                    .iter()
+                    .map(|name| {
+                        (
+                            PathElem::new(*name).unwrap(),
+                            Entry::Dir(Tree::default().id()),
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("tree fits the format")
         };
         let entry = tree(&["a", "b"]).encode().len() - tree(&["a"]).encode().len();
         assert_eq!(entry, 38);
         // A file entry carries its byte length, so it encodes wider; its
         // decoded pair is wider too. It sets the factor.
-        let file = |names: &[&str]| Tree {
-            entries: names
-                .iter()
-                .map(|name| {
-                    (
-                        PathElem::new(*name).unwrap(),
-                        Entry::File(FileEntry::new(
-                            FileState::Regular {
-                                content: BlobId::of(b"x"),
-                                executable: false,
-                            },
-                            1,
-                        )),
-                    )
-                })
-                .collect(),
+        let file = |names: &[&str]| {
+            Tree::new(
+                names
+                    .iter()
+                    .map(|name| {
+                        (
+                            PathElem::new(*name).unwrap(),
+                            Entry::File(FileEntry::new(
+                                FileState::Regular {
+                                    content: BlobId::of(b"x"),
+                                    executable: false,
+                                },
+                                1,
+                            )),
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("tree fits the format")
         };
         let file_entry = file(&["a", "b"]).encode().len() - file(&["a"]).encode().len();
         assert_eq!(file_entry, 47);

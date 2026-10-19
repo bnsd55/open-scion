@@ -310,7 +310,7 @@ pub fn blame(
         };
         // The next version, if the walk goes on, is the newest one at or
         // below this version's parent.
-        next = changeset.parents.first().copied();
+        next = changeset.parents().first().copied();
         // The nodes the lookups read hold share bytes until the call
         // ends. A take that does not fit stops the walk: the next call
         // goes on at the version this one explained, and reads the nodes
@@ -331,7 +331,7 @@ pub fn blame(
             }
         }
         let puts_text = matches!(
-            changeset.changes.get(&path),
+            changeset.changes().get(&path),
             Some(Some(FileState::Regular { content, .. })) if *content == blob
         );
         if !puts_text {
@@ -409,7 +409,7 @@ pub fn blame(
         }
         diffed += cost;
         if give_lines(&mut lines, id, older.as_ref(), &text) {
-            changesets.push((id, changeset.author, path.clone()));
+            changesets.push((id, changeset.author().clone(), path.clone()));
         }
         progressed = true;
         drop(diff_hold);
@@ -783,7 +783,7 @@ fn deleted_files<'c>(
         let mut trees = HashMap::new();
         let mut deleted = Vec::new();
         for (other, _) in changeset
-            .changes
+            .changes()
             .iter()
             .filter(|(_, state)| state.is_none())
         {
@@ -812,7 +812,7 @@ fn lookup_cached(
             Slot::Vacant(slot) => slot.insert(c.get_tree(id)?),
         };
         let name = PathElem::new(name).expect("a RepoPath part is a valid name");
-        match tree.entries.get(&name) {
+        match tree.entries().get(&name) {
             Some(next) => entry = *next,
             None => return Ok(None),
         }
