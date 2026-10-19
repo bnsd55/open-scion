@@ -4,6 +4,8 @@
 
 #![cfg(unix)]
 
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::process::Command;
 
 use common::{REPO, TOKEN, changeset, land};
@@ -32,6 +34,25 @@ fn scn(url: &str, home: &std::path::Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// Runs `scn ARGS` against `url`, with `home` as the home directory,
+/// and answers the raw stdout bytes: names in arguments and output need
+/// not be UTF-8.
+fn scn_bytes(url: &str, home: &std::path::Path, args: &[OsStr]) -> Vec<u8> {
+    let out = Command::new(env!("CARGO_BIN_EXE_scn"))
+        .args(["--server", url, "--repo", REPO])
+        .args(args)
+        .env("SCION_TOKEN", TOKEN)
+        .env("HOME", home)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
 }
 
 /// Lands `keep.txt` and `docs/{a.txt,b.txt}` on `store`, and points
@@ -237,4 +258,65 @@ fn a_mounts_overlay_commits_without_a_scan() {
         ),
         "added"
     );
+}
+
+/// A name that is not UTF-8 commits its own content, not that of the
+/// file its lossy spelling names.
+#[test]
+fn a_non_utf8_name_commits_its_own_content() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
+    let base = start(&store);
+    let tiers = common::Tiers::start(data, store);
+    let mounted = mount(&tiers, &base);
+    let vfs = &mounted.vfs;
+
+    // Through the VFS: a file named with an invalid byte, and one whose
+    // name is that byte's lossy spelling (U+FFFD).
+    let raw = b"a\xffb";
+    let lossy = String::from_utf8_lossy(raw).into_owned();
+    assert_ne!(lossy.as_bytes(), &raw[..]);
+    tiers.runtime.block_on(async {
+        let root = NFSFileSystem::root_dir(vfs);
+        let (id, _) = vfs
+            .create(root, &filename3::from(raw.to_vec()), sattr3::default())
+            .await
+            .unwrap();
+        vfs.write(id, 0, b"raw\n").await.unwrap();
+        let (id, _) = vfs
+            .create(
+                root,
+                &filename3::from(lossy.clone().into_bytes()),
+                sattr3::default(),
+            )
+            .await
+            .unwrap();
+        vfs.write(id, 0, b"lossy\n").await.unwrap();
+    });
+
+    let cs = scn(
+        &tiers.server,
+        mounted.home.path(),
+        &[
+            "commit",
+            "-m",
+            "raw names",
+            "--from-mount",
+            mounted.view.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(cs.len(), 64, "the commit printed no changeset: {cs}");
+
+    // Each name carries its own content.
+    let cat = |name: &[u8]| {
+        let mut arg = OsString::from("cs:");
+        arg.push(OsStr::from_bytes(name));
+        scn_bytes(
+            &tiers.server,
+            mounted.home.path(),
+            &[OsStr::new("cat"), &arg],
+        )
+    };
+    assert_eq!(cat(raw), b"raw\n");
+    assert_eq!(cat(lossy.as_bytes()), b"lossy\n");
 }
