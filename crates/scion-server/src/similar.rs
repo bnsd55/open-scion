@@ -825,11 +825,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let deleted_blob = store.blobs().put(&lines(0..60)).unwrap();
-        // Two added files, 60 chunks each: the first slot that crosses the
-        // cap cuts the file's indexing, with one target left to index.
+        // Two added files, 60 chunks each and of a different content, so no
+        // same-content pair is found before step 3: the first slot that
+        // crosses the cap cuts the file's indexing, with one target left to
+        // index.
         let added_blobs = [
-            store.blobs().put(&lines(0..60)).unwrap(),
             store.blobs().put(&lines(100..160)).unwrap(),
+            store.blobs().put(&lines(200..260)).unwrap(),
         ];
         let deleted_path = RepoPath::new("old").unwrap();
         let added_paths = ["a/new", "b/new"].map(|p| RepoPath::new(p).unwrap());
@@ -877,11 +879,12 @@ mod tests {
             .unwrap();
         let other1 = store.blobs().put(&lines(2000..2060)).unwrap();
         let other2 = store.blobs().put(&lines(3000..3060)).unwrap();
-        let deleted_paths = ["z/like", "a/one", "b/two"].map(|p| RepoPath::new(p).unwrap());
+        // The deleted files in path order, the like one last.
+        let deleted_paths = ["a/one", "b/two", "z/like"].map(|p| RepoPath::new(p).unwrap());
         let deleted = [
-            (&deleted_paths[0], file(like)),
-            (&deleted_paths[1], file(other1)),
-            (&deleted_paths[2], file(other2)),
+            (&deleted_paths[0], file(other1)),
+            (&deleted_paths[1], file(other2)),
+            (&deleted_paths[2], file(like)),
         ];
         let added = [(&added_path, file(added_blob))];
         let read = |_: &RepoPath, blob, _| Ok(Some(Chunks::read(&store, blob)?));
