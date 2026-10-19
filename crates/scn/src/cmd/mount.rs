@@ -1,5 +1,5 @@
 //! `mount` and `unmount`: the virtual checkout
-//! ([#11](https://github.com/bnsd55/open-scion/issues/11)).
+//! ([#11](https://github.com/bnsd55/openscion/issues/11)).
 
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;

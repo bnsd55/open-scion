@@ -6,7 +6,7 @@ scion-daemon.
 `scion-cache` is the regional tier in front of a server;
 `scion-daemon` is one per OS user on a machine.
 
-Part of [open-scion](https://github.com/bnsd55/open-scion), a version
+Part of [openscion](https://github.com/bnsd55/openscion), a version
 control system for large monorepos. See the repository for the design
 and the rest of the system.
 

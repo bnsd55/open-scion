@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-open-scion is an early proof of concept. Only the latest commit on `main` is
+openscion is an early proof of concept. Only the latest commit on `main` is
 supported, and it is not meant for production use yet.
 
 ## Reporting a vulnerability
@@ -10,7 +10,7 @@ supported, and it is not meant for production use yet.
 Please do not open a public issue for a security problem.
 
 Report it privately through GitHub:
-[**Report a vulnerability**](https://github.com/bnsd55/open-scion/security/advisories/new)
+[**Report a vulnerability**](https://github.com/bnsd55/openscion/security/advisories/new)
 (the *Security* tab of this repository).
 
 Include what you found, how to reproduce it, and what an attacker could do with

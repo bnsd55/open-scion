@@ -1,6 +1,6 @@
 # Stability
 
-What each surface of open-scion promises in 0.x, what may change without
+What each surface of openscion promises in 0.x, what may change without
 notice, and how to upgrade. The crates carry one version, cut as
 [RELEASING.md](RELEASING.md) says. In 0.x, SemVer means: a patch release
 (`0.1.z`) fixes bugs and never changes a contract; a minor release
@@ -18,7 +18,7 @@ forward with a migration.
 | Ticket bytes (`scion-proto`, prefix `scion\0ticket\0v1\0`) | A ticket issued by one 0.x server is accepted by that server while its key lives; the bytes' prefix is versioned, and the signature covers it. | Nothing. | May change the bytes behind the prefix, or issue a v2 beside v1; keys do not survive a prefix change. | Clients hold tickets opaquely and re-request them; nothing to migrate. |
 | `scn` CLI, human output | Nothing about the wording or layout; [cli.md](cli.md) documents the current shape. | May change wording. | May change anything. | Scripts that read human output are not stable; use `--json`. |
 | `scn` CLI, `--json` output | A patch keeps the field names and types of a command's JSON. | Nothing. | May add fields, and may change or remove fields (0.x: the JSON is best-effort machine-readable, not a contract). | Scripts that read the JSON should ignore unknown fields. |
-| Crate APIs (`scion-core`, `scion-proto`, `scion-tier`, `scion-server` as a library) | In 0.1.x the crates are not published on crates.io: the owner keeps the release source-only until the public APIs are narrowed ([#21](https://github.com/bnsd55/open-scion/issues/21)), so the Rust APIs are internal and nothing outside this repo may depend on them. The toolchain floor is the workspace's MSRV (1.88 now), checked by CI. | Bug fixes only, no API change. | May break any API: the crates are this project's own implementation, and the `scion-server` library especially is the server binary's inside, not a public SDK. When the crates publish (#21), this row gets their 0.x crate policy. | Build from a tagged source tree; there is nothing to pin on crates.io yet. |
+| Crate APIs (`scion-core`, `scion-proto`, `scion-tier`, `scion-server` as a library) | In 0.1.x the crates are not published on crates.io: the owner keeps the release source-only until the public APIs are narrowed ([#21](https://github.com/bnsd55/openscion/issues/21)), so the Rust APIs are internal and nothing outside this repo may depend on them. The toolchain floor is the workspace's MSRV (1.88 now), checked by CI. | Bug fixes only, no API change. | May break any API: the crates are this project's own implementation, and the `scion-server` library especially is the server binary's inside, not a public SDK. When the crates publish (#21), this row gets their 0.x crate policy. | Build from a tagged source tree; there is nothing to pin on crates.io yet. |
 | The `test-hooks` feature of `scion-server` | Nothing, ever: it exists for this repo's own tests and gated proofs, default off. | May change or vanish. | May change or vanish. | Nothing may depend on it; the repo's own test hooks are the only users. |
 
 What this file means by the version numbers: all five crates share one

@@ -1,9 +1,9 @@
 # Releasing
 
-How to cut a release of open-scion. v0.1.x is a source release: a git
+How to cut a release of openscion. v0.1.x is a source release: a git
 tag plus GitHub release notes. Nothing publishes crates: the crates
 publish later, after their public APIs are narrowed
-([#21](https://github.com/bnsd55/open-scion/issues/21)). Nothing here
+([#21](https://github.com/bnsd55/openscion/issues/21)). Nothing here
 tags by itself: each step is run by a person.
 
 ## Before a release
@@ -59,7 +59,7 @@ A release is cut through one PR from a branch named
    notes describe:
 
    ```sh
-   git tag -a v0.1.0 -m "open-scion v0.1.0"
+   git tag -a v0.1.0 -m "openscion v0.1.0"
    git push origin v0.1.0
    ```
 

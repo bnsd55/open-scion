@@ -1,6 +1,6 @@
-# Contributing to open-scion
+# Contributing to openscion
 
-Thank you for your interest. open-scion is at an early stage and the design
+Thank you for your interest. openscion is at an early stage and the design
 still moves, so the best first step is an issue: describe the problem or the
 idea, and agree on the approach before writing a large change.
 
@@ -18,8 +18,8 @@ gRPC code) and `git` (the import tests build small git repositories). For fuzzin
 `cargo-fuzz`.
 
 ```sh
-git clone https://github.com/bnsd55/open-scion
-cd open-scion
+git clone https://github.com/bnsd55/openscion
+cd openscion
 cargo test --workspace
 ```
 
