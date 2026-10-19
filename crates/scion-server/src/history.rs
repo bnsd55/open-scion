@@ -28,7 +28,7 @@
 //!   a path changed after the base exactly when a generation in its entry is
 //!   above the base's.
 
-use std::collections::{BTreeMap, HashMap, btree_map, hash_map};
+use std::collections::{BTreeMap, HashMap, btree_map};
 use std::fmt;
 use std::ops::Bound::{self, Unbounded};
 
@@ -446,23 +446,22 @@ impl Nodes {
     }
 
     fn row(&mut self, c: &mut dyn MetaTx, id: NodeId) -> Result<&Row> {
-        if let Some(row) = self.rows.get(&id) {
-            return Ok(row);
-        }
-        let (row, bytes) = get_row(c, id)?;
-        if let Some(cap) = self.cap {
-            if self.bytes + bytes > cap {
-                // SHORTCUT: clears all at once, not a per-entry LRU: a
-                // check reads each path once, so a row it cleared is
-                // unlikely to be wanted again before the check ends.
-                // Upgrade to an LRU if one check's re-reads ever show in
-                // the node-read metrics.
-                self.rows.clear();
-                self.bytes = 0;
+        if !self.rows.contains_key(&id) {
+            let (row, bytes) = get_row(c, id)?;
+            if let Some(cap) = self.cap {
+                if self.bytes + bytes > cap {
+                    // SHORTCUT: clears all at once, not a per-entry LRU: a
+                    // check reads each path once, so a row it cleared is
+                    // unlikely to be wanted again before the check ends.
+                    // Upgrade to an LRU if one check's re-reads ever show
+                    // in the node-read metrics.
+                    self.rows.clear();
+                    self.bytes = 0;
+                }
             }
+            self.bytes += bytes;
+            self.rows.insert(id, row);
         }
-        self.bytes += bytes;
-        self.rows.insert(id, row);
         Ok(&self.rows[&id])
     }
 
