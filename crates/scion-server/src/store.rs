@@ -956,7 +956,7 @@ pub struct Blobs {
     /// and gc, which export none.
     metrics: std::sync::OnceLock<std::sync::Arc<crate::metrics::Metrics>>,
     /// Calls to [`Blobs::verify`] so far.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     verifies: std::sync::atomic::AtomicU64,
     /// The test hook that fails a file write of this backend with the
     /// disk's answer: `n` lets `n` writes through and fails the one
@@ -1107,7 +1107,7 @@ impl Blobs {
             write_locks: (0..WRITE_STRIPES).map(|_| Mutex::new(())).collect(),
             group_flush: GroupFlush::default(),
             metrics: std::sync::OnceLock::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             verifies: std::sync::atomic::AtomicU64::default(),
             fail_writes: std::sync::atomic::AtomicUsize::new(UNARMED),
             fail_writes_errno: std::sync::atomic::AtomicU8::new(28),
@@ -1381,7 +1381,7 @@ impl Blobs {
     ///
     /// [`Error::Io`] if the file exists but cannot be read.
     pub fn verify(&self, id: BlobId) -> Result<BlobStatus> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         self.verifies
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let file = match self.open_file(id) {
@@ -1698,14 +1698,22 @@ impl Blobs {
         (dir, path)
     }
 
+    /// Whether the blob's file is on disk. A cheap stat, no read: the
+    /// importer's skip checks it, so a blob whose row survives but whose
+    /// file was deleted under the server still refuses the import.
+    pub(crate) fn file_exists(&self, id: BlobId) -> bool {
+        self.location(id).1.exists()
+    }
+
     #[cfg(test)]
     pub(crate) fn full_flushes(&self) -> u64 {
         self.group_flush.lock().finished
     }
 
     /// Calls to [`Blobs::verify`] so far.
-    #[cfg(test)]
-    pub(crate) fn verifies(&self) -> u64 {
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn verifies(&self) -> u64 {
         self.verifies.load(std::sync::atomic::Ordering::Relaxed)
     }
 }

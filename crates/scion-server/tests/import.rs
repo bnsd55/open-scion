@@ -1478,3 +1478,71 @@ fn an_import_on_a_read_only_disk_fails_and_lands_after_the_remount() {
     // The remount is back: the same import, again from the top, works.
     try_import(&store, &git, &rev).unwrap();
 }
+
+#[test]
+fn a_reimport_of_blobs_with_no_rows_still_verifies_and_fsyncs_them() {
+    // The import's third file write is the one the disk refuses: two blob
+    // files are renamed into place, and the batch's rows never commit.
+    let git = Git::init();
+    git.write("g/a", "alpha\n");
+    git.write("g/b", "beta\n");
+    git.write("g/c", "gamma\n");
+    let rev = git.commit("three files");
+    let (_dir, store) = open_store();
+    store.blobs().fail_writes_after(2);
+    try_import(&store, &git, &rev).unwrap_err();
+    // The two files are on disk, but no row names them and the ref is not
+    // there: nothing was acknowledged.
+    assert!(store.read(|c| c.repo_id("r")).is_ok());
+    let repo_id = store.read(|c| c.repo_id("r")).unwrap();
+    assert!(
+        store
+            .read(|c| c.get_ref(repo_id, "main"))
+            .unwrap()
+            .is_none()
+    );
+    // The re-import must not trust the files: without rows they may be
+    // the leftovers of a write whose fsync never succeeded, so each goes
+    // through put's keep path, which verifies and fsyncs before it
+    // answers.
+    let verifies = store.blobs().verifies();
+    let fsyncs = store.blobs().fsync_count();
+    import(&store, &git, &rev);
+    // At least the two keeps read back: a wrong skip would leave the
+    // counter flat. The checker may read one more.
+    assert!(
+        store.blobs().verifies() - verifies >= 2,
+        "the two stored files went through keep's read-back"
+    );
+    assert!(
+        store.blobs().fsync_count() - fsyncs >= 4,
+        "the kept files were fsynced, file and directory both"
+    );
+}
+
+#[test]
+fn a_second_import_of_row_named_blobs_neither_verifies_nor_fsyncs() {
+    let git = Git::init();
+    git.write("g/a", "alpha\n");
+    git.write("g/b", "beta\n");
+    let rev = git.commit("first");
+    let (_dir, store) = open_store();
+    import(&store, &git, &rev);
+    // A later commit takes the file away, and the commit after that puts
+    // the same bytes back: the re-added blob is named by a committed row,
+    // so the import skips its put: no read-back, no fsync.
+    git.remove("g/b");
+    let _middle = git.commit("take beta away");
+    git.write("g/b", "beta\n");
+    let next = git.commit("put beta back");
+    let fsyncs = store.blobs().fsync_count();
+    import(&store, &git, &next);
+    // The skip's proof is the fsyncs: the put of the row-named blob never
+    // reaches the keep path, so no keep fsync fires. The checker's own
+    // read-backs of the tree are a separate mechanism and stay.
+    assert_eq!(
+        store.blobs().fsync_count(),
+        fsyncs,
+        "a row-named blob skips the keep fsyncs"
+    );
+}
