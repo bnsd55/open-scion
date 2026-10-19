@@ -569,7 +569,7 @@ pub fn metadata(store: &Backend, seen: &mut HashSet<Vec<u8>>) -> (BTreeSet<BlobI
                     continue;
                 }
                 let states: Vec<FileState> = if table == "changesets" {
-                    let changes = Changeset::decode(&body).unwrap().changes;
+                    let changes = Changeset::decode(&body).unwrap().changes().clone();
                     changes.into_values().flatten().collect()
                 } else {
                     let entries = Tree::decode(&body).unwrap().entries().into_values();
@@ -668,7 +668,7 @@ pub async fn walk_refs(
             };
             if checked.changesets.insert(at) {
                 let diff = diff(scion, parent, at).await;
-                assert_eq!(diff, changeset.changes(), "{target}: root tree of {at}");
+                assert_eq!(&diff, changeset.changes(), "{target}: root tree of {at}");
             }
             let previous = history.insert(at, (target, changeset));
             let twice = "is on two refs, or twice on one";
@@ -703,7 +703,7 @@ pub fn check_lands(ledger: &Ledger, history: &HashMap<ChangesetId, (&str, Change
                 assert_eq!(*target, sent.target, "{key}");
                 // The server may rebase, so only the parents may differ.
                 let mut want = sent.changeset.clone();
-                want.parents.clone_from(&landed.parents);
+                want = want.with_parents(landed.parents().to_vec()).unwrap();
                 assert_eq!(landed, &want, "{key}");
                 lands_on_refs += 1;
             }

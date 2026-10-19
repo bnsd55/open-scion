@@ -309,7 +309,10 @@ fn put_len(w: &mut Vec<u8>, len: usize) {
     // The types guarantee this: every value is built through a checked
     // constructor or by the decoder, whose lengths come from u32be fields.
     debug_assert!(len <= MAX_FIELD, "object field longer than u32::MAX");
-    let len = len as u32;
+    // A release build that somehow broke the invariant writes u32::MAX
+    // rather than a truncated neighbor: the object's ID then fails its
+    // check, and no stored byte is silently misread.
+    let len = u32::try_from(len).unwrap_or(u32::MAX);
     w.extend_from_slice(&len.to_be_bytes());
 }
 

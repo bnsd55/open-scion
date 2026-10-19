@@ -168,6 +168,21 @@ fn concurrent_creates_of_one_changeset_store_it_once() {
     assert_eq!(count_of(&f.store, f.dir.path()), before + 1);
 }
 
+/// Rebuilds `cs` with the given fields, through the checked constructor: the
+/// core enforces the format's bounds, and every edit in the table stays
+/// inside them; the server's own limits are what the rows test.
+fn rebuilt(
+    cs: &Changeset,
+    parents: Vec<ChangesetId>,
+    committer: Option<IdentityTime>,
+    message: Vec<u8>,
+    author: IdentityTime,
+    changes: std::collections::BTreeMap<RepoPath, Option<FileState>>,
+) -> Changeset {
+    Changeset::new(parents, author, committer, message, changes)
+        .expect("rebuilt changeset fits the format")
+}
+
 #[test]
 fn bad_requests_are_rejected_and_store_nothing() {
     // Asserts the rows of the data directory's database.
@@ -187,16 +202,6 @@ fn bad_requests_are_rejected_and_store_nothing() {
         let base = changeset(vec![f.root], &[("dir/new", Some(regular("new")))]);
         build(&base).encode()
     };
-    let rebuilt =
-        |cs: &Changeset,
-         parents: Vec<ChangesetId>,
-         committer: Option<IdentityTime>,
-         message: Vec<u8>,
-         author: IdentityTime,
-         changes: std::collections::BTreeMap<RepoPath, Option<FileState>>| {
-            Changeset::new(parents, author, committer, message, changes)
-                .expect("rebuilt changeset fits the format")
-        };
     let invalid = [
         ("undecodable", b"not a changeset".to_vec(), "bad changeset"),
         (
