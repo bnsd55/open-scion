@@ -1886,6 +1886,18 @@ mod tests {
     async fn a_planted_symlink_is_never_written_through() {
         let test = start(&[("README.md", b"hello\n", Some(false))]).await;
         let id = find(&test.vfs, "README.md").await.unwrap();
+        // The overlay file exists only once the VFS materializes it.
+        let _ = test
+            .vfs
+            .setattr(
+                id,
+                sattr3 {
+                    mode: set_mode3::mode(0o644),
+                    ..sattr3::default()
+                },
+            )
+            .await
+            .unwrap();
         let file = test
             .vfs
             .overlay_file(&test.vfs.nodes.read().await.by_id[&id].path.clone().unwrap());
