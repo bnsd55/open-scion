@@ -119,7 +119,7 @@ pub(crate) fn view_root(
     metrics: &crate::metrics::Metrics,
     deadline: &Deadline,
 ) -> Result<TreeId> {
-    let real = crate::tree::root_tree(store, repo, cs)?;
+    let real = crate::tree::root_tree(store, repo, cs, deadline)?;
     let context: Vec<Vec<u8>> = prefixes.iter().map(|p| p.as_bytes().to_vec()).collect();
     let ctx_digest = context_digest(&context);
     // The digest the caller derives under is live: every caller holds it
@@ -1266,7 +1266,7 @@ mod tests {
     /// [`crate::access::MAX_PREFIXES_PER_SET`] of them, as one read rule
     /// set.
     fn rs_prefixes(store: &Backend, repo: RepoId, cs: ChangesetId) -> Vec<RepoPath> {
-        let root = crate::tree::root_tree(store, repo, cs).unwrap();
+        let root = crate::tree::root_tree_unbounded(store, repo, cs).unwrap();
         let mut out = Vec::new();
         let mut stack = vec![(root, Vec::new())];
         while let Some((id, path)) = stack.pop() {

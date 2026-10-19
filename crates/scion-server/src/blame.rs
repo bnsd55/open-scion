@@ -203,7 +203,7 @@ pub fn blame(
     // first-parent history has a value.
     let derive_until = Deadline::new(until.unwrap_or_else(|| Instant::now() + CALL_LIMIT));
     crate::derived::get_by::<history::PathHistory>(store, repo, start, &derive_until)?;
-    let root = tree::root_tree(store, repo, start)?;
+    let root = tree::root_tree(store, repo, start, &derive_until)?;
     let mut blob = regular_blob(store, root, &start_path)?;
     // The text of the version the walk starts at. Its bytes stay taken for
     // the whole call: each step's older text replaces them when it becomes
@@ -227,8 +227,13 @@ pub fn blame(
         resume.counted
     };
     // The rows of the answer, and the state of one diff, stay taken for the
-    // whole call. Not a first take: it never waits.
-    let _state_hold = memory.try_take(counted * BYTES_PER_LINE)?;
+    // whole call. Not a first take: it never waits. The cursor's line
+    // count is the client's word, so its product with the per-line cost
+    // is checked: a count that overflows is a bad cursor, not a wrap that
+    // takes no bytes and reads an unbounded window.
+    let _state_hold = memory.try_take(counted.checked_mul(BYTES_PER_LINE).ok_or_else(|| {
+        Error::InvalidArgument(format!("bad blame cursor: {counted} lines is too many"))
+    })?)?;
     if resume.after_line > counted {
         return Err(Error::InvalidArgument(format!(
             "the cursor's line {} is past the {counted} lines of {path:?}",
@@ -334,7 +339,7 @@ pub fn blame(
         let mut cost = 0;
         let found = match next {
             Some(parent) => {
-                let root = tree::root_tree(store, repo, parent)?;
+                let root = tree::root_tree(store, repo, parent, &derive_until)?;
                 let budget = Budget {
                     cost: &mut cost,
                     cap: left,

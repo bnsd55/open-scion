@@ -165,6 +165,12 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Changed
 
+- A second Ctrl-C or SIGTERM while the server drains ends it at once
+  (`#294`): a drain waits for the calls in flight, and one held open by
+  a stuck client left the operator with a server that answered nothing
+  and ended only under `kill -9`. The first signal's graceful drain is
+  as it was; the second cuts the calls in flight, logs that it did,
+  and exits 1.
 - A git import no longer re-reads and re-fsyncs blobs that a committed
   row of the target repo already names (#238): one row probe per
   distinct blob proves the stored copy durable, so a branch import over
@@ -219,6 +225,16 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- A fill of a kind over every parent (the commit graph) no longer holds
+  a parent once per child that reached it in its walk: the seen set now
+  checks pushes, so the walk's queue is as wide as the graph's frontier
+  instead of as wide as its edges.
+
+- A silent TLS peer holds its connection's place for at most the
+  handshake timeout, not twice that: one deadline from the accept
+  bounds the TLS handshake and the HTTP/2 preface that follows it
+  together, so the preface timer gets what is left of the deadline
+  after the handshake ends.
 - A `Diff` call's rename search could index every large added file for
   one deleted file, far past the budget that bounds it: one file's work
   was its index of every added file it could be like, and the budget
@@ -325,11 +341,18 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Security
 
+- A blame cursor that claims an impossible line count is refused as a
+  bad cursor (`#288`): the count is the client's word, and its
+  per-line memory cost was multiplied without an overflow check, so a
+  count of 2^57 wrapped to zero and the walk went on to size its
+  window from the count - one request could stop the server.
+
 - The mount's overlay writes no longer follow a symlink planted in the
   overlay: a write, a truncate, a mode change, and the deletions note
   refuse one. A symlinked parent directory still redirects (a named
   limit: the upgrade is opening every parent through a handle chain,
   as `materialize.rs` does).
+
 - The server refuses a data directory that group or others can write, or
   that sits under a directory another user can change: the blobs and the
   metadata are only as private as their directory (`#197`).

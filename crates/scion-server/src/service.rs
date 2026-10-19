@@ -1284,7 +1284,7 @@ impl Scion for ScionService {
                         )?;
                         read::file_blob_at(&store, root, &path)?
                     }
-                    None => read::file_blob(&store, &req.repo, id, &path)?,
+                    None => read::file_blob(&store, &req.repo, id, &path, &deadline)?,
                 };
                 Ok((blob, store.blobs().size(blob)?))
             })
@@ -1354,7 +1354,7 @@ impl Scion for ScionService {
                         )?;
                         read::list_dir_at(&store, root, path.as_ref())?
                     }
-                    None => read::list_dir(&store, &req.repo, id, path.as_ref())?,
+                    None => read::list_dir(&store, &req.repo, id, path.as_ref(), &deadline)?,
                 };
                 Ok(tree.encode())
             })
@@ -1538,6 +1538,8 @@ impl Scion for ScionService {
     async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<DiffResponse>, Status> {
         let caller = caller(&request)?;
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
+        let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
+        let _deadline = deadline.guard();
         let req = request.into_inner();
         check_whole_reader(&self.access, &caller, &req.repo)?;
         let old = parse_id(&req.old_changeset_id, "old_changeset_id")?;
@@ -1553,7 +1555,15 @@ impl Scion for ScionService {
             .worker
             .run(move |store| {
                 let _slot = slot;
-                read::diff(&store, &req.repo, old, new, path.as_ref(), after.as_ref())
+                read::diff(
+                    &store,
+                    &req.repo,
+                    old,
+                    new,
+                    path.as_ref(),
+                    after.as_ref(),
+                    &deadline,
+                )
             })
             .await?;
         let entries = page

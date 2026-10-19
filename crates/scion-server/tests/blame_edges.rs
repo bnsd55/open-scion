@@ -503,3 +503,52 @@ async fn a_partial_reader_gets_one_answer_for_any_path() {
         );
     }
 }
+
+/// A hand-made cursor that claims an impossible line count is refused with
+/// `INVALID_ARGUMENT`, not answered: the count is the client's word, and a
+/// count whose per-line cost overflows usize must not reach the walk. The
+/// cursor is one any client can build - the digest is over the request's
+/// own repo, changeset and path - so the check cannot trust the count.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cursor_that_names_an_impossible_line_count_is_refused() {
+    let (dir, store, root) = store(b"a\n");
+    let (_stop, mut client) = serve(&store, dir.path(), whole_access(), TOKEN).await;
+
+    // The cursor: version 1, the digest of this repo, changeset and path,
+    // a walk that goes on at the root (so the count is the cursor's), a
+    // line count of 2^57, and a window of one open line at line 0.
+    let counted: u64 = 1 << 57;
+    let digest = blake3::Hasher::new()
+        .update(REPO.as_bytes())
+        .update(&[0])
+        .update(root.as_bytes())
+        .update(PATH.as_bytes())
+        .finalize();
+    let mut cursor = Vec::new();
+    cursor.push(1);
+    cursor.extend_from_slice(&digest.as_bytes()[..16]);
+    cursor.push(1);
+    cursor.extend_from_slice(root.as_bytes());
+    cursor.extend_from_slice(&u32::try_from(PATH.len()).unwrap().to_be_bytes());
+    cursor.extend_from_slice(PATH.as_bytes());
+    cursor.extend_from_slice(&0u64.to_be_bytes());
+    cursor.push(0);
+    cursor.extend_from_slice(&(counted - 1).to_be_bytes());
+    cursor.extend_from_slice(&counted.to_be_bytes());
+    cursor.extend_from_slice(&0u32.to_be_bytes());
+    cursor.extend_from_slice(&1u32.to_be_bytes());
+    cursor.push(1);
+    cursor.push(0);
+    cursor.push(0);
+
+    let err = client
+        .blame(BlameRequest {
+            repo: REPO.to_string(),
+            changeset_id: root.as_bytes().to_vec(),
+            path: PATH.as_bytes().to_vec(),
+            cursor,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
+}

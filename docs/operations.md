@@ -49,6 +49,12 @@ Choose the tokens with care: `--token T` makes one principal, `default`, with
 every right on every repo. For several people or services, use an access
 file instead (see "Tokens: one, or an access file", below).
 
+Stopping the server: Ctrl-C or SIGTERM starts a graceful drain — the
+listeners close, in-flight calls finish, and the process exits 0. A second
+signal while the drain runs ends it at once: the in-flight calls are cut,
+the log says so, and the process exits 1. Wait out the drain; send the
+second signal only when a cut is cheaper than the wait.
+
 ### Server and a regional cache
 
 A cache serves object reads to a region and refuses every other call
