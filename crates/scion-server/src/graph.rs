@@ -549,6 +549,13 @@ impl At {
         let node = derived::get_by::<CommitGraph>(store, repo, id, deadline)?;
         Ok(Self { id, node })
     }
+
+    /// [`At::get`] for tests: no request to serve, nothing bounds the fill.
+    #[cfg(test)]
+    fn get_unbounded(store: &Backend, repo: RepoId, id: ChangesetId) -> Result<Self> {
+        let node = derived::get_unbounded::<CommitGraph>(store, repo, id)?;
+        Ok(Self { id, node })
+    }
 }
 
 /// Reads nodes and parents for one step of a query, until its deadline.
@@ -956,16 +963,19 @@ mod tests {
         // Each query counts its reads of nodes and parents.
         let ancestry = |ancestor: ChangesetId, descendant: ChangesetId| {
             let floor = store.read(|c| c.generation(repo, ancestor)).unwrap();
-            let mut search =
-                Search::new(At::get(&store, repo, descendant).unwrap(), ancestor, floor);
+            let mut search = Search::new(
+                At::get_unbounded(&store, repo, descendant).unwrap(),
+                ancestor,
+                floor,
+            );
             let (found, cost) =
                 in_steps(&store, &later(), STEPS, |index| search.next(index)).unwrap();
             (found, cost.reads)
         };
         let bases = |a: ChangesetId, b: ChangesetId| {
             let (a, b) = (
-                At::get(&store, repo, a).unwrap(),
-                At::get(&store, repo, b).unwrap(),
+                At::get_unbounded(&store, repo, a).unwrap(),
+                At::get_unbounded(&store, repo, b).unwrap(),
             );
             store
                 .read(|c| {
@@ -1055,8 +1065,8 @@ mod tests {
         let (_dir, store, repo, ids) = store_graph_with_nodes(&parents);
         let (side, tip) = (*ids.last().unwrap(), ids[history[N - 1]]);
         let (a, b) = (
-            At::get(&store, repo, side).unwrap(),
-            At::get(&store, repo, tip).unwrap(),
+            At::get_unbounded(&store, repo, side).unwrap(),
+            At::get_unbounded(&store, repo, tip).unwrap(),
         );
         let deadline = later();
         let met = store.read(|c| meeting(&mut Index::new(c, &deadline), a, b));
@@ -1122,7 +1132,7 @@ mod tests {
 
         // A call that goes in the middle of a walk stops it at its next read.
         let floor = store.read(|c| c.generation(repo, side)).unwrap();
-        let search = || Search::new(At::get(&store, repo, tip).unwrap(), side, floor);
+        let search = || Search::new(At::get_unbounded(&store, repo, tip).unwrap(), side, floor);
         let mut whole = search();
         let (found, all) = walk_until(&store, usize::MAX, |index| whole.next(index));
         assert!(found.unwrap());
@@ -1133,8 +1143,8 @@ mod tests {
 
         let paint = || {
             Paint::new(
-                At::get(&store, repo, side).unwrap(),
-                At::get(&store, repo, tip).unwrap(),
+                At::get_unbounded(&store, repo, side).unwrap(),
+                At::get_unbounded(&store, repo, tip).unwrap(),
             )
         };
         let mut whole = paint();
@@ -1151,8 +1161,8 @@ mod tests {
         let (_dir, store, repo, ids) = store_graph_with_nodes(&ladder(20));
         let (side, tip) = (ids[1], *ids.last().unwrap());
         let mut paint = Paint::new(
-            At::get(&store, repo, side).unwrap(),
-            At::get(&store, repo, tip).unwrap(),
+            At::get_unbounded(&store, repo, side).unwrap(),
+            At::get_unbounded(&store, repo, tip).unwrap(),
         );
         let mut other = None;
         let (bases, _) = in_steps(&store, &later(), STEPS, |index| {
@@ -1182,8 +1192,8 @@ mod tests {
         let (_dir, store, repo, ids) = store_graph_with_nodes(&ladder(20));
         let (side, tip) = (ids[1], *ids.last().unwrap());
         let mut paint = Paint::new(
-            At::get(&store, repo, side).unwrap(),
-            At::get(&store, repo, tip).unwrap(),
+            At::get_unbounded(&store, repo, side).unwrap(),
+            At::get_unbounded(&store, repo, tip).unwrap(),
         );
         let before = store.blobs().full_flushes();
         let mut commits = 0;

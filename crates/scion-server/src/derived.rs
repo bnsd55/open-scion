@@ -1250,7 +1250,7 @@ mod tests {
         }
         let mut after = Vec::new();
         for &cs in &ids {
-            let tree = tree::root_tree(&store, repo, cs).unwrap();
+            let tree = tree::root_tree_unbounded(&store, repo, cs).unwrap();
             after.push((
                 RootTree::NAME.to_owned(),
                 RootTree::VERSION,

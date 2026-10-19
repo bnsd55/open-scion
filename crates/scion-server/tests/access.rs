@@ -617,7 +617,15 @@ fn repo_with_docs_and_secret() -> (tempfile::TempDir, Backend, ChangesetId, Blob
 /// The tree ID of `secret` under the real root of `tip`.
 fn root_tree_id(store: &Backend, tip: ChangesetId) -> TreeId {
     let repo_id = store.read(|c| c.repo_id(REPO)).unwrap();
-    let root = scion_server::tree::root_tree(store, repo_id, tip).unwrap();
+    let root = scion_server::tree::root_tree(
+        store,
+        repo_id,
+        tip,
+        &scion_server::deadline::Deadline::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(300),
+        ),
+    )
+    .unwrap();
     let tree = store.read(|c| c.get_tree(root)).unwrap();
     match tree
         .entries
