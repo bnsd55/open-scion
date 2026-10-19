@@ -165,6 +165,12 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Changed
 
+- A second Ctrl-C or SIGTERM while the server drains ends it at once
+  (`#294`): a drain waits for the calls in flight, and one held open by
+  a stuck client left the operator with a server that answered nothing
+  and ended only under `kill -9`. The first signal's graceful drain is
+  as it was; the second cuts the calls in flight, logs that it did,
+  and exits 1.
 - A git import no longer re-reads and re-fsyncs blobs that a committed
   row of the target repo already names (#238): one row probe per
   distinct blob proves the stored copy durable, so a branch import over
@@ -219,6 +225,10 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- A fill of a kind over every parent (the commit graph) no longer holds
+  a parent once per child that reached it in its walk: the seen set now
+  checks pushes, so the walk's queue is as wide as the graph's frontier
+  instead of as wide as its edges.
 - A land's check of a base that the path index does not reach kept
   every history node row it read, with no cap on their bytes: a row is
   up to 64 KiB, and one check reads one or more per part of each of the
