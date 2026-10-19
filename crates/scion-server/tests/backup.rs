@@ -5,6 +5,7 @@
 //! `pg_dump`, which the runbook documents.
 
 use scion_core::{BlobId, Changeset, FileState, IdentityTime, RepoPath};
+use scion_server::meta::{Meta as _, MetaTx as _};
 use scion_server::{Backend, Store, fsck};
 
 /// A backup taken while the store serves: the metadata snapshot names
@@ -72,18 +73,14 @@ fn a_backup_taken_while_serving_restores_whole() {
     let backup_db = tempfile::tempdir().unwrap();
     let snapshot = backup_db.path().join("scion.db");
     let live = rusqlite::Connection::open(dir.path().join("scion.db")).unwrap();
-    live.execute(
-        &format!("VACUUM INTO '{}'", snapshot.display()),
-        [],
-    )
-    .expect("the metadata snapshot is taken");
+    live.execute(&format!("VACUUM INTO '{}'", snapshot.display()), [])
+        .expect("the metadata snapshot is taken");
 
     // The copy of the blob files runs while more writes land: a blob the
     // snapshot names stays reachable, whatever gc does not do here, and
     // the copy may or may not hold the newer ones.
     let writer = {
         let store = store.clone();
-        let repo = repo;
         let mut parent = Some(*ids.last().unwrap());
         std::thread::spawn(move || {
             for i in 20..30u8 {
@@ -131,7 +128,10 @@ fn a_backup_taken_while_serving_restores_whole() {
     // metadata).
     let restored_dir = tempfile::tempdir().unwrap();
     std::fs::copy(&snapshot, restored_dir.path().join("scion.db")).unwrap();
-    copy_tree(&backup.path().join("objects"), &restored_dir.path().join("objects"));
+    copy_tree(
+        &backup.path().join("objects"),
+        &restored_dir.path().join("objects"),
+    );
 
     // The store opens: the restore is accepted, and fsck sees no damage.
     let restored = Backend::Sqlite(Store::open(restored_dir.path()).unwrap());
