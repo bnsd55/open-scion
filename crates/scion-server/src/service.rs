@@ -2204,8 +2204,11 @@ mod tests {
             target_ref: "main".into(),
             request_key: "k".into(),
         });
-        // A timeout the call has already spent.
-        request.set_timeout(Duration::from_nanos(1));
+        // A timeout the call has already spent: the request's
+        // grpc-timeout header, one nanosecond.
+        request
+            .metadata_mut()
+            .insert("grpc-timeout", "1n".parse().unwrap());
         let status = service.land(request).await.expect_err("past deadline");
         assert_eq!(status.code(), Code::DeadlineExceeded);
         let text = metrics.render();
