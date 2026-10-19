@@ -7,13 +7,13 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use scion_server::write;
+use scion_server::test_support::write;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok((cs, id)) = write::decode(data) {
         let (bytes, again) = cs.encode_with_id();
         assert_eq!(bytes, data);
         assert_eq!(again, id);
-        assert!(cs.changes.len() <= write::MAX_CHANGES);
+        assert!(cs.changes().len() <= write::MAX_CHANGES);
     }
 });

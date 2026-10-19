@@ -27,10 +27,13 @@ use scion_proto::v1::{
     Encoding, GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, ObjectKind, ObjectPart,
     ResolveRefRequest, ResolveRefResponse,
 };
-use scion_server::import::{ImportOptions, import_git};
-use scion_server::meta::Meta as _;
-use scion_server::meta::MetaTx as _;
-use scion_server::{Backend, Store, service, tree};
+use scion_server::test_support::meta::Meta as _;
+use scion_server::test_support::meta::MetaTx as _;
+use scion_server::{
+    Backend, Store,
+    test_support::{service, tree},
+};
+use scion_server::{ImportOptions, import_git};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -121,7 +124,7 @@ impl Server {
         let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         // The server mints the checkout's ticket, which scn then spends.
-        let tickets = Some(std::sync::Arc::new(scion_server::tickets::Keys::generate()));
+        let tickets = Some(std::sync::Arc::new(scion_server::Keys::generate()));
         runtime.spawn(service::serve(
             store,
             listener,
@@ -129,7 +132,7 @@ impl Server {
             service::ServeOptions {
                 data: data.path().to_path_buf(),
                 limits: Limits::default(),
-                quotas: scion_server::quotas::Quotas::off(),
+                quotas: scion_server::Quotas::off(),
                 pending_lands: None,
                 land_stale_secs: 1 << 40,
                 tls: None,
@@ -393,21 +396,23 @@ type Files<'a> = &'a [(&'a [u8], FileState)];
 
 /// A root changeset with `files`.
 fn root_changeset(files: Files) -> Changeset {
-    Changeset {
-        parents: vec![],
-        author: IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"hostile\n".to_vec(),
-        changes: files
+    Changeset::new(
+        vec![],
+        IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"hostile\n".to_vec(),
+        files
             .iter()
             .map(|(path, state)| (RepoPath::new(*path).unwrap(), Some(*state)))
             .collect(),
-    }
+    )
+    .expect("changeset fits the format")
 }
 
 /// Stores each file list as a root changeset in a new repo.
@@ -616,13 +621,14 @@ impl Liar {
                 object.data.len() as u64,
             ))
         };
-        let tree = Tree {
-            entries: [
+        let tree = Tree::new(
+            [
                 (PathElem::new("a").unwrap(), file(&high)),
                 (PathElem::new("b").unwrap(), file(&low)),
             ]
             .into(),
-        };
+        )
+        .expect("tree fits the format");
         let in_path_order = vec![high.id.clone(), low.id.clone()];
         let mut objects = vec![high, low];
         let mut push = |tree: Tree| {
@@ -636,9 +642,10 @@ impl Liar {
         };
         let mut root = push(tree);
         for _ in 0..depth {
-            root = push(Tree {
-                entries: [(PathElem::new("d").unwrap(), Entry::Dir(root))].into(),
-            });
+            root = push(
+                Tree::new([(PathElem::new("d").unwrap(), Entry::Dir(root))].into())
+                    .expect("tree fits the format"),
+            );
         }
         let objects = objects
             .into_iter()
@@ -966,8 +973,8 @@ impl Expiring {
             id: BlobId::of(b"x\n").as_bytes().to_vec(),
             data: b"x\n".to_vec(),
         };
-        let tree = Tree {
-            entries: [(
+        let tree = Tree::new(
+            [(
                 PathElem::new("a").unwrap(),
                 Entry::File(FileEntry::new(
                     FileState::Regular {
@@ -978,7 +985,8 @@ impl Expiring {
                 )),
             )]
             .into(),
-        };
+        )
+        .expect("tree fits the format");
         let (data, root) = tree.encode_with_id();
         let tree = Object {
             kind: ObjectKind::Tree.into(),
@@ -1096,26 +1104,30 @@ fn a_schema_6_data_dir_upgrades_and_checks_out() {
     let store = Store::open(data.path()).unwrap();
     let hello = store.blobs().put(b"hello").unwrap();
     let world = store.blobs().put(b"hello world").unwrap();
-    let author = IdentityTime {
-        name: b"Ada".to_vec(),
-        email: b"ada@example.com".to_vec(),
-        unix_secs: 1_700_000_000,
-        tz_offset_minutes: 0,
-    };
-    let changeset = |parent: Option<ChangesetId>, content: BlobId| Changeset {
-        parents: parent.into_iter().collect(),
-        author: author.clone(),
-        committer: None,
-        message: b"upgrade\n".to_vec(),
-        changes: [(
-            RepoPath::new("a").unwrap(),
-            Some(FileState::Regular {
-                content,
-                executable: false,
-            }),
-        )]
-        .into_iter()
-        .collect(),
+    let author = IdentityTime::new(
+        b"Ada".to_vec(),
+        b"ada@example.com".to_vec(),
+        1_700_000_000,
+        0,
+    )
+    .expect("identity fits the format");
+    let changeset = |parent: Option<ChangesetId>, content: BlobId| {
+        Changeset::new(
+            parent.into_iter().collect(),
+            author.clone(),
+            None,
+            b"upgrade\n".to_vec(),
+            [(
+                RepoPath::new("a").unwrap(),
+                Some(FileState::Regular {
+                    content,
+                    executable: false,
+                }),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .expect("changeset fits the format")
     };
     let mut lens: std::collections::HashMap<BlobId, u64> =
         [(hello, 5u64), (world, 11)].into_iter().collect();
@@ -1124,7 +1136,7 @@ fn a_schema_6_data_dir_upgrades_and_checks_out() {
             let repo = c.create_repo(REPO)?;
             let mut missing = |b| {
                 lens.remove(&b)
-                    .ok_or_else(|| scion_server::error::Error::NotFound(format!("blob {b}")))
+                    .ok_or_else(|| scion_server::Error::NotFound(format!("blob {b}")))
             };
             let root = tree::store_changeset(c, repo, &changeset(None, hello), &mut missing)?.0;
             let child =

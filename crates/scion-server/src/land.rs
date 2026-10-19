@@ -580,7 +580,7 @@ fn plan(
 ) -> Result<Plan> {
     let target = &req.target_ref;
     let cs = c.get_changeset(repo, req.changeset)?;
-    let [base] = cs.parents[..] else {
+    let [base] = cs.parents()[..] else {
         return Ok(Plan::Reject(
             "a land needs a changeset with exactly one parent".into(),
         ));
@@ -593,7 +593,7 @@ fn plan(
         None => index.insert(PathIndex::new(c, repo, head.target, &lands.used)?),
     };
     index.advance_to(lands, c, repo, head.target, &req.deadline)?;
-    let conflicts = match index.check(lands, c, repo, base, &cs.changes, &req.deadline)? {
+    let conflicts = match index.check(lands, c, repo, base, cs.changes(), &req.deadline)? {
         Checked::Paths(conflicts) => conflicts,
         Checked::NotOnHistory => {
             return Ok(Plan::Reject(format!(
@@ -609,10 +609,9 @@ fn plan(
         );
         return Ok(Plan::Conflict(detail, conflicts));
     }
-    let rebased = Changeset {
-        parents: vec![head.target],
-        ..cs
-    };
+    let rebased = cs
+        .with_parents(vec![head.target])
+        .expect("one parent fits the format");
     Ok(Plan::Land { rebased, head })
 }
 
@@ -673,7 +672,7 @@ fn settle(
     match landed {
         Ok((outcome, generation)) => {
             if let (Some(index), Some(id)) = (index.as_mut(), outcome.result) {
-                index.record(lands, id, generation, &rebased.changes);
+                index.record(lands, id, generation, rebased.changes());
             }
             tracing::info!(land_id, id = ?outcome.result, target = %target, "landed");
             Ok(Finished::Outcome(outcome))
@@ -811,7 +810,7 @@ impl PathIndex {
                 break;
             }
             let cs = c.get_changeset(repo, id)?;
-            most += added_bytes(&cs.changes);
+            most += added_bytes(cs.changes());
             if self.bytes + most > MAX_INDEX_BYTES {
                 tracing::info!(
                     generation,
@@ -819,8 +818,8 @@ impl PathIndex {
                 );
                 break;
             }
-            cur = cs.parents.first().copied();
-            walked.push((id, generation, cs.changes));
+            cur = cs.parents().first().copied();
+            walked.push((id, generation, cs.changes().clone()));
         }
         *self = Self::new(c, repo, head, &self.used)?;
         Ok(())
@@ -901,11 +900,11 @@ impl PathIndex {
                 return Ok(Walk::Missed);
             }
             let cs = c.get_changeset(repo, id)?;
-            let cost = self.cost([(generation, &cs.changes)]);
-            if !self.grow(lands, cost, |index| index.add(id, generation, &cs.changes)) {
+            let cost = self.cost([(generation, cs.changes())]);
+            if !self.grow(lands, cost, |index| index.add(id, generation, cs.changes())) {
                 return Ok(Walk::Stopped);
             }
-            let Some(&parent) = cs.parents.first() else {
+            let Some(&parent) = cs.parents().first() else {
                 return Ok(Walk::Missed);
             };
             self.floor = parent;
@@ -1192,12 +1191,7 @@ mod tests {
     }
 
     fn author() -> IdentityTime {
-        IdentityTime {
-            name: b"t".to_vec(),
-            email: b"t@x".to_vec(),
-            unix_secs: 0,
-            tz_offset_minutes: 0,
-        }
+        IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0).expect("identity fits the format")
     }
 
     thread_local! {
@@ -1229,13 +1223,14 @@ mod tests {
         let (repo, root) = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
-                let root = Changeset {
-                    parents: vec![],
-                    author: author(),
-                    committer: None,
-                    message: b"root".to_vec(),
-                    changes: BTreeMap::from([put("a/x", "1"), put("b/y", "2"), put("c", "3")]),
-                };
+                let root = Changeset::new(
+                    vec![],
+                    author(),
+                    None,
+                    b"root".to_vec(),
+                    BTreeMap::from([put("a/x", "1"), put("b/y", "2"), put("c", "3")]),
+                )
+                .expect("changeset fits the format");
                 let id = c.insert_changeset(repo, &root)?;
                 assert!(c.cas_ref(repo, "main", None, id)?);
                 Ok((repo, id))
@@ -1266,13 +1261,14 @@ mod tests {
     }
 
     fn changeset(parents: Vec<ChangesetId>, changes: Edits<'_>) -> Changeset {
-        Changeset {
+        Changeset::new(
             parents,
-            author: author(),
-            committer: None,
-            message: format!("{changes:?}").into_bytes(),
-            changes: changes.iter().cloned().collect(),
-        }
+            author(),
+            None,
+            format!("{changes:?}").into_bytes(),
+            changes.iter().cloned().collect(),
+        )
+        .expect("changeset fits the format")
     }
 
     impl Fixture {
@@ -1466,7 +1462,7 @@ mod tests {
         assert!(f.file(tip, "a/x").is_some() && f.file(tip, "b/new").is_some());
         assert!(f.file(tip, "c").is_none());
         let rebased = f.store.read(|c| c.get_changeset(f.repo, tip)).unwrap();
-        assert_eq!(rebased.parents, vec![one]);
+        assert_eq!(rebased.parents(), vec![one]);
     }
 
     #[test]
@@ -1553,7 +1549,7 @@ mod tests {
         // replanned onto the head the import made.
         let parents = f
             .store
-            .read(|c| Ok(c.get_changeset(f.repo, landed)?.parents))
+            .read(|c| Ok(c.get_changeset(f.repo, landed)?.parents().to_vec()))
             .unwrap();
         assert_eq!(parents, vec![import], "the land rebased onto the import");
         assert_eq!(metrics.land_replans(), 1, "the replan counted once");
@@ -1608,7 +1604,7 @@ mod tests {
             assert_eq!(after.version, before.version + 1, "{crash:?}: moved once");
             assert_eq!(Some(after.target), out.result);
             let landed = f.store.read(|c| c.get_changeset(repo, after.target));
-            assert_eq!(landed.unwrap().parents, vec![before.target], "{crash:?}");
+            assert_eq!(landed.unwrap().parents(), [before.target], "{crash:?}");
             assert_eq!(fresh.land(&f.store, &caller(), &req).unwrap(), out);
             assert_eq!(f.landed_count(), 1, "{crash:?}");
         }
@@ -1987,7 +1983,7 @@ mod tests {
         let mut files: HashSet<&[u8]> = HashSet::new();
         let mut dirs: HashSet<&[u8]> = HashSet::new();
         for cs in changesets {
-            for path in cs.changes.keys() {
+            for path in cs.changes().keys() {
                 let path = path.as_bytes();
                 if let Some(&key) = paths.get(path).or_else(|| parents.get(path)) {
                     files.insert(key);
@@ -2058,7 +2054,7 @@ mod tests {
                     let mut next = Some(tip);
                     while let Some(id) = next {
                         let cs = c.get_changeset(repo, id)?;
-                        next = cs.parents.first().copied();
+                        next = cs.parents().first().copied();
                         chain.push((id, c.generation(repo, id)?, cs));
                     }
                     // One index for all bases, as a ref's index serves its lands.
@@ -2068,8 +2064,8 @@ mod tests {
                     let mut model = PathIndex::at(tip, tip_gen, &lands.used);
                     for (n, &(base, base_gen, _)) in chain.iter().enumerate() {
                         if let Some((id, generation, cs)) = n.checked_sub(1).map(|m| &chain[m]) {
-                            let cost = model.cost([(*generation, &cs.changes)]);
-                            let add = |m: &mut PathIndex| m.add(*id, *generation, &cs.changes);
+                            let cost = model.cost([(*generation, cs.changes())]);
+                            let add = |m: &mut PathIndex| m.add(*id, *generation, cs.changes());
                             assert!(model.grow(&lands, cost, add));
                         }
                         let walked = touched_by(chain[..n].iter().map(|(.., cs)| cs), &land);
@@ -2457,7 +2453,7 @@ mod tests {
                     let tip = out.result.unwrap();
                     assert_eq!(m.f.main().target, tip, "{case}");
                     let rebased = m.f.store.read(|c| c.get_changeset(m.f.repo, tip));
-                    assert_eq!(rebased.unwrap().parents, vec![m.head], "{case}");
+                    assert_eq!(rebased.unwrap().parents(), [m.head], "{case}");
                     assert_eq!(
                         m.f.file(tip, path),
                         change

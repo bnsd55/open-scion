@@ -549,7 +549,7 @@ impl Vfs {
                     warn("cannot read a tree of the mount", &e);
                     nfsstat3::NFS3ERR_IO
                 })?;
-            for (name, entry) in tree.entries {
+            for (name, entry) in tree.entries() {
                 let path = Self::child(dir_path.as_ref(), name.as_bytes())?;
                 if nodes.deleted.contains(&path) || nodes.by_path.contains_key(&Some(path.clone()))
                 {
@@ -557,7 +557,7 @@ impl Vfs {
                 }
                 let kind = match entry {
                     Entry::Dir(tree) => Kind::Dir {
-                        tree: Some(tree),
+                        tree: Some(*tree),
                         listed: None,
                     },
                     Entry::File(file) => match (file.state(), file.size()) {
@@ -1643,8 +1643,11 @@ mod tests {
         GetRootTreeRequest as Ask, GetRootTreeResponse, ObjectPart, ResolveRefRequest,
         ResolveRefResponse,
     };
-    use scion_server::meta::{Meta as _, MetaTx as _};
-    use scion_server::{Backend, service, tree};
+    use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+    use scion_server::{
+        Backend,
+        test_support::{service, tree},
+    };
     use std::collections::HashMap as StdHashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -1691,18 +1694,20 @@ mod tests {
                     .zip(&contents)
                     .map(|((path, _, _), state)| (RepoPath::new(*path).unwrap(), Some(*state)))
                     .collect();
-                let cs = Changeset {
-                    parents: vec![],
-                    author: IdentityTime {
-                        name: b"Ada".to_vec(),
-                        email: b"ada@example.com".to_vec(),
-                        unix_secs: 1_700_000_000,
-                        tz_offset_minutes: 0,
-                    },
-                    committer: None,
-                    message: b"test\n".to_vec(),
-                    changes: changes.into_iter().collect(),
-                };
+                let cs = Changeset::new(
+                    vec![],
+                    IdentityTime::new(
+                        b"Ada".to_vec(),
+                        b"ada@example.com".to_vec(),
+                        1_700_000_000,
+                        0,
+                    )
+                    .expect("identity fits the format"),
+                    None,
+                    b"test\n".to_vec(),
+                    changes.into_iter().collect(),
+                )
+                .expect("changeset fits the format");
                 let (id, _) = tree::store_changeset(c, repo, &cs, &mut lens)?;
                 let version = c.get_ref(repo, "main")?.map(|r| r.version);
                 c.cas_ref(repo, "main", version, id)?;
@@ -1719,13 +1724,13 @@ mod tests {
             service::ServeOptions {
                 data: data.path().to_path_buf(),
                 limits: Limits::default(),
-                quotas: scion_server::quotas::Quotas::off(),
+                quotas: scion_server::Quotas::off(),
                 pending_lands: None,
                 land_stale_secs: 1 << 40,
                 tls: None,
-                metrics: std::sync::Arc::new(scion_server::metrics::Metrics::default()),
+                metrics: std::sync::Arc::new(scion_server::Metrics::default()),
             },
-            Some(std::sync::Arc::new(scion_server::tickets::Keys::generate())),
+            Some(std::sync::Arc::new(scion_server::Keys::generate())),
             std::future::pending(),
         ));
         let client = crate::client::test_objects(&url, TOKEN).await;
@@ -2237,7 +2242,7 @@ mod tests {
     struct Expiring {
         root: TreeId,
         objects: StdHashMap<Vec<u8>, Sent>,
-        key: std::sync::Arc<scion_server::tickets::Keys>,
+        key: std::sync::Arc<scion_server::Keys>,
         /// The ticket of the first mint, which `get_objects` refuses.
         first: std::sync::Mutex<Vec<u8>>,
         /// Shared with the test, which reads it while the server runs.
@@ -2252,8 +2257,8 @@ mod tests {
                 id: BlobId::of(b"x\n").as_bytes().to_vec(),
                 data: b"x\n".to_vec(),
             };
-            let tree = Tree {
-                entries: [(
+            let tree = Tree::new(
+                [(
                     PathElem::new("a").unwrap(),
                     Entry::File(FileEntry::new(
                         FileState::Regular {
@@ -2264,7 +2269,8 @@ mod tests {
                     )),
                 )]
                 .into(),
-            };
+            )
+            .expect("tree fits the format");
             let (data, root) = tree.encode_with_id();
             let tree = Sent {
                 kind: ObjectKind::Tree.into(),
@@ -2276,7 +2282,7 @@ mod tests {
                 objects: [(blob.id.clone(), blob), (tree.id.clone(), tree)]
                     .into_iter()
                     .collect(),
-                key: std::sync::Arc::new(scion_server::tickets::Keys::generate()),
+                key: std::sync::Arc::new(scion_server::Keys::generate()),
                 first: std::sync::Mutex::new(Vec::new()),
                 mints: std::sync::Arc::new(AtomicUsize::new(0)),
             }

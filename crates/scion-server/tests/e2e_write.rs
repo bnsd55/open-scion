@@ -7,12 +7,12 @@ use scion_proto::runtime::auth::Bearer;
 use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ReadFileRequest};
-use scion_server::meta::MetaTx as _;
-use scion_server::metrics::Metrics;
+use scion_server::Metrics;
+use scion_server::test_support::meta::MetaTx as _;
 use std::sync::Arc;
 
-use scion_server::meta::Meta as _;
-use scion_server::{Backend, service};
+use scion_server::test_support::meta::Meta as _;
+use scion_server::{Backend, test_support::service};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 use tonic::Code;
@@ -51,18 +51,20 @@ async fn blobs_are_per_repo(mut client: Client, root: ChangesetId) {
 }
 
 fn changeset(parents: Vec<ChangesetId>, path: &str, state: Option<FileState>) -> Changeset {
-    Changeset {
+    Changeset::new(
         parents,
-        author: IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"change\n".to_vec(),
-        changes: [(RepoPath::new(path).unwrap(), state)].into(),
-    }
+        IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"change\n".to_vec(),
+        [(RepoPath::new(path).unwrap(), state)].into(),
+    )
+    .expect("changeset fits the format")
 }
 
 fn regular(content: BlobId) -> FileState {
@@ -96,7 +98,7 @@ async fn uploaded_file_reads_back_through_a_created_changeset() {
         service::ServeOptions {
             data: dir.path().to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,

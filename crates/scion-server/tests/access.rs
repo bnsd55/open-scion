@@ -16,16 +16,16 @@ use scion_proto::v1::{
 };
 use std::sync::Arc;
 
+use scion_server::Access;
 use scion_server::Store;
-use scion_server::access::Access;
-use scion_server::meta::Meta as _;
+use scion_server::test_support::meta::Meta as _;
 
 /// The second repo of the two-world comparisons: its tree holds `docs`
 /// only, so the same path is genuinely missing there.
 const OTHER: &str = "other";
-use scion_server::meta::MetaTx as _;
-use scion_server::metrics::Metrics;
-use scion_server::{Backend, service};
+use scion_server::Metrics;
+use scion_server::test_support::meta::MetaTx as _;
+use scion_server::{Backend, test_support::service};
 use std::future::Future;
 use std::pin::Pin;
 use tokio::net::TcpListener;
@@ -93,18 +93,20 @@ fn hex(token: &str) -> String {
 }
 
 fn changeset(parents: Vec<ChangesetId>, path: &str, state: Option<FileState>) -> Changeset {
-    Changeset {
+    Changeset::new(
         parents,
-        author: IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"change\n".to_vec(),
-        changes: [(RepoPath::new(path).unwrap(), state)].into(),
-    }
+        IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"change\n".to_vec(),
+        [(RepoPath::new(path).unwrap(), state)].into(),
+    )
+    .expect("changeset fits the format")
 }
 
 fn regular(content: BlobId) -> FileState {
@@ -163,13 +165,13 @@ async fn serve(store: &Backend, dir: &std::path::Path, access: Access) -> (Stop,
         service::ServeOptions {
             data: dir.to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::new(Metrics::default()),
         },
-        Some(Arc::new(scion_server::tickets::Keys::generate())),
+        Some(Arc::new(scion_server::Keys::generate())),
         async {
             stopped.await.ok();
         },
@@ -603,11 +605,20 @@ fn repo_with_docs_and_secret() -> (tempfile::TempDir, Backend, ChangesetId, Blob
     let tip = store
         .write(|c| {
             let repo = c.repo_id(REPO)?;
-            let mut cs = changeset(vec![root], "docs/a", Some(regular(docs_blob)));
-            cs.changes.insert(
+            let cs = changeset(vec![root], "docs/a", Some(regular(docs_blob)));
+            let mut changes = cs.changes().clone();
+            changes.insert(
                 RepoPath::new("secret/b").unwrap(),
                 Some(regular(secret_blob)),
             );
+            let cs = Changeset::new(
+                cs.parents().to_vec(),
+                cs.author().clone(),
+                cs.committer().cloned(),
+                cs.message().to_vec(),
+                changes,
+            )
+            .expect("changeset fits the format");
             c.insert_changeset(repo, &cs)
         })
         .unwrap();
@@ -617,18 +628,18 @@ fn repo_with_docs_and_secret() -> (tempfile::TempDir, Backend, ChangesetId, Blob
 /// The tree ID of `secret` under the real root of `tip`.
 fn root_tree_id(store: &Backend, tip: ChangesetId) -> TreeId {
     let repo_id = store.read(|c| c.repo_id(REPO)).unwrap();
-    let root = scion_server::tree::root_tree(
+    let root = scion_server::test_support::tree::root_tree(
         store,
         repo_id,
         tip,
-        &scion_server::deadline::Deadline::new(
+        &scion_server::test_support::deadline::Deadline::new(
             std::time::Instant::now() + std::time::Duration::from_secs(300),
         ),
     )
     .unwrap();
     let tree = store.read(|c| c.get_tree(root)).unwrap();
     match tree
-        .entries
+        .entries()
         .get(&scion_core::PathElem::new(b"secret".to_vec()).unwrap())
     {
         Some(Entry::Dir(id)) => *id,
@@ -690,8 +701,11 @@ async fn a_partial_reader_reads_only_its_view() {
     }
     let (listed, listed_id) = Tree::decode_with_id(&tree_bytes).unwrap();
     assert_eq!(listed_id, view_root, "the list is of the view root");
-    assert!(listed.entries.contains_key(&elem(b"docs")), "{listed:?}");
-    assert!(!listed.entries.contains_key(&elem(b"secret")), "{listed:?}");
+    assert!(listed.entries().contains_key(&elem(b"docs")), "{listed:?}");
+    assert!(
+        !listed.entries().contains_key(&elem(b"secret")),
+        "{listed:?}"
+    );
 
     // ReadFile serves a visible path and hides a hidden one, the same as a
     // missing one.
@@ -1675,7 +1689,7 @@ fn a_partial_reader_case(paths: &[String], rule_seeds: &[u16]) -> Result<(), Tes
                         }
                         let (listed, _id) = Tree::decode_with_id(&bytes).unwrap();
                         listed
-                            .entries
+                            .entries()
                             .keys()
                             .map(|k| k.as_bytes().to_vec())
                             .collect::<Vec<_>>()

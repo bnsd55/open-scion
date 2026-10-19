@@ -157,6 +157,11 @@ pub struct Metrics {
     pg_pool_wait: [AtomicU64; BUCKETS.len() + 2],
     pg_readers_busy: AtomicU64,
     pg_tx_age: AtomicU64,
+    /// Bytes that stalled replies of live connections hold, as one
+    /// [`crate::STALLED_REPLY_BYTES`]-sized estimate per stalled reply,
+    /// counted by [`crate::runtime::listen::Stalled`] and given back when
+    /// the stalled reply's stream ends.
+    stalled_reply_bytes: AtomicU64,
 }
 
 /// A metric name, as the index of its RPC.
@@ -333,6 +338,29 @@ impl Metrics {
         )
     }
 
+    /// Counts `bytes` more that stalled replies hold, in HTTP/2 on their
+    /// connections.
+    pub(crate) fn stalled_reply_held(&self, bytes: u64) {
+        self.stalled_reply_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Gives `bytes` of the stalled replies back: the stalled reply's
+    /// stream ended, so its parts went. One count is given back once, so a
+    /// give below zero means a count was given back twice.
+    pub(crate) fn stalled_reply_freed(&self, bytes: u64) {
+        let held = self.stalled_reply_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        assert!(
+            held >= bytes,
+            "the stalled-reply gauge fell under zero: {held} held, {bytes} given back"
+        );
+    }
+
+    /// What stalled replies hold now, for the tests that count them.
+    #[cfg(test)]
+    pub(crate) fn stalled_reply_bytes(&self) -> u64 {
+        self.stalled_reply_bytes.load(Ordering::Relaxed)
+    }
+
     /// Renders the registry as the Prometheus text format.
     #[must_use]
     pub fn render(&self) -> String {
@@ -357,6 +385,7 @@ impl Metrics {
         }
         self.render_derive_walks(&mut text);
         self.render_pg(&mut text);
+        self.render_stalled(&mut text);
         text
     }
 
@@ -580,6 +609,21 @@ impl Metrics {
             "scion_pg_tx_age_seconds {}",
             seconds(self.pg_tx_age.load(Ordering::Relaxed))
         );
+    }
+
+    /// What the stalled replies of the process's connections hold. Nothing
+    /// renders while no reply is stalled.
+    fn render_stalled(&self, text: &mut String) {
+        use std::fmt::Write as _;
+        let value = self.stalled_reply_bytes.load(Ordering::Relaxed);
+        if value > 0 {
+            let _ = writeln!(
+                text,
+                "# HELP scion_stalled_reply_bytes Bytes that stalled replies hold in HTTP/2, as one estimate per stalled reply.\n\
+                 # TYPE scion_stalled_reply_bytes gauge\n\
+                 scion_stalled_reply_bytes {value}"
+            );
+        }
     }
 }
 

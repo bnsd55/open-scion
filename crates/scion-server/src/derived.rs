@@ -102,6 +102,7 @@ pub(crate) trait Kind {
 /// # Errors
 ///
 /// As [`get_by`], without [`Error::DeadlineExceeded`].
+#[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn get_unbounded<K: Kind>(
     store: &Backend,
     repo: RepoId,
@@ -822,7 +823,7 @@ fn parent_values<K: Kind>(
 ) -> Result<Option<Vec<K::Value>>> {
     let read = if K::ALL_PARENTS { usize::MAX } else { 1 };
     let mut values = Vec::new();
-    for &parent in changeset.parents.iter().take(read) {
+    for &parent in changeset.parents().iter().take(read) {
         match load::<K>(c, parent)? {
             Some(value) => values.push(value),
             None => return Ok(None),
@@ -926,7 +927,7 @@ mod tests {
             DERIVES.set(DERIVES.get() + 1);
             assert!(parents.len() <= 1, "a first-parent kind gets one value");
             let counted = cs
-                .changes
+                .changes()
                 .values()
                 .filter(|state| V == 1 || state.is_some());
             Ok(parents.first().copied().unwrap_or(0) + counted.count() as u64)
@@ -963,7 +964,7 @@ mod tests {
             _lens: crate::tree::BlobLens<'_>,
         ) -> Result<Vec<ChangesetId>> {
             DERIVES.set(DERIVES.get() + 1);
-            assert_eq!(parents.len(), cs.parents.len(), "a value for each parent");
+            assert_eq!(parents.len(), cs.parents().len(), "a value for each parent");
             Ok(ancestry(id, parents))
         }
 
@@ -1236,18 +1237,15 @@ mod tests {
                     (RepoPath::new(path).unwrap(), state)
                 })
                 .collect();
-            let cs = Changeset {
-                parents: ids.last().copied().into_iter().collect(),
-                author: IdentityTime {
-                    name: b"a".to_vec(),
-                    email: b"a@x".to_vec(),
-                    unix_secs: 0,
-                    tz_offset_minutes: 0,
-                },
-                committer: None,
-                message: vec![],
+            let cs = Changeset::new(
+                ids.last().copied().into_iter().collect(),
+                IdentityTime::new(b"a".to_vec(), b"a@x".to_vec(), 0, 0)
+                    .expect("identity fits the format"),
+                None,
+                vec![],
                 changes,
-            };
+            )
+            .expect("changeset fits the format");
             ids.push(store(c, repo, &cs)?);
         }
         Ok((repo, ids))
@@ -1692,10 +1690,15 @@ mod tests {
 
         // The chain puts "a"; its blob file makes the real lens work.
         store.blobs().put(b"a").unwrap();
-        let cs = Changeset {
-            parents: vec![ids[6]],
-            ..store.read(|c| c.get_changeset(repo, ids[0])).unwrap()
-        };
+        let base = store.read(|c| c.get_changeset(repo, ids[0])).unwrap();
+        let cs = Changeset::new(
+            vec![ids[6]],
+            base.author().clone(),
+            base.committer().cloned(),
+            base.message().to_vec(),
+            base.changes().clone(),
+        )
+        .unwrap();
         store
             .write(|c| tree::store_changeset(c, repo, &cs, &mut tree::lens_of(&store)))
             .unwrap();
@@ -1899,18 +1902,20 @@ mod tests {
                             (RepoPath::new(path).unwrap(), state)
                         })
                         .collect();
-                    let cs = Changeset {
-                        parents: ids.last().copied().into_iter().collect(),
-                        author: IdentityTime {
-                            name: b"b".to_vec(),
-                            email: [b"b@", name.as_bytes(), b"@x"].concat(),
-                            unix_secs: 0,
-                            tz_offset_minutes: 0,
-                        },
-                        committer: None,
-                        message: vec![],
+                    let cs = Changeset::new(
+                        ids.last().copied().into_iter().collect(),
+                        IdentityTime::new(
+                            b"b".to_vec(),
+                            [b"b@", name.as_bytes(), b"@x"].concat(),
+                            0,
+                            0,
+                        )
+                        .expect("identity fits the format"),
+                        None,
+                        vec![],
                         changes,
-                    };
+                    )
+                    .expect("changeset fits the format");
                     ids.push(tree::store_changeset(c, repo, &cs, &mut tree::lens_none())?.0);
                 }
                 Ok((repo, ids))

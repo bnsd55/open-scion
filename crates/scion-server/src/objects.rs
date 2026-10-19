@@ -299,7 +299,7 @@ async fn start_reply(
     let first = find(&worker, &in_flight, busy, read, &allowed, zstd, key)
         .await
         .ok_or_else(reply::busy)?;
-    let (tx, stream) = reply::channel();
+    let (tx, stream, slot) = reply::channel();
     tokio::spawn(
         async move {
             let _walk_share = walk_share;
@@ -318,7 +318,7 @@ async fn start_reply(
                     key,
                 )
             };
-            reply::send_objects(first, rest, tx, waits.stall, stalled, produce).await;
+            reply::send_objects(first, rest, tx, waits.stall, stalled, slot, produce).await;
         }
         // The reply runs outside the call, but stays in its span.
         .instrument(tracing::Span::current()),
@@ -945,8 +945,8 @@ mod tests {
         let (root, leaf) = store
             .write(|c| {
                 let blob = BlobId::of(b"blob");
-                let leaf = c.put_tree(&Tree {
-                    entries: BTreeMap::from([(
+                let leaf = c.put_tree(
+                    &Tree::new(BTreeMap::from([(
                         PathElem::new("f").unwrap(),
                         Entry::File(FileEntry::new(
                             FileState::Regular {
@@ -955,10 +955,11 @@ mod tests {
                             },
                             0,
                         )),
-                    )]),
-                })?;
-                let mid = c.put_tree(&Tree {
-                    entries: BTreeMap::from([
+                    )]))
+                    .expect("tree fits the format"),
+                )?;
+                let mid = c.put_tree(
+                    &Tree::new(BTreeMap::from([
                         (
                             wide,
                             Entry::File(FileEntry::new(
@@ -970,11 +971,16 @@ mod tests {
                             )),
                         ),
                         (PathElem::new("s").unwrap(), Entry::Dir(leaf)),
-                    ]),
-                })?;
-                let root = c.put_tree(&Tree {
-                    entries: BTreeMap::from([(PathElem::new("d").unwrap(), Entry::Dir(mid))]),
-                })?;
+                    ]))
+                    .expect("tree fits the format"),
+                )?;
+                let root = c.put_tree(
+                    &Tree::new(BTreeMap::from([(
+                        PathElem::new("d").unwrap(),
+                        Entry::Dir(mid),
+                    )]))
+                    .expect("tree fits the format"),
+                )?;
                 Ok((root, leaf))
             })
             .unwrap();
@@ -1017,9 +1023,7 @@ mod tests {
         use std::collections::BTreeMap;
         let dir = tempfile::tempdir().unwrap();
         let store = Backend::open_test(dir.path()).unwrap();
-        let tree = Tree {
-            entries: BTreeMap::new(),
-        };
+        let tree = Tree::new(BTreeMap::new()).expect("tree fits the format");
         let id = store.write(|c| c.put_tree(&tree)).unwrap();
         let size = store.read(|c| c.tree_size(id)).unwrap();
         let (body, _) = tree.encode_with_id();
@@ -1042,18 +1046,15 @@ mod tests {
             .write(|c| {
                 c.insert_changeset(
                     repo,
-                    &Changeset {
-                        parents: Vec::new(),
-                        author: IdentityTime {
-                            name: b"A".to_vec(),
-                            email: b"a@example.com".to_vec(),
-                            unix_secs: 1,
-                            tz_offset_minutes: 0,
-                        },
-                        committer: None,
-                        message: b"probe\n".to_vec(),
-                        changes: BTreeMap::new(),
-                    },
+                    &Changeset::new(
+                        Vec::new(),
+                        IdentityTime::new(b"A".to_vec(), b"a@example.com".to_vec(), 1, 0)
+                            .expect("identity fits the format"),
+                        None,
+                        b"probe\n".to_vec(),
+                        BTreeMap::new(),
+                    )
+                    .expect("changeset fits the format"),
                 )
             })
             .unwrap();

@@ -16,11 +16,11 @@ use scion_proto::v1::{
     LogRequest, MergeBaseRequest, PutBlobRequest, ReadFileRequest, ResolveRefRequest,
 };
 
-use scion_server::access::Access;
-use scion_server::meta::{Meta as _, MetaTx as _};
-use scion_server::metrics::Metrics;
-use scion_server::tickets::Keys;
-use scion_server::{Backend, service};
+use scion_server::Access;
+use scion_server::Keys;
+use scion_server::Metrics;
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::{Backend, test_support::service};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -66,17 +66,18 @@ async fn store() -> (tempfile::TempDir, Backend, scion_core::ChangesetId) {
             .unwrap()
     };
     let blob = store.blobs().put(b"# hello\n").unwrap();
-    let cs = scion_core::Changeset {
-        parents: vec![],
-        author: scion_core::IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"root\n".to_vec(),
-        changes: [(
+    let cs = scion_core::Changeset::new(
+        vec![],
+        scion_core::IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"root\n".to_vec(),
+        [(
             scion_core::RepoPath::new("README").unwrap(),
             Some(scion_core::FileState::Regular {
                 content: blob,
@@ -84,7 +85,8 @@ async fn store() -> (tempfile::TempDir, Backend, scion_core::ChangesetId) {
             }),
         )]
         .into(),
-    };
+    )
+    .expect("changeset fits the format");
     let root = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -114,7 +116,7 @@ async fn serve(
         service::ServeOptions {
             data: dir.to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
@@ -455,17 +457,18 @@ fn changeset_on(
     content: scion_core::BlobId,
     path: &str,
 ) -> (Vec<u8>, scion_core::ChangesetId) {
-    let cs = scion_core::Changeset {
-        parents: vec![*root],
-        author: scion_core::IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_001,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"a change\n".to_vec(),
-        changes: [(
+    let cs = scion_core::Changeset::new(
+        vec![*root],
+        scion_core::IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_001,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"a change\n".to_vec(),
+        [(
             scion_core::RepoPath::new(path).unwrap(),
             Some(scion_core::FileState::Regular {
                 content,
@@ -473,7 +476,8 @@ fn changeset_on(
             }),
         )]
         .into(),
-    };
+    )
+    .expect("changeset fits the format");
     let (bytes, id) = cs.encode_with_id();
     (bytes, id)
 }

@@ -10,11 +10,14 @@ use std::process::{Command, Output};
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, GitOid, IdentityTime, RepoPath};
 use scion_proto::runtime::listen::Limits;
-use scion_server::import::{ImportOptions, import_git};
-use scion_server::meta::Meta as _;
-use scion_server::meta::MetaTx as _;
-use scion_server::read::MAX_DIFF_ENTRIES;
-use scion_server::{Backend, Store, service, tree};
+use scion_server::test_support::meta::Meta as _;
+use scion_server::test_support::meta::MetaTx as _;
+use scion_server::test_support::read::MAX_DIFF_ENTRIES;
+use scion_server::{
+    Backend, Store,
+    test_support::{service, tree},
+};
+use scion_server::{ImportOptions, import_git};
 use serde_json::Value;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -89,7 +92,7 @@ impl Server {
             service::ServeOptions {
                 data: data.path().to_path_buf(),
                 limits: Limits::default(),
-                quotas: scion_server::quotas::Quotas::off(),
+                quotas: scion_server::Quotas::off(),
                 pending_lands: None,
                 land_stale_secs: 1 << 40,
                 tls: None,
@@ -348,18 +351,20 @@ fn two_changesets_lens(
             let repo = c.create_repo(REPO)?;
             let mut parents = Vec::new();
             for changes in [base, changes] {
-                let cs = Changeset {
-                    parents: parents.last().copied().into_iter().collect(),
-                    author: IdentityTime {
-                        name: b"Ada".to_vec(),
-                        email: b"ada@example.com".to_vec(),
-                        unix_secs: 1_700_000_000,
-                        tz_offset_minutes: 0,
-                    },
-                    committer: None,
-                    message: b"change".to_vec(),
+                let cs = Changeset::new(
+                    parents.last().copied().into_iter().collect(),
+                    IdentityTime::new(
+                        b"Ada".to_vec(),
+                        b"ada@example.com".to_vec(),
+                        1_700_000_000,
+                        0,
+                    )
+                    .expect("identity fits the format"),
+                    None,
+                    b"change".to_vec(),
                     changes,
-                };
+                )
+                .expect("changeset fits the format");
                 parents.push(tree::store_changeset(c, repo, &cs, &mut *lens)?.0);
             }
             Ok((parents[0], parents[1]))

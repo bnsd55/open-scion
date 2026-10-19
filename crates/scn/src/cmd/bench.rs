@@ -103,24 +103,26 @@ async fn run_agent(
             .put_blob(format!("run {start} agent {agent} change {i}\n").into_bytes())
             .await?;
         let path = RepoPath::new(format!("bench/agent-{agent:04}/{i:06}.txt"))?;
-        let changeset = Changeset {
-            parents: vec![parent],
-            author: IdentityTime {
-                name: b"scn bench".to_vec(),
-                email: b"bench@localhost".to_vec(),
-                unix_secs: now_unix_secs()?,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: format!("bench: agent {agent} change {i}\n").into_bytes(),
-            changes: BTreeMap::from([(
+        let changeset = Changeset::new(
+            vec![parent],
+            IdentityTime::new(
+                b"scn bench".to_vec(),
+                b"bench@localhost".to_vec(),
+                now_unix_secs()?,
+                0,
+            )
+            .expect("identity fits the format"),
+            None,
+            format!("bench: agent {agent} change {i}\n").into_bytes(),
+            BTreeMap::from([(
                 path,
                 Some(FileState::Regular {
                     content: blob,
                     executable: false,
                 }),
             )]),
-        };
+        )
+        .expect("changeset fits the format");
         let id = ctx.create_changeset(&changeset).await?;
         let landing = Instant::now();
         let reply = ctx
@@ -169,7 +171,7 @@ async fn verify(mut ctx: Ctx, start: ChangesetId, landed: &[ChangesetId]) -> Res
                 }
                 ensure!(history.insert(id), "changeset {id} appears twice on main");
                 cur = Changeset::decode(&entry.changeset)?
-                    .parents
+                    .parents()
                     .first()
                     .copied();
             }

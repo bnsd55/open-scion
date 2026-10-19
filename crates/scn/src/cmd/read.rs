@@ -90,7 +90,7 @@ pub async fn ls(ctx: &mut Ctx, spec: &str) -> Result<()> {
     let tree = Tree::decode(&tree_bytes).context("server sent a bad tree")?;
     if ctx.json {
         let entries: Vec<Value> = tree
-            .entries
+            .entries()
             .iter()
             .map(|(name, entry)| {
                 let mut value = entry_json(entry);
@@ -101,7 +101,7 @@ pub async fn ls(ctx: &mut Ctx, spec: &str) -> Result<()> {
         outln!("{}", Value::from(entries));
         return Ok(());
     }
-    for (name, entry) in &tree.entries {
+    for (name, entry) in tree.entries() {
         let (mode, kind) = describe(entry);
         let slash = if matches!(entry, Entry::Dir(_)) {
             "/"
@@ -170,11 +170,15 @@ pub async fn log(ctx: &mut Ctx, rev: &str, path: Option<&RepoPath>, limit: u32) 
         return Ok(());
     }
     for (id, cs) in &entries {
-        let subject = cs.message.split(|&b| b == b'\n').next().unwrap_or_default();
+        let subject = cs
+            .message()
+            .split(|&b| b == b'\n')
+            .next()
+            .unwrap_or_default();
         outln!(
             "{} {} {}",
             &id.to_string()[..12],
-            lossy(&cs.author.name),
+            lossy(cs.author().name()),
             lossy(subject)
         );
     }
@@ -201,7 +205,7 @@ pub async fn show(ctx: &mut Ctx, rev: &str) -> Result<()> {
     if ctx.json {
         let mut value = changeset_json(id, &cs);
         value["changes"] = cs
-            .changes
+            .changes()
             .iter()
             .map(|(path, state)| {
                 let mut change = match state {
@@ -220,19 +224,19 @@ pub async fn show(ctx: &mut Ctx, rev: &str) -> Result<()> {
         return Ok(());
     }
     outln!("changeset {id}");
-    for parent in &cs.parents {
+    for parent in cs.parents() {
         outln!("parent    {parent}");
     }
-    outln!("author    {}", identity(&cs.author));
-    if let Some(committer) = &cs.committer {
+    outln!("author    {}", identity(cs.author()));
+    if let Some(committer) = &cs.committer() {
         outln!("committer {}", identity(committer));
     }
     outln!();
-    for line in lossy(&cs.message).lines() {
+    for line in lossy(cs.message()).lines() {
         outln!("    {line}");
     }
     outln!();
-    for (path, state) in &cs.changes {
+    for (path, state) in cs.changes() {
         let op = if state.is_some() { "put   " } else { "delete" };
         outln!("{op} {}", lossy(path.as_bytes()));
     }
@@ -273,13 +277,17 @@ fn describe(entry: &Entry) -> (&'static str, &'static str) {
 
 /// `Name <email> unix-seconds +hhmm`, as in a git commit.
 fn identity(who: &IdentityTime) -> String {
-    let sign = if who.tz_offset_minutes < 0 { '-' } else { '+' };
-    let minutes = who.tz_offset_minutes.unsigned_abs();
+    let sign = if who.tz_offset_minutes() < 0 {
+        '-'
+    } else {
+        '+'
+    };
+    let minutes = who.tz_offset_minutes().unsigned_abs();
     format!(
         "{} <{}> {} {sign}{:02}{:02}",
-        lossy(&who.name),
-        lossy(&who.email),
-        who.unix_secs,
+        lossy(who.name()),
+        lossy(who.email()),
+        who.unix_secs(),
         minutes / 60,
         minutes % 60
     )
@@ -287,20 +295,20 @@ fn identity(who: &IdentityTime) -> String {
 
 pub(crate) fn identity_json(who: &IdentityTime) -> Value {
     json!({
-        "name": lossy(&who.name),
-        "email": lossy(&who.email),
-        "unix_secs": who.unix_secs,
-        "tz_offset_minutes": who.tz_offset_minutes,
+        "name": lossy(who.name()),
+        "email": lossy(who.email()),
+        "unix_secs": who.unix_secs(),
+        "tz_offset_minutes": who.tz_offset_minutes(),
     })
 }
 
 fn changeset_json(id: ChangesetId, cs: &Changeset) -> Value {
     json!({
         "id": id.to_string(),
-        "parents": cs.parents.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "author": identity_json(&cs.author),
-        "committer": cs.committer.as_ref().map(identity_json),
-        "message": lossy(&cs.message),
+        "parents": cs.parents().iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "author": identity_json(cs.author()),
+        "committer": cs.committer().map(identity_json),
+        "message": lossy(cs.message()),
     })
 }
 

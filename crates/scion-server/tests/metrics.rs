@@ -10,9 +10,9 @@ use scion_proto::runtime::auth::Bearer;
 use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{BlameRequest, CreateChangesetRequest, LandRequest, ReadFileRequest};
-use scion_server::meta::MetaTx as _;
-use scion_server::metrics::Metrics;
-use scion_server::{Backend, Store, service};
+use scion_server::Metrics;
+use scion_server::test_support::meta::MetaTx as _;
+use scion_server::{Backend, Store, test_support::service};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 use tonic::service::interceptor::InterceptedService;
@@ -47,24 +47,26 @@ async fn eventually(metrics: &Metrics, want: &str) {
 }
 
 fn author(secs: u64) -> IdentityTime {
-    IdentityTime {
-        name: b"Ada".to_vec(),
-        email: b"ada@example.com".to_vec(),
-        unix_secs: i64::try_from(secs).unwrap_or(i64::MAX),
-        tz_offset_minutes: 0,
-    }
+    IdentityTime::new(
+        b"Ada".to_vec(),
+        b"ada@example.com".to_vec(),
+        i64::try_from(secs).unwrap_or(i64::MAX),
+        0,
+    )
+    .expect("identity fits the format")
 }
 
 fn changeset(parents: Vec<ChangesetId>, path: &str, state: Option<FileState>) -> Changeset {
-    Changeset {
+    Changeset::new(
         parents,
-        author: author(1_700_000_000),
-        committer: None,
-        message: path.as_bytes().to_vec(),
-        changes: [(RepoPath::new(path).unwrap(), state)]
+        author(1_700_000_000),
+        None,
+        path.as_bytes().to_vec(),
+        [(RepoPath::new(path).unwrap(), state)]
             .into_iter()
             .collect(),
-    }
+    )
+    .expect("changeset fits the format")
 }
 
 /// A store with one repo, one root changeset that writes a file, and a
@@ -112,7 +114,7 @@ async fn setup() -> (
         service::ServeOptions {
             data: dir.path().to_path_buf(),
             limits: Limits::default(),
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
@@ -139,12 +141,12 @@ fn on_top(store: &Store, parent: ChangesetId, path: &str, content: &[u8]) -> Cha
     store
         .write(|c| {
             let repo = c.repo_id(REPO)?;
-            let cs = Changeset {
-                parents: vec![parent],
-                author: author(1_700_000_001),
-                committer: None,
-                message: path.as_bytes().to_vec(),
-                changes: [(
+            let cs = Changeset::new(
+                vec![parent],
+                author(1_700_000_001),
+                None,
+                path.as_bytes().to_vec(),
+                [(
                     RepoPath::new(path).unwrap(),
                     Some(FileState::Regular {
                         content: BlobId::of(content),
@@ -153,7 +155,8 @@ fn on_top(store: &Store, parent: ChangesetId, path: &str, content: &[u8]) -> Cha
                 )]
                 .into_iter()
                 .collect(),
-            };
+            )
+            .expect("changeset fits the format");
             c.insert_changeset(repo, &cs)
         })
         .unwrap()

@@ -13,8 +13,11 @@ use scion_proto::runtime::auth::Bearer;
 use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::{ObjectKind, ObjectRef};
-use scion_server::meta::{Meta as _, MetaTx as _};
-use scion_server::{Backend, service, tree};
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::{
+    Backend,
+    test_support::{service, tree},
+};
 use scion_tier::{
     CACHE_UPSTREAM_TIMEOUT, DAEMON_UPSTREAM_TIMEOUT, DiskStore, MemoryStore, Tier, bind_unix,
 };
@@ -89,7 +92,7 @@ impl Tiers {
 
         // The server mints the tickets; the cache verifies them; the daemon
         // only forwards them.
-        let tickets = scion_server::tickets::Keys::generate();
+        let tickets = scion_server::Keys::generate();
         let verify_keys = tickets.for_verify().to_vec();
         let (listener, server) = tcp();
         runtime.spawn(service::serve(
@@ -99,7 +102,7 @@ impl Tiers {
             service::ServeOptions {
                 data: data.path().to_path_buf(),
                 limits: Limits::default(),
-                quotas: scion_server::quotas::Quotas::off(),
+                quotas: scion_server::Quotas::off(),
                 pending_lands: None,
                 land_stale_secs: 1 << 40,
                 tls: None,
@@ -241,21 +244,23 @@ pub fn noise(len: usize) -> Vec<u8> {
 
 /// A changeset on `parent` that puts `files` (raw path and state).
 pub fn changeset(parent: Option<ChangesetId>, files: &[(&str, FileState)]) -> Changeset {
-    Changeset {
-        parents: parent.into_iter().collect(),
-        author: IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"tiers\n".to_vec(),
-        changes: files
+    Changeset::new(
+        parent.into_iter().collect(),
+        IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"tiers\n".to_vec(),
+        files
             .iter()
             .map(|(path, state)| (RepoPath::new(*path).unwrap(), Some(*state)))
             .collect(),
-    }
+    )
+    .expect("changeset fits the format")
 }
 
 /// Stores `cs` in the repo and points `main` at it.

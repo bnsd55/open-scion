@@ -8,11 +8,14 @@
 //! Git headers that Scion does not model (`encoding`, `gpgsig`, `mergetag`)
 //! are dropped, so a changeset ID is not a function of the git object name.
 
-use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 #[cfg(test)]
 use std::sync::{Mutex, PoisonError};
+// Both `Cell` users sit behind a cfg: the slow-record model of a test,
+// and the check counter the test-hooks feature turns on.
+#[cfg(any(test, feature = "test-hooks"))]
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use gix::ObjectId;
@@ -146,6 +149,28 @@ pub fn import_git(
     import_with_cache(store, repo, git_dir, opts, BLOB_CACHE_ENTRIES, MAX_CHANGES)
 }
 
+/// Opens the git repository of an import and resolves the commit `rev`
+/// names: the tip the import works toward. Only SHA-1 repositories are
+/// supported.
+fn open_tip(git_dir: &Path, rev: &str) -> Result<(gix::Repository, gix::hash::ObjectId)> {
+    let mut git = gix::open(git_dir)
+        .map_err(|e| Error::Git(format!("cannot open {}: {e}", git_dir.display())))?;
+    if git.object_hash() != gix::hash::Kind::Sha1 {
+        return Err(Error::Git(format!(
+            "{}: only SHA-1 repositories are supported",
+            git_dir.display()
+        )));
+    }
+    git.object_cache_size_if_unset(OBJECT_CACHE_BYTES);
+    let tip = git
+        .rev_parse_single(rev)
+        .and_then(|id| id.object())
+        .and_then(gix::Object::peel_to_commit)
+        .map_err(|e| Error::Git(format!("cannot resolve {rev:?} to a commit: {e}")))?
+        .id;
+    Ok((git, tip))
+}
+
 /// [`import_git`] with at most `cache_entries` entries in each blob cache,
 /// and a commit capped at `max_changes` changed paths (the write path's
 /// [`MAX_CHANGES`]; a test overrides it with a smaller one).
@@ -158,21 +183,7 @@ fn import_with_cache(
     max_changes: usize,
 ) -> Result<ImportReport> {
     let started = Instant::now();
-    let mut git = gix::open(git_dir)
-        .map_err(|e| Error::Git(format!("cannot open {}: {e}", git_dir.display())))?;
-    if git.object_hash() != gix::hash::Kind::Sha1 {
-        return Err(Error::Git(format!(
-            "{}: only SHA-1 repositories are supported",
-            git_dir.display()
-        )));
-    }
-    git.object_cache_size_if_unset(OBJECT_CACHE_BYTES);
-    let tip = git
-        .rev_parse_single(opts.rev.as_str())
-        .and_then(|id| id.object())
-        .and_then(gix::Object::peel_to_commit)
-        .map_err(|e| Error::Git(format!("cannot resolve {:?} to a commit: {e}", opts.rev)))?
-        .id;
+    let (git, tip) = open_tip(git_dir, &opts.rev)?;
 
     // A shared import re-runs often: look the repo up before opening a
     // write transaction for it, so the common path does not commit at all
@@ -231,7 +242,7 @@ fn import_with_cache(
         // first, in steps: after a version bump it has none, and the
         // transaction would derive its whole history.
         for (_, cs, _) in &prepared {
-            if let Some(&parent) = cs.parents.first().filter(|p| !in_batch.contains(*p)) {
+            if let Some(&parent) = cs.parents().first().filter(|p| !in_batch.contains(*p)) {
                 tree::fill_root_tree(store, repo_id, parent)?;
             }
         }
@@ -248,6 +259,9 @@ fn import_with_cache(
         // the counted boundary a test holds the lock at.
         #[cfg(any(test, feature = "test-hooks"))]
         store.run_after_batch(batch_no);
+        // A release build reads the batch index nowhere.
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = batch_no;
     }
 
     // The tip was imported before, or planned and imported above.
@@ -585,13 +599,14 @@ impl Importer<'_> {
             })
             .transpose()?;
         let git_tree = decoded.tree();
-        let changeset = Changeset {
+        let changeset = Changeset::new(
             parents,
-            author: identity(commit, "author", decoded.author())?,
-            committer: Some(identity(commit, "committer", decoded.committer())?),
-            message: decoded.message.to_vec(),
-            changes: self.diff(commit, base, git_tree, batch)?,
-        };
+            identity(commit, "author", decoded.author())?,
+            Some(identity(commit, "committer", decoded.committer())?),
+            decoded.message.to_vec(),
+            self.diff(commit, base, git_tree, batch)?,
+        )
+        .expect("changeset fits the format");
         Ok((changeset, git_tree))
     }
 
@@ -763,7 +778,8 @@ impl Checker<'_> {
             let want = read_tree(self.git, commit, Some(git_id))?;
             let have: BTreeMap<Vec<u8>, Entry> = c
                 .get_tree(scion_id)?
-                .entries
+                .entries()
+                .clone()
                 .into_iter()
                 .map(|(name, entry)| (name.as_bytes().to_vec(), entry))
                 .collect();
@@ -971,13 +987,13 @@ fn identity(
     let bad = |e: gix::Error| Error::Git(format!("commit {commit}: bad {role}: {e}"));
     let signature = signature.map_err(bad)?;
     let time = signature.time().map_err(bad)?;
-    Ok(IdentityTime {
-        name: signature.name.to_vec(),
-        email: signature.email.to_vec(),
-        unix_secs: time.seconds,
-        // Git stores whole minutes, so this is exact.
-        tz_offset_minutes: time.offset / 60,
-    })
+    Ok(IdentityTime::new(
+        signature.name.to_vec(),
+        signature.email.to_vec(),
+        time.seconds,
+        time.offset / 60,
+    )
+    .expect("identity fits the format"))
 }
 
 fn per_sec(count: usize, since: Instant) -> u128 {
@@ -1157,17 +1173,16 @@ mod tests {
         let server = Backend::Sqlite(Store::open(data.path()).unwrap());
         let importer = Backend::Sqlite(Store::open_shared(data.path()).unwrap());
         // main is at root. Git has root ─ tip, and a land puts X on root.
-        let changeset = |parents, message: &str| Changeset {
-            parents,
-            author: IdentityTime {
-                name: b"Ada".to_vec(),
-                email: b"ada@example.com".to_vec(),
-                unix_secs: 0,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: message.into(),
-            changes: BTreeMap::new(),
+        let changeset = |parents, message: &str| {
+            Changeset::new(
+                parents,
+                IdentityTime::new(b"Ada".to_vec(), b"ada@example.com".to_vec(), 0, 0)
+                    .expect("identity fits the format"),
+                None,
+                message.into(),
+                BTreeMap::new(),
+            )
+            .expect("changeset fits the format")
         };
         let (repo, tip, x) = server
             .write(|c| {
@@ -1240,17 +1255,16 @@ mod tests {
         // main is at root. The chain root <- a1 <- a2 <- a3 <- tip hangs
         // under it, so every mover target is still an ancestor of the
         // imported tip and the import never hears "diverged".
-        let changeset = |parents, message: &str| Changeset {
-            parents,
-            author: IdentityTime {
-                name: b"Ada".to_vec(),
-                email: b"ada@example.com".to_vec(),
-                unix_secs: 0,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: message.into(),
-            changes: BTreeMap::new(),
+        let changeset = |parents, message: &str| {
+            Changeset::new(
+                parents,
+                IdentityTime::new(b"Ada".to_vec(), b"ada@example.com".to_vec(), 0, 0)
+                    .expect("identity fits the format"),
+                None,
+                message.into(),
+                BTreeMap::new(),
+            )
+            .expect("changeset fits the format")
         };
         let (repo, tip, links): (RepoId, ChangesetId, Arc<[ChangesetId]>) = server
             .write(|c| {

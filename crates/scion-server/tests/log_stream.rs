@@ -16,10 +16,10 @@ use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::BlameRequest;
 use scion_proto::v1::LogRequest;
 use scion_proto::v1::scion_client::ScionClient;
-use scion_server::meta::{Meta as _, MetaTx as _};
-use scion_server::metrics::Metrics;
-use scion_server::tree;
-use scion_server::{Backend, Store, service};
+use scion_server::Metrics;
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::test_support::tree;
+use scion_server::{Backend, Store, test_support::service};
 use tonic::codec::Streaming;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -52,18 +52,20 @@ fn chain(
                     content: store.blobs().put(&content).unwrap(),
                     executable: false,
                 };
-                let cs = Changeset {
-                    parents: ids.last().copied().into_iter().collect(),
-                    author: scion_core::IdentityTime {
-                        name: vec![b'a'; name_len],
-                        email: b"t@x".to_vec(),
-                        unix_secs: 1_700_000_000,
-                        tz_offset_minutes: 0,
-                    },
-                    committer: None,
-                    message: format!("change {i}\n").into_bytes(),
-                    changes: [(RepoPath::new(b"d/f.txt").unwrap(), Some(regular))].into(),
-                };
+                let cs = Changeset::new(
+                    ids.last().copied().into_iter().collect(),
+                    scion_core::IdentityTime::new(
+                        vec![b'a'; name_len],
+                        b"t@x".to_vec(),
+                        1_700_000_000,
+                        0,
+                    )
+                    .expect("identity fits the format"),
+                    None,
+                    format!("change {i}\n").into_bytes(),
+                    [(RepoPath::new(b"d/f.txt").unwrap(), Some(regular))].into(),
+                )
+                .expect("changeset fits the format");
                 ids.push(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0);
             }
             Ok(ids)
@@ -83,7 +85,7 @@ async fn serve(store: Backend, dir: &std::path::Path, limits: Limits) -> String 
         service::ServeOptions {
             data: dir.to_path_buf(),
             limits,
-            quotas: scion_server::quotas::Quotas::off(),
+            quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
@@ -296,6 +298,7 @@ async fn a_unary_reply_over_the_message_limit_is_refused() {
         scion_proto::runtime::listen::tcp(listener),
         None,
         std::future::pending(),
+        std::sync::Arc::new(scion_proto::runtime::metrics::Metrics::default()),
     ));
     let channel = Channel::from_shared(format!("http://{addr}"))
         .unwrap()

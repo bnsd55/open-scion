@@ -1,0 +1,81 @@
+name: version-matrix
+on:
+  schedule:
+    # Once a day, at 02:45 UTC, a quarter hour after the nightly soak:
+    # the two nightly jobs never start on the same minute.
+    - cron: "45 2 * * *"
+  workflow_dispatch:
+    inputs:
+      prev_ref:
+        description: the commit or tag to test as N-1; default, the newest release tag behind HEAD
+        default: ""
+
+permissions:
+  contents: read
+
+# Every third-party action is pinned to the commit SHA its version tag
+# named, with the version in a comment, as ci.yml does.
+jobs:
+  version-matrix:
+    name: version matrix
+    runs-on: ubuntu-24.04
+    # Two release builds, the N-1 one often from cache, then seven pair
+    # runs of the smoke story; 60 minutes bounds a hung build.
+    timeout-minutes: 60
+    steps:
+      # Full history, with tags: the matrix resolves N-1 from the tags
+      # behind HEAD and checks the chosen commit out as a worktree, and
+      # the default depth-1 clone has neither.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      # The N-1 ref, before any build: the script's own resolution, the
+      # input of the dispatch when it names one. No ref: the summary says
+      # the job skipped and the run stays green, never silent.
+      - name: resolve the N-1 ref
+        id: prev
+        env:
+          # The input goes through env:, not through the run: string, so
+          # no shell sees it unquoted.
+          PREV_REF: ${{ github.event.inputs.prev_ref }}
+        run: |
+          ref=$(scripts/version-matrix.sh --resolve-ref)
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      # The N-1 checkout at a stable path, so rust-cache can key on it.
+      # The ref goes through env:, not through the run: string, so no
+      # shell sees it unquoted — it ends in the dispatch input.
+      - name: check out the N-1 tree
+        if: steps.prev.outputs.ref != ''
+        env:
+          PREV_REF: ${{ steps.prev.outputs.ref }}
+        run: git worktree add --detach prev "$PREV_REF"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.prev.outputs.ref != ''
+        with:
+          # The auto key hashes prev/Cargo.lock, which is the lock of the
+          # N-1 commit itself: a cache hit is exactly the commit built
+          # before.
+          workspaces: prev
+          key: version-matrix-${{ steps.prev.outputs.ref }}
+      - name: run the version matrix
+        if: steps.prev.outputs.ref != ''
+        env:
+          # The pair runs share the job's workspace; PREV_SRC stays in
+          # place after the script, so the cache step above it can save
+          # the N-1 target dir (rust-cache's post step runs last).
+          PREV_SRC: ${{ github.workspace }}/prev
+        run: |
+          # 55 min: the builds and the pairs, under the job's own cap.
+          timeout 3300 scripts/version-matrix.sh
+      # Logs of a red run stay, whichever step failed.
+      - name: upload the logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: version-matrix-logs
+          path: /tmp/scion-matrix*/
+          if-no-files-found: ignore

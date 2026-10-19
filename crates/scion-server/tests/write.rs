@@ -8,13 +8,13 @@ use rusqlite::{Connection, params};
 use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileEntry, FileState, IdentityTime, RepoPath,
 };
-use scion_server::error::ApplyError;
-use scion_server::meta::{Meta as _, MetaTx as _};
-use scion_server::store::BlobStatus;
-use scion_server::write::{
+use scion_server::test_support::error::ApplyError;
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::test_support::store::BlobStatus;
+use scion_server::test_support::write::{
     MAX_CHANGES, MAX_COMMIT_MESSAGE_BYTES, MAX_IDENTITY_BYTES, create_changeset,
 };
-use scion_server::{Backend, Error, tree};
+use scion_server::{Backend, Error, test_support::tree};
 use tempfile::TempDir;
 
 const REPO: &str = "main";
@@ -90,18 +90,20 @@ fn path(p: &str) -> RepoPath {
 }
 
 fn changeset(parents: Vec<ChangesetId>, changes: &[(&str, Option<FileState>)]) -> Changeset {
-    Changeset {
+    Changeset::new(
         parents,
-        author: IdentityTime {
-            name: b"Ada".to_vec(),
-            email: b"ada@example.com".to_vec(),
-            unix_secs: 1_700_000_000,
-            tz_offset_minutes: 0,
-        },
-        committer: None,
-        message: b"change\n".to_vec(),
-        changes: changes.iter().map(|(p, s)| (path(p), *s)).collect(),
-    }
+        IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"change\n".to_vec(),
+        changes.iter().map(|(p, s)| (path(p), *s)).collect(),
+    )
+    .expect("changeset fits the format")
 }
 
 /// The bytes of a changeset on `parent` whose change count is `n`, with no
@@ -166,7 +168,22 @@ fn concurrent_creates_of_one_changeset_store_it_once() {
     assert_eq!(count_of(&f.store, f.dir.path()), before + 1);
 }
 
+/// Rebuilds `cs` with the given fields, through the checked constructor: the
+/// core enforces the format's bounds, and every edit in the table stays
+/// inside them; the server's own limits are what the rows test.
+fn rebuilt(
+    parents: Vec<ChangesetId>,
+    committer: Option<IdentityTime>,
+    message: Vec<u8>,
+    author: IdentityTime,
+    changes: std::collections::BTreeMap<RepoPath, Option<FileState>>,
+) -> Changeset {
+    Changeset::new(parents, author, committer, message, changes)
+        .expect("rebuilt changeset fits the format")
+}
+
 #[test]
+#[allow(clippy::too_many_lines)]
 fn bad_requests_are_rejected_and_store_nothing() {
     // Asserts the rows of the data directory's database.
     if skip_on_postgres("asserts the rows of the data directory's database") {
@@ -178,21 +195,40 @@ fn bad_requests_are_rejected_and_store_nothing() {
         .store
         .read(|c| count_changesets(c.sqlite().unwrap()))
         .unwrap();
-    let ok = |edit: fn(&mut Changeset)| {
-        let mut cs = changeset(vec![f.root], &[("dir/new", Some(regular("new")))]);
-        edit(&mut cs);
-        cs.encode()
+    // Rebuilds the base changeset with the edit's fields. The core
+    // constructor enforces the format's bounds, and every edit here stays
+    // inside them; the server's own limits are what these rows test.
+    let ok = |build: fn(&Changeset) -> Changeset| {
+        let base = changeset(vec![f.root], &[("dir/new", Some(regular("new")))]);
+        build(&base).encode()
     };
     let invalid = [
         ("undecodable", b"not a changeset".to_vec(), "bad changeset"),
         (
             "no parents",
-            ok(|cs| cs.parents.clear()),
+            ok(|cs| {
+                rebuilt(
+                    Vec::new(),
+                    cs.committer().cloned(),
+                    cs.message().to_vec(),
+                    cs.author().clone(),
+                    cs.changes().clone(),
+                )
+            }),
             "exactly one parent",
         ),
         (
             "two parents",
-            ok(|cs| cs.parents.push(cs.parents[0])),
+            ok(|cs| {
+                let p = cs.parents()[0];
+                rebuilt(
+                    vec![p, p],
+                    cs.committer().cloned(),
+                    cs.message().to_vec(),
+                    cs.author().clone(),
+                    cs.changes().clone(),
+                )
+            }),
             "exactly one parent",
         ),
         (
@@ -203,14 +239,29 @@ fn bad_requests_are_rejected_and_store_nothing() {
         (
             "missing blob",
             ok(|cs| {
-                cs.changes
-                    .insert(path("dir/zzz"), Some(regular("never uploaded")));
+                let mut changes = cs.changes().clone();
+                changes.insert(path("dir/zzz"), Some(regular("never uploaded")));
+                rebuilt(
+                    cs.parents().to_vec(),
+                    cs.committer().cloned(),
+                    cs.message().to_vec(),
+                    cs.author().clone(),
+                    changes,
+                )
             }),
             "is not stored",
         ),
         (
             "committer set",
-            ok(|cs| cs.committer = Some(cs.author.clone())),
+            ok(|cs| {
+                rebuilt(
+                    cs.parents().to_vec(),
+                    Some(cs.author().clone()),
+                    cs.message().to_vec(),
+                    cs.author().clone(),
+                    cs.changes().clone(),
+                )
+            }),
             "committer",
         ),
         // No change follows these counts. The limit error, not "ends early",
@@ -227,12 +278,36 @@ fn bad_requests_are_rejected_and_store_nothing() {
         ),
         (
             "message too long",
-            ok(|cs| cs.message = vec![b'm'; MAX_COMMIT_MESSAGE_BYTES + 1]),
+            ok(|cs| {
+                rebuilt(
+                    cs.parents().to_vec(),
+                    cs.committer().cloned(),
+                    vec![b'm'; MAX_COMMIT_MESSAGE_BYTES + 1],
+                    cs.author().clone(),
+                    cs.changes().clone(),
+                )
+            }),
             "message",
         ),
         (
             "email too long",
-            ok(|cs| cs.author.email = vec![b'e'; MAX_IDENTITY_BYTES + 1]),
+            ok(|cs| {
+                let a = cs.author();
+                let long = IdentityTime::new(
+                    a.name().to_vec(),
+                    vec![b'e'; MAX_IDENTITY_BYTES + 1],
+                    a.unix_secs(),
+                    a.tz_offset_minutes(),
+                )
+                .expect("identity fits the format");
+                rebuilt(
+                    cs.parents().to_vec(),
+                    cs.committer().cloned(),
+                    cs.message().to_vec(),
+                    long,
+                    cs.changes().clone(),
+                )
+            }),
             "author",
         ),
     ];
@@ -302,7 +377,7 @@ fn created_changesets_have_the_expected_root_tree() {
     .unwrap();
 
     let repo = f.store.read(|c| c.repo_id(REPO)).unwrap();
-    let deadline = scion_server::deadline::Deadline::new(
+    let deadline = scion_server::test_support::deadline::Deadline::new(
         std::time::Instant::now() + std::time::Duration::from_secs(300),
     );
     let lookup = |cs, p: &str| {

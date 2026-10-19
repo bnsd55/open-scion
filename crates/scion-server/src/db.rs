@@ -8,7 +8,9 @@
 //! a write transaction. Tests that hold a `Connection` reach the queries
 //! through [`SqliteTx`], which derefs to the connection.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(any(test, feature = "test-hooks"))]
+use std::collections::HashSet;
 use std::ops::Deref;
 
 use gix::ObjectId;
@@ -55,7 +57,7 @@ pub(crate) fn no_repo(name: &str) -> Error {
 /// The puts of a changeset's changes: each path and its blob, in path
 /// order, with repeats. A gitlink names no blob, whatever its bytes.
 pub(crate) fn puts(cs: &Changeset) -> impl Iterator<Item = (&RepoPath, BlobId)> + '_ {
-    cs.changes
+    cs.changes()
         .iter()
         .filter_map(|(path, state)| Some((path, state.as_ref()?.blob()?)))
 }
@@ -120,6 +122,7 @@ pub(crate) fn fill_repo_blobs(c: &Connection) -> Result<(u64, u64)> {
 }
 
 /// The error of a graph walk that reached its bound.
+#[cfg(any(test, feature = "test-hooks"))]
 fn too_deep(max_visits: usize) -> Error {
     Error::ResourceExhausted(format!(
         "the history is too deep: the answer needs more than {max_visits} changesets"
@@ -181,13 +184,13 @@ impl MetaTx for SqliteTx<'_> {
     fn insert_changeset(&mut self, repo: RepoId, cs: &Changeset) -> Result<ChangesetId> {
         let (body, id) = cs.encode_with_id();
         let mut parent_gen = 0;
-        for parent in &cs.parents {
+        for parent in cs.parents() {
             parent_gen = parent_gen.max(self.generation(repo, *parent)?);
         }
         self.0
             .prepare_cached("INSERT OR IGNORE INTO changesets (id, gen, body) VALUES (?1, ?2, ?3)")?
             .execute(params![id.as_bytes(), parent_gen + 1, body])?;
-        for (n, parent) in (0_i64..).zip(&cs.parents) {
+        for (n, parent) in (0_i64..).zip(cs.parents()) {
             self.0
                 .prepare_cached(
                     "INSERT OR IGNORE INTO changeset_parents (cs, n, parent) VALUES (?1, ?2, ?3)",
@@ -303,6 +306,8 @@ impl MetaTx for SqliteTx<'_> {
     /// # Errors
     ///
     /// Database errors.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(any(test, feature = "test-hooks"))]
     fn first_parent(&mut self, id: ChangesetId) -> Result<Option<ChangesetId>> {
         let parent: Option<Vec<u8>> = self
             .0
@@ -353,6 +358,8 @@ impl MetaTx for SqliteTx<'_> {
     /// [`Error::NotFound`] if `repo` does not have either changeset.
     /// [`Error::ResourceExhausted`] if the walk needs more than `max_visits`
     /// changesets.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(any(test, feature = "test-hooks"))]
     fn is_ancestor(
         &mut self,
         repo: RepoId,
@@ -1195,18 +1202,15 @@ pub(crate) mod testing {
         let mut ids: Vec<ChangesetId> = Vec::new();
         for (i, of) in parents.iter().enumerate() {
             let (message, changes) = make(i);
-            let cs = Changeset {
-                parents: of.iter().map(|&p| ids[p]).collect(),
-                author: IdentityTime {
-                    name: b"a".to_vec(),
-                    email: b"a@x".to_vec(),
-                    unix_secs: 0,
-                    tz_offset_minutes: 0,
-                },
-                committer: None,
+            let cs = Changeset::new(
+                of.iter().map(|&p| ids[p]).collect(),
+                IdentityTime::new(b"a".to_vec(), b"a@x".to_vec(), 0, 0)
+                    .expect("identity fits the format"),
+                None,
                 message,
                 changes,
-            };
+            )
+            .expect("changeset fits the format");
             ids.push(SqliteTx(c).insert_changeset(repo, &cs)?);
         }
         Ok(ids)
@@ -1298,21 +1302,18 @@ mod tests {
     use crate::store::migrate;
 
     fn changeset(parents: Vec<ChangesetId>, changes: &[(&str, Option<FileState>)]) -> Changeset {
-        Changeset {
+        Changeset::new(
             parents,
-            author: IdentityTime {
-                name: b"a".to_vec(),
-                email: b"a@x".to_vec(),
-                unix_secs: 0,
-                tz_offset_minutes: 0,
-            },
-            committer: None,
-            message: Vec::new(),
-            changes: changes
+            IdentityTime::new(b"a".to_vec(), b"a@x".to_vec(), 0, 0)
+                .expect("identity fits the format"),
+            None,
+            Vec::new(),
+            changes
                 .iter()
                 .map(|(path, state)| (RepoPath::new(*path).unwrap(), *state))
                 .collect(),
-        }
+        )
+        .expect("changeset fits the format")
     }
 
     fn file(content: &str) -> FileState {
