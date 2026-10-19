@@ -267,28 +267,35 @@ start() {
   return 0
 }
 
-# stop DIR: stop every process `start DIR` started. The pids are not
-# children of this shell (each server started inside a command
+# stop_one DIR NAME: stop the one process `start DIR NAME` started. The
+# pid is not a child of this shell (the server started inside a command
 # substitution that has since exited), so wait cannot confirm a death:
 # poll kill -0 for ten seconds, then KILL, and say which process needed
 # it. A wedged server here is exactly what the matrix hunts; it must
 # fail loud, not hang cleanup.
+stop_one() {
+  local dir=$1 name=$2 f="$1/$2.log.pid" pid n
+  [ -e "$f" ] || return 0
+  pid=$(cat "$f")
+  rm -f "$f"
+  kill -TERM "$pid" 2> /dev/null || true
+  n=0
+  while kill -0 "$pid" 2> /dev/null && [ "$n" -lt 100 ]; do
+    sleep 0.1
+    n=$((n + 1))
+  done
+  if kill -0 "$pid" 2> /dev/null; then
+    note "$name (pid $pid) ignored TERM; sent KILL"
+    kill -KILL "$pid" 2> /dev/null || true
+  fi
+}
+
+# stop DIR: stop every process `start DIR` started.
 stop() {
-  local dir=$1 f pid n
+  local dir=$1 f
   for f in "$dir"/*.log.pid; do
     [ -e "$f" ] || return 0
-    pid=$(cat "$f")
-    rm -f "$f"
-    kill -TERM "$pid" 2> /dev/null || true
-    n=0
-    while kill -0 "$pid" 2> /dev/null && [ "$n" -lt 100 ]; do
-      sleep 0.1
-      n=$((n + 1))
-    done
-    if kill -0 "$pid" 2> /dev/null; then
-      note "$(basename "$f" .log.pid) (pid $pid) ignored TERM; sent KILL"
-      kill -KILL "$pid" 2> /dev/null || true
-    fi
+    stop_one "$dir" "$(basename "$f" .log.pid)"
   done
 }
 
@@ -370,14 +377,22 @@ pair_2() {
     --metrics-listen 127.0.0.1:0)
   mport=$(metrics_port "$dir/server.log")
   [ -n "$mport" ] || die "pair '$PAIR' ($SIDE): the server logged no metrics port"
-  # The cache logs the address it asked for, not the one it bound, so
-  # port 0 would name itself. SHORTCUT: it takes the port beside the
-  # server's, which the kernel never reserved; coder5's fix makes
-  # scion-cache log its bound address, and this becomes :0 again.
-  cport=$((sport + 1))
-  start cache "$dir" "$cache/scion-cache" port --listen "127.0.0.1:$cport" \
+  # The cache binds port 0 and its serving line names the address it
+  # bound, as the server's does. An N-1 cache older than a826c71 logged
+  # the port it asked for instead, 0, which nothing can connect to; for
+  # such a pair, take the port beside the server's, which the kernel
+  # never reserved for it.
+  cport=$(start cache "$dir" "$cache/scion-cache" port --listen 127.0.0.1:0 \
     --upstream "http://127.0.0.1:$sport" \
-    --ticket-public-key "$(cat "$dir/ticket.pub")" > /dev/null
+    --ticket-public-key "$(cat "$dir/ticket.pub")")
+  if [ "$cport" = 0 ]; then
+    note "the N-1 cache predates a826c71: it cannot name its port"
+    stop_one "$dir" cache
+    cport=$((sport + 1))
+    start cache "$dir" "$cache/scion-cache" port --listen "127.0.0.1:$cport" \
+      --upstream "http://127.0.0.1:$sport" \
+      --ticket-public-key "$(cat "$dir/ticket.pub")" > /dev/null
+  fi
   # The read through the tier must match the direct read byte for byte.
   # The ref and its ticket come from the server; the objects ride the
   # cache, as cli.md documents the split.
