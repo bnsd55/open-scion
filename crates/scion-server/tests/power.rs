@@ -281,6 +281,12 @@ async fn every_reply_survives_a_power_cut() {
         eprintln!("round {round}: mounted");
         create_repo(&data);
         eprintln!("round {round}: repo created");
+        // A reaped child's flock can outlive the waitpid by one tick, and
+        // the restart's open raced it (#260): wait for the lock to be free
+        // before the new server opens.
+        common::spawn_guard::across_release(|| {
+            common::spawn_guard::wait_for_lock_release(&data);
+        });
         let mut server = Server::start(&data, &log);
         eprintln!("round {round}: server up");
         check(&server.url, &data, &mut ledger, &mut checked, &mut rng).await;
@@ -598,6 +604,11 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
         let mut lazy = Lazyfs::start(dir.path(), &lazyfs, round);
         let data = lazy.mount.join("data");
         create_repo(&data);
+        // A reaped child's flock can outlive the waitpid by one tick, and
+        // the next round's server must not race it (#260).
+        common::spawn_guard::across_release(|| {
+            common::spawn_guard::wait_for_lock_release(&data);
+        });
         let mut server = Server::start(&data, &server_log);
         events.line(&format!("round {round}: server up"));
         // Acked waves: every put is answered before the cut, so every one
