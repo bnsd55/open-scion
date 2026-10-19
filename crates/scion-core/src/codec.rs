@@ -17,6 +17,7 @@ pub(crate) const MAX_FIELD: usize = u32::MAX as usize;
 /// Why a value cannot be encoded. Constructors refuse values that break a
 /// v1 bound, so [`Changeset::encode`] and [`Tree::encode`] never see one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EncodeError {
     /// A field or count is above the v1 format's `u32be` bound.
     FieldTooLong(&'static str),
@@ -56,6 +57,7 @@ const GIT_SHA256: u8 = 2;
 
 /// Why bytes are not a canonical v1 object, or break a limit the caller set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecodeError {
     /// The input ends before the object does, or a length points past the end.
     UnexpectedEnd,
