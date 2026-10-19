@@ -1619,7 +1619,6 @@ limit and its upgrade path. This is the list on `main` today.
 
 | File | Shortcut | Upgrade | Issue |
 |---|---|---|---|
-| `scion-core/src/codec.rs` (`put_len`) | Encoding panics if a field is longer than `u32::MAX`. Every ingest path caps sizes far below that. | `try_encode` returning `Result`, if a path ever does not. | |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/openscion/issues/35) |
 | `scion-server/src/store.rs` (`flush_dirs`) | LazyFS persists a rename at rename time, so the power-loss cut never drops a directory entry: the `fsync` of each directory after a rename (section 3) is invisible there. The dm-log-writes suite (section 9) covers it: a real ext4 log replayed to each reply's last flush, and the mutation that deletes the directory fsync turns it red. | A suite over a filesystem whose directory fsync does not force a journal commit, when a bug report says a directory entry was lost on one. | |
 | `scion-server/src/main.rs` (`Command`) | The `Serve` subcommand holds its flags by value: 309 bytes against `Import`'s 109, 20 bytes over `clippy::large_enum_variant`, so the lint is off for the enum. | Box the TLS and ticket paths of `Serve` if a variant grows further. | |

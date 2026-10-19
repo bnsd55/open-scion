@@ -127,10 +127,9 @@ impl Fake {
                 (PathElem::new(path.clone()).unwrap(), state)
             })
             .collect();
-        let (tree_bytes, root) = Tree {
-            entries: entries.into_iter().collect(),
-        }
-        .encode_with_id();
+        let (tree_bytes, root) = Tree::new(entries.into_iter().collect())
+            .expect("tree fits the format")
+            .encode_with_id();
         let tree = Object {
             kind: ObjectKind::Tree.into(),
             id: root.as_bytes().to_vec(),
@@ -175,10 +174,9 @@ impl Fake {
                 (PathElem::new(path.clone()).unwrap(), state)
             })
             .collect();
-        let (tree_bytes, root) = Tree {
-            entries: entries.into_iter().collect(),
-        }
-        .encode_with_id();
+        let (tree_bytes, root) = Tree::new(entries.into_iter().collect())
+            .expect("tree fits the format")
+            .encode_with_id();
         let tree = Object {
             kind: ObjectKind::Tree.into(),
             id: root.as_bytes().to_vec(),
@@ -595,8 +593,8 @@ async fn a_tier_refuses_an_object_whose_bytes_do_not_match_its_id() {
         ..blob(b"bad\n")
     };
     // A valid tree, sent for the ID of another one.
-    let tree = Tree {
-        entries: [(
+    let tree = Tree::new(
+        [(
             PathElem::new("f").unwrap(),
             Entry::File(scion_core::FileEntry::new(
                 FileState::Regular {
@@ -607,7 +605,8 @@ async fn a_tier_refuses_an_object_whose_bytes_do_not_match_its_id() {
             )),
         )]
         .into(),
-    };
+    )
+    .expect("tree fits the format");
     let bad_tree = Object {
         kind: ObjectKind::Tree.into(),
         id: tree.id().as_bytes().to_vec(),
@@ -1390,13 +1389,14 @@ async fn a_view_ticket_cannot_reach_a_warm_blob_outside_its_view() {
     let fake = Fake::new(&[&secret], Duration::ZERO);
     // bob's view: a root tree that lists `src` only, signed by the same
     // key and served, so the walk of his ticket can read it.
-    let (view_bytes, view_root) = Tree {
-        entries: [(
+    let (view_bytes, view_root) = Tree::new(
+        [(
             PathElem::new(b"src".to_vec()).unwrap(),
             Entry::Dir(Tree::default().encode_with_id().1),
         )]
         .into(),
-    }
+    )
+    .expect("tree fits the format")
     .encode_with_id();
     let view_tree = Object {
         kind: ObjectKind::Tree.into(),
@@ -1469,13 +1469,14 @@ async fn a_view_ticket_cannot_reach_a_warm_blob_outside_its_view() {
 async fn a_daemons_cache_still_refuses_a_view_ticket_outside_its_view() {
     let secret = blob(b"docs/secret, outside the view\n");
     let fake = Fake::new(&[&secret], Duration::ZERO);
-    let (view_bytes, view_root) = Tree {
-        entries: [(
+    let (view_bytes, view_root) = Tree::new(
+        [(
             PathElem::new(b"src".to_vec()).unwrap(),
             Entry::Dir(Tree::default().encode_with_id().1),
         )]
         .into(),
-    }
+    )
+    .expect("tree fits the format")
     .encode_with_id();
     let view_tree = Object {
         kind: ObjectKind::Tree.into(),

@@ -367,21 +367,23 @@ fn chain<S: Into<Option<FileState>>>(
             let repo = c.create_repo(REPO)?;
             let mut ids: Vec<ChangesetId> = Vec::new();
             for (message, files) in changesets {
-                let cs = Changeset {
-                    parents: ids.last().copied().into_iter().collect(),
-                    author: IdentityTime {
-                        name: b"Ada".to_vec(),
-                        email: b"ada@example.com".to_vec(),
-                        unix_secs: 1_700_000_000,
-                        tz_offset_minutes: 0,
-                    },
-                    committer: None,
+                let cs = Changeset::new(
+                    ids.last().copied().into_iter().collect(),
+                    IdentityTime::new(
+                        b"Ada".to_vec(),
+                        b"ada@example.com".to_vec(),
+                        1_700_000_000,
+                        0,
+                    )
+                    .expect("identity fits the format"),
+                    None,
                     message,
-                    changes: files
+                    files
                         .into_iter()
                         .map(|(p, state)| (RepoPath::new(p).unwrap(), state.into()))
                         .collect(),
-                };
+                )
+                .expect("changeset fits the format");
                 // The blobs of this chain are never read, only named; their lengths
                 // are irrelevant to log and blame.
                 ids.push(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0);
