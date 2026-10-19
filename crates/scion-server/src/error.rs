@@ -225,6 +225,8 @@ impl From<Error> for Status {
             Error::InvalidArgument(_) | Error::Apply(_) => Status::invalid_argument(e.to_string()),
             Error::PermissionDenied(_) => Status::permission_denied(e.to_string()),
             Error::Aborted(_) => Status::aborted(e.to_string()),
+            // The call went; the job that served it stopped at its next
+            // check. Nobody reads the reply, so the message is for the log.
             Error::Cancelled(_) => Status::cancelled(e.to_string()),
             Error::DeadlineExceeded(_) => Status::deadline_exceeded(e.to_string()),
             Error::FailedPrecondition(_) => Status::failed_precondition(e.to_string()),
@@ -356,6 +358,12 @@ mod tests {
             cause.sqlite_error_code(),
             Some(rusqlite::ErrorCode::DatabaseCorrupt)
         );
+
+    /// A cancelled call maps to its own code, not a deadline's.
+    #[test]
+    fn a_cancelled_call_answers_cancelled_not_deadline_exceeded() {
+        let err = Error::Cancelled("its call has gone".to_owned());
+        assert_eq!(Status::from(err).code(), Code::Cancelled);
     }
 
     /// A drained pool of Postgres readers answers `unavailable`, so the
@@ -382,11 +390,5 @@ mod tests {
         // EDQUOT number differs between the platforms.
         let io = std::io::Error::from(std::io::ErrorKind::QuotaExceeded);
         assert_eq!(Status::from(Error::Io(io)).code(), Code::ResourceExhausted);
-    }
-
-    #[test]
-    fn a_cancelled_call_answers_cancelled_not_deadline_exceeded() {
-        let err = Error::Cancelled("its call has gone".to_owned());
-        assert_eq!(Status::from(err).code(), Code::Cancelled);
     }
 }

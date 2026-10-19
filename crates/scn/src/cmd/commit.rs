@@ -1,14 +1,14 @@
 //! `commit`.
 
+use anyhow::{Context, Result, bail, ensure};
+use scion_core::{Changeset, FileState, IdentityTime, RepoPath};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
-use scion_core::{Changeset, FileState, IdentityTime, RepoPath};
-
 use crate::client::{Ctx, now_unix_secs};
+use crate::outln;
 
 /// Arguments of `scn commit`.
 #[derive(clap::Args)]
@@ -138,9 +138,9 @@ pub async fn commit(ctx: &mut Ctx, args: CommitArgs) -> Result<()> {
     .expect("changeset fields fit the format");
     let id = ctx.create_changeset(&changeset).await?;
     if ctx.json {
-        println!("{}", serde_json::json!({ "changeset": id.to_string() }));
+        outln!("{}", serde_json::json!({ "changeset": id.to_string() }));
     } else {
-        println!("{id}");
+        outln!("{id}");
     }
     Ok(())
 }

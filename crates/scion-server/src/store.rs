@@ -2110,10 +2110,10 @@ impl BlobBatch<'_> {
     /// any blob.
     // SHORTCUT: the power-loss suite's cut drops unsynced file data, but
     // LazyFS persists a rename at rename time, so the directory fsync here
-    // is never exercised by it. Upgrade: a block-level replay that drops
-    // un-flushed writes in order (dm-log-writes replay to each FLUSH), when
-    // a bug report or a change to this rename path says a directory entry
-    // was lost.
+    // is never exercised by it; the block-level replay that covers it runs
+    // in CI (tests/dm_log_writes.rs). The next upgrade: the same replay
+    // over a filesystem whose directory fsync does not force a journal
+    // commit, when a bug report says a directory entry was lost on one.
     fn flush_dirs(self) -> Result<bool> {
         for dir in &self.dirs {
             let name = dir.display().to_string();

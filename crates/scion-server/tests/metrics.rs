@@ -339,3 +339,9 @@ async fn a_read_file_counts_its_bytes_and_a_stopped_call_counts_as_cancelled() {
     )
     .await;
 }
+// A streamed `Log` the client stops has no test here: the transport counts
+// a dropped reply as cancelled before any answer of the server's own is
+// read, so the count is the same whatever `check()` answers, and no test
+// of it can fail for a real reason (mutation-checked). The locks for a
+// cancelled call are the unit tests of `deadline::check` and the graph
+// walks, and the land tests that read a pending row and its retry.

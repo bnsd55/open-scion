@@ -135,7 +135,8 @@ pub struct LandRequest {
     /// Caller-chosen key. A retry with the same key returns the same land.
     pub request_key: String,
     /// When the server gives up on the request. The plan stops at it with
-    /// [`Error::DeadlineExceeded`], and the land stays pending.
+    /// [`Error::DeadlineExceeded`], or with [`Error::Cancelled`] once the
+    /// call that asked has gone, and the land stays pending.
     pub deadline: Deadline,
 }
 
@@ -270,9 +271,10 @@ impl Lands {
     /// [`Error::NotFound`] if the repo or changeset does not exist.
     /// [`Error::InvalidArgument`] for a malformed request, or a request key
     /// reused for a different land. [`Error::Aborted`] if other writers kept
-    /// moving the ref, and [`Error::DeadlineExceeded`] if the plan ran past
-    /// the request's deadline. The land then stays pending, and a retry with
-    /// the same request key resumes it. Store errors otherwise.
+    /// moving the ref, [`Error::DeadlineExceeded`] if the plan ran past
+    /// the request's deadline, or [`Error::Cancelled`] if the call went.
+    /// The land then stays pending, and a retry with the same request key
+    /// resumes it. Store errors otherwise.
     pub fn land(&self, store: &Backend, caller: &Caller, req: &LandRequest) -> Result<LandOutcome> {
         let outcome = self.land_committed(store, caller, req);
         // An index can hold up to the whole budget, and freeing it takes a
@@ -282,11 +284,11 @@ impl Lands {
         let outcome = outcome?;
         if let Some(metrics) = &self.metrics {
             metrics.land(match outcome.state {
-                LandState::Landed => 0,
-                LandState::Conflict => 1,
-                LandState::Rejected => 2,
+                LandState::Landed => "landed",
+                LandState::Conflict => "conflict",
+                LandState::Rejected => "rejected",
                 // A pending land waits for a retry with its key.
-                LandState::Pending => 3,
+                LandState::Pending => "retry",
             });
         }
         // Lands on one ref commit one at a time. Waiting for the flush after
@@ -328,13 +330,16 @@ impl Lands {
             let result = finish(self, store, repo, land_id, req, &mut index);
             // The index may be ahead of the database; rebuild it next time. A
             // lost race wrote nothing, so the index is still good. So is an
-            // index that a deadline stopped: an advance adds nothing until it
-            // reaches the tip, and a reach adds one whole changeset at a time,
-            // so a retry goes on from where the reach stopped.
-            if result
-                .as_ref()
-                .is_err_and(|e| !matches!(e, Error::Aborted(_) | Error::DeadlineExceeded(_)))
-            {
+            // index that a deadline stopped, or that stopped because the
+            // call went: an advance adds nothing until it reaches the tip,
+            // and a reach adds one whole changeset at a time, so a retry
+            // goes on from where the reach stopped.
+            if result.as_ref().is_err_and(|e| {
+                !matches!(
+                    e,
+                    Error::Aborted(_) | Error::DeadlineExceeded(_) | Error::Cancelled(_)
+                )
+            }) {
                 *index = None;
             }
             let head = match result.map_err(stays_pending)? {
@@ -503,10 +508,14 @@ enum Finished {
     Derive(ChangesetId),
 }
 
-/// Says that a land that stopped at its deadline stays pending.
+/// Says that a land that stopped at its deadline, or whose call went,
+/// stays pending.
 fn stays_pending(e: Error) -> Error {
     match e {
         Error::DeadlineExceeded(why) => Error::DeadlineExceeded(format!(
+            "{why}; the land stays pending, retry with the same request key"
+        )),
+        Error::Cancelled(why) => Error::Cancelled(format!(
             "{why}; the land stays pending, retry with the same request key"
         )),
         e => e,
@@ -882,7 +891,7 @@ impl PathIndex {
     /// changeset that does not fit in [`MAX_INDEX_BYTES`], which is then the
     /// floor. The caller has checked that `base` is not the floor and not in
     /// the index. Fails with [`Error::DeadlineExceeded`] once `deadline` has
-    /// passed.
+    /// passed, or [`Error::Cancelled`] once the call has gone.
     fn reach(
         &mut self,
         lands: &Lands,
@@ -1825,6 +1834,60 @@ mod tests {
             };
             let err = f.lands.land(&f.store, &caller(), &late).unwrap_err();
             assert!(matches!(err, Error::DeadlineExceeded(_)), "{key}: {err}");
+            assert_eq!(f.main(), before, "{key}");
+            let sql = "SELECT state FROM lands WHERE request_key = ?1";
+            let row: String = f
+                .store
+                .read(|c| {
+                    Ok(c.sqlite()
+                        .unwrap()
+                        .query_row(sql, [key], |row| row.get(0))?)
+                })
+                .unwrap();
+            assert_eq!(row, "pending", "{key}");
+            // The index stays, so a retry goes on from where the plan stopped.
+            f.index(|_| ());
+            let out = f.land(cs, key);
+            assert_eq!(out.state, state, "{key}: {}", out.detail);
+        }
+    }
+
+    /// A land whose call has gone: the deadline has not passed, but the
+    /// call's guard dropped, so the plan's next check answers
+    /// [`Error::Cancelled`]. The land stays pending, keeps its path index,
+    /// and a retry with the same key finishes it: the same promise a
+    /// deadline-stopped land keeps.
+    #[test]
+    fn a_land_whose_call_went_stays_pending_and_a_retry_finishes_it() {
+        use LandState::{Conflict, Landed};
+        let f = fixture();
+        // The index starts at B, so root is below its floor.
+        f.move_main(f.commit(f.root, &[put("b/y", "B")]));
+        f.fill("f", 1);
+        // An import moves main, so the next plan advances the index.
+        f.move_main(f.commit(f.main().target, &[put("c", "import")]));
+        let on_head = f.commit(f.main().target, &[put("a/x", "mine")]);
+        // The plan of this one walks back from the floor.
+        let on_root = f.commit(f.root, &[put("c", "mine")]);
+        for (cs, key, state) in [
+            (on_head, "gone head", Landed),
+            (on_root, "gone root", Conflict),
+        ] {
+            let before = f.main();
+            // The call went before the plan started: the guard drops, the
+            // deadline itself is far in the future.
+            let deadline = Deadline::new(Instant::now() + std::time::Duration::from_secs(600));
+            let guard = deadline.guard();
+            let gone = LandRequest {
+                deadline,
+                ..req(cs, key)
+            };
+            drop(guard);
+            let err = f.lands.land(&f.store, &caller(), &gone).unwrap_err();
+            assert!(
+                matches!(&err, Error::Cancelled(why) if why.contains("its call has gone")),
+                "{key}: {err}"
+            );
             assert_eq!(f.main(), before, "{key}");
             let sql = "SELECT state FROM lands WHERE request_key = ?1";
             let row: String = f

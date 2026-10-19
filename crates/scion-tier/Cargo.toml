@@ -37,6 +37,8 @@ zstd.workspace = true
 workspace = true
 
 [dev-dependencies]
+hyper-util.workspace = true
 rcgen.workspace = true
 tempfile.workspace = true
 tonic-health.workspace = true
+tower.workspace = true

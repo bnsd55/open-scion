@@ -12,6 +12,8 @@
 //!   handling of every call.
 //! - [`cmd`]: one module per command (`cat`, `ls`, `log`, `commit`,
 //!   `checkout`, `mount`, the query commands) and their `--json` output.
+//! - [`out`]: the one stdout writer, and the quiet exit that a closed
+//!   pipe (`scn blame f | head -1`) gets.
 //! - [`materialize`]: writing trees to disk, the checkout and the mount
 //!   overlay.
 //! - [`vfs`]: reading trees through the API, with the sizes and states
@@ -31,6 +33,7 @@
 pub mod client;
 pub mod cmd;
 pub mod materialize;
+pub mod out;
 pub mod vfs;
 
 /// The gate the unit tests of this binary run their forks and their

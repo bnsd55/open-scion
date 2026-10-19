@@ -204,7 +204,8 @@ impl Kind for CommitGraph {
 /// # Errors
 ///
 /// [`Error::NotFound`] if `repo` does not have either changeset.
-/// [`Error::DeadlineExceeded`] once `deadline` has passed.
+/// [`Error::DeadlineExceeded`] once `deadline` has passed, or
+/// [`Error::Cancelled`] once the call has gone.
 pub fn is_ancestor(
     store: &Backend,
     repo: RepoId,
@@ -228,7 +229,8 @@ pub fn is_ancestor(
 /// # Errors
 ///
 /// [`Error::NotFound`] if `repo` does not have either changeset.
-/// [`Error::DeadlineExceeded`] once `deadline` has passed.
+/// [`Error::DeadlineExceeded`] once `deadline` has passed, or
+/// [`Error::Cancelled`] once the call has gone.
 pub fn merge_bases(
     store: &Backend,
     repo: RepoId,
@@ -254,7 +256,8 @@ pub fn merge_bases(
 ///
 /// # Errors
 ///
-/// [`Error::DeadlineExceeded`] once `deadline` has passed.
+/// [`Error::DeadlineExceeded`] once `deadline` has passed, or
+/// [`Error::Cancelled`] once the call has gone.
 pub(crate) fn on_first_parents(
     c: &mut dyn MetaTx,
     tip: ChangesetId,
@@ -327,10 +330,14 @@ fn in_steps<T>(
     // see is durable, with one flush for all steps.
     store.wait_durable(seen)?;
     let Cost { reads, steps } = cost;
-    if let Err(Error::DeadlineExceeded(why)) = &result {
-        tracing::info!(reads, steps, %why, "a graph query stopped");
-    } else {
-        tracing::debug!(reads, steps, "graph query");
+    match &result {
+        Err(Error::DeadlineExceeded(why)) => {
+            tracing::info!(reads, steps, %why, "a graph query stopped at its deadline");
+        }
+        Err(Error::Cancelled(why)) => {
+            tracing::info!(reads, steps, %why, "a graph query stopped: its call went");
+        }
+        _ => tracing::debug!(reads, steps, "graph query"),
     }
     result.map(|answer| (answer, cost))
 }
@@ -1140,7 +1147,7 @@ mod tests {
         assert!(found.unwrap());
         let mut stopped = search();
         let (late, moves) = walk_until(&store, 50, |index| stopped.next(index));
-        assert!(matches!(late, Err(Error::DeadlineExceeded(_))), "{late:?}");
+        assert!(matches!(late, Err(Error::Cancelled(_))), "{late:?}");
         assert!(50 < moves && moves < all, "{moves} of {all} moves");
 
         let paint = || {
@@ -1154,7 +1161,7 @@ mod tests {
         assert_eq!(bases.unwrap(), [side]);
         let mut stopped = paint();
         let (late, moves) = walk_until(&store, 50, |index| stopped.next(index));
-        assert!(matches!(late, Err(Error::DeadlineExceeded(_))), "{late:?}");
+        assert!(matches!(late, Err(Error::Cancelled(_))), "{late:?}");
         assert!(50 < moves && moves < all, "{moves} of {all} moves");
     }
 
