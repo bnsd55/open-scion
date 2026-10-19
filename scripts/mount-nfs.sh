@@ -92,7 +92,9 @@ timeout 120 "$BIN/scion-server" --data "$WORK/server" import \
 note "mounting main on $VIEW"
 # mount(2) needs an existing mount point; scn mount does not make one.
 mkdir -p "$VIEW"
-"$BIN/scn" --server "$SERVER" mount "$VIEW" main \
+# The writes of (b) and the commit of (c) need --unstable-writable: the
+# v0.1 mount is read-only without it.
+"$BIN/scn" --server "$SERVER" mount --unstable-writable "$VIEW" main \
   > "$WORK/mount.log" 2>&1 &
 MOUNT_PID=$!
 echo "$MOUNT_PID" > "$WORK/mount.pid"
@@ -155,6 +157,39 @@ if timeout 30 sudo mount -t nfs -o "vers=3,tcp,port=$port,mountport=$port,nolock
   die "the tampered mount path $wrong_target was accepted"
 fi
 timeout 30 stat "$VIEW/renamed.txt" > /dev/null || die "the mount died"
+
+# (e2) A mount without --unstable-writable is read-only: the read works,
+# the write is refused with EROFS, and the commit from it names the flag.
+VIEW2="$WORK/ro-view"
+mkdir -p "$VIEW2"
+"$BIN/scn" --server "$SERVER" mount "$VIEW2" main \
+  > "$WORK/mount-ro.log" 2>&1 &
+RO_PID=$!
+timeout 30 bash -c 'until grep -q "^sudo mount -t nfs" '"$WORK"'/mount-ro.log 2> /dev/null; do
+  kill -0 '"$RO_PID"' 2> /dev/null || { cat '"$WORK"'/mount-ro.log >&2; die "the read-only scn mount died"; }
+  sleep 0.2
+done' || die "the read-only mount printed no mount command"
+RO_CMD=$(grep '^sudo mount -t nfs' "$WORK/mount-ro.log" | tail -n 1)
+# shellcheck disable=SC2086
+timeout 60 sudo $RO_CMD || die "the read-only mount command failed: $RO_CMD"
+timeout 60 bash -c 'until [ -f "'"$VIEW2"'/README.md" ]; do sleep 0.2; done' \
+  || { cat "$WORK/mount-ro.log" >&2; die "the read-only mount did not come up"; }
+got=$(timeout 30 cat "$VIEW2/README.md")
+[ "$got" = "hello from the mount test" ] || die "the read-only mount served '$got'"
+if timeout 30 bash -c 'echo refused > "'"$VIEW2"'/refused.txt"' 2> /dev/null; then
+  die "a read-only mount took a write"
+fi
+RO_COMMIT=$(timeout 60 "$BIN/scn" --server "$SERVER" commit -m "ro" \
+  --from-mount "$VIEW2" 2>&1 || true)
+echo "$RO_COMMIT" | grep -q -- "--unstable-writable" \
+  || die "the commit from a read-only mount names no flag: $RO_COMMIT"
+timeout 60 "$BIN/scn" --server "$SERVER" unmount "$VIEW2" \
+  > "$WORK/unmount-ro.log" 2>&1 || die "scn unmount of the read-only mount failed"
+sudo umount -f -l "$VIEW2" 2> /dev/null || true
+if mount | grep -q " on $VIEW2 "; then
+  die "$VIEW2 is still mounted"
+fi
+kill "$RO_PID" 2> /dev/null || true
 
 # (f) The unmount: scn unmount as the user drops the session record, then
 # the real umount under sudo, and the mount table is clean afterwards.
