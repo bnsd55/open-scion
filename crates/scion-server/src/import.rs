@@ -8,11 +8,14 @@
 //! Git headers that Scion does not model (`encoding`, `gpgsig`, `mergetag`)
 //! are dropped, so a changeset ID is not a function of the git object name.
 
-use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 #[cfg(test)]
 use std::sync::{Mutex, PoisonError};
+// Both `Cell` users sit behind a cfg: the slow-record model of a test,
+// and the check counter the test-hooks feature turns on.
+#[cfg(any(test, feature = "test-hooks"))]
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use gix::ObjectId;
@@ -207,7 +210,11 @@ fn import_with_cache(
         intact: LruCache::new(cache_entries),
     };
     let mut done = 0;
-    for (batch_no, batch) in plan.todo.chunks(BATCH).enumerate() {
+    // The batch index the test hook takes. The hook itself sits behind
+    // the feature, so the counter is a release build's dead weight.
+    #[cfg(any(test, feature = "test-hooks"))]
+    let mut batch_no = 0usize;
+    for batch in plan.todo.chunks(BATCH) {
         // Blobs are made durable first, so no stored metadata points at a
         // blob that a crash could lose.
         let mut blobs = store.blobs().batch();
@@ -247,7 +254,10 @@ fn import_with_cache(
         // A batch's commit has ended and the write lock is free: this is
         // the counted boundary a test holds the lock at.
         #[cfg(any(test, feature = "test-hooks"))]
-        store.run_after_batch(batch_no);
+        {
+            store.run_after_batch(batch_no);
+            batch_no += 1;
+        }
     }
 
     // The tip was imported before, or planned and imported above.

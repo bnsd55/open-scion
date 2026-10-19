@@ -1,10 +1,13 @@
 //! Limits on names that clients send: repos, refs and request keys.
 
+// The limit rides for the tests' builds; production code reaches it
+// through `scion-proto` directly.
+#[cfg(any(test, feature = "test-hooks"))]
 pub use scion_proto::runtime::check::MAX_NAME_BYTES;
 
 use crate::error::{Error, Result};
 
-/// Checks a client-supplied name: 1 to [`MAX_NAME_BYTES`] bytes and no
+/// Checks a client-supplied name: 1 to `MAX_NAME_BYTES` bytes and no
 /// control characters, so names are safe to log and to print. The tiers use
 /// the same rule ([`scion_proto::runtime::check::name`]).
 ///

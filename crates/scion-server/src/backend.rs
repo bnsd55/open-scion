@@ -229,7 +229,9 @@ fn hex16(bytes: &[u8; 16]) -> String {
     hex
 }
 
-/// The URL of the test database.
+/// The URL of the test database. Its callers sit behind the test-hooks
+/// feature, and so does this.
+#[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn test_url() -> Result<String> {
     std::env::var("SCION_TEST_POSTGRES_URL").map_err(|_| {
         crate::error::Error::InvalidArgument(
@@ -239,7 +241,9 @@ pub(crate) fn test_url() -> Result<String> {
 }
 
 /// A database schema name that belongs to `data`, so the tests of one
-/// directory share it and no others see it.
+/// directory share it and no others see it. Its callers sit behind the
+/// test-hooks feature, and so does this.
+#[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn test_schema(data: &Path) -> String {
     let path = data.canonicalize().unwrap_or_else(|_| data.to_path_buf());
     let mut hasher = std::collections::hash_map::DefaultHasher::new();

@@ -242,7 +242,9 @@ struct Inner {
     /// `<data>/server.lock`, for a server `Store`.
     _server_lock: Option<fs::File>,
     /// Write transactions run so far, for tests of how imports share the
-    /// write lock.
+    /// write lock. Only a test-hooks build reads it, and only its unit
+    /// tests bump it.
+    #[cfg(any(test, feature = "test-hooks"))]
     txes: AtomicU64,
     /// How many of the next commits fail as a busy database, for tests of
     /// the import's busy retry: the transaction ran and rolled back, so
@@ -440,6 +442,7 @@ impl Store {
                 alone,
                 _lock: lock,
                 _server_lock: server_lock,
+                #[cfg(any(test, feature = "test-hooks"))]
                 txes: AtomicU64::new(0),
                 fail_commits: AtomicU64::new(0),
                 #[cfg(any(test, feature = "test-hooks"))]
@@ -1048,14 +1051,17 @@ pub struct DurabilityLog {
     steps: std::sync::Mutex<Vec<DurabilityStep>>,
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
 impl DurabilityLog {
-    /// Records one step.
+    /// Records one step. A release build keeps no steps: a record is a
+    /// drop.
     fn record(&self, step: DurabilityStep) {
+        #[cfg(any(test, feature = "test-hooks"))]
         self.steps
             .lock()
             .expect("the durability log's lock")
             .push(step);
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        drop(step);
     }
 
     /// The steps recorded so far, oldest first.
@@ -1547,7 +1553,6 @@ impl Blobs {
         self.fsync_gate(name, operation)?;
         let started = std::time::Instant::now();
         let out = f();
-        #[cfg(any(test, feature = "test-hooks"))]
         if out.is_ok() {
             match step {
                 SyncStep::TempFile(id) => self.log.record(DurabilityStep::FileFsync(*id)),
@@ -1560,8 +1565,6 @@ impl Blobs {
                 SyncStep::Unnamed => {}
             }
         }
-        #[cfg(not(any(test, feature = "test-hooks")))]
-        drop(step);
         self.record_sync(started);
         out.map_err(Error::Io)
     }
