@@ -9,7 +9,9 @@ on:
     inputs:
       minutes:
         description: run length in minutes
-        default: "120"
+        # A dispatch is the bounded manual run; the nightly schedule runs
+        # 120 regardless of this default.
+        default: "10"
 
 # Every third-party action is pinned to the commit SHA its version tag
 # named, with the version in a comment, as ci.yml does.
