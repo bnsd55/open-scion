@@ -153,7 +153,7 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
     );
     outln!("{}", mount_command(port, &secret, &dir));
     if !args.no_mount {
-        try_mount(port, &secret, &dir);
+        try_mount(port, &secret, &dir)?;
     }
 
     wait_stopped().await;
@@ -297,7 +297,7 @@ fn mount_command(port: u16, secret: &str, dir: &Path) -> String {
 
 /// Tries to mount without sudo; on failure, prints the sudo command and
 /// keeps serving ([#11]).
-fn try_mount(port: u16, secret: &str, dir: &Path) {
+fn try_mount(port: u16, secret: &str, dir: &Path) -> Result<()> {
     let mut command = if cfg!(target_os = "macos") {
         let mut command = std::process::Command::new("mount_nfs");
         command.arg(format!(
@@ -320,6 +320,7 @@ fn try_mount(port: u16, secret: &str, dir: &Path) {
         outln!("mount failed; to mount, run:");
         outln!("{}", mount_command(port, secret, dir));
     }
+    Ok(())
 }
 
 /// Unmounts `dir`, best effort.

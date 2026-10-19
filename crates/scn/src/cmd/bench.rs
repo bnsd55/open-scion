@@ -80,7 +80,7 @@ pub async fn bench(ctx: &Ctx, args: BenchArgs) -> Result<()> {
     }
     let elapsed = started.elapsed();
     verify(ctx.clone(), start, &stats.landed).await?;
-    report(ctx.json, agents, &mut stats, elapsed);
+    report(ctx.json, agents, &mut stats, elapsed)?;
     Ok(())
 }
 
@@ -211,7 +211,7 @@ fn percentiles_ms(sorted: &[Duration]) -> [f64; 3] {
     [at(0.50), at(0.99), at(1.0)]
 }
 
-fn report(json: bool, agents: usize, stats: &mut Stats, elapsed: Duration) {
+fn report(json: bool, agents: usize, stats: &mut Stats, elapsed: Duration) -> Result<()> {
     stats.land.sort();
     stats.total.sort();
     let [land_p50, land_p99, land_max] = percentiles_ms(&stats.land);
@@ -232,7 +232,7 @@ fn report(json: bool, agents: usize, stats: &mut Stats, elapsed: Duration) {
             "verified_on_main": true,
         });
         outln!("{out}");
-        return;
+        return Ok(());
     }
     outln!(
         "{landed} lands by {agents} agents in {:.1} s: {rate:.0} lands/s",
@@ -242,6 +242,7 @@ fn report(json: bool, agents: usize, stats: &mut Stats, elapsed: Duration) {
     outln!("land RPC     p50 {land_p50:.1} ms  p99 {land_p99:.1} ms  max {land_max:.1} ms");
     outln!("end to end   p50 {total_p50:.1} ms  p99 {total_p99:.1} ms  (upload + create + land)");
     outln!("verified: main gained exactly the {landed} landed changesets");
+    Ok(())
 }
 
 #[cfg(test)]

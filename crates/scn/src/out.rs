@@ -28,16 +28,16 @@ fn stop_quietly() -> ! {
     std::process::exit(0)
 }
 
-/// Prints one line to stdout. The `outln!` macro calls this; never
-/// call it directly, so every print site reads like a `println!`.
-pub fn line(args: std::fmt::Arguments<'_>) {
-    let mut out = io::stdout();
-    if let Err(e) = out.write_fmt(args) {
-        if broken_pipe(&e) {
-            stop_quietly();
-        }
-        eprintln!("scn: cannot write to stdout: {e}");
-        std::process::exit(2);
+/// Prints one line to stdout. The `outln!` macro calls this and
+/// propagates the error with `?`; never call it directly, so every
+/// print site reads like a `println!`. A broken pipe ends the process
+/// quietly; any other error returns, and the caller fails the command
+/// the usual way.
+pub fn line(args: std::fmt::Arguments<'_>) -> io::Result<()> {
+    match io::stdout().write_fmt(args) {
+        Ok(()) => Ok(()),
+        Err(e) if broken_pipe(&e) => stop_quietly(),
+        Err(e) => Err(e),
     }
 }
 
@@ -73,15 +73,17 @@ pub fn flush<W: Write>(out: &mut W) -> io::Result<()> {
     }
 }
 
-/// stdout's `println!` of scn: it prints through [`line`](fn@line), so a closed
-/// pipe ends the command quietly instead of panicking. Like `println!`,
-/// each call prints one newline after its arguments.
+/// stdout's `println!` of scn: it prints through [`line`](fn@line) and
+/// propagates a non-broken-pipe error with `?`, so a closed pipe ends
+/// the command quietly and any other stdout error fails it the usual
+/// way. Like `println!`, each call prints one newline after its
+/// arguments.
 #[macro_export]
 macro_rules! outln {
     () => {
-        $crate::out::line(format_args!("\n"))
+        $crate::out::line(format_args!("\n"))?
     };
     ($($arg:tt)*) => {
-        $crate::out::line(format_args!("{}\n", format_args!($($arg)*)))
+        $crate::out::line(format_args!("{}\n", format_args!($($arg)*)))?
     };
 }

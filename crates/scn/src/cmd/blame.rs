@@ -157,14 +157,19 @@ pub async fn blame(ctx: &mut Ctx, spec: &str) -> Result<()> {
     {
         text.extend(chunk.data);
     }
-    print_text(&lines, &sources, path.as_bytes(), &text);
+    print_text(&lines, &sources, path.as_bytes(), &text)?;
     Ok(())
 }
 
 /// Prints each line of `text`, the file at `path`, after its changeset, its
 /// author and time, and its line number. As in git, each line also shows
 /// the path of its source if any line came from another path.
-fn print_text(lines: &[(ChangesetId, u32)], sources: &Sources, path: &[u8], text: &[u8]) {
+fn print_text(
+    lines: &[(ChangesetId, u32)],
+    sources: &Sources,
+    path: &[u8],
+    text: &[u8],
+) -> Result<()> {
     let width = lines.len().to_string().len();
     let path_width = if sources.values().any(|(_, p)| p != path) {
         sources
@@ -194,6 +199,7 @@ fn print_text(lines: &[(ChangesetId, u32)], sources: &Sources, path: &[u8], text
             text.strip_suffix('\n').unwrap_or(&text)
         );
     }
+    Ok(())
 }
 
 /// Lines grouped into ranges, as JSON: consecutive lines from the same
