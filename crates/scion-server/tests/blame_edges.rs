@@ -601,7 +601,7 @@ async fn an_older_version_with_too_many_lines_counts_as_absent() {
     let mut body = vec![b'\n'; under - 1];
     body.push(b'x');
     let child_blob = put(&store, &body);
-    let (parent, child) = store
+    let (_parent, child) = store
         .write(|c| {
             let repo = c.repo_id(REPO)?;
             let parent = c.insert_changeset(
@@ -617,7 +617,8 @@ async fn an_older_version_with_too_many_lines_counts_as_absent() {
         .unwrap();
     let (_stop, mut client) = serve(&store, dir.path(), whole_access(), TOKEN).await;
     let (ranges, changesets, next, _parts) = blame(&mut client, &child, PATH, b"").await;
-    assert_eq!(covered(&ranges), (1..=under as u32).collect::<Vec<u32>>());
+    let under = u32::try_from(under).unwrap();
+    assert_eq!(covered(&ranges), (1..=under).collect::<Vec<u32>>());
     assert_eq!(changesets.len(), 1, "{changesets:?}");
     assert_eq!(changesets[0].changeset_id, child.as_bytes().to_vec());
     assert!(next.is_empty(), "the walk explained the whole file");
