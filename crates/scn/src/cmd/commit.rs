@@ -62,6 +62,15 @@ pub async fn commit(ctx: &mut Ctx, args: CommitArgs) -> Result<()> {
         Some(dir) => {
             let record = crate::cmd::mount::session_for_dir(dir)
                 .with_context(|| format!("cannot commit from the mount on {}", dir.display()))?;
+            // A read-only mount holds no changes: its writes are refused.
+            // The flag is the same one the mount took its writes with, so
+            // the error names it.
+            anyhow::ensure!(
+                record.writable,
+                "the mount on {} is read-only; it takes `scn mount \
+                 --unstable-writable`",
+                dir.display()
+            );
             let mut edits = BTreeMap::new();
             for (path, change) in crate::cmd::mount::overlay_changes(&record)? {
                 let edit = match change {

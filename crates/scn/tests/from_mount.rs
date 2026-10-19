@@ -7,7 +7,7 @@
 use std::process::Command;
 
 use common::{REPO, TOKEN, changeset, land};
-use nfsserve::nfs::{filename3, sattr3, set_size3};
+use nfsserve::nfs::{filename3, nfspath3, nfsstat3, sattr3, set_size3};
 use open_scion::client::{Ctx, id_from, test_objects};
 use open_scion::cmd::mount::{MountRecord, write_sessions};
 use open_scion::vfs::{NFSFileSystem, Vfs};
@@ -88,8 +88,14 @@ struct Mount {
     view: std::path::PathBuf,
 }
 
-/// Mounts the tree of `base` through the VFS.
+/// Mounts the tree of `base` through the VFS, with the writes a
+/// `--unstable-writable` mount takes.
 fn mount(tiers: &common::Tiers, base: &ChangesetId) -> Mount {
+    mount_as(tiers, base, true)
+}
+
+/// Mounts as `--unstable-writable` would (`writable`) or not.
+fn mount_as(tiers: &common::Tiers, base: &ChangesetId, writable: bool) -> Mount {
     let (objects, roots, reply) = tiers.runtime.block_on(async {
         let objects = test_objects(&tiers.server, TOKEN).await;
         // The refresh of the ticket goes to the server, like a mount's.
@@ -121,7 +127,8 @@ fn mount(tiers: &common::Tiers, base: &ChangesetId) -> Mount {
         root,
         &reply.ticket,
         overlay.join("tree"),
-    );
+    )
+    .writable(writable);
     // The session file the commit reads, under the home of the `scn` runs.
     std::fs::create_dir_all(home.path().join(".scion")).unwrap();
     write_sessions(
@@ -131,6 +138,7 @@ fn mount(tiers: &common::Tiers, base: &ChangesetId) -> Mount {
             overlay: overlay.clone(),
             rev: "main".to_owned(),
             pid: std::process::id(),
+            writable,
         }],
     )
     .unwrap();
@@ -329,4 +337,116 @@ fn a_non_utf8_name_commits_its_own_content() {
     };
     assert_eq!(blob(state(raw)), b"raw\n");
     assert_eq!(blob(state(lossy.as_bytes())), b"lossy\n");
+}
+
+/// A mount without `--unstable-writable` answers `EROFS` to every
+/// mutating call the NFS trait has, before it looks at its arguments,
+/// and its reads still work.
+#[test]
+fn a_read_only_mount_answers_rofs_to_every_write() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
+    let base = start(&store);
+    let tiers = common::Tiers::start(data, store.clone());
+    let mounted = mount_as(&tiers, &base, false);
+    let vfs = &mounted.vfs;
+
+    tiers.runtime.block_on(async {
+        let root = NFSFileSystem::root_dir(vfs);
+        let rofs = nfsstat3::NFS3ERR_ROFS;
+
+        // A read still works: the mount is read-only, not dark.
+        let id = vfs
+            .lookup(root, &filename3::from(b"keep.txt".to_vec()))
+            .await
+            .unwrap();
+        let (bytes, _) = vfs.read(id, 0, 5).await.unwrap();
+        assert_eq!(bytes, b"same\n");
+
+        // Every mutating call the VFS implements is refused.
+        assert_eq!(
+            vfs.setattr(id, sattr3::default()).await.unwrap_err(),
+            rofs,
+            "setattr"
+        );
+        assert_eq!(vfs.write(id, 0, b"x").await.unwrap_err(), rofs, "write");
+        assert_eq!(
+            vfs.create(root, &filename3::from(b"n".to_vec()), sattr3::default())
+                .await
+                .unwrap_err(),
+            rofs,
+            "create"
+        );
+        assert_eq!(
+            vfs.create_exclusive(root, &filename3::from(b"e".to_vec()))
+                .await
+                .unwrap_err(),
+            rofs,
+            "create_exclusive"
+        );
+        assert_eq!(
+            vfs.mkdir(root, &filename3::from(b"d".to_vec()))
+                .await
+                .unwrap_err(),
+            rofs,
+            "mkdir"
+        );
+        assert_eq!(
+            vfs.remove(root, &filename3::from(b"keep.txt".to_vec()))
+                .await
+                .unwrap_err(),
+            rofs,
+            "remove"
+        );
+        assert_eq!(
+            vfs.rename(
+                root,
+                &filename3::from(b"keep.txt".to_vec()),
+                root,
+                &filename3::from(b"moved".to_vec())
+            )
+            .await
+            .unwrap_err(),
+            rofs,
+            "rename"
+        );
+        assert_eq!(
+            vfs.symlink(
+                root,
+                &filename3::from(b"lnk".to_vec()),
+                &nfspath3::from(b"x".to_vec()),
+                &sattr3::default()
+            )
+            .await
+            .unwrap_err(),
+            rofs,
+            "symlink"
+        );
+    });
+}
+
+/// `commit --from-mount` refuses a read-only mount, with the flag the
+/// mount would have needed named in the error.
+#[test]
+fn a_commit_from_a_read_only_mount_names_the_flag() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
+    let base = start(&store);
+    let tiers = common::Tiers::start(data, store.clone());
+    let mounted = mount_as(&tiers, &base, false);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_scn"))
+        .args(["--server", &tiers.server, "--repo", REPO])
+        .args(["commit", "-m", "no writes", "--from-mount"])
+        .arg(&mounted.view)
+        .env("SCION_TOKEN", TOKEN)
+        .env("HOME", mounted.home.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the commit is refused");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--unstable-writable"),
+        "the error names the flag: {err}"
+    );
 }

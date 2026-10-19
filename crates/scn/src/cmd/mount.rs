@@ -30,6 +30,11 @@ pub struct MountArgs {
     /// Serve NFS, but do not try to mount: print the command instead.
     #[arg(long)]
     no_mount: bool,
+    /// Take writes on the mount, for the v0.1 unstable write path: a
+    /// symlinked parent directory in the overlay can still redirect a
+    /// write outside it, so the mount is read-only without this.
+    #[arg(long)]
+    unstable_writable: bool,
 }
 
 /// Arguments of `scn unmount`.
@@ -50,6 +55,9 @@ pub struct MountRecord {
     pub rev: String,
     /// The process that serves the NFS server.
     pub pid: u32,
+    /// Whether the mount takes writes: `--unstable-writable` sets it. A
+    /// record that predates the flag was a read-only mount.
+    pub writable: bool,
 }
 
 /// Serves the ref over the network filesystem on a free loopback port,
@@ -98,7 +106,8 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
         root,
         &reply.ticket,
         overlay.join(CHANGES),
-    );
+    )
+    .writable(args.unstable_writable);
     let secret = vfs.secret_name();
 
     // The identity of the serving process: an exclusive lock on the
@@ -116,6 +125,7 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
         overlay: overlay.clone(),
         rev: args.rev.clone(),
         pid: std::process::id(),
+        writable: args.unstable_writable,
     })?;
     // The bind is the one step that can still fail before serving: on
     // its failure, remove the record, so the next mount takes over.
@@ -424,6 +434,10 @@ fn parse_sessions(json: &serde_json::Value) -> Result<Vec<MountRecord>> {
                         .and_then(serde_json::Value::as_u64)
                         .ok_or_else(|| anyhow!("record {n} has no pid"))?,
                 )?,
+                writable: record
+                    .get("writable")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
             })
         })
         .collect()
@@ -457,6 +471,7 @@ pub fn write_sessions(file: &Path, sessions: &[MountRecord]) -> Result<()> {
                 "overlay": record.overlay.display().to_string(),
                 "rev": record.rev,
                 "pid": record.pid,
+                "writable": record.writable,
             })
         })
         .collect();

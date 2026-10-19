@@ -152,8 +152,12 @@ error exits 2. A checkout that a signal stops removes what it wrote, and
 then dies by the signal (a shell reports 130 for Ctrl-C).
 
 `scn mount` serves a ref over NFSv3 from `scn` itself, so a file loads when
-it is first read, not when the checkout starts. Writes land in a private
-overlay directory, and `scn commit --from-mount DIR` commits exactly what
+it is first read, not when the checkout starts. In v0.1 the mount is
+read-only: every write is answered `EROFS`, and `scn commit --from-mount`
+refuses, because a symlinked parent directory in the overlay can still
+redirect a write outside it. `scn mount --unstable-writable` takes writes
+into a private overlay directory, and `scn commit --from-mount DIR`
+commits exactly what
 the mount holds. It is for single-user machines only: any local user who
 can read the mount table can reach the mounted content through the NFS
 port. `scn unmount DIR` stops it and removes the overlay.

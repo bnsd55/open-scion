@@ -51,6 +51,10 @@ Every command takes these flags, before or after the subcommand:
   -p DIR`; `scn` refuses a missing mount point), then serve the ref as
   an NFSv3 filesystem that reads files on demand. `--no-mount` serves
   NFS but does not try to mount: it prints the mount command instead.
+  The mount is read-only: every write is answered `EROFS`. With
+  `--unstable-writable` it takes writes into its overlay — unstable,
+  because a symlinked parent directory in the overlay can still
+  redirect a write outside it.
   `scn unmount DIR` stops the mount.
 - `scn commit --message MESSAGE` (`-m`) — create a changeset on the server. It moves no
   ref; use `scn land` next. `--base REV` is the base (default `main`);
@@ -58,7 +62,8 @@ Every command takes these flags, before or after the subcommand:
   (repeatable), `--delete PATH` deletes, `--executable` marks the put
   files executable, and `--author "Name <email>"` (default
   `scn <scn@localhost>`) names the author. `--from-mount DIR` takes the
-  changes from the overlay of a `scn mount` on `DIR`, instead of `--put`
+  changes from the overlay of a writable `scn mount --unstable-writable`
+  on `DIR`, instead of `--put`
   and `--delete`; it commits what the overlay holds at that moment, so a
   commit while a file of the mount is still being written records the
   bytes written so far, the way `git add` does on a file being saved.
