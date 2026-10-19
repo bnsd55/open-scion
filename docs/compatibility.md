@@ -61,9 +61,10 @@ that touches a listed pair must carry:
 - The release notes of every minor name each pair it narrows.
 
 Within a minor line, a newer client keeps working against an N-1
-server: it sends nothing the old server cannot answer. A client that
-calls an RPC an older server does not have gets `UNIMPLEMENTED`, and
-prints which server version the call needs.
+server: it sends nothing the old server cannot answer. A minor that
+adds a call also makes its client handle `UNIMPLEMENTED` from an N-1
+server: it fails that one command with an error that names the server
+version it needs, and every other command keeps working.
 
 ## What is proven today, and what lands later
 
