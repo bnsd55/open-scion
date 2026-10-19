@@ -67,12 +67,9 @@ pub const DEFAULT_CONNECTIONS: NonZeroUsize = NonZeroUsize::new(128).unwrap();
 pub const DEFAULT_STREAMS: NonZeroU32 = NonZeroU32::new(256).unwrap();
 
 /// A client must send the HTTP/2 preface within this long after it gets its
-/// place, or its connection is closed.
+/// place, or its connection is closed. The same bound covers the TLS
+/// handshake on a TLS listener.
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// A TLS handshake must end within this long, or the connection is dropped.
-/// The same wait as [`HANDSHAKE_TIMEOUT`], and generous for one round trip
-/// plus a certificate check.
 
 /// After this long without a frame from a client, the process sends it an
 /// HTTP/2 ping.
