@@ -4,7 +4,7 @@
 //! lost, no file is left half-written, and the next write works once the
 //! space is back.
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
-use scion_server::{Backend, Error, Store};
+use scion_server::{Backend, Error, StorageClass, Store};
 
 /// A store on the backend the tests run on.
 fn store() -> (tempfile::TempDir, Backend) {
@@ -142,7 +142,7 @@ fn a_metadata_write_that_must_grow_the_file_answers_out_of_space() {
         .unwrap_err();
     let out_of_space = matches!(
         &error,
-        Error::Db(e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull)
+        Error::Storage(storage) if storage.class() == StorageClass::DiskFull
     );
     assert!(out_of_space, "{error:?}");
     // The same raw error, mapped: the fixed reply, no path in it.

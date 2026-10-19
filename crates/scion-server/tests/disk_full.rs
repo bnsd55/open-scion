@@ -105,7 +105,7 @@ fn is_out_of_space(e: &Error) -> bool {
             io.kind(),
             std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
         ),
-        Error::Db(db) => db.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull),
+        Error::Storage(storage) => storage.class() == scion_server::StorageClass::DiskFull,
         _ => false,
     }
 }

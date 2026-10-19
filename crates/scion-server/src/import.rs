@@ -356,7 +356,7 @@ fn store_batch(
             });
             match result {
                 Ok(_) => break,
-                Err(Error::Busy) if tries < BUSY_TRIES => {
+                Err(e) if e.is_busy() && tries < BUSY_TRIES => {
                     tries += 1;
                     taken = 0;
                     checker.reset_for_retry();

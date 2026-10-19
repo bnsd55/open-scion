@@ -46,7 +46,7 @@ use scion_proto::runtime::auth::create_private_dir_all;
 use crate::db::SqliteTx;
 use crate::deadline::Deadline;
 use crate::derived::DeriveFlights;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, Storage};
 
 /// The schema version this build makes and reads.
 pub(crate) const SCHEMA_VERSION: u32 = 9;
@@ -717,7 +717,9 @@ impl Store {
             // drops here, which rolls it back: nothing was written, exactly
             // as a commit past `busy_timeout` ends.
             self.inner.committed.fetch_add(1, Ordering::Release);
-            return Err(Error::Busy);
+            return Err(Error::Storage(Storage::busy(std::io::Error::other(
+                "the commit was made to fail by the test hook",
+            ))));
         }
         let committed = tx.commit();
         self.inner.committed.fetch_add(1, Ordering::Release);

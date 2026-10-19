@@ -1246,7 +1246,7 @@ fn an_import_that_stays_busy_fails_with_the_busy_error() {
     // gives up with the busy error instead of retrying forever.
     store.fail_next_commits(BUSY_TRIES + 1);
     let error = try_import(&store, &git, &rev).unwrap_err();
-    assert!(matches!(error, Error::Busy), "{error:?}");
+    assert!(error.is_busy(), "{error:?}");
     // Nothing was written: the ref is not there, and no changeset is.
     let refs: i64 = store
         .read(|c| {
