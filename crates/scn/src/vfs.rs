@@ -1940,16 +1940,19 @@ mod tests {
         ));
         assert_eq!(std::fs::read(&target).unwrap(), b"keep\n");
 
-        // The note of deletions refuses a planted symlink too, and the
-        // rename still lands the note where it belongs.
+        // The note of deletions refuses a planted symlink: no temp note
+        // is made, and the symlink's target keeps its bytes. Without the
+        // symlink, the note lands, and the rename replaces nothing.
         let note = tempfile::tempdir().unwrap();
         let outside = note.path().join("outside");
         std::fs::write(&outside, b"keep\n").unwrap();
         std::os::unix::fs::symlink(&outside, note.path().join(".deletes.tmp")).unwrap();
         let mut deleted = std::collections::HashSet::new();
         deleted.insert(RepoPath::new("gone.txt").unwrap());
-        write_deletes(note.path(), &deleted).unwrap();
+        assert!(write_deletes(note.path(), &deleted).is_err());
         assert_eq!(std::fs::read(&outside).unwrap(), b"keep\n");
+        std::fs::remove_file(note.path().join(".deletes.tmp")).unwrap();
+        write_deletes(note.path(), &deleted).unwrap();
         assert_eq!(
             read_deletes(note.path()).unwrap(),
             [RepoPath::new("gone.txt").unwrap()]
