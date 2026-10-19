@@ -560,7 +560,7 @@ async fn a_cursor_that_names_an_impossible_line_count_is_refused() {
 /// cap is line-based, so no big file is needed to cross it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_file_with_too_many_lines_is_refused() {
-    let (dir, store, root) = store("");
+    let (dir, store, root) = store(b"");
     let over = scion_server::blame::MAX_BLAME_DIFF_LINES + 1;
     let blob = put(&store, vec![b'\n'; over].as_slice());
     let tip = store
@@ -590,7 +590,7 @@ async fn a_file_with_too_many_lines_is_refused() {
 /// no diff of the over-cap version.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_older_version_with_too_many_lines_counts_as_absent() {
-    let (dir, store, root) = store("");
+    let (dir, store, root) = store(b"");
     let over = scion_server::blame::MAX_BLAME_DIFF_LINES + 1;
     // The parent: `over` empty lines. The child: the first `over - 1` of
     // them, under the cap, so the request itself is servable.
@@ -617,7 +617,7 @@ async fn an_older_version_with_too_many_lines_counts_as_absent() {
         .unwrap();
     let (_stop, mut client) = serve(&store, dir.path(), whole_access(), TOKEN).await;
     let (ranges, changesets, next, _parts) = blame(&mut client, &child, PATH, b"").await;
-    assert_eq!(covered(&ranges), (1..=under).collect::<Vec<u32>>());
+    assert_eq!(covered(&ranges), (1..=under as u32).collect::<Vec<u32>>());
     assert_eq!(changesets.len(), 1, "{changesets:?}");
     assert_eq!(changesets[0].changeset_id, child.as_bytes().to_vec());
     assert!(next.is_empty(), "the walk explained the whole file");
