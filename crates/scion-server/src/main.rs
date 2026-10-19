@@ -738,7 +738,14 @@ fn read_hex(file: &Path, secret: bool) -> anyhow::Result<String> {
     let meta = opened
         .metadata()
         .with_context(|| format!("cannot read {}", file.display()))?;
-    ensure_key_file(meta.mode(), meta.uid(), me, secret, file)?;
+    ensure_key_file(
+        meta.is_file(),
+        meta.mode() & 0o777,
+        meta.uid(),
+        me,
+        secret,
+        file,
+    )?;
     let mut text = String::new();
     std::io::Read::read_to_string(&mut &opened, &mut text)
         .with_context(|| format!("cannot read {}", file.display()))?;
@@ -749,9 +756,16 @@ fn read_hex(file: &Path, secret: bool) -> anyhow::Result<String> {
 /// user that runs the server or by root, with a mode that keeps the key
 /// whole (a seed is also read by its owner alone). Pure over the fstat
 /// fields, so the tests can prove each refusal without a second user.
-fn ensure_key_file(mode: u32, uid: u32, me: u32, secret: bool, file: &Path) -> anyhow::Result<()> {
+fn ensure_key_file(
+    is_file: bool,
+    mode: u32,
+    uid: u32,
+    me: u32,
+    secret: bool,
+    file: &Path,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
-        rustix::fs::FileType::from_raw_mode(mode.try_into().unwrap()).is_file(),
+        is_file,
         "{} is not a file (a symlink is refused too)",
         file.display()
     );
@@ -828,28 +842,28 @@ mod key_file_tests {
 
     /// The raw fstat mode of a regular file with permission bits `bits`.
     fn file_mode(bits: u32) -> u32 {
-        0o100_000 | bits
+        bits
     }
 
     #[test]
     fn a_key_owned_by_the_server_user_passes() {
-        ensure_key_file(file_mode(0o600), 501, 501, true, Path::new("key")).unwrap();
-        ensure_key_file(file_mode(0o644), 501, 501, false, Path::new("key")).unwrap();
+        ensure_key_file(true, file_mode(0o600), 501, 501, true, Path::new("key")).unwrap();
+        ensure_key_file(true, file_mode(0o644), 501, 501, false, Path::new("key")).unwrap();
     }
 
     /// A key owned by root passes: a service manager that holds the keys
     /// at root-owned files is normal.
     #[test]
     fn a_root_owned_key_passes() {
-        ensure_key_file(file_mode(0o600), 0, 501, true, Path::new("key")).unwrap();
-        ensure_key_file(file_mode(0o644), 0, 501, false, Path::new("key")).unwrap();
+        ensure_key_file(true, file_mode(0o600), 0, 501, true, Path::new("key")).unwrap();
+        ensure_key_file(true, file_mode(0o644), 0, 501, false, Path::new("key")).unwrap();
     }
 
     /// The owner check is what keeps a key file another user holds —
     /// and can replace at will — out, whatever its mode.
     #[test]
     fn a_key_owned_by_another_user_is_refused() {
-        let err = ensure_key_file(file_mode(0o644), 502, 501, false, Path::new("key"))
+        let err = ensure_key_file(true, file_mode(0o644), 502, 501, false, Path::new("key"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("owned by another user"), "{err}");
@@ -857,7 +871,7 @@ mod key_file_tests {
 
     #[test]
     fn a_key_that_is_not_a_file_is_refused() {
-        let err = ensure_key_file(0o040_700, 501, 501, true, Path::new("key"))
+        let err = ensure_key_file(false, file_mode(0o700), 501, 501, true, Path::new("key"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("is not a file"), "{err}");
@@ -865,7 +879,7 @@ mod key_file_tests {
 
     #[test]
     fn a_group_readable_seed_is_refused() {
-        let err = ensure_key_file(file_mode(0o640), 501, 501, true, Path::new("key"))
+        let err = ensure_key_file(true, file_mode(0o640), 501, 501, true, Path::new("key"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("read by group or others"), "{err}");
@@ -873,7 +887,7 @@ mod key_file_tests {
 
     #[test]
     fn a_group_writable_public_key_is_refused() {
-        let err = ensure_key_file(file_mode(0o664), 501, 501, false, Path::new("key"))
+        let err = ensure_key_file(true, file_mode(0o664), 501, 501, false, Path::new("key"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("written by group or others"), "{err}");
