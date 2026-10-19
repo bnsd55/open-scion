@@ -973,8 +973,8 @@ mod tests {
 
         // An expired deadline stops the walk before the first tree.
         let past = Some(Instant::now() - Duration::from_secs(1));
-        let room = Arc::new(Semaphore::new(1 << 20));
-        let err = prove(&store, *root.as_bytes(), &refs, &room, past).unwrap_err();
+        let plenty = Arc::new(Semaphore::new(1 << 20));
+        let err = prove(&store, *root.as_bytes(), &refs, &plenty, past).unwrap_err();
         assert!(matches!(err, Error::DeadlineExceeded(_)), "{err:?}");
         assert_eq!(WALK_DECODED.load(Ordering::SeqCst), decoded);
     }
