@@ -445,6 +445,7 @@ pub fn diff(
 /// # Errors
 ///
 /// [`Error::NotFound`] if the repo or a changeset does not exist.
+#[allow(clippy::too_many_arguments)] // the page's knobs, one per caller choice
 pub fn diff_with(
     store: &Backend,
     repo: &str,

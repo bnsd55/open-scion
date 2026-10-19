@@ -671,12 +671,12 @@ mod tests {
         let parents = vec![vec![], vec![0], vec![0], vec![1, 2]];
         let (_dir, store, repo, ids) = store_graph(&parents);
         let past = Deadline::new(Instant::now());
-        let got = is_ancestor(&store, repo, ids[0], ids[5], &past);
+        let got = is_ancestor(&store, repo, ids[0], ids[3], &past);
         assert!(
             matches!(got, Err(crate::error::Error::DeadlineExceeded(_))),
             "{got:?}"
         );
-        let cold = store.read(|c| Ok(derived::load::<CommitGraph>(c, ids[5]).unwrap()));
+        let cold = store.read(|c| Ok(derived::load::<CommitGraph>(c, ids[3]).unwrap()));
         assert!(cold.unwrap().is_none(), "the query derived a node");
     }
 
