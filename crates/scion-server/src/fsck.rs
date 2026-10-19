@@ -797,7 +797,10 @@ mod tests {
         let (_dir, store, id) = store();
         let repo = store.write(|c| c.repo_id(REPO)).unwrap();
         let tree =
-            crate::tree::root_tree(&crate::backend::Backend::Sqlite(store.clone()), repo, id)
+            // The fsck command has no request deadline: it derives the root
+            // tree in steps, so writes run beside it, and reports damage
+            // instead of failing a call.
+            crate::tree::root_tree_unbounded(&crate::backend::Backend::Sqlite(store.clone()), repo, id)
                 .unwrap();
         store
             .write(|c| {

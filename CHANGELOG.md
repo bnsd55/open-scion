@@ -165,6 +165,12 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Changed
 
+- A second Ctrl-C or SIGTERM while the server drains ends it at once
+  (`#294`): a drain waits for the calls in flight, and one held open by
+  a stuck client left the operator with a server that answered nothing
+  and ended only under `kill -9`. The first signal's graceful drain is
+  as it was; the second cuts the calls in flight, logs that it did,
+  and exits 1.
 - A git import no longer re-reads and re-fsyncs blobs that a committed
   row of the target repo already names (#238): one row probe per
   distinct blob proves the stored copy durable, so a branch import over
@@ -219,6 +225,11 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- A silent TLS peer holds its connection's place for at most the
+  handshake timeout, not twice that: one deadline from the accept
+  bounds the TLS handshake and the HTTP/2 preface that follows it
+  together, so the preface timer gets what is left of the deadline
+  after the handshake ends.
 - A `Diff` call's rename search could index every large added file for
   one deleted file, far past the budget that bounds it: one file's work
   was its index of every added file it could be like, and the budget

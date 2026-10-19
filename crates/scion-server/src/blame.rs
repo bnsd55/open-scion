@@ -203,7 +203,7 @@ pub fn blame(
     // first-parent history has a value.
     let derive_until = Deadline::new(until.unwrap_or_else(|| Instant::now() + CALL_LIMIT));
     crate::derived::get_by::<history::PathHistory>(store, repo, start, &derive_until)?;
-    let root = tree::root_tree(store, repo, start)?;
+    let root = tree::root_tree(store, repo, start, &derive_until)?;
     let mut blob = regular_blob(store, root, &start_path)?;
     // The text of the version the walk starts at. Its bytes stay taken for
     // the whole call: each step's older text replaces them when it becomes
@@ -339,7 +339,7 @@ pub fn blame(
         let mut cost = 0;
         let found = match next {
             Some(parent) => {
-                let root = tree::root_tree(store, repo, parent)?;
+                let root = tree::root_tree(store, repo, parent, &derive_until)?;
                 let budget = Budget {
                     cost: &mut cost,
                     cap: left,

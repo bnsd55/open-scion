@@ -409,7 +409,7 @@ impl Objects for ObjectsService {
                             &store, repo_id, digest, cs, prefixes, live, metrics, &deadline,
                         )?
                     }
-                    None => read::root_tree(&store, &repo, cs)?,
+                    None => read::root_tree(&store, &repo, cs, &deadline)?,
                 };
                 Ok((tree, repo))
             })

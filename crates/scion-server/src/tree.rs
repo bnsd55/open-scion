@@ -13,6 +13,7 @@ use scion_core::{
 
 use crate::backend::Backend;
 use crate::db;
+use crate::deadline::Deadline;
 use crate::derived::{self, Kind};
 use crate::error::{ApplyError, Error, Result};
 use crate::graph::CommitGraph;
@@ -164,14 +165,31 @@ impl Kind for RootTree {
     }
 }
 
-/// The root tree of a changeset that `repo` may see, deriving it if needed.
+/// The root tree of a changeset that `repo` may see, deriving it if needed,
+/// until `deadline`.
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. [`Error::Corrupt`] if a
 /// stored changeset does not apply to its parent tree.
-pub fn root_tree(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
-    derived::get::<RootTree>(store, repo, cs)
+/// [`Error::DeadlineExceeded`] once `deadline` has passed.
+pub fn root_tree(
+    store: &Backend,
+    repo: RepoId,
+    cs: ChangesetId,
+    deadline: &Deadline,
+) -> Result<TreeId> {
+    derived::get_by::<RootTree>(store, repo, cs, deadline)
+}
+
+/// [`root_tree`] with no deadline: the caller has no request to serve, so
+/// nothing bounds the fill in time. For the `fsck` command and tests.
+///
+/// # Errors
+///
+/// As [`root_tree`], without [`Error::DeadlineExceeded`].
+pub fn root_tree_unbounded(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
+    derived::get_unbounded::<RootTree>(store, repo, cs)
 }
 
 /// Derives the root tree of `cs` in steps if it is missing, as the
@@ -658,7 +676,7 @@ mod tests {
                 .unwrap();
             let trees: Vec<String> = ids
                 .iter()
-                .map(|&cs| root_tree(&store, repo, cs).unwrap().to_string())
+                .map(|&cs| root_tree_unbounded(&store, repo, cs).unwrap().to_string())
                 .collect();
             assert_eq!(trees, golden, "stored when written: {stored}");
         }
@@ -679,6 +697,34 @@ mod tests {
         }
     }
 
+    /// A cold root tree and a past deadline: the read refuses instead of
+    /// deriving the history first. On main, where the derive ran without
+    /// the deadline, `read_file` returned the file's bytes.
+    #[test]
+    fn a_read_with_a_past_deadline_derives_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        store.blobs().put(b"1").unwrap();
+        // A changeset with no root tree row yet.
+        let cs = store
+            .write(|c| {
+                let repo = c.create_repo("r")?;
+                c.insert_changeset(repo, &changeset(None, &[("a/b", Some("1"))]))
+            })
+            .unwrap();
+        let past = crate::deadline::Deadline::new(std::time::Instant::now());
+        let got = crate::read::read_file(
+            &store,
+            "r",
+            cs,
+            &scion_core::RepoPath::new("a/b").unwrap(),
+            &past,
+        );
+        assert!(matches!(got, Err(Error::DeadlineExceeded(_))), "{got:?}");
+        let cold = store.read(|c| Ok(derived::load::<RootTree>(c, cs).unwrap()));
+        assert!(cold.unwrap().is_none(), "the read derived a root tree");
+    }
+
     /// `GetRootTree` sends a tree ID that the client then fetches. So a tree
     /// derived during the read is durable before the reply, or a power loss
     /// could lose a tree that the client was told about.
@@ -696,7 +742,10 @@ mod tests {
             .unwrap();
         let get_root_tree = || {
             let before = store.blobs().full_flushes();
-            let tree = crate::read::root_tree(&store, "r", cs).unwrap();
+            let deadline = crate::deadline::Deadline::new(
+                std::time::Instant::now() + crate::deadline::CALL_LIMIT,
+            );
+            let tree = crate::read::root_tree(&store, "r", cs, &deadline).unwrap();
             (tree, store.blobs().full_flushes() - before)
         };
         let (tree, flushes) = get_root_tree();
@@ -738,8 +787,8 @@ mod tests {
                 Ok((repo, parent.unwrap()))
             })
             .unwrap();
-        let tree = root_tree(&store, repo, tip).unwrap();
+        let tree = root_tree_unbounded(&store, repo, tip).unwrap();
         assert_eq!(store.read(|c| Ok(files(c, tree))).unwrap().len(), 7);
-        assert_eq!(root_tree(&store, repo, tip).unwrap(), tree);
+        assert_eq!(root_tree_unbounded(&store, repo, tip).unwrap(), tree);
     }
 }

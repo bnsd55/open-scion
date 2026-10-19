@@ -447,7 +447,15 @@ fn objects(channel: Channel) -> scion_proto::v1::objects_client::ObjectsClient<C
 /// server's own keys.
 fn ticket_for(keys: &scion_server::tickets::Keys, principal: &str, store: &Backend) -> Vec<u8> {
     let cs = main_ref(store).target;
-    let root = scion_server::read::root_tree(store, REPO, cs).unwrap();
+    let root = scion_server::read::root_tree(
+        store,
+        REPO,
+        cs,
+        &scion_server::deadline::Deadline::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(300),
+        ),
+    )
+    .unwrap();
     keys.sign(REPO, principal, *root.as_bytes()).unwrap()
 }
 
