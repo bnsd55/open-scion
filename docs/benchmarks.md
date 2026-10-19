@@ -152,10 +152,14 @@ run, whole.
 
 | | |
 |---|---|
-| scion commit | the commit the workflow checked out (shown in the run) |
 | Dataset | [tokio-rs/tokio](https://github.com/tokio-rs/tokio) at `be689a35f5ade5a39e507f79d3ec85cdab27806f` (tag `tokio-1.53.0`) |
-| Runner | `ubuntu-24.04`, a shared GitHub runner, 4 cores |
-| Commands | `scripts/bench-checkout.sh`, `JOBS=50 REPS=5`; git 2.51 as the runner ships |
+| Runner | `ubuntu-24.04`, a shared GitHub runner |
+| Commands | `scripts/bench-checkout.sh`, `JOBS=50 REPS=5` |
+
+Before the table, each run prints the facts that drift: its scion commit,
+its git version, its core count and its kernel. The job summary carries
+those four lines above the table, so the numbers and the facts of the run
+travel together.
 
 ## Results
 

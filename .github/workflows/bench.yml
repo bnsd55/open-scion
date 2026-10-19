@@ -33,6 +33,14 @@ jobs:
       - run: cargo build --release
       # pipefail: the benchmark's exit code is the run's verdict (it checks
       # that every job wrote the same files), and the tee must not eat it.
+      - name: the facts of the run
+        run: |
+          {
+            echo "scion commit: $(git rev-parse HEAD)"
+            echo "git: $(git --version)"
+            echo "cores: $(nproc)"
+            echo "kernel: $(uname -r)"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: run the checkout benchmark
         run: |
           set -o pipefail
