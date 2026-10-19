@@ -121,6 +121,30 @@ fn a_postgres_open_makes_the_data_directory_it_names() {
     assert!(error.to_string().contains("--postgres-url"), "{error}");
 }
 
+/// A marker whose first line is neither `postgres` nor absent is damage:
+/// read as absent, a Postgres directory would open as a fresh, empty
+/// SQLite store, which looks like a server with no data at all. Both
+/// directions refuse, before anything is read or written; the checks run
+/// before the database is contacted, so these tests need no Postgres.
+#[test]
+fn a_damaged_marker_refuses_both_opens() {
+    for (name, text) in [("empty", ""), ("garbage", "an old build left this\n")] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("backend"), text).unwrap();
+        let Err(error) = Backend::open(dir.path(), None, None) else {
+            panic!("the {name} marker refuses the SQLite open");
+        };
+        assert!(error.to_string().contains("damaged"), "{error}");
+        // A URL is named, but the marker check precedes the database:
+        // the open fails before it contacts anything.
+        let Err(error) = Backend::open(dir.path(), Some("postgres://127.0.0.1:5/scion"), None)
+        else {
+            panic!("the {name} marker refuses the Postgres open");
+        };
+        assert!(error.to_string().contains("damaged"), "{error}");
+    }
+}
+
 /// A write that another writer blocks answers busy in seconds, not past
 /// the minute-long statement clock: the open sets a lock timeout like the
 /// SQLite busy timeout, and a lock the database cannot give in it maps to

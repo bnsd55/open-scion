@@ -25,8 +25,8 @@ use crate::meta::{MetaTx, RepoId};
 pub type BlobLens<'a> = &'a mut dyn FnMut(BlobId) -> Result<u64>;
 
 /// The lens of the store's blobs, from each frame header, for the callers
-/// that hold the store: `store_changeset` and the root-tree derivation it
-/// triggers on the first parent.
+/// that hold the store and no pre-read lengths, such as tests and the
+/// in-transaction derive of `store_changeset`.
 pub fn lens_of(store: &Backend) -> impl FnMut(BlobId) -> Result<u64> + '_ {
     |blob| Ok(store.blobs().size(blob)? as u64)
 }
@@ -141,6 +141,7 @@ pub fn backfill_root_tree(store: &Backend, repo: &str, cs: ChangesetId) -> Resul
 impl Kind for RootTree {
     const NAME: &'static str = "root_tree";
     const VERSION: u32 = 1;
+    const NEEDS_LENS: bool = true;
     type Value = TreeId;
 
     fn derive(

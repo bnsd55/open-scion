@@ -28,7 +28,7 @@
 //!   a path changed after the base exactly when a generation in its entry is
 //!   above the base's.
 
-use std::collections::{BTreeMap, HashMap, btree_map, hash_map};
+use std::collections::{BTreeMap, HashMap, btree_map};
 use std::fmt;
 use std::ops::Bound::{self, Unbounded};
 
@@ -88,6 +88,23 @@ thread_local! {
     /// Bytes stored in `history_nodes` on this thread. Tests use it to
     /// bound the cost of a change.
     pub(crate) static NODE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The byte cap of one check's row cache. Tests lower it, so that
+    /// they reach it.
+    pub(crate) static CHECK_NODE_BYTES_CAP: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// The byte cap of one check's row cache: the same bound a log page's
+/// nodes stop at, [`crate::read::MAX_LOG_NODE_BYTES`].
+#[cfg(not(test))]
+fn check_node_bytes_cap() -> usize {
+    crate::read::MAX_LOG_NODE_BYTES
+}
+
+/// The byte cap of one check's row cache, as a test set it.
+#[cfg(test)]
+fn check_node_bytes_cap() -> usize {
+    CHECK_NODE_BYTES_CAP.with(std::cell::Cell::get)
 }
 
 /// The ID of a history node: the hash of its bytes.
@@ -401,28 +418,49 @@ struct Hit {
 }
 
 /// The rows that one call has read, so that it reads each one once, and
-/// how many bytes they hold.
+/// how many bytes they hold. A capped cache clears all its rows once they
+/// pass the cap, so that it never holds more than the cap plus one row:
+/// the answer never changes, and only re-reads cost more. An uncapped
+/// cache holds every row, for a caller that bounds its work by the total,
+/// as a log page does.
 #[derive(Default)]
 pub(crate) struct Nodes {
     rows: HashMap<NodeId, Row>,
     bytes: usize,
+    cap: Option<usize>,
 }
 
 impl Nodes {
+    /// A cache that clears its rows once they pass `cap` bytes.
+    pub(crate) fn capped(cap: usize) -> Self {
+        Nodes {
+            rows: HashMap::new(),
+            bytes: 0,
+            cap: Some(cap),
+        }
+    }
+
     /// The stored bytes of the rows read so far.
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
 
     fn row(&mut self, c: &mut dyn MetaTx, id: NodeId) -> Result<&Row> {
-        Ok(match self.rows.entry(id) {
-            hash_map::Entry::Occupied(row) => row.into_mut(),
-            hash_map::Entry::Vacant(slot) => {
-                let (row, bytes) = get_row(c, id)?;
-                self.bytes += bytes;
-                slot.insert(row)
+        if !self.rows.contains_key(&id) {
+            let (row, bytes) = get_row(c, id)?;
+            if self.bytes + bytes > self.cap.unwrap_or(usize::MAX) {
+                // SHORTCUT: clears all at once, not a per-entry LRU: a
+                // check reads each path once, so a row it cleared is
+                // unlikely to be wanted again before the check ends.
+                // Upgrade to an LRU if one check's re-reads ever show in
+                // the node-read metrics.
+                self.rows.clear();
+                self.bytes = 0;
             }
-        })
+            self.bytes += bytes;
+            self.rows.insert(id, row);
+        }
+        Ok(&self.rows[&id])
     }
 
     /// The entry that the level at `id` holds for `name`: down its stacked
@@ -496,7 +534,9 @@ pub(crate) fn newest_change(
 /// The paths of `paths` that a changeset newer than `base_gen` touched, on
 /// the first-parent history whose tree is `root`: the same path, a path
 /// below it, or a file at a directory above it. This is the rule of the
-/// land's path index. Reads each node on the paths at most once.
+/// land's path index. Reads at most one node per part of each path; the
+/// rows it read sit in a cache that clears once they pass their byte cap,
+/// so a row can be read again, and the answer stays.
 ///
 /// # Errors
 ///
@@ -509,7 +549,7 @@ pub(crate) fn touched_after<'p>(
     base_gen: i64,
     deadline: &Deadline,
 ) -> Result<Vec<RepoPath>> {
-    let mut nodes = Nodes::default();
+    let mut nodes = Nodes::capped(check_node_bytes_cap());
     let mut touched = Vec::new();
     for path in paths {
         deadline.check()?;
@@ -965,6 +1005,113 @@ mod tests {
         );
         let page = read::log_page(&store, "r", *ids.last().unwrap(), None, 10, &past);
         assert!(matches!(page, Err(Error::DeadlineExceeded(_))), "{page:?}");
+    }
+
+    /// A land's check over many paths gives the same answer with a tiny
+    /// cache cap as with none: clearing the cache costs re-reads, never
+    /// the answer. The capped cache never holds more than the cap plus
+    /// one row.
+    #[test]
+    fn a_land_check_over_many_paths_answers_the_same_with_a_tiny_cache() {
+        let (_dir, store, repo) = open();
+        // A base that puts 20 long-named files at each of 40 directories
+        // and one file at each of 40 more; a tip that puts one more file
+        // at each of the first 40, which touches every one of those
+        // directories after the base. The base's rows are far more than
+        // one row of the 1 KiB the test cut stores, so a capped cache
+        // must clear where an uncapped one holds them all.
+        let base_edits: Vec<(String, bool)> = (0..40)
+            .flat_map(|d| {
+                (0..20)
+                    .map(move |f| (format!("d{d}/f{f:02}{}", "x".repeat(280)), true))
+                    .chain(std::iter::once((format!("e{d}/old"), true)))
+            })
+            .collect();
+        let tip_edits: Vec<(String, bool)> = (0..40).map(|d| (format!("d{d}/x"), true)).collect();
+        let base: Vec<(&str, bool)> = base_edits
+            .iter()
+            .map(|(p, put)| (p.as_str(), *put))
+            .collect();
+        let tip: Vec<(&str, bool)> = tip_edits
+            .iter()
+            .map(|(p, put)| (p.as_str(), *put))
+            .collect();
+        let ids = store_chain(&store, repo, None, &[base.as_slice(), tip.as_slice()], true);
+        let (base, tip) = (ids[0], ids[1]);
+        let base_gen = store.read(|c| c.generation(repo, base)).unwrap();
+
+        // The land's paths: the tip's changed paths, whose directories the
+        // tip touched after the base, and paths at the untouched
+        // directories.
+        let paths: Vec<RepoPath> = (0..40)
+            .map(|d| path(&format!("d{d}/x")))
+            .chain((0..40).map(|d| path(&format!("e{d}/new"))))
+            .collect();
+
+        // The path history of the tip, derived once, gives the root.
+        let root = derived::get_by::<PathHistory>(&store, repo, tip, &later()).unwrap();
+
+        // No cap: the answer, with each distinct row read once.
+        CHECK_NODE_BYTES_CAP.with(|c| c.set(usize::MAX));
+        NODE_READS.with(|c| c.set(0));
+        let mut all = Nodes::default();
+        store
+            .read(|c| {
+                for p in &paths {
+                    lookup(c, &mut all, root, p)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let total = all.bytes();
+        let uncapped_reads = NODE_READS.with(std::cell::Cell::get);
+
+        let full = store
+            .read(|c| touched_after(c, root, &paths, base_gen, &later()))
+            .unwrap();
+
+        // A cap of one byte: the cache holds one row at most, and the
+        // answer is the same, at the cost of re-reads.
+        CHECK_NODE_BYTES_CAP.with(|c| c.set(1));
+        NODE_READS.with(|c| c.set(0));
+        let mut nodes = Nodes::capped(1);
+        let mut most = 0;
+        store
+            .read(|c| {
+                for p in &paths {
+                    lookup(c, &mut nodes, root, p)?;
+                    most = most.max(nodes.bytes());
+                }
+                Ok(())
+            })
+            .unwrap();
+        let capped_reads = NODE_READS.with(std::cell::Cell::get);
+        let tiny = store
+            .read(|c| touched_after(c, root, &paths, base_gen, &later()))
+            .unwrap();
+        CHECK_NODE_BYTES_CAP.with(|c| c.set(usize::MAX));
+
+        let touched: Vec<String> = full
+            .iter()
+            .map(|p| String::from_utf8_lossy(p.as_bytes()).into_owned())
+            .collect();
+        assert_eq!(tiny, full, "{touched:?}");
+        assert_eq!(
+            full.len(),
+            40,
+            "the tip's own paths, not the untouched ones"
+        );
+        assert!(
+            capped_reads > uncapped_reads,
+            "the cache cleared: {capped_reads} re-reads against {uncapped_reads}"
+        );
+        // The cap plus one row: a row stores at most the test cut's 1 KiB,
+        // and the walk of many paths holds far more than that uncapped.
+        assert!(most <= 1 + 2 * CUT.max_bytes, "the cache held {most} bytes");
+        assert!(
+            most < total,
+            "the cache cleared, instead of holding all {total} bytes"
+        );
     }
 
     #[test]

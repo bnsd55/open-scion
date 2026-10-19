@@ -72,20 +72,17 @@ const _: () = assert!(PG_READERS == crate::store::READERS);
 /// directory is a SQLite one: directories of older builds have no file.
 const MARKER: &str = "backend";
 
-/// What the data directory's marker held when an open began.
+/// The store UUID the data directory's marker held when an open began.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Marker {
     pub(crate) uuid: Option<[u8; 16]>,
-    pub(crate) present: bool,
 }
 
 impl Marker {
     /// Reads the marker of `data`, if any.
     pub(crate) fn read(data: &Path) -> Self {
-        let present = data.join(MARKER).exists();
         Self {
             uuid: marker_uuid(data),
-            present,
         }
     }
 }
@@ -105,11 +102,51 @@ fn refuse_sqlite_dir(data: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The marker's first line, if the file exists: `postgres` for this
+/// build, and the second line, when present, is the store UUID. Read as
+/// bytes, so a damaged marker is refused, not mistaken for absent.
+fn marker_first_line(data: &Path) -> Result<Option<String>> {
+    let bytes = match std::fs::read(data.join(MARKER)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(crate::error::Error::Io(e)),
+    };
+    let line = bytes.split(|&b| b == b'\n').next().unwrap_or_default();
+    // For the comparison only: the file this build wrote is ASCII, and a
+    // byte that is not UTF-8 becomes a replacement character, which the
+    // comparison refuses.
+    let text = String::from_utf8_lossy(line);
+    Ok(Some(text.trim().to_owned()))
+}
+
+/// Refuses a marker whose first line is neither `postgres` nor absent.
+/// This build writes either nothing (no marker, the directories of older
+/// builds) or `postgres`; an empty or garbled marker is damage, and a
+/// marker read as absent opens a Postgres directory as a fresh, empty
+/// SQLite store, which looks like a server with no data at all.
+fn refuse_damaged_marker(data: &Path) -> Result<()> {
+    match marker_first_line(data)? {
+        Some(first) if first != "postgres" => {
+            let path = data.join(MARKER);
+            Err(crate::error::Error::FailedPrecondition(format!(
+                "the backend marker {} is damaged: its first line is \
+                 {:?}, but this build wrote either no marker or `postgres`. \
+                 Check whether the directory was restored over, \
+                 hand-edited, or written by another build; give \
+                 --postgres-url if its metadata lives in Postgres",
+                path.display(),
+                first
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Refuses to open the data directory as SQLite when its marker names
 /// Postgres: its rows live in the database, and a second, empty store
 /// here would look like a server with no data at all.
 fn refuse_postgres_marker(data: &Path) -> Result<()> {
-    if marker_names_postgres(&std::fs::read_to_string(data.join(MARKER)).unwrap_or_default()) {
+    if marker_first_line(data)?.as_deref() == Some("postgres") {
         return Err(crate::error::Error::InvalidArgument(
             "this data directory keeps its metadata in Postgres: \
              give --postgres-url"
@@ -117,12 +154,6 @@ fn refuse_postgres_marker(data: &Path) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-/// Whether a marker file's text names the Postgres backend: its first
-/// line does. The second, when present, is the store UUID.
-fn marker_names_postgres(text: &str) -> bool {
-    text.lines().next().map(str::trim) == Some("postgres")
 }
 
 /// The store UUID a marker carries, if it names one: 32 hex digits on
@@ -145,7 +176,7 @@ fn marker_uuid(data: &Path) -> Option<[u8; 16]> {
 /// store would serve metadata whose blobs are not on this disk. A
 /// refusal writes nothing: the UUID was compared in the database open,
 /// before any blob of this directory was named.
-fn marker_agrees(data: &Path, marker_was_absent: bool, uuid: [u8; 16]) -> Result<()> {
+fn marker_agrees(data: &Path, uuid: [u8; 16]) -> Result<()> {
     let marker = data.join(MARKER);
     match marker_uuid(data) {
         Some(held) if held != uuid => {
@@ -162,11 +193,8 @@ fn marker_agrees(data: &Path, marker_was_absent: bool, uuid: [u8; 16]) -> Result
         Some(_) => {}
         None => {
             // A fresh pair, or a marker that predates the UUID: the
-            // database's identity is the one this directory takes.
-            if marker_was_absent {
-                // The claim of a fresh directory is its first file.
-                std::fs::write(&marker, "postgres\n").map_err(crate::error::Error::Io)?;
-            }
+            // database's identity is the one this directory takes, and
+            // `write_marker` writes it durable at once.
             write_marker(&marker, uuid)?;
         }
     }
@@ -289,12 +317,14 @@ impl Backend {
     /// What the store or the database returns.
     pub fn open(data: &Path, postgres_url: Option<&str>, ca: Option<&Path>) -> Result<Self> {
         if let Some(url) = postgres_url {
+            refuse_damaged_marker(data)?;
             let marker = Marker::read(data);
             refuse_sqlite_dir(data)?;
             let pg = Pg::open_exclusive(url, ca, PG_READERS, data, marker)?;
-            marker_agrees(data, !marker.present, pg.store_uuid())?;
+            marker_agrees(data, pg.store_uuid())?;
             Ok(Self::Postgres(pg))
         } else {
+            refuse_damaged_marker(data)?;
             refuse_postgres_marker(data)?;
             Ok(Self::Sqlite(Store::open(data)?))
         }
@@ -309,12 +339,14 @@ impl Backend {
     /// What the store or the database returns.
     pub fn open_shared(data: &Path, postgres_url: Option<&str>, ca: Option<&Path>) -> Result<Self> {
         if let Some(url) = postgres_url {
+            refuse_damaged_marker(data)?;
             let marker = Marker::read(data);
             refuse_sqlite_dir(data)?;
             let pg = Pg::open(url, ca, PG_READERS, data, marker)?;
-            marker_agrees(data, !marker.present, pg.store_uuid())?;
+            marker_agrees(data, pg.store_uuid())?;
             Ok(Self::Postgres(pg))
         } else {
+            refuse_damaged_marker(data)?;
             refuse_postgres_marker(data)?;
             Ok(Self::Sqlite(Store::open_shared(data)?))
         }
@@ -330,11 +362,12 @@ impl Backend {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn open_test_shared(data: &Path) -> Result<Self> {
         if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
+            refuse_damaged_marker(data)?;
             let marker = Marker::read(data);
             refuse_sqlite_dir(data)?;
             let pg =
                 Pg::open_test_shared(&test_url()?, &test_schema(data), PG_READERS, data, marker)?;
-            marker_agrees(data, !marker.present, pg.store_uuid())?;
+            marker_agrees(data, pg.store_uuid())?;
             return Ok(Self::Postgres(pg));
         }
         refuse_postgres_marker(data)?;
@@ -353,10 +386,11 @@ impl Backend {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn open_test(data: &Path) -> Result<Self> {
         if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
+            refuse_damaged_marker(data)?;
             let marker = Marker::read(data);
             refuse_sqlite_dir(data)?;
             let pg = Pg::open_test(&test_url()?, &test_schema(data), PG_READERS, data, marker)?;
-            marker_agrees(data, !marker.present, pg.store_uuid())?;
+            marker_agrees(data, pg.store_uuid())?;
             return Ok(Self::Postgres(pg));
         }
         refuse_postgres_marker(data)?;
