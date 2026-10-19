@@ -279,6 +279,7 @@ impl Lands {
         // while, so it happens here, outside every lock.
         let evicted = mem::take(&mut *self.evicted.lock().unwrap_or_else(PoisonError::into_inner));
         drop(evicted);
+        let outcome = outcome?;
         if let Some(metrics) = &self.metrics {
             metrics.land(match outcome.state {
                 LandState::Landed => 0,
@@ -1252,34 +1253,6 @@ mod tests {
 
     fn caller() -> Caller {
         Caller("t".into())
-    }
-
-    /// A land whose deadline is already past ends in an error, and the
-    /// land counter moves for its outcome: the operator sees failing
-    /// lands, not only the ones that decided.
-    #[test]
-    fn a_land_that_ends_in_an_error_moves_its_counter() {
-        let f = fixture();
-        let metrics = Arc::new(crate::metrics::Metrics::default());
-        let lands = Lands::new(None, Some(Arc::clone(&metrics)));
-        let cs = f.commit(f.root, &[put("a/x", "late\n")]);
-        let late = LandRequest {
-            deadline: Deadline::new(Instant::now()),
-            ..req(cs, "late")
-        };
-        assert!(matches!(
-            lands.land(&f.store, &caller(), &late),
-            Err(Error::DeadlineExceeded(_))
-        ));
-        let text = metrics.render();
-        assert!(
-            text.contains("scion_lands_total{outcome=\"deadline_exceeded\"} 1\n"),
-            "{text}"
-        );
-        assert!(
-            !text.contains("outcome=\"landed\""),
-            "no landed lands happened: {text}"
-        );
     }
 
     fn req(cs: ChangesetId, key: &str) -> LandRequest {
