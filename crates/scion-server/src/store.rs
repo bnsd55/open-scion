@@ -289,14 +289,30 @@ impl Store {
     /// database cannot be created, or if the schema is newer than this build,
     /// or older while another `Store` uses the directory.
     pub fn open(dir: &Path) -> Result<Self> {
-        Self::open_as(dir, true, &build(), DERIVE_WALKS_CAP)
+        Self::open_as(dir, true, &build(), DeriveFlights::new(DERIVE_WALKS_CAP))
     }
 
     /// Opens or creates a data directory as its server, with a cap of
     /// `walks` derive walks in flight. For tests of the cap.
     #[cfg(test)]
     pub(crate) fn open_with_walks(dir: &Path, walks: usize) -> Result<Self> {
-        Self::open_as(dir, true, &build(), walks)
+        Self::open_as(dir, true, &build(), DeriveFlights::new(walks))
+    }
+
+    /// Opens or creates a data directory as its server, with a byte budget
+    /// for its bounded derive walks. For tests of the budget.
+    #[cfg(test)]
+    pub(crate) fn open_with_walk_bytes(
+        dir: &Path,
+        walks: usize,
+        walk_bytes: crate::memory::Bytes,
+    ) -> Result<Self> {
+        Self::open_as(
+            dir,
+            true,
+            &build(),
+            DeriveFlights::with_walk_bytes(walks, walk_bytes),
+        )
     }
 
     /// Opens or creates a data directory for a process that does not land,
@@ -315,11 +331,11 @@ impl Store {
     ///
     /// As [`Store::open`], except that a server `Store` is no conflict.
     pub fn open_shared(dir: &Path) -> Result<Self> {
-        Self::open_as(dir, false, &build(), DERIVE_WALKS_CAP)
+        Self::open_as(dir, false, &build(), DeriveFlights::new(DERIVE_WALKS_CAP))
     }
 
     /// Opens a data directory for a process of build `build` ([`build`]).
-    fn open_as(dir: &Path, server: bool, build: &str, walks_cap: usize) -> Result<Self> {
+    fn open_as(dir: &Path, server: bool, build: &str, derive: DeriveFlights) -> Result<Self> {
         create_private_dir_all(dir)?;
         // The blobs and the metadata are only as private as the directory:
         // a group- or others-writable directory lets another user read or
@@ -428,7 +444,7 @@ impl Store {
                 fail_commits: AtomicU64::new(0),
                 #[cfg(any(test, feature = "test-hooks"))]
                 hooks: ImportHooks::default(),
-                derive: DeriveFlights::new(walks_cap),
+                derive,
                 writers: Mutex::new(0),
                 write_woken: Condvar::new(),
             }),
@@ -2656,11 +2672,22 @@ mod tests {
                 other => panic!("expected the open to fail, got {:?}", other.err()),
             };
             let server = Store::open(dir.path()).unwrap();
-            refused(Store::open_as(dir.path(), false, &other, DERIVE_WALKS_CAP));
+            refused(Store::open_as(
+                dir.path(),
+                false,
+                &other,
+                DeriveFlights::new(DERIVE_WALKS_CAP),
+            ));
             Store::open_shared(dir.path()).unwrap();
             drop(server);
             // The import of the other build opened alone, so its build counts.
-            let import = Store::open_as(dir.path(), false, &other, DERIVE_WALKS_CAP).unwrap();
+            let import = Store::open_as(
+                dir.path(),
+                false,
+                &other,
+                DeriveFlights::new(DERIVE_WALKS_CAP),
+            )
+            .unwrap();
             refused(Store::open(dir.path()));
             refused(Store::open_shared(dir.path()));
             drop(import);

@@ -185,9 +185,9 @@ pub(crate) struct DeriveFlights {
     /// The bytes the bounded walks of this store may hold for their
     /// frontiers, as one pool they take from per step. A walk over the
     /// budget stops at its step boundary, and the call answers busy, so a
-    /// retry resumes when the budget has room again. Empty for the
-    /// unbounded forms, which take none.
-    walk_bytes: Mutex<crate::memory::Bytes>,
+    /// retry resumes when the budget has room again. The unbounded forms
+    /// (fsck, import, the derive command) take none.
+    walk_bytes: crate::memory::Bytes,
     /// The operator metrics, set once by the server before it serves:
     /// the walks in flight and the walks in the wait are gauges there.
     /// Empty in import, fsck and gc, which export none.
@@ -196,15 +196,22 @@ pub(crate) struct DeriveFlights {
 
 impl DeriveFlights {
     pub(crate) fn new(walks_cap: usize) -> Self {
+        Self::with_walk_bytes(
+            walks_cap,
+            crate::memory::Bytes::named(DERIVE_WALK_BUDGET, "derive walk"),
+        )
+    }
+
+    /// A flights set whose bounded walks share `walk_bytes`. For tests of
+    /// the byte budget, which use a pool a chain can outgrow.
+    #[cfg(test)]
+    pub(crate) fn with_walk_bytes(walks_cap: usize, walk_bytes: crate::memory::Bytes) -> Self {
         Self {
             flights: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(0),
             woken: Condvar::new(),
             walks_cap,
-            walk_bytes: Mutex::new(crate::memory::Bytes::named(
-                DERIVE_WALK_BUDGET,
-                "derive walk",
-            )),
+            walk_bytes,
             metrics: std::sync::OnceLock::new(),
         }
     }
@@ -215,21 +222,10 @@ impl DeriveFlights {
         let _ = self.metrics.set(metrics);
     }
 
-    /// The bytes pool the bounded walks of this store share.
+    /// The bytes pool the bounded walks of this store share. Cheap: the
+    /// pool is a shared handle.
     pub(crate) fn walk_bytes(&self) -> crate::memory::Bytes {
-        self.walk_bytes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-
-    /// Replaces the walks' bytes pool. For tests of the budget.
-    #[cfg(test)]
-    pub(crate) fn set_walk_bytes(&self, walk_bytes: crate::memory::Bytes) {
-        *self
-            .walk_bytes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = walk_bytes;
+        self.walk_bytes.clone()
     }
 }
 
@@ -880,7 +876,7 @@ fn require(c: &mut dyn MetaTx, repo: RepoId, cs: ChangesetId) -> Result<()> {
 mod tests {
     use crate::backend::Backend;
     use crate::db::SqliteTx;
-    use crate::store::Store;
+    use crate::store::{DERIVE_WALKS_CAP, Store};
     use rusqlite::Connection;
     use std::cell::Cell;
     use std::collections::HashMap;
@@ -1538,14 +1534,26 @@ mod tests {
     /// growth, never more.
     #[test]
     fn a_derive_walk_over_its_byte_budget_stops_busy_and_a_retry_resumes() {
-        let (_dir, store, repo, ids) = store_with(&chain(12));
+        // The walk of a chain of 12 takes six steps (STEP is 2 in tests);
+        // the store's budget holds seven steps' worth, and this test holds
+        // two of them, as the walks of other callers would.
+        let budget = 7 * walk_step_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::Sqlite(
+            Store::open_with_walk_bytes(
+                dir.path(),
+                DERIVE_WALKS_CAP,
+                crate::memory::Bytes::named(budget, "derive walk"),
+            )
+            .unwrap(),
+        );
+        let (repo, ids) = store.write(|c| store_chain(c, &chain(12))).unwrap();
         let tip = ids[11];
-        // Room for three steps of the walk, not the six a chain of 12
-        // needs (STEP is 2 in tests).
-        let budget = 3 * walk_step_bytes();
-        store
+        let held = store
             .derive_flights()
-            .set_walk_bytes(crate::memory::Bytes::named(budget, "derive walk"));
+            .walk_bytes()
+            .try_take(2 * walk_step_bytes())
+            .unwrap();
         let deadline = Deadline::new(std::time::Instant::now() + Duration::from_secs(60));
         let busy = get_by::<Ancestry>(&store, repo, tip, &deadline);
         let Err(Error::Unavailable(why)) = &busy else {
@@ -1569,18 +1577,13 @@ mod tests {
             rows_of(&store, Ancestry::NAME, Ancestry::VERSION),
             [] as [(Vec<u8>, Vec<u8>); 0]
         );
-        // A retry on the same tiny budget stops busy again.
+        // A retry while the budget is still held stops busy again.
         assert!(matches!(
             get_by::<Ancestry>(&store, repo, tip, &deadline),
             Err(Error::Unavailable(_))
         ));
         // With room again, a retry resumes and finishes.
-        store
-            .derive_flights()
-            .set_walk_bytes(crate::memory::Bytes::named(
-                DERIVE_WALK_BUDGET,
-                "derive walk",
-            ));
+        drop(held);
         get_by::<Ancestry>(&store, repo, tip, &deadline).unwrap();
         assert_eq!(rows_of(&store, Ancestry::NAME, Ancestry::VERSION).len(), 12);
     }
@@ -1589,13 +1592,17 @@ mod tests {
     /// bytes: a history the budget cannot hold still derives.
     #[test]
     fn an_unbounded_derive_walk_takes_no_bytes() {
-        let (_dir, store, repo, ids) = store_with(&chain(12));
-        store
-            .derive_flights()
-            .set_walk_bytes(crate::memory::Bytes::named(
-                walk_step_bytes(),
-                "derive walk",
-            ));
+        let budget = walk_step_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::Sqlite(
+            Store::open_with_walk_bytes(
+                dir.path(),
+                DERIVE_WALKS_CAP,
+                crate::memory::Bytes::named(budget, "derive walk"),
+            )
+            .unwrap(),
+        );
+        let (repo, ids) = store.write(|c| store_chain(c, &chain(12))).unwrap();
         assert_eq!(
             get_unbounded::<Ancestry>(&store, repo, ids[11])
                 .unwrap()
