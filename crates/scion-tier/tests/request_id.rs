@@ -45,8 +45,8 @@ impl Fake {
     fn new() -> Self {
         let data = b"ride one id\n";
         let blob = BlobId::of(data);
-        let (tree_bytes, root) = Tree {
-            entries: [(
+        let (tree_bytes, root) = Tree::new(
+            [(
                 PathElem::new(b"f".to_vec()).unwrap(),
                 scion_core::Entry::File(scion_core::FileEntry::new(
                     scion_core::FileState::Regular {
@@ -58,7 +58,8 @@ impl Fake {
             )]
             .into_iter()
             .collect(),
-        }
+        )
+        .unwrap()
         .encode_with_id();
         let parts = HashMap::from([
             (root.as_bytes().to_vec(), Bytes::from(tree_bytes)),
