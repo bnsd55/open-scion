@@ -214,15 +214,22 @@ batch() {
   # the upgrade is a real git server (http-backend) in the rig.
   nstat -az TcpExtListenOverflows TcpExtListenDrops > "$WORK/$name.nstat.0" 2>/dev/null || \
     netstat -s > "$WORK/$name.nstat.0" 2>/dev/null || true
+  # The job's number drives the stagger, and its path is the checkout
+  # target, so sh gets both: $3 is the number, $2 the command, and $1 the
+  # path that the command's own "$1" reads.
+  local rc=0
   seq 1 "$jobs" | /usr/bin/time -p xargs -P "$jobs" -I{} sh -c \
-    'sleep "$(printf "0.%02ds" $(( ($1 - 1) % 20 )))"; eval "$2"' \
-    sh "$WORK/$name/{}" "$cmd" \
-    > "$WORK/$name.log" 2>&1 || {
+    'sleep "$(printf "0.%02ds" $(( ($3 - 1) % 20 )))"; eval "$2"' \
+    sh "$WORK/$name/{}" "$cmd" {} \
+    > "$WORK/$name.log" 2>&1 || rc=$?
+  # The counters land even when the batch failed: an overflow during a
+  # failed batch is exactly the evidence the run exists for.
+  nstat -az TcpExtListenOverflows TcpExtListenDrops > "$WORK/$name.nstat.1" 2>/dev/null || \
+    netstat -s > "$WORK/$name.nstat.1" 2>/dev/null || true
+  [ "$rc" -eq 0 ] || {
     tail -n 20 "$WORK/$name.log" >&2
     die "$name: a job failed"
   }
-  nstat -az TcpExtListenOverflows TcpExtListenDrops > "$WORK/$name.nstat.1" 2>/dev/null || \
-    netstat -s > "$WORK/$name.nstat.1" 2>/dev/null || true
 }
 
 # wall FILE: the wall time, in seconds, from the /usr/bin/time -p report in
