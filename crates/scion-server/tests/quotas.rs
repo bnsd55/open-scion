@@ -380,12 +380,11 @@ async fn a_stream_holds_its_slot_until_the_stream_ends() {
     // buffer) plus up to about 10 MB of loopback TCP autotuning (the
     // server's send buffer and the client's receive buffer, whatever the
     // runner tunes them to) can soak up a reply before the producer must
-    // wait for a read. 16 MiB left too little margin — a runner with fat
-    // autotune could absorb the whole reply, free the slot before the
-    // probe, and the probe saw NotFound instead of ResourceExhausted
-    // (#291's failure, once). 64 MiB clears every buffer a CI runner can
-    // tune; raise it if this failure ever comes back, and raise the
-    // hold assert below with it.
+    // wait for a read. A 3 MiB reply once fit whole and freed the slot
+    // before the probe (#291); 16 MiB sat about 14 MB of buffers plus a
+    // thin margin by arithmetic, and no failure was ever seen at 16 —
+    // 64 MiB is about 4x what we measured. Raise it if this failure ever
+    // comes back, and raise the hold assert below with it.
     let big = vec![b'z'; 64 * 1024 * 1024];
     let blob = store.blobs().put(&big).unwrap();
     // The root's `README` is small, so point `main` at a changeset whose
