@@ -359,7 +359,7 @@ pub fn blame(
         let mut cost = 0;
         let found = match next {
             Some(parent) => {
-                let root = tree::root_tree(store, repo, parent, &derive_until)?;
+                let root = tree::root_tree(store, repo, parent, &walk_until)?;
                 let budget = Budget {
                     cost: &mut cost,
                     cap: left,
