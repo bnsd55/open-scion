@@ -198,8 +198,8 @@ pub struct Budget<'a> {
     /// Once `cost` reaches this, the search starts no more work. It checks
     /// before each pair of step 2, before each deleted file of step 3, and
     /// after each target's slot in a file's indexing, so the work on one of
-    /// them runs to the end and one call's cost stays at most `cap` plus
-    /// one target's slot cost.
+    /// them runs to the end and one call's cost stays at most `cap`, plus
+    /// one target's slot cost, plus one deleted file's read and lookup.
     pub cap: usize,
     /// Whether step 3 looks at one more deleted file than it already had,
     /// even past the cap, so that a search that goes on over calls always
@@ -267,10 +267,11 @@ pub struct Outcome {
 /// hash, if not read yet, then reads the deleted file and looks up its
 /// chunks in the index. The budget is checked after each target's slot, so
 /// one file's indexing costs at most one slot past the cap; a file that
-/// stops there is not read and adds no scores. Added files with the same
-/// blob share one place in the index, so a blob is read and indexed once,
-/// however many paths add it. So it holds the tables of those added blobs,
-/// and of one deleted file.
+/// stops there is not read and adds no scores. The last target's slot
+/// completes the file's indexing, so that file is still read and looked up
+/// past the cap. Added files with the same blob share one place in the
+/// index, so a blob is read and indexed once, however many paths add it.
+/// So it holds the tables of those added blobs, and of one deleted file.
 ///
 /// A search for one added file can stop at the budget and go on later: pass
 /// the [`Progress`] made of [`Outcome::stopped`] and the deleted file of the
@@ -547,14 +548,14 @@ impl<R: FnMut(&RepoPath, BlobId, usize) -> Result<Option<Chunks>>> Search<'_, R>
             let known = self.known.get(&d).copied();
             found.clear();
             wanted.clear();
-            // The budget bounds one call at its cap plus one target's slot
-            // cost. When a slot crosses the cap, this file stops here: it
-            // is not read and adds no scores, so a resumed call redoes it
-            // from its index. The last target's slot is exempt: it completes
-            // the file's indexing, so the file is read and scored, and the
-            // cap bounds the indexing at one slot past it. This keeps a
-            // resumed search moving: it has one target (blame), so its seed
-            // always completes.
+            // The budget bounds one call at its cap, plus one target's
+            // slot cost, plus one deleted file's read and lookup. When a
+            // slot crosses the cap, this file stops here: it is not read
+            // and adds no scores, so a resumed call redoes it from its
+            // index. The last target's slot is exempt: it completes the
+            // file's indexing, so the file is read and looked up past the
+            // cap. This keeps a resumed search moving: it has one target
+            // (blame), so its seed always completes.
             let mut over = false;
             for (t, &(a, to, to_size)) in targets.iter().enumerate() {
                 match known {
