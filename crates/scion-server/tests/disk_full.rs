@@ -167,6 +167,11 @@ fn a_full_disk_answers_out_of_space_and_needs_no_repair() {
     let after = store.blobs().put(b"after\n").unwrap();
     assert_eq!(store.blobs().get(after).unwrap(), b"after\n");
     drop(store);
+    // A reaped helper's inherited lock can outlive the drop by one tick
+    // (#284): no spawn starts, and the lock is free, before the reopen.
+    common::spawn_guard::across_release(|| {
+        common::spawn_guard::wait_for_lock_release(&mount.0.join("data"));
+    });
     // A restart needs no repair: the store opens again, and fsck is
     // clean.
     let store = open_store(&mount);
@@ -210,6 +215,10 @@ fn a_full_metadata_disk_answers_out_of_space_and_needs_no_repair() {
     mount.remount_bigger("64m", "4096");
     store.write(|c| c.create_repo("after")).unwrap();
     drop(store);
+    // As above: the reopen must not race a lingering lock (#284).
+    common::spawn_guard::across_release(|| {
+        common::spawn_guard::wait_for_lock_release(&mount.0.join("data"));
+    });
     // A restart needs no repair, and fsck is clean.
     let store = open_store(&mount);
     let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
@@ -241,6 +250,10 @@ fn a_disk_out_of_inodes_answers_out_of_space_and_needs_no_repair() {
     mount.remount_bigger("64m", "4096");
     store.blobs().put(b"after\n").unwrap();
     drop(store);
+    // As above: the reopen must not race a lingering lock (#284).
+    common::spawn_guard::across_release(|| {
+        common::spawn_guard::wait_for_lock_release(&mount.0.join("data"));
+    });
     let store = open_store(&mount);
     let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
     assert!(report.is_clean(), "{:?}", report.problems);
