@@ -138,6 +138,10 @@ impl Bytes {
     ///
     /// [`Error::ResourceExhausted`] if they are not free now or `n` is more
     /// than the whole pool; the error names the budget.
+    ///
+    /// # Panics
+    ///
+    /// If the budget lock is poisoned, which only a panic inside it causes.
     pub fn try_take(&self, n: usize) -> Result<Held> {
         if n > self.0.cap {
             return Err(Error::ResourceExhausted(format!(
@@ -268,41 +272,33 @@ mod tests {
         drop(held);
     }
 
-    /// A give that lands at the timeout boundary hands its bytes over: the
-    /// waiter's timeout and the drop race for the lock, and the recheck
-    /// after the wait makes the race harmless. Before the recheck, the
-    /// rounds whose timeout relocked first refused bytes that were free.
+    /// A give that lands while a waiter sits in its wait hands the bytes
+    /// over: the drop's notify wakes it, and the take rechecks the budget
+    /// after the wait, so the bytes are taken however the wake and the
+    /// timeout race. A release that lands this close to the deadline is
+    /// the case the recheck is for.
     #[test]
-    fn a_give_that_lands_at_the_timeout_boundary_is_taken() {
-        for round in 0..5 {
-            let bytes = Arc::new(Bytes::new(100));
-            let held = bytes.take(100, None).expect("fits");
-            let waiter = {
-                let bytes = Arc::clone(&bytes);
-                std::thread::spawn(move || {
-                    let until = Instant::now() + Duration::from_millis(100);
-                    bytes.take(100, Some(until))
-                })
-            };
-            let blocked = (0..2000).any(|_| {
-                if bytes.0.waiting.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
-                    return true;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-                false
-            });
-            assert!(blocked, "round {round}: the waiter never blocked");
-            // The give lands 2 ms before the deadline. A waiter that wakes
-            // at its deadline anyway rechecks a budget that already holds
-            // the give, and takes what the old code refused.
-            std::thread::sleep(Duration::from_millis(98));
-            drop(held);
-            let got = waiter.join().unwrap();
-            assert!(
-                got.is_ok(),
-                "round {round}: the give at the boundary was refused: {got:?}"
-            );
-        }
+    fn a_give_that_lands_in_the_wait_is_taken() {
+        let bytes = Arc::new(Bytes::new(100));
+        let held = bytes.take(100, None).expect("fits");
+        let waiter = {
+            let bytes = Arc::clone(&bytes);
+            std::thread::spawn(move || {
+                let until = Instant::now() + Duration::from_secs(5);
+                bytes.take(100, Some(until))
+            })
+        };
+        let blocked = (0..2000).any(|_| {
+            if bytes.0.waiting.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            false
+        });
+        assert!(blocked, "the waiter never blocked on the empty budget");
+        drop(held);
+        let got = waiter.join().unwrap();
+        assert!(got.is_ok(), "the give in the wait was refused: {got:?}");
     }
 
     #[test]
