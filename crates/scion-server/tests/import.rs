@@ -596,10 +596,13 @@ fn verification_catches_a_tree_that_differs_from_git() {
                 }),
             )]);
             let bad = tree::apply(c, Some(root), &extra, &mut |_| Ok(0))?;
-            c.sqlite().unwrap().execute(
-                "UPDATE derived SET value = ?1 WHERE kind = 'root_tree' AND cs = ?2",
-                params![bad.as_bytes(), first.tip.as_bytes()],
-            )?;
+            c.sqlite()
+                .unwrap()
+                .execute(
+                    "UPDATE derived SET value = ?1 WHERE kind = 'root_tree' AND cs = ?2",
+                    params![bad.as_bytes(), first.tip.as_bytes()],
+                )
+                .map_err(scion_server::test_support::error::from_sqlite)?;
             Ok(())
         })
         .unwrap();
@@ -617,9 +620,10 @@ fn verification_catches_a_tree_that_differs_from_git() {
     );
     let rows: i64 = store
         .read(|c| {
-            Ok(c.sqlite()
+            c.sqlite()
                 .unwrap()
-                .query_row("SELECT count(*) FROM git_import", [], |r| r.get(0))?)
+                .query_row("SELECT count(*) FROM git_import", [], |r| r.get(0))
+                .map_err(scion_server::test_support::error::from_sqlite)
         })
         .unwrap();
     assert_eq!(rows, 1, "the failed batch rolled back");
@@ -977,9 +981,10 @@ fn an_import_process_shares_the_data_directory_with_lands() {
     // Every commit is imported, and the other ref points at the tip.
     let rows: i64 = store
         .read(|c| {
-            Ok(c.sqlite()
+            c.sqlite()
                 .unwrap()
-                .query_row("SELECT count(*) FROM git_import", [], |row| row.get(0))?)
+                .query_row("SELECT count(*) FROM git_import", [], |row| row.get(0))
+                .map_err(scion_server::test_support::error::from_sqlite)
         })
         .unwrap();
     assert_eq!(rows, 400);
@@ -1249,21 +1254,23 @@ fn an_import_that_stays_busy_fails_with_the_busy_error() {
     // gives up with the busy error instead of retrying forever.
     store.fail_next_commits(BUSY_TRIES + 1);
     let error = try_import(&store, &git, &rev).unwrap_err();
-    assert!(matches!(error, Error::Busy), "{error:?}");
+    assert!(error.is_busy(), "{error:?}");
     // Nothing was written: the ref is not there, and no changeset is.
     let refs: i64 = store
         .read(|c| {
-            Ok(c.sqlite()
+            c.sqlite()
                 .unwrap()
-                .query_row("SELECT count(*) FROM refs", [], |row| row.get(0))?)
+                .query_row("SELECT count(*) FROM refs", [], |row| row.get(0))
+                .map_err(scion_server::test_support::error::from_sqlite)
         })
         .unwrap();
     assert_eq!(refs, 0);
     let cs: i64 = store
         .read(|c| {
-            Ok(c.sqlite()
+            c.sqlite()
                 .unwrap()
-                .query_row("SELECT count(*) FROM changesets", [], |row| row.get(0))?)
+                .query_row("SELECT count(*) FROM changesets", [], |row| row.get(0))
+                .map_err(scion_server::test_support::error::from_sqlite)
         })
         .unwrap();
     assert_eq!(cs, 0);

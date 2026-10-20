@@ -41,6 +41,8 @@
 use std::future::Future;
 use std::io;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+use std::path::Path;
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -51,7 +53,7 @@ use crate::runtime::metrics::Metrics;
 use crate::runtime::request_id;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Sleep;
 use tokio_rustls::rustls::ServerConfig;
@@ -634,6 +636,77 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for Connection<IO> {
     }
 }
 
+/// Checks that only this user can reach `dir`: a real directory (not a
+/// symlink), owned by the effective user, with no access for group or
+/// others, under directories that no other user can change
+/// ([`check_ancestors`](crate::runtime::auth::check_ancestors)). Then nobody
+/// else can read what is inside, or put a file there. Returns `dir` with its
+/// parent resolved: use it, not `dir`, so no symlink is followed again.
+/// Fails with `PermissionDenied`, naming the rule that `dir` breaks.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::PermissionDenied`] if `dir` breaks one of the rules.
+pub fn check_private_dir(dir: &Path) -> io::Result<std::path::PathBuf> {
+    let me = rustix::process::geteuid().as_raw();
+    let dir = crate::runtime::auth::check_ancestors(dir, me)?;
+    let meta = std::fs::symlink_metadata(&dir)?;
+    let refuse = |why: &str| {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} {why}", dir.display()),
+        ))
+    };
+    if !meta.is_dir() {
+        return refuse("is not a directory (a symlink is refused too)");
+    }
+    if meta.uid() != me {
+        return refuse("is owned by another user");
+    }
+    if meta.mode() & 0o077 != 0 {
+        return refuse("is open to other users; make it mode 0700");
+    }
+    Ok(dir)
+}
+
+/// Listens on a Unix socket at `path`, in a directory that only this user
+/// can reach: a real directory, owned by this user, closed to others. So
+/// nobody else can connect, even in the
+/// moment before the socket gets mode 0600, or put another socket in its
+/// place. Replaces a socket file that nothing listens on, such as one left
+/// by a crash.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::PermissionDenied`] if the directory is not private,
+/// [`io::ErrorKind::AddrInUse`] if a process listens on `path`, or I/O errors.
+pub async fn bind_unix(path: &Path) -> io::Result<UnixListener> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} names no socket file", path.display()),
+        )
+    })?;
+    // The checked directory, so no symlink in `path` is followed again.
+    let path = &check_private_dir(dir)?.join(name);
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket()) {
+        if UnixStream::connect(path).await.is_ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("a process listens on {}", path.display()),
+            ));
+        }
+        std::fs::remove_file(path)?;
+    }
+    let listener = UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read as _, Write as _};
@@ -833,10 +906,14 @@ mod tests {
         }
     }
 
-    /// Writes `pem` into the temp directory of a test, as `name`.
+    /// Writes `pem` into the temp directory of a test, as `name`, 0600:
+    /// the keys are secrets, and the checked read refuses one that group
+    /// or others can read.
     fn write(dir: &Path, name: &str, pem: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join(name);
         std::fs::write(&path, pem).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         path
     }
 

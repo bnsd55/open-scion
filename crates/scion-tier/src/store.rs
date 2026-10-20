@@ -22,6 +22,7 @@ use rustix::fs::FlockOperation;
 use scion_core::{BlobId, TreeId};
 use scion_proto::Bytes;
 use scion_proto::runtime::auth::create_private_dir_all;
+use scion_proto::runtime::listen::check_private_dir;
 use scion_proto::runtime::object::MAX_ENCODED_BYTES;
 
 use crate::Key;
@@ -1193,7 +1194,7 @@ impl DiskStore {
     pub fn open(dir: &Path, limit: usize) -> io::Result<Self> {
         create_private_dir_all(dir)?;
         // The checked directory, so no symlink in `dir` is followed again.
-        let dir = &crate::check_private_dir(dir)?;
+        let dir = &check_private_dir(dir)?;
         let lock_file = lock_dir(dir)?;
         let objects = dir.join("objects");
         let tmp = dir.join("tmp");

@@ -1020,7 +1020,7 @@ mod tests {
         store
             .read(|c| {
                 c.query_row("SELECT count() FROM view_trees", [], |row| row.get(0))
-                    .map_err(crate::error::Error::from)
+                    .map_err(crate::error::from_sqlite)
             })
             .unwrap()
     }

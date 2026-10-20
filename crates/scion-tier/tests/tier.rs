@@ -12,6 +12,7 @@ use std::time::Duration;
 use scion_core::{BlobId, Entry, FileState, PathElem, Tree};
 use scion_proto::CHUNK_BYTES;
 use scion_proto::runtime::listen::Limits;
+use scion_proto::runtime::listen::bind_unix;
 use scion_proto::runtime::object::{self, Assembler, Header};
 use scion_proto::runtime::tls::{ClientTls, ServerTls};
 use scion_proto::v1::objects_client::ObjectsClient;
@@ -20,7 +21,7 @@ use scion_proto::v1::{
     Encoding, GetObjectsRequest, GetRootTreeRequest, GetRootTreeResponse, ObjectKind, ObjectPart,
     ObjectRef, ResolveRefRequest, ResolveRefResponse,
 };
-use scion_tier::{CACHE_UPSTREAM_TIMEOUT, DiskStore, Key, MemoryStore, Store, Tier, bind_unix};
+use scion_tier::{CACHE_UPSTREAM_TIMEOUT, DiskStore, Key, MemoryStore, Store, Tier};
 use tokio::net::TcpListener;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::{TcpListenerStream, UnixListenerStream};
@@ -1132,10 +1133,14 @@ impl TestAuthority {
 /// Writes a certificate and its key into `dir`, as `name.pem` and
 /// `name.key`.
 fn write_pem(dir: &tempfile::TempDir, name: &str, cert: &str, key: &str) -> TestCert {
+    use std::os::unix::fs::PermissionsExt as _;
     let cert_path = dir.path().join(format!("{name}.pem"));
     std::fs::write(&cert_path, cert).unwrap();
     let key_path = dir.path().join(format!("{name}.key"));
     std::fs::write(&key_path, key).unwrap();
+    // A key is a secret: the checked read refuses one that group or
+    // others can read.
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     TestCert {
         cert: cert_path,
         key: key_path,

@@ -3,12 +3,15 @@
 //! Also the check that no other user can swap a local path on its way
 //! ([`check_ancestors`]), shared by `scn` and the daemon, and the way every
 //! process makes its own directories private ([`create_private_dir_all`]).
+//! Files that hold secrets, or keys that must stay whole, are read through
+//! one checked descriptor ([`read_secret_file`], [`read_shared_file`]).
 
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fs, io};
 
+use rustix::fs::OFlags;
 use tonic::metadata::errors::InvalidMetadataValue;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::Interceptor;
@@ -196,6 +199,155 @@ pub fn check_ancestors(path: &Path, me: u32) -> io::Result<PathBuf> {
     Ok(parent.join(name))
 }
 
+/// Reads `file` for a secret that only the account that runs this process
+/// (or root) may hold: an access file of bearer tokens, a TLS private key,
+/// a ticket seed. The directories above `file` are checked
+/// ([`check_ancestors`]), the file is opened once through the resolved path
+/// with `O_NOFOLLOW`, and kind, owner (this user or root), and mode run on
+/// the open descriptor that the bytes are read from: a regular file that no
+/// group or others account can read. A swap between the checks and the read
+/// then dies at the open or on the descriptor's checks, and the bytes come
+/// from the checked descriptor either way. Only the owner, the group and
+/// the mode bits are read, not ACLs.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::PermissionDenied`] naming the rule that broke and the
+/// `chmod` that fixes it; I/O errors if the file cannot be opened or read.
+pub fn read_secret_file(file: &Path) -> io::Result<Vec<u8>> {
+    read_checked_file(file, true)
+}
+
+/// Reads `file` that is public but must stay whole, such as the public key
+/// that a ticket rotation keeps alive: the same one-descriptor check as
+/// [`read_secret_file`], except the mode rule is write, not read - no group
+/// or others account may be able to write it, because a changed key breaks
+/// every tier that verifies against the old one. Read permission for the
+/// others is fine.
+///
+/// # Errors
+///
+/// As [`read_secret_file`].
+pub fn read_shared_file(file: &Path) -> io::Result<Vec<u8>> {
+    read_checked_file(file, false)
+}
+
+/// Wraps the error of [`read_secret_file`] or [`read_shared_file`] for a
+/// caller that reports with anyhow: a refusal already names the file and
+/// the fix, so it stands alone; every other error gets the file named.
+///
+/// # Errors
+///
+/// Always: `why`, as the caller can report it.
+#[must_use]
+pub fn checked_read_error(file: &Path, why: io::Error) -> anyhow::Error {
+    if why.kind() == io::ErrorKind::PermissionDenied {
+        anyhow::anyhow!("{why}")
+    } else {
+        anyhow::Error::new(why).context(format!("cannot read {}", file.display()))
+    }
+}
+
+/// [`read_secret_file`] and [`read_shared_file`]: `secret` picks the mode
+/// rule (no group or others read, or no write).
+fn read_checked_file(file: &Path, secret: bool) -> io::Result<Vec<u8>> {
+    let me = rustix::process::geteuid().as_raw();
+    let resolved = check_ancestors(file, me)?;
+    let opened = rustix::fs::open(
+        &resolved,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|why| {
+        if why == rustix::io::Errno::LOOP {
+            // ELOOP says a symlink refused the open: at the file itself, or
+            // a loop on the way. The first is worth naming precisely.
+            let at_end = match fs::symlink_metadata(resolved) {
+                Ok(meta) => meta.file_type().is_symlink(),
+                Err(_) => false,
+            };
+            if at_end {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("{} is a symlink (a symlink is refused too)", file.display()),
+                )
+            } else {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("a symlink loop blocks {}", file.display()),
+                )
+            }
+        } else {
+            why.into()
+        }
+    })?;
+    let opened = fs::File::from(opened);
+    let meta = opened.metadata()?;
+    ensure_file_checks(meta.mode(), meta.uid(), me, secret, file)?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut &opened, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// The descriptor checks of [`read_checked_file`]: a regular file, owned by
+/// the account that runs this process or by root, with a mode that keeps
+/// the file whole (a secret is also read by its owner alone). Pure over the
+/// fstat fields, so the tests can prove each refusal without a second
+/// account.
+/// The type and permission bits of an `st_mode`, as POSIX fixes them for
+/// every platform: the kind in the `S_IFMT` mask, `S_IFREG` for a regular
+/// file. Plain constants, so the check is over the `u32` mode the tests
+/// hold, with no conversion that is a no-op on Linux and would truncate
+/// on macOS.
+const S_IFMT: u32 = 0o170_000;
+const S_IFREG: u32 = 0o100_000;
+
+fn ensure_file_checks(mode: u32, uid: u32, me: u32, secret: bool, file: &Path) -> io::Result<()> {
+    if mode & S_IFMT != S_IFREG {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a file (a symlink is refused too)",
+                file.display()
+            ),
+        ));
+    }
+    if uid != 0 && uid != me {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is owned by another user (uid {}); this process runs as uid {}",
+                file.display(),
+                uid,
+                me
+            ),
+        ));
+    }
+    let bits = mode & 0o777;
+    if secret {
+        if bits.trailing_zeros() < 6 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} can be read by group or others (fix: chmod 600 {})",
+                    file.display(),
+                    file.display()
+                ),
+            ));
+        }
+    } else if bits & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} can be written by group or others (fix: chmod go-w {})",
+                file.display(),
+                file.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Makes `dir` and each missing directory above it with mode 0700, where
 /// [`fs::create_dir_all`] asks for 0777. A umask only takes bits away from
 /// the mode asked for, so whatever the umask is, group and others get no
@@ -371,5 +523,74 @@ mod tests {
         symlink(&open, tmp.path().join("to-open")).unwrap();
         let err = check_ancestors(&tmp.path().join("to-open/daemon.sock"), me).unwrap_err();
         assert!(err.to_string().contains("/open can be written"), "{err}");
+    }
+
+    /// The raw fstat mode of a regular file with permission bits `bits`.
+    fn file_mode(bits: u32) -> u32 {
+        0o100_000 | bits
+    }
+
+    #[test]
+    fn a_file_owned_by_this_account_or_root_passes_the_descriptor_checks() {
+        ensure_file_checks(file_mode(0o600), 501, 501, true, Path::new("key")).unwrap();
+        ensure_file_checks(file_mode(0o644), 501, 501, false, Path::new("key")).unwrap();
+    }
+
+    /// A file owned by root passes: a service manager that holds the keys
+    /// at root-owned files is normal.
+    #[test]
+    fn a_root_owned_file_passes_the_descriptor_checks() {
+        ensure_file_checks(file_mode(0o600), 0, 501, true, Path::new("key")).unwrap();
+        ensure_file_checks(file_mode(0o644), 0, 501, false, Path::new("key")).unwrap();
+    }
+
+    /// The owner check is what keeps a secret another account holds -
+    /// and can replace at will - out, whatever its mode.
+    #[test]
+    fn a_file_owned_by_another_account_is_refused() {
+        let err = ensure_file_checks(file_mode(0o644), 502, 501, false, Path::new("key"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("owned by another user"), "{err}");
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_file_is_refused() {
+        let err = ensure_file_checks(0o040_700, 501, 501, true, Path::new("key"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not a file"), "{err}");
+    }
+
+    #[test]
+    fn a_group_readable_secret_is_refused_and_a_group_writable_shared_file_is_refused() {
+        let err = ensure_file_checks(file_mode(0o640), 501, 501, true, Path::new("key"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("read by group or others"), "{err}");
+        let err = ensure_file_checks(file_mode(0o664), 501, 501, false, Path::new("key"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("written by group or others"), "{err}");
+        // A 0644 shared file passes: the others may read what is public.
+        ensure_file_checks(file_mode(0o644), 501, 501, false, Path::new("key")).unwrap();
+    }
+
+    /// The whole path of [`read_secret_file`]: a private file reads back
+    /// through the checked descriptor, and a link at the end dies at the
+    /// open even when its target has a perfect mode and owner.
+    #[test]
+    fn a_secret_reads_through_the_descriptor_and_a_link_dies_at_the_open() {
+        let (tmp, me) = tempdir();
+        let secret = tmp.path().join("s");
+        fs::write(&secret, b"bytes").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_secret_file(&secret).unwrap(), b"bytes");
+        let link = tmp.path().join("link");
+        symlink(&secret, &link).unwrap();
+        let err = read_secret_file(&link).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        let _ = me;
     }
 }

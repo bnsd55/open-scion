@@ -145,11 +145,15 @@ fn changesets(store: &Backend, dir: &Path) -> HashMap<String, String> {
                 .collect();
             let id = store
                 .read(|c| {
-                    let cs: Vec<u8> = c.sqlite().unwrap().query_row(
-                        "SELECT cs FROM git_import WHERE git_oid = ?1",
-                        [&oid],
-                        |row| row.get(0),
-                    )?;
+                    let cs: Vec<u8> = c
+                        .sqlite()
+                        .unwrap()
+                        .query_row(
+                            "SELECT cs FROM git_import WHERE git_oid = ?1",
+                            [&oid],
+                            |row| row.get(0),
+                        )
+                        .map_err(scion_server::test_support::error::from_sqlite)?;
                     Ok(ChangesetId::try_from(cs.as_slice()).unwrap())
                 })
                 .unwrap();

@@ -172,7 +172,7 @@ fn a_write_blocked_by_another_writer_answers_busy_in_seconds() {
         .expect_err("the held name refuses the write");
     let waited = started.elapsed();
     let _ = held.batch_execute("ROLLBACK");
-    assert!(matches!(error, scion_server::Error::Busy), "{error:?}");
+    assert!(error.is_busy(), "{error:?}");
     assert!(
         waited >= std::time::Duration::from_secs(4),
         "answered after {waited:?}"
@@ -361,7 +361,7 @@ fn an_unreachable_database_is_not_a_takeover() {
         let error = store
             .write(|c| c.create_repo("down").map(|_| ()))
             .expect_err("a write against a database that is down fails");
-        assert!(matches!(error, scion_server::Error::Busy), "{error:?}");
+        assert!(error.is_busy(), "{error:?}");
         assert!(
             !Backend::fenced(&store),
             "an unreachable database must not fence the backend"

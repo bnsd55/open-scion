@@ -119,7 +119,8 @@ fn a_read_that_leaves_a_transaction_open_is_replaced() {
                 use rusqlite::params;
                 c.sqlite()
                     .expect("a SQLite backend")
-                    .execute("BEGIN", params![])?;
+                    .execute("BEGIN", params![])
+                    .map_err(scion_server::test_support::error::from_sqlite)?;
                 panic!("the read dies with its transaction open");
                 #[allow(unreachable_code)]
                 Ok::<(), scion_server::Error>(())

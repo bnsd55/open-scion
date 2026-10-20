@@ -359,7 +359,7 @@ fn store_batch(
             });
             match result {
                 Ok(_) => break,
-                Err(Error::Busy) if tries < BUSY_TRIES => {
+                Err(e) if e.is_busy() && tries < BUSY_TRIES => {
                     tries += 1;
                     taken = 0;
                     checker.reset_for_retry();
@@ -1348,7 +1348,12 @@ mod tests {
         import("main~1");
         // As after a version bump of the root tree: no stored root trees.
         let sql = "DELETE FROM derived WHERE kind = ?1";
-        let removed = store.write(|c| Ok(c.sqlite().unwrap().execute(sql, [RootTree::NAME])?));
+        let removed = store.write(|c| {
+            c.sqlite()
+                .unwrap()
+                .execute(sql, [RootTree::NAME])
+                .map_err(crate::error::from_sqlite)
+        });
         assert_eq!(removed.unwrap(), 4);
 
         let commits = store.commits();

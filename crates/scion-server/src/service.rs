@@ -2209,7 +2209,12 @@ mod tests {
         }
         let sql = "SELECT state FROM lands WHERE request_key = 'k'";
         let state: String = store
-            .read(|c| Ok(c.sqlite().unwrap().query_row(sql, [], |row| row.get(0))?))
+            .read(|c| {
+                c.sqlite()
+                    .unwrap()
+                    .query_row(sql, [], |row| row.get(0))
+                    .map_err(crate::error::from_sqlite)
+            })
             .unwrap();
         assert_eq!(state, "pending");
         let main = store.read(|c| {
