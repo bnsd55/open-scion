@@ -172,9 +172,77 @@ fn a_verify_names_a_blob_whose_bytes_someone_corrupted() {
     let empty = tempfile::tempdir().unwrap();
     match archive::restore(&out, empty.path(), None, None) {
         Err(scion_server::Error::Corrupt(why)) => {
-            assert!(why.contains("other bytes than its name says"), "{why}");
+            assert!(why.contains("not sound"), "{why}");
         }
         other => panic!("expected Corrupt, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_manifest_name_that_escapes_the_archive_is_refused() {
+    // The archive is input from outside the server: a repo name the
+    // manifest holds must be one path component before it ever joins one.
+    let data = tempfile::tempdir().unwrap();
+    let (store, _main) = source(data.path());
+    let out = tempfile::tempdir().unwrap().path().join("archive");
+    archive::export(&store, data.path(), Some(REPO), false, &out).unwrap();
+    drop(store);
+    let manifest_path = out.join("manifest.json");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    for name in ["../escape", "/abs", "..", "."] {
+        let mut evil = manifest.clone();
+        evil["repos"] = serde_json::json!([{ "name": name, "changesets": 0 }]);
+        std::fs::write(&manifest_path, serde_json::to_string(&evil).unwrap()).unwrap();
+        match archive::verify(&out) {
+            Err(scion_server::Error::Corrupt(why)) => {
+                assert!(why.contains(name), "{why}");
+            }
+            Err(other) => panic!("expected Corrupt for {name:?}, got {other:?}"),
+            Ok(damages) => panic!("expected a refusal for {name:?}, got {damages:?}"),
+        }
+        let empty = tempfile::tempdir().unwrap();
+        match archive::restore(&out, empty.path(), None, None) {
+            Err(scion_server::Error::Corrupt(why)) => {
+                assert!(why.contains(name), "{why}");
+            }
+            other => panic!("expected a refusal for {name:?}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_blob_file_that_expands_past_the_cap_is_refused() {
+    // A decompression bomb: a tiny zstd frame whose content is far past
+    // the server's cap for one blob. The reader refuses it without
+    // holding the expansion.
+    let data = tempfile::tempdir().unwrap();
+    let (store, _main) = source(data.path());
+    let out = tempfile::tempdir().unwrap().path().join("archive");
+    archive::export(&store, data.path(), Some(REPO), false, &out).unwrap();
+    drop(store);
+    // Pick a member, and replace its file with a frame of zeros that is
+    // over the cap when it expands. Hash it so the NAME is right: the
+    // refusal must come from the cap, not the name check.
+    let cap = scion_server::test_support::store::MAX_OBJECT_BYTES;
+    let bomb_raw = vec![0_u8; cap + 1];
+    let bomb_id = BlobId::of(&bomb_raw);
+    let path = data_path_of(&out, bomb_id);
+    let frame = zstd::bulk::compress(&bomb_raw, 3).unwrap();
+    // The archive names its members; rewrite members.txt to name the bomb.
+    let members = out.join("repos").join(REPO).join("members.txt");
+    std::fs::write(&members, format!("{bomb_id}\n")).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &frame).unwrap();
+    let damages = archive::verify(&out).unwrap();
+    assert_eq!(damages.len(), 1, "{damages:?}");
+    assert!(damages[0].contains("expands past the cap"), "{damages:?}");
+    let empty = tempfile::tempdir().unwrap();
+    match archive::restore(&out, empty.path(), None, None) {
+        Err(scion_server::Error::Corrupt(why)) => {
+            assert!(why.contains("not sound"), "{why}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
     }
 }
 

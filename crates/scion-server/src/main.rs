@@ -439,12 +439,13 @@ async fn main() -> anyhow::Result<()> {
     // be given together), the argv form warns, the env is quiet.
     let postgres_url = postgres_url_of(&cli)?;
     let store = match cli.command {
-        Command::Import { .. } | Command::Fsck | Command::Gc { .. }
-        | Command::Export { .. } => Backend::open_shared(
-            &cli.data,
-            postgres_url.as_deref(),
-            cli.postgres_ca.as_deref(),
-        ),
+        Command::Import { .. } | Command::Fsck | Command::Gc { .. } | Command::Export { .. } => {
+            Backend::open_shared(
+                &cli.data,
+                postgres_url.as_deref(),
+                cli.postgres_ca.as_deref(),
+            )
+        }
         Command::HashToken { .. } => return hash_token(),
         Command::TicketKey { .. } => return write_ticket_key(),
         Command::Verify { .. } | Command::Restore { .. } => unreachable!("handled below"),

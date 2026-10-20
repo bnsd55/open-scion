@@ -194,17 +194,19 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
         }
         for member in read_members(&dir.join("members.txt"))? {
             let path = blob_path(archive, &member);
-            match fs::read(&path) {
-                Ok(bytes) => {
-                    let raw = zstd::decode_all(bytes.as_slice()).map_err(|error| {
-                        Error::Corrupt(format!("{} does not decompress: {error}", path.display()))
-                    })?;
-                    if BlobId::of(&raw) != member {
-                        damages.push(format!(
-                            "the blob file of {member} holds other bytes than its name says"
-                        ));
+            match fs::File::open(&path) {
+                Ok(file) => match decode_blob(&path, file) {
+                    Ok(raw) => {
+                        if BlobId::of(&raw) != member {
+                            damages.push(format!(
+                                "the blob file of {member} holds other bytes than its name says"
+                            ));
+                        }
                     }
-                }
+                    // A bomb, or a frame the decoder cannot read: one
+                    // damage, and verify goes on to name the rest.
+                    Err(why) => damages.push(format!("{why}")),
+                },
                 Err(_) => damages.push(format!("the blob file of {member} is missing")),
             }
         }
@@ -222,11 +224,14 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
 /// are not in the archive: the replay's `store_changeset` rebuilds them.
 /// Returns the repo names it restored.
 ///
+/// The archive is input from outside the server: [`verify`] runs first,
+/// and any damage refuses the replay, so the reader of the files and the
+/// writer of the store can never disagree.
+///
 /// # Errors
 ///
-/// A data directory that already holds a store, a failed open, a blob
-/// whose bytes do not hash to its name, or what the replay's writes
-/// return.
+/// A data directory that already holds a store, a failed open, damage
+/// [`verify`] finds, or what the replay's writes return.
 pub fn restore(
     archive: &Path,
     data: &Path,
@@ -243,6 +248,16 @@ pub fn restore(
     }
     let manifest = read_manifest(archive)?;
     let names = repo_names(&manifest)?;
+    // One check path: the same verify a reader runs, before any write. A
+    // damage here refuses the replay, and names itself.
+    let damages = verify(archive)?;
+    if !damages.is_empty() {
+        return Err(Error::Corrupt(format!(
+            "the archive is not sound; verify names {} damages, the first: {}",
+            damages.len(),
+            damages[0]
+        )));
+    }
     let store = Backend::open(data, postgres_url, postgres_ca)?;
     for name in &names {
         let dir = archive.join("repos").join(name);
@@ -256,9 +271,9 @@ pub fn restore(
         // raw bytes writes the file with its durability dance, and the ID
         // is the hash of the raw bytes, so the IDs carry over.
         for member in &members {
-            let bytes = fs::read(blob_path(archive, member))?;
-            let raw = zstd::decode_all(bytes.as_slice())
-                .map_err(|error| Error::Corrupt(format!("a blob does not decompress: {error}")))?;
+            let path = blob_path(archive, member);
+            let file = fs::File::open(&path)?;
+            let raw = decode_blob(&path, file)?;
             let stored = store.blobs().put(&raw)?;
             if stored != *member {
                 return Err(Error::Corrupt(format!(
@@ -475,28 +490,35 @@ fn write_changesets(path: &Path, changesets: &[(ChangesetId, i64, Vec<u8>)]) -> 
 }
 
 /// Reads the changeset stream back.
+//
+// SHORTCUT: the whole stream is read into memory, so a restore holds one
+// repo's full history (bodies) in RAM. Ceiling: a repo whose history is
+// gigabytes needs gigabytes. Upgrade path: stream the frames from a
+// `BufReader`, one record at a time, into the replay transaction.
 fn read_changesets(path: &Path) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>> {
     let bytes = fs::read(path)?;
     let mut out = Vec::new();
     let mut at = 0_usize;
     while at < bytes.len() {
         let end = at + 4;
-        let len = bytes
-            .get(at..end)
-            .ok_or_else(|| torn(path))?
-            .iter()
-            .rev()
-            .fold(0_u64, |n, b| (n << 8) | u64::from(*b));
+        let len = u32::from_le_bytes(
+            bytes
+                .get(at..end)
+                .ok_or_else(|| torn(path))?
+                .try_into()
+                .map_err(|_| torn(path))?,
+        );
         let len = usize::try_from(len).map_err(|_| torn(path))?;
         let end = end + 32;
         let id = bytes.get(at + 4..end).ok_or_else(|| torn(path))?.to_vec();
         let end = end + 8;
-        let generation = bytes
-            .get(at + 36..end)
-            .ok_or_else(|| torn(path))?
-            .iter()
-            .rev()
-            .fold(0_i64, |n, b| (n << 8) | i64::from(*b));
+        let generation = i64::from_le_bytes(
+            bytes
+                .get(at + 36..end)
+                .ok_or_else(|| torn(path))?
+                .try_into()
+                .map_err(|_| torn(path))?,
+        );
         let end = end + len;
         let body = bytes.get(at + 44..end).ok_or_else(|| torn(path))?.to_vec();
         let id = ChangesetId::try_from(id.as_slice()).map_err(|error| {
@@ -663,12 +685,54 @@ fn repo_names(manifest: &serde_json::Value) -> Result<Vec<String>> {
     repos
         .iter()
         .map(|repo| {
-            repo["name"]
+            let name = repo["name"]
                 .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| Error::Corrupt("a manifest repo has no name".to_owned()))
+                .ok_or_else(|| Error::Corrupt("a manifest repo has no name".to_owned()))?;
+            repo_name(name)?;
+            Ok(name.to_owned())
         })
         .collect()
+}
+
+/// Checks a repo name the archive holds before it ever becomes a path: the
+/// live rule for names a client sends (`names::check`, the rule
+/// `create_repo`'s callers apply), and then that the name is ONE path
+/// component, so `../escape` and `/abs` cannot name a file outside the
+/// archive. The name comes from outside the server: treat it as untrusted.
+fn repo_name(name: &str) -> Result<()> {
+    crate::names::check("repo", name)?;
+    if name.contains('/') || name == "." || name == ".." {
+        return Err(Error::Corrupt(format!(
+            "the manifest's repo name {name:?} is not one path component"
+        )));
+    }
+    Ok(())
+}
+
+/// The most a blob file may expand to: the server's own cap for one blob,
+/// plus the byte the check of it needs. A small file that decompresses
+/// past this is a bomb, and the reader refuses it without holding it.
+fn blob_decode_cap() -> u64 {
+    crate::store::MAX_OBJECT_BYTES as u64 + 1
+}
+
+/// Decompresses a stored blob file, bounded: at most [`blob_decode_cap`]
+/// bytes leave the decoder, so a crafted frame cannot grow in memory past
+/// the cap. The bytes past the cap are the refusal.
+fn decode_blob(path: &Path, bytes: fs::File) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let decoder = zstd::stream::Decoder::new(bytes)?;
+    let mut raw = decoder.take(blob_decode_cap());
+    let mut out = Vec::new();
+    raw.read_to_end(&mut out)?;
+    if out.len() > crate::store::MAX_OBJECT_BYTES {
+        return Err(Error::Corrupt(format!(
+            "{} expands past the cap of {} bytes",
+            path.display(),
+            crate::store::MAX_OBJECT_BYTES
+        )));
+    }
+    Ok(out)
 }
 
 /// A local-time RFC 3339 stamp of now, to the second.
