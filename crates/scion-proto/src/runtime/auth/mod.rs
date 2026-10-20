@@ -410,21 +410,21 @@ fn minimal_acl_matches_mode(acl: &[u8], mode: u32) -> bool {
 fn fd_has_hidden_acl(fd: impl rustix::fd::AsFd, mode: u32, dir: bool) -> bool {
     #[cfg(target_os = "linux")]
     {
-        let mut buf = [0u8; 64];
+        // A minimal ACL xattr is 28 bytes; 64 covers any form this check
+        // could accept, and a longer one is refused by the parse.
+        let mut buf = Vec::with_capacity(64);
         match rustix::fs::fgetxattr(fd, POSIX_ACL_ACCESS, &mut buf) {
             Err(rustix::io::Errno::NODATA) => {}
             Ok(bytes) => {
-                if !minimal_acl_matches_mode(bytes, mode) {
+                if !minimal_acl_matches_mode(&bytes, mode) {
                     return true;
                 }
             }
             Err(_) => return true,
         }
         if dir {
-            return !matches!(
-                rustix::fs::fgetxattr(fd, POSIX_ACL_DEFAULT, &mut buf),
-                Err(rustix::io::Errno::NODATA)
-            );
+            let default = rustix::fs::fgetxattr(fd, POSIX_ACL_DEFAULT, &mut buf);
+            return !matches!(default, Err(rustix::io::Errno::NODATA));
         }
         false
     }
