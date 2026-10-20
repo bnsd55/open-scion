@@ -21,4 +21,7 @@
 # cfg-gated hook items across the sources (~800 more) count in every
 # report. They are exercised by the same suite the report measures,
 # so their share is honest test-side code, not unmeasured
-# production code.
+# production code. The seam's ~880 counted lines are about 2.5 points
+# of the total, so they can hold a gate above the truth: when the
+# total falls to 83 percent or below, move the seam into its own
+# files before the gate's number is trusted.
