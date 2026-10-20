@@ -126,10 +126,14 @@ fn every_supported_cell_runs_natively_and_every_platform_job_is_claimed() {
     }
 }
 
-/// A job of a workflow: its `runs-on` label and its service images.
+/// A job of a workflow: its `runs-on` label, its service images, and
+/// the version list of its strategy matrix (a matrix job's service
+/// image is the expression `${{ matrix.version }}`, which the check
+/// resolves through the list).
 struct Job {
     runs_on: String,
     services: Vec<String>,
+    matrix_versions: Vec<String>,
 }
 
 impl Job {
@@ -150,13 +154,19 @@ impl Job {
         }
     }
 
-    /// Whether a service runs `postgres:<major>`.
+    /// Whether a service runs `postgres:<major>`: a literal image by
+    /// its own version, a matrix image through the job's version list.
     fn runs_postgres(&self, major: &str) -> bool {
-        self.services.iter().any(|image| {
-            image
-                .strip_prefix("postgres:")
-                .is_some_and(|rest| rest.split('.').next() == Some(major))
-        })
+        self.services
+            .iter()
+            .any(|image| match image.strip_prefix("postgres:") {
+                Some(version) if version.contains("matrix.version") => self
+                    .matrix_versions
+                    .iter()
+                    .any(|v| v.split('.').next() == Some(major)),
+                Some(version) => version.split('.').next() == Some(major),
+                None => false,
+            })
     }
 }
 
@@ -171,6 +181,7 @@ fn parse_jobs(text: &str) -> Vec<(String, Job)> {
     let mut key: Option<String> = None;
     let mut runs_on: Option<String> = None;
     let mut matrix_oses: Vec<String> = Vec::new();
+    let mut matrix_versions: Vec<String> = Vec::new();
     let mut services: Vec<String> = Vec::new();
     let mut in_services = false;
     for line in text.lines() {
@@ -198,6 +209,7 @@ fn parse_jobs(text: &str) -> Vec<(String, Job)> {
                     name,
                     runs_on.take(),
                     &mut matrix_oses,
+                    &mut matrix_versions,
                     &mut services,
                 );
             }
@@ -214,14 +226,10 @@ fn parse_jobs(text: &str) -> Vec<(String, Job)> {
                 "services" => in_services = true,
                 "image" if in_services => services.push(v.trim().trim_matches('\'').to_owned()),
                 "os" if v.trim().starts_with('[') => {
-                    matrix_oses = v
-                        .trim()
-                        .trim_start_matches('[')
-                        .trim_end_matches(']')
-                        .split(',')
-                        .map(|os| os.trim().to_owned())
-                        .filter(|os| !os.is_empty())
-                        .collect();
+                    matrix_oses = list(v);
+                }
+                "version" if v.trim().starts_with('[') => {
+                    matrix_versions = list(v);
                 }
                 _ => {}
             }
@@ -236,10 +244,23 @@ fn parse_jobs(text: &str) -> Vec<(String, Job)> {
             name,
             runs_on.take(),
             &mut matrix_oses,
+            &mut matrix_versions,
             &mut services,
         );
     }
     jobs
+}
+
+/// `[a, b, c]` as its parts.
+fn list(value: &str) -> Vec<String> {
+    value
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .map(|item| item.trim().trim_matches('"').trim_matches('\'').to_owned())
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 /// Push one job, or one per strategy-matrix OS when `runs-on` is the
@@ -249,6 +270,7 @@ fn flush(
     name: String,
     runs_on: Option<String>,
     matrix_oses: &mut Vec<String>,
+    matrix_versions: &mut Vec<String>,
     services: &mut Vec<String>,
 ) {
     let Some(runs_on) = runs_on else { return };
@@ -259,6 +281,7 @@ fn flush(
                 Job {
                     runs_on: os.clone(),
                     services: services.clone(),
+                    matrix_versions: matrix_versions.clone(),
                 },
             ));
         }
@@ -268,6 +291,7 @@ fn flush(
             Job {
                 runs_on,
                 services: std::mem::take(services),
+                matrix_versions: std::mem::take(matrix_versions),
             },
         ));
     }

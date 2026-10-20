@@ -20,7 +20,10 @@ marked supported here.
 | Component | OS | Arch | Data filesystem | Postgres | Status | CI job | Why |
 |---|---|---|---|---|---|---|---|
 | scion-server | Linux | x64 | ext4 | — | supported | `test` (ci.yml) | The default runner disk; the whole workspace suite runs on it |
+| scion-server | Linux | x64 | ext4 | 16 | supported | `test-postgres` (ci.yml) | The Postgres-backed suite, native `postgres:16.15` service, plus the takeover drill |
 | scion-server | Linux | x64 | ext4 | 17 | supported | `test-postgres` (ci.yml) | The Postgres-backed suite, native `postgres:17.11` service, plus the takeover drill |
+| scion-server | Linux | x64 | ext4 | 18 | supported | `test-postgres` (ci.yml) | The Postgres-backed suite, native `postgres:18.6` service, plus the takeover drill |
+| scion-server | Linux | x64 | ext4 | 15 | unsupported | — | Upstream supports 15 until November 2027, but the project does not claim it yet; one matrix line adds it when an operator asks |
 | scion-server | Linux | x64 | tmpfs | — | supported | `test` (ci.yml) | The `disk_full` step fills a real tmpfs (`SCION_DISK_REQUIRE=1`) |
 | scion-server | Linux | arm64 | ext4 | — | supported | `test-arm64` (ci.yml) | Native `ubuntu-24.04-arm` runner, full workspace suite on arm64 |
 | scion-server | Linux | arm64 | ext4 | 17 | best effort | — | The arm64 suite runs SQLite; the Postgres-backed arm64 run comes with the Postgres-major wave |
