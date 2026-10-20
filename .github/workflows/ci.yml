@@ -171,6 +171,32 @@ jobs:
         env:
           PROPTEST_CASES: "2000"
 
+
+  # The arm64 cells of the support matrix (docs/support.md) are proven
+  # here, natively: a hosted arm64 runner builds and runs the whole
+  # workspace on its own architecture. Cross-compiling is not evidence.
+  # The block-level power-cut suites (dm-log-writes) and the LazyFS
+  # power-loss job stay on x64: their loop-device and FUSE harnesses
+  # are proven there, and one platform carries that evidence.
+  test-arm64:
+    name: test (linux arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test --workspace
+        env:
+          PROPTEST_CASES: "2000"
+      - name: a real disk full (tmpfs)
+        run: cargo test -p open-scion-server --test disk_full
+        env:
+          SCION_DISK_REQUIRE: "1"
+
   power-loss:
     name: power-loss
     runs-on: ubuntu-24.04
