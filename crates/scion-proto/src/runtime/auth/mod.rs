@@ -7,7 +7,6 @@
 //! one checked descriptor ([`read_secret_file`], [`read_shared_file`]),
 //! whose ACL checks wrap the one `ffi` module.
 
-use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -431,6 +430,7 @@ fn fd_has_hidden_acl(fd: impl rustix::fd::AsFd, mode: u32, dir: bool) -> bool {
     }
     #[cfg(target_os = "macos")]
     {
+        use std::os::fd::AsRawFd as _;
         let _ = (mode, dir);
         ffi::fd_has_acl(fd.as_fd().as_raw_fd())
     }
