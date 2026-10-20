@@ -5,6 +5,7 @@
 
 use scion_core::{Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_server::Backend;
+use scion_server::test_support::backend::from_store;
 use scion_server::test_support::meta::MetaTx as _;
 use scion_server::test_support::{meta::Meta as _, store::Store};
 use std::collections::BTreeMap;
@@ -69,7 +70,7 @@ impl Fixture {
 
 fn setup() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+    let store = from_store(Store::open(dir.path()).unwrap());
     let blob = |content: &str| store.blobs().put(content.as_bytes()).unwrap();
     let state = |blob| {
         Some(FileState::Regular {

@@ -10,6 +10,7 @@ use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{BlameChangeset, BlameRange, BlameRequest};
 use scion_server::Access;
+use scion_server::test_support::backend::from_store;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::{
     Backend,
@@ -82,7 +83,7 @@ fn commit(
 /// `root_body`, written by a 4-byte author.
 fn store(root_body: &[u8]) -> (tempfile::TempDir, Backend, ChangesetId) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+    let store = from_store(Store::open(dir.path()).unwrap());
     let blob = store.blobs().put(root_body).unwrap();
     let root = store
         .write(|c| {

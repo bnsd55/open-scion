@@ -38,6 +38,8 @@ This project rebuilds the ideas from that public article.
 **Platforms.** Linux and macOS. Windows is not supported. What exactly is
 tested and what is not: [Supported platforms](#supported-platforms) below.
 What each release promises per surface: [docs/stability.md](docs/stability.md).
+What each severity level gets and for how long:
+[docs/support.md](docs/support.md).
 
 **Scope of v0.1.** v0.1 is one server process on one machine. The article
 describes a horizontally scalable system: a small fleet of servers that need

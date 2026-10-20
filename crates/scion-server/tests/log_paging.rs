@@ -16,6 +16,7 @@ use scion_proto::v1::LogRequest;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_server::Backend;
 use scion_server::Metrics;
+use scion_server::test_support::backend::from_store;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::{service, store::Store, tree};
 use tonic::service::interceptor::InterceptedService;
@@ -34,7 +35,7 @@ type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
 /// message names i, so a test can tell which changeset an entry holds.
 fn chain(count: usize) -> (tempfile::TempDir, Backend, Vec<scion_core::ChangesetId>) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+    let store = from_store(Store::open(dir.path()).unwrap());
     let ids = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;

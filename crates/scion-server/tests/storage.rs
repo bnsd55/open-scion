@@ -3,6 +3,7 @@
 //! out-of-space reply that names no server path; nothing acknowledged is
 //! lost, no file is left half-written, and the next write works once the
 //! space is back.
+use scion_server::test_support::backend::BackendExt;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::store::Store;
 use scion_server::{Backend, Error, StorageClass};
@@ -107,14 +108,14 @@ fn a_batch_that_loses_a_file_keeps_its_earlier_files() {
 /// `extra`, so the next write that must grow the file hits the real
 /// disk-full of the database, not a hook.
 fn cap_metadata(store: &Backend, extra: i64) {
-    let Backend::Sqlite(store) = store else {
-        panic!("the page cap is a data-directory test");
-    };
+    let store = store
+        .sqlite()
+        .expect("the page cap is a data-directory test");
     store.cap_database_pages(extra);
 }
 
 fn release_metadata(store: &Backend) {
-    let Backend::Sqlite(store) = store else {
+    let Some(store) = store.sqlite() else {
         return;
     };
     store.release_database_pages();
