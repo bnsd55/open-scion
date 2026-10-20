@@ -294,11 +294,12 @@ fn blame_fixture(dir: &Path) {
 #[test]
 fn blame_matches_git_blame_first_parent() {
     if Backend::test_is_postgres() {
-        // The git side of the comparison is named by the data directory's
-        // own `git_import` rows, which the test reads through the SQLite
-        // file; a Postgres store keeps them in the database, and no
-        // test-side read exists for them. The scion blame lines the other
-        // rows of this file check are backend-agnostic.
+        // SHORTCUT: this ceiling is the skip itself; Postgres import
+        // provenance (the git_import rows) is unread by these tests, so the
+        // git side of the comparison has no Postgres run. Upgrade path: a
+        // backend-agnostic git_import read on MetaTx, then drop the skip.
+        // The scion blame lines the other rows of this file check are
+        // backend-agnostic.
         eprintln!("skip on postgres: the test reads the data directory's git_import rows");
         return;
     }

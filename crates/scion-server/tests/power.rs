@@ -54,6 +54,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use common::*;
 use scion_core::BlobId;
+use scion_server::Backend;
 use scion_server::test_support::store::BlobStatus;
 use tonic::Status;
 
