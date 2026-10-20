@@ -24,6 +24,37 @@ The pieces:
 
 ## 1. Deployment shapes
 
+### First boot
+
+A first start on a fresh machine is three commands, and each promises
+something:
+
+```sh
+./scion-server --data /srv/scion serve --token <TOKEN>
+```
+
+The first command creates the data directory if it does not exist, keeps
+its files private, and serves. The log's `serving` line names the address.
+
+```sh
+grpc_health_probe -addr 127.0.0.1:7878 -service scion.v1.Scion
+```
+
+The readiness probe answers `SERVING` once the server listens; the empty
+service name is the liveness probe (`grpc_health_probe -addr
+127.0.0.1:7878` with no `-service`).
+
+```sh
+git -C /srv/git/my-repo log --oneline -1
+./scion-server --data /srv/scion import /srv/git/my-repo
+```
+
+The first import makes the repo (named `main` unless `--repo` says
+otherwise), and a client's `scn log main` reads it back; the import can
+run while the server serves.
+
+Proof: crates/scion-server/tests/first_boot.rs::a_first_boot_serves_probes_and_reads_back
+
 ### One server
 
 ```sh
@@ -322,6 +353,29 @@ group- or others-writable, for a swapped file changes whom a client
 trusts or whose certificates the server accepts: `chmod go-w` them, and
 check after a copy tool or a umask 002 session, where a fresh file
 starts 0664.
+
+### Rotating the server's certificate
+
+The client trusts a CA, not the server's certificate: a certificate the
+same CA signed, written to the server's `--tls-cert` and `--tls-key`
+files, needs no client change. The rotation is:
+
+1. Make the new certificate, signed by the CA the clients already hold,
+   and write it over the server's cert and key files (`chmod 600` the
+   key; the certificate may be 0644).
+2. Restart the server: a stop (the drain protects the calls in flight)
+   and a start with the same `--tls-cert` and `--tls-key` paths, which
+   now hold the new pair.
+3. The client's promise: its `--tls-ca` file did not change, and it
+   connects.
+
+A NEW CA is the other case: every client and tier that holds the old CA
+file must get the new one BEFORE the server moves, or the clients it
+serves cannot verify it. The swap on live clients is the recorded drill
+(docs/drills/, template there), not a CI test: no test can hold the
+clients' files of a running fleet.
+
+Proof: crates/scn/tests/tls.rs::a_rotated_server_certificate_needs_no_client_change
 
 ### In containers
 
