@@ -206,16 +206,25 @@ pub fn check_ancestors(path: &Path, me: u32) -> io::Result<PathBuf> {
             // (Linux, macOS) An ACL that grants what the mode's bits do
             // not is one more way another account reaches this directory.
             #[cfg(any(target_os = "linux", target_os = "macos"))]
-            if ancestor_has_hidden_acl(dir, meta.mode())? {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "{} carries an ACL beyond its mode bits, so another user could swap {} (fix: setfacl -b {})",
-                        dir.display(),
-                        path.display(),
-                        dir.display()
-                    ),
-                ));
+            if let Some(what) = ancestor_has_hidden_acl(dir, meta.mode())? {
+                // The fix names the tool of the platform: macOS clears
+                // an ACL with chmod -N; Linux with setfacl -b. The
+                // message names the entry that granted.
+                #[cfg(target_os = "macos")]
+                let fix = format!(
+                    "{} carries an ACL beyond its mode bits, {} (fix: chmod -N {})",
+                    dir.display(),
+                    what,
+                    dir.display()
+                );
+                #[cfg(target_os = "linux")]
+                let fix = format!(
+                    "{} carries an ACL beyond its mode bits, {} (fix: setfacl -b {})",
+                    dir.display(),
+                    what,
+                    dir.display()
+                );
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, fix));
             }
             continue;
         };
@@ -339,15 +348,25 @@ pub fn open_checked_file(file: &Path, secret: bool) -> io::Result<std::fs::File>
     // one more account that can reach this file: the check runs on the
     // checked descriptor, before the caller reads anything from it.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if fd_has_hidden_acl(&opened, meta.mode(), false) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "{} carries an ACL beyond its mode bits, so another user could reach it (fix: setfacl -b {})",
-                file.display(),
-                file.display()
-            ),
-        ));
+    if let Some(what) = fd_has_hidden_acl(&opened, meta.mode(), false) {
+        // The fix names the tool of the platform: macOS clears an ACL
+        // with chmod -N; Linux with setfacl -b. The message names the
+        // entry that granted.
+        #[cfg(target_os = "macos")]
+        let fix = format!(
+            "{} carries an ACL beyond its mode bits, {} (fix: chmod -N {})",
+            file.display(),
+            what,
+            file.display()
+        );
+        #[cfg(target_os = "linux")]
+        let fix = format!(
+            "{} carries an ACL beyond its mode bits, {} (fix: setfacl -b {})",
+            file.display(),
+            what,
+            file.display()
+        );
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, fix));
     }
     Ok(opened)
 }
@@ -407,7 +426,7 @@ fn minimal_acl_matches_mode(acl: &[u8], mode: u32) -> bool {
 /// lives in `ffi`, the one module the workspace's unsafe-code lint lets
 /// hold it.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn fd_has_hidden_acl(fd: impl rustix::fd::AsFd, mode: u32, dir: bool) -> bool {
+fn fd_has_hidden_acl(fd: impl rustix::fd::AsFd, mode: u32, dir: bool) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
         // A minimal ACL xattr is 28 bytes; 64 covers any form this check
@@ -419,22 +438,32 @@ fn fd_has_hidden_acl(fd: impl rustix::fd::AsFd, mode: u32, dir: bool) -> bool {
             Err(rustix::io::Errno::NODATA) => {}
             Ok(len) => {
                 if !minimal_acl_matches_mode(&buf[..len], mode) {
-                    return true;
+                    return Some("its access ACL reaches beyond the mode's bits".to_owned());
                 }
             }
-            Err(_) => return true,
+            Err(_) => return Some("its ACL could not be read".to_owned()),
         }
         if dir {
             let default = rustix::fs::fgetxattr(fd, POSIX_ACL_DEFAULT, &mut buf);
-            return !matches!(default, Err(rustix::io::Errno::NODATA));
+            return (!matches!(default, Err(rustix::io::Errno::NODATA)))
+                .then(|| "the directory carries a default ACL".to_owned());
         }
-        false
+        None
     }
     #[cfg(target_os = "macos")]
     {
         use std::os::fd::AsRawFd as _;
         let _ = (mode, dir);
-        ffi::fd_has_acl(fd.as_fd().as_raw_fd())
+        // A deny-only ACL grants nobody anything: the ambient
+        // home-folder shape of issue #399, whose entries deny delete.
+        // The mode bits stay the whole story.
+        match ffi::fd_acl(fd.as_fd().as_raw_fd()) {
+            ffi::Verdict::None | ffi::Verdict::DenyOnly => None,
+            ffi::Verdict::Granting(kind, who) => Some(match who {
+                Some(id) => format!("{kind} for account {id} grants access"),
+                None => format!("{kind} grants access"),
+            }),
+        }
     }
 }
 
@@ -443,7 +472,7 @@ fn fd_has_hidden_acl(fd: impl rustix::fd::AsFd, mode: u32, dir: bool) -> bool {
 /// directory the walk checked. An `O_PATH` descriptor will not do: the
 /// xattr reads answer `EBADF` for one, so the directory opens read-only.
 #[cfg(target_os = "linux")]
-fn ancestor_has_hidden_acl(dir: &Path, mode: u32) -> io::Result<bool> {
+fn ancestor_has_hidden_acl(dir: &Path, mode: u32) -> io::Result<Option<String>> {
     let opened = rustix::fs::open(
         dir,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -455,7 +484,7 @@ fn ancestor_has_hidden_acl(dir: &Path, mode: u32) -> io::Result<bool> {
 /// The macOS ancestor check: `O_DIRECTORY` does not exist there, so the
 /// directory opens read-only, still `O_NOFOLLOW`.
 #[cfg(target_os = "macos")]
-fn ancestor_has_hidden_acl(dir: &Path, _mode: u32) -> io::Result<bool> {
+fn ancestor_has_hidden_acl(dir: &Path, _mode: u32) -> io::Result<Option<String>> {
     let opened = rustix::fs::open(
         dir,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -853,12 +882,69 @@ mod tests {
             err.to_string().contains("ACL beyond its mode bits"),
             "{err}"
         );
+        // The fix names the tool of the platform, not Linux's setfacl.
+        assert!(
+            err.to_string().contains("chmod -N"),
+            "the refusal must name the macOS fix: {err}"
+        );
         assert!(
             run(["-N", &file.to_string_lossy()].as_ref())
                 .status
                 .success()
         );
         read_shared_file(&file).unwrap();
+    }
+
+    /// The $HOME shape of issue #399: a directory whose only ACL entry
+    /// denies something (`chmod +a "everyone deny delete"`, the ambient
+    /// home-folder shape) denies only, and a file under it is read.
+    /// A deny entry grants nobody anything, so the mode bits stay the
+    /// whole story.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_deny_only_acl_is_read_through() {
+        let (tmp, _me) = tempdir();
+        let dir = tmp.path().join("home-like");
+        mkdir(&dir, 0o755);
+        let file = dir.join("secret");
+        fs::write(&file, b"bytes").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("chmod")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(
+            run(["+a", "everyone deny delete", &dir.to_string_lossy()].as_ref())
+                .status
+                .success()
+        );
+        read_shared_file(&file).unwrap();
+    }
+
+    /// A parent that carries only deny entries passes
+    /// [`check_ancestors`]: the walk of the ancestors accepts a
+    /// deny-only ACL, the ambient macOS home-folder shape, because a
+    /// deny entry grants nobody anything.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn check_ancestors_passes_a_deny_only_parent() {
+        let (tmp, me) = tempdir();
+        let dir = tmp.path().join("home-like");
+        mkdir(&dir, 0o755);
+        let run = |args: &[&str]| {
+            std::process::Command::new("chmod")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(
+            run(["+a", "everyone deny delete", &dir.to_string_lossy()].as_ref())
+                .status
+                .success()
+        );
+        check_ancestors(&dir.join("child"), me).unwrap();
     }
 
     /// The workspace denies the unsafe-code lint everywhere but this
