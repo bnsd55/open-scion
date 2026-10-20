@@ -6,17 +6,22 @@ supported platform, and nothing shortcuts one. Planned work the roadmap
 does not name is tracked in
 [issues](https://github.com/bnsd55/openscion/issues).
 
+## v0.1.0 - the first release
+
+The source release that every later one is cut from. Its steps live in
+[RELEASING.md](RELEASING.md): one SSH-signed annotated tag, one
+immutable GitHub release, nothing published anywhere else.
+
 ## v0.1.1 - distribution and portability
 
 Make the project safe to install anywhere it claims to work.
 
 - A clean install and the [quick start](../README.md#try-it) pass on every
   supported platform (Linux and macOS), under umask 002 and umask 022,
-  per [the release smoke](https://github.com/bnsd55/openscion/issues/317).
+  per the release smoke that CI runs on every release commit.
 - No known flaky test.
-- [Ubuntu's umask 002 and user private groups trip the group-writable
-  checks](https://github.com/bnsd55/openscion/issues/302).
-- [Publish the crates to crates.io](https://github.com/bnsd55/openscion/issues/21).
+- Ubuntu's umask 002 and user private groups trip the group-writable
+  checks.
 
 ## v0.2.0 - compatibility and recovery
 
@@ -24,17 +29,16 @@ Make the pieces trustworthy together, and the data safe to lose.
 
 - Clients, servers, caches and daemons of version N and N-1 work
   together, per a written compatibility policy.
-- [A store written by an old build opens and
-  upgrades](https://github.com/bnsd55/openscion/issues/318).
-- [A backup of the data directory, and of a Postgres-backed store,
-  restores and serves](https://github.com/bnsd55/openscion/issues/319).
+- A store written by an old build opens and upgrades.
+- A backup of the data directory, and of a Postgres-backed store,
+  restores and serves.
 - `ticket-key` rotation runs while reads serve: done, [#242](https://github.com/bnsd55/openscion/issues/242)
   landed the end-to-end test of the steps in [operations](operations.md#2-ticket-keys).
-- [The version matrix and the missing operating
-  metrics](https://github.com/bnsd55/openscion/issues/239), for the
-  pairs the policy claims.
-- [The fault and recovery matrix: disk full, EIO, a Postgres restart,
-  mismatched restores](https://github.com/bnsd55/openscion/issues/238).
+- The version matrix runs the client, server, cache, daemon and store
+  pairs the policy claims, and the operating metrics it reports are
+  named.
+- The fault and recovery matrix: disk full, EIO, a Postgres restart,
+  mismatched restores.
 
 ## v0.3.0 - a single-node operational beta
 
@@ -43,18 +47,168 @@ Prove the one-machine server under real load.
 - A 72-hour soak and fault job runs against one server, with resource
   ceilings named in advance, and its raw numbers published in
   [benchmarks](benchmarks.md); the soak workload and the metrics it
-  reports are [the other half of #239](https://github.com/bnsd55/openscion/issues/239).
+  reports are the operating-metrics work of v0.2.0.
 - [The checkout benchmark stands against `git clone`](https://github.com/bnsd55/openscion/issues/6)
   and the numbers say where the line is.
 
-## Out until those pass
+## v0.4.0 - the production boundary
+
+Say exactly what v1.0 will support.
+
+- One active `scion-server` is the production topology. SQLite or a
+  named Postgres major version holds metadata. One blob store holds
+  content. Cache tiers may sit in front.
+- The server host, its administrators and the data directories are
+  trusted. Network peers, tokens and principals are not.
+- A shared data directory, a server data directory on a network
+  filesystem, `--insecure-listen`, an untrusted local account and
+  `scn mount` on a multi-user host are outside the production profile.
+- `docs/threat-model.md` names the assets, attackers, trust boundaries
+  and security invariants. Each invariant names its test.
+- `docs/support.md` defines severity, backports and end of support. The
+  current minor gets bug, security and data-loss fixes. The previous
+  minor gets critical and high security and data-loss fixes.
+- Credential handling passes end to end. No production secret needs to
+  appear in argv.
+- The project holds the OpenSSF Best Practices passing badge. A pinned
+  OpenSSF Scorecard policy runs on `main`.
+- `docs/fuzzing.md` maps every untrusted decoder and object walk to a
+  nightly target with a kept corpus and a named time budget.
+
+## v0.5.0 - durability and recovery
+
+Prove that accepted data survives the failures the production profile
+names.
+
+- The fault and recovery matrix passes for every production metadata
+  backend.
+- Crash, power-loss, disk-full, EIO, Postgres-restart, cancellation,
+  retry and garbage-collection tests compare the result with an
+  independent operation ledger, then run `fsck`.
+- A reference model checks concurrent lands, retries and restarts.
+- A live backup and restore is consistent across metadata and blobs.
+- The current release restores a backup made by N-1. An upgrade drill
+  restores the pre-upgrade backup and serves it with the N-1 binary.
+- `docs/operations.md` states the durability point, the tested backup
+  RPO and the measured restore time.
+- A confirmed severity-1 data-loss or corruption defect blocks the
+  release.
+
+## v0.6.0 - the 1.x contracts
+
+Freeze the surfaces users need, not the implementation.
+
+- `docs/stability.md` names the 1.x promises for object format v1,
+  protocol v1, CLI `--json`, exit codes, production configuration and
+  schemas.
+- Object format v1 never changes. Protocol v1 remains served throughout
+  1.x. CLI JSON and production configuration change additively.
+- Tickets and snapshots follow the N and N-1 mixed-version window.
+- The version matrix runs the supported client, server, cache, daemon
+  and store pairs.
+- A store written by every tagged release opens and upgrades. Rollback
+  restores the pre-upgrade backup.
+- A full repository exports to a versioned logical archive. CI verifies
+  and restores the archive.
+- No crate publishes to crates.io at v1.0 (D12). A narrow client crate
+  may publish when a real outside consumer exists. The server, tier and
+  CLI internals stay private, and a machine check watches the facade
+  that a later publish would freeze.
+
+## v0.7.0 - operations
+
+Make one server routine to run.
+
+- `docs/operations.md` has runbooks for install, upgrade, rollback,
+  backup, restore, key and certificate rotation, disk full, EIO, a
+  Postgres restart, a failed migration, an `fsck` failure and garbage
+  collection.
+- Each runbook has a CI test or a recorded release drill.
+- Readiness, liveness and graceful drain have end-to-end tests.
+  Readiness goes false before the server drains in-flight calls.
+- Prometheus alert rules and the log fields they use are versioned and
+  checked.
+- An audit log records authentication, writes, ref changes and
+  administrative changes without tokens or file contents.
+- The operating metrics publish the supported capacity envelope, tail
+  latency, memory, disk growth and recovery time on a named workload
+  and machine.
+- The documentation says that one active server has no automatic
+  failover.
+
+## v0.8.0 - releases and project continuity
+
+Make releases repeatable without one person's machine or account.
+
+- A component, OS, architecture, filesystem and Postgres support matrix
+  names one native CI job for every supported cell.
+- CI builds every release artifact from the protected tag.
+- The release smoke passes natively on every supported cell under umask
+  002 and 022.
+- The unsigned release payload rebuilds byte for byte.
+- Each artifact has a checksum, an SPDX or CycloneDX SBOM and
+  verifiable provenance. From this release, the binaries and SBOMs get
+  GitHub artifact attestations (D18). The recorded release workflow is
+  assessed against SLSA Build L3, as `docs/slsa.md` (planned) records.
+- Production code has at least 80 percent statement coverage, measured
+  with a pinned tool, with the exclusions checked in (D15).
+- Required tests have no hidden retry. The scheduled full suite passes
+  30 consecutive runs, with no open flaky-test issue.
+- The project holds the OpenSSF Best Practices silver badge.
+- `GOVERNANCE.md` names the roles and decision rules. Protected
+  branches need an independent human review and all required checks.
+- Two maintainers can accept a change, handle a private report and cut
+  a release without one person's account, machine or private key.
+
+## v0.9.0 - release candidate
+
+Run the finished product before naming it stable.
+
+- Features and formats freeze at the first release candidate.
+- An outside security review covers the server, tiers, CLI and
+  supported deployment. No critical or high finding stays open. A
+  medium finding needs a mitigation, an owner and an expiry.
+- The public review summary names the scope, reviewer, date, finding
+  counts and disposition.
+- One release candidate runs the production trial for 30 days on every
+  metadata backend advertised as production.
+- `docs/production-trial.md` records the commit, binaries, backend,
+  filesystem, workload, counts, upgrades, restores, key and certificate
+  rotations and incidents.
+- A second operator follows the install, upgrade, rollback and restore
+  runbooks without help from their author.
+- The full release procedure runs from a clean tag. No release-blocking
+  flake, security finding, data-loss defect or corruption defect stays
+  open.
+
+## v1.0.0 - single-server production
+
+Cut the tested release. Add no new surface.
+
+- Findings from v0.9.0 are closed. A medium-or-lower security finding
+  may carry a written risk acceptance with an owner and expiry.
+- v1.0.0 differs from the final release candidate only in version,
+  changelog and release metadata. The release smoke runs again.
+- `README.md`, `SECURITY.md`, `docs/stability.md`,
+  `docs/compatibility.md`, `docs/operations.md` and
+  `docs/RELEASING.md` state the supported deployment, support window
+  and 1.x promises.
+- The release notes link the gate evidence.
+
+## Out until v1.0.0 passes
 
 Work the gates above do not earn yet. Issues stay open; none starts
-before v0.3.0 passes.
+before v1.0.0 passes.
 
 - [A horizontally scalable backend](https://github.com/bnsd55/openscion/issues/47):
   more than one server process sharing data, per region and per node.
-- New RPCs, including [history and writes for a principal with folder
-  read rules](https://github.com/bnsd55/openscion/issues/183).
+  v1.0 promises one active server and no automatic failover (D11).
+- [History and writes for a principal with folder read
+  rules](https://github.com/bnsd55/openscion/issues/183).
 - Blame as derived data.
 - More writable-mount features.
+- A virtual checkout safe from other local users: the server trusts
+  every local account that can read its data directory, so this is a
+  different storage and virtual-checkout design, not a hardening of
+  this one.
+- Protection from an untrusted local account on the server host.
