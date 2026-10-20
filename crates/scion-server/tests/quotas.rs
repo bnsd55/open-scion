@@ -135,6 +135,7 @@ async fn server_with_tickets(
         access,
         service::ServeOptions {
             data: dir.to_path_buf(),
+            audit: scion_server::test_support::audit::Audit::off(),
             limits: Limits::default(),
             quotas,
             pending_lands: None,

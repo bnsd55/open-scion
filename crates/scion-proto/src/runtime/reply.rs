@@ -508,7 +508,7 @@ mod tests {
         use crate::runtime::metrics::Metrics;
 
         let metrics = Arc::new(Metrics::default());
-        let stalled = Stalled::new(STALLED_REPLY_BYTES * 2, Arc::clone(&metrics));
+        let stalled = Stalled::new(None, STALLED_REPLY_BYTES * 2, Arc::clone(&metrics));
         let budget = Arc::new(Semaphore::new(IN_FLIGHT_BYTES));
         let permit = take(&budget, 3 * CHUNK_BYTES, BUSY_TIMEOUT).await.unwrap();
         let (tx, mut stream, slot) = channel();

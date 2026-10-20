@@ -58,6 +58,7 @@
 //! enabling it in a build is at the user's own risk.
 
 pub(crate) mod access;
+pub(crate) mod audit;
 pub(crate) mod auth;
 pub(crate) mod backend;
 pub use backend::Backend;
@@ -105,6 +106,12 @@ pub mod test_support {
     /// The caller behind an authenticated RPC, for tests that name one.
     pub mod auth {
         pub use crate::auth::Caller;
+    }
+    /// The audit log: a real file, or the off handle, and the fault
+    /// hook that makes the next appends fail.
+    pub mod audit {
+        #[allow(unreachable_pub)]
+        pub use crate::audit::{Audit, Event};
     }
     /// The blame operation behind the `Blame` RPC, with its limits.
     pub mod blame {
@@ -202,5 +209,9 @@ pub use import::{ImportOptions, ImportReport, import_git};
 pub use quotas::Quotas;
 pub use scion_proto::runtime::metrics::Metrics;
 pub use service::{ServeOptions, serve};
+// `ServeOptions` is public and holds the audit handle, so the handle is
+// public too; unreachable_pub does not see through the re-export.
+#[allow(unreachable_pub)]
+pub use audit::{Audit, Event};
 pub use tickets::Keys;
 pub use tree::{RootTree, backfill_root_tree};

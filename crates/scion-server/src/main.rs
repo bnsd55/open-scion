@@ -127,6 +127,11 @@ struct ServeArgs {
     /// `--insecure-listen`, because the metrics travel unencrypted.
     #[arg(long, value_name = "ADDR")]
     metrics_listen: Option<SocketAddr>,
+    /// Where the audit log goes. The default is `audit.log` in the data
+    /// directory. Every server records one: there is no way to turn the
+    /// audit off.
+    #[arg(long, value_name = "FILE")]
+    audit_file: Option<PathBuf>,
     /// How long the in-flight calls have to finish once the first signal
     /// starts the drain. Past it the calls are cut, the log names the
     /// count, and the process exits non-zero, so a supervisor restarts it.
@@ -378,6 +383,31 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Serve { .. } => {
             let flags = flags.expect("a serve command validated its flags");
+            // The audit opens after the store: the data directory must be
+            // empty at its first open, and the default audit file lives
+            // in it. A server that cannot record refuses to run.
+            let audit_path = flags
+                .audit_file
+                .clone()
+                .unwrap_or_else(|| cli.data.join("audit.log"));
+            let audit = scion_server::Audit::open(&audit_path)
+                .with_context(|| format!("cannot open audit log {}", audit_path.display()))?;
+            audit
+                .record(scion_server::Event::new(
+                    "admin",
+                    "ok",
+                    serde_json::json!({
+                        "what": "start",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "tls": flags.server_tls.is_some(),
+                        "mtls": flags.mtls,
+                        "insecure_listen": flags.insecure_listen,
+                        "access_tokens": flags.access.token_count(),
+                        "ticket_keys": flags.tickets.as_ref().map_or(0, |keys| keys.for_verify().len()),
+                    }),
+                ))
+                .await
+                .with_context(|| format!("cannot record the audit start line in {}", audit_path.display()))?;
             serve(
                 store,
                 flags.listen,
@@ -393,6 +423,7 @@ async fn main() -> anyhow::Result<()> {
                     max_stalled_bytes: flags.max_stalled_bytes,
                     metrics_listen: flags.metrics_listen,
                     drain_timeout: Duration::from_secs(flags.drain_timeout_secs),
+                    audit,
                 },
                 flags.tickets,
             )
@@ -524,6 +555,9 @@ struct ServeConfig {
     /// How long the drain waits for the in-flight calls before it cuts
     /// them (`--drain-timeout-secs`).
     drain_timeout: std::time::Duration,
+    /// The audit log, opened by the caller, which records its start
+    /// line before the server serves.
+    audit: scion_server::Audit,
 }
 
 /// The validated flags of a `serve` command: everything `serve` needs is
@@ -541,6 +575,12 @@ struct ServeFlags {
     metrics_listen: Option<SocketAddr>,
     tickets: Option<Arc<scion_server::Keys>>,
     drain_timeout_secs: u64,
+    /// The audit log the operator asked for, if any. The default path
+    /// is the data directory's, which only the caller knows.
+    audit_file: Option<PathBuf>,
+    /// The listen and TLS posture, for the audit's start line.
+    insecure_listen: bool,
+    mtls: bool,
 }
 
 /// Checks every `serve` flag that a parse alone does not settle: the rules
@@ -589,6 +629,9 @@ fn serve_flags(args: &ServeArgs) -> anyhow::Result<ServeFlags> {
         metrics_listen: args.metrics_listen,
         tickets,
         drain_timeout_secs: args.drain_timeout_secs,
+        audit_file: args.audit_file.clone(),
+        insecure_listen: args.insecure_listen,
+        mtls: args.tls_client_ca.is_some(),
     })
 }
 
@@ -667,6 +710,7 @@ async fn serve(
             land_stale_secs: config.land_stale_secs,
             tls: config.server_tls,
             metrics,
+            audit: config.audit,
         },
         tickets,
         async move {
