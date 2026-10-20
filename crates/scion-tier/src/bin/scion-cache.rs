@@ -55,12 +55,23 @@ struct Cli {
     /// Most object bytes to keep in memory.
     #[arg(long, default_value_t = 1 << 30)]
     max_bytes: usize,
-    /// Bearer token that clients must send.
-    #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
-    token: String,
-    /// Bearer token to send upstream.
-    #[arg(long, env = "SCION_UPSTREAM_TOKEN", hide_env_values = true)]
-    upstream_token: String,
+    /// Bearer token that clients must send. Give `--token-file`, or
+    /// `SCION_TOKEN`; the argv form sits in the process list and warns.
+    #[arg(long, value_name = "TOKEN")]
+    token: Option<String>,
+    /// File with the bearer token of `--token`, read like the access
+    /// file: the owner alone may read it, and a symlink is refused.
+    #[arg(long, conflicts_with = "token", value_name = "FILE")]
+    token_file: Option<PathBuf>,
+    /// Bearer token to send upstream. Give `--upstream-token-file`, or
+    /// `SCION_UPSTREAM_TOKEN`; the argv form sits in the process list
+    /// and warns.
+    #[arg(long, value_name = "TOKEN")]
+    upstream_token: Option<String>,
+    /// File with the bearer token of `--upstream-token`, read like the
+    /// access file.
+    #[arg(long, conflicts_with = "upstream_token", value_name = "FILE")]
+    upstream_token_file: Option<PathBuf>,
     /// The public keys (64 hex characters, from `scion-server ticket-key`)
     /// that a ticket of a call must verify against. One is enough; a
     /// second keeps the old key alive during a rotation. Without one, no
@@ -104,6 +115,66 @@ struct Cli {
     metrics_listen: Option<SocketAddr>,
 }
 
+/// The two tokens of a tier: what it asks for, and what it sends
+/// upstream. Each resolves through the checked file, the env, or the
+/// argv form, which warns.
+fn resolve_tokens(cli: &Cli) -> anyhow::Result<(String, String)> {
+    let token = secret_of(
+        cli.token.as_deref(),
+        cli.token_file.as_deref(),
+        "--token",
+        "--token-file",
+        "SCION_TOKEN",
+    )?;
+    let upstream = secret_of(
+        cli.upstream_token.as_deref(),
+        cli.upstream_token_file.as_deref(),
+        "--upstream-token",
+        "--upstream-token-file",
+        "SCION_UPSTREAM_TOKEN",
+    )?;
+    Ok((token, upstream))
+}
+
+/// A secret that the flags may carry three ways: the checked file, the
+/// env, or the argv form, which warns that the process list shows it.
+/// The warning names the replacement, per the deprecation rule: warn
+/// first, remove in a later minor.
+fn secret_of(
+    token: Option<&str>,
+    file: Option<&std::path::Path>,
+    flag: &str,
+    file_flag: &str,
+    env: &str,
+) -> anyhow::Result<String> {
+    match (token, file) {
+        (Some(_), Some(_)) => unreachable!("clap refuses {flag} with {file_flag}"),
+        (Some(_), None) => {
+            eprintln!(
+                "warning: {flag} put a secret on the command line, which ps and \
+                 /proc/$$/cmdline show to every local account; use {file_flag} \
+                 (or {env}) instead (the argv form is deprecated and goes away \
+                 in a later release)"
+            );
+            Ok(token.expect("the argv form is given").to_owned())
+        }
+        (None, Some(file)) => {
+            let bytes = scion_proto::runtime::auth::read_secret_file(file)
+                .map_err(|why| scion_proto::runtime::auth::checked_read_error(file, why))?;
+            let text = String::from_utf8(bytes)
+                .map_err(|_| anyhow::anyhow!("{} is not UTF-8", file.display()))?;
+            let token = text.trim();
+            anyhow::ensure!(!token.is_empty(), "{} holds no token", file.display());
+            Ok(token.to_owned())
+        }
+        (None, None) => {
+            let from_env = std::env::var(env).unwrap_or_default();
+            anyhow::ensure!(!from_env.is_empty(), "give {flag}, {file_flag} or {env}");
+            Ok(from_env)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Logs go to stderr: stdout may carry command output that callers
@@ -113,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    anyhow::ensure!(!cli.token.is_empty(), "--token must not be empty");
+    let (token, upstream) = resolve_tokens(&cli)?;
     let server_tls = match (cli.tls_cert.as_deref(), cli.tls_key.as_deref()) {
         (None, None) => None,
         (Some(cert), Some(key)) => Some(ServerTls::load(cert, key, cli.tls_client_ca.as_deref())?),
@@ -138,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
     let tier = Tier::new(
         store,
         &cli.upstream,
-        &cli.upstream_token,
+        &upstream,
         CACHE_UPSTREAM_TIMEOUT,
         Some(&client_tls),
         ticket_keys(&cli.ticket_public_key)?,
@@ -197,7 +268,7 @@ async fn main() -> anyhow::Result<()> {
         stalled_bytes: cli.max_stalled_bytes,
     };
     Box::pin(tier.serve(
-        &cli.token,
+        &token,
         listen::tcp(listener),
         limits,
         server_tls,
