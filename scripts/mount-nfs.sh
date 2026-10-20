@@ -52,7 +52,16 @@ export SCION_TOKEN
 for c in sudo mount umount modprobe; do
   command -v "$c" > /dev/null || die "needs $c"
 done
-need
+# GNU timeout caps the build and the mount wait. This script does not
+# source common.sh, so it resolves its own - timeout, else gtimeout
+# (a default Mac has neither under the name timeout; issue #399).
+if command -v timeout > /dev/null 2>&1; then
+  TIMEOUT=timeout
+elif command -v gtimeout > /dev/null 2>&1; then
+  TIMEOUT=gtimeout
+else
+  die "needs GNU timeout (macOS: brew install coreutils)"
+fi
 
 note "building the debug binaries"
 "$TIMEOUT" 300 cargo build --locked --quiet -p open-scion-server -p open-scion
