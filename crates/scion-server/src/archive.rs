@@ -45,7 +45,8 @@ struct ArchiveLand {
 
 /// Exports `repo`, or the whole store with `all`, to the archive directory
 /// `out`, which must not exist. The metadata sections are one read
-/// snapshot ([`Meta::read`]); the blob files are copied after it, which is
+/// snapshot (one transaction over the store's metadata); the blob files
+/// are copied after it, which is
 /// safe because a blob file is immutable and `gc` keeps a blob past its
 /// grace. Returns the manifest as written.
 ///
