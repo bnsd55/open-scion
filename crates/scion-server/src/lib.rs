@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Scion server: durable storage, server-side commits and lands, and reads.
 //!
 //! This is the storage and serving crate of [openscion]: the bottom of the

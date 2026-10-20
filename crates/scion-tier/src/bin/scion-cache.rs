@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! `scion-cache`: a regional cache tier. Serves the `Objects` calls from
 //! memory and fetches misses from its upstream, the server.
 

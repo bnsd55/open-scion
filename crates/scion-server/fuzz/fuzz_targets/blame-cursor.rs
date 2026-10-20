@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! A blame cursor arrives from the client with every resumed call. Any
 //! input must end in a parsed cursor or an error, never a panic; and the
 //! format round-trips structurally: what the decoder read encodes and

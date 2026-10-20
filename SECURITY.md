@@ -3,7 +3,9 @@
 ## Supported versions
 
 openscion is alpha software (0.x). Only the latest commit on `main` is
-supported, and it is not meant for production use yet.
+supported, and it is not meant for production use yet. What each
+severity level gets, and for how long:
+[docs/support.md](docs/support.md).
 
 ## Reporting a vulnerability
 

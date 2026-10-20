@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! The access file parser takes bytes that an operator wrote: any input
 //! ends in a parsed file or an error message, never a panic. The format
 //! has no encoder, so there is no round-trip to check.

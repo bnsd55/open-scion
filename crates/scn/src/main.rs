@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! `scn`: command-line client for a Scion server.
 
 use std::path::PathBuf;

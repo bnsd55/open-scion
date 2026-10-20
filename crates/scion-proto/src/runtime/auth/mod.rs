@@ -4,12 +4,16 @@
 //! ([`check_ancestors`]), shared by `scn` and the daemon, and the way every
 //! process makes its own directories private ([`create_private_dir_all`]).
 //! Files that hold secrets, or keys that must stay whole, are read through
-//! one checked descriptor ([`read_secret_file`], [`read_shared_file`]).
+//! one checked descriptor ([`read_secret_file`], [`read_shared_file`]),
+//! whose ACL checks wrap the one `ffi` module.
 
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{fs, io};
+
+#[cfg(target_os = "macos")]
+mod ffi;
 
 use rustix::fs::OFlags;
 use tonic::metadata::errors::InvalidMetadataValue;
@@ -153,7 +157,12 @@ impl Interceptor for Bearer {
 /// then: `DiskStore::open` makes its directory first.
 ///
 /// By choice, as OpenSSH's `StrictModes`, a group-writable directory is
-/// refused, and only the owner and the mode bits are read, not ACLs.
+/// refused: the sticky bit excuses a group only when others can write too
+/// (the `/tmp` shape, `01777`). Only the owner and the mode bits are read
+/// on the walk itself, and an ACL that grants what the mode's bits do
+/// not is refused too: on Linux by the POSIX-ACL xattrs, on macOS through
+/// the descriptor's extended ACL (the one `ffi` module the workspace's
+/// lint lets hold it).
 ///
 /// # Errors
 ///
@@ -181,10 +190,33 @@ pub fn check_ancestors(path: &Path, me: u32) -> io::Result<PathBuf> {
         let (why, fix) = if meta.uid() != 0 && meta.uid() != me {
             let why = format!("is owned by another user (uid {})", meta.uid());
             (why, String::new())
-        } else if meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
-            let why = "can be written by group or others, and has no sticky bit".to_owned();
+        } else if meta.mode() & 0o020 != 0 && meta.mode() & 0o002 == 0 {
+            // A group that can write the directory can plant and swap its
+            // own entries, and the sticky bit does not stop that: it
+            // bounds who may remove a name, not who may add one. It
+            // excuses a group only when others can write too, the `/tmp`
+            // shape, where the others-write rule below is the real wall.
+            let why = "can be written by the group, and the sticky bit does not excuse a group"
+                .to_owned();
+            (why, format!(" (fix: chmod g-w {})", dir.display()))
+        } else if meta.mode() & 0o002 != 0 && meta.mode() & 0o1000 == 0 {
+            let why = "can be written by others, and has no sticky bit".to_owned();
             (why, format!(" (fix: chmod go-w {})", dir.display()))
         } else {
+            // (Linux, macOS) An ACL that grants what the mode's bits do
+            // not is one more way another account reaches this directory.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if ancestor_has_hidden_acl(dir, meta.mode())? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} carries an ACL beyond its mode bits, so another user could swap {} (fix: setfacl -b {})",
+                        dir.display(),
+                        path.display(),
+                        dir.display()
+                    ),
+                ));
+            }
             continue;
         };
         return Err(io::Error::new(
@@ -208,7 +240,9 @@ pub fn check_ancestors(path: &Path, me: u32) -> io::Result<PathBuf> {
 /// group or others account can read. A swap between the checks and the read
 /// then dies at the open or on the descriptor's checks, and the bytes come
 /// from the checked descriptor either way. Only the owner, the group and
-/// the mode bits are read, not ACLs.
+/// the mode bits are read on the descriptor, and an ACL that grants
+/// what the mode's bits do not is refused too: on Linux by the POSIX-ACL
+/// xattrs, on macOS through the descriptor's extended ACL.
 ///
 /// # Errors
 ///
@@ -301,7 +335,133 @@ pub fn open_checked_file(file: &Path, secret: bool) -> io::Result<std::fs::File>
     let opened = fs::File::from(opened);
     let meta = opened.metadata()?;
     ensure_file_checks(meta.mode(), meta.uid(), me, secret, file)?;
+    // (Linux, macOS) An ACL that grants what the mode's bits do not is
+    // one more account that can reach this file: the check runs on the
+    // checked descriptor, before the caller reads anything from it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if fd_has_hidden_acl(&opened, meta.mode(), false) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} carries an ACL beyond its mode bits, so another user could reach it (fix: setfacl -b {})",
+                file.display(),
+                file.display()
+            ),
+        ));
+    }
     Ok(opened)
+}
+
+/// The extended attributes that carry POSIX ACLs, and the tags and id of
+/// the minimal form's three entries.
+#[cfg(target_os = "linux")]
+const POSIX_ACL_ACCESS: &str = "system.posix_acl_access";
+#[cfg(target_os = "linux")]
+const POSIX_ACL_DEFAULT: &str = "system.posix_acl_default";
+
+/// Whether a POSIX access-ACL attribute keeps the file's own mode: only
+/// the exact minimal form adds nothing the mode does not already grant.
+/// The minimal form is 28 bytes: version 2, then one `USER_OBJ`, one
+/// `GROUP_OBJ` and one `OTHER` entry, each tag, perm and an undefined id,
+/// and the permissions equal to the mode's own bits. A named user or
+/// group, a mask, any other version or length, or a perm above the mode's
+/// bits grants access beyond what the owner asked for.
+#[cfg(any(target_os = "linux", test))]
+#[must_use]
+fn minimal_acl_matches_mode(acl: &[u8], mode: u32) -> bool {
+    // The minimal form's entries, in order: tag, the mode's bits for that
+    // class, and the undefined id every minimal entry carries.
+    let want = [
+        (0x0001u16, ((mode >> 6) & 7) as u16), // ACL_USER_OBJ
+        (0x0004u16, ((mode >> 3) & 7) as u16), // ACL_GROUP_OBJ
+        (0x0020u16, (mode & 7) as u16),        // ACL_OTHER
+    ];
+    if acl.len() != 28 {
+        return false;
+    }
+    if u32::from_le_bytes([acl[0], acl[1], acl[2], acl[3]]) != 2 {
+        return false;
+    }
+    for (i, (tag, perm)) in want.iter().enumerate() {
+        let entry = &acl[4 + i * 8..4 + (i + 1) * 8];
+        if u16::from_le_bytes([entry[0], entry[1]]) != *tag {
+            return false;
+        }
+        if u16::from_le_bytes([entry[2], entry[3]]) != *perm {
+            return false;
+        }
+        if u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]) != u32::MAX {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether the descriptor's ACLs grant what `mode`'s bits do not. On
+/// Linux: a POSIX access ACL beyond the exact minimal form, or, on a
+/// directory, any default ACL at all (files created under it would
+/// inherit one). On macOS: any extended ACL at all - a descriptor either
+/// has ACL entries or it has none. A missing attribute is fine; any read
+/// error other than `ENODATA` is a hidden ACL too, because this check
+/// cannot vouch for what it cannot read. The FFI this needs on macOS
+/// lives in `ffi`, the one module the workspace's unsafe-code lint lets
+/// hold it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn fd_has_hidden_acl(fd: impl rustix::fd::AsFd, mode: u32, dir: bool) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // A minimal ACL xattr is 28 bytes; 64 covers any form this check
+        // could accept, and a longer one is refused by the parse. The
+        // read answers the byte count; the bytes live in `buf`.
+        let mut buf = [0u8; 64];
+        let fd = rustix::fd::AsFd::as_fd(&fd);
+        match rustix::fs::fgetxattr(fd, POSIX_ACL_ACCESS, &mut buf) {
+            Err(rustix::io::Errno::NODATA) => {}
+            Ok(len) => {
+                if !minimal_acl_matches_mode(&buf[..len], mode) {
+                    return true;
+                }
+            }
+            Err(_) => return true,
+        }
+        if dir {
+            let default = rustix::fs::fgetxattr(fd, POSIX_ACL_DEFAULT, &mut buf);
+            return !matches!(default, Err(rustix::io::Errno::NODATA));
+        }
+        false
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd as _;
+        let _ = (mode, dir);
+        ffi::fd_has_acl(fd.as_fd().as_raw_fd())
+    }
+}
+
+/// Whether an ancestor directory's ACLs grant what its mode's bits do
+/// not. Opened `O_NOFOLLOW` and descriptor-checked, so the fd is the
+/// directory the walk checked. An `O_PATH` descriptor will not do: the
+/// xattr reads answer `EBADF` for one, so the directory opens read-only.
+#[cfg(target_os = "linux")]
+fn ancestor_has_hidden_acl(dir: &Path, mode: u32) -> io::Result<bool> {
+    let opened = rustix::fs::open(
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    Ok(fd_has_hidden_acl(&opened, mode, true))
+}
+
+/// The macOS ancestor check: `O_DIRECTORY` does not exist there, so the
+/// directory opens read-only, still `O_NOFOLLOW`.
+#[cfg(target_os = "macos")]
+fn ancestor_has_hidden_acl(dir: &Path, _mode: u32) -> io::Result<bool> {
+    let opened = rustix::fs::open(
+        dir,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    Ok(fd_has_hidden_acl(&opened, 0, true))
 }
 
 /// The descriptor checks of [`read_checked_file`]: a regular file, owned by
@@ -519,6 +679,240 @@ mod tests {
         // Writable by the group only is refused too.
         fs::set_permissions(&open, fs::Permissions::from_mode(0o770)).unwrap();
         check_ancestors(&path, me).unwrap_err();
+    }
+
+    /// A group-writable ancestor is refused whatever the sticky bit does:
+    /// the sticky bit bounds who may remove a name, not who may add one.
+    /// It excuses a group only when others can write too, the `/tmp` shape.
+    #[test]
+    fn a_group_writable_ancestor_is_refused_even_with_the_sticky_bit() {
+        let (tmp, me) = tempdir();
+        let open = tmp.path().join("open");
+        mkdir(&open, 0o700);
+        mkdir(&open.join("private"), 0o700);
+        let path = open.join("private/daemon.sock");
+        // 01770 and 02770: sticky, group-writable, others clear.
+        for mode in [0o1770, 0o2770] {
+            fs::set_permissions(&open, fs::Permissions::from_mode(mode)).unwrap();
+            let err = check_ancestors(&path, me).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            assert!(
+                err.to_string()
+                    .contains("the sticky bit does not excuse a group"),
+                "{err}"
+            );
+        }
+        // The `/tmp` shape keeps passing: 01777 is sticky, g+w and o+w.
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o1777)).unwrap();
+        check_ancestors(&path, me).unwrap();
+    }
+
+    /// Builds a POSIX ACL xattr: version 2, then the entries as
+    /// (tag, perm, id), the tags the POSIX draft fixes: `ACL_USER_OBJ` 1,
+    /// `ACL_GROUP_OBJ` 4, `ACL_OTHER` 32, `ACL_USER` 2, `ACL_MASK` 16.
+    fn acl_bytes(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut bytes = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in entries {
+            bytes.extend_from_slice(&tag.to_le_bytes());
+            bytes.extend_from_slice(&perm.to_le_bytes());
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// The exact minimal ACL of the mode parses: one `USER_OBJ`, one
+    /// `GROUP_OBJ`, one `OTHER`, undefined ids, perms equal to the mode's
+    /// bits.
+    #[test]
+    fn a_minimal_acl_matching_the_mode_passes() {
+        let mode = 0o640u32;
+        let acl = acl_bytes(&[
+            (0x0001, ((mode >> 6) & 7) as u16, u32::MAX),
+            (0x0004, ((mode >> 3) & 7) as u16, u32::MAX),
+            (0x0020, (mode & 7) as u16, u32::MAX),
+        ]);
+        assert!(minimal_acl_matches_mode(&acl, mode));
+    }
+
+    /// Every shape beyond the exact minimal form is refused: each clause
+    /// below fails if its check is deleted.
+    #[test]
+    fn every_acl_shape_beyond_the_minimal_is_refused() {
+        let mode = 0o640u32;
+        let user_obj = (0x0001u16, ((mode >> 6) & 7) as u16, u32::MAX);
+        let group_obj = (0x0004u16, ((mode >> 3) & 7) as u16, u32::MAX);
+        let other = (0x0020u16, (mode & 7) as u16, u32::MAX);
+        // A named user (and so a mask, and so a fourth entry).
+        let acl = acl_bytes(&[
+            user_obj,
+            group_obj,
+            (0x0002, 4, 1000),
+            (0x0010, 4, u32::MAX),
+            other,
+        ]);
+        assert!(!minimal_acl_matches_mode(&acl, mode));
+        // The wrong version.
+        let mut acl = acl_bytes(&[user_obj, group_obj, other]);
+        acl[0] = 3;
+        assert!(!minimal_acl_matches_mode(&acl, mode));
+        // The wrong length.
+        let mut acl = acl_bytes(&[user_obj, group_obj, other]);
+        acl.pop();
+        assert!(!minimal_acl_matches_mode(&acl, mode));
+        // A perm above what the mode grants, per class.
+        let acl = acl_bytes(&[user_obj, (0x0004, 7, u32::MAX), other]);
+        assert!(!minimal_acl_matches_mode(&acl, mode));
+        let acl = acl_bytes(&[user_obj, group_obj, (0x0020, 7, u32::MAX)]);
+        assert!(!minimal_acl_matches_mode(&acl, mode));
+        let acl = acl_bytes(&[(0x0001, 7, u32::MAX), group_obj, other]);
+        assert!(!minimal_acl_matches_mode(&acl, mode));
+        // An id that is not the undefined one.
+        let acl = acl_bytes(&[(0x0001, ((mode >> 6) & 7) as u16, 0), group_obj, other]);
+        assert!(!minimal_acl_matches_mode(&acl, mode));
+        // Entries out of order or missing.
+        let acl = acl_bytes(&[group_obj, user_obj, other]);
+        assert!(!minimal_acl_matches_mode(&acl, mode));
+    }
+
+    /// A real ACL on the filesystem is refused, and its removal restores
+    /// the read. Skipped where `setfacl` is absent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_acl_beyond_the_mode_is_refused_for_real() {
+        let have_setfacl = std::process::Command::new("setfacl")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !have_setfacl {
+            eprintln!("setfacl is missing; the real-ACL case is skipped");
+            return;
+        }
+        let (tmp, me) = tempdir();
+        let file = tmp.path().join("shared");
+        fs::write(&file, b"bytes").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("setfacl")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        // A named user forces a mask: an ACL beyond the mode's own bits.
+        assert!(
+            run(["-m", "u:1:r", &file.to_string_lossy()].as_ref())
+                .status
+                .success()
+        );
+        let err = read_shared_file(&file).unwrap_err();
+        assert!(err.to_string().contains("beyond its mode bits"), "{err}");
+        // Removing it restores the read.
+        assert!(
+            run(["-b", &file.to_string_lossy()].as_ref())
+                .status
+                .success()
+        );
+        read_shared_file(&file).unwrap();
+        // A default ACL on a directory is refused for every file under it.
+        let dir = tmp.path().join("with-default");
+        mkdir(&dir, 0o700);
+        assert!(
+            run(["-d", "-m", "u:1:r", &dir.to_string_lossy()].as_ref())
+                .status
+                .success()
+        );
+        let err = check_ancestors(&dir.join("child"), me).unwrap_err();
+        assert!(
+            err.to_string().contains("ACL beyond its mode bits"),
+            "{err}"
+        );
+    }
+
+    /// A real extended ACL on macOS is refused, and its removal restores
+    /// the read: `chmod +a` grants an entry to `everyone`, `chmod -N`
+    /// clears every ACL entry the file carries.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_extended_acl_is_refused_for_real() {
+        let (tmp, _me) = tempdir();
+        let file = tmp.path().join("shared");
+        fs::write(&file, b"bytes").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("chmod")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(
+            run(["+a", "everyone allow read", &file.to_string_lossy()].as_ref())
+                .status
+                .success()
+        );
+        let err = read_shared_file(&file).unwrap_err();
+        assert!(
+            err.to_string().contains("ACL beyond its mode bits"),
+            "{err}"
+        );
+        assert!(
+            run(["-N", &file.to_string_lossy()].as_ref())
+                .status
+                .success()
+        );
+        read_shared_file(&file).unwrap();
+    }
+
+    /// The workspace denies the unsafe-code lint everywhere but this
+    /// crate, and this crate keeps it in the one private `ffi` module:
+    /// walk the crate's sources and refuse the lint's opt-out, or a bare
+    /// token, anywhere else. The test fails the moment the boundary
+    /// breaks.
+    #[test]
+    fn unsafe_code_lives_only_in_the_ffi_module() {
+        fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, files);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        // Built in pieces: the needle must not appear in this test's own
+        // source, or the test would refuse itself.
+        let opt_out = ["allow(", "unsafe", "_code", ")"].concat();
+        let ffi = src.join("runtime/auth/ffi.rs");
+        let mut saw_ffi = false;
+        for file in files {
+            let text = fs::read_to_string(&file).unwrap();
+            let code = text.replace("unsafe_code", "");
+            if file == ffi {
+                saw_ffi = true;
+                assert!(
+                    text.contains(&opt_out),
+                    "the ffi module must opt out of the lint explicitly"
+                );
+            } else {
+                let code = code.replace("`unsafe`", "");
+                // The needles are built in pieces, or this test's own
+                // source would hold the tokens it refuses.
+                let (sp, brace) = ("unsafe\u{20}", "unsafe\u{7b}");
+                assert!(
+                    !code.contains(sp) && !code.contains(brace),
+                    "{} holds a token outside the ffi module",
+                    file.display()
+                );
+                assert!(
+                    !text.contains(&opt_out),
+                    "{} opts out of the unsafe-code lint",
+                    file.display()
+                );
+            }
+        }
+        assert!(saw_ffi, "the ffi module went missing");
     }
 
     #[test]
