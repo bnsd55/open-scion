@@ -1247,6 +1247,11 @@ impl Drop for PgWriteWaiter<'_> {
 /// [`MetaTx`] methods. The transaction is begun and ended with statements
 /// of the client, so a `PgTx` is a plain client handle: it stays covariant
 /// in its lifetime, which the backend enum's transaction needs.
+///
+/// `pub` with the unreachable-pub allow, like [`SqliteTx`](crate::db::SqliteTx):
+/// [`Meta::Tx`] names it, and the trait re-exports through
+/// `test_support::meta`.
+#[allow(unreachable_pub)]
 pub struct PgTx<'a> {
     c: &'a mut PgClient,
     /// The transaction was ended by `commit` or `rollback`; a drop then
