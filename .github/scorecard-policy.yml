@@ -1,0 +1,60 @@
+# The pinned OpenSSF Scorecard policy: a floor per check, not an
+# aggregate score. A check below its floor fails the scorecard job
+# unless an unexpired exception covers it; every exception names an
+# owner, a reason, and an expiry date (YYYY-MM-DD), and expires hard.
+# The floors are checks the project meets today; the checks it does
+# not meet yet are exceptions, not low floors.
+policy: 1
+
+floors:
+  Binary-Artifacts: 10
+  Branch-Protection: 8
+  CI-Tests: 10
+  Dangerous-Workflow: 10
+  Dependency-Update-Tool: 10
+  License: 10
+  Maintained: 10
+  Pinned-Dependencies: 10
+  Security-Policy: 10
+  Token-Permissions: 10
+  Vulnerabilities: 10
+
+exceptions:
+  - check: Signed-Releases
+    owner: Ben Shaharizad <bnsd55@gmail.com>
+    reason: no release has been cut yet; the first release ships signed
+      artifacts per docs/RELEASING.md
+    expires: "2027-03-31"
+  - check: SBOM
+    owner: Ben Shaharizad <bnsd55@gmail.com>
+    reason: the SBOM step lands in the release workflow with the first
+      release
+    expires: "2027-03-31"
+  - check: Packaging
+    owner: Ben Shaharizad <bnsd55@gmail.com>
+    reason: nothing is published yet; the crates publish with the first
+      release (#21), and the publish check keeps them valid
+    expires: "2027-03-31"
+  - check: SAST
+    owner: Ben Shaharizad <bnsd55@gmail.com>
+    reason: CodeQL landed (ci.yml's codeql workflow); drop this once a
+      published Scorecard result shows its score
+    expires: "2026-12-31"
+  - check: Fuzzing
+    owner: Ben Shaharizad <bnsd55@gmail.com>
+    reason: only the per-PR smoke runs today; the nightly run with kept
+      corpora is the fix
+    expires: "2027-03-31"
+  - check: Code-Review
+    owner: Ben Shaharizad <bnsd55@gmail.com>
+    reason: one maintainer; reviews become a requirement the moment a
+      second one lands
+    expires: "2027-03-31"
+  - check: Contributors
+    owner: Ben Shaharizad <bnsd55@gmail.com>
+    reason: two contributors; grows with the project
+    expires: "2027-03-31"
+  - check: CII-Best-Practices
+    owner: Ben Shaharizad <bnsd55@gmail.com>
+    reason: the badge application waits for the first release
+    expires: "2027-03-31"
