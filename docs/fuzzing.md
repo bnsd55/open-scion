@@ -32,6 +32,7 @@ longer budget and keeps its corpus between runs (`.github/workflows/fuzz.yml`).
 | decoder | target |
 | --- | --- |
 | the access file (`scion-server/src/access.rs`, `Access::parse`) | `scion-server/fuzz: access` |
+| the archive files (`scion-server/src/archive.rs`, `verify`/`restore`: the manifest and its names, `changesets.bin`, `refs.json`, `lands.json`, `members.txt`, `provenance.json`, the blob files) | `scion-server/fuzz: archive-verify` |
 | the tier snapshot seed file (`scion-tier/src/snapshot.rs`, `seed`; an operator drops the file beside a cold store) | `scion-tier/fuzz: snapshot-seed` |
 
 ### No target

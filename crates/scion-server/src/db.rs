@@ -469,6 +469,18 @@ impl MetaTx for SqliteTx<'_> {
         Ok(changed == 1)
     }
 
+    fn restore_ref(&mut self, repo: RepoId, name: &str, target: &[u8], version: i64) -> Result<()> {
+        self.0
+            .prepare_cached(
+                "INSERT OR REPLACE INTO refs (repo_id, name, target, version) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .map_err(crate::error::from_sqlite)?
+            .execute(params![repo.0, name, target, version])
+            .map_err(crate::error::from_sqlite)?;
+        Ok(())
+    }
+
     /// The stored bytes of a derived value, if computed.
     ///
     /// # Errors
@@ -1052,6 +1064,64 @@ impl MetaTx for SqliteTx<'_> {
             .map_err(crate::error::from_sqlite)?;
         let rows = stmt
             .query_map(params![repo.0], |row| row.get(0))
+            .map_err(crate::error::from_sqlite)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(crate::error::from_sqlite)
+    }
+
+    fn repo_changesets_with_bodies(
+        &mut self,
+        repo: RepoId,
+    ) -> Result<Vec<(Vec<u8>, i64, Vec<u8>)>> {
+        let mut stmt = self
+            .0
+            .prepare_cached(
+                "SELECT c.id, c.gen, c.body FROM repo_changesets r \
+                 JOIN changesets c ON c.id = r.cs WHERE r.repo_id = ?1 ORDER BY c.gen, c.id",
+            )
+            .map_err(crate::error::from_sqlite)?;
+        let rows = stmt
+            .query_map(params![repo.0], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(crate::error::from_sqlite)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(crate::error::from_sqlite)
+    }
+
+    fn list_refs(&mut self, repo: RepoId) -> Result<Vec<(String, Vec<u8>, i64)>> {
+        let mut stmt = self
+            .0
+            .prepare_cached(
+                "SELECT name, target, version FROM refs WHERE repo_id = ?1 ORDER BY name",
+            )
+            .map_err(crate::error::from_sqlite)?;
+        let rows = stmt
+            .query_map(params![repo.0], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(crate::error::from_sqlite)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(crate::error::from_sqlite)
+    }
+
+    fn pending_lands(&mut self, repo: RepoId) -> Result<Vec<crate::meta::PendingLand>> {
+        let mut stmt = self
+            .0
+            .prepare_cached(
+                "SELECT caller, request_key, target_ref, input_cs FROM lands \
+                 WHERE repo_id = ?1 AND state = 'pending' ORDER BY land_id",
+            )
+            .map_err(crate::error::from_sqlite)?;
+        let rows = stmt
+            .query_map(params![repo.0], |row| {
+                Ok(crate::meta::PendingLand {
+                    caller: row.get(0)?,
+                    request_key: row.get(1)?,
+                    target_ref: row.get(2)?,
+                    input_cs: row.get(3)?,
+                })
+            })
             .map_err(crate::error::from_sqlite)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(crate::error::from_sqlite)
