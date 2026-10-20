@@ -193,7 +193,7 @@ fn every_proof_line_names_a_test_that_exists() {
         let text = std::fs::read_to_string(&source)
             .unwrap_or_else(|_| panic!("the proof file {file} is not in the repo"));
         assert!(
-            text.contains(&format!("fn {fun}")),
+            text.contains(&format!("fn {fun}(")) || text.contains(&format!("fn {fun}<")),
             "the proof names {file}::{fun}, but that function is not in the file"
         );
     }
