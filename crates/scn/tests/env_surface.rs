@@ -13,7 +13,7 @@
 //! seen; only deleting the read turns the check red.
 
 const GOLDEN: &[&str] = &[
-    // `scn` reads the SCION_* ones (clap `env = ...`), `scion-server`
+    // `scn` reads the SCION_* ones (clap `env = ...`); `scion-server`
     // its own; the server's log filter is `RUST_LOG`, which
     // `tracing_subscriber` reads by convention, not by literal.
     "SCION_SERVER",
@@ -27,9 +27,13 @@ const GOLDEN: &[&str] = &[
     // var names a file that holds the secret, so the secret itself
     // never sits in argv or env).
     "SCION_DATA",
-    "SCION_TOKEN",
     "SCION_POSTGRES_URL",
     "SCION_POSTGRES_URL_FILE",
+    // `scion-cache` and `scion-daemon` read these: the daemon's data
+    // dir by clap, the two tokens through `secret_of`, whose env name
+    // is a string argument (`std::env::var(name)` inside).
+    "SCION_DAEMON_DATA",
+    "SCION_UPSTREAM_TOKEN",
 ];
 
 #[test]
@@ -69,8 +73,13 @@ fn every_env_var_the_binaries_read_is_in_the_golden() {
     );
 }
 
-/// The env var names a source file reads: clap's `env = "X"` attribute,
-/// and the hand reads `std::env::var("X")` / `std::env::var_os("X")`.
+/// The env var names a source file reads, by every shape the code
+/// uses: clap's `env = "X"` attribute; the hand reads
+/// `std::env::var("X")` / `std::env::var_os("X")`; and a name handed
+/// to a helper as a string argument — a `secret_of(..., "SCION_X")`
+/// call reads the var by the name it was given, so the call's string
+/// arguments count as reads too (the scan follows the call to its
+/// closing paren, the calls are multi-line).
 fn read_var_names(text: &str) -> Vec<String> {
     let mut names = Vec::new();
     for needle in ["env = \"", "env::var(\"", "env::var_os(\""] {
@@ -84,18 +93,54 @@ fn read_var_names(text: &str) -> Vec<String> {
             from += at + needle.len();
         }
     }
+    let mut from = 0;
+    while let Some(at) = text[from..].find("secret_of(") {
+        let call = &text[from + at + "secret_of(".len()..];
+        let mut depth = 1usize;
+        let mut open: Option<usize> = None;
+        for (i, c) in call.char_indices() {
+            match c {
+                '"' => match open {
+                    None => open = Some(i + 1),
+                    Some(start) => {
+                        names.push(call[start..i].to_owned());
+                        open = None;
+                    }
+                },
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        from += at + "secret_of(".len();
+    }
+    // The `secret_of` shape grabs every quoted argument of the call,
+    // the flags included (`--token`); keep the env-name shape only:
+    // all caps, digits and underscores.
+    names.retain(|name| {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+    });
     names
 }
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// Every `.rs` source file of `scn` and `scion-server`: the shipped
-/// binaries whose env reads are the promise.
+/// Every `.rs` source file of the four shipped binaries: `scn`,
+/// `scion-server`, and the tier crate that builds `scion-cache` and
+/// `scion-daemon`.
 fn sources() -> Vec<String> {
     let mut texts = Vec::new();
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for crate_dir in ["scn", "scion-server"] {
+    for crate_dir in ["scn", "scion-server", "scion-tier"] {
         walk(&manifest.join("..").join(crate_dir).join("src"), &mut texts);
     }
     texts
