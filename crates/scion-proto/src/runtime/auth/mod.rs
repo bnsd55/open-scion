@@ -414,24 +414,19 @@ fn fd_has_hidden_acl(fd: impl rustix::fd::AsFd, mode: u32, dir: bool) -> bool {
         // could accept, and a longer one is refused by the parse. The
         // read answers the byte count; the bytes live in `buf`.
         let mut buf = [0u8; 64];
-        let read = |name: &str| -> Result<Option<&[u8]>, rustix::io::Errno> {
-            match rustix::fs::fgetxattr(fd, name, &mut buf) {
-                Err(rustix::io::Errno::NODATA) => Ok(None),
-                Ok(len) => Ok(Some(&buf[..len])),
-                Err(err) => Err(err),
-            }
-        };
-        match read(POSIX_ACL_ACCESS) {
-            Ok(None) => {}
-            Ok(Some(bytes)) => {
-                if !minimal_acl_matches_mode(bytes, mode) {
+        let fd = rustix::fd::AsFd::as_fd(&fd);
+        match rustix::fs::fgetxattr(fd, POSIX_ACL_ACCESS, &mut buf) {
+            Err(rustix::io::Errno::NODATA) => {}
+            Ok(len) => {
+                if !minimal_acl_matches_mode(&buf[..len], mode) {
                     return true;
                 }
             }
             Err(_) => return true,
         }
         if dir {
-            return !matches!(read(POSIX_ACL_DEFAULT), Ok(None));
+            let default = rustix::fs::fgetxattr(fd, POSIX_ACL_DEFAULT, &mut buf);
+            return !matches!(default, Err(rustix::io::Errno::NODATA));
         }
         false
     }
