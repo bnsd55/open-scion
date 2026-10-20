@@ -367,6 +367,7 @@ A bearer token over plain TCP to a non-loopback address stays refused.
 | [`docs/protocol-v1.md`](https://github.com/bnsd55/openscion/blob/main/docs/protocol-v1.md) | The v1 API contract: calls, limits, status codes, retries, durability and what a client checks |
 | [`docs/cli.md`](https://github.com/bnsd55/openscion/blob/main/docs/cli.md) | Every `scn` command: what it does, its flags, the global flags and env vars, and the exit codes |
 | [`docs/operations.md`](https://github.com/bnsd55/openscion/blob/main/docs/operations.md) | How to run a server: deploy, keys, the access file, Postgres, backups, and what each failure means |
+| [`docs/threat-model.md`](https://github.com/bnsd55/openscion/blob/main/docs/threat-model.md) | The supported profile, the assets, the actors, the trust boundaries, and each security invariant with the test that proves it |
 | [`docs/faults.md`](https://github.com/bnsd55/openscion/blob/main/docs/faults.md) | One row per fault: what the client sees, what the operator sees, what survives a restart, and the test that proves it |
 | [`docs/compatibility.md`](https://github.com/bnsd55/openscion/blob/main/docs/compatibility.md) | Which component pairs work at versions N and N-1, what "works" means per pair, and what a break needs |
 | [`docs/benchmarks.md`](https://github.com/bnsd55/openscion/blob/main/docs/benchmarks.md) | How the demo and the benchmarks run, what each number means, and how to rerun them |
