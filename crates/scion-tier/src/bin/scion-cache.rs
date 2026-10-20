@@ -102,6 +102,12 @@ struct Cli {
     /// `--insecure-listen`, because the metrics travel unencrypted.
     #[arg(long, value_name = "ADDR")]
     metrics_listen: Option<SocketAddr>,
+    /// How long the in-flight calls have to finish once the first signal
+    /// starts the drain. Past it the calls are cut, the log names the
+    /// count, and the process exits non-zero, so a supervisor restarts it.
+    /// A second signal always cuts at once.
+    #[arg(long, default_value_t = listen::DEFAULT_DRAIN_TIMEOUT.as_secs())]
+    drain_timeout_secs: u64,
 }
 
 #[tokio::main]
@@ -165,6 +171,10 @@ async fn main() -> anyhow::Result<()> {
         scion_proto::runtime::metrics::shutdown_signal().await;
         let _ = end_tx.send(());
     });
+    // The drain bound: the in-flight calls have this long after the
+    // first signal, then they are cut and the process exits non-zero.
+    let drain_secs = Duration::from_secs(cli.drain_timeout_secs);
+    scion_proto::runtime::metrics::spawn_drain_bound(end_rx.clone(), drain_secs, tier.metrics());
     if let Some(metrics_listen) = cli.metrics_listen {
         let address = metrics_listen.to_string();
         let checked =
