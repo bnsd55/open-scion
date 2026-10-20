@@ -35,7 +35,7 @@ use crate::tree;
 /// versions that one step removes. A step holds the write connection, so
 /// this bounds how long other writes wait. Tests use a small step, so that a
 /// short history takes several steps.
-pub const STEP: usize = if cfg!(test) { 2 } else { 100 };
+pub(crate) const STEP: usize = if cfg!(test) { 2 } else { 100 };
 
 /// How many steps derive `changesets` changesets.
 #[cfg(test)]
