@@ -162,7 +162,7 @@ pub mod test_support {
 // public the module it sits in looks. The doc(hidden) items are not
 // here, and never were.
 pub use access::Access;
-pub use error::{Error, Result, Storage, StorageClass};
+pub use error::{Error, Git, Result, Storage, StorageClass};
 pub use gc::DEFAULT_GRACE_SECS;
 pub use graph::{CommitGraph, backfill_commit_graph};
 pub use history::{PathHistory, backfill_path_history};

@@ -1559,8 +1559,8 @@ secret stops stray and accidental callers only; it is not a protection.
 
 ## 8. Security model
 
-openscion is a proof of concept for one trusted machine. Do not expose it to
-an untrusted network.
+openscion is alpha software for one trusted machine. Do not expose
+it to an untrusted network.
 
 | Area | Today | Limit |
 |---|---|---|

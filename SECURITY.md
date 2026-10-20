@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-openscion is an early proof of concept. Only the latest commit on `main` is
+openscion is alpha software (0.x). Only the latest commit on `main` is
 supported, and it is not meant for production use yet.
 
 ## Reporting a vulnerability
