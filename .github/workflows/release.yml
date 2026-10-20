@@ -154,7 +154,7 @@ jobs:
           export LC_ALL=C
           cargo cyclonedx --all --format json --spec-version 1.5
           mkdir -p out
-          for crate in open-scion-server open-scion-tier scn; do
+          for crate in open-scion-server open-scion-tier open-scion; do
             find . -name "$crate.cdx.json" -exec cp {} "out/$crate.cdx.json" \;
           done
           # The SBOM attestation reads only documents that carry a
@@ -281,7 +281,7 @@ jobs:
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-path: cell/scn
-          sbom-path: cell/scn.cdx.json
+          sbom-path: cell/open-scion.cdx.json
 
   # The evidence step: the attestation verify output, on every run,
   # dry-run included. Its log is what the PR body links for the proof
