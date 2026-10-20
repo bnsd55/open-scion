@@ -361,13 +361,26 @@ async fn main() -> anyhow::Result<()> {
     // kind, which a running server of an older build may read, so it opens as
     // the server.
     let store = match cli.command {
-        Command::Import { .. } | Command::Fsck | Command::Gc { .. } => Backend::open_shared(
+        Command::Import { .. } | Command::Gc { .. } => Backend::open_shared(
             &cli.data,
             cli.postgres_url.as_deref(),
             cli.postgres_ca.as_deref(),
         ),
         Command::HashToken { .. } => return hash_token(),
         Command::TicketKey { .. } => return write_ticket_key(),
+        // `fsck` cannot run when the store cannot open, and its table
+        // says that is 2, not the generic open failure's 1.
+        Command::Fsck => match Backend::open_shared(
+            &cli.data,
+            cli.postgres_url.as_deref(),
+            cli.postgres_ca.as_deref(),
+        ) {
+            Ok(store) => Ok(store),
+            Err(e) => {
+                eprintln!("scion-server fsck: {e}");
+                std::process::exit(2);
+            }
+        },
         Command::Serve { .. } | Command::Derive { .. } => Backend::open(
             &cli.data,
             cli.postgres_url.as_deref(),

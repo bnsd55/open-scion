@@ -39,6 +39,35 @@ ago, so a user on a recent-at-release Rust can always build a 0.x
 source tree. The rule lives here; CI's `check (MSRV)` job proves the
 floor builds, not that the six-month rule holds.
 
+## The 1.x promises
+
+What each surface promises in 1.x. The 0.x table above keeps saying
+what 0.x does; this section is what 1.0 freezes. The rule for all of
+them: **additive only** — a 1.x minor may add calls, fields, flags,
+env vars, exit codes and migrations, and never remove or retype one.
+A breaking change is a new version served or read beside the old one
+([compatibility.md](compatibility.md)), dropped no earlier than the
+next minor.
+
+| Surface | What 1.x promises | The machine check |
+|---|---|---|
+| Object format v1 | The bytes and the ID hashes never change — not in 1.x, not later. A new format is new IDs, read beside v1, forever. | Exists: `crates/scion-core/tests/golden.rs` pins the bytes and IDs. |
+| Protocol v1 | Served throughout 1.x: the calls, their status codes, limits and durability rules never break; optional fields are added only; a break is v2 beside v1. | `crates/scion-proto/tests/protocol_surface.rs`: the calls and field numbers of the checked-in proto are additive-only against a golden (a removed call, a renumbered field, or a retyped field fails; an added one passes). |
+| `scn` CLI, `--json` output | Field names and types are additive-only in 1.x: a minor may add fields, never change or remove one. | `crates/scn/tests/json_golden.rs`: every command the test runs answers with the fields and types its golden row names, read from the binary itself. |
+| `scn` CLI, exit codes | 0 on success, 1 only for `is-ancestor`'s "no", 2 on any error. | `crates/scn/tests/exit_codes.rs`: one line per row of the table. |
+| `scion-server` exit codes | `fsck` exits 0 when it saw no damage, 1 when it did, 2 when it could not run. | `crates/scion-server/tests/fsck_exit.rs`: clean, damaged, and unopenable stores, one line per row. |
+| Production configuration | The flags, env vars and file formats the shipped binaries read change additively in 1.x: what a release ships stays, and 1.x only adds. The flags: docs_flags and docs_cli pin the names the docs carry. The env vars: `crates/scn/tests/env_surface.rs` reads the sources of both binaries, so a removed var fails and a new one enters the golden on purpose. The file formats (the access file, the marker) are versioned like the other wire surfaces. | Exists for flags; the env golden is new. |
+| SQLite and Postgres schemas | The 0.x rule is the 1.x rule: a released migration never changes, open migrates forward one migration per released version, a database newer than the build is refused, and the N/N-1 window holds (a store from release N-1 opens on N; the pre-upgrade backup restores onto N-1). | Exists: the migration tests; the N-1 restore drill (#379 item 3) once it lands. |
+| Ticket bytes | The 0.x rule holds, and the window is pinned: v2 may be issued beside v1, both read until at least the next minor (compatibility.md). | Exists: the ticket prefix tests pin the version bytes. |
+| Snapshot files | The 0.x rule holds, and the window is pinned: a new magic is written beside the old one until at least the next minor. | Exists: the snapshot magic tests. |
+
+What carries no machine check, and why: "served throughout 1.x" is a
+statement about every release, not a run — its machine form is the
+additive goldens above, which fail CI on the change that would break a
+client, before it ships. The version matrix and the tagged-store
+drills are their own surfaces (#381, #382) and stability.md links to
+them instead of duplicating their checks.
+
 ## Where each promise is written down
 
 - Wire protocol: [protocol-v1.md](protocol-v1.md), the contract of
@@ -56,3 +85,7 @@ floor builds, not that the six-month rule holds.
 - Ticket bytes: the prefix `scion\0ticket\0v1\0` in
   [`crates/scion-proto/src/ticket.rs`](../crates/scion-proto/src/ticket.rs).
 - The CLI's commands, flags and `--json` fields: [cli.md](cli.md).
+- The 1.x goldens: the proto surface
+  (`crates/scion-proto/tests/protocol_surface_v1.golden`), the JSON
+  fields (`crates/scn/tests/json_fields_v1.golden`), and the env vars
+  named in `crates/scn/tests/env_surface.rs`.
