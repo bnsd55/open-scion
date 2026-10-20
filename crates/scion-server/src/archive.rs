@@ -227,7 +227,12 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
 /// A data directory that already holds a store, a failed open, a blob
 /// whose bytes do not hash to its name, or what the replay's writes
 /// return.
-pub fn restore(archive: &Path, data: &Path, postgres_url: Option<&str>) -> Result<Vec<String>> {
+pub fn restore(
+    archive: &Path,
+    data: &Path,
+    postgres_url: Option<&str>,
+    postgres_ca: Option<&Path>,
+) -> Result<Vec<String>> {
     for existing in ["scion.db", MARKER, "objects"] {
         if data.join(existing).exists() {
             return Err(Error::FailedPrecondition(format!(
@@ -238,7 +243,7 @@ pub fn restore(archive: &Path, data: &Path, postgres_url: Option<&str>) -> Resul
     }
     let manifest = read_manifest(archive)?;
     let names = repo_names(&manifest)?;
-    let store = Backend::open(data, postgres_url, None)?;
+    let store = Backend::open(data, postgres_url, postgres_ca)?;
     for name in &names {
         let dir = archive.join("repos").join(name);
         let changesets = read_changesets(&dir.join("changesets.bin"))?;

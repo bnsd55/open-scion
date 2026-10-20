@@ -118,9 +118,9 @@ fn an_export_beside_a_writer_verifies_and_restores_resolving_main() {
     // generations, a clean fsck, and a main that resolves to what the
     // snapshot read.
     let restored_dir = tempfile::tempdir().unwrap();
-    let names = archive::restore(&out, restored_dir.path(), None).unwrap();
+    let names = archive::restore(&out, restored_dir.path(), None, None).unwrap();
     assert_eq!(names, vec![REPO]);
-    let restored = Backend::open_test(restored_dir.path()).unwrap();
+    let restored = Backend::open(restored_dir.path(), None, None).unwrap();
     let problems = fsck::run(&restored, fsck::BATCH, &mut |_| {}).unwrap();
     assert!(problems.problems.is_empty(), "{problems:?}");
     let repo = restored.read(|c| c.repo_id(REPO)).unwrap();
@@ -170,7 +170,7 @@ fn a_verify_names_a_blob_whose_bytes_someone_corrupted() {
         "{damages:?}"
     );
     let empty = tempfile::tempdir().unwrap();
-    match archive::restore(&out, empty.path(), None) {
+    match archive::restore(&out, empty.path(), None, None) {
         Err(scion_server::Error::Corrupt(why)) => {
             assert!(why.contains("other bytes than its name says"), "{why}");
         }
@@ -190,7 +190,7 @@ fn a_restore_refuses_a_data_directory_that_already_holds_a_store() {
     let (store, _main) = source(data.path());
     let out = tempfile::tempdir().unwrap().path().join("archive");
     archive::export(&store, data.path(), Some(REPO), false, &out).unwrap();
-    match archive::restore(&out, data.path(), None) {
+    match archive::restore(&out, data.path(), None, None) {
         Err(scion_server::Error::FailedPrecondition(why)) => {
             assert!(why.contains("already holds a store"), "{why}");
         }

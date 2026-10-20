@@ -479,7 +479,12 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(i32::from(!damages.is_empty()));
         }
         Command::Restore { archive } => {
-            let names = match archive::restore(&archive, &cli.data, None) {
+            let names = match archive::restore(
+                &archive,
+                &cli.data,
+                cli.postgres_url.as_deref(),
+                cli.postgres_ca.as_deref(),
+            ) {
                 Ok(names) => names,
                 Err(e) => {
                     eprintln!("scion-server restore: {e:#}");
