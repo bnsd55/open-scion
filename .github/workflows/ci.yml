@@ -142,6 +142,11 @@ jobs:
           PROPTEST_CASES: "64"
           SCION_TEST_BACKEND: postgres
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+          # The backup test dumps the live metadata with the job's own
+          # Postgres, so its tools match the server: the container name
+          # points at the service container above, and the test never
+          # stops it (the takeover step below does, after the tests).
+          SCION_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
       # The takeover test stops the database and restarts it. The service
       # container of this job is the only postgres:17.11 on the runner, and
       # it belongs to this job alone, so it may go down and come back.

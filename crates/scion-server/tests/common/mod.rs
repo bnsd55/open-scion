@@ -356,7 +356,7 @@ pub(crate) const LARGE: usize = 64 << 10;
 /// Builds one op's files: mostly small, some to about 1 MiB, so a kill
 /// can stop a blob write in the middle; some share one path, so lands
 /// conflict. Puts every blob and records it in the ledger.
-async fn build_files(
+pub(crate) async fn build_files(
     scion: &mut Scion,
     name: &str,
     op: u64,
