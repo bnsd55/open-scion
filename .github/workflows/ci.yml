@@ -96,6 +96,19 @@ jobs:
       - run: cargo test --workspace
         env:
           PROPTEST_CASES: "2000"
+      - name: the work tree is still clean after the tests
+        run: |
+          # A test that writes outside its sandbox (the #332 class) shows up
+          # here: the suite must leave the checked-out tree as it found it.
+          # The diff names the files, so the writer is one step away. New
+          # untracked files count too (a stray bench-output.txt); target/
+          # is gitignored, so the build stays out of the report.
+          dirty=$(git status --porcelain --untracked-files=all)
+          if [ -n "$dirty" ]; then
+            git diff --exit-code || true
+            echo "::error::the test suite left the work tree dirty: $dirty"
+            exit 1
+          fi
       - name: a real disk full (tmpfs)
         run: cargo test -p open-scion-server --test disk_full
         env:
@@ -142,6 +155,16 @@ jobs:
           PROPTEST_CASES: "64"
           SCION_TEST_BACKEND: postgres
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+      - name: the work tree is still clean after the tests
+        run: |
+          # New untracked files count too (a stray bench-output.txt);
+          # target/ is gitignored, so the build stays out of the report.
+          dirty=$(git status --porcelain --untracked-files=all)
+          if [ -n "$dirty" ]; then
+            git diff --exit-code || true
+            echo "::error::the test suite left the work tree dirty: $dirty"
+            exit 1
+          fi
       # The takeover test stops the database and restarts it. The service
       # container of this job is the only postgres:17.11 on the runner, and
       # it belongs to this job alone, so it may go down and come back.
@@ -170,6 +193,16 @@ jobs:
       - run: cargo test --workspace
         env:
           PROPTEST_CASES: "2000"
+      - name: the work tree is still clean after the tests
+        run: |
+          # New untracked files count too (a stray bench-output.txt);
+          # target/ is gitignored, so the build stays out of the report.
+          dirty=$(git status --porcelain --untracked-files=all)
+          if [ -n "$dirty" ]; then
+            git diff --exit-code || true
+            echo "::error::the test suite left the work tree dirty: $dirty"
+            exit 1
+          fi
 
   power-loss:
     name: power-loss

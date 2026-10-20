@@ -41,6 +41,9 @@ zstd.workspace = true
 [dev-dependencies]
 rcgen.workspace = true
 tempfile.workspace = true
+# The protocol-surface golden decodes the descriptor set the build
+# wrote: the surface is what the compiler saw, not a hand parse.
+prost-types = "0.14"
 
 [build-dependencies]
 tonic-prost-build.workspace = true

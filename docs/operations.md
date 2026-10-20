@@ -5,6 +5,11 @@ steps an operator needs, written from the code on `main`. Every command in
 this guide was run once in a fresh directory. The flags of a release are its
 truth: `--help` of each binary lists everything.
 
+A section whose steps a test runs ends with a `Proof:` line that names the
+test (file and function). The docs_ops tests fail when a proof's test is
+gone, when a command of a shell block names a flag `--help` does not, and
+when the drills of docs/drills/ lose their template.
+
 The pieces:
 
 - `scion-server` — the one process that stores and lands. One data directory
@@ -349,6 +354,8 @@ Rotation, step by step:
 
 A daemon checks no ticket and forwards it, so it needs no key at any step.
 
+Proof: crates/scn/tests/rotation.rs::ticket_key_rotation_while_a_checkout_reads
+
 ## 3. Backup and restore
 
 A data directory is `scion.db` plus `objects/`; the lock files and `tmp/`
@@ -424,6 +431,8 @@ new database), the marker, and `objects/` into a fresh directory; run
 gc-raced backup left, so run it after every restore, before the server
 serves.
 
+Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restores_whole
+
 ## 4. Upgrades
 
 The schema version lives in the database. On open, a server migrates an
@@ -458,6 +467,8 @@ backfills a whole history in steps when you want it done before the first
 query (it opens the directory as the server, so with the server stopped, and
 it is safe to repeat).
 
+Proof: crates/scion-server/tests/crash.rs::a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one
+
 ## 5. Routines
 
 The routines are these:
@@ -486,6 +497,8 @@ The routines are these:
   file batch, one when it ends, each with the counts and the time it
   took, and a line at most every 10 s of a long run with the repos done
   and the total.
+
+  Proof: crates/scion-server/tests/gc_metrics.rs::a_real_run_writes_the_report_as_textfile_metrics
 
 **The collector's metrics file.** The collector runs as its own process,
 so the server's `/metrics` cannot show what it did. Instead, give the run
