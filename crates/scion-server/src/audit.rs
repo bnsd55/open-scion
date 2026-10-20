@@ -162,7 +162,7 @@ impl Audit {
     }
 
     /// Records one line, and returns once it is durable on the disk.
-    /// With [`Audit::off`], the line is dropped and the call succeeds.
+    /// With the off handle, the line is dropped and the call succeeds.
     ///
     /// # Errors
     ///
