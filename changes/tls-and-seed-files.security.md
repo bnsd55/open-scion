@@ -8,4 +8,6 @@ server accepts, and a swapped seed can seed what the daemon serves.
 These reads go through one checked descriptor now (read_shared_file:
 ancestors checked, O_NOFOLLOW, kind, owner, and a mode no other
 account can write, checked on the open descriptor the bytes are read
-from), as the secrets already did.
+from), as the secrets already did. The checked open is its own step
+now, so a seed the size of a disk streams through a buffered reader
+instead of being held whole in memory.

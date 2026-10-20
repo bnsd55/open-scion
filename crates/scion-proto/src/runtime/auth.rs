@@ -251,6 +251,23 @@ pub fn checked_read_error(file: &Path, why: io::Error) -> anyhow::Error {
 /// [`read_secret_file`] and [`read_shared_file`]: `secret` picks the mode
 /// rule (no group or others read, or no write).
 fn read_checked_file(file: &Path, secret: bool) -> io::Result<Vec<u8>> {
+    let mut opened = open_checked_file(file, secret)?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut opened, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Opens `file` for a secret or a whole-keeping read, with every check of
+/// [`read_secret_file`] run on the open descriptor, and returns the
+/// checked file for the caller to read itself: a caller with a large file
+/// streams it through a [`std::io::BufReader`] instead of holding the
+/// whole file in memory. `secret` picks the mode rule (no group or others
+/// read, or no write).
+///
+/// # Errors
+///
+/// As [`read_secret_file`].
+pub fn open_checked_file(file: &Path, secret: bool) -> io::Result<std::fs::File> {
     let me = rustix::process::geteuid().as_raw();
     let resolved = check_ancestors(file, me)?;
     let opened = rustix::fs::open(
@@ -284,9 +301,7 @@ fn read_checked_file(file: &Path, secret: bool) -> io::Result<Vec<u8>> {
     let opened = fs::File::from(opened);
     let meta = opened.metadata()?;
     ensure_file_checks(meta.mode(), meta.uid(), me, secret, file)?;
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut &opened, &mut bytes)?;
-    Ok(bytes)
+    Ok(opened)
 }
 
 /// The descriptor checks of [`read_checked_file`]: a regular file, owned by
