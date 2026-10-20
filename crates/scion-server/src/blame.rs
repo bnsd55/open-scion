@@ -8,6 +8,11 @@
 //! rename, found as `git blame` finds it. Stop when every line has a
 //! changeset, or at a bound.
 
+// Every pub item of this module is re-exported by the test seam
+// (`test_support` in lib.rs), and unreachable_pub does not see
+// through a re-export, so this marker would fire on all of them
+// under any feature set.
+#![allow(unreachable_pub)]
 use std::collections::HashMap;
 use std::collections::hash_map::Entry as Slot;
 use std::time::Instant;

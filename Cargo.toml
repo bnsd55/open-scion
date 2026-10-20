@@ -58,6 +58,7 @@ zstd = { version = "0.14", default-features = false }
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
+unreachable_pub = "warn"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
