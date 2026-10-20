@@ -187,6 +187,18 @@ fn name_status(diff: &Value) -> Vec<String> {
 
 #[test]
 fn merge_base_is_ancestor_and_diff_match_git() {
+    if Backend::test_is_postgres() {
+        // The git side of the comparison is named by the data directory's
+        // own `git_import` rows, which the test reads through the SQLite
+        // file; a Postgres store keeps them in the database, and no
+        // test-side read exists for them.
+        eprintln!("skip on postgres: the test reads the data directory's git_import rows");
+        return;
+    }
+    merge_base_is_ancestor_and_diff_match_git_inner();
+}
+
+fn merge_base_is_ancestor_and_diff_match_git_inner() {
     let git_dir = tempfile::tempdir().unwrap();
     let dir = git_dir.path();
     git(dir, &["init", "-q", "-b", "main"]);
