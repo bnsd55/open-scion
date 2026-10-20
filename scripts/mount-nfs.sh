@@ -52,6 +52,7 @@ export SCION_TOKEN
 for c in sudo mount umount modprobe; do
   command -v "$c" > /dev/null || die "needs $c"
 done
+need
 
 note "building the debug binaries"
 "$TIMEOUT" 300 cargo build --locked --quiet -p open-scion-server -p open-scion
