@@ -51,6 +51,18 @@ fn every_supported_cell_runs_natively_and_every_platform_job_is_claimed() {
     );
 
     let mut claimed: Vec<String> = Vec::new();
+    // A platform job can also be claimed as evidence in a row's Why
+    // (`power-loss` is the daemon's power-cut evidence, not a cell of
+    // its own): a backticked mention in the Why counts.
+    for key in jobs.keys() {
+        let name = key.split(':').nth(1).unwrap_or("");
+        if rows
+            .iter()
+            .any(|row| row.why.contains(&format!("`{name}`")))
+        {
+            claimed.push(name.to_owned());
+        }
+    }
     for row in &rows {
         let cell = format!(
             "{} on {} {} ({})",
@@ -94,6 +106,11 @@ fn every_supported_cell_runs_natively_and_every_platform_job_is_claimed() {
     }
 
     for name in PLATFORM_JOBS {
+        assert!(
+            jobs.keys().any(|k| k.split(':').nth(1) == Some(*name)),
+            "the {name} job is gone from the workflows while the matrix \
+             still names it"
+        );
         assert!(
             claimed.iter().any(|c| c == name),
             "the {name} job runs a platform suite no matrix row claims"
@@ -265,6 +282,7 @@ struct Row {
     postgres: Option<String>,
     status: String,
     job: Option<(String, String)>,
+    why: String,
 }
 
 /// The matrix rows of docs/support.md: the table under "## Platform
@@ -314,6 +332,7 @@ fn matrix_rows() -> Vec<Row> {
             },
             status: cell(6).to_owned(),
             job,
+            why: cell(8).to_owned(),
         });
     }
     rows

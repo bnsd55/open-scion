@@ -24,18 +24,17 @@ marked supported here.
 | scion-server | Linux | x64 | tmpfs | — | supported | `test` (ci.yml) | The `disk_full` step fills a real tmpfs (`SCION_DISK_REQUIRE=1`) |
 | scion-server | Linux | arm64 | ext4 | — | best effort | — | The code has no arch pins, but no native job runs it yet; hosted `ubuntu-24.04-arm` is free for public repos |
 | scion-server | Linux | arm64 | ext4 | 17 | best effort | — | Same: the arm64 job lands before this cell claims supported |
-| scion-server | macOS | arm64 | ext4 | — | supported | `test-macos` (ci.yml) | Native `macos-15` runner, full workspace suite |
+| scion-server | macOS | arm64 | APFS | — | supported | `test-macos` (ci.yml) | Native `macos-15` runner, full workspace suite; the runner's disk is APFS |
 | scion-server | Windows | x64 | any | — | unsupported | — | No job builds or tests it; the lock files and paths assume POSIX. Unsupported until a native job exists |
 | scion-cache | Linux | x64 | memory | — | supported | `test` (ci.yml) | The suite covers the tier crate; objects live in memory |
 | scion-cache | Linux | arm64 | memory | — | best effort | — | No native job yet |
 | scion-cache | macOS | arm64 | memory | — | supported | `test-macos` (ci.yml) | The suite covers the tier crate |
-| scion-daemon | Linux | x64 | local disk | — | supported | `test` (ci.yml) | The suite covers the tier crate; power cuts are proven by the `power-loss` job (LazyFS fault injection, a harness — not a filesystem promise) |
-| scion-daemon | Linux | x64 | power cuts | — | supported | `power-loss` (ci.yml) | The daemon on LazyFS takes block-level power cuts and must keep every acknowledgment |
+| scion-daemon | Linux | x64 | local disk | — | supported | `test` (ci.yml) | The suite covers the tier crate; the daemon's power-cut evidence is the `power-loss` job (LazyFS fault injection, a harness — not a filesystem promise) |
 | scion-daemon | Linux | arm64 | local disk | — | best effort | — | No native job yet |
-| scion-daemon | macOS | arm64 | local disk | — | supported | `test-macos` (ci.yml) | The suite covers the tier crate |
+| scion-daemon | macOS | arm64 | local disk (APFS) | — | supported | `test-macos` (ci.yml) | The suite covers the tier crate |
 | scn | Linux | x64 | any | — | supported | `test` (ci.yml) | The CLI suite runs in the workspace job |
 | scn | Linux | arm64 | any | — | best effort | — | No native job yet |
-| scn | macOS | arm64 | any | — | supported | `test-macos` (ci.yml) | The CLI suite runs in the macOS job |
+| scn | macOS | arm64 | any | — | supported | `test-macos` (ci.yml) | The CLI suite runs in the macOS job; the runner's disk is APFS |
 | scn mount | Linux | x64 | NFS | — | supported | `nfs-mount` (ci.yml) | The kernel NFS client mounts scn's server on the runner |
 | scn mount | macOS | arm64 | NFS | — | best effort | — | macOS can mount NFS, but no job proves it |
 | scn mount | Windows | any | any | — | unsupported | — | The mount serves NFSv3 and rides POSIX mounts |
