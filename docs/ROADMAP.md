@@ -16,29 +16,55 @@ immutable GitHub release, nothing published anywhere else.
 
 Make the project safe to install anywhere it claims to work.
 
-- A clean install and the [quick start](../README.md#try-it) pass on every
-  supported platform (Linux and macOS), under umask 002 and umask 022,
-  per the release smoke that CI runs on every release commit.
-- No known flaky test.
-- Ubuntu's umask 002 and user private groups trip the group-writable
-  checks.
+- A clean install and the [quick start](../README.md#try-it) pass on
+  every supported platform (Linux and macOS), under umask 002 and umask
+  022: done, [#317](https://github.com/bnsd55/openscion/issues/317)
+  landed the release smoke, and its CI job runs on every push, in a
+  matrix over ubuntu-24.04 and macos-15, since [#326](https://github.com/bnsd55/openscion/pull/326).
+- No known flaky test: a standing gate of this milestone, watched by
+  the scheduled nightly suite.
+- [Ubuntu's umask 002 and user private groups trip the group-writable
+  checks](https://github.com/bnsd55/openscion/issues/302): open, the
+  last item of this gate.
 
 ## v0.2.0 - compatibility and recovery
 
 Make the pieces trustworthy together, and the data safe to lose.
 
 - Clients, servers, caches and daemons of version N and N-1 work
-  together, per a written compatibility policy.
-- A store written by an old build opens and upgrades.
+  together, per a written compatibility policy: done,
+  [#329](https://github.com/bnsd55/openscion/issues/329) landed
+  [compatibility.md](compatibility.md), and
+  [#336](https://github.com/bnsd55/openscion/issues/336) and
+  [#347](https://github.com/bnsd55/openscion/issues/347) landed the
+  version-matrix job that runs the policy's pairs.
+- A store written by an old build opens and upgrades: done,
+  [#318](https://github.com/bnsd55/openscion/issues/318) closed through
+  [#323](https://github.com/bnsd55/openscion/pull/323), which builds a
+  version-1 store of each backend in place and serves from it after the
+  open migrates it.
 - A backup of the data directory, and of a Postgres-backed store,
-  restores and serves.
-- `ticket-key` rotation runs while reads serve: done, [#242](https://github.com/bnsd55/openscion/issues/242)
-  landed the end-to-end test of the steps in [operations](operations.md#2-ticket-keys).
+  restores and serves: done,
+  [#319](https://github.com/bnsd55/openscion/issues/319) closed through
+  [#322](https://github.com/bnsd55/openscion/pull/322) — the runbook of
+  [operations](operations.md) for both backends, and a test that
+  restores a snapshot taken while the server serves.
+- `ticket-key` rotation runs while reads serve: done,
+  [#242](https://github.com/bnsd55/openscion/issues/242) landed the
+  end-to-end test of the steps in [operations](operations.md#2-ticket-keys).
 - The version matrix runs the client, server, cache, daemon and store
   pairs the policy claims, and the operating metrics it reports are
-  named.
+  named: done,
+  [#239](https://github.com/bnsd55/openscion/issues/239) closed with
+  the matrix green on `main`, the nightly soak
+  ([#320](https://github.com/bnsd55/openscion/issues/320)) running the
+  mixed workload with named ceilings, and the last missing operating
+  metric (gc's) a textfile
+  ([#327](https://github.com/bnsd55/openscion/issues/327)).
 - The fault and recovery matrix: disk full, EIO, a Postgres restart,
-  mismatched restores.
+  mismatched restores: done,
+  [#238](https://github.com/bnsd55/openscion/issues/238) closed with a
+  row per case in [faults](faults.md), each naming its test.
 
 ## v0.3.0 - a single-node operational beta
 
@@ -46,10 +72,13 @@ Prove the one-machine server under real load.
 
 - A 72-hour soak and fault job runs against one server, with resource
   ceilings named in advance, and its raw numbers published in
-  [benchmarks](benchmarks.md); the soak workload and the metrics it
-  reports are the operating-metrics work of v0.2.0.
-- [The checkout benchmark stands against `git clone`](https://github.com/bnsd55/openscion/issues/6)
-  and the numbers say where the line is.
+  [benchmarks](benchmarks.md): done, the nightly soak
+  ([#320](https://github.com/bnsd55/openscion/issues/320)) runs the
+  mixed workload with named ceilings, and the numbers land in
+  [benchmarks](benchmarks.md).
+- [The checkout benchmark stands against `git clone`](https://github.com/bnsd55/openscion/issues/6):
+  done, the comparison and its numbers are in
+  [benchmarks](benchmarks.md).
 
 ## v0.4.0 - the production boundary
 
