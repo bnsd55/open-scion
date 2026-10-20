@@ -38,6 +38,7 @@ async fn root_tree(objects: &mut Objects, changeset: ChangesetId) -> TreeId {
 }
 
 use scion_core::{Changeset, ChangesetId, Tree, TreeId};
+use scion_server::Backend;
 
 fn seed() -> u64 {
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH);
@@ -52,6 +53,15 @@ fn seed() -> u64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_reply_survives_a_kill_of_the_server() {
+    if Backend::test_is_postgres() {
+        // The rows operate on the SQLite file of the data directory: the
+        // ledger checks reopen `scion.db` directly, and the schema-upgrade
+        // row copies it. The Postgres kill story is the database rows:
+        // `backend_refusals.rs` proves the unreachable database and the
+        // takeover, and the metadata rides on Postgres's own durability.
+        eprintln!("skip on postgres: the rows operate on the SQLite file of the data directory");
+        return;
+    }
     let mut rng = Rng::new(seed());
     let kills = usize::try_from(env("SCION_CRASH_KILLS", 6)).unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -180,6 +190,11 @@ fn schema(data: &Path) -> Schema {
 /// transaction. The next start upgrades it and serves.
 #[test]
 fn a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one() {
+    if Backend::test_is_postgres() {
+        // The row copies and swaps the SQLite file of the data directory.
+        eprintln!("skip on postgres: the row operates on the SQLite file of the data directory");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let (data, log) = (dir.path().join("data"), dir.path().join("server.log"));
     let root = version_2_data(&data);

@@ -24,6 +24,7 @@ use scion_proto::v1::{
     LandResponse, LandState, PutBlobRequest, ResolveRefRequest,
 };
 use scion_server::Backend;
+use scion_server::test_support::meta::Meta as _;
 use scion_server::test_support::meta::MetaTx as _;
 use scion_server::test_support::store::BlobStatus;
 use scion_server::test_support::{store::Store, tree};
@@ -85,7 +86,11 @@ impl Server {
 
 impl Server {
     /// Starts a server on `data` and waits until it listens. It appends its
-    /// log to `log`.
+    /// log to `log`. In Postgres mode (`SCION_TEST_BACKEND=postgres`) it
+    /// proves the backend it was asked for before it returns: the data
+    /// directory carries the Postgres marker and no SQLite database, so a
+    /// run whose spawn lost its `--postgres-url` fails here, not vacuously
+    /// as a second SQLite run.
     pub(crate) fn start(data: &Path, log: &Path) -> Self {
         let mut server = Self::spawn(data, log);
         let start = Instant::now();
@@ -96,6 +101,18 @@ impl Server {
             }
             assert!(start.elapsed() < Duration::from_secs(60), "no listen");
             std::thread::sleep(Duration::from_millis(10));
+        }
+        if Backend::test_is_postgres() {
+            let marker = fs::read_to_string(data.join("backend")).unwrap_or_default();
+            assert_eq!(
+                marker.lines().next(),
+                Some("postgres"),
+                "the server is not Postgres-backed: marker {marker:?}"
+            );
+            assert!(
+                !data.join("scion.db").exists(),
+                "a Postgres-backed server must not keep a SQLite database"
+            );
         }
         server
     }
@@ -121,14 +138,26 @@ impl Server {
             .append(true)
             .open(log)
             .unwrap();
+        // The Postgres mode of the fault suites: metadata from the test
+        // database, one schema per data directory, the same name
+        // `Backend::open_test` gives it. The URL carries the schema as a
+        // libpq `options` parameter, which the open merges with its own
+        // options, so the tables and rows of this directory land in it.
+        let postgres_url = if Backend::test_is_postgres() {
+            Some(postgres_url(data))
+        } else {
+            None
+        };
         // The child shares a flock until it execs (see `spawn_guard`): the
         // read side keeps this spawn out of a lock-release window of
         // another test.
         let child = spawn_guard::across_spawn(|| {
-            Command::new(env!("CARGO_BIN_EXE_scion-server"))
-                .arg("--data")
-                .arg(data)
-                .args(["serve", "--token", TOKEN, "--listen", "127.0.0.1:0"])
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_scion-server"));
+            cmd.arg("--data").arg(data);
+            if let Some(url) = &postgres_url {
+                cmd.arg("--postgres-url").arg(url);
+            }
+            cmd.args(["serve", "--token", TOKEN, "--listen", "127.0.0.1:0"])
                 // Plain log lines, so the address parses without escape
                 // codes.
                 .env("NO_COLOR", "1")
@@ -146,6 +175,48 @@ impl Server {
             addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             url: String::new(),
         }
+    }
+}
+
+/// The `--postgres-url` of a server on `data`: the test database, with the
+/// data directory's own schema as the search path, which this creates
+/// first. The name is the one `Backend::open_test` gives the same
+/// directory, so a pre-seeded store and the server that serves it share
+/// one schema.
+fn postgres_url(data: &Path) -> String {
+    let url = std::env::var("SCION_TEST_POSTGRES_URL")
+        .expect("SCION_TEST_POSTGRES_URL must name the test database");
+    let schema = Backend::test_schema(data).expect("postgres mode names a schema");
+    let mut client =
+        postgres::Client::connect(&url, postgres::NoTls).expect("the test database connects");
+    client
+        .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+        .unwrap();
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}options=--search_path%3D{schema}")
+}
+
+/// The store of a data directory for a process beside the server: SQLite
+/// in the SQLite runs, and the Postgres test backend in the Postgres ones,
+/// which keeps the metadata in the database and no SQLite file in the
+/// directory.
+pub(crate) fn open_store(data: &Path) -> Backend {
+    if Backend::test_is_postgres() {
+        Backend::open_test(data).unwrap()
+    } else {
+        Backend::Sqlite(Store::open(data).unwrap())
+    }
+}
+
+/// [`open_store`], as a process that does not land: the checker and racer
+/// helpers that only verify blob files open this, and a Postgres open of
+/// it keeps the metadata in the database instead of making a stray
+/// SQLite file in a Postgres-backed directory.
+pub(crate) fn open_store_shared(data: &Path) -> Backend {
+    if Backend::test_is_postgres() {
+        Backend::open_test_shared(data).unwrap()
+    } else {
+        Backend::Sqlite(Store::open_shared(data).unwrap())
     }
 }
 
@@ -283,7 +354,7 @@ pub(crate) struct Ledger {
 
 /// Repo `r` with one root changeset, and refs `main` and `dev` at it. No RPC
 pub(crate) fn create_repo(data: &Path) {
-    let store = Store::open(data).unwrap();
+    let store = open_store(data);
     let readme = store.blobs().put(b"crash suite\n").unwrap();
     let root = Changeset::new(
         vec![],
@@ -303,12 +374,8 @@ pub(crate) fn create_repo(data: &Path) {
     store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
-            let (id, _) = tree::store_changeset(
-                c,
-                repo,
-                &root,
-                &mut tree::lens_of(&Backend::Sqlite(store.clone())),
-            )?;
+            let (id, _) =
+                tree::store_changeset(c, repo, &root, &mut tree::lens_of(&store.clone()))?;
             for name in REFS {
                 assert!(c.cas_ref(repo, name, None, id)?);
             }

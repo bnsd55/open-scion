@@ -264,7 +264,10 @@ jobs:
           SCION_LAZYFS_TRACE_DIR: ${{ runner.temp }}/lazyfs-trace
           SCION_TEST_BACKEND: postgres
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
-        run: cargo test -p open-scion-server --test power
+        # One server of the database at a time: the binary's Postgres open
+        # takes the database's one-server lock, so the suite runs serially
+        # here. The SQLite run above stays parallel.
+        run: cargo test -p open-scion-server --test power -- --test-threads=1
       # The suite writes the LazyFS ops trace to
       # $SCION_LAZYFS_TRACE_DIR/lazyfs-r<N>.log; on a failure the trace
       # says what the cut actually persisted.
