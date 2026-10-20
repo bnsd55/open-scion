@@ -94,6 +94,7 @@ async fn every_reply_survives_a_kill_of_the_server() {
         for client in clients {
             let mut got = client.await.unwrap();
             ledger.blobs.append(&mut got.blobs);
+            ledger.oplog.merge(got.oplog);
             cut += got.lands.iter().filter(|sent| sent.reply.is_none()).count();
             ledger.lands.append(&mut got.lands);
         }
