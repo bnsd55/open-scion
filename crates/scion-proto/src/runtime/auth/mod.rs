@@ -440,13 +440,13 @@ fn fd_has_hidden_acl(fd: impl rustix::fd::AsFd, mode: u32, dir: bool) -> bool {
 
 /// Whether an ancestor directory's ACLs grant what its mode's bits do
 /// not. Opened `O_NOFOLLOW` and descriptor-checked, so the fd is the
-/// directory the walk checked; `O_PATH` on Linux needs no permission of
-/// its own.
+/// directory the walk checked. An `O_PATH` descriptor will not do: the
+/// xattr reads answer `EBADF` for one, so the directory opens read-only.
 #[cfg(target_os = "linux")]
 fn ancestor_has_hidden_acl(dir: &Path, mode: u32) -> io::Result<bool> {
     let opened = rustix::fs::open(
         dir,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         rustix::fs::Mode::empty(),
     )?;
     Ok(fd_has_hidden_acl(&opened, mode, true))
@@ -567,30 +567,6 @@ mod tests {
     fn mkdir(path: &Path, mode: u32) {
         fs::create_dir(path).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-    }
-
-    /// TEMPORARY debug probe: what do the xattr reads answer on CI?
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn debug_probe_xattr_answers() {
-        let tmp = tempfile::tempdir().unwrap();
-        for (label, path) in [("/tmp", Path::new("/tmp")), ("fresh", tmp.path())] {
-            let opened = rustix::fs::open(
-                path,
-                OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            );
-            match opened {
-                Err(e) => println!("PROBE {label}: open ERR {e:?}"),
-                Ok(fd) => {
-                    for name in ["system.posix_acl_access", "system.posix_acl_default"] {
-                        let mut buf = [0u8; 64];
-                        let r = rustix::fs::fgetxattr(&fd, name, &mut buf);
-                        println!("PROBE {label} {name}: {r:?}");
-                    }
-                }
-            }
-        }
     }
 
     fn mode_of(path: &Path) -> u32 {
