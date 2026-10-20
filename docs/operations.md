@@ -660,6 +660,32 @@ first internal error from a read:
 
 Proof: crates/scion-server/tests/storage.rs::a_failing_disk_runbook_fscks_restores_and_serves
 
+### A Postgres restart
+
+A Postgres-backed server keeps running when the database restarts under
+it: the calls that touch the database answer while it is down (a write
+answers the busy error a client retries against), the store does not
+fence itself (an unreachable database is no proof that another process
+took the data), and no server restart is part of the fix. When the
+database is back, the next write reconnects, takes the advisory lock
+again, and runs; nothing needs cleaning up by hand. The runbook is:
+
+1. Watch `scion_pg_pool_wait_seconds` and the busy errors: they tell a
+   database that is down from one that is slow.
+2. Fix the database (restart the container or the service); the server
+   needs nothing.
+3. After the restart, one write is the check: it runs, and the reads
+   behind it see the data. If a write keeps failing after the database
+   is back, the fence is the suspect: the fence is section 1's "One
+   server process serves one database" - a fenced server exits 70, and
+   a supervisor restart of it takes the lock back or refuses.
+
+The one thing not to do: do not restart the server while the database
+is down. A start against an unreachable database fails, and a restart
+throws away the sessions that would reconnect on their own.
+
+Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover
+
 ## 6. What to watch
 
 **Metrics.** The server and the cache export Prometheus metrics at
