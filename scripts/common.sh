@@ -47,6 +47,16 @@ need() {
   for c in cargo git pkill seq curl; do
     command -v "$c" > /dev/null || die "needs $c"
   done
+  # GNU timeout caps every client and maintenance call. A default Mac
+  # has none: Homebrew installs it as gtimeout (issue #399, whose soak
+  # machine failed every call at once because nothing checked).
+  if command -v timeout > /dev/null 2>&1; then
+    TIMEOUT=timeout
+  elif command -v gtimeout > /dev/null 2>&1; then
+    TIMEOUT=gtimeout
+  else
+    die "needs GNU timeout (macOS: brew install coreutils)"
+  fi
   [ -x /usr/bin/time ] || die "needs /usr/bin/time (Debian, Ubuntu: apt install time)"
 }
 
@@ -234,6 +244,91 @@ batch() {
 
 # wall FILE: the wall time, in seconds, from the /usr/bin/time -p report in
 # FILE. cpu FILE...: the user plus system CPU time of all the reports.
+
+# The slow client: it holds a ReadFile stream open and drains it at a
+# crawl, so back pressure reaches the server (issue #239). The crawl is
+# dd, one 4 KiB block at a time with a pause between: `read -N` exists
+# in neither dash (Ubuntu's /bin/sh) nor bash 3.2 (macOS's /bin/sh and
+# /bin/bash), so a reader built on it exited at once - hidden by `||
+# true` - and no nightly ever held a stream (issue #399). Each drain
+# logs epoch,bytes,held into $WORK/slow-held.csv, and
+# check_slow_stream fails the run on a drain that read fewer bytes
+# than the file has and did not end inside a kill window: it ended
+# early while the server was still serving, which is what the old
+# reader did on every pass.
+SLOW_FILE=${SLOW_FILE:-main:tokio/CHANGELOG.md}
+SLOW_DRAIN_CAP=${SLOW_DRAIN_CAP:-180}
+
+slow_reader() {
+  local t0 now total
+  while [ "$(date +%s)" -lt "$END" ]; do
+    t0=$(date +%s)
+    # shellcheck disable=SC2016 # the drain reads its own $1 and $2
+    total=$("$TIMEOUT" "$SLOW_DRAIN_CAP" sh -c '
+      eval "$1" | {
+        total=0
+        while :; do
+          dd bs=4096 count=1 of="$2" 2> /dev/null || break
+          sz=$(wc -c < "$2")
+          [ "$sz" -gt 0 ] || break
+          total=$((total + sz))
+          sleep 0.25
+        done
+        echo "$total"
+      }' drain "$BIN/scn --server $SERVER cat $SLOW_FILE" "$WORK/slow.block" \
+      2>> "$WORK/slow.log")
+    [ -n "$total" ] || total=0
+    now=$(date +%s)
+    echo "$(date +%s),$total,$((now - t0))" >> "$WORK/slow-held.csv"
+    sleep 1
+  done
+}
+
+# count_fds PID: the server's open files. macOS has no /proc, where a
+# find of /proc/PID/fd failed into /dev/null and every count was 0, so
+# the open-files bound passed vacuously (issue #399); there it is
+# lsof, which costs a few ms once every 10 s. Linux reads /proc.
+count_fds() {
+  case $(uname -s) in
+    Darwin) lsof -p "$1" 2> /dev/null | tail -n +2 | wc -l | tr -d ' ' ;;
+    *) find "/proc/$1/fd" -maxdepth 1 2> /dev/null | wc -l | tr -d ' ' ;;
+  esac
+}
+
+# check_slow_stream EXPECTED: EXPECTED is the file's byte size, taken
+# once while the server was fresh. A drain that read fewer bytes and
+# did not overlap a kill - soak-fault's restarts.csv names them; the
+# plain soak has none - ended early while the server was still
+# serving, and fails the run (issue #399). A run whose slow reader
+# held no stream at all fails the same way: a measurement that reads
+# nothing is a broken measurement, not a passing one.
+check_slow_stream() {
+  local expected=$1 red=0 any=0 start bytes held end kills
+  kills=""
+  if [ -f "$WORK/restarts.csv" ]; then
+    kills=$(cut -d' ' -f3 "$WORK/restarts.csv" 2> /dev/null)
+  fi
+  while IFS=, read -r start bytes held; do
+    [ -n "$start" ] || continue
+    if [ "$bytes" -ge "$expected" ]; then
+      # This drain delivered the whole file: the reader held a stream.
+      any=1
+      continue
+    fi
+    end=$((start + held))
+    for k in $kills; do
+      [ "$start" -le $((k + 5)) ] && [ "$end" -ge $((k - 5)) ] && continue 2
+    done
+    echo "FAIL: the slow reader ended early: $bytes of $expected bytes, held ${held}s" >&2
+    red=1
+    break
+  done < "$WORK/slow-held.csv"
+  if [ "$any" -eq 0 ]; then
+    echo "FAIL: the slow reader held no stream: no drain delivered the file" >&2
+    return 1
+  fi
+  return "$red"
+}
 wall() { awk '$1 == "real" && NF == 2 { s = $2 } END { printf "%.2f\n", s }' "$1"; }
 cpu() { awk '($1 == "user" || $1 == "sys") && NF == 2 { s += $2 } END { printf "%.2f\n", s }' "$@"; }
 

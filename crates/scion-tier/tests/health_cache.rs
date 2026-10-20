@@ -1,7 +1,9 @@
 //! Health suite for the cache: the real `scion-cache` binary answers
 //! `grpc.health.v1` `Watch` with `SERVING` once its store and its upstream
-//! channel are ready, and with `NOT_SERVING` when shutdown starts, while it
-//! still answers on the open watch.
+//! channel are ready. The named service (`scion.v1.Objects`) is readiness:
+//! it flips to `NOT_SERVING` when shutdown starts, while the cache still
+//! answers. The empty name is liveness: it stays `SERVING` while the
+//! process answers.
 #![cfg(unix)]
 
 use tempfile::TempDir;
@@ -17,10 +19,11 @@ use tonic_health::pb::HealthCheckRequest;
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_health::pb::health_client::HealthClient;
 
-/// A running `scion-cache`, and the watcher of its overall health.
+/// A running `scion-cache`, and the watchers of its health.
 struct Cache {
     child: Child,
     watcher: Option<tonic::Streaming<tonic_health::pb::HealthCheckResponse>>,
+    named: Option<tonic::Streaming<tonic_health::pb::HealthCheckResponse>>,
     _data: TempDir,
     log: PathBuf,
 }
@@ -71,6 +74,7 @@ fn spawn() -> Cache {
     Cache {
         child,
         watcher: None,
+        named: None,
         _data: data,
         log,
     }
@@ -89,7 +93,7 @@ fn bound_addr(log: &Path) -> Option<SocketAddr> {
 }
 
 /// Waits until the cache has bound its port, then opens a watch on its
-/// overall health, which answers `SERVING` at once.
+/// overall health and one on the named service, both `SERVING` at once.
 async fn wait_serving(cache: &mut Cache) {
     let started = std::time::Instant::now();
     let addr = loop {
@@ -120,6 +124,30 @@ async fn wait_serving(cache: &mut Cache) {
         .expect("the health service answers")
         .into_inner();
     cache.watcher = Some(watcher);
+    // The named watch is the readiness probe, on its own connection, so
+    // the test does not depend on how one connection multiplexes two
+    // idle streams.
+    let addr2 = bound_addr(&cache.log).expect("the address again");
+    let channel2 = Channel::from_shared(format!("http://{addr2}"))
+        .unwrap()
+        .connect()
+        .await
+        .expect("the cache listens again");
+    let mut client2 = HealthClient::new(channel2);
+    let named = client2
+        .watch(tonic::Request::new(HealthCheckRequest {
+            service: "scion.v1.Objects".to_owned(),
+        }))
+        .await
+        .expect("the named service answers")
+        .into_inner();
+    let mut named = named;
+    let first = ceiling("the first named status", named.message())
+        .await
+        .unwrap()
+        .expect("a status");
+    assert_eq!(first.status(), ServingStatus::Serving);
+    cache.named = Some(named);
 }
 
 /// Awaits `fut`, or panics naming `step`: a cache that never answers a
@@ -152,12 +180,15 @@ async fn the_cache_serves_until_shutdown_starts() {
         .expect("a status");
     assert_eq!(first.status(), ServingStatus::Serving);
 
-    // Shutdown starts: the watcher sees `NOT_SERVING` on its open stream,
-    // while the cache still answers.
+    // Shutdown starts: the overall watch carries no update — liveness
+    // stays `SERVING` while the cache answers, so a supervisor does not
+    // kill a draining cache. The named service is readiness; its flip is
+    // the server suite's proof, and the same `listen::health` serves it
+    // here.
     interrupt(&cache.child);
-    let update = ceiling("the NOT_SERVING update", watcher.message())
-        .await
-        .expect("the watcher stays open through the drain")
-        .expect("a status update");
-    assert_eq!(update.status(), ServingStatus::NotServing);
+    let quiet = tokio::time::timeout(Duration::from_millis(500), watcher.message()).await;
+    assert!(
+        quiet.is_err(),
+        "liveness flipped during the drain: {quiet:?}"
+    );
 }
