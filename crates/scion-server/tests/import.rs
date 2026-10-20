@@ -563,7 +563,8 @@ fn a_path_scion_cannot_store_fails_the_import() {
 
     let (_dir, store) = open_store();
     match try_import(&store, &git, "HEAD") {
-        Err(Error::Git(msg)) => {
+        Err(e @ Error::Git(_)) => {
+            let msg = e.to_string();
             assert!(msg.contains(&commit), "{msg}");
             assert!(msg.contains("d/d/d/"), "{msg}");
         }

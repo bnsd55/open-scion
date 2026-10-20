@@ -46,7 +46,7 @@ pub enum Error {
     #[error("{0}")]
     FailedPrecondition(String),
     /// A changeset does not apply to its parent tree.
-    #[error(transparent)]
+    #[error("{0}")]
     Apply(#[from] ApplyError),
     /// Stored data does not match its ID or format.
     #[error("corrupt data: {0}")]
@@ -60,9 +60,12 @@ pub enum Error {
     /// The object folder failed.
     #[error("i/o: {0}")]
     Io(#[from] std::io::Error),
-    /// A git repository could not be read during import.
+    /// A git repository could not be read during an import. The message
+    /// says what the import was doing; the git library's own error is the
+    /// source, for the log, when there is one. Which git library the
+    /// server embeds is not part of the API.
     #[error("git: {0}")]
-    Git(String),
+    Git(#[source] Git),
     /// Another writer kept winning a race. Nothing was written; the same
     /// request may succeed if retried.
     #[error("{0}")]
@@ -122,6 +125,50 @@ impl std::fmt::Display for StorageClass {
 pub struct Storage {
     class: StorageClass,
     source: Source,
+}
+
+/// A git failure of an import: the context the import was in, and the
+/// git library's own error as the source, when there is one. The fields
+/// are private, so the git library's error type never crosses the API.
+#[derive(Debug)]
+pub struct Git {
+    message: String,
+    source: Option<Source>,
+}
+
+impl Git {
+    /// The import refused the work for its own rule (a limit, an object
+    /// kind Scion does not store): there is no underlying error.
+    pub(crate) fn message(message: String) -> Self {
+        Self {
+            message,
+            source: None,
+        }
+    }
+
+    /// The git library failed underneath the import's step: its error is
+    /// the source, so the log keeps the chain.
+    pub(crate) fn cause(message: String, source: impl Into<Source>) -> Self {
+        Self {
+            message,
+            source: Some(source.into()),
+        }
+    }
+}
+
+impl std::fmt::Display for Git {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for Git {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.source {
+            Some(source) => Some(&**source),
+            None => None,
+        }
+    }
 }
 
 /// The engine's own error, boxed: it is only ever read as a source.
@@ -204,12 +251,13 @@ pub fn from_sqlite(e: rusqlite::Error) -> Error {
     }
 }
 
-/// A storage error's class text with its causes, for a log line: a
-/// [`Storage`] names only its class, and the engine's detail sits in the
-/// sources.
-fn storage_causes(storage: &Storage) -> String {
-    let mut text = storage.to_string();
-    let mut source = std::error::Error::source(storage);
+/// An error's display text with its causes, for a log line: the display
+/// names the context, and the sources carry the engine's detail. The
+/// same walk serves every error that wraps another, so a wrapped cause
+/// can no longer be dropped from the log by a new variant.
+fn causes(e: &dyn std::error::Error) -> String {
+    let mut text = e.to_string();
+    let mut source = e.source();
     while let Some(cause) = source {
         text.push_str(": ");
         text.push_str(&cause.to_string());
@@ -244,7 +292,7 @@ impl From<Error> for Status {
                     // No repo on this line: the database is shared by
                     // repos. The call whose work failed logs the repo and
                     // the caller.
-                    tracing::warn!(error = %storage_causes(&storage), "the database stayed busy");
+                    tracing::warn!(error = %causes(&storage), "the database stayed busy");
                     Status::unavailable("the database is busy; retry")
                 }
                 // The disk is full, or the quota spent: the server's own
@@ -252,12 +300,12 @@ impl From<Error> for Status {
                 // so it names no server path; the path and the operation
                 // are in the log line of the write that failed.
                 StorageClass::DiskFull => {
-                    tracing::error!(error = %storage_causes(&storage), "the server is out of disk space");
+                    tracing::error!(error = %causes(&storage), "the server is out of disk space");
                     Status::resource_exhausted("the server is out of disk space; retry later")
                 }
                 // Details stay in the server log, not in the reply.
                 StorageClass::Internal => {
-                    tracing::error!(error = %storage_causes(&storage), "internal error");
+                    tracing::error!(error = %causes(&storage), "internal error");
                     Status::internal("internal error")
                 }
             },
@@ -286,8 +334,10 @@ impl From<Error> for Status {
                 Status::unavailable("the disk is read-only; retry later")
             }
             Error::Corrupt(_) | Error::Git(_) | Error::Io(_) => {
-                // Details stay in the server log, not in the reply.
-                tracing::error!(error = %e, "internal error");
+                // Details stay in the server log, not in the reply. The
+                // log line carries the whole source chain, so a wrapped
+                // cause reaches the log even though the reply does not.
+                tracing::error!(error = %causes(&e), "internal error");
                 Status::internal("internal error")
             }
         }
@@ -365,6 +415,38 @@ mod tests {
     fn a_cancelled_call_answers_cancelled_not_deadline_exceeded() {
         let err = Error::Cancelled("its call has gone".to_owned());
         assert_eq!(Status::from(err).code(), Code::Cancelled);
+    }
+
+    /// Every error that wraps another returns it from `source()`: the
+    /// logs walk the chain, so a variant that drops its cause would log
+    /// nothing but its own text. A variant that wraps nothing has no
+    /// source, by design.
+    #[test]
+    fn every_error_that_wraps_another_returns_it_through_source() {
+        // The storage: the chain is Error → Storage → the engine's error.
+        let e = db(ffi::SQLITE_CORRUPT);
+        let source = std::error::Error::source(&e).expect("the storage is the source");
+        assert!(source.source().is_some(), "the engine error is the source");
+        // The apply error: the changeset apply error is the source.
+        let path = RepoPath::new(b"a").expect("the path fits the format");
+        let e = Error::from(ApplyError::DirInTheWay(path));
+        assert!(
+            std::error::Error::source(&e).is_some(),
+            "the apply error is the source"
+        );
+        // The git failure: the chain is Error → Git → the library's error.
+        let e = Error::Git(Git::cause(
+            "cannot open /x".to_owned(),
+            std::io::Error::other("not a repository"),
+        ));
+        let git = std::error::Error::source(&e).expect("the git failure is the source");
+        let cause = git.source().expect("the library error is the source");
+        assert_eq!(cause.to_string(), "not a repository");
+        // The git refusal of its own rule wraps nothing: the chain ends
+        // at the git failure itself, with no further cause.
+        let e = Error::Git(Git::message("the import cap is spent".to_owned()));
+        let git = std::error::Error::source(&e).expect("the git failure is the source");
+        assert!(git.source().is_none(), "the refusal has no cause");
     }
 
     /// A drained pool of Postgres readers answers `unavailable`, so the
