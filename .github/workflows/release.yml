@@ -182,7 +182,11 @@ jobs:
             echo "rustflags=$RUSTFLAGS"
             echo "flags=--locked --release"
           } > out/release-environment.txt
-          (cd out && sum ./* > checksums.txt.tmp && mv checksums.txt.tmp checksums.txt)
+          # The checksums cover the payload; the environment record is
+          # metadata about the build (the runner image rolls weekly, so
+          # the two builds of one run can name different images).
+          (cd out && sum ./* | grep -v ' release-environment.txt$' \
+            > checksums.txt.tmp && mv checksums.txt.tmp checksums.txt)
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.name }}
@@ -208,8 +212,11 @@ jobs:
       - name: Compare the two payloads
         run: |
           set -euo pipefail
-          (cd a && sha256sum ./*) | sort > a.txt
-          (cd b && sha256sum ./*) | sort > b.txt
+          # The payload must agree byte for byte. The environment record
+          # stays out: it describes each build (its runner image), and
+          # one run can span two image versions.
+          (cd a && sha256sum ./* | grep -v ' release-environment.txt$') | sort > a.txt
+          (cd b && sha256sum ./* | grep -v ' release-environment.txt$') | sort > b.txt
           diff a.txt b.txt
           echo "NO DIFFERENCE"
 
