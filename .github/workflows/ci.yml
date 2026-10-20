@@ -93,6 +93,20 @@ jobs:
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: probe /tmp xattrs (temporary debug)
+        run: |
+          python3 - <<'PY'
+          import os, tempfile
+          d = tempfile.mkdtemp()
+          for p in ("/", "/tmp", d):
+              for n in ("system.posix_acl_access", "system.posix_acl_default"):
+                  try:
+                      v = os.getxattr(p, n)
+                      print(p, n, len(v), v.hex())
+                  except OSError as e:
+                      print(p, n, "ERR", e.errno, e.strerror)
+          PY
+          stat -f -c 'fstype %T' /tmp
       - run: cargo test --workspace
         env:
           PROPTEST_CASES: "2000"
@@ -167,20 +181,6 @@ jobs:
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: probe /tmp xattrs (temporary debug)
-        run: |
-          python3 - <<'PY'
-          import os, tempfile
-          d = tempfile.mkdtemp()
-          for p in ("/", "/tmp", d):
-              for n in ("system.posix_acl_access", "system.posix_acl_default"):
-                  try:
-                      v = os.getxattr(p, n)
-                      print(p, n, len(v), v.hex())
-                  except OSError as e:
-                      print(p, n, "ERR", e.errno, e.strerror)
-          PY
-          stat -f -c 'fstype %T' /tmp
       - run: cargo test --workspace
         env:
           PROPTEST_CASES: "2000"
