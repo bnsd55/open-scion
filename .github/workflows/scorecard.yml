@@ -42,7 +42,23 @@ jobs:
           # its score from this run, and the Scorecard team's weekly
           # public scan can reuse it instead of re-running the checks.
           publish_results: true
+      # A second pass in Scorecard's JSON results format, so the policy
+      # check sees EVERY check with its score: the SARIF reports only
+      # checks with findings, and a skipped or errored check must fail
+      # the policy, not hide behind a missing entry. The action's docs
+      # list the supported formats: "The format in which to store the
+      # results [json | sarif | intoto]".
+      - name: run the Scorecard analysis again, as JSON for the policy
+        uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+        with:
+          results_file: results.json
+          results_format: json
+          # Published once, above; a second publish is refused.
+          publish_results: false
       - name: upload the SARIF to code scanning
         uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
         with:
           sarif_file: results.sarif
+      - name: enforce the pinned policy
+        run: python3 scripts/check-scorecard-policy.py results.json
+          .github/scorecard-policy.yml

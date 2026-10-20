@@ -49,11 +49,24 @@ Choose the tokens with care: `--token T` makes one principal, `default`, with
 every right on every repo. For several people or services, use an access
 file instead (see "Tokens: one, or an access file", below).
 
-Stopping the server: Ctrl-C or SIGTERM starts a graceful drain — the
-listeners close, in-flight calls finish, and the process exits 0. A second
-signal while the drain runs ends it at once: the in-flight calls are cut,
-the log says so, and the process exits 1. Wait out the drain; send the
-second signal only when a cut is cheaper than the wait.
+Stopping the server: Ctrl-C or SIGTERM starts a graceful drain, in this
+order — the health service answers `NOT_SERVING` for the service names
+(readiness goes false), the listeners close to new connections, the
+in-flight calls finish, and the process exits 0. The whole server (the
+empty health name) stays `SERVING` while it answers, so a liveness probe
+does not kill a draining server. The in-flight calls have
+`--drain-timeout-secs` (default 600) to finish; past it they are cut, the
+log names the count, and the process exits 1. A second signal while the
+drain runs ends it at once, with the same exit. Wait out the drain; send
+the second signal only when a cut is cheaper than the wait.
+
+A call that was answered kept its promise: a put or a land that the client
+saw a reply for is durable, over the stop and after the restart. A call
+that was cut got no reply and carries no promise. A cut land stays
+`pending`: a retry with the same request key resumes it where it stopped;
+pending lands sweep themselves after `--land-stale-secs` (see the quotas
+above). The metrics gauge `scion_calls_in_flight` counts the calls the
+drain still waits for.
 
 ### Server and a regional cache
 
@@ -561,6 +574,17 @@ token: the server's health covers the services `scion.v1.Scion` and
 `scion.v1.Objects`, a tier's covers `scion.v1.Objects`. The server
 serves no gRPC reflection, so a probe tool must know the health protocol
 itself (`grpc_health_probe` does).
+
+Probe the service's name for readiness and the empty name for liveness.
+Readiness is `NOT_SERVING` from the start of a drain to the exit, so a load
+balancer stops sending work before the listeners close. Liveness stays
+`SERVING` while the process answers — including through a drain — so the
+supervisor restarts a wedged process, not a draining one. Kubernetes
+probes read the same service natively: a readiness probe of
+`grpc.health.v1` on the serving port with `service: scion.v1.Scion`, a
+liveness probe with no service name. A daemon serves a Unix socket, where
+probes do not apply; its stop is the same drain, and the daemon's client
+reconnects.
 
 **The log lines.** Every process logs to stderr with `tracing`; the lines
 that mean something. Every line of a call carries the `call` span's
