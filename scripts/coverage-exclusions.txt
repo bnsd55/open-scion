@@ -4,13 +4,21 @@
 # after the regex. The job fails when a pattern here matches no tracked
 # file, so a vacuous exclusion cannot hide in this file.
 #
-# Today the file holds no patterns, for two reasons the measure makes
+# Today the file holds no patterns, for one reason the measure makes
 # true by construction:
 #
 # - The generated proto code (tonic_prost_build) builds into OUT_DIR
 #   under target/, which the measure never counts.
-# - The test seam of scion-server (the "test_support" module,
-#   lib.rs's "the one test seam") sits behind the test-hooks feature,
-#   and the measure runs the default features, so the seam does not
-#   compile into the report. A regex cannot name part of lib.rs; if
-#   the seam ever moves to its own file, its line goes here.
+#
+# The test seam IS in the measure, and the count is accepted for now
+# (SHORTCUT: the seam rides in the measured files; move its items into
+# their own files - lib.rs's test_support module and the cfg-gated
+# items of backend.rs, pg.rs and store.rs, about 900 lines together -
+# and then one pattern here excludes them). The gate is on the total,
+# and the seam's lines are the tests' own calls: a test build compiles
+# the test-hooks feature (the crate's dev-dependency open-scion-server
+# names it), so lib.rs's test_support module (87 lines) and the
+# cfg-gated hook items across the sources (~800 more) count in every
+# report. They are exercised by the same suite the report measures,
+# so their share is honest test-side code, not unmeasured
+# production code.
