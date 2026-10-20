@@ -1,68 +1,63 @@
 #!/usr/bin/env python3
 """Enforce the pinned Scorecard policy (.github/scorecard-policy.yml).
 
-Usage: check-scorecard-policy.py RESULTS.SARIF POLICY.YML
+Usage: check-scorecard-policy.py RESULTS.JSON POLICY.YML
 
 Fails when a floored check scores below its floor and no unexpired
-exception covers it, and when any exception has expired. The SARIF
-reports only checks with findings; a floored check the SARIF does not
-name counts as 10.
+exception covers it, when a floored check is missing from the results
+entirely (Scorecard skipped it or it errored), and when any exception
+has expired. Score -1 is Scorecard's "could not run" and fails like
+any other score below a floor.
 """
 
 import datetime
 import json
-import re
 import sys
 
 import yaml
-
-
-def scores_from_sarif(path):
-    """check name -> score, from the Scorecard SARIF's results."""
-    with open(path) as f:
-        runs = json.load(f)["runs"]
-    out = {}
-    for run in runs:
-        rules = run.get("tool", {}).get("driver", {}).get("rules", [])
-        for result in run.get("results", []):
-            rule = {}
-            if result.get("ruleIndex") is not None and 0 <= result[
-                    "ruleIndex"] < len(rules):
-                rule = rules[result["ruleIndex"]]
-            name = result.get("ruleId") or rule.get("name")
-            match = re.search(r"score is (\d+)",
-                              result.get("message", {}).get("text", ""))
-            if name and match:
-                out[name] = int(match.group(1))
-    return out
 
 
 def today():
     return datetime.date.today()
 
 
+
+def scores_from_json(path):
+    """check name -> score, from Scorecard's JSON results."""
+    with open(path) as f:
+        return {check["name"]: check["score"]
+                for check in json.load(f)["checks"]}
+
+
 def main():
-    scores = scores_from_sarif(sys.argv[1])
+    scores = scores_from_json(sys.argv[1])
     with open(sys.argv[2]) as f:
         policy = yaml.safe_load(f)
     failures = []
     for check, floor in sorted(policy["floors"].items()):
-        score = scores.get(check, 10)
+        if check not in scores:
+            failures.append(
+                f"{check}: missing from the results (skipped or errored), "
+                f"so its floor {floor} is unverified")
+            continue
+        score = scores[check]
         if score >= floor:
             continue
+        label = ("could not run (-1)" if score == -1
+                 else f"score {score}")
         waived = [
             exc for exc in policy.get("exceptions", [])
             if exc["check"] == check
             and datetime.date.fromisoformat(exc["expires"]) >= today()
         ]
         if waived:
-            print(f"{check}: score {score} < floor {floor}, waived by an "
-                  f"exception of {waived[0]['owner']} "
-                  f"until {waived[0]['expires']}")
+            print(f"{check}: {label} is below its floor {floor}, waived by "
+                  f"an exception of {waived[0]['owner']} until "
+                  f"{waived[0]['expires']}")
         else:
             failures.append(
-                f"{check}: score {score} is below its floor {floor}, and "
-                f"no unexpired exception covers it")
+                f"{check}: {label} is below its floor {floor}, and no "
+                f"unexpired exception covers it")
     for exc in policy.get("exceptions", []):
         if datetime.date.fromisoformat(exc["expires"]) < today():
             failures.append(
@@ -72,8 +67,8 @@ def main():
         for line in failures:
             print(f"policy violation: {line}", file=sys.stderr)
         return 1
-    print(f"policy holds: {len(policy['floors'])} floors checked, "
-          f"{len(scores)} checks scored, no violations")
+    print(f"policy holds: {len(policy['floors'])} floors checked against "
+          f"{len(scores)} scored checks, no violations")
     return 0
 
 
