@@ -787,7 +787,7 @@ mod tests {
             eprintln!("setfacl is missing; the real-ACL case is skipped");
             return;
         }
-        let (tmp, _me) = tempdir();
+        let (tmp, me) = tempdir();
         let file = tmp.path().join("shared");
         fs::write(&file, b"bytes").unwrap();
         fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
@@ -820,7 +820,7 @@ mod tests {
                 .status
                 .success()
         );
-        let err = check_ancestors(&dir.join("child"), _me).unwrap_err();
+        let err = check_ancestors(&dir.join("child"), me).unwrap_err();
         assert!(
             err.to_string().contains("ACL beyond its mode bits"),
             "{err}"
