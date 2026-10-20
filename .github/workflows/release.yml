@@ -65,12 +65,16 @@ jobs:
             [ "$(echo "$object" | jq -r .tagger.email)" = bnsd55@gmail.com ] || {
               echo "the tagger is not the owner"; exit 1; }
           fi
-          # The tagged commit is on main: comparing main to it must say
-          # the tag is behind (an ancestor), not ahead or diverged.
+          # For a real release, the tagged commit is on main: comparing
+          # main to it must say the tag is behind (an ancestor), not
+          # ahead or diverged. A dry-run proves the pipeline on a branch
+          # and skips this check with the signature checks.
           peeled="$(echo "$object" | jq -r .object.sha)"
-          status="$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$peeled" --jq .status)"
-          [ "$status" = behind ] || [ "$status" = identical ] || {
-            echo "the tagged commit is not on main"; exit 1; }
+          if [ "$dry" != true ]; then
+            status="$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$peeled" --jq .status)"
+            [ "$status" = behind ] || [ "$status" = identical ] || {
+              echo "the tagged commit is not on main"; exit 1; }
+          fi
           echo "peeled=$peeled" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
