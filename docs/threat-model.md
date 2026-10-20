@@ -124,9 +124,9 @@ that breaks one is caught.
   `scion-server/tests/every_rpc_unauthenticated.rs::every_rpc_answers_unauthenticated_without_a_valid_token`
 - **A token is one principal.** The access file holds BLAKE3 digests and
   each digest maps to one principal with its rules.
-  `scion-proto/src/runtime/auth.rs::each_token_gets_its_own_principal`. The
+  `scion-proto/src/runtime/auth/mod.rs::each_token_gets_its_own_principal`. The
   compare is constant
-  time (`auth.rs`, `constant_time_eq`); no test yet - a timing test is
+  time (`scion-proto/src/runtime/auth/mod.rs::constant_time_eq`); no test yet - a timing test is
   not reliable, so the code is the proof.
 - **A repo outside a principal's rules does not exist.** Every RPC
   answers `NOT_FOUND` for it, as for a repo that is not there.
@@ -172,10 +172,10 @@ that breaks one is caught.
   a whole-keeping file refuses group and others write; a symlink dies
   at the open; the ancestors are checked, with the sticky-bit exception;
   and the bytes are read from the checked descriptor.
-  `scion-proto/src/runtime/auth.rs::a_file_owned_by_another_account_is_refused`,
-  `scion-proto/src/runtime/auth.rs::a_group_readable_secret_is_refused_and_a_group_writable_shared_file_is_refused`,
-  `scion-proto/src/runtime/auth.rs::a_secret_reads_through_the_descriptor_and_a_link_dies_at_the_open`,
-  `scion-proto/src/runtime/auth.rs::a_directory_that_others_can_write_is_refused_unless_sticky`,
+  `scion-proto/src/runtime/auth/mod.rs::a_file_owned_by_another_account_is_refused`,
+  `scion-proto/src/runtime/auth/mod.rs::a_group_readable_secret_is_refused_and_a_group_writable_shared_file_is_refused`,
+  `scion-proto/src/runtime/auth/mod.rs::a_secret_reads_through_the_descriptor_and_a_link_dies_at_the_open`,
+  `scion-proto/src/runtime/auth/mod.rs::a_directory_that_others_can_write_is_refused_unless_sticky`,
   `scion-server/src/main.rs::key_file_tests:a_key_owned_by_another_user_is_refused`,
   `scion-proto/src/runtime/tls.rs::a_symlinked_certificate_is_refused_with_a_perfect_target`
 - **A data directory opens only as one server, for one build.** The
@@ -212,6 +212,11 @@ that breaks one is caught.
   reachable by
   other local users is out of profile, not hidden: the mount says so at
   start and in `--help`.
+- **The directory checks read no ACL that the mode does not grant, and
+  refuse every ACL beyond the mode.** The sticky-bit exception excuses
+  no group write. `scion-proto/src/runtime/auth/mod.rs::a_minimal_acl_matching_the_mode_passes`,
+  `scion-proto/src/runtime/auth/mod.rs::an_acl_beyond_the_mode_is_refused_for_real`,
+  `scion-proto/src/runtime/auth/mod.rs::a_group_writable_ancestor_is_refused_even_with_the_sticky_bit`
 - **Internal errors say `internal error`.** The detail stays in the
   log, named by the request id.
   `scion-server/tests/request_id.rs::a_calls_request_id_names_its_span_in_the_servers_log`
@@ -227,15 +232,27 @@ They become issues as the project moves past alpha.
   defence, and that is the load-time format.
 - A narrowed access file does not cut outstanding tickets: they hold
   for at most 15 minutes from signing, by design (rotate the key to cut
-  at once). Documented, no test.
+  at once). The window and the cut are pinned:
+  `scion-server/tests/access.rs::an_outstanding_ticket_survives_a_narrowed_access_file_until_the_key_rotates`
 - TLS revocation, and hostname checks beyond what the CA signs: no
   test; revocation has no issue yet.
 - The owner and mode checks read no ACLs: an ACL that grants a write
   the mode does not gets past them. Documented as a limit; no test.
-- A partial reader sees real changeset IDs for its view: a new ID with
-  the same view root reveals that a hidden-only change landed. No test.
+- A partial reader sees real changeset IDs for its view: a landing on
+  hidden paths moves `main`, and the reader's `ResolveRef` answers the
+  new ID over an unchanged view. The channel is pinned as documented
+  behavior, not closed:
+  `scion-server/tests/access.rs::a_partial_reader_sees_a_hidden_landing_through_the_ref_id`
 - The page cache makes a shared blob fast, and the rename of a replaced
   blob frees the old file: two side channels the code does not hide. No
-  test.
+  test can exist here: both are behavior of the operating system and
+  the hardware below the process, so no test of this repository can
+  observe them, let alone refuse them. The data directory's file modes
+  are the only wall, and they are tested.
+- The mount's single-user rule rests on the operating system: the NFS
+  server cannot tell local users apart, so the code has nothing to
+  check, and a test of this repository cannot observe other local users
+  either. It is out of profile, and the mount says so at start and in
+  `--help`.
 - `scn mount` serves any local user who can read the mount table: the
   secret is not a wall. Out of profile by design; no test.

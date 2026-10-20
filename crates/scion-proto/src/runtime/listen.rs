@@ -94,6 +94,12 @@ pub(crate) const MAX_CONNECTION_AGE: Duration = Duration::from_secs(30 * 60);
 /// call still in it. At least the server's longest call (600 s).
 pub const CONNECTION_GRACE: Duration = Duration::from_secs(600);
 
+/// The default of `--drain-timeout-secs`: how long the in-flight calls
+/// have to finish once the first signal starts the drain, before the
+/// process cuts them and exits non-zero. At least the server's longest
+/// call (`CONNECTION_GRACE`), so a clean drain is not cut.
+pub const DEFAULT_DRAIN_TIMEOUT: Duration = CONNECTION_GRACE;
+
 /// The bytes of the HTTP/2 client preface.
 const PREFACE_BYTES: usize = 24;
 
@@ -270,8 +276,11 @@ const TIMERS: Timers = Timers {
 /// The gRPC health service (`grpc.health.v1`), on the same port as the
 /// other services and without a token, so a probe needs none. It is
 /// `SERVING` for the whole server (the empty name) and for every name in
-/// `services`; when shutdown starts, every one of these names flips to
-/// `NOT_SERVING`, before the drain, while the server still answers.
+/// `services`. The readiness probe reads a service's name: when shutdown
+/// starts, these names flip to `NOT_SERVING`, before the drain, while the
+/// server still answers. The liveness probe reads the empty name: it
+/// stays `SERVING` while the process answers, so a stop does not tell the
+/// supervisor to kill a draining server.
 ///
 /// Returns the service to add to the router, and the wrapped shutdown.
 pub async fn health(
@@ -289,7 +298,9 @@ pub async fn health(
     }
     let shutdown = async move {
         shutdown.await;
-        for name in std::iter::once("").chain(services.iter().copied()) {
+        // Only the service names flip: the empty name is liveness, and a
+        // stop must not tell the supervisor to kill a draining server.
+        for name in services.iter().copied() {
             reporter
                 .set_service_status(name, tonic_health::ServingStatus::NotServing)
                 .await;
