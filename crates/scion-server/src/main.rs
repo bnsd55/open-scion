@@ -18,7 +18,7 @@ use scion_server::{ImportOptions, import_git};
 
 use scion_server::Metrics;
 use scion_server::Quotas;
-use scion_server::{Backend, Error, ServeOptions, fsck, gc};
+use scion_server::{Backend, Error, ServeOptions, archive, fsck, gc};
 use tracing_subscriber::EnvFilter;
 
 /// The scion server: import, serve and derive.
@@ -181,6 +181,42 @@ enum Command {
     /// One line per problem: kind, ID, path. Exit 0 when it saw no damage,
     /// 1 when it did, 2 when it could not run.
     Fsck,
+    /// Export a whole repository, or the whole store, to a versioned
+    /// logical archive: a directory of files that `verify` checks and
+    /// `restore` replays into an empty store. The format is
+    /// docs/archive-format.md. The metadata sections are one read
+    /// snapshot, so it is safe beside a live server.
+    Export {
+        /// The name of one repository to export.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Export every repository of the store.
+        #[arg(long)]
+        all: bool,
+        /// The archive directory to write. It must not exist.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Check an archive against its format, without the store's code: it
+    /// re-hashes every blob file and every changeset body, and checks
+    /// that every ref, parent, and land input is backed. One line per
+    /// damage. Exit 0 when it saw none, 1 when it did, 2 when it could
+    /// not run.
+    Verify {
+        /// The archive directory to check.
+        #[arg(long)]
+        archive: PathBuf,
+    },
+    /// Replay an archive into an EMPTY data directory: the blob files go
+    /// through the store's own write path, so every object ID carries
+    /// over; the changesets replay in generation order; the refs go back
+    /// with the versions the export read; the pending lands are recorded
+    /// again, so a retry with the same request key resumes.
+    Restore {
+        /// The archive directory to replay.
+        #[arg(long)]
+        archive: PathBuf,
+    },
     /// Collect the blob files and the rows that nothing names any more: a
     /// row whose blob no stored changeset of its repo puts, and a file that
     /// no repo's row names, both older than the grace period. Safe beside a
@@ -234,6 +270,29 @@ enum KindName {
     /// The path history of each changeset.
     #[value(name = "path_history")]
     PathHistory,
+}
+
+/// Runs `export` and prints the manifest's counts. Exits 0, or 2 when
+/// the export could not run.
+fn archive_export(store: &Backend, data: &Path, repo: Option<&str>, all: bool, out: &Path) -> ! {
+    match archive::export(store, data, repo, all, out) {
+        Ok(manifest) => {
+            let counts = &manifest["counts"];
+            println!(
+                "export: {} repos, {} changesets, {} refs, {} lands, {} blobs",
+                counts["repos"],
+                counts["changesets"],
+                counts["refs"],
+                counts["pending_lands"],
+                counts["blobs"],
+            );
+            std::process::exit(0)
+        }
+        Err(e) => {
+            eprintln!("scion-server export: {e}");
+            std::process::exit(2);
+        }
+    }
 }
 
 /// Runs `fsck` against `store`, prints one line per problem, and exits:
@@ -356,18 +415,22 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve(args) => Some(serve_flags(args)?),
         _ => None,
     };
-    // `hash-token` needs no data directory. An import does not land, so it
-    // can run beside the server. `derive` removes rows of older versions of a
-    // kind, which a running server of an older build may read, so it opens as
-    // the server.
+    // `hash-token`, `verify`, and `restore` need no data directory (verify
+    // reads only the archive; restore makes a new one). An import does not
+    // land, so it can run beside the server. `derive` removes rows of older
+    // versions of a kind, which a running server of an older build may
+    // read, so it opens as the server.
     let store = match cli.command {
-        Command::Import { .. } | Command::Fsck | Command::Gc { .. } => Backend::open_shared(
-            &cli.data,
-            cli.postgres_url.as_deref(),
-            cli.postgres_ca.as_deref(),
-        ),
+        Command::Import { .. } | Command::Fsck | Command::Gc { .. } | Command::Export { .. } => {
+            Backend::open_shared(
+                &cli.data,
+                cli.postgres_url.as_deref(),
+                cli.postgres_ca.as_deref(),
+            )
+        }
         Command::HashToken { .. } => return hash_token(),
         Command::TicketKey { .. } => return write_ticket_key(),
+        Command::Verify { .. } | Command::Restore { .. } => unreachable!("handled below"),
         Command::Serve { .. } | Command::Derive { .. } => Backend::open(
             &cli.data,
             cli.postgres_url.as_deref(),
@@ -400,6 +463,36 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::HashToken { .. } | Command::TicketKey { .. } => {
             unreachable!("handled before the store opens")
+        }
+        Command::Verify { archive } => {
+            let damages = match archive::verify(&archive) {
+                Ok(damages) => damages,
+                Err(e) => {
+                    eprintln!("scion-server verify: {e:#}");
+                    std::process::exit(2);
+                }
+            };
+            for line in &damages {
+                println!("{line}");
+            }
+            println!("verify: {} damages", damages.len());
+            std::process::exit(i32::from(!damages.is_empty()));
+        }
+        Command::Restore { archive } => {
+            let names = match archive::restore(&archive, &cli.data, None) {
+                Ok(names) => names,
+                Err(e) => {
+                    eprintln!("scion-server restore: {e:#}");
+                    std::process::exit(2);
+                }
+            };
+            for name in &names {
+                println!("{name}");
+            }
+            println!("restore: {} repos", names.len());
+        }
+        Command::Export { repo, all, out } => {
+            archive_export(&store, &cli.data, repo.as_deref(), all, &out);
         }
         Command::Fsck => {
             return fsck_command(&store);

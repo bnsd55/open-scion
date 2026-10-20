@@ -2265,6 +2265,20 @@ impl MetaTx for PgTx<'_> {
         Ok(changed == 1)
     }
 
+    fn restore_ref(&mut self, repo: RepoId, name: &str, target: &[u8], version: i64) -> Result<()> {
+        self.c.execute(
+            "INSERT INTO refs (repo_id, name, target, version) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (repo_id, name) DO UPDATE SET target = $3, version = $4",
+            &[
+                P::i64(repo.0),
+                P::text(name),
+                P::bytes(target),
+                P::i64(version),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// The stored bytes of a derived value, if computed.
     fn get_derived(
         &mut self,
@@ -2825,6 +2839,49 @@ impl MetaTx for PgTx<'_> {
             &[P::i64(repo.0)],
         )?;
         Ok(rows.iter().map(|row| row.get(0)).collect())
+    }
+
+    fn repo_changesets_with_bodies(
+        &mut self,
+        repo: RepoId,
+    ) -> Result<Vec<(Vec<u8>, i64, Vec<u8>)>> {
+        let rows = self.c.query(
+            "SELECT c.id, c.gen, c.body FROM repo_changesets r \
+             JOIN changesets c ON c.id = r.cs WHERE r.repo_id = $1 ORDER BY c.gen, c.id",
+            &[P::i64(repo.0)],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect())
+    }
+
+    fn list_refs(&mut self, repo: RepoId) -> Result<Vec<(String, Vec<u8>, i64)>> {
+        let rows = self.c.query(
+            "SELECT name, target, version FROM refs WHERE repo_id = $1 ORDER BY name",
+            &[P::i64(repo.0)],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect())
+    }
+
+    fn pending_lands(&mut self, repo: RepoId) -> Result<Vec<crate::meta::PendingLand>> {
+        let rows = self.c.query(
+            "SELECT caller, request_key, target_ref, input_cs FROM lands \
+             WHERE repo_id = $1 AND state = 'pending' ORDER BY land_id",
+            &[P::i64(repo.0)],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| crate::meta::PendingLand {
+                caller: row.get(0),
+                request_key: row.get(1),
+                target_ref: row.get(2),
+                input_cs: row.get(3),
+            })
+            .collect())
     }
 
     /// The body of changeset `cs`, or `None` when it is not stored.
