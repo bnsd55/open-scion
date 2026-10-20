@@ -151,7 +151,7 @@ jobs:
       - name: The SBOM of each shipped binary's crate
         run: |
           set -euo pipefail
-          cargo cyclonedx --all --format json
+          cargo cyclonedx --all --format json --spec-version 1.5
           mkdir -p out
           for crate in open-scion-server open-scion-tier scn; do
             find . -name "$crate.cdx.json" -exec cp {} "out/$crate.cdx.json" \;
