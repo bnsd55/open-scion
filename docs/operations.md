@@ -496,14 +496,13 @@ new database), the marker, and `objects/` into a fresh directory; run
 gc-raced backup left, so run it after every restore, before the server
 serves.
 
-The restore takes a measured time, not a promise: a store of 20 repos,
-1000 changesets and about 32 MiB of raw blob content (1000 files of
-about 32 KiB) restored in about <N> seconds on the `restore time` CI
-job's `ubuntu-24.04` runner, `fsck` included. The number comes only
-from that job (the runner label is the machine class, never a local
-machine) and it is re-measured on every run of the guide's CI; the
-`restore_bench.rs` test prints the seconds and fails past a 600 s
-bound.
+The restore takes a measured time, not a promise: the `restore-bench`
+workflow (a run on `main` or a dispatch, on the fixed `ubuntu-24.04`
+runner, never a local machine) restores a stated store — 20 repos, 1000
+changesets, about 32 MiB of raw blob content in files of about 32 KiB —
+with `fsck`, an open and a read, prints the seconds, and fails past a
+600 s bound. The measured number lives in the workflow's run log and
+this section names it once the first run has printed it.
 
 Proof: crates/scion-server/tests/restore_bench.rs::a_restore_of_a_stated_store_takes_a_stated_time
 
