@@ -60,8 +60,8 @@ jobs:
   # nightly sees what a 72-hour run would. It runs beside the soak, not
   # after it, so one failing never skips the other. The kill schedule
   # and the checks live in scripts/soak-fault.sh; the ceilings reuse
-  # soak's env names, and SOAK_WARMUP_MIN is the baseline window that
-  # soak's RSS bound is moving to (the two align when that lands).
+  # soak's env names, and SOAK_WARM_SECONDS is the baseline window that
+  # soak's RSS bound moves to (#365), applied per restart segment.
   soak-fault:
     name: soak-fault
     runs-on: ubuntu-24.04
@@ -81,7 +81,10 @@ jobs:
           SOAK_RSS_PCT: "150" # 150 percent of the segment's warm RSS,
           SOAK_FD_GROWTH: "100" # 100 open files over the segment's start,
           SOAK_P99_FACTOR: "2" # and the late p99 under 2x the early p99.
-          SOAK_WARMUP_MIN: "10" # the baseline window, per segment.
+          # The RSS baseline window, the same name and rule soak.yml
+          # passes to soak.sh (#365): the baseline is the first sample
+          # after it, per restart segment.
+          SOAK_WARM_SECONDS: "1800"
         run: |
           # The same cap as the soak: 150 min covers 120 min of load.
           timeout 9000 scripts/soak-fault.sh

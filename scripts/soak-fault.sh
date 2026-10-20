@@ -31,12 +31,10 @@
 # beside the running server (release-smoke.sh runs it the same way),
 # and the ledger holds. Ceilings, from soak.yml's names, apply per
 # restart segment - each restart resets the server's memory, so the
-# whole-run bound of soak.sh would false-fail. The RSS baseline is
-# taken SOAK_WARMUP_MIN minutes into each segment; soak.sh takes it
-# from the same window (coder5 is pinning the exact warm-up there -
-# SHORTCUT: this script reads SOAK_WARMUP_MIN, default 10, until that
-# lands, then the two align). A segment shorter than the warm-up window
-# proves the mechanics, not the RSS bound; it is logged and skipped.
+# whole-run bound of soak.sh would false-fail. The RSS baseline is the
+# first sample SOAK_WARM_SECONDS into the segment, the same rule and
+# name #365 gives soak.sh. A segment shorter than the window checks no
+# RSS bound; it is logged and skipped.
 #
 # What this proves and what it does not: the ledger check is
 # system-level - acknowledged lands are in the ref's history after the
@@ -60,11 +58,19 @@ set -euo pipefail
 RUN_MINUTES=${RUN_MINUTES:-10}
 AGENTS=${AGENTS:-2}
 # The ceilings, the same names soak.yml passes to soak.sh. Each applies
-# per restart segment, from the segment's post-warm-up baseline.
+# per restart segment. The RSS baseline is the first sample taken at
+# least SOAK_WARM_SECONDS into the segment, the rule #365 gives soak.sh:
+# the server's memory climbs while its caches fill, and a baseline from
+# the first minute makes every longer warm-up a false red. A segment
+# with no sample after the window checks no RSS bound - it cannot tell
+# warm-up from a leak. With the nightly's 20-minute kill cadence the
+# segments sit inside the 30-minute window, so the nightly checks the
+# fd and p99 bounds and the mechanics of every restart; the RSS bound
+# means something at the 72-hour scale (issue #239).
 SOAK_RSS_PCT=${SOAK_RSS_PCT:-150}
 SOAK_FD_GROWTH=${SOAK_FD_GROWTH:-100}
 SOAK_P99_FACTOR=${SOAK_P99_FACTOR:-2}
-SOAK_WARMUP_MIN=${SOAK_WARMUP_MIN:-10}
+SOAK_WARM_SECONDS=${SOAK_WARM_SECONDS:-1800}
 # The kill schedule, in seconds from the start. Nightly (120 min):
 # every 20 minutes, six kills, the last 2 minutes before the end.
 # Shorter runs kill at a quarter, a half and three quarters of the run.
@@ -492,21 +498,30 @@ done
 # The ceilings, per restart segment, from each segment's post-warm-up
 # baseline. A segment with no sample after its warm-up window proves
 # the mechanics only; say so and move on.
-warm=$((SOAK_WARMUP_MIN * 60))
+warm=$((SOAK_WARM_SECONDS))
 seg_fail=0
 for s in $(seq 1 "$SEG"); do
-  awk -F, -v s="$s" -v w="$warm" -v t0="$(head -n 1 "$WORK/metrics.csv" | cut -d, -f1)" \
-    '$2 == s && ($1 - t0) >= w' "$WORK/metrics.csv" > "$WORK/seg-$s.csv"
+  awk -F, -v s="$s" -v w="$warm" '$2 == s { print }' "$WORK/metrics.csv" > "$WORK/seg-$s.csv"
   if [ ! -s "$WORK/seg-$s.csv" ]; then
-    echo "segment $s: shorter than the warm-up; mechanics only"
+    echo "segment $s: no samples" >&2
+    seg_fail=1
     continue
   fi
-  base_rss=$(head -n 1 "$WORK/seg-$s.csv" | cut -d, -f3)
-  end_rss=$(tail -n 1 "$WORK/seg-$s.csv" | cut -d, -f3)
-  if [ -n "$base_rss" ] && [ -n "$end_rss" ] && \
-    [ "$end_rss" -gt $((base_rss * SOAK_RSS_PCT / 100)) ]; then
-    echo "FAIL: segment $s RSS grew past ${SOAK_RSS_PCT}%: $base_rss KB -> $end_rss KB" >&2
-    seg_fail=1
+  seg_start=$(head -n 1 "$WORK/seg-$s.csv" | cut -d, -f1)
+  # The baseline is the first sample at least SOAK_WARM_SECONDS into
+  # the segment (#365's rule, per segment). None: the segment never
+  # got warm; the RSS bound says nothing there.
+  base_row=$(awk -F, -v s0="$seg_start" -v w="$warm" '($1 - s0) >= w' "$WORK/seg-$s.csv" | head -n 1)
+  if [ -z "$base_row" ]; then
+    echo "segment $s: shorter than the ${SOAK_WARM_SECONDS}s warm-up; checks no RSS bound"
+  else
+    base_rss=$(echo "$base_row" | cut -d, -f3)
+    end_rss=$(tail -n 1 "$WORK/seg-$s.csv" | cut -d, -f3)
+    if [ -n "$base_rss" ] && [ -n "$end_rss" ] && \
+      [ "$end_rss" -gt $((base_rss * SOAK_RSS_PCT / 100)) ]; then
+      echo "FAIL: segment $s RSS grew past ${SOAK_RSS_PCT}% of its warm RSS (the sample after ${SOAK_WARM_SECONDS}s): $base_rss KB -> $end_rss KB" >&2
+      seg_fail=1
+    fi
   fi
   base_fds=$(head -n 1 "$WORK/seg-$s.csv" | cut -d, -f4)
   if ! awk -F, -v s0="$base_fds" -v g="$SOAK_FD_GROWTH" \
