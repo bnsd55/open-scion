@@ -38,7 +38,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::auth::Caller;
 use crate::backend::Marker;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, Storage};
 use crate::history::NodeId;
 use crate::import::SHA1;
 use crate::land::{
@@ -1530,7 +1530,9 @@ fn run_statement(client: &mut Client, job: &Job) -> Result<Reply> {
 /// unreachable database answers what a client retries against.
 fn setup_error(setup: &Setup, ever_held: bool) -> Error {
     if matches!(setup.outcome, SetupOutcome::Unreachable) {
-        return Error::Busy;
+        return Error::Storage(Storage::busy(std::io::Error::other(
+            "the database was unreachable at setup",
+        )));
     }
     Error::FailedPrecondition(lost_message(ever_held).into())
 }
@@ -1785,13 +1787,13 @@ fn connect_on(url: &str, ca: Option<&Path>, options: &str) -> Result<Client> {
     Ok(client)
 }
 
-/// A database error that a caller may retry maps to [`Error::Busy`]: the
-/// importer retries a batch on it, and the gRPC status becomes
-/// UNAVAILABLE. The rest keep their database error.
+/// A database error that a caller may retry maps to a busy [`Storage`]:
+/// the importer retries a batch on it, and the gRPC status becomes
+/// UNAVAILABLE. The rest keep the engine's error as the source.
 fn map_pg_error(e: postgres::Error) -> Error {
     // A connection the database dropped is as retryable as a busy one.
     if e.is_closed() {
-        return Error::Busy;
+        return Error::Storage(Storage::busy(e));
     }
     match e.code() {
         // Deadlock, serialization failure, an administrative shutdown, a
@@ -1801,7 +1803,7 @@ fn map_pg_error(e: postgres::Error) -> Error {
                 || code.code().starts_with("08") =>
         {
             tracing::warn!("the database is busy: {e}");
-            Error::Busy
+            Error::Storage(Storage::busy(e))
         }
         // The lock or the statement waited past its clock, as a SQLite
         // write does past its busy timeout: the caller has been at it
@@ -1814,22 +1816,27 @@ fn map_pg_error(e: postgres::Error) -> Error {
         // foreign key) is one answer among many: it logs quietly.
         Some(code) if code.code().starts_with("23") => {
             tracing::debug!("the database refused a statement: {e}");
-            Error::Pg(e)
+            Error::Storage(Storage::internal(e))
+        }
+        // Out of space: the same shortage, wherever the metadata lives.
+        Some(code) if code.code() == "53100" => {
+            tracing::error!("the server is out of disk space: {e}");
+            Error::Storage(Storage::disk_full(e))
         }
         // A statement the database never saw: the connection could not
         // be made or was cut on the way. No SQLSTATE names it, and a
         // client retries it as it retries a busy one.
         None => {
             tracing::warn!("the database is unreachable: {e}");
-            Error::Busy
+            Error::Storage(Storage::busy(e))
         }
-        // The rest keep their database error, and reach the log in full:
-        // a bug of this backend, such as a bad parameter, must not look
-        // busy, or the importer retries it and the log says nothing but
-        // "busy".
+        // The rest keep the engine's error as the source, and it reaches
+        // the log in full: a bug of this backend, such as a bad parameter,
+        // must not look busy, or the importer retries it and the log says
+        // nothing but "busy".
         _ => {
             tracing::warn!("the database refused a statement: {e}");
-            Error::Pg(e)
+            Error::Storage(Storage::internal(e))
         }
     }
 }

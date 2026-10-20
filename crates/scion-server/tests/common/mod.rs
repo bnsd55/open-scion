@@ -513,12 +513,16 @@ pub fn metadata(store: &Backend, seen: &mut HashSet<Vec<u8>>) -> (BTreeSet<BlobI
     raw.read(|c| {
         let mut named = BTreeSet::new();
         for table in ["changesets", "trees"] {
-            let mut rows = c.prepare(&format!("SELECT id, body FROM {table}"))?;
-            let rows = rows.query_map([], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })?;
+            let mut rows = c
+                .prepare(&format!("SELECT id, body FROM {table}"))
+                .map_err(scion_server::test_support::error::from_sqlite)?;
+            let rows = rows
+                .query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(scion_server::test_support::error::from_sqlite)?;
             for row in rows {
-                let (id, body) = row?;
+                let (id, body) = row.map_err(scion_server::test_support::error::from_sqlite)?;
                 if !seen.insert(id) {
                     continue;
                 }

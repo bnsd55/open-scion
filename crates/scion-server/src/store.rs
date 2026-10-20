@@ -46,7 +46,7 @@ use scion_proto::runtime::auth::create_private_dir_all;
 use crate::db::SqliteTx;
 use crate::deadline::Deadline;
 use crate::derived::DeriveFlights;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, Storage, from_sqlite};
 
 /// The schema version this build makes and reads.
 pub(crate) const SCHEMA_VERSION: u32 = 9;
@@ -337,17 +337,13 @@ impl Store {
     }
 
     /// Opens a data directory for a process of build `build` ([`build`]).
-    fn open_as(dir: &Path, server: bool, build: &str, derive: DeriveFlights) -> Result<Self> {
-        create_private_dir_all(dir)?;
-        // The blobs and the metadata are only as private as the directory:
-        // a group- or others-writable directory lets another user read or
-        // replace them, and so does one under a directory another user can
-        // change.
-        let me = rustix::process::geteuid().as_raw();
+    /// Refuses a data directory that a symlink or a group/others-writable
+    /// mode would make unsafe, before anything opens inside it. The
+    /// refusal is by kind, not by the link's mode: on macOS lchmod can
+    /// give a symlink any mode, so a mode check alone does not catch one,
+    /// and a link's target can change behind the checks.
+    fn refuse_bad_dir(dir: &Path) -> Result<()> {
         let meta = fs::symlink_metadata(dir)?;
-        // The refusal is by kind, not by the link's mode: on macOS lchmod
-        // can give a symlink any mode, so a mode check alone does not
-        // catch one, and a link's target can change behind the checks.
         if meta.file_type().is_symlink() {
             return Err(io::Error::new(
                 ErrorKind::PermissionDenied,
@@ -369,6 +365,17 @@ impl Store {
             )
             .into());
         }
+        Ok(())
+    }
+
+    fn open_as(dir: &Path, server: bool, build: &str, derive: DeriveFlights) -> Result<Self> {
+        create_private_dir_all(dir)?;
+        // The blobs and the metadata are only as private as the directory:
+        // a group- or others-writable directory lets another user read or
+        // replace them, and so does one under a directory another user can
+        // change.
+        Self::refuse_bad_dir(dir)?;
+        let me = rustix::process::geteuid().as_raw();
         let dir = scion_proto::runtime::auth::check_ancestors(dir, me)?;
         // A second server fails here, before it waits for anything.
         let server_lock = if server {
@@ -418,18 +425,18 @@ impl Store {
         // and `write` then waits for a full flush of the drive cache that it
         // shares with concurrent commits and blob syncs. With `ON`, each
         // commit runs its own full flush under the write connection's lock,
-        // which a
-        // shared `Store` needs (see `open_shared`). Its commits are few and
+        // which a shared `Store` needs (see `open_shared`). Its commits are few and
         // large. `checkpoint_fullfsync`: a checkpoint, which is rare, fully
         // flushes the pages it copies before the log can be reused.
-        db.execute_batch(&format!(
+        let pragmas = format!(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;
              PRAGMA fullfsync = {};
              PRAGMA checkpoint_fullfsync = ON;
              PRAGMA foreign_keys = ON;",
             if server { "OFF" } else { "ON" }
-        ))?;
+        );
+        db.execute_batch(&pragmas).map_err(from_sqlite)?;
         // Only a `Store` that is alone changes the schema.
         let version = user_version(&mut SqliteTx(&db))?;
         if !alone && version < SCHEMA_VERSION {
@@ -719,7 +726,9 @@ impl Store {
             .unwrap_or_else(PoisonError::into_inner) += 1;
         let _waiting = WriteWaiter(&self.inner.writers, &self.inner.write_woken);
         let mut db = self.lock();
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(from_sqlite)?;
         let value = f(&mut SqliteTx(&tx))?;
         // Counted before a read can see it, and again once it ended (see
         // `read` and `flush`).
@@ -730,13 +739,14 @@ impl Store {
             // drops here, which rolls it back: nothing was written, exactly
             // as a commit past `busy_timeout` ends.
             self.inner.committed.fetch_add(1, Ordering::Release);
-            return Err(Error::Busy);
+            let fail = std::io::Error::other("the commit was made to fail by the test hook");
+            return Err(Error::Storage(Storage::busy(fail)));
         }
         let committed = tx.commit();
         self.inner.committed.fetch_add(1, Ordering::Release);
         #[cfg(test)]
         self.inner.txes.fetch_add(1, Ordering::Relaxed);
-        committed?;
+        committed.map_err(from_sqlite)?;
         Ok(value)
     }
 
@@ -776,11 +786,12 @@ impl Store {
 /// Opens a connection to `path` with the settings that every connection
 /// needs.
 fn connect(path: &Path, flags: OpenFlags) -> Result<Connection> {
-    let db = Connection::open_with_flags(path, flags)?;
+    let db = Connection::open_with_flags(path, flags).map_err(from_sqlite)?;
     // Writes of the processes take turns: one waits up to 5 s for the
     // other's transaction. A read waits as long while another connection
     // recovers the log.
-    db.busy_timeout(Duration::from_secs(5))?;
+    db.busy_timeout(Duration::from_secs(5))
+        .map_err(from_sqlite)?;
     // Enough for every hot statement, so none is prepared twice.
     db.set_prepared_statement_cache_capacity(64);
     Ok(db)
@@ -928,7 +939,8 @@ fn in_use(dir: &Path, name: &str, by: &str) -> Error {
 }
 
 fn user_version(db: &mut SqliteTx<'_>) -> Result<u32> {
-    Ok(db.pragma_query_value(None, "user_version", |row| row.get(0))?)
+    db.pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(from_sqlite)
 }
 
 /// Runs the migrations from the database's version up to `target`. Only
@@ -943,14 +955,15 @@ pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
     // Each migration runs in its own transaction, with the version it sets.
     // A crash rolls it back, and the next open runs it again from its start.
     for (to, sql) in (1..=target).zip(MIGRATIONS).skip(version as usize) {
-        let tx = db.unchecked_transaction()?;
-        tx.execute_batch(sql)?;
+        let tx = db.unchecked_transaction().map_err(from_sqlite)?;
+        tx.execute_batch(sql).map_err(from_sqlite)?;
         if to == 4 {
             // SQL cannot read the blob IDs inside changeset bytes.
             crate::db::fill_repo_blobs(&tx)?;
         }
-        tx.pragma_update(None, "user_version", to)?;
-        tx.commit()?;
+        tx.pragma_update(None, "user_version", to)
+            .map_err(from_sqlite)?;
+        tx.commit().map_err(from_sqlite)?;
     }
     Ok(())
 }
@@ -2661,7 +2674,10 @@ mod tests {
             assert_eq!(version(&store), SCHEMA_VERSION);
             // A newer schema is refused, alone or not.
             store
-                .write(|c| Ok(c.pragma_update(None, "user_version", 99)?))
+                .write(|c| {
+                    c.pragma_update(None, "user_version", 99)
+                        .map_err(from_sqlite)
+                })
                 .unwrap();
             drop(store);
             super::spawn_guard::wait_for_lock_release(dir.path());
@@ -2929,7 +2945,10 @@ mod tests {
         // Of the write connection, which commits.
         let fullfsync = |store: &Store| -> bool {
             store
-                .read_unflushed(|c| Ok(c.pragma_query_value(None, "fullfsync", |row| row.get(0))?))
+                .read_unflushed(|c| {
+                    c.pragma_query_value(None, "fullfsync", |row| row.get(0))
+                        .map_err(from_sqlite)
+                })
                 .unwrap()
         };
         assert!(!fullfsync(&Store::open(dir.path()).unwrap()));
@@ -3342,7 +3361,7 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         let before = store.blobs().full_flushes();
         store
-            .write(|c| Ok(c.execute_batch("CREATE TABLE t (x)")?))
+            .write(|c| c.execute_batch("CREATE TABLE t (x)").map_err(from_sqlite))
             .unwrap();
         // Elsewhere the commit's own fsync flushes the cache: no extra flush.
         assert_eq!(
@@ -3355,7 +3374,10 @@ mod tests {
     fn flushes_in_read(store: &Store) -> u64 {
         let before = store.blobs().full_flushes();
         store
-            .read(|c| Ok(c.query_row("SELECT count(*) FROM repos", [], |_| Ok(()))?))
+            .read(|c| {
+                c.query_row("SELECT count(*) FROM repos", [], |_| Ok(()))
+                    .map_err(from_sqlite)
+            })
             .unwrap();
         store.blobs().full_flushes() - before
     }
@@ -3391,7 +3413,8 @@ mod tests {
     }
 
     fn repos(c: &mut SqliteTx<'_>) -> Result<i64> {
-        Ok(c.query_row("SELECT count(*) FROM repos", [], |row| row.get(0))?)
+        c.query_row("SELECT count(*) FROM repos", [], |row| row.get(0))
+            .map_err(from_sqlite)
     }
 
     fn add_repo(name: &'static str) -> impl Fn(&mut SqliteTx<'_>) -> Result<()> {
@@ -3427,7 +3450,7 @@ mod tests {
             long.join().unwrap().unwrap();
         });
         // A read cannot write, so no commit skips the counts of `commit`.
-        let write = store.read(|c| Ok(c.execute("DELETE FROM repos", [])?));
+        let write = store.read(|c| c.execute("DELETE FROM repos", []).map_err(from_sqlite));
         assert!(write.is_err());
     }
 
@@ -3538,7 +3561,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         store
-            .write(|c| Ok(c.execute_batch("CREATE TABLE t (x BLOB)")?))
+            .write(|c| {
+                c.execute_batch("CREATE TABLE t (x BLOB)")
+                    .map_err(from_sqlite)
+            })
             .unwrap();
         let done = AtomicBool::new(false);
         thread::scope(|s| {
@@ -3557,7 +3583,7 @@ mod tests {
             for _ in 0..COMMITS {
                 let insert = "INSERT INTO t VALUES (zeroblob(65536))";
                 store
-                    .commit(|c| Ok(c.execute(insert, []).map(drop)?))
+                    .commit(|c| c.execute(insert, []).map(drop).map_err(from_sqlite))
                     .unwrap();
             }
             done.store(true, Ordering::Relaxed);
@@ -3576,7 +3602,7 @@ mod tests {
         store.write(add_repo("a")).unwrap();
         store
             .read(|c| {
-                c.execute_batch("BEGIN")?;
+                c.execute_batch("BEGIN").map_err(from_sqlite)?;
                 repos(c).map(drop)
             })
             .unwrap();

@@ -516,7 +516,8 @@ fn diff_skips_a_subtree_with_the_same_id_on_both_sides() {
             };
             c.sqlite()
                 .unwrap()
-                .execute("DELETE FROM trees WHERE id = ?1", [keep.as_bytes()])?;
+                .execute("DELETE FROM trees WHERE id = ?1", [keep.as_bytes()])
+                .map_err(scion_server::test_support::error::from_sqlite)?;
             Ok(())
         })
         .unwrap();

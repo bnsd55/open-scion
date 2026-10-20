@@ -28,6 +28,7 @@ use scion_proto::v1::{
     ResolveRefRequest, ResolveRefResponse,
 };
 use scion_server::Backend;
+use scion_server::test_support::error::from_sqlite;
 use scion_server::test_support::meta::Meta as _;
 use scion_server::test_support::meta::MetaTx as _;
 use scion_server::test_support::{service, store::Store, tree};
@@ -67,6 +68,16 @@ fn git(dir: &Path, args: &[&str]) {
         "git {args:?}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// A scalar row from the store's SQLite file, through the store's error
+/// type: the helper the upgrade tests read schema versions and counts
+/// with.
+fn sqlite_scalar<T: rusqlite::types::FromSql>(
+    c: &rusqlite::Connection,
+    sql: &str,
+) -> scion_server::Result<T> {
+    c.query_row(sql, [], |row| row.get(0)).map_err(from_sqlite)
 }
 
 /// A git repository with one commit that has every entry kind: regular and
@@ -1176,11 +1187,11 @@ fn a_schema_6_data_dir_upgrades_and_checks_out() {
     // This build upgrades the directory on open.
     let store = Store::open(data.path()).unwrap();
     let version: u32 = store
-        .read(|c| Ok(c.pragma_query_value(None, "user_version", |row| row.get(0))?))
+        .read(|c| sqlite_scalar(c, "PRAGMA user_version"))
         .unwrap();
     assert_eq!(version, 9);
     let trees: i64 = store
-        .read(|c| Ok(c.query_row("SELECT count() FROM trees", [], |row| row.get(0))?))
+        .read(|c| sqlite_scalar(c, "SELECT count() FROM trees"))
         .unwrap();
     assert_eq!(trees, 0, "the old trees are gone");
     let report = scion_server::fsck::run(

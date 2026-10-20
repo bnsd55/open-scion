@@ -1367,9 +1367,10 @@ mod tests {
         let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
         let version: u32 = store
             .read(|c| {
-                Ok(c.sqlite()
+                c.sqlite()
                     .unwrap()
-                    .pragma_query_value(None, "user_version", |row| row.get(0))?)
+                    .pragma_query_value(None, "user_version", |row| row.get(0))
+                    .map_err(crate::error::from_sqlite)
             })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
@@ -1684,7 +1685,12 @@ mod tests {
         let older = "INSERT INTO derived (kind, version, cs, value)
                      SELECT kind, 0, cs, value FROM derived WHERE kind = ?1";
         let added = store
-            .write(|c| Ok(c.sqlite().unwrap().execute(older, [RootTree::NAME])?))
+            .write(|c| {
+                c.sqlite()
+                    .unwrap()
+                    .execute(older, [RootTree::NAME])
+                    .map_err(crate::error::from_sqlite)
+            })
             .unwrap();
         assert_eq!(added, 7);
 

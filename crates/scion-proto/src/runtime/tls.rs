@@ -45,8 +45,10 @@ impl ServerTls {
     /// certificate that does not match its key.
     pub fn load(cert: &Path, key: &Path, client_ca: Option<&Path>) -> anyhow::Result<Self> {
         let certs = certificates(cert, "the TLS certificate")?;
-        let key = PrivateKeyDer::from_pem_file(key)
-            .with_context(|| format!("cannot read the TLS key {}", key.display()))?;
+        let key_bytes = crate::runtime::auth::read_secret_file(key)
+            .map_err(|why| crate::runtime::auth::checked_read_error(key, why))?;
+        let key = PrivateKeyDer::from_pem_slice(&key_bytes)
+            .with_context(|| format!("the TLS key {} is not PEM", key.display()))?;
         let builder = ServerConfig::builder_with_provider(provider())
             .with_safe_default_protocol_versions()
             .context("no supported TLS protocol version")?;
@@ -113,8 +115,8 @@ impl ClientTls {
                 let cert = std::fs::read(cert).with_context(|| {
                     format!("cannot read the client certificate {}", cert.display())
                 })?;
-                let key = std::fs::read(key)
-                    .with_context(|| format!("cannot read the client key {}", key.display()))?;
+                let key = crate::runtime::auth::read_secret_file(key)
+                    .map_err(|why| crate::runtime::auth::checked_read_error(key, why))?;
                 Some((cert, key))
             }
             _ => bail!("a client certificate needs both the certificate and the key"),
@@ -156,5 +158,74 @@ impl ClientTls {
         endpoint
             .tls_config(tls)
             .context("bad TLS client configuration")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, os::unix::fs::PermissionsExt as _};
+
+    /// A self-signed certificate and its key, as PEM files in `dir`.
+    fn pem_files(dir: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::{fs, os::unix::fs::PermissionsExt as _};
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cert_path = dir.path().join("tls.pem");
+        let key_path = dir.path().join("tls.key");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        // The key is a secret: the checked read refuses one that group or
+        // others can read, whatever the umask of the run.
+        std::fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        (cert_path, key_path)
+    }
+
+    #[test]
+    fn a_tls_key_the_group_or_others_can_read_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = pem_files(&dir);
+        std::fs::set_permissions(&key, fs::Permissions::from_mode(0o640)).unwrap();
+        let err = match ServerTls::load(&cert, &key, None) {
+            Ok(_) => panic!("a group-readable TLS key is accepted"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("read by group or others"), "{err}");
+    }
+
+    #[test]
+    fn a_private_tls_key_loads_and_the_certificate_stays_a_plain_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = pem_files(&dir);
+        std::fs::set_permissions(&cert, fs::Permissions::from_mode(0o644)).unwrap();
+        ServerTls::load(&cert, &key, None).unwrap();
+    }
+
+    #[test]
+    fn a_symlinked_tls_key_is_refused_with_a_perfect_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = pem_files(&dir);
+        let link = dir.path().join("link.key");
+        std::os::unix::fs::symlink(&key, &link).unwrap();
+        let err = match ServerTls::load(&cert, &link, None) {
+            Ok(_) => panic!("a symlinked TLS key is accepted"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn a_client_key_the_group_can_read_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = pem_files(&dir);
+        std::fs::set_permissions(&key, fs::Permissions::from_mode(0o640)).unwrap();
+        let err = match ClientTls::load(None, Some(&cert), Some(&key)) {
+            Ok(_) => panic!("a group-readable client key is accepted"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("read by group or others"), "{err}");
     }
 }

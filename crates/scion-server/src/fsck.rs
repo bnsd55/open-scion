@@ -772,17 +772,20 @@ mod tests {
         let (_dir, store, id) = store();
         store
             .write(|c| {
-                let mut body: Vec<u8> = c.query_row(
-                    "SELECT body FROM changesets WHERE id = ?1",
-                    [id.as_bytes()],
-                    |row| row.get(0),
-                )?;
+                let mut body: Vec<u8> = c
+                    .query_row(
+                        "SELECT body FROM changesets WHERE id = ?1",
+                        [id.as_bytes()],
+                        |row| row.get(0),
+                    )
+                    .map_err(crate::error::from_sqlite)?;
                 let n = body.len();
                 body[n - 1] ^= 1;
                 c.execute(
                     "UPDATE changesets SET body = ?1 WHERE id = ?2",
                     rusqlite::params![body, id.as_bytes()],
-                )?;
+                )
+                .map_err(crate::error::from_sqlite)?;
                 Ok(())
             })
             .unwrap();
@@ -806,17 +809,20 @@ mod tests {
                 .unwrap();
         store
             .write(|c| {
-                let mut body: Vec<u8> = c.query_row(
-                    "SELECT body FROM trees WHERE id = ?1",
-                    [tree.as_bytes()],
-                    |row| row.get(0),
-                )?;
+                let mut body: Vec<u8> = c
+                    .query_row(
+                        "SELECT body FROM trees WHERE id = ?1",
+                        [tree.as_bytes()],
+                        |row| row.get(0),
+                    )
+                    .map_err(crate::error::from_sqlite)?;
                 let n = body.len();
                 body[n - 1] ^= 1;
                 c.execute(
                     "UPDATE trees SET body = ?1 WHERE id = ?2",
                     rusqlite::params![body, tree.as_bytes()],
-                )?;
+                )
+                .map_err(crate::error::from_sqlite)?;
                 Ok(())
             })
             .unwrap();
@@ -898,7 +904,8 @@ mod tests {
                 c.execute(
                     "UPDATE derived SET value = ?1 WHERE kind = 'commit_graph'",
                     rusqlite::params![&[0_u8; 32][..]],
-                )?;
+                )
+                .map_err(crate::error::from_sqlite)?;
                 Ok(())
             })
             .unwrap();
@@ -918,7 +925,7 @@ mod tests {
                 c.execute(
                     "INSERT INTO derived (kind, version, cs, value) VALUES ('root_tree', 9, ?1, ?2)",
                     rusqlite::params![id.as_bytes(), id.as_bytes()],
-                )?;
+                ).map_err(crate::error::from_sqlite)?;
                 Ok(())
             })
             .unwrap();

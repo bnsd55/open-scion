@@ -1133,10 +1133,14 @@ impl TestAuthority {
 /// Writes a certificate and its key into `dir`, as `name.pem` and
 /// `name.key`.
 fn write_pem(dir: &tempfile::TempDir, name: &str, cert: &str, key: &str) -> TestCert {
+    use std::os::unix::fs::PermissionsExt as _;
     let cert_path = dir.path().join(format!("{name}.pem"));
     std::fs::write(&cert_path, cert).unwrap();
     let key_path = dir.path().join(format!("{name}.key"));
     std::fs::write(&key_path, key).unwrap();
+    // A key is a secret: the checked read refuses one that group or
+    // others can read.
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     TestCert {
         cert: cert_path,
         key: key_path,

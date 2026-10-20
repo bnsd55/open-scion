@@ -1314,7 +1314,10 @@ mod tests {
             self.store
                 .read(|c| {
                     let sql = "SELECT count(*) FROM lands WHERE state = 'landed'";
-                    Ok(c.sqlite().unwrap().query_row(sql, [], |row| row.get(0))?)
+                    c.sqlite()
+                        .unwrap()
+                        .query_row(sql, [], |row| row.get(0))
+                        .map_err(crate::error::from_sqlite)
                 })
                 .unwrap()
         }
@@ -1333,7 +1336,12 @@ mod tests {
             let sql = "UPDATE lands SET finished_at = finished_at - ?2 WHERE land_id = ?1";
             let aged = self
                 .store
-                .write(|c| Ok(c.sqlite().unwrap().execute(sql, params![land_id, secs])?))
+                .write(|c| {
+                    c.sqlite()
+                        .unwrap()
+                        .execute(sql, params![land_id, secs])
+                        .map_err(crate::error::from_sqlite)
+                })
                 .unwrap();
             assert_eq!(aged, 1);
         }
@@ -1839,9 +1847,10 @@ mod tests {
             let row: String = f
                 .store
                 .read(|c| {
-                    Ok(c.sqlite()
+                    c.sqlite()
                         .unwrap()
-                        .query_row(sql, [key], |row| row.get(0))?)
+                        .query_row(sql, [key], |row| row.get(0))
+                        .map_err(crate::error::from_sqlite)
                 })
                 .unwrap();
             assert_eq!(row, "pending", "{key}");
@@ -1893,9 +1902,10 @@ mod tests {
             let row: String = f
                 .store
                 .read(|c| {
-                    Ok(c.sqlite()
+                    c.sqlite()
                         .unwrap()
-                        .query_row(sql, [key], |row| row.get(0))?)
+                        .query_row(sql, [key], |row| row.get(0))
+                        .map_err(crate::error::from_sqlite)
                 })
                 .unwrap();
             assert_eq!(row, "pending", "{key}");
@@ -2780,9 +2790,10 @@ mod tests {
         store_blobs(&store);
         let version: u32 = store
             .read(|c| {
-                Ok(c.sqlite()
+                c.sqlite()
                     .unwrap()
-                    .pragma_query_value(None, "user_version", |row| row.get(0))?)
+                    .pragma_query_value(None, "user_version", |row| row.get(0))
+                    .map_err(crate::error::from_sqlite)
             })
             .unwrap();
         assert_eq!(version, crate::store::SCHEMA_VERSION);
@@ -2792,9 +2803,16 @@ mod tests {
             .read(|c| {
                 let sql = "SELECT state, abs(finished_at - unixepoch()) < 60 FROM lands
                            ORDER BY land_id";
-                let mut stmt = c.sqlite().unwrap().prepare(sql)?;
-                let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-                Ok(rows.collect::<rusqlite::Result<_>>()?)
+                let mut stmt = c
+                    .sqlite()
+                    .unwrap()
+                    .prepare(sql)
+                    .map_err(crate::error::from_sqlite)?;
+                let rows = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .map_err(crate::error::from_sqlite)?;
+                rows.collect::<rusqlite::Result<_>>()
+                    .map_err(crate::error::from_sqlite)
             })
             .unwrap();
         let want = [
@@ -2889,11 +2907,14 @@ mod tests {
         // why, and that a retry needs a new request key.
         f.store
             .write(|c| {
-                c.sqlite().unwrap().execute(
-                    "UPDATE lands SET created_at = unixepoch() - 100000
+                c.sqlite()
+                    .unwrap()
+                    .execute(
+                        "UPDATE lands SET created_at = unixepoch() - 100000
                      WHERE state = 'pending'",
-                    [],
-                )?;
+                        [],
+                    )
+                    .map_err(crate::error::from_sqlite)?;
                 Ok(())
             })
             .unwrap();
@@ -2902,11 +2923,14 @@ mod tests {
         let (state, detail): (String, String) = f
             .store
             .read(|c| {
-                Ok(c.sqlite().unwrap().query_row(
-                    "SELECT state, detail FROM lands WHERE request_key = 'old'",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )?)
+                c.sqlite()
+                    .unwrap()
+                    .query_row(
+                        "SELECT state, detail FROM lands WHERE request_key = 'old'",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(crate::error::from_sqlite)
             })
             .unwrap();
         assert_eq!(state, "rejected");

@@ -116,7 +116,8 @@ fn change_count(parent: ChangesetId, n: usize) -> Vec<u8> {
 }
 
 fn count_changesets(c: &Connection) -> scion_server::Result<i64> {
-    Ok(c.query_row("SELECT count(*) FROM changesets", [], |row| row.get(0))?)
+    c.query_row("SELECT count(*) FROM changesets", [], |row| row.get(0))
+        .map_err(scion_server::test_support::error::from_sqlite)
 }
 
 /// The changeset rows of the store's world: the data directory's table on
@@ -509,10 +510,13 @@ fn a_changeset_that_does_not_match_its_id_reads_as_corrupt() {
     let repo = f
         .store
         .write(|c| {
-            c.sqlite().unwrap().execute(
-                "UPDATE changesets SET body = ?1 WHERE id = ?2",
-                params![other, f.root.as_bytes()],
-            )?;
+            c.sqlite()
+                .unwrap()
+                .execute(
+                    "UPDATE changesets SET body = ?1 WHERE id = ?2",
+                    params![other, f.root.as_bytes()],
+                )
+                .map_err(scion_server::test_support::error::from_sqlite)?;
             c.repo_id(REPO)
         })
         .unwrap();
