@@ -13,10 +13,7 @@ use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::{GetObjectsRequest, GetRootTreeRequest, ObjectKind, ObjectRef};
 use scion_server::Keys;
 use scion_server::test_support::meta::MetaTx as _;
-use scion_server::{
-    Backend,
-    test_support::{service, store::Store},
-};
+use scion_server::test_support::{backend::from_store, service, store::Store};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tonic::Code;
@@ -78,7 +75,7 @@ async fn server() -> (
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let keys = Keys::generate();
     tokio::spawn(service::serve(
-        Backend::Sqlite(store.clone()),
+        from_store(store.clone()),
         listener,
         TOKEN,
         service::ServeOptions {
@@ -316,7 +313,7 @@ async fn server_of_readme() -> (
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let keys = Keys::generate();
     tokio::spawn(service::serve(
-        Backend::Sqlite(server_store.clone()),
+        from_store(server_store.clone()),
         listener,
         TOKEN,
         service::ServeOptions {
@@ -558,7 +555,7 @@ async fn tiers() -> (Tiers, tokio::sync::oneshot::Sender<()>, tempfile::TempDir)
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let keys = Keys::generate();
     tokio::spawn(service::serve(
-        Backend::Sqlite(store.clone()),
+        from_store(store.clone()),
         listener,
         TOKEN,
         service::ServeOptions {

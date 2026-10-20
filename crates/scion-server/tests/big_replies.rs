@@ -10,14 +10,12 @@ use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{
     CreateChangesetRequest, GetChangesetRequest, ListDirRequest, PutBlobRequest,
 };
+use scion_server::test_support::backend::from_store;
 use scion_server::test_support::meta::MetaTx;
 use std::sync::Arc;
 
 use scion_server::Metrics;
-use scion_server::{
-    Backend,
-    test_support::{service, store::Store},
-};
+use scion_server::test_support::{service, store::Store};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 use tonic::Status;
@@ -74,7 +72,7 @@ async fn big_repo(names: usize) -> (tempfile::TempDir, Scion, ChangesetId) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(service::serve(
-        Backend::Sqlite(store.clone()),
+        from_store(store.clone()),
         listener,
         TOKEN,
         service::ServeOptions {

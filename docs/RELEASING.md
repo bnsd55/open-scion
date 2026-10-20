@@ -1,10 +1,11 @@
 # Releasing
 
-How to cut a release of openscion. v0.1.x is a source release: a git
-tag plus GitHub release notes. Nothing publishes crates: the crates
-publish later, after their public APIs are narrowed
-([#21](https://github.com/bnsd55/openscion/issues/21)). Nothing here
-tags by itself: each step is run by a person.
+How to cut a release of openscion. v0.1.x is a source release: one
+SSH-signed annotated git tag plus one immutable GitHub release with
+notes. Nothing publishes crates: the owner has decided (D12) that no
+crate publishes before a real outside consumer exists, so a narrow
+client crate is the only publish ever planned. Nothing here tags by
+itself: each step is run by a person.
 
 ## Before a release
 
@@ -68,24 +69,27 @@ A release is cut through one PR from a branch named
 
 ## Release steps
 
-1. **Tag.** Cut an annotated tag from the commit that the release
-   notes describe:
+1. **Tag, signed.** Cut an annotated tag from the commit that the
+   release notes describe. The owner signs it personally with their SSH
+   key (D18), so the signature a verifier checks is the owner's, not a
+   CI secret's:
 
    ```sh
-   git tag -a v0.1.0 -m "openscion v0.1.0"
+   git -c gpg.format=ssh -c user.signingkey="$HOME/.ssh/id_ed25519.pub" \
+     tag -s v0.1.0 -m "openscion v0.1.0"
    git push origin v0.1.0
    ```
 
-   Before the push, the same check runs locally, on the tag alone:
+   Verify the signature before the push (`git tag -v v0.1.0`), and that
+   the tag points at the release commit:
 
    ```sh
    test "$(git rev-parse 'v0.1.0^{}')" = "$(git rev-parse <the release commit>)"
    ```
 
    Then push, and check the tag landed on the release commit. An
-   annotated tag
-   makes `git ls-remote` print the tag object's SHA, so compare the
-   peeled ref to the commit:
+   annotated tag makes `git ls-remote` print the tag object's SHA, so
+   compare the peeled ref to the commit:
 
    ```sh
    test "$(git ls-remote origin 'refs/tags/v0.1.0^{}' | cut -f1)" \
@@ -95,10 +99,12 @@ A release is cut through one PR from a branch named
    If the check fails, stop and redo the tag per "Undoing a bad tag"
    before any release notes point at it.
 
-2. **GitHub release.** Open a release for the tag with the notes
-   rebuilt from the `CHANGELOG.md` section of the version at that
+2. **GitHub release, immutable.** Open a release for the tag with the
+   notes rebuilt from the `CHANGELOG.md` section of the version at that
    commit (`git show v0.1.0:CHANGELOG.md`), and the measured numbers
-   with the provenance the checklist asks for.
+   with the provenance the checklist asks for. Mark the release
+   immutable (GitHub's release protection, set at publish time), so a
+   compromised account cannot replace its assets or notes later.
 
 ## Undoing a bad tag
 

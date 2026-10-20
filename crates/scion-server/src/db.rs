@@ -38,6 +38,11 @@ thread_local! {
 /// The transaction handle of the SQLite [`Store`](crate::store::Store): a
 /// reader, or the write connection inside one transaction. The queries of
 /// the shared tables are its [`MetaTx`] methods.
+///
+/// `pub` with the unreachable-pub allow: [`Meta::Tx`] names it, and the
+/// trait re-exports through `test_support::meta` (the #333 seam), so the
+/// type must stay as visible as the trait that carries it.
+#[allow(unreachable_pub)]
 pub struct SqliteTx<'a>(pub(crate) &'a Connection);
 
 impl Deref for SqliteTx<'_> {

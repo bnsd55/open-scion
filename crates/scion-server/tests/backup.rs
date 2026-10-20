@@ -5,6 +5,7 @@
 //! `pg_dump`, which the runbook documents.
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
+use scion_server::test_support::backend::from_store;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _, RepoId};
 use scion_server::test_support::store::Store;
 use scion_server::{Backend, fsck};
@@ -58,7 +59,7 @@ fn a_backup_taken_while_serving_restores_whole() {
         &restored_dir.path().join("objects"),
     );
 
-    let restored = Backend::Sqlite(Store::open(restored_dir.path()).unwrap());
+    let restored = from_store(Store::open(restored_dir.path()).unwrap());
     let report = fsck::run(&restored, 1, &mut |_| {}).unwrap();
     assert!(
         report.problems.is_empty(),

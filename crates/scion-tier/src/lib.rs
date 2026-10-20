@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Cache tiers for the `Objects` service: `scion-cache` and `scion-daemon`.
 //!
 //! A tier sits between clients and the server: a `scion-cache` holds the

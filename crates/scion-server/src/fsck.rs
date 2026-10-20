@@ -633,7 +633,7 @@ mod tests {
                     &mut tx,
                     repo,
                     cs,
-                    &mut crate::tree::lens_of(&Backend::Sqlite(store.clone())),
+                    &mut crate::tree::lens_of(&Backend::sqlite(store.clone())),
                 )?;
                 let version = tx.get_ref(repo, "main")?.map(|r| r.version);
                 assert!(tx.cas_ref(repo, "main", version, id)?);
@@ -685,7 +685,7 @@ mod tests {
     #[test]
     fn a_clean_store_reports_nothing() {
         let (_dir, store, _) = store();
-        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(report.is_clean(), "{:?}", kinds(&report));
         assert!(report.old.is_empty());
     }
@@ -699,7 +699,7 @@ mod tests {
         let id = store.blobs().put(b"orphan\n").unwrap();
         let (_, path) = store.blobs().location(id);
         std::fs::remove_file(&path).unwrap();
-        assert!(!missing_is_damage(&Backend::Sqlite(store.clone()), id));
+        assert!(!missing_is_damage(&Backend::sqlite(store.clone()), id));
     }
 
     #[test]
@@ -715,7 +715,7 @@ mod tests {
             .unwrap();
         let (_, path) = store.blobs().location(id);
         std::fs::remove_file(&path).unwrap();
-        assert!(missing_is_damage(&Backend::Sqlite(store.clone()), id));
+        assert!(missing_is_damage(&Backend::sqlite(store.clone()), id));
     }
 
     /// A file that is back between the two looks of the check was
@@ -724,7 +724,7 @@ mod tests {
     fn a_file_back_between_the_two_looks_is_not_damage() {
         let (_dir, store, _) = store();
         let id = store.blobs().put(b"again\n").unwrap();
-        assert!(!missing_is_damage(&Backend::Sqlite(store.clone()), id));
+        assert!(!missing_is_damage(&Backend::sqlite(store.clone()), id));
     }
 
     /// The blob of the first put of the changeset `id`.
@@ -745,7 +745,7 @@ mod tests {
         let path = store.blobs().location(blob).1;
         let bytes = std::fs::read(&path).unwrap();
         std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
-        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(
             has(&report, "blob-corrupt", &blob.to_string()),
             "{:?}",
@@ -758,7 +758,7 @@ mod tests {
         let (_dir, store, id) = store();
         let blob = first_put(&store, id);
         std::fs::remove_file(store.blobs().location(blob).1).unwrap();
-        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(
             has(&report, "blob-missing", &blob.to_string()),
             "{:?}",
@@ -789,7 +789,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(
             has(&report, "changeset-bad", &id.to_string()),
             "{:?}",
@@ -805,7 +805,7 @@ mod tests {
             // The fsck command has no request deadline: it derives the root
             // tree in steps, so writes run beside it, and reports damage
             // instead of failing a call.
-            crate::tree::root_tree_unbounded(&crate::backend::Backend::Sqlite(store.clone()), repo, id)
+            crate::tree::root_tree_unbounded(&crate::backend::Backend::sqlite(store.clone()), repo, id)
                 .unwrap();
         store
             .write(|c| {
@@ -826,7 +826,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(
             has(&report, "tree-bad", &tree.to_string()),
             "{:?}",
@@ -844,7 +844,7 @@ mod tests {
         raw.execute("DELETE FROM repo_changesets WHERE cs = ?1", [id.as_bytes()])
             .unwrap();
         drop(raw);
-        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(has(&report, "ref-dangling", "main"), "{:?}", kinds(&report));
     }
 
@@ -866,7 +866,7 @@ mod tests {
         )
         .unwrap();
         drop(raw);
-        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(
             has(&report, "history-node-bad", "does not decode"),
             "{:?}",
@@ -888,7 +888,7 @@ mod tests {
         )
         .unwrap();
         drop(raw);
-        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(
             has(&report, "changeset-missing", "named by derived"),
             "{:?}",
@@ -909,7 +909,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(
             has(&report, "derived-bad", "commit_graph"),
             "{:?}",
@@ -929,7 +929,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
+        let report = run(&Backend::sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(report.is_clean(), "{:?}", kinds(&report));
         assert_eq!(report.old, BTreeSet::from([("root_tree".to_owned(), 9)]));
     }
@@ -954,7 +954,7 @@ mod tests {
         // One row per batch, and a land between two of them: the writes of
         // a live server must not look like damage.
         let mut landed = false;
-        let report = run(&Backend::Sqlite(store.clone()), 1, &mut |stage| {
+        let report = run(&Backend::sqlite(store.clone()), 1, &mut |stage| {
             if stage == Stage::RepoBlobs && !landed {
                 landed = true;
                 land(

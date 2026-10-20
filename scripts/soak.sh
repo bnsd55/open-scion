@@ -25,6 +25,15 @@ AGENTS=${AGENTS:-2}
 SOAK_RSS_PCT=${SOAK_RSS_PCT:-150}
 SOAK_FD_GROWTH=${SOAK_FD_GROWTH:-100}
 SOAK_P99_FACTOR=${SOAK_P99_FACTOR:-2}
+# The warm-up window: the RSS baseline is the first sample after it, not
+# the first sample of the run. The server's memory climbs while its
+# caches fill - sqlite page caches (8 readers plus the write connection),
+# allocator arenas, prepared statements - and on one local 35-minute run
+# it kept climbing for about 30 minutes before it went flat. A baseline
+# at 60 s made every longer warm-up a false red. A run shorter than the
+# window plus two samples checks no RSS bound: it cannot tell warm-up
+# from a leak (the soak on a PR checks the mechanics, not the trend).
+SOAK_WARM_SECONDS=${SOAK_WARM_SECONDS:-1800}
 # Enough lands that the writers would need more than the run to finish;
 # bench is stopped at the end, and the server's own Land counter says what
 # it landed.
@@ -180,11 +189,24 @@ canceller & echo $! > "$WORK/soak-canceller.pid"
 slow_reader & echo $! > "$WORK/soak-slow.pid"
 
 : > "$WORK/metrics.csv"
-sleep 60 # the warm start, before the first sample
+: > "$WORK/metrics-store.csv"
+T0=$(date +%s)
+sleep 60 # the first sample still sees the run's first minute
+warm_rss=
 while [ "$(date +%s)" -lt "$END" ]; do
   sample
-  echo "$(date +%s),$(sed -n 1p "$WORK/last.sample" | cut -d, -f1),\
+  now=$(date +%s)
+  rss=$(sed -n 1p "$WORK/last.sample" | cut -d, -f1)
+  echo "$now,$rss,\
 $(sed -n 1p "$WORK/last.sample" | cut -d, -f2),$(latency)" >> "$WORK/metrics.csv"
+  # The store's size on disk, next to the RSS it may share a cause with:
+  # files a leak of disk would grow, and what Ben's run-length decision
+  # needs (issue #239).
+  du -sk "$WORK/server" | awk -v e="$now" '{ print e "," $1 }' \
+    >> "$WORK/metrics-store.csv"
+  if [ -z "$warm_rss" ] && [ $((now - T0)) -ge "$SOAK_WARM_SECONDS" ]; then
+    warm_rss=$rss
+  fi
   sleep 10
 done
 # The writers stop at the end: bench has no time limit of its own.
@@ -197,15 +219,15 @@ sleep 2
 # EXIT trap of common.sh's make_work removes $WORK after this.
 mkdir -p "${RUNNER_TEMP:-/tmp}/soak-artifacts"
 cp "$WORK/metrics.csv" "${RUNNER_TEMP:-/tmp}/soak-artifacts/metrics.csv"
+cp "$WORK/metrics-store.csv" "${RUNNER_TEMP:-/tmp}/soak-artifacts/metrics-store.csv"
 cp "$WORK"/*.log "${RUNNER_TEMP:-/tmp}/soak-artifacts/" 2> /dev/null || true
 
 rows=$(wc -l < "$WORK/metrics.csv" | tr -d ' ')
 third=$((rows / 3))
-rss_warm=$(sed -n 1p "$WORK/metrics.csv" | cut -d, -f2)
 rss_end=$(tail -n 1 "$WORK/metrics.csv" | cut -d, -f2)
 fds_start=$(sed -n 1p "$WORK/metrics.csv" | cut -d, -f3)
-if [ -n "$rss_warm" ] && [ -n "$rss_end" ] && [ "$rss_end" -gt $((rss_warm * SOAK_RSS_PCT / 100)) ]; then
-  echo "FAIL: server RSS grew past ${SOAK_RSS_PCT}%: $rss_warm KB -> $rss_end KB" >&2
+if [ -n "${warm_rss:-}" ] && [ "$rss_end" -gt $((warm_rss * SOAK_RSS_PCT / 100)) ]; then
+  echo "FAIL: server RSS grew past ${SOAK_RSS_PCT}% of its warm RSS (the sample after ${SOAK_WARM_SECONDS}s): ${warm_rss} KB -> ${rss_end} KB" >&2
   fail=1
 fi
 if awk -F, -v s="${fds_start:-0}" -v g="$SOAK_FD_GROWTH" '$3 > s + g { c++; if (c >= 3) exit 1 }' \
@@ -259,7 +281,13 @@ echo
 row "step" "result"
 row "land requests served" "$landed"
 row "samples" "$rows"
-row "server RSS first -> last" "${rss_warm:-?} KB -> ${rss_end:-?} KB"
+if [ -n "${warm_rss:-}" ]; then
+  row "server RSS warm (after ${SOAK_WARM_SECONDS}s) -> last" "${warm_rss} KB -> ${rss_end:-?} KB"
+else
+  row "server RSS bound" "not checked: the run ended before the ${SOAK_WARM_SECONDS}s warm-up"
+fi
+row "store size first -> last" "$(sed -n 1p "$WORK/metrics-store.csv" | cut -d, -f2) KB -> \
+$(tail -n 1 "$WORK/metrics-store.csv" | cut -d, -f2) KB"
 row "p99 early -> late" "${early:-?} ms -> ${late:-?} ms"
 [ "${fail:-0}" -eq 0 ] || die "the soak failed its bounds"
 
