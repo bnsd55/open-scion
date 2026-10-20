@@ -5,6 +5,11 @@ steps an operator needs, written from the code on `main`. Every command in
 this guide was run once in a fresh directory. The flags of a release are its
 truth: `--help` of each binary lists everything.
 
+A section whose steps a test runs ends with a `Proof:` line that names the
+test (file and function). The docs_ops tests fail when a proof's test is
+gone, when a command of a shell block names a flag `--help` does not, and
+when the drills of docs/drills/ lose their template.
+
 The pieces:
 
 - `scion-server` — the one process that stores and lands. One data directory
@@ -22,7 +27,7 @@ The pieces:
 ### One server
 
 ```sh
-./scion-server --data /srv/scion serve --token <TOKEN>
+SCION_TOKEN=<TOKEN> ./scion-server --data /srv/scion serve
 ```
 
 That is the whole deployment: clients talk to `127.0.0.1:7878` (or `--listen`
@@ -45,9 +50,13 @@ one client may hold open at once, and `--max-stalled-bytes` (64 MiB)
 bounds what the stalled replies of one connection may hold before the
 connection is closed. A cache and a daemon take the same three flags.
 
-Choose the tokens with care: `--token T` makes one principal, `default`, with
-every right on every repo. For several people or services, use an access
-file instead (see "Tokens: one, or an access file", below).
+Choose the tokens with care: `--token T` (or `SCION_TOKEN=T`) makes one
+principal, `default`, with every right on every repo. A token on the command
+line is readable by every local account, so the argv form warns and goes
+away in a later release; pass the token through `SCION_TOKEN` or
+`--token-file FILE` (a file the owner alone may read). For several people or
+services, use an access file instead (see "Tokens: one, or an access file",
+below).
 
 Stopping the server: Ctrl-C or SIGTERM starts a graceful drain, in this
 order — the health service answers `NOT_SERVING` for the service names
@@ -78,8 +87,8 @@ client's `--token` is what it sends, the other side of the pair of the tier
 in front of it.
 
 ```sh
-./scion-cache --token <CACHE_TOKEN> --upstream-token <SERVER_TOKEN> \
-  --upstream http://SERVER:7878 \
+SCION_TOKEN=<CACHE_TOKEN> SCION_UPSTREAM_TOKEN=<SERVER_TOKEN> \
+  ./scion-cache --upstream http://SERVER:7878 \
   --ticket-public-key <PUBLIC_KEY_HEX>
 ```
 
@@ -94,9 +103,8 @@ cache with `scn checkout --server http://SERVER:7878 --objects http://CACHE:7879
 ### Server, cache, and a daemon per user
 
 ```sh
-./scion-daemon --data ~/.scion-daemon \
-  --token <USER_TOKEN> --upstream-token <CACHE_TOKEN> \
-  --upstream http://CACHE:7879
+SCION_TOKEN=<USER_TOKEN> SCION_UPSTREAM_TOKEN=<CACHE_TOKEN> \
+  ./scion-daemon --data ~/.scion-daemon --upstream http://CACHE:7879
 ```
 
 The daemon's data directory must be private to its user (mode 0700, not a
@@ -199,7 +207,7 @@ BLAKE3 digest (never the token itself) and maps each to a principal with
 per-repo read and write rules:
 
 ```sh
-TOK=$(./scion-server hash-token --token <SECRET>)
+TOK=$(printf %s <SECRET> | ./scion-server hash-token)
 printf 'token\tops\t%s\nread\tops\tr\nwrite\tops\tr\n' "$TOK" > /srv/scion/access.txt
 chmod 600 /srv/scion/access.txt
 ./scion-server --data /srv/scion serve --access /srv/scion/access.txt \
@@ -310,9 +318,9 @@ it):
 | Variable | Flag | Read by | Notes |
 | --- | --- | --- | --- |
 | `SCION_DATA` | `--data` | `scion-server` | Data directory, default `scion-data`. |
-| `SCION_POSTGRES_URL` | `--postgres-url` | `scion-server` | The URL holds the database credentials; the environment keeps them out of the process list (`ps`). |
-| `SCION_TOKEN` | `--token` | `scion-server` (`serve`, `hash-token`), `scion-cache`, `scion-daemon`, `scn` | A secret; the environment keeps it out of the process list. |
-| `SCION_UPSTREAM_TOKEN` | `--upstream-token` | `scion-cache`, `scion-daemon` | A secret, as `SCION_TOKEN`. |
+| `SCION_POSTGRES_URL` | `--postgres-url` | `scion-server` | The URL holds the database credentials; the environment keeps them out of the process list (`ps`). `--postgres-url-file` reads it from a file the owner alone may read, and the argv form is deprecated. |
+| `SCION_TOKEN` | `--token` | `scion-server` (`serve`, `hash-token`), `scion-cache`, `scion-daemon`, `scn` | A secret; the environment keeps it out of the process list. The `--token-file` flag reads the token from a file the owner alone may read, and `hash-token` reads it from stdin. The argv form prints a deprecation warning and goes away in a later release. |
+| `SCION_UPSTREAM_TOKEN` | `--upstream-token` | `scion-cache`, `scion-daemon` | A secret, as `SCION_TOKEN`; `--upstream-token-file` reads it from a file, and the argv form is deprecated. |
 | `SCION_DAEMON_DATA` | `--data` | `scion-daemon` | Data directory, default `scion-daemon-data`. |
 | `SCION_AUTHOR` | `--author` | `scn commit` | Default `scn <scn@localhost>`. |
 | `SCION_SERVER` | `--server` | `scn` | Default `http://127.0.0.1:7878`. |
@@ -356,6 +364,8 @@ Rotation, step by step:
    with only the new public key.
 
 A daemon checks no ticket and forwards it, so it needs no key at any step.
+
+Proof: crates/scn/tests/rotation.rs::ticket_key_rotation_while_a_checkout_reads
 
 ## 3. Backup and restore
 
@@ -432,6 +442,8 @@ new database), the marker, and `objects/` into a fresh directory; run
 gc-raced backup left, so run it after every restore, before the server
 serves.
 
+Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restores_whole
+
 ## 4. Upgrades
 
 The schema version lives in the database. On open, a server migrates an
@@ -466,6 +478,8 @@ backfills a whole history in steps when you want it done before the first
 query (it opens the directory as the server, so with the server stopped, and
 it is safe to repeat).
 
+Proof: crates/scion-server/tests/crash.rs::a_kill_during_a_schema_upgrade_leaves_the_old_schema_or_the_new_one
+
 ## 5. Routines
 
 The routines are these:
@@ -494,6 +508,8 @@ The routines are these:
   file batch, one when it ends, each with the counts and the time it
   took, and a line at most every 10 s of a long run with the repos done
   and the total.
+
+  Proof: crates/scion-server/tests/gc_metrics.rs::a_real_run_writes_the_report_as_textfile_metrics
 
 **The collector's metrics file.** The collector runs as its own process,
 so the server's `/metrics` cannot show what it did. Instead, give the run
