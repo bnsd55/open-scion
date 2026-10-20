@@ -569,6 +569,30 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    /// TEMPORARY debug probe: what do the xattr reads answer on CI?
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn debug_probe_xattr_answers() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (label, path) in [("/tmp", Path::new("/tmp")), ("fresh", tmp.path())] {
+            let opened = rustix::fs::open(
+                path,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            );
+            match opened {
+                Err(e) => println!("PROBE {label}: open ERR {e:?}"),
+                Ok(fd) => {
+                    for name in ["system.posix_acl_access", "system.posix_acl_default"] {
+                        let mut buf = [0u8; 64];
+                        let r = rustix::fs::fgetxattr(&fd, name, &mut buf);
+                        println!("PROBE {label} {name}: {r:?}");
+                    }
+                }
+            }
+        }
+    }
+
     fn mode_of(path: &Path) -> u32 {
         fs::symlink_metadata(path).unwrap().mode() & 0o7777
     }
