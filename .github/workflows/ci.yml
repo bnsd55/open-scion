@@ -107,6 +107,8 @@ jobs:
                       print(p, n, "ERR", e.errno, e.strerror)
           PY
           stat -f -c 'fstype %T' /tmp
+      - name: probe rustix fgetxattr (temporary debug)
+        run: cargo test -p open-scion-proto --lib debug_probe -- --nocapture
       - run: cargo test --workspace
         env:
           PROPTEST_CASES: "2000"
