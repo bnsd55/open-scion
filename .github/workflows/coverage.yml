@@ -72,25 +72,62 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: the checked-in exclusions, as one regex
         run: |
-          regex=$(sed 's/#.*//' scripts/coverage-exclusions.txt \
-            | tr -d '[:space:]' | grep -v '^$' | paste -s -d '|')
-          echo "COVERAGE_IGNORE=$regex" >> "$GITHUB_ENV"
+          regex=$(sed 's/^[[:space:]]*//; s/#.*//; s/[[:space:]]*$//' scripts/coverage-exclusions.txt \
+            | grep -v '^$' | paste -s -d '|' -)
+          # An empty file holds no patterns, and an empty regex would
+          # match everything: the flag is passed only when a pattern
+          # exists.
+          if [ -n "$regex" ]; then
+            echo "COVERAGE_IGNORE=$regex" >> "$GITHUB_ENV"
+          fi
+      # A vacuous exclusion is the same bug class as the soak's zero
+      # counts: a pattern that matches no tracked file excludes nothing
+      # and promises a number the report does not hold. The gate reads
+      # the file, so this guard runs before the measures.
+      - name: every exclusion pattern matches a tracked file
+        run: |
+          ok=1
+          while IFS= read -r pattern; do
+            if ! git ls-files | grep -qE "$pattern"; then
+              echo "the exclusion pattern '$pattern' matches no tracked file"
+              ok=0
+            fi
+          done < <(sed 's/^[[:space:]]*//; s/#.*//; s/[[:space:]]*$//' scripts/coverage-exclusions.txt | grep -v '^$')
+          [ "$ok" = 1 ]
       # Two measures accumulate their profiles (--no-report, then
       # --no-clean keeps the first run's), and the report step merges
-      # them into the one number the gate checks. The takeover test
-      # stays out: it stops the shared database, as in ci.yml's jobs.
+      # them into the one number the gate checks. The exclusion regex
+      # goes to the report step too: the filter applies when the report
+      # is built, and the proof below reads its printed list. The
+      # takeover test stays out: it stops the shared database, as in
+      # ci.yml's jobs.
       - name: measure, the default backend
-        run: cargo llvm-cov --no-report --workspace --ignore-filename-regex "$COVERAGE_IGNORE"
+        run: |
+          cargo llvm-cov --no-report --workspace \
+            ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"}
         env:
           PROPTEST_CASES: "64"
       - name: measure, the postgres backend
-        run: cargo llvm-cov --no-report --no-clean --workspace --ignore-filename-regex "$COVERAGE_IGNORE"
+        run: |
+          cargo llvm-cov --no-report --no-clean --workspace \
+            ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"}
         env:
           PROPTEST_CASES: "64"
           SCION_TEST_BACKEND: postgres
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
       - name: the merged report, and the gate
-        run: cargo llvm-cov report --summary-only --fail-under-lines 80
+        run: |
+          cargo llvm-cov report --summary-only --fail-under-lines 80 \
+            ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
+            | tee target/coverage/report-summary.txt
+          # The proof the filter applies: no excluded file may appear
+          # in the printed per-file list.
+          while IFS= read -r pattern; do
+            if grep -qE "$pattern" target/coverage/report-summary.txt; then
+              echo "the report still shows a file matching the exclusion '$pattern'"
+              exit 1
+            fi
+          done < <(sed 's/^[[:space:]]*//; s/#.*//; s/[[:space:]]*$//' scripts/coverage-exclusions.txt | grep -v '^$')
       - name: keep the profiles out of the cache
         if: always()
         run: rm -rf target/coverage

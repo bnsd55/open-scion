@@ -5,7 +5,11 @@ sha256, and fails when the merged report drops under 80 percent lines -
 the roadmap's statement bar, where a Rust statement is an executable
 line. Two measures accumulate into one report: the default backend and
 the Postgres backend, so pg.rs is in the number; the per-crate summary
-prints in the log. The exclusions are checked in
-(scripts/coverage-exclusions.txt): the test seam only, with its reason;
-the generated proto code is out of the measure by construction (it
-builds into OUT_DIR under target/) and the file says so.
+prints in the log. The exclusions are checked in (scripts/coverage-exclusions.txt): the
+file holds no patterns today, with the reasons - the generated proto
+code builds into OUT_DIR under target/ and the measure never counts it,
+and the test seam sits behind the test-hooks feature, which the
+default-feature measure does not compile. A pattern that matches no
+tracked file fails the job, so a vacuous exclusion cannot hide in the
+file, and the report step proves its own filter: no excluded file may
+appear in its printed list.
