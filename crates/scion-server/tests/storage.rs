@@ -125,8 +125,8 @@ fn a_metadata_write_that_must_grow_the_file_answers_out_of_space() {
     let (_dir, store) = store();
     if Backend::test_is_postgres() {
         // On Postgres the metadata lives in the database; its disk full is
-        // the SQLSTATE 53100 arm, covered in error.rs beside the busy
-        // test. The blob files of this test still run on Postgres, above.
+        // the SQLSTATE 53100 arm of the pg mapping, a unit test of
+        // pg.rs. The blob files of this test still run on Postgres, above.
         return;
     }
     let _repo = store.write(|c| c.create_repo("r")).unwrap();

@@ -148,30 +148,51 @@ fn a_damaged_marker_refuses_both_opens() {
 /// A write that another writer blocks answers busy in seconds, not past
 /// the minute-long statement clock: the open sets a lock timeout like the
 /// SQLite busy timeout, and a lock the database cannot give in it maps to
-/// busy, so the client retries.
+/// busy, so the client retries. The SQLite side of the row runs here too:
+/// another connection of the test holds the write lock past the same
+/// clock, through the busy timeout the open sets.
 #[test]
 fn a_write_blocked_by_another_writer_answers_busy_in_seconds() {
-    if skip_on_sqlite() {
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
     let store = Backend::open_test(dir.path()).unwrap();
-    // A connection of the test holds the name in an open transaction: it
-    // inserted the row and never ended the transaction, so every writer
-    // of the same name waits for it.
-    let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
-    let schema = Backend::test_schema(dir.path()).unwrap();
-    let mut held = postgres::Client::connect(&url, postgres::NoTls).unwrap();
-    held.batch_execute(&format!("SET search_path TO {schema}"))
-        .unwrap();
-    held.batch_execute("BEGIN; INSERT INTO repos (name) VALUES ('held');")
-        .unwrap();
+    if Backend::test_is_postgres() {
+        // A connection of the test holds the name in an open transaction: it
+        // inserted the row and never ended the transaction, so every writer
+        // of the same name waits for it.
+        let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+        let schema = Backend::test_schema(dir.path()).unwrap();
+        let mut held = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        held.batch_execute(&format!("SET search_path TO {schema}"))
+            .unwrap();
+        held.batch_execute("BEGIN; INSERT INTO repos (name) VALUES ('held');")
+            .unwrap();
+        let error = run_blocked_write(&store);
+        let _ = held.batch_execute("ROLLBACK");
+        let _ = error;
+    } else {
+        // A raw connection of the test holds the write lock: BEGIN
+        // IMMEDIATE takes the lock the store's writer wants, and holds
+        // it while the store waits out its busy timeout.
+        let held = rusqlite::Connection::open(dir.path().join("scion.db")).unwrap();
+        held.busy_timeout(std::time::Duration::from_millis(100))
+            .unwrap();
+        held.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let error = run_blocked_write(&store);
+        let _ = held.execute_batch("ROLLBACK");
+        let _ = error;
+    }
+}
+
+/// The blocked write of [`a_write_blocked_by_another_writer_answers_busy_in_seconds`],
+/// timed and checked for the busy answer. Returns the error so a caller
+/// may roll its holder back before the store drops; the checks above
+/// have already proven the answer.
+fn run_blocked_write(store: &Backend) -> scion_server::Error {
     let started = std::time::Instant::now();
     let error = store
         .write(|c| c.create_repo("held").map(|_| ()))
         .expect_err("the held name refuses the write");
     let waited = started.elapsed();
-    let _ = held.batch_execute("ROLLBACK");
     assert!(error.is_busy(), "{error:?}");
     assert!(
         waited >= std::time::Duration::from_secs(4),
@@ -181,6 +202,7 @@ fn a_write_blocked_by_another_writer_answers_busy_in_seconds() {
         waited < std::time::Duration::from_secs(20),
         "answered after {waited:?}"
     );
+    error
 }
 
 /// The store UUID: the first Postgres open mints one, the marker file

@@ -1793,12 +1793,24 @@ fn map_pg_error(e: postgres::Error) -> Error {
     if e.is_closed() {
         return Error::Storage(Storage::busy(e));
     }
-    match e.code() {
+    // The SQLSTATE, when the database sent one: a connection error has
+    // none, and a connection it refused or cut maps like a busy one.
+    // The code is a str view of the error, so it is copied before the
+    // error moves into the dispatch.
+    let code = e.code().map(|c| c.code().to_owned());
+    pg_error_of(code.as_deref(), e)
+}
+
+/// The SQLSTATE dispatch of [`map_pg_error`], split from the error it
+/// maps so a test can drive one SQLSTATE through the mapping without a
+/// database that reports it.
+fn pg_error_of(code: Option<&str>, e: postgres::Error) -> Error {
+    match code {
         // Deadlock, serialization failure, an administrative shutdown, a
         // database that starts up, a lock another writer holds.
         Some(code)
-            if matches!(code.code(), "40P01" | "40001" | "57P01" | "57P03" | "55P03")
-                || code.code().starts_with("08") =>
+            if matches!(code, "40P01" | "40001" | "57P01" | "57P03" | "55P03")
+                || code.starts_with("08") =>
         {
             tracing::warn!("the database is busy: {e}");
             Error::Storage(Storage::busy(e))
@@ -1806,18 +1818,18 @@ fn map_pg_error(e: postgres::Error) -> Error {
         // The lock or the statement waited past its clock, as a SQLite
         // write does past its busy timeout: the caller has been at it
         // too long, and the client retries past its own deadline.
-        Some(code) if code.code() == "57014" => {
+        Some("57014") => {
             tracing::warn!("the database gave the statement up: {e}");
             Error::DeadlineExceeded("the database kept the caller waiting".to_owned())
         }
         // A violation the code handles (a duplicate key, a check, a
         // foreign key) is one answer among many: it logs quietly.
-        Some(code) if code.code().starts_with("23") => {
+        Some(code) if code.starts_with("23") => {
             tracing::debug!("the database refused a statement: {e}");
             Error::Storage(Storage::internal(e))
         }
         // Out of space: the same shortage, wherever the metadata lives.
-        Some(code) if code.code() == "53100" => {
+        Some("53100") => {
             tracing::error!("the server is out of disk space: {e}");
             Error::Storage(Storage::disk_full(e))
         }
@@ -3105,6 +3117,33 @@ mod tests {
         assert_eq!(
             merged_options(Some("--search_path=scion_test_1"), OWN),
             format!("--search_path=scion_test_1 {OWN}")
+        );
+    }
+
+    #[test]
+    fn a_53100_database_error_is_disk_full_with_the_fixed_reply() {
+        use super::pg_error_of;
+        use crate::{Error, StorageClass};
+        // A source of the right type with no SQLSTATE of its own: a
+        // connect to port 1, which every kernel refuses. The mapping
+        // runs on the SQLSTATE the test hands it, not on this source.
+        let Err(refused) = Client::connect("postgres://127.0.0.1:1/x", NoTls) else {
+            panic!("a connect to port 1 is refused");
+        };
+        assert!(!refused.is_closed());
+        assert!(refused.code().is_none());
+        let error = pg_error_of(Some("53100"), refused);
+        assert!(
+            matches!(&error, Error::Storage(s) if s.class() == StorageClass::DiskFull),
+            "{error:?}"
+        );
+        // The reply the client sees is the fixed one: it names the
+        // shortage and the retry, not the server path.
+        let status = tonic::Status::from(error);
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            status.message(),
+            "the server is out of disk space; retry later"
         );
     }
 

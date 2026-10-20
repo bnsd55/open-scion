@@ -2305,7 +2305,8 @@ mod tests {
         let (_dir, store, cs) = landed_store();
         if Backend::test_is_postgres() {
             // The page cap is a data-directory hook; the Postgres disk
-            // full is the SQLSTATE 53100 arm, counted by the same code.
+            // full is the SQLSTATE 53100 arm of the pg mapping, a unit
+            // test of pg.rs, and it feeds the same counter code.
             return;
         }
         let Backend::Sqlite(store) = &store else {
