@@ -17,7 +17,7 @@ start with v0.4.
 ## What each level gets
 
 Today, with one supported line (the latest commit on `main`, per
-[SECURITY.md](SECURITY.md)), every fix lands on `main` and rides the
+[SECURITY.md](../SECURITY.md)), every fix lands on `main` and rides the
 next release.
 
 From v0.4 the split is: the current minor (release N) gets fixes for
