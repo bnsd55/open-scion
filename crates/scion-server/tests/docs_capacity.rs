@@ -113,9 +113,8 @@ fn numeric_columns_parse_and_dashes_say_what_failed() {
             .unwrap_or_else(|_| panic!("errors does not parse: {row:?}"));
         for (at, cell) in row[3..].iter().enumerate() {
             if cell.as_str() != "-" {
-                cell.parse::<f64>().unwrap_or_else(|_| {
-                    panic!("a number does not parse: {cell:?} in {row:?}")
-                });
+                cell.parse::<f64>()
+                    .unwrap_or_else(|_| panic!("a number does not parse: {cell:?} in {row:?}"));
                 continue;
             }
             // A dash is allowed only where a failed bench left the land
