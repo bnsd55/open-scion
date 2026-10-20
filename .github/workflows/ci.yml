@@ -5,12 +5,19 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # The nightly: the same suite, on main, once a night. The v0.8.0 line
+  # "the scheduled full suite passes 30 consecutive runs" counts these
+  # runs (scripts/nightly-streak.sh reads them with --event schedule).
+  schedule:
+    - cron: "0 3 * * *"
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # The event in the group keeps a 03:00 schedule from cancelling a run a
+  # push to main started minutes earlier: the nightly waits its turn.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 # Every third-party action is pinned to the commit SHA its version tag
@@ -380,3 +387,19 @@ jobs:
       # and 002): import, ticket-key, serve, scn reads and writes, fsck,
       # and a one-signal shutdown that must exit 0, on Linux and macOS.
       - run: scripts/release-smoke.sh
+
+  nightly-streak:
+    name: nightly streak
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # A report, not a gate: the v0.8.0 line "the scheduled full suite
+    # passes 30 consecutive runs" is a fact this job prints, and the run
+    # history is where anyone re-checks it. Read-only over the runs.
+    permissions:
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: the current streak of the nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/nightly-streak.sh
