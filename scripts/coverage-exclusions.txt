@@ -1,0 +1,16 @@
+# The statement-coverage measure's exclusions: one filename regex per
+# line, joined by the coverage job into cargo-llvm-cov's
+# --ignore-filename-regex. A # starts a comment, on its own line or
+# after the regex.
+#
+# Generated code needs no line here on purpose: the proto build
+# (tonic_prost_build) writes it into OUT_DIR under target/, which the
+# measure does not count; recorded so the absence is deliberate. The
+# binaries' main glue is not excluded either: the clap glue is thin,
+# and the gate reads the per-crate numbers, where a thin binary's
+# number stays visible.
+
+# The test seam of scion-server: scaffolding that only tests run,
+# behind the test-hooks feature (the lib.rs header names it). It is
+# not production code.
+crates/scion-server/src/test_support/
