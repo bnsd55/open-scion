@@ -61,7 +61,11 @@ groups:
         labels:
           severity: medium
         annotations:
-          response: Runbook to write; start at docs/operations.md section 6.
+          response: >-
+            Sort the p99 by the rpc label to find the slow call; a
+            write-side rise points at the store's fsyncs (BlobSyncSlow
+            fires too), a read-side one at cache misses or a cold memo
+            (docs/operations.md section 6).
       - alert: DiskNearlyFull
         expr: scion_data_free_bytes < 10 * 1024 * 1024 * 1024
         for: 15m
@@ -97,8 +101,9 @@ groups:
           severity: low
         annotations:
           response: >-
-            Runbook to write: the per-tree memo is not serving and every
-            derivation re-walks (docs/operations.md section 6).
+            The per-tree memo is not serving and every derivation
+            re-walks: compare the walk rate with a restart or a memory
+            cap and raise the memory (docs/operations.md section 6).
       - alert: StalledRepliesHigh
         expr: scion_stalled_reply_bytes > 48 * 1024 * 1024
         for: 15m
@@ -106,8 +111,10 @@ groups:
           severity: medium
         annotations:
           response: >-
-            Runbook to write: clients stop reading mid-reply; the cap is
-            --max-stalled-bytes (64 MiB, docs/operations.md section 6).
+            Replies pile up because a client stops reading mid-reply:
+            find the connection in the log's stalled-reply notices; the
+            cap closes it at --max-stalled-bytes (docs/operations.md
+            section 6).
       - alert: TicketRefusals
         expr: >-
           sum(rate(scion_requests_total{rpc="Objects/GetObjects", code=~"permission_denied|unauthenticated"}[5m])) > 1
@@ -180,7 +187,9 @@ groups:
           severity: medium
         annotations:
           response: >-
-            Runbook to write: the snapshot is not serving
+            The tier fetches what it should serve from its snapshot:
+            check CacheDown and the tier's memory caps (--max-bytes,
+            --snapshot-bytes), and raise or restart it
             (docs/operations.md sections 1 and 6).
   - name: gc
     rules:

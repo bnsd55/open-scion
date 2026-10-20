@@ -177,13 +177,15 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # promtool, pinned by version and the release tarball's sha256
-      # (the same discipline the action pins follow), downloaded with
-      # curl so no third-party action enters the supply chain.
+      # promtool, pinned to the current LTS line (3.13, supported on
+      # prometheus.io's release-cycle page through 2027-07) by version
+      # and the release tarball's sha256 (the same discipline the action
+      # pins follow), downloaded with curl so no third-party action
+      # enters the supply chain.
       - run: |
           curl -fsSL -o /tmp/prometheus.tgz \
-            https://github.com/prometheus/prometheus/releases/download/v2.55.1/prometheus-2.55.1.linux-amd64.tar.gz
-          echo "19700bdd42ec31ee162e4079ebda4cd0a44432df4daa637141bdbea4b1cd8927  /tmp/prometheus.tgz" | sha256sum -c -
+            https://github.com/prometheus/prometheus/releases/download/v3.13.4/prometheus-3.13.4.linux-amd64.tar.gz
+          echo "87f21a66f96c597a189cef8d640e8921b621fc17a9feff707c332c4f3b3ddd56  /tmp/prometheus.tgz" | sha256sum -c -
           mkdir /tmp/promtool
           tar -xzf /tmp/prometheus.tgz -C /tmp/promtool --strip-components 1
           /tmp/promtool/promtool check rules deploy/prometheus/openscion-alerts.yml

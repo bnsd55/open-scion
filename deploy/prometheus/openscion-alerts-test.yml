@@ -183,7 +183,11 @@ tests:
               severity: medium
               rpc: Scion/Blame
             exp_annotations:
-              response: Runbook to write; start at docs/operations.md section 6.
+              response: >-
+                Sort the p99 by the rpc label to find the slow call; a
+                write-side rise points at the store's fsyncs
+                (BlobSyncSlow fires too), a read-side one at cache
+                misses or a cold memo (docs/operations.md section 6).
 
   # A8 DiskNearlyFull: 5 GiB free is inside the 10 GiB floor; 20 GiB
   # is not.
@@ -287,8 +291,10 @@ tests:
               severity: low
             exp_annotations:
               response: >-
-                Runbook to write: the per-tree memo is not serving and
-                every derivation re-walks (docs/operations.md section 6).
+                The per-tree memo is not serving and every derivation
+                re-walks: compare the walk rate with a restart or a
+                memory cap and raise the memory (docs/operations.md
+                section 6).
 
   # A12 StalledRepliesHigh: 48 MiB is the threshold, so 48 MiB minus
   # one byte does not fire and one byte over does.
@@ -312,9 +318,10 @@ tests:
               severity: medium
             exp_annotations:
               response: >-
-                Runbook to write: clients stop reading mid-reply; the
-                cap is --max-stalled-bytes (64 MiB, docs/operations.md
-                section 6).
+                Replies pile up because a client stops reading
+                mid-reply: find the connection in the log's
+                stalled-reply notices; the cap closes it at
+                --max-stalled-bytes (docs/operations.md section 6).
 
   # A13 PgReadersPinned: all 8 readers busy fires; 7 does not.
   - interval: 1m
@@ -470,8 +477,10 @@ tests:
               severity: medium
             exp_annotations:
               response: >-
-                Runbook to write: the snapshot is not serving
-                (docs/operations.md sections 1 and 6).
+                The tier fetches what it should serve from its
+                snapshot: check CacheDown and the tier's memory caps
+                (--max-bytes, --snapshot-bytes), and raise or restart
+                it (docs/operations.md sections 1 and 6).
 
   # A18 GcStale: a timestamp that stopped 48.3 h ago fires; a fresh
   # one (its age goes negative in the test's clock) does not.
