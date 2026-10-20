@@ -151,10 +151,22 @@ jobs:
       - name: The SBOM of each shipped binary's crate
         run: |
           set -euo pipefail
+          export LC_ALL=C
           cargo cyclonedx --all --format json --spec-version 1.5
           mkdir -p out
           for crate in open-scion-server open-scion-tier scn; do
             find . -name "$crate.cdx.json" -exec cp {} "out/$crate.cdx.json" \;
+          done
+          # The SBOM attestation reads only documents that carry a
+          # serialNumber; cargo-cyclonedx writes none. A deterministic
+          # one: the UUID-shaped digest of the file itself, so the two
+          # builds still agree.
+          for sbom in out/*.cdx.json; do
+            h="$(sha256sum "$sbom" 2>/dev/null | cut -d' ' -f1 \
+              || shasum -a 256 "$sbom" | cut -d' ' -f1)"
+            u="urn:uuid:${h:0:8}-${h:8:4}-5${h:13:3}-a${h:17:3}-${h:20:12}"
+            jq --arg sn "$u" '.serialNumber = $sn' "$sbom" > "$sbom.tmp" \
+              && mv "$sbom.tmp" "$sbom"
           done
       - name: Collect, hash, record the environment
         run: |
