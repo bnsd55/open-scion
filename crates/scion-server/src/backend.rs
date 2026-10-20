@@ -212,6 +212,12 @@ fn refuse_postgres_marker(data: &Path) -> Result<()> {
 
 /// The store UUID a marker carries, if it names one: 32 hex digits on
 /// its second line.
+/// The store UUID the data directory's marker holds, for the archive's
+/// manifest: it names where the metadata came from.
+pub(crate) fn store_uuid_of(data: &Path) -> Option<[u8; 16]> {
+    marker_uuid(data)
+}
+
 fn marker_uuid(data: &Path) -> Option<[u8; 16]> {
     let text = std::fs::read_to_string(data.join(MARKER)).ok()?;
     let line = text.lines().nth(1)?.trim();
@@ -948,6 +954,30 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn repo_changesets_with_bodies(
+        &mut self,
+        repo: RepoId,
+    ) -> Result<Vec<(Vec<u8>, i64, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.repo_changesets_with_bodies(repo),
+            Self::Postgres(pg) => pg.repo_changesets_with_bodies(repo),
+        }
+    }
+
+    fn list_refs(&mut self, repo: RepoId) -> Result<Vec<(String, Vec<u8>, i64)>> {
+        match self {
+            Self::Sqlite(tx) => tx.list_refs(repo),
+            Self::Postgres(pg) => pg.list_refs(repo),
+        }
+    }
+
+    fn pending_lands(&mut self, repo: RepoId) -> Result<Vec<crate::meta::PendingLand>> {
+        match self {
+            Self::Sqlite(tx) => tx.pending_lands(repo),
+            Self::Postgres(pg) => pg.pending_lands(repo),
+        }
+    }
+
     fn delete_repo_blob(&mut self, repo: RepoId, blob: &[u8]) -> Result<()> {
         match self {
             Self::Sqlite(tx) => tx.delete_repo_blob(repo, blob),
@@ -1061,6 +1091,13 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.cas_ref(repo, name, expected, target),
             Self::Postgres(pg) => pg.cas_ref(repo, name, expected, target),
+        }
+    }
+
+    fn restore_ref(&mut self, repo: RepoId, name: &str, target: &[u8], version: i64) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.restore_ref(repo, name, target, version),
+            Self::Postgres(pg) => pg.restore_ref(repo, name, target, version),
         }
     }
 

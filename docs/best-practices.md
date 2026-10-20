@@ -101,7 +101,7 @@ public claim the owner makes.
 | documentation_quick_start | met | README.md Try it; smoke runs it |
 | documentation_current | met | docs_ops and docs_links pin the docs |
 | documentation_achievements | Ben | The README badge is the owner's call |
-| accessibility_best_practices | gap | A scope statement; a SHOULD |
+| accessibility_best_practices | met | README.md states the text scope |
 | internationalization | N/A | English messages by design |
 | sites_password_security | N/A | The sites are GitHub's |
 | maintenance_or_update | met | docs/compatibility.md, docs/support.md |
@@ -124,8 +124,8 @@ public claim the owner makes.
 | automated_integration_testing | met | ci.yml, per-job reports |
 | regression_tests_added50 | Ben | The policy is set; the share is a fact |
 | test_statement_coverage80 | met | The coverage gate: 85.7 percent lines |
-| test_policy_mandated | gap | One line in CONTRIBUTING.md |
-| tests_documented_added | gap | The same line, in the same file |
+| test_policy_mandated | met | CONTRIBUTING.md: tested, or said why not |
+| tests_documented_added | met | CONTRIBUTING.md, the same rule |
 | warnings_strict | met | -D warnings, both platforms |
 | implement_secure_design | met | docs/threat-model.md's invariants |
 | crypto_weaknesses | met | As passing |
@@ -145,19 +145,15 @@ public claim the owner makes.
 
 ## The gaps, smallest first
 
-1. `test_policy_mandated` and `tests_documented_added`: one line in
-   CONTRIBUTING.md (a doc change).
-2. `governance` and `roles_responsibilities`: GOVERNANCE.md, whose content
+1. `governance` and `roles_responsibilities`: GOVERNANCE.md, whose content
    the owner approves (a doc change; the facts are Ben's).
-3. `dco`: a DCO section in CONTRIBUTING.md and a sign-off check (a doc
+2. `dco`: a DCO section in CONTRIBUTING.md and a sign-off check (a doc
    change plus a small CI check).
-4. `signed_releases`: the owner decides the release channels; the artifact
+3. `signed_releases`: the owner decides the release channels; the artifact
    attestations are already the v0.8.0 roadmap line (Ben).
-5. `access_continuity` and `bus_factor`: a second person with access, or a
+4. `access_continuity` and `bus_factor`: a second person with access, or a
    documented recovery path (Ben).
-6. `report_responses`, `enhancement_responses`, `regression_tests_added50`:
+5. `report_responses`, `enhancement_responses`, `regression_tests_added50`:
    facts from the issue tracker's history (Ben).
-7. `know_secure_design` and `know_common_errors`: person claims the owner
+6. `know_secure_design` and `know_common_errors`: person claims the owner
    answers on the form (Ben).
-8. `accessibility_best_practices`: a scope statement (a doc change; a SHOULD
-   that does not block the level).

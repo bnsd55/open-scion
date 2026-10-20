@@ -38,6 +38,13 @@ This project rebuilds the ideas from that public article.
 **Platforms.** Linux and macOS. Windows is not supported. What exactly is
 tested and what is not: [Supported platforms](#supported-platforms) below.
 What each release promises per surface: [docs/stability.md](docs/stability.md).
+
+**Interface.** openscion is a command-line tool and a service, and its
+interface is text: commands, plain files, and log lines. That is the
+accessibility surface this project supports. Human output may change
+between releases; `--json` output is the stable form for scripts and
+assistive tools ([docs/stability.md](docs/stability.md)).
+
 What each severity level gets and for how long:
 [docs/support.md](docs/support.md).
 

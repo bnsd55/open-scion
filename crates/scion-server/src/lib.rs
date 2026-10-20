@@ -62,6 +62,7 @@ pub(crate) mod audit;
 pub(crate) mod auth;
 pub(crate) mod backend;
 pub use backend::Backend;
+pub mod archive;
 pub(crate) mod blame;
 pub(crate) mod db;
 pub(crate) mod deadline;
