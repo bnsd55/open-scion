@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 /// # Errors
 ///
 /// [`Error::InvalidArgument`] naming `what` if the name breaks a rule.
-pub fn check(what: &str, value: &str) -> Result<()> {
+pub(crate) fn check(what: &str, value: &str) -> Result<()> {
     scion_proto::runtime::check::name(what, value).map_err(Error::InvalidArgument)
 }
 

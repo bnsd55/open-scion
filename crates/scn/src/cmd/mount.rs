@@ -58,6 +58,9 @@ pub(crate) mod record {
 
     /// One live mount, as the session file holds it.
     #[derive(Clone, Debug, PartialEq)]
+    // The test seam re-exports this (test_support.cmd.mount), and
+    // unreachable_pub does not see through a re-export.
+    #[allow(unreachable_pub)]
     pub struct MountRecord {
         /// The mounted directory, absolute.
         pub dir: PathBuf,
@@ -76,6 +79,9 @@ pub(crate) mod record {
     /// sibling temp file, made durable, renamed over the table. A crash mid
     /// write leaves the old table, not a torn one; a concurrent scn writes
     /// its own temp file, so a clobber is impossible.
+    // The test seam re-exports this (test_support.cmd.mount), and
+    // unreachable_pub does not see through a re-export.
+    #[allow(unreachable_pub)]
     pub fn write_sessions(file: &Path, sessions: &[MountRecord]) -> Result<()> {
         let records: Vec<serde_json::Value> = sessions
             .iter()

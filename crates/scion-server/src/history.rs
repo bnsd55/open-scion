@@ -109,6 +109,9 @@ fn check_node_bytes_cap() -> usize {
 
 /// The ID of a history node: the hash of its bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+// In the signatures of the pub `MetaTx` methods the test seam
+// re-exports; unreachable_pub does not see signature reachability.
+#[allow(unreachable_pub)]
 pub struct NodeId(pub(crate) [u8; 32]);
 
 impl NodeId {

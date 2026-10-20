@@ -25,6 +25,11 @@
 //! On a backend whose commit is durable on return, `write` is `commit`,
 //! `flush` does nothing, and a read need not wait.
 
+// Every pub item of this module is re-exported by the test seam
+// (`test_support` in lib.rs), and unreachable_pub does not see
+// through a re-export, so this marker would fire on all of them
+// under any feature set.
+#![allow(unreachable_pub)]
 use scion_core::RepoPath;
 use scion_core::{BlobId, Changeset, ChangesetId, Tree, TreeId};
 

@@ -240,6 +240,9 @@ impl Error {
 /// wrote nothing), a full one is the server's own shortage, and the rest
 /// keep the engine's error as the source. The test seams export it, so
 /// the integration tests convert the way the crate does.
+// The test seam re-exports this (test_support.error), and
+// unreachable_pub does not see through a re-export.
+#[allow(unreachable_pub)]
 #[must_use]
 pub fn from_sqlite(e: rusqlite::Error) -> Error {
     if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) {
