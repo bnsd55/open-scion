@@ -5,6 +5,52 @@ the support policy the v0.4 gate asks for ([ROADMAP.md](ROADMAP.md)).
 It describes what the project does today and names the pieces that
 start with v0.4.
 
+## Platform matrix
+
+What runs where, at what confidence. A cell is a component on an OS,
+an architecture, a data filesystem and a Postgres major. The rule of
+the v0.8 gate ([ROADMAP.md](ROADMAP.md)): a cell the matrix marks
+**supported** runs natively in CI — a job of
+[.github/workflows/ci.yml](../.github/workflows/ci.yml) builds and
+tests it on its own platform, every push. Cross-compiling is not
+evidence: a binary built on another platform proves nothing about the
+cell it targets, and a release ships artifacts only for the cells
+marked supported here.
+
+| Component | OS | Arch | Data filesystem | Postgres | Status | CI job | Why |
+|---|---|---|---|---|---|---|---|
+| scion-server | Linux | x64 | ext4 | — | supported | `test` (ci.yml) | The default runner disk; the whole workspace suite runs on it |
+| scion-server | Linux | x64 | ext4 | 17 | supported | `test-postgres` (ci.yml) | The Postgres-backed suite, native `postgres:17.11` service, plus the takeover drill |
+| scion-server | Linux | x64 | tmpfs | — | supported | `test` (ci.yml) | The `disk_full` step fills a real tmpfs (`SCION_DISK_REQUIRE=1`) |
+| scion-server | Linux | arm64 | ext4 | — | best effort | — | The code has no arch pins, but no native job runs it yet; hosted `ubuntu-24.04-arm` is free for public repos |
+| scion-server | Linux | arm64 | ext4 | 17 | best effort | — | Same: the arm64 job lands before this cell claims supported |
+| scion-server | macOS | arm64 | APFS | — | supported | `test-macos` (ci.yml) | Native `macos-15` runner, full workspace suite; the runner's disk is APFS |
+| scion-server | Windows | x64 | any | — | unsupported | — | No job builds or tests it; the lock files and paths assume POSIX. Unsupported until a native job exists |
+| scion-cache | Linux | x64 | memory | — | supported | `test` (ci.yml) | The suite covers the tier crate; objects live in memory |
+| scion-cache | Linux | arm64 | memory | — | best effort | — | No native job yet |
+| scion-cache | macOS | arm64 | memory | — | supported | `test-macos` (ci.yml) | The suite covers the tier crate |
+| scion-daemon | Linux | x64 | local disk | — | supported | `test` (ci.yml) | The suite covers the tier crate; the daemon's power-cut evidence is the `power-loss` job (LazyFS fault injection, a harness — not a filesystem promise) |
+| scion-daemon | Linux | arm64 | local disk | — | best effort | — | No native job yet |
+| scion-daemon | macOS | arm64 | local disk (APFS) | — | supported | `test-macos` (ci.yml) | The suite covers the tier crate |
+| scn | Linux | x64 | any | — | supported | `test` (ci.yml) | The CLI suite runs in the workspace job |
+| scn | Linux | arm64 | any | — | best effort | — | No native job yet |
+| scn | macOS | arm64 | any | — | supported | `test-macos` (ci.yml) | The CLI suite runs in the macOS job; the runner's disk is APFS |
+| scn mount | Linux | x64 | NFS | — | supported | `nfs-mount` (ci.yml) | The kernel NFS client mounts scn's server on the runner |
+| scn mount | macOS | arm64 | NFS | — | best effort | — | macOS can mount NFS, but no job proves it |
+| scn mount | Windows | any | any | — | unsupported | — | The mount serves NFSv3 and rides POSIX mounts |
+
+Runner labels move (macOS versions retire, Ubuntu releases come): the
+labels this table names are checked against the workflows by a test,
+`support_matrix` in `crates/scion-server/tests/`, the same way
+[stability.md](stability.md)'s promises are pinned. A cell flips to
+supported only when its native job exists; the test fails while a
+supported row's job is missing, mismatched, or gone.
+
+Postgres majors are promised per cell, not as a family: the server
+answers on the majors the `test-postgres` job runs (17 today), and
+adding a major is one service line plus its suite minutes — the cell
+row is added when the job runs it.
+
 ## Severity levels
 
 | Level | It means | Example from this project |

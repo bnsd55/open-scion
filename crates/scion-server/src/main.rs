@@ -253,6 +253,10 @@ enum KindName {
 
 /// Runs `fsck` against `store`, prints one line per problem, and exits:
 /// 0 when it saw no damage, 1 when it did, 2 when it could not run.
+/// The exits are `std::process::exit`, which skips destructors: safe
+/// here, because nothing this function holds needs dropping — the
+/// store's lock is released by the kernel at exit, and the report is
+/// plain data.
 fn fsck_command(store: &Backend) -> anyhow::Result<()> {
     let report = match fsck::run(store, fsck::BATCH, &mut |_| {}) {
         Ok(report) => report,
@@ -379,13 +383,29 @@ async fn main() -> anyhow::Result<()> {
     // be given together), the argv form warns, the env is quiet.
     let postgres_url = postgres_url_of(&cli)?;
     let store = match cli.command {
-        Command::Import { .. } | Command::Fsck | Command::Gc { .. } => Backend::open_shared(
+        Command::Import { .. } | Command::Gc { .. } => Backend::open_shared(
             &cli.data,
             postgres_url.as_deref(),
             cli.postgres_ca.as_deref(),
         ),
         Command::HashToken { .. } => return hash_token(),
         Command::TicketKey { .. } => return write_ticket_key(),
+        // `fsck` cannot run when the store cannot open, and its table
+        // says that is 2, not the generic open failure's 1.
+        Command::Fsck => match Backend::open_shared(
+            &cli.data,
+            cli.postgres_url.as_deref(),
+            cli.postgres_ca.as_deref(),
+        ) {
+            Ok(store) => Ok(store),
+            Err(e) => {
+                eprintln!("scion-server fsck: {e}");
+                // `exit` skips destructors: safe on this path, because
+                // nothing was opened yet — the store refused to open,
+                // so there is no lock to release and nothing buffered.
+                std::process::exit(2);
+            }
+        },
         Command::Serve { .. } | Command::Derive { .. } => Backend::open(
             &cli.data,
             postgres_url.as_deref(),
