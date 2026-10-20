@@ -645,33 +645,38 @@ checking out through a cache and a daemon beside it.
 | Runner | the hosted runner class, by its public label and spec |
 | Repetitions | 2 per cell; the table reports the cell's whole run, and the run's raw samples are the workflow run's `capacity.csv` artifact |
 
-| backend | writers | readers | lands/min | land p99 ms | checkout p50 ms | checkout p99 ms | server RSS MiB | store KiB per 1k lands |
-|---|---|---|---|---|---|---|---|---|
-| sqlite | 2 | 0 | - | - | - | - | - | - |
-| sqlite | 2 | 5 | - | - | - | - | - | - |
-| sqlite | 2 | 20 | - | - | - | - | - | - |
-| sqlite | 50 | 0 | - | - | - | - | - | - |
-| sqlite | 50 | 5 | - | - | - | - | - | - |
-| sqlite | 50 | 20 | - | - | - | - | - | - |
-| sqlite | 200 | 0 | - | - | - | - | - | - |
-| sqlite | 200 | 5 | - | - | - | - | - | - |
-| sqlite | 200 | 20 | - | - | - | - | - | - |
-| postgres | 2 | 0 | - | - | - | - | - | - |
-| postgres | 2 | 5 | - | - | - | - | - | - |
-| postgres | 2 | 20 | - | - | - | - | - | - |
-| postgres | 50 | 0 | - | - | - | - | - | - |
-| postgres | 50 | 5 | - | - | - | - | - | - |
-| postgres | 50 | 20 | - | - | - | - | - | - |
-| postgres | 200 | 0 | - | - | - | - | - | - |
-| postgres | 200 | 5 | - | - | - | - | - | - |
-| postgres | 200 | 20 | - | - | - | - | - | - |
+| backend | writers | readers | lands/min | land p99 ms | checkout p50 ms | checkout p99 ms | errors | server RSS MiB | store KiB per 1k lands |
+|---|---|---|---|---|---|---|---|---|---|
+| sqlite | 2 | 0 | - | - | - | - | - | - | - |
+| sqlite | 2 | 5 | - | - | - | - | - | - | - |
+| sqlite | 2 | 20 | - | - | - | - | - | - | - |
+| sqlite | 50 | 0 | - | - | - | - | - | - | - |
+| sqlite | 50 | 5 | - | - | - | - | - | - | - |
+| sqlite | 50 | 20 | - | - | - | - | - | - | - |
+| sqlite | 200 | 0 | - | - | - | - | - | - | - |
+| sqlite | 200 | 5 | - | - | - | - | - | - | - |
+| sqlite | 200 | 20 | - | - | - | - | - | - | - |
+| postgres | 2 | 0 | - | - | - | - | - | - | - |
+| postgres | 2 | 5 | - | - | - | - | - | - | - |
+| postgres | 2 | 20 | - | - | - | - | - | - | - |
+| postgres | 50 | 0 | - | - | - | - | - | - | - |
+| postgres | 50 | 5 | - | - | - | - | - | - | - |
+| postgres | 50 | 20 | - | - | - | - | - | - | - |
+| postgres | 200 | 0 | - | - | - | - | - | - | - |
+| postgres | 200 | 5 | - | - | - | - | - | - | - |
+| postgres | 200 | 20 | - | - | - | - | - | - | - |
 
-The cells with `-` are the ones no run has filled yet. The envelope's
-edge, the point where a cell stops being an answer: a checkout p99 over
-5 seconds, a land p99 over 5 seconds, or a client error outside the
-accepted classes of the soak. A reader who wants a different edge applies
-it to the run's `capacity.csv` artifact, which the footer's workflow run
-keeps.
+The cells with `-` are the ones no run has filled yet. The errors column
+is part of the data, not a failure of the run: the envelope's edge IS
+where errors start, so a cell whose clients failed is recorded with its
+error count and stands in the table. The edge, the point where a cell
+stops being an answer: a checkout p99 over 5 seconds, a land p99 over
+5 seconds, or a client error outside the accepted classes of the soak -
+in the table, that is a cell with errors above 0. A reader who wants a
+different edge applies it to the run's `capacity.csv` artifact, which
+the footer's workflow run keeps. A cell whose bench died names no land
+percentile (`-` there); its lands per minute still come from the
+server's counter.
 
 The store growth column is the SQLite store's only; the Postgres cells
 name no store growth, because the database's disk is its service

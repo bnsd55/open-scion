@@ -44,7 +44,7 @@ note() { echo "-- $*" >&2; }
 # The tools that a plain Linux or macOS may lack. The rest are POSIX.
 need() {
   local c
-  for c in cargo git pkill seq curl; do
+  for c in cargo git pkill seq curl jq; do
     command -v "$c" > /dev/null || die "needs $c"
   done
   # GNU timeout caps every client and maintenance call. A default Mac

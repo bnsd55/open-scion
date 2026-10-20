@@ -131,7 +131,7 @@ for backend in sqlite postgres; do
         while [ "$(date +%s)" -lt "$END" ]; do
           n=$((n + 1))
           t0=$(date +%s%N)
-          if timeout 60 "$BIN/scn" --server "$SERVER" --objects "$DAEMON" checkout main \
+          if "$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" --objects "$DAEMON" checkout main \
             --sparse "$SPARSE_DIR" --into "$WORK/reads/$n" > /dev/null 2>> "$WORK/reads-$backend-w$w-r$r.log"; then
             t1=$(date +%s%N)
             echo $(( (t1 - t0) / 1000000 )) >> "$WORK/read-times.csv"
@@ -142,15 +142,24 @@ for backend in sqlite postgres; do
         done
       }
       readers & echo $! > "$WORK/capacity-readers.pid"
+      # The server's Land counter at the cell's start: lands served is
+      # the counter's growth over the cell, so a cell whose bench dies
+      # still reports what its writers got through.
+      lands_before=$(curl -fsS "http://127.0.0.1:$SERVER_METRICS_PORT/metrics" 2> /dev/null |
+        awk '/^scion_requests_total\{.*rpc="Scion\/Land"/ { s += $NF } END { print s + 0 }')
       rep=1
+      bench_fail=0
       while [ "$rep" -le "$REPS" ]; do
         # The writers land for this repetition; the server's own report
         # carries the land percentiles.
         sleep 10 # the cell's warm start, before bench begins
-        if ! timeout 600 "$BIN/scn" --server "$SERVER" bench --agents "$w" \
+        if ! "$TIMEOUT" 600 "$BIN/scn" --server "$SERVER" bench --agents "$w" \
           --lands "$LANDS" --json > "$WORK/bench-$backend-w$w-r$r.json" 2> "$WORK/bench-$backend-w$w-r$r.log"; then
-          tail -n 5 "$WORK/bench-$backend-w$w-r$r.log" >&2
-          die "bench failed in cell $backend w$w r$r rep$rep"
+          # A bench that failed is the cell's data, not the run's
+          # failure: the envelope's edge is where errors start. The row
+          # records it and the grid goes on.
+          echo "bench failed in cell $backend w$w r$r rep$rep (the row records it)" >&2
+          bench_fail=1
         fi
         # The readers keep going until this rep's slice of the run is
         # over, so every rep sees the same reader load.
@@ -162,29 +171,38 @@ for backend in sqlite postgres; do
       kill "$(cat "$WORK/capacity-readers.pid")" 2> /dev/null || true
       wait "$(cat "$WORK/capacity-readers.pid")" 2> /dev/null || true
       rss_end=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')
+      # Lands served, from the server's counter, while it still serves:
+      # the counter counts what the writers got through, whether bench
+      # finished or not.
+      lands_end=$(curl -fsS "http://127.0.0.1:$SERVER_METRICS_PORT/metrics" 2> /dev/null |
+        awk '/^scion_requests_total\{.*rpc="Scion\/Land"/ { s += $NF } END { print s + 0 }')
       stop_scion
-      # One row per repetition would need bench per rep; bench's report
-      # covers all REPS lands together, so the row is the cell's total:
-      # lands per minute over the whole cell, and the percentiles the
-      # report carried.
-      if [ -s "$WORK/read-fail.log" ]; then
-        echo "FAIL: the readers failed in cell $backend w$w r$r:" >&2
-        head -n 3 "$WORK/read-fail.log" >&2
-        die "the readers failed"
+      reader_failures=0
+      [ -f "$WORK/read-fail.log" ] && reader_failures=$(wc -l < "$WORK/read-fail.log" | tr -d ' ')
+      errors=$((reader_failures + bench_fail))
+      # Lands per minute from the server's own counter: it counts what
+      # the writers got through, whether bench finished or not.
+      minutes=$(( ($(date +%s) - T0 + 59) / 60 ))
+      [ "$minutes" -ge 1 ] || minutes=1
+      lands_min=$(( (lands_end - lands_before) / minutes ))
+      if [ "$bench_fail" -eq 0 ] && [ -s "$WORK/bench-$backend-w$w-r$r.json" ]; then
+        land_p99=$(jq -r '.land_ms.p99' "$WORK/bench-$backend-w$w-r$r.json")
+      else
+        # No bench report, no land percentiles: the cell says so in the
+        # errors column, and the land p99 column stays empty.
+        land_p99="-"
       fi
-      lands_per_s=$(python3 -c "
-import json,sys
-with open(sys.argv[1]) as f: d=json.load(f)
-print(f\"{d['lands_per_second']:.1f},{d['land_ms']['p99']:.0f}\")
-" "$WORK/bench-$backend-w$w-r$r.json")
-      lps=${lands_per_s%%,*}
-      land_p99=${lands_per_s##*,}
       c50=$(pct "$WORK/read-times.csv" 0.50)
       c99=$(pct "$WORK/read-times.csv" 0.99)
+      [ -n "$c50" ] || c50="-"
+      [ -n "$c99" ] || c99="-"
       store_end=$(du -sk "$WORK/server" | cut -f1)
       growth=$(( (store_end - STORE_START) * 1000 / (LANDS * REPS) ))
-      echo "$backend,$w,$r,$lps,$land_p99,$c50,$c99,$rss_end,$growth" \
+      echo "$backend,$w,$r,$lands_min,$land_p99,$c50,$c99,$errors,$rss_end,$growth" \
         >> "$WORK/capacity.csv"
+      if [ "$errors" -gt 0 ]; then
+        note "cell $backend w$w r$r: $errors client errors (readers $reader_failures, bench $bench_fail) - recorded, next cell"
+      fi
       rm -f "$WORK/read-times.csv" "$WORK/read-fail.log"
     done
   done
@@ -199,10 +217,10 @@ cp "$WORK"/bench-*.json "${RUNNER_TEMP:-/tmp}/capacity-artifacts/" 2> /dev/null 
 row() { printf '%-46s %s\n' "$1" "$2"; }
 echo "capacity envelope: machine $CAPACITY_MACHINE, commit $HEAD_HEX"
 echo
-echo "| backend | writers | readers | lands/min | land p99 ms | checkout p50 ms | checkout p99 ms | server RSS MiB | store KiB per 1k lands |"
-echo "|---|---|---|---|---|---|---|---|---|"
-while IFS=, read -r backend w r lps land_p99 c50 c99 rss growth; do
-  echo "| $backend | $w | $r | $lps | $land_p99 | $c50 | $c99 | $((rss / 1024)) | $growth |"
+echo "| backend | writers | readers | lands/min | land p99 ms | checkout p50 ms | checkout p99 ms | errors | server RSS MiB | store KiB per 1k lands |"
+echo "|---|---|---|---|---|---|---|---|---|---|"
+while IFS=, read -r backend w r lands_min land_p99 c50 c99 errors rss growth; do
+  echo "| $backend | $w | $r | $lands_min | $land_p99 | $c50 | $c99 | $errors | $((rss / 1024)) | $growth |"
 done < "$WORK/capacity.csv"
 echo
 row "commit" "$HEAD_HEX"
