@@ -536,6 +536,26 @@ schema 4 walks every repo's changesets). Two rules:
   migration waits for them to stop: the error says `stop the other processes
   that use ...`. One process at a time migrates.
 
+### A failed migration
+
+A migration that cannot finish leaves the database at one whole step, so
+the two failures an operator sees are the two rules above, and the runbook
+is the rule that names the case:
+
+1. The open refuses with `schema version N is newer than this build`:
+   the data ran on a newer build than this binary. The fix is the old
+   binary, or the restore of section 3. Never edit `user_version` by
+   hand: the version is the migration's bookmark, and a hand-moved one
+   leaves the database half-migrated in a way no migration can finish.
+2. The start waits with `stop the other processes that use ...`: another
+   process holds the directory. Stop it; the migration runs on the next
+   start.
+
+After the fix, the server starts and serves; `fsck` says the store is
+whole.
+
+Proof: crates/scion-server/tests/crash.rs::a_newer_schema_refuses_the_open_and_a_restore_serves
+
 An import reads git revision `--rev` (default `HEAD`) into scion repo
 `--repo` (default `main`), and points scion ref `--ref` (default `main`)
 at the imported tip. Besides every root and merge, it re-checks `--verify`
@@ -564,6 +584,14 @@ The routines are these:
 - `fsck` on a schedule (it is read-only, so it can run beside a live
   server), and always on a fresh backup copy. Exit 1 with the problem lines
   is the signal to restore from a backup; there is no automatic repair.
+
+  An fsck failure (exit 1) is the restore runbook of section 3, and the
+  test that proves it is the failing-disk runbook's: damage on disk,
+  the `fsck` command to its exit 1 with the problem named, the restore
+  into a fresh directory, and fsck clean on the restored copy before
+  the server starts.
+
+  Proof: crates/scion-server/tests/storage.rs::a_failing_disk_runbook_fscks_restores_and_serves
 - `tmp/` needs no attention: every open removes the staging folders of dead
   processes, and a lone open also removes files a build older than the
   schema left there.
