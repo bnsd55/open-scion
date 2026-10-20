@@ -159,6 +159,8 @@ jobs:
       - name: Collect, hash, record the environment
         run: |
           set -euo pipefail
+          # Byte order for names and sort output: stable on every image.
+          export LC_ALL=C
           sum() {
             if command -v sha256sum >/dev/null 2>&1; then
               sha256sum "$@"
@@ -213,6 +215,7 @@ jobs:
       - name: Compare the two payloads
         run: |
           set -euo pipefail
+          export LC_ALL=C
           # The payload must agree byte for byte. The environment record
           # stays out: it describes each build (its runner image), and
           # one run can span two image versions. Bare filenames, so the
