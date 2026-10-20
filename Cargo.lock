@@ -2583,6 +2583,7 @@ dependencies = [
  "prost",
  "rusqlite",
  "rustix",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
