@@ -640,11 +640,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_client_that_stops_reading_is_cut_off_and_frees_its_budget() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
-        let raw = match &store {
-            Backend::Sqlite(raw) => raw,
-            Backend::Postgres(_) => unreachable!(),
-        };
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let raw = store.as_sqlite().expect("the client tests run on SQLite");
         let keys: Vec<Key> = [b"one".as_slice(), b"second", b"three"]
             .iter()
             .map(|data| Key::Blob(store.blobs().put(data).unwrap()))
@@ -693,7 +690,7 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let a = Key::Blob(store.blobs().put(b"a blob").unwrap());
         let budget = 1000;
         let in_flight = Arc::new(Semaphore::new(budget));
@@ -735,7 +732,7 @@ mod tests {
     #[tokio::test]
     async fn a_walk_bigger_than_the_free_budget_ends_resource_exhausted() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let a = Key::Blob(store.blobs().put(b"a blob").unwrap());
         let budget = 1000;
         let in_flight = Arc::new(Semaphore::new(budget));
@@ -774,7 +771,7 @@ mod tests {
     #[tokio::test]
     async fn a_wait_for_room_ends_before_the_deadline() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let a = Key::Blob(store.blobs().put(b"a blob").unwrap());
         let in_flight = Arc::new(Semaphore::new(1000));
         let _others = reply::try_take(&in_flight, 1000).unwrap();
@@ -814,7 +811,7 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let content = vec![b'x'; 5000];
         let key = Key::Blob(store.blobs().put(&content).unwrap());
         let in_flight =
@@ -863,7 +860,7 @@ mod tests {
     #[tokio::test]
     async fn a_blob_goes_out_as_its_stored_file_in_parts_or_unpacked() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         // Over three parts once packed: bytes that do not compress.
         let mut state = 1_u64;
         let content: Vec<u8> = (0..3 * CHUNK_BYTES + 100)
@@ -937,7 +934,7 @@ mod tests {
         use scion_core::{Entry, FileEntry, FileState, PathElem, Tree};
         use std::collections::BTreeMap;
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         // A middle tree whose one file entry has a wide name, so its body
         // is hundreds of bytes, under a root of one small entry, over a
         // leaf the ref ends at.

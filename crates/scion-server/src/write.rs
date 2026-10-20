@@ -224,7 +224,7 @@ mod tests {
     /// A store with repo `main` and an empty root changeset in it.
     fn store_with_root() -> (tempfile::TempDir, Backend, ChangesetId) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let root = store
             .write(|c| {
                 let repo = c.create_repo("main")?;

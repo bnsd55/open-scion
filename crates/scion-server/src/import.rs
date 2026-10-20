@@ -316,7 +316,7 @@ fn store_batch(
     let slow_record = SLOW_RECORD.with(Cell::get);
     // A Postgres database has one writer: a long batch holds it, like a
     // shared data directory's write lock does. The budget applies to both.
-    let shared = store.is_shared() || matches!(store, Backend::Postgres(_));
+    let shared = store.is_shared() || store.as_postgres().is_some();
     let mut rest = prepared;
     while !rest.is_empty() {
         let mut taken = 0;
@@ -1067,7 +1067,7 @@ mod tests {
         };
         let import = |cache_entries| {
             let data = tempfile::tempdir().unwrap();
-            let store = Backend::Sqlite(Store::open(data.path()).unwrap());
+            let store = Backend::sqlite(Store::open(data.path()).unwrap());
             import_with_cache(&store, "main", dir, &opts, cache_entries, MAX_CHANGES).unwrap()
         };
         let tiny = import(2);
@@ -1089,7 +1089,7 @@ mod tests {
         git(dir, &["commit", "-q", "-m", "add"]);
 
         let data = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(data.path()).unwrap());
+        let store = Backend::sqlite(Store::open(data.path()).unwrap());
         let opts = |rev: &str| ImportOptions {
             rev: rev.into(),
             target_ref: "main".into(),
@@ -1139,7 +1139,7 @@ mod tests {
         git(dir, &["commit", "-q", "-m", "one"]);
 
         let data = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(data.path()).unwrap());
+        let store = Backend::sqlite(Store::open(data.path()).unwrap());
         let opts = ImportOptions {
             rev: "main".into(),
             target_ref: "main".into(),
@@ -1170,8 +1170,8 @@ mod tests {
     fn a_land_while_the_import_checks_the_ref_is_never_overwritten() {
         crate::store::spawn_guard::prime_gix_lookup();
         let data = tempfile::tempdir().unwrap();
-        let server = Backend::Sqlite(Store::open(data.path()).unwrap());
-        let importer = Backend::Sqlite(Store::open_shared(data.path()).unwrap());
+        let server = Backend::sqlite(Store::open(data.path()).unwrap());
+        let importer = Backend::sqlite(Store::open_shared(data.path()).unwrap());
         // main is at root. Git has root ─ tip, and a land puts X on root.
         let changeset = |parents, message: &str| {
             Changeset::new(
@@ -1250,8 +1250,8 @@ mod tests {
     #[test]
     fn an_import_that_keeps_losing_the_ref_swap_gives_up() {
         let data = tempfile::tempdir().unwrap();
-        let server = Backend::Sqlite(Store::open(data.path()).unwrap());
-        let importer = Backend::Sqlite(Store::open_shared(data.path()).unwrap());
+        let server = Backend::sqlite(Store::open(data.path()).unwrap());
+        let importer = Backend::sqlite(Store::open_shared(data.path()).unwrap());
         // main is at root. The chain root <- a1 <- a2 <- a3 <- tip hangs
         // under it, so every mover target is still an ancestor of the
         // imported tip and the import never hears "diverged".
@@ -1333,7 +1333,7 @@ mod tests {
             git(dir, &["commit", "-q", "-m", &i.to_string()]);
         }
         let data = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(data.path()).unwrap());
+        let store = Backend::sqlite(Store::open(data.path()).unwrap());
         let import = |rev: &str| {
             let opts = ImportOptions {
                 rev: rev.into(),
@@ -1376,8 +1376,8 @@ mod tests {
             );
         }
         let data = tempfile::tempdir().unwrap();
-        let server = Backend::Sqlite(Store::open(data.path()).unwrap());
-        let importer = Backend::Sqlite(Store::open_shared(data.path()).unwrap());
+        let server = Backend::sqlite(Store::open(data.path()).unwrap());
+        let importer = Backend::sqlite(Store::open_shared(data.path()).unwrap());
         let opts = ImportOptions {
             rev: "main".into(),
             target_ref: "main".into(),
@@ -1428,7 +1428,7 @@ mod tests {
             );
         }
         let data = tempfile::tempdir().unwrap();
-        let importer = Backend::Sqlite(Store::open(data.path()).unwrap());
+        let importer = Backend::sqlite(Store::open(data.path()).unwrap());
         let opts = ImportOptions {
             rev: "main".into(),
             target_ref: "main".into(),

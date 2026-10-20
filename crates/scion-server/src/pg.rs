@@ -3234,7 +3234,7 @@ mod tests {
                 .get(0)
         };
         assert_eq!(ledger, i64::from(super::PG_SCHEMA_VERSION));
-        let backend = crate::Backend::Postgres(pg);
+        let backend = crate::Backend::postgres(pg);
         old_store::assert_serves(&backend, &cs, id, blob_a, blob_b);
     }
 
@@ -3345,10 +3345,12 @@ mod pool_tests {
             return None;
         }
         let data = tempfile::tempdir().unwrap();
-        match crate::backend::Backend::open_test(data.path()).unwrap() {
-            crate::backend::Backend::Postgres(pg) => Some(pg),
-            crate::backend::Backend::Sqlite(_) => unreachable!("the env named postgres"),
-        }
+        let backend = crate::backend::Backend::open_test(data.path()).unwrap();
+        let pg = backend
+            .as_postgres()
+            .cloned()
+            .expect("the env named postgres");
+        Some(pg)
     }
 
     /// A transaction whose connection dies mid-way leaves the worker's

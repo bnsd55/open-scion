@@ -113,6 +113,37 @@ pub mod test_support {
     pub mod deadline {
         pub use crate::deadline::*;
     }
+    /// The opaque backend, for the tests that build one from a store
+    /// they prepared, or read the data directory's own store out of
+    /// one. The backend itself carries no test methods: the facade
+    /// type stays clean, and the seams live here.
+    pub mod backend {
+        /// Wraps a store the test prepared ([`Store::open`], or
+        /// `open_with_walks` for a capped walk) into a backend, as the
+        /// engine-agnostic constructors cannot: they open their own.
+        /// The engine the store holds is the test's choice, not part
+        /// of the API.
+        #[must_use]
+        pub fn from_store(store: crate::test_support::store::Store) -> crate::Backend {
+            crate::Backend::sqlite(store)
+        }
+
+        /// The test-only reads of a backend: the data directory's own
+        /// store, when the backend is one. [`None`] on Postgres, whose
+        /// rows a test reads through the [`MetaTx`] queries.
+        pub trait BackendExt {
+            /// The store of a data-directory backend, for the tests
+            /// that assert the storage's internals (its raw rows, its
+            /// page caps).
+            fn sqlite(&self) -> Option<&crate::test_support::store::Store>;
+        }
+
+        impl BackendExt for crate::Backend {
+            fn sqlite(&self) -> Option<&crate::test_support::store::Store> {
+                self.as_sqlite()
+            }
+        }
+    }
     /// The error a changeset apply can end in, and the conversion the
     /// tests share with the crate, for the write tests.
     pub mod error {

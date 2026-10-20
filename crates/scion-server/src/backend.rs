@@ -1,10 +1,10 @@
 //! The metadata backend of a server: one of the supported databases,
 //! behind the crate's internal metadata trait.
 //!
-//! [`Backend::Sqlite`] is the data directory of [`Store`].
-//! [`Backend::Postgres`] is a shared database (`Pg`). A caller holds one
-//! and reads or writes through it; the transaction type differs per
-//! backend, so the queries of a call go through `BackendTx`, which
+//! A backend is opaque: the caller opens it (a data directory, or a
+//! shared Postgres database from a URL) and reads or writes through it,
+//! without naming which engine it holds. The transaction type differs
+//! per backend, so the queries of a call go through `BackendTx`, which
 //! forwards them to the backend's own transaction.
 
 use gix::ObjectId;
@@ -27,13 +27,64 @@ use std::sync::atomic::AtomicBool;
 use crate::store::{Blobs, Store};
 
 /// The metadata storage of a server: the data directory, or a shared
-/// Postgres database.
+/// Postgres database. The backend is opaque — which engine it holds is
+/// private, so a caller matches classes of behavior through the
+/// methods, never the engine: a new engine (or a major bump of one) is
+/// then a private change of this crate, not a break of its API.
 #[derive(Clone)]
-pub enum Backend {
+pub struct Backend {
+    inner: Inner,
+}
+
+/// The one engine this build holds, behind the opaque [`Backend`].
+#[derive(Clone)]
+enum Inner {
     /// One data directory on this machine.
     Sqlite(Store),
     /// A Postgres database that a fleet of servers can share.
     Postgres(Pg),
+}
+
+impl Backend {
+    /// A backend on the data directory's own store, for the crate's
+    /// tests: they prepare a store (a walk cap, a page cap) and then
+    /// wrap it.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn sqlite(store: Store) -> Self {
+        Self {
+            inner: Inner::Sqlite(store),
+        }
+    }
+
+    /// A backend on a prepared Postgres handle, for the crate's tests.
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub(crate) fn postgres(pg: Pg) -> Self {
+        Self {
+            inner: Inner::Postgres(pg),
+        }
+    }
+
+    /// The data directory's own store, when this backend is one.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn as_sqlite(&self) -> Option<&Store> {
+        match &self.inner {
+            Inner::Sqlite(store) => Some(store),
+            Inner::Postgres(_) => None,
+        }
+    }
+
+    /// The Postgres handle, when this backend is one.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn as_postgres(&self) -> Option<&Pg> {
+        match &self.inner {
+            Inner::Postgres(pg) => Some(pg),
+            Inner::Sqlite(_) => None,
+        }
+    }
 }
 
 /// The transaction of a [`Backend`]: the queries of one call, forwarded to
@@ -280,9 +331,9 @@ impl Backend {
     /// The derive walks of this backend: which are in flight, and the cap
     /// on how many may be.
     pub(crate) fn derive_flights(&self) -> &crate::derived::DeriveFlights {
-        match self {
-            Self::Sqlite(store) => store.derive_flights(),
-            Self::Postgres(pg) => pg.derive_flights(),
+        match &self.inner {
+            Inner::Sqlite(store) => store.derive_flights(),
+            Inner::Postgres(pg) => pg.derive_flights(),
         }
     }
 
@@ -290,9 +341,9 @@ impl Backend {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn writers_waiting(&self) -> usize {
-        match self {
-            Self::Sqlite(store) => store.writers_waiting(),
-            Self::Postgres(pg) => pg.writers_waiting(),
+        match &self.inner {
+            Inner::Sqlite(store) => store.writers_waiting(),
+            Inner::Postgres(pg) => pg.writers_waiting(),
         }
     }
 
@@ -306,9 +357,9 @@ impl Backend {
         &self,
         deadline: Option<&crate::deadline::Deadline>,
     ) -> Result<()> {
-        match self {
-            Self::Sqlite(store) => store.wait_for_writers(deadline),
-            Self::Postgres(pg) => pg.wait_for_writers(deadline),
+        match &self.inner {
+            Inner::Sqlite(store) => store.wait_for_writers(deadline),
+            Inner::Postgres(pg) => pg.wait_for_writers(deadline),
         }
     }
 
@@ -326,11 +377,15 @@ impl Backend {
             refuse_sqlite_dir(data)?;
             let pg = Pg::open_exclusive(url, ca, PG_READERS, data, marker)?;
             marker_agrees(data, pg.store_uuid())?;
-            Ok(Self::Postgres(pg))
+            Ok(Self {
+                inner: Inner::Postgres(pg),
+            })
         } else {
             refuse_damaged_marker(data)?;
             refuse_postgres_marker(data)?;
-            Ok(Self::Sqlite(Store::open(data)?))
+            Ok(Self {
+                inner: Inner::Sqlite(Store::open(data)?),
+            })
         }
     }
 
@@ -348,11 +403,15 @@ impl Backend {
             refuse_sqlite_dir(data)?;
             let pg = Pg::open(url, ca, PG_READERS, data, marker)?;
             marker_agrees(data, pg.store_uuid())?;
-            Ok(Self::Postgres(pg))
+            Ok(Self {
+                inner: Inner::Postgres(pg),
+            })
         } else {
             refuse_damaged_marker(data)?;
             refuse_postgres_marker(data)?;
-            Ok(Self::Sqlite(Store::open_shared(data)?))
+            Ok(Self {
+                inner: Inner::Sqlite(Store::open_shared(data)?),
+            })
         }
     }
 
@@ -372,7 +431,9 @@ impl Backend {
             let pg =
                 Pg::open_test_shared(&test_url()?, &test_schema(data), PG_READERS, data, marker)?;
             marker_agrees(data, pg.store_uuid())?;
-            return Ok(Self::Postgres(pg));
+            return Ok(Self {
+                inner: Inner::Postgres(pg),
+            });
         }
         refuse_postgres_marker(data)?;
         Self::open_shared(data, None, None)
@@ -395,7 +456,9 @@ impl Backend {
             refuse_sqlite_dir(data)?;
             let pg = Pg::open_test(&test_url()?, &test_schema(data), PG_READERS, data, marker)?;
             marker_agrees(data, pg.store_uuid())?;
-            return Ok(Self::Postgres(pg));
+            return Ok(Self {
+                inner: Inner::Postgres(pg),
+            });
         }
         refuse_postgres_marker(data)?;
         Self::open(data, None, None)
@@ -417,9 +480,9 @@ impl Backend {
     /// it is never fenced.
     #[must_use]
     pub fn fenced(&self) -> bool {
-        match self {
-            Self::Sqlite(_) => false,
-            Self::Postgres(pg) => pg.fenced(),
+        match &self.inner {
+            Inner::Sqlite(_) => false,
+            Inner::Postgres(pg) => pg.fenced(),
         }
     }
 
@@ -430,9 +493,9 @@ impl Backend {
     /// seam, so it is public and documented instead of doc(hidden).
     #[must_use]
     pub fn fence_flag(&self) -> Option<Arc<AtomicBool>> {
-        match self {
-            Self::Sqlite(_) => None,
-            Self::Postgres(pg) => Some(pg.fence_flag()),
+        match &self.inner {
+            Inner::Sqlite(_) => None,
+            Inner::Postgres(pg) => Some(pg.fence_flag()),
         }
     }
 
@@ -458,18 +521,18 @@ impl Backend {
     #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn txes(&self) -> u64 {
-        match self {
-            Self::Sqlite(store) => store.txes(),
-            Self::Postgres(_) => 0,
+        match &self.inner {
+            Inner::Sqlite(store) => store.txes(),
+            Inner::Postgres(_) => 0,
         }
     }
 
     /// The blob folder. Blob files stay on local disk in every backend.
     #[must_use]
     pub fn blobs(&self) -> &Blobs {
-        match self {
-            Self::Sqlite(store) => store.blobs(),
-            Self::Postgres(pg) => pg.blobs(),
+        match &self.inner {
+            Inner::Sqlite(store) => store.blobs(),
+            Inner::Postgres(pg) => pg.blobs(),
         }
     }
 
@@ -478,9 +541,9 @@ impl Backend {
     /// sorts its writers out itself.
     #[must_use]
     pub fn is_shared(&self) -> bool {
-        match self {
-            Self::Sqlite(store) => store.is_shared(),
-            Self::Postgres(_) => false,
+        match &self.inner {
+            Inner::Sqlite(store) => store.is_shared(),
+            Inner::Postgres(_) => false,
         }
     }
 
@@ -491,9 +554,9 @@ impl Backend {
     /// gauges and the collector-key wait. Without it, import, fsck and
     /// gc record nothing.
     pub fn set_metrics(&self, metrics: Arc<Metrics>) {
-        match self {
-            Self::Sqlite(store) => store.set_metrics(metrics),
-            Self::Postgres(pg) => pg.set_metrics(metrics),
+        match &self.inner {
+            Inner::Sqlite(store) => store.set_metrics(metrics),
+            Inner::Postgres(pg) => pg.set_metrics(metrics),
         }
     }
 
@@ -502,9 +565,9 @@ impl Backend {
     /// immediate and whose readers are pages, not connections.
     #[must_use]
     pub fn pg_tx_age(&self) -> Duration {
-        match self {
-            Self::Sqlite(_) => Duration::ZERO,
-            Self::Postgres(pg) => pg.tx_age(),
+        match &self.inner {
+            Inner::Sqlite(_) => Duration::ZERO,
+            Inner::Postgres(pg) => pg.tx_age(),
         }
     }
 
@@ -514,9 +577,9 @@ impl Backend {
     #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn commits(&self) -> u64 {
-        match self {
-            Self::Sqlite(store) => store.commits(),
-            Self::Postgres(_) => 0,
+        match &self.inner {
+            Inner::Sqlite(store) => store.commits(),
+            Inner::Postgres(_) => 0,
         }
     }
 }
@@ -528,7 +591,7 @@ impl Backend {
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_next_commits(&self, n: u32) {
-        if let Self::Sqlite(store) = self {
+        if let Inner::Sqlite(store) = &self.inner {
             store.fail_next_commits(n);
         }
     }
@@ -538,7 +601,7 @@ impl Backend {
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_busy_timeout(&self, timeout: std::time::Duration) {
-        if let Self::Sqlite(store) = self {
+        if let Inner::Sqlite(store) = &self.inner {
             store.set_busy_timeout(timeout);
         }
     }
@@ -549,9 +612,9 @@ impl Backend {
     #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     fn hooks(&self) -> &crate::store::ImportHooks {
-        match self {
-            Self::Sqlite(store) => store.hooks(),
-            Self::Postgres(pg) => pg.hooks(),
+        match &self.inner {
+            Inner::Sqlite(store) => store.hooks(),
+            Inner::Postgres(pg) => pg.hooks(),
         }
     }
 
@@ -593,19 +656,19 @@ impl Meta for Backend {
         Self: 'a;
 
     fn read<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
-        match self {
-            Self::Sqlite(store) => store.read(|tx| f(&mut BackendTx::Sqlite(tx))),
-            Self::Postgres(pg) => pg.read(|tx| f(&mut BackendTx::Postgres(tx.reborrow()))),
+        match &self.inner {
+            Inner::Sqlite(store) => store.read(|tx| f(&mut BackendTx::Sqlite(tx))),
+            Inner::Postgres(pg) => pg.read(|tx| f(&mut BackendTx::Postgres(tx.reborrow()))),
         }
     }
 
     fn read_counted<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> (Result<T>, u64) {
-        match self {
-            Self::Sqlite(store) => {
+        match &self.inner {
+            Inner::Sqlite(store) => {
                 let (result, seen) = store.read_counted(|tx| f(&mut BackendTx::Sqlite(tx)));
                 (result, seen)
             }
-            Self::Postgres(pg) => {
+            Inner::Postgres(pg) => {
                 let (result, seen) =
                     pg.read_counted(|tx| f(&mut BackendTx::Postgres(tx.reborrow())));
                 (result, seen)
@@ -614,39 +677,39 @@ impl Meta for Backend {
     }
 
     fn wait_durable(&self, seen: u64) -> Result<()> {
-        match self {
-            Self::Sqlite(store) => store.wait_durable(seen),
-            Self::Postgres(pg) => pg.wait_durable(seen),
+        match &self.inner {
+            Inner::Sqlite(store) => store.wait_durable(seen),
+            Inner::Postgres(pg) => pg.wait_durable(seen),
         }
     }
 
     fn read_unflushed<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
-        match self {
-            Self::Sqlite(store) => store.read_unflushed(|tx| f(&mut BackendTx::Sqlite(tx))),
-            Self::Postgres(pg) => {
+        match &self.inner {
+            Inner::Sqlite(store) => store.read_unflushed(|tx| f(&mut BackendTx::Sqlite(tx))),
+            Inner::Postgres(pg) => {
                 pg.read_unflushed(|tx| f(&mut BackendTx::Postgres(tx.reborrow())))
             }
         }
     }
 
     fn commit<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
-        match self {
-            Self::Sqlite(store) => store.commit(move |tx| f(&mut BackendTx::Sqlite(tx))),
-            Self::Postgres(pg) => pg.commit(move |tx| f(&mut BackendTx::Postgres(tx.reborrow()))),
+        match &self.inner {
+            Inner::Sqlite(store) => store.commit(move |tx| f(&mut BackendTx::Sqlite(tx))),
+            Inner::Postgres(pg) => pg.commit(move |tx| f(&mut BackendTx::Postgres(tx.reborrow()))),
         }
     }
 
     fn write<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
-        match self {
-            Self::Sqlite(store) => store.write(move |tx| f(&mut BackendTx::Sqlite(tx))),
-            Self::Postgres(pg) => pg.write(move |tx| f(&mut BackendTx::Postgres(tx.reborrow()))),
+        match &self.inner {
+            Inner::Sqlite(store) => store.write(move |tx| f(&mut BackendTx::Sqlite(tx))),
+            Inner::Postgres(pg) => pg.write(move |tx| f(&mut BackendTx::Postgres(tx.reborrow()))),
         }
     }
 
     fn flush(&self) -> Result<()> {
-        match self {
-            Self::Sqlite(store) => store.flush(),
-            Self::Postgres(pg) => pg.flush(),
+        match &self.inner {
+            Inner::Sqlite(store) => store.flush(),
+            Inner::Postgres(pg) => pg.flush(),
         }
     }
 }

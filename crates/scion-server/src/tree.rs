@@ -658,7 +658,7 @@ mod tests {
         ];
         for stored in [true, false] {
             let dir = tempfile::tempdir().unwrap();
-            let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+            let store = Backend::sqlite(Store::open(dir.path()).unwrap());
             // The chain's six puts name blobs "1".."6"; their files feed the
             // real lens, so stored and re-derived trees carry true lengths.
             for c in ["1", "2", "3", "4", "5", "6"] {
@@ -705,7 +705,7 @@ mod tests {
     #[test]
     fn a_read_with_a_past_deadline_derives_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         store.blobs().put(b"1").unwrap();
         // A changeset with no root tree row yet.
         let cs = store
@@ -733,7 +733,7 @@ mod tests {
     #[test]
     fn get_root_tree_flushes_once_after_it_derives() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         store.blobs().put(b"1").unwrap();
         // A changeset with no root tree row yet.
         let cs = store
@@ -760,7 +760,7 @@ mod tests {
     #[test]
     fn root_tree_derives_a_long_chain_and_caches_it() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let author = IdentityTime::new(b"a".to_vec(), b"a@x".to_vec(), 0, 0)
             .expect("identity fits the format");
         // Every put of the chain names its index as the blob; their files

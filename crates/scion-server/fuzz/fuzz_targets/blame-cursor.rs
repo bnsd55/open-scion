@@ -29,7 +29,7 @@ fn fixture() -> &'static (TempDir, Backend, ChangesetId) {
     static FIXTURE: OnceLock<(TempDir, Backend, ChangesetId)> = OnceLock::new();
     FIXTURE.get_or_init(|| {
         let dir = tempfile::tempdir().expect("temp dir");
-        let store = Backend::Sqlite(Store::open(dir.path()).expect("store"));
+        let store = scion_server::test_support::backend::from_store(Store::open(dir.path()).expect("store"));
         let tip = store
             .write(|c| {
                 let repo = c.create_repo(REPO)?;

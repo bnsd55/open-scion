@@ -24,6 +24,8 @@ use scion_proto::v1::{
     LandResponse, LandState, PutBlobRequest, ResolveRefRequest,
 };
 use scion_server::Backend;
+use scion_server::test_support::backend::BackendExt;
+use scion_server::test_support::backend::from_store;
 use scion_server::test_support::meta::MetaTx as _;
 use scion_server::test_support::store::BlobStatus;
 use scion_server::test_support::{store::Store, tree};
@@ -307,7 +309,7 @@ pub fn create_repo(data: &Path) {
                 c,
                 repo,
                 &root,
-                &mut tree::lens_of(&Backend::Sqlite(store.clone())),
+                &mut tree::lens_of(&from_store(store.clone())),
             )?;
             for name in REFS {
                 assert!(c.cas_ref(repo, name, None, id)?);
@@ -506,10 +508,9 @@ pub fn pending_lands(c: &rusqlite::Connection) -> i64 {
 pub fn metadata(store: &Backend, seen: &mut HashSet<Vec<u8>>) -> (BTreeSet<BlobId>, i64) {
     // The rows of the data directory's own database: this helper asserts the
     // storage's internals, which only the SQLite backend holds.
-    let raw = match store {
-        Backend::Sqlite(raw) => raw,
-        Backend::Postgres(_) => unreachable!(),
-    };
+    let raw = store
+        .sqlite()
+        .expect("the storage's internals are a data-directory thing");
     raw.read(|c| {
         let mut named = BTreeSet::new();
         for table in ["changesets", "trees"] {
@@ -735,7 +736,7 @@ pub async fn check(
     // Every blob that the metadata names is intact, and so is every blob
     // file: a file reaches its name only whole.
     let store = Store::open_shared(data).unwrap();
-    let (named, pending) = metadata(&Backend::Sqlite(store.clone()), &mut checked.rows);
+    let (named, pending) = metadata(&from_store(store.clone()), &mut checked.rows);
     assert_eq!(pending, 0, "every land sent was retried");
     let files = blob_files(data);
     for id in named.into_iter().chain(files) {

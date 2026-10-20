@@ -845,7 +845,7 @@ mod tests {
     /// A new store with repo `r`.
     fn open() -> (tempfile::TempDir, Backend, RepoId) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let repo = store.write(|c| c.create_repo("r")).unwrap();
         (dir, store, repo)
     }
