@@ -1,5 +1,11 @@
 //! When a job that a call started gives up.
 
+// Every pub item of this module is re-exported by the test seam
+// (`test_support` in lib.rs). unreachable_pub does not see through
+// a re-export and fires on these items with and without the
+// test-hooks feature, so the allow covers both sets.
+#![allow(unreachable_pub)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};

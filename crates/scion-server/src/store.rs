@@ -26,6 +26,11 @@
 //! released lock must keep child spawns out of that window, as
 //! `spawn_guard` does in this crate's tests.
 
+// Every pub item of this module is re-exported by the test seam
+// (`test_support` in lib.rs), and unreachable_pub does not see
+// through a re-export, so this marker would fire on all of them
+// under any feature set.
+#![allow(unreachable_pub)]
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, ErrorKind, Read, Seek, Write};

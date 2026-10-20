@@ -56,17 +56,17 @@ use crate::db;
 use crate::error::{Error, Result};
 
 /// Longest principal name, in bytes.
-pub const MAX_PRINCIPAL_BYTES: usize = 64;
+pub(crate) const MAX_PRINCIPAL_BYTES: usize = 64;
 
 /// The most distinct canonical read rule sets one repo may hold. A set is
 /// shared by every principal whose read prefixes canonicalize to it, so the
 /// cap is on roles, not principals. Over the cap, the access file is
 /// refused at load.
-pub const MAX_RULE_SETS_PER_REPO: usize = 32;
+pub(crate) const MAX_RULE_SETS_PER_REPO: usize = 32;
 
 /// The most prefixes one canonical read rule set may hold. Over the cap,
 /// the access file is refused at load.
-pub const MAX_PREFIXES_PER_SET: usize = 256;
+pub(crate) const MAX_PREFIXES_PER_SET: usize = 256;
 
 impl From<&str> for Access {
     /// [`Access::single`]: one token that may do everything.
