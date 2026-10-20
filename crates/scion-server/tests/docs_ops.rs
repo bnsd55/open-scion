@@ -203,6 +203,103 @@ fn every_proof_line_names_a_test_that_exists() {
     );
 }
 
+/// The alerts' responses point at the operations guide, and every
+/// pointer resolves: a `docs/operations.md#anchor` names a heading of
+/// the guide (GitHub's slug of it), a `section N` names the guide's
+/// `## N.` heading. The reference lives in deploy/prometheus/*.yml,
+/// whose files the alert rules and their test expectations both are.
+#[test]
+fn every_alert_response_anchor_resolves() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/prometheus");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("deploy/prometheus opens") {
+        let path = entry.expect("entry reads").path();
+        if path.extension().is_none_or(|e| e != "yml") {
+            continue;
+        }
+        // The YAML folds its prose: a reference may wrap mid-phrase, so
+        // the file reads as one line before the pointers are matched.
+        let text = std::fs::read_to_string(&path).expect("the alert file opens");
+        let text = text.replace('\n', " ");
+        for (at, _) in text.match_indices("docs/operations.md") {
+            {
+                let rest = &text[at + "docs/operations.md".len()..];
+                let rest = rest.trim_start_matches(['(', ' ']);
+                if let Some(anchor) = rest.strip_prefix('#') {
+                    let slug: String = anchor
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                        .collect();
+                    assert!(
+                        headings(&doc()).iter().any(|h| h == &slug),
+                        "the alert file {} points at docs/operations.md#{}, but no heading of the guide has that slug",
+                        path.display(),
+                        slug
+                    );
+                } else if let Some(rest) = rest.strip_prefix("sections ") {
+                    for part in rest.split(" and ") {
+                        let section: String = part
+                            .trim_start()
+                            .chars()
+                            .take_while(char::is_ascii_digit)
+                            .collect();
+                        assert!(
+                            !section.is_empty() && doc().contains(&format!("## {section}.")),
+                            "the alert file {} points at docs/operations.md section {}, but the guide has no such section",
+                            path.display(),
+                            section
+                        );
+                        checked += 1;
+                    }
+                    continue;
+                } else if let Some(rest) = rest.strip_prefix("section") {
+                    let section: String = rest
+                        .trim_start()
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect();
+                    assert!(
+                        !section.is_empty() && doc().contains(&format!("## {section}.")),
+                        "the alert file {} points at docs/operations.md section {}, but the guide has no such section",
+                        path.display(),
+                        section
+                    );
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked >= 20,
+        "the alerts' guide references shrank: only {checked} found"
+    );
+}
+
+/// Every heading of the guide, as GitHub slugs it: lowercased, spaces
+/// and dots to dashes, other punctuation dropped.
+fn headings(doc: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in doc.lines() {
+        let Some(heading) = line.strip_prefix("#") else {
+            continue;
+        };
+        let heading = heading.trim_start_matches('#').trim();
+        let mut slug = String::new();
+        for c in heading.chars() {
+            if c.is_ascii_alphanumeric() {
+                slug.extend(c.to_lowercase());
+            } else if c == ' ' || c == '.' {
+                slug.push('-');
+            }
+        }
+        while slug.ends_with('-') {
+            slug.pop();
+        }
+        out.push(slug);
+    }
+    out
+}
+
 /// The command-line extractor: continuations join, other tools pass,
 /// placeholders and values never read as flags.
 #[test]
