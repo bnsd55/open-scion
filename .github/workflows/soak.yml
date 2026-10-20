@@ -54,3 +54,41 @@ jobs:
           name: soak-artifacts
           path: ${{ runner.temp }}/soak-artifacts/
           if-no-files-found: ignore
+
+  # The fault half of the soak (issue #239, part 3): the same mixed
+  # load, with the server killed and restarted on schedule, so the
+  # nightly sees what a 72-hour run would. It runs beside the soak, not
+  # after it, so one failing never skips the other. The kill schedule
+  # and the checks live in scripts/soak-fault.sh; the ceilings reuse
+  # soak's env names, and SOAK_WARMUP_MIN is the baseline window that
+  # soak's RSS bound is moving to (the two align when that lands).
+  soak-fault:
+    name: soak-fault
+    runs-on: ubuntu-24.04
+    # The same shape as the soak: 150 min covers 120 min of load, and
+    # the build, the checks and the teardown share the rest.
+    timeout-minutes: 165
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: run the fault soak
+        env:
+          RUN_MINUTES: ${{ github.event.inputs.minutes || '120' }}
+          SOAK_RSS_PCT: "150" # 150 percent of the segment's warm RSS,
+          SOAK_FD_GROWTH: "100" # 100 open files over the segment's start,
+          SOAK_P99_FACTOR: "2" # and the late p99 under 2x the early p99.
+          SOAK_WARMUP_MIN: "10" # the baseline window, per segment.
+        run: |
+          # The same cap as the soak: 150 min covers 120 min of load.
+          timeout 9000 scripts/soak-fault.sh
+      - name: upload the samples and the logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: soak-fault-artifacts
+          path: ${{ runner.temp }}/soak-fault-artifacts/
+          if-no-files-found: ignore
