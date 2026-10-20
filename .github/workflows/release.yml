@@ -307,7 +307,10 @@ jobs:
           set -euo pipefail
           # An SBOM file is the payload of an sbom attestation, not a
           # subject; the artifacts it describes carry the attestation.
-          find cell -type f ! -name '*.cdx.json' |
+          # The environment record is metadata, covered by the hash in
+          # the attested checksums.txt.
+          find cell -type f \
+            ! -name '*.cdx.json' ! -name 'release-environment.txt' |
             while read -r file; do
               gh attestation verify "$file" --repo "$GITHUB_REPOSITORY"
             done
@@ -334,7 +337,8 @@ jobs:
       - name: Every artifact verifies against this repository
         run: |
           set -euo pipefail
-          find artifacts -type f ! -name 'checksums.txt' ! -name '*.cdx.json' |
+          find artifacts -type f ! -name 'checksums.txt' \
+            ! -name '*.cdx.json' ! -name 'release-environment.txt' |
             while read -r file; do
               gh attestation verify "$file" --repo "$GITHUB_REPOSITORY"
             done
