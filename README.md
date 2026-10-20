@@ -218,6 +218,11 @@ write	alice	main	src
 write	ci	main
 ```
 
+The file holds token digests, so it is a secret: the server reads it only
+when its owner (or root) alone can read it, and refuses one that group or
+others can read at start. `chmod 600 FILE` fixes it, and is worth doing
+under umask 002, where a fresh file starts 0664.
+
 A principal whose read rules are all prefixes is a *partial reader*: it
 reads only what they cover, through the view of the repo that the server
 derives for it. `ResolveRef` and `GetRootTree` answer the real changeset
@@ -330,6 +335,13 @@ client certificate with `--tls-client-ca` (mTLS); the cache and the daemon
 present one with `--tls-client-cert` and `--tls-client-key`. To make the
 certificates of a test setup, a tool such as `minica` or `openssl` makes a CA
 and leaves signed for each host's name or address.
+
+The server reads the private key only when its owner (or root) alone can
+read it: `chmod 600 server.key`. The certificate and every CA file must
+not be group- or others-writable — a swapped certificate or CA changes
+whom a client trusts or which client certificates the server accepts —
+so `chmod go-w` on them, and check after a copy tool or a umask 002
+session, where a fresh file starts 0664.
 
 ```sh
 ./target/release/scion-server --data /tmp/scion serve \
