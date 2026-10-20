@@ -56,7 +56,7 @@ next minor.
 | `scn` CLI, `--json` output | Field names and types are additive-only in 1.x: a minor may add fields, never change or remove one. | `crates/scn/tests/json_golden.rs`: every command the test runs answers with the fields and types its golden row names, read from the binary itself. |
 | `scn` CLI, exit codes | 0 on success, 1 only for `is-ancestor`'s "no", 2 on any error. | `crates/scn/tests/exit_codes.rs`: one line per row of the table. |
 | `scion-server` exit codes | `fsck` exits 0 when it saw no damage, 1 when it did, 2 when it could not run. | `crates/scion-server/tests/fsck_exit.rs`: clean, damaged, and unopenable stores, one line per row. |
-| Production configuration | The flags, env vars and file formats the shipped binaries read change additively in 1.x: what a release ships stays, and 1.x only adds. The flags: docs_flags and docs_cli pin the names the docs carry. The env vars: `crates/scn/tests/env_surface.rs` reads the sources of both binaries, so a removed var fails and a new one enters the golden on purpose. The file formats (the access file, the marker) are versioned like the other wire surfaces. | Exists for flags; the env golden is new. |
+| Production configuration | The flags, env vars and file formats the shipped binaries read change additively in 1.x: what a release ships stays, and 1.x only adds. The flags: docs_flags and docs_cli pin the names the docs carry. The env vars: `crates/scn/tests/env_surface.rs` reads the sources of both binaries, so a removed var fails and a new one enters the golden on purpose. The file formats carry no version field yet (the access file and the marker have none), so the 1.x promise is: keys add only, and a line a build does not know is refused at load, never silently read as a rule — the access file's parser refuses unknown keys, and `an_unknown_line_is_refused` in `crates/scion-server/tests/access.rs` pins it. A version field arrives with the first change that cannot stay additive. | Exists for flags; the env golden is new; the unknown-key refusal is pinned by `an_unknown_line_is_refused`. |
 | SQLite and Postgres schemas | The 0.x rule is the 1.x rule: a released migration never changes, open migrates forward one migration per released version, a database newer than the build is refused, and the N/N-1 window holds (a store from release N-1 opens on N; the pre-upgrade backup restores onto N-1). | Exists: the migration tests; the N-1 restore drill (#379 item 3) once it lands. |
 | Ticket bytes | The 0.x rule holds, and the window is pinned: v2 may be issued beside v1, both read until at least the next minor (compatibility.md). | Exists: the ticket prefix tests pin the version bytes. |
 | Snapshot files | The 0.x rule holds, and the window is pinned: a new magic is written beside the old one until at least the next minor. | Exists: the snapshot magic tests. |
@@ -64,9 +64,10 @@ next minor.
 What carries no machine check, and why: "served throughout 1.x" is a
 statement about every release, not a run — its machine form is the
 additive goldens above, which fail CI on the change that would break a
-client, before it ships. The version matrix and the tagged-store
-drills are their own surfaces (#381, #382) and stability.md links to
-them instead of duplicating their checks.
+client, before it ships. The version matrix is
+[compatibility.md](compatibility.md)'s surface, and the tagged-store
+and N-1 drills are #382's and #379's: stability.md links to them
+instead of duplicating their checks.
 
 ## Where each promise is written down
 

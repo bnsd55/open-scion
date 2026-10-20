@@ -238,6 +238,10 @@ enum KindName {
 
 /// Runs `fsck` against `store`, prints one line per problem, and exits:
 /// 0 when it saw no damage, 1 when it did, 2 when it could not run.
+/// The exits are `std::process::exit`, which skips destructors: safe
+/// here, because nothing this function holds needs dropping — the
+/// store's lock is released by the kernel at exit, and the report is
+/// plain data.
 fn fsck_command(store: &Backend) -> anyhow::Result<()> {
     let report = match fsck::run(store, fsck::BATCH, &mut |_| {}) {
         Ok(report) => report,
@@ -378,6 +382,9 @@ async fn main() -> anyhow::Result<()> {
             Ok(store) => Ok(store),
             Err(e) => {
                 eprintln!("scion-server fsck: {e}");
+                // `exit` skips destructors: safe on this path, because
+                // nothing was opened yet — the store refused to open,
+                // so there is no lock to release and nothing buffered.
                 std::process::exit(2);
             }
         },

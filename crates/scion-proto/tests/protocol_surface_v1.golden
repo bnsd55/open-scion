@@ -3,6 +3,11 @@
 # reads crates/scion-proto/proto/scion.proto and asserts this list is
 # still all there; anything new passes, anything removed or renumbered
 # fails (docs/stability.md, docs/compatibility.md).
+
+# Regenerated from the build's descriptor set (prost-types): one line
+# per call (input, output, streaming), per message field (number,
+# label, type, oneof), and per enum value (number).
+
 BlameChangeset.author_email:3:bytes
 BlameChangeset.author_name:2:bytes
 BlameChangeset.author_tz_offset_minutes:5:int32
@@ -37,6 +42,12 @@ DiffRequest.repo:1:string
 DiffResponse.entries:1:repeated DiffEntry
 DiffResponse.next_after:2:bytes
 DiffResponse.renames_incomplete:3:bool
+Encoding.ENCODING_RAW:0
+Encoding.ENCODING_ZSTD:1
+FileKind.FILE_KIND_GITLINK:3
+FileKind.FILE_KIND_REGULAR:1
+FileKind.FILE_KIND_SYMLINK:2
+FileKind.FILE_KIND_UNSPECIFIED:0
 FileState.executable:3:bool
 FileState.id:2:bytes
 FileState.kind:1:FileKind
@@ -65,6 +76,11 @@ LandResponse.detail:4:string
 LandResponse.land_id:1:string
 LandResponse.result_changeset_id:3:bytes
 LandResponse.state:2:LandState
+LandState.LAND_STATE_CONFLICT:3
+LandState.LAND_STATE_LANDED:2
+LandState.LAND_STATE_PENDING:1
+LandState.LAND_STATE_REJECTED:4
+LandState.LAND_STATE_UNSPECIFIED:0
 ListDirRequest.changeset_id:2:bytes
 ListDirRequest.path:3:bytes
 ListDirRequest.repo:1:string
@@ -81,6 +97,9 @@ MergeBaseRequest.a_changeset_id:2:bytes
 MergeBaseRequest.b_changeset_id:3:bytes
 MergeBaseRequest.repo:1:string
 MergeBaseResponse.changeset_ids:1:repeated bytes
+ObjectKind.OBJECT_KIND_BLOB:2
+ObjectKind.OBJECT_KIND_TREE:1
+ObjectKind.OBJECT_KIND_UNSPECIFIED:0
 ObjectPart.data:3:bytes
 ObjectPart.encoded_size:5:uint64
 ObjectPart.encoding:4:Encoding
@@ -90,9 +109,9 @@ ObjectPart.size:6:uint64
 ObjectRef.id:2:bytes
 ObjectRef.kind:1:ObjectKind
 ObjectRef.path:3:bytes
-Objects.GetObjects
-Objects.GetRootTree
-Objects.ResolveRef
+Objects.GetObjects:in=GetObjectsRequest:out=ObjectPart:server_stream
+Objects.GetRootTree:in=GetRootTreeRequest:out=GetRootTreeResponse
+Objects.ResolveRef:in=ResolveRefRequest:out=ResolveRefResponse
 PutBlobRequest.data:2:bytes
 PutBlobRequest.repo:1:string
 PutBlobResponse.blob_id:1:bytes
@@ -103,16 +122,16 @@ ReadFileResponse.data:1:bytes
 ResolveRefRequest.name:2:string
 ResolveRefRequest.repo:1:string
 ResolveRefResponse.changeset_id:1:bytes
-Scion.Blame
-Scion.CreateChangeset
-Scion.Diff
-Scion.GetChangeset
-Scion.GetLand
-Scion.IsAncestor
-Scion.Land
-Scion.ListDir
-Scion.Log
-Scion.MergeBase
-Scion.PutBlob
-Scion.ReadFile
-Scion.ResolveRef
+Scion.Blame:in=BlameRequest:out=BlameResponse:server_stream
+Scion.CreateChangeset:in=CreateChangesetRequest:out=CreateChangesetResponse
+Scion.Diff:in=DiffRequest:out=DiffResponse
+Scion.GetChangeset:in=GetChangesetRequest:out=GetChangesetResponse:server_stream
+Scion.GetLand:in=GetLandRequest:out=LandResponse
+Scion.IsAncestor:in=IsAncestorRequest:out=IsAncestorResponse
+Scion.Land:in=LandRequest:out=LandResponse
+Scion.ListDir:in=ListDirRequest:out=ListDirResponse:server_stream
+Scion.Log:in=LogRequest:out=LogResponse:server_stream
+Scion.MergeBase:in=MergeBaseRequest:out=MergeBaseResponse
+Scion.PutBlob:in=PutBlobRequest:out=PutBlobResponse:client_stream
+Scion.ReadFile:in=ReadFileRequest:out=ReadFileResponse:server_stream
+Scion.ResolveRef:in=ResolveRefRequest:out=ResolveRefResponse
