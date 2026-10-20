@@ -94,6 +94,12 @@ pub struct Audit {
     /// test-hooks seam.
     #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
     faults: Arc<AtomicU64>,
+    /// How many directory fsyncs the opens of this audit did: the
+    /// audit file's own fsync makes its bytes durable, not its entry
+    /// in the parent, so the open syncs the parent. Counted for the
+    /// test that proves the create path does it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    dir_fsyncs: Arc<AtomicU64>,
     /// The readiness sender of the off handle, held so its watch never
     /// closes: a closed watch would flip readiness at once.
     _ready_tx: Option<watch::Sender<bool>>,
@@ -114,7 +120,8 @@ impl Audit {
     /// The parent is not a private directory, or the file exists with
     /// the wrong kind, owner, or mode, or the open fails.
     pub fn open(path: &Path) -> io::Result<Audit> {
-        let file = checked_open(path)?;
+        let dir_fsyncs = Arc::new(AtomicU64::new(0));
+        let file = checked_open(path, Some(&dir_fsyncs))?;
         let (tx, rx) = mpsc::channel(QUEUE);
         let (ready_tx, ready_rx) = watch::channel(true);
         let path = path.to_path_buf();
@@ -127,8 +134,16 @@ impl Audit {
             tx: Some(tx),
             ready: ready_rx,
             faults,
+            dir_fsyncs,
             _ready_tx: None,
         })
+    }
+
+    /// The directory fsyncs this audit's opens did. Only the
+    /// in-module tests read it.
+    #[cfg(test)]
+    fn dir_syncs(&self) -> u64 {
+        self.dir_fsyncs.load(Ordering::Relaxed)
     }
 
     /// A handle for tests that serve without an audit file: every
@@ -142,6 +157,7 @@ impl Audit {
             tx: None,
             ready,
             faults: Arc::new(AtomicU64::new(0)),
+            dir_fsyncs: Arc::new(AtomicU64::new(0)),
             _ready_tx: Some(ready_tx),
         }
     }
@@ -196,7 +212,10 @@ fn queue_closed() -> io::Error {
 }
 
 /// Opens the audit file with the checks of a secret file, for append.
-fn checked_open(path: &Path) -> io::Result<std::fs::File> {
+fn checked_open(
+    path: &Path,
+    dir_syncs: Option<&AtomicU64>,
+) -> io::Result<std::fs::File> {
     let me = rustix::process::getuid().as_raw();
     // The walk resolves and checks every directory above the file, so
     // no other user can swap it on the way; the open's `O_NOFOLLOW`
@@ -223,6 +242,24 @@ fn checked_open(path: &Path) -> io::Result<std::fs::File> {
         return Err(io::Error::other(
             "the audit file must be a plain 0600 file of the user or root",
         ));
+    }
+    // The file's fsync makes its bytes durable, not its entry in the
+    // parent: a crash right after the first start would lose the file
+    // itself. Sync the directory once per open.
+    if let Some(parent) = resolved.parent() {
+        let dir = rustix::fs::open(
+            parent,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        let dir = std::fs::File::from(dir);
+        dir.sync_data()?;
+        if let Some(counted) = dir_syncs {
+            counted.fetch_add(1, Ordering::Relaxed);
+        }
     }
     Ok(file.into())
 }
@@ -499,6 +536,17 @@ mod tests {
         let shared: Vec<&Value> = lines.iter().filter(|line| line["peer"] == "*").collect();
         assert_eq!(shared.len(), 1, "one bucket holds every stranger");
         assert_eq!(shared[0]["count"], 10);
+    }
+
+    #[test]
+    fn every_open_syncs_the_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let audit = Audit::open(&path).unwrap();
+        assert_eq!(audit.dir_syncs(), 1, "the create syncs the parent");
+        drop(audit);
+        let audit = Audit::open(&path).unwrap();
+        assert_eq!(audit.dir_syncs(), 1, "a reopen syncs the parent again");
     }
 
     #[test]
