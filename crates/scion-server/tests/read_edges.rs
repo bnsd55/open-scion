@@ -12,6 +12,7 @@ use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{ListDirRequest, ReadFileRequest};
 use scion_server::Access;
 use scion_server::Backend;
+use scion_server::test_support::backend::from_store;
 use scion_server::test_support::meta::MetaTx as _;
 use scion_server::test_support::{meta::Meta as _, service, store::Store};
 use tokio::net::TcpListener;
@@ -66,7 +67,7 @@ fn author() -> IdentityTime {
 /// root. An empty `files` makes an empty directory.
 fn store(files: &[(Vec<u8>, &[u8])]) -> (tempfile::TempDir, Backend, ChangesetId) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+    let store = from_store(Store::open(dir.path()).unwrap());
     let root = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;

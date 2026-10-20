@@ -199,8 +199,12 @@ run removes. It is safe beside a live server and safe to repeat.
 ### Access file
 
 `--token T` gives one principal, `default`, which may read and write every
-repo. For several principals, write an access file and start the server with
-`--access FILE` (give one of the two, not both). The file is UTF-8 text, one
+repo. Prefer `--token-file FILE` (a file the owner alone can read) or
+`SCION_TOKEN` in the environment: a token on the command line is readable by
+every local account (`ps`), so the argv form prints a deprecation warning
+and goes away in a later release. For several principals, write an access
+file and start the server with
+`--access FILE` (give one of the forms, not two). The file is UTF-8 text, one
 rule per line, fields separated by one tab. Empty lines and lines that start
 with `#` are skipped:
 
@@ -241,7 +245,7 @@ The file holds digests, never tokens. Print the digest of a token with
 
 ```sh
 token=$(read -s -p token: t; echo "$t")
-digest=$(./target/release/scion-server hash-token --token "$token")
+digest=$(printf %s "$token" | ./target/release/scion-server hash-token)
 ```
 
 A principal with no rule for a repo cannot see the repo: every call answers

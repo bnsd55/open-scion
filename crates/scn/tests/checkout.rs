@@ -1195,7 +1195,7 @@ fn a_schema_6_data_dir_upgrades_and_checks_out() {
         .unwrap();
     assert_eq!(trees, 0, "the old trees are gone");
     let report = scion_server::fsck::run(
-        &scion_server::Backend::Sqlite(store.clone()),
+        &scion_server::test_support::backend::from_store(store.clone()),
         1,
         &mut |_| {},
     )
@@ -1205,7 +1205,10 @@ fn a_schema_6_data_dir_upgrades_and_checks_out() {
     // A checkout of the upgraded directory re-derives the trees. The db
     // path outlives `data`, which `Server::start` takes.
     let db_path = data.path().join("scion.db");
-    let server = Server::start(data, Backend::Sqlite(store.clone()));
+    let server = Server::start(
+        data,
+        scion_server::test_support::backend::from_store(store.clone()),
+    );
     let tmp = tempfile::tempdir().unwrap();
     let dest = tmp.path().join("dest");
     let out = server.scn(&["checkout", "main", "--into", text(&dest)]);

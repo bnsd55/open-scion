@@ -24,6 +24,8 @@ use scion_proto::v1::{
     LandResponse, LandState, PutBlobRequest, ResolveRefRequest,
 };
 use scion_server::Backend;
+use scion_server::test_support::backend::BackendExt;
+use scion_server::test_support::backend::from_store;
 use scion_server::test_support::meta::Meta as _;
 use scion_server::test_support::meta::MetaTx as _;
 use scion_server::test_support::store::BlobStatus;
@@ -204,7 +206,7 @@ pub(crate) fn open_store(data: &Path) -> Backend {
     if Backend::test_is_postgres() {
         Backend::open_test(data).unwrap()
     } else {
-        Backend::Sqlite(Store::open(data).unwrap())
+        from_store(Store::open(data).unwrap())
     }
 }
 
@@ -216,7 +218,7 @@ pub(crate) fn open_store_shared(data: &Path) -> Backend {
     if Backend::test_is_postgres() {
         Backend::open_test_shared(data).unwrap()
     } else {
-        Backend::Sqlite(Store::open_shared(data).unwrap())
+        from_store(Store::open_shared(data).unwrap())
     }
 }
 
@@ -229,7 +231,9 @@ pub(crate) fn bound_addr(log: &Path) -> Option<SocketAddr> {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        // `Child::kill` sends SIGKILL.
+        // Every path reaps the child, panics included: `kill` sends
+        // SIGKILL (a frozen server dies too), and `wait` takes its
+        // status, so no zombie outlives the test that started it.
         self.child.kill().ok();
         self.child.wait().ok();
     }
@@ -350,6 +354,9 @@ pub(crate) struct Ledger {
     pub blobs: Vec<BlobId>,
     /// Every land sent, in order. `CreateChangeset` replied for each one.
     pub lands: Vec<Sent>,
+    /// The independent operation ledger (#377): what each reply
+    /// acknowledged, recorded here in the test process.
+    pub oplog: ledger::OpLog,
 }
 
 /// Repo `r` with one root changeset, and refs `main` and `dev` at it. No RPC
@@ -413,6 +420,62 @@ pub(crate) const LARGE: usize = 64 << 10;
 /// One client: uploads files, creates a changeset on a ref's head (or on an
 /// older base of it), and lands it, until a call fails. Only the kill may
 /// fail a call, and it sets `signals.killed` first.
+/// Builds one op's files: mostly small, some to about 1 MiB, so a kill
+/// can stop a blob write in the middle; some share one path, so lands
+/// conflict. Puts every blob and records it in the ledger.
+async fn build_files(
+    scion: &mut Scion,
+    name: &str,
+    op: u64,
+    rng: &mut Rng,
+    ledger: &mut Ledger,
+    signals: &Arc<Signals>,
+) -> BTreeMap<RepoPath, Option<FileState>> {
+    let mut files = Vec::new();
+    for i in 0..=rng.below(3) {
+        let len = if rng.below(8) == 0 {
+            LARGE + rng.below(1 << 20)
+        } else {
+            1 + rng.below(4096)
+        };
+        files.push((format!("{name}/{op}/f{i}"), rng.bytes(len)));
+    }
+    if rng.below(6) == 0 {
+        files.push((SHARED.into(), rng.bytes(16)));
+    }
+    let mut changes = BTreeMap::new();
+    for (path, data) in files {
+        let large = usize::from(data.len() > LARGE);
+        signals.large_uploads.fetch_add(large, Ordering::SeqCst);
+        let put = put_blob(scion, &data).await;
+        signals.large_uploads.fetch_sub(large, Ordering::SeqCst);
+        let id = put.unwrap_or_else(|status| {
+            let killed = signals.killed.load(Ordering::SeqCst);
+            assert!(killed, "{name}: PutBlob failed before the kill: {status:?}");
+            BlobId::of(&data)
+        });
+        assert_eq!(id, BlobId::of(&data));
+        ledger.blobs.push(id);
+        ledger.oplog.record(
+            ledger::Kind::Blob {
+                id,
+                sha256: ledger::sha256(&data),
+                len: data.len(),
+                used_in: None,
+            },
+            format!("{name}-{op}: put {path}"),
+        );
+        changes.insert(
+            RepoPath::new(path).unwrap(),
+            Some(FileState::Regular {
+                content: id,
+                executable: false,
+            }),
+        );
+    }
+    changes
+}
+
 pub(crate) async fn client(
     url: String,
     name: String,
@@ -436,46 +499,33 @@ pub(crate) async fn client(
         let base = match bases.get(target) {
             Some(&base) if rng.below(4) == 0 => base,
             _ => match resolve_ref(&mut objects, target).await {
-                Ok(id) => id,
+                Ok(id) => {
+                    ledger.oplog.record(
+                        ledger::Kind::Ref {
+                            name: target,
+                            at: id,
+                        },
+                        format!("{name}-{op}: resolve {target}"),
+                    );
+                    id
+                }
                 Err(status) => return cut(ledger, "ResolveRef", &status),
             },
         };
         bases.insert(target, base);
 
-        // Mostly small files, some up to about 1 MiB, so a kill can stop a
-        // blob write in the middle.
-        let mut files = Vec::new();
-        for i in 0..=rng.below(3) {
-            let len = if rng.below(8) == 0 {
-                LARGE + rng.below(1 << 20)
-            } else {
-                1 + rng.below(4096)
-            };
-            files.push((format!("{name}/{op}/f{i}"), rng.bytes(len)));
-        }
-        if rng.below(6) == 0 {
-            files.push((SHARED.into(), rng.bytes(16)));
-        }
-        let mut changes = BTreeMap::new();
-        for (path, data) in files {
-            let large = usize::from(data.len() > LARGE);
-            signals.large_uploads.fetch_add(large, Ordering::SeqCst);
-            let put = put_blob(&mut scion, &data).await;
-            signals.large_uploads.fetch_sub(large, Ordering::SeqCst);
-            let id = match put {
-                Ok(id) => id,
-                Err(status) => return cut(ledger, "PutBlob", &status),
-            };
-            assert_eq!(id, BlobId::of(&data));
-            ledger.blobs.push(id);
-            let state = FileState::Regular {
-                content: id,
-                executable: false,
-            };
-            changes.insert(RepoPath::new(path).unwrap(), Some(state));
-        }
+        let changes = build_files(&mut scion, &name, op, &mut rng, &mut ledger, &signals).await;
 
         let key = format!("{name}-{op}");
+        let linked: Vec<(BlobId, Vec<u8>)> = changes
+            .iter()
+            .filter_map(|(path, state)| {
+                state
+                    .as_ref()
+                    .and_then(FileState::blob)
+                    .map(|id| (id, path.as_bytes().to_vec()))
+            })
+            .collect();
         let changeset = Changeset::new(
             vec![base],
             author(),
@@ -490,12 +540,21 @@ pub(crate) async fn client(
             changeset: bytes,
         };
         match scion.create_changeset(request).await {
-            Ok(reply) => assert_eq!(changeset_id(&reply.into_inner().changeset_id), id),
+            Ok(reply) => {
+                assert_eq!(changeset_id(&reply.into_inner().changeset_id), id);
+                for (blob, path) in &linked {
+                    ledger.oplog.link_blob(*blob, id, path);
+                }
+                ledger.oplog.record(
+                    ledger::Kind::Changeset { id },
+                    format!("{name}-{op}: create"),
+                );
+            }
             Err(status) => return cut(ledger, "CreateChangeset", &status),
         }
 
         let sent = Sent {
-            key,
+            key: key.clone(),
             target,
             changeset,
             id,
@@ -504,7 +563,21 @@ pub(crate) async fn client(
         let request = sent.request();
         ledger.lands.push(sent);
         match scion.land(request).await {
-            Ok(reply) => ledger.lands.last_mut().unwrap().reply = Some(reply.into_inner()),
+            Ok(reply) => {
+                let reply = reply.into_inner();
+                ledger.oplog.record(
+                    ledger::Kind::Land {
+                        key: key.clone(),
+                        land_id: reply.land_id.clone(),
+                        target,
+                        state: reply.state(),
+                        result: (reply.state() == LandState::Landed)
+                            .then(|| changeset_id(&reply.result_changeset_id)),
+                    },
+                    format!("{name}-{op}: land"),
+                );
+                ledger.lands.last_mut().unwrap().reply = Some(reply);
+            }
             Err(status) => return cut(ledger, "Land", &status),
         }
     }
@@ -517,6 +590,8 @@ pub(crate) async fn client(
 pub(crate) struct Checked {
     /// Lands `..lands` were retried after a restart.
     pub lands: usize,
+    /// Ledger entries `..oplog` were checked back through the RPCs.
+    pub oplog: usize,
     /// Blobs `..blobs` of the ledger were read back.
     pub blobs: usize,
     /// Changesets whose root tree was checked against their changes.
@@ -578,10 +653,9 @@ pub(crate) fn pending_lands(c: &rusqlite::Connection) -> i64 {
 pub(crate) fn metadata(store: &Backend, seen: &mut HashSet<Vec<u8>>) -> (BTreeSet<BlobId>, i64) {
     // The rows of the data directory's own database: this helper asserts the
     // storage's internals, which only the SQLite backend holds.
-    let raw = match store {
-        Backend::Sqlite(raw) => raw,
-        Backend::Postgres(_) => unreachable!(),
-    };
+    let raw = store
+        .sqlite()
+        .expect("the storage's internals are a data-directory thing");
     raw.read(|c| {
         let mut named = BTreeSet::new();
         for table in ["changesets", "trees"] {
@@ -783,6 +857,7 @@ pub(crate) async fn check(
         "temp files after the restart: {folders:?}"
     );
     let (mut scion, mut objects) = connect(url).await.unwrap();
+    checked.oplog = ledger::check(&ledger.oplog, url, checked.oplog, ledger::SAMPLE, rng).await;
     let new_lands = checked.lands;
     retry_lands(&scion, ledger, checked, rng).await;
     let history = walk_refs(&mut scion, &mut objects, checked).await;
@@ -812,7 +887,7 @@ pub(crate) async fn check(
     // Every blob that the metadata names is intact, and so is every blob
     // file: a file reaches its name only whole.
     let store = Store::open_shared(data).unwrap();
-    let (named, pending) = metadata(&Backend::Sqlite(store.clone()), &mut checked.rows);
+    let (named, pending) = metadata(&from_store(store.clone()), &mut checked.rows);
     assert_eq!(pending, 0, "every land sent was retried");
     let files = blob_files(data);
     for id in named.into_iter().chain(files) {
@@ -845,6 +920,7 @@ pub(crate) fn env(name: &str, default: u64) -> u64 {
 /// drop and reopen: a pending write side also stops new read sides, so the
 /// spawners finish before the release window opens. (The same guard, for
 /// the unit tests of the server, is `store::spawn_guard`.)
+pub(crate) mod ledger;
 pub(crate) mod spawn_guard {
     use std::sync::RwLock;
 

@@ -2763,7 +2763,7 @@ mod tests {
             // the schema to this build's version and serves.
             let store = Store::open(dir.path()).unwrap();
             assert_eq!(store.read(user_version).unwrap(), SCHEMA_VERSION);
-            let backend = crate::Backend::Sqlite(store);
+            let backend = crate::Backend::sqlite(store);
             old_store::assert_serves(&backend, &cs, id, blob_a, blob_b);
         });
     }

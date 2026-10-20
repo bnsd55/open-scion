@@ -168,6 +168,12 @@ pub struct Metrics {
     /// counted by [`crate::runtime::listen::Stalled`] and given back when
     /// the stalled reply's stream ends.
     stalled_reply_bytes: AtomicU64,
+    /// Calls the counting layer has seen whose reply body it has not
+    /// given back yet: the calls a drain still waits for, as the
+    /// [`scion_calls_in_flight`] gauge. A call that never reaches a
+    /// counting body (the future is dropped before the reply) is given
+    /// back by the same guard that counted it.
+    calls_in_flight: AtomicU64,
 }
 
 /// A metric name, as the index of its RPC.
@@ -225,6 +231,25 @@ impl Metrics {
         buckets[BUCKETS.len() + 1].fetch_add(1, Ordering::Relaxed);
         self.bytes_in[rpc.0].fetch_add(bytes_in, Ordering::Relaxed);
         self.bytes_out[rpc.0].fetch_add(bytes_out, Ordering::Relaxed);
+    }
+
+    /// Counts one call the counting layer has taken: the gauge rises at
+    /// the call and falls when its reply body ends, so it is the set of
+    /// calls a drain still waits for.
+    pub(crate) fn call_started(&self) {
+        self.calls_in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn call_finished(&self) {
+        let held = self.calls_in_flight.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(held > 0, "the in-flight gauge fell under zero");
+    }
+
+    /// The gauge of calls whose reply body has not ended: what a drain
+    /// still waits for.
+    #[must_use]
+    pub fn calls_in_flight(&self) -> u64 {
+        self.calls_in_flight.load(Ordering::Relaxed)
     }
 
     /// Counts one land that ended as `outcome`: how the server's land path
@@ -630,6 +655,15 @@ impl Metrics {
                  scion_stalled_reply_bytes {value}"
             );
         }
+        // The in-flight gauge always renders: a drain watcher reads it
+        // before and during the stop, and zero is a reading.
+        let _ = writeln!(
+            text,
+            "# HELP scion_calls_in_flight Calls whose reply body has not ended, as the count a drain still waits for.\n\
+             # TYPE scion_calls_in_flight gauge\n\
+             scion_calls_in_flight {}",
+            self.calls_in_flight.load(Ordering::Relaxed)
+        );
     }
 }
 
@@ -708,6 +742,30 @@ pub fn loopback_or_allow(
              over plain HTTP. Pass --insecure-listen to allow it."
         ))
     }
+}
+
+/// The drain bound, for a binary that serves until a signal: when
+/// `drain_started` resolves (the first signal's watch), the in-flight
+/// calls have `timeout` to finish. On expiry the calls still running are
+/// cut, the log names the count, and the process exits non-zero, so a
+/// supervisor restarts it instead of waiting on a call that never ends.
+/// A second signal cuts at once, because the same watch ends the
+/// caller's own serve future.
+pub fn spawn_drain_bound(
+    mut drain_started: tokio::sync::watch::Receiver<()>,
+    timeout: std::time::Duration,
+    metrics: std::sync::Arc<Metrics>,
+) {
+    tokio::spawn(async move {
+        let _ = drain_started.changed().await;
+        tokio::time::sleep(timeout).await;
+        let open = metrics.calls_in_flight();
+        tracing::warn!(
+            open,
+            "the drain timeout passed; the calls still running were cut"
+        );
+        std::process::exit(1);
+    });
 }
 
 /// Resolves when the process is asked to end: Ctrl+C, or SIGTERM on Unix.
@@ -844,6 +902,9 @@ struct CountingBody {
     bytes_out: u64,
     /// Set once the call is counted, by the trailers or by the drop.
     counted: bool,
+    /// Counts the call in [`Metrics::calls_in_flight`] until this body
+    /// ends: the drain waits for exactly this long.
+    guard: Option<CallGuard>,
 }
 
 impl http_body::Body for CountingBody {
@@ -894,6 +955,9 @@ impl http_body::Body for CountingBody {
 
 impl Drop for CountingBody {
     fn drop(&mut self) {
+        // The guard's drop gives the call back to the in-flight gauge,
+        // whether the reply ended or the transport dropped the body.
+        drop(self.guard.take());
         if !self.counted {
             self.metrics
                 .cancelled(self.rpc, self.started, self.bytes_in, self.bytes_out);
@@ -956,6 +1020,20 @@ impl<S: tonic::server::NamedService> tonic::server::NamedService for MetricsServ
 // router feeds) with a reply of any body type, behind an interceptor or
 // not; the reply goes back to the router as a `tonic::body::Body` again,
 // around a [`CountingBody`].
+/// Counts one call from the moment the layer takes it to the moment its
+/// reply body ends, so the in-flight gauge names what a drain still waits
+/// for. Dropping the guard gives the call back, so a future the transport
+/// abandons before its reply cannot leak a count.
+struct CallGuard {
+    metrics: std::sync::Arc<Metrics>,
+}
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        self.metrics.call_finished();
+    }
+}
+
 impl<S, B> tower::Service<http::Request<tonic::body::Body>> for MetricsService<S>
 where
     S: tower::Service<
@@ -984,6 +1062,10 @@ where
         let metrics = self.metrics.clone();
         let rpc = metrics.rpc(request.uri().path());
         let started = Instant::now();
+        let guard = CallGuard {
+            metrics: std::sync::Arc::clone(&metrics),
+        };
+        metrics.call_started();
         // The bytes of a request: its content-length, or what its body
         // hints, or nothing (a streaming request that sends no length).
         let bytes_in = request
@@ -1015,17 +1097,25 @@ where
                 metrics.request(rpc, code, started, bytes_in, 0);
                 counted = true;
             }
-            Ok(response.map(|body| match rpc {
-                Some(rpc) => tonic::body::Body::new(CountingBody {
-                    inner: boxed(body),
-                    metrics,
-                    rpc,
-                    started,
-                    bytes_in,
-                    bytes_out: 0,
-                    counted,
-                }),
-                None => tonic::body::Body::new(boxed(body)),
+            Ok(response.map(|body| {
+                if let Some(rpc) = rpc {
+                    tonic::body::Body::new(CountingBody {
+                        inner: boxed(body),
+                        metrics,
+                        rpc,
+                        started,
+                        bytes_in,
+                        bytes_out: 0,
+                        counted,
+                        guard: Some(guard),
+                    })
+                } else {
+                    // A path the registry does not count (the health service,
+                    // an unknown name): its call leaves the gauge when its
+                    // handler has answered, which is when its reply is ready.
+                    drop(guard);
+                    tonic::body::Body::new(boxed(body))
+                }
             }))
         })
     }
@@ -1076,6 +1166,7 @@ mod tests {
             bytes_in: 7,
             bytes_out: 0,
             counted: false,
+            guard: None,
         };
         drain(&mut body);
         drop(body);
@@ -1118,6 +1209,7 @@ mod tests {
             bytes_in: 0,
             bytes_out: 0,
             counted: false,
+            guard: None,
         };
         // One frame leaves, and no trailer follows: the client went away.
         {

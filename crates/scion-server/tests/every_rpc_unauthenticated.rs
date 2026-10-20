@@ -19,6 +19,7 @@ use scion_proto::v1::{
 use scion_server::Access;
 use scion_server::Keys;
 use scion_server::Metrics;
+use scion_server::test_support::backend::BackendExt;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::{Backend, test_support::service};
 use std::future::Future;
@@ -413,9 +414,7 @@ fn state_of_blocking(store: &Backend, dir: &Path) -> (i64, Vec<i64>) {
             .get(0);
         return (version, counts);
     }
-    let Backend::Sqlite(store) = store else {
-        unreachable!("the test backend is SQLite or Postgres")
-    };
+    let store = store.sqlite().expect("the test backend is SQLite");
     let counts = store
         .read(|c| {
             let mut names = c

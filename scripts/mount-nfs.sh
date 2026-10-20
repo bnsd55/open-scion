@@ -52,9 +52,19 @@ export SCION_TOKEN
 for c in sudo mount umount modprobe; do
   command -v "$c" > /dev/null || die "needs $c"
 done
+# GNU timeout caps the build and the mount wait. This script does not
+# source common.sh, so it resolves its own - timeout, else gtimeout
+# (a default Mac has neither under the name timeout; issue #399).
+if command -v timeout > /dev/null 2>&1; then
+  TIMEOUT=timeout
+elif command -v gtimeout > /dev/null 2>&1; then
+  TIMEOUT=gtimeout
+else
+  die "needs GNU timeout (macOS: brew install coreutils)"
+fi
 
 note "building the debug binaries"
-timeout 300 cargo build --locked --quiet -p open-scion-server -p open-scion
+"$TIMEOUT" 300 cargo build --locked --quiet -p open-scion-server -p open-scion
 
 # The kernel NFS client: the module, and mount.nfs(8).
 sudo modprobe nfs
@@ -77,7 +87,7 @@ fi
   $PG_ARG \
   > "$WORK/server.log" 2>&1 &
 echo $! > "$WORK/server.pid"
-timeout 30 bash -c 'until grep -q serving '"$WORK"'/server.log 2> /dev/null; do sleep 0.2; done' \
+"$TIMEOUT" 30 bash -c 'until grep -q serving '"$WORK"'/server.log 2> /dev/null; do sleep 0.2; done' \
   || die "the server did not start"
 # The run proves the backend it was asked for: a Postgres-backed server
 # writes the marker and no SQLite database, so a spawn that lost its
@@ -101,7 +111,7 @@ git -C "$WORK/src" -c user.name=mount-nfs -c user.email=mount-nfs@localhost \
   commit -qm "seed the repo"
 # The import opens the same backend beside the serving one, so it takes
 # the same `--postgres-url` in Postgres mode.
-timeout 120 "$BIN/scion-server" --data "$WORK/server" import \
+"$TIMEOUT" 120 "$BIN/scion-server" --data "$WORK/server" import \
   --repo main --rev main "$WORK/src" \
   $PG_ARG \
   > "$WORK/import.out" 2> "$WORK/import.log" || {
@@ -122,7 +132,7 @@ mkdir -p "$VIEW"
   > "$WORK/mount.log" 2>&1 &
 MOUNT_PID=$!
 echo "$MOUNT_PID" > "$WORK/mount.pid"
-timeout 30 bash -c 'until grep -q "^sudo mount -t nfs" '"$WORK"'/mount.log 2> /dev/null; do
+"$TIMEOUT" 30 bash -c 'until grep -q "^sudo mount -t nfs" '"$WORK"'/mount.log 2> /dev/null; do
   kill -0 '"$MOUNT_PID"' 2> /dev/null || { cat '"$WORK"'/mount.log >&2; die "scn mount died"; }
   sleep 0.2
 done' || die "scn mount printed no mount command"
@@ -130,22 +140,22 @@ MOUNT_CMD=$(grep '^sudo mount -t nfs' "$WORK/mount.log" | tail -n 1)
 # The split of $MOUNT_CMD is the point: it is the whole command line that
 # scn mount printed.
 # shellcheck disable=SC2086
-timeout 60 sudo $MOUNT_CMD || die "the printed mount command failed: $MOUNT_CMD"
-timeout 60 bash -c 'until [ -f "'"$VIEW"'/README.md" ]; do sleep 0.2; done' \
+"$TIMEOUT" 60 sudo $MOUNT_CMD || die "the printed mount command failed: $MOUNT_CMD"
+"$TIMEOUT" 60 bash -c 'until [ -f "'"$VIEW"'/README.md" ]; do sleep 0.2; done' \
   || { cat "$WORK/mount.log" >&2; die "the mount did not come up"; }
 
 # (a) A read through the mount, its bytes against the landed blob.
-got=$(timeout 30 cat "$VIEW/README.md")
+got=$("$TIMEOUT" 30 cat "$VIEW/README.md")
 [ "$got" = "hello from the mount test" ] || die "the mount served '$got'"
 
 # (b) A write, a rename and a delete through the mount.
-timeout 30 bash -c 'echo "written through the mount" > "'"$VIEW"'/notes.txt"'
-timeout 30 mv "$VIEW/notes.txt" "$VIEW/renamed.txt"
-timeout 30 rm "$VIEW/README.md"
+"$TIMEOUT" 30 bash -c 'echo "written through the mount" > "'"$VIEW"'/notes.txt"'
+"$TIMEOUT" 30 mv "$VIEW/notes.txt" "$VIEW/renamed.txt"
+"$TIMEOUT" 30 rm "$VIEW/README.md"
 
 # (c) The commit from the mount. The session file and the overlay belong to
 # the user, so scn runs as the user, no sudo.
-timeout 60 "$BIN/scn" --server "$SERVER" commit -m "from the mount" \
+"$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" commit -m "from the mount" \
   --from-mount "$VIEW" \
   > "$WORK/from-mount.out" 2> "$WORK/from-mount.log" || {
   tail -n 20 "$WORK/from-mount.log" >&2
@@ -156,7 +166,7 @@ CS2=$(grep -Eo '[0-9a-f]{64}' "$WORK/from-mount.out" | tail -n 1)
 
 # (d) The diff of main against the new changeset: exactly the rename and
 # the delete, two lines.
-diff_out=$(timeout 60 "$BIN/scn" --server "$SERVER" diff main "$CS2")
+diff_out=$("$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" diff main "$CS2")
 echo "$diff_out" | grep -q 'A' || true
 echo "$diff_out" | grep -Eq '^A[^[:alnum:]]*renamed\.txt$' \
   || die "the diff lacks 'A renamed.txt': $diff_out"
@@ -175,12 +185,12 @@ port=$(echo "$line" | grep -o 'port=[0-9]*' | head -n 1 | cut -d= -f2)
 note "mount table: $target port $port"
 wrong_target="${target%?}x"
 mkdir -p "$WORK/wrong"
-if timeout 30 sudo mount -t nfs -o "vers=3,tcp,port=$port,mountport=$port,nolock,soft" \
+if "$TIMEOUT" 30 sudo mount -t nfs -o "vers=3,tcp,port=$port,mountport=$port,nolock,soft" \
   "$wrong_target" "$WORK/wrong" 2> "$WORK/wrong.log"; then
   sudo umount "$WORK/wrong" 2> /dev/null || true
   die "the tampered mount path $wrong_target was accepted"
 fi
-timeout 30 stat "$VIEW/renamed.txt" > /dev/null || die "the mount died"
+"$TIMEOUT" 30 stat "$VIEW/renamed.txt" > /dev/null || die "the mount died"
 
 # (e2) A mount without --unstable-writable is read-only: the read works,
 # the write is refused with EROFS, and the commit from it names the flag.
@@ -189,25 +199,25 @@ mkdir -p "$VIEW2"
 "$BIN/scn" --server "$SERVER" mount "$VIEW2" main \
   > "$WORK/mount-ro.log" 2>&1 &
 RO_PID=$!
-timeout 30 bash -c 'until grep -q "^sudo mount -t nfs" '"$WORK"'/mount-ro.log 2> /dev/null; do
+"$TIMEOUT" 30 bash -c 'until grep -q "^sudo mount -t nfs" '"$WORK"'/mount-ro.log 2> /dev/null; do
   kill -0 '"$RO_PID"' 2> /dev/null || { cat '"$WORK"'/mount-ro.log >&2; die "the read-only scn mount died"; }
   sleep 0.2
 done' || die "the read-only mount printed no mount command"
 RO_CMD=$(grep '^sudo mount -t nfs' "$WORK/mount-ro.log" | tail -n 1)
 # shellcheck disable=SC2086
-timeout 60 sudo $RO_CMD || die "the read-only mount command failed: $RO_CMD"
-timeout 60 bash -c 'until [ -f "'"$VIEW2"'/README.md" ]; do sleep 0.2; done' \
+"$TIMEOUT" 60 sudo $RO_CMD || die "the read-only mount command failed: $RO_CMD"
+"$TIMEOUT" 60 bash -c 'until [ -f "'"$VIEW2"'/README.md" ]; do sleep 0.2; done' \
   || { cat "$WORK/mount-ro.log" >&2; die "the read-only mount did not come up"; }
-got=$(timeout 30 cat "$VIEW2/README.md")
+got=$("$TIMEOUT" 30 cat "$VIEW2/README.md")
 [ "$got" = "hello from the mount test" ] || die "the read-only mount served '$got'"
-if timeout 30 bash -c 'echo refused > "'"$VIEW2"'/refused.txt"' 2> /dev/null; then
+if "$TIMEOUT" 30 bash -c 'echo refused > "'"$VIEW2"'/refused.txt"' 2> /dev/null; then
   die "a read-only mount took a write"
 fi
-RO_COMMIT=$(timeout 60 "$BIN/scn" --server "$SERVER" commit -m "ro" \
+RO_COMMIT=$("$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" commit -m "ro" \
   --from-mount "$VIEW2" 2>&1 || true)
 echo "$RO_COMMIT" | grep -q -- "--unstable-writable" \
   || die "the commit from a read-only mount names no flag: $RO_COMMIT"
-timeout 60 "$BIN/scn" --server "$SERVER" unmount "$VIEW2" \
+"$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" unmount "$VIEW2" \
   > "$WORK/unmount-ro.log" 2>&1 || die "scn unmount of the read-only mount failed"
 sudo umount -f -l "$VIEW2" 2> /dev/null || true
 if mount | grep -q " on $VIEW2 "; then
@@ -217,7 +227,7 @@ kill "$RO_PID" 2> /dev/null || true
 
 # (f) The unmount: scn unmount as the user drops the session record, then
 # the real umount under sudo, and the mount table is clean afterwards.
-timeout 60 "$BIN/scn" --server "$SERVER" unmount "$VIEW" \
+"$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" unmount "$VIEW" \
   > "$WORK/unmount.log" 2>&1 || die "scn unmount failed"
 sudo umount -f -l "$VIEW" 2> /dev/null || true
 if mount | grep -q " on $VIEW "; then

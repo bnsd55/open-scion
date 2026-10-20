@@ -320,7 +320,7 @@ mod tests {
 
     fn store() -> (tempfile::TempDir, Backend) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(crate::test_support::store::Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(crate::test_support::store::Store::open(dir.path()).unwrap());
         (dir, store)
     }
 
@@ -1013,9 +1013,7 @@ mod tests {
 
     /// How many view rows `store` holds.
     fn rows(store: &Backend) -> i64 {
-        let Backend::Sqlite(store) = store else {
-            unreachable!("the view tests run on SQLite");
-        };
+        let store = store.as_sqlite().expect("the view tests run on SQLite");
         // `SqliteTx` derefs to the connection.
         store
             .read(|c| {
@@ -1185,7 +1183,7 @@ mod tests {
     fn a_head_plus_one_rewalks_what_the_memo_cannot_serve() {
         let dir = std::env::var("SCION_VIEW_BENCH_DATA").expect("SCION_VIEW_BENCH_DATA");
         let repo_name = std::env::var("SCION_VIEW_BENCH_REPO").unwrap_or_else(|_| "main".into());
-        let store = Backend::Sqlite(Store::open(Path::new(&dir)).unwrap());
+        let store = Backend::sqlite(Store::open(Path::new(&dir)).unwrap());
         let repo = store.read(|c| c.repo_id(&repo_name)).unwrap();
         let tip = store
             .read(|c| c.get_ref(repo, "main"))

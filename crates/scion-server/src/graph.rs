@@ -701,7 +701,7 @@ mod tests {
         parents: &[Vec<usize>],
     ) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let (repo, ids) = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
@@ -958,7 +958,7 @@ mod tests {
         // busy the machine is.
         const N: usize = 4_096;
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let (repo, ids, side) = deep_chain(&store, N);
         let tip = ids[N - 1];
         // Myers bounds a walk down to a depth by about 3 log2 n moves.

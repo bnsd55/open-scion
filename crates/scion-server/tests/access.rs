@@ -17,6 +17,7 @@ use scion_proto::v1::{
 use std::sync::Arc;
 
 use scion_server::Access;
+use scion_server::test_support::backend::from_store;
 use scion_server::test_support::meta::Meta as _;
 use scion_server::test_support::store::Store;
 
@@ -884,6 +885,11 @@ async fn a_partial_readers_ticket_reaches_only_its_view() {
 
 /// A partial reader writes nothing: the write calls all answer the same
 /// uniform `UNIMPLEMENTED`, with no per-object difference.
+/// The side channel the threat model names: a partial reader sees the
+/// ref's real changeset ID, so a hidden-only landing shows through a new
+/// ID over an unchanged view, with every path answer the same.
+/// A partial reader writes nothing: the write calls all answer the same
+/// uniform `UNIMPLEMENTED`, with no per-object difference.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_partial_reader_writes_nothing() {
     let (dir, store, root, _blob) = store();
@@ -898,6 +904,141 @@ async fn a_partial_reader_writes_nothing() {
     );
     unimplemented("Land", scion.land(req::land(root.as_bytes())).await);
     unimplemented("GetLand", scion.get_land(req::get_land()).await);
+}
+
+/// The side channel the threat model names: a partial reader sees the
+/// ref's real changeset ID, so a hidden-only landing shows through a new
+/// ID over an unchanged view, with every path answer the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_reader_sees_a_hidden_landing_through_the_ref_id() {
+    let (dir, store, tip, _docs, _secret) = repo_with_docs_and_secret();
+    let (_stop, mut pat, mut objects) = server(&store, dir.path(), partial_access(), "pat").await;
+
+    let first = pat
+        .resolve_ref(req::resolve_ref())
+        .await
+        .unwrap()
+        .into_inner()
+        .changeset_id;
+    let view = objects
+        .get_root_tree(req::get_root_tree(tip.as_bytes()))
+        .await
+        .unwrap()
+        .into_inner();
+
+    // A change outside the reader's prefix lands on main, as a real land
+    // would: the ref moves to it.
+    let hidden = put(&store, b"hidden\n");
+    let _landed = store
+        .write(|c| {
+            let repo = c.repo_id(REPO)?;
+            let cs = c.insert_changeset(
+                repo,
+                &changeset(vec![tip], "secret/c", Some(regular(hidden))),
+            )?;
+            let version = c.get_ref(repo, "main")?.unwrap().version;
+            assert!(c.cas_ref(repo, "main", Some(version), cs)?);
+            Ok(cs)
+        })
+        .unwrap();
+
+    let second = pat
+        .resolve_ref(req::resolve_ref())
+        .await
+        .unwrap()
+        .into_inner()
+        .changeset_id;
+    assert_ne!(first, second, "the landing shows through the ref's ID");
+    let after = objects
+        .get_root_tree(req::get_root_tree(&second))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(view.tree_id, after.tree_id, "the view root is unchanged");
+}
+
+/// The window the operations guide promises: a narrowed access file cuts
+/// a principal at the next start, but an outstanding ticket keeps working
+/// for its whole life - at most 15 minutes from signing - while the key
+/// holds, and a new key cuts it at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_outstanding_ticket_survives_a_narrowed_access_file_until_the_key_rotates() {
+    let (dir, store, tip, docs, _secret) = repo_with_docs_and_secret();
+    let full = Access::parse(&format!("token\tpat\t{}\nread\tpat\t{REPO}\n", hex("pat"))).unwrap();
+    let narrowed = Access::parse(&format!("token\tnobody\t{}\n", hex("nobody"))).unwrap();
+
+    let keys = scion_server::Keys::generate();
+    let (stop, url) = serve_keys(&store, dir.path(), full, keys.clone()).await;
+    let mut pat = objects(&url, Some("pat")).await;
+    let ticket = pat
+        .get_root_tree(req::get_root_tree(tip.as_bytes()))
+        .await
+        .unwrap()
+        .into_inner()
+        .ticket;
+    let get = |ticket: Vec<u8>, url: String| async move {
+        let mut objects = objects(&url, None).await;
+        objects
+            .get_objects(GetObjectsRequest {
+                refs: vec![ObjectRef {
+                    kind: ObjectKind::Blob as i32,
+                    id: docs.as_bytes().to_vec(),
+                    path: b"docs/a".to_vec(),
+                }],
+                accept: Vec::new(),
+                ticket,
+            })
+            .await
+    };
+    let mut reply = get(ticket.clone(), url.clone()).await.unwrap().into_inner();
+    while (reply.message().await.unwrap()).is_some() {}
+    drop(pat);
+    stop.send(()).ok();
+
+    // The access file no longer knows `pat`. The outstanding ticket still
+    // serves, because its permission is the walk, not the rules.
+    let (_stop, url) = serve_keys(&store, dir.path(), narrowed.clone(), keys.clone()).await;
+    let mut reply = get(ticket.clone(), url.clone()).await.unwrap().into_inner();
+    while (reply.message().await.unwrap()).is_some() {}
+
+    // A new key cuts the old ticket at once.
+    let (_stop, url) =
+        serve_keys(&store, dir.path(), narrowed, scion_server::Keys::generate()).await;
+    let err = get(ticket, url).await.unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied, "{err:?}");
+    assert!(err.to_string().contains("bad ticket"), "{err:?}");
+}
+
+/// `serve` with explicit ticket keys, so a restart can keep the key - and
+/// every outstanding ticket with it.
+async fn serve_keys(
+    store: &Backend,
+    dir: &std::path::Path,
+    access: Access,
+    keys: scion_server::Keys,
+) -> (Stop, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(service::serve(
+        store.clone(),
+        listener,
+        access,
+        service::ServeOptions {
+            data: dir.to_path_buf(),
+            limits: Limits::default(),
+            quotas: scion_server::Quotas::off(),
+            pending_lands: None,
+            land_stale_secs: 1 << 40,
+            tls: None,
+            metrics: Arc::new(Metrics::default()),
+        },
+        Some(Arc::new(keys)),
+        async {
+            stopped.await.ok();
+        },
+    ));
+    (stop, format!("http://{addr}"))
 }
 
 /// The code that says "accepted".
@@ -1535,7 +1676,7 @@ fn a_partial_reader_case(paths: &[String], rule_seeds: &[u16]) -> Result<(), Tes
     // The store: a chain of changesets whose tip tree holds every path,
     // and each file's blob, as an upload would leave them.
     let dir = tempfile::tempdir().unwrap();
-    let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+    let store = from_store(Store::open(dir.path()).unwrap());
     let tip = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -1568,7 +1709,7 @@ fn a_partial_reader_case(paths: &[String], rule_seeds: &[u16]) -> Result<(), Tes
         .cloned()
         .collect();
     let dir_b = tempfile::tempdir().unwrap();
-    let store_b = Backend::Sqlite(Store::open(dir_b.path()).unwrap());
+    let store_b = from_store(Store::open(dir_b.path()).unwrap());
     let tip_b = store_b
         .write(|c| {
             let repo = c.create_repo(REPO)?;

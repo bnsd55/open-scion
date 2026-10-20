@@ -109,8 +109,8 @@ run_story() {
   # The server on a port the OS chooses: `--listen 127.0.0.1:0`, and the
   # log's `serving listen=` line names the port, so the story never races
   # another test for a fixed port.
-  "$BIN/scion-server" --data "$WORK/server" serve --listen 127.0.0.1:0 \
-    --token smoke --ticket-key "$WORK/ticket.key" \
+  SCION_TOKEN=smoke "$BIN/scion-server" --data "$WORK/server" serve \
+    --listen 127.0.0.1:0 --ticket-key "$WORK/ticket.key" \
     >"$WORK/server.log" 2>&1 &
   SERVER_PID=$!
   for _ in $(seq 1 300); do

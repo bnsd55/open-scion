@@ -11,7 +11,9 @@ Every command takes these flags, before or after the subcommand:
 
 | Flag | Environment | Default | Meaning |
 |---|---|---|---|
-| `--token TOKEN` | `SCION_TOKEN` | none, required | Bearer token for the server. Pass it in `SCION_TOKEN`, not here: the command line is readable by every local user (`ps`), the environment of your own process is not. |
+| `--token TOKEN` | `SCION_TOKEN` | none, required | Bearer token for the server. Pass it in `SCION_TOKEN`, not here: the command line is readable by every local user (`ps`), the environment of your own process is not. The argv form prints a deprecation warning and goes away in a later release. |
+| `--token-file FILE` |  | none | The token from a file the owner alone may read (a symlink or a group-readable file is refused). |
+
 | `--server ADDR` | `SCION_SERVER` | `http://127.0.0.1:7878` | Server address: `http://HOST:PORT`, or `unix:///PATH` for a `scion-daemon` on this node. |
 | `--objects ADDR` | `SCION_OBJECTS` | none | Address of a `scion-cache` or `scion-daemon` that serves `GetObjects` with a ticket. Without it, object reads go to `--server`, which also has them. |
 | `--tls-ca FILE` | `SCION_TLS_CA` | none | Trust this CA (PEM) for an https server. |

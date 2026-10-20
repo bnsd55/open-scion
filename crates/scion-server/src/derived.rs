@@ -1150,7 +1150,7 @@ mod tests {
     /// A new store with `history` in repo `r`, as [`store_chain`] stores it.
     fn store_with(history: &[Edits]) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let (repo, ids) = store.write(|c| store_chain(c, history)).unwrap();
         (dir, store, repo, ids)
     }
@@ -1362,7 +1362,7 @@ mod tests {
                 .all(|(kind, v, ..)| kind == RootTree::NAME && *v == RootTree::VERSION)
         );
 
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let version: u32 = store
             .read(|c| {
                 c.sqlite()
@@ -1540,7 +1540,7 @@ mod tests {
         // two of them, as the walks of other callers would.
         let budget = 7 * walk_step_bytes();
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(
+        let store = Backend::sqlite(
             Store::open_with_walk_bytes(
                 dir.path(),
                 DERIVE_WALKS_CAP,
@@ -1595,7 +1595,7 @@ mod tests {
     fn an_unbounded_derive_walk_takes_no_bytes() {
         let budget = walk_step_bytes();
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(
+        let store = Backend::sqlite(
             Store::open_with_walk_bytes(
                 dir.path(),
                 DERIVE_WALKS_CAP,
@@ -1717,7 +1717,7 @@ mod tests {
         parents: &[Vec<usize>],
     ) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let (repo, ids) = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
@@ -2049,12 +2049,12 @@ mod tests {
         // its permit taken. The gate, not a clock, holds it there: the
         // walk's permit stays taken for as long as the test wants.
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open_with_walks(dir.path(), 1).unwrap());
+        let store = Backend::sqlite(Store::open_with_walks(dir.path(), 1).unwrap());
         let (repo1, ids1) = another_chain(&store, "one", &chain(3));
         let (repo2, ids2) = another_chain(&store, "two", &chain(3));
         let (repo3, ids3) = another_chain(&store, "three", &chain(3));
         let dir2 = tempfile::tempdir().unwrap();
-        let store2 = Backend::Sqlite(Store::open(dir2.path()).unwrap());
+        let store2 = Backend::sqlite(Store::open(dir2.path()).unwrap());
         let (repo_b, ids_b) = another_chain(&store2, "r", &chain(3));
         let (owner, beside) = std::thread::scope(|scope| {
             let _gate = gate_closed();
@@ -2246,7 +2246,7 @@ mod tests {
         // transactions on the write connection, and the land would wait
         // behind all of them.
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open_with_walks(dir.path(), 2).unwrap());
+        let store = Backend::sqlite(Store::open_with_walks(dir.path(), 2).unwrap());
         let mut repos: Vec<(RepoId, ChangesetId)> = Vec::new();
         for i in 0..40 {
             let (repo, ids) = another_chain(&store, &format!("r{i}"), &chain(4));

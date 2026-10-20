@@ -1775,7 +1775,7 @@ mod tests {
 
     fn file_store(content: &[u8]) -> (tempfile::TempDir, Backend, ChangesetId, BlobId) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let blob = store.blobs().put(content).unwrap();
         let state = FileState::Regular {
             content: blob,
@@ -2135,7 +2135,7 @@ mod tests {
         // main goes root ─ B. The land's base is root, below the floor of a
         // new path index at B, so its plan walks back.
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let blob = store.blobs().put(b"x").unwrap();
         let put = |parents, path: &str| {
             Changeset::new(
@@ -2244,7 +2244,7 @@ mod tests {
         // main moved past the changeset's parent, so the land's plan has
         // a walk to make: the spent deadline stops it at its first check.
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let blob = store.blobs().put(b"x").unwrap();
         let put = |parents, path: &str| {
             Changeset::new(
@@ -2309,14 +2309,14 @@ mod tests {
             // test of pg.rs, and it feeds the same counter code.
             return;
         }
-        let Backend::Sqlite(store) = &store else {
-            panic!("the page cap is a data-directory test");
-        };
+        let store = store
+            .as_sqlite()
+            .expect("the page cap is a data-directory test");
         // The land's own changeset must grow the file past its cap: two
         // thousand files, far past any space the setup left free.
         store.cap_database_pages(0);
         let metrics = Arc::new(Metrics::default());
-        let service = counting_service(&Backend::Sqlite(store.clone()), &metrics);
+        let service = counting_service(&Backend::sqlite(store.clone()), &metrics);
         let request = as_default(scion_proto::v1::LandRequest {
             repo: "r".into(),
             changeset_id: cs.as_bytes().to_vec(),
@@ -2337,7 +2337,7 @@ mod tests {
     /// grow the metadata file.
     fn landed_store() -> (tempfile::TempDir, Backend, ChangesetId) {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let blob = store.blobs().put(b"x").unwrap();
         let mut files = Vec::new();
         for i in 0..2000 {
@@ -2446,7 +2446,7 @@ mod tests {
     async fn at_most_max_graph_queries_run_at_once() {
         // root ─ a, and root ─ b.
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let ids = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
@@ -2543,7 +2543,7 @@ mod tests {
     #[tokio::test]
     async fn a_worker_panic_does_not_reach_the_client() {
         let dir = tempfile::tempdir().unwrap();
-        let worker = Worker::new(Backend::Sqlite(Store::open(dir.path()).unwrap()));
+        let worker = Worker::new(Backend::sqlite(Store::open(dir.path()).unwrap()));
         let status = worker
             .run(|_| -> Result<()> { panic!("secret detail") })
             .await
