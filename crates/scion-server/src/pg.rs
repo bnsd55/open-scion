@@ -117,7 +117,7 @@ impl Fence {
 
 /// Handle to one Postgres database. Cheap to clone.
 #[derive(Clone)]
-pub struct Pg {
+pub(crate) struct Pg {
     inner: Arc<PgInner>,
 }
 
@@ -988,7 +988,7 @@ impl Pg {
 
     /// The blob folder.
     #[must_use]
-    pub fn blobs(&self) -> &Blobs {
+    pub(crate) fn blobs(&self) -> &Blobs {
         &self.inner.blobs
     }
 
@@ -1005,7 +1005,7 @@ impl Pg {
     /// The age of the oldest open read transaction, for the
     /// `scion_pg_tx_age_seconds` gauge. Zero when no read is open.
     #[must_use]
-    pub fn tx_age(&self) -> Duration {
+    pub(crate) fn tx_age(&self) -> Duration {
         self.inner
             .readers
             .oldest_open()
@@ -1014,7 +1014,10 @@ impl Pg {
     }
 
     /// A read on the write client, so it sees the caller's own commits.
-    pub fn read_unflushed<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
+    pub(crate) fn read_unflushed<T>(
+        &self,
+        f: impl FnOnce(&mut PgTx<'_>) -> Result<T>,
+    ) -> Result<T> {
         self.check_fenced()?;
         let (mut writer, _waiting) = self.lock_writer();
         let mut pg = PgTx {
@@ -1035,7 +1038,7 @@ impl Pg {
     ///
     /// What `f` returns, a database error from begin, or
     /// [`Error::Unavailable`] when no reader was free in time.
-    pub fn read<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
+    pub(crate) fn read<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
         self.read_bounded(f, READ_STATEMENT_TIMEOUT, READ_IDLE_TIMEOUT, READER_WAIT)
     }
 
@@ -1071,7 +1074,7 @@ impl Pg {
     /// # Errors
     ///
     /// What `f` returns, or a database error from begin or commit.
-    pub fn commit<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
+    pub(crate) fn commit<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
         self.check_fenced()?;
         let (mut writer, _waiting) = self.lock_writer();
         // A write transaction runs at READ COMMITTED, the Postgres
@@ -1141,7 +1144,7 @@ impl Pg {
     /// # Errors
     ///
     /// As [`Pg::commit`].
-    pub fn write<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
+    pub(crate) fn write<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
         self.commit(f)
     }
 
@@ -1173,7 +1176,7 @@ impl Pg {
     /// The import's test hooks and busy-retry count.
     #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
-    pub fn hooks(&self) -> &crate::store::ImportHooks {
+    pub(crate) fn hooks(&self) -> &crate::store::ImportHooks {
         &self.inner.hooks
     }
 
@@ -1244,6 +1247,11 @@ impl Drop for PgWriteWaiter<'_> {
 /// [`MetaTx`] methods. The transaction is begun and ended with statements
 /// of the client, so a `PgTx` is a plain client handle: it stays covariant
 /// in its lifetime, which the backend enum's transaction needs.
+///
+/// `pub` with the unreachable-pub allow, like [`SqliteTx`](crate::db::SqliteTx):
+/// [`Meta::Tx`] names it, and the trait re-exports through
+/// `test_support::meta`.
+#[allow(unreachable_pub)]
 pub struct PgTx<'a> {
     c: &'a mut PgClient,
     /// The transaction was ended by `commit` or `rollback`; a drop then
@@ -3234,7 +3242,7 @@ mod tests {
                 .get(0)
         };
         assert_eq!(ledger, i64::from(super::PG_SCHEMA_VERSION));
-        let backend = crate::Backend::Postgres(pg);
+        let backend = crate::Backend::postgres(pg);
         old_store::assert_serves(&backend, &cs, id, blob_a, blob_b);
     }
 
@@ -3345,10 +3353,12 @@ mod pool_tests {
             return None;
         }
         let data = tempfile::tempdir().unwrap();
-        match crate::backend::Backend::open_test(data.path()).unwrap() {
-            crate::backend::Backend::Postgres(pg) => Some(pg),
-            crate::backend::Backend::Sqlite(_) => unreachable!("the env named postgres"),
-        }
+        let backend = crate::backend::Backend::open_test(data.path()).unwrap();
+        let pg = backend
+            .as_postgres()
+            .cloned()
+            .expect("the env named postgres");
+        Some(pg)
     }
 
     /// A transaction whose connection dies mid-way leaves the worker's
