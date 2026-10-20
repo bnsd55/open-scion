@@ -130,7 +130,9 @@ scion-server --data /srv/scion \
 - `--postgres-ca` (a PEM file) is required with a remote host too: the
   database must present a certificate it signed, and there is no mode that
   accepts any certificate. A host on this machine (`localhost`, a loopback
-  address) may go without either.
+  address) may go without either. The CA file must not be group- or
+  others-writable: a swapped CA changes whom the database connection
+  trusts, and the open refuses one (`chmod go-w /srv/scion/db-ca.pem`).
 - The open checks the database runs `synchronous_commit=on`: a returned
   commit must be durable. A database that answers otherwise is refused.
 - The open migrates the database's schema to this build's version, one
@@ -256,6 +258,15 @@ private CA: `scn --tls-ca ca.pem`, a tier for its upstream with its own
 (`--tls-client-ca` on the server or cache; `--tls-client-cert` and
 `--tls-client-key` on the cache or daemon). A bearer token over plain TCP to
 a non-loopback address stays refused.
+
+The server reads the private key only when its owner (or root) alone can
+read it, and refuses one that group or others can read at start
+(`chmod 600 KEY`). The certificate and every CA file (`--tls-cert`, the
+CAs of `--tls-ca`, `--tls-client-ca`, `--postgres-ca`) must not be
+group- or others-writable, for a swapped file changes whom a client
+trusts or whose certificates the server accepts: `chmod go-w` them, and
+check after a copy tool or a umask 002 session, where a fresh file
+starts 0664.
 
 ### In containers
 
