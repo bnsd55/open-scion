@@ -76,7 +76,7 @@ const CLAIM_MODE: Mode = Mode::RWXU;
 static REMOVING: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// The temp directory that a dropped [`Checkout`] is removing now, if any.
-pub fn removing() -> Option<PathBuf> {
+pub(crate) fn removing() -> Option<PathBuf> {
     REMOVING
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -99,7 +99,7 @@ fn set_removing(temp: Option<PathBuf>) {
 // Windows is unsupported: no Windows rules here. Device names (`CON`, `NUL`)
 // and names that end in a dot or a space pass. Case and Unicode folding is
 // caught at write time, on the filesystem in use.
-pub fn check_name(name: &[u8]) -> Result<(), &'static str> {
+pub(crate) fn check_name(name: &[u8]) -> Result<(), &'static str> {
     for chunk in name.utf8_chunks() {
         let text = chunk.valid();
         if text.chars().any(char::is_control)
@@ -190,7 +190,7 @@ fn open_dest(dest: &Path) -> Result<Option<OwnedFd>> {
 /// A checkout being written into a temp directory. Dropped without
 /// [`Checkout::finish`], it removes every path it made, wherever it is now,
 /// and then the temp directory.
-pub struct Checkout {
+pub(crate) struct Checkout {
     /// The directory that holds the temp directory: the destination if it
     /// exists, or else its parent.
     base: OwnedFd,
@@ -287,7 +287,7 @@ impl Checkout {
     /// Fails if `dest` is a symlink, a file, or a directory that is not empty
     /// or that another user owns; if a missing `dest` has no final name (for
     /// example `..`); or if a directory cannot be opened or written.
-    pub fn start(dest: &Path) -> Result<Self> {
+    pub(crate) fn start(dest: &Path) -> Result<Self> {
         match open_dest(dest)? {
             Some(dir) => Self::make(dir, dest.to_path_buf(), None),
             None => Self::start_next_to(dest),
@@ -367,7 +367,7 @@ impl Checkout {
     /// Fails if a part breaks [`check_name`], if a parent is a symlink or not
     /// a directory, if the path collides with another one on this filesystem,
     /// or if the write fails.
-    pub fn file(&mut self, path: &RepoPath, executable: bool, data: &[u8]) -> Result<()> {
+    pub(crate) fn file(&mut self, path: &RepoPath, executable: bool, data: &[u8]) -> Result<()> {
         let mut write = || -> io::Result<()> {
             let name = self.parent(path)?;
             let dir = self.held(path.as_bytes());
@@ -410,7 +410,7 @@ impl Checkout {
     ///
     /// As [`Checkout::file`], or if the target is not a valid symlink target
     /// (empty, or has a NUL).
-    pub fn symlink(&mut self, path: &RepoPath, target: &[u8]) -> Result<()> {
+    pub(crate) fn symlink(&mut self, path: &RepoPath, target: &[u8]) -> Result<()> {
         let mut link = || -> io::Result<()> {
             let name = self.parent(path)?;
             let dir = self.held(path.as_bytes());
@@ -432,7 +432,7 @@ impl Checkout {
     /// Fails, and removes what it wrote, if the destination is a non-empty
     /// directory, a file or a symlink, or if something appeared in an
     /// existing destination during the checkout.
-    pub fn finish(mut self) -> Result<()> {
+    pub(crate) fn finish(mut self) -> Result<()> {
         match &self.dest {
             Dest::New { name, mode } => self.rename_onto(name, *mode)?,
             Dest::Existing => self.move_up()?,

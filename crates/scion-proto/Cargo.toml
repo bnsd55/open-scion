@@ -30,6 +30,7 @@ prost.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tokio-stream.workspace = true
+# The unix-socket bind (listen.rs) and #356's checked reads name the owner.
 rustix.workspace = true
 tonic = { workspace = true, features = ["tls-ring"] }
 tonic-health.workspace = true

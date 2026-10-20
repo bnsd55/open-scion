@@ -7,14 +7,15 @@
 [![CI](https://github.com/bnsd55/openscion/actions/workflows/ci.yml/badge.svg)](https://github.com/bnsd55/openscion/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
-![Status: proof of concept](https://img.shields.io/badge/status-proof%20of%20concept-yellow.svg)
+![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
 
 A version control system for large monorepos where most of the writers are
 AI agents. The server keeps the history and makes the commits; clients ask
 only for what they need. Written in Rust.
 
-> **Early proof of concept.** It runs on one machine and is not ready for real
-> code. The order of the work, and what stays out until it passes, is in
+> **Alpha (0.x).** It runs on one machine and is not ready for production
+> code. What holds between versions is in [docs/stability.md](docs/stability.md);
+> the order of the work, and what stays out until it passes, is in
 > [docs/ROADMAP.md](docs/ROADMAP.md); planned work is tracked in
 > [issues](https://github.com/bnsd55/openscion/issues)
 > and [milestones](https://github.com/bnsd55/openscion/milestones).
