@@ -206,6 +206,45 @@ jobs:
         env:
           SCION_DISK_REQUIRE: "1"
 
+  # The xfs cell of the support matrix (docs/support.md): every store
+  # the server suite opens lands on a real xfs loop device, through
+  # TMPDIR, so the storage-touching tests run on xfs natively. The
+  # tmpfs disk-full step stays with the x64 job: filling a filesystem
+  # to its cap is tmpfs-specific there, and the xfs evidence is the
+  # suite running on xfs at all.
+  test-xfs:
+    name: test (xfs)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: an xfs loop device for the stores
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xfsprogs
+          truncate -s 8G "$RUNNER_TEMP/xfs.img"
+          LOOP=$(sudo losetup -f --show "$RUNNER_TEMP/xfs.img")
+          echo "xfs_loop=$LOOP" >> "$GITHUB_ENV"
+          sudo mkfs.xfs "$LOOP"
+          sudo mkdir -p /mnt/xfs
+          sudo mount "$LOOP" /mnt/xfs
+          sudo chown "$(id -u):$(id -g)" /mnt/xfs
+      - run: TMPDIR=/mnt/xfs cargo test -p open-scion-server
+        env:
+          # The xfs job proves filesystem parity, not more cases; the
+          # SQLite job on the runner disk already runs 2000.
+          PROPTEST_CASES: "64"
+      - name: the loop device goes away
+        if: always()
+        run: |
+          sudo umount /mnt/xfs || true
+          [ -n "$xfs_loop" ] && sudo losetup -d "$xfs_loop" || true
+
   power-loss:
     name: power-loss
     runs-on: ubuntu-24.04

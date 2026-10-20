@@ -27,6 +27,7 @@ marked supported here.
 | scion-server | Linux | x64 | tmpfs | — | supported | `test` (ci.yml) | The `disk_full` step fills a real tmpfs (`SCION_DISK_REQUIRE=1`) |
 | scion-server | Linux | arm64 | ext4 | — | supported | `test-arm64` (ci.yml) | Native `ubuntu-24.04-arm` runner, full workspace suite on arm64 |
 | scion-server | Linux | arm64 | ext4 | 17 | best effort | — | The arm64 suite runs SQLite; the Postgres-backed arm64 run comes with the Postgres-major wave |
+| scion-server | Linux | x64 | xfs | — | supported | `test-xfs` (ci.yml) | Every store the server suite opens lands on a real xfs loop device (TMPDIR); the probe runs `losetup` + `mkfs.xfs` on the stock runner kernel |
 | scion-server | macOS | arm64 | APFS | — | supported | `test-macos` (ci.yml) | Native `macos-15` runner, full workspace suite; the runner's disk is APFS |
 | scion-server | Windows | x64 | any | — | unsupported | — | No job builds or tests it; the lock files and paths assume POSIX. Unsupported until a native job exists |
 | scion-cache | Linux | x64 | memory | — | supported | `test` (ci.yml) | The suite covers the tier crate; objects live in memory |
