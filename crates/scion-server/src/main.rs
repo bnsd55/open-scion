@@ -127,6 +127,12 @@ struct ServeArgs {
     /// `--insecure-listen`, because the metrics travel unencrypted.
     #[arg(long, value_name = "ADDR")]
     metrics_listen: Option<SocketAddr>,
+    /// How long the in-flight calls have to finish once the first signal
+    /// starts the drain. Past it the calls are cut, the log names the
+    /// count, and the process exits non-zero, so a supervisor restarts it.
+    /// A second signal always cuts at once.
+    #[arg(long, default_value_t = listen::DEFAULT_DRAIN_TIMEOUT.as_secs())]
+    drain_timeout_secs: u64,
 }
 
 #[derive(Subcommand)]
@@ -386,6 +392,7 @@ async fn main() -> anyhow::Result<()> {
                     max_streams: flags.max_streams,
                     max_stalled_bytes: flags.max_stalled_bytes,
                     metrics_listen: flags.metrics_listen,
+                    drain_timeout: Duration::from_secs(flags.drain_timeout_secs),
                 },
                 flags.tickets,
             )
@@ -514,6 +521,9 @@ struct ServeConfig {
     max_stalled_bytes: NonZeroU64,
     metrics_listen: Option<SocketAddr>,
     data: std::path::PathBuf,
+    /// How long the drain waits for the in-flight calls before it cuts
+    /// them (`--drain-timeout-secs`).
+    drain_timeout: std::time::Duration,
 }
 
 /// The validated flags of a `serve` command: everything `serve` needs is
@@ -530,6 +540,7 @@ struct ServeFlags {
     max_stalled_bytes: NonZeroU64,
     metrics_listen: Option<SocketAddr>,
     tickets: Option<Arc<scion_server::Keys>>,
+    drain_timeout_secs: u64,
 }
 
 /// Checks every `serve` flag that a parse alone does not settle: the rules
@@ -577,6 +588,7 @@ fn serve_flags(args: &ServeArgs) -> anyhow::Result<ServeFlags> {
         max_stalled_bytes: args.max_stalled_bytes,
         metrics_listen: args.metrics_listen,
         tickets,
+        drain_timeout_secs: args.drain_timeout_secs,
     })
 }
 
@@ -607,6 +619,15 @@ async fn serve(
         tracing::warn!("a second signal ended the drain; the in-flight calls were cut");
         std::process::exit(1);
     });
+    // The drain bound: when the first signal starts the drain, the
+    // in-flight calls have this long to finish. On expiry the calls are
+    // cut, the log names the count, and the process exits non-zero. The
+    // second signal above stays the operator's at-once cut.
+    scion_proto::runtime::metrics::spawn_drain_bound(
+        end_rx.clone(),
+        config.drain_timeout,
+        Arc::clone(&metrics),
+    );
     if let Some(metrics_listen) = config.metrics_listen {
         let address = metrics_listen.to_string();
         let metrics_listener = tokio::net::TcpListener::bind(metrics_listen)
