@@ -2303,6 +2303,7 @@ dependencies = [
  "hyper-util",
  "open-scion-core",
  "prost",
+ "rustix",
  "tokio",
  "tokio-rustls",
  "tokio-stream",

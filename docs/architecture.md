@@ -1610,6 +1610,9 @@ read ticket, which the server mints and only the server can mint:
 - **The client.** `scn` mints one ticket per checkout and refreshes it at
   most once per call on `ticket expired`.
 
+The precise profile, the actors, and the security invariants, each
+with the test that proves it, are in [docs/threat-model.md](threat-model.md).
+
 Report security problems as described in [SECURITY.md](../SECURITY.md).
 
 ## 9. Deliberate shortcuts

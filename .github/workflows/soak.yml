@@ -15,6 +15,9 @@ on:
 
 # Every third-party action is pinned to the commit SHA its version tag
 # named, with the version in a comment, as ci.yml does.
+permissions:
+  contents: read
+
 jobs:
   soak:
     name: soak
@@ -40,6 +43,14 @@ jobs:
           SOAK_RSS_PCT: "150" # 150 percent of its warm RSS,
           SOAK_FD_GROWTH: "100" # 100 open files over its start, steady,
           SOAK_P99_FACTOR: "2" # and its late p99 must stay under 2x its early p99.
+          # The RSS warm-up window: the bound's baseline is the first
+          # sample after 1800 s (30 min), because the server's memory
+          # climbs while its caches and arenas fill - one 35-minute run
+          # saw about 30 minutes of it - and a baseline at the start made
+          # every longer warm-up a false red. The nightly still checks
+          # 90 minutes of RSS after it. A run shorter than the window
+          # checks no RSS bound: it cannot tell warm-up from a leak.
+          SOAK_WARM_SECONDS: "1800"
         run: |
           # The soak's own cap: 150 min covers the 120 min of load, and
           # the build, the checks and the teardown live in the job's

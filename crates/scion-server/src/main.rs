@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! The `scion-server` binary: `import`, `serve` and `derive`.
 
 use std::io::Write as _;

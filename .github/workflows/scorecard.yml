@@ -1,0 +1,48 @@
+name: scorecard
+on:
+  push:
+    # Only the default branch is supported by the action.
+    branches: [main]
+  schedule:
+    # Weekly, Saturdays 04:30 UTC — off the soak (daily 02:30) and the
+    # CodeQL slot (Monday 03:07), so no two heavy scans queue together.
+    - cron: "30 4 * * 6"
+
+# Every third-party action is pinned to the commit SHA its version tag
+# named, with the version in a comment, as ci.yml does.
+permissions:
+  contents: read
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      # The two writes the docs name for this job: the SARIF upload to
+      # code scanning, and the OIDC token that publishes the public
+      # result when publish_results is true. The reads are the default
+      # contents: read plus actions: read for the workflow-run checks.
+      security-events: write
+      id-token: write
+      actions: read
+      contents: read
+    steps:
+      # persist-credentials: false: the analysis needs no token after
+      # checkout, so the job leaves none behind.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: run the Scorecard analysis
+        uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # Publishes the run: the public REST API (and any badge) gets
+          # its score from this run, and the Scorecard team's weekly
+          # public scan can reuse it instead of re-running the checks.
+          publish_results: true
+      - name: upload the SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: results.sarif

@@ -218,6 +218,11 @@ write	alice	main	src
 write	ci	main
 ```
 
+The file holds token digests, so it is a secret: the server reads it only
+when its owner (or root) alone can read it, and refuses one that group or
+others can read at start. `chmod 600 FILE` fixes it, and is worth doing
+under umask 002, where a fresh file starts 0664.
+
 A principal whose read rules are all prefixes is a *partial reader*: it
 reads only what they cover, through the view of the repo that the server
 derives for it. `ResolveRef` and `GetRootTree` answer the real changeset
@@ -331,6 +336,13 @@ present one with `--tls-client-cert` and `--tls-client-key`. To make the
 certificates of a test setup, a tool such as `minica` or `openssl` makes a CA
 and leaves signed for each host's name or address.
 
+The server reads the private key only when its owner (or root) alone can
+read it: `chmod 600 server.key`. The certificate and every CA file must
+not be group- or others-writable — a swapped certificate or CA changes
+whom a client trusts or which client certificates the server accepts —
+so `chmod go-w` on them, and check after a copy tool or a umask 002
+session, where a fresh file starts 0664.
+
 ```sh
 ./target/release/scion-server --data /tmp/scion serve \
   --listen 0.0.0.0:7878 --tls-cert server.pem --tls-key server.key &
@@ -355,6 +367,7 @@ A bearer token over plain TCP to a non-loopback address stays refused.
 | [`docs/protocol-v1.md`](https://github.com/bnsd55/openscion/blob/main/docs/protocol-v1.md) | The v1 API contract: calls, limits, status codes, retries, durability and what a client checks |
 | [`docs/cli.md`](https://github.com/bnsd55/openscion/blob/main/docs/cli.md) | Every `scn` command: what it does, its flags, the global flags and env vars, and the exit codes |
 | [`docs/operations.md`](https://github.com/bnsd55/openscion/blob/main/docs/operations.md) | How to run a server: deploy, keys, the access file, Postgres, backups, and what each failure means |
+| [`docs/threat-model.md`](https://github.com/bnsd55/openscion/blob/main/docs/threat-model.md) | The supported profile, the assets, the actors, the trust boundaries, and each security invariant with the test that proves it |
 | [`docs/faults.md`](https://github.com/bnsd55/openscion/blob/main/docs/faults.md) | One row per fault: what the client sees, what the operator sees, what survives a restart, and the test that proves it |
 | [`docs/compatibility.md`](https://github.com/bnsd55/openscion/blob/main/docs/compatibility.md) | Which component pairs work at versions N and N-1, what "works" means per pair, and what a break needs |
 | [`docs/benchmarks.md`](https://github.com/bnsd55/openscion/blob/main/docs/benchmarks.md) | How the demo and the benchmarks run, what each number means, and how to rerun them |
