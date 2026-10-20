@@ -4,7 +4,7 @@
 //! lost, no file is left half-written, and the next write works once the
 //! space is back.
 use scion_server::test_support::backend::BackendExt;
-use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::test_support::meta::{Meta as _, MetaTx as _, RepoId};
 use scion_server::test_support::store::Store;
 use scion_server::{Backend, Error, StorageClass};
 
@@ -345,4 +345,165 @@ fn a_fsync_hook_refuses_exactly_one_fsync_per_count() {
     );
     store.blobs().put(b"c\n").unwrap();
     assert_eq!(store.blobs().get(one).unwrap(), b"a\n");
+}
+
+/// The failing-disk runbook (docs/operations.md, "A failing disk"),
+/// step by step: a read the disk refuses answers internal, the fsck
+/// command names the damage and exits 1, the restore of a backup taken
+/// per section 3 serves clean, and the runbook's fsck-after-restore is
+/// clean too.
+#[test]
+fn a_failing_disk_runbook_fscks_restores_and_serves() {
+    if Backend::test_is_postgres() {
+        // The metadata lives in the database then: the backup arm of
+        // the runbook is the pg_dump one, and backup.rs covers it.
+        return;
+    }
+    let (dir, store) = store();
+    // Real data: a repo whose changeset names one blob, and a second
+    // blob the read can fail on.
+    let (named, healthy, repo, cs) = seed_named_repo(&store);
+
+    // The backup the runbook restores from, in section 3's order: the
+    // metadata snapshot first, the blob files second.
+    let backup = dir.path().join("backup");
+    std::fs::create_dir_all(backup.join("objects")).unwrap();
+    let vacuumed = backup.join("scion.db");
+    let snap = std::process::Command::new("sqlite3")
+        .arg(dir.path().join("scion.db"))
+        .arg(format!("VACUUM INTO '{}'", vacuumed.display()))
+        .output()
+        .expect("sqlite3 runs");
+    assert!(
+        snap.status.success(),
+        "VACUUM INTO failed: {}",
+        String::from_utf8_lossy(&snap.stderr)
+    );
+    // Then the blob files, per section 3's order.
+    copy_tree(&dir.path().join("objects"), &backup.join("objects"));
+
+    // The disk fails: a read of the healthy blob answers EIO, and the
+    // client's reply is an internal error, not a retry invitation.
+    store.blobs().fail_reads_after(0);
+    let error = store.blobs().get(healthy).unwrap_err();
+    let io_failure = matches!(&error, Error::Io(io) if io.raw_os_error() == Some(5));
+    assert!(io_failure, "{error:?}");
+    let reply = tonic::Status::from(match &error {
+        Error::Io(_io) => Error::Io(std::io::Error::from_raw_os_error(5)),
+        _ => unreachable!(),
+    });
+    assert_eq!(reply.code(), tonic::Code::Internal);
+
+    // The damage the runbook's fsck must find: the disk wrote wrong
+    // bytes to the named blob's file behind the store's back.
+    let damaged = blob_path(dir.path(), named);
+    let before = std::fs::read(&damaged).unwrap();
+    let mut corrupted = before.clone();
+    corrupted[0] ^= 0xff;
+    std::fs::write(&damaged, &corrupted).unwrap();
+
+    // fsck, the runbook's command: exit 1, with the problem named.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
+        .args(["--data", dir.path().to_str().unwrap(), "fsck"])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("the fsck command runs");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        report.contains(named.to_string().as_str()),
+        "fsck names the damaged blob: {report}"
+    );
+
+    // The restore, section 3's recipe: a fresh directory gets the
+    // metadata snapshot and the objects copy, fsck runs on it, and the
+    // server opens it.
+    let fresh = dir.path().join("restored");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::copy(&vacuumed, fresh.join("scion.db")).unwrap();
+    copy_tree(&backup.join("objects"), &fresh.join("objects"));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
+        .args(["--data", fresh.to_str().unwrap(), "fsck"])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("the fsck command runs");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let restored = Backend::open_test(&fresh).expect("the restored store opens");
+    assert_eq!(restored.blobs().get(named).unwrap(), b"named\n");
+    assert_eq!(restored.blobs().get(healthy).unwrap(), b"healthy\n");
+    let head = restored
+        .read(|c| c.get_ref(repo, "main").map(|r| r.map(|r| r.target)))
+        .unwrap();
+    assert_eq!(
+        head,
+        Some(cs),
+        "the restored ref names the restored changeset"
+    );
+}
+
+/// Real data for the runbook tests: one blob a changeset names, one
+/// blob that is only a file, the repo, and the ref's target.
+fn seed_named_repo(
+    store: &Backend,
+) -> (
+    scion_core::BlobId,
+    scion_core::BlobId,
+    RepoId,
+    scion_core::ChangesetId,
+) {
+    let named = store.blobs().put(b"named\n").unwrap();
+    let healthy = store.blobs().put(b"healthy\n").unwrap();
+    let repo = store.write(|c| c.create_repo("main")).unwrap();
+    let cs = scion_core::Changeset::new(
+        vec![],
+        scion_core::IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"runbook\n".to_vec(),
+        [(
+            scion_core::RepoPath::new("RUNBOOK.md").unwrap(),
+            Some(scion_core::FileState::Regular {
+                content: named,
+                executable: false,
+            }),
+        )]
+        .into(),
+    )
+    .expect("changeset fits the format");
+    let cs = store
+        .write(|c| c.insert_changeset(repo, &cs))
+        .expect("the changeset lands");
+    store
+        .write(|c| c.cas_ref(repo, "main", None, cs))
+        .expect("the ref moves");
+    (named, healthy, repo, cs)
+}
+
+/// Section 3's `cp -R` of the objects tree, folder by folder.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
 }

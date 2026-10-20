@@ -642,6 +642,24 @@ again by the client; the server never kept half of it.
 
 Proof: crates/scion-server/tests/disk_full.rs::a_disk_full_runbook_gcs_then_writes_resume
 
+### A failing disk
+
+A disk that fails reads does not fail writes: a read whose file the disk
+cannot serve answers an internal error (the client retries into the same
+device, so do not loop), and the rest of the store keeps serving. On the
+first internal error from a read:
+
+1. Run `fsck` (it is read-only, so it can run beside the live server).
+   Exit 1 with the problem lines names the damage; the store has no
+   repair.
+2. If fsck reports damage, restore from a backup (section 3): a fresh
+   directory gets the metadata snapshot and the objects copy, fsck runs
+   on it, and the server starts at the new path. A read that failed and
+   later succeeds means the disk recovered, not that the damage was
+   never there: run fsck anyway.
+
+Proof: crates/scion-server/tests/storage.rs::a_failing_disk_runbook_fscks_restores_and_serves
+
 ## 6. What to watch
 
 **Metrics.** The server and the cache export Prometheus metrics at
