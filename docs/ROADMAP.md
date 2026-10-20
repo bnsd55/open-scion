@@ -21,8 +21,12 @@ Make the project safe to install anywhere it claims to work.
   022: done, [#317](https://github.com/bnsd55/openscion/issues/317)
   landed the release smoke, and its CI job runs on every push, in a
   matrix over ubuntu-24.04 and macos-15, since [#326](https://github.com/bnsd55/openscion/pull/326).
-- No known flaky test: a standing gate of this milestone, watched by
-  the scheduled nightly suite.
+- No known flaky test: nothing watches the full suite on a schedule —
+  only the nightly soak and the nightly version matrix run on a clock;
+  the suite runs per push and per pull request. One suspected flake is
+  open: scn's `failed printing to stdout: Broken pipe` in the release
+  smoke, which [#341](https://github.com/bnsd55/openscion/pull/341)
+  likely fixed, not yet confirmed by green runs.
 - [Ubuntu's umask 002 and user private groups trip the group-writable
   checks](https://github.com/bnsd55/openscion/issues/302): open, the
   last item of this gate.
@@ -56,10 +60,11 @@ Make the pieces trustworthy together, and the data safe to lose.
   pairs the policy claims, and the operating metrics it reports are
   named: done,
   [#239](https://github.com/bnsd55/openscion/issues/239) closed with
-  the matrix green on `main`, the nightly soak
-  ([#320](https://github.com/bnsd55/openscion/issues/320)) running the
-  mixed workload with named ceilings, and the last missing operating
-  metric (gc's) a textfile
+  the matrix green on `main`, the soak running nightly
+  ([#320](https://github.com/bnsd55/openscion/issues/320); its last
+  scheduled run failed on the RSS warm-up, the fix is open in
+  [#365](https://github.com/bnsd55/openscion/pull/365)), and the last
+  missing operating metric (gc's) a textfile
   ([#327](https://github.com/bnsd55/openscion/issues/327)).
 - The fault and recovery matrix: disk full, EIO, a Postgres restart,
   mismatched restores: done,
@@ -72,10 +77,14 @@ Prove the one-machine server under real load.
 
 - A 72-hour soak and fault job runs against one server, with resource
   ceilings named in advance, and its raw numbers published in
-  [benchmarks](benchmarks.md): done, the nightly soak
-  ([#320](https://github.com/bnsd55/openscion/issues/320)) runs the
-  mixed workload with named ceilings, and the numbers land in
-  [benchmarks](benchmarks.md).
+  [benchmarks](benchmarks.md): open. What exists is a 120-minute
+  nightly soak ([#320](https://github.com/bnsd55/openscion/issues/320)),
+  whose only scheduled run on `main` failed (the RSS baseline is the
+  first sample after the warm-up window; the fix is open in
+  [#365](https://github.com/bnsd55/openscion/pull/365)). The fault job
+  does not exist yet. No 72-hour run has happened: it will run on a
+  rented VM as a one-job self-hosted runner (D10). No soak numbers are
+  in [benchmarks](benchmarks.md) yet.
 - [The checkout benchmark stands against `git clone`](https://github.com/bnsd55/openscion/issues/6):
   done, the comparison and its numbers are in
   [benchmarks](benchmarks.md).
