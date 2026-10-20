@@ -106,7 +106,7 @@ pub(crate) fn fd_acl(fd: std::os::fd::RawFd) -> Verdict {
             Verdict::Granting("an ACL that could not be read", None)
         };
     }
-    let mut verdict = Verdict::DenyOnly;
+    let verdict = Verdict::DenyOnly;
     let mut granting: Option<(&'static str, Option<u32>)> = None;
     let mut entry_id = ACL_FIRST_ENTRY;
     loop {
