@@ -1,0 +1,51 @@
+name: codeql
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, Mondays 03:07 UTC — off the soak (02:30) and the version
+    # matrix's own slot, so no two heavy scans queue together.
+    - cron: "7 3 * * 1"
+
+# Every third-party action is pinned to the commit SHA its version tag
+# named, with the version in a comment, as ci.yml does. The two
+# codeql-action pins share one commit: the subactions version together.
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # The one write this job needs: it uploads its own SARIF result to
+      # code scanning. Nothing else in the job touches the repo.
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            # `none` is the build mode the CodeQL docs name for Rust: the
+            # database is extracted from the sources without building, so
+            # no cargo step and no toolchain step run here.
+            build-mode: none
+          - language: actions
+            # Workflows are config data: there is nothing to build.
+            build-mode: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+      - uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          category: "/language:${{ matrix.language }}"
