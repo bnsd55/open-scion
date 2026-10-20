@@ -1174,15 +1174,16 @@ mod tests {
     /// derivation. Runs against a store that `scion-server import` built:
     ///
     /// ```sh
-    /// SCION_VIEW_BENCH_DATA=/tmp/store \
+    /// SCION_TEST_VIEW_BENCH_DATA=/tmp/store \
     ///   cargo test -p open-scion-server --lib views::tests::a_head_plus_one -- \
     ///   --ignored --nocapture
     /// ```
     #[test]
-    #[ignore = "needs a store from `scion-server import`: SCION_VIEW_BENCH_DATA"]
+    #[ignore = "needs a store from `scion-server import`: SCION_TEST_VIEW_BENCH_DATA"]
     fn a_head_plus_one_rewalks_what_the_memo_cannot_serve() {
-        let dir = std::env::var("SCION_VIEW_BENCH_DATA").expect("SCION_VIEW_BENCH_DATA");
-        let repo_name = std::env::var("SCION_VIEW_BENCH_REPO").unwrap_or_else(|_| "main".into());
+        let dir = std::env::var("SCION_TEST_VIEW_BENCH_DATA").expect("SCION_TEST_VIEW_BENCH_DATA");
+        let repo_name =
+            std::env::var("SCION_TEST_VIEW_BENCH_REPO").unwrap_or_else(|_| "main".into());
         let store = Backend::sqlite(Store::open(Path::new(&dir)).unwrap());
         let repo = store.read(|c| c.repo_id(&repo_name)).unwrap();
         let tip = store

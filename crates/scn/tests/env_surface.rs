@@ -5,10 +5,16 @@
 //! var from the code nor editing a doc can make this pass. Adding a var
 //! passes once it is added to the golden consciously — a var is a
 //! production surface, so it enters the golden on purpose.
+//!
+//! The scan sees every way a binary reads a var: clap's `env = "X"`
+//! attribute, a `std::env::var("X")` or `var_os("X")` call, and a var
+//! name handed to a helper as a string. A var that moves from one
+//! shape to another (as #402 moved the secrets out of clap) stays
+//! seen; only deleting the read turns the check red.
 
 const GOLDEN: &[&str] = &[
     // `scn` reads the SCION_* ones (clap `env = ...`), `scion-server`
-    // its own two; the server's log filter is `RUST_LOG`, which
+    // its own; the server's log filter is `RUST_LOG`, which
     // `tracing_subscriber` reads by convention, not by literal.
     "SCION_SERVER",
     "SCION_TOKEN",
@@ -16,21 +22,25 @@ const GOLDEN: &[&str] = &[
     "SCION_TLS_CA",
     "SCION_AUTHOR",
     "SCION_REPO",
-    // `scion-server` reads these (clap `env = ...`):
+    // `scion-server` reads these: `SCION_DATA` by clap, the token and
+    // URL by hand (`std::env::var`), the URL file by clap (a `_FILE`
+    // var names a file that holds the secret, so the secret itself
+    // never sits in argv or env).
     "SCION_DATA",
+    "SCION_TOKEN",
     "SCION_POSTGRES_URL",
+    "SCION_POSTGRES_URL_FILE",
 ];
 
 #[test]
 fn the_env_vars_the_golden_names_still_exist() {
-    let source = sources();
     let missing: Vec<&str> = GOLDEN
         .iter()
         .copied()
         .filter(|var| {
-            !source
+            !sources()
                 .iter()
-                .any(|text| text.contains(&format!("env = \"{var}\"")))
+                .any(|text| read_var_names(text).iter().any(|read| read == *var))
         })
         .collect();
     assert!(
@@ -41,22 +51,14 @@ fn the_env_vars_the_golden_names_still_exist() {
     );
 }
 
-/// Every `SCION_*` literal the binaries read must sit in the golden: a
-/// new var cannot enter quietly. The `SCION_TEST_*` vars are test
-/// hooks (never a promise) and stay out.
+/// Every `SCION_*` literal the binaries read, by any read shape, must
+/// sit in the golden: a new var cannot enter quietly. The `SCION_TEST_*`
+/// vars are test hooks (never a promise) and stay out.
 #[test]
 fn every_env_var_the_binaries_read_is_in_the_golden() {
     let undeclared: BTreeSet<String> = sources()
         .iter()
-        .flat_map(|text| {
-            text.match_indices("env = \"")
-                .map(move |(i, _)| {
-                    let rest = &text[i + 7..];
-                    rest.find('"').map(|end| rest[..end].to_owned())
-                })
-                .collect::<Vec<_>>()
-        })
-        .flatten()
+        .flat_map(|text| read_var_names(text))
         .filter(|name| name.starts_with("SCION_") && !name.starts_with("SCION_TEST_"))
         .filter(|name| !GOLDEN.contains(&name.as_str()))
         .collect();
@@ -65,6 +67,24 @@ fn every_env_var_the_binaries_read_is_in_the_golden() {
         "the binaries read env vars the 1.x golden does not name; add them to \
          the golden consciously: {undeclared:?}"
     );
+}
+
+/// The env var names a source file reads: clap's `env = "X"` attribute,
+/// and the hand reads `std::env::var("X")` / `std::env::var_os("X")`.
+fn read_var_names(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for needle in ["env = \"", "env::var(\"", "env::var_os(\""] {
+        let mut from = 0;
+        while let Some(at) = text[from..].find(needle) {
+            let rest = &text[from + at + needle.len()..];
+            match rest.find('"') {
+                Some(end) => names.push(rest[..end].to_owned()),
+                None => break,
+            }
+            from += at + needle.len();
+        }
+    }
+    names
 }
 
 use std::collections::BTreeSet;
