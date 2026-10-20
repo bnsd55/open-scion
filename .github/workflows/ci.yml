@@ -339,6 +339,7 @@ jobs:
             crates/scion-core/fuzz
             crates/scion-proto/fuzz
             crates/scion-server/fuzz
+            crates/scion-tier/fuzz
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-fuzz
@@ -346,7 +347,7 @@ jobs:
         run: |
           # The prebuilt cargo-fuzz defaults to a musl target, where the
           # address sanitizer cannot run.
-          for crate in scion-core scion-proto scion-server; do
+          for crate in scion-core scion-proto scion-server scion-tier; do
             fuzz_dir="$GITHUB_WORKSPACE/crates/$crate/fuzz"
             for target_file in "$fuzz_dir"/fuzz_targets/*.rs; do
               target=$(basename "$target_file" .rs)

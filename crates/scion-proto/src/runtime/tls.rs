@@ -19,10 +19,15 @@ pub(crate) fn provider() -> Arc<CryptoProvider> {
     Arc::new(tokio_rustls::rustls::crypto::ring::default_provider())
 }
 
-/// The certificates of one PEM file, one or more.
-fn certificates(path: &Path, what: &str) -> anyhow::Result<Vec<CertificateDer<'static>>> {
-    CertificateDer::pem_file_iter(path)
-        .with_context(|| format!("cannot read {} {}", what, path.display()))?
+/// Reads a PEM file that must stay whole — a certificate, a CA — through
+/// one checked descriptor, and parses it. A swapped file changes whose
+/// certificates a server accepts or whom a client trusts, so the read
+/// refuses a symlink, checks the ancestors, and requires the owner and a
+/// mode that no other account can write ([`read_shared_file`]).
+fn shared_pem(path: &Path, what: &str) -> anyhow::Result<Vec<CertificateDer<'static>>> {
+    let bytes = crate::runtime::auth::read_shared_file(path)
+        .map_err(|why| crate::runtime::auth::checked_read_error(path, why))?;
+    CertificateDer::pem_slice_iter(&bytes)
         .collect::<Result<_, _>>()
         .with_context(|| format!("{} {} is not PEM", what, path.display()))
 }
@@ -44,7 +49,7 @@ impl ServerTls {
     /// A file that is missing or is not PEM of the right kind, or a
     /// certificate that does not match its key.
     pub fn load(cert: &Path, key: &Path, client_ca: Option<&Path>) -> anyhow::Result<Self> {
-        let certs = certificates(cert, "the TLS certificate")?;
+        let certs = shared_pem(cert, "the TLS certificate")?;
         let key_bytes = crate::runtime::auth::read_secret_file(key)
             .map_err(|why| crate::runtime::auth::checked_read_error(key, why))?;
         let key = PrivateKeyDer::from_pem_slice(&key_bytes)
@@ -56,7 +61,7 @@ impl ServerTls {
             None => builder.with_no_client_auth(),
             Some(ca) => {
                 let mut roots = RootCertStore::empty();
-                for certificate in certificates(ca, "the client CA")? {
+                for certificate in shared_pem(ca, "the client CA")? {
                     roots
                         .add(certificate)
                         .context("the client CA is not a root certificate")?;
@@ -112,9 +117,8 @@ impl ClientTls {
         let identity = match (cert, key) {
             (None, None) => None,
             (Some(cert), Some(key)) => {
-                let cert = std::fs::read(cert).with_context(|| {
-                    format!("cannot read the client certificate {}", cert.display())
-                })?;
+                let cert = crate::runtime::auth::read_shared_file(cert)
+                    .map_err(|why| crate::runtime::auth::checked_read_error(cert, why))?;
                 let key = crate::runtime::auth::read_secret_file(key)
                     .map_err(|why| crate::runtime::auth::checked_read_error(key, why))?;
                 Some((cert, key))
@@ -124,8 +128,8 @@ impl ClientTls {
         let ca = match ca {
             None => None,
             Some(ca) => Some(
-                std::fs::read(ca)
-                    .with_context(|| format!("cannot read the CA {}", ca.display()))?,
+                crate::runtime::auth::read_shared_file(ca)
+                    .map_err(|why| crate::runtime::auth::checked_read_error(ca, why))?,
             ),
         };
         Ok(Self { ca, identity })
@@ -178,6 +182,9 @@ mod tests {
         let key_path = dir.path().join("tls.key");
         std::fs::write(&cert_path, cert.pem()).unwrap();
         std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        // The certificate is a shared file: the checked read refuses one
+        // that group or others can write, whatever the umask of the run.
+        std::fs::set_permissions(&cert_path, fs::Permissions::from_mode(0o644)).unwrap();
         // The key is a secret: the checked read refuses one that group or
         // others can read, whatever the umask of the run.
         std::fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -197,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn a_private_tls_key_loads_and_the_certificate_stays_a_plain_read() {
+    fn a_private_tls_key_loads_and_a_plain_certificate_loads() {
         let dir = tempfile::tempdir().unwrap();
         let (cert, key) = pem_files(&dir);
         std::fs::set_permissions(&cert, fs::Permissions::from_mode(0o644)).unwrap();
@@ -227,5 +234,63 @@ mod tests {
             Err(err) => err.to_string(),
         };
         assert!(err.contains("read by group or others"), "{err}");
+    }
+
+    /// A certificate that group or others can write is refused: a swapped
+    /// certificate lets someone else be the server.
+    #[test]
+    fn a_certificate_the_group_or_others_can_write_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = pem_files(&dir);
+        std::fs::set_permissions(&cert, fs::Permissions::from_mode(0o664)).unwrap();
+        let err = match ServerTls::load(&cert, &key, None) {
+            Ok(_) => panic!("a group-writable certificate is accepted"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("written by group or others"), "{err}");
+    }
+
+    /// A symlinked certificate is refused at the open, even when its
+    /// target has a perfect mode and owner.
+    #[test]
+    fn a_symlinked_certificate_is_refused_with_a_perfect_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = pem_files(&dir);
+        let link = dir.path().join("link.pem");
+        std::os::unix::fs::symlink(&cert, &link).unwrap();
+        let err = match ServerTls::load(&link, &key, None) {
+            Ok(_) => panic!("a symlinked certificate is accepted"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("symlink"), "{err}");
+    }
+
+    /// A client CA that group or others can write is refused: a swapped
+    /// CA changes whose client certificates the server accepts.
+    #[test]
+    fn a_client_ca_the_group_or_others_can_write_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = pem_files(&dir);
+        let (ca, _) = pem_files(&dir);
+        std::fs::set_permissions(&ca, fs::Permissions::from_mode(0o662)).unwrap();
+        let err = match ServerTls::load(&cert, &key, Some(&ca)) {
+            Ok(_) => panic!("a group-writable client CA is accepted"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("written by group or others"), "{err}");
+    }
+
+    /// The CA a client trusts is a shared file too: a swapped one changes
+    /// whom the client believes it is talking to.
+    #[test]
+    fn a_client_tls_ca_the_group_or_others_can_write_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ca, _) = pem_files(&dir);
+        std::fs::set_permissions(&ca, fs::Permissions::from_mode(0o662)).unwrap();
+        let err = match ClientTls::load(Some(&ca), None, None) {
+            Ok(_) => panic!("a group-writable CA is accepted"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("written by group or others"), "{err}");
     }
 }

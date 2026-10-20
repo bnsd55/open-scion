@@ -1846,10 +1846,12 @@ fn make_tls(ca: &Path) -> Result<MakeRustlsConnect> {
     use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject as _};
     use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::CryptoProvider};
 
+    // The CA must stay whole: a swapped one changes whom the database
+    // connection trusts, so it is read through one checked descriptor.
+    let ca_bytes = scion_proto::runtime::auth::read_shared_file(ca)
+        .map_err(|e| Error::InvalidArgument(format!("cannot read the database CA: {e}")))?;
     let mut roots = RootCertStore::empty();
-    for certificate in CertificateDer::pem_file_iter(ca)
-        .map_err(|e| Error::InvalidArgument(format!("cannot read the database CA: {e}")))?
-    {
+    for certificate in CertificateDer::pem_slice_iter(&ca_bytes) {
         let certificate = certificate
             .map_err(|e| Error::InvalidArgument(format!("the database CA is not PEM: {e}")))?;
         roots

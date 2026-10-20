@@ -11,7 +11,6 @@
 //! the object.
 
 use std::fmt::Write as _;
-use std::fs;
 use std::io::{self, BufRead as _, BufReader, BufWriter, ErrorKind, Read as _, Write as _};
 use std::path::Path;
 
@@ -117,7 +116,11 @@ pub fn seed(store: &DiskStore, path: &Path) -> io::Result<Option<Seeded>> {
             format!("{} is not a snapshot: {why}", path.display()),
         )
     };
-    let mut file = BufReader::new(fs::File::open(path)?);
+    // The snapshot is a shared file, and can be the size of a disk: the
+    // checked open hands the parser a file it streams, not the whole file
+    // in memory.
+    let bytes = scion_proto::runtime::auth::open_checked_file(path, false)?;
+    let mut file = BufReader::new(bytes);
     let mut header = [0; MAGIC.len() + 2];
     if !fill(&mut file, &mut header)? || !header.starts_with(MAGIC) {
         return Err(not_snapshot("it does not start as one"));
@@ -188,6 +191,8 @@ fn fill(file: &mut impl io::Read, buf: &mut [u8]) -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use scion_core::{BlobId, Entry, FileEntry, FileState, PathElem, Tree};
     use scion_proto::runtime::object;
     use scion_proto::ticket::{self, now};
@@ -198,6 +203,16 @@ mod tests {
 
     use super::*;
     use crate::{DAEMON_UPSTREAM_TIMEOUT, MemoryStore, Store, Tier};
+
+    /// A temp directory the ancestor check accepts whatever the umask of
+    /// the run: this run's own, mode 0700. A store's or a snapshot's
+    /// parent that group or others can write is refused, as it must be.
+    fn private_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
 
     /// A blob's key and stored form.
     fn blob(data: &[u8]) -> (Key, Bytes) {
@@ -252,7 +267,7 @@ mod tests {
 
     #[test]
     fn a_cold_store_starts_with_the_snapshot_and_a_warm_one_ignores_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let (objects, path, _) = snapshot_in(dir.path());
         let size = |i: usize| objects[i].1.len();
         // Room for the last two only: the tree (the first object) is over
@@ -278,9 +293,103 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 
+    /// A snapshot that group or others can write is refused: a swapped
+    /// file can seed what the daemon serves, so the checked read refuses
+    /// one, even though the records inside are checked too.
+    /// A large snapshot streams, not slurps: the checked open hands the
+    /// parser a file it reads through, so a snapshot the size of a disk
+    /// costs disk reads, not memory. A regression to a whole-file read
+    /// shows up as resident memory the size of the file. The file is
+    /// sparse, so only its first bytes are ever written or read: a header
+    /// and one record whose size no object has, where the parse stops.
+    #[test]
+    fn a_large_snapshot_is_read_as_a_stream_not_held_in_memory() {
+        use std::io::{Seek as _, Write as _};
+        let dir = private_dir();
+        let path = dir.path().join("r.scnsnap");
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(MAGIC).unwrap();
+        file.write_all(&1u16.to_le_bytes()).unwrap();
+        file.write_all(b"r").unwrap();
+        let mut record = [0u8; RECORD];
+        // A blob record whose size no object has: the parse stops here.
+        record[0] = b'B';
+        record[33..37].copy_from_slice(&u32::MAX.to_le_bytes());
+        file.write_all(&record).unwrap();
+        file.set_len(2 << 30).unwrap();
+        // A snapshot is a shared file: the checked read refuses one that
+        // group or others can write, whatever the umask of the run.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+        let (size, offset) = (
+            file.metadata().unwrap().len(),
+            file.stream_position().unwrap(),
+        );
+        drop(file);
+        assert_eq!(
+            (size, offset),
+            (2 << 30, (MAGIC.len() + 2 + 1 + RECORD) as u64)
+        );
+        let before = resident_kb();
+        let store = DiskStore::open(&dir.path().join("one"), 1 << 20).unwrap();
+        let seeded = seed(&store, &path).unwrap().unwrap();
+        assert!(seeded.damaged);
+        assert_eq!(seeded.stored, 0);
+        let growth = resident_kb().saturating_sub(before);
+        assert!(
+            growth < 512 * 1024,
+            "the seed held the snapshot in memory: {growth} KiB"
+        );
+    }
+
+    /// The resident memory of this process, in KiB, as `ps` reports it.
+    fn resident_kb() -> u64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_group_writable_snapshot_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = private_dir();
+        let path = dir.path().join("r.scnsnap");
+        write(&path, "r", &[blob(b"aaaa")]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let store = DiskStore::open(&dir.path().join("one"), 1 << 20).unwrap();
+        let err = seed(&store, &path).unwrap_err().to_string();
+        assert!(err.contains("written by group or others"), "{err}");
+    }
+
+    /// A symlinked snapshot is refused at the open, even when its target
+    /// has a perfect mode.
+    #[test]
+    fn a_symlinked_snapshot_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = private_dir();
+        let real = dir.path().join("real.scnsnap");
+        write(&real, "r", &[blob(b"aaaa")]).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.path().join("r.scnsnap");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let store = DiskStore::open(&dir.path().join("one"), 1 << 20).unwrap();
+        let err = seed(&store, &link).unwrap_err().to_string();
+        assert!(err.contains("symlink"), "{err}");
+    }
+
     #[test]
     fn a_bad_object_is_skipped_and_a_torn_file_keeps_the_objects_before_the_tear() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let (a, b, c) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"cccc"));
         // `b`'s ID with bytes that are another blob.
         let lie = (b.0, blob(b"not b").1);
@@ -313,7 +422,7 @@ mod tests {
 
     #[test]
     fn an_object_over_the_store_limit_is_skipped_not_stored() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let small = blob(b"aa");
         let big = blob(&vec![b'x'; 4096]);
         assert!(big.1.len() > small.1.len());
@@ -332,7 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_seeded_daemon_serves_the_snapshot_without_its_upstream() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_dir();
         let (objects, path, root) = snapshot_in(dir.path());
         let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
         seed(&store, &path).unwrap().unwrap();
