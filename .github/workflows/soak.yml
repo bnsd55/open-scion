@@ -15,6 +15,9 @@ on:
 
 # Every third-party action is pinned to the commit SHA its version tag
 # named, with the version in a comment, as ci.yml does.
+permissions:
+  contents: read
+
 jobs:
   soak:
     name: soak
