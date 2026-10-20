@@ -56,7 +56,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zstd = { version = "0.14", default-features = false }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
 unreachable_pub = "warn"
 

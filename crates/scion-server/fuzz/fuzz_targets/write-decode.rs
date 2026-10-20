@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! write::decode is the server's door for changesets a client sent. Any
 //! input must end in an error, or in a changeset whose encoding is exactly
 //! the input (the decoder is strict, so it accepts only canonical bytes),

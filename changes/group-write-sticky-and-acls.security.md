@@ -13,5 +13,12 @@ ACL is not the exact minimal form (version 2, one USER_OBJ, one
 GROUP_OBJ, one OTHER, undefined ids, perms equal to the mode's bits),
 an ancestor directory with such an ACL or with any default ACL is
 refused on the walk, and an ACL that cannot be read is refused with the
-rest. On Linux only: macOS ACLs are unchecked, they need acl_get_fd_np,
-an unsafe FFI call, and the workspace forbids unsafe_code.
+rest. On macOS the descriptor's extended ACL is read through one private
+ffi module (acl_get_fd_np, the one place the workspace's unsafe-code
+lint lets hold it): a descriptor with no ACL passes, one or more entries
+refuses, a read that fails refuses. The workspace's unsafe_code lint
+drops from forbid to deny, with the lint forbid at every crate root but
+this one, and a test walks the crate's sources and refuses unsafe code
+outside the ffi module. On this Mac the temp directories carry no ACLs
+and the ambient deny-only ACLs of the system pass, as they grant
+nothing; an ACL that grants anything is refused.

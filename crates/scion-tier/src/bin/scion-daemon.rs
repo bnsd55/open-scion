@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! `scion-daemon`: the node tier. Stores objects on disk for every job on the
 //! node, serves them over a Unix socket, and fetches misses from its upstream,
 //! a `scion-cache`.

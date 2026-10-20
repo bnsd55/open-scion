@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Object model and canonical byte format for Scion.
 //!
 //! This is the lowest layer of the system: the objects that every other
