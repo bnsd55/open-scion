@@ -1,0 +1,74 @@
+name: fuzz
+
+on:
+  schedule:
+    # Nightly, after the soak: every target gets its named budget, and the
+    # corpus it grew carries into the next night through the cache.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  targets:
+    name: fuzz ${{ matrix.crate }} ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The wire and client-door decoders get the long budgets; the
+          # small validators get the short ones.
+          - { crate: scion-core, target: decode, budget: 300 }
+          - { crate: scion-core, target: repo-path, budget: 120 }
+          - { crate: scion-proto, target: object, budget: 300 }
+          - { crate: scion-proto, target: ticket, budget: 120 }
+          - { crate: scion-proto, target: check-name, budget: 120 }
+          - { crate: scion-proto, target: request-id, budget: 120 }
+          - { crate: scion-server, target: write-decode, budget: 300 }
+          - { crate: scion-server, target: blame-cursor, budget: 300 }
+          - { crate: scion-server, target: access, budget: 120 }
+          - { crate: scion-tier, target: snapshot-seed, budget: 300 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: crates/${{ matrix.crate }}/fuzz
+      - name: restore the corpus
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: crates/${{ matrix.crate }}/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.crate }}-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.crate }}-${{ matrix.target }}-
+      - name: fuzz ${{ matrix.target }} for ${{ matrix.budget }} s
+        run: |
+          # The prebuilt cargo-fuzz defaults to a musl target, where the
+          # address sanitizer cannot run (ci.yml's smoke notes this too).
+          mkdir -p "crates/${{ matrix.crate }}/fuzz/corpus/${{ matrix.target }}"
+          seeds=""
+          [ -d "crates/${{ matrix.crate }}/fuzz/seeds/${{ matrix.target }}" ] && \
+            seeds="crates/${{ matrix.crate }}/fuzz/seeds/${{ matrix.target }}"
+          cd "crates/${{ matrix.crate }}" && cargo fuzz run \
+            --target x86_64-unknown-linux-gnu "${{ matrix.target }}" \
+            "fuzz/corpus/${{ matrix.target }}" $seeds \
+            -- -max_total_time=${{ matrix.budget }}
+      - name: upload the crashing input
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: crash-${{ matrix.crate }}-${{ matrix.target }}
+          path: crates/${{ matrix.crate }}/fuzz/artifacts/
+          if-no-files-found: ignore
