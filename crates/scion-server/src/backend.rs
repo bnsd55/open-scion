@@ -58,7 +58,6 @@ impl Backend {
     }
 
     /// A backend on a prepared Postgres handle, for the crate's tests.
-    #[doc(hidden)]
     #[cfg(test)]
     pub(crate) fn postgres(pg: Pg) -> Self {
         Self {
