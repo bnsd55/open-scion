@@ -212,10 +212,7 @@ fn queue_closed() -> io::Error {
 }
 
 /// Opens the audit file with the checks of a secret file, for append.
-fn checked_open(
-    path: &Path,
-    dir_syncs: Option<&AtomicU64>,
-) -> io::Result<std::fs::File> {
+fn checked_open(path: &Path, dir_syncs: Option<&AtomicU64>) -> io::Result<std::fs::File> {
     let me = rustix::process::getuid().as_raw();
     // The walk resolves and checks every directory above the file, so
     // no other user can swap it on the way; the open's `O_NOFOLLOW`
