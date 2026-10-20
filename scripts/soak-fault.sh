@@ -76,7 +76,10 @@ SOAK_WARM_SECONDS=${SOAK_WARM_SECONDS:-1800}
 # Shorter runs kill at a quarter, a half and three quarters of the run.
 KILL_AT=()
 if [ "$RUN_MINUTES" -ge 60 ]; then
-  for m in $(seq 20 20 $((RUN_MINUTES - 2))); do
+  # Long runs kill every KILL_EVERY_MIN minutes (20 at the nightly's
+  # 120); a 72-hour run sets its own cadence, so the restarts stay a
+  # sample, not the run.
+  for m in $(seq "${KILL_EVERY_MIN:-20}" "${KILL_EVERY_MIN:-20}" $((RUN_MINUTES - 2))); do
     KILL_AT+=("$((m * 60))")
   done
 else
@@ -443,9 +446,16 @@ while [ "$(date +%s)" -lt "$END" ]; do
       kill_once
     fi
   fi
-  echo "$(date +%s),$SEG,$(ps -o rss= -p "$SERVER_PID" | tr -d ' '),\
+  now=$(date +%s)
+  rss=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')
+  echo "$now,$SEG,$rss,\
 $(find "/proc/$SERVER_PID/fd" -maxdepth 1 2> /dev/null | wc -l | tr -d ' '),$(latency)" \
     >> "$WORK/metrics.csv"
+  # The store's size on disk, next to the RSS it may share a cause with
+  # (soak.sh, #365): what a 72-hour run-length decision needs (issue
+  # #239).
+  du -sk "$WORK/server" | awk -v e="$now" '{ print e "," $1 }' \
+    >> "$WORK/metrics-store.csv"
   sleep 10
 done
 
@@ -455,8 +465,9 @@ done
 # own directory, so a manual run beside soak.sh does not overwrite
 # soak's CSVs.
 mkdir -p "${RUNNER_TEMP:-/tmp}/soak-fault-artifacts"
-cp "$WORK/metrics.csv" "$WORK/restarts.csv" \
+cp "$WORK/metrics.csv" "$WORK/restarts.csv" "$WORK/metrics-store.csv" \
   "${RUNNER_TEMP:-/tmp}/soak-fault-artifacts/" 2> /dev/null || true
+cp "$WORK"/ledger/*.csv "${RUNNER_TEMP:-/tmp}/soak-fault-artifacts/" 2> /dev/null || true
 cp "$WORK"/*.log "${RUNNER_TEMP:-/tmp}/soak-fault-artifacts/" 2> /dev/null || true
 
 fail=0
