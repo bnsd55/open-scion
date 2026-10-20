@@ -68,6 +68,9 @@ classifies() {
 }
 
 need
+# jq parses bench's JSON report; only this script needs it, so its
+# check lives here and not in common.sh's need().
+command -v jq > /dev/null || die "needs jq"
 
 make_work capacity
 if [ -n "${SCION_BIN:-}" ]; then
