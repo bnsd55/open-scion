@@ -88,6 +88,10 @@ impl Backend {
 
 /// The transaction of a [`Backend`]: the queries of one call, forwarded to
 /// the backend's own transaction.
+// Nameable through the pub `Meta` impl for `Backend` (its associated
+// `Tx`), and the test seam serves the trait; unreachable_pub does not
+// see trait-impl reachability.
+#[allow(unreachable_pub)]
 pub enum BackendTx<'a> {
     /// A transaction of the data directory.
     Sqlite(&'a mut SqliteTx<'a>),

@@ -8,9 +8,10 @@ use std::time::Instant;
 
 use anyhow::Context as _;
 use clap::Parser;
+use scion_proto::runtime::listen::bind_unix;
 use scion_proto::runtime::listen::{self, Limits};
 use scion_proto::runtime::tls::ClientTls;
-use scion_tier::{DAEMON_UPSTREAM_TIMEOUT, DiskStore, Tier, bind_unix, snapshot};
+use scion_tier::{DAEMON_UPSTREAM_TIMEOUT, DiskStore, Tier, snapshot};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_stream::wrappers::UnixListenerStream;
 use tracing_subscriber::EnvFilter;

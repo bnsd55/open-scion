@@ -24,6 +24,11 @@
 //! landed one (a retry returns it). The ref and the row move in the same
 //! transaction, so they never disagree.
 
+// Every pub item of this module is re-exported by the test seam
+// (`test_support` in lib.rs), and unreachable_pub does not see
+// through a re-export, so this marker would fire on all of them
+// under any feature set.
+#![allow(unreachable_pub)]
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem;
 use std::sync::atomic::{AtomicUsize, Ordering};

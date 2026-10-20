@@ -28,7 +28,7 @@ use scion_core::{
 
 use crate::backend::Backend;
 use crate::deadline::{CALL_LIMIT, Deadline};
-use crate::error::{Error, Result};
+use crate::error::{Error, Git, Result};
 use crate::graph;
 use crate::meta::Meta as _;
 use crate::meta::{MetaTx, RepoId};
@@ -58,6 +58,9 @@ const TX_YIELD: Duration = Duration::from_millis(100);
 /// The batch's writes are idempotent, so a retry is safe; past the bound
 /// the import fails with the busy error. A client that shares the data
 /// directory reads this to bound its own wait for an import.
+// The test seam re-exports this (test_support.import in lib.rs), and
+// unreachable_pub does not see through a re-export.
+#[allow(unreachable_pub)]
 pub const BUSY_TRIES: u32 = 10;
 
 /// The most swaps one import makes for one ref. Like a land's swaps (see
@@ -154,19 +157,19 @@ pub fn import_git(
 /// supported.
 fn open_tip(git_dir: &Path, rev: &str) -> Result<(gix::Repository, gix::hash::ObjectId)> {
     let mut git = gix::open(git_dir)
-        .map_err(|e| Error::Git(format!("cannot open {}: {e}", git_dir.display())))?;
+        .map_err(|e| Error::Git(Git::cause(format!("cannot open {}", git_dir.display()), e)))?;
     if git.object_hash() != gix::hash::Kind::Sha1 {
-        return Err(Error::Git(format!(
+        return Err(Error::Git(Git::message(format!(
             "{}: only SHA-1 repositories are supported",
             git_dir.display()
-        )));
+        ))));
     }
     git.object_cache_size_if_unset(OBJECT_CACHE_BYTES);
     let tip = git
         .rev_parse_single(rev)
         .and_then(|id| id.object())
         .and_then(gix::Object::peel_to_commit)
-        .map_err(|e| Error::Git(format!("cannot resolve {rev:?} to a commit: {e}")))?
+        .map_err(|e| Error::Git(Git::cause(format!("cannot resolve {rev:?} to a commit"), e)))?
         .id;
     Ok((git, tip))
 }
@@ -577,7 +580,7 @@ impl Importer<'_> {
         let object = find_commit(git, commit)?;
         let decoded = object
             .decode()
-            .map_err(|e| Error::Git(format!("cannot decode commit {commit}: {e}")))?;
+            .map_err(|e| Error::Git(Git::cause(format!("cannot decode commit {commit}"), e)))?;
         let parents = decoded
             .parents()
             .map(|parent| {
@@ -595,7 +598,7 @@ impl Importer<'_> {
                 find_commit(git, parent)?
                     .tree_id()
                     .map(gix::Id::detach)
-                    .map_err(|e| Error::Git(format!("commit {parent}: no tree: {e}")))
+                    .map_err(|e| Error::Git(Git::cause(format!("commit {parent}: no tree"), e)))
             })
             .transpose()?;
         let git_tree = decoded.tree();
@@ -669,12 +672,12 @@ impl Importer<'_> {
     ) -> Result<()> {
         changes.insert(path, state);
         if changes.len() > self.max_changes {
-            return Err(Error::Git(format!(
+            return Err(Error::Git(Git::message(format!(
                 "commit {commit}: {} changed paths exceed the import's limit of {}, \
                  and Scion stores one commit as one changeset",
                 changes.len(),
                 self.max_changes
-            )));
+            ))));
         }
         Ok(())
     }
@@ -691,11 +694,11 @@ impl Importer<'_> {
         cached(&mut self.blobs, oid, || {
             let blob = read_blob(self.git, oid)?;
             if blob.data.len() > MAX_OBJECT_BYTES {
-                return Err(Error::Git(format!(
+                return Err(Error::Git(Git::message(format!(
                     "commit {commit}: \"{}\" is larger than {MAX_OBJECT_BYTES} bytes, \
                      the most Scion stores",
                     path.as_bytes().escape_ascii()
-                )));
+                ))));
             }
             let id = BlobId::of(&blob.data);
             // A committed row of this repo names this blob only after the
@@ -888,7 +891,11 @@ fn file_state(
         FileKind::Gitlink => FileState::Gitlink {
             commit: match oid {
                 ObjectId::Sha1(bytes) => GitOid::Sha1(bytes),
-                other => return Err(Error::Git(format!("unsupported object ID {other}"))),
+                other => {
+                    return Err(Error::Git(Git::message(format!(
+                        "unsupported object ID {other}"
+                    ))));
+                }
             },
         },
     })
@@ -904,13 +911,17 @@ fn read_tree(
     let Some(id) = id else {
         return Ok(BTreeMap::new());
     };
-    let bad = |what: String| Error::Git(format!("commit {commit}: tree {id}: {what}"));
+    let bad =
+        |what: String| Error::Git(Git::message(format!("commit {commit}: tree {id}: {what}")));
+    let cause = |what: String, e: gix::Error| {
+        Error::Git(Git::cause(format!("commit {commit}: tree {id}: {what}"), e))
+    };
     let tree = git
         .find_tree(id)
-        .map_err(|e| bad(format!("cannot read: {e}")))?;
+        .map_err(|e| cause("cannot read".to_owned(), e))?;
     let decoded = tree
         .decode()
-        .map_err(|e| bad(format!("cannot decode: {e}")))?;
+        .map_err(|e| cause("cannot decode".to_owned(), e))?;
     let mut entries = BTreeMap::new();
     for e in &decoded.entries {
         let oid = e.oid.to_owned();
@@ -962,21 +973,24 @@ fn child_path(commit: ObjectId, dir: &[u8], name: &[u8]) -> Result<RepoPath> {
     PathElem::new(name)
         .and_then(|_| RepoPath::new(path.as_slice()))
         .map_err(|e| {
-            Error::Git(format!(
-                "commit {commit}: path \"{}\" is not valid in Scion: {e}",
-                path.escape_ascii()
+            Error::Git(Git::cause(
+                format!(
+                    "commit {commit}: path \"{}\" is not valid in Scion",
+                    path.escape_ascii()
+                ),
+                e,
             ))
         })
 }
 
 fn find_commit(git: &gix::Repository, commit: ObjectId) -> Result<gix::Commit<'_>> {
     git.find_commit(commit)
-        .map_err(|e| Error::Git(format!("cannot read commit {commit}: {e}")))
+        .map_err(|e| Error::Git(Git::cause(format!("cannot read commit {commit}"), e)))
 }
 
 fn read_blob(git: &gix::Repository, oid: ObjectId) -> Result<gix::Blob<'_>> {
     git.find_blob(oid)
-        .map_err(|e| Error::Git(format!("cannot read blob {oid}: {e}")))
+        .map_err(|e| Error::Git(Git::cause(format!("cannot read blob {oid}"), e)))
 }
 
 fn identity(
@@ -984,7 +998,7 @@ fn identity(
     role: &str,
     signature: gix::Result<SignatureRef<'_>>,
 ) -> Result<IdentityTime> {
-    let bad = |e: gix::Error| Error::Git(format!("commit {commit}: bad {role}: {e}"));
+    let bad = |e: gix::Error| Error::Git(Git::cause(format!("commit {commit}: bad {role}"), e));
     let signature = signature.map_err(bad)?;
     let time = signature.time().map_err(bad)?;
     Ok(IdentityTime::new(

@@ -80,7 +80,7 @@ impl Plan {
 }
 
 /// Implements the `Objects` RPCs.
-pub struct ObjectsService {
+pub(crate) struct ObjectsService {
     worker: Worker,
     access: Arc<Access>,
     /// The registry that counts the view derivations.

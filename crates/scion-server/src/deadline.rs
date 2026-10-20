@@ -1,5 +1,11 @@
 //! When a job that a call started gives up.
 
+// Every pub item of this module is re-exported by the test seam
+// (`test_support` in lib.rs). unreachable_pub does not see through
+// a re-export and fires on these items with and without the
+// test-hooks feature, so the allow covers both sets.
+#![allow(unreachable_pub)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -51,6 +57,13 @@ impl Deadline {
         self.at
     }
 
+    /// How long a wait may last: what is left until this. Zero once this
+    /// has passed, never negative, never a panic.
+    #[must_use]
+    pub fn remaining(&self) -> Duration {
+        self.at.saturating_duration_since(Instant::now())
+    }
+
     /// Fails with [`Error::Cancelled`] once the call has gone, or
     /// [`Error::DeadlineExceeded`] once the deadline has passed.
     pub(crate) fn check(&self) -> Result<()> {
@@ -82,6 +95,20 @@ mod tests {
     use tonic::{Code, Status};
 
     use super::*;
+
+    /// The one arithmetic a wait can get wrong: after expiry, remaining
+    /// must be zero — never a panic, never a negative that wraps huge.
+    #[test]
+    fn remaining_is_zero_after_expiry_and_counts_down_before_it() {
+        let past = Deadline::new(Instant::now().checked_sub(Duration::from_secs(10)).unwrap());
+        assert_eq!(past.remaining(), Duration::ZERO);
+        let future = Deadline::new(Instant::now() + Duration::from_secs(60));
+        let left = future.remaining();
+        assert!(
+            left > Duration::ZERO && left <= Duration::from_secs(60),
+            "{left:?}"
+        );
+    }
 
     #[test]
     fn a_check_after_its_call_went_answers_cancelled() {

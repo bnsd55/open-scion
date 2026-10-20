@@ -36,12 +36,10 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::Read as _;
-use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
-use std::{fmt, fs, io, iter};
+use std::{fmt, io, iter};
 
 use anyhow::Context as _;
 use scion_core::{BlobId, Tree, TreeId};
@@ -65,7 +63,6 @@ use scion_proto::v1::{
 };
 use scion_proto::{Bytes, MAX_MESSAGE_BYTES, MAX_OBJECT_BYTES, MAX_PART_MESSAGE_BYTES};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio_stream::Stream;
 use tonic::service::Interceptor;
@@ -1395,73 +1392,6 @@ impl<S: Store> Objects for Tier<S> {
         );
         Ok(Response::new(stream))
     }
-}
-
-/// Checks that only this user can reach `dir`: a real directory (not a
-/// symlink), owned by the effective user, with no access for group or
-/// others, under directories that no other user can change
-/// ([`check_ancestors`](scion_proto::runtime::auth::check_ancestors)). Then nobody
-/// else can read what is inside, or put a file there. Returns `dir` with its
-/// parent resolved: use it, not `dir`, so no symlink is followed again.
-/// Fails with `PermissionDenied`, naming the rule that `dir` breaks.
-pub(crate) fn check_private_dir(dir: &Path) -> io::Result<std::path::PathBuf> {
-    let me = rustix::process::geteuid().as_raw();
-    let dir = scion_proto::runtime::auth::check_ancestors(dir, me)?;
-    let meta = fs::symlink_metadata(&dir)?;
-    let refuse = |why: &str| {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{} {why}", dir.display()),
-        ))
-    };
-    if !meta.is_dir() {
-        return refuse("is not a directory (a symlink is refused too)");
-    }
-    if meta.uid() != me {
-        return refuse("is owned by another user");
-    }
-    if meta.mode() & 0o077 != 0 {
-        return refuse("is open to other users; make it mode 0700");
-    }
-    Ok(dir)
-}
-
-/// Listens on a Unix socket at `path`, in a directory that only this user
-/// can reach: a real directory, owned by this user, closed to others. So
-/// nobody else can connect, even in the
-/// moment before the socket gets mode 0600, or put another socket in its
-/// place. Replaces a socket file that nothing listens on, such as one left
-/// by a crash.
-///
-/// # Errors
-///
-/// [`io::ErrorKind::PermissionDenied`] if the directory is not private,
-/// [`io::ErrorKind::AddrInUse`] if a process listens on `path`, or I/O errors.
-pub async fn bind_unix(path: &Path) -> io::Result<UnixListener> {
-    let dir = match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
-    let name = path.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} names no socket file", path.display()),
-        )
-    })?;
-    // The checked directory, so no symlink in `path` is followed again.
-    let path = &check_private_dir(dir)?.join(name);
-    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket()) {
-        if UnixStream::connect(path).await.is_ok() {
-            return Err(io::Error::new(
-                io::ErrorKind::AddrInUse,
-                format!("a process listens on {}", path.display()),
-            ));
-        }
-        fs::remove_file(path)?;
-    }
-    let listener = UnixListener::bind(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(listener)
 }
 
 #[cfg(test)]

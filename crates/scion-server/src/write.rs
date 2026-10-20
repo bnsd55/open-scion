@@ -5,6 +5,11 @@
 //! blobs (`repo_blobs`): those uploaded to it, and those that its changesets
 //! name. So a changeset cannot name another repo's blob and then read it.
 
+// Every pub item of this module is re-exported by the test seam
+// (`test_support` in lib.rs), and unreachable_pub does not see
+// through a re-export, so this marker would fire on all of them
+// under any feature set.
+#![allow(unreachable_pub)]
 use std::collections::BTreeSet;
 
 use scion_core::{BlobId, Changeset, ChangesetId, RepoPath};

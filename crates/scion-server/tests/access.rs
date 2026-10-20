@@ -371,21 +371,21 @@ fn denied<T>(name: &str, reply: Result<T, Status>) {
 mod req {
     use super::*;
 
-    pub fn put_blob() -> PutBlobRequest {
+    pub(crate) fn put_blob() -> PutBlobRequest {
         PutBlobRequest {
             repo: REPO.into(),
             data: b"x".to_vec(),
         }
     }
 
-    pub fn create_changeset() -> CreateChangesetRequest {
+    pub(crate) fn create_changeset() -> CreateChangesetRequest {
         CreateChangesetRequest {
             repo: REPO.into(),
             changeset: b"not read".to_vec(),
         }
     }
 
-    pub fn land(root: &[u8]) -> LandRequest {
+    pub(crate) fn land(root: &[u8]) -> LandRequest {
         LandRequest {
             repo: REPO.into(),
             changeset_id: root.to_vec(),
@@ -394,32 +394,32 @@ mod req {
         }
     }
 
-    pub fn get_land() -> GetLandRequest {
+    pub(crate) fn get_land() -> GetLandRequest {
         GetLandRequest {
             repo: REPO.into(),
             land_id: "1".into(),
         }
     }
 
-    pub fn resolve_ref() -> ResolveRefRequest {
+    pub(crate) fn resolve_ref() -> ResolveRefRequest {
         ResolveRefRequest {
             repo: REPO.into(),
             name: "main".into(),
         }
     }
 
-    pub fn get_changeset(root: &[u8]) -> GetChangesetRequest {
+    pub(crate) fn get_changeset(root: &[u8]) -> GetChangesetRequest {
         GetChangesetRequest {
             repo: REPO.into(),
             changeset_id: root.to_vec(),
         }
     }
 
-    pub fn read_file(root: &[u8], path: &[u8]) -> ReadFileRequest {
+    pub(crate) fn read_file(root: &[u8], path: &[u8]) -> ReadFileRequest {
         read_file_at(REPO, root, path)
     }
 
-    pub fn read_file_at(repo: &str, root: &[u8], path: &[u8]) -> ReadFileRequest {
+    pub(crate) fn read_file_at(repo: &str, root: &[u8], path: &[u8]) -> ReadFileRequest {
         ReadFileRequest {
             repo: repo.into(),
             changeset_id: root.to_vec(),
@@ -427,7 +427,7 @@ mod req {
         }
     }
 
-    pub fn list_dir(root: &[u8]) -> ListDirRequest {
+    pub(crate) fn list_dir(root: &[u8]) -> ListDirRequest {
         ListDirRequest {
             repo: REPO.into(),
             changeset_id: root.to_vec(),
@@ -435,7 +435,7 @@ mod req {
         }
     }
 
-    pub fn list_dir_at(repo: &str, root: &[u8], path: &[u8]) -> ListDirRequest {
+    pub(crate) fn list_dir_at(repo: &str, root: &[u8], path: &[u8]) -> ListDirRequest {
         ListDirRequest {
             repo: repo.into(),
             changeset_id: root.to_vec(),
@@ -443,7 +443,7 @@ mod req {
         }
     }
 
-    pub fn log(root: &[u8]) -> LogRequest {
+    pub(crate) fn log(root: &[u8]) -> LogRequest {
         LogRequest {
             repo: REPO.into(),
             changeset_id: root.to_vec(),
@@ -452,7 +452,7 @@ mod req {
         }
     }
 
-    pub fn blame(root: &[u8], path: &[u8]) -> BlameRequest {
+    pub(crate) fn blame(root: &[u8], path: &[u8]) -> BlameRequest {
         BlameRequest {
             repo: REPO.into(),
             changeset_id: root.to_vec(),
@@ -461,7 +461,7 @@ mod req {
         }
     }
 
-    pub fn merge_base(root: &[u8]) -> MergeBaseRequest {
+    pub(crate) fn merge_base(root: &[u8]) -> MergeBaseRequest {
         MergeBaseRequest {
             repo: REPO.into(),
             a_changeset_id: root.to_vec(),
@@ -469,7 +469,7 @@ mod req {
         }
     }
 
-    pub fn is_ancestor(root: &[u8]) -> IsAncestorRequest {
+    pub(crate) fn is_ancestor(root: &[u8]) -> IsAncestorRequest {
         IsAncestorRequest {
             repo: REPO.into(),
             ancestor_id: root.to_vec(),
@@ -477,7 +477,7 @@ mod req {
         }
     }
 
-    pub fn diff(root: &[u8]) -> DiffRequest {
+    pub(crate) fn diff(root: &[u8]) -> DiffRequest {
         DiffRequest {
             repo: REPO.into(),
             old_changeset_id: root.to_vec(),
@@ -487,14 +487,14 @@ mod req {
         }
     }
 
-    pub fn get_root_tree(root: &[u8]) -> GetRootTreeRequest {
+    pub(crate) fn get_root_tree(root: &[u8]) -> GetRootTreeRequest {
         GetRootTreeRequest {
             repo: REPO.into(),
             changeset_id: root.to_vec(),
         }
     }
 
-    pub fn get_objects(blob: &[u8]) -> GetObjectsRequest {
+    pub(crate) fn get_objects(blob: &[u8]) -> GetObjectsRequest {
         GetObjectsRequest {
             refs: vec![ObjectRef {
                 kind: ObjectKind::Blob as i32,
