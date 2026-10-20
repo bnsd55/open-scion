@@ -334,6 +334,7 @@ async fn every_reply_survives_a_power_cut() {
                 .unwrap_or_else(|_| panic!("a client never finished after the kill"))
                 .unwrap();
             ledger.blobs.append(&mut got.blobs);
+            ledger.oplog.merge(got.oplog);
             cut_lands += got.lands.iter().filter(|sent| sent.reply.is_none()).count();
             ledger.lands.append(&mut got.lands);
         }
