@@ -12,10 +12,7 @@ use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{BlameRequest, CreateChangesetRequest, LandRequest, ReadFileRequest};
 use scion_server::Metrics;
 use scion_server::test_support::meta::MetaTx as _;
-use scion_server::{
-    Backend,
-    test_support::{service, store::Store},
-};
+use scion_server::test_support::{backend::from_store, service, store::Store};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 use tonic::service::interceptor::InterceptedService;
@@ -111,7 +108,7 @@ async fn setup() -> (
     let addr = listener.local_addr().unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(service::serve(
-        Backend::Sqlite(store.clone()),
+        from_store(store.clone()),
         listener,
         TOKEN,
         service::ServeOptions {

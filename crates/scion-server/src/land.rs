@@ -1233,7 +1233,7 @@ mod tests {
     /// A repo whose `main` points at a root with `a/x`, `b/y` and `c`.
     fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let (repo, root) = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
@@ -2094,7 +2094,7 @@ mod tests {
             room in proptest::option::of(0..4000_usize),
         ) {
             let dir = tempfile::tempdir().unwrap();
-            let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+            let store = Backend::sqlite(Store::open(dir.path()).unwrap());
             let (repo, ids) = store
                 .write(|c| {
                     let repo = c.create_repo("r")?;
@@ -2789,7 +2789,7 @@ mod tests {
             (child, pending_cs)
         };
 
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         // The fixture wrote no blob files; the pending land's tree build
         // reads their lengths, so store them now.
         store_blobs(&store);

@@ -756,7 +756,7 @@ mod tests {
     #[test]
     fn a_blob_added_at_many_paths_is_indexed_once() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let new = store.blobs().put(&lines(0..4000)).unwrap();
         // 90% like `new`.
         let old = store
@@ -791,7 +791,7 @@ mod tests {
     #[test]
     fn a_file_refused_is_read_once() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let new = store.blobs().put(&lines(0..1000)).unwrap();
         let refused = store.blobs().put(&lines(0..900)).unwrap();
         let paths = ["a/new", "b/new"].map(|p| RepoPath::new(p).unwrap());
@@ -824,7 +824,7 @@ mod tests {
     #[test]
     fn a_file_whose_indexing_crosses_the_budget_stops_before_its_read() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let deleted_blob = store.blobs().put(&lines(0..60)).unwrap();
         // Two added files, 60 chunks each and of a different content, so no
         // same-content pair is found before step 3: the first slot that
@@ -870,7 +870,7 @@ mod tests {
     #[test]
     fn resumed_calls_reach_the_renames_of_one_uncapped_call() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
         let added_blob = store.blobs().put(&lines(0..60)).unwrap();
         let added_path = RepoPath::new("new").unwrap();
         // One deleted file 90% like the added file, two unlike.

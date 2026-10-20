@@ -509,7 +509,7 @@ mod tests {
                     &mut tx,
                     repo,
                     cs,
-                    &mut crate::tree::lens_of(&Backend::Sqlite(store.clone())),
+                    &mut crate::tree::lens_of(&Backend::sqlite(store.clone())),
                 )?;
                 let version = tx.get_ref(repo, "main")?.map(|r| r.version);
                 assert!(tx.cas_ref(repo, "main", version, id)?);
@@ -573,9 +573,9 @@ mod tests {
     fn gc_removes_what_nothing_names() {
         let (_dir, store) = store();
         let x = uploaded(&store, b"orphan\n");
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
         let report = collect(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
@@ -593,9 +593,9 @@ mod tests {
         let (_dir, store) = store();
         let x = store.blobs().put(b"kept\n").unwrap();
         land(&store, &cs(None, &[("a.txt", file_of(&store, b"kept\n"))]));
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
         let report = collect(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
@@ -609,7 +609,7 @@ mod tests {
         let (_dir, store) = store();
         let x = uploaded(&store, b"fresh\n");
         let report = collect(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
@@ -635,9 +635,9 @@ mod tests {
             &store,
             &cs(None, &[("a.txt", file_of(&store, b"shared\n"))]),
         );
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
         let report = collect(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
@@ -650,7 +650,7 @@ mod tests {
     fn a_changeset_after_the_snapshot_pins_its_blobs() {
         let (_dir, store) = store();
         let x = uploaded(&store, b"pinned\n");
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
         let mut injected = false;
         let report = {
             let store = &store;
@@ -669,7 +669,7 @@ mod tests {
                 }
             };
             collect(
-                &Backend::Sqlite(store.clone()),
+                &Backend::sqlite(store.clone()),
                 Duration::from_secs(DEFAULT_GRACE_SECS),
                 &mut between,
             )
@@ -685,7 +685,7 @@ mod tests {
         let (_dir, store) = store();
         let text = b"again\n";
         let x = uploaded(&store, text);
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
         let before = mtime_of(&store, x);
         std::thread::sleep(Duration::from_millis(20));
         // The second upload of the same content keeps the stored copy.
@@ -694,7 +694,7 @@ mod tests {
         assert!(after > before, "the keep must touch the file: {before:?}");
         // The touched file is younger than the grace, so the run keeps it.
         let report = collect(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
@@ -722,11 +722,11 @@ mod tests {
             deadline: Deadline::new(Instant::now()),
         };
         let err = lands
-            .land(&Backend::Sqlite(store.clone()), &Caller("t".into()), &req)
+            .land(&Backend::sqlite(store.clone()), &Caller("t".into()), &req)
             .unwrap_err();
         assert!(matches!(err, crate::Error::DeadlineExceeded(_)), "{err:?}");
         // Every stored blob is old, and nothing new is orphaned.
-        let report = collect(&Backend::Sqlite(store.clone()), Duration::ZERO, &mut |_| {});
+        let report = collect(&Backend::sqlite(store.clone()), Duration::ZERO, &mut |_| {});
         assert_eq!(report.rows_pruned, 0, "{report:?}");
         assert_eq!(report.files_removed, 0, "{report:?}");
     }
@@ -735,7 +735,7 @@ mod tests {
     fn rows_go_before_files_so_a_crash_leaves_no_missing_file() {
         let (_dir, store) = store();
         let x = uploaded(&store, b"crash\n");
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
         // What a crash between the two stages leaves: the rows are gone,
         // the file is an orphan.
         store
@@ -757,7 +757,7 @@ mod tests {
             })
             .unwrap();
         // The next run removes the orphan file.
-        let report = collect(&Backend::Sqlite(store.clone()), Duration::ZERO, &mut |_| {});
+        let report = collect(&Backend::sqlite(store.clone()), Duration::ZERO, &mut |_| {});
         assert_eq!(report.files_removed, 1, "{report:?}");
     }
 
@@ -766,16 +766,16 @@ mod tests {
         let (_dir, store) = store();
         let x = store.blobs().put(b"later\n").unwrap();
         let report = collect(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
         assert_eq!(report.files_young, 1, "{report:?}");
         assert_eq!(report.files_removed, 0, "{report:?}");
         // Once it is old, the next run removes it.
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
         let report = collect(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
@@ -794,7 +794,7 @@ mod tests {
         // and `scion-server gc` run.
         let other = Store::open_shared(dir.path()).unwrap();
         let x = store.blobs().put(b"raced\n").unwrap();
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
 
         // The put of the other process holds the lock while it works on
         // the file. Every wait below is bounded.
@@ -802,7 +802,7 @@ mod tests {
         let listed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let listed2 = listed.clone();
         let (done, done_rx) = std::sync::mpsc::channel();
-        let backend = Backend::Sqlite(store.clone());
+        let backend = Backend::sqlite(store.clone());
         std::thread::spawn(move || {
             let report = collect(
                 &backend,
@@ -848,7 +848,7 @@ mod tests {
     fn a_row_added_between_the_listing_and_the_sweep_keeps_its_file() {
         let (_dir, store) = store();
         let x = store.blobs().put(b"listed\n").unwrap();
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
         let mut injected = false;
         let report = {
             let mut between = |stage: Stage| {
@@ -865,7 +865,7 @@ mod tests {
                 }
             };
             collect(
-                &Backend::Sqlite(store.clone()),
+                &Backend::sqlite(store.clone()),
                 Duration::from_secs(DEFAULT_GRACE_SECS),
                 &mut between,
             )
@@ -877,7 +877,7 @@ mod tests {
             store.blobs().verify(x).unwrap(),
             crate::store::BlobStatus::Valid
         );
-        let check = crate::fsck::run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
+        let check = crate::fsck::run(&Backend::sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(check.is_clean(), "{check:?}");
     }
 
@@ -885,7 +885,7 @@ mod tests {
     fn a_dry_run_removes_nothing() {
         let (_dir, store) = store();
         let x = uploaded(&store, b"dry\n");
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
         let mut removed = 0;
         let mut between = |stage: Stage| {
             if stage == Stage::BlobFiles {
@@ -893,7 +893,7 @@ mod tests {
             }
         };
         let report = run(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             true,
             &mut between,
@@ -912,7 +912,7 @@ mod tests {
         );
         // The real run after it collects both.
         let real = collect(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
@@ -924,7 +924,7 @@ mod tests {
     fn a_store_that_never_holds_blobs_collects_nothing() {
         let (_dir, store) = store();
         let report = collect(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
