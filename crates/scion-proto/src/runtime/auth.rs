@@ -153,7 +153,10 @@ impl Interceptor for Bearer {
 /// then: `DiskStore::open` makes its directory first.
 ///
 /// By choice, as OpenSSH's `StrictModes`, a group-writable directory is
-/// refused, and only the owner and the mode bits are read, not ACLs.
+/// refused: the sticky bit excuses a group only when others can write too
+/// (the `/tmp` shape, `01777`). Only the owner and the mode bits are read
+/// on the walk itself, and a POSIX ACL that grants what the mode's bits do
+/// not is refused too (Linux; on macOS ACLs are not checked).
 ///
 /// # Errors
 ///
@@ -181,10 +184,33 @@ pub fn check_ancestors(path: &Path, me: u32) -> io::Result<PathBuf> {
         let (why, fix) = if meta.uid() != 0 && meta.uid() != me {
             let why = format!("is owned by another user (uid {})", meta.uid());
             (why, String::new())
-        } else if meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
-            let why = "can be written by group or others, and has no sticky bit".to_owned();
+        } else if meta.mode() & 0o020 != 0 && meta.mode() & 0o002 == 0 {
+            // A group that can write the directory can plant and swap its
+            // own entries, and the sticky bit does not stop that: it
+            // bounds who may remove a name, not who may add one. It
+            // excuses a group only when others can write too, the `/tmp`
+            // shape, where the others-write rule below is the real wall.
+            let why = "can be written by the group, and the sticky bit does not excuse a group"
+                .to_owned();
+            (why, format!(" (fix: chmod g-w {})", dir.display()))
+        } else if meta.mode() & 0o002 != 0 && meta.mode() & 0o1000 == 0 {
+            let why = "can be written by others, and has no sticky bit".to_owned();
             (why, format!(" (fix: chmod go-w {})", dir.display()))
         } else {
+            // (Linux) An ACL that grants what the mode's bits do not is one
+            // more way another account reaches this directory.
+            #[cfg(target_os = "linux")]
+            if ancestor_has_hidden_acl(dir, meta.mode())? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} carries an ACL beyond its mode bits, so another user could swap {} (fix: setfacl -b {})",
+                        dir.display(),
+                        path.display(),
+                        dir.display()
+                    ),
+                ));
+            }
             continue;
         };
         return Err(io::Error::new(
@@ -208,7 +234,9 @@ pub fn check_ancestors(path: &Path, me: u32) -> io::Result<PathBuf> {
 /// group or others account can read. A swap between the checks and the read
 /// then dies at the open or on the descriptor's checks, and the bytes come
 /// from the checked descriptor either way. Only the owner, the group and
-/// the mode bits are read, not ACLs.
+/// the mode bits are read on the descriptor, and a POSIX ACL that grants
+/// what the mode's bits do not is refused too (Linux; on macOS ACLs are
+/// not checked).
 ///
 /// # Errors
 ///
@@ -301,6 +329,20 @@ pub fn open_checked_file(file: &Path, secret: bool) -> io::Result<std::fs::File>
     let opened = fs::File::from(opened);
     let meta = opened.metadata()?;
     ensure_file_checks(meta.mode(), meta.uid(), me, secret, file)?;
+    // (Linux) An ACL that grants what the mode's bits do not is one more
+    // account that can reach this file: the check runs on the checked
+    // descriptor, before the caller reads anything from it.
+    #[cfg(target_os = "linux")]
+    if fd_has_hidden_acl(&opened, meta.mode(), false) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} carries an ACL beyond its mode bits, so another user could reach it (fix: setfacl -b {})",
+                file.display(),
+                file.display()
+            ),
+        ));
+    }
     Ok(opened)
 }
 
@@ -607,5 +649,150 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
         assert!(err.to_string().contains("symlink"), "{err}");
         let _ = me;
+        /// A group-writable ancestor is refused whatever the sticky bit does:
+        /// the sticky bit bounds who may remove a name, not who may add one.
+        /// It excuses a group only when others can write too, the `/tmp` shape.
+        #[test]
+        fn a_group_writable_ancestor_is_refused_even_with_the_sticky_bit() {
+            let (tmp, me) = tempdir();
+            let open = tmp.path().join("open");
+            mkdir(&open, 0o700);
+            mkdir(&open.join("private"), 0o700);
+            let path = open.join("private/daemon.sock");
+            // 01770 and 02770: sticky, group-writable, others clear.
+            for mode in [0o1770, 0o2770] {
+                fs::set_permissions(&open, fs::Permissions::from_mode(mode)).unwrap();
+                let err = check_ancestors(&path, me).unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+                assert!(
+                    err.to_string()
+                        .contains("the sticky bit does not excuse a group"),
+                    "{err}"
+                );
+            }
+            // The `/tmp` shape keeps passing: 01777 is sticky, g+w and o+w.
+            fs::set_permissions(&open, fs::Permissions::from_mode(0o1777)).unwrap();
+            check_ancestors(&path, me).unwrap();
+        }
+
+        /// Builds a POSIX ACL xattr: version 2, then the entries as
+        /// (tag, perm, id), the tags the POSIX draft fixes: `ACL_USER_OBJ` 1,
+        /// `ACL_GROUP_OBJ` 4, `ACL_OTHER` 32, `ACL_USER` 2, `ACL_MASK` 16.
+        fn acl_bytes(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+            let mut bytes = 2u32.to_le_bytes().to_vec();
+            for (tag, perm, id) in entries {
+                bytes.extend_from_slice(&tag.to_le_bytes());
+                bytes.extend_from_slice(&perm.to_le_bytes());
+                bytes.extend_from_slice(&id.to_le_bytes());
+            }
+            bytes
+        }
+
+        /// The exact minimal ACL of the mode parses: one `USER_OBJ`, one
+        /// `GROUP_OBJ`, one `OTHER`, undefined ids, perms equal to the mode's
+        /// bits.
+        #[test]
+        fn a_minimal_acl_matching_the_mode_passes() {
+            let mode = 0o640u32;
+            let acl = acl_bytes(&[
+                (0x0001, ((mode >> 6) & 7) as u16, u32::MAX),
+                (0x0004, ((mode >> 3) & 7) as u16, u32::MAX),
+                (0x0020, (mode & 7) as u16, u32::MAX),
+            ]);
+            assert!(minimal_acl_matches_mode(&acl, mode));
+        }
+
+        /// Every shape beyond the exact minimal form is refused: each clause
+        /// below fails if its check is deleted.
+        #[test]
+        fn every_acl_shape_beyond_the_minimal_is_refused() {
+            let mode = 0o640u32;
+            let user_obj = (0x0001u16, ((mode >> 6) & 7) as u16, u32::MAX);
+            let group_obj = (0x0004u16, ((mode >> 3) & 7) as u16, u32::MAX);
+            let other = (0x0020u16, (mode & 7) as u16, u32::MAX);
+            // A named user (and so a mask, and so a fourth entry).
+            let acl = acl_bytes(&[
+                user_obj,
+                group_obj,
+                (0x0002, 4, 1000),
+                (0x0010, 4, u32::MAX),
+                other,
+            ]);
+            assert!(!minimal_acl_matches_mode(&acl, mode));
+            // The wrong version.
+            let mut acl = acl_bytes(&[user_obj, group_obj, other]);
+            acl[0] = 3;
+            assert!(!minimal_acl_matches_mode(&acl, mode));
+            // The wrong length.
+            let mut acl = acl_bytes(&[user_obj, group_obj, other]);
+            acl.pop();
+            assert!(!minimal_acl_matches_mode(&acl, mode));
+            // A perm above what the mode grants, per class.
+            let acl = acl_bytes(&[user_obj, (0x0004, 7, u32::MAX), other]);
+            assert!(!minimal_acl_matches_mode(&acl, mode));
+            let acl = acl_bytes(&[user_obj, group_obj, (0x0020, 7, u32::MAX)]);
+            assert!(!minimal_acl_matches_mode(&acl, mode));
+            let acl = acl_bytes(&[(0x0001, 7, u32::MAX), group_obj, other]);
+            assert!(!minimal_acl_matches_mode(&acl, mode));
+            // An id that is not the undefined one.
+            let acl = acl_bytes(&[(0x0001, ((mode >> 6) & 7) as u16, 0), group_obj, other]);
+            assert!(!minimal_acl_matches_mode(&acl, mode));
+            // Entries out of order or missing.
+            let acl = acl_bytes(&[group_obj, user_obj, other]);
+            assert!(!minimal_acl_matches_mode(&acl, mode));
+        }
+
+        /// A real ACL on the filesystem is refused, and its removal restores
+        /// the read. Skipped where `setfacl` is absent.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn an_acl_beyond_the_mode_is_refused_for_real() {
+            let have_setfacl = std::process::Command::new("setfacl")
+                .arg("--version")
+                .output()
+                .is_ok_and(|out| out.status.success());
+            if !have_setfacl {
+                eprintln!("setfacl is missing; the real-ACL case is skipped");
+                return;
+            }
+            let (tmp, _me) = tempdir();
+            let file = tmp.path().join("shared");
+            fs::write(&file, b"bytes").unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+            let run = |args: &[&str]| {
+                std::process::Command::new("setfacl")
+                    .args(args)
+                    .output()
+                    .unwrap()
+            };
+            // A named user forces a mask: an ACL beyond the mode's own bits.
+            assert!(
+                run(["-m", "u:1:r", &file.to_string_lossy()].as_ref())
+                    .status
+                    .success()
+            );
+            let err = read_shared_file(&file).unwrap_err();
+            assert!(err.to_string().contains("beyond its mode bits"), "{err}");
+            // Removing it restores the read.
+            assert!(
+                run(["-b", &file.to_string_lossy()].as_ref())
+                    .status
+                    .success()
+            );
+            read_shared_file(&file).unwrap();
+            // A default ACL on a directory is refused for every file under it.
+            let dir = tmp.path().join("with-default");
+            mkdir(&dir, 0o700);
+            assert!(
+                run(["-d", "-m", "u:1:r", &dir.to_string_lossy()].as_ref())
+                    .status
+                    .success()
+            );
+            let err = check_ancestors(&dir.join("child"), _me).unwrap_err();
+            assert!(
+                err.to_string().contains("ACL beyond its mode bits"),
+                "{err}"
+            );
+        }
     }
 }
