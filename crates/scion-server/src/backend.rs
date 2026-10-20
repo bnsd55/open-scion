@@ -76,9 +76,9 @@ impl Backend {
         }
     }
 
-    /// The Postgres handle, when this backend is one.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
+    /// The Postgres handle, when this backend is one. The crate's own
+    /// code reads it to tell the one-writer engines apart (a Postgres
+    /// database always has one writer; a data directory may be shared).
     pub(crate) fn as_postgres(&self) -> Option<&Pg> {
         match &self.inner {
             Inner::Postgres(pg) => Some(pg),
