@@ -53,8 +53,10 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       # Input never touches the shell directly (a template injection
       # would read as code here): the commit comes through env, and it
-      # must be a 40-hex-digit SHA before anything else runs.
+      # must be a 40-hex-digit SHA before anything else runs; the tag
+      # name too, for a tag name may hold $( ) ; and backticks.
       DRY_RUN_COMMIT: ${{ inputs.commit }}
+      RELEASE_TAG: ${{ github.ref_name }}
     steps:
       - id: tag
         run: |
@@ -79,7 +81,7 @@ jobs:
             echo "tag=$commit" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          tag="${{ github.ref_name }}"
+          tag="$RELEASE_TAG"
           # An annotated tag only: a lightweight tag has no tag object,
           # so it cannot carry a signature (D18).
           gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" \
