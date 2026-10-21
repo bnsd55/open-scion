@@ -103,23 +103,43 @@ jobs:
           - backend: the postgres backend
             value: postgres
             name: postgres
+            slice: 5
+            total: 8
+          - backend: the postgres backend
+            value: postgres
+            name: postgres
+            slice: 6
+            total: 8
+          - backend: the postgres backend
+            value: postgres
+            name: postgres
+            slice: 7
+            total: 8
+          - backend: the postgres backend
+            value: postgres
+            name: postgres
+            slice: 8
+            total: 8
+          - backend: the postgres backend
+            value: postgres
+            name: postgres
             slice: 1
-            total: 4
+            total: 8
           - backend: the postgres backend
             value: postgres
             name: postgres
             slice: 2
-            total: 4
+            total: 8
           - backend: the postgres backend
             value: postgres
             name: postgres
             slice: 3
-            total: 4
+            total: 8
           - backend: the postgres backend
             value: postgres
             name: postgres
             slice: 4
-            total: 4
+            total: 8
     services:
       postgres:
         image: postgres:17.11
@@ -269,7 +289,7 @@ jobs:
           printf '[profile.default]\ntimeout = "600s"\nretries = 1\nslow-timeout = { period = "60s", terminate-after = 8 }\n' > .config/nextest.toml
           # shellcheck disable=SC1090
           source <(cargo llvm-cov show-env --sh)
-          # A hard cap 15 minutes under the wall the agent dies at:
+          # A hard cap 20 minutes under the wall the agent dies at:
           # setup costs the job about a quarter of an hour, so the cap
           # fires a half hour before the wall, the step fails cleanly,
           # and its log uploads with the watcher's trend in it.
@@ -284,7 +304,7 @@ jobs:
             pkgs="--workspace"
           fi
           # shellcheck disable=SC2086
-          nice -n 19 timeout -k 60 900 cargo nextest run $pkgs \
+          nice -n 19 timeout -k 60 1200 cargo nextest run $pkgs \
             --no-fail-fast \
             --partition hash:${{ matrix.slice }}/${{ matrix.total }} \
             > measure.log 2>&1
