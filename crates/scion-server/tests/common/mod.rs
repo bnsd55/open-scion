@@ -268,11 +268,49 @@ impl Server {
 pub(crate) type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
 pub(crate) type Objects = ObjectsClient<InterceptedService<Channel, Bearer>>;
 
-pub(crate) async fn connect(url: &str) -> Result<(Scion, Objects), tonic::transport::Error> {
-    let channel = Channel::from_shared(url.to_owned())
+/// How long a test client may take to connect, and how long one call
+/// may run. A server that dies mid-reply must not leave a client
+/// waiting forever: a Channel without a connect timeout keeps trying
+/// to reconnect, and a call without a deadline waits on the reply for
+/// good. The ceilings fail loud with a name, in seconds, instead of
+/// eating the job's cap.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One channel for a test client: the timeout is the point. Every call
+/// on the channel carries `timeout` (the Endpoint applies it per
+/// request), so a server that dies mid-reply ends the call instead of
+/// parking it. A test that wants a tighter deadline sets its own and
+/// the smaller one fires first.
+pub(crate) async fn channel(url: &str) -> Result<Channel, tonic::transport::Error> {
+    channel_within(url, CALL_TIMEOUT).await
+}
+
+/// The same channel with a ceiling of the test's choosing, for the test
+/// that proves the ceiling itself.
+pub(crate) async fn channel_within(
+    url: &str,
+    timeout: Duration,
+) -> Result<Channel, tonic::transport::Error> {
+    Channel::from_shared(url.to_owned())
         .unwrap()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(timeout)
         .connect()
-        .await?;
+        .await
+}
+
+pub(crate) async fn connect(url: &str) -> Result<(Scion, Objects), tonic::transport::Error> {
+    connect_within(url, CALL_TIMEOUT).await
+}
+
+/// The pair of clients on a channel with a ceiling of the test's
+/// choosing: the proof of the ceiling itself uses 2 s.
+pub(crate) async fn connect_within(
+    url: &str,
+    timeout: Duration,
+) -> Result<(Scion, Objects), tonic::transport::Error> {
+    let channel = channel_within(url, timeout).await?;
     let bearer = Bearer::new(TOKEN).unwrap();
     let objects = ObjectsClient::with_interceptor(channel.clone(), bearer.clone());
     Ok((ScionClient::with_interceptor(channel, bearer), objects))
@@ -336,23 +374,49 @@ pub(crate) struct Ledger {
     pub oplog: ledger::OpLog,
 }
 
+/// The suite repo's root directory is wide, so a land's metadata cost
+/// is easy to see: a land writes one history node and one tree node per
+/// directory on its changed paths, and each node holds the whole
+/// directory level (the cost model of `history.rs`), so the bytes a
+/// land writes are the sizes of the directories above its change -
+/// about 64 bytes per entry, measured at directories of 1000 and 10000
+/// entries (63897 and 638976 bytes per land). The root is on every
+/// path, so with 1500 entries every land of the suites writes about 96
+/// KiB above its change, wide enough that a land stays pending between
+/// two looks at the database - the moment a kill must meet. The flake
+/// of #478 was that moment passing unseen: a fast runner's lands
+/// finished before the first poll, and the old fatal wait named a hold
+/// that never happened.
+const WIDE_ENTRIES: usize = 1500;
+
 /// Repo `r` with one root changeset, and refs `main` and `dev` at it. No RPC
 pub(crate) fn create_repo(data: &Path) {
     let store = Store::open(data).unwrap();
     let readme = store.blobs().put(b"crash suite\n").unwrap();
+    let mut files = vec![(
+        RepoPath::new("README").unwrap(),
+        Some(FileState::Regular {
+            content: readme,
+            executable: false,
+        }),
+    )];
+    for i in 0..WIDE_ENTRIES {
+        let bytes = format!("wide {i}\n").into_bytes();
+        let blob = store.blobs().put(&bytes).unwrap();
+        files.push((
+            RepoPath::new(format!("w{i:06}").into_bytes()).unwrap(),
+            Some(FileState::Regular {
+                content: blob,
+                executable: false,
+            }),
+        ));
+    }
     let root = Changeset::new(
         vec![],
         author(),
         None,
         b"root\n".to_vec(),
-        [(
-            RepoPath::new("README").unwrap(),
-            Some(FileState::Regular {
-                content: readme,
-                executable: false,
-            }),
-        )]
-        .into(),
+        files.into_iter().collect(),
     )
     .expect("changeset fits the format");
     store
@@ -370,6 +434,24 @@ pub(crate) fn create_repo(data: &Path) {
             Ok(())
         })
         .unwrap();
+}
+
+/// A bounded [`wait_until`]: gives the condition its time, reports
+/// whether it ever held, and never panics. The kill suites use it where
+/// a moment they want is likely but not certain, and count the kills
+/// that met it.
+pub(crate) async fn wait_until_bounded(what: &str, secs: u64, ready: impl Fn() -> bool) -> bool {
+    let give_up = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if ready() {
+            return true;
+        }
+        if Instant::now() >= give_up {
+            eprintln!("the waited-for condition did not hold within {secs} s: {what}");
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
 
 pub(crate) async fn put_blob(scion: &mut Scion, data: &[u8]) -> Result<BlobId, Status> {

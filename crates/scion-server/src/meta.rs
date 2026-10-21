@@ -31,7 +31,7 @@
 // under any feature set.
 #![allow(unreachable_pub)]
 use scion_core::RepoPath;
-use scion_core::{BlobId, Changeset, ChangesetId, Tree, TreeId};
+use scion_core::{BlobId, Changeset, ChangesetId, Entry, Tree, TreeId};
 
 use gix::ObjectId;
 
@@ -246,6 +246,16 @@ pub trait MetaTx {
 
     /// Reads a tree's stored `TreeV1` bytes, checked against its ID.
     fn get_tree_body(&mut self, id: TreeId) -> Result<Vec<u8>>;
+
+    /// Finds one entry of a tree by name, from the tree's stored bytes,
+    /// without decoding the whole node. The bytes are checked against
+    /// their ID before the scan, and the scan refuses what the decoder
+    /// refuses, so a body that is not canonical fails here as it would
+    /// in [`MetaTx::get_tree`].
+    fn lookup_tree_entry(&mut self, id: TreeId, name: &[u8]) -> Result<Option<Entry>> {
+        let body = self.get_tree_body(id)?;
+        Tree::find_entry(&body, name).map_err(|e| Error::Corrupt(format!("tree {id}: {e}")))
+    }
 
     /// The length of a tree's stored bytes, without reading them.
     fn tree_size(&mut self, id: TreeId) -> Result<usize>;

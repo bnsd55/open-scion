@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 use std::time::{Duration, SystemTime};
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
@@ -779,9 +780,18 @@ pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
             "database schema version {version} is newer than this build ({SCHEMA_VERSION})"
         )));
     }
+    if version == target {
+        return Ok(());
+    }
+    tracing::info!(
+        from_version = version,
+        to_version = target,
+        "migrating the metadata schema"
+    );
     // Each migration runs in its own transaction, with the version it sets.
     // A crash rolls it back, and the next open runs it again from its start.
     for (to, sql) in (1..=target).zip(MIGRATIONS).skip(version as usize) {
+        let step = Instant::now();
         let tx = db.unchecked_transaction().map_err(from_sqlite)?;
         tx.execute_batch(sql).map_err(from_sqlite)?;
         if to == 4 {
@@ -791,7 +801,18 @@ pub(crate) fn migrate(db: &Connection, target: u32) -> Result<()> {
         tx.pragma_update(None, "user_version", to)
             .map_err(from_sqlite)?;
         tx.commit().map_err(from_sqlite)?;
+        tracing::info!(
+            from_version = to - 1,
+            to_version = to,
+            elapsed_ms = u64::try_from(step.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "the metadata schema migrated one step"
+        );
     }
+    tracing::info!(
+        from_version = version,
+        to_version = target,
+        "the metadata migration is done"
+    );
     Ok(())
 }
 

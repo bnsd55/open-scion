@@ -46,6 +46,11 @@ open-scion-server = { workspace = true, features = ["test-hooks"] }
 # Path only: a version would make `cargo package` resolve it from the
 # registry.
 open-scion = { path = ".", features = ["test-hooks"] }
+# The keepalive test shortens the client keepalive through the seam,
+# which the feature turns on for the test build's scion-proto.
+open-scion-proto = { workspace = true, features = ["test-hooks"] }
+# The keepalive test moves the relay's bytes with tokio's ext traits.
+tokio = { workspace = true, features = ["io-util"] }
 open-scion-tier.workspace = true
 tempfile.workspace = true
 tracing.workspace = true
