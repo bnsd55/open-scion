@@ -250,6 +250,9 @@ async fn chain(fake: &Fake) -> (ObjectsClient<tonic::transport::Channel>, TempDi
 
     let channel = Endpoint::try_from("http://daemon")
         .unwrap()
+        // A daemon that died must not leave the test dialing forever.
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
         .connect_with_connector(service_fn(move |_: Uri| {
             let socket = socket.clone();
             async move {

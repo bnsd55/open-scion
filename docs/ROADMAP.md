@@ -162,8 +162,21 @@ Make one server routine to run.
 - `docs/operations.md` has runbooks for install, upgrade, rollback,
   backup, restore, key and certificate rotation, disk full, EIO, a
   Postgres restart, a failed migration, an `fsck` failure and garbage
-  collection.
-- Each runbook has a CI test or a recorded release drill.
+  collection: done - the disk-full and failing-disk runbooks
+  ([#448](https://github.com/bnsd55/openscion/pull/448)), the
+  Postgres-restart runbook
+  ([#453](https://github.com/bnsd55/openscion/pull/453)), the
+  failed-migration and fsck-failure runbooks
+  ([#454](https://github.com/bnsd55/openscion/pull/454)), and the
+  first-boot (the install runbook) and certificate-rotation runbooks
+  ([#457](https://github.com/bnsd55/openscion/pull/457)).
+- Each runbook has a CI test or a recorded release drill: done, with
+  each runbook's `Proof:` line held by the docs_ops registry, except
+  one arm: rollback's run-the-old-binary arm, whose drill is #431 (the
+  pre-upgrade backup restores and serves under the N-1 binary). The
+  restore arm is proven
+  ([#454](https://github.com/bnsd55/openscion/pull/454)'s
+  `a_newer_schema_refuses_the_open_and_a_restore_serves`).
 - Readiness, liveness and graceful drain have end-to-end tests.
   Readiness goes false before the server drains in-flight calls.
 - Prometheus alert rules and the log fields they use are versioned and
