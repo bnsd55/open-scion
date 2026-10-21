@@ -509,15 +509,18 @@ serves.
 
 The restore takes a measured time, not a promise: the `restore-bench`
 workflow (a run on `main` or a dispatch, on the fixed `ubuntu-24.04`
-runner, never a local machine) restores a stated store — 20 repos, 1000
-changesets, about 32 MiB of raw blob content in files of about 32 KiB —
-with `fsck`, an open and a read, prints the seconds, and fails past a
-600 s bound. The measured number lives in the workflow's run log and
-this section names it once the first run has printed it.
+runner, never a local machine) restores a stated store — 40 repos,
+12000 changesets, 750 MiB of raw blob content in files of about 64 KiB
+— with `fsck`, an open and a read, prints the seconds, and fails past
+a 600 s bound. A real store's restore time scales with its blob bytes
+and its changeset count. On the fixed runner that store restored in
+0.3 s (run 39532665456: 2493 MiB/s, 39893 changesets/s; the store
+built in 9.6 s). One sample at one size; a second size is the next
+step when the number starts steering a decision. The current numbers
+live in the workflow's run log on `main`, and a run that drifts far
+from them is a regression to look at, not a promise to restate here.
 
 Proof: crates/scion-server/tests/restore_bench.rs::a_restore_of_a_stated_store_takes_a_stated_time
-
-Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restores_whole
 
 Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restores_whole
 

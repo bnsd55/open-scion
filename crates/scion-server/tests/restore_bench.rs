@@ -17,10 +17,13 @@ use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::store::Store;
 
 /// The stated size of the measured store: repos and changesets per repo.
-const REPOS: u8 = 20;
-const CHANGESETS_PER_REPO: u8 = 50;
+/// Big enough that the per-byte and per-changeset costs of a restore
+/// show past the fixed costs (a store of tens of MiB restores in a
+/// fraction of a second, which tells an operator nothing).
+const REPOS: u8 = 40;
+const CHANGESETS_PER_REPO: u16 = 300;
 /// The content bytes of each changeset's own file.
-const FILE_BYTES: usize = 32 * 1024;
+const FILE_BYTES: usize = 64 * 1024;
 /// A restore of this size past this bound means something changed in the
 /// restore path, not in the machine.
 const RESTORE_BOUND_SECS: u64 = 600;
@@ -43,7 +46,7 @@ fn a_restore_of_a_stated_store_takes_a_stated_time() {
         // version they saw, as a client's land does.
         let mut ref_version: Option<i64> = None;
         for step in 0..CHANGESETS_PER_REPO {
-            let bytes = vec![b'a' + (step % 26); FILE_BYTES];
+            let bytes = vec![b'a' + u8::try_from(step % 26).unwrap(); FILE_BYTES];
             let blob = store.blobs().put(&bytes).unwrap();
             blob_bytes += bytes.len() as u64;
             let cs = chain_changeset(&name, step, blob, parent);
@@ -95,12 +98,19 @@ fn a_restore_of_a_stated_store_takes_a_stated_time() {
     drop(restored);
     let restore = restore_started.elapsed();
 
-    // The line the docs quote, with the stated size beside it.
+    // The lines the docs quote: the size, the time, and the rate they
+    // imply, so an operator of a bigger store can scale the number.
+    let raw_mib = blob_bytes as f64 / (1024.0 * 1024.0);
     println!(
         "restore: {:.1} s (build {:.1} s) for {REPOS} repos, {changesets} changesets, \
-         {blob_bytes} raw blob bytes in files of about {FILE_BYTES} bytes",
+         {blob_bytes} raw blob bytes ({raw_mib:.0} MiB) in files of about {FILE_BYTES} bytes",
         restore.as_secs_f64(),
         build.as_secs_f64(),
+    );
+    println!(
+        "restore rate: {:.0} MiB/s, {:.0} changesets/s (ubuntu-24.04, one sample)",
+        raw_mib / restore.as_secs_f64().max(0.001),
+        changesets as f64 / restore.as_secs_f64().max(0.001),
     );
     assert!(
         restore.as_secs() < RESTORE_BOUND_SECS,
@@ -111,7 +121,7 @@ fn a_restore_of_a_stated_store_takes_a_stated_time() {
 
 /// The changeset `step` of a chain in `name`: one file backed by `blob`,
 /// on `parent`, with a message that names it.
-fn chain_changeset(name: &str, step: u8, blob: BlobId, parent: Option<ChangesetId>) -> Changeset {
+fn chain_changeset(name: &str, step: u16, blob: BlobId, parent: Option<ChangesetId>) -> Changeset {
     Changeset::new(
         parent.into_iter().collect(),
         IdentityTime::new(name.as_bytes().to_vec(), b"bench@x".to_vec(), 0, 0)
