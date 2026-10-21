@@ -442,6 +442,184 @@ fn pairs<'a>(
     found
 }
 
+/// Lands contend on one ref: eight lands at once, each retried until
+/// it settles. The audit's ref lines, read in file order, must tell a
+/// history that happened: the first move's `old` is the ref's head
+/// before any land, and every later `old` is the `new` of the line
+/// before it. A move recorded from outside the ref's lock reads a head
+/// that a concurrent land has already replaced, and the chain breaks.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn concurrent_lands_ref_lines_tell_one_true_history() {
+    use scion_core::{FileState, IdentityTime, RepoPath};
+    use scion_proto::v1::LandRequest;
+    use std::fmt::Write as _;
+
+    // Seven large changesets and one small one: the large lands'
+    // jobs spend real time reading the changeset back, the small
+    // land settles fast.
+    const PATHS: usize = 5000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let audit_path = dir.path().join("audit.log");
+    let audit = Audit::open(&audit_path).unwrap();
+    let start = store.resolve_ref(REPO, "main").unwrap();
+    let (stop, url) = serve_with_audit(&store, dir.path(), write_access(), audit).await;
+
+    // Eight changesets on the root, one per lander, inserted straight
+    // into the store: the land is what this test drives.
+    let lands: Vec<_> = (0..8)
+        .map(|i| {
+            let count = if i == 0 { 1 } else { PATHS };
+            let mut blobs = Vec::new();
+            let changes: std::collections::BTreeMap<_, _> = (0..count)
+                .map(|j| {
+                    let blob = store
+                        .blobs()
+                        .put(format!("land {i} file {j}\n").as_bytes())
+                        .unwrap();
+                    blobs.push(blob);
+                    (
+                        RepoPath::new(format!("docs/{i}/{j}")).unwrap(),
+                        Some(FileState::Regular {
+                            content: blob,
+                            executable: false,
+                        }),
+                    )
+                })
+                .collect();
+            let change = scion_core::Changeset::new(
+                vec![start],
+                IdentityTime::new(
+                    b"Ada".to_vec(),
+                    b"ada@example.com".to_vec(),
+                    1_700_000_000,
+                    i,
+                )
+                .expect("identity fits the format"),
+                None,
+                format!("land {i}\n").into_bytes(),
+                changes,
+            )
+            .expect("changeset fits the format");
+            store
+                .write(|c| {
+                    let repo = c.repo_id(REPO)?;
+                    let id = c.insert_changeset(repo, &change)?;
+                    for blob in &blobs {
+                        c.add_repo_blob(repo, *blob)?;
+                    }
+                    Ok(id)
+                })
+                .unwrap()
+        })
+        .collect();
+    let mut start_hex = String::new();
+    for byte in start.as_bytes() {
+        write!(start_hex, "{byte:02x}").unwrap();
+    }
+
+    // Eight landers, one changeset each, retrying until the land
+    // settles. A land whose ref moved under it answers Aborted and
+    // stays pending; the same request key resumes it.
+    let join = |i: usize| {
+        let url = url.clone();
+        let cs = lands[i];
+        tokio::spawn(async move {
+            let mut ci = writer(&url, &format!("t-land-{i}")).await;
+            loop {
+                match ci
+                    .land(LandRequest {
+                        repo: REPO.into(),
+                        changeset_id: cs.as_bytes().to_vec(),
+                        target_ref: "main".into(),
+                        request_key: format!("k-{i}"),
+                    })
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(status)
+                        if status.code() == tonic::Code::Aborted
+                            || status.code() == tonic::Code::Unavailable => {}
+
+                    Err(status) => panic!("land {i} failed: {status:?}"),
+                }
+            }
+        })
+    };
+    // Hold the store's write connection, so no land's job can record
+    // itself, let alone move the ref, until every call has read the
+    // ref: the calls' first tasks need only the readers, and the
+    // intents in the audit file say they are past them. Then let go:
+    // the jobs proceed, the ref lock serializes their moves, and each
+    // move's `previous` (or, on the racing code, the call's own early
+    // read) must be the head the move actually replaced.
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let blocker = std::thread::spawn({
+        let store = store.clone();
+        move || {
+            store
+                .read_unflushed(|_| {
+                    held_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        }
+    });
+    held_rx.recv().unwrap();
+    for i in 1..8 {
+        join(i);
+    }
+    join(0);
+    // The eight intents say every call is past its intent; their
+    // first tasks read the ref within microseconds of it.
+    wait_for_lines(&audit_path, 8).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    go_tx.send(()).unwrap();
+    blocker.join().unwrap();
+    for i in 0..8 {
+        join(i).await.unwrap();
+    }
+
+    stop.send(()).unwrap();
+    wait_for_lines(&audit_path, 2).await;
+
+    let lines = read_lines(&audit_path);
+    let refs: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|line| line["event"] == "ref" && line["outcome"] == "ok")
+        .collect();
+    assert!(
+        refs.len() >= 8,
+        "every land that moved the ref has a line: {}",
+        refs.len()
+    );
+    let mut moves: Vec<(String, String)> = refs
+        .iter()
+        .map(|line| {
+            (
+                line["old"].as_str().unwrap_or_default().to_string(),
+                line["new"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    moves.dedup();
+    assert_eq!(
+        moves.first().map(|(old, _)| old.as_str()),
+        Some(start_hex.as_str()),
+        "the first move moved the head the lands started from"
+    );
+    for pair in moves.windows(2) {
+        assert_eq!(
+            pair[0].1, pair[1].0,
+            "each move moved the ref its predecessor left it at"
+        );
+    }
+}
+
 /// Waits until the file holds `n` lines: the stop's flush runs on its
 /// own task, so the lines land a moment after the stop.
 async fn wait_for_lines(path: &std::path::Path, n: usize) {

@@ -22,6 +22,13 @@ On open, a file whose last line has no newline gets one, so a line
 that a full drive cut in the middle stays a fragment of its own and
 cannot swallow the lines that follow.
 
+A land's ref line names the head the move replaced, read where the
+move happens, under the ref's lock: a replayed land (the same request
+key after it landed) reports that first move's head in its land line,
+and adds no ref line, because it moved nothing. The ref lines of a
+ref, in file order, are the ref's true history: each old is the
+previous line's new.
+
 Blob and tree digests are never logged (a digest is a dictionary key
 to contents), and neither are token bytes or token hashes. Rotation
 is by size, keeps a bounded number of old files, and names what it
