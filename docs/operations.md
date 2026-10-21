@@ -187,10 +187,10 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
 
 - `--postgres-url-file` (or `SCION_POSTGRES_URL`) names the database.
   `--postgres-url` takes the same value on the command line; it is
-  kept for tests, where it warns, because the process list shows its
-  value to every local account. Off this machine the URL must ask for
-  TLS (`sslmode=require`): the open refuses a remote URL that does
-  not.
+  deprecated: it warns now and goes away in a later release, because
+  the process list shows its value to every local account. Off this
+  machine the URL must ask for TLS (`sslmode=require`): the open
+  refuses a remote URL that does not.
 - `--postgres-ca` (a PEM file) is required with a remote host too: the
   database must present a certificate it signed, and there is no mode that
   accepts any certificate. A host on this machine (`localhost`, a loopback
@@ -362,15 +362,15 @@ Every flag that takes a secret's value also has a file form
 (`--x-file`) and an environment form. The file form is the deployment
 form: the owner alone may read it, and a symlink is refused. The
 environment value is visible to the same user and to root. The argv
-form is kept for tests: its value is readable by every local account
-through `ps`, so the binaries warn when it is used.
+form is deprecated: it warns now and goes away in a later release, and
+its value is readable by every local account through `ps`.
 
 | Variable | Flag | Read by | Notes |
 | --- | --- | --- | --- |
 | `SCION_DATA` | `--data` | `scion-server` | Data directory, default `scion-data`. |
-| `SCION_POSTGRES_URL` | `--postgres-url` | `scion-server` | The URL holds the database credentials; the environment keeps them out of the process list (`ps`). `--postgres-url-file` reads it from a file the owner alone may read, and the argv form is kept for tests; it warns. |
+| `SCION_POSTGRES_URL` | `--postgres-url` | `scion-server` | The URL holds the database credentials; the environment keeps them out of the process list (`ps`). `--postgres-url-file` reads it from a file the owner alone may read, and the argv form is deprecated: it warns now and goes away in a later release. |
 | `SCION_TOKEN` | `--token` | `scion-server` (`serve`, `hash-token`), `scion-cache`, `scion-daemon`, `scn` | A secret; the environment keeps it out of the process list. The `--token-file` flag reads the token from a file the owner alone may read, and `hash-token` reads it from stdin. The argv form prints a deprecation warning and goes away in a later release. |
-| `SCION_UPSTREAM_TOKEN` | `--upstream-token` | `scion-cache`, `scion-daemon` | A secret, as `SCION_TOKEN`; `--upstream-token-file` reads it from a file, and the argv form is kept for tests; it warns. |
+| `SCION_UPSTREAM_TOKEN` | `--upstream-token` | `scion-cache`, `scion-daemon` | A secret, as `SCION_TOKEN`; `--upstream-token-file` reads it from a file, and the argv form is deprecated: it warns now and goes away in a later release. |
 | `SCION_DAEMON_DATA` | `--data` | `scion-daemon` | Data directory, default `scion-daemon-data`. |
 | `SCION_AUTHOR` | `--author` | `scn commit` | Default `scn <scn@localhost>`. |
 | `SCION_SERVER` | `--server` | `scn` | Default `http://127.0.0.1:7878`. |
