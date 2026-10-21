@@ -19,9 +19,8 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # A pull_request run may cancel the run before it (same branch,
-  # superseded); a push to main may not — every land's run has to
-  # finish so it verifies the head it ran on.
+  # This file has no pull_request trigger, so the expression always
+  # reads false: a dispatch cannot cancel the nightly in flight.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
