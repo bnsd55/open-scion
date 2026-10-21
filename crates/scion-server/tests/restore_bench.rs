@@ -46,7 +46,20 @@ fn a_restore_of_a_stated_store_takes_a_stated_time() {
         // version they saw, as a client's land does.
         let mut ref_version: Option<i64> = None;
         for step in 0..CHANGESETS_PER_REPO {
-            let bytes = vec![b'a' + u8::try_from(step % 26).unwrap(); FILE_BYTES];
+            // Distinct, incompressible content per blob: an LCG stream
+            // seeded by the repo and the step. A repeating pattern would
+            // both deduplicate (two blobs of one ID) and compress (a
+            // 64 KiB file of one repeated block stores tens of bytes),
+            // and the restore would move a fraction of the raw bytes.
+            let mut seed = (u64::from(repo) << 32) ^ u64::from(step);
+            let bytes = (0..FILE_BYTES)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (seed >> 33) as u8
+                })
+                .collect::<Vec<u8>>();
             let blob = store.blobs().put(&bytes).unwrap();
             blob_bytes += bytes.len() as u64;
             let cs = chain_changeset(&name, step, blob, parent);
@@ -87,6 +100,11 @@ fn a_restore_of_a_stated_store_takes_a_stated_time() {
         &backup.path().join("objects"),
         &restored_dir.path().join("objects"),
     );
+    // Durability inside the timer: an operator's restore is done when a
+    // crash cannot lose what was restored, so the copied files and the
+    // directories holding them are fsynced before the clock stops.
+    fsync_tree(&restored_dir.path().join("objects"));
+    fsync_dir(restored_dir.path());
     let restored = from_store(Store::open(restored_dir.path()).unwrap());
     let report = fsck::run(&restored, 1, &mut |_| {}).unwrap();
     assert!(
@@ -99,17 +117,27 @@ fn a_restore_of_a_stated_store_takes_a_stated_time() {
     let restore = restore_started.elapsed();
 
     // The lines the docs quote: the size, the time, and the rate they
-    // imply, so an operator of a bigger store can scale the number.
+    // imply, so an operator of a bigger store can scale the number. The
+    // bytes on disk are the restore's real payload, stated beside the
+    // raw content bytes: they are the same only while nothing
+    // deduplicates.
+    let on_disk: u64 = walk(&restored_dir.path().join("objects"))
+        .iter()
+        .filter(|p| p.is_file())
+        .filter_map(|p| fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
     let raw_mib = blob_bytes as f64 / (1024.0 * 1024.0);
+    let disk_mib = on_disk as f64 / (1024.0 * 1024.0);
     println!(
         "restore: {:.1} s (build {:.1} s) for {REPOS} repos, {changesets} changesets, \
-         {blob_bytes} raw blob bytes ({raw_mib:.0} MiB) in files of about {FILE_BYTES} bytes",
+         {blob_bytes} raw blob bytes ({raw_mib:.0} MiB) in files of about {FILE_BYTES} bytes;          {on_disk} bytes ({disk_mib:.0} MiB) on disk after the restore",
         restore.as_secs_f64(),
         build.as_secs_f64(),
     );
     println!(
-        "restore rate: {:.0} MiB/s, {:.0} changesets/s (ubuntu-24.04, one sample)",
-        raw_mib / restore.as_secs_f64().max(0.001),
+        "restore rate: {:.0} MiB/s on disk, {:.0} changesets/s (ubuntu-24.04, one sample, fsync included)",
+        disk_mib / restore.as_secs_f64().max(0.001),
         changesets as f64 / restore.as_secs_f64().max(0.001),
     );
     assert!(
@@ -117,6 +145,45 @@ fn a_restore_of_a_stated_store_takes_a_stated_time() {
         "the restore took {restore:?}, past the {RESTORE_BOUND_SECS} s bound: something \
          changed in the restore path, not in the machine"
     );
+}
+
+/// fsyncs every file under `root`, then the directories on the way down.
+fn fsync_tree(root: &Path) {
+    let mut dirs = Vec::new();
+    for entry in walk(root) {
+        if entry.is_dir() {
+            dirs.push(entry.to_path_buf());
+        } else {
+            let _ = fs::File::open(&entry).and_then(|f| f.sync_all());
+        }
+    }
+    for dir in dirs.iter().rev() {
+        let _ = fs::File::open(dir).and_then(|f| f.sync_all());
+    }
+    let _ = fs::File::open(root).and_then(|f| f.sync_all());
+}
+
+fn fsync_dir(dir: &Path) {
+    let _ = fs::File::open(dir).and_then(|f| f.sync_all());
+}
+
+/// Every path under `root`, files and directories, depth first.
+fn walk(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path.clone());
+            }
+            out.push(path);
+        }
+    }
+    out
 }
 
 /// The changeset `step` of a chain in `name`: one file backed by `blob`,
