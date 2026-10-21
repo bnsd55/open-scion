@@ -552,14 +552,18 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
         None => {}
     }
 
-    // The fill ended at the wall. Free a margin: the run's own
-    // evidence says the store's open writes more than one chunk's
-    // worth (sessions, locks, the repo row), so a margin of chunks
-    // admits the open, and the lands behind it run into the wall again.
+    // The fill ended at the wall. Free a margin, and VACUUM it through:
+    // a DELETE alone leaves the dead pages in the filler table's own
+    // free map, which no other table's extend can take (run 4's
+    // evidence - the open still met the wall through 16 deleted
+    // chunks). The VACUUM returns the pages to the database, the WAL
+    // rides its own disk, and the store's open and lands spend the
+    // freed pages until the wall closes again.
     client
         .batch_execute(
             "DELETE FROM diskfull_filler.filler WHERE ctid IN \
-             (SELECT ctid FROM diskfull_filler.filler LIMIT 16)",
+             (SELECT ctid FROM diskfull_filler.filler LIMIT 16);
+             VACUUM diskfull_filler.filler;",
         )
         .expect("a margin frees");
 
