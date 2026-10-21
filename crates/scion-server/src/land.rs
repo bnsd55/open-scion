@@ -2950,4 +2950,65 @@ mod tests {
             .unwrap();
         assert_eq!(resumed.1.state, LandState::Rejected);
     }
+
+    /// Pass 5, W1: a request key is scoped to one caller in one repo. B
+    /// reusing A's key gets its own land, not A's result; neither caller
+    /// can read the other's land by its id.
+    #[test]
+    fn another_principals_key_and_land_id_are_not_shared() {
+        let f = fixture();
+        let a_cs = f.commit(f.root, &[put("a/x", "a")]);
+        let a_land = f.land(a_cs, "shared");
+        assert_eq!(a_land.state, LandState::Landed);
+
+        // B lands its own changeset under A's key: the lookup names B, so
+        // this is a new land, and it lands on the head A left.
+        let head = f.main().target;
+        let b_cs = f.commit(head, &[put("b/y", "b")]);
+        let b_out = Lands::default()
+            .land(&f.store, &Caller("b".into()), &req(b_cs, "shared"))
+            .unwrap();
+        assert_eq!(b_out.state, LandState::Landed, "{}", b_out.detail);
+        assert_ne!(b_out.land_id, a_land.land_id, "two rows, one per caller");
+
+        // A land's id answers only to its own caller.
+        assert!(matches!(f.get(a_land.land_id), Ok(_)));
+        let b_gets_a = get_land(&f.store, &Caller("b".into()), "r", a_land.land_id);
+        assert!(matches!(b_gets_a, Err(Error::NotFound(_))), "{b_gets_a:?}");
+        let a_gets_b = get_land(&f.store, &caller(), "r", b_out.land_id);
+        assert!(matches!(a_gets_b, Err(Error::NotFound(_))), "{a_gets_b:?}");
+    }
+
+    /// Pass 5, W4: the ref CAS names a version, not a target, so an ABA
+    /// (main moves X -> Y -> X) still refuses a CAS that plans at the old
+    /// version: the version moved twice even though the target came back.
+    #[test]
+    fn a_cas_at_a_version_which_moved_and_moved_back_refuses() {
+        let f = fixture();
+        let head = f.main();
+        assert_eq!(head.version, 1);
+        let y = f.commit(f.root, &[put("b/y", "y")]);
+        assert!(
+            f.store
+                .write(|c| c.cas_ref(f.repo, "main", Some(head.version), y))
+                .unwrap()
+        );
+        // Back to the same target X: the version still moves.
+        assert!(
+            f.store
+                .write(|c| c.cas_ref(f.repo, "main", Some(2), head.target))
+                .unwrap()
+        );
+        assert_eq!(f.main().target, head.target, "X again, by target");
+        assert_eq!(f.main().version, 3, "but a new version");
+        // A land that planned at version 1 refuses to move the ref, whatever
+        // it names as the new target.
+        let cs = f.commit(head.target, &[put("a/x", "later")]);
+        assert!(
+            !f.store
+                .write(|c| c.cas_ref(f.repo, "main", Some(head.version), cs))
+                .unwrap()
+        );
+        assert_eq!(f.main().version, 3, "the refused CAS moved nothing");
+    }
 }
