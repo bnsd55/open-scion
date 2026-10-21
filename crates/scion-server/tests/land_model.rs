@@ -36,6 +36,7 @@ use scion_core::{Changeset, ChangesetId, FileState, RepoPath};
 use scion_proto::v1::{
     self, CreateChangesetRequest, GetLandRequest, LandRequest, LandResponse, LandState,
 };
+use scion_server::Backend;
 use tonic::Status;
 
 /// Rounds of land, kill and check. Each round starts the server, runs the
@@ -717,7 +718,14 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
         // two rounds in three, at a moment a land is pending, so a crash
         // meets a pending row.
         tokio::time::sleep(Duration::from_millis(150)).await;
-        if round % 3 != 0 {
+        if round % 3 != 0 && !Backend::test_is_postgres() {
+            // SHORTCUT: this ceiling is the SQLite-file read; the lands
+            // rows are unread on Postgres, so there the cut just waits
+            // the plain timer, and a pending row meets the crash less
+            // often. Upgrade path: a test-hooks pending-lands read on
+            // MetaTx, then drop the branch. The read must also not run
+            // on Postgres: opening scion.db beside a Postgres server
+            // would create a file the restart refuses.
             let conn = rusqlite::Connection::open(data.join("scion.db")).unwrap();
             wait_until(|| pending_lands(&conn) > 0).await;
         }

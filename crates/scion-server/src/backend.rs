@@ -299,7 +299,24 @@ pub(crate) fn test_url() -> Result<String> {
 /// test-hooks feature, and so does this.
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn test_schema(data: &Path) -> String {
-    let path = data.canonicalize().unwrap_or_else(|_| data.to_path_buf());
+    // A name that does not depend on whether the directory exists yet:
+    // the first open of a test hashes a directory that is not there yet,
+    // and on a mac the temp root is reached through a symlink, so hashing the raw
+    // path then and the resolved path later names two schemas. The name
+    // resolves the deepest ancestor that exists, then appends the rest,
+    // so every open of one directory hashes one path.
+    let mut existing = data.to_path_buf();
+    let mut tail = std::collections::VecDeque::new();
+    while !existing.exists()
+        && let Some(name) = existing.file_name().map(std::ffi::OsStr::to_owned)
+    {
+        tail.push_front(name);
+        existing.pop();
+    }
+    let mut path = existing.canonicalize().unwrap_or(existing);
+    for name in tail {
+        path.push(name);
+    }
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(&path, &mut hasher);
     format!("scion_test_{:016x}", std::hash::Hasher::finish(&hasher))
