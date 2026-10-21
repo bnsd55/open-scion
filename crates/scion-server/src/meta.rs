@@ -31,13 +31,13 @@
 // under any feature set.
 #![allow(unreachable_pub)]
 use scion_core::RepoPath;
-use scion_core::{BlobId, Changeset, ChangesetId, Tree, TreeId};
+use scion_core::{BlobId, Changeset, ChangesetId, Entry, Tree, TreeId};
 
 use gix::ObjectId;
 
 use crate::auth::Caller;
 use crate::db::SqliteTx;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::history::NodeId;
 use crate::land::{LandOutcome, LandRequest, LandState};
 use crate::store::Store;
@@ -222,17 +222,57 @@ pub trait MetaTx {
     /// Stores a tree. Safe to repeat.
     fn put_tree(&mut self, tree: &Tree) -> Result<TreeId>;
 
+    /// Stores pre-encoded trees, whose ids are their content hashes. Safe
+    /// to repeat. The batch is one round trip per table on Postgres,
+    /// however deep the tree chain was; a store that has no batch form
+    /// stores the rows one by one. No id may differ from its body's
+    /// hash: the callers take each id from `encode_with_id`.
+    fn put_trees(&mut self, trees: &[(TreeId, Vec<u8>)]) -> Result<()> {
+        for (id, body) in trees {
+            let (tree, body_id) = Tree::decode_with_id(body)
+                .map_err(|e| Error::Corrupt(format!("tree {id}: {e}")))?;
+            if body_id != *id {
+                return Err(Error::Corrupt(format!(
+                    "tree {id} does not match its body's id {body_id}"
+                )));
+            }
+            self.put_tree(&tree)?;
+        }
+        Ok(())
+    }
+
     /// Reads a tree, and checks it against its ID.
     fn get_tree(&mut self, id: TreeId) -> Result<Tree>;
 
     /// Reads a tree's stored `TreeV1` bytes, checked against its ID.
     fn get_tree_body(&mut self, id: TreeId) -> Result<Vec<u8>>;
 
+    /// Finds one entry of a tree by name, from the tree's stored bytes,
+    /// without decoding the whole node. The bytes are checked against
+    /// their ID before the scan, and the scan refuses what the decoder
+    /// refuses, so a body that is not canonical fails here as it would
+    /// in [`MetaTx::get_tree`].
+    fn lookup_tree_entry(&mut self, id: TreeId, name: &[u8]) -> Result<Option<Entry>> {
+        let body = self.get_tree_body(id)?;
+        Tree::find_entry(&body, name).map_err(|e| Error::Corrupt(format!("tree {id}: {e}")))
+    }
+
     /// The length of a tree's stored bytes, without reading them.
     fn tree_size(&mut self, id: TreeId) -> Result<usize>;
 
     /// Adds a blob to the blobs that `repo` may name. `Ok(true)` if new.
     fn add_repo_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool>;
+
+    /// Adds every blob to the blobs that `repo` may name. The batch is
+    /// one round trip on Postgres, however many blobs the changeset
+    /// puts; a store that has no batch form adds them one by one. Each
+    /// blob that is already there stays as it is.
+    fn add_repo_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<()> {
+        for blob in blobs {
+            self.add_repo_blob(repo, *blob)?;
+        }
+        Ok(())
+    }
 
     /// Inserts a land, or finds the land for the same request key. Returns
     /// the repo and the land's outcome, pending or final. `pending_limit`
@@ -315,6 +355,30 @@ pub trait MetaTx {
     /// The blobs that `repo` may name, all of them.
     fn repo_blob_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>>;
 
+    /// The `(changeset ID, generation, body)` of the changesets `repo`
+    /// holds, in generation order. The archive's export reads them in this
+    /// order, and a restore replays them in it, so parents come first.
+    fn repo_changesets_with_bodies(&mut self, repo: RepoId) -> Result<Vec<ChangesetRow>>;
+
+    /// The refs of `repo`, as `(name, target, version)`, in name order.
+    /// The archive's export reads them.
+    fn list_refs(&mut self, repo: RepoId) -> Result<Vec<(String, Vec<u8>, i64)>>;
+
+    /// The lands of `repo` that are still `pending`, as the caller, the
+    /// request key, the target ref, and the input changeset, in land ID
+    /// order. The archive's export reads them.
+    fn pending_lands(&mut self, repo: RepoId) -> Result<Vec<PendingLand>>;
+
+    /// Puts ref `name` of `repo` at `target` with the exact `version`,
+    /// whatever is there now. The archive's restore uses it to carry the
+    /// version the export read; live traffic moves refs with
+    /// [`MetaTx::cas_ref`] instead, which bumps the version.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    fn restore_ref(&mut self, repo: RepoId, name: &str, target: &[u8], version: i64) -> Result<()>;
+
     /// Removes the row that names `blob` for `repo`.
     fn delete_repo_blob(&mut self, repo: RepoId, blob: &[u8]) -> Result<()>;
 
@@ -374,6 +438,24 @@ pub struct RepoId(pub i64);
 /// One stored changeset with its repo, as the collector's walk reads it:
 /// `(repo, changeset ID, body)`.
 pub struct RepoChangeset(pub RepoId, pub Vec<u8>, pub Vec<u8>);
+
+/// One row of [`MetaTx::repo_changesets_with_bodies`]: the changeset's
+/// ID, its derived generation, and its encoded body.
+pub type ChangesetRow = (Vec<u8>, i64, Vec<u8>);
+
+/// A land that is still pending, as the archive's export reads it: the
+/// fields a restore needs to record it again, so a retry with the same
+/// request key resumes it.
+pub struct PendingLand {
+    /// The principal that sent the land.
+    pub caller: String,
+    /// The client's request key, the idempotency of the retry.
+    pub request_key: String,
+    /// The ref the land moves.
+    pub target_ref: String,
+    /// The changeset the land puts on the ref.
+    pub input_cs: Vec<u8>,
+}
 
 /// A derived row of `fsck`: kind, version, changeset, value, and whether
 /// the changeset is stored.

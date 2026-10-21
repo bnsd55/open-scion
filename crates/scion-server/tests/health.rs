@@ -15,7 +15,6 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::time::Duration;
 
-use tonic::transport::Channel;
 use tonic_health::pb::HealthCheckRequest;
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_health::pb::health_client::HealthClient;
@@ -104,9 +103,7 @@ async fn wait_serving(server: &mut Server, log: &Path) {
         assert!(started.elapsed() < Duration::from_secs(10), "timed out");
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
+    let channel = common::channel(&format!("http://{addr}"))
         .await
         .expect("the server listens");
     let mut client = HealthClient::new(channel);
@@ -121,9 +118,7 @@ async fn wait_serving(server: &mut Server, log: &Path) {
     // connection, so the test does not depend on how one connection
     // multiplexes two idle streams.
     let addr2 = bound_addr(log).expect("the address again");
-    let channel2 = Channel::from_shared(format!("http://{addr2}"))
-        .unwrap()
-        .connect()
+    let channel2 = common::channel(&format!("http://{addr2}"))
         .await
         .expect("the server listens again");
     let mut client2 = HealthClient::new(channel2);
@@ -219,11 +214,17 @@ async fn a_second_signal_ends_the_drain_of_an_open_call() {
         .expect("the named watch stays open through the drain")
         .expect("a status update");
     assert_eq!(update.status(), ServingStatus::NotServing);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(
-        server.child.try_wait().unwrap().is_none(),
-        "the drain ended while the watch was open"
-    );
+    // The drain must hold while the watch is open: a negative cannot be
+    // polled for once, so it is asserted across a window. A slow machine
+    // only widens the check, and a broken drain fails inside it.
+    let give_up = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < give_up {
+        assert!(
+            server.child.try_wait().unwrap().is_none(),
+            "the drain ended while the watch was open"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     // The second signal cuts the drain: the process ends promptly, with a
     // non-zero exit code, and the log names the cut.

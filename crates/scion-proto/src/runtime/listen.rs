@@ -40,6 +40,7 @@
 
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
@@ -54,7 +55,7 @@ use crate::runtime::request_id;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::time::Sleep;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::server::TlsStream;
@@ -89,6 +90,64 @@ pub(crate) const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 /// After this long, a connection is asked to close, so one that a client
 /// keeps for life (a daemon keeps one to its cache) gives its place up.
 pub(crate) const MAX_CONNECTION_AGE: Duration = Duration::from_secs(30 * 60);
+
+/// The HTTP/2 keepalive a client of a scion server runs: it pings its
+/// peer at this interval, busy or idle, and the peer's answer must come
+/// within [`CLIENT_KEEPALIVE_TIMEOUT`]. The server pings its side at
+/// `KEEPALIVE_INTERVAL` (60 s, private to this module); a client that
+/// asks sooner sees a dead server first, and a kill without a FIN or
+/// RST (a frozen process, a host gone) ends its calls in about the
+/// interval plus the timeout, not at a call deadline.
+pub const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a client's connection waits for a keepalive answer before
+/// the connection is dead: two thirds of [`CLIENT_KEEPALIVE_INTERVAL`],
+/// so a dead peer costs about 50 s, inside the tier's 60 s upstream
+/// window, and a healthy server that stalls for a moment (an fsync
+/// storm, a swap burst) is not cut by every client at once.
+pub const CLIENT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The TCP keepalive probe interval of a client connection, under the
+/// HTTP/2 interval, so a dead connection is visible below HTTP/2 too.
+pub const CLIENT_TCP_KEEPALIVE: Duration = Duration::from_secs(15);
+
+const _: () = assert!(CLIENT_KEEPALIVE_INTERVAL.as_secs() == 30);
+const _: () = assert!(CLIENT_KEEPALIVE_TIMEOUT.as_secs() == 20);
+const _: () = assert!(CLIENT_TCP_KEEPALIVE.as_secs() == 15);
+const _: () = assert!(
+    CLIENT_KEEPALIVE_INTERVAL.as_secs() + CLIENT_KEEPALIVE_TIMEOUT.as_secs() <= 60,
+    "a dead peer must fail a client inside the tier's 60 s upstream window"
+);
+
+thread_local! {
+    /// A test's shorter keepalive, as `(interval, timeout)`: the same
+    /// dead-peer failure is proved in seconds, and the product
+    /// constants above stay the documented ones. `None` is the product.
+    /// Thread-local, so a `multi_thread` test that sets it on one worker
+    /// can build the channel on another and lose it; the test's bound on
+    /// the failure time catches that.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub static CLIENT_KEEPALIVE_OVERRIDE: std::cell::Cell<Option<(Duration, Duration)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The keepalive a client of a scion server runs: the interval it pings
+/// at, and the time an answer gets, as `(interval, timeout)`.
+#[must_use]
+pub fn client_keepalive() -> (Duration, Duration) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Some(keepalive) = CLIENT_KEEPALIVE_OVERRIDE.with(std::cell::Cell::get) {
+        return keepalive;
+    }
+    (CLIENT_KEEPALIVE_INTERVAL, CLIENT_KEEPALIVE_TIMEOUT)
+}
+
+/// The TCP keepalive probe interval of a client connection.
+#[must_use]
+pub fn client_tcp_keepalive() -> Duration {
+    CLIENT_TCP_KEEPALIVE
+}
 
 /// A connection that was asked to close is closed this long later, with any
 /// call still in it. At least the server's longest call (600 s).
@@ -160,17 +219,30 @@ struct Counted {
     waker: Mutex<Option<Waker>>,
     /// Whether the crossing has been logged.
     logged: AtomicBool,
+    /// The peer of the connection, when it is a socket: the audit's
+    /// refusal lines name it, and the call span's `peer` field carries
+    /// it. None on a connection that is not a socket.
+    peer: Option<SocketAddr>,
 }
 
 impl Stalled {
-    pub(crate) fn new(limit: u64, metrics: Arc<Metrics>) -> Self {
+    pub(crate) fn new(peer: Option<SocketAddr>, limit: u64, metrics: Arc<Metrics>) -> Self {
         Self(Arc::new(Counted {
+            peer,
             limit,
             bytes: AtomicU64::new(0),
             metrics,
             waker: Mutex::new(None),
             logged: AtomicBool::new(false),
         }))
+    }
+
+    /// The peer of `request`'s connection, when it is a socket. Below
+    /// the router the connect info is the only peer a call still has:
+    /// the audit's refusal lines name it.
+    #[must_use]
+    pub fn peer(&self) -> Option<SocketAddr> {
+        self.0.peer
     }
 
     /// The handle of `request`'s connection, if it is one of ours. A reply
@@ -196,6 +268,7 @@ impl Stalled {
             tracing::warn!(
                 held,
                 limit = self.0.limit,
+                peer = ?self.0.peer,
                 "closing a connection: its stalled replies hold too much"
             );
             if let Some(waker) = self
@@ -286,6 +359,7 @@ const TIMERS: Timers = Timers {
 pub async fn health(
     services: &[&'static str],
     shutdown: impl Future<Output = ()>,
+    mut ready: watch::Receiver<bool>,
 ) -> (
     tonic_health::pb::health_server::HealthServer<impl tonic_health::pb::health_server::Health>,
     impl Future<Output = ()>,
@@ -297,7 +371,15 @@ pub async fn health(
             .await;
     }
     let shutdown = async move {
-        shutdown.await;
+        tokio::select! {
+            () = shutdown => {},
+            // The audit lost a line: the log has a hole, so the names
+            // flip now and stay flipped until a restart. The audit has
+            // logged the reason on its own path.
+            _ = ready.wait_for(|ready| !*ready) => {
+                tracing::error!("readiness lost: an audit line was not made durable");
+            },
+        }
         // Only the service names flip: the empty name is liveness, and a
         // stop must not tell the supervisor to kill a draining server.
         for name in services.iter().copied() {
@@ -329,7 +411,7 @@ impl Limits {
     ) -> Result<(), tonic::transport::Error>
     where
         I: Stream<Item = io::Result<IO>> + Send + 'static,
-        IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
+        IO: AsyncRead + AsyncWrite + Connected + PeerOf + Unpin + Send + 'static,
     {
         self.serve_with(&TIMERS, router, incoming, tls, shutdown, metrics)
             .await
@@ -346,7 +428,7 @@ impl Limits {
     ) -> Result<(), tonic::transport::Error>
     where
         I: Stream<Item = io::Result<IO>> + Send + 'static,
-        IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
+        IO: AsyncRead + AsyncWrite + Connected + PeerOf + Unpin + Send + 'static,
     {
         // One span per call: the RPC and the peer at the start, and the
         // principal and the repo once the call knows them. `error_span`, so
@@ -354,10 +436,13 @@ impl Limits {
         // `warn` filter still shows its fields.
         let server = Server::builder()
             .trace_fn(|request| {
+                // The connection's handle carries the peer: the connect
+                // info of a request below the router is ours, and the
+                // transport's `TcpConnectInfo` is not on the request.
                 let peer = request
                     .extensions()
-                    .get::<tonic::transport::server::TcpConnectInfo>()
-                    .and_then(tonic::transport::server::TcpConnectInfo::remote_addr)
+                    .get::<Stalled>()
+                    .and_then(Stalled::peer)
                     .map(|addr| addr.to_string())
                     .unwrap_or_default();
                 // The caller's request ID, if it sent one that fits. A
@@ -441,7 +526,7 @@ fn accept_tls<I, IO>(
 ) -> ReceiverStream<io::Result<Connection<TlsStream<IO>>>>
 where
     I: Stream<Item = io::Result<IO>> + Send + 'static,
-    IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
+    IO: AsyncRead + AsyncWrite + Connected + PeerOf + Unpin + Send + 'static,
 {
     let places = Arc::new(Semaphore::new(max.get()));
     let (done, served) = mpsc::channel(max.get());
@@ -488,6 +573,7 @@ where
             tokio::spawn(async move {
                 match wait.await {
                     Ok(Ok(stream)) => {
+                        let peer = stream.get_ref().0.peer_of();
                         // The place goes with the connection, and frees when
                         // it is dropped, which the gone receiver also does.
                         let _ = sender
@@ -495,7 +581,7 @@ where
                                 io: stream,
                                 _place: place,
                                 preface,
-                                stalled: Stalled::new(stalled_bytes, metrics),
+                                stalled: Stalled::new(peer, stalled_bytes, metrics),
                             }))
                             .await;
                     }
@@ -527,6 +613,7 @@ fn accept<I, IO, E>(
 ) -> impl Stream<Item = Result<Connection<IO>, E>>
 where
     I: Stream<Item = Result<IO, E>>,
+    IO: PeerOf,
 {
     let max = max.get();
     let stalled_bytes = stalled_bytes.get();
@@ -545,14 +632,44 @@ where
                     .await
                     .expect("the semaphore of places is never closed")
             };
+            let peer = io.peer_of();
             Ok(Connection {
                 io,
                 _place: place,
                 preface: Some((PREFACE_BYTES, Box::pin(tokio::time::sleep(handshake)))),
-                stalled: Stalled::new(stalled_bytes, metrics),
+                stalled: Stalled::new(peer, stalled_bytes, metrics),
             })
         }
     })
+}
+
+/// The peer of a connected stream, for the audit's refusal lines and
+/// the call span's `peer` field: the connect info a request carries
+/// below the router is the only peer a call still has.
+#[allow(unreachable_pub)]
+pub trait PeerOf {
+    /// The peer of the stream, when it is a socket.
+    fn peer_of(&self) -> Option<SocketAddr>;
+}
+
+impl PeerOf for tokio::net::TcpStream {
+    fn peer_of(&self) -> Option<SocketAddr> {
+        self.peer_addr().ok()
+    }
+}
+
+impl<IO: PeerOf> PeerOf for TlsStream<IO> {
+    fn peer_of(&self) -> Option<SocketAddr> {
+        self.get_ref().0.peer_of()
+    }
+}
+
+/// A Unix socket has no peer address: the audit's refusal lines name no
+/// peer for it.
+impl PeerOf for UnixStream {
+    fn peer_of(&self) -> Option<SocketAddr> {
+        None
+    }
 }
 
 /// A connection that keeps its place of [`accept`] until it is dropped.

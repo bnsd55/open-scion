@@ -543,6 +543,10 @@ type Bearer = Result<Request<()>, Status>;
 async fn connect(url: &str, token: Option<&str>) -> Client {
     let channel = Endpoint::from_shared(url.to_owned())
         .unwrap()
+        // A server or cache that died mid-reply must not leave the test
+        // waiting forever: the dial and every call are bounded.
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
         .connect()
         .await
         .unwrap();

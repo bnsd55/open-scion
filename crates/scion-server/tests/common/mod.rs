@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::Write as _;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -78,11 +79,33 @@ pub(crate) struct Server {
     pub url: String,
 }
 
+/// The token file of this test process: one per process, in the temp
+/// dir the ancestor walk accepts, private to the owner.
+pub(crate) fn token_file() -> &'static std::path::PathBuf {
+    use std::sync::OnceLock;
+    static FILE: OnceLock<std::path::PathBuf> = OnceLock::new();
+    FILE.get_or_init(|| std::env::temp_dir().join(format!("scion-token-{}", std::process::id())))
+}
+
+/// One staging name per call: two tests spawning at once must not race
+/// one staging file's rename.
+fn staging() -> &'static std::sync::atomic::AtomicU64 {
+    use std::sync::OnceLock;
+    use std::sync::atomic::AtomicU64;
+    static STAGING: OnceLock<AtomicU64> = OnceLock::new();
+    STAGING.get_or_init(|| AtomicU64::new(0))
+}
+
 impl Server {
     /// The server process's id, for a test that must tell the server's
     /// files from another process's.
     pub(crate) fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Whether the server process exited, and how: `None` while it runs.
+    pub(crate) fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().unwrap()
     }
 }
 
@@ -140,6 +163,29 @@ impl Server {
             .append(true)
             .open(log)
             .unwrap();
+        // The token rides in a 0600 file, the runbook's way: argv is
+        // readable by every user of the machine. The file lives in the
+        // temp dir every test's own tempdir sits in - the directories the
+        // ancestor walk already accepts - not next to a log that CI may
+        // place under the work dir, whose ancestors carry a default ACL
+        // the walk refuses. The rename is atomic, so a server that reads
+        // while a sibling test rewrites sees whole bytes.
+        let token_file = token_file();
+        let n = staging().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = token_file.with_extension(format!("tmp{n}"));
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .unwrap()
+                .write_all(TOKEN.as_bytes())
+                .unwrap();
+        }
+        fs::rename(tmp, token_file).unwrap();
         // The Postgres mode of the fault suites: metadata from the test
         // database, one schema per data directory, the same name
         // `Backend::open_test` gives it. The URL carries the schema as a
@@ -159,7 +205,9 @@ impl Server {
             if let Some(url) = &postgres_url {
                 cmd.arg("--postgres-url").arg(url);
             }
-            cmd.args(["serve", "--token", TOKEN, "--listen", "127.0.0.1:0"])
+            cmd.args(["serve", "--token-file"])
+                .arg(token_file)
+                .args(["--listen", "127.0.0.1:0"])
                 // Plain log lines, so the address parses without escape
                 // codes.
                 .env("NO_COLOR", "1")
@@ -299,11 +347,49 @@ impl Server {
 pub(crate) type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
 pub(crate) type Objects = ObjectsClient<InterceptedService<Channel, Bearer>>;
 
-pub(crate) async fn connect(url: &str) -> Result<(Scion, Objects), tonic::transport::Error> {
-    let channel = Channel::from_shared(url.to_owned())
+/// How long a test client may take to connect, and how long one call
+/// may run. A server that dies mid-reply must not leave a client
+/// waiting forever: a Channel without a connect timeout keeps trying
+/// to reconnect, and a call without a deadline waits on the reply for
+/// good. The ceilings fail loud with a name, in seconds, instead of
+/// eating the job's cap.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One channel for a test client: the timeout is the point. Every call
+/// on the channel carries `timeout` (the Endpoint applies it per
+/// request), so a server that dies mid-reply ends the call instead of
+/// parking it. A test that wants a tighter deadline sets its own and
+/// the smaller one fires first.
+pub(crate) async fn channel(url: &str) -> Result<Channel, tonic::transport::Error> {
+    channel_within(url, CALL_TIMEOUT).await
+}
+
+/// The same channel with a ceiling of the test's choosing, for the test
+/// that proves the ceiling itself.
+pub(crate) async fn channel_within(
+    url: &str,
+    timeout: Duration,
+) -> Result<Channel, tonic::transport::Error> {
+    Channel::from_shared(url.to_owned())
         .unwrap()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(timeout)
         .connect()
-        .await?;
+        .await
+}
+
+pub(crate) async fn connect(url: &str) -> Result<(Scion, Objects), tonic::transport::Error> {
+    connect_within(url, CALL_TIMEOUT).await
+}
+
+/// The pair of clients on a channel with a ceiling of the test's
+/// choosing: the proof of the ceiling itself uses 2 s.
+pub(crate) async fn connect_within(
+    url: &str,
+    timeout: Duration,
+) -> Result<(Scion, Objects), tonic::transport::Error> {
+    let channel = channel_within(url, timeout).await?;
     let bearer = Bearer::new(TOKEN).unwrap();
     let objects = ObjectsClient::with_interceptor(channel.clone(), bearer.clone());
     Ok((ScionClient::with_interceptor(channel, bearer), objects))
@@ -367,23 +453,49 @@ pub(crate) struct Ledger {
     pub oplog: ledger::OpLog,
 }
 
+/// The suite repo's root directory is wide, so a land's metadata cost
+/// is easy to see: a land writes one history node and one tree node per
+/// directory on its changed paths, and each node holds the whole
+/// directory level (the cost model of `history.rs`), so the bytes a
+/// land writes are the sizes of the directories above its change -
+/// about 64 bytes per entry, measured at directories of 1000 and 10000
+/// entries (63897 and 638976 bytes per land). The root is on every
+/// path, so with 1500 entries every land of the suites writes about 96
+/// KiB above its change, wide enough that a land stays pending between
+/// two looks at the database - the moment a kill must meet. The flake
+/// of #478 was that moment passing unseen: a fast runner's lands
+/// finished before the first poll, and the old fatal wait named a hold
+/// that never happened.
+const WIDE_ENTRIES: usize = 1500;
+
 /// Repo `r` with one root changeset, and refs `main` and `dev` at it. No RPC
 pub(crate) fn create_repo(data: &Path) {
     let store = open_store(data);
     let readme = store.blobs().put(b"crash suite\n").unwrap();
+    let mut files = vec![(
+        RepoPath::new("README").unwrap(),
+        Some(FileState::Regular {
+            content: readme,
+            executable: false,
+        }),
+    )];
+    for i in 0..WIDE_ENTRIES {
+        let bytes = format!("wide {i}\n").into_bytes();
+        let blob = store.blobs().put(&bytes).unwrap();
+        files.push((
+            RepoPath::new(format!("w{i:06}").into_bytes()).unwrap(),
+            Some(FileState::Regular {
+                content: blob,
+                executable: false,
+            }),
+        ));
+    }
     let root = Changeset::new(
         vec![],
         author(),
         None,
         b"root\n".to_vec(),
-        [(
-            RepoPath::new("README").unwrap(),
-            Some(FileState::Regular {
-                content: readme,
-                executable: false,
-            }),
-        )]
-        .into(),
+        files.into_iter().collect(),
     )
     .expect("changeset fits the format");
     store
@@ -397,6 +509,24 @@ pub(crate) fn create_repo(data: &Path) {
             Ok(())
         })
         .unwrap();
+}
+
+/// A bounded [`wait_until`]: gives the condition its time, reports
+/// whether it ever held, and never panics. The kill suites use it where
+/// a moment they want is likely but not certain, and count the kills
+/// that met it.
+pub(crate) async fn wait_until_bounded(what: &str, secs: u64, ready: impl Fn() -> bool) -> bool {
+    let give_up = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if ready() {
+            return true;
+        }
+        if Instant::now() >= give_up {
+            eprintln!("the waited-for condition did not hold within {secs} s: {what}");
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
 
 pub(crate) async fn put_blob(scion: &mut Scion, data: &[u8]) -> Result<BlobId, Status> {
@@ -914,10 +1044,24 @@ pub(crate) async fn check(
     }
 }
 
-/// Waits until `ready` holds, for at most 10 s.
-pub(crate) async fn wait_until(ready: impl Fn() -> bool) {
+/// Waits until `ready` holds, for at most 10 s, and names the condition
+/// it never saw: a caller that waits for "a large upload is in flight"
+/// must not run its crash on a moment that condition never came.
+pub(crate) async fn wait_until(what: &str, ready: impl Fn() -> bool) {
     let give_up = Instant::now() + Duration::from_secs(10);
-    while !ready() && Instant::now() < give_up {
+    loop {
+        // The condition is checked first and believed: a land that is
+        // pending at this instant may land before a second look, so the
+        // wait must not re-ask after the loop (a re-check races the very
+        // thing it waited for, and names a hold that did happen as one
+        // that never did).
+        if ready() {
+            return;
+        }
+        assert!(
+            Instant::now() < give_up,
+            "the waited-for condition never held within 10 s: {what}"
+        );
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }

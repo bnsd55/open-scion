@@ -26,6 +26,10 @@ use std::sync::atomic::AtomicBool;
 
 use crate::store::{Blobs, Store};
 
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "test_support/backend.rs"]
+pub(crate) mod test_hooks;
+
 /// The metadata storage of a server: the data directory, or a shared
 /// Postgres database. The backend is opaque — which engine it holds is
 /// private, so a caller matches classes of behavior through the
@@ -37,6 +41,7 @@ pub struct Backend {
 }
 
 /// The one engine this build holds, behind the opaque [`Backend`].
+
 #[derive(Clone)]
 enum Inner {
     /// One data directory on this machine.
@@ -46,32 +51,11 @@ enum Inner {
 }
 
 impl Backend {
-    /// A backend on the data directory's own store, for the crate's
-    /// tests: they prepare a store (a walk cap, a page cap) and then
-    /// wrap it.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn sqlite(store: Store) -> Self {
-        Self {
-            inner: Inner::Sqlite(store),
-        }
-    }
-
     /// A backend on a prepared Postgres handle, for the crate's tests.
     #[cfg(test)]
     pub(crate) fn postgres(pg: Pg) -> Self {
         Self {
             inner: Inner::Postgres(pg),
-        }
-    }
-
-    /// The data directory's own store, when this backend is one.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn as_sqlite(&self) -> Option<&Store> {
-        match &self.inner {
-            Inner::Sqlite(store) => Some(store),
-            Inner::Postgres(_) => None,
         }
     }
 
@@ -99,21 +83,7 @@ pub enum BackendTx<'a> {
     Postgres(PgTx<'a>),
 }
 
-impl BackendTx<'_> {
-    /// The connection of the data directory, for a test that asserts its
-    /// rows. [`None`] on Postgres, whose rows a test reads through the
-    /// [`MetaTx`] queries.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    pub fn sqlite(&self) -> Option<&rusqlite::Connection> {
-        match self {
-            // SqliteTx derefs to the connection.
-            Self::Sqlite(tx) => Some(tx),
-            Self::Postgres(_) => None,
-        }
-    }
-}
+impl BackendTx<'_> {}
 
 /// Clients that a Postgres backend pools for its reads: as many as a
 /// data directory holds, so the graph-walk bound of the server keeps its
@@ -212,6 +182,12 @@ fn refuse_postgres_marker(data: &Path) -> Result<()> {
 
 /// The store UUID a marker carries, if it names one: 32 hex digits on
 /// its second line.
+/// The store UUID the data directory's marker holds, for the archive's
+/// manifest: it names where the metadata came from.
+pub(crate) fn store_uuid_of(data: &Path) -> Option<[u8; 16]> {
+    marker_uuid(data)
+}
+
 fn marker_uuid(data: &Path) -> Option<[u8; 16]> {
     let text = std::fs::read_to_string(data.join(MARKER)).ok()?;
     let line = text.lines().nth(1)?.trim();
@@ -283,44 +259,6 @@ fn hex16(bytes: &[u8; 16]) -> String {
     hex
 }
 
-/// The URL of the test database. Its callers sit behind the test-hooks
-/// feature, and so does this.
-#[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn test_url() -> Result<String> {
-    std::env::var("SCION_TEST_POSTGRES_URL").map_err(|_| {
-        crate::error::Error::InvalidArgument(
-            "SCION_TEST_POSTGRES_URL must name the test database".into(),
-        )
-    })
-}
-
-/// A database schema name that belongs to `data`, so the tests of one
-/// directory share it and no others see it. Its callers sit behind the
-/// test-hooks feature, and so does this.
-#[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn test_schema(data: &Path) -> String {
-    // A name that does not depend on whether the directory exists yet:
-    // the first open of a test hashes a directory that is not there yet,
-    // and on a mac the temp root is reached through a symlink, so hashing the raw
-    // path then and the resolved path later names two schemas. The name
-    // resolves the deepest ancestor that exists, then appends the rest,
-    // so every open of one directory hashes one path.
-    let mut existing = data.to_path_buf();
-    let mut tail = std::collections::VecDeque::new();
-    while !existing.exists()
-        && let Some(name) = existing.file_name().map(std::ffi::OsStr::to_owned)
-    {
-        tail.push_front(name);
-        existing.pop();
-    }
-    let mut path = existing.canonicalize().unwrap_or(existing);
-    for name in tail {
-        path.push(name);
-    }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(&path, &mut hasher);
-    format!("scion_test_{:016x}", std::hash::Hasher::finish(&hasher))
-}
 
 impl Backend {
     /// Where a ref points.
@@ -337,15 +275,6 @@ impl Backend {
                 .map(|r| r.target)
                 .ok_or_else(|| crate::error::Error::NotFound(format!("ref {name:?}")))
         })
-    }
-
-    /// The advisory-lock key of the test schema's one-server lock, for
-    /// the test that takes the lock from its own connection, as a
-    /// second server process would.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_server_lock(data: &Path) -> Result<i64> {
-        Ok(crate::pg::schema_lock_key(&test_schema(data)))
     }
 
     /// The derive walks of this backend: which are in flight, and the cap
@@ -435,66 +364,6 @@ impl Backend {
         }
     }
 
-    /// [`Backend::open_test`], as a process that does not land: on the
-    /// data directory this is a shared [`Store`](crate::store::Store).
-    ///
-    /// # Errors
-    ///
-    /// What the store or the database returns, and a missing test URL.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn open_test_shared(data: &Path) -> Result<Self> {
-        if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
-            refuse_damaged_marker(data)?;
-            let marker = Marker::read(data);
-            refuse_sqlite_dir(data)?;
-            let pg =
-                Pg::open_test_shared(&test_url()?, &test_schema(data), PG_READERS, data, marker)?;
-            marker_agrees(data, pg.store_uuid())?;
-            return Ok(Self {
-                inner: Inner::Postgres(pg),
-            });
-        }
-        refuse_postgres_marker(data)?;
-        Self::open_shared(data, None, None)
-    }
-
-    /// Opens the backend that `SCION_TEST_BACKEND` names, for the
-    /// integration tests: `postgres` runs them against a Postgres database,
-    /// whose URL comes from `SCION_TEST_POSTGRES_URL`; any other value, or
-    /// none, opens the data directory. The URL is never logged.
-    ///
-    /// # Errors
-    ///
-    /// What the store or the database returns, and a missing test URL.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn open_test(data: &Path) -> Result<Self> {
-        if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
-            refuse_damaged_marker(data)?;
-            let marker = Marker::read(data);
-            refuse_sqlite_dir(data)?;
-            let pg = Pg::open_test(&test_url()?, &test_schema(data), PG_READERS, data, marker)?;
-            marker_agrees(data, pg.store_uuid())?;
-            return Ok(Self {
-                inner: Inner::Postgres(pg),
-            });
-        }
-        refuse_postgres_marker(data)?;
-        Self::open(data, None, None)
-    }
-
-    /// Whether `SCION_TEST_BACKEND` names Postgres. A test that asserts the
-    /// rows of the data directory's database skips itself on Postgres: its
-    /// assertions are about the SQLite schema, which the schema drift test
-    /// covers for Postgres.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    pub fn test_is_postgres() -> bool {
-        std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres")
-    }
-
     /// Whether this backend lost its database to another process: every
     /// read and write fails from then on. SQLite has no lock to lose, so
     /// it is never fenced.
@@ -516,34 +385,6 @@ impl Backend {
         match &self.inner {
             Inner::Sqlite(_) => None,
             Inner::Postgres(pg) => Some(pg.fence_flag()),
-        }
-    }
-
-    /// The schema that [`Backend::open_test`] gave this data directory on
-    /// Postgres: a test that counts rows through its own Postgres client
-    /// names it the same way. A result, so the callers unwrap one shape.
-    /// The schema a test backend of this directory uses, when the tests
-    /// run on Postgres. Hidden: a test holds a lock in it from a
-    /// connection of its own.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    pub fn test_schema(data: &Path) -> Option<String> {
-        if Self::test_is_postgres() {
-            Some(test_schema(data))
-        } else {
-            None
-        }
-    }
-
-    /// Write transactions run so far. SQLite only.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    pub fn txes(&self) -> u64 {
-        match &self.inner {
-            Inner::Sqlite(store) => store.txes(),
-            Inner::Postgres(_) => 0,
         }
     }
 
@@ -590,84 +431,9 @@ impl Backend {
             Inner::Postgres(pg) => pg.tx_age(),
         }
     }
-
-    /// Commits made so far. SQLite only: it counts the transactions of the
-    /// write connection, which is what the tests of the batching watch.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    pub fn commits(&self) -> u64 {
-        match &self.inner {
-            Inner::Sqlite(store) => store.commits(),
-            Inner::Postgres(_) => 0,
-        }
-    }
 }
 
-impl Backend {
-    /// Sets how many of the next commits of the data directory fail as a
-    /// busy database. A Postgres database has no busy error, so this only
-    /// reaches SQLite.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn fail_next_commits(&self, n: u32) {
-        if let Inner::Sqlite(store) = &self.inner {
-            store.fail_next_commits(n);
-        }
-    }
-
-    /// Sets how long the write connection of the data directory waits for
-    /// a busy database.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn set_busy_timeout(&self, timeout: std::time::Duration) {
-        if let Inner::Sqlite(store) = &self.inner {
-            store.set_busy_timeout(timeout);
-        }
-    }
-
-    /// The import's test hooks and busy-retry count, the same state on
-    /// both backends.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    fn hooks(&self) -> &crate::store::ImportHooks {
-        match &self.inner {
-            Inner::Sqlite(store) => store.hooks(),
-            Inner::Postgres(pg) => pg.hooks(),
-        }
-    }
-
-    /// Sets the step the tests run after each batch of the import commits.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn set_after_batch(&self, step: Option<crate::store::AfterBatch>) {
-        self.hooks().set_after_batch(step);
-    }
-
-    /// How many busy retries of the import's batches ran so far.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    pub fn busy_retries(&self) -> u64 {
-        self.hooks().busy_retries()
-    }
-
-    /// Runs the test step of a batch boundary, with the count of batches
-    /// done so far.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn run_after_batch(&self, batches: usize) {
-        self.hooks().run_after_batch(batches);
-    }
-
-    /// Counts one busy retry of the import's batch.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn note_busy_retry(&self) {
-        self.hooks().note_busy_retry();
-    }
-}
+impl Backend {}
 
 impl Meta for Backend {
     type Tx<'a>
@@ -862,6 +628,13 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn put_trees(&mut self, trees: &[(TreeId, Vec<u8>)]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.put_trees(trees),
+            Self::Postgres(pg) => pg.put_trees(trees),
+        }
+    }
+
     fn get_tree(&mut self, id: TreeId) -> Result<Tree> {
         match self {
             Self::Sqlite(tx) => tx.get_tree(id),
@@ -887,6 +660,13 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.add_repo_blob(repo, blob),
             Self::Postgres(pg) => pg.add_repo_blob(repo, blob),
+        }
+    }
+
+    fn add_repo_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.add_repo_blobs(repo, blobs),
+            Self::Postgres(pg) => pg.add_repo_blobs(repo, blobs),
         }
     }
 
@@ -962,6 +742,30 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.repo_blob_ids(repo),
             Self::Postgres(pg) => pg.repo_blob_ids(repo),
+        }
+    }
+
+    fn repo_changesets_with_bodies(
+        &mut self,
+        repo: RepoId,
+    ) -> Result<Vec<(Vec<u8>, i64, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.repo_changesets_with_bodies(repo),
+            Self::Postgres(pg) => pg.repo_changesets_with_bodies(repo),
+        }
+    }
+
+    fn list_refs(&mut self, repo: RepoId) -> Result<Vec<(String, Vec<u8>, i64)>> {
+        match self {
+            Self::Sqlite(tx) => tx.list_refs(repo),
+            Self::Postgres(pg) => pg.list_refs(repo),
+        }
+    }
+
+    fn pending_lands(&mut self, repo: RepoId) -> Result<Vec<crate::meta::PendingLand>> {
+        match self {
+            Self::Sqlite(tx) => tx.pending_lands(repo),
+            Self::Postgres(pg) => pg.pending_lands(repo),
         }
     }
 
@@ -1078,6 +882,13 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.cas_ref(repo, name, expected, target),
             Self::Postgres(pg) => pg.cas_ref(repo, name, expected, target),
+        }
+    }
+
+    fn restore_ref(&mut self, repo: RepoId, name: &str, target: &[u8], version: i64) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.restore_ref(repo, name, target, version),
+            Self::Postgres(pg) => pg.restore_ref(repo, name, target, version),
         }
     }
 

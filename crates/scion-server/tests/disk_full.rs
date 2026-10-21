@@ -261,3 +261,146 @@ fn a_disk_out_of_inodes_answers_out_of_space_and_needs_no_repair() {
     let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
     assert!(report.is_clean(), "{:?}", report.problems);
 }
+
+/// The client's blob put, the server's own path: `put_blob` records
+/// the `repo_blobs` row that gc's live-set walk reads; a bare
+/// `blobs().put` does not.
+fn seed_client_blob(
+    store: &Backend,
+    repo: scion_server::test_support::meta::RepoId,
+    content: &[u8],
+) -> scion_core::BlobId {
+    let upload = store.blobs().upload().unwrap().append(content).unwrap();
+    scion_server::test_support::write::put_blob(store, repo, upload)
+        .expect("the client's blob put lands")
+}
+
+/// The disk-full runbook (docs/operations.md, "Disk full"), step by
+/// step: the disk fills and refuses, the gc routine frees what nothing
+/// names (a dry run first, then a real one), fsck is clean, and writes
+/// resume with no restart and no repair.
+#[test]
+fn a_disk_full_runbook_gcs_then_writes_resume() {
+    if !required() {
+        return;
+    }
+    let mount = Mount::new("runbook", "8m", "4096");
+    let store = open_store(&mount, "first open of the runbook test");
+    // The data the operator keeps: one repo whose changeset names one
+    // blob, so the gc routine must keep it and free the rest. The blob
+    // goes up the server's own path: put_blob records the repo_blobs
+    // row the gc's live-set walk reads, as a client's PutBlob would.
+    let repo = store.write(|c| c.create_repo("main")).unwrap();
+    let named = seed_client_blob(&store, repo, b"named\n");
+    let cs = scion_core::Changeset::new(
+        vec![],
+        scion_core::IdentityTime::new(
+            b"Ada".to_vec(),
+            b"ada@example.com".to_vec(),
+            1_700_000_000,
+            0,
+        )
+        .expect("identity fits the format"),
+        None,
+        b"runbook\n".to_vec(),
+        [(
+            scion_core::RepoPath::new("RUNBOOK.md").unwrap(),
+            Some(scion_core::FileState::Regular {
+                content: named,
+                executable: false,
+            }),
+        )]
+        .into(),
+    )
+    .expect("changeset fits the format");
+    let cs = store
+        .write(|c| c.insert_changeset(repo, &cs))
+        .expect("the changeset lands");
+    store
+        .write(|c| c.cas_ref(repo, "main", None, cs))
+        .expect("the ref moves");
+    let unnamed = store.blobs().put(b"unnamed\n").unwrap();
+
+    // Step 0, the alert's trigger: the disk fills and refuses.
+    let (error, _landed) = fill_with_blobs(&store, 64 * 1024);
+    assert!(is_out_of_space(&error), "{error:?}");
+
+    // Step 1, the runbook's gc routine: a dry run reports what it
+    // would collect and removes nothing, then a real run collects the
+    // unnamed blobs. The blobs are seconds old, so the grace must be
+    // zero for the run to take them.
+    let data = mount.0.join("data");
+    let gc = |dry: bool| {
+        let mut args = vec![
+            "--data".to_owned(),
+            data.display().to_string(),
+            "gc".to_owned(),
+            "--grace-secs".to_owned(),
+            "0".to_owned(),
+        ];
+        if dry {
+            args.push("--dry-run".to_owned());
+        }
+        let out = common::spawn_guard::across_spawn(|| {
+            std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
+                .args(&args)
+                .env("NO_COLOR", "1")
+                .output()
+                .expect("the gc command runs")
+        });
+        assert!(
+            out.status.success(),
+            "gc {} failed: {}",
+            if dry { "--dry-run" } else { "real" },
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let dry = gc(true);
+    assert!(dry.contains("(dry run)"), "a dry run labels itself: {dry}");
+    let real = gc(false);
+    assert!(
+        !real.contains("dry run"),
+        "the real run does not label itself: {real}"
+    );
+    // The real run's count: "gc: N repos, M rows pruned, K files removed".
+    let files = real
+        .split(" rows pruned, ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|count| count.parse::<u64>().ok())
+        .unwrap_or(0);
+    assert!(
+        files > 0,
+        "the real run removed the unnamed blobs, not {files}: {real}"
+    );
+
+    // The gc freed the space the unnamed blobs held: the named one
+    // still reads, the unnamed one is gone, and a write lands again
+    // with no restart and no grow.
+    assert_eq!(store.blobs().get(named).unwrap(), b"named\n");
+    assert!(
+        store.blobs().get(unnamed).is_err(),
+        "gc removed the blob nothing names"
+    );
+    let freed = store.blobs().put(b"freed\n").unwrap();
+    assert_eq!(store.blobs().get(freed).unwrap(), b"freed\n");
+
+    // Step 2 of the runbook: fsck, and it is clean.
+    let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
+    assert!(report.is_clean(), "{:?}", report.problems);
+
+    // Step 3's premise: gc freed too little here (the named data stays
+    // and the mount is still nearly full is fine) - the runbook's own
+    // step is to grow the volume, which needs no restart.
+    mount.remount_bigger("64m", "4096");
+    let after = store.blobs().put(b"after\n").unwrap();
+    assert_eq!(store.blobs().get(after).unwrap(), b"after\n");
+    drop(store);
+    common::spawn_guard::across_release(|| {
+        common::spawn_guard::wait_for_lock_release(&mount.0.join("data"));
+    });
+    let store = open_store(&mount, "reopen of the runbook test");
+    let report = scion_server::fsck::run(&store, 1, &mut |_| {}).unwrap();
+    assert!(report.is_clean(), "{:?}", report.problems);
+}

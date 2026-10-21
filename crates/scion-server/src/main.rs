@@ -18,7 +18,7 @@ use scion_server::{ImportOptions, import_git};
 
 use scion_server::Metrics;
 use scion_server::Quotas;
-use scion_server::{Backend, Error, ServeOptions, fsck, gc};
+use scion_server::{Backend, Error, ServeOptions, archive, fsck, gc};
 use tracing_subscriber::EnvFilter;
 
 /// The scion server: import, serve and derive.
@@ -137,6 +137,11 @@ struct ServeArgs {
     /// `--insecure-listen`, because the metrics travel unencrypted.
     #[arg(long, value_name = "ADDR")]
     metrics_listen: Option<SocketAddr>,
+    /// Where the audit log goes. The default is `audit.log` in the data
+    /// directory. Every server records one: there is no way to turn the
+    /// audit off.
+    #[arg(long, value_name = "FILE")]
+    audit_file: Option<PathBuf>,
     /// How long the in-flight calls have to finish once the first signal
     /// starts the drain. Past it the calls are cut, the log names the
     /// count, and the process exits non-zero, so a supervisor restarts it.
@@ -196,6 +201,42 @@ enum Command {
     /// One line per problem: kind, ID, path. Exit 0 when it saw no damage,
     /// 1 when it did, 2 when it could not run.
     Fsck,
+    /// Export a whole repository, or the whole store, to a versioned
+    /// logical archive: a directory of files that `verify` checks and
+    /// `restore` replays into an empty store. The format is
+    /// docs/archive-format.md. The metadata sections are one read
+    /// snapshot, so it is safe beside a live server.
+    Export {
+        /// The name of one repository to export.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Export every repository of the store.
+        #[arg(long)]
+        all: bool,
+        /// The archive directory to write. It must not exist.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Check an archive against its format, without the store's code: it
+    /// re-hashes every blob file and every changeset body, and checks
+    /// that every ref, parent, and land input is backed. One line per
+    /// damage. Exit 0 when it saw none, 1 when it did, 2 when it could
+    /// not run.
+    Verify {
+        /// The archive directory to check.
+        #[arg(long)]
+        archive: PathBuf,
+    },
+    /// Replay an archive into an EMPTY data directory: the blob files go
+    /// through the store's own write path, so every object ID carries
+    /// over; the changesets replay in generation order; the refs go back
+    /// with the versions the export read; the pending lands are recorded
+    /// again, so a retry with the same request key resumes.
+    Restore {
+        /// The archive directory to replay.
+        #[arg(long)]
+        archive: PathBuf,
+    },
     /// Collect the blob files and the rows that nothing names any more: a
     /// row whose blob no stored changeset of its repo puts, and a file that
     /// no repo's row names, both older than the grace period. Safe beside a
@@ -249,6 +290,29 @@ enum KindName {
     /// The path history of each changeset.
     #[value(name = "path_history")]
     PathHistory,
+}
+
+/// Runs `export` and prints the manifest's counts. Exits 0, or 2 when
+/// the export could not run.
+fn archive_export(store: &Backend, data: &Path, repo: Option<&str>, all: bool, out: &Path) -> ! {
+    match archive::export(store, data, repo, all, out) {
+        Ok(manifest) => {
+            let counts = &manifest["counts"];
+            println!(
+                "export: {} repos, {} changesets, {} refs, {} lands, {} blobs",
+                counts["repos"],
+                counts["changesets"],
+                counts["refs"],
+                counts["pending_lands"],
+                counts["blobs"],
+            );
+            std::process::exit(0)
+        }
+        Err(e) => {
+            eprintln!("scion-server export: {e}");
+            std::process::exit(2);
+        }
+    }
 }
 
 /// Runs `fsck` against `store`, prints one line per problem, and exits:
@@ -375,26 +439,29 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve(args) => Some(serve_flags(args)?),
         _ => None,
     };
-    // `hash-token` needs no data directory. An import does not land, so it
-    // can run beside the server. `derive` removes rows of older versions of a
-    // kind, which a running server of an older build may read, so it opens as
-    // the server.
+    // `hash-token`, `verify`, and `restore` need no data directory (verify
+    // reads only the archive; restore makes a new one). An import does not
+    // land, so it can run beside the server. `derive` removes rows of older
+    // versions of a kind, which a running server of an older build may
+    // read, so it opens as the server.
     // The Postgres URL of the flags: the file form wins (the two cannot
     // be given together), the argv form warns, the env is quiet.
     let postgres_url = postgres_url_of(&cli)?;
     let store = match cli.command {
-        Command::Import { .. } | Command::Gc { .. } => Backend::open_shared(
-            &cli.data,
-            postgres_url.as_deref(),
-            cli.postgres_ca.as_deref(),
-        ),
+        Command::Import { .. } | Command::Gc { .. } | Command::Export { .. } => {
+            Backend::open_shared(
+                &cli.data,
+                postgres_url.as_deref(),
+                cli.postgres_ca.as_deref(),
+            )
+        }
         Command::HashToken { .. } => return hash_token(),
         Command::TicketKey { .. } => return write_ticket_key(),
         // `fsck` cannot run when the store cannot open, and its table
         // says that is 2, not the generic open failure's 1.
         Command::Fsck => match Backend::open_shared(
             &cli.data,
-            cli.postgres_url.as_deref(),
+            postgres_url.as_deref(),
             cli.postgres_ca.as_deref(),
         ) {
             Ok(store) => Ok(store),
@@ -406,6 +473,7 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(2);
             }
         },
+        Command::Verify { .. } | Command::Restore { .. } => unreachable!("handled below"),
         Command::Serve { .. } | Command::Derive { .. } => Backend::open(
             &cli.data,
             postgres_url.as_deref(),
@@ -416,6 +484,31 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Serve { .. } => {
             let flags = flags.expect("a serve command validated its flags");
+            // The audit opens after the store: the data directory must be
+            // empty at its first open, and the default audit file lives
+            // in it. A server that cannot record refuses to run.
+            let audit_path = flags
+                .audit_file
+                .clone()
+                .unwrap_or_else(|| cli.data.join("audit.log"));
+            let audit = scion_server::Audit::open(&audit_path)
+                .with_context(|| format!("cannot open audit log {}", audit_path.display()))?;
+            audit
+                .record(scion_server::Event::new(
+                    "admin",
+                    "ok",
+                    serde_json::json!({
+                        "what": "start",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "tls": flags.server_tls.is_some(),
+                        "mtls": flags.mtls,
+                        "insecure_listen": flags.insecure_listen,
+                        "access_tokens": flags.access.token_count(),
+                        "ticket_keys": flags.tickets.as_ref().map_or(0, |keys| keys.for_verify().len()),
+                    }),
+                ))
+                .await
+                .with_context(|| format!("cannot record the audit start line in {}", audit_path.display()))?;
             serve(
                 store,
                 flags.listen,
@@ -431,6 +524,7 @@ async fn main() -> anyhow::Result<()> {
                     max_stalled_bytes: flags.max_stalled_bytes,
                     metrics_listen: flags.metrics_listen,
                     drain_timeout: Duration::from_secs(flags.drain_timeout_secs),
+                    audit,
                 },
                 flags.tickets,
             )
@@ -438,6 +532,41 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::HashToken { .. } | Command::TicketKey { .. } => {
             unreachable!("handled before the store opens")
+        }
+        Command::Verify { archive } => {
+            let damages = match archive::verify(&archive) {
+                Ok(damages) => damages,
+                Err(e) => {
+                    eprintln!("scion-server verify: {e:#}");
+                    std::process::exit(2);
+                }
+            };
+            for line in &damages {
+                println!("{line}");
+            }
+            println!("verify: {} damages", damages.len());
+            std::process::exit(i32::from(!damages.is_empty()));
+        }
+        Command::Restore { archive } => {
+            let names = match archive::restore(
+                &archive,
+                &cli.data,
+                cli.postgres_url.as_deref(),
+                cli.postgres_ca.as_deref(),
+            ) {
+                Ok(names) => names,
+                Err(e) => {
+                    eprintln!("scion-server restore: {e:#}");
+                    std::process::exit(2);
+                }
+            };
+            for name in &names {
+                println!("{name}");
+            }
+            println!("restore: {} repos", names.len());
+        }
+        Command::Export { repo, all, out } => {
+            archive_export(&store, &cli.data, repo.as_deref(), all, &out);
         }
         Command::Fsck => {
             return fsck_command(&store);
@@ -562,6 +691,9 @@ struct ServeConfig {
     /// How long the drain waits for the in-flight calls before it cuts
     /// them (`--drain-timeout-secs`).
     drain_timeout: std::time::Duration,
+    /// The audit log, opened by the caller, which records its start
+    /// line before the server serves.
+    audit: scion_server::Audit,
 }
 
 /// The validated flags of a `serve` command: everything `serve` needs is
@@ -579,6 +711,12 @@ struct ServeFlags {
     metrics_listen: Option<SocketAddr>,
     tickets: Option<Arc<scion_server::Keys>>,
     drain_timeout_secs: u64,
+    /// The audit log the operator asked for, if any. The default path
+    /// is the data directory's, which only the caller knows.
+    audit_file: Option<PathBuf>,
+    /// The listen and TLS posture, for the audit's start line.
+    insecure_listen: bool,
+    mtls: bool,
 }
 
 /// Checks every `serve` flag that a parse alone does not settle: the rules
@@ -637,6 +775,9 @@ fn serve_flags(args: &ServeArgs) -> anyhow::Result<ServeFlags> {
         metrics_listen: args.metrics_listen,
         tickets,
         drain_timeout_secs: args.drain_timeout_secs,
+        audit_file: args.audit_file.clone(),
+        insecure_listen: args.insecure_listen,
+        mtls: args.tls_client_ca.is_some(),
     })
 }
 
@@ -715,6 +856,7 @@ async fn serve(
             land_stale_secs: config.land_stale_secs,
             tls: config.server_tls,
             metrics,
+            audit: config.audit,
         },
         tickets,
         async move {

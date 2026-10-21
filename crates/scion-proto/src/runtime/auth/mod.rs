@@ -261,6 +261,22 @@ pub fn read_secret_file(file: &Path) -> io::Result<Vec<u8>> {
     read_checked_file(file, true)
 }
 
+/// The most bytes [`read_secret_file`] and [`read_shared_file`] take
+/// whole. The largest legitimate caller is the access file's worst
+/// case — 32 rule sets of 256 prefixes, about 800 KB — so 1 MiB covers
+/// every token, URL, key and access file with room, and anything past
+/// it is refused without a read. The snapshot reader streams through
+/// [`open_checked_file`](Self::open_checked_file) instead and holds no
+/// cap: a snapshot is the size of a disk by design.
+/// The most bytes [`read_secret_file`] and [`read_shared_file`] take
+/// whole. The largest legitimate caller is the access file's worst
+/// case — 32 rule sets of 256 prefixes, about 800 KB — so 1 MiB covers
+/// every token, URL, key and access file with room, and anything past
+/// it is refused without a read. The snapshot reader streams through
+/// [`open_checked_file`](Self::open_checked_file) instead and holds no
+/// cap: a snapshot is the size of a disk by design.
+pub(crate) const MAX_CHECKED_FILE: u64 = 1024 * 1024;
+
 /// Reads `file` that is public but must stay whole, such as the public key
 /// that a ticket rotation keeps alive: the same one-descriptor check as
 /// [`read_secret_file`], except the mode rule is write, not read - no group
@@ -293,10 +309,58 @@ pub fn checked_read_error(file: &Path, why: io::Error) -> anyhow::Error {
 
 /// [`read_secret_file`] and [`read_shared_file`]: `secret` picks the mode
 /// rule (no group or others read, or no write).
+///
+/// The whole file is taken into memory, so the size cap
+/// ([`MAX_CHECKED_FILE`]) refuses anything past it. The cap holds
+/// twice: the descriptor's length refuses a big file before a byte is
+/// read (the early, cheap refusal), and the read itself runs through
+/// [`Take`](std::io::Take) at the cap, so a file that grows between
+/// the two — an append, a growing sparse file — is still refused, not
+/// read whole. The largest legitimate caller is the access file's
+/// worst case (32 rule sets of 256 prefixes, about 800 KB), a token
+/// or a URL is a few KiB, and 1 MiB covers both with room. The
+/// snapshot reader streams instead and holds no cap by design.
 fn read_checked_file(file: &Path, secret: bool) -> io::Result<Vec<u8>> {
-    let mut opened = open_checked_file(file, secret)?;
+    let opened = open_checked_file(file, secret)?;
+    let size = opened.metadata()?.len();
+    if size > MAX_CHECKED_FILE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is {} bytes, past the {} MiB cap for a checked file",
+                file.display(),
+                size,
+                MAX_CHECKED_FILE / (1024 * 1024)
+            ),
+        ));
+    }
+    read_bounded(opened, MAX_CHECKED_FILE, || {
+        format!(
+            "{} grew past the {} MiB cap for a checked file while it was read",
+            file.display(),
+            MAX_CHECKED_FILE / (1024 * 1024)
+        )
+    })
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Reads `reader` whole under `cap`, with no trust in the size anyone
+/// reported: the read itself is bounded at `cap + 1` bytes, and one
+/// byte more than the cap is refused through `too_long` — a reader
+/// whose bytes arrived after the size was taken (an appended file, a
+/// growing sparse file) is refused, not held.
+fn read_bounded<R: std::io::Read>(
+    reader: R,
+    cap: u64,
+    too_long: impl FnOnce() -> String,
+) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
     let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut opened, &mut bytes)?;
+    let mut bounded = reader.take(cap + 1);
+    bounded.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, too_long()));
+    }
     Ok(bytes)
 }
 
@@ -315,7 +379,11 @@ pub fn open_checked_file(file: &Path, secret: bool) -> io::Result<std::fs::File>
     let resolved = check_ancestors(file, me)?;
     let opened = rustix::fs::open(
         &resolved,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        // NONBLOCK: a FIFO would otherwise block the open until a
+        // writer shows up, and a planted FIFO would hang the server at
+        // startup. A regular file ignores it; a FIFO fails the file-
+        // type check below, on the descriptor, before any read.
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
         rustix::fs::Mode::empty(),
     )
     .map_err(|why| {
@@ -582,7 +650,29 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The bound the checked read puts on the bytes themselves: a
+    /// source whose size said `cap` but that yields `cap + 1` bytes
+    /// when read — a file that grew after the fstat — is refused by
+    /// [`read_bounded`], deterministically, with no thread and no
+    /// timing. A source that yields exactly the cap is read whole.
+    #[test]
+    fn a_reader_that_yields_one_byte_past_the_cap_is_refused() {
+        // The size lied: it said 16 bytes, the reader yields 17.
+        let liar = std::io::Cursor::new(vec![b'x'; 17]);
+        let refused = read_bounded(liar, 16, || "the source grew past the cap".to_owned());
+        let why = refused.expect_err("a reader one byte past the cap must be refused");
+        assert!(why.to_string().contains("grew past"), "{why}");
+
+        // The honest edge: exactly the cap bytes, read whole.
+        let honest = std::io::Cursor::new(vec![b'y'; 16]);
+        let bytes = read_bounded(honest, 16, || "never".to_owned())
+            .expect("a source at exactly the cap reads whole");
+        assert_eq!(bytes.len(), 16);
+    }
+    use std::os::unix::fs::symlink;
 
     use super::*;
 
@@ -917,6 +1007,40 @@ mod tests {
         };
         assert!(
             run(["+a", "everyone deny delete", &dir.to_string_lossy()].as_ref())
+                .status
+                .success()
+        );
+        read_shared_file(&file).unwrap();
+    }
+
+    /// An ACL added to a file and then removed leaves no empty ACL
+    /// behind: the read passes both with the deny entry (deny only) and
+    /// after its removal, as if the file had never carried an ACL.
+    /// Measured on macOS: `chmod +a` then `chmod -a` collapses the ACL,
+    /// and `acl_get_fd_np` answers `ENOENT` again — the no-ACL case —
+    /// so the walk never sees a zero-entry handle whose first call
+    /// would answer `EINVAL`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_acl_added_and_removed_leaves_no_empty_acl_behind() {
+        let (tmp, _me) = tempdir();
+        let file = tmp.path().join("shared");
+        fs::write(&file, b"bytes").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("chmod")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(
+            run(["+a", "everyone deny delete", &file.to_string_lossy()].as_ref())
+                .status
+                .success()
+        );
+        read_shared_file(&file).unwrap();
+        assert!(
+            run(["-a", "everyone deny delete", &file.to_string_lossy()].as_ref())
                 .status
                 .success()
         );

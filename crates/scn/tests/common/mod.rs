@@ -3,6 +3,8 @@
 // Each test file uses only some of them.
 #![allow(dead_code)]
 
+use std::time::Duration;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -38,6 +40,11 @@ pub(crate) type Client = ObjectsClient<InterceptedService<Channel, Bearer>>;
 pub(crate) async fn connect(url: &str) -> Client {
     let channel = Endpoint::from_shared(url.to_owned())
         .unwrap()
+        // A server that died mid-reply must not leave a test client
+        // waiting forever: the connect timeout bounds the dial, the
+        // per-request timeout bounds every call.
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
         .connect()
         .await
         .unwrap();
@@ -100,6 +107,7 @@ impl Tiers {
             TOKEN,
             service::ServeOptions {
                 data: data.path().to_path_buf(),
+                audit: scion_server::test_support::audit::Audit::off(),
                 limits: Limits::default(),
                 quotas: scion_server::Quotas::off(),
                 pending_lands: None,

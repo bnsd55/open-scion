@@ -41,7 +41,15 @@ use tonic::Status;
 
 /// Rounds of land, kill and check. Each round starts the server, runs the
 /// principals, kills the server under them, and checks.
-const ROUNDS: u64 = 3;
+// Fifteen rounds: ten of them are kill rounds (every round but those
+// divisible by three), and the wide lands keep a land pending in nearly
+// every kill - this suite measured 100 of 100 kill rounds over 50
+// runs. At the crash suite's conservative rate of about one kill in two
+// meeting pending, the chance all ten kill rounds miss is about
+// 0.5^10, just under 0.1% - the margin the final assert needs, so the
+// assert itself cannot be the next flake.
+const ROUNDS: u64 = 15;
+
 /// Principals that land concurrently. Each holds its own connections and
 /// its own request keys: the by-key rule is per (repo, caller, key).
 const PRINCIPALS: usize = 4;
@@ -701,6 +709,7 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
 
     let mut model = Model::default();
     let mut rng = Rng::new(seed);
+    let mut pending_kills = 0usize;
     for round in 0..rounds {
         let server = Server::start(&data, &log);
         let signals = Arc::new(Signals::default());
@@ -714,9 +723,15 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
                 tokio::spawn(principal(url, caller, rng, OPS, signals))
             })
             .collect();
-        // Let the principals get to work, then kill the server under them:
-        // two rounds in three, at a moment a land is pending, so a crash
-        // meets a pending row.
+        // Let the principals get to work, then kill the server under
+        // them: two rounds in three, at a moment a land is pending, so a
+        // crash meets a pending row. The wide lands keep a land pending
+        // long enough to see; the wait is bounded and counted, not
+        // fatal - the test asserts at its end that at least one kill met
+        // a pending row, so the moment the model exists to test is
+        // measured, not assumed (the flake of #478: a fast runner's
+        // lands finished before the first poll, and the old fatal wait
+        // named a hold that never happened).
         tokio::time::sleep(Duration::from_millis(150)).await;
         if round % 3 != 0 && !Backend::test_is_postgres() {
             // SHORTCUT: this ceiling is the SQLite-file read; the lands
@@ -727,7 +742,13 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
             // on Postgres: opening scion.db beside a Postgres server
             // would create a file the restart refuses.
             let conn = rusqlite::Connection::open(data.join("scion.db")).unwrap();
-            wait_until(|| pending_lands(&conn) > 0).await;
+            if wait_until_bounded("a land is pending in the database", 5, || {
+                pending_lands(&conn) > 0
+            })
+            .await
+            {
+                pending_kills += 1;
+            }
         }
         tokio::time::sleep(Duration::from_millis(u64::try_from(rng.below(60)).unwrap())).await;
         signals.killed.store(true, Ordering::SeqCst);
@@ -770,4 +791,10 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
         "{} lands checked over {rounds} rounds; the model holds",
         model.recs.len()
     );
+    assert!(
+        pending_kills > 0,
+        "no kill met a land pending in the database: {pending_kills} of {rounds} rounds; \
+         the wide lands must keep pending common"
+    );
+    println!("{pending_kills} of {rounds} kill rounds met a land pending in the database");
 }

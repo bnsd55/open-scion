@@ -493,7 +493,19 @@ impl<S: Store> Tier<S> {
             );
             endpoint
         };
-        let channel = endpoint.connect_lazy();
+        // The mirror of the server's own keepalive (listen.rs): a peer
+        // that died without a FIN or RST is noticed in about
+        // `CLIENT_KEEPALIVE_INTERVAL` plus its timeout, not at the tier's
+        // upstream timeout of a whole call.
+        let (interval, answer) = scion_proto::runtime::listen::client_keepalive();
+        let channel = endpoint
+            .http2_keep_alive_interval(interval)
+            .keep_alive_timeout(answer)
+            // An idle channel must notice a dead peer too: the next call
+            // answers at once, not after the upstream window.
+            .keep_alive_while_idle(true)
+            .tcp_keepalive(Some(scion_proto::runtime::listen::client_tcp_keepalive()))
+            .connect_lazy();
         let bearer = if upstream_token.is_empty() {
             None
         } else {
@@ -568,7 +580,13 @@ impl<S: Store> Tier<S> {
     ) -> Result<(), tonic::transport::Error>
     where
         I: Stream<Item = io::Result<IO>> + Send + 'static,
-        IO: AsyncRead + AsyncWrite + Connected + Unpin + Send + 'static,
+        IO: scion_proto::runtime::listen::PeerOf
+            + AsyncRead
+            + AsyncWrite
+            + Connected
+            + Unpin
+            + Send
+            + 'static,
     {
         // Outside the token check, so a refused call counts too.
         let metrics = Arc::clone(&self.inner.metrics);
@@ -583,8 +601,10 @@ impl<S: Store> Tier<S> {
         // The health service answers `grpc.health.v1.Check` and `Watch` on
         // the same port, without a token: a probe carries none. The store
         // and the upstream channel opened before this call, so the tier
-        // starts serving.
-        let (health, shutdown) = listen::health(&["scion.v1.Objects"], shutdown).await;
+        // starts serving. The tier has no audit log: its readiness
+        // watch never flips on its own.
+        let (_ready, ready) = tokio::sync::watch::channel(true);
+        let (health, shutdown) = listen::health(&["scion.v1.Objects"], shutdown, ready).await;
         let router = |mut server: Server| server.add_service(health).add_service(objects);
         limits
             .serve(
