@@ -308,12 +308,17 @@ jobs:
           # An SBOM file is the payload of an sbom attestation, not a
           # subject; the artifacts it describes carry the attestation.
           # The environment record is metadata, covered by the hash in
-          # the attested checksums.txt.
-          find cell -type f \
-            ! -name '*.cdx.json' ! -name 'release-environment.txt' |
-            while read -r file; do
-              gh attestation verify "$file" --repo "$GITHUB_REPOSITORY"
-            done
+          # the attested checksums.txt. One line per artifact: the
+          # number of attestations the sigstore bundle verified.
+          count=0
+          while read -r file; do
+            n="$(gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" \
+              --format json --jq 'length')"
+            echo "attested: $file ($n attestations)"
+            count=$((count + n))
+          done < <(find cell -type f \
+            ! -name '*.cdx.json' ! -name 'release-environment.txt')
+          echo "$count attestations verified in total"
 
   # The release step: only on a real tag, never in a dry-run, and only
   # after the diff and the attestations passed. The release is created
