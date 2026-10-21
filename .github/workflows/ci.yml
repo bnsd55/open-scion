@@ -98,7 +98,7 @@ jobs:
           for lock in crates/*/fuzz/Cargo.lock; do
             dir="$(dirname "$lock")"
             echo "== cargo deny check in $dir"
-            (cd "$dir" && cargo deny --config "$dir/deny.toml" check)
+            (cd "$dir" && cargo deny --config deny.toml check)
           done
       # A new sub-workspace whose lockfile sits outside the loop above
       # would carry advisories unseen again; this names it.
