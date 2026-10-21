@@ -779,7 +779,13 @@ impl Pg {
         data: &Path,
         marker: Marker,
     ) -> Result<Self> {
-        Self::open_in(url, ca, readers, data, None, true, marker)
+        // The schema a URL names is real for an exclusive open too: the
+        // tests ride one database with one schema per data directory, and
+        // each directory's server is the one server OF ITS SCHEMA, not of
+        // the whole database. Without this, parallel servers of distinct
+        // schemas would fence each other on the database-wide key.
+        let schema = schema_of_url(url);
+        Self::open_in(url, ca, readers, data, schema.as_deref(), true, marker)
     }
 
     /// [`Pg::open`], in `schema` instead of the database's default one, for
@@ -1734,6 +1740,22 @@ fn merged_options(from_url: Option<&str>, own: &str) -> String {
         Some(from_url) if !from_url.is_empty() => format!("{from_url} {own}"),
         _ => own.to_owned(),
     }
+}
+
+/// The schema the URL's own `options` name, if it names one: the tests
+/// ride `options=--search_path%3D<schema>`, and every connection of the
+/// open, exclusive or not, resolves its unqualified names inside it. A
+/// URL without the option names no schema, and a bare `--search_path=`
+/// (libpq's other spellings) is not this backend's ride, so it names
+/// none either.
+fn schema_of_url(url: &str) -> Option<String> {
+    let config: postgres::Config = url.parse().ok()?;
+    config
+        .get_options()
+        .iter()
+        .find_map(|option| option.strip_prefix("--search_path="))
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
 }
 
 /// [`connect_with`]'s work: parse, then connect.
@@ -3113,7 +3135,7 @@ fn prepare_test_schema(url: &str, schema: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, NoTls, P, merged_options};
+    use super::{Client, NoTls, P, merged_options, schema_of_url};
     use crate::backend::old_store;
     use crate::pg::Pg;
     use std::sync::Arc;
@@ -3125,6 +3147,30 @@ mod tests {
         assert_eq!(
             merged_options(Some("--search_path=scion_test_1"), OWN),
             format!("--search_path=scion_test_1 {OWN}")
+        );
+    }
+
+    #[test]
+    fn a_url_that_rides_a_schema_names_it_and_a_plain_one_names_none() {
+        // The ride the tests use: URL-encoded `options`, one schema.
+        assert_eq!(
+            schema_of_url(
+                "postgres://postgres:scion@localhost:5432/scion?options=--search_path%3Dscion_test_ab"
+            )
+            .as_deref(),
+            Some("scion_test_ab")
+        );
+        // A production URL names no schema and keeps the database lock.
+        assert_eq!(
+            schema_of_url("postgres://postgres:scion@localhost:5432/scion"),
+            None
+        );
+        // An option of another kind is not a ride.
+        assert_eq!(
+            schema_of_url(
+                "postgres://postgres:scion@localhost:5432/scion?options=-cstatement_timeout%3D1s"
+            ),
+            None
         );
     }
 

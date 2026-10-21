@@ -185,17 +185,25 @@ impl Server {
 /// first. The name is the one `Backend::open_test` gives the same
 /// directory, so a pre-seeded store and the server that serves it share
 /// one schema.
-fn postgres_url(data: &Path) -> String {
-    let url = std::env::var("SCION_TEST_POSTGRES_URL")
-        .expect("SCION_TEST_POSTGRES_URL must name the test database");
-    let schema = Backend::test_schema(data).expect("postgres mode names a schema");
-    let mut client =
-        postgres::Client::connect(&url, postgres::NoTls).expect("the test database connects");
-    client
-        .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
-        .unwrap();
-    let sep = if url.contains('?') { '&' } else { '?' };
-    format!("{url}{sep}options=--search_path%3D{schema}")
+pub(crate) fn postgres_url(data: &Path) -> String {
+    // The connect is one blocking call at setup; some callers run inside
+    // an async runtime, and `postgres` blocks its own thread, so the call
+    // runs on a thread of its own to stay out of the runtime's way.
+    let data = data.to_path_buf();
+    std::thread::spawn(move || {
+        let url = std::env::var("SCION_TEST_POSTGRES_URL")
+            .expect("SCION_TEST_POSTGRES_URL must name the test database");
+        let schema = Backend::test_schema(&data).expect("postgres mode names a schema");
+        let mut client =
+            postgres::Client::connect(&url, postgres::NoTls).expect("the test database connects");
+        client
+            .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+            .unwrap();
+        let sep = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{sep}options=--search_path%3D{schema}")
+    })
+    .join()
+    .unwrap()
 }
 
 /// The store of a data directory for a process beside the server: SQLite

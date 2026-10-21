@@ -56,9 +56,14 @@ fn spawn_with(extra: &[&str], data: &Path, log: &Path) -> Server {
         .append(true)
         .open(log)
         .unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_scion-server"))
-        .arg("--data")
-        .arg(data)
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_scion-server"));
+    cmd.arg("--data").arg(data);
+    // Postgres mode: the same schema the test helpers filled (the marker
+    // file in the data directory makes a plain SQLite start refuse).
+    if scion_server::Backend::test_is_postgres() {
+        cmd.arg("--postgres-url").arg(common::postgres_url(data));
+    }
+    let child = cmd
         .args(["serve", "--token", common::TOKEN, "--listen", "127.0.0.1:0"])
         .args(extra)
         // Plain log lines, so the address parses without escape codes.
@@ -84,7 +89,14 @@ async fn wait_serving(server: &mut Server, log: &Path) {
     let started = std::time::Instant::now();
     let addr = loop {
         if let Some(status) = server.child.try_wait().ok().flatten() {
-            panic!("the server exited early: {status}");
+            // The server's own log names the refusal; a silent exit code
+            // is not debuggable.
+            let tail = fs::read_to_string(log).unwrap_or_default();
+            let last: Vec<&str> = tail.lines().rev().take(6).collect();
+            panic!(
+                "the server exited early: {status}; log tail: {}",
+                last.into_iter().rev().collect::<Vec<_>>().join(" | ")
+            );
         }
         if let Some(addr) = bound_addr(log) {
             break addr;
@@ -454,12 +466,14 @@ async fn after_the_restart(
             "the resumed land is at the ref"
         );
     }
-    let clean = Command::new(env!("CARGO_BIN_EXE_scion-server"))
-        .arg("--data")
-        .arg(data)
-        .arg("fsck")
-        .output()
-        .unwrap();
+    let mut fsck = Command::new(env!("CARGO_BIN_EXE_scion-server"));
+    fsck.arg("--data").arg(data);
+    // On Postgres the store lives in the database; a bare fsck would
+    // read the data directory's SQLite and report what is not there.
+    if scion_server::Backend::test_is_postgres() {
+        fsck.arg("--postgres-url").arg(common::postgres_url(data));
+    }
+    let clean = fsck.arg("fsck").output().unwrap();
     assert_eq!(clean.status.code(), Some(0), "fsck is clean");
     drop(again);
 }
