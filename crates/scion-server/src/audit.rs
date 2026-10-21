@@ -121,7 +121,8 @@ impl Audit {
     /// the wrong kind, owner, or mode, or the open fails.
     pub fn open(path: &Path) -> io::Result<Audit> {
         let dir_fsyncs = Arc::new(AtomicU64::new(0));
-        let file = checked_open(path, Some(&dir_fsyncs))?;
+        let mut file = checked_open(path, Some(&dir_fsyncs))?;
+        glue_torn_line(&mut file)?;
         let (tx, rx) = mpsc::channel(QUEUE);
         let (ready_tx, ready_rx) = watch::channel(true);
         let path = path.to_path_buf();
@@ -261,6 +262,27 @@ fn checked_open(path: &Path, dir_syncs: Option<&AtomicU64>) -> io::Result<std::f
     Ok(file.into())
 }
 
+/// An append that failed mid-line (an ENOSPC in the middle of a write)
+/// leaves a torn line, and the next line glues onto it: every line
+/// after the tear would fail to parse. On open, a file that does not
+/// end in a newline gets one, so the tear stays a line of its own.
+fn glue_torn_line(file: &mut std::fs::File) -> io::Result<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+    let size = file.metadata()?.len();
+    if size == 0 {
+        return Ok(());
+    }
+    let mut last = [0u8; 1];
+    file.seek(SeekFrom::Start(size - 1))?;
+    file.read_exact(&mut last)?;
+    file.seek(SeekFrom::End(0))?;
+    if last[0] != b'\n' {
+        file.write_all(b"\n")?;
+        file.sync_data()?;
+    }
+    Ok(())
+}
+
 /// The writer thread: one owner of the file. It takes its file, path,
 /// readiness and faults by value because it is the only owner there is.
 #[allow(clippy::needless_pass_by_value)]
@@ -372,6 +394,11 @@ impl Meter {
 pub(crate) async fn meter_task(meter: Arc<Meter>, audit: Audit, mut stop: watch::Receiver<()>) {
     let mut ticks = tokio::time::interval(METER_FLUSH);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick fires at once: it starts the interval, it flushes
+    // nothing. A flush of an empty meter would also split a peer's
+    // refusals across two lines when this task's first poll comes late
+    // after a busy start.
+    ticks.tick().await;
     loop {
         tokio::select! {
             _ = ticks.tick() => meter.flush(&audit).await,
@@ -613,6 +640,31 @@ mod tests {
         drop(audit);
         let audit = Audit::open(&path).unwrap();
         assert_eq!(audit.dir_syncs(), 1, "a reopen syncs the parent again");
+    }
+
+    #[tokio::test]
+    async fn a_torn_line_is_glued_on_reopen_so_the_next_lines_parse() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        // A line that an ENOSPC cut in the middle: no newline at the
+        // end. The tear stays a fragment; the glue keeps it from
+        // swallowing the lines that follow.
+        std::fs::write(&path, b"{\"v\":1,\"event\":\"write").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let audit = Audit::open(&path).unwrap();
+        audit
+            .record(Event::new("write", "ok", json!({})))
+            .await
+            .unwrap();
+        drop(audit);
+        let bytes = std::fs::read(&path).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "the tear is a line of its own");
+        assert!(lines[0].starts_with("{\"v\":1"), "the tear keeps its bytes");
+        serde_json::from_str::<serde_json::Value>(lines[1])
+            .expect("the next line parses whole");
     }
 
     #[test]

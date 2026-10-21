@@ -32,7 +32,8 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
 
-use crate::metrics::{Metrics, MetricsLayer, land_error_label};
+use crate::metrics::{Metrics, MetricsLayer, code_label};
+use serde_json::Value;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::Instrument as _;
@@ -306,6 +307,7 @@ pub async fn serve(
             lands,
             quotas.clone(),
             Arc::clone(&metrics),
+            audit.clone(),
         )
         .into_server(),
         crate::audit::AuditedAuth::new(auth.clone(), Arc::clone(&meter)),
@@ -371,6 +373,9 @@ pub struct ScionService {
     /// `READ_BUDGET_BYTES` permits, one per byte, shared by all `ReadFile`
     /// replies.
     reads: Arc<Semaphore>,
+    /// The audit log: state changes record an intent line before they
+    /// run and a result line after.
+    audit: crate::audit::Audit,
 }
 
 impl ScionService {
@@ -411,6 +416,7 @@ impl ScionService {
         lands: Arc<Lands>,
         quotas: Quotas,
         metrics: Arc<Metrics>,
+        audit: crate::audit::Audit,
     ) -> Self {
         Self {
             worker,
@@ -418,6 +424,7 @@ impl ScionService {
             lands,
             quotas,
             metrics,
+            audit,
             uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
             blames: Arc::new(Semaphore::new(MAX_BLAMES)),
             blame_memory: crate::memory::Bytes::new(BLAME_MEMORY_BUDGET),
@@ -429,6 +436,123 @@ impl ScionService {
 
     fn into_server(self) -> ScionServer<Self> {
         into_server(self)
+    }
+
+    /// Records the audit's intent line for a state change, and waits
+    /// until it is durable: evidence first, so a change whose evidence
+    /// was not made durable does not happen.
+    async fn audit_intent(
+        &self,
+        request_id: &str,
+        principal: &str,
+        event: &'static str,
+        fields: serde_json::Value,
+    ) -> Result<(), Status> {
+        let line = crate::audit::Event::new(
+            event,
+            "intent",
+            json_fields(request_id, principal, &fields),
+        );
+        self.audit.record(line).await.map_err(|why| {
+            tracing::error!(reason = %why, "an audit intent was not made durable");
+            Status::unavailable("the audit line was not made durable")
+        })
+    }
+
+    /// Records the audit's result line after a state change. The
+    /// change has happened, so a lost result line cannot take it back:
+    /// the writer latches readiness, and this logs the loss.
+    async fn audit_result(
+        &self,
+        request_id: &str,
+        principal: &str,
+        event: &'static str,
+        outcome: &'static str,
+        fields: serde_json::Value,
+    ) {
+        let line = crate::audit::Event::new(
+            event,
+            outcome,
+            json_fields(request_id, principal, &fields),
+        );
+        if let Err(why) = self.audit.record(line).await {
+            tracing::error!(reason = %why, "an audit result was not made durable");
+        }
+    }
+
+    /// Records the audit's land and ref lines of a land that ran, and
+    /// passes its outcome through.
+    async fn land_recorded(
+        &self,
+        request_id: &str,
+        principal: &str,
+        repo: &str,
+        target_ref: &str,
+        old: Option<&str>,
+        outcome: land::LandOutcome,
+    ) -> Result<land::LandOutcome, Status> {
+        let mut fields = serde_json::json!({
+            "rpc": "Land",
+            "repo": repo,
+            "ref": target_ref,
+            "state": outcome.state.as_str(),
+            "land_id": outcome.land_id,
+        });
+        if let Some(landed) = outcome.result {
+            fields["new"] = serde_json::json!(hex_id(landed.as_bytes()));
+            if let Some(from) = old {
+                fields["old"] = serde_json::json!(from);
+            }
+        }
+        if !outcome.detail.is_empty() {
+            fields["detail"] = serde_json::json!(outcome.detail);
+        }
+        self.audit_result(request_id, principal, "land", "ok", fields)
+            .await;
+        if let Some(landed) = outcome.result {
+            // The move itself: which principal moved which ref from
+            // what to what. The land's intent line made the evidence
+            // first; this line is the move's record.
+            self.audit_result(
+                request_id,
+                principal,
+                "ref",
+                "ok",
+                serde_json::json!({
+                    "rpc": "Land",
+                    "repo": repo,
+                    "ref": target_ref,
+                    "old": old,
+                    "new": hex_id(landed.as_bytes()),
+                }),
+            )
+            .await;
+        }
+        Ok(outcome)
+    }
+
+    /// Records the audit's result line of a write that ran, and passes
+    /// its outcome through: `ok`, or `failed` with the reply's code.
+    async fn write_outcome<T>(
+        &self,
+        request_id: &str,
+        principal: &str,
+        mut fields: serde_json::Value,
+        outcome: Result<T, Status>,
+    ) -> Result<T, Status> {
+        match outcome {
+            Ok(value) => {
+                self.audit_result(request_id, principal, "write", "ok", fields)
+                    .await;
+                Ok(value)
+            }
+            Err(status) => {
+                fields["why"] = serde_json::json!(code_label(status.code()));
+                self.audit_result(request_id, principal, "write", "failed", fields)
+                    .await;
+                Err(status)
+            }
+        }
     }
 
     /// Runs a `MergeBase`, `IsAncestor` or `Log` with a path: at most
@@ -545,6 +669,24 @@ pub(crate) fn check_whole_reader(
 }
 
 /// `ResolveRef`, served by both services.
+/// The shared fields of an audit line: who, which call, on which RPC.
+fn json_fields(
+    request_id: &str,
+    principal: &str,
+    fields: &serde_json::Value,
+) -> serde_json::Value {
+    let mut all = serde_json::json!({
+        "request_id": request_id,
+        "principal": principal,
+    });
+    if let (Value::Object(all), Value::Object(extra)) = (&mut all, fields) {
+        for (key, value) in extra {
+            all.insert(key.clone(), value.clone());
+        }
+    }
+    all
+}
+
 pub(crate) async fn resolve_ref(
     worker: &Worker,
     access: &Access,
@@ -575,6 +717,28 @@ fn parse_optional_path(bytes: Vec<u8>) -> Result<Option<RepoPath>, Status> {
     } else {
         parse_path(bytes).map(Some)
     }
+}
+
+/// The caller's request ID, if it sent one that fits: the audit's
+/// intent and result lines join by it.
+fn request_id_of<T>(request: &Request<T>) -> String {
+    scion_proto::runtime::request_id::sanitize(
+        request
+            .metadata()
+            .get(scion_proto::runtime::request_id::REQUEST_ID)
+            .map(tonic::metadata::MetadataValue::as_bytes),
+    )
+    .unwrap_or_default()
+}
+
+/// The hex of a content ID, as the audit's old and new ref values.
+fn hex_id(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 pub(crate) fn caller<T>(request: &Request<T>) -> Result<Caller, Status> {
@@ -1112,6 +1276,7 @@ impl Scion for ScionService {
             .await
             .map_err(|_| Status::unavailable("server is shutting down"))?;
         let caller = caller(&request)?;
+        let request_id = request_id_of(&request);
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let mut stream = request.into_inner();
         let first = stream
@@ -1128,6 +1293,9 @@ impl Scion for ScionService {
             ));
         }
         self.access.check_writer(&caller, &first.repo)?;
+        let repo_name = first.repo.clone();
+        let principal = caller.0.clone();
+        let mut bytes_total = first.data.len();
         // The first message's bytes, and the budget that the later messages
         // of this upload take from. Held until the reply, on every path.
         let mut quota = self
@@ -1152,37 +1320,78 @@ impl Scion for ScionService {
                     "only the first PutBlob message names the repo",
                 ));
             }
+            bytes_total += chunk.data.len();
             quota.add(chunk.data.len()).map_err(Status::from)?;
             upload = self.worker.run(move |_| upload.append(&chunk.data)).await?;
         }
-        let id = self
+        let bytes = bytes_total;
+        self.audit_intent(
+            &request_id,
+            caller.0.as_str(),
+            "write",
+            serde_json::json!({ "rpc": "PutBlob", "repo": repo_name, "bytes": bytes }),
+        )
+        .await?;
+        let written = self
             .worker
             .run(move |store| write::put_blob(&store, repo, upload))
+            .await;
+        let fields = serde_json::json!({ "rpc": "PutBlob", "repo": repo_name, "bytes": bytes });
+        let id = self
+            .write_outcome(&request_id, &principal, fields, written)
             .await?;
         Ok(Response::new(PutBlobResponse {
             blob_id: id.as_bytes().to_vec(),
         }))
     }
 
+
     async fn create_changeset(
         &self,
         request: Request<CreateChangesetRequest>,
     ) -> Result<Response<CreateChangesetResponse>, Status> {
         let caller = caller(&request)?;
+        let request_id = request_id_of(&request);
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let CreateChangesetRequest { repo, changeset } = request.into_inner();
         check_whole_reader(&self.access, &caller, &repo)?;
+        let principal = caller.0.clone();
+        self.audit_intent(
+            &request_id,
+            principal.as_str(),
+            "write",
+            serde_json::json!({ "rpc": "CreateChangeset", "repo": repo }),
+        )
+        .await?;
         let access = Arc::clone(&self.access);
-        let id = self
+        let repo_for_write = repo.clone();
+        let outcome = self
             .worker
             .run(move |store| {
                 // The rules first, so a change that the caller may not make
                 // reads no blob. Decoding twice costs little next to reading
                 // every blob back.
                 let (cs, _) = write::decode(&changeset)?;
-                access.check_write(&caller, &repo, cs.changes().keys())?;
-                write::create_changeset(&store, &repo, &changeset)
+                access.check_write(&caller, &repo_for_write, cs.changes().keys())?;
+                write::create_changeset(&store, &repo_for_write, &changeset)
             })
+            .await;
+        // A changeset ID names content the caller already had; the
+        // audit never names a blob or a tree.
+        let fields = match &outcome {
+            Ok(id) => serde_json::json!({
+                "rpc": "CreateChangeset",
+                "repo": repo,
+                "changeset": hex_id(id.as_bytes()),
+            }),
+            Err(status) => serde_json::json!({
+                "rpc": "CreateChangeset",
+                "repo": repo,
+                "why": code_label(status.code()),
+            }),
+        };
+        let id = self
+            .write_outcome(&request_id, &principal, fields, outcome)
             .await?;
         Ok(Response::new(CreateChangesetResponse {
             changeset_id: id.as_bytes().to_vec(),
@@ -1199,11 +1408,25 @@ impl Scion for ScionService {
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
         let _call = deadline.guard();
         let caller = caller(&request)?;
+        let request_id = request_id_of(&request);
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         let req = request.into_inner();
         check_whole_reader(&self.access, &caller, &req.repo)?;
         check_name("target_ref", &req.target_ref)?;
         check_name("request_key", &req.request_key)?;
+        let principal = caller.0.clone();
+        self.audit_intent(
+            &request_id,
+            principal.as_str(),
+            "land",
+            serde_json::json!({
+                "rpc": "Land",
+                "repo": req.repo,
+                "ref": req.target_ref,
+                "request_key": req.request_key,
+            }),
+        )
+        .await?;
         let req = land::LandRequest {
             changeset: parse_id(&req.changeset_id, "changeset_id")?,
             repo: req.repo,
@@ -1211,7 +1434,21 @@ impl Scion for ScionService {
             request_key: req.request_key,
             deadline,
         };
+        // The ref's current target, so the audit's ref line can name
+        // what it moved from. A ref that does not exist yet moves from
+        // nothing.
+        let old = self
+            .worker
+            .run({
+                let repo = req.repo.clone();
+                let target_ref = req.target_ref.clone();
+                move |store| Ok(store.resolve_ref(&repo, &target_ref).ok().map(|id| hex_id(id.as_bytes())))
+            })
+            .await
+            .ok()
+            .flatten();
         let (lands, access) = (Arc::clone(&self.lands), Arc::clone(&self.access));
+        let (repo, target_ref) = (req.repo.clone(), req.target_ref.clone());
         // The land's own result comes back inside an Ok, so this handler,
         // not the worker, builds the reply's Status: a land that ends in
         // an error moves the land counter, by the code of the reply the
@@ -1228,10 +1465,34 @@ impl Scion for ScionService {
             })
             .await;
         match outcome {
-            Ok(Ok(outcome)) => Ok(Response::new(land_response(outcome))),
+            Ok(Ok(outcome)) => {
+                self.land_recorded(
+                    &request_id,
+                    &principal,
+                    &repo,
+                    &target_ref,
+                    old.as_deref(),
+                    outcome,
+                )
+                .await
+                .map(|outcome| Response::new(land_response(outcome)))
+            }
             Ok(Err(e)) => {
                 let status = Status::from(e);
-                self.metrics.land(land_error_label(status.code()));
+                self.metrics.land(code_label(status.code()));
+                self.audit_result(
+                    &request_id,
+                    principal.as_str(),
+                    "land",
+                    "failed",
+                    serde_json::json!({
+                        "rpc": "Land",
+                        "repo": repo,
+                        "ref": target_ref,
+                        "why": code_label(status.code()),
+                    }),
+                )
+                .await;
                 Err(status)
             }
             // The worker's own failures (a panic, a shutdown) built no
@@ -1735,6 +1996,7 @@ mod tests {
             Arc::default(),
             Quotas::off(),
             Arc::default(),
+            crate::audit::Audit::off(),
         )
     }
 
@@ -1949,6 +2211,7 @@ mod tests {
             Arc::default(),
             Quotas::off(),
             Arc::default(),
+            crate::audit::Audit::off(),
         );
         // A valid changeset, which puts `f`: decode succeeds, the rules
         // deny the write. The check runs in the job, so this also shows
@@ -2252,6 +2515,7 @@ mod tests {
             Arc::new(Lands::new(None, Some(Arc::clone(metrics)))),
             Quotas::off(),
             Arc::clone(metrics),
+            crate::audit::Audit::off(),
         )
     }
 

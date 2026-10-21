@@ -200,6 +200,227 @@ async fn refused_stream(url: &str, token: &str) -> Code {
     code.expect("twenty calls made")
 }
 
+/// The hex of a token, as the access file names it.
+fn hex(name: &str) -> String {
+    blake3::Hash::from(token_digest(name)).to_hex().to_string()
+}
+
+/// A store whose repo `main` has one root changeset that puts `README`,
+/// and a writer who may change every path.
+fn write_access() -> Access {
+    let text = format!("token\tci\t{}\nwrite\tci\t{REPO}\nread\tci\t{REPO}\n", hex("ci"));
+    Access::parse(&text).expect("the access file parses")
+}
+
+/// A changeset with one parent that puts `path`.
+fn changeset(parents: Vec<scion_core::ChangesetId>, path: &str, content: scion_core::BlobId) -> scion_core::Changeset {
+    use scion_core::{FileState, IdentityTime, RepoPath};
+    scion_core::Changeset::new(
+        parents,
+        IdentityTime::new(b"Ada".to_vec(), b"ada@example.com".to_vec(), 1_700_000_000, 0)
+            .expect("identity fits the format"),
+        None,
+        b"change\n".to_vec(),
+        [(
+            RepoPath::new(path).unwrap(),
+            Some(FileState::Regular {
+                content,
+                executable: false,
+            }),
+        )]
+        .into(),
+    )
+    .expect("changeset fits the format")
+}
+
+/// Adds `authorization: Bearer ci` and an `x-request-id` to every
+/// request, so the audit's intent and result lines join by it.
+#[derive(Clone)]
+struct WriteCall(String);
+
+impl Interceptor for WriteCall {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        let value = "Bearer ci".to_string().parse().unwrap();
+        request.metadata_mut().insert("authorization", value);
+        let id = self.0.parse().unwrap();
+        request.metadata_mut().insert("x-request-id", id);
+        Ok(request)
+    }
+}
+
+type Writer = ScionClient<InterceptedService<Channel, WriteCall>>;
+
+async fn writer(url: &str, request_id: &str) -> Writer {
+    let channel = Channel::from_shared(url.to_owned())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    ScionClient::with_interceptor(channel, WriteCall(request_id.to_owned()))
+}
+
+/// Every state change records an intent line before it runs and a
+/// result line after, and the pair joins by the request ID. No line
+/// names a blob or a tree.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_changeset_and_land_record_intent_and_result_pairs() {
+    use scion_proto::v1::{CreateChangesetRequest, LandRequest, PutBlobRequest};
+    use tokio_stream::once;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let audit_path = dir.path().join("audit.log");
+    let audit = Audit::open(&audit_path).unwrap();
+    let (stop, url) = serve_with_audit(&store, dir.path(), write_access(), audit).await;
+    let mut ci = writer(&url, "t-put").await;
+
+    // The write: an upload of a guide blob.
+    let blob = store.blobs().put(b"guide\n").unwrap();
+    ci.put_blob(once(PutBlobRequest {
+        repo: REPO.into(),
+        data: b"guide\n".to_vec(),
+    }))
+    .await
+    .expect("the upload is allowed");
+
+    // The changeset on top of the root, then the land.
+    let root = store.resolve_ref(REPO, "main").unwrap();
+    let (bytes, id) =
+        changeset(vec![root], "docs/guide", blob).encode_with_id();
+    let mut ci = writer(&url, "t-create").await;
+    ci.create_changeset(CreateChangesetRequest {
+        repo: REPO.into(),
+        changeset: bytes.clone(),
+    })
+    .await
+    .expect("the create is allowed");
+    let mut ci = writer(&url, "t-land").await;
+    ci.land(LandRequest {
+        repo: REPO.into(),
+        changeset_id: id.as_bytes().to_vec(),
+        target_ref: "main".into(),
+        request_key: "t-1".into(),
+    })
+    .await
+    .expect("the land is allowed");
+
+    stop.send(()).unwrap();
+    wait_for_lines(&audit_path, 7).await;
+
+    let lines = read_lines(&audit_path);
+    // Every pair joins by its request ID, intent before result.
+
+    // The write pair: bytes, and no blob digest anywhere.
+    let writes = pairs(&lines, "write");
+    assert_eq!(writes.len(), 2, "one pair for the upload, one for the create");
+    let put = writes
+        .iter()
+        .find(|(intent, _)| intent["rpc"] == "PutBlob")
+        .expect("the upload pair");
+    assert_eq!(put.1["bytes"], 6, "the upload names its bytes");
+    let create = writes
+        .iter()
+        .find(|(intent, _)| intent["rpc"] == "CreateChangeset")
+        .expect("the create pair");
+    assert!(create.1["changeset"].is_string(), "the create names the changeset");
+
+    // The land pair: state, land id, and the ref's move.
+    let lands = pairs(&lines, "land");
+    assert_eq!(lands.len(), 1, "one land pair");
+    assert_eq!(lands[0].1["state"], "landed");
+    assert_eq!(lands[0].1["ref"], "main");
+    assert!(lands[0].1["land_id"].is_i64());
+    let refs: Vec<_> = lines
+        .iter()
+        .filter(|l| l["event"] == "ref" && l["outcome"] == "ok")
+        .collect();
+    assert_eq!(refs.len(), 1, "one ref line: the move's record");
+    assert!(refs[0]["new"].is_string(), "the move names its new target");
+    assert!(refs[0]["old"].is_null() || refs[0]["old"].is_string(), "the move names what it moved from");
+
+    // No line ever names a blob or a tree: the upload's data digest is
+    // not in the file.
+    let text = std::fs::read(&audit_path).unwrap();
+    let text = String::from_utf8(text).unwrap();
+    let mut blob_hex = String::with_capacity(blob.as_bytes().len() * 2);
+    for byte in blob.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(blob_hex, "{byte:02x}");
+    }
+    assert!(!text.contains(&blob_hex), "no blob digest in the audit");
+}
+
+/// A write whose audit intent was not made durable does not happen:
+/// the upload is refused, and the store holds no new blob.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_whose_intent_fails_is_refused() {
+    use scion_proto::v1::{PutBlobRequest, ResolveRefRequest};
+    use tokio_stream::once;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let audit_path = dir.path().join("audit.log");
+    let audit = Audit::open(&audit_path).unwrap();
+    audit.fail_next_appends(1).unwrap();
+    let (stop, url) = serve_with_audit(&store, dir.path(), write_access(), audit).await;
+    let mut ci = writer(&url, "t-fail").await;
+
+    let status = ci
+        .put_blob(once(PutBlobRequest {
+            repo: REPO.into(),
+            data: b"never lands\n".to_vec(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+
+    // The blob is not in the store: resolve it? An upload names no
+    // ref, so read the blob list the way the service does.
+    // The store() fixture's repo holds exactly one blob (the README's).
+    // The refused upload must not have added its content.
+    let id = scion_core::BlobId::of(b"never lands\n");
+    let missing = store.blobs().get(id).is_err();
+    assert!(missing, "the refused write stored nothing");
+
+    // The readiness loss latches: the health names flip and the server
+    // drains, so a later call is refused too. The log has a hole; the
+    // supervisor restarts a server that can prove its lines again.
+    let later = ci
+        .resolve_ref(ResolveRefRequest {
+            repo: REPO.into(),
+            name: "main".into(),
+        })
+        .await;
+    assert!(later.is_err(), "a server whose audit lost a line drains");
+
+    let _ = stop.send(());
+}
+
+/// The intent and result of every `event` in `lines`, joined by their
+/// request ID, the intent first.
+fn pairs<'a>(
+    lines: &'a [serde_json::Value],
+    event: &str,
+) -> Vec<(&'a serde_json::Value, &'a serde_json::Value)> {
+    let mut found = vec![];
+    for (i, line) in lines.iter().enumerate() {
+        if line["event"] == event && line["outcome"] == "intent" {
+            let (j, result) = lines
+                .iter()
+                .enumerate()
+                .find(|(_, r)| {
+                    r["event"] == event
+                        && r["request_id"] == line["request_id"]
+                        && r["outcome"] != "intent"
+                })
+                .expect("every intent has its result");
+            assert!(i < j, "the intent comes before its result");
+            found.push((line, result));
+        }
+    }
+    found
+}
+
 /// Waits until the file holds `n` lines: the stop's flush runs on its
 /// own task, so the lines land a moment after the stop.
 async fn wait_for_lines(path: &std::path::Path, n: usize) {
