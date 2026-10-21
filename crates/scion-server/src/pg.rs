@@ -1677,16 +1677,27 @@ fn connect_on(url: &str, ca: Option<&Path>, options: &str) -> Result<Client> {
 /// the importer retries a batch on it, and the gRPC status becomes
 /// UNAVAILABLE. The rest keep the engine's error as the source.
 fn map_pg_error(e: postgres::Error) -> Error {
+    let code = e
+        .code()
+        .map(postgres::error::SqlState::code)
+        .map(str::to_owned);
+    pg_error_of(code.as_deref(), e)
+}
+
+/// The mapping on one SQLSTATE, split from [`map_pg_error`] so a unit
+/// test can hand it a code: the `postgres` crate's error type cannot be
+/// built with a chosen one.
+fn pg_error_of(code: Option<&str>, e: postgres::Error) -> Error {
     // A connection the database dropped is as retryable as a busy one.
     if e.is_closed() {
         return Error::Storage(Storage::busy(e));
     }
-    match e.code() {
+    match code {
         // Deadlock, serialization failure, an administrative shutdown, a
         // database that starts up, a lock another writer holds.
         Some(code)
-            if matches!(code.code(), "40P01" | "40001" | "57P01" | "57P03" | "55P03")
-                || code.code().starts_with("08") =>
+            if matches!(code, "40P01" | "40001" | "57P01" | "57P03" | "55P03")
+                || code.starts_with("08") =>
         {
             tracing::warn!("the database is busy: {e}");
             Error::Storage(Storage::busy(e))
@@ -1694,18 +1705,27 @@ fn map_pg_error(e: postgres::Error) -> Error {
         // The lock or the statement waited past its clock, as a SQLite
         // write does past its busy timeout: the caller has been at it
         // too long, and the client retries past its own deadline.
-        Some(code) if code.code() == "57014" => {
+        Some("57014") => {
             tracing::warn!("the database gave the statement up: {e}");
             Error::DeadlineExceeded("the database kept the caller waiting".to_owned())
         }
         // A violation the code handles (a duplicate key, a check, a
         // foreign key) is one answer among many: it logs quietly.
-        Some(code) if code.code().starts_with("23") => {
+        Some(code) if code.starts_with("23") => {
             tracing::debug!("the database refused a statement: {e}");
             Error::Storage(Storage::internal(e))
         }
         // Out of space: the same shortage, wherever the metadata lives.
-        Some(code) if code.code() == "53100" => {
+        // 53100 is a full data or WAL directory; 53400 is the temp-file
+        // cap a `temp_file_limit` sets, the space this query may use -
+        // whichever the database hits, the client's answer is the same
+        // fixed retry-later shortage. The other codes of the same
+        // classes stay internal on purpose: 53200 is out of MEMORY (the
+        // fixed reply would name a disk and lie), 53000 is the class's
+        // catch-all (too vague to promise a disk answer), and 58030 is
+        // an io_error - a failing device is the EIO row's internal, not
+        // a space shortage.
+        Some("53100" | "53400") => {
             tracing::error!("the server is out of disk space: {e}");
             Error::Storage(Storage::disk_full(e))
         }
@@ -3606,5 +3626,54 @@ mod pool_tests {
             .filter(|out| matches!(out, Err(Error::ResourceExhausted(_))))
             .count();
         assert_eq!((recorded, refused), (1, 1), "{results:?}");
+    }
+
+    /// The out-of-space SQLSTATEs of the Postgres docs' class 53 and 58:
+    /// which map to the fixed `ResourceExhausted` shortage and which
+    /// stay internal, and that the decision is the same for every code.
+    #[test]
+    fn the_disk_full_sqlstates_answer_the_fixed_shortage() {
+        use super::pg_error_of;
+        use crate::{Error, StorageClass};
+        // A source of the right type with no SQLSTATE of its own: a
+        // connect to port 1, which every kernel refuses. The mapping
+        // runs on the SQLSTATE the test hands it, not on this source.
+        let source = || {
+            match Client::connect("postgres://127.0.0.1:1/x", NoTls) {
+                Ok(_) => panic!("a connect to port 1 is refused"),
+                Err(refused) => refused,
+            }
+        };
+        let full = |code: &str| {
+            let error = pg_error_of(Some(code), source());
+            (
+                matches!(&error, Error::Storage(s) if s.class() == StorageClass::DiskFull),
+                tonic::Status::from(error),
+            )
+        };
+        // 53100: the data or WAL directory is full. 53400: the temp-file
+        // cap a temp_file_limit sets. Both are a space shortage, and the
+        // client sees the same fixed reply for either.
+        for code in ["53100", "53400"] {
+            let (full, status) = full(code);
+            assert!(full, "{code} must map to the disk-full storage class");
+            assert_eq!(status.code(), tonic::Code::ResourceExhausted, "{code}");
+            assert_eq!(
+                status.message(),
+                "the server is out of disk space; retry later",
+                "{code}"
+            );
+        }
+        // The codes of the same classes that are NOT a disk shortage
+        // stay internal, on purpose: 53200 is out of memory, 53000 is
+        // the class's catch-all, 58030 is an io_error (a failing device
+        // is the EIO row's internal, not a space shortage). Pinning them
+        // keeps a later "helpful" widening from answering a memory
+        // error with a disk reply.
+        for code in ["53200", "53000", "58030"] {
+            let (full, status) = full(code);
+            assert!(!full, "{code} must not map to the disk-full class");
+            assert_eq!(status.code(), tonic::Code::Internal, "{code}");
+        }
     }
 }
