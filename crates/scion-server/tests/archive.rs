@@ -82,14 +82,14 @@ fn a_section_holds_one_snapshot_when_a_writer_lands_between_its_statements() {
     // hook only records the row and moves the ref.
     let hook_blob = store.blobs().put(b"hook").unwrap();
 
-    // The writer the hook runs: the first call lands one changeset on
-    // `dev` while the section holds its snapshot; the later calls pass.
+    // The writer the hook runs: the first section takes the hook and it
+    // lands one changeset on `dev` while that section holds its
+    // snapshot; the fired flag says the hook ran inside THIS export.
     let writes = store.clone();
-    let landed = std::sync::atomic::AtomicBool::new(false);
+    let say = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let inside = std::sync::Arc::clone(&say);
     archive::set_section_hook(Some(Box::new(move || {
-        if landed.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
+        inside.store(true, std::sync::atomic::Ordering::SeqCst);
         writes
             .write(|c| {
                 let repo = c.repo_id(REPO)?;
@@ -111,6 +111,10 @@ fn a_section_holds_one_snapshot_when_a_writer_lands_between_its_statements() {
     let manifest = archive::export(&store, data.path(), None, true, &out)
         .unwrap_or_else(|e| panic!("export failed: {e:#}"));
     archive::set_section_hook(None);
+    assert!(
+        say.load(std::sync::atomic::Ordering::SeqCst),
+        "the hook never ran inside this export's section"
+    );
     assert_eq!(manifest["format"], "scion-archive");
 
     // The archive is sound, per the format, with no store code.

@@ -44,31 +44,27 @@ pub(crate) struct ArchiveLand {
     pub(crate) input_cs: ChangesetId,
 }
 
-/// The test's writer between a section's statements. A test installs it
-/// to commit a changeset mid-section, and the section must not see the
-/// commit: that is what one read snapshot means. None passes nothing.
+// The test's writer between a section's statements. A test installs it
+// on its own thread, and the export runs on the caller's thread, so the
+// hook fires inside that test's export and in no other's. One-shot:
+// the first section takes it, the rest pass. None passes nothing.
 #[cfg(any(test, feature = "test-hooks"))]
-static SECTION_HOOK: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
-    std::sync::Mutex::new(None);
+thread_local! {
+    static SECTION_HOOK: std::cell::RefCell<Option<Box<dyn Fn() + Send>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Installs the hook that runs between a section's statements, or takes
 /// it back with `None`.
 #[cfg(any(test, feature = "test-hooks"))]
-pub fn set_section_hook(hook: Option<Box<dyn Fn() + Send + Sync>>) {
-    *SECTION_HOOK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = hook;
+pub fn set_section_hook(hook: Option<Box<dyn Fn() + Send>>) {
+    SECTION_HOOK.with(|slot| *slot.borrow_mut() = hook);
 }
 
-/// The installed hook, if any. Returns it under the guard: the call runs
-/// while the section's snapshot is held, so the hook cannot be swapped
-/// out from under it.
+/// Takes the installed hook, if any.
 #[cfg(any(test, feature = "test-hooks"))]
-fn with_section_hook(f: impl FnOnce(Option<&(dyn Fn() + Send + Sync)>)) {
-    let guard = SECTION_HOOK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    f(guard.as_deref());
+fn take_section_hook() -> Option<Box<dyn Fn() + Send>> {
+    SECTION_HOOK.with(|slot| slot.borrow_mut().take())
 }
 
 /// Exports `repo`, or the whole store with `all`, to the archive directory
@@ -617,11 +613,10 @@ fn snapshot_section(store: &Backend, name: &str) -> Result<RepoSection> {
             .collect::<Result<Vec<_>>>()?;
         // A test's writer, called between the section's statements: what
         // it commits must stay outside this section's snapshot.
-        with_section_hook(|hook| {
-            if let Some(hook) = hook {
-                hook();
-            }
-        });
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(hook) = take_section_hook() {
+            hook();
+        }
         let refs = tx
             .list_refs(repo_id)?
             .into_iter()
