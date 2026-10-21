@@ -88,6 +88,7 @@ async fn serve(store: Backend, dir: &std::path::Path, limits: Limits) -> String 
         TOKEN,
         service::ServeOptions {
             data: dir.to_path_buf(),
+            audit: scion_server::test_support::audit::Audit::off(),
             limits,
             quotas: scion_server::Quotas::off(),
             pending_lands: None,

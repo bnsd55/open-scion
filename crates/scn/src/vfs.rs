@@ -1741,6 +1741,7 @@ mod tests {
             TOKEN,
             service::ServeOptions {
                 data: data.path().to_path_buf(),
+                audit: scion_server::test_support::audit::Audit::off(),
                 limits: Limits::default(),
                 quotas: scion_server::Quotas::off(),
                 pending_lands: None,

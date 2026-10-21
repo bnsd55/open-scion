@@ -112,6 +112,7 @@ fn server_with_two_changesets() -> (String, String, String, tokio::runtime::Runt
         TOKEN,
         service::ServeOptions {
             data: dir.path().to_path_buf(),
+            audit: scion_server::test_support::audit::Audit::off(),
             limits: Limits::default(),
             quotas: Quotas::off(),
             pending_lands: None,
