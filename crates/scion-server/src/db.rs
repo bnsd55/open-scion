@@ -889,9 +889,11 @@ impl MetaTx for SqliteTx<'_> {
             .transpose()
             .map_err(|e| Error::Corrupt(format!("land {land_id} result: {e}")))?;
         Ok(LandOutcome {
+            moved: false,
             land_id,
             state: LandState::parse(&state)?,
             result,
+            previous: None,
             detail,
             conflict_paths: decode_paths(&paths)
                 .ok_or_else(|| Error::Corrupt(format!("land {land_id} conflict paths")))?,
@@ -911,8 +913,8 @@ impl MetaTx for SqliteTx<'_> {
         let updated = self
             .0
             .prepare_cached(
-                "UPDATE lands SET state = ?3, result_cs = ?4, detail = ?5, conflict_paths = ?6,
-                     finished_at = unixepoch()
+                "UPDATE lands SET state = ?3, result_cs = ?4, detail = ?5,
+                     conflict_paths = ?6, finished_at = unixepoch()
                  WHERE repo_id = ?1 AND land_id = ?2 AND state = 'pending'",
             )
             .map_err(crate::error::from_sqlite)?
@@ -931,9 +933,11 @@ impl MetaTx for SqliteTx<'_> {
             )));
         }
         Ok(LandOutcome {
+            moved: false,
             land_id,
             state,
             result,
+            previous: None,
             detail,
             conflict_paths,
         })

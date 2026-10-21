@@ -352,3 +352,157 @@ mod checker {
         assert_eq!(targets(markdown), vec!["b.md", "c.png \"t\"", "e.md#f"]);
     }
 }
+
+/// Every `path.rs::fn_name` the docs name is a test that exists: the
+/// file is in the repo, it holds `fn fn_name`, and that fn is a test -
+/// `#[test]`, `#[tokio::test]`, or one a `proptest!` generates - not a
+/// helper. A renamed or deleted test leaves the doc pointing at
+/// nothing, and the invariant looks proven when it is not, so the
+/// reference fails here and the doc's proof line names the fix.
+///
+/// A reference with a directory (`crates/x/tests/y.rs::name`) must be
+/// that file. A bare `y.rs::name` holds if any `y.rs` of the repo has
+/// the test: the doc names the file's basename, the check pins the fn.
+fn dangling_test_references(documents: &[PathBuf], root: &Path) -> (Vec<String>, usize) {
+    let mut dangling: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for doc in documents {
+        let markdown = fs::read_to_string(doc).expect("a doc reads");
+        let rel_doc = doc.strip_prefix(root).unwrap_or(doc).display();
+        let mut in_fence = false;
+        for (no, line) in markdown.lines().enumerate() {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence {
+                continue;
+            }
+            // Every `...rs::name` in the line: the reference's path is
+            // the longest run of path characters before `.rs::`, and
+            // the name is the run of test-name characters after it.
+            let mut rest = line;
+            while let Some(at) = rest.find(".rs::") {
+                let before = &rest[..at];
+                let start = before
+                    .rfind(|c: char| !(c.is_alphanumeric() || matches!(c, '/' | '_' | '-' | '.')))
+                    .map_or(0, |i| i + 1);
+                let path = format!("{}.rs", &before[start..]);
+                let after = &rest[at + 5..];
+                let end = after
+                    .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+                    .unwrap_or(after.len());
+                let name = &after[..end];
+                rest = after;
+                if name.is_empty() {
+                    continue;
+                }
+                checked += 1;
+                let where_ = format!("{rel_doc}:{}", no + 1);
+                if path.contains('/') {
+                    let named = [root.join(&path), root.join("crates").join(&path)]
+                        .into_iter()
+                        .find(|file| file.exists());
+                    match named {
+                        None => {
+                            dangling.push(format!("{where_}: no file {path} for {path}::{name}"));
+                        }
+                        Some(file)
+                            if !is_a_test(&fs::read_to_string(&file).unwrap_or_default(), name) =>
+                        {
+                            dangling.push(format!("{where_}: {path} has no test fn {name}"));
+                        }
+                        Some(_) => {}
+                    }
+                } else {
+                    // A bare `y.rs`: one of the repo's y.rs files must
+                    // hold the test.
+                    let found_somewhere = rust_files(root).iter().any(|f| {
+                        f.file_name()
+                            .is_some_and(|n| n.to_str() == Some(path.as_str()))
+                            && is_a_test(&fs::read_to_string(f).unwrap_or_default(), name)
+                    });
+                    if !found_somewhere {
+                        dangling.push(format!(
+                            "{where_}: no {path} in the repo holds a test fn {name}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    (dangling, checked)
+}
+
+/// The `.rs` files of the repo, `target/` and `.git/` skipped.
+fn rust_files(root: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(dir).expect("the repo tree reads") {
+            let path = entry.expect("an entry").path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if path.is_dir() {
+                if name != "target" && name != ".git" {
+                    stack.push(path);
+                }
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+/// Whether `rust` holds a test fn `name`: `#[test]` or `#[tokio::test]`
+/// sits between the fn and the code above it, or the fn is one a
+/// `proptest!` block generates.
+fn is_a_test(rust: &str, name: &str) -> bool {
+    let needle = format!("fn {name}(");
+    let lines: Vec<&str> = rust.lines().collect();
+    let mut proptest_depth = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if proptest_depth > 0 {
+            proptest_depth += line.matches('{').count();
+            proptest_depth = proptest_depth.saturating_sub(line.matches('}').count());
+            continue;
+        }
+        if trimmed.starts_with("proptest") && trimmed.contains("proptest! {") {
+            proptest_depth = 1 + line.matches('{').count() - line.matches('}').count() - 1;
+            continue;
+        }
+        if !trimmed.contains(&needle) {
+            continue;
+        }
+        for above in lines[..i].iter().rev() {
+            let t = above.trim();
+            if t.starts_with("#[") {
+                if t.starts_with("#[test") || t.starts_with("#[tokio::test") {
+                    return true;
+                }
+                continue;
+            }
+            if t.starts_with("//") {
+                continue;
+            }
+            break;
+        }
+        return false;
+    }
+    false
+}
+
+#[test]
+fn every_proof_name_in_the_docs_is_a_test() {
+    let root = Path::new(ROOT);
+    let docs = documents();
+    let (dangling, checked) = dangling_test_references(&docs, root);
+    assert!(checked > 0, "the docs name test proofs");
+    assert!(
+        dangling.is_empty(),
+        "{} of {checked} named tests are dangling:\n{}",
+        dangling.len(),
+        dangling.join("\n")
+    );
+}
