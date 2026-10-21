@@ -96,6 +96,7 @@ async fn served() -> (
             data: dir.path().to_path_buf(),
             limits: Limits::default(),
             quotas: scion_server::Quotas::off(),
+            audit: scion_server::test_support::audit::Audit::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
