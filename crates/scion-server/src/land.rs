@@ -154,6 +154,15 @@ pub struct LandOutcome {
     pub state: LandState,
     /// The rebased changeset, when landed.
     pub result: Option<ChangesetId>,
+    /// The ref's target the land's move replaced, when landed: the head
+    /// the land rebased onto, set where the move happens, under the
+    /// ref's lock, and not stored. A replay has none: the move's head
+    /// lives in the land line of the call that made the move.
+    pub previous: Option<ChangesetId>,
+    /// Whether this call's own settle moved the ref. A replay of an
+    /// already-landed request reports the first move's outcome, and
+    /// moved nothing itself.
+    pub moved: bool,
     /// Why it conflicted or was rejected.
     pub detail: String,
     /// Paths that conflict.
@@ -673,7 +682,7 @@ fn settle(
             )));
         }
         let generation = c.generation(repo, id)?;
-        let outcome = c.set_land_state(
+        let mut outcome = c.set_land_state(
             repo,
             land_id,
             LandState::Landed,
@@ -681,6 +690,12 @@ fn settle(
             String::new(),
             vec![],
         )?;
+        // The move's CAS pins the version the plan read, so
+        // `head.target` is the target this move replaced: the audit's
+        // old value, set here where the move happens, under the ref's
+        // lock, and not stored.
+        outcome.moved = true;
+        outcome.previous = Some(head.target);
         Ok((outcome, generation))
     });
     match landed {
@@ -1260,6 +1275,13 @@ mod tests {
         }
     }
 
+    /// The stored fields of an outcome: a replay returns the first
+    /// call's outcome. `moved` and `previous` are set in memory by the
+    /// call that moved the ref, and a replay has none.
+    fn stored(out: &LandOutcome) -> (i64, LandState, Option<ChangesetId>, String) {
+        (out.land_id, out.state, out.result, out.detail.clone())
+    }
+
     fn caller() -> Caller {
         Caller("t".into())
     }
@@ -1514,7 +1536,9 @@ mod tests {
         let f = fixture();
         let cs = f.commit(f.root, &[put("a/x", "new")]);
         let first = f.land(cs, "k");
-        assert_eq!(f.land(cs, "k"), first);
+        let replay = f.land(cs, "k");
+        assert_eq!(stored(&replay), stored(&first));
+        assert!(!replay.moved, "the replay moved nothing itself");
         assert_eq!(f.main().version, 2, "the ref moved once");
         let other = f.commit(f.root, &[put("b/y", "other")]);
         assert!(matches!(
@@ -1577,7 +1601,7 @@ mod tests {
         assert_eq!(metrics.land_replans(), 1, "the replan counted once");
         // A retry with the same key returns the same outcome.
         let again = lands.land(&f.store, &caller(), &req(cs, "hook")).unwrap();
-        assert_eq!(again, out);
+        assert_eq!(stored(&again), stored(&out));
     }
 
     #[test]
@@ -1627,7 +1651,9 @@ mod tests {
             assert_eq!(Some(after.target), out.result);
             let landed = f.store.read(|c| c.get_changeset(repo, after.target));
             assert_eq!(landed.unwrap().parents(), [before.target], "{crash:?}");
-            assert_eq!(fresh.land(&f.store, &caller(), &req).unwrap(), out);
+            let replay = fresh.land(&f.store, &caller(), &req).unwrap();
+            assert_eq!(stored(&replay), stored(&out));
+            assert!(!replay.moved, "{crash:?}: the replay moved nothing");
             assert_eq!(f.landed_count(), 1, "{crash:?}");
         }
     }
@@ -1637,8 +1663,8 @@ mod tests {
         let f = fixture();
         let out = f.land(f.commit(f.root, &[put("a/x", "new")]), "k");
         assert_eq!(
-            get_land(&f.store, &caller(), "r", out.land_id).unwrap(),
-            out
+            stored(&get_land(&f.store, &caller(), "r", out.land_id).unwrap()),
+            stored(&out)
         );
         let other = Caller("someone else".into());
         assert!(matches!(
@@ -2651,8 +2677,8 @@ mod tests {
         assert!(f.gone(&rejected));
         f.age(recent.land_id, LAND_RETENTION_SECS - 60);
         f.land(f.commit(f.main().target, &[put("d", "1")]), "next");
-        assert_eq!(f.get(recent.land_id).unwrap(), recent);
-        assert_eq!(f.get(pending.land_id).unwrap(), pending);
+        assert_eq!(stored(&f.get(recent.land_id).unwrap()), stored(&recent));
+        assert_eq!(stored(&f.get(pending.land_id).unwrap()), stored(&pending));
     }
 
     #[test]
@@ -2662,7 +2688,7 @@ mod tests {
         f.age(first.land_id, LAND_RETENTION_SECS + 1);
         // The only land expired, but it is the newest, so it stays.
         f.store.write(|c| c.expire_lands()).unwrap();
-        assert_eq!(f.get(first.land_id).unwrap(), first);
+        assert_eq!(stored(&f.get(first.land_id).unwrap()), stored(&first));
         // The next land gets a higher ID, and then the first one expires.
         let second = f.land(f.commit(f.root, &[put("f2", "x")]), "2");
         assert!(second.land_id > first.land_id);
@@ -2730,8 +2756,8 @@ mod tests {
         f.age(first.land_id, LAND_RETENTION_SECS - 60);
         f.fill("t", 3);
         let retry = f.try_land(cs, "key").unwrap();
-        assert_eq!(retry, first);
-        assert_eq!(retry.land_id, first.land_id);
+        assert_eq!(stored(&retry), stored(&first));
+        assert!(!retry.moved, "the retry moved nothing itself");
     }
 
     #[test]
@@ -2949,5 +2975,67 @@ mod tests {
             .write(|c| c.record_land(&caller(), &req(cs, "old"), None))
             .unwrap();
         assert_eq!(resumed.1.state, LandState::Rejected);
+    }
+
+    /// Pass 5, W1: a request key is scoped to one caller in one repo. B
+    /// reusing A's key gets its own land, not A's result; neither caller
+    /// can read the other's land by its id.
+    #[test]
+    fn another_principals_key_and_land_id_are_not_shared() {
+        let f = fixture();
+        let a_cs = f.commit(f.root, &[put("a/x", "a")]);
+        let a_land = f.land(a_cs, "shared");
+        assert_eq!(a_land.state, LandState::Landed);
+
+        // B lands its own changeset under A's key: the lookup names B, so
+        // this is a new land, and it lands on the head A left.
+        let head = f.main().target;
+        let b_cs = f.commit(head, &[put("b/y", "b")]);
+        let b_out = Lands::default()
+            .land(&f.store, &Caller("b".into()), &req(b_cs, "shared"))
+            .unwrap();
+        assert_eq!(b_out.state, LandState::Landed, "{}", b_out.detail);
+        assert_ne!(b_out.land_id, a_land.land_id, "two rows, one per caller");
+
+        // A land's id answers only to its own caller.
+        f.get(a_land.land_id)
+            .unwrap_or_else(|e| panic!("A reads its land: {e:?}"));
+        let b_gets_a = get_land(&f.store, &Caller("b".into()), "r", a_land.land_id);
+        assert!(matches!(b_gets_a, Err(Error::NotFound(_))), "{b_gets_a:?}");
+        let a_gets_b = get_land(&f.store, &caller(), "r", b_out.land_id);
+        assert!(matches!(a_gets_b, Err(Error::NotFound(_))), "{a_gets_b:?}");
+    }
+
+    /// Pass 5, W4: the ref CAS names a version, not a target, so an ABA
+    /// (main moves X -> Y -> X) still refuses a CAS that plans at the old
+    /// version: the version moved twice even though the target came back.
+    #[test]
+    fn a_cas_at_a_version_which_moved_and_moved_back_refuses() {
+        let f = fixture();
+        let head = f.main();
+        assert_eq!(head.version, 1);
+        let y = f.commit(f.root, &[put("b/y", "y")]);
+        assert!(
+            f.store
+                .write(|c| c.cas_ref(f.repo, "main", Some(head.version), y))
+                .unwrap()
+        );
+        // Back to the same target X: the version still moves.
+        assert!(
+            f.store
+                .write(|c| c.cas_ref(f.repo, "main", Some(2), head.target))
+                .unwrap()
+        );
+        assert_eq!(f.main().target, head.target, "X again, by target");
+        assert_eq!(f.main().version, 3, "but a new version");
+        // A land that planned at version 1 refuses to move the ref, whatever
+        // it names as the new target.
+        let cs = f.commit(head.target, &[put("a/x", "later")]);
+        assert!(
+            !f.store
+                .write(|c| c.cas_ref(f.repo, "main", Some(head.version), cs))
+                .unwrap()
+        );
+        assert_eq!(f.main().version, 3, "the refused CAS moved nothing");
     }
 }

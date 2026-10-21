@@ -122,7 +122,10 @@ pub fn lookup(c: &mut dyn MetaTx, root: TreeId, path: &RepoPath) -> Result<Optio
         let Entry::Dir(id) = entry else {
             return Ok(None);
         };
-        match c.get_tree(id)?.entries().clone().remove(&name) {
+        // One entry, straight from the stored bytes: no whole-node
+        // decode, no entry-map clone. A big directory costs what the
+        // one entry costs, not the whole folder.
+        match c.lookup_tree_entry(id, name.as_bytes())? {
             Some(next) => entry = next,
             None => return Ok(None),
         }
@@ -404,7 +407,6 @@ mod tests {
     use crate::meta::Meta as _;
     use crate::store::Store;
     use scion_core::{BlobId, Changeset, IdentityTime};
-
     /// `(path, Some(content))` puts a regular file; `(path, None)` deletes.
     type Edits<'a> = &'a [(&'a str, Option<&'a str>)];
 
@@ -471,6 +473,93 @@ mod tests {
             );
             assert_eq!(lookup(c, t2, &path("a/b"))?, None);
             assert_eq!(lookup(c, t2, &path("e/x"))?, None, "a file has no children");
+            Ok(())
+        });
+    }
+
+    /// The names one level holds, plus the names that must miss: before
+    /// the first, between two, after the last. Present names carry the
+    /// entry the full decode's map holds for them.
+    fn level_checks(tree: &Tree) -> Vec<(Vec<u8>, bool, Option<Entry>)> {
+        let names: Vec<Vec<u8>> = tree
+            .entries()
+            .keys()
+            .map(|n| n.as_bytes().to_vec())
+            .collect();
+        let mut checks = Vec::new();
+        checks.push((vec![0], false, None));
+        for (i, name) in names.iter().enumerate() {
+            let entry = tree
+                .entries()
+                .get(&PathElem::new(name.clone()).unwrap())
+                .copied();
+            checks.push((name.clone(), true, entry));
+            if i + 1 < names.len() {
+                let mut between = name.clone();
+                between.push(0);
+                between.extend_from_slice(b"mid");
+                checks.push((between, false, None));
+            }
+        }
+        if names.len() >= 2 {
+            // A name that sorts between the two last entries: the scan
+            // must stop near the end, not walk to the last byte.
+            let mut before_last = names[names.len() - 2].clone();
+            before_last.extend_from_slice(b"a0");
+            checks.push((before_last, false, None));
+            let last = &names[names.len() - 1];
+            checks.push((
+                last.clone(),
+                true,
+                tree.entries()
+                    .get(&PathElem::new(last.clone()).unwrap())
+                    .copied(),
+            ));
+        }
+        checks.push((b"zzzz-after-the-last".to_vec(), false, None));
+        checks
+    }
+
+    #[test]
+    fn lookup_tree_entry_answers_what_the_full_decode_answers() {
+        with_db(|c| {
+            let t = apply(
+                c,
+                None,
+                &changes(&[
+                    ("a", Some("1")),
+                    ("aB/c", Some("2")),
+                    ("b/one", Some("3")),
+                    ("b/two", Some("4")),
+                    ("b/three", Some("5")),
+                    ("deep/x/y", Some("6")),
+                    ("\u{3bb}/\u{3b1}", Some("7")),
+                    ("\u{3bb}/\u{3c9}", Some("8")),
+                ]),
+                &mut lens_none(),
+            )?;
+            // Every directory level of the tree, with its id.
+            let mut dirs = vec![t];
+            for p in ["aB", "b", "deep", "deep/x", "\u{3bb}"] {
+                match lookup(c, t, &path(p))? {
+                    Some(Entry::Dir(id)) => dirs.push(id),
+                    other => panic!("{p} is not a dir: {other:?}"),
+                }
+            }
+            for dir in dirs {
+                let tree = c.get_tree(dir)?;
+                for (name, present, expected) in level_checks(&tree) {
+                    let found = c.lookup_tree_entry(dir, &name)?;
+                    if present {
+                        assert_eq!(
+                            found, expected,
+                            "the scan's answer differs from the full decode for {name:?}"
+                        );
+                    } else {
+                        assert!(found.is_none(), "name {name:?} is present but must miss");
+                    }
+                }
+            }
             Ok(())
         });
     }
