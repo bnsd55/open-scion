@@ -157,6 +157,8 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
         }
         let dir = archive.join("repos").join(name);
         let changesets = read_changesets(&dir.join("changesets.bin"))?;
+        let members = read_members(&dir.join("members.txt"))?;
+        let member_set: HashSet<BlobId> = members.iter().copied().collect();
         let ids: HashSet<ChangesetId> = changesets.iter().map(|(id, _, _)| *id).collect();
         let mut decoded = Vec::new();
         for (id, generation, body) in &changesets {
@@ -182,6 +184,18 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
                 if !ids.contains(parent) {
                     damages.push(format!(
                         "repo {name}: changeset {id} names parent {parent}, which the archive does not hold"
+                    ));
+                }
+            }
+            // The replay rebuilds every tree from the changes' blobs
+            // alone, so a changeset whose change names a blob the
+            // members.txt does not list passes here and dies mid-replay
+            // — the reader and the writer would disagree about the same
+            // archive. Name it here, where the reader reads.
+            for state in cs.changes().values().flatten() {
+                if let Some(blob) = state.blob().filter(|blob| !member_set.contains(blob)) {
+                    damages.push(format!(
+                        "repo {name}: changeset {id} names blob {blob}, which its members.txt does not list"
                     ));
                 }
             }
@@ -213,12 +227,12 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
                 ));
             }
         }
-        for member in read_members(&dir.join("members.txt"))? {
-            let path = blob_path(archive, &member);
+        for member in &members {
+            let path = blob_path(archive, member);
             match fs::File::open(&path) {
                 Ok(file) => match decode_blob(&path, file) {
                     Ok(raw) => {
-                        if BlobId::of(&raw) != member {
+                        if BlobId::of(&raw) != *member {
                             damages.push(format!(
                                 "the blob file of {member} holds other bytes than its name says"
                             ));
@@ -265,6 +279,24 @@ pub fn restore(
     postgres_url: Option<&str>,
     postgres_ca: Option<&Path>,
 ) -> Result<Vec<String>> {
+    restore_with(archive, data, postgres_url, postgres_ca, |path, url, ca| {
+        Backend::open(path, url, ca)
+    })
+}
+
+/// [`restore`] with the store's opener chosen: the one seam the tests
+/// use, so a test can arm the store's fail seam on the very store a
+/// restore opens and watch the choreography — staging, replay, rename,
+/// the drop of what it made — under a failure that is the store's, not
+/// the archive's. Everything else is the public restore's.
+#[doc(hidden)]
+pub fn restore_with(
+    archive: &Path,
+    data: &Path,
+    postgres_url: Option<&str>,
+    postgres_ca: Option<&Path>,
+    open: impl FnOnce(&Path, Option<&str>, Option<&Path>) -> Result<Backend>,
+) -> Result<Vec<String>> {
     for existing in ["scion.db", MARKER, "objects"] {
         if data.join(existing).exists() {
             return Err(Error::FailedPrecondition(format!(
@@ -289,7 +321,7 @@ pub fn restore(
         fs::remove_dir_all(&staging)?;
     }
     fs::create_dir_all(&staging)?;
-    let replayed = restore_into(archive, &staging, postgres_url, postgres_ca);
+    let replayed = restore_into_with(archive, &staging, postgres_url, postgres_ca, open);
     match replayed {
         Ok(names) => {
             if let Err(error) = fs::rename(&staging, data) {
@@ -304,6 +336,15 @@ pub fn restore(
         }
         Err(error) => {
             let _ = fs::remove_dir_all(&staging);
+            // On Postgres the store's identity was minted by this
+            // restore's open (a database that already named a store
+            // refuses a marker-less staging directory), so the failed
+            // replay leaves only that mint behind. Drop it, best
+            // effort, so the operator's retry against the same
+            // database is refused by nothing.
+            if let Err(why) = reset_postgres_identity(postgres_url, postgres_ca) {
+                tracing::warn!(error = %why, "cannot reset the restored database's identity");
+            }
             Err(error)
         }
     }
@@ -312,11 +353,12 @@ pub fn restore(
 /// The replay itself, into whatever directory the caller named: the
 /// publication (the rename into the target) is [`restore`]'s, so a
 /// failure here cannot leave anything behind.
-fn restore_into(
+fn restore_into_with(
     archive: &Path,
     data: &Path,
     postgres_url: Option<&str>,
     postgres_ca: Option<&Path>,
+    open: impl FnOnce(&Path, Option<&str>, Option<&Path>) -> Result<Backend>,
 ) -> Result<Vec<String>> {
     let manifest = read_manifest(archive)?;
     let names = repo_names(&manifest)?;
@@ -330,7 +372,12 @@ fn restore_into(
             damages[0]
         )));
     }
-    let store = Backend::open(data, postgres_url, postgres_ca)?;
+    let store = open(data, postgres_url, postgres_ca)?;
+    // The sections and the blobs first, all of them: the blobs are
+    // files under `data` (the staging directory the publication
+    // renames), so a failure here is the staging drop's, and no row
+    // was written yet.
+    let mut sections = Vec::new();
     for name in &names {
         let dir = archive.join("repos").join(name);
         let changesets = read_changesets(&dir.join("changesets.bin"))?;
@@ -353,29 +400,33 @@ fn restore_into(
                 )));
             }
         }
-        let repo_id = store.write(|c| c.create_repo(name))?;
-        // The lens the tree building needs: the size of every member blob,
-        // read from the files the put above just made durable.
-        let mut lens = HashMap::new();
-        for member in &members {
-            lens.insert(*member, store.blobs().size(*member)? as u64);
-        }
-        // One write transaction per repo: the changesets replay in
-        // generation order, and a parent always has a smaller generation,
-        // so every parent is in before its child.
-        store.write(|c| {
-            for (_id, _gen, body) in &changesets {
+        sections.push((name.clone(), changesets, members, refs, lands, provenance));
+    }
+    // One write transaction for the whole metadata replay, every repo:
+    // the changesets replay in generation order (a parent always has a
+    // smaller generation, so every parent is in before its child), and
+    // a failure anywhere rolls back every row, on either backend — the
+    // database a restore was replaying into comes out as it was found,
+    // not half-named. The restore opens a fresh store, so the
+    // transaction is the only writer and its length is the restore's.
+    store.write(|c| {
+        for (name, changesets, members, refs, lands, provenance) in &sections {
+            let repo_id = c.create_repo(name)?;
+            // The lens the tree building needs: the size of every member
+            // blob, read from the files the put above just made durable.
+            let mut lens = HashMap::new();
+            for member in members {
+                lens.insert(*member, store.blobs().size(*member)? as u64);
+            }
+            for (_id, _gen, body) in changesets {
                 let (cs, _) = Changeset::decode_with_id(body)
                     .map_err(|error| Error::Corrupt(format!("a stored changeset body: {error}")))?;
                 tree::store_changeset(c, repo_id, &cs, &mut tree::lens_from(&lens))?;
             }
-            Ok(())
-        })?;
-        store.write(|c| {
-            for (ref_name, target, version) in &refs {
+            for (ref_name, target, version) in refs {
                 c.restore_ref(repo_id, ref_name, target.as_bytes(), *version)?;
             }
-            for land in &lands {
+            for land in lands {
                 c.record_land(
                     &Caller(land.caller.clone()),
                     &LandRequest {
@@ -390,13 +441,22 @@ fn restore_into(
                     None,
                 )?;
             }
-            for (oid, cs) in &provenance {
+            for (oid, cs) in provenance {
                 c.put_git_import(repo_id, *oid, *cs)?;
             }
-            Ok(())
-        })?;
-    }
+        }
+        Ok(())
+    })?;
     Ok(names)
+}
+
+/// Undoes the identity a failed restore's open minted in the database:
+/// a fresh store names no store, and the next open mints again. The
+/// tables the migration made stay (they are empty, and the next open's
+/// migration is idempotent); only the name goes.
+fn reset_postgres_identity(url: Option<&str>, ca: Option<&Path>) -> Result<()> {
+    let Some(url) = url else { return Ok(()) };
+    crate::pg::reset_identity(url, ca)
 }
 
 /// The archive's blob file of `id`, in the store's own fan-out shape.

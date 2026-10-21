@@ -313,35 +313,60 @@ fn two_pending_lands_sharing_a_request_key_are_named_or_tolerated() {
     }
 }
 
-/// The attack: an archive whose `verify` is silent but whose replay
-/// dies halfway — a changeset names a blob its members.txt does not
-/// list, so the replay's tree build finds no size for it. Whatever the
-/// failure, the target must come out as it went in: empty. A half
-/// store is the attacker's win, because the operator cannot tell
-/// restored state from unrestored; the staging directory is what keeps
-/// the target whole.
+/// The attack: a changeset whose change names a blob the members.txt
+/// does not list. Nothing else in `verify` looks at the changes'
+/// members, so the reader passed what the replay would die on — the
+/// reader and the writer disagreed about one archive. The cross-check
+/// names it, and the restore refuses with the target as it went in.
 #[test]
-fn a_replay_that_dies_halfway_leaves_the_target_empty() {
+fn a_changeset_naming_an_unlisted_blob_is_named_and_refused() {
     let (_keep, out, _main, _second) = sound_archive();
-    // Drop one member line the last changeset's tree names. Verify
-    // passes: nothing in it cross-checks the changesets' members
-    // against members.txt, and every blob file it does check is whole.
+    // Drop one member line the last changeset's tree names.
     let members_path = section(&out, REPO).join("members.txt");
     let members = std::fs::read_to_string(&members_path).unwrap();
     let lines: Vec<&str> = members.lines().collect();
     assert_eq!(lines.len(), 3, "the fixture holds three members");
     std::fs::write(&members_path, lines[..2].join("\n") + "\n").unwrap();
+
     let damages = archive::verify(&out).unwrap();
     assert!(
-        damages.is_empty(),
-        "the point is verify silence: {damages:?}"
+        damages
+            .iter()
+            .any(|d| d.contains("members.txt does not list")),
+        "verify must name the changeset's unlisted blob: {damages:?}"
     );
 
     let empty = tempfile::tempdir().unwrap();
     let restored = archive::restore(&out, empty.path(), None, None);
+    assert!(restored.is_err(), "a named damage must refuse the replay");
+    let written = std::fs::read_dir(empty.path()).unwrap().count();
+    assert_eq!(
+        written, 0,
+        "a refused restore must not leave a half-restored store"
+    );
+}
+
+/// The attack behind the two above: whatever kills the replay halfway
+/// — here the store's own fail seam, armed on the very store the
+/// restore opens — the target must come out as it went in: empty. The
+/// whole metadata replay is one transaction, so the store rolls back
+/// to what it was, and the staging directory is dropped; nothing of
+/// the restore remains anywhere.
+#[test]
+fn a_mid_replay_failure_leaves_the_target_empty() {
+    let (_keep, out, _main, _second) = sound_archive();
+    let empty = tempfile::tempdir().unwrap();
+    let restored = archive::restore_with(&out, empty.path(), None, None, |path, url, ca| {
+        let store = scion_server::Backend::open(path, url, ca)?;
+        // The seam: the store's next commit — the whole metadata
+        // transaction, every repo — fails as busy, the way a disk or a
+        // lock would make it.
+        store.fail_next_commits(1);
+        Ok(store)
+    });
     assert!(
         restored.is_err(),
-        "a replay that cannot finish must not report success"
+        "a replay whose store refuses its commit must not report success"
     );
     let written = std::fs::read_dir(empty.path()).unwrap().count();
     assert_eq!(
@@ -359,4 +384,94 @@ fn a_replay_that_dies_halfway_leaves_the_target_empty() {
         "the staging directory must not survive a failed restore: {}",
         staging.display()
     );
+}
+
+/// The Postgres half of the mid-replay attack: the whole metadata
+/// replay is one transaction, so a replay whose write waits out the
+/// store's lock clock and dies as busy rolls back every row, and the
+/// failed restore resets the identity its open minted — the database
+/// comes out as it went in, empty and nameless, and the operator's
+/// retry against the same URL is refused by nothing. Runs only where
+/// `SCION_TEST_POSTGRES_URL` names the job's own scratch instance.
+#[test]
+fn a_pg_replay_that_dies_halfway_leaves_the_database_empty() {
+    let Ok(base) = std::env::var("SCION_TEST_POSTGRES_URL") else {
+        return;
+    };
+    // The restore's database names one store, so the attack gets its
+    // own: created and dropped here, never the tests' shared one.
+    let name = format!("scion_restore_attack_{}", std::process::id());
+    let mut maker = postgres::Client::connect(&base, postgres::NoTls).unwrap();
+    maker
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {name}"))
+        .unwrap();
+    maker
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .unwrap();
+    let url = format!(
+        "{}/{}",
+        base.rsplit_once('/')
+            .map_or(base.as_str(), |(rest, _)| rest),
+        name
+    );
+    let (_keep, out, _main, _second) = sound_archive();
+    let empty = tempfile::tempdir().unwrap();
+    let holder_url = url.clone();
+    let (locked, wait_locked) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let mut db = postgres::Client::connect(&holder_url, postgres::NoTls).unwrap();
+        // The lock goes down as soon as the restore's open has made
+        // its tables, and holds past the writer's 5 s clock: the
+        // replay's one write dies as busy. The channel says the lock
+        // is down, and the replay waits for that word before it runs.
+        loop {
+            let there: Option<String> = db
+                .query_one("SELECT to_regclass('public.changesets')::text", &[])
+                .unwrap()
+                .get(0);
+            if there.is_some() {
+                db.batch_execute("BEGIN; LOCK TABLE changesets IN EXCLUSIVE MODE;")
+                    .unwrap();
+                let _ = locked.send(());
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let _ = db.batch_execute("COMMIT");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    });
+    let restored = archive::restore_with(&out, empty.path(), Some(&url), None, |path, url, ca| {
+        let store = scion_server::Backend::open(path, url, ca)?;
+        // The lock is on the table before the replay may write: the
+        // store's 5 s clock runs out against it, and the write dies.
+        wait_locked
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the holder never took its table");
+        Ok(store)
+    });
+    assert!(
+        restored.is_err(),
+        "a replay that waited out the lock clock must not report success"
+    );
+    holder.join().unwrap();
+    let written = std::fs::read_dir(empty.path()).unwrap().count();
+    assert_eq!(
+        written, 0,
+        "the target must stay empty when the replay dies halfway"
+    );
+    // The database came out as it went in: no row the replay wrote,
+    // and no identity — the next open mints again, so the retry is
+    // refused by nothing.
+    let mut check = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    for table in ["repos", "changesets", "refs", "store_uuid"] {
+        let rows: i64 = check
+            .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(rows, 0, "{table} must be empty after a failed restore");
+    }
+    drop(check);
+    maker
+        .batch_execute(&format!("DROP DATABASE {name}"))
+        .unwrap();
 }

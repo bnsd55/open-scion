@@ -1659,7 +1659,7 @@ fn server_lock_raw(client: &mut Client, key: i64) -> bool {
         .is_ok_and(|row| row.is_some_and(|row| row.get::<_, bool>(0)))
 }
 
-/// A plain connection. Only the test schema's preparation calls it.
+/// A plain connection. The test schema's preparation calls it.
 #[cfg(any(test, feature = "test-hooks"))]
 fn connect(url: &str, ca: Option<&Path>) -> Result<PgClient> {
     connect_with(url, ca, "", None)
@@ -1675,6 +1675,19 @@ fn connect_with(
     schema: Option<&str>,
 ) -> Result<PgClient> {
     spawn_client(url, ca, options, schema, None, None)
+}
+
+/// Undoes the identity a failed restore's open minted in the database:
+/// a fresh store names no store, and the next open mints again. The
+/// tables the migration made stay (they are empty, and the next open's
+/// migration is idempotent); only the name goes.
+pub(crate) fn reset_identity(url: &str, ca: Option<&Path>) -> Result<()> {
+    let client = connect_with(url, ca, "", None)?;
+    client.as_raw(|client| {
+        client
+            .batch_execute("DELETE FROM store_uuid WHERE one = 1")
+            .map_err(map_pg_error)
+    })
 }
 
 /// [`connect_with`], as the one server process of the database: the

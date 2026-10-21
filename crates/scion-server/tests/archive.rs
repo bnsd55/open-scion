@@ -235,8 +235,14 @@ fn a_blob_file_that_expands_past_the_cap_is_refused() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, &frame).unwrap();
     let damages = archive::verify(&out).unwrap();
-    assert_eq!(damages.len(), 1, "{damages:?}");
-    assert!(damages[0].contains("expands past the cap"), "{damages:?}");
+    // The members.txt rewrite also leaves the changesets' own blobs
+    // unlisted, and the cross-check that keeps the reader and the
+    // replay honest names each of those; the bomb's cap refusal must
+    // be among them.
+    assert!(
+        damages.iter().any(|d| d.contains("expands past the cap")),
+        "{damages:?}"
+    );
     let empty = tempfile::tempdir().unwrap();
     match archive::restore(&out, empty.path(), None, None) {
         Err(scion_server::Error::Corrupt(why)) => {
