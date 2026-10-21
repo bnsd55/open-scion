@@ -11,6 +11,17 @@ outcome:string
 peer:string
 ts:string
 v:number
+[land/failed]
+event:string
+outcome:string
+principal:string
+ref:string
+repo:string
+request_id:string
+rpc:string
+ts:string
+v:number
+why:string
 [land/intent]
 event:string
 outcome:string

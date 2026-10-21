@@ -42,13 +42,7 @@ const REPO: &str = "main";
 /// The kinds this test cannot drive in-process, with why. The census
 /// [`the_audit_census_of_the_source_is_complete`] holds the full set;
 /// this list is the gap the exercise leaves, exactly.
-const NOT_EXERCISED: &[(&str, &str, &str)] = &[(
-    "land",
-    "failed",
-    "the land verdict's own error is a ref race or a corrupt row; no \
-     in-process call drives it, and its field shape joins the golden \
-     when one does",
-)];
+const NOT_EXERCISED: &[(&str, &str, &str)] = &[];
 
 type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
 
@@ -382,6 +376,69 @@ fn the_audit_census_of_the_source_is_complete() {
     );
 }
 
+/// Moves main past the land's index without a land: two changesets
+/// join the store and main jumps to the second one. The next land's
+/// walk then has steps to take, and its first step consults the
+/// deadline. Direct store writes leave no audit lines.
+fn move_main_past_the_index(
+    store: &Backend,
+    id: scion_core::ChangesetId,
+    blob: scion_core::BlobId,
+) {
+    let bridge1 = changeset(vec![id], "docs/bridge-1", blob);
+    store
+        .write(|c| {
+            let repo = c.repo_id(REPO)?;
+            let first = c.insert_changeset(repo, &bridge1)?;
+            let second = changeset(vec![first], "docs/bridge-2", blob);
+            let second = c.insert_changeset(repo, &second)?;
+            let version = c.get_ref(repo, "main")?.map(|state| state.version);
+            c.cas_ref(repo, "main", version, second)?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// A land whose job stalls past its own deadline: a blocker holds the
+/// store's write connection, so the job waits at its commit while the
+/// 500 ms request runs out. The first check after the unblock answers
+/// deadline-exceeded (or, once the call's own timeout has cut it, the
+/// call has gone), so the job writes the failed line. Certain on both
+/// backends: the job cannot reach the walk before the unblock.
+async fn late_land(store: &Backend, url: &str, late_id: scion_core::ChangesetId) {
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let blocker = std::thread::spawn({
+        let store = store.clone();
+        move || {
+            store
+                .read_unflushed(|_| {
+                    held_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        }
+    });
+    held_rx.recv().unwrap();
+    let mut late = tonic::Request::new(LandRequest {
+        repo: REPO.into(),
+        changeset_id: late_id.as_bytes().to_vec(),
+        target_ref: "main".into(),
+        request_key: "t-late".into(),
+    });
+    late.metadata_mut()
+        .insert("grpc-timeout", "500m".parse().unwrap());
+    let mut late_call = writer(url, "t-late").await;
+    let late = tokio::task::spawn(async move {
+        let _ = late_call.land(late).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    go_tx.send(()).unwrap();
+    blocker.join().unwrap();
+    let _ = late.await;
+}
+
 /// The line shape of one rendered audit line: field name to JSON type.
 fn shape(line: &serde_json::Value) -> BTreeMap<String, &'static str> {
     line.as_object()
@@ -471,10 +528,26 @@ async fn exercise() -> (tempfile::TempDir, std::path::PathBuf) {
     .await
     .expect("the land is allowed");
 
+    // A land whose job stalls past its own deadline. The setup: a
+    // changeset that can land cleanly, main moved past the land's
+    // index so its walk has steps, and a blocker that holds the
+    // store's write connection while the 500 ms request runs out.
+    let (bytes, late_id) = changeset(vec![root], "docs/late", blob).encode_with_id();
+    let mut ci = writer(&url, "t-create-2").await;
+    ci.create_changeset(CreateChangesetRequest {
+        repo: REPO.into(),
+        changeset: bytes,
+    })
+    .await
+    .expect("the create is allowed");
+    move_main_past_the_index(&store, id, blob);
+    late_land(&store, &url, late_id).await;
+
     // The stop flushes the meter's counts before the server ends.
     stop.send(()).unwrap();
     wait_for_kind(&audit_path, "auth", "refused").await;
-    wait_for_lines(&audit_path, 10).await;
+    wait_for_kind(&audit_path, "land", "failed").await;
+    wait_for_lines(&audit_path, 15).await;
     (dir, audit_path)
 }
 
