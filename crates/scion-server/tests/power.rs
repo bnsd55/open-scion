@@ -269,7 +269,11 @@ async fn every_reply_survives_a_power_cut() {
     let lazyfs = lazyfs_dir().unwrap();
     let seed = seed();
     let mut rng = Rng::new(seed);
-    let rounds = usize::try_from(env("SCION_POWER_ROUNDS", 4)).unwrap();
+    // Ten cuts, same margin as the crash suite: at the conservative
+    // rate of about half the cuts meeting a land pending in the
+    // database, the chance all ten miss is about 0.5^10, just under
+    // 0.1%.
+    let rounds = usize::try_from(env("SCION_POWER_ROUNDS", 10)).unwrap();
     let mut pending_kills = 0usize;
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("server.log");

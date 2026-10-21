@@ -53,7 +53,11 @@ fn seed() -> u64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_reply_survives_a_kill_of_the_server() {
     let mut rng = Rng::new(seed());
-    let kills = usize::try_from(env("SCION_CRASH_KILLS", 6)).unwrap();
+    // Ten kills: at the measured rate about half the kills meet a land
+    // pending in the database, so the chance that all ten miss is about
+    // 0.5^10, just under 0.1% - the bar the assert's margin needs, so
+    // the assert itself cannot be the next flake.
+    let kills = usize::try_from(env("SCION_CRASH_KILLS", 10)).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let (data, log) = (dir.path().join("data"), dir.path().join("server.log"));
     create_repo(&data);

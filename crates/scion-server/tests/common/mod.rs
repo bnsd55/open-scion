@@ -336,16 +336,22 @@ pub(crate) struct Ledger {
     pub oplog: ledger::OpLog,
 }
 
-/// Repo `r` with one root changeset, and refs `main` and `dev` at it. No RPC
-/// The root's directory is wide: a land's tree and history nodes hold
-/// the whole level of every directory on the changed path, and the root
-/// is on every path, so about 64 bytes per entry of metadata ride each
-/// land (measured by the `land_cost` test). Wide enough that a land stays
-/// pending between two looks at the database - the moment a kill must
-/// meet (the flake of #478: a fast runner's lands passed through
-/// pending before the first poll).
+/// The suite repo's root directory is wide, so a land's metadata cost
+/// is easy to see: a land writes one history node and one tree node per
+/// directory on its changed paths, and each node holds the whole
+/// directory level (the cost model of `history.rs`), so the bytes a
+/// land writes are the sizes of the directories above its change -
+/// about 64 bytes per entry, measured at directories of 1000 and 10000
+/// entries (63897 and 638976 bytes per land). The root is on every
+/// path, so with 1500 entries every land of the suites writes about 96
+/// KiB above its change, wide enough that a land stays pending between
+/// two looks at the database - the moment a kill must meet. The flake
+/// of #478 was that moment passing unseen: a fast runner's lands
+/// finished before the first poll, and the old fatal wait named a hold
+/// that never happened.
 const WIDE_ENTRIES: usize = 1500;
 
+/// Repo `r` with one root changeset, and refs `main` and `dev` at it. No RPC
 pub(crate) fn create_repo(data: &Path) {
     let store = Store::open(data).unwrap();
     let readme = store.blobs().put(b"crash suite\n").unwrap();

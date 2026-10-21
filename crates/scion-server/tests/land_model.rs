@@ -40,7 +40,15 @@ use tonic::Status;
 
 /// Rounds of land, kill and check. Each round starts the server, runs the
 /// principals, kills the server under them, and checks.
-const ROUNDS: u64 = 3;
+// Fifteen rounds: ten of them are kill rounds (every round but those
+// divisible by three), and the wide lands keep a land pending in nearly
+// every kill - this suite measured 100 of 100 kill rounds over 50
+// runs. At the crash suite's conservative rate of about one kill in two
+// meeting pending, the chance all ten kill rounds miss is about
+// 0.5^10, just under 0.1% - the margin the final assert needs, so the
+// assert itself cannot be the next flake.
+const ROUNDS: u64 = 15;
+
 /// Principals that land concurrently. Each holds its own connections and
 /// its own request keys: the by-key rule is per (repo, caller, key).
 const PRINCIPALS: usize = 4;
