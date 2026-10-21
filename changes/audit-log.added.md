@@ -12,10 +12,34 @@ request ID; a read records one. If the audit append fails, the change
 is refused and readiness reports not-ready. Refused authentication is
 aggregated per peer per interval into one counted line, capped.
 
+The write, land and ref events carry what an operator needs and no
+contents: the RPC, the repo, the ref, the byte count of an upload,
+the land's state and ID, and a ref move's old and new changeset IDs.
+A changeset ID names content the caller already had; a blob or tree
+digest would name contents, so none appears.
+
+On open, a file whose last line has no newline gets one, so a line
+that a full drive cut in the middle stays a fragment of its own and
+cannot swallow the lines that follow.
+
+A land's ref line names the head the move replaced, read where the
+move happens, under the ref's lock, and is written only by the call
+that made the move. A replayed land (the same request key after it
+landed) moved nothing, so its land line names no old and no ref line
+appears for it; an auditor finds the head the move replaced in the
+land line of the call that made the move, under the same land_id.
+The ref lines of a ref, in file order, are the ref's true history:
+each old is the previous line's new.
+
 Blob and tree digests are never logged (a digest is a dictionary key
 to contents), and neither are token bytes or token hashes. Rotation
 is by size, keeps a bounded number of old files, and names what it
 dropped in an admin line.
 
-Not covered yet: nothing - the events above are the whole of the
-issue's list.
+Not covered yet: the ref moves that happen outside the server.
+Import moves a ref to each imported tip (import.rs), and archive
+restore writes refs back (restore_ref); they run as their own
+processes and cannot hand lines to the server's writer, so they must
+append their own lines to the same audit file, intent before the
+move. Until they do, a reader of the log must not take it as
+complete: a ref can move without a line.

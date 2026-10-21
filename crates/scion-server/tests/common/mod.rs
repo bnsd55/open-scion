@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::Write as _;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -77,6 +78,23 @@ pub(crate) struct Server {
     pub url: String,
 }
 
+/// The token file of this test process: one per process, in the temp
+/// dir the ancestor walk accepts, private to the owner.
+pub(crate) fn token_file() -> &'static std::path::PathBuf {
+    use std::sync::OnceLock;
+    static FILE: OnceLock<std::path::PathBuf> = OnceLock::new();
+    FILE.get_or_init(|| std::env::temp_dir().join(format!("scion-token-{}", std::process::id())))
+}
+
+/// One staging name per call: two tests spawning at once must not race
+/// one staging file's rename.
+fn staging() -> &'static std::sync::atomic::AtomicU64 {
+    use std::sync::OnceLock;
+    use std::sync::atomic::AtomicU64;
+    static STAGING: OnceLock<AtomicU64> = OnceLock::new();
+    STAGING.get_or_init(|| AtomicU64::new(0))
+}
+
 impl Server {
     /// The server process's id, for a test that must tell the server's
     /// files from another process's.
@@ -128,6 +146,29 @@ impl Server {
             .append(true)
             .open(log)
             .unwrap();
+        // The token rides in a 0600 file, the runbook's way: argv is
+        // readable by every user of the machine. The file lives in the
+        // temp dir every test's own tempdir sits in - the directories the
+        // ancestor walk already accepts - not next to a log that CI may
+        // place under the work dir, whose ancestors carry a default ACL
+        // the walk refuses. The rename is atomic, so a server that reads
+        // while a sibling test rewrites sees whole bytes.
+        let token_file = token_file();
+        let n = staging().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = token_file.with_extension(format!("tmp{n}"));
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .unwrap()
+                .write_all(TOKEN.as_bytes())
+                .unwrap();
+        }
+        fs::rename(tmp, token_file).unwrap();
         // The child shares a flock until it execs (see `spawn_guard`): the
         // read side keeps this spawn out of a lock-release window of
         // another test.
@@ -135,7 +176,9 @@ impl Server {
             Command::new(env!("CARGO_BIN_EXE_scion-server"))
                 .arg("--data")
                 .arg(data)
-                .args(["serve", "--token", TOKEN, "--listen", "127.0.0.1:0"])
+                .args(["serve", "--token-file"])
+                .arg(token_file)
+                .args(["--listen", "127.0.0.1:0"])
                 // Plain log lines, so the address parses without escape
                 // codes.
                 .env("NO_COLOR", "1")
@@ -836,10 +879,24 @@ pub(crate) async fn check(
     }
 }
 
-/// Waits until `ready` holds, for at most 10 s.
-pub(crate) async fn wait_until(ready: impl Fn() -> bool) {
+/// Waits until `ready` holds, for at most 10 s, and names the condition
+/// it never saw: a caller that waits for "a large upload is in flight"
+/// must not run its crash on a moment that condition never came.
+pub(crate) async fn wait_until(what: &str, ready: impl Fn() -> bool) {
     let give_up = Instant::now() + Duration::from_secs(10);
-    while !ready() && Instant::now() < give_up {
+    loop {
+        // The condition is checked first and believed: a land that is
+        // pending at this instant may land before a second look, so the
+        // wait must not re-ask after the loop (a re-check races the very
+        // thing it waited for, and names a hold that did happen as one
+        // that never did).
+        if ready() {
+            return;
+        }
+        assert!(
+            Instant::now() < give_up,
+            "the waited-for condition never held within 10 s: {what}"
+        );
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }

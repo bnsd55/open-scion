@@ -310,13 +310,19 @@ async fn every_reply_survives_a_power_cut() {
                 tokio::time::sleep(Duration::from_millis(u64::try_from(run).unwrap())).await;
             }
             1 => {
-                wait_until(|| signals.large_uploads.load(Ordering::SeqCst) > 0).await;
+                wait_until("a large upload is in flight", || {
+                    signals.large_uploads.load(Ordering::SeqCst) > 0
+                })
+                .await;
                 let delay = u64::try_from(rng.below(30)).unwrap();
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
             _ => {
                 let db = rusqlite::Connection::open(data.join("scion.db")).unwrap();
-                wait_until(|| pending_lands(&db) > 0).await;
+                wait_until("a land is pending in the database", || {
+                    pending_lands(&db) > 0
+                })
+                .await;
             }
         }
         eprintln!("round {round}: clients spawning");
@@ -351,6 +357,107 @@ async fn every_reply_survives_a_power_cut() {
     }
     println!("{rounds} cuts; {total} lands, {cut_lands} of them cut mid-call");
     assert!(total > 0, "the clients did little work");
+}
+
+/// The audit proves sync-before-reply on its own: a write whose reply
+/// went out must have its intent and result lines in the backing file
+/// after a cut, because the audit fsyncs each line before the handler
+/// answers. If an append skipped its fsync, `LazyFS` would drop the
+/// line at the cut and this test would find the reply acknowledged
+/// with no evidence behind it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acknowledged_write_s_audit_lines_survive_a_power_cut() {
+    if !may_run() {
+        return;
+    }
+    let lazyfs = lazyfs_dir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("server.log");
+    let lazy = Lazyfs::start(dir.path(), &lazyfs, 0);
+    let data = lazy.mount.join("data");
+    create_repo(&data);
+    common::spawn_guard::across_release(|| {
+        common::spawn_guard::wait_for_lock_release(&data);
+    });
+    let server = Server::start(&data, &log);
+
+    // One upload with a request ID, through the real binary.
+    let request_id = "cut-1";
+    put_blob_marked(&server.url, request_id, b"audit survives the cut\n").await;
+
+    // The cut drops every write that `LazyFS` had not seen an fsync
+    // for. The reply is out, so the audit's lines cannot be among them.
+    let mut lazy = lazy;
+    lazy.cut();
+    drop(server);
+    let audit = lazy.backing.join("data").join("audit.log");
+    let bytes = fs::read(&audit).unwrap_or_else(|why| {
+        panic!("the backing audit log is gone: {why}");
+    });
+    let text = String::from_utf8(bytes).unwrap();
+    drop(lazy);
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let intent = lines
+        .iter()
+        .find(|line| {
+            line["event"] == "write"
+                && line["outcome"] == "intent"
+                && line["request_id"] == request_id
+        })
+        .expect("the acknowledged write's intent line survived the cut");
+    assert_eq!(intent["rpc"], "PutBlob");
+    assert_eq!(intent["bytes"], 23, "the intent names its bytes");
+    let result = lines
+        .iter()
+        .find(|line| {
+            line["event"] == "write" && line["outcome"] == "ok" && line["request_id"] == request_id
+        })
+        .expect("the acknowledged write's result line survived the cut");
+    assert_eq!(result["bytes"], 23);
+}
+
+/// One upload through the real server, marked with a request ID.
+async fn put_blob_marked(url: &str, request_id: &str, data: &[u8]) {
+    use scion_proto::v1::PutBlobRequest;
+    use scion_proto::v1::scion_client::ScionClient;
+    use tonic::Request;
+    use tonic::service::interceptor::Interceptor;
+    use tonic::transport::Channel;
+
+    /// The bearer token of the default principal, and the request ID
+    /// the audit's pair joins by.
+    struct Mark(Option<tonic::metadata::AsciiMetadataValue>, String);
+
+    impl Interceptor for Mark {
+        fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+            request
+                .metadata_mut()
+                .insert("authorization", self.0.clone().unwrap());
+            let id = self.1.parse().unwrap();
+            request.metadata_mut().insert("x-request-id", id);
+            Ok(request)
+        }
+    }
+
+    let channel = Channel::from_shared(url.to_owned())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let bearer: tonic::metadata::AsciiMetadataValue =
+        format!("Bearer {}", common::TOKEN).parse().unwrap();
+    let mut scion =
+        ScionClient::with_interceptor(channel, Mark(Some(bearer), request_id.to_owned()));
+    scion
+        .put_blob(tokio_stream::once(PutBlobRequest {
+            repo: common::REPO.into(),
+            data: data.to_vec(),
+        }))
+        .await
+        .expect("the upload is allowed");
 }
 
 const RACERS: usize = 16;
