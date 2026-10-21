@@ -804,8 +804,8 @@ Tell the causes apart:
 - The rate is high, steady, and `LatencyP99High` fires on a read RPC
   with it: the derivations hold the store's readers. On Postgres,
   `scion_pg_readers_busy` pinned at 8 with a growing
-  `scion_pg_tx_age_seconds` says the walks hold the pool; raise the pool
-  or stagger the readers.
+  `scion_pg_tx_age_seconds` says the walks hold the pool; stagger the
+  readers, so the walks do not all run at once.
 
 Escalate when steady high walks and read latency land together and the
 access file has not changed for days: the working set outgrew the
@@ -834,17 +834,17 @@ Tell the causes apart:
 
 - One client, once: a crashed reader or a paused consumer. The cap
   already handled it — the buffers went with the connection. No fix.
-- The same client, again and again: its reader is slower than the
+- The same peer, again and again: its reader is slower than the
   server's producer. Fix the client (read the reply as it streams; the
-  request's `request_id` names it in both logs).
+  close notice names the peer address, and the calls of one client
+  carry its `request_id` in both logs).
 - Many clients, bytes near the cap on several connections: the replies
   are large and the clients are many — raise
   `--max-stalled-bytes` only if the box has the memory for it, or add a
   cache tier so the large replies do not all reach the server.
 
-Escalate when the close notice repeats for one principal and the client
-is not yours to fix: the client's owner stops the waste, not the
-server.
+Escalate when the close notice repeats for one peer and the client is
+not yours to fix: the client's owner stops the waste, not the server.
 
 Proof: crates/scion-server/tests/log_stream.rs::a_stalled_log_reply_is_counted_and_closes_the_connection
 
@@ -866,9 +866,10 @@ curl -s 127.0.0.1:9100/metrics \
 Tell the causes apart:
 
 - The ratio falls over the first minutes after a tier restart: the
-  memory store is warming. No fix; a tier with `--snapshot` refills from
-  its snapshot file instead of its upstream, which is why the snapshot
-  flag exists (section 1).
+  memory store warms from the reads it serves. No fix. A cache cannot
+  refill itself from its own snapshot file at start; what the snapshot
+  is for is the daemon's warm start: the cache writes the file with
+  `--snapshot`, and a daemon starts from it with `--seed` (section 1).
 - The ratio is steady high and `CacheDown` is not firing: the working
   set does not fit the tier's memory. Raise `--max-bytes` (and
   `--snapshot-bytes`, so the snapshot can hold it), or put a tier near

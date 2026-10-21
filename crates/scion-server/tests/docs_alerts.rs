@@ -20,7 +20,6 @@ use scion_proto::v1::{
 use scion_server::test_support::meta::MetaTx as _;
 use scion_server::test_support::{backend::from_store, service, store::Store};
 use scion_server::{Access, Keys, Metrics};
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tonic::service::interceptor::InterceptedService;
@@ -57,9 +56,13 @@ struct Runbook {
     keys: Keys,
     cs: scion_core::ChangesetId,
     hello: BlobId,
-    metrics: Arc<Metrics>,
     addr: String,
+    /// The address the guide's blocks curl: the same registry, over the
+    /// HTTP body `/metrics` serves.
+    metrics_addr: std::net::SocketAddr,
     stop: tokio::sync::oneshot::Sender<()>,
+    /// Keeps the metrics endpoint's shutdown open for the test's life.
+    _stop_metrics: tokio::sync::oneshot::Sender<()>,
     _dir: tempfile::TempDir,
 }
 
@@ -131,6 +134,18 @@ async fn runbook() -> Runbook {
             stopped.await.ok();
         },
     ));
+    // The metrics endpoint the guide's blocks curl: the same body
+    // `/metrics` serves, on its own loopback port.
+    let metrics_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metrics_addr = metrics_listener.local_addr().unwrap();
+    let (stop_metrics, stopped_metrics) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(scion_proto::runtime::metrics::serve(
+        metrics_listener,
+        Arc::clone(&metrics),
+        async {
+            stopped_metrics.await.ok();
+        },
+    ));
     let channel = Channel::from_shared(format!("http://{addr}"))
         .unwrap()
         .connect()
@@ -142,60 +157,63 @@ async fn runbook() -> Runbook {
         keys,
         cs,
         hello,
-        metrics,
         addr: format!("http://{addr}"),
+        metrics_addr,
         stop,
+        _stop_metrics: stop_metrics,
         _dir: dir,
     }
 }
 
-/// The `value` of every `name` line of a `/metrics` body, by label set.
-/// A bare counter's line has no labels, so its label set is empty.
-fn scrape(text: &str, name: &str) -> Vec<(String, u64)> {
-    text.lines()
-        .filter_map(|line| {
-            let rest = line.strip_prefix(name)?;
-            let rest = rest.strip_suffix('}').unwrap_or(rest);
-            let (labels, value) = match rest.trim().split_once(' ') {
-                Some((labels, value)) => (labels.trim_end_matches('}').to_owned(), value),
-                None => (String::new(), rest.trim()),
-            };
-            Some((labels, value.parse().ok()?))
-        })
-        .collect()
+/// The first fenced sh block under `heading` of docs/operations.md,
+/// verbatim: the guide's own words, newlines and all.
+fn runbook_block(heading: &str) -> String {
+    let doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/operations.md");
+    let text = std::fs::read_to_string(&doc).expect("docs/operations.md opens");
+    let mut lines = text
+        .lines()
+        .skip_while(|line| line.trim() != format!("### {heading}").trim());
+    lines.next();
+    let mut lines = lines.skip_while(|line| line.trim() != "```sh");
+    lines.next();
+    let mut block = Vec::new();
+    for line in lines {
+        if line.trim() == "```" {
+            break;
+        }
+        block.push(line);
+    }
+    assert!(!block.is_empty(), "no sh block under {heading}");
+    block.join("\n")
 }
 
-/// The runbook's per-RPC p99 table: for every RPC that served a call,
-/// the first `le` whose cumulative count reaches 99% of its calls — the
-/// awk of the guide, in Rust, over the same `/metrics` body.
-fn p99_buckets(text: &str) -> BTreeMap<String, String> {
-    let mut buckets: BTreeMap<String, Vec<(String, u64)>> = BTreeMap::new();
-    for (labels, value) in scrape(text, "scion_request_seconds_bucket{") {
-        let rpc = labels
-            .split(',')
-            .find_map(|kv| kv.strip_prefix("rpc=\"")?.strip_suffix('"'))
-            .unwrap()
-            .to_owned();
-        let le = labels
-            .split(',')
-            .find_map(|kv| kv.strip_prefix("le=\"")?.strip_suffix('"'))
-            .unwrap_or_else(|| panic!("no le in labels: {labels}"))
-            .to_owned();
-        buckets.entry(rpc).or_default().push((le, value));
-    }
-    let mut p99 = BTreeMap::new();
-    for (rpc, series) in buckets {
-        let total = series.last().unwrap().1;
-        if total == 0 {
-            continue;
-        }
-        let (le, _) = series
-            .iter()
-            .find(|(_, count)| count * 100 >= 99 * total)
-            .unwrap();
-        p99.insert(rpc, le.clone());
-    }
-    p99
+/// Runs the guide's block off the test's runtime thread: the block
+/// curls the same runtime's metrics endpoint, so a blocking run would
+/// deadlock the single-threaded test runtime against its own server.
+async fn run_guide_block_async(
+    heading: &'static str,
+    metrics_addr: std::net::SocketAddr,
+) -> String {
+    tokio::task::spawn_blocking(move || run_guide_block(heading, metrics_addr))
+        .await
+        .expect("the blocking pool runs the guide's block")
+}
+
+/// Runs the guide's block with the real metrics address in place of the
+/// documented one, and returns its stdout.
+fn run_guide_block(heading: &str, metrics_addr: std::net::SocketAddr) -> String {
+    let command = runbook_block(heading).replace("127.0.0.1:9100", &metrics_addr.to_string());
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .output()
+        .expect("sh runs the guide's block");
+    assert!(
+        out.status.success(),
+        "the guide's block failed: {command}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("the block's stdout is utf-8")
 }
 
 /// The calls that put two RPCs' histograms on the wire: an upload and a
@@ -229,26 +247,30 @@ async fn latency_p99_names_the_slow_rpc_from_the_served_histogram() {
     let mut rb = runbook().await;
     warm_the_histograms(&mut rb).await;
 
-    // The endpoint serves render() verbatim, so the runbook's awk sees
-    // the same body. Every RPC that served a call gets a p99 bucket, and
-    // the bucket's bound is one of the histogram's own.
-    let text = rb.metrics.render();
-    let p99 = p99_buckets(&text);
-    let bounds = [
-        "0.001", "0.004", "0.016", "0.064", "0.256", "1", "4", "16", "64", "+Inf",
-    ];
-    for (rpc, le) in &p99 {
+    // The guide's own awk, over the real endpoint, with the documented
+    // address swapped for the test's: every RPC that served a call gets
+    // a p99 line, and the bucket's bound is one of the histogram's own.
+    let stdout = run_guide_block_async("Latency p99 high", rb.metrics_addr).await;
+    let mut lines = 0;
+    for line in stdout.lines() {
+        let (rpc, bound) = line.split_once(" p99 in ").unwrap_or_else(|| {
+            panic!("the guide's awk printed a line the runbook does not explain: {line}")
+        });
+        let bounds = [
+            "0.001", "0.004", "0.016", "0.064", "0.256", "1", "4", "16", "64", "+Inf",
+        ];
         assert!(
-            bounds.contains(&le.as_str()),
-            "{rpc}: the p99 bucket {le} is not a bucket bound"
+            bounds.contains(&bound),
+            "{rpc}: the p99 bucket {bound} is not a bucket bound"
         );
+        lines += 1;
     }
-    for rpc in ["Scion/PutBlob", "Objects/GetRootTree"] {
-        assert!(
-            p99.contains_key(rpc),
-            "{rpc} served a call but has no p99 bucket"
-        );
-    }
+    assert!(
+        lines >= 2,
+        "the guide's awk named {lines} RPCs; the upload and the read served two"
+    );
+    assert!(stdout.contains("Scion/PutBlob"));
+    assert!(stdout.contains("Objects/GetRootTree"));
 }
 
 #[tokio::test]
@@ -265,10 +287,11 @@ async fn view_memo_serves_the_second_read_of_one_changeset() {
         })
         .await
         .expect("the partial reader may read its view");
-    let after_first = scrape(&rb.metrics.render(), "scion_view_trees_walked_total")
-        .into_iter()
-        .map(|(_, value)| value)
-        .sum::<u64>();
+    let first_text = run_guide_block_async("View memo bypassed", rb.metrics_addr).await;
+    let after_first: u64 = first_text
+        .lines()
+        .find_map(|line| line.split_whitespace().last()?.parse().ok())
+        .expect("the guide's grep found the walked counter");
     assert!(
         after_first > 0,
         "the first derivation walked nothing: the counter is not on the wire"
@@ -285,10 +308,11 @@ async fn view_memo_serves_the_second_read_of_one_changeset() {
         })
         .await
         .expect("the partial reader may read its view again");
-    let after_second = scrape(&rb.metrics.render(), "scion_view_trees_walked_total")
-        .into_iter()
-        .map(|(_, value)| value)
-        .sum::<u64>();
+    let stdout = run_guide_block_async("View memo bypassed", rb.metrics_addr).await;
+    let after_second: u64 = stdout
+        .lines()
+        .find_map(|line| line.split_whitespace().last()?.parse().ok())
+        .expect("the guide's grep found the walked counter");
     assert_eq!(
         after_second, after_first,
         "the second read walked again: the memo did not serve it"
@@ -361,6 +385,18 @@ async fn tier_miss_ratio_falls_when_the_store_serves_the_second_read() {
             stopped_cache.await.ok();
         },
     ));
+    // The tier's own metrics endpoint: the block under the tier-miss
+    // heading curls the TIER's /metrics, the alert's own subject.
+    let tier_metrics = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tier_metrics_addr = tier_metrics.local_addr().unwrap();
+    let (stop_tier_metrics, stopped_tier_metrics) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(scion_proto::runtime::metrics::serve(
+        tier_metrics,
+        cache.metrics(),
+        async {
+            stopped_tier_metrics.await.ok();
+        },
+    ));
     let channel = Channel::from_shared(format!("http://{cache_addr}"))
         .unwrap()
         .connect()
@@ -379,41 +415,35 @@ async fn tier_miss_ratio_falls_when_the_store_serves_the_second_read() {
         .expect("the token may read")
         .into_inner();
 
-    // The first read through an empty tier is all misses; the body the
-    // runbook's awk reads holds the misses line and no hits line yet.
+    // The first read through an empty tier is all misses.
     let bytes = read_through_tier(&mut tier, &reply.ticket, rb.hello).await;
     assert_eq!(bytes, b"pub fn main() {}\n");
-    let text = cache.metrics().render();
-    let misses: u64 = scrape(&text, "scion_cache_misses_total")
-        .into_iter()
-        .map(|(_, value)| value)
-        .sum();
-    let hits: u64 = scrape(&text, "scion_cache_hits_total")
-        .into_iter()
-        .map(|(_, value)| value)
-        .sum();
-    assert!(misses > 0, "the first read fetched nothing upstream");
-    assert_eq!(hits, 0, "the first read was served from the empty store");
 
-    // The second read of the same object is the store's: the miss ratio
-    // the runbook computes falls, which is the warmup case its first
-    // branch names.
-    let _ = read_through_tier(&mut tier, &reply.ticket, rb.hello).await;
-    let text = cache.metrics().render();
-    let misses: u64 = scrape(&text, "scion_cache_misses_total")
-        .into_iter()
-        .map(|(_, value)| value)
-        .sum();
-    let hits: u64 = scrape(&text, "scion_cache_hits_total")
-        .into_iter()
-        .map(|(_, value)| value)
-        .sum();
-    assert!(hits > 0, "the second read was not served from the store");
-    // The ratio the runbook computes is misses over all reads: one hit
-    // among them is what makes it fall.
+    // The guide's own awk, over the tier's real endpoint: the ratio is
+    // 1 — misses against no hits.
+    let stdout = run_guide_block_async("Tier miss rate", tier_metrics_addr).await;
+    let ratio: f64 = stdout
+        .trim()
+        .parse()
+        .expect("the guide's awk printed the ratio");
     assert!(
-        misses > 0 && hits < misses + hits,
-        "the ratio never falls: {misses} misses against {hits} hits"
+        (ratio - 1.0).abs() < f64::EPSILON,
+        "the first read's ratio is {ratio}, not 1"
     );
-    let _ = (rb.stop, stop_cache);
+
+    // The second read of the same object is the store's: the ratio the
+    // guide's awk computes falls, which is the warmup case its first
+    // branch names.
+    let bytes = read_through_tier(&mut tier, &reply.ticket, rb.hello).await;
+    assert_eq!(bytes, b"pub fn main() {}\n");
+    let stdout = run_guide_block_async("Tier miss rate", tier_metrics_addr).await;
+    let ratio: f64 = stdout
+        .trim()
+        .parse()
+        .expect("the guide's awk printed the ratio");
+    assert!(
+        ratio < 1.0,
+        "the ratio never fell: {ratio} after a served read"
+    );
+    let _ = (rb.stop, stop_cache, stop_tier_metrics);
 }
