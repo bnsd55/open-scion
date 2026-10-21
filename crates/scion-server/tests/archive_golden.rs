@@ -123,18 +123,18 @@ fn normalized_manifest(manifest: &serde_json::Value) -> String {
     if Backend::test_is_postgres() {
         let hex = uuid
             .as_str()
-            .unwrap_or_else(|| panic!("Postgres writes the marker file: {uuid}"));
+            .unwrap_or_else(|| panic!("Postgres writes the marker file"));
         assert!(
             hex.len() == 32
                 && hex
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-            "the store UUID is 32 lowercase hex: {hex}"
+            "the store UUID is not 32 lowercase hex"
         );
     } else {
         assert!(
             uuid.is_null(),
-            "SQLite keeps the UUID in the database: {uuid}"
+            "SQLite keeps the UUID in the database; the manifest names one"
         );
     }
     let stamp = manifest["snapshot_at"]
@@ -143,10 +143,10 @@ fn normalized_manifest(manifest: &serde_json::Value) -> String {
     assert_eq!(
         stamp.len(),
         20,
-        "the stamp is RFC 3339 to the second with a Z: {stamp}"
+        "the stamp is not RFC 3339 to the second with a Z"
     );
-    assert_eq!(&stamp[..2], "20", "the stamp starts with a year: {stamp}");
-    assert!(stamp.ends_with('Z'), "the stamp ends in Z: {stamp}");
+    assert_eq!(&stamp[..2], "20", "the stamp starts with a year");
+    assert!(stamp.ends_with('Z'), "the stamp does not end in Z");
     let mut normalized = serde_json::to_string_pretty(manifest).unwrap();
     normalized = normalized.replace(
         &format!("\"store_uuid\": {}", serde_json::to_string(uuid).unwrap()),
