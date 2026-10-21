@@ -1,0 +1,133 @@
+# The statement-coverage gate: the roadmap's v0.8.0 bar, measured over
+# production code with a pinned tool, the exclusions checked in
+# (scripts/coverage-exclusions.txt). The gate runs on the merged report
+# of two measures: the default backend and the Postgres backend, so a
+# whole production backend (pg.rs) is not invisible to the number.
+#
+# No pull_request trigger on purpose: the PR lane does not pay for the
+# coverage build, and an edit to this file is not a workflow-lane PR
+# that every open PR must merge. The same reason bench.yml and soak.yml
+# are their own files.
+
+name: coverage
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Every third-party action is pinned to the commit SHA its version tag
+# named, with the version in a comment, as ci.yml does.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  # Everything the measure writes stays under the worktree's own target
+  # dir; nothing goes to /tmp (the run that filled the runner's disk
+  # wrote there).
+  CARGO_LLVM_COV_TARGET_DIR: target/coverage
+
+jobs:
+  coverage:
+    name: coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:17.11
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # cargo-llvm-cov, pinned by version and the release tarball's
+      # sha256 (the same discipline the action pins follow), downloaded
+      # with curl so no third-party action enters the supply chain.
+      # v0.9.1 is the newest release at least two weeks old when this
+      # pin was made (2026-09-06).
+      - run: |
+          curl -fsSL -o /tmp/cargo-llvm-cov.tgz \
+            https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz
+          echo "b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a  /tmp/cargo-llvm-cov.tgz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/cargo-llvm-cov.tgz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: the checked-in exclusions, as one regex
+        run: |
+          regex=$(sed 's/^[[:space:]]*//; s/#.*//; s/[[:space:]]*$//' scripts/coverage-exclusions.txt \
+            | grep -v '^$' | paste -s -d '|' -)
+          # An empty file holds no patterns, and an empty regex would
+          # match everything: the flag is passed only when a pattern
+          # exists.
+          if [ -n "$regex" ]; then
+            echo "COVERAGE_IGNORE=$regex" >> "$GITHUB_ENV"
+          fi
+      # A vacuous exclusion is the same bug class as the soak's zero
+      # counts: a pattern that matches no tracked file excludes nothing
+      # and promises a number the report does not hold. The gate reads
+      # the file, so this guard runs before the measures.
+      - name: every exclusion pattern matches a tracked file
+        run: |
+          ok=1
+          while IFS= read -r pattern; do
+            if ! git ls-files | grep -qE "$pattern"; then
+              echo "the exclusion pattern '$pattern' matches no tracked file"
+              ok=0
+            fi
+          done < <(sed 's/^[[:space:]]*//; s/#.*//; s/[[:space:]]*$//' scripts/coverage-exclusions.txt | grep -v '^$')
+          [ "$ok" = 1 ]
+      # Two measures accumulate their profiles (--no-report, then
+      # --no-clean keeps the first run's), and the report step merges
+      # them into the one number the gate checks. The exclusion regex
+      # goes to the report step too: the filter applies when the report
+      # is built, and the proof below reads its printed list. The
+      # takeover test stays out: it stops the shared database, as in
+      # ci.yml's jobs.
+      - name: measure, the default backend
+        run: |
+          cargo llvm-cov --no-report --workspace \
+            ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"}
+        env:
+          PROPTEST_CASES: "64"
+      - name: measure, the postgres backend
+        run: |
+          cargo llvm-cov --no-report --no-clean --workspace \
+            ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"}
+        env:
+          PROPTEST_CASES: "64"
+          SCION_TEST_BACKEND: postgres
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+      - name: the merged report, and the gate
+        run: |
+          cargo llvm-cov report --summary-only --fail-under-lines 80 \
+            ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
+            | tee target/coverage/report-summary.txt
+          # The proof the filter applies: no excluded file may appear
+          # in the printed per-file list.
+          while IFS= read -r pattern; do
+            if grep -qE "$pattern" target/coverage/report-summary.txt; then
+              echo "the report still shows a file matching the exclusion '$pattern'"
+              exit 1
+            fi
+          done < <(sed 's/^[[:space:]]*//; s/#.*//; s/[[:space:]]*$//' scripts/coverage-exclusions.txt | grep -v '^$')
+      - name: keep the profiles out of the cache
+        if: always()
+        run: rm -rf target/coverage

@@ -220,6 +220,20 @@ that breaks one is caught.
 - **Internal errors say `internal error`.** The detail stays in the
   log, named by the request id.
   `scion-server/tests/request_id.rs::a_calls_request_id_names_its_span_in_the_servers_log`
+- **An archive is untrusted input.** `verify` and `restore` treat every
+  byte of an archive as coming from outside the server: a repo name the
+  manifest holds is checked against the live name rule and that it is
+  one path component, before it ever joins a path
+  (`scion-server/tests/archive.rs::a_manifest_name_that_escapes_the_archive_is_refused`),
+  and a blob file decompresses through a bounded stream, at most the
+  server's max blob size plus one, so a crafted frame cannot grow in
+  memory past the cap
+  (`scion-server/tests/archive.rs::a_blob_file_that_expands_past_the_cap_is_refused`).
+- **A restore verifies first, and goes only into an empty store.** It
+  runs the same `verify` a reader runs and refuses on any damage, and it
+  refuses a data directory that already holds a store
+  (`scion-server/tests/archive.rs::a_verify_names_a_blob_whose_bytes_someone_corrupted`,
+  `scion-server/tests/archive.rs::a_restore_refuses_a_data_directory_that_already_holds_a_store`).
 
 ## 6. What has no test yet
 
