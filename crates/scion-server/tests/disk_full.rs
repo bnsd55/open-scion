@@ -462,6 +462,23 @@ fn data_dir(client: &mut postgres::Client) -> String {
         .get::<_, String>(0)
 }
 
+/// A chunk the database cannot shrink: bytes of a plain pseudorandom
+/// sequence, so TOAST's compression keeps none of the room the test
+/// means to spend (run 7's evidence: a chunk of one repeated byte
+/// compressed 4:1, and the 64 MiB margin held under 1 MiB).
+#[allow(clippy::cast_possible_truncation)]
+fn incompressible(len: usize) -> Vec<u8> {
+    let mut state = 0x5343_494F_4E53_u64;
+    (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u8
+        })
+        .collect()
+}
+
 /// Fills the margin table to `total` bytes, the room the store's open
 /// and first lands will spend later. Its files unlink at the DROP, so
 /// freeing it needs no vacuum's luck about where the dead pages sit.
@@ -472,7 +489,7 @@ fn fill_margin(client: &mut postgres::Client, chunk_len: usize, total: usize) {
              CREATE TABLE IF NOT EXISTS diskfull_filler.margin (chunk bytea)",
         )
         .expect("the margin table is created");
-    let chunk = vec![b'm'; chunk_len];
+    let chunk = incompressible(chunk_len);
     let mut put = 0usize;
     while put < total {
         client
@@ -496,7 +513,7 @@ fn fill(client: &mut postgres::Client, chunk_len: usize) -> Option<postgres::Err
     client
         .batch_execute("CREATE TABLE IF NOT EXISTS diskfull_filler.filler (chunk bytea)")
         .expect("the filler table is created");
-    let chunk = vec![b'f'; chunk_len];
+    let chunk = incompressible(chunk_len);
     loop {
         match client.execute("INSERT INTO diskfull_filler.filler VALUES ($1)", &[&chunk]) {
             Ok(_) => {
@@ -620,7 +637,7 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
     let data = dir.path().join("data");
     let store = Backend::open_test(&data).expect("the store opens");
     let _repo = store
-        .read(|c| c.create_repo("filler"))
+        .write(|c| c.create_repo("filler"))
         .expect("the repo lands");
     let outcome = loop {
         // A backstop: lands that never stop mean the fill was not full,
