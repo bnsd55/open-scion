@@ -16,7 +16,7 @@ use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::write;
 use scion_server::{Backend, Error};
 
-use crate::common::REPO;
+use crate::common::{REPO, create_repo};
 
 fn required() -> bool {
     if !cfg!(target_os = "linux") {
@@ -636,9 +636,9 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     let store = Backend::open_test(&data).expect("the store opens");
-    let _repo = store
-        .write(|c| c.create_repo(REPO))
-        .expect("the repo lands");
+    // The suite's repo helper: the repo r with a root changeset and the
+    // ref main, so the lands below have a parent to land onto.
+    create_repo(&data);
     let outcome = loop {
         // A backstop: lands that never stop mean the fill was not full,
         // which is this test's own failure, not the server's.
