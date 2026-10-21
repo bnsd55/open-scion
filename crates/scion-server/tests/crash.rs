@@ -80,13 +80,19 @@ async fn every_reply_survives_a_kill_of_the_server() {
         match rng.below(3) {
             0 => {}
             1 => {
-                wait_until(|| signals.large_uploads.load(Ordering::SeqCst) > 0).await;
+                wait_until("a large upload is in flight", || {
+                    signals.large_uploads.load(Ordering::SeqCst) > 0
+                })
+                .await;
                 let delay = u64::try_from(rng.below(30)).unwrap();
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
             _ => {
                 let db = rusqlite::Connection::open(data.join("scion.db")).unwrap();
-                wait_until(|| pending_lands(&db) > 0).await;
+                wait_until("a land is pending in the database", || {
+                    pending_lands(&db) > 0
+                })
+                .await;
             }
         }
         signals.killed.store(true, Ordering::SeqCst);

@@ -424,6 +424,9 @@ fn a_pg_replay_that_dies_halfway_leaves_the_database_empty() {
         // its tables, and holds past the writer's 5 s clock: the
         // replay's one write dies as busy. The channel says the lock
         // is down, and the replay waits for that word before it runs.
+        // Bounded: a table that never appears hangs this thread forever
+        // and CI dies of a timeout with no name — so 30 s, then panic.
+        let started = std::time::Instant::now();
         loop {
             let there: Option<String> = db
                 .query_one("SELECT to_regclass('public.changesets')::text", &[])
@@ -437,6 +440,10 @@ fn a_pg_replay_that_dies_halfway_leaves_the_database_empty() {
                 let _ = db.batch_execute("COMMIT");
                 return;
             }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "the test database never gained its changesets table within 30 s"
+            );
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
     });
