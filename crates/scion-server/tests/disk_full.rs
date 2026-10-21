@@ -667,20 +667,7 @@ fn land_until(store: &Backend, from: usize, blob: scion_core::BlobId, dry: bool)
             Ok(id) => id,
             Err(e) => return (last, Err((e, cs.encode()))),
         };
-        let head = store
-            .read(|c| {
-                let repo = c.repo_id(REPO)?;
-                Ok(c.get_ref(repo, "main")?
-                    .map(|r| (repo, r.version))
-                    .expect("main exists"))
-            })
-            .unwrap();
-        store
-            .write(|c| {
-                assert!(c.cas_ref(head.0, "main", Some(head.1), id)?, "main moves");
-                Ok(())
-            })
-            .expect("main advances");
+        move_main(store, id);
         last = Some(id);
     }
 }
@@ -807,11 +794,31 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
         .expect("the checkpoint runs");
     let retried = write::create_changeset(&store, REPO, &failed)
         .expect("the stopped write lands once the database has room");
+    move_main(&store, retried);
     assert_eq!(
         main_target(&store),
         retried,
         "main moves to the retried write"
     );
+}
+
+/// Moves the ref main to `id`: the ref move is the land's own act, so
+/// every stored changeset needs this to become the head.
+fn move_main(store: &Backend, id: scion_core::ChangesetId) {
+    let head = store
+        .read(|c| {
+            let repo = c.repo_id(REPO)?;
+            Ok(c.get_ref(repo, "main")?
+                .map(|r| (repo, r.version))
+                .expect("main exists"))
+        })
+        .unwrap();
+    store
+        .write(|c| {
+            assert!(c.cas_ref(head.0, "main", Some(head.1), id)?, "main moves");
+            Ok(())
+        })
+        .expect("main advances");
 }
 
 /// The repo the lands land into: the root changeset, the ref main,
