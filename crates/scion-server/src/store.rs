@@ -61,7 +61,7 @@ pub(crate) mod test_hooks;
 use test_hooks::{DurabilityLog, DurabilityStep, WritePark};
 
 /// The schema version this build makes and reads.
-pub(crate) const SCHEMA_VERSION: u32 = 10;
+pub(crate) const SCHEMA_VERSION: u32 = 9;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database from
 /// version `n - 1` to version `n`. A released migration never changes.
@@ -75,7 +75,6 @@ const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [
     include_str!("../migrations/0007_tree_sizes.sql"),
     include_str!("../migrations/0008_view_roots.sql"),
     include_str!("../migrations/0009_view_trees.sql"),
-    include_str!("../migrations/0010_land_previous.sql"),
 ];
 
 /// Largest object accepted or read back, uncompressed: 100 MiB, the hard

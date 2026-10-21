@@ -927,29 +927,16 @@ impl MetaTx for BackendTx<'_> {
         land_id: i64,
         state: LandState,
         result: Option<ChangesetId>,
-        previous: Option<ChangesetId>,
         detail: String,
         conflict_paths: Vec<RepoPath>,
     ) -> Result<LandOutcome> {
         match self {
-            Self::Sqlite(tx) => tx.set_land_state(
-                repo,
-                land_id,
-                state,
-                result,
-                previous,
-                detail,
-                conflict_paths,
-            ),
-            Self::Postgres(pg) => pg.set_land_state(
-                repo,
-                land_id,
-                state,
-                result,
-                previous,
-                detail,
-                conflict_paths,
-            ),
+            Self::Sqlite(tx) => {
+                tx.set_land_state(repo, land_id, state, result, detail, conflict_paths)
+            }
+            Self::Postgres(pg) => {
+                pg.set_land_state(repo, land_id, state, result, detail, conflict_paths)
+            }
         }
     }
 

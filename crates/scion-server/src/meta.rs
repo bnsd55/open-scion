@@ -261,16 +261,12 @@ pub trait MetaTx {
     fn land_outcome(&mut self, repo: RepoId, caller: &Caller, land_id: i64) -> Result<LandOutcome>;
 
     /// Moves a pending land to its final state, and returns the outcome.
-    /// `previous` is the ref's target the move replaced, when the move
-    /// is a land's.
-    #[allow(clippy::too_many_arguments)]
     fn set_land_state(
         &mut self,
         repo: RepoId,
         land_id: i64,
         state: LandState,
         result: Option<ChangesetId>,
-        previous: Option<ChangesetId>,
         detail: String,
         conflict_paths: Vec<RepoPath>,
     ) -> Result<LandOutcome>;

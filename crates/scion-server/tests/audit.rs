@@ -584,20 +584,63 @@ async fn concurrent_lands_ref_lines_tell_one_true_history() {
         join(i).await.unwrap();
     }
 
+    // A replay of a landed land: the same request key, after the land
+    // settled. It reports the stored outcome and moved nothing, so its
+    // land line names no old, and no ref line appears for it.
+    let mut replay = writer(&url, "t-land-0").await;
+    replay
+        .land(LandRequest {
+            repo: REPO.into(),
+            changeset_id: lands[0].as_bytes().to_vec(),
+            target_ref: "main".into(),
+            request_key: "k-0".into(),
+        })
+        .await
+        .unwrap_or_else(|status| panic!("the replay failed: {status:?}"));
+
     stop.send(()).unwrap();
-    wait_for_lines(&audit_path, 2).await;
+    // Eight intents, eight land results, eight ref lines, and the
+    // replay's land line.
+    wait_for_lines(&audit_path, 25).await;
 
     let lines = read_lines(&audit_path);
+    let land_lines: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|line| line["event"] == "land" && line["outcome"] == "ok")
+        .collect();
+    let replay_line = land_lines
+        .iter()
+        .rev()
+        .find(|line| line["request_id"] == "t-land-0")
+        .unwrap_or_else(|| panic!("the replay's land line is missing"));
+    assert!(
+        replay_line.get("old").is_none(),
+        "a replay moved nothing, so its land line names no old: {replay_line}"
+    );
+    // The move's own land line names the head the move replaced: the
+    // auditor finds it under the same land_id, and it agrees with the
+    // move's ref line.
+    let mover = land_lines
+        .iter()
+        .find(|line| line["land_id"] == replay_line["land_id"] && line.get("old").is_some())
+        .unwrap_or_else(|| panic!("the move's land line names no old"));
+    let mover_ref = refs_needed(&lines, "t-land-0");
+    assert_eq!(
+        mover["old"], mover_ref["old"],
+        "the move's land line and its ref line name the same head"
+    );
+
     let refs: Vec<&serde_json::Value> = lines
         .iter()
         .filter(|line| line["event"] == "ref" && line["outcome"] == "ok")
         .collect();
-    assert!(
-        refs.len() >= 8,
-        "every land that moved the ref has a line: {}",
+    assert_eq!(
+        refs.len(),
+        8,
+        "only the calls that moved the ref have ref lines: {}",
         refs.len()
     );
-    let mut moves: Vec<(String, String)> = refs
+    let chain: Vec<(String, String)> = refs
         .iter()
         .map(|line| {
             (
@@ -606,18 +649,25 @@ async fn concurrent_lands_ref_lines_tell_one_true_history() {
             )
         })
         .collect();
-    moves.dedup();
     assert_eq!(
-        moves.first().map(|(old, _)| old.as_str()),
+        chain.first().map(|(old, _)| old.as_str()),
         Some(start_hex.as_str()),
         "the first move moved the head the lands started from"
     );
-    for pair in moves.windows(2) {
+    for pair in chain.windows(2) {
         assert_eq!(
             pair[0].1, pair[1].0,
             "each move moved the ref its predecessor left it at"
         );
     }
+}
+
+/// The ref line of the call whose request id is `id`.
+fn refs_needed<'a>(lines: &'a [serde_json::Value], id: &str) -> &'a serde_json::Value {
+    lines
+        .iter()
+        .find(|line| line["event"] == "ref" && line["request_id"] == id)
+        .unwrap_or_else(|| panic!("no ref line for {id}"))
 }
 
 /// Waits until the file holds `n` lines: the stop's flush runs on its
