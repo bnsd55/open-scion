@@ -85,7 +85,7 @@ fn exported(store: &Backend, data: &Path) -> (tempfile::TempDir, PathBuf) {
 }
 
 /// The repo section directory of `name` in the archive.
-fn section<'a>(archive: &Path, name: &str) -> PathBuf {
+fn section(archive: &Path, name: &str) -> PathBuf {
     archive.join("repos").join(name)
 }
 
@@ -203,7 +203,9 @@ fn a_changeset_recorded_twice_is_named_or_tolerated_not_half_restored() {
     if !damages.is_empty() {
         // The reader named the duplicate: proof it holds.
         assert!(
-            damages.iter().any(|d| d.contains("twice") || d.contains("duplicate")),
+            damages
+                .iter()
+                .any(|d| d.contains("twice") || d.contains("duplicate")),
             "verify must name the duplicate record, not something else: {damages:?}"
         );
         return;
@@ -258,7 +260,7 @@ fn a_ref_to_another_repos_changeset_is_refused() {
     let crafted = serde_json::json!([
         {"name": "main", "target": main_tip, "version": 1}
     ]);
-    std::fs::write(&section(&out, SECOND).join("refs.json"), crafted.to_string()).unwrap();
+    std::fs::write(section(&out, SECOND).join("refs.json"), crafted.to_string()).unwrap();
 
     let damages = archive::verify(&out).unwrap();
     assert!(
@@ -309,4 +311,52 @@ fn two_pending_lands_sharing_a_request_key_are_named_or_tolerated() {
             "a refused replay must not leave a half-restored store"
         );
     }
+}
+
+/// The attack: an archive whose `verify` is silent but whose replay
+/// dies halfway — a changeset names a blob its members.txt does not
+/// list, so the replay's tree build finds no size for it. Whatever the
+/// failure, the target must come out as it went in: empty. A half
+/// store is the attacker's win, because the operator cannot tell
+/// restored state from unrestored; the staging directory is what keeps
+/// the target whole.
+#[test]
+fn a_replay_that_dies_halfway_leaves_the_target_empty() {
+    let (_keep, out, _main, _second) = sound_archive();
+    // Drop one member line the last changeset's tree names. Verify
+    // passes: nothing in it cross-checks the changesets' members
+    // against members.txt, and every blob file it does check is whole.
+    let members_path = section(&out, REPO).join("members.txt");
+    let members = std::fs::read_to_string(&members_path).unwrap();
+    let lines: Vec<&str> = members.lines().collect();
+    assert_eq!(lines.len(), 3, "the fixture holds three members");
+    std::fs::write(&members_path, lines[..2].join("\n") + "\n").unwrap();
+    let damages = archive::verify(&out).unwrap();
+    assert!(
+        damages.is_empty(),
+        "the point is verify silence: {damages:?}"
+    );
+
+    let empty = tempfile::tempdir().unwrap();
+    let restored = archive::restore(&out, empty.path(), None, None);
+    assert!(
+        restored.is_err(),
+        "a replay that cannot finish must not report success"
+    );
+    let written = std::fs::read_dir(empty.path()).unwrap().count();
+    assert_eq!(
+        written, 0,
+        "the target must stay empty when the replay dies halfway"
+    );
+    // This restore's own staging scratch, beside the target, is gone
+    // with the failure: nothing of the restore remains anywhere.
+    let staging = empty.path().with_file_name(format!(
+        "{}.restoring",
+        empty.path().file_name().unwrap().to_string_lossy()
+    ));
+    assert!(
+        !staging.exists(),
+        "the staging directory must not survive a failed restore: {}",
+        staging.display()
+    );
 }

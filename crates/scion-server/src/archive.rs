@@ -251,9 +251,8 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
 ///
 /// # Errors
 ///
-/// A data directory that already holds a store, a failed open, damage
-/// [`verify`] finds, or what the replay's writes return.
-/// Replays an archive into an empty store: the blob bytes go through the
+/// A data directory that already holds a store or has no name, a failed
+/// open, damage [`verify`] finds, or what the replay's writes return.: the blob bytes go through the
 /// store's own write path, so every object ID is the hash of its bytes;
 /// the data directory the caller named is filled by renaming a staging
 /// directory beside it into place only when the whole replay held — a
