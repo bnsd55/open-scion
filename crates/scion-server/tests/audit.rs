@@ -781,6 +781,14 @@ async fn a_land_whose_call_is_cut_still_writes_its_result_and_ref_lines() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    // The land's result line is the promise under test: the job, not
+    // the call, writes it. What the line says depends on a race the
+    // design owns: the cut call's deadline guard ends the deadline, and
+    // the land's plan checks it between steps (land.rs), so on a slower
+    // backend the land may stop as cancelled — still pending, still
+    // resumable — instead of landing. Either way the job wrote the
+    // evidence. A moved ref comes only with an ok line, and then the
+    // ref line agrees with it.
     let lines = read_lines(&audit_path);
     assert!(
         lines.len() > lines_before,
@@ -789,24 +797,45 @@ async fn a_land_whose_call_is_cut_still_writes_its_result_and_ref_lines() {
     let land_line = lines
         .iter()
         .find(|line| {
-            line["event"] == "land" && line["outcome"] == "ok" && line["request_id"] == "t-cut"
+            line["event"] == "land"
+                && line["request_id"] == "t-cut"
+                && (line["outcome"] == "ok" || line["outcome"] == "failed")
         })
-        .unwrap_or_else(|| panic!("the cut call's land result never reached the file"));
-    assert_eq!(
-        land_line["new"],
-        serde_json::Value::String(store.resolve_ref(REPO, "main").unwrap().to_string()),
-        "the land's result names the head it moved to"
-    );
-    let ref_line = refs_needed(&lines, "t-cut");
-    assert_eq!(
-        ref_line["old"],
-        serde_json::Value::String(root.to_string()),
-        "the move names the head it replaced"
-    );
-    assert_eq!(
-        ref_line["new"], land_line["new"],
-        "the ref line and the land line name the same new head"
-    );
+        .unwrap_or_else(|| {
+            panic!(
+                "the cut call's land result never reached the file; lines: {}",
+                serde_json::to_string(&lines).unwrap()
+            )
+        });
+    if land_line["outcome"] == "ok" {
+        assert_eq!(
+            land_line["new"],
+            serde_json::Value::String(
+                store.resolve_ref(REPO, "main").unwrap().to_string()
+            ),
+            "the land's result names the head it moved to"
+        );
+        let ref_line = refs_needed(&lines, "t-cut");
+        assert_eq!(
+            ref_line["old"],
+            serde_json::Value::String(root.to_string()),
+            "the move names the head it replaced"
+        );
+        assert_eq!(
+            ref_line["new"], land_line["new"],
+            "the ref line and the land line name the same new head"
+        );
+    } else {
+        assert_eq!(
+            land_line["why"], "cancelled",
+            "a cut call's land fails only by its own cancellation"
+        );
+        assert_eq!(
+            store.resolve_ref(REPO, "main").unwrap(),
+            root,
+            "a cancelled land moved no ref; it stays pending for a retry"
+        );
+    }
 
     stop.send(()).unwrap();
 }
