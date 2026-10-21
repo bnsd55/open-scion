@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::Write as _;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -123,6 +124,21 @@ impl Server {
             .append(true)
             .open(log)
             .unwrap();
+        // The token rides in a 0600 file, the runbook's way: argv is
+        // readable by every user of the machine.
+        let token_file = log.with_file_name("scion-token");
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&token_file)
+                .unwrap()
+                .write_all(TOKEN.as_bytes())
+                .unwrap();
+        }
         // The child shares a flock until it execs (see `spawn_guard`): the
         // read side keeps this spawn out of a lock-release window of
         // another test.
@@ -130,7 +146,9 @@ impl Server {
             Command::new(env!("CARGO_BIN_EXE_scion-server"))
                 .arg("--data")
                 .arg(data)
-                .args(["serve", "--token", TOKEN, "--listen", "127.0.0.1:0"])
+                .args(["serve", "--token-file"])
+                .arg(&token_file)
+                .args(["--listen", "127.0.0.1:0"])
                 // Plain log lines, so the address parses without escape
                 // codes.
                 .env("NO_COLOR", "1")

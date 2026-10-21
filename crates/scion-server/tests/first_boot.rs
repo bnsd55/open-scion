@@ -7,6 +7,7 @@
 mod common;
 
 use common::*;
+use std::os::unix::fs::PermissionsExt as _;
 use tonic::transport::Channel;
 use tonic_health::pb::HealthCheckRequest;
 use tonic_health::pb::health_check_response::ServingStatus;
@@ -38,9 +39,13 @@ async fn a_first_boot_serves_probes_and_reads_back() {
 
     // Command 1: start the server on a directory that does not exist
     // yet. The first boot creates it, with its files private, and
-    // serves.
+    // serves. The token went in a file (the runbook's umask 077 and
+    // printf), not in argv.
     assert!(!data.exists(), "the first boot creates the directory");
     let server = Server::start(&data, &log);
+    let token_file = log.with_file_name("scion-token");
+    let mode = std::fs::metadata(&token_file).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "the token file is private");
 
     // Command 2: the readiness probe of the service, and the liveness
     // probe of the empty name.

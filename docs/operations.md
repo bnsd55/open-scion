@@ -26,14 +26,18 @@ The pieces:
 
 ### First boot
 
-A first start on a fresh machine is three commands, and each promises
-something:
+A first start on a fresh machine is a token file and three commands,
+and each command promises something. The token goes in a file, not in
+argv: any user of the machine reads argv with `ps`.
 
 ```sh
-./scion-server --data /srv/scion serve --token <TOKEN>
+umask 077
+printf %s "$SCION_TOKEN" > /srv/scion-token
+./scion-server --data /srv/scion serve --token-file /srv/scion-token
 ```
 
-The first command creates the data directory if it does not exist, keeps
+The `umask 077` and the printf make the token file private (0600). The
+serve command creates the data directory if it does not exist, keeps
 its files private, and serves. The log's `serving` line names the address.
 
 ```sh
