@@ -252,7 +252,7 @@ or rotate the ticket key (`--ticket-key`) to cut them off at once. Objects
 already on a user's daemon are out of reach of both; give a daemon only
 repos all its users may read whole.
 
-### Folder read rules
+### The audit log
 
 The server records an audit log: an append-only JSON-lines file of
 refused authentication (counted per peer), writes, ref changes, lands
