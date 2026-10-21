@@ -101,24 +101,31 @@ pub(crate) const MAX_CONNECTION_AGE: Duration = Duration::from_secs(30 * 60);
 pub const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How long a client's connection waits for a keepalive answer before
-/// the connection is dead: a third of [`CLIENT_KEEPALIVE_INTERVAL`], so
-/// a dead peer costs about 40 s.
-pub const CLIENT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// the connection is dead: two thirds of [`CLIENT_KEEPALIVE_INTERVAL`],
+/// so a dead peer costs about 50 s, inside the tier's 60 s upstream
+/// window, and a healthy server that stalls for a moment (an fsync
+/// storm, a swap burst) is not cut by every client at once.
+pub const CLIENT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The TCP keepalive probe interval of a client connection, under the
 /// HTTP/2 interval, so a dead connection is visible below HTTP/2 too.
 pub const CLIENT_TCP_KEEPALIVE: Duration = Duration::from_secs(15);
 
 const _: () = assert!(CLIENT_KEEPALIVE_INTERVAL.as_secs() == 30);
-const _: () = assert!(CLIENT_KEEPALIVE_TIMEOUT.as_secs() == 10);
+const _: () = assert!(CLIENT_KEEPALIVE_TIMEOUT.as_secs() == 20);
 const _: () = assert!(CLIENT_TCP_KEEPALIVE.as_secs() == 15);
+const _: () = assert!(
+    CLIENT_KEEPALIVE_INTERVAL.as_secs() + CLIENT_KEEPALIVE_TIMEOUT.as_secs() <= 60,
+    "a dead peer must fail a client inside the tier's 60 s upstream window"
+);
 
 thread_local! {
     /// A test's shorter keepalive, as `(interval, timeout)`: the same
     /// dead-peer failure is proved in seconds, and the product
     /// constants above stay the documented ones. `None` is the product.
-    /// Thread-local, and it applies only to connections built on the
-    /// thread that set it.
+    /// Thread-local, so a `multi_thread` test that sets it on one worker
+    /// can build the channel on another and lose it; the test's bound on
+    /// the failure time catches that.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     pub static CLIENT_KEEPALIVE_OVERRIDE: std::cell::Cell<Option<(Duration, Duration)>> =

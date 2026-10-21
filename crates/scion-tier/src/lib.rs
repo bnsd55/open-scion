@@ -501,6 +501,8 @@ impl<S: Store> Tier<S> {
         let channel = endpoint
             .http2_keep_alive_interval(interval)
             .keep_alive_timeout(answer)
+            // An idle channel must notice a dead peer too: the next call
+            // answers at once, not after the upstream window.
             .keep_alive_while_idle(true)
             .tcp_keepalive(Some(scion_proto::runtime::listen::client_tcp_keepalive()))
             .connect_lazy();

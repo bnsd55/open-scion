@@ -41,6 +41,8 @@ fn live(endpoint: Endpoint) -> Endpoint {
     endpoint
         .http2_keep_alive_interval(interval)
         .keep_alive_timeout(timeout)
+        // An idle channel must notice a dead peer too: the next call
+        // answers at once, not after the call's own deadline.
         .keep_alive_while_idle(true)
         .tcp_keepalive(Some(keepalive::client_tcp_keepalive()))
 }
