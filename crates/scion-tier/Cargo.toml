@@ -37,6 +37,7 @@ zstd.workspace = true
 workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 hyper-util.workspace = true
 rcgen.workspace = true
 tempfile.workspace = true

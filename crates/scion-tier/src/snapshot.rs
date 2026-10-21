@@ -24,14 +24,24 @@ use crate::store::{DiskStore, RECORD, Store as _, parse_record, push_record};
 pub const MAGIC: &[u8; 9] = b"scnsnap1\n";
 
 /// The file name of `repo`'s snapshot: `REPO.scnsnap`, with each byte other
-/// than an ASCII letter, a digit, `-`, `_` or a `.` after the first byte
-/// written as `%XX`. So any repo name gives one plain name in the snapshot
-/// directory: `team/app` gives `team%2Fapp.scnsnap`.
+/// than an ASCII lowercase letter, a digit, `-`, `_` or a `.` after the
+/// first byte written as `%XX` with uppercase hex digits. The capitals
+/// are escaped like any other byte, so the output holds lowercase
+/// literal letters only and a capital appears only as a hex digit right
+/// after a `%` — and since `%` itself is escaped, the escapes line up
+/// and two names that a case-insensitive disk would fold into one file
+/// cannot both give the same name. `MAIN` gives `%4D%41%49%4E.scnsnap`,
+/// `team/app` gives `team%2Fapp.scnsnap`.
 #[must_use]
 pub fn file_name(repo: &str) -> String {
     let mut name = String::with_capacity(repo.len() + 8);
     for (i, byte) in repo.bytes().enumerate() {
-        if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || (byte == b'.' && i > 0) {
+        if byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || byte == b'-'
+            || byte == b'_'
+            || (byte == b'.' && i > 0)
+        {
             name.push(char::from(byte));
         } else {
             // Writing to a `String` does not fail.
@@ -418,6 +428,72 @@ mod tests {
         let store = DiskStore::open(&dir.path().join("three"), 1 << 20).unwrap();
         let err = seed(&store, &path).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData, "{err}");
+    }
+
+    /// The wire pass, B7's property, on every OS: a fold-blind reader
+    /// (a case-insensitive disk) must not see two different repos in
+    /// one snapshot file, so two names whose file names are equal under
+    /// ASCII case folding must be the same name. Capitals, `%`, `.` and
+    /// non-ASCII bytes are the shapes that could break it.
+    #[test]
+    fn two_names_with_one_folded_file_name_are_one_name() {
+        let candidates = [
+            "main",
+            "MAIN",
+            "Main",
+            "mAiN",
+            "%25",
+            "%2f",
+            "%4D",
+            "%4d",
+            "a.b",
+            "a%2Eb",
+            "caf\u{e9}",
+            "caf\u{301}e",
+            "team/app",
+            "TEAM/APP",
+            "",
+        ];
+        for a in &candidates {
+            for b in &candidates {
+                let (fa, fb) = (file_name(a), file_name(b));
+                if fa.eq_ignore_ascii_case(&fb) {
+                    assert_eq!(a, b, "{a:?} and {b:?} fold into one snapshot file: {fa:?}");
+                }
+            }
+        }
+    }
+
+    /// The wire pass, B7: on a disk that folds names (case, or Unicode
+    /// normalization), two repos whose names fold write their snapshots
+    /// to one file, and the second write silently replaces the first —
+    /// the first repo's snapshot is gone, and the operator sees no
+    /// refusal. The fix is in `file_name`: the capitals are escaped, so
+    /// the output holds lowercase literal letters only and no fold can
+    /// put two names on one file. Runs where the fold is real.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn two_repos_that_fold_to_one_name_do_not_overwrite_one_snapshot() {
+        let dir = private_dir();
+        let a = blob(b"alpha");
+        let b = blob(b"beta");
+        let main = dir.path().join(file_name("main"));
+        write(&main, "main", std::slice::from_ref(&a)).unwrap();
+        let folded = dir.path().join(file_name("MAIN"));
+        // The names differ now: MAIN's file name escapes its capitals.
+        assert_ne!(main, folded, "MAIN's snapshot must have a name of its own");
+        write(&folded, "MAIN", std::slice::from_ref(&b)).unwrap();
+        // Both files hold what their own repo wrote.
+        let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
+        let seeded = seed(&store, &main).unwrap().unwrap();
+        assert_eq!(seeded.repo, "main");
+        assert_eq!((seeded.stored, seeded.skipped), (1, 0));
+        assert_eq!(store.get(a.0, a.1.len()).unwrap(), Some(a.1));
+        let store = DiskStore::open(&dir.path().join("data-2"), 1 << 20).unwrap();
+        let seeded = seed(&store, &folded).unwrap().unwrap();
+        assert_eq!(seeded.repo, "MAIN");
+        assert_eq!((seeded.stored, seeded.skipped), (1, 0));
+        assert_eq!(store.get(b.0, b.1.len()).unwrap(), Some(b.1));
     }
 
     #[test]
