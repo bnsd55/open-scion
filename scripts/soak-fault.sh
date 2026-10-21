@@ -359,9 +359,9 @@ writers() {
   wait
 }
 writers & echo $! > "$WORK/soak-writers.pid"
-readers & echo $! > "$WORK/soak-readers.pid"
-importer & echo $! > "$WORK/soak-importer.pid"
-gcer & echo $! > "$WORK/soak-gcer.pid"
+loop_bg soak-readers readers
+loop_bg soak-importer importer
+loop_bg soak-gcer gcer
 canceller & echo $! > "$WORK/soak-canceller.pid"
 slow_reader & echo $! > "$WORK/soak-slow.pid"
 
