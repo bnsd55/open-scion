@@ -605,7 +605,12 @@ fn wide_changeset(
 /// land names stay distinct.
 fn fill_all(client: &mut postgres::Client, dry: bool) -> usize {
     println!("phase: before the fill, {}", free_bytes(client));
-    let margin = if dry { 8 } else { 64 } * 1024 * 1024;
+    // The margin: room for the open, the repo, and the first lands.
+    // The wet run's lands spend about 14 KiB a land, so a small margin
+    // closes the wall within a few hundred lands - a big margin would
+    // spend itself on thousands of lands first (run 13's evidence: 64
+    // MiB was spent past the 5000-land backstop).
+    let margin = if dry { 8 } else { 12 } * 1024 * 1024;
     fill_margin(client, 4 * 1024 * 1024, margin);
     // The lands' count starts at the fill's chunk count, so the land
     // names stay distinct from the filler's row names.
