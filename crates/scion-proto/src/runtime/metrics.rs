@@ -102,7 +102,7 @@ const LANDS: [&str; 14] = [
 /// change a label's meaning. The land handler counts after it builds the
 /// reply's `Status`.
 #[must_use]
-pub fn land_error_label(code: tonic::Code) -> &'static str {
+pub fn code_label(code: tonic::Code) -> &'static str {
     match code {
         tonic::Code::Aborted => "aborted",
         tonic::Code::DeadlineExceeded => "deadline_exceeded",

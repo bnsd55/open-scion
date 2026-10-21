@@ -24,6 +24,41 @@ The pieces:
 
 ## 1. Deployment shapes
 
+### First boot
+
+A first start on a fresh machine is a token file and three commands,
+and each command promises something. The token goes in a file, not in
+argv: any user of the machine reads argv with `ps`.
+
+```sh
+umask 077
+printf %s "$SCION_TOKEN" > /srv/scion-token
+./scion-server --data /srv/scion serve --token-file /srv/scion-token
+```
+
+The `umask 077` and the printf make the token file private (0600). The
+serve command creates the data directory if it does not exist, keeps
+its files private, and serves. The log's `serving` line names the address.
+
+```sh
+grpc_health_probe -addr 127.0.0.1:7878 -service scion.v1.Scion
+```
+
+The readiness probe answers `SERVING` once the server listens; the empty
+service name is the liveness probe (`grpc_health_probe -addr
+127.0.0.1:7878` with no `-service`).
+
+```sh
+git -C /srv/git/my-repo log --oneline -1
+./scion-server --data /srv/scion import /srv/git/my-repo
+```
+
+The first import makes the repo (named `main` unless `--repo` says
+otherwise), and a client's `scn log main` reads it back; the import can
+run while the server serves.
+
+Proof: crates/scion-server/tests/first_boot.rs::a_first_boot_serves_probes_and_reads_back
+
 ### One server
 
 ```sh
@@ -100,6 +135,31 @@ Proof: crates/scion-server/tests/backend_refusals.rs::a_lost_server_lock_fences_
 Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover
 Proof: crates/scion-server/tests/crash.rs::every_reply_survives_a_kill_of_the_server
 
+#### Stopping it for real: a unit file
+
+An operator does not run the server in a shell; it runs under a
+supervisor. The minimal systemd unit — the token through the file
+(§1), the restart on a crash, and the drain on a stop — is:
+
+```ini
+# /etc/systemd/system/scion.service
+[Service]
+ExecStart=/usr/local/bin/scion-server --data /srv/scion serve \
+  --token-file /etc/scion/token \
+  --ticket-key /srv/scion-keys/ticket.key
+Restart=on-failure
+User=scion
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`systemctl stop scion` sends SIGTERM, and the drain of the last
+section is what happens next. Never kill by pattern: on a machine that
+runs more than one service, `pkill -f scion-server` kills every
+project's server, not yours. Stop by unit, or by the exact PID of the
+process you started.
+
 ### Server and a regional cache
 
 A cache serves object reads to a region and refuses every other call
@@ -163,14 +223,34 @@ run, and outlives one machine. The blob files stay in the data directory in
 every backend: they are the big majority of the bytes, and the database
 never stores them.
 
+The URL carries the database's credentials, so give it as a file the
+owner alone may read, not on the command line: a value on the command
+line is readable by every local account (`ps`), an environment value
+by the same user and root, and a file with the checks of the access
+file by whoever can read it.
+
 ```sh
+printf 'postgres://user@dbhost/scion?sslmode=require\n' > /srv/scion/db-url
+chmod 600 /srv/scion/db-url
 scion-server --data /srv/scion \
-  --postgres-url postgres://user@dbhost/scion?sslmode=require \
+  --postgres-url-file /srv/scion/db-url \
   --postgres-ca /srv/scion/db-ca.pem serve --access /srv/scion/access.txt
 ```
 
-- `--postgres-url` names the database. Off this machine the URL must ask
-  for TLS (`sslmode=require`): the open refuses a remote URL that does not.
+For containers and units that hold no secret files, the environment
+form is second best:
+
+```sh
+SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
+  scion-server --data /srv/scion serve --access /srv/scion/access.txt
+```
+
+- `--postgres-url-file` (or `SCION_POSTGRES_URL`) names the database.
+  `--postgres-url` takes the same value on the command line; it is
+  deprecated: it warns now and goes away in a later release, because
+  the process list shows its value to every local account. Off this
+  machine the URL must ask for TLS (`sslmode=require`): the open
+  refuses a remote URL that does not.
 - `--postgres-ca` (a PEM file) is required with a remote host too: the
   database must present a certificate it signed, and there is no mode that
   accepts any certificate. A host on this machine (`localhost`, a loopback
@@ -186,6 +266,21 @@ scion-server --data /srv/scion \
 - One server process serves one database: a second `serve` on the same
   `--postgres-url` fails at its open with "another server holds this
   database". An import does not take that lock and runs beside a server.
+- The server opens one write connection and a pool of 8 read
+  connections, plus the short-lived connections of a migration or an
+  import. Size the database's `max_connections` for all of it: the
+  server's own 9, the operator's tooling beside it (`pg_dump`, `psql`,
+  a metrics scraper), and a margin. A database at its connection cap
+  refuses the server's next connection, and every call that needs one
+  answers `unavailable` until one is free.
+- The one-server rule and the write queue are Postgres advisory locks,
+  visible as `pg_locks` rows of kind `advisory`: the one-server lock
+  and the migration lock are fixed keys of the database, and every
+  write transaction also takes the schema's collector key
+  (`pg_advisory_xact_lock(hashtext(current_schema() || ':gc'))`),
+  which orders it against the collector's sweeps and gives up on that
+  key alone after 60 s. An `advisory` row in `pg_locks` is one of
+  these, held by this server by design, not a stuck client to kill.
 - A write that waits for another writer's lock gives up after 5 s and
   answers unavailable, like the SQLite store past its busy timeout; the
   client retries.
@@ -212,6 +307,21 @@ scion-server --data /srv/scion \
   session checks itself once a minute, so a loss is seen even while no
   client calls: the check runs on the server's own session, through the
   same queue as every statement, never on a second connection.
+- A start after an unclean kill can refuse its open with "another
+  server holds this database": the dead server's session is still in
+  the database, and the one-server lock dies only when Postgres ends
+  that session. On the same host that is at once - the kernel closes a
+  dead process's sockets - so the service manager's restart
+  (`Restart=on-failure`) is the whole recovery: the first start exits,
+  the next takes the lock. A server whose host vanished without a
+  packet is another matter: Postgres learns of that death only through
+  TCP keepalives, whose clock is the database's `tcp_keepalives_idle`
+  (unset, it falls back to the system default, often 2 hours), so end
+  the dead session by hand (`pg_terminate_backend`) or lower that
+  clock where a lost host must free the lock sooner. The server's own
+  connections carry the tighter bounds (`keepalives_idle` 30 s, a 30 s
+  TCP user timeout), so the reverse - this server noticing a dead
+  database - is bounded by the server, not the database.
 - The SQLite store has none of this: one file is opened by one process at
   the kernel level, so there is no lock to lose and no fence. The notes
   above that name the one-server lock and the fence are Postgres only.
@@ -252,7 +362,7 @@ or rotate the ticket key (`--ticket-key`) to cut them off at once. Objects
 already on a user's daemon are out of reach of both; give a daemon only
 repos all its users may read whole.
 
-### Folder read rules
+### The audit log
 
 The server records an audit log: an append-only JSON-lines file of
 refused authentication (counted per peer), writes, ref changes, lands
@@ -262,6 +372,11 @@ There is no way to turn it off: a server that cannot record refuses the
 changes it cannot account for, and flips readiness until a restart. The
 file is mode 0600, never a symlink, in a directory only the server's
 user may write.
+
+The lines of concurrent changes can appear in a different order than the
+changes themselves: each job records its result after its change. Each
+ref line names its old and new head, so a ref's history is rebuilt by
+linking old to new, not by line order.
 
 ### Folder read rules
 
@@ -323,6 +438,29 @@ trusts or whose certificates the server accepts: `chmod go-w` them, and
 check after a copy tool or a umask 002 session, where a fresh file
 starts 0664.
 
+### Rotating the server's certificate
+
+The client trusts a CA, not the server's certificate: a certificate the
+same CA signed, written to the server's `--tls-cert` and `--tls-key`
+files, needs no client change. The rotation is:
+
+1. Make the new certificate, signed by the CA the clients already hold,
+   and write it over the server's cert and key files (`chmod 600` the
+   key; the certificate may be 0644).
+2. Restart the server: a stop (the drain protects the calls in flight)
+   and a start with the same `--tls-cert` and `--tls-key` paths, which
+   now hold the new pair.
+3. The client's promise: its `--tls-ca` file did not change, and it
+   connects.
+
+A NEW CA is the other case: every client and tier that holds the old CA
+file must get the new one BEFORE the server moves, or the clients it
+serves cannot verify it. The swap on live clients is the recorded drill
+(docs/drills/, template there), not a CI test: no test can hold the
+clients' files of a running fleet.
+
+Proof: crates/scn/tests/tls.rs::a_rotated_server_certificate_needs_no_client_change
+
 ### In containers
 
 `docker/compose.yml` brings up a server and a cache in one image, both with
@@ -338,12 +476,19 @@ variable holds the same value the flag would. These are the ones the
 binaries read (each names the flag it stands for, and which binary reads
 it):
 
+Every flag that takes a secret's value also has a file form
+(`--x-file`) and an environment form. The file form is the deployment
+form: the owner alone may read it, and a symlink is refused. The
+environment value is visible to the same user and to root. The argv
+form is deprecated: it warns now and goes away in a later release, and
+its value is readable by every local account through `ps`.
+
 | Variable | Flag | Read by | Notes |
 | --- | --- | --- | --- |
 | `SCION_DATA` | `--data` | `scion-server` | Data directory, default `scion-data`. |
-| `SCION_POSTGRES_URL` | `--postgres-url` | `scion-server` | The URL holds the database credentials; the environment keeps them out of the process list (`ps`). `--postgres-url-file` reads it from a file the owner alone may read, and the argv form is deprecated. |
+| `SCION_POSTGRES_URL` | `--postgres-url` | `scion-server` | The URL holds the database credentials; the environment keeps them out of the process list (`ps`). `--postgres-url-file` reads it from a file the owner alone may read, and the argv form is deprecated: it warns now and goes away in a later release. |
 | `SCION_TOKEN` | `--token` | `scion-server` (`serve`, `hash-token`), `scion-cache`, `scion-daemon`, `scn` | A secret; the environment keeps it out of the process list. The `--token-file` flag reads the token from a file the owner alone may read, and `hash-token` reads it from stdin. The argv form prints a deprecation warning and goes away in a later release. |
-| `SCION_UPSTREAM_TOKEN` | `--upstream-token` | `scion-cache`, `scion-daemon` | A secret, as `SCION_TOKEN`; `--upstream-token-file` reads it from a file, and the argv form is deprecated. |
+| `SCION_UPSTREAM_TOKEN` | `--upstream-token` | `scion-cache`, `scion-daemon` | A secret, as `SCION_TOKEN`; `--upstream-token-file` reads it from a file, and the argv form is deprecated: it warns now and goes away in a later release. |
 | `SCION_DAEMON_DATA` | `--data` | `scion-daemon` | Data directory, default `scion-daemon-data`. |
 | `SCION_AUTHOR` | `--author` | `scn commit` | Default `scn <scn@localhost>`. |
 | `SCION_SERVER` | `--server` | `scn` | Default `http://127.0.0.1:7878`. |
@@ -376,12 +521,14 @@ Rotation, step by step:
 3. Restart the server with both keys: `--ticket-key NEW.key
    --ticket-key-old OLD-PUBLIC`. The old argument is a file holding the
    **public** key of the previous key (the hex that the old run printed),
-   not its seed. A public key is not a secret: anyone may read the file,
-   but group and others must not be able to WRITE it (a changed key breaks
-   every tier that verifies against the old one), it must not be a
-   symlink, and the directories above it must be private to its owner or
-   root. `chmod go-w OLD-PUBLIC` fixes a copy tool's 0666. Tickets of
-   either key verify while both are given.
+   not its seed — and the file holds the bare hex and nothing else: 64
+   hex characters, no `name=` prefix, no trailing line. A public key is
+   not a secret: anyone may read the file, but group and others must not
+   be able to WRITE it (a changed key breaks every tier that verifies
+   against the old one), it must not be a symlink, and the directories
+   above it must be private to its owner or root. `chmod go-w
+   OLD-PUBLIC` fixes a copy tool's 0666. Tickets of either key verify
+   while both are given.
 4. When no client can hold a ticket of the old key any more (tickets live 15
    minutes), restart the server without `--ticket-key-old` and the caches
    with only the new public key.
@@ -757,10 +904,6 @@ the process, scraped from there. The names:
   collector's advisory key; waits that climb toward the key's own 60 s
   bound mean the writer queue does not drain.
 - `scion_pg_pool_wait_seconds` — (Postgres only) how long calls waited for
-  a read connection. A rising tail means the 8 readers are held by long
-  walks; the calls that waited past the pool's bound failed
-  `unavailable`.
-- `scion_pg_pool_wait_seconds` — (Postgres only) how long calls waited for
   a read connection. A read transaction is bounded at 300 s per statement
   and 30 s idle between statements, and a call waits at most 30 s for a
   reader before it fails `unavailable`. A rising tail means the 8 readers
@@ -780,7 +923,9 @@ the process, scraped from there. The names:
 token: the server's health covers the services `scion.v1.Scion` and
 `scion.v1.Objects`, a tier's covers `scion.v1.Objects`. The server
 serves no gRPC reflection, so a probe tool must know the health protocol
-itself (`grpc_health_probe` does).
+itself (`grpc_health_probe` does). Get it from that project's GitHub
+releases (a single static binary per platform — no other install), or
+use Kubernetes probes, which speak the same protocol natively.
 
 Probe the service's name for readiness and the empty name for liveness.
 Readiness is `NOT_SERVING` from the start of a drain to the exit, so a load
@@ -1043,3 +1188,24 @@ container's, not a file tree the script can measure. RSS is the server's
 at the end of the cell: a capacity cell is minutes long, not the hours a
 warm-up would need, so it is a level, not a leak bound - the leak bound
 is the soak's.
+
+Recovery is a measured time too, not a promise: the `recovery-bench`
+workflow (a run on `main` or a dispatch, on the fixed `ubuntu-24.04`
+runner, never a local machine) builds a stated store - 20 repos, 1000
+changesets, 31 MiB of raw blob content in files of about 32 KiB, and 5
+lands recorded pending - starts a server on it, flies lands through the
+wire for two seconds, kills the server with SIGKILL mid-land, and then
+measures from the restart's command until readiness answers `SERVING`
+and the first read resolves a ref. It prints the seconds and fails past
+a 60 s bound. The kill is the runbook's crash: no flush, no drain -
+whatever the write-ahead log holds is what recovery starts from. On
+the fixed runner that recovery took 0.1 s (run 39623531102: readiness
+answered `SERVING` and the first read resolved within a tenth of a
+second of the restart's command, with 5 pending lands left by the
+kill; the store built in 0.7 s). One sample at one size; a second size
+is the next step when the number starts steering a decision. The
+current numbers live in the workflow's run log on `main`, and a run
+that drifts far from them is a regression to look at, not a promise to
+restate here.
+
+Proof: crates/scion-server/tests/recovery_bench.rs::a_restart_after_a_kill_recovers_in_a_stated_time
