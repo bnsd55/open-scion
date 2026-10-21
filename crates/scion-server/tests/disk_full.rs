@@ -479,12 +479,12 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
     // sits on a small tmpfs: the workflow's own job mounts it and says
     // so here. SHORTCUT: the env var is the tmpfs's only witness - a
     // local run against a big disk would fill for hours before 53100.
-    let Ok(mib) = std::env::var("SCION_PG_TMPFS_MB") else {
-        println!("skipping: set SCION_PG_TMPFS_MB to the service's tmpfs size");
+    let Ok(bytes) = std::env::var("SCION_PG_TMPFS_BYTES") else {
+        println!("skipping: set SCION_PG_TMPFS_BYTES to the service's tmpfs size");
         return;
     };
-    let Ok(mib) = mib.parse::<u64>() else {
-        panic!("SCION_PG_TMPFS_MB must be a number of MiB");
+    let Ok(bytes) = bytes.parse::<u64>() else {
+        panic!("SCION_PG_TMPFS_BYTES must be a number of bytes");
     };
     let url = std::env::var("SCION_TEST_POSTGRES_URL").expect("SCION_TEST_POSTGRES_URL");
     let mut client = raw(&url);
@@ -495,25 +495,24 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
         println!("the data directory {dir} is the service's own; the env var vouches for it");
     }
     // The margin keeps the proving write's own extend inside a full
-    // disk: a WAL segment and slack, so a WAL write can also be the one
-    // that hits ENOSPC - the panic arm the test names when it fires.
-    let margin = 32 * 1024 * 1024;
-    assert!(
-        mib * 1024 * 1024 > margin * 2,
-        "the tmpfs is too small to fill"
-    );
-    let ceiling = mib * 1024 * 1024 - margin;
+    // disk. The WAL is off the tmpfs (the service mounts it elsewhere),
+    // so a heap extend is the write that fails, with the clean 53100 -
+    // the WAL-panic arm cannot fire here, and the Database unreachable
+    // row covers a lost connection.
+    let margin = 8 * 1024 * 1024;
+    assert!(bytes > margin * 2, "the tmpfs is too small to fill");
+    let ceiling = bytes - margin;
 
     // The fill: the database's own disk fills to the margin, either by
     // the filler's inserts or by the insert that failed first.
     let filled_by = fill(&mut client, 4 * 1024 * 1024, ceiling);
-    let mut arm = match &filled_by {
+    match &filled_by {
         Some(e) if e.code() == Some(&postgres::error::SqlState::DISK_FULL) => {
-            "A (the filler's insert took the 53100)"
+            println!("the filler's insert took the 53100 first");
         }
         Some(e) => panic!("the fill failed with something else: {e:?}"),
-        None => "the margin (the proving write's extend)",
-    };
+        None => {}
+    }
 
     // The proving write: the same land a client's client would run,
     // through the store's own write path.
@@ -527,23 +526,14 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
     let outcome = store.write(|c| c.create_repo(name));
     match outcome {
         Err(e) if sqlstate(&e).as_deref() == Some("53100") => {
-            // Arm A: the clean 53100, mapped to the disk-full storage
-            // class - the class the fixed ResourceExhausted reply rides
-            // on (the pg_error_of unit test pins the reply's text).
+            // The clean 53100, mapped to the disk-full storage class -
+            // the class the fixed ResourceExhausted reply rides on (the
+            // pg_error_of unit test pins the reply's text). The WAL is
+            // off the tmpfs, so a heap extend is the write that fails,
+            // and a lost connection cannot wear the disk's reply.
             assert!(
                 is_out_of_space(&e),
                 "the full database's write must map to out of space: {e:?}"
-            );
-        }
-        Err(e) if sqlstate(&e).is_none() => {
-            // Arm B: the WAL write hit the disk and Postgres panicked -
-            // the connection died with it. The client must NOT see the
-            // fixed disk reply: the store answers busy or unavailable,
-            // a retry-able answer, while the service recovers.
-            arm = "B (the WAL write panicked and the connection died)";
-            assert!(
-                !is_out_of_space(&e),
-                "a lost connection must not wear the disk's reply: {e:?}"
             );
         }
         Err(e) => panic!("the proving write failed another way: {e:?}"),
@@ -551,7 +541,6 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
             "the proving write landed on a database filled to its margin; the fill was not full"
         ),
     }
-    let _ = arm;
 
     // Reads work on both arms: the rows the fill landed are still there.
     let read: i64 = client
