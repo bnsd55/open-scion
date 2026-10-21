@@ -91,6 +91,12 @@ thread_local! {
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     pub static CHECKS: Cell<usize> = const { Cell::new(0) };
+    /// A test's lower bound on one commit or tree object's bytes, and on
+    /// one tree's entries: the refusal is proved with small objects, and
+    /// the product caps stay the documented ones. `None` is the product.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub static STRUCTURE_CAPS: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
 }
 /// Cache for decoded git objects. A tree diff re-reads the trees that the
 /// previous commit's diff just read.
@@ -928,10 +934,11 @@ fn read_tree(
     // `MIN_TREE_ENTRY`, so this is the most entries the decode can
     // produce.
     let most_entries = size / MIN_TREE_ENTRY;
-    if most_entries > MAX_TREE_ENTRIES as u64 {
+    let cap = tree_entries_cap();
+    if most_entries > cap {
         return Err(bad(format!(
             "{id} is {size} bytes, about {most_entries} entries, \
-             past the import's limit of {MAX_TREE_ENTRIES} entries per tree"
+             past the import's limit of {cap} entries per tree"
         )));
     }
     let decoded = tree
@@ -1021,6 +1028,29 @@ const MAX_STRUCTURE_BYTES: u64 = MAX_OBJECT_BYTES as u64;
 /// than build a map that size.
 const MAX_TREE_ENTRIES: usize = 1_000_000;
 
+// The cap the docs name: a structure object is bounded by the file cap,
+// and a test lowers it only through the seam, never in the product.
+const _: () = assert!(MAX_STRUCTURE_BYTES == 100 << 20);
+const _: () = assert!(MAX_TREE_ENTRIES == 1_000_000);
+
+/// The byte cap this thread's import enforces, or the product's.
+fn structure_bytes_cap() -> u64 {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Some((bytes, _)) = STRUCTURE_CAPS.with(Cell::get) {
+        return bytes;
+    }
+    MAX_STRUCTURE_BYTES
+}
+
+/// The most entries this thread's import builds a tree map for.
+fn tree_entries_cap() -> u64 {
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Some((_, entries)) = STRUCTURE_CAPS.with(Cell::get) {
+        return entries;
+    }
+    MAX_TREE_ENTRIES as u64
+}
+
 /// The smallest bytes one tree entry can take: a mode (5), a space, a
 /// one-byte name, a NUL and a 20-byte object name.
 const MIN_TREE_ENTRY: u64 = 5 + 1 + 1 + 1 + 20;
@@ -1042,9 +1072,10 @@ fn capped_object(
             )))
         })?;
     let (kind, size) = (header.kind(), header.size());
-    if size > MAX_STRUCTURE_BYTES {
+    let cap = structure_bytes_cap();
+    if size > cap {
         return Err(Error::Git(Git::message(format!(
-            "{what} {id} is {size} bytes, past the import's limit of {MAX_STRUCTURE_BYTES}"
+            "{what} {id} is {size} bytes, past the import's limit of {cap}"
         ))));
     }
     Ok((kind, size))

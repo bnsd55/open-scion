@@ -160,7 +160,7 @@ pub mod test_support {
     }
     /// The counters the import tests read between retries.
     pub mod import {
-        pub use crate::import::{BUSY_TRIES, CHECKS};
+        pub use crate::import::{BUSY_TRIES, CHECKS, STRUCTURE_CAPS};
     }
     /// The land operation: its queue, requests and outcomes.
     pub mod land {

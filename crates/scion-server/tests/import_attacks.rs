@@ -12,11 +12,8 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use scion_server::test_support::import::STRUCTURE_CAPS;
 use scion_server::{Backend, Error, ImportOptions, import_git};
-
-/// The import's byte cap for one commit or tree object, the same number
-/// the store keeps files under. Tests write one object past it.
-const MAX_OBJECT_BYTES: usize = 100 << 20;
 use tempfile::TempDir;
 
 /// A git repository in a temp dir, with fixed identities and no user or
@@ -310,16 +307,19 @@ fn reserved_names_import_like_any_other_name() {
     }
 }
 
-/// An object past [`scion_server`]'s structure cap is refused on its
-/// header, before the import decodes it whole, and the refusal names the
-/// size.
+/// The caps are the product's only when the seam is at `None`: a test
+/// lowers them on its thread and proves the same refusal with objects a
+/// few bytes big. The compile-time asserts in `import.rs` hold the
+/// product caps at the documented numbers.
 #[test]
 fn an_oversized_commit_is_refused_before_it_is_decoded() {
+    // The seam lowers the byte cap to one kibibyte; the commit below is
+    // a few kibibytes of message, which no git tool would write and the
+    // import refuses on the header, before any decode.
+    STRUCTURE_CAPS.with(|caps| caps.set(Some((1024, u64::MAX))));
     let git = Git::init();
     let tree = plain_tree(&git);
-    // A message that takes the commit object past the blob cap, which is
-    // the import's structure cap too.
-    let message = format!("{}\n", "A".repeat(MAX_OBJECT_BYTES + 1));
+    let message = format!("{}\n", "A".repeat(4096));
     let head = commit(
         &tree,
         &[
@@ -331,29 +331,32 @@ fn an_oversized_commit_is_refused_before_it_is_decoded() {
     let head = git.object("commit", &head);
     git.force_main(&head);
     match verdict(&git) {
-        Ok(commits) => panic!("a {MAX_OBJECT_BYTES}-byte-plus commit imported {commits} commits"),
+        Ok(commits) => panic!("a commit past the byte cap imported {commits} commits"),
         Err(Error::Git(e)) => {
             let why = e.to_string();
             assert!(
-                why.contains(&MAX_OBJECT_BYTES.to_string()),
-                "the refusal names the size: {why}"
+                why.contains("limit of 1024"),
+                "the refusal names the cap: {why}"
             );
+            assert!(why.contains(" bytes,"), "the refusal names the size: {why}");
         }
         Err(other) => panic!("refused as {other:?}"),
     }
+    STRUCTURE_CAPS.with(|caps| caps.set(None));
 }
 
 /// A tree whose entry count passes the byte cap but not the entry cap is
 /// refused before `read_tree` builds its map.
 #[test]
 fn an_oversized_tree_is_refused_before_its_map_is_built() {
+    // The seam lowers the entry cap to ten; the tree holds eleven. Each
+    // entry names a blob id from nowhere: the refusal must come before
+    // any read.
+    STRUCTURE_CAPS.with(|caps| caps.set(Some((u64::MAX, 10))));
     let git = Git::init();
-    // One million entries take about 29 MB, under the byte cap; the map
-    // for them is what the import refuses to build. Each entry names a
-    // blob id from nowhere: the refusal must come before any read.
     let name = "a".repeat(40);
-    let mut tree = Vec::with_capacity(1_100_000 * 30);
-    for _ in 0..1_100_000 {
+    let mut tree = Vec::new();
+    for _ in 0..11 {
         tree.extend_from_slice(&entry("100644", b"n", &name));
     }
     let tree = git.object("tree", &tree);
@@ -361,7 +364,7 @@ fn an_oversized_tree_is_refused_before_its_map_is_built() {
     let head = git.object("commit", &head);
     git.force_main(&head);
     match verdict(&git) {
-        Ok(commits) => panic!("a tree of 1_100_000 entries imported {commits} commits"),
+        Ok(commits) => panic!("a tree past the entry cap imported {commits} commits"),
         Err(Error::Git(e)) => {
             let why = e.to_string();
             assert!(
@@ -371,6 +374,7 @@ fn an_oversized_tree_is_refused_before_its_map_is_built() {
         }
         Err(other) => panic!("refused as {other:?}"),
     }
+    STRUCTURE_CAPS.with(|caps| caps.set(None));
 }
 
 /// A symlink entry stores its target bytes as a blob, like git holds them;
