@@ -53,7 +53,11 @@ RUN_URL=${RUN_URL:-}
 # scion-server this script starts through common.sh's start_scion too.
 # Empty means sqlite, and an empty value is filtered, so one export
 # serves both backends.
-export SCION_POSTGRES_URL=${SCION_PG_URL:-}
+# The Postgres URL reaches every scion-server through the env, which
+# postgres_url_of reads quietly and an empty value filters. The export
+# is per cell: a sqlite cell must not see a URL, or its server opens
+# Postgres and the cell dies - what the first dispatch proved.
+SCION_POSTGRES_URL=${SCION_PG_URL:-}
 
 # classifies LOG: the soak's accepted failures. A cell whose clients
 # failed with anything else is past the edge; the run stops there.
@@ -107,6 +111,14 @@ for backend in sqlite postgres; do
   if [ "$backend" = postgres ] && [ -z "${SCION_PG_URL:-}" ]; then
     note "no SCION_PG_URL: the Postgres cells are not run"
     continue
+  fi
+  # The env decides the backend of every server this cell raises, so it
+  # is set here, per cell: the URL for postgres, empty (which the
+  # reader filters) for sqlite.
+  if [ "$backend" = postgres ]; then
+    export SCION_POSTGRES_URL=$SCION_PG_URL
+  else
+    export SCION_POSTGRES_URL=
   fi
   # A fresh store per cell: every cell starts equal, and the growth a
   # cell measures is the growth its own lands cause.
