@@ -1,0 +1,16 @@
+# The statement-coverage measure's exclusions: one filename regex per
+# line, joined by the coverage job into cargo-llvm-cov's
+# --ignore-filename-regex. A # starts a comment, on its own line or
+# after the regex. The job fails when a pattern here matches no tracked
+# file, so a vacuous exclusion cannot hide in this file.
+#
+# Today the file holds no patterns, for one reason the measure makes
+# true by construction:
+#
+# - The generated proto code (tonic_prost_build) builds into OUT_DIR
+#   under target/, which the measure never counts.
+#
+# The test seam lives in its own files (crates/scion-server/src/test_support/),
+# declared by their parent modules with #[path], so the exclusion here is a
+# file pattern and the production files carry no seam code:
+crates/scion-server/src/test_support/

@@ -77,6 +77,29 @@ pending lands sweep themselves after `--land-stale-secs` (see the quotas
 above). The metrics gauge `scion_calls_in_flight` counts the calls the
 drain still waits for.
 
+#### One server, and no automatic failover
+
+There is no automatic failover. One active server holds the store: a
+second server on the same data directory (or the same Postgres database)
+refuses to start, and a running server whose lock the database gave to
+another process is fenced — it answers `FailedPrecondition` to every call
+and exits. That is the guard against two servers taking one store, not a
+failover path.
+
+When the one server dies, every client's calls fail until it is back.
+Nothing takes over by itself: no standby, no leader election, no routing.
+The operator restarts the server on the same data directory (`systemctl
+restart scion`, or the container's restart policy); a restart retakes the
+store and serves the writes that were acknowledged before the death, and
+the calls that were in flight are the client's to retry. While the server
+is down, the tiers and daemons in front of it serve what they have cached
+and refuse the rest. If the directory itself is lost, the recovery is a
+restore from backup (section 3).
+
+Proof: crates/scion-server/tests/backend_refusals.rs::a_lost_server_lock_fences_the_backend
+Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover
+Proof: crates/scion-server/tests/crash.rs::every_reply_survives_a_kill_of_the_server
+
 ### Server and a regional cache
 
 A cache serves object reads to a region and refuses every other call
@@ -231,6 +254,17 @@ repos all its users may read whole.
 
 ### Folder read rules
 
+The server records an audit log: an append-only JSON-lines file of
+refused authentication (counted per peer), writes, ref changes, lands
+and administrative changes, with no tokens and no contents. It lives at
+`audit.log` in the data directory; `--audit-file` puts it elsewhere.
+There is no way to turn it off: a server that cannot record refuses the
+changes it cannot account for, and flips readiness until a restart. The
+file is mode 0600, never a symlink, in a directory only the server's
+user may write.
+
+### Folder read rules
+
 A `read` or `write` rule may name a path prefix as its fourth field, by
 path parts: `read alice main src` lets alice read `src` and below
 (`src/a` yes, `srcx` no), and nothing else of that repo. No prefix means
@@ -358,6 +392,48 @@ Proof: crates/scn/tests/rotation.rs::ticket_key_rotation_while_a_checkout_reads
 
 ## 3. Backup and restore
 
+### The durability point
+
+What an acknowledged write has survived, before you need a backup:
+
+- A **blob put** is answered after the blob's temp file was fsynced, the
+  file was renamed into `objects/`, the directories of every new file were
+  fsynced, and the drive's write cache was flushed. The server does not
+  answer from its page cache: a power cut after the reply can lose nothing
+  the caller was told was stored, on either backend — the blob path is the
+  data directory's in both.
+- A **land** is answered after its blobs were synced as above and its
+  metadata commit was made durable. On SQLite, the commit fsyncs the WAL
+  (`synchronous = FULL`); on Postgres, every connection runs
+  `synchronous_commit = on`, and the server refuses to open a database
+  that turned it off. A land's reply therefore names a commit the
+  database will not lose, and the database's own durability rules carry
+  it from there.
+- What the above does **not** survive: the loss of the drive itself, or
+  the loss of the machine. That is what the backup below is for.
+
+Proof: crates/scion-server/tests/power.rs::every_reply_survives_a_power_cut
+Proof: crates/scion-server/tests/dm_log_writes.rs::an_acknowledged_blob_survives_a_cut_at_the_last_barrier_before_its_reply
+Proof: crates/scion-server/tests/crash.rs::every_reply_survives_a_kill_of_the_server
+Proof: crates/scion-server/tests/storage.rs::a_retry_after_a_failed_dir_fsync_makes_the_kept_file_durable
+
+The Postgres metadata half of the first two rules is Postgres's own
+contract (`synchronous_commit = on`), which the server checks at every
+open (`crates/scion-server/src/pg.rs`, the `SHOW synchronous_commit`
+check): a test of the database's fsync would test Postgres, not Scion.
+
+A backup (data taken outside the server) has a wider point: the
+**recovery point** of a backup is the moment of its metadata snapshot.
+Every write acknowledged after the snapshot began may be lost — a backup
+run every N minutes has a recovery point of about N minutes of
+acknowledged writes, plus the write in flight while the snapshot ran.
+Writes acknowledged **before** the snapshot read back whole after a
+restore, whatever was happening in the meantime.
+
+Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restores_whole
+Proof (open, #411): the live-backup test of that PR pins what a backup taken while
+the server keeps writing may and may not hold
+
 A data directory is `scion.db` plus `objects/`; the lock files and `tmp/`
 are process state, not data. A copy of the directory is a backup:
 
@@ -431,6 +507,25 @@ new database), the marker, and `objects/` into a fresh directory; run
 gc-raced backup left, so run it after every restore, before the server
 serves.
 
+The restore takes a measured time, not a promise: the `restore-bench`
+workflow (a run on `main` or a dispatch, on the fixed `ubuntu-24.04`
+runner, never a local machine) restores a stated store — 40 repos,
+12000 changesets, 750 MiB of raw blob content in files of about 64 KiB,
+every blob distinct and incompressible — with `fsck`, an open and a
+read, prints the seconds, and fails past a 600 s bound. The measured
+time includes the fsync of every restored file and directory: a
+restore is done when a crash cannot lose it. A real store's restore
+time scales with its blob bytes and its changeset count. On the fixed
+runner that store restored in 10.5 s (run 39539498175: 72 MiB/s on
+disk, 1147 changesets/s; the 750 MiB on disk matched the raw bytes,
+and the store built in 28.0 s). One sample at one size; a second size
+is the next step when the number starts steering a decision. The
+current numbers live in the workflow's run log on `main`, and a run
+that drifts far from them is a regression to look at, not a promise
+to restate here.
+
+Proof: crates/scion-server/tests/restore_bench.rs::a_restore_of_a_stated_store_takes_a_stated_time
+
 Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restores_whole
 
 ## 4. Upgrades
@@ -447,6 +542,26 @@ schema 4 walks every repo's changesets). Two rules:
 - If other processes (an `import`, a `fsck`) share the directory, a
   migration waits for them to stop: the error says `stop the other processes
   that use ...`. One process at a time migrates.
+
+### A failed migration
+
+A migration that cannot finish leaves the database at one whole step, so
+the two failures an operator sees are the two rules above, and the runbook
+is the rule that names the case:
+
+1. The open refuses with `schema version N is newer than this build`:
+   the data ran on a newer build than this binary. The fix is the old
+   binary, or the restore of section 3. Never edit `user_version` by
+   hand: the version is the migration's bookmark, and a hand-moved one
+   leaves the database half-migrated in a way no migration can finish.
+2. The start waits with `stop the other processes that use ...`: another
+   process holds the directory. Stop it; the migration runs on the next
+   start.
+
+After the fix, the server starts and serves; `fsck` says the store is
+whole.
+
+Proof: crates/scion-server/tests/crash.rs::a_newer_schema_refuses_the_open_and_a_restore_serves
 
 An import reads git revision `--rev` (default `HEAD`) into scion repo
 `--repo` (default `main`), and points scion ref `--ref` (default `main`)
@@ -476,6 +591,14 @@ The routines are these:
 - `fsck` on a schedule (it is read-only, so it can run beside a live
   server), and always on a fresh backup copy. Exit 1 with the problem lines
   is the signal to restore from a backup; there is no automatic repair.
+
+  An fsck failure (exit 1) is the restore runbook of section 3, and the
+  test that proves it is the failing-disk runbook's: damage on disk,
+  the `fsck` command to its exit 1 with the problem named, the restore
+  into a fresh directory, and fsck clean on the restored copy before
+  the server starts.
+
+  Proof: crates/scion-server/tests/storage.rs::a_failing_disk_runbook_fscks_restores_and_serves
 - `tmp/` needs no attention: every open removes the staging folders of dead
   processes, and a lone open also removes files a build older than the
   schema left there.
@@ -529,6 +652,74 @@ in the scrape.
   versions itself.
 - A cache is stateless except its snapshots: its whole state is memory plus
   the snapshot files, so restart it whenever you like.
+
+### Disk full
+
+The disk the data directory sits on has two alerts: `DiskNearlyFull` at
+10 GiB free and `DiskFull` at 1 GiB free. At either one:
+
+1. Run the gc routine (above): first a `--dry-run` to see what it would
+   collect, then a real run. The collector is safe beside a live server,
+   and on a store whose repos grew by accident (a forgotten import, a
+   test repo nobody removed), this alone frees the space.
+2. Run `fsck` when the run ends. A full disk can leave a write that
+   failed mid-way; fsck tells you whether anything was damaged (there
+   is no repair: restore from a backup, section 3, when it reports one).
+3. If gc collected too little, the data is bigger than the disk: grow
+   the volume, or move the data directory to a bigger one (a stop, a
+   copy per section 3, a start at the new path). Growing a mounted
+   volume needs no restart: the next write sees the new size.
+
+Nothing in the store needs repair because the disk filled: a write that
+failed out-of-space left no torn file, and when space is back, writes
+resume with no restart. A blob whose upload was refused must be uploaded
+again by the client; the server never kept half of it.
+
+Proof: crates/scion-server/tests/disk_full.rs::a_disk_full_runbook_gcs_then_writes_resume
+
+### A failing disk
+
+A disk that fails reads does not fail writes: a read whose file the disk
+cannot serve answers an internal error (the client retries into the same
+device, so do not loop), and the rest of the store keeps serving. On the
+first internal error from a read:
+
+1. Run `fsck` (it is read-only, so it can run beside the live server).
+   Exit 1 with the problem lines names the damage; the store has no
+   repair.
+2. If fsck reports damage, restore from a backup (section 3): a fresh
+   directory gets the metadata snapshot and the objects copy, fsck runs
+   on it, and the server starts at the new path. A read that failed and
+   later succeeds means the disk recovered, not that the damage was
+   never there: run fsck anyway.
+
+Proof: crates/scion-server/tests/storage.rs::a_failing_disk_runbook_fscks_restores_and_serves
+
+### A Postgres restart
+
+A Postgres-backed server keeps running when the database restarts under
+it: the calls that touch the database answer while it is down (a write
+answers the busy error a client retries against), the store does not
+fence itself (an unreachable database is no proof that another process
+took the data), and no server restart is part of the fix. When the
+database is back, the next write reconnects, takes the advisory lock
+again, and runs; nothing needs cleaning up by hand. The runbook is:
+
+1. Watch `scion_pg_pool_wait_seconds` and the busy errors: they tell a
+   database that is down from one that is slow.
+2. Fix the database (restart the container or the service); the server
+   needs nothing.
+3. After the restart, one write is the check: it runs, and the reads
+   behind it see the data. If a write keeps failing after the database
+   is back, the fence is the suspect: the fence is section 1's "One
+   server process serves one database" - a fenced server exits 70, and
+   a supervisor restart of it takes the lock back or refuses.
+
+The one thing not to do: do not restart the server while the database
+is down. A start against an unreachable database fails, and a restart
+throws away the sessions that would reconnect on their own.
+
+Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover
 
 ## 6. What to watch
 
@@ -640,3 +831,215 @@ of one operation.
 
 A ticket refusal, an access refusal, or a corrupt blob each log one line
 per event, never the bytes or the token that caused them.
+
+### Latency p99 high
+
+`LatencyP99High` fires when one RPC's 99th-percentile duration has sat
+over 4 s for 15 minutes. One slow RPC is that call's path; every RPC
+slow at once is the machine or the store under everything.
+
+Find the RPC and the bucket its p99 sits in — the first `le` whose
+cumulative count reaches 99% of the RPC's calls:
+
+```sh
+curl -s 127.0.0.1:9100/metrics | awk '
+  /^scion_request_seconds_bucket/ {
+    match($0, /rpc="[^"]*"/); rpc = substr($0, RSTART + 5, RLENGTH - 6)
+    match($0, /le="[^"]*"/);  le  = substr($0, RSTART + 4, RLENGTH - 5)
+    n[rpc]++; b[rpc, n[rpc]] = le; c[rpc, n[rpc]] = $NF
+  }
+  END {
+    for (r in n) {
+      total = c[r, n[r]] + 0
+      for (i = 1; i <= n[r]; i++)
+        if (c[r, i] + 0 >= 0.99 * total) { print r, "p99 in", b[r, i]; break }
+    }
+  }'
+```
+
+Tell the causes apart by which RPC is slow:
+
+- A write RPC (`Scion/Land`, `Scion/CreateChangeset`): the store's
+  fsyncs. `BlobSyncSlow` fires beside it when the mean fsync passes 2 s;
+  if it does, the drive is the cause, and the fix is faster storage or
+  fewer imports beside serving (section 5's import routine).
+- A read RPC (`Objects/GetObjects`, `Objects/ReadFile`):
+  `scion_cache_misses_total` rising on the tier in front points at cache
+  misses (the tier miss rate runbook below); `scion_pg_pool_wait_seconds`
+  with a rising tail (Postgres) points at readers held by long walks
+  (the pool metrics above); a partial reader's slow first read of a rule
+  set is the view memo warming (the runbook below).
+- Every RPC: the host is short of CPU, memory or disk headroom; the
+  fixes are off the server (move imports, scale out, add a cache).
+
+Escalate when a read RPC's p99 stays over 4 s with the caches warm and
+the drive quiet: that is a store shape a restart does not fix, and it
+needs the store's owner.
+
+Proof: crates/scion-server/tests/docs_alerts.rs::latency_p99_names_the_slow_rpc_from_the_served_histogram
+
+### View memo bypassed
+
+`ViewMemoBypassed` fires when the rate of `scion_view_trees_walked_total`
+stays over 5 per second for 30 minutes: partial readers' view
+derivations keep opening real trees instead of finding the per-tree
+memo rows the derivation cached before (the `view_trees` table).
+
+Read the counter twice, a minute apart, and subtract:
+
+```sh
+curl -s 127.0.0.1:9100/metrics | grep '^scion_view_trees_walked_total'
+```
+
+Tell the causes apart:
+
+- The rate is high but falling, and the repo's tip moves fast: every new
+  changeset re-derives the folders its changes touched. That is the
+  design working — a new changeset walks only what moved — and no fix
+  applies. The alert's 30-minute `for` exists so this warmup does not
+  fire it.
+- The rate is high and steady: the same (tree, context) pairs derive
+  again and again. The memo rows were swept: rows of a rule-set digest
+  that no grant hashes to any more die in bounded steps, so a recent
+  change to the access file's read rules (or a projection upgrade) makes
+  every read walk until the rows rebuild. Restore the rules, or let the
+  first reads pay and the rate falls.
+- The rate is high, steady, and `LatencyP99High` fires on a read RPC
+  with it: the derivations hold the store's readers. On Postgres,
+  `scion_pg_readers_busy` pinned at 8 with a growing
+  `scion_pg_tx_age_seconds` says the walks hold the pool; stagger the
+  readers, so the walks do not all run at once.
+
+Escalate when steady high walks and read latency land together and the
+access file has not changed for days: the working set outgrew the
+memo's shape, and it needs the store's owner.
+
+Proof: crates/scion-server/tests/docs_alerts.rs::view_memo_serves_the_second_read_of_one_changeset
+
+### Stalled replies high
+
+`StalledRepliesHigh` fires when `scion_stalled_reply_bytes` has sat over
+48 MiB for 15 minutes: replies whose clients stopped reading mid-reply
+hold their buffers in the server. The cap is `--max-stalled-bytes`
+(default 64 MiB) per connection; a connection over it is closed with
+everything it holds, and the server logs
+`closing a connection: its stalled replies hold too much` once, with the
+bytes it held.
+
+Read the gauge and find the client that stopped:
+
+```sh
+curl -s 127.0.0.1:9100/metrics | grep '^scion_stalled_reply_bytes'
+grep 'closing a connection' server.log
+```
+
+Tell the causes apart:
+
+- One client, once: a crashed reader or a paused consumer. The cap
+  already handled it — the buffers went with the connection. No fix.
+- The same peer, again and again: its reader is slower than the
+  server's producer. Fix the client (read the reply as it streams; the
+  close notice names the peer address, and the calls of one client
+  carry its `request_id` in both logs).
+- Many clients, bytes near the cap on several connections: the replies
+  are large and the clients are many — raise
+  `--max-stalled-bytes` only if the box has the memory for it, or add a
+  cache tier so the large replies do not all reach the server.
+
+Escalate when the close notice repeats for one peer and the client is
+not yours to fix: the client's owner stops the waste, not the server.
+
+Proof: crates/scion-server/tests/log_stream.rs::a_stalled_log_reply_is_counted_and_closes_the_connection
+
+### Tier miss rate
+
+`TierMissRate` fires when a tier's misses have held over half its reads
+for 30 minutes: the tier fetches from upstream what it should have
+served from its own store.
+
+Read the two counters and divide — misses over all reads:
+
+```sh
+curl -s 127.0.0.1:9100/metrics \
+  | awk '/^scion_cache_hits_total/ {h = $NF}
+         /^scion_cache_misses_total/ {m = $NF}
+         END {if (h + m > 0) print m / (h + m)}'
+```
+
+Tell the causes apart:
+
+- The ratio falls over the first minutes after a tier restart: the
+  memory store warms from the reads it serves. No fix. A cache cannot
+  refill itself from its own snapshot file at start; what the snapshot
+  is for is the daemon's warm start: the cache writes the file with
+  `--snapshot`, and a daemon starts from it with `--seed` (section 1).
+- The ratio is steady high and `CacheDown` is not firing: the working
+  set does not fit the tier's memory. Raise `--max-bytes` (and
+  `--snapshot-bytes`, so the snapshot can hold it), or put a tier near
+  each group of users instead of one tier for all.
+- The ratio is 1: nothing ever hits. The tier's store never sees a
+  second read of the same object — the clients are cold readers of
+  disjoint data, and a cache is the wrong tool for them; point the
+  clients at the server or accept the misses.
+
+Escalate when the ratio stays high with the caps raised and the box's
+memory free: the tier's placement or shape needs its owner.
+
+Proof: crates/scion-server/tests/docs_alerts.rs::tier_miss_ratio_falls_when_the_store_serves_the_second_read
+
+## 7. Capacity
+
+What one server takes, measured on one named machine, so the numbers have
+a bottom. The table below is the published envelope
+([#387](https://github.com/bnsd55/openscion/issues/387)): every cell is a
+run of [`scripts/capacity.sh`](../scripts/capacity.sh) on a GitHub-hosted
+runner of the class named in the caption, with the dataset of
+[benchmarks.md](benchmarks.md) (tokio at a pinned commit), SQLite or
+Postgres behind the server, `scn bench` landing through it and readers
+checking out through a cache and a daemon beside it.
+
+| | |
+|---|---|
+| Commit | the `git rev-parse HEAD` of the run that produced the table |
+| Runner | the hosted runner class, by its public label and spec |
+| Repetitions | 2 per cell; the table reports the cell's whole run, and the run's raw samples are the workflow run's `capacity.csv` artifact |
+
+| backend | writers | readers | lands/min | land p99 ms | checkout p50 ms | checkout p99 ms | errors | server RSS MiB | store KiB per 1k lands |
+|---|---|---|---|---|---|---|---|---|---|
+| sqlite | 2 | 0 | - | - | - | - | - | - | - |
+| sqlite | 2 | 5 | - | - | - | - | - | - | - |
+| sqlite | 2 | 20 | - | - | - | - | - | - | - |
+| sqlite | 50 | 0 | - | - | - | - | - | - | - |
+| sqlite | 50 | 5 | - | - | - | - | - | - | - |
+| sqlite | 50 | 20 | - | - | - | - | - | - | - |
+| sqlite | 200 | 0 | - | - | - | - | - | - | - |
+| sqlite | 200 | 5 | - | - | - | - | - | - | - |
+| sqlite | 200 | 20 | - | - | - | - | - | - | - |
+| postgres | 2 | 0 | - | - | - | - | - | - | - |
+| postgres | 2 | 5 | - | - | - | - | - | - | - |
+| postgres | 2 | 20 | - | - | - | - | - | - | - |
+| postgres | 50 | 0 | - | - | - | - | - | - | - |
+| postgres | 50 | 5 | - | - | - | - | - | - | - |
+| postgres | 50 | 20 | - | - | - | - | - | - | - |
+| postgres | 200 | 0 | - | - | - | - | - | - | - |
+| postgres | 200 | 5 | - | - | - | - | - | - | - |
+| postgres | 200 | 20 | - | - | - | - | - | - | - |
+
+The cells with `-` are the ones no run has filled yet. The errors column
+is part of the data, not a failure of the run: the envelope's edge IS
+where errors start, so a cell whose clients failed is recorded with its
+error count and stands in the table. The edge, the point where a cell
+stops being an answer: a checkout p99 over 5 seconds, a land p99 over
+5 seconds, or a client error outside the accepted classes of the soak -
+in the table, that is a cell with errors above 0. A reader who wants a
+different edge applies it to the run's `capacity.csv` artifact, which
+the footer's workflow run keeps. A cell whose bench died names no land
+percentile (`-` there); its lands per minute still come from the
+server's counter.
+
+The store growth column is the SQLite store's only; the Postgres cells
+name no store growth, because the database's disk is its service
+container's, not a file tree the script can measure. RSS is the server's
+at the end of the cell: a capacity cell is minutes long, not the hours a
+warm-up would need, so it is a level, not a leak bound - the leak bound
+is the soak's.

@@ -199,6 +199,17 @@ that breaks one is caught.
   symlinked snapshot is refused, and `--seed-full-repo` must say so.
   `scion-tier/src/snapshot.rs::a_group_writable_snapshot_is_refused`,
   `scion-tier/src/snapshot.rs::a_symlinked_snapshot_is_refused`
+- **Two repos whose names differ only by case do not share one
+  snapshot file.** On a case-insensitive disk, `main` and `MAIN` would
+  fold one onto the other: the second repo's snapshot write replaced
+  the first's, and a seed of the first read the second's file;
+  `scion-tier/src/snapshot.rs::file_name` escapes
+  every capital (and every byte outside the plain name set) as `%XX`,
+  so the file name keeps lowercase only, and the property test holds
+  it for any repo name
+  (`scion-tier/src/snapshot.rs::any_repo_name_gives_one_plain_file_name`,
+  with its regression file in
+  `scion-tier/proptest-regressions/snapshot.txt`). #452
 - **Checkout writes nothing it should not.** Names that are unsafe fail
   before anything is written, a failed checkout removes what it wrote,
   a signal cleans up, and an existing destination is left untouched on
@@ -220,7 +231,58 @@ that breaks one is caught.
 - **Internal errors say `internal error`.** The detail stays in the
   log, named by the request id.
   `scion-server/tests/request_id.rs::a_calls_request_id_names_its_span_in_the_servers_log`
-
+- **An archive is untrusted input.** `verify` and `restore` treat every
+  byte of an archive as coming from outside the server: a repo name the
+  manifest holds is checked against the live name rule and that it is
+  one path component, before it ever joins a path
+  (`scion-server/tests/archive.rs::a_manifest_name_that_escapes_the_archive_is_refused`),
+  and a blob file decompresses through a bounded stream, at most the
+  server's max blob size plus one, so a crafted frame cannot grow in
+  memory past the cap
+  (`scion-server/tests/archive.rs::a_blob_file_that_expands_past_the_cap_is_refused`).
+- **A restore verifies first, and goes only into an empty store.** It
+  runs the same `verify` a reader runs and refuses on any damage, and it
+  refuses a data directory that already holds a store
+  (`scion-server/tests/archive.rs::a_verify_names_a_blob_whose_bytes_someone_corrupted`,
+  `scion-server/tests/archive.rs::a_restore_refuses_a_data_directory_that_already_holds_a_store`).
+- **A secret path cannot hang or flood the checked read.** The open is
+  `O_NONBLOCK`, so a planted FIFO dies at the open instead of blocking
+  the server at startup; the kind check takes a regular file only; and
+  the bytes are read bounded at a fixed cap, so a file that lies about
+  its size, or grows between the fstat and the read, is refused
+  deterministically. (#433)
+  `scion-proto/src/runtime/auth/mod.rs::open_checked_file`,
+  `scion-proto/src/runtime/auth/mod.rs::read_bounded` over
+  `MAX_CHECKED_FILE`; the tests
+  `scion-proto/src/runtime/auth/mod.rs::a_file_that_is_not_a_file_is_refused`,
+  `scion-proto/src/runtime/auth/mod.rs::a_reader_that_yields_one_byte_past_the_cap_is_refused`
+- **An archive cannot fold two names onto one file, duplicate a repo,
+  or land half.** `verify` refuses a manifest that names one repo
+  twice, and refuses two names that fold to one directory on a
+  case-insensitive disk — the disk's own (device, inode) is the judge,
+  not a fold table (`scion-server/src/archive.rs::check_section_dir`); colliding land
+  keys are named or tolerated, never half-restored; and a replay that
+  dies halfway leaves the target empty, because `restore` fills a
+  staging directory and publishes by one rename
+  (`scion-server/src/archive.rs::restore_impl`). (#438) The tests:
+  `scion-server/tests/archive.rs::an_archive_naming_two_repos_that_fold_to_one_is_refused`,
+  `scion-server/tests/archive_attacks.rs::a_manifest_naming_one_repo_twice_is_refused_before_any_write`,
+  `scion-server/tests/archive_attacks.rs::two_pending_lands_sharing_a_request_key_are_named_or_tolerated`,
+  `scion-server/tests/archive_attacks.rs::a_mid_replay_failure_leaves_the_target_empty`,
+  `scion-server/tests/archive_attacks.rs::a_pg_replay_that_dies_halfway_leaves_the_database_empty`
+- **A refused-auth flood is counted by the machine, not the socket.**
+  The audit meter folds one peer's refusals into counted lines keyed
+  by the address — an IPv6 by its /64, the smallest block one site
+  routes — so one machine opening a thousand connections from a
+  thousand ports cannot fill the peer cap for free and bury a real
+  stranger in the shared bucket. (#414)
+  `scion-server/src/audit.rs::meter_key`, and the test
+  `scion-server/src/audit.rs::one_address_rotating_ports_does_not_bury_a_stranger`
+- **A restore verifies first, and goes only into an empty store.** It
+  runs the same `verify` a reader runs and refuses on any damage, and it
+  refuses a data directory that already holds a store
+  (`scion-server/tests/archive.rs::a_verify_names_a_blob_whose_bytes_someone_corrupted`,
+  `scion-server/tests/archive.rs::a_restore_refuses_a_data_directory_that_already_holds_a_store`).
 ## 6. What has no test yet
 
 Each of these is a claim this document makes without a test behind it.
@@ -236,8 +298,6 @@ They become issues as the project moves past alpha.
   `scion-server/tests/access.rs::an_outstanding_ticket_survives_a_narrowed_access_file_until_the_key_rotates`
 - TLS revocation, and hostname checks beyond what the CA signs: no
   test; revocation has no issue yet.
-- The owner and mode checks read no ACLs: an ACL that grants a write
-  the mode does not gets past them. Documented as a limit; no test.
 - A partial reader sees real changeset IDs for its view: a landing on
   hidden paths moves `main`, and the reader's `ResolveRef` answers the
   new ID over an unchanged view. The channel is pinned as documented
