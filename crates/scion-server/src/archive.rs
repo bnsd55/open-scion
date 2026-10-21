@@ -6,7 +6,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write as _;
+use std::io::{self, Write as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use gix::ObjectId;
@@ -94,10 +95,25 @@ pub fn export(
     let mut total_refs = 0_u64;
     let mut total_lands = 0_u64;
     let mut total_members = 0_u64;
+    // The archive's root: made recursively, as before — the operator
+    // names a path whose parents may not exist, and the fold risk this
+    // module guards is between REPO names, not in the operator's own
+    // path. Each section directory below is a NON-recursive create, so
+    // a fold on the disk is an error, not a silent reuse of another
+    // repo's directory.
+    make_dir(out)?;
+    let repos_dir = out.join("repos");
+    fs::DirBuilder::new()
+        .create(&repos_dir)
+        .map_err(|error| Error::Corrupt(format!("cannot make {}: {error}", repos_dir.display())))?;
+    // The section directories this export made, by their (device,
+    // inode): on a disk that folds names, two repos' directories can be
+    // one directory, and the disk is the only judge of that.
+    let mut made: HashMap<(u64, u64), String> = HashMap::new();
     for name in &names {
         let section = snapshot_section(store, name)?;
 
-        let report = write_section(data, out, &section)?;
+        let report = write_section(data, out, &section, &mut made)?;
         total_changesets += report.changesets;
         total_refs += report.refs;
         total_lands += report.lands;
@@ -144,9 +160,37 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
     let manifest = read_manifest(archive)?;
     let names = repo_names(&manifest)?;
     let mut damages = Vec::new();
+    // The manifest is data from a file: a name twice means the reader
+    // and the restore would both walk the repo twice, and the restore
+    // would replay two stores into one. Name it before anything else.
+    // And on a disk that folds names, two names can be one directory:
+    // the disk's own (device, inode) is the judge, not our fold. The
+    // section of a folded pair is one directory read twice, and the
+    // restore would replay one repo's data under both names.
+    let mut seen_names = HashSet::new();
+    let mut seen_dirs: HashMap<(u64, u64), String> = HashMap::new();
+    let mut sections = Vec::new();
     for name in &names {
+        if !seen_names.insert(name) {
+            damages.push(format!(
+                "the manifest names repo {name} twice; one repo, one section"
+            ));
+            continue;
+        }
+        // The disk, not a fold table, judges whether two names are one
+        // directory: a symlink stands in for another section, and a
+        // folded pair is one directory read twice.
+        let dir = archive.join("repos").join(name);
+        match check_section_dir(&dir, name, &mut seen_dirs) {
+            Ok(()) => sections.push(name.clone()),
+            Err(damage) => damages.push(damage),
+        }
+    }
+    for name in &sections {
         let dir = archive.join("repos").join(name);
         let changesets = read_changesets(&dir.join("changesets.bin"))?;
+        let members = read_members(&dir.join("members.txt"))?;
+        let member_set: HashSet<BlobId> = members.iter().copied().collect();
         let ids: HashSet<ChangesetId> = changesets.iter().map(|(id, _, _)| *id).collect();
         let mut decoded = Vec::new();
         for (id, generation, body) in &changesets {
@@ -175,6 +219,18 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
                     ));
                 }
             }
+            // The replay rebuilds every tree from the changes' blobs
+            // alone, so a changeset whose change names a blob the
+            // members.txt does not list passes here and dies mid-replay
+            // — the reader and the writer would disagree about the same
+            // archive. Name it here, where the reader reads.
+            for state in cs.changes().values().flatten() {
+                if let Some(blob) = state.blob().filter(|blob| !member_set.contains(blob)) {
+                    damages.push(format!(
+                        "repo {name}: changeset {id} names blob {blob}, which its members.txt does not list"
+                    ));
+                }
+            }
         }
         for (ref_name, target, _version) in read_refs(&dir.join("refs.json"))? {
             if !ids.contains(&target) {
@@ -183,7 +239,18 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
                 ));
             }
         }
+        // The pending lands replay as the store's own `record_land`
+        // calls, and the store keeps a request key unique per repo: two
+        // lands on one key make the replay fail halfway, with half a
+        // store behind it. Name the collision here, before any write.
+        let mut seen_keys = HashSet::new();
         for land in read_lands(&dir.join("lands.json"))? {
+            if !seen_keys.insert(land.request_key.clone()) {
+                damages.push(format!(
+                    "repo {name}: two pending lands share the request key {}; one key, one land",
+                    land.request_key
+                ));
+            }
             if !ids.contains(&land.input_cs) {
                 damages.push(format!(
                     "repo {name}: the land with request key {} names input {}, which the archive does not hold",
@@ -192,12 +259,12 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
                 ));
             }
         }
-        for member in read_members(&dir.join("members.txt"))? {
-            let path = blob_path(archive, &member);
+        for member in &members {
+            let path = blob_path(archive, member);
             match fs::File::open(&path) {
                 Ok(file) => match decode_blob(&path, file) {
                     Ok(raw) => {
-                        if BlobId::of(&raw) != member {
+                        if BlobId::of(&raw) != *member {
                             damages.push(format!(
                                 "the blob file of {member} holds other bytes than its name says"
                             ));
@@ -212,6 +279,38 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
         }
     }
     Ok(damages)
+}
+
+/// Checks that the section directory of `name` is a plain directory,
+/// and that the disk does not fold it onto a directory another name
+/// already claimed. One damage per failure, naming both names on a
+/// fold.
+fn check_section_dir(
+    dir: &Path,
+    name: &str,
+    seen_dirs: &mut HashMap<(u64, u64), String>,
+) -> Result<(), String> {
+    let section = match fs::symlink_metadata(dir) {
+        Ok(section) => section,
+        Err(error) => {
+            return Err(format!(
+                "the manifest names repo {name}, whose section cannot be read: {error}"
+            ));
+        }
+    };
+    if section.file_type().is_symlink() || !section.is_dir() {
+        return Err(format!(
+            "the section of repo {name} is not a plain directory"
+        ));
+    }
+    let identity = (section.dev(), section.ino());
+    if let Some(other) = seen_dirs.get(&identity) {
+        return Err(format!(
+            "the repos {other} and {name} fold to one directory on this disk"
+        ));
+    }
+    seen_dirs.insert(identity, name.to_owned());
+    Ok(())
 }
 
 /// Replays an archive into an empty store: the blob bytes go through the
@@ -230,13 +329,55 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
 ///
 /// # Errors
 ///
-/// A data directory that already holds a store, a failed open, damage
-/// [`verify`] finds, or what the replay's writes return.
+/// A data directory that already holds a store or has no name, a failed
+/// open, damage [`verify`] finds, or what the replay's writes return.: the blob bytes go through the
+/// store's own write path, so every object ID is the hash of its bytes;
+/// the data directory the caller named is filled by renaming a staging
+/// directory beside it into place only when the whole replay held — a
+/// restore that fails, for any reason, leaves the target as it found it:
+/// an operator cannot tell restored state from unrestored, so a half
+/// store is the one thing this must never leave.
 pub fn restore(
     archive: &Path,
     data: &Path,
     postgres_url: Option<&str>,
     postgres_ca: Option<&Path>,
+) -> Result<Vec<String>> {
+    restore_impl(archive, data, postgres_url, postgres_ca, |path, url, ca| {
+        Backend::open(path, url, ca)
+    })
+}
+
+/// The restore with the store's opener chosen: the one seam the tests
+/// use, so a test can arm the store's fail seam on the very store a
+/// restore opens and watch the choreography — staging, replay, rename,
+/// the drop of what it made — under a failure that is the store's, not
+/// the archive's. Everything else is the public restore's, behind the
+/// `test-hooks` feature.
+///
+/// # Errors
+///
+/// As [`restore`].
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn restore_with(
+    archive: &Path,
+    data: &Path,
+    postgres_url: Option<&str>,
+    postgres_ca: Option<&Path>,
+    open: impl FnOnce(&Path, Option<&str>, Option<&Path>) -> Result<Backend>,
+) -> Result<Vec<String>> {
+    restore_impl(archive, data, postgres_url, postgres_ca, open)
+}
+
+/// The whole restore — preflight, verify, the staging choreography, the
+/// rename — with the opener a parameter. Private: the public [`restore`]
+/// and the test hook are its only callers.
+fn restore_impl(
+    archive: &Path,
+    data: &Path,
+    postgres_url: Option<&str>,
+    postgres_ca: Option<&Path>,
+    open: impl FnOnce(&Path, Option<&str>, Option<&Path>) -> Result<Backend>,
 ) -> Result<Vec<String>> {
     for existing in ["scion.db", MARKER, "objects"] {
         if data.join(existing).exists() {
@@ -246,6 +387,61 @@ pub fn restore(
             )));
         }
     }
+    // The staging directory sits beside the target, on the same
+    // filesystem, so the final publication is one rename: either the
+    // target is the restored store or it is what it was.
+    let file_name = data.file_name().ok_or_else(|| {
+        Error::FailedPrecondition(format!(
+            "{} has no file name; a restore needs a named directory",
+            data.display()
+        ))
+    })?;
+    let staging = data.with_file_name(format!("{}.restoring", file_name.to_string_lossy()));
+    if staging.exists() {
+        // The scratch name is this restore's own: a leftover of a run
+        // that died mid-replay, never a store an operator made.
+        fs::remove_dir_all(&staging)?;
+    }
+    fs::create_dir_all(&staging)?;
+    let replayed = restore_into_with(archive, &staging, postgres_url, postgres_ca, open);
+    match replayed {
+        Ok(names) => {
+            if let Err(error) = fs::rename(&staging, data) {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(Error::FailedPrecondition(format!(
+                    "the restore replayed whole, but {} could not take {}'s place: {error}",
+                    data.display(),
+                    staging.display()
+                )));
+            }
+            Ok(names)
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            // On Postgres the store's identity was minted by this
+            // restore's open (a database that already named a store
+            // refuses a marker-less staging directory), so the failed
+            // replay leaves only that mint behind. Drop it, best
+            // effort, so the operator's retry against the same
+            // database is refused by nothing.
+            if let Err(why) = reset_postgres_identity(postgres_url, postgres_ca) {
+                tracing::warn!(error = %why, "cannot reset the restored database's identity");
+            }
+            Err(error)
+        }
+    }
+}
+
+/// The replay itself, into whatever directory the caller named: the
+/// publication (the rename into the target) is [`restore`]'s, so a
+/// failure here cannot leave anything behind.
+fn restore_into_with(
+    archive: &Path,
+    data: &Path,
+    postgres_url: Option<&str>,
+    postgres_ca: Option<&Path>,
+    open: impl FnOnce(&Path, Option<&str>, Option<&Path>) -> Result<Backend>,
+) -> Result<Vec<String>> {
     let manifest = read_manifest(archive)?;
     let names = repo_names(&manifest)?;
     // One check path: the same verify a reader runs, before any write. A
@@ -258,7 +454,12 @@ pub fn restore(
             damages[0]
         )));
     }
-    let store = Backend::open(data, postgres_url, postgres_ca)?;
+    let store = open(data, postgres_url, postgres_ca)?;
+    // The sections and the blobs first, all of them: the blobs are
+    // files under `data` (the staging directory the publication
+    // renames), so a failure here is the staging drop's, and no row
+    // was written yet.
+    let mut sections = Vec::new();
     for name in &names {
         let dir = archive.join("repos").join(name);
         let changesets = read_changesets(&dir.join("changesets.bin"))?;
@@ -281,29 +482,33 @@ pub fn restore(
                 )));
             }
         }
-        let repo_id = store.write(|c| c.create_repo(name))?;
-        // The lens the tree building needs: the size of every member blob,
-        // read from the files the put above just made durable.
-        let mut lens = HashMap::new();
-        for member in &members {
-            lens.insert(*member, store.blobs().size(*member)? as u64);
-        }
-        // One write transaction per repo: the changesets replay in
-        // generation order, and a parent always has a smaller generation,
-        // so every parent is in before its child.
-        store.write(|c| {
-            for (_id, _gen, body) in &changesets {
+        sections.push((name.clone(), changesets, members, refs, lands, provenance));
+    }
+    // One write transaction for the whole metadata replay, every repo:
+    // the changesets replay in generation order (a parent always has a
+    // smaller generation, so every parent is in before its child), and
+    // a failure anywhere rolls back every row, on either backend — the
+    // database a restore was replaying into comes out as it was found,
+    // not half-named. The restore opens a fresh store, so the
+    // transaction is the only writer and its length is the restore's.
+    store.write(|c| {
+        for (name, changesets, members, refs, lands, provenance) in &sections {
+            let repo_id = c.create_repo(name)?;
+            // The lens the tree building needs: the size of every member
+            // blob, read from the files the put above just made durable.
+            let mut lens = HashMap::new();
+            for member in members {
+                lens.insert(*member, store.blobs().size(*member)? as u64);
+            }
+            for (_id, _gen, body) in changesets {
                 let (cs, _) = Changeset::decode_with_id(body)
                     .map_err(|error| Error::Corrupt(format!("a stored changeset body: {error}")))?;
                 tree::store_changeset(c, repo_id, &cs, &mut tree::lens_from(&lens))?;
             }
-            Ok(())
-        })?;
-        store.write(|c| {
-            for (ref_name, target, version) in &refs {
+            for (ref_name, target, version) in refs {
                 c.restore_ref(repo_id, ref_name, target.as_bytes(), *version)?;
             }
-            for land in &lands {
+            for land in lands {
                 c.record_land(
                     &Caller(land.caller.clone()),
                     &LandRequest {
@@ -318,13 +523,22 @@ pub fn restore(
                     None,
                 )?;
             }
-            for (oid, cs) in &provenance {
+            for (oid, cs) in provenance {
                 c.put_git_import(repo_id, *oid, *cs)?;
             }
-            Ok(())
-        })?;
-    }
+        }
+        Ok(())
+    })?;
     Ok(names)
+}
+
+/// Undoes the identity a failed restore's open minted in the database:
+/// a fresh store names no store, and the next open mints again. The
+/// tables the migration made stay (they are empty, and the next open's
+/// migration is idempotent); only the name goes.
+fn reset_postgres_identity(url: Option<&str>, ca: Option<&Path>) -> Result<()> {
+    let Some(url) = url else { return Ok(()) };
+    crate::pg::reset_identity(url, ca)
 }
 
 /// The archive's blob file of `id`, in the store's own fan-out shape.
@@ -414,9 +628,35 @@ struct RepoReport {
 }
 
 /// Writes the files of one repo section, and copies its blob files.
-fn write_section(data: &Path, out: &Path, section: &RepoSection) -> Result<RepoReport> {
+fn write_section(
+    data: &Path,
+    out: &Path,
+    section: &RepoSection,
+    made: &mut HashMap<(u64, u64), String>,
+) -> Result<RepoReport> {
     let dir = out.join("repos").join(&section.name);
-    make_dir(&dir)?;
+    // One non-recursive create per section: on a disk that folds names
+    // (case, Unicode normalization) a second repo whose name folds into
+    // an earlier one's lands in the SAME directory, and its files
+    // overwrite the first's — the archive would be corrupt at write
+    // time, silently. AlreadyExists is the fold, and the export names
+    // both names and stops.
+    if let Err(error) = fs::DirBuilder::new().create(&dir) {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            let partner = same_directory(made, &dir, &section.name)?;
+            return Err(Error::Corrupt(format!(
+                "the repos {partner} and {} fold to one directory on this disk; \
+                 export to a case-sensitive disk",
+                section.name
+            )));
+        }
+        return Err(Error::Corrupt(format!(
+            "cannot make {}: {error}",
+            dir.display()
+        )));
+    }
+    let identity = directory_identity(&dir)?;
+    made.insert(identity, section.name.clone());
     write_changesets(&dir.join("changesets.bin"), &section.changesets)?;
     let refs_json: Vec<serde_json::Value> = section
         .refs
@@ -754,6 +994,24 @@ fn snapshot_instant() -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// The (device, inode) of a directory: the disk's own answer to whether
+/// two names name one directory.
+fn directory_identity(dir: &Path) -> Result<(u64, u64)> {
+    let meta = fs::symlink_metadata(dir)
+        .map_err(|error| Error::Corrupt(format!("cannot read {}: {error}", dir.display())))?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+/// The name already recorded for the directory `dir` now stands for, if
+/// one is: the fold partner that the export refuses to overwrite.
+fn same_directory(made: &HashMap<(u64, u64), String>, dir: &Path, name: &str) -> Result<String> {
+    let identity = directory_identity(dir)?;
+    Ok(made
+        .get(&identity)
+        .cloned()
+        .unwrap_or_else(|| name.to_owned()))
 }
 
 fn make_dir(dir: &Path) -> Result<()> {

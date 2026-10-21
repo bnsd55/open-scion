@@ -1549,6 +1549,14 @@ fn connect_with(
     spawn_client(url, ca, options, schema, None, None)
 }
 
+/// Undoes the identity a failed restore's open minted in the database:
+/// a fresh store names no store, and the next open mints again. The
+/// tables the migration made stay (they are empty, and the next open's
+/// migration is idempotent); only the name goes.
+pub(crate) fn reset_identity(url: &str, ca: Option<&Path>) -> Result<()> {
+    connect_with(url, ca, "", None)?.batch("DELETE FROM store_uuid WHERE one = 1")
+}
+
 /// [`connect_with`], as the one server process of the database: the
 /// advisory lock it takes survives as long as the client, and a
 /// reconnecting client takes it again. A lost lock trips the fence
