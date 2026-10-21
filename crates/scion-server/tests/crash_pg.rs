@@ -532,20 +532,23 @@ fn a_kill_during_a_land_leaves_the_ref_old_or_new() {
     // (The server's log: the tempdir keeps it; a failure prints it.)
     let warm = seed_wide_changeset(&data, "warm");
     let mut server = PgServer::spawn(&data, &schema, &log);
-    let step = warm_land(&server, warm, "warm") / 8;
-    let head = ref_target(&data);
-    assert_eq!(head, warm, "the warm land moved main");
+    warm_land(&server, warm, "warm");
     server.kill_and_wait();
 
     // One wide changeset per rep, seeded before the loop, each on the
     // head its rep will find: the kill of rep k lands inside rep k's own
     // land, and the next rep's changeset rebases onto whatever main is
-    // by then.
+    // by then. A probe changeset beside each cut gives the rep its
+    // measure: the probe's land on the rep's own server and head is the
+    // twin of the land the rep kills, so the kill step is measured from
+    // what the kill interrupts and not from the first land's time.
     let cuts: Vec<_> = (0..REPS)
         .map(|k| {
             (
                 format!("cut{k}"),
                 seed_wide_changeset(&data, &format!("cut{k}")),
+                format!("probe{k}"),
+                seed_wide_changeset(&data, &format!("probe{k}")),
             )
         })
         .collect();
@@ -556,11 +559,17 @@ fn a_kill_during_a_land_leaves_the_ref_old_or_new() {
     let mut saw_old = false;
     let mut saw_new = false;
     let mut reps = 0usize;
-    let mut head = warm;
-    for (k, (name, cs)) in cuts.iter().enumerate() {
+    for (k, (name, cs, probe_name, probe_cs)) in cuts.iter().enumerate() {
+        let mut server = PgServer::spawn(&data, &schema, &log);
+        // The measure is the kill's twin: the same server, the same
+        // head depth, a land of the same width. The step comes from it,
+        // so a batching change of the product moves the kills with it.
+        let probe_started = Instant::now();
+        land(&server.url, probe_cs.as_bytes(), probe_name).expect("the probe lands");
+        let step = probe_started.elapsed() / 8;
+        let head = ref_target(&data);
         let call_name = name.clone();
         let call_cs = *cs;
-        let mut server = PgServer::spawn(&data, &schema, &log);
         let url = server.url.clone();
         let handle = std::thread::spawn(move || land(&url, call_cs.as_bytes(), &call_name));
         // The move sits at the very end of a land, so the factors run
@@ -625,7 +634,6 @@ fn a_kill_during_a_land_leaves_the_ref_old_or_new() {
         } else {
             saw_old = true;
         }
-        head = after;
     }
     assert!(
         saw_old && saw_new,
