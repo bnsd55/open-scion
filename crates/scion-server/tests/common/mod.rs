@@ -153,7 +153,7 @@ impl Server {
                 .write_all(TOKEN.as_bytes())
                 .unwrap();
         }
-        fs::rename(&tmp, &token_file).unwrap();
+        fs::rename(tmp, token_file).unwrap();
         // The child shares a flock until it execs (see `spawn_guard`): the
         // read side keeps this spawn out of a lock-release window of
         // another test.
@@ -162,7 +162,7 @@ impl Server {
                 .arg("--data")
                 .arg(data)
                 .args(["serve", "--token-file"])
-                .arg(&token_file)
+                .arg(token_file)
                 .args(["--listen", "127.0.0.1:0"])
                 // Plain log lines, so the address parses without escape
                 // codes.
