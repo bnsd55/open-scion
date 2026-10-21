@@ -810,9 +810,7 @@ async fn a_land_whose_call_is_cut_still_writes_its_result_and_ref_lines() {
     if land_line["outcome"] == "ok" {
         assert_eq!(
             land_line["new"],
-            serde_json::Value::String(
-                store.resolve_ref(REPO, "main").unwrap().to_string()
-            ),
+            serde_json::Value::String(store.resolve_ref(REPO, "main").unwrap().to_string()),
             "the land's result names the head it moved to"
         );
         let ref_line = refs_needed(&lines, "t-cut");
