@@ -552,15 +552,16 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
         None => {}
     }
 
-    // The fill ended at the wall. Free one chunk: the store's own open
-    // and its first writes fit in that room, and the lands behind them
-    // run into the wall again.
+    // The fill ended at the wall. Free a margin: the run's own
+    // evidence says the store's open writes more than one chunk's
+    // worth (sessions, locks, the repo row), so a margin of chunks
+    // admits the open, and the lands behind it run into the wall again.
     client
         .batch_execute(
             "DELETE FROM diskfull_filler.filler WHERE ctid IN \
-             (SELECT ctid FROM diskfull_filler.filler LIMIT 1)",
+             (SELECT ctid FROM diskfull_filler.filler LIMIT 16)",
         )
-        .expect("one chunk frees");
+        .expect("a margin frees");
 
     // The proving write: lands a client would run, through the store's
     // own write path, until the wall stops one of them.
