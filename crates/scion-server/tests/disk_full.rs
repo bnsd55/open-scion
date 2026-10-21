@@ -467,7 +467,10 @@ fn data_dir(client: &mut postgres::Client) -> String {
 /// freeing it needs no vacuum's luck about where the dead pages sit.
 fn fill_margin(client: &mut postgres::Client, chunk_len: usize, total: usize) {
     client
-        .batch_execute("CREATE TABLE IF NOT EXISTS diskfull_filler.margin (chunk bytea)")
+        .batch_execute(
+            "CREATE SCHEMA IF NOT EXISTS diskfull_filler;
+             CREATE TABLE IF NOT EXISTS diskfull_filler.margin (chunk bytea)",
+        )
         .expect("the margin table is created");
     let chunk = vec![b'm'; chunk_len];
     let mut put = 0usize;
