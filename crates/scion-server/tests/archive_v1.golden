@@ -21,7 +21,7 @@
   ],
   "snapshot_at": "<time>",
   "snapshot_note": "the metadata sections are one read snapshot; the blob files are immutable, and gc keeps a blob past its grace",
-  "store_uuid": null,
+  "store_uuid": "<uuid or null>",
   "version": 1
 }
 # One row per archive file, hash and path, sorted by path.

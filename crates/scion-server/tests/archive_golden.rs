@@ -112,22 +112,34 @@ fn rows(archive: &Path) -> Vec<(String, String)> {
 /// golden's `main` - on a fresh store, `fsck` clean.
 /// The manifest is a format surface (docs/archive-format.md names its
 /// keys). Its two run-dependent values normalize: the store UUID to
-/// `<uuid>` after it shows as 32 lowercase hex (a SQLite directory has
-/// none - the UUID lives in the database), and the snapshot instant to
-/// `<time>` after it shows as an RFC 3339 stamp to the second with a
-/// Z. The rest of the manifest pins as text, so a renamed key or a
-/// dropped array shows as a readable diff.
+/// `<uuid or null>` - null on SQLite, which keeps the UUID in the
+/// database, and 32 lowercase hex on Postgres, which writes the marker
+/// file - and the snapshot instant to `<time>` after it shows as an
+/// RFC 3339 stamp to the second with a Z. The rest of the manifest
+/// pins as text, so a renamed key or a dropped array shows as a
+/// readable diff.
 fn normalized_manifest(manifest: &serde_json::Value) -> String {
-    let uuid = manifest["store_uuid"].as_str().unwrap_or_default();
-    assert!(
-        uuid.is_empty()
-            || (uuid.len() == 32
-                && uuid
+    let uuid = &manifest["store_uuid"];
+    if Backend::test_is_postgres() {
+        let hex = uuid
+            .as_str()
+            .unwrap_or_else(|| panic!("Postgres writes the marker file: {uuid}"));
+        assert!(
+            hex.len() == 32
+                && hex
                     .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
-        "the store UUID is 32 lowercase hex, or absent on SQLite: {uuid}"
-    );
-    let stamp = manifest["snapshot_at"].as_str().unwrap_or_default();
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "the store UUID is 32 lowercase hex: {hex}"
+        );
+    } else {
+        assert!(
+            uuid.is_null(),
+            "SQLite keeps the UUID in the database: {uuid}"
+        );
+    }
+    let stamp = manifest["snapshot_at"]
+        .as_str()
+        .expect("the snapshot instant is a string");
     assert_eq!(
         stamp.len(),
         20,
@@ -137,8 +149,8 @@ fn normalized_manifest(manifest: &serde_json::Value) -> String {
     assert!(stamp.ends_with('Z'), "the stamp ends in Z: {stamp}");
     let mut normalized = serde_json::to_string_pretty(manifest).unwrap();
     normalized = normalized.replace(
-        &format!("\"store_uuid\": \"{uuid}\""),
-        "\"store_uuid\": \"<uuid>\"",
+        &format!("\"store_uuid\": {}", serde_json::to_string(uuid).unwrap()),
+        "\"store_uuid\": \"<uuid or null>\"",
     );
     normalized.replace(
         &format!("\"snapshot_at\": \"{stamp}\""),
