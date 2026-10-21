@@ -206,6 +206,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-workspace-crates: true
+      # The Linux lint job never compiles macOS-only code (the ACL FFI
+      # module among it), so clippy runs here too, before the tests:
+      # same warm cache, a couple of minutes on a job that already
+      # builds everything, and no second macOS runner to book.
+      - run: cargo clippy --workspace --lib --bins -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
         env:
           PROPTEST_CASES: "2000"
