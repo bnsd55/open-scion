@@ -691,3 +691,176 @@ async fn wait_for_lines(path: &std::path::Path, n: usize) {
         String::from_utf8_lossy(&bytes)
     );
 }
+
+/// The evidence does not depend on the call living: a call cut after
+/// the land's commit — a client that left, a deadline, a shutdown —
+/// still leaves the land's result line and the ref line in the file,
+/// because the store job that moved the ref writes them itself. The
+/// cut call's reply is gone; the audit's answer to its intent is not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_land_whose_call_is_cut_still_writes_its_result_and_ref_lines() {
+    use scion_proto::v1::{CreateChangesetRequest, LandRequest, PutBlobRequest};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let audit_path = dir.path().join("audit.log");
+    let audit = Audit::open(&audit_path).unwrap();
+    let (stop, url) = serve_with_audit(&store, dir.path(), write_access(), audit).await;
+    let lines_before = read_lines(&audit_path).len();
+
+    // The blob and the changeset the land moves to main.
+    let mut ci = writer(&url, "t-setup").await;
+    let blob = store.blobs().put(b"guide\n").unwrap();
+    ci.put_blob(tokio_stream::once(PutBlobRequest {
+        repo: REPO.into(),
+        data: b"guide\n".to_vec(),
+    }))
+    .await
+    .expect("the upload is allowed");
+    let root = store.resolve_ref(REPO, "main").unwrap();
+    let (bytes, id) = changeset(vec![root], "docs/guide", blob).encode_with_id();
+    ci.create_changeset(CreateChangesetRequest {
+        repo: REPO.into(),
+        changeset: bytes,
+    })
+    .await
+    .expect("the create is allowed");
+    let intent_lines = read_lines(&audit_path).len();
+
+    // Hold the store's write connection, so the land's job cannot move
+    // the ref yet: the call hangs on its commit.
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let blocker = std::thread::spawn({
+        let store = store.clone();
+        move || {
+            store
+                .read_unflushed(|_| {
+                    held_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        }
+    });
+    held_rx.recv().unwrap();
+
+    // The land call runs on its own; its intent is in the file, so the
+    // call is inside its job. Then the call is cut: the client's task
+    // is aborted, and the handler's future is dropped mid-await. The
+    // job keeps running — that is the case the old code lost.
+    let mut cut = writer(&url, "t-cut").await;
+    let call = tokio::task::spawn(async move {
+        let req = LandRequest {
+            repo: REPO.into(),
+            changeset_id: id.as_bytes().to_vec(),
+            target_ref: "main".into(),
+            request_key: "k-cut".into(),
+        };
+        let _ = cut.land(req).await;
+    });
+    wait_for_lines(&audit_path, intent_lines + 1).await;
+    call.abort();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Let the land commit. The job, not the dead call, now owes the
+    // audit its result and its ref line.
+    go_tx.send(()).unwrap();
+    blocker.join().unwrap();
+    // The intent, the land's result and the ref line — waited for with
+    // a deadline, not raced once.
+    for _ in 0..100 {
+        let lines = read_lines(&audit_path);
+        let answered = lines.iter().any(|line| {
+            line["event"] == "land" && line["outcome"] == "ok" && line["request_id"] == "t-cut"
+        }) && lines
+            .iter()
+            .any(|line| line["event"] == "ref" && line["request_id"] == "t-cut");
+        if answered {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let lines = read_lines(&audit_path);
+    assert!(
+        lines.len() > lines_before,
+        "the cut call left no lines at all"
+    );
+    let land_line = lines
+        .iter()
+        .find(|line| {
+            line["event"] == "land" && line["outcome"] == "ok" && line["request_id"] == "t-cut"
+        })
+        .unwrap_or_else(|| panic!("the cut call's land result never reached the file"));
+    assert_eq!(
+        land_line["new"],
+        serde_json::Value::String(store.resolve_ref(REPO, "main").unwrap().to_string()),
+        "the land's result names the head it moved to"
+    );
+    let ref_line = refs_needed(&lines, "t-cut");
+    assert_eq!(
+        ref_line["old"],
+        serde_json::Value::String(root.to_string()),
+        "the move names the head it replaced"
+    );
+    assert_eq!(
+        ref_line["new"], land_line["new"],
+        "the ref line and the land line name the same new head"
+    );
+
+    stop.send(()).unwrap();
+}
+
+/// A call that sends no request ID — or one the server refuses to log
+/// — still leaves lines that join: the server makes the ID, and the
+/// intent and the result of one write carry the same one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_without_a_request_id_gets_one_from_the_server() {
+    use scion_proto::v1::PutBlobRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let audit_path = dir.path().join("audit.log");
+    let audit = Audit::open(&audit_path).unwrap();
+    let (stop, url) = serve_with_audit(&store, dir.path(), write_access(), audit).await;
+
+    // The empty header is dropped by the server's own rule (a value is
+    // 1 to 64 bytes), so this call arrives without one.
+    let mut ci = writer(&url, "").await;
+    ci.put_blob(tokio_stream::once(PutBlobRequest {
+        repo: REPO.into(),
+        data: b"guide\n".to_vec(),
+    }))
+    .await
+    .expect("the upload is allowed");
+    let mut ci = writer(&url, "").await;
+    ci.put_blob(tokio_stream::once(PutBlobRequest {
+        repo: REPO.into(),
+        data: b"second\n".to_vec(),
+    }))
+    .await
+    .expect("the second upload is allowed");
+
+    stop.send(()).unwrap();
+    // Two writes, each with its intent and its result.
+    wait_for_lines(&audit_path, 4).await;
+
+    let lines = read_lines(&audit_path);
+    let pairs = pairs(&lines, "write");
+    assert_eq!(pairs.len(), 2, "each write left an intent and a result");
+    for (intent, result) in &pairs {
+        let id = intent["request_id"].as_str().unwrap_or("");
+        assert!(
+            !id.is_empty(),
+            "a call with no header still gets a request_id: {intent}"
+        );
+        assert_eq!(
+            result["request_id"].as_str().unwrap_or(""),
+            id,
+            "the pair joins by the server-made ID"
+        );
+    }
+    let first = pairs[0].0["request_id"].as_str().unwrap();
+    let second = pairs[1].0["request_id"].as_str().unwrap();
+    assert_ne!(first, second, "two calls made in one process differ");
+}

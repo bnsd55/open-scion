@@ -79,7 +79,6 @@ impl Event {
 }
 
 /// The audit log of one server. Cloned handles share the one writer.
-/// The audit log of one server. Cloned handles share the one writer.
 #[allow(unreachable_pub)]
 #[derive(Clone, Debug)]
 pub struct Audit {
@@ -197,6 +196,30 @@ impl Audit {
         .await
         .map_err(|_| queue_closed())?;
         ack.await.map_err(|_| queue_closed())?
+    }
+
+    /// Records one line from a blocking thread, and returns once it is
+    /// durable on the disk. The blocking form of [`Audit::record`], for
+    /// a store job that cannot await: the job that changes the state
+    /// writes the state change's own result lines, so the evidence does
+    /// not depend on the call that asked for the change living on.
+    ///
+    /// # Errors
+    ///
+    /// The line was not made durable: the append failed, or the writer
+    /// is gone. A result line lost here is logged by its caller; the
+    /// state change it reports has already happened.
+    pub fn record_blocking(&self, event: &Event) -> io::Result<()> {
+        let Some(tx) = &self.tx else {
+            return Ok(());
+        };
+        let (done, ack) = oneshot::channel();
+        tx.blocking_send(Msg {
+            line: event.render(),
+            done,
+        })
+        .map_err(|_| queue_closed())?;
+        ack.blocking_recv().map_err(|_| queue_closed())?
     }
 
     /// The readiness of the audit: false once a line was lost. It
