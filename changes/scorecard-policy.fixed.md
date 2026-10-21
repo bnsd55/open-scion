@@ -1,5 +1,5 @@
-The Scorecard job is green on main again. Three fixes and two
-exceptions:
+This fixes the Scorecard job's four failing checks. Three fixes and
+two exceptions:
 
 - The Dockerfile pins both base images by their multi-arch index
   digest, with the tag in a comment: rust:1.88-bookworm and
