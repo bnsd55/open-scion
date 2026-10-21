@@ -11,8 +11,12 @@
 //! `mount`, `remount`, and `umount` commands themselves.
 mod common;
 
+use scion_core::{Changeset, IdentityTime, RepoPath};
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::test_support::write;
 use scion_server::{Backend, Error};
+
+use crate::common::REPO;
 
 fn required() -> bool {
     if !cfg!(target_os = "linux") {
@@ -283,16 +287,12 @@ fn seed_client_blob(
 /// whose `options` carry the schema, so the gc's open lands in this
 /// directory's database corner and not beside it.
 fn gc_args(data: &std::path::Path, dry: bool) -> String {
-    let mut args = vec![
-        "--data".to_owned(),
-        data.display().to_string(),
-        "gc".to_owned(),
-        "--grace-secs".to_owned(),
-        "0".to_owned(),
-    ];
+    let mut args = vec!["--data".to_owned(), data.display().to_string()];
     if Backend::test_is_postgres()
         && let Ok(url) = std::env::var("SCION_TEST_POSTGRES_URL")
     {
+        // The URL is a flag of the root command, so it goes before the
+        // subcommand; its options carry this directory's schema.
         let schema = Backend::test_schema(data).expect("the test names a schema");
         args.push("--postgres-url".to_owned());
         args.push(format!(
@@ -300,6 +300,7 @@ fn gc_args(data: &std::path::Path, dry: bool) -> String {
             if url.contains('?') { "&" } else { "?" }
         ));
     }
+    args.extend(["gc".to_owned(), "--grace-secs".to_owned(), "0".to_owned()]);
     if dry {
         args.push("--dry-run".to_owned());
     }
@@ -450,7 +451,7 @@ fn data_dir(client: &mut postgres::Client) -> String {
 /// until its on-disk size passes `ceiling` bytes, and returns the raw
 /// error of the insert that hit the full disk, when one did - the fill
 /// itself can be the write that fails first.
-fn fill(client: &mut postgres::Client, chunk_len: usize, ceiling: u64) -> Option<postgres::Error> {
+fn fill(client: &mut postgres::Client, chunk_len: usize) -> Option<postgres::Error> {
     client
         .batch_execute("CREATE SCHEMA IF NOT EXISTS diskfull_filler")
         .expect("the filler schema is created");
@@ -459,13 +460,6 @@ fn fill(client: &mut postgres::Client, chunk_len: usize, ceiling: u64) -> Option
         .expect("the filler table is created");
     let chunk = vec![b'f'; chunk_len];
     loop {
-        let size: i64 = client
-            .query_one("SELECT pg_database_size(current_database())", &[])
-            .expect("the database size answers")
-            .get(0);
-        if size.cast_unsigned() >= ceiling {
-            return None;
-        }
         match client.execute("INSERT INTO diskfull_filler.filler VALUES ($1)", &[&chunk]) {
             Ok(_) => {
                 // A checkpoint keeps the WAL small, so the tmpfs's space
@@ -479,6 +473,39 @@ fn fill(client: &mut postgres::Client, chunk_len: usize, ceiling: u64) -> Option
     }
 }
 
+/// A changeset whose rows are wide: many entries, each naming a path,
+/// so one land's metadata write must grow the database.
+fn wide_changeset(store: &Backend, name: &str) -> Changeset {
+    let base = store
+        .read(|c| {
+            let repo = c.repo_id(REPO)?;
+            Ok(c.get_ref(repo, "main")?.expect("main exists").target)
+        })
+        .unwrap();
+    let author = IdentityTime::new(
+        b"Ada".to_vec(),
+        b"ada@example.com".to_vec(),
+        1_700_000_000,
+        0,
+    )
+    .expect("identity fits the format");
+    let puts: std::collections::BTreeMap<_, _> = (0..400)
+        .map(|i| {
+            (
+                RepoPath::new(format!("d/{name}/f{i}.txt").as_str()).unwrap(),
+                None,
+            )
+        })
+        .collect();
+    Changeset::new(
+        vec![base],
+        author,
+        None,
+        format!("{name}\n").into_bytes(),
+        puts,
+    )
+    .expect("changeset fits the format")
+}
 #[test]
 fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
     if !required() {
@@ -496,7 +523,7 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
         println!("skipping: set SCION_PG_TMPFS_BYTES to the service's tmpfs size");
         return;
     };
-    let Ok(bytes) = bytes.parse::<u64>() else {
+    let Ok(_bytes) = bytes.parse::<u64>() else {
         panic!("SCION_PG_TMPFS_BYTES must be a number of bytes");
     };
     let url = std::env::var("SCION_TEST_POSTGRES_URL").expect("SCION_TEST_POSTGRES_URL");
@@ -507,18 +534,16 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
         // env var is the witness instead.
         println!("the data directory {dir} is the service's own; the env var vouches for it");
     }
-    // The margin keeps the proving write's own extend inside a full
-    // disk. The WAL is off the tmpfs (the service mounts it elsewhere),
-    // so a heap extend is the write that fails, with the clean 53100 -
-    // the WAL-panic arm cannot fire here, and the Database unreachable
-    // row covers a lost connection.
-    let margin = 8 * 1024 * 1024;
-    assert!(bytes > margin * 2, "the tmpfs is too small to fill");
-    let ceiling = bytes - margin;
+    // The fill needs only a sane size: big enough that a handful of
+    // chunks fill it, small enough that the job stays quick. The WAL
+    // is off the tmpfs (the service mounts it elsewhere), so a heap
+    // extend is the write that fails, with the clean 53100 - a lost
+    // connection is the Database unreachable row, not this one.
 
-    // The fill: the database's own disk fills to the margin, either by
-    // the filler's inserts or by the insert that failed first.
-    let filled_by = fill(&mut client, 4 * 1024 * 1024, ceiling);
+    // The fill: the database's own disk fills until an insert meets the
+    // wall - no ceiling, the wall is the evidence.
+    let mut landed = 0usize;
+    let filled_by = fill(&mut client, 4 * 1024 * 1024);
     match &filled_by {
         Some(e) if e.code() == Some(&postgres::error::SqlState::DISK_FULL) => {
             println!("the filler's insert took the 53100 first");
@@ -527,34 +552,50 @@ fn a_full_postgres_database_answers_out_of_space_and_needs_no_repair() {
         None => {}
     }
 
-    // The proving write: the same land a client's client would run,
-    // through the store's own write path.
+    // The fill ended at the wall. Free one chunk: the store's own open
+    // and its first writes fit in that room, and the lands behind them
+    // run into the wall again.
+    client
+        .batch_execute(
+            "DELETE FROM diskfull_filler.filler WHERE ctid IN \
+             (SELECT ctid FROM diskfull_filler.filler LIMIT 1)",
+        )
+        .expect("one chunk frees");
+
+    // The proving write: lands a client would run, through the store's
+    // own write path, until the wall stops one of them.
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     let store = Backend::open_test(&data).expect("the store opens");
     let _repo = store
         .read(|c| c.create_repo("filler"))
         .expect("the repo lands");
-    let name = "the write that must fail";
-    let outcome = store.write(|c| c.create_repo(name));
-    match outcome {
-        Err(e) if sqlstate(&e).as_deref() == Some("53100") => {
-            // The clean 53100, mapped to the disk-full storage class -
-            // the class the fixed ResourceExhausted reply rides on (the
-            // pg_error_of unit test pins the reply's text). The WAL is
-            // off the tmpfs, so a heap extend is the write that fails,
-            // and a lost connection cannot wear the disk's reply.
-            assert!(
-                is_out_of_space(&e),
-                "the full database's write must map to out of space: {e:?}"
-            );
+    let outcome = loop {
+        // A backstop: lands that never stop mean the fill was not full,
+        // which is this test's own failure, not the server's.
+        assert!(landed < 5000, "the lands never hit the database's limit");
+        landed += 1;
+        let cs = wide_changeset(&store, &format!("fill{landed}"));
+        match write::create_changeset(&store, REPO, &cs.encode()) {
+            Ok(_) => {}
+            Err(e) => break e,
         }
-        Err(e) => panic!("the proving write failed another way: {e:?}"),
-        Ok(_) => panic!(
-            "the proving write landed on a database filled to its margin; the fill was not full"
-        ),
-    }
-
+    };
+    // The loop's break carries the error; a land that never fails is
+    // the backstop's own panic above.
+    assert!(
+        sqlstate(&outcome).as_deref() == Some("53100"),
+        "the proving write failed another way: {outcome:?}"
+    );
+    // The clean 53100, mapped to the disk-full storage class - the
+    // class the fixed ResourceExhausted reply rides on (the pg_error_of
+    // unit test pins the reply's text). The WAL is off the tmpfs, so a
+    // heap extend is the write that fails, and a lost connection cannot
+    // wear the disk's reply.
+    assert!(
+        is_out_of_space(&outcome),
+        "the full database's write must map to out of space: {outcome:?}"
+    );
     // Reads work on both arms: the rows the fill landed are still there.
     let read: i64 = client
         .query_one("SELECT count(*) FROM diskfull_filler.filler", &[])
