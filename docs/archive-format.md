@@ -155,7 +155,11 @@ digits of the changeset it became, which the archive's
 `verify` reads only the archive:
 
 1. `manifest.json` exists, names the format and version the reader
-   knows, and every repo it names has a directory.
+   knows, and every repo it names has a directory — a plain one, not a
+   symlink, and no two repos' directories one and the same: on a disk
+   that folds names (case, or Unicode normalization), two names can be
+   one directory, and both the export and the verify refuse the fold
+   instead of replaying one repo's data under two names.
 2. Every changeset record re-hashes to its ID and decodes, and every
    generation is at least 1.
 3. Every changeset parent, ref target, land input, and provenance

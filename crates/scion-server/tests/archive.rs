@@ -235,8 +235,14 @@ fn a_blob_file_that_expands_past_the_cap_is_refused() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, &frame).unwrap();
     let damages = archive::verify(&out).unwrap();
-    assert_eq!(damages.len(), 1, "{damages:?}");
-    assert!(damages[0].contains("expands past the cap"), "{damages:?}");
+    // The members.txt rewrite also leaves the changesets' own blobs
+    // unlisted, and the cross-check that keeps the reader and the
+    // replay honest names each of those; the bomb's cap refusal must
+    // be among them.
+    assert!(
+        damages.iter().any(|d| d.contains("expands past the cap")),
+        "{damages:?}"
+    );
     let empty = tempfile::tempdir().unwrap();
     match archive::restore(&out, empty.path(), None, None) {
         Err(scion_server::Error::Corrupt(why)) => {
@@ -356,5 +362,121 @@ fn a_changeset_a_parent_points_past_is_named() {
     assert!(
         damages.iter().any(|line| line.contains("parent")),
         "{damages:?}"
+    );
+}
+
+/// The wire attack, and the disk's answer: on a disk that folds names
+/// (case, or Unicode normalization), an archive whose manifest names
+/// two repos that fold to one name gives both names one section
+/// directory, and a restore that trusted the bytes would replay one
+/// repo's data under both. The disk, not a fold table, is the judge:
+/// `verify` reads each section's (device, inode) and refuses a pair
+/// that is one directory. This test runs where the fold is real; on a
+/// case-sensitive disk the two names are two directories and the
+/// symlink test below is the proof instead.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_archive_naming_two_repos_that_fold_to_one_is_refused() {
+    let data = tempfile::tempdir().unwrap();
+    let (store, _main) = source(data.path());
+    let out = tempfile::tempdir().unwrap().path().join("archive");
+    archive::export(&store, data.path(), None, true, &out).unwrap();
+    drop(store);
+
+    // Second the repo under a name that folds into it on this disk:
+    // the manifest gains a "MAIN" section, and the section it names is
+    // the one directory this disk already holds — an archive crafted
+    // (or exported) so that both names read the same bytes.
+    let manifest_path = out.join("manifest.json");
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    let crafted = manifest.replace(
+        r#""repos": ["#,
+        r#""repos": [{"name": "MAIN", "changesets": 3, "refs": 1, "pending_lands": 0, "members": 3, "provenance": 0},"#,
+    );
+    assert_ne!(crafted, manifest, "the manifest's shape moved upstream");
+    std::fs::write(&manifest_path, crafted).unwrap();
+
+    let damages = archive::verify(&out).unwrap();
+    assert!(
+        damages
+            .iter()
+            .any(|d| d.contains("MAIN") && d.contains("fold")),
+        "verify must name the folded pair: {damages:?}"
+    );
+    let empty = tempfile::tempdir().unwrap();
+    let restored = archive::restore(&out, empty.path(), None, None);
+    assert!(
+        restored.is_err(),
+        "a restore that would replay one repo's data under two names must refuse"
+    );
+    let written = std::fs::read_dir(empty.path()).unwrap().count();
+    assert_eq!(written, 0, "a refused restore leaves the target as it was");
+}
+
+/// The same fold, the one way two names reach one directory on a
+/// case-sensitive disk: a section that is a symlink to another's. The
+/// reader refuses a section that is not a plain directory, on every OS.
+#[test]
+fn a_section_that_is_a_symlink_to_another_is_refused() {
+    let data = tempfile::tempdir().unwrap();
+    let (store, _main) = source(data.path());
+    let out = tempfile::tempdir().unwrap().path().join("archive");
+    archive::export(&store, data.path(), None, true, &out).unwrap();
+    drop(store);
+
+    // The manifest names a second repo whose section is a symlink to
+    // the first's directory.
+    let manifest_path = out.join("manifest.json");
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    let crafted = manifest.replace(
+        r#""repos": ["#,
+        r#""repos": [{"name": "linked", "changesets": 3, "refs": 1, "pending_lands": 0, "members": 3, "provenance": 0},"#,
+    );
+    assert_ne!(crafted, manifest, "the manifest's shape moved upstream");
+    std::fs::write(&manifest_path, crafted).unwrap();
+    std::os::unix::fs::symlink(
+        out.join("repos").join(REPO),
+        out.join("repos").join("linked"),
+    )
+    .unwrap();
+
+    let damages = archive::verify(&out).unwrap();
+    assert!(
+        damages
+            .iter()
+            .any(|d| d.contains("linked") && d.contains("not a plain directory")),
+        "verify must refuse a section that is a symlink: {damages:?}"
+    );
+    let empty = tempfile::tempdir().unwrap();
+    let restored = archive::restore(&out, empty.path(), None, None);
+    assert!(restored.is_err(), "a named damage must refuse the replay");
+}
+
+/// The export half of the fold: on a disk that folds names, exporting a
+/// store whose repo names fold to one refuses, instead of writing the
+/// second repo's files over the first's and calling the corrupt
+/// archive sound. Runs where the fold is real.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_export_of_two_repos_that_fold_to_one_is_refused() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(&data.path().join("store")).unwrap();
+    for name in ["main", "MAIN"] {
+        store
+            .write(|c| {
+                let repo = c.create_repo(name)?;
+                let cs = changeset(vec![], &[("a", Some(regular("a")))]);
+                let id = tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0;
+                assert!(c.cas_ref(repo, "main", None, id)?);
+                c.add_repo_blob(repo, BlobId::of(b"a"))?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    let out = tempfile::tempdir().unwrap().path().join("archive");
+    let error = archive::export(&store, data.path(), None, true, &out).unwrap_err();
+    assert!(
+        error.to_string().contains("fold"),
+        "the export must name the fold: {error:#}"
     );
 }

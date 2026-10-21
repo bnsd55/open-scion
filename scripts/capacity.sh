@@ -48,12 +48,6 @@ READ_SECONDS=${READ_SECONDS:-90}
 CELL_WARM_SECONDS=${CELL_WARM_SECONDS:-60}
 CAPACITY_MACHINE=${CAPACITY_MACHINE:-unknown runner}
 RUN_URL=${RUN_URL:-}
-# The Postgres cells take their URL from the env, not the command line:
-# the env is quiet (main.rs's postgres_url_of), and it reaches every
-# scion-server this script starts through common.sh's start_scion too.
-# Empty means sqlite, and an empty value is filtered, so one export
-# serves both backends.
-export SCION_POSTGRES_URL=${SCION_PG_URL:-}
 
 # classifies LOG: the soak's accepted failures. A cell whose clients
 # failed with anything else is past the edge; the run stops there.
@@ -107,6 +101,17 @@ for backend in sqlite postgres; do
   if [ "$backend" = postgres ] && [ -z "${SCION_PG_URL:-}" ]; then
     note "no SCION_PG_URL: the Postgres cells are not run"
     continue
+  fi
+  # The Postgres URL reaches every scion-server through the env, which
+  # postgres_url_of reads quietly and an empty value filters. The env
+  # decides the backend of every server this cell raises, so it is set
+  # here, per cell: the URL for postgres, empty for sqlite. A sqlite
+  # cell that saw a URL would open Postgres and die - what the first
+  # dispatch proved.
+  if [ "$backend" = postgres ]; then
+    export SCION_POSTGRES_URL=$SCION_PG_URL
+  else
+    export SCION_POSTGRES_URL=
   fi
   # A fresh store per cell: every cell starts equal, and the growth a
   # cell measures is the growth its own lands cause.

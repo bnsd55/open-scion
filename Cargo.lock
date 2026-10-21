@@ -2613,6 +2613,7 @@ dependencies = [
  "hyper-util",
  "open-scion-core",
  "open-scion-proto",
+ "proptest",
  "rcgen",
  "rusqlite",
  "rustix",

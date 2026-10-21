@@ -210,6 +210,7 @@ impl Stalled {
             tracing::warn!(
                 held,
                 limit = self.0.limit,
+                peer = ?self.0.peer,
                 "closing a connection: its stalled replies hold too much"
             );
             if let Some(waker) = self
