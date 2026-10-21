@@ -1,7 +1,7 @@
 //! A migration that runs leaves its story in the log: one line at the
-//! start (from_version, to_version), one line per step (from_version,
-//! to_version, elapsed_ms), one line at the end, and nothing when
-//! nothing migrates. An operator watching an upgrade reads these; this
+//! start (`from_version`, `to_version`), one line per step
+//! (`from_version`, `to_version`, `elapsed_ms`), one line at the end,
+//! and nothing when nothing migrates. An operator watching an upgrade reads these; this
 //! test parses the fields the way the guide's §4 promises them, on both
 //! backends.
 
@@ -68,7 +68,7 @@ fn since(mark: usize) -> String {
 }
 
 /// The lines that name a message, with the values of `field` in order.
-fn fields<'a>(log: &'a str, message: &str, field: &str) -> Vec<u32> {
+fn fields(log: &str, message: &str, field: &str) -> Vec<u32> {
     log.lines()
         .filter(|line| line.contains(message))
         .filter_map(|line| {
