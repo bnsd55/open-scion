@@ -32,15 +32,19 @@ personally with their SSH key. GitHub checked that signature against
 the key on the owner's account when the tag was pushed; you can check
 it again yourself.
 
-Fetch the tag and pin the owner's key once. The key comes from the
-owner's GitHub account over HTTPS, and the signer line binds it to the
-owner's email — the same email the pipeline demands on the tag:
+Fetch the tag and pin the owner's signing key once. The tag is signed
+with the owner's SSH **signing** key (git's `user.signingkey`), which
+GitHub keeps apart from the authentication keys that
+`github.com/<user>.keys` lists; the API serves it at
+`ssh_signing_keys`. The signer line binds that key to the owner's
+email — the same email the release pipeline demands on the tag:
 
 ```sh
 git clone https://github.com/bnsd55/openscion && cd openscion
 git fetch origin tag v0.1.0
 
-curl -s https://api.github.com/users/bnsd55.keys \
+curl -s https://api.github.com/users/bnsd55/ssh_signing_keys \
+  | jq -r '.[].key' \
   | awk '{print "bnsd55@gmail.com", $1, $2}' \
   > ~/.ssh/openscion_allowed_signers
 ```
