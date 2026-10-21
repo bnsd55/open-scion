@@ -75,6 +75,9 @@ branch does.
   that names its limit and its upgrade path.
 - **Tests that can fail.** A test must be able to fail for a real reason. For
   logic changes, show that the test fails without the fix.
+- **Tested, or said why not.** Major new functionality lands with tests in
+  the automated suite. A pull request that cannot test its change says why
+  not, in the description.
 - **The format is frozen.** `docs/format-v1.md` defines the bytes that object
   IDs hash. A change there changes every ID and needs a new format version and
   a discussion first.

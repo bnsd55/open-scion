@@ -50,6 +50,11 @@ jobs:
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Save from main only. A pull request restores main's cache;
+          # per-branch caches (66) blew past the 10 GB ceiling and evicted
+          # each other.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # A release build has no dev-dependencies, so the test-hooks feature
@@ -69,6 +74,8 @@ jobs:
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
   supply-chain:
@@ -93,9 +100,25 @@ jobs:
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-workspace-crates: true
       - run: cargo test --workspace
         env:
           PROPTEST_CASES: "2000"
+      - name: the work tree is still clean after the tests
+        run: |
+          # A test that writes outside its sandbox (the #332 class) shows up
+          # here: the suite must leave the checked-out tree as it found it.
+          # The diff names the files, so the writer is one step away. New
+          # untracked files count too (a stray bench-output.txt); target/
+          # is gitignored, so the build stays out of the report.
+          dirty=$(git status --porcelain --untracked-files=all)
+          if [ -n "$dirty" ]; then
+            git diff --exit-code || true
+            echo "::error::the test suite left the work tree dirty: $dirty"
+            exit 1
+          fi
       - name: a real disk full (tmpfs)
         run: cargo test -p open-scion-server --test disk_full
         env:
@@ -144,6 +167,9 @@ jobs:
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-workspace-crates: true
       - run: cargo test -p open-scion-server
         env:
           # The Postgres job proves backend parity, not more cases; the
@@ -151,6 +177,16 @@ jobs:
           PROPTEST_CASES: "64"
           SCION_TEST_BACKEND: postgres
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+      - name: the work tree is still clean after the tests
+        run: |
+          # New untracked files count too (a stray bench-output.txt);
+          # target/ is gitignored, so the build stays out of the report.
+          dirty=$(git status --porcelain --untracked-files=all)
+          if [ -n "$dirty" ]; then
+            git diff --exit-code || true
+            echo "::error::the test suite left the work tree dirty: $dirty"
+            exit 1
+          fi
       # The takeover test stops the database and restarts it. The service
       # container of this job is the only postgres image of this job's
       # version on the runner, and it belongs to this job alone, so it
@@ -176,9 +212,48 @@ jobs:
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-workspace-crates: true
+      # The Linux lint job never compiles macOS-only code (the ACL FFI
+      # module among it), so clippy runs here too, before the tests:
+      # same warm cache, a couple of minutes on a job that already
+      # builds everything, and no second macOS runner to book.
+      - run: cargo clippy --workspace --lib --bins -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
         env:
           PROPTEST_CASES: "2000"
+      - name: the work tree is still clean after the tests
+        run: |
+          # New untracked files count too (a stray bench-output.txt);
+          # target/ is gitignored, so the build stays out of the report.
+          dirty=$(git status --porcelain --untracked-files=all)
+          if [ -n "$dirty" ]; then
+            git diff --exit-code || true
+            echo "::error::the test suite left the work tree dirty: $dirty"
+            exit 1
+          fi
+
+  promtool:
+    name: promtool
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # promtool, pinned to the current LTS line (3.13, supported on
+      # prometheus.io's release-cycle page through 2027-07) by version
+      # and the release tarball's sha256 (the same discipline the action
+      # pins follow), downloaded with curl so no third-party action
+      # enters the supply chain.
+      - run: |
+          curl -fsSL -o /tmp/prometheus.tgz \
+            https://github.com/prometheus/prometheus/releases/download/v3.13.4/prometheus-3.13.4.linux-amd64.tar.gz
+          echo "87f21a66f96c597a189cef8d640e8921b621fc17a9feff707c332c4f3b3ddd56  /tmp/prometheus.tgz" | sha256sum -c -
+          mkdir /tmp/promtool
+          tar -xzf /tmp/prometheus.tgz -C /tmp/promtool --strip-components 1
+          /tmp/promtool/promtool check rules deploy/prometheus/openscion-alerts.yml
+          /tmp/promtool/promtool test rules deploy/prometheus/openscion-alerts-test.yml
 
 
   # The arm64 cells of the support matrix (docs/support.md) are proven
@@ -258,6 +333,8 @@ jobs:
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: cache the LazyFS build
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -317,6 +394,8 @@ jobs:
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: the kernel NFS client
         run: |
           sudo apt-get update -qq
@@ -355,6 +434,8 @@ jobs:
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo +1.88 check --locked --workspace --all-targets --all-features
 
   grpc-conformance:
@@ -368,6 +449,8 @@ jobs:
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --release -p open-scion-server
       # A client that is not the Rust one (issue #32): grpcurl calls
       # ResolveRef, GetRootTree and GetObjects with a ticket, and every
@@ -414,26 +497,34 @@ jobs:
             crates/scion-proto/fuzz
             crates/scion-server/fuzz
             crates/scion-tier/fuzz
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-fuzz
       - name: fuzz the parsers
         run: |
           # The prebuilt cargo-fuzz defaults to a musl target, where the
-          # address sanitizer cannot run.
+          # address sanitizer cannot run. The targets run four at a time:
+          # serially they cost ~11 min, the job's own tail.
+          run_target() {
+            crate="$1" target="$2"
+            fuzz_dir="$GITHUB_WORKSPACE/crates/$crate/fuzz"
+            mkdir -p "$fuzz_dir/corpus/$target"
+            seeds=()
+            [ -d "$fuzz_dir/seeds/$target" ] && seeds+=("$fuzz_dir/seeds/$target")
+            (cd "$GITHUB_WORKSPACE/crates/$crate" && cargo fuzz run \
+              --target x86_64-unknown-linux-gnu "$target" \
+              "$fuzz_dir/corpus/$target" "${seeds[@]}" \
+              -- -max_total_time=20) || exit 1
+          }
+          export -f run_target
           for crate in scion-core scion-proto scion-server scion-tier; do
             fuzz_dir="$GITHUB_WORKSPACE/crates/$crate/fuzz"
             for target_file in "$fuzz_dir"/fuzz_targets/*.rs; do
               target=$(basename "$target_file" .rs)
-              mkdir -p "$fuzz_dir/corpus/$target"
-              seeds=()
-              [ -d "$fuzz_dir/seeds/$target" ] && seeds+=("$fuzz_dir/seeds/$target")
-              (cd "$GITHUB_WORKSPACE/crates/$crate" && cargo fuzz run \
-                --target x86_64-unknown-linux-gnu "$target" \
-                "$fuzz_dir/corpus/$target" "${seeds[@]}" \
-                -- -max_total_time=15)
+              printf '%s %s\n' "$crate" "$target"
             done
-          done
+          done | xargs -n2 -P4 bash -c 'run_target "$@"' _
 
   release-smoke:
     name: release smoke (${{ matrix.os }})
@@ -450,6 +541,8 @@ jobs:
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The README quick start on the release binaries, twice (umask 022
       # and 002): import, ticket-key, serve, scn reads and writes, fsck,
       # and a one-signal shutdown that must exit 0, on Linux and macOS.

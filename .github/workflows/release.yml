@@ -1,0 +1,383 @@
+name: release
+
+# The release pipeline (#389, #390). On a pushed v* tag it builds every
+# artifact from the tag twice per cell (two runners), fails on any byte
+# difference, attests the artifacts and their SBOMs, and publishes. A
+# dry-run (workflow_dispatch) runs everything but the publish, on an
+# unsigned tag name, so the whole pipeline is provable before the first
+# real tag. It never runs on pull_request, and nothing goes to
+# crates.io (D12).
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build, compare and attest; publish nothing."
+        type: boolean
+        default: true
+      commit:
+        description: "The commit SHA to build (dry-run); an ancestor of main."
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  # protoc is pinned by version, with the checksum the install-action's
+  # manifest carries per platform: scion-proto's build.rs runs it on
+  # every build, so its output is part of the payload.
+  PROTOC_SPEC: protoc@3.36.2
+  CYCLONEDX_SPEC: cargo-cyclonedx@0.5.9
+
+jobs:
+  # The tag's identity, proven without the owner's key: GitHub verified
+  # the SSH signature at push time with the key on the owner's account;
+  # the API hands back that verdict.
+  # The tag's identity, proven without the owner's key: GitHub verified
+  # the SSH signature at push time with the key on the owner's account;
+  # the API hands back that verdict. The verdicts live in
+  # scripts/release-verify-tag.sh, fed canned answers by
+  # scripts/test-release-verify-tag.sh — no CI run holds a signed tag.
+  # A dry-run dispatch proves the rest of the pipeline against a plain
+  # commit of main's history instead.
+  verify-tag:
+    runs-on: ubuntu-24.04
+    outputs:
+      peeled: ${{ steps.tag.outputs.peeled }}
+      tag: ${{ steps.tag.outputs.tag }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # Input never touches the shell directly (a template injection
+      # would read as code here): the commit comes through env, and it
+      # must be a 40-hex-digit SHA before anything else runs; the tag
+      # name too, for a tag name may hold $( ) ; and backticks.
+      DRY_RUN_COMMIT: ${{ inputs.commit }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - id: tag
+        run: |
+          set -euo pipefail
+          dry="${{ inputs.dry_run && 'true' || 'false' }}"
+          if [ "$dry" = true ]; then
+            # SHORTCUT: the dry-run skips the tag-object read and the
+            # signature check entirely — verify-tag's signature path
+            # first runs on the real tag. Upgrade: a scratch signed tag
+            # in a fork, if that ever breaks.
+            case "${DRY_RUN_COMMIT}" in
+              [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+              *) echo "the commit must be a full 40-hex SHA"; exit 1 ;;
+            esac
+            commit="$DRY_RUN_COMMIT"
+            # A dry run proves only what could be tagged: the commit is
+            # an ancestor of main (or main itself).
+            status="$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$commit" --jq .status)"
+            [ "$status" = behind ] || [ "$status" = identical ] || {
+              echo "the commit is not an ancestor of main"; exit 1; }
+            echo "peeled=$commit" >> "$GITHUB_OUTPUT"
+            echo "tag=$commit" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tag="$RELEASE_TAG"
+          # An annotated tag only: a lightweight tag has no tag object,
+          # so it cannot carry a signature (D18).
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" \
+            > ref-answer.json
+          [ "$(jq -r .object.type ref-answer.json)" = tag ] || {
+            echo "a release needs an annotated tag, not a lightweight one"; exit 1; }
+          tagsha="$(jq -r .object.sha ref-answer.json)"
+          gh api "repos/$GITHUB_REPOSITORY/git/tags/$tagsha" \
+            > tag-answer.json
+          # The verdicts are the script's; the compare needs the API.
+          peeled="$(scripts/release-verify-tag.sh check ref-answer.json tag-answer.json)"
+          status="$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$peeled" --jq .status)"
+          [ "$status" = behind ] || [ "$status" = identical ] || {
+            echo "the tagged commit is not on main"; exit 1; }
+          echo "peeled=$peeled" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  # The cells come from .github/release-cells.json, the one list the
+  # support matrix reads too. Each cell builds twice: -a and -b, on
+  # different runners, and the diff job fails on one differing byte.
+  cells:
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.expand.outputs.build }}
+      names: ${{ steps.expand.outputs.names }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: expand
+        run: |
+          set -euo pipefail
+          build="$(jq -c '[.[] as $c |
+            $c + {name: ($c.cell + "-a")} ] +
+            [.[] as $c | $c + {name: ($c.cell + "-b")}]' \
+            .github/release-cells.json)"
+          names="$(jq -c '[.[].cell]' .github/release-cells.json)"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "names=$names" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [verify-tag, cells]
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.cells.outputs.build) }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.verify-tag.outputs.tag }}
+      TARGET: ${{ matrix.target }}
+      # The generated proto module's path is embedded as a string
+      # literal (env!("OUT_DIR") inside tonic::include_proto!), and a
+      # literal remap cannot touch. A fixed target directory makes the
+      # literal identical on every runner, so the two builds still
+      # agree byte for byte.
+      CARGO_TARGET_DIR: /tmp/scion-target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify-tag.outputs.peeled }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: ${{ env.PROTOC_SPEC }}
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: ${{ env.CYCLONEDX_SPEC }}
+      - name: The epoch is the tag commit's time; the paths are remapped
+        run: |
+          set -euo pipefail
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=--remap-path-prefix=$PWD=/src --remap-path-prefix=$HOME/.cargo/registry=/cargo/registry -Cstrip=symbols" >> "$GITHUB_ENV"
+      - name: Fetch the lockfile's graph, then build offline
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          CARGO_NET_OFFLINE=true cargo build --locked --release \
+            --target "$TARGET" \
+            --bin scion-server --bin scion-cache --bin scion-daemon --bin scn
+      - name: The source tarball, byte-stable
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          git archive --format=tar --prefix="openscion-$version/" HEAD |
+            gzip -n > "openscion-$version-source.tar.gz"
+      - name: The SBOM of each shipped binary's crate
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          cargo cyclonedx --all --format json --spec-version 1.5
+          mkdir -p out
+          for crate in open-scion-server open-scion-tier open-scion; do
+            find . -name "$crate.cdx.json" -exec cp {} "out/$crate.cdx.json" \;
+          done
+          # The SBOM attestation reads only documents that carry a
+          # serialNumber; cargo-cyclonedx writes none. A deterministic
+          # one: the UUID-shaped digest of the file itself, so the two
+          # builds still agree.
+          for sbom in out/*.cdx.json; do
+            h="$(sha256sum "$sbom" 2>/dev/null | cut -d' ' -f1 \
+              || shasum -a 256 "$sbom" | cut -d' ' -f1)"
+            u="urn:uuid:${h:0:8}-${h:8:4}-5${h:13:3}-a${h:17:3}-${h:20:12}"
+            jq --arg sn "$u" '.serialNumber = $sn' "$sbom" > "$sbom.tmp" \
+              && mv "$sbom.tmp" "$sbom"
+          done
+      - name: Collect, hash, record the environment
+        run: |
+          set -euo pipefail
+          # Byte order for names and sort output: stable on every image.
+          export LC_ALL=C
+          sum() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$@"
+            else
+              shasum -a 256 "$@"
+            fi
+          }
+          mkdir -p out
+          for bin in scion-server scion-cache scion-daemon scn; do
+            cp "/tmp/scion-target/$TARGET/release/$bin" out/
+          done
+          cp openscion-*-source.tar.gz out/
+          {
+            echo "tag=$TAG"
+            echo "target=$TARGET"
+            echo "runner-image=${ImageOS}-${ImageVersion}"
+            echo "source-date-epoch=$SOURCE_DATE_EPOCH"
+            echo "rustc=$(rustc -vV | grep '^release' | cut -d' ' -f2)"
+            echo "protoc=$(protoc --version)"
+            echo "cargo-cyclonedx=$(cargo cyclonedx --version | cut -d' ' -f2)"
+            echo "rustflags=$RUSTFLAGS"
+            echo "flags=--locked --release"
+          } > out/release-environment.txt
+          # The checksums cover the payload; the environment record is
+          # metadata about the build (the runner image rolls weekly, so
+          # the two builds of one run can name different images). Bare
+          # filenames, so the filter matches shasum's output.
+          (cd out && sum -- * | grep -v ' release-environment.txt$' \
+            > checksums.txt.tmp && mv checksums.txt.tmp checksums.txt)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.name }}
+          path: out/
+
+  # #390: for every cell, the two builds must agree, byte for byte,
+  # before anything is attested or published.
+  reproducible:
+    needs: [build, cells]
+    strategy:
+      matrix:
+        cell: ${{ fromJson(needs.cells.outputs.names) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.cell }}-a
+          path: a
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.cell }}-b
+          path: b
+      - name: Compare the two payloads
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          # The payload must agree byte for byte. The environment record
+          # stays out: it describes each build (its runner image), and
+          # one run can span two image versions. Bare filenames, so the
+          # filter matches.
+          (cd a && sha256sum -- * | grep -v ' release-environment.txt$') | sort > a.txt
+          (cd b && sha256sum -- * | grep -v ' release-environment.txt$') | sort > b.txt
+          diff a.txt b.txt
+          echo "NO DIFFERENCE"
+
+  # The provenance of one cell's artifacts: a DSSE envelope the
+  # GitHub-hosted builder signs, so nobody in the pipeline holds a
+  # release key.
+  attest:
+    needs: [verify-tag, reproducible, cells]
+    strategy:
+      matrix:
+        cell: ${{ fromJson(needs.cells.outputs.names) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.cell }}-a
+          path: cell
+      - name: Attest every binary, the source tarball and the checksums
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            cell/scion-server
+            cell/scion-cache
+            cell/scion-daemon
+            cell/scn
+            cell/openscion-*-source.tar.gz
+            cell/checksums.txt
+      - name: Attest the server crate's SBOM against its binary
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: cell/scion-server
+          sbom-path: cell/open-scion-server.cdx.json
+      - name: Attest the tier crate's SBOM against its binaries
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: |
+            cell/scion-cache
+            cell/scion-daemon
+          sbom-path: cell/open-scion-tier.cdx.json
+      - name: Attest the scn crate's SBOM against its binary
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: cell/scn
+          sbom-path: cell/open-scion.cdx.json
+
+  # The evidence step: the attestation verify output, on every run,
+  # dry-run included. Its log is what the PR body links for the proof
+  # before the first real tag.
+  verify:
+    needs: [verify-tag, attest, cells]
+    if: ${{ !cancelled() && needs.attest.result == 'success' }}
+    strategy:
+      matrix:
+        cell: ${{ fromJson(needs.cells.outputs.names) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.cell }}-a
+          path: cell
+      - name: gh attestation verify, on the record
+        run: |
+          set -euo pipefail
+          # An SBOM file is the payload of an sbom attestation, not a
+          # subject; the artifacts it describes carry the attestation.
+          # The environment record is metadata, covered by the hash in
+          # the attested checksums.txt. One line per artifact: the
+          # number of attestations the sigstore bundle verified.
+          count=0
+          while read -r file; do
+            n="$(gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" \
+              --format json --jq 'length')"
+            echo "attested: $file ($n attestations)"
+            count=$((count + n))
+          done < <(find cell -type f \
+            ! -name '*.cdx.json' ! -name 'release-environment.txt')
+          echo "$count attestations verified in total"
+
+  # The release step: only on a real tag, never in a dry-run, and only
+  # after the diff and the attestations passed. The release is created
+  # immutable; the repository-wide setting is on Ben's list.
+  release:
+    needs: [verify-tag, verify]
+    if: ${{ !cancelled() && needs.verify.result == 'success' && !(inputs.dry_run || false) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.verify-tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify-tag.outputs.peeled }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+      - name: Every artifact verifies against this repository
+        run: |
+          set -euo pipefail
+          find artifacts -type f ! -name 'checksums.txt' \
+            ! -name '*.cdx.json' ! -name 'release-environment.txt' |
+            while read -r file; do
+              gh attestation verify "$file" --repo "$GITHUB_REPOSITORY"
+            done
+      - name: Publish
+        run: |
+          set -euo pipefail
+          notes="$(git show "$TAG":CHANGELOG.md |
+            awk '/^## \['"$TAG"']/{f=1} f && /^## \[/{if(++n==2) exit} f')"
+          gh release create "$TAG" --verify-tag --immutable \
+            --title "$TAG" --notes "$notes"
+          # The -b payloads are the diff's witnesses, not release files:
+          # upload only the -a set of each cell.
+          jq -r '.[].cell' .github/release-cells.json |
+            while read -r cell; do
+              gh release upload "$TAG" "artifacts/$cell-a"/*
+            done
