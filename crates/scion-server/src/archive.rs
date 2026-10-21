@@ -279,18 +279,36 @@ pub fn restore(
     postgres_url: Option<&str>,
     postgres_ca: Option<&Path>,
 ) -> Result<Vec<String>> {
-    restore_with(archive, data, postgres_url, postgres_ca, |path, url, ca| {
+    restore_impl(archive, data, postgres_url, postgres_ca, |path, url, ca| {
         Backend::open(path, url, ca)
     })
 }
 
-/// [`restore`] with the store's opener chosen: the one seam the tests
+/// The restore with the store's opener chosen: the one seam the tests
 /// use, so a test can arm the store's fail seam on the very store a
 /// restore opens and watch the choreography — staging, replay, rename,
 /// the drop of what it made — under a failure that is the store's, not
-/// the archive's. Everything else is the public restore's.
-#[doc(hidden)]
+/// the archive's. Everything else is the public restore's, behind the
+/// `test-hooks` feature.
+///
+/// # Errors
+///
+/// As [`restore`].
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn restore_with(
+    archive: &Path,
+    data: &Path,
+    postgres_url: Option<&str>,
+    postgres_ca: Option<&Path>,
+    open: impl FnOnce(&Path, Option<&str>, Option<&Path>) -> Result<Backend>,
+) -> Result<Vec<String>> {
+    restore_impl(archive, data, postgres_url, postgres_ca, open)
+}
+
+/// The whole restore — preflight, verify, the staging choreography, the
+/// rename — with the opener a parameter. Private: the public [`restore`]
+/// and the test hook are its only callers.
+fn restore_impl(
     archive: &Path,
     data: &Path,
     postgres_url: Option<&str>,
