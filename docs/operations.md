@@ -358,6 +358,11 @@ changes it cannot account for, and flips readiness until a restart. The
 file is mode 0600, never a symlink, in a directory only the server's
 user may write.
 
+The lines of concurrent changes can appear in a different order than the
+changes themselves: each job records its result after its change. Each
+ref line names its old and new head, so a ref's history is rebuilt by
+linking old to new, not by line order.
+
 ### Folder read rules
 
 A `read` or `write` rule may name a path prefix as its fourth field, by
