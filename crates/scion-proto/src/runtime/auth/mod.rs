@@ -268,6 +268,13 @@ pub fn read_secret_file(file: &Path) -> io::Result<Vec<u8>> {
 /// it is refused without a read. The snapshot reader streams through
 /// [`open_checked_file`](Self::open_checked_file) instead and holds no
 /// cap: a snapshot is the size of a disk by design.
+/// The most bytes [`read_secret_file`] and [`read_shared_file`] take
+/// whole. The largest legitimate caller is the access file's worst
+/// case — 32 rule sets of 256 prefixes, about 800 KB — so 1 MiB covers
+/// every token, URL, key and access file with room, and anything past
+/// it is refused without a read. The snapshot reader streams through
+/// [`open_checked_file`](Self::open_checked_file) instead and holds no
+/// cap: a snapshot is the size of a disk by design.
 pub(crate) const MAX_CHECKED_FILE: u64 = 1024 * 1024;
 
 /// Reads `file` that is public but must stay whole, such as the public key
@@ -304,14 +311,17 @@ pub fn checked_read_error(file: &Path, why: io::Error) -> anyhow::Error {
 /// rule (no group or others read, or no write).
 ///
 /// The whole file is taken into memory, so the size cap
-/// ([`MAX_CHECKED_FILE`]) refuses anything past it before a byte is
-/// read: the largest legitimate caller is the access file's worst case
-/// (32 rule sets of 256 prefixes, about 800 KB), a token or a URL is a
-/// few KiB, and 1 MiB covers both with room — a file past the cap is
-/// an attacker's, or an operator's, mistake worth naming, not memory.
-/// The snapshot reader streams instead and holds no cap by design.
+/// ([`MAX_CHECKED_FILE`]) refuses anything past it. The cap holds
+/// twice: the descriptor's length refuses a big file before a byte is
+/// read (the early, cheap refusal), and the read itself runs through
+/// [`Take`](std::io::Take) at the cap, so a file that grows between
+/// the two — an append, a growing sparse file — is still refused, not
+/// read whole. The largest legitimate caller is the access file's
+/// worst case (32 rule sets of 256 prefixes, about 800 KB), a token
+/// or a URL is a few KiB, and 1 MiB covers both with room. The
+/// snapshot reader streams instead and holds no cap by design.
 fn read_checked_file(file: &Path, secret: bool) -> io::Result<Vec<u8>> {
-    let mut opened = open_checked_file(file, secret)?;
+    let opened = open_checked_file(file, secret)?;
     let size = opened.metadata()?.len();
     if size > MAX_CHECKED_FILE {
         return Err(io::Error::new(
@@ -324,8 +334,24 @@ fn read_checked_file(file: &Path, secret: bool) -> io::Result<Vec<u8>> {
             ),
         ));
     }
+    // The take: one byte past the cap means the file grew after the
+    // fstat, and the read refuses instead of holding what it got.
     let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut opened, &mut bytes)?;
+    {
+        use std::io::Read as _;
+        let mut bounded = opened.take(MAX_CHECKED_FILE + 1);
+        bounded.read_to_end(&mut bytes)?;
+    }
+    if bytes.len() as u64 > MAX_CHECKED_FILE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} grew past the {} MiB cap for a checked file while it was read",
+                file.display(),
+                MAX_CHECKED_FILE / (1024 * 1024)
+            ),
+        ));
+    }
     Ok(bytes)
 }
 
@@ -615,7 +641,71 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Whether a file that is small at open and grows past the cap before
+    /// the read is refused: the read is bounded by [`Take`], so the answer
+    /// must be yes. The file starts at exactly the cap (the fstat check
+    /// passes) and a hot writer thread appends while the read copies, so
+    /// the growth lands between the fstat and the read — the gap only the
+    /// [`Take`] bound closes. A quiet file at exactly the cap is allowed,
+    /// which pins the boundary the take must keep.
+    #[test]
+    fn a_file_that_grows_past_the_cap_while_it_is_read_is_refused() {
+        let dir = tempfile::tempdir().expect("the temp dir opens");
+        let path = dir.path().join("token");
+        let chunk = std::sync::Arc::new(vec![b'x'; 64 * 1024]);
+
+        // The boundary first, quiet: a file at exactly the cap reads
+        // whole, because the take bounds at cap + 1.
+        {
+            std::fs::File::create(&path)
+                .and_then(|file| file.set_len(MAX_CHECKED_FILE))
+                .expect("the file is made and sized");
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("the mode is set");
+        let quiet = read_secret_file(&path).expect("a file at the cap is allowed");
+        assert_eq!(quiet.len() as u64, MAX_CHECKED_FILE);
+
+        // The growing file, retried a few times: the writer appends in a
+        // hot loop while the read copies a mebibyte of file, so at least
+        // one attempt sees the growth land between the fstat and the
+        // read. Every attempt must be refused: the take holds the cap,
+        // whatever the file did after the fstat.
+        for _ in 0..8 {
+            {
+                std::fs::File::create(&path)
+                    .and_then(|file| file.set_len(MAX_CHECKED_FILE))
+                    .expect("the file is made and sized");
+            }
+            let stop = Arc::new(AtomicBool::new(false));
+            let writer_stop = Arc::clone(&stop);
+            let writer_path = path.clone();
+            let writer_chunk = Arc::clone(&chunk);
+            let writer = std::thread::spawn(move || {
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&writer_path)
+                    .expect("the appender opens");
+                while !writer_stop.load(Ordering::Relaxed) {
+                    let _ = file.write_all(&writer_chunk);
+                }
+            });
+            let read = read_secret_file(&path);
+            stop.store(true, Ordering::Relaxed);
+            writer.join().expect("the appender stops");
+            let why =
+                read.expect_err("the read held a file that grew past the cap while it was read");
+            let why = format!("{why:?}");
+            assert!(why.contains("cap"), "the refusal must name the cap: {why}");
+        }
+    }
+    use std::os::unix::fs::symlink;
 
     use super::*;
 
