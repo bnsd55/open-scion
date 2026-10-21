@@ -94,10 +94,10 @@ pub(crate) const MAX_CONNECTION_AGE: Duration = Duration::from_secs(30 * 60);
 /// The HTTP/2 keepalive a client of a scion server runs: it pings its
 /// peer at this interval, busy or idle, and the peer's answer must come
 /// within [`CLIENT_KEEPALIVE_TIMEOUT`]. The server pings its side at
-/// [`KEEPALIVE_INTERVAL`] (60 s); a client that asks sooner sees a dead
-/// server first, and a kill without a FIN or RST (a frozen process, a
-/// host gone) ends its calls in about the interval plus the timeout,
-/// not at a call deadline.
+/// `KEEPALIVE_INTERVAL` (60 s, private to this module); a client that
+/// asks sooner sees a dead server first, and a kill without a FIN or
+/// RST (a frozen process, a host gone) ends its calls in about the
+/// interval plus the timeout, not at a call deadline.
 pub const CLIENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How long a client's connection waits for a keepalive answer before
