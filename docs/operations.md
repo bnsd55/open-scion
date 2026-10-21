@@ -163,14 +163,33 @@ run, and outlives one machine. The blob files stay in the data directory in
 every backend: they are the big majority of the bytes, and the database
 never stores them.
 
+The URL carries the database's credentials, so give it as a file the
+owner alone may read, not on the command line: a value on the command
+line is readable by every local account (`ps`), an environment value
+by the same user and root, and a file with the checks of the access
+file by whoever can read it.
+
 ```sh
+printf 'postgres://user@dbhost/scion?sslmode=require\n' > /srv/scion/db-url
+chmod 600 /srv/scion/db-url
 scion-server --data /srv/scion \
-  --postgres-url postgres://user@dbhost/scion?sslmode=require \
+  --postgres-url-file /srv/scion/db-url \
   --postgres-ca /srv/scion/db-ca.pem serve --access /srv/scion/access.txt
 ```
 
-- `--postgres-url` names the database. Off this machine the URL must ask
-  for TLS (`sslmode=require`): the open refuses a remote URL that does not.
+For containers and units that hold no secret files, the environment
+form is second best:
+
+```sh
+SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
+  scion-server --data /srv/scion serve --access /srv/scion/access.txt
+```
+
+- `--postgres-url-file` (or `SCION_POSTGRES_URL`) names the database.
+  `--postgres-url` takes the same value on the command line; it exists
+  for tests, warns, and is deprecated, because the process list shows
+  it to every local account. Off this machine the URL must ask for TLS
+  (`sslmode=require`): the open refuses a remote URL that does not.
 - `--postgres-ca` (a PEM file) is required with a remote host too: the
   database must present a certificate it signed, and there is no mode that
   accepts any certificate. A host on this machine (`localhost`, a loopback
@@ -337,6 +356,14 @@ Several flags can be set with an environment variable instead: the
 variable holds the same value the flag would. These are the ones the
 binaries read (each names the flag it stands for, and which binary reads
 it):
+
+Every flag that takes a secret's value also has a file form
+(`--x-file`) and an environment form. The file form is the deployment
+form: the owner alone may read it, and a symlink is refused. The
+environment value is visible to the same user and to root. The argv
+form exists for tests: its value is readable by every local account
+through `ps`, so the binaries warn when it is used, and it is
+deprecated.
 
 | Variable | Flag | Read by | Notes |
 | --- | --- | --- | --- |
